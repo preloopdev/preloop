@@ -383,6 +383,18 @@ pub enum NdjsonEvent {
         /// New status.
         status: ExecutionStatus,
     },
+    /// Job completed with result and outputs.
+    JobCompleted {
+        /// Run id.
+        run_id: RunId,
+        /// Job id.
+        job_id: JobId,
+        /// Final status.
+        status: ExecutionStatus,
+        /// Job outputs.
+        #[serde(default)]
+        outputs: BTreeMap<String, String>,
+    },
 }
 
 /// Annotation severity.
