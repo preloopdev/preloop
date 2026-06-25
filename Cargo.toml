@@ -1,13 +1,13 @@
 [workspace]
 members = [
-    "crates/preloop-artifacts",
-    "crates/preloop-cache",
-    "crates/preloop-conformance",
-    "crates/preloop-gha-expressions",
-    "crates/preloop-gha-parser",
-    "crates/preloop-gha-protocol",
-    "crates/preloop-runner-client",
-    "crates/preloop-runner-server",
+    "crates/aksh-artifacts",
+    "crates/aksh-cache",
+    "crates/aksh-conformance",
+    "crates/aksh-gha-expressions",
+    "crates/aksh-gha-parser",
+    "crates/aksh-gha-protocol",
+    "crates/aksh-runner-client",
+    "crates/aksh-runner-server",
 ]
 resolver = "2"
 

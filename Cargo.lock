@@ -12,6 +12,116 @@ dependencies = [
 ]
 
 [[package]]
+name = "aksh-artifacts"
+version = "0.1.0"
+dependencies = [
+ "aksh-gha-protocol",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "aksh-cache"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "aksh-conformance"
+version = "0.1.0"
+dependencies = [
+ "aksh-gha-parser",
+ "aksh-gha-protocol",
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "tokio",
+ "walkdir",
+]
+
+[[package]]
+name = "aksh-gha-expressions"
+version = "0.1.0"
+dependencies = [
+ "indexmap",
+ "proptest",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "aksh-gha-parser"
+version = "0.1.0"
+dependencies = [
+ "aksh-gha-expressions",
+ "aksh-gha-protocol",
+ "indexmap",
+ "proptest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "aksh-gha-protocol"
+version = "0.1.0"
+dependencies = [
+ "indexmap",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "uuid",
+]
+
+[[package]]
+name = "aksh-runner-client"
+version = "0.1.0"
+dependencies = [
+ "aksh-gha-protocol",
+ "anyhow",
+ "clap",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "aksh-runner-server"
+version = "0.1.0"
+dependencies = [
+ "aksh-artifacts",
+ "aksh-cache",
+ "aksh-gha-parser",
+ "aksh-gha-protocol",
+ "anyhow",
+ "axum",
+ "base64",
+ "bytes",
+ "clap",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tower-http 0.5.2",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -845,116 +955,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
 dependencies = [
  "zerocopy",
-]
-
-[[package]]
-name = "preloop-artifacts"
-version = "0.1.0"
-dependencies = [
- "preloop-gha-protocol",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "preloop-cache"
-version = "0.1.0"
-dependencies = [
- "sha2",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
-]
-
-[[package]]
-name = "preloop-conformance"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "preloop-gha-parser",
- "preloop-gha-protocol",
- "serde",
- "serde_json",
- "tokio",
- "walkdir",
-]
-
-[[package]]
-name = "preloop-gha-expressions"
-version = "0.1.0"
-dependencies = [
- "indexmap",
- "proptest",
- "serde_json",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "preloop-gha-parser"
-version = "0.1.0"
-dependencies = [
- "indexmap",
- "preloop-gha-expressions",
- "preloop-gha-protocol",
- "proptest",
- "serde",
- "serde_json",
- "serde_yaml",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "preloop-gha-protocol"
-version = "0.1.0"
-dependencies = [
- "indexmap",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "uuid",
-]
-
-[[package]]
-name = "preloop-runner-client"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "preloop-gha-protocol",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "preloop-runner-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "base64",
- "bytes",
- "clap",
- "preloop-artifacts",
- "preloop-cache",
- "preloop-gha-parser",
- "preloop-gha-protocol",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "tower",
- "tower-http 0.5.2",
- "tracing",
- "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]
