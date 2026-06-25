@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
 use aksh_gha_protocol::{JobId, JobPlan, StepPlan};
+
+/// Expression evaluation for workflow fields.
+pub mod eval;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
