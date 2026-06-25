@@ -1,0 +1,11 @@
+# ExpectedException: TemplateValidationException
+# ExpectedMessage: A sequence was not expected
+
+parameters:
+- name: str1
+  default:
+  - a
+  - b
+
+steps:
+- script: echo assert
