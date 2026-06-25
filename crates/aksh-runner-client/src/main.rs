@@ -3,9 +3,9 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use aksh_gha_protocol::RunId;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use aksh_gha_protocol::RunId;
 use reqwest::Url;
 use serde_json::Value;
 
