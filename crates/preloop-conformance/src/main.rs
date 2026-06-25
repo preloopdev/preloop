@@ -73,6 +73,7 @@ async fn expand_fixtures(fixtures: PathBuf) -> anyhow::Result<()> {
         };
         if !matches!(ext, "yml" | "yaml")
             || path.components().any(|c| c.as_os_str() == "azpipelines")
+            || path.file_name().is_some_and(|name| name == "action.yml")
         {
             skipped += 1;
             continue;
@@ -80,6 +81,10 @@ async fn expand_fixtures(fixtures: PathBuf) -> anyhow::Result<()> {
         let text = tokio::fs::read_to_string(path)
             .await
             .with_context(|| format!("read {}", path.display()))?;
+        if !looks_like_workflow(&text) {
+            skipped += 1;
+            continue;
+        }
         match parse_workflow(&text)
             .and_then(|workflow| expand_jobs(&workflow).map(|jobs| jobs.len()))
         {
@@ -108,6 +113,13 @@ async fn expand_fixtures(fixtures: PathBuf) -> anyhow::Result<()> {
     }
     eprintln!("parsed {parsed}, skipped {skipped}");
     Ok(())
+}
+
+fn looks_like_workflow(text: &str) -> bool {
+    text.lines().any(|line| {
+        let trimmed = line.trim_start();
+        !line.starts_with(' ') && (trimmed == "jobs:" || trimmed.starts_with("jobs: "))
+    })
 }
 
 async fn compare_command(
