@@ -19,7 +19,7 @@ use preloop_gha_protocol::{
     RunAccepted, RunId, RunnerJobMessage, RunnerRegistrationRequest, RunnerSession,
     RunnerSessionRequest, WorkflowSubmission, PROTOCOL_VERSION,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, Mutex};
