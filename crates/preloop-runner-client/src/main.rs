@@ -92,7 +92,8 @@ async fn main() -> anyhow::Result<()> {
                     let text = tokio::fs::read_to_string(&path)
                         .await
                         .with_context(|| format!("read payload {}", path.display()))?;
-                    serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?
+                    serde_json::from_str(&text)
+                        .with_context(|| format!("parse {}", path.display()))?
                 }
                 None => serde_json::json!({}),
             };
@@ -141,9 +142,12 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Events { run_id } => {
             print_response(
-                http.get(cli.server.join(&format!("/api/v1/runs/{run_id}/events.ndjson"))?)
-                    .send()
-                    .await?,
+                http.get(
+                    cli.server
+                        .join(&format!("/api/v1/runs/{run_id}/events.ndjson"))?,
+                )
+                .send()
+                .await?,
             )
             .await?;
         }

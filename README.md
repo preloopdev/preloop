@@ -19,7 +19,7 @@ This is a Rust implementation scaffold with the core parser, expression evaluato
 
 ## Toolchain
 
-The workspace targets Rust 1.78 or newer and uses `tokio`, `axum`, `serde_yaml`, `tracing`, `thiserror`, `anyhow`, and `clap`.
+The workspace targets Rust 1.86 or newer and uses `tokio`, `axum`, `serde_yaml`, `tracing`, `thiserror`, `anyhow`, and `clap`.
 
 ```sh
 cargo fmt --all
@@ -31,4 +31,3 @@ cargo run -p preloop-runner-client -- submit --workflow .github/workflows/ci.yml
 ## Upstream Reference
 
 The conformance target is `ChristopherHX/runner.server` at commit `992ccbbbf9afcde477c38c316e053b1af457ad40` unless `PRELOOP_UPSTREAM_RUNNER_SERVER_REF` is set. See [docs/reference/runner-server.md](docs/reference/runner-server.md) for the mapped surface and deliberate Preloop differences.
-

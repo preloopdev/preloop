@@ -53,7 +53,7 @@ pub fn eval_expression(input: &str, context: &Context) -> Result<Value, Expressi
     let mut parser = Parser::new(tokens);
     let expr = parser.parse_expr()?;
     parser.expect_end()?;
-    Ok(eval(&expr, context)?)
+    eval(&expr, context)
 }
 
 /// Evaluate an expression as GitHub Actions truthiness.
@@ -161,14 +161,17 @@ fn eval_call(name: &str, args: &[Expr], context: &Context) -> Result<Value, Expr
         "success" => Ok(Value::Bool(true)),
         "failure" => Ok(Value::Bool(false)),
         "cancelled" => Ok(Value::Bool(false)),
-        "contains" => Ok(Value::Bool(
-            values
-                .first()
-                .zip(values.get(1))
-                .is_some_and(|(haystack, needle)| contains(haystack, needle)),
+        "contains" => {
+            Ok(Value::Bool(values.first().zip(values.get(1)).is_some_and(
+                |(haystack, needle)| contains(haystack, needle),
+            )))
+        }
+        "startswith" => Ok(Value::Bool(
+            string_arg(&values, 0).starts_with(&string_arg(&values, 1)),
         )),
-        "startswith" => Ok(Value::Bool(string_arg(&values, 0).starts_with(&string_arg(&values, 1)))),
-        "endswith" => Ok(Value::Bool(string_arg(&values, 0).ends_with(&string_arg(&values, 1)))),
+        "endswith" => Ok(Value::Bool(
+            string_arg(&values, 0).ends_with(&string_arg(&values, 1)),
+        )),
         "format" => Ok(Value::String(format_args(&values))),
         "tojson" => Ok(Value::String(
             serde_json::to_string(values.first().unwrap_or(&Value::Null)).unwrap_or_default(),
@@ -251,9 +254,12 @@ impl<'a> Lexer<'a> {
                     self.bump();
                 }
                 '\'' => tokens.push(Token::String(self.string()?)),
-                '0'..='9' => tokens.push(Token::Number(self.take_while(|c| c.is_ascii_digit() || c == '.'))),
+                '0'..='9' => tokens.push(Token::Number(
+                    self.take_while(|c| c.is_ascii_digit() || c == '.'),
+                )),
                 'a'..='z' | 'A'..='Z' | '_' => {
-                    let ident = self.take_while(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+                    let ident =
+                        self.take_while(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
                     match ident.to_ascii_lowercase().as_str() {
                         "true" => tokens.push(Token::Bool(true)),
                         "false" => tokens.push(Token::Bool(false)),
@@ -566,4 +572,3 @@ mod tests {
         }
     }
 }
-

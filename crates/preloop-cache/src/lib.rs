@@ -41,7 +41,12 @@ impl CacheStore {
     }
 
     /// Save a cache archive.
-    pub async fn put(&self, key: &str, version: &str, bytes: &[u8]) -> Result<CacheEntry, CacheError> {
+    pub async fn put(
+        &self,
+        key: &str,
+        version: &str,
+        bytes: &[u8],
+    ) -> Result<CacheEntry, CacheError> {
         let path = self.path_for(key, version);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
@@ -90,7 +95,11 @@ impl CacheStore {
         self.root.join(hash_name(key, version)).join("archive.tzst")
     }
 
-    async fn find_prefix(&self, prefix: &str, version: &str) -> Result<Option<CacheEntry>, CacheError> {
+    async fn find_prefix(
+        &self,
+        prefix: &str,
+        version: &str,
+    ) -> Result<Option<CacheEntry>, CacheError> {
         let mut dir = fs::read_dir(&self.root).await?;
         while let Some(entry) = dir.next_entry().await? {
             let path = entry.path().join("archive.tzst");
@@ -124,7 +133,7 @@ fn hash_name(key: &str, version: &str) -> String {
         "{}-{}-{}",
         key_component(key),
         hash_suffix(version),
-        hex(&hasher.finalize())
+        hex(hasher.finalize())
     )
 }
 
@@ -133,7 +142,7 @@ fn key_component(key: &str) -> String {
 }
 
 fn hash_suffix(version: &str) -> String {
-    hex(&Sha256::digest(version.as_bytes()))[..16].to_owned()
+    hex(Sha256::digest(version.as_bytes()))[..16].to_owned()
 }
 
 fn hex(bytes: impl AsRef<[u8]>) -> String {

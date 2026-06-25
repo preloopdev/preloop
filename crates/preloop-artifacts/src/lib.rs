@@ -55,7 +55,11 @@ impl ArtifactStore {
         bytes: &[u8],
     ) -> Result<Artifact, ArtifactError> {
         let id = Uuid::new_v4();
-        let path = self.root.join(run_id.to_string()).join(id.to_string()).join(file_name);
+        let path = self
+            .root
+            .join(run_id.to_string())
+            .join(id.to_string())
+            .join(file_name);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
         }
@@ -102,11 +106,13 @@ mod tests {
         let store = ArtifactStore::new(temp.path()).await.unwrap();
         let run_id = RunId::new();
 
-        let artifact = store.put(run_id, "logs", "job.txt", b"hello").await.unwrap();
+        let artifact = store
+            .put(run_id, "logs", "job.txt", b"hello")
+            .await
+            .unwrap();
         let bytes = store.get(&artifact).await.unwrap();
 
         assert_eq!(bytes, b"hello");
         assert_eq!(store.list_run(run_id).await.unwrap().len(), 1);
     }
 }
-
