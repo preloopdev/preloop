@@ -71,6 +71,7 @@ Rough completeness against "100% faithful control plane": **~15–20%.**
 | `needs` DAG scheduling                           | not in server                                             | ❌ missing                                    |
 | `if` / contexts / outputs propagation            | modeled, never evaluated                                  | ❌ missing                                    |
 | Secrets policy / masking on the wire             | `SecretString` good, never used on wire                   | ⚠️ type only                                 |
+| **GitHub bootstrap** (`/actions/runner-registration`) | absent — runner dead-ends at Gitea `/api/v3/...`     | ❌ missing                                    |
 | **Runner session handshake (RSA/AES)**           | absent                                                    | ❌ missing                                    |
 | **Encrypted message queue (`TaskAgentMessage`)** | bespoke plaintext                                         | ❌ missing                                    |
 | `**AgentJobRequestMessage**`                     | structurally different                                    | ❌ missing                                    |
@@ -92,35 +93,43 @@ Grouped by the role they play for the official runner:
 
 ### 2.1 Runner lifecycle (mandatory for any job to run)
 
+- **GitHub bootstrap** — `POST api.github.com/actions/runner-registration` with
+  `{ url, runner_event }`. Returns the pipelines host URL that all subsequent AzDO
+  calls target. **This is the actual first call the runner makes** (verified by MITM
+  capture 2026-06-25; see `experiments/mitm/reports/`). On a non-GitHub URL the
+  runner switches to Gitea-style `POST /api/v3/actions/runner-registration` and never
+  reaches any `_apis/...` endpoint.
 - `ConnectionDataController` — `GET _apis/connectionData`: AzDO `ConnectionData` +
-
-  `LocationServiceData` GUID→location map. **First call the runner makes.**
+  `LocationServiceData` GUID→location map. **Delta-poll protocol**: the runner passes
+  `connectOptions=0&lastChangeId={n}&lastChangeId64={n}` and reconnects when the
+  server signals a change. MITM capture shows 10 fetches during registration+idle
+  (not a one-shot call).
 - `RunnerRegistrationController` / `AgentController` — agent (runner) registration; the
-
-  runner sends an **RSA public key**, server stores it for session-key wrapping.
-- `AgentPoolsController` — pool discovery.
+  runner sends an **RSA public key** (`authorization.publicKey.{exponent, modulus}`),
+  server stores it for session-key wrapping. `PUT .../agents/{id}` for replacement
+  (runner says "Successfully replaced the runner"); `POST` for creation.
+- `AgentPoolsController` — pool discovery (`GET .../pools?poolType=Automation`).
+  Returns 401 when the bearer token expires; runner re-authenticates via OAuth and
+  retries.
 - `AgentSessionController` — `POST .../sessions`: returns `TaskAgentSession` with an
-
-  **AES `encryptionKey`, RSA-wrapped** with the runner's pubkey. All later message bodies
-
-  are AES-encrypted with this key.
-- `MessageController` — `GET .../messages?sessionId&lastMessageId` long-poll returning
-
+  **AES `encryptionKey`, RSA-wrapped** with the runner's pubkey. All later message
+  bodies are AES-encrypted with this key. Request carries `useFipsEncryption` bool.
+- `MessageController` — `GET .../messages` long-poll returning
   `TaskAgentMessage{ messageId, messageType, iV, body }`; `DELETE .../messages/{id}` ack.
+  MITM-observed query params: `sessionId={guid}&status=Online&runnerVersion=2.317.0&os=macOS&architecture=ARM64&disableUpdate=false`.
+  The route also supports `lastMessageId` (not observed in this capture).
+  The runner self-reports platform on every poll. Mean DELETE (ack) latency: 1114ms.
 
   **This is the 6,839-line heart**: it also runs the whole evaluation (triggers,
-
   expressions, matrix, needs, contexts) and builds the job. Upstream leans on GitHub's
-
   real `DistributedTask.ObjectTemplating`, `Expressions2`, and `Pipelines.ContextData`
-
   SDKs — that is the semantic bar.
 - `AgentRequestController` — job request lease/renew/lock semantics.
 - `AuthController` / `OidcController` — OAuth client-credentials token issuance; the
-
-  runner attaches a bearer token to every subsequent call. `OidcController` mints job
-
-  OIDC tokens (`id-token: write`).
+  runner attaches a bearer token to every subsequent call. Token comes from
+  `tokenghub.actions.githubusercontent.com/_apis/oauth2/token/{guid}`. **Mandatory
+  heartbeat**: MITM capture shows 3 token refreshes in 60s, triggered by 401 on pool
+  queries. `OidcController` mints job OIDC tokens (`id-token: write`).
 
 ### 2.2 Job reporting (mandatory for status/logs/annotations)
 
@@ -453,32 +462,56 @@ Steps:
   **byte-identically** (modulo documented field-order normalization).
 - Property test: arbitrary DTO → serialize → deserialize is identity.
 
-### Phase B — `connectionData`, location services, OAuth/auth
+### Phase B — GitHub bootstrap, `connectionData`, location services, OAuth/auth
 
 **Goal:** the runner gets past discovery + authenticates.
 
 Steps:
 
-1. Implement `GET _apis/connectionData` returning the full service-GUID location map
+1. **GitHub bootstrap** — the runner's actual first call (MITM-verified). Two routes,
+   same handler:
+   - `POST /actions/runner-registration` — used when `--url` points at `github.com`
+   - `POST /api/v3/actions/runner-registration` — used when `--url` points at any
+     other host (GHES, Gitea, localhost). This is what the runner sends to aksh.
 
-   (copy GUIDs from the captured fixture; they are stable).
-2. `AuthController` equivalent: OAuth2 client-credentials `POST .../oauth2/token` → bearer.
-
+   **Request** (MITM-captured):
+   ```json
+   { "url": "http://localhost:PORT/runner/server", "runner_event": "register" }
+   ```
+   **Response** (MITM-captured from GitHub):
+   ```json
+   {
+     "token": "<OAuth JWT>",
+     "token_schema": "OAuthAccessToken",
+     "url": "https://<pipelines-host>/<session-prefix>/"
+   }
+   ```
+   aksh must return its own `_apis/...` base URL in `url` and a valid JWT in `token`.
+   Without this, the runner dead-ends: MITM-verified 3 failed attempts against
+   runner.server, zero AzDO flows.
+2. Implement `GET _apis/connectionData` returning the full service-GUID location map.
+   MITM capture shows this is a **delta-poll**: the runner passes
+   `connectOptions=0&lastChangeId={n}&lastChangeId64={n}` and reconnects on change.
+   (10 fetches during registration+idle; not a one-shot call.) Copy GUIDs from the
+   captured fixture; they are stable.
+3. `AuthController` equivalent: OAuth2 client-credentials `POST .../oauth2/token` → bearer.
    Issue/verify a local signing key; accept the runner's `.credentials` client auth.
-3. Bearer middleware (tower layer) gating all `_apis/...` routes; map missing/invalid →
-
-   AzDO 401 envelope.
-4. `OidcController`: mint a local OIDC JWT for `id-token: write` jobs (configurable issuer).
+   MITM capture shows the token endpoint is `/_apis/oauth2/token/{guid}` and the runner
+   refreshes 3× in 60s (triggered by 401 on pool queries).
+4. Bearer middleware (tower layer) gating all `_apis/...` routes; map missing/invalid →
+   AzDO 401 envelope. Pool queries (`GET .../pools?poolType=Automation`) return 401 when
+   the token expires; the runner re-auths and retries.
+5. `OidcController`: mint a local OIDC JWT for `id-token: write` jobs (configurable issuer).
 
 **Validate (Phase B):**
 
 - Point the **real `Runner.Listener config`** at aksh; it must register and store
-
   credentials without error (`./config.sh --url http://localhost:PORT --token X`).
 - Golden: our `connectionData` response contains the same service-location set as the
-
   fixture (assert superset of the GUIDs the runner indexes).
 - Negative: unauthenticated `_apis/...` → 401 with the AzDO error shape.
+- MITM re-run: with proxy in front of aksh, `captures/` must show the runner proceeding
+  past bootstrap to `/_apis/connectionData` (not dead-ending at `/api/v3/...`).
 
 ### Phase C — Registration + session key exchange (RSA/AES)
 
@@ -679,6 +712,21 @@ Build `aksh-conformance` into a real differential tester:
   - **Integration** — real `Runner.Listener` against aksh (later: inside a provider host).
 
 Normalization policy must be explicit and reviewed, so "match" is meaningful, not lax.
+
+### MITM experiment (`experiments/mitm/`)
+
+A separate mitmproxy-based capture harness exists at `experiments/mitm/` for recording
+exact HTTP traffic between the official runner and any control plane. It produces:
+
+- `captures/<backend>/<scenario>/latest/flows.jsonl` — every request/response with
+  headers (redacted), JSON bodies, base64 bodies, SHA256 hashes, and per-flow timing.
+- `reports/<scenario>/<timestamp>.md` — automated comparison of two captures with
+  endpoint matrix, per-endpoint JSON diffs, p50/p95 timing, and missing-endpoint lists.
+
+The first live capture (2026-06-25, `actions/runner` v2.317.0, macOS arm64) against
+`github.com/Bnjoroge1/Docktree` produced 24 GitHub control-plane flows. Against
+`runner.server` it produced 3 failed `POST /api/v3/actions/runner-registration` flows
+(zero AzDO traffic). Full results: `docs/mitm-comparison-report.md`.
 
 ---
 
