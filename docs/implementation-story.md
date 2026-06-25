@@ -220,12 +220,50 @@ future-proof against runner protocol evolution.
 
 ---
 
-## Chapter 7: What Comes Next
+## Chapter 7: The Encrypted Session
 
-With the runner able to discover endpoints and authenticate, the next
-chapters will cover:
+The runner protocol doesn't trust HTTP. Every message body is encrypted
+with AES-256-CBC, and the AES key is RSA-wrapped before being sent to
+the runner. This isn't optional — without it, the runner won't enter
+the message loop.
 
-- **Phase C**: The encrypted session (RSA key exchange, AES message bodies)
+### The Handshake
+
+1. Runner sends its RSA public key during registration
+2. Server generates a random 32-byte AES key
+3. Server RSA-OAEP wraps the AES key with the runner's public key
+4. Server returns `TaskAgentSession { encryptionKey: { value: <wrapped>, encrypted: true } }`
+5. Runner decrypts the AES key with its private key
+6. Every subsequent `TaskAgentMessage` has an AES-encrypted `body` + random `iv`
+7. Runner decrypts: `AES-CBC(key, iv).decrypt(body)`
+
+### The Implementation
+
+The `crypto` module in `aksh-gha-protocol` handles the math:
+
+- `AgentRsaKeypair::generate()` — 2048-bit RSA keypair
+- `wrap_key(plaintext)` — RSA-OAEP-SHA1 encrypt
+- `SessionEncryption::generate()` — random AES-256 key
+- `encrypt(plaintext)` — AES-256-CBC + PKCS#7 pad, returns `(ciphertext, iv)`
+- `decrypt(ciphertext, iv)` — reverse
+
+The server generates one RSA keypair at startup (per-process). Each
+session gets a fresh AES key. The AES key lives in `InnerState.session_keys`
+until the session is destroyed.
+
+### The Tradeoff
+
+We could have used RSA-OAEP-SHA256 (FIPS mode). We didn't — the runner
+defaults to SHA-1, and the upstream `runner.server` uses SHA-1. Matching
+the default avoids the FIPS flag complexity. If someone needs FIPS, they
+can swap the hash in one line.
+
+---
+
+## Chapter 8: What Comes Next
+
+With encrypted sessions working, the next chapters will cover:
+
 - **Phase D**: The evaluator (wiring expressions, building job messages)
 - **Phase E**: Timeline and logs (status flowing back from the runner)
 - **Phase F**: The needs DAG (multi-job scheduling)
