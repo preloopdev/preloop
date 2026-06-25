@@ -18,13 +18,14 @@ use aksh_artifacts::ArtifactStore;
 use aksh_cache::CacheStore;
 use aksh_gha_parser::{expand_jobs_with_reusables, parse_workflow};
 use aksh_gha_protocol::{
+    self as protocol,
     azdo::{
-        ConnectionData, EncryptionKey as AzdoEncryptionKey, LocationServiceData,
+        self, ConnectionData, EncryptionKey as AzdoEncryptionKey, LocationServiceData,
         ServiceDefinition, TaskAgentSession as AzdoSession,
     },
     crypto::{AgentRsaKeypair, SessionEncryption},
     event_to_ndjson, ExecutionStatus, JobCompletion, JobId, NdjsonEvent, RegisteredRunner,
-    RunAccepted, RunId, RunnerJobMessage, RunnerRegistrationRequest, RunnerSession,
+    RunAccepted, RunId, RunnerRegistrationRequest, RunnerSession,
     RunnerSessionRequest, WorkflowSubmission, PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
@@ -199,7 +200,7 @@ struct RunRecord {
 #[derive(Debug, Clone)]
 struct QueuedJob {
     run_id: RunId,
-    message: RunnerJobMessage,
+    message: azdo::AgentJobRequestMessage,
 }
 
 #[derive(Debug, Clone)]
@@ -318,10 +319,17 @@ async fn submit_run(
         let mut inner = shared.state.inner.lock().await;
         let mut statuses = BTreeMap::new();
         for job in jobs {
+            let agent_msg = aksh_gha_parser::job_builder::build_agent_job_message(
+                &job,
+                &github,
+                &job.env,
+                &submission.secrets.iter().map(|(k, v)| (k.clone(), v.expose().to_owned())).collect(),
+                &submission.vars,
+            ).map_err(|e| ApiError::bad_request(format!("failed to build job message: {e}")))?;
             statuses.insert(job.id.clone(), ExecutionStatus::Queued);
             inner.queue.push_back(QueuedJob {
                 run_id,
-                message: RunnerJobMessage::new(run_id, job, github.clone()),
+                message: agent_msg,
             });
         }
         let queued_jobs = statuses.len();
@@ -502,26 +510,62 @@ async fn delete_session(
 
 async fn next_message(
     State(shared): State<Arc<SharedState>>,
-) -> Result<Json<Option<RunnerJobMessage>>, ApiError> {
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Option<azdo::TaskAgentMessage>>, ApiError> {
+    let session_id = params.get("sessionId").cloned()
+        .unwrap_or_else(|| "default".to_owned());
+
     let mut inner = shared.state.inner.lock().await;
     let Some(queued) = inner.queue.pop_front() else {
         return Ok(Json(None));
     };
+
+    // Update run status
     if let Some(run) = inner.runs.get_mut(&queued.run_id) {
         run.status = ExecutionStatus::InProgress;
         run.jobs
-            .insert(queued.message.job.id.clone(), ExecutionStatus::InProgress);
+            .insert(JobId(queued.message.job_id.to_string()), ExecutionStatus::InProgress);
     }
+
+    // Get the session's AES key for encryption
+    let session_key = inner.session_keys.get(&session_id)
+        .map(|s| s.key.clone())
+        .unwrap_or_default();
+
+    // Serialize the job message to JSON
+    let body_json = serde_json::to_string(&queued.message)
+        .map_err(|e| ApiError::bad_request(format!("failed to serialize job message: {e}")))?;
+
+    // Encrypt with session AES key
+    let (encrypted_body, iv) = if !session_key.is_empty() {
+        let enc = SessionEncryption::from_key(session_key);
+        enc.encrypt(body_json.as_bytes())
+            .map_err(|e| ApiError::bad_request(format!("encryption failed: {e}")))?
+    } else {
+        // No encryption key — send plaintext (for testing)
+        (body_json.into_bytes(), vec![0u8; 16])
+    };
+
     drop(inner);
+
+    let run_id = queued.run_id;
+    let job_id = JobId(queued.message.job_id.to_string());
+
     shared
         .state
         .emit(NdjsonEvent::JobStatus {
-            run_id: queued.run_id,
-            job_id: queued.message.job.id.clone(),
+            run_id,
+            job_id,
             status: ExecutionStatus::InProgress,
         })
         .await;
-    Ok(Json(Some(queued.message)))
+
+    Ok(Json(Some(azdo::TaskAgentMessage {
+        message_id: 1,
+        message_type: "PipelineAgentJobRequest".to_owned(),
+        body: base64::engine::general_purpose::STANDARD.encode(&encrypted_body),
+        iv: Some(iv),
+    })))
 }
 
 async fn complete_job(
