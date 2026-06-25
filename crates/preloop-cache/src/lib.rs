@@ -100,7 +100,8 @@ impl CacheStore {
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
-            if name.starts_with(&hash_prefix(prefix)) && name.ends_with(&hash_suffix(version)) {
+            let expected_prefix = format!("{}-{}-", key_component(prefix), hash_suffix(version));
+            if name.starts_with(&expected_prefix) {
                 let size = fs::metadata(&path).await?.len();
                 return Ok(Some(CacheEntry {
                     key: prefix.to_owned(),
@@ -121,14 +122,14 @@ fn hash_name(key: &str, version: &str) -> String {
     hasher.update(version.as_bytes());
     format!(
         "{}-{}-{}",
-        hash_prefix(key),
+        key_component(key),
         hash_suffix(version),
         hex(&hasher.finalize())
     )
 }
 
-fn hash_prefix(key: &str) -> String {
-    hex(&Sha256::digest(key.as_bytes()))[..16].to_owned()
+fn key_component(key: &str) -> String {
+    hex(key.as_bytes())
 }
 
 fn hash_suffix(version: &str) -> String {
