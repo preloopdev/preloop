@@ -1,4 +1,4 @@
-//! Shared domain and wire models for Preloop's GitHub Actions control plane.
+//! Shared domain and wire models for aksh's GitHub Actions control plane.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -7,6 +7,9 @@ use std::str::FromStr;
 use indexmap::IndexMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
+
+/// Azure DevOps wire-format DTOs for the official runner protocol.
+pub mod azdo;
 
 /// Protocol version exposed by this crate's runner-compatible DTOs.
 pub const PROTOCOL_VERSION: &str = "2026-06-25.aksh.v1";

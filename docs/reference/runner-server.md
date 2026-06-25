@@ -10,7 +10,7 @@ Pinned reference commit used during this implementation pass:
 
 ## Compatibility Scope
 
-Preloop mirrors the parts of `runner.server` required to run GitHub Actions locally through an official `Runner.Listener` process:
+aksh mirrors the parts of `runner.server` required to run GitHub Actions locally through an official `Runner.Listener` process:
 
 - CLI workflow submission equivalent to `Runner.Client`.
 - Workflow/event/payload ingestion.
@@ -23,17 +23,16 @@ Azure Pipelines support from upstream is out of initial scope. The Rust domain m
 
 ## Upstream Files Mapped
 
-- `src/Runner.Client/*` maps to `preloop-runner-client`.
-- `src/Runner.Server/Controllers/*` maps to `preloop-runner-server` plus `preloop-cache` and `preloop-artifacts`.
-- `src/Runner.Server/Models/*` maps to `preloop-gha-protocol`.
+- `src/Runner.Client/*` maps to `aksh-runner-client`.
+- `src/Runner.Server/Controllers/*` maps to `aksh-server` plus `aksh-cache` and `aksh-artifacts`.
+- `src/Runner.Server/Models/*` maps to `aksh-protocol`.
 - `src/Runner.Server/Services/*` maps to parser, expression, secrets, and run orchestration modules.
-- `testworkflows/*` maps to `fixtures/upstream-workflows` and `preloop-conformance`.
+- `testworkflows/*` maps to `fixtures/upstream-workflows` and `aksh-conformance`.
 
-## Deliberate Preloop Choices
+## Deliberate aksh Choices
 
-- Preloop stores durable run state only behind explicit repository traits. The default server starts with an in-memory store for fast local feedback.
+- aksh stores durable run state only behind explicit repository traits. The default server starts with an in-memory store for fast local feedback.
 - Secret values are represented by a redaction-safe type whose `Debug`, `Display`, and serialization output never expose the secret payload.
 - Runner protocol DTOs are versioned and isolated from internal domain models.
 - All long-running async work receives an explicit cancellation token and shutdown path.
 - NDJSON events are a first-class output, not a side effect of human log formatting.
-
