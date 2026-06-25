@@ -18,6 +18,7 @@ use aksh_artifacts::ArtifactStore;
 use aksh_cache::CacheStore;
 use aksh_gha_parser::{expand_jobs_with_reusables, parse_workflow};
 use aksh_gha_protocol::{
+    azdo::{ConnectionData, LocationServiceData, ServiceDefinition},
     event_to_ndjson, ExecutionStatus, JobCompletion, JobId, NdjsonEvent, RegisteredRunner,
     RunAccepted, RunId, RunnerJobMessage, RunnerRegistrationRequest, RunnerSession,
     RunnerSessionRequest, WorkflowSubmission, PROTOCOL_VERSION,
@@ -67,6 +68,7 @@ async fn shutdown_signal(shutdown: CancellationToken) {
 pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/_apis/v1/oauth2/token", post(oauth2_token))
         .route("/api/v1/runs", post(submit_run))
         .route("/api/v1/runs/:run_id", get(get_run))
         .route("/api/v1/runs/:run_id/cancel", post(cancel_run))
@@ -577,12 +579,43 @@ fn summarize_run(statuses: impl Iterator<Item = ExecutionStatus>) -> ExecutionSt
     }
 }
 
-async fn connection_data() -> Json<serde_json::Value> {
-    Json(json!({
-        "locationServiceData": {},
-        "authenticatedUser": {"providerDisplayName": "aksh"},
-        "deploymentType": "aksh"
-    }))
+async fn connection_data() -> Json<ConnectionData> {
+    Json(real_connection_data())
+}
+
+fn real_connection_data() -> ConnectionData {
+    ConnectionData {
+        location_service_data: Some(LocationServiceData {
+            service_definitions: vec![
+                svc_def("AgentPools", "a8c47e17-4d56-4a56-92bb-de7ea7dc65be", "/_apis/v1/AgentPools"),
+                svc_def("Agent", "e298ef32-5878-4cab-993c-043836571f42", "/_apis/v1/Agent/{poolId}/{agentId}"),
+                svc_def("AgentSession", "134e239e-2df3-4794-a6f6-24f1f19ec8dc", "/_apis/v1/AgentSession/{poolId}/{sessionId}"),
+                svc_def("Message", "c3a054f6-7a8a-49c0-944e-3a8e5d7adfd7", "/_apis/v1/Message/{poolId}/{messageId}"),
+                svc_def("AgentRequest", "fc825784-c92a-4299-9221-998a02d1b54f", "/_apis/v1/AgentRequest/{poolId}/{requestId}"),
+                svc_def("ActionDownloadInfo", "27d7f831-88c1-4719-8ca1-6a061dad90eb", "/_apis/v1/ActionDownloadInfo/{scopeIdentifier}/{hubName}/{planId}"),
+                svc_def("TimeLineWebConsoleLog", "858983e4-19bd-4c5e-864c-507b59b58b12", "/_apis/v1/TimeLineWebConsoleLog/{scopeIdentifier}/{hubName}/{planId}/{timelineId}/{recordId}"),
+                svc_def("TimelineRecords", "8893bc5b-35b2-4be7-83cb-99e683551db4", "/_apis/v1/Timeline/{scopeIdentifier}/{hubName}/{planId}/{timelineId}"),
+                svc_def("Logfiles", "46f5667d-263a-4684-91b1-dff7fdcf64e2", "/_apis/v1/Logfiles/{scopeIdentifier}/{hubName}/{planId}/{logId}"),
+                svc_def("FinishJob", "557624af-b29e-4c20-8ab0-0399d2204f3f", "/_apis/v1/FinishJob/{scopeIdentifier}/{hubName}/{planId}"),
+                svc_def("Artifact", "85023071-bd5e-4438-89b0-2a5bf362a19d", "/_apis/pipelines/workflows/{runId}/artifacts"),
+                svc_def("ArtifactFileContainer", "e4f5c81e-e250-447b-9fef-bd48471bea5e", "/_apis/pipelines/workflows/container/{containerId}"),
+                svc_def("TimelineAttachments", "7898f959-9cdf-4096-b29e-7f293031629e", "/_apis/v1/Timeline/{scopeIdentifier}/{hubName}/{planId}/{timelineId}/attachments/{recordId}/{type}/{name}"),
+                svc_def("Timeline", "83597576-cc2c-453c-bea6-2882ae6a1653", "/_apis/v1/Timeline/{scopeIdentifier}/{hubName}/{planId}/timeline/{timelineId}"),
+                svc_def("CustomerIntelligence", "b5cc35c2-ff2b-491d-a085-24b6e9f396fd", "/_apis/v1/tasks"),
+                svc_def("Tasks", "60aac929-f0cd-4bc8-9ce4-6b30e8f1b1bd", "/_apis/v1/tasks/{taskId}/{versionString}"),
+                svc_def("Cache", "a7c78d38-31a8-417e-ba6b-7e58b352f304", "_apis/artifactcache"),
+                svc_def("BuildArtifacts", "1db06c96-014e-44e1-ac91-90b2d4b3e984", "_apis/pipelines/workflows/{buildId}/artifacts"),
+            ],
+        }),
+    }
+}
+
+fn svc_def(name: &str, id: &str, location: &str) -> ServiceDefinition {
+    ServiceDefinition {
+        identifier: Some(id.to_owned()),
+        location_mapping: Some(BTreeMap::from([("".to_owned(), location.to_owned())])),
+        display_name: Some(name.to_owned()),
+    }
 }
 
 async fn runner_pools() -> Json<serde_json::Value> {
@@ -590,6 +623,32 @@ async fn runner_pools() -> Json<serde_json::Value> {
         "count": 1,
         "value": [{"id": 1, "name": "Default", "isHosted": false}]
     }))
+}
+
+#[derive(Deserialize)]
+struct TokenRequest {
+    #[allow(dead_code)]
+    grant_type: String,
+    #[allow(dead_code)]
+    client_id: Option<String>,
+    #[allow(dead_code)]
+    client_secret: Option<String>,
+}
+
+#[derive(Serialize)]
+struct TokenResponse {
+    access_token: String,
+    token_type: String,
+    expires_in: u64,
+}
+
+async fn oauth2_token(Json(_req): Json<TokenRequest>) -> Json<TokenResponse> {
+    let token = format!("aksh-{}", uuid::Uuid::new_v4());
+    Json(TokenResponse {
+        access_token: token,
+        token_type: "bearer".to_owned(),
+        expires_in: 3600,
+    })
 }
 
 async fn cache_put(
