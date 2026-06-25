@@ -200,6 +200,8 @@ impl AppState {
 struct InnerState {
     runs: BTreeMap<RunId, RunRecord>,
     queue: VecDeque<QueuedJob>,
+    /// Jobs waiting for their `needs` dependencies to complete.
+    pending_jobs: VecDeque<QueuedJob>,
     runners: BTreeMap<i64, RegisteredRunner>,
     sessions: BTreeMap<String, RunnerSession>,
     session_keys: BTreeMap<String, SessionEncryption>,
@@ -347,11 +349,21 @@ async fn submit_run(
                 &submission.secrets.iter().map(|(k, v)| (k.clone(), v.expose().to_owned())).collect(),
                 &submission.vars,
             ).map_err(|e| ApiError::bad_request(format!("failed to build job message: {e}")))?;
-            statuses.insert(job.id.clone(), ExecutionStatus::Queued);
-            inner.queue.push_back(QueuedJob {
+
+            let queued_job = QueuedJob {
                 run_id,
                 message: agent_msg,
-            });
+            };
+
+            // Check if dependencies are met (no needs = ready immediately)
+            if job.needs.is_empty() {
+                statuses.insert(job.id.clone(), ExecutionStatus::Queued);
+                inner.queue.push_back(queued_job);
+            } else {
+                // Job has dependencies — queue it as pending
+                statuses.insert(job.id.clone(), ExecutionStatus::Queued);
+                inner.pending_jobs.push_back(queued_job);
+            }
         }
         let queued_jobs = statuses.len();
         inner.runs.insert(
@@ -652,6 +664,43 @@ async fn complete_job_inner(
     Ok(Json(record))
 }
 
+/// Check if pending jobs can be dispatched and promote them to the queue.
+fn promote_ready_jobs(inner: &mut InnerState) {
+    let mut promoted = Vec::new();
+    let mut remaining = VecDeque::new();
+
+    while let Some(job) = inner.pending_jobs.pop_front() {
+        // Get the job's needs from the message
+        let needs_satisfied = {
+            let run = inner.runs.get(&job.run_id);
+            let job_id_str = job.message.job_id.to_string();
+            // Find the base job id from the expanded id
+            let base_id = job_id_str.split('[').next().unwrap_or(&job_id_str);
+
+            if let Some(run) = run {
+                // Check all needs are complete (success or skipped)
+                run.jobs.iter().any(|(dep_id, status)| {
+                    dep_id.0.starts_with(base_id)
+                        && matches!(status, ExecutionStatus::Success | ExecutionStatus::Skipped)
+                }) || run.jobs.values().all(|s| matches!(s, ExecutionStatus::Success | ExecutionStatus::Skipped))
+            } else {
+                false
+            }
+        };
+
+        if needs_satisfied {
+            promoted.push(job);
+        } else {
+            remaining.push_back(job);
+        }
+    }
+
+    inner.pending_jobs = remaining;
+    for job in promoted {
+        inner.queue.push_back(job);
+    }
+}
+
 // ─── Phase E: Timeline, logs, completion ────────────────────────────────────
 
 /// PATCH timeline records — runner updates step/job state.
@@ -728,6 +777,9 @@ async fn finish_job(
     } else {
         RunId::new()
     };
+
+    // Promote pending jobs whose dependencies are now met
+    promote_ready_jobs(&mut inner);
 
     info!(
         job_id = %event.job_id,
