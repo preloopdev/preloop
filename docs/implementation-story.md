@@ -315,12 +315,44 @@ Encrypt always. The overhead is negligible (one AES op per message).
 
 ---
 
-## Chapter 9: What Comes Next
+## Chapter 9: The Feedback Loop — Timeline, Logs, Completion
 
-With the runner able to receive and decrypt job messages, the next
-chapters will cover:
+The runner doesn't just execute and vanish. It streams status back through
+the timeline API: step state transitions, log uploads, live console lines,
+and a final completion event with outputs. This is how you know what
+happened.
 
-- **Phase E**: Timeline and logs (status flowing back from the runner)
+### The Flow
+
+1. Runner PATCHes `TimelineRecord` for each step (pending → inProgress → completed)
+2. Runner creates log files and appends output lines
+3. Runner streams live console via `TimeLineWebConsoleLog`
+4. Runner sends `JobCompletedEvent` with final result + outputs
+
+### What We Built
+
+Five new endpoints, all following the AzDO URL templates from `connectionData`:
+
+- `PATCH .../Timeline/.../:timeline_id` — accepts `Vec<TimelineRecord>`, logs state
+  transitions
+- `POST .../Logfiles/.../:log_id` — log creation (stub for now)
+- `POST .../TimeLineWebConsoleLog/.../:record_id` — live console (stub)
+- `POST .../FinishJob/.../:plan_id` — updates run status, emits `JobCompleted` event
+
+### The Tradeoff
+
+Timeline records are currently accepted but not persisted — they're logged and
+emitted as events, but there's no database backing them yet. For a faithful
+control plane, you'd want to store these and serve them back for queries. For
+now, the runner can complete a job and the server acknowledges it. Full
+timeline persistence comes when we add the `RunStore` trait (Phase H).
+
+---
+
+## Chapter 10: What Comes Next
+
+With the feedback loop in place, the remaining chapters cover:
+
 - **Phase F**: The needs DAG (multi-job scheduling)
 - **Phase G**: Trigger and matrix fidelity
 - **Phase H**: Actions, cache, artifacts
