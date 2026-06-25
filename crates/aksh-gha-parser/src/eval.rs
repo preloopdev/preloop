@@ -2,6 +2,7 @@
 //!
 //! Wires `aksh-gha-expressions` to resolve `${{ }}` in workflow fields
 //! and build the `contextData` the runner needs for expression evaluation.
+
 //!
 //! Design principle: we resolve `${{ }}` in string fields that the
 //! *server* owns (env, with, run, runs-on). We emit the raw expression
@@ -9,6 +10,7 @@
 
 use std::collections::BTreeMap;
 
+use indexmap::IndexMap;
 use aksh_gha_expressions::{eval_expression, Context};
 use serde_json::{Map, Value};
 
@@ -97,7 +99,7 @@ pub fn build_context(
     github: &Value,
     env: &BTreeMap<String, String>,
     vars: &BTreeMap<String, String>,
-    matrix: &BTreeMap<String, Value>,
+    matrix: &IndexMap<String, Value>,
     strategy: &Value,
     secrets: &BTreeMap<String, String>,
 ) -> Context {

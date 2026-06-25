@@ -664,16 +664,13 @@ fn step_plan(step: Step) -> StepPlan {
     }
 }
 
-fn expanded_job_id(base: &str, matrix: &BTreeMap<String, Value>) -> String {
+fn expanded_job_id(base: &str, matrix: &IndexMap<String, Value>) -> String {
     if matrix.is_empty() {
         return base.to_owned();
     }
-    let suffix = matrix
-        .iter()
-        .map(|(key, value)| format!("{key}={}", value_key(value)))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{base}[{suffix}]")
+    // GitHub format: "name (v1, v2)" with values in declaration order
+    let values: Vec<String> = matrix.values().map(value_key).collect();
+    format!("{base} ({})", values.join(", "))
 }
 
 fn value_key(value: &Value) -> String {
@@ -686,12 +683,13 @@ fn value_key(value: &Value) -> String {
 fn expand_matrix(
     job_id: &str,
     matrix: Option<&Matrix>,
-) -> Result<Vec<BTreeMap<String, Value>>, ParserError> {
+) -> Result<Vec<IndexMap<String, Value>>, ParserError> {
     let Some(matrix) = matrix else {
-        return Ok(vec![BTreeMap::new()]);
+        return Ok(vec![IndexMap::new()]);
     };
 
-    let mut combinations = vec![BTreeMap::new()];
+    // Use IndexMap to preserve declaration order
+    let mut combinations: Vec<IndexMap<String, Value>> = vec![IndexMap::new()];
     for (axis, values) in &matrix.axes {
         let axis_values = match values {
             Value::Array(values) => values.clone(),
@@ -710,15 +708,15 @@ fn expand_matrix(
     }
 
     for excluded in &matrix.exclude {
-        let excluded = object_entry(job_id, "exclude", excluded)?;
+        let excluded = object_entry_indexed(job_id, "exclude", excluded)?;
         combinations.retain(|candidate| !matches_partial(candidate, &excluded));
     }
 
     for included in &matrix.include {
-        let included = object_entry(job_id, "include", included)?;
+        let included = object_entry_indexed(job_id, "include", included)?;
         if let Some(existing) = combinations
             .iter_mut()
-            .find(|candidate| can_merge_include(candidate, &included))
+            .find(|candidate| can_merge_include_indexed(candidate, &included))
         {
             existing.extend(included);
         } else {
@@ -727,10 +725,36 @@ fn expand_matrix(
     }
 
     if combinations.is_empty() {
-        combinations.push(BTreeMap::new());
+        combinations.push(IndexMap::new());
     }
 
     Ok(combinations)
+}
+
+fn object_entry_indexed(
+    job_id: &str,
+    field: &'static str,
+    value: &Value,
+) -> Result<IndexMap<String, Value>, ParserError> {
+    let Value::Object(map) = value else {
+        return Err(ParserError::InvalidMatrixEntry {
+            job_id: job_id.to_owned(),
+            field,
+        });
+    };
+    Ok(map
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect())
+}
+
+fn can_merge_include_indexed(
+    candidate: &IndexMap<String, Value>,
+    include: &IndexMap<String, Value>,
+) -> bool {
+    include
+        .iter()
+        .all(|(key, value)| candidate.get(key).is_none_or(|existing| existing == value))
 }
 
 fn object_entry(
@@ -750,7 +774,7 @@ fn object_entry(
         .collect())
 }
 
-fn matches_partial(candidate: &BTreeMap<String, Value>, partial: &BTreeMap<String, Value>) -> bool {
+fn matches_partial(candidate: &IndexMap<String, Value>, partial: &IndexMap<String, Value>) -> bool {
     partial.iter().all(|(key, value)| {
         candidate
             .get(key)
@@ -759,8 +783,8 @@ fn matches_partial(candidate: &BTreeMap<String, Value>, partial: &BTreeMap<Strin
 }
 
 fn can_merge_include(
-    candidate: &BTreeMap<String, Value>,
-    include: &BTreeMap<String, Value>,
+    candidate: &IndexMap<String, Value>,
+    include: &IndexMap<String, Value>,
 ) -> bool {
     include
         .iter()
