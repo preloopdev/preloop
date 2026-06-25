@@ -1,0 +1,44 @@
+//! Preloop runner server binary.
+
+use std::net::SocketAddr;
+use std::path::PathBuf;
+
+use clap::{Parser, Subcommand};
+use preloop_runner_server::{serve, ServerConfig};
+
+#[derive(Debug, Parser)]
+#[command(name = "preloop-runner-server")]
+#[command(about = "Preloop local GitHub Actions control plane")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Start the HTTP server.
+    Serve {
+        /// Address to listen on.
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        listen: SocketAddr,
+        /// State directory.
+        #[arg(long, default_value = ".preloop")]
+        state_dir: PathBuf,
+    },
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Serve { listen, state_dir } => {
+            serve(ServerConfig { listen, state_dir }).await?;
+        }
+    }
+    Ok(())
+}
+

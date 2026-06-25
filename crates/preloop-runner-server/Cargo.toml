@@ -1,0 +1,29 @@
+[package]
+name = "preloop-runner-server"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+preloop-artifacts = { path = "../preloop-artifacts" }
+preloop-cache = { path = "../preloop-cache" }
+preloop-gha-parser = { path = "../preloop-gha-parser" }
+preloop-gha-protocol = { path = "../preloop-gha-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
