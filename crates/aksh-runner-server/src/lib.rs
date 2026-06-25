@@ -152,6 +152,11 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             "/_apis/v1/FinishJob/:scope/:hub/:plan_id",
             post(finish_job),
         )
+        // Phase H: Action download info
+        .route(
+            "/_apis/v1/ActionDownloadInfo/:scope/:hub/:plan_id",
+            post(action_download_info),
+        )
         .layer(TraceLayer::new_for_http())
         .with_state(Arc::new(SharedState { state, shutdown }))
 }
@@ -800,6 +805,15 @@ async fn finish_job(
         .await;
 
     Json(json!({ "ok": true }))
+}
+
+/// POST action download info — resolve action references to download URLs.
+async fn action_download_info(
+    State(_shared): State<Arc<SharedState>>,
+    Json(request): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    // For now, return empty info — actions will be downloaded from GitHub
+    Json(json!({ "archiveDownloadTickets": {} }))
 }
 
 fn summarize_run(statuses: impl Iterator<Item = ExecutionStatus>) -> ExecutionStatus {
