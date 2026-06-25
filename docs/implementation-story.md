@@ -171,19 +171,63 @@ derived from them.
 
 ---
 
-## What Comes Next
+## Chapter 6: The Discovery Handshake
 
-With the DTOs in place, the next chapters will cover:
+The runner's very first HTTP call is `GET /_apis/connectionData`. It's
+not authenticated — it's the one anonymous endpoint. The response tells
+the runner *where to find everything else*.
 
-- **Phase B**: `connectionData` + auth (the runner discovers and
-  authenticates)
-- **Phase C**: Session crypto (RSA/AES key exchange, encrypted messages)
-- **Phase D**: The evaluator (wiring the expression engine, building
-  real `AgentJobRequestMessage`s)
-- **Phase E**: Timeline/logs/completion (status flowing back)
-- **Phase F**: The `needs` DAG (multi-job scheduling)
-- **Phase G**: Trigger and matrix fidelity (parsing matches GitHub)
-- **Phase H**: Actions, cache, artifacts (the full asset pipeline)
+### Why a GUID Map?
 
-Each phase is independently testable and produces a commit that moves
-the needle. The story continues.
+The Azure DevOps protocol uses GUIDs to identify services, not URL paths.
+Each service definition has a GUID and a URL template:
+
+```json
+{
+  "identifier": "c3a054f6-7a8a-49c0-944e-3a8e5d7adfd7",
+  "locationMapping": {"": "/_apis/v1/Message/{poolId}/{messageId}"},
+  "displayName": "Message"
+}
+```
+
+The runner indexes these GUIDs and uses them to construct API calls.
+There are 18 of them — one for each subsystem: agent pools, sessions,
+messages, timelines, logs, artifacts, cache, and more.
+
+We copied the exact GUIDs and URL templates from `runner.server`'s
+`ConnectionDataController.cs`. These are stable across runner versions —
+the GUIDs are part of the protocol contract, not the implementation.
+
+### The OAuth Dance
+
+After discovering endpoints, the runner authenticates. The protocol uses
+OAuth2 client-credentials flow: the runner sends a `POST` to the token
+endpoint with its registration credentials, and receives a bearer token.
+Every subsequent call includes `Authorization: Bearer <token>`.
+
+For the initial implementation, the token endpoint accepts any credentials
+and issues a UUID-based bearer token. Token validation, signing, and
+expiry will come in later phases. The important thing right now is that
+the runner can complete the handshake and reach the message queue.
+
+### The Tradeoff
+
+We could have skipped `connectionData` entirely and hard-coded the URL
+paths. But then the runner would fail if it ever changes its discovery
+logic (and it has — the broker migration path in `MessageListener.cs`
+shows this). By faithfully implementing the discovery handshake, we
+future-proof against runner protocol evolution.
+
+---
+
+## Chapter 7: What Comes Next
+
+With the runner able to discover endpoints and authenticate, the next
+chapters will cover:
+
+- **Phase C**: The encrypted session (RSA key exchange, AES message bodies)
+- **Phase D**: The evaluator (wiring expressions, building job messages)
+- **Phase E**: Timeline and logs (status flowing back from the runner)
+- **Phase F**: The needs DAG (multi-job scheduling)
+- **Phase G**: Trigger and matrix fidelity
+- **Phase H**: Actions, cache, artifacts

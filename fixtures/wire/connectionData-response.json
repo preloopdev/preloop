@@ -1,0 +1,24 @@
+{
+  "locationServiceData": {
+    "serviceDefinitions": [
+      {"identifier": "a8c47e17-4d56-4a56-92bb-de7ea7dc65be", "locationMapping": {"": "/_apis/v1/AgentPools"}, "displayName": "AgentPools"},
+      {"identifier": "e298ef32-5878-4cab-993c-043836571f42", "locationMapping": {"": "/_apis/v1/Agent/{poolId}/{agentId}"}, "displayName": "Agent"},
+      {"identifier": "134e239e-2df3-4794-a6f6-24f1f19ec8dc", "locationMapping": {"": "/_apis/v1/AgentSession/{poolId}/{sessionId}"}, "displayName": "AgentSession"},
+      {"identifier": "c3a054f6-7a8a-49c0-944e-3a8e5d7adfd7", "locationMapping": {"": "/_apis/v1/Message/{poolId}/{messageId}"}, "displayName": "Message"},
+      {"identifier": "fc825784-c92a-4299-9221-998a02d1b54f", "locationMapping": {"": "/_apis/v1/AgentRequest/{poolId}/{requestId}"}, "displayName": "AgentRequest"},
+      {"identifier": "27d7f831-88c1-4719-8ca1-6a061dad90eb", "locationMapping": {"": "/_apis/v1/ActionDownloadInfo/{scopeIdentifier}/{hubName}/{planId}"}, "displayName": "ActionDownloadInfo"},
+      {"identifier": "858983e4-19bd-4c5e-864c-507b59b58b12", "locationMapping": {"": "/_apis/v1/TimeLineWebConsoleLog/{scopeIdentifier}/{hubName}/{planId}/{timelineId}/{recordId}"}, "displayName": "TimeLineWebConsoleLog"},
+      {"identifier": "8893bc5b-35b2-4be7-83cb-99e683551db4", "locationMapping": {"": "/_apis/v1/Timeline/{scopeIdentifier}/{hubName}/{planId}/{timelineId}"}, "displayName": "TimelineRecords"},
+      {"identifier": "46f5667d-263a-4684-91b1-dff7fdcf64e2", "locationMapping": {"": "/_apis/v1/Logfiles/{scopeIdentifier}/{hubName}/{planId}/{logId}"}, "displayName": "Logfiles"},
+      {"identifier": "557624af-b29e-4c20-8ab0-0399d2204f3f", "locationMapping": {"": "/_apis/v1/FinishJob/{scopeIdentifier}/{hubName}/{planId}"}, "displayName": "FinishJob"},
+      {"identifier": "85023071-bd5e-4438-89b0-2a5bf362a19d", "locationMapping": {"": "/_apis/pipelines/workflows/{runId}/artifacts"}, "displayName": "Artifact"},
+      {"identifier": "E4F5C81E-E250-447B-9FEF-BD48471BEA5E", "locationMapping": {"": "/_apis/pipelines/workflows/container/{containerId}"}, "displayName": "ArtifactFileContainer"},
+      {"identifier": "7898f959-9cdf-4096-b29e-7f293031629e", "locationMapping": {"": "/_apis/v1/Timeline/{scopeIdentifier}/{hubName}/{planId}/{timelineId}/attachments/{recordId}/{type}/{name}"}, "displayName": "TimelineAttachments"},
+      {"identifier": "83597576-cc2c-453c-bea6-2882ae6a1653", "locationMapping": {"": "/_apis/v1/Timeline/{scopeIdentifier}/{hubName}/{planId}/timeline/{timelineId}"}, "displayName": "Timeline"},
+      {"identifier": "b5cc35c2-ff2b-491d-a085-24b6e9f396fd", "locationMapping": {"": "/_apis/v1/tasks"}, "displayName": "CustomerIntelligence"},
+      {"identifier": "60AAC929-F0CD-4BC8-9CE4-6B30E8F1B1BD", "locationMapping": {"": "/_apis/v1/tasks/{taskId}/{versionString}"}, "displayName": "Tasks"},
+      {"identifier": "a7c78d38-31a8-417e-ba6b-7e58b352f304", "locationMapping": {"": "_apis/artifactcache"}, "displayName": "Cache"},
+      {"identifier": "1db06c96-014e-44e1-ac91-90b2d4b3e984", "locationMapping": {"": "_apis/pipelines/workflows/{buildId}/artifacts"}, "displayName": "BuildArtifacts"}
+    ]
+  }
+}
