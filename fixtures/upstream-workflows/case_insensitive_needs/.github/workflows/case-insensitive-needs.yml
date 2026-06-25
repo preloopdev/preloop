@@ -1,0 +1,11 @@
+on: push
+jobs:
+  test:
+    runs-on: self-hosted
+    steps:
+    - run: echo Hi
+  test2:
+    needs: Test
+    runs-on: self-hosted
+    steps:
+    - run: echo Hi

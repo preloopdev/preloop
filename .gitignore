@@ -1,0 +1,7 @@
+/target/
+/.preloop/
+*.db
+*.sqlite
+*.log
+.DS_Store
+
