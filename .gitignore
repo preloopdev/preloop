@@ -5,3 +5,6 @@
 *.log
 .DS_Store
 
+experiments/mitm/.cache/
+experiments/mitm/captures/
+experiments/mitm/reports/
