@@ -73,15 +73,29 @@ impl Trigger {
 
 /// Environment map with scalar values normalized to strings.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct Env(pub BTreeMap<String, EnvValue>);
+#[serde(untagged)]
+pub enum Env {
+    /// No environment.
+    #[default]
+    Empty,
+    /// Mapping environment.
+    Map(BTreeMap<String, EnvValue>),
+    /// Expression-valued environment such as `${{ secrets }}`.
+    Expression(String),
+}
 
 impl Env {
     fn into_strings(self) -> BTreeMap<String, String> {
-        self.0
-            .into_iter()
-            .map(|(key, value)| (key, value.into_string()))
-            .collect()
+        match self {
+            Self::Empty => BTreeMap::new(),
+            Self::Map(values) => values
+                .into_iter()
+                .map(|(key, value)| (key, value.into_string()))
+                .collect(),
+            Self::Expression(value) => {
+                BTreeMap::from([("__preloop_env_expression".to_owned(), value)])
+            }
+        }
     }
 }
 
@@ -153,6 +167,8 @@ pub enum RunsOn {
     Single(String),
     /// Multiple labels.
     Many(Vec<String>),
+    /// Expression or object-valued runner selector.
+    Dynamic(Value),
 }
 
 impl Default for RunsOn {
@@ -166,6 +182,8 @@ impl RunsOn {
         match self {
             Self::Single(value) => vec![value.clone()],
             Self::Many(values) => values.clone(),
+            Self::Dynamic(Value::String(value)) => vec![value.clone()],
+            Self::Dynamic(_) => Vec::new(),
         }
     }
 }
@@ -264,6 +282,14 @@ fn normalize_yaml_keys(value: &mut serde_yaml::Value) {
             if let Some(on_value) = map.remove(serde_yaml::Value::Bool(true)) {
                 map.insert(serde_yaml::Value::String("on".to_owned()), on_value);
             }
+            let keys = map.keys().cloned().collect::<Vec<_>>();
+            for key in keys {
+                if !matches!(key, serde_yaml::Value::String(_)) {
+                    if let Some(value) = map.remove(key.clone()) {
+                        map.insert(serde_yaml::Value::String(yaml_key_to_string(&key)), value);
+                    }
+                }
+            }
             for value in map.values_mut() {
                 normalize_yaml_keys(value);
             }
@@ -274,6 +300,19 @@ fn normalize_yaml_keys(value: &mut serde_yaml::Value) {
             }
         }
         _ => {}
+    }
+}
+
+fn yaml_key_to_string(value: &serde_yaml::Value) -> String {
+    match value {
+        serde_yaml::Value::String(value) => value.clone(),
+        serde_yaml::Value::Bool(value) => value.to_string(),
+        serde_yaml::Value::Number(value) => value.to_string(),
+        serde_yaml::Value::Null => "null".to_owned(),
+        other => serde_yaml::to_string(other)
+            .unwrap_or_default()
+            .trim()
+            .to_owned(),
     }
 }
 
