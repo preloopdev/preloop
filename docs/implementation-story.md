@@ -260,11 +260,66 @@ can swap the hash in one line.
 
 ---
 
-## Chapter 8: What Comes Next
+## Chapter 8: The Evaluator — Where Expressions Meet the Wire
 
-With encrypted sessions working, the next chapters will cover:
+This is the hardest chapter. The expression engine existed but was
+orphaned — no code called it. The parser existed but didn't resolve
+`${{ }}`. The protocol DTOs existed but nothing built them. Phase D
+connects all three.
 
-- **Phase D**: The evaluator (wiring expressions, building job messages)
+### The Pipeline
+
+1. **Parse** the workflow YAML → `Workflow` struct (already done)
+2. **Expand** jobs with matrix → `Vec<JobPlan>` (already done)
+3. **Evaluate** expressions in each field → resolved strings
+4. **Build** `AgentJobRequestMessage` with resolved data
+5. **Encrypt** the message body with the session's AES key
+6. **Deliver** as `TaskAgentMessage` to the runner
+
+### Step 3: Expression Resolution
+
+The `eval` module in the parser wires `aksh-gha-expressions` to resolve
+`${{ }}` in string fields. A key design decision: we resolve expressions
+in fields the *server* owns (env, with, run, runs-on) but emit raw
+expression strings for `if` conditions. The runner evaluates `if`
+conditions itself — it needs to see the original expression to evaluate
+it in the context of actual job status.
+
+### Step 4: The Job Message Builder
+
+`AgentJobRequestMessage` is the most complex DTO. The builder takes a
+`JobPlan` + context data and produces:
+
+- Resolved steps with evaluated `env`, `with`, `run`
+- `contextData` map: `github`, `env`, `vars`, `matrix`, `strategy`,
+  `needs`, `secrets`
+- `variables` with `VariableValue` (value + isSecret flag)
+- `maskHints` for every secret value
+- `SystemVssConnection` service endpoint
+- Timeline and job UUIDs
+
+### Step 5: Encryption
+
+The runner expects every message body to be AES-encrypted. The server
+serializes the `AgentJobRequestMessage` to JSON, encrypts with the
+session's AES key + a random IV, and base64-encodes the ciphertext.
+The runner decrypts with the same key (unwrapped from RSA during
+session creation).
+
+### The Tradeoff
+
+We could have skipped encryption for local use — the runner would
+still work. But then you'd have two code paths: encrypted for
+production, plaintext for local. That's a bug waiting to happen.
+Encrypt always. The overhead is negligible (one AES op per message).
+
+---
+
+## Chapter 9: What Comes Next
+
+With the runner able to receive and decrypt job messages, the next
+chapters will cover:
+
 - **Phase E**: Timeline and logs (status flowing back from the runner)
 - **Phase F**: The needs DAG (multi-job scheduling)
 - **Phase G**: Trigger and matrix fidelity
