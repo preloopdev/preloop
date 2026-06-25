@@ -82,6 +82,131 @@ impl Trigger {
             Trigger::Map(values) => values.contains_key(event),
         }
     }
+
+    /// Returns true when the workflow should run for an event with context.
+    /// Supports branch/tag/path filtering.
+    pub fn matches_with_context(
+        &self,
+        event: &str,
+        branch: Option<&str>,
+        tag: Option<&str>,
+        paths: &[String],
+    ) -> bool {
+        match self {
+            Trigger::Single(value) => value == event,
+            Trigger::Many(values) => values.iter().any(|value| value == event),
+            Trigger::Map(values) => {
+                if !values.contains_key(event) {
+                    return false;
+                }
+                // Check branch/tag/path filters
+                if let Some(config) = values.get(event) {
+                    if let Some(obj) = config.as_object() {
+                        // branches filter
+                        if let Some(branches) = obj.get("branches") {
+                            if let Some(branch) = branch {
+                                if !matches_filter(branches, branch) {
+                                    return false;
+                                }
+                            } else {
+                                return false;
+                            }
+                        }
+                        // branches-ignore
+                        if let Some(ignore) = obj.get("branches-ignore") {
+                            if let Some(branch) = branch {
+                                if matches_filter(ignore, branch) {
+                                    return false;
+                                }
+                            }
+                        }
+                        // tags filter
+                        if let Some(tags) = obj.get("tags") {
+                            if let Some(tag) = tag {
+                                if !matches_filter(tags, tag) {
+                                    return false;
+                                }
+                            } else {
+                                return false;
+                            }
+                        }
+                        // tags-ignore
+                        if let Some(ignore) = obj.get("tags-ignore") {
+                            if let Some(tag) = tag {
+                                if matches_filter(ignore, tag) {
+                                    return false;
+                                }
+                            }
+                        }
+                        // paths filter
+                        if let Some(path_filters) = obj.get("paths") {
+                            if !paths.is_empty() && !paths.iter().any(|p| matches_filter(path_filters, p)) {
+                                return false;
+                            }
+                        }
+                        // paths-ignore
+                        if let Some(ignore) = obj.get("paths-ignore") {
+                            if paths.iter().any(|p| matches_filter(ignore, p)) {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                true
+            }
+        }
+    }
+}
+
+/// Check if a value matches a filter pattern (string or array of strings with globs).
+fn matches_filter(filter: &Value, value: &str) -> bool {
+    match filter {
+        Value::String(pattern) => glob_match(pattern, value),
+        Value::Array(patterns) => patterns.iter().any(|p| {
+            if let Value::String(pattern) = p {
+                glob_match(pattern, value)
+            } else {
+                false
+            }
+        }),
+        _ => false,
+    }
+}
+
+/// Simple glob matching (supports * and **).
+fn glob_match(pattern: &str, value: &str) -> bool {
+    // Simple glob: * matches any characters, ** matches path separators too
+    if pattern == "*" {
+        return true;
+    }
+    if pattern.contains("**") {
+        // Double star: match across path separators
+        let parts: Vec<&str> = pattern.split("**").collect();
+        if parts.len() == 2 {
+            let prefix = parts[0].trim_end_matches('/');
+            let suffix = parts[1].trim_start_matches('/');
+            if !prefix.is_empty() && !value.starts_with(prefix) {
+                return false;
+            }
+            if !suffix.is_empty() {
+                let remaining = if prefix.is_empty() {
+                    value
+                } else {
+                    value.strip_prefix(prefix).unwrap_or(value)
+                };
+                return remaining.ends_with(suffix) || remaining.contains(suffix);
+            }
+            return true;
+        }
+    }
+    // Single star: match within a path segment
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 2 {
+        let prefix = parts[0];
+        let suffix = parts[1];
+        return value.starts_with(prefix) && value.ends_with(suffix);
+    }
+    pattern == value
 }
 
 /// Environment map with scalar values normalized to strings.
