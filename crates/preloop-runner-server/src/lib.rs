@@ -71,7 +71,10 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         .route("/api/v1/runs/:run_id/events.ndjson", get(run_events))
         .route("/api/v1/runners", post(register_runner))
         .route("/api/v1/runners/sessions", post(create_session))
-        .route("/api/v1/runners/sessions/:session_id/messages", get(next_message))
+        .route(
+            "/api/v1/runners/sessions/:session_id/messages",
+            get(next_message),
+        )
         .route("/api/v1/jobs/complete", post(complete_job))
         .route("/runner/server/_apis/connectionData", get(connection_data))
         .route(
@@ -214,9 +217,15 @@ async fn submit_run(
         drop(inner);
         shared
             .state
-            .emit(NdjsonEvent::RunAccepted { run_id, queued_jobs })
+            .emit(NdjsonEvent::RunAccepted {
+                run_id,
+                queued_jobs,
+            })
             .await;
-        Ok(Json(RunAccepted { run_id, queued_jobs }))
+        Ok(Json(RunAccepted {
+            run_id,
+            queued_jobs,
+        }))
     }
 }
 
@@ -245,7 +254,10 @@ async fn cancel_run(
             .ok_or_else(|| ApiError::not_found("run not found"))?;
         record.status = ExecutionStatus::Cancelled;
         for status in record.jobs.values_mut() {
-            if matches!(*status, ExecutionStatus::Queued | ExecutionStatus::InProgress) {
+            if matches!(
+                *status,
+                ExecutionStatus::Queued | ExecutionStatus::InProgress
+            ) {
                 *status = ExecutionStatus::Cancelled;
             }
         }
@@ -437,19 +449,20 @@ async fn complete_job_inner(
 
 fn summarize_run(statuses: impl Iterator<Item = ExecutionStatus>) -> ExecutionStatus {
     let statuses = statuses.collect::<Vec<_>>();
-    if statuses.iter().any(|status| *status == ExecutionStatus::Failure) {
+    if statuses
+        .iter()
+        .any(|status| *status == ExecutionStatus::Failure)
+    {
         ExecutionStatus::Failure
     } else if statuses
         .iter()
         .any(|status| *status == ExecutionStatus::Cancelled)
     {
         ExecutionStatus::Cancelled
-    } else if statuses.iter().all(|status| {
-        matches!(
-            status,
-            ExecutionStatus::Success | ExecutionStatus::Skipped
-        )
-    }) {
+    } else if statuses
+        .iter()
+        .all(|status| matches!(status, ExecutionStatus::Success | ExecutionStatus::Skipped))
+    {
         ExecutionStatus::Success
     } else {
         ExecutionStatus::InProgress

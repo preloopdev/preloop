@@ -261,7 +261,7 @@ pub fn parse_workflow(input: &str) -> Result<Workflow, ParserError> {
 fn normalize_yaml_keys(value: &mut serde_yaml::Value) {
     match value {
         serde_yaml::Value::Mapping(map) => {
-            if let Some(on_value) = map.remove(&serde_yaml::Value::Bool(true)) {
+            if let Some(on_value) = map.remove(serde_yaml::Value::Bool(true)) {
                 map.insert(serde_yaml::Value::String("on".to_owned()), on_value);
             }
             for value in map.values_mut() {
@@ -394,19 +394,27 @@ fn object_entry(
             field,
         });
     };
-    Ok(map.iter().map(|(key, value)| (key.clone(), value.clone())).collect())
+    Ok(map
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect())
 }
 
 fn matches_partial(candidate: &BTreeMap<String, Value>, partial: &BTreeMap<String, Value>) -> bool {
-    partial
-        .iter()
-        .all(|(key, value)| candidate.get(key).is_some_and(|candidate| candidate == value))
+    partial.iter().all(|(key, value)| {
+        candidate
+            .get(key)
+            .is_some_and(|candidate| candidate == value)
+    })
 }
 
-fn can_merge_include(candidate: &BTreeMap<String, Value>, include: &BTreeMap<String, Value>) -> bool {
+fn can_merge_include(
+    candidate: &BTreeMap<String, Value>,
+    include: &BTreeMap<String, Value>,
+) -> bool {
     include
         .iter()
-        .all(|(key, value)| candidate.get(key).map_or(true, |existing| existing == value))
+        .all(|(key, value)| candidate.get(key).is_none_or(|existing| existing == value))
 }
 
 #[cfg(test)]

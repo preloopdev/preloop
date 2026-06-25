@@ -417,4 +417,3 @@ mod tests {
         assert_eq!(secret.expose(), "super-secret");
     }
 }
-

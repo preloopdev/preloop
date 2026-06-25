@@ -1,3 +1,5 @@
+//! Golden tests for stable protocol JSON shapes.
+
 use preloop_gha_protocol::{event_to_ndjson, ExecutionStatus, JobId, NdjsonEvent, RunId};
 use uuid::Uuid;
 
@@ -16,4 +18,3 @@ fn ndjson_event_shape_is_stable() {
         "{\"type\":\"job_status\",\"run_id\":\"00000000-0000-0000-0000-000000000001\",\"job_id\":\"test[os=ubuntu-latest]\",\"status\":\"success\"}\n"
     );
 }
-

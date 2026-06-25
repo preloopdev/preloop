@@ -71,14 +71,18 @@ async fn expand_fixtures(fixtures: PathBuf) -> anyhow::Result<()> {
         let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
             continue;
         };
-        if !matches!(ext, "yml" | "yaml") || path.components().any(|c| c.as_os_str() == "azpipelines") {
+        if !matches!(ext, "yml" | "yaml")
+            || path.components().any(|c| c.as_os_str() == "azpipelines")
+        {
             skipped += 1;
             continue;
         }
         let text = tokio::fs::read_to_string(path)
             .await
             .with_context(|| format!("read {}", path.display()))?;
-        match parse_workflow(&text).and_then(|workflow| expand_jobs(&workflow).map(|jobs| jobs.len())) {
+        match parse_workflow(&text)
+            .and_then(|workflow| expand_jobs(&workflow).map(|jobs| jobs.len()))
+        {
             Ok(job_count) => {
                 parsed += 1;
                 println!(
@@ -106,7 +110,11 @@ async fn expand_fixtures(fixtures: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn compare_command(upstream: String, preloop: String, args: Vec<String>) -> anyhow::Result<()> {
+async fn compare_command(
+    upstream: String,
+    preloop: String,
+    args: Vec<String>,
+) -> anyhow::Result<()> {
     let upstream_output = Command::new(&upstream)
         .args(&args)
         .stdout(Stdio::piped())
@@ -138,4 +146,3 @@ async fn compare_command(upstream: String, preloop: String, args: Vec<String>) -
     }
     Ok(())
 }
-

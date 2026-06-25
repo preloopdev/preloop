@@ -15,7 +15,7 @@ resolver = "2"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/preloop/preloop"
-rust-version = "1.78"
+rust-version = "1.86"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -39,11 +39,10 @@ serde_yaml = "0.9"
 sha2 = "0.10"
 tempfile = "3.10"
 thiserror = "1.0"
-tokio = { version = "1.37", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "fs", "io-util"] }
+tokio = { version = "1.37", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "fs", "io-util", "process"] }
 tokio-util = "0.7"
 tower-http = { version = "0.5", features = ["trace", "cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1.8", features = ["v4", "serde"] }
 walkdir = "2.5"
-
