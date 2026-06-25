@@ -11,6 +11,9 @@ use uuid::Uuid;
 /// Azure DevOps wire-format DTOs for the official runner protocol.
 pub mod azdo;
 
+/// RSA/AES session encryption for the runner protocol.
+pub mod crypto;
+
 /// Protocol version exposed by this crate's runner-compatible DTOs.
 pub const PROTOCOL_VERSION: &str = "2026-06-25.aksh.v1";
 
