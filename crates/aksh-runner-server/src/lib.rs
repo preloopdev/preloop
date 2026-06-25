@@ -18,7 +18,11 @@ use aksh_artifacts::ArtifactStore;
 use aksh_cache::CacheStore;
 use aksh_gha_parser::{expand_jobs_with_reusables, parse_workflow};
 use aksh_gha_protocol::{
-    azdo::{ConnectionData, LocationServiceData, ServiceDefinition},
+    azdo::{
+        ConnectionData, EncryptionKey as AzdoEncryptionKey, LocationServiceData,
+        ServiceDefinition, TaskAgentSession as AzdoSession,
+    },
+    crypto::{AgentRsaKeypair, SessionEncryption},
     event_to_ndjson, ExecutionStatus, JobCompletion, JobId, NdjsonEvent, RegisteredRunner,
     RunAccepted, RunId, RunnerJobMessage, RunnerRegistrationRequest, RunnerSession,
     RunnerSessionRequest, WorkflowSubmission, PROTOCOL_VERSION,
@@ -153,8 +157,12 @@ impl AppState {
         let cache = CacheStore::new(state_dir.join("cache")).await?;
         let artifacts = ArtifactStore::new(state_dir.join("artifacts")).await?;
         let (events, _) = broadcast::channel(1024);
+        let keypair = AgentRsaKeypair::generate()
+            .map_err(|e| anyhow::anyhow!("Failed to generate RSA keypair: {}", e))?;
+        let mut inner = InnerState::default();
+        inner.agent_keypair = Some(keypair);
         Ok(Self {
-            inner: Arc::new(Mutex::new(InnerState::default())),
+            inner: Arc::new(Mutex::new(inner)),
             events,
             cache,
             artifacts,
@@ -172,6 +180,8 @@ struct InnerState {
     queue: VecDeque<QueuedJob>,
     runners: BTreeMap<i64, RegisteredRunner>,
     sessions: BTreeMap<String, RunnerSession>,
+    session_keys: BTreeMap<String, SessionEncryption>,
+    agent_keypair: Option<AgentRsaKeypair>,
     pending_caches: BTreeMap<i64, PendingCache>,
     artifacts: BTreeMap<String, ArtifactRecord>,
     next_runner_id: i64,
@@ -448,17 +458,37 @@ async fn register_runner(
 
 async fn create_session(
     State(shared): State<Arc<SharedState>>,
-    Json(request): Json<RunnerSessionRequest>,
-) -> Json<RunnerSession> {
-    let session = RunnerSession {
-        session_id: aksh_gha_protocol::SessionId::new(),
-        runner_id: request.runner_id,
+    Json(_request): Json<RunnerSessionRequest>,
+) -> Json<AzdoSession> {
+    let session_id = uuid::Uuid::new_v4();
+
+    // Generate AES session key
+    let session_enc = SessionEncryption::generate();
+
+    // RSA-wrap the AES key with the agent's public key
+    let wrapped_key = {
+        let inner = shared.state.inner.lock().await;
+        let keypair = inner.agent_keypair.as_ref()
+            .expect("RSA keypair must be initialized");
+        keypair.wrap_key(&session_enc.key)
+            .expect("RSA wrap should not fail for valid key")
     };
-    let mut inner = shared.state.inner.lock().await;
-    inner
-        .sessions
-        .insert(session.session_id.0.to_string(), session.clone());
-    Json(session)
+
+    // Store the session key for later message decryption
+    {
+        let mut inner = shared.state.inner.lock().await;
+        inner.session_keys.insert(session_id.to_string(), session_enc);
+    }
+
+    info!(%session_id, "session created with encrypted AES key");
+
+    Json(AzdoSession {
+        session_id,
+        encryption_key: AzdoEncryptionKey {
+            value: wrapped_key,
+            encrypted: true,
+        },
+    })
 }
 
 async fn delete_session(
