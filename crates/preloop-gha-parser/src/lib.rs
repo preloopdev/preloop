@@ -1,6 +1,7 @@
 //! Typed GitHub Actions workflow parser and job expander.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
 use preloop_gha_protocol::{JobId, JobPlan, StepPlan};
@@ -23,6 +24,12 @@ pub enum ParserError {
         job_id: String,
         /// Matrix field.
         field: &'static str,
+    },
+    /// Local reusable workflow was referenced but not supplied.
+    #[error("local reusable workflow `{path}` was not found")]
+    MissingReusableWorkflow {
+        /// Referenced workflow path.
+        path: String,
     },
 }
 
@@ -265,6 +272,105 @@ pub struct Step {
     pub if_condition: Option<String>,
 }
 
+/// Action metadata from `action.yml` or `action.yaml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionMetadata {
+    /// Action display name.
+    pub name: String,
+    /// Action description.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Action inputs.
+    #[serde(default)]
+    pub inputs: BTreeMap<String, ActionInput>,
+    /// Action outputs.
+    #[serde(default)]
+    pub outputs: BTreeMap<String, ActionOutput>,
+    /// Runtime definition.
+    pub runs: ActionRuns,
+}
+
+/// Action input metadata.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ActionInput {
+    /// Description.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Required flag.
+    #[serde(default)]
+    pub required: bool,
+    /// Default value.
+    #[serde(default)]
+    pub default: Option<Value>,
+}
+
+/// Action output metadata.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ActionOutput {
+    /// Description.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Output value expression.
+    #[serde(default)]
+    pub value: Option<String>,
+}
+
+/// Action runtime metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "using", rename_all = "kebab-case")]
+pub enum ActionRuns {
+    /// Composite action.
+    Composite {
+        /// Composite action steps.
+        #[serde(default)]
+        steps: Vec<Step>,
+    },
+    /// Node 12 action.
+    Node12 {
+        /// Main script.
+        main: String,
+        /// Optional pre script.
+        #[serde(default)]
+        pre: Option<String>,
+        /// Optional post script.
+        #[serde(default)]
+        post: Option<String>,
+    },
+    /// Node 16 action.
+    Node16 {
+        /// Main script.
+        main: String,
+        /// Optional pre script.
+        #[serde(default)]
+        pre: Option<String>,
+        /// Optional post script.
+        #[serde(default)]
+        post: Option<String>,
+    },
+    /// Node 20 action.
+    Node20 {
+        /// Main script.
+        main: String,
+        /// Optional pre script.
+        #[serde(default)]
+        pre: Option<String>,
+        /// Optional post script.
+        #[serde(default)]
+        post: Option<String>,
+    },
+    /// Docker action.
+    Docker {
+        /// Docker image or Dockerfile.
+        image: String,
+        /// Entrypoint override.
+        #[serde(default)]
+        entrypoint: Option<String>,
+        /// Arguments.
+        #[serde(default)]
+        args: Vec<String>,
+    },
+}
+
 /// Parse workflow YAML.
 pub fn parse_workflow(input: &str) -> Result<Workflow, ParserError> {
     let mut value: serde_yaml::Value = serde_yaml::from_str(input)?;
@@ -274,6 +380,13 @@ pub fn parse_workflow(input: &str) -> Result<Workflow, ParserError> {
         return Err(ParserError::EmptyJobs);
     }
     Ok(workflow)
+}
+
+/// Parse local action metadata from `action.yml` or `action.yaml`.
+pub fn parse_action_metadata(input: &str) -> Result<ActionMetadata, ParserError> {
+    let mut value: serde_yaml::Value = serde_yaml::from_str(input)?;
+    normalize_yaml_keys(&mut value);
+    Ok(serde_yaml::from_value(value)?)
 }
 
 fn normalize_yaml_keys(value: &mut serde_yaml::Value) {
@@ -339,6 +452,73 @@ pub fn expand_jobs(workflow: &Workflow) -> Result<Vec<JobPlan>, ParserError> {
         }
     }
     Ok(plans)
+}
+
+/// Expand jobs and inline local reusable workflows when their YAML is supplied.
+pub fn expand_jobs_with_reusables(
+    workflow: &Workflow,
+    reusable_workflows: &BTreeMap<String, String>,
+) -> Result<Vec<JobPlan>, ParserError> {
+    let mut plans = Vec::new();
+    let global_env = workflow.env.clone().into_strings();
+    for (job_id, job) in &workflow.jobs {
+        if let Some(uses) = &job.uses {
+            if is_local_reusable_workflow(uses) {
+                let path = normalize_reusable_path(uses);
+                let yaml = reusable_workflows
+                    .get(&path)
+                    .ok_or_else(|| ParserError::MissingReusableWorkflow { path: path.clone() })?;
+                let called = parse_workflow(yaml)?;
+                let mut called_plans = expand_jobs(&called)?;
+                for called_plan in &mut called_plans {
+                    let old_id = called_plan.id.0.clone();
+                    called_plan.id = JobId(format!("{job_id}/{old_id}"));
+                    called_plan.base_id = format!("{job_id}/{}", called_plan.base_id);
+                    called_plan.needs = called_plan
+                        .needs
+                        .iter()
+                        .map(|need| JobId(format!("{job_id}/{}", need.0)))
+                        .collect();
+                    called_plan.env.extend(global_env.clone());
+                    called_plan.env.extend(job.env.clone().into_strings());
+                }
+                plans.extend(called_plans);
+                continue;
+            }
+        }
+
+        for matrix in expand_matrix(job_id, job.strategy.matrix.as_ref())? {
+            let expanded_id = expanded_job_id(job_id, &matrix);
+            let mut env = global_env.clone();
+            env.extend(job.env.clone().into_strings());
+            plans.push(JobPlan {
+                id: JobId(expanded_id),
+                base_id: job_id.clone(),
+                name: job.name.clone().unwrap_or_else(|| job_id.clone()),
+                runs_on: job.runs_on.labels(),
+                needs: job.needs.ids(),
+                matrix,
+                env,
+                steps: job.steps.iter().cloned().map(step_plan).collect(),
+                if_condition: job.if_condition.clone(),
+            });
+        }
+    }
+    Ok(plans)
+}
+
+fn is_local_reusable_workflow(uses: &str) -> bool {
+    uses.starts_with("./") || uses.starts_with(".github/")
+}
+
+fn normalize_reusable_path(uses: &str) -> String {
+    let without_ref = uses.split('@').next().unwrap_or(uses);
+    let path = without_ref.strip_prefix("./").unwrap_or(without_ref);
+    Path::new(path)
+        .components()
+        .collect::<PathBuf>()
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn step_plan(step: Step) -> StepPlan {
@@ -498,5 +678,61 @@ jobs:
                 && job.matrix.get("experimental") == Some(&json!(true))
         }));
         assert_eq!(jobs[0].env.get("GLOBAL"), Some(&"true".to_owned()));
+    }
+
+    #[test]
+    fn parses_local_action_metadata() {
+        let action = parse_action_metadata(
+            r#"
+name: local composite
+description: test action
+inputs:
+  who:
+    required: true
+    default: world
+runs:
+  using: composite
+  steps:
+    - run: echo "hello ${{ inputs.who }}"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(action.name, "local composite");
+        assert!(matches!(action.runs, ActionRuns::Composite { .. }));
+        assert!(action.inputs.get("who").is_some_and(|input| input.required));
+    }
+
+    #[test]
+    fn expands_local_reusable_workflow_call_jobs() {
+        let caller = parse_workflow(
+            r#"
+on: push
+jobs:
+  call:
+    uses: ./.github/workflows/reusable.yml
+"#,
+        )
+        .unwrap();
+        let mut reusable = BTreeMap::new();
+        reusable.insert(
+            ".github/workflows/reusable.yml".to_owned(),
+            r#"
+on:
+  workflow_call:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo reusable
+"#
+            .to_owned(),
+        );
+
+        let jobs = expand_jobs_with_reusables(&caller, &reusable).unwrap();
+
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id.0, "call/test");
+        assert_eq!(jobs[0].runs_on, vec!["ubuntu-latest"]);
     }
 }
