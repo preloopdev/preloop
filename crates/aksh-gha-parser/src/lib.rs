@@ -8,6 +8,9 @@ use aksh_gha_protocol::{JobId, JobPlan, StepPlan};
 
 /// Expression evaluation for workflow fields.
 pub mod eval;
+
+/// Build `AgentJobRequestMessage` from parsed workflow data.
+pub mod job_builder;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
