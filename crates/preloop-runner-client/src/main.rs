@@ -5,8 +5,9 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use preloop_gha_protocol::{RunId, SecretString, WorkflowSubmission};
+use preloop_gha_protocol::RunId;
 use reqwest::Url;
+use serde_json::Value;
 
 #[derive(Debug, Parser)]
 #[command(name = "preloop")]
@@ -95,17 +96,14 @@ async fn main() -> anyhow::Result<()> {
                 }
                 None => serde_json::json!({}),
             };
-            let submission = WorkflowSubmission {
+            let submission = SubmitWire {
                 workflow_yaml,
                 event,
                 payload,
                 repository,
                 git_ref,
                 vars: parse_pairs(vars)?,
-                secrets: parse_pairs(secrets)?
-                    .into_iter()
-                    .map(|(key, value)| (key, SecretString::new(value)))
-                    .collect(),
+                secrets: parse_pairs(secrets)?,
             };
             let response = http
                 .post(cli.server.join("/api/v1/runs")?)
@@ -166,9 +164,19 @@ fn parse_pairs(values: Vec<String>) -> anyhow::Result<BTreeMap<String, String>> 
         .collect()
 }
 
+#[derive(serde::Serialize)]
+struct SubmitWire {
+    workflow_yaml: String,
+    event: String,
+    payload: Value,
+    repository: String,
+    git_ref: String,
+    vars: BTreeMap<String, String>,
+    secrets: BTreeMap<String, String>,
+}
+
 async fn print_response(response: reqwest::Response) -> anyhow::Result<()> {
     let text = response.error_for_status()?.text().await?;
     println!("{text}");
     Ok(())
 }
-
