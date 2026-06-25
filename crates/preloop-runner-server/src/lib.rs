@@ -6,20 +6,23 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
+use bytes::Bytes;
 use preloop_artifacts::ArtifactStore;
 use preloop_cache::CacheStore;
-use preloop_gha_parser::{expand_jobs, parse_workflow};
+use preloop_gha_parser::{expand_jobs_with_reusables, parse_workflow};
 use preloop_gha_protocol::{
     event_to_ndjson, ExecutionStatus, JobCompletion, JobId, NdjsonEvent, RegisteredRunner,
     RunAccepted, RunId, RunnerJobMessage, RunnerRegistrationRequest, RunnerSession,
     RunnerSessionRequest, WorkflowSubmission, PROTOCOL_VERSION,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, Mutex};
@@ -76,6 +79,26 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             get(next_message),
         )
         .route("/api/v1/jobs/complete", post(complete_job))
+        .route("/api/v1/cache", post(cache_put))
+        .route("/api/v1/cache", get(cache_get))
+        .route("/api/v1/artifacts", post(artifact_put))
+        .route("/api/v1/artifacts/:artifact_id", get(artifact_get))
+        .route("/_apis/artifactcache/cache", post(cache_reserve))
+        .route("/_apis/artifactcache/cache", get(cache_lookup))
+        .route("/_apis/artifactcache/cache/:cache_id", patch(cache_upload))
+        .route("/_apis/artifactcache/cache/:cache_id", post(cache_commit))
+        .route(
+            "/_apis/pipelines/workflows/:run_id/artifacts",
+            post(artifact_create),
+        )
+        .route(
+            "/_apis/pipelines/workflows/:run_id/artifacts",
+            get(artifact_list),
+        )
+        .route(
+            "/_apis/pipelines/workflows/:run_id/artifacts/:artifact_id",
+            get(artifact_get_compat),
+        )
         .route("/runner/server/_apis/connectionData", get(connection_data))
         .route(
             "/runner/server/_apis/distributedtask/pools",
@@ -147,7 +170,10 @@ struct InnerState {
     queue: VecDeque<QueuedJob>,
     runners: BTreeMap<i64, RegisteredRunner>,
     sessions: BTreeMap<String, RunnerSession>,
+    pending_caches: BTreeMap<i64, PendingCache>,
+    artifacts: BTreeMap<String, ArtifactRecord>,
     next_runner_id: i64,
+    next_cache_id: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -162,6 +188,88 @@ struct RunRecord {
 struct QueuedJob {
     run_id: RunId,
     message: RunnerJobMessage,
+}
+
+#[derive(Debug, Clone)]
+struct PendingCache {
+    key: String,
+    version: String,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ArtifactRecord {
+    id: String,
+    run_id: RunId,
+    name: String,
+    file_name: String,
+    path: String,
+    size: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct CachePutRequest {
+    key: String,
+    version: String,
+    #[serde(default)]
+    content_base64: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CacheQuery {
+    key: Option<String>,
+    keys: Option<String>,
+    version: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CacheLookupResponse {
+    hit: bool,
+    key: Option<String>,
+    version: Option<String>,
+    size: Option<u64>,
+    content_base64: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CacheReserveRequest {
+    key: String,
+    version: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CacheReserveResponse {
+    cache_id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CacheCommitRequest {
+    #[serde(default)]
+    size: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactPutRequest {
+    run_id: RunId,
+    name: String,
+    file_name: String,
+    #[serde(default)]
+    content_base64: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ArtifactCreateRequest {
+    name: String,
+    #[serde(default = "default_artifact_file_name")]
+    file_name: String,
+}
+
+fn default_artifact_file_name() -> String {
+    "artifact.bin".to_owned()
 }
 
 async fn healthz(State(shared): State<Arc<SharedState>>) -> Json<serde_json::Value> {
@@ -183,7 +291,7 @@ async fn submit_run(
             submission.event
         )));
     }
-    let jobs = expand_jobs(&workflow)?;
+    let jobs = expand_jobs_with_reusables(&workflow, &submission.reusable_workflows)?;
     let run_id = RunId::new();
     let github = json!({
         "event_name": submission.event,
@@ -484,6 +592,253 @@ async fn runner_pools() -> Json<serde_json::Value> {
     }))
 }
 
+async fn cache_put(
+    State(shared): State<Arc<SharedState>>,
+    Json(request): Json<CachePutRequest>,
+) -> Result<Json<CacheLookupResponse>, ApiError> {
+    let bytes = decode_base64(&request.content_base64)?;
+    let entry = shared
+        .state
+        .cache
+        .put(&request.key, &request.version, &bytes)
+        .await?;
+    Ok(Json(CacheLookupResponse {
+        hit: true,
+        key: Some(entry.key),
+        version: Some(entry.version),
+        size: Some(entry.size),
+        content_base64: None,
+    }))
+}
+
+async fn cache_get(
+    State(shared): State<Arc<SharedState>>,
+    Query(query): Query<CacheQuery>,
+) -> Result<Json<CacheLookupResponse>, ApiError> {
+    let key = query.key.unwrap_or_default();
+    let restore_keys = parse_restore_keys(query.keys.as_deref());
+    let Some((entry, bytes)) = shared
+        .state
+        .cache
+        .get(&key, &query.version, &restore_keys)
+        .await?
+    else {
+        return Ok(Json(CacheLookupResponse {
+            hit: false,
+            key: None,
+            version: None,
+            size: None,
+            content_base64: None,
+        }));
+    };
+    Ok(Json(CacheLookupResponse {
+        hit: true,
+        key: Some(entry.key),
+        version: Some(entry.version),
+        size: Some(entry.size),
+        content_base64: Some(BASE64_STANDARD.encode(bytes)),
+    }))
+}
+
+async fn cache_reserve(
+    State(shared): State<Arc<SharedState>>,
+    Json(request): Json<CacheReserveRequest>,
+) -> Json<CacheReserveResponse> {
+    let mut inner = shared.state.inner.lock().await;
+    inner.next_cache_id += 1;
+    let cache_id = inner.next_cache_id;
+    inner.pending_caches.insert(
+        cache_id,
+        PendingCache {
+            key: request.key,
+            version: request.version,
+            bytes: Vec::new(),
+        },
+    );
+    Json(CacheReserveResponse { cache_id })
+}
+
+async fn cache_upload(
+    State(shared): State<Arc<SharedState>>,
+    Path(cache_id): Path<i64>,
+    bytes: Bytes,
+) -> Result<StatusCode, ApiError> {
+    let mut inner = shared.state.inner.lock().await;
+    let pending = inner
+        .pending_caches
+        .get_mut(&cache_id)
+        .ok_or_else(|| ApiError::not_found("cache reservation not found"))?;
+    pending.bytes.extend_from_slice(&bytes);
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn cache_commit(
+    State(shared): State<Arc<SharedState>>,
+    Path(cache_id): Path<i64>,
+    Json(request): Json<CacheCommitRequest>,
+) -> Result<Json<CacheLookupResponse>, ApiError> {
+    let pending = {
+        let mut inner = shared.state.inner.lock().await;
+        inner
+            .pending_caches
+            .remove(&cache_id)
+            .ok_or_else(|| ApiError::not_found("cache reservation not found"))?
+    };
+    if let Some(size) = request.size {
+        let actual = pending.bytes.len() as u64;
+        if size != actual {
+            return Err(ApiError::bad_request(format!(
+                "cache size mismatch: expected {size}, got {actual}"
+            )));
+        }
+    }
+    let entry = shared
+        .state
+        .cache
+        .put(&pending.key, &pending.version, &pending.bytes)
+        .await?;
+    Ok(Json(CacheLookupResponse {
+        hit: true,
+        key: Some(entry.key),
+        version: Some(entry.version),
+        size: Some(entry.size),
+        content_base64: None,
+    }))
+}
+
+async fn cache_lookup(
+    State(shared): State<Arc<SharedState>>,
+    Query(query): Query<CacheQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let key = query.key.unwrap_or_default();
+    let restore_keys = parse_restore_keys(query.keys.as_deref());
+    let response = shared
+        .state
+        .cache
+        .get(&key, &query.version, &restore_keys)
+        .await?;
+    if let Some((entry, _bytes)) = response {
+        Ok(Json(json!({
+            "cacheKey": entry.key,
+            "scope": "preloop",
+            "archiveLocation": format!("/api/v1/cache?key={}&version={}", key, query.version),
+        })))
+    } else {
+        Ok(Json(json!({})))
+    }
+}
+
+async fn artifact_put(
+    State(shared): State<Arc<SharedState>>,
+    Json(request): Json<ArtifactPutRequest>,
+) -> Result<Json<ArtifactRecord>, ApiError> {
+    let bytes = decode_base64(&request.content_base64)?;
+    put_artifact(
+        shared,
+        request.run_id,
+        request.name,
+        request.file_name,
+        bytes,
+    )
+    .await
+}
+
+async fn artifact_create(
+    State(shared): State<Arc<SharedState>>,
+    Path(run_id): Path<RunId>,
+    Json(request): Json<ArtifactCreateRequest>,
+) -> Result<Json<ArtifactRecord>, ApiError> {
+    put_artifact(shared, run_id, request.name, request.file_name, Vec::new()).await
+}
+
+async fn put_artifact(
+    shared: Arc<SharedState>,
+    run_id: RunId,
+    name: String,
+    file_name: String,
+    bytes: Vec<u8>,
+) -> Result<Json<ArtifactRecord>, ApiError> {
+    let artifact = shared
+        .state
+        .artifacts
+        .put(run_id, &name, &file_name, &bytes)
+        .await?;
+    let record = ArtifactRecord {
+        id: artifact.id.to_string(),
+        run_id,
+        name,
+        file_name,
+        path: artifact.path.to_string_lossy().into_owned(),
+        size: artifact.size,
+    };
+    let mut inner = shared.state.inner.lock().await;
+    inner.artifacts.insert(record.id.clone(), record.clone());
+    Ok(Json(record))
+}
+
+async fn artifact_get(
+    State(shared): State<Arc<SharedState>>,
+    Path(artifact_id): Path<String>,
+) -> Result<Response, ApiError> {
+    read_artifact(shared, artifact_id).await
+}
+
+async fn artifact_get_compat(
+    State(shared): State<Arc<SharedState>>,
+    Path((_run_id, artifact_id)): Path<(RunId, String)>,
+) -> Result<Response, ApiError> {
+    read_artifact(shared, artifact_id).await
+}
+
+async fn read_artifact(
+    shared: Arc<SharedState>,
+    artifact_id: String,
+) -> Result<Response, ApiError> {
+    let record = {
+        let inner = shared.state.inner.lock().await;
+        inner
+            .artifacts
+            .get(&artifact_id)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("artifact not found"))?
+    };
+    let bytes = tokio::fs::read(&record.path).await?;
+    Ok(Response::builder()
+        .header("content-type", "application/octet-stream")
+        .body(Body::from(bytes))
+        .expect("static response builder"))
+}
+
+async fn artifact_list(
+    State(shared): State<Arc<SharedState>>,
+    Path(run_id): Path<RunId>,
+) -> Json<serde_json::Value> {
+    let inner = shared.state.inner.lock().await;
+    let value = inner
+        .artifacts
+        .values()
+        .filter(|artifact| artifact.run_id == run_id)
+        .collect::<Vec<_>>();
+    Json(json!({
+        "count": value.len(),
+        "value": value,
+    }))
+}
+
+fn parse_restore_keys(keys: Option<&str>) -> Vec<String> {
+    keys.unwrap_or_default()
+        .split(',')
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn decode_base64(value: &str) -> Result<Vec<u8>, ApiError> {
+    BASE64_STANDARD
+        .decode(value)
+        .map_err(|error| ApiError::bad_request(format!("invalid base64 content: {error}")))
+}
+
 /// API error.
 #[derive(Debug)]
 pub struct ApiError {
@@ -519,8 +874,153 @@ impl From<preloop_gha_protocol::ProtocolError> for ApiError {
     }
 }
 
+impl From<preloop_cache::CacheError> for ApiError {
+    fn from(value: preloop_cache::CacheError) -> Self {
+        Self::bad_request(value.to_string())
+    }
+}
+
+impl From<preloop_artifacts::ArtifactError> for ApiError {
+    fn from(value: preloop_artifacts::ArtifactError) -> Self {
+        Self::bad_request(value.to_string())
+    }
+}
+
+impl From<std::io::Error> for ApiError {
+    fn from(value: std::io::Error) -> Self {
+        Self::bad_request(value.to_string())
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (self.status, Json(json!({ "error": self.message }))).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Method, Request, StatusCode};
+    use serde_json::Value;
+    use tokio_util::sync::CancellationToken;
+    use tower::ServiceExt;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn cache_protocol_reserves_uploads_commits_and_restores() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+
+        let reserve = request_json(
+            &app,
+            Method::POST,
+            "/_apis/artifactcache/cache",
+            json!({"key": "linux-node", "version": "v1"}),
+        )
+        .await;
+        let cache_id = reserve["cacheId"].as_i64().unwrap();
+
+        let upload = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PATCH)
+                    .uri(format!("/_apis/artifactcache/cache/{cache_id}"))
+                    .body(Body::from("cache-bytes"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(upload.status(), StatusCode::ACCEPTED);
+
+        request_json(
+            &app,
+            Method::POST,
+            &format!("/_apis/artifactcache/cache/{cache_id}"),
+            json!({"size": 11}),
+        )
+        .await;
+
+        let lookup = request_json(
+            &app,
+            Method::GET,
+            "/api/v1/cache?key=linux-node&version=v1",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(lookup["hit"], true);
+        assert_eq!(lookup["content_base64"], "Y2FjaGUtYnl0ZXM=");
+    }
+
+    #[tokio::test]
+    async fn artifact_endpoint_stores_and_downloads_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+        let run_id = RunId::new();
+
+        let created = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/artifacts",
+            json!({
+                "run_id": run_id,
+                "name": "logs",
+                "file_name": "job.txt",
+                "content_base64": "aGVsbG8="
+            }),
+        )
+        .await;
+        let artifact_id = created["id"].as_str().unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/v1/artifacts/{artifact_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&bytes[..], b"hello");
+    }
+
+    async fn request_json(app: &Router, method: Method, uri: &str, body: Value) -> Value {
+        let request = if method == Method::GET {
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap()
+        } else {
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert!(
+            response.status().is_success(),
+            "unexpected status: {}",
+            response.status()
+        );
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        }
     }
 }

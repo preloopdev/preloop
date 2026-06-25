@@ -38,16 +38,27 @@ This implementation is not yet a proven byte-for-byte replacement for upstream
 - upstream workflow fixtures are checked into `fixtures/upstream-workflows`;
 - conformance commands are documented in `docs/conformance.md`.
 
+Implemented in the current Rust slice:
+
+- all in-scope upstream GitHub Actions workflow fixtures parse and expand;
+- local `action.yml` / `action.yaml` metadata parses for composite, Node, and
+  Docker action definitions;
+- local reusable workflow call jobs can be expanded when the caller supplies the
+  referenced workflow YAML;
+- cache and artifact stores have HTTP endpoint coverage, including
+  runner-shaped cache reserve/upload/commit/lookup routes;
+- expression evaluation covers common boolean logic, equality, comparisons,
+  status helpers, JSON conversion, `format`, `contains`, `startsWith`,
+  `endsWith`, `join`, and a local-safe `hashFiles` placeholder.
+
 Known staged areas:
 
-- expression functions cover common local CI paths but not the full GitHub
-  Actions expression language;
-- reusable workflows parse, but full call graph execution and secret inheritance
-  still need conformance-backed implementation;
-- runner protocol endpoints are skeletal and must be expanded with golden
-  fixtures from a real `Runner.Listener`;
-- cache and artifact stores are local and functional, but HTTP protocol parity
-  needs endpoint-level golden tests;
+- expression functions cover common local CI paths but still need complete
+  GitHub Actions coercion and object-filter semantics;
+- reusable workflow expansion handles local call jobs, but input mapping,
+  outputs, nested call graphs, and secret inheritance still need
+  conformance-backed execution tests;
+- runner protocol endpoints need golden fixtures captured from a real
+  `Runner.Listener`;
 - libkrun integration is documented as the final gate and not implemented in
   this repository yet.
-
