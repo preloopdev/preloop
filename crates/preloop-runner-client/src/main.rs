@@ -27,6 +27,9 @@ enum Command {
         /// Workflow YAML path.
         #[arg(short = 'W', long)]
         workflow: PathBuf,
+        /// Repository workspace root used to collect local reusable workflows.
+        #[arg(long)]
+        workspace_root: Option<PathBuf>,
         /// GitHub event name.
         #[arg(long, default_value = "push")]
         event: String,
@@ -77,6 +80,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Submit {
             workflow,
+            workspace_root,
             event,
             payload,
             repository,
@@ -105,6 +109,11 @@ async fn main() -> anyhow::Result<()> {
                 git_ref,
                 vars: parse_pairs(vars)?,
                 secrets: parse_pairs(secrets)?,
+                reusable_workflows: collect_reusable_workflows(
+                    workspace_root.as_deref(),
+                    &workflow,
+                )
+                .await?,
             };
             let response = http
                 .post(cli.server.join("/api/v1/runs")?)
@@ -177,6 +186,52 @@ struct SubmitWire {
     git_ref: String,
     vars: BTreeMap<String, String>,
     secrets: BTreeMap<String, String>,
+    reusable_workflows: BTreeMap<String, String>,
+}
+
+async fn collect_reusable_workflows(
+    workspace_root: Option<&std::path::Path>,
+    submitted_workflow: &std::path::Path,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    let Some(root) = workspace_root else {
+        return Ok(BTreeMap::new());
+    };
+    let workflow_dir = root.join(".github").join("workflows");
+    let mut out = BTreeMap::new();
+    let mut entries = match tokio::fs::read_dir(&workflow_dir).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read {}", workflow_dir.display()))
+        }
+    };
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if !matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("yml" | "yaml")
+        ) || same_file_path(&path, submitted_workflow)
+        {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(root)
+            .with_context(|| format!("make {} relative to {}", path.display(), root.display()))?
+            .to_string_lossy()
+            .into_owned();
+        let yaml = tokio::fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("read reusable workflow {}", path.display()))?;
+        out.insert(relative, yaml);
+    }
+    Ok(out)
+}
+
+fn same_file_path(left: &std::path::Path, right: &std::path::Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
 }
 
 async fn print_response(response: reqwest::Response) -> anyhow::Result<()> {

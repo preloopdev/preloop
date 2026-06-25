@@ -105,6 +105,10 @@ enum BinaryOp {
     And,
     Eq,
     Ne,
+    Gt,
+    Ge,
+    Lt,
+    Le,
 }
 
 fn eval(expr: &Expr, context: &Context) -> Result<Value, ExpressionError> {
@@ -137,6 +141,26 @@ fn eval(expr: &Expr, context: &Context) -> Result<Value, ExpressionError> {
                 &eval(left, context)?,
                 &eval(right, context)?,
             ))),
+            BinaryOp::Gt => Ok(Value::Bool(compare_values(
+                &eval(left, context)?,
+                &eval(right, context)?,
+                |ordering| ordering.is_gt(),
+            ))),
+            BinaryOp::Ge => Ok(Value::Bool(compare_values(
+                &eval(left, context)?,
+                &eval(right, context)?,
+                |ordering| ordering.is_ge(),
+            ))),
+            BinaryOp::Lt => Ok(Value::Bool(compare_values(
+                &eval(left, context)?,
+                &eval(right, context)?,
+                |ordering| ordering.is_lt(),
+            ))),
+            BinaryOp::Le => Ok(Value::Bool(compare_values(
+                &eval(left, context)?,
+                &eval(right, context)?,
+                |ordering| ordering.is_le(),
+            ))),
         },
         Expr::Call { name, args } => eval_call(name, args, context),
     }
@@ -146,6 +170,27 @@ fn values_equal(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::String(left), Value::String(right)) => left.eq_ignore_ascii_case(right),
         _ => left == right,
+    }
+}
+
+fn compare_values(
+    left: &Value,
+    right: &Value,
+    predicate: impl FnOnce(std::cmp::Ordering) -> bool,
+) -> bool {
+    if let (Some(left), Some(right)) = (numeric_value(left), numeric_value(right)) {
+        return left.partial_cmp(&right).is_some_and(predicate);
+    }
+    predicate(string_value(left).cmp(&string_value(right)))
+}
+
+fn numeric_value(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(value) => value.as_f64(),
+        Value::String(value) => value.parse().ok(),
+        Value::Bool(true) => Some(1.0),
+        Value::Bool(false) | Value::Null => Some(0.0),
+        _ => None,
     }
 }
 
@@ -173,6 +218,12 @@ fn eval_call(name: &str, args: &[Expr], context: &Context) -> Result<Value, Expr
             string_arg(&values, 0).ends_with(&string_arg(&values, 1)),
         )),
         "format" => Ok(Value::String(format_args(&values))),
+        "fromjson" => Ok(values
+            .first()
+            .and_then(|value| serde_json::from_str(&string_value(value)).ok())
+            .unwrap_or(Value::Null)),
+        "join" => Ok(Value::String(join_args(&values))),
+        "hashfiles" => Ok(Value::String(String::new())),
         "tojson" => Ok(Value::String(
             serde_json::to_string(values.first().unwrap_or(&Value::Null)).unwrap_or_default(),
         )),
@@ -212,6 +263,19 @@ fn format_args(values: &[Value]) -> String {
     out
 }
 
+fn join_args(values: &[Value]) -> String {
+    let separator = string_arg(values, 1);
+    match values.first() {
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(string_value)
+            .collect::<Vec<_>>()
+            .join(&separator),
+        Some(value) => string_value(value),
+        None => String::new(),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum Token {
     Ident(String),
@@ -228,6 +292,10 @@ enum Token {
     Or,
     Eq,
     Ne,
+    Gt,
+    Ge,
+    Lt,
+    Le,
     End,
 }
 
@@ -297,6 +365,22 @@ impl<'a> Lexer<'a> {
                         tokens.push(Token::Eq);
                     } else {
                         return Err(ExpressionError::Unexpected("=".to_owned()));
+                    }
+                }
+                '>' => {
+                    self.bump();
+                    if self.consume('=') {
+                        tokens.push(Token::Ge);
+                    } else {
+                        tokens.push(Token::Gt);
+                    }
+                }
+                '<' => {
+                    self.bump();
+                    if self.consume('=') {
+                        tokens.push(Token::Le);
+                    } else {
+                        tokens.push(Token::Lt);
                     }
                 }
                 '&' => {
@@ -421,6 +505,10 @@ impl Parser {
             let op = match self.current() {
                 Token::Eq => BinaryOp::Eq,
                 Token::Ne => BinaryOp::Ne,
+                Token::Gt => BinaryOp::Gt,
+                Token::Ge => BinaryOp::Ge,
+                Token::Lt => BinaryOp::Lt,
+                Token::Le => BinaryOp::Le,
                 _ => break,
             };
             self.advance();
@@ -556,6 +644,32 @@ mod tests {
         assert_eq!(
             eval_expression("'left' || unknown()", &context).unwrap(),
             Value::String("left".to_owned())
+        );
+    }
+
+    #[test]
+    fn evaluates_json_join_and_comparisons() {
+        let context = Context::default();
+
+        assert_eq!(
+            eval_expression("fromJson('[\"a\",\"b\"]')", &context).unwrap(),
+            json!(["a", "b"])
+        );
+        assert_eq!(
+            eval_expression("join(fromJson('[\"a\",\"b\"]'), '-')", &context).unwrap(),
+            Value::String("a-b".to_owned())
+        );
+        assert_eq!(
+            eval_expression("'10' > 2", &context).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_expression("2 <= 2", &context).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_expression("hashFiles('Cargo.toml')", &context).unwrap(),
+            Value::String(String::new())
         );
     }
 

@@ -142,6 +142,9 @@ pub struct WorkflowSubmission {
     /// Caller-provided secrets.
     #[serde(default)]
     pub secrets: SecretMap,
+    /// Local reusable workflow YAML keyed by repository-relative path.
+    #[serde(default)]
+    pub reusable_workflows: BTreeMap<String, String>,
 }
 
 fn default_ref() -> String {
