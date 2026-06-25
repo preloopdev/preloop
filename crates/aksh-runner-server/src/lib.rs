@@ -131,6 +131,27 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             "/runner/server/_apis/distributedtask/hubs/actions/plans/:run_id/jobs/:job_id",
             patch(complete_job_compat),
         )
+        // Phase E: Timeline, logs, completion
+        .route(
+            "/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id",
+            patch(patch_timeline_records),
+        )
+        .route(
+            "/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id",
+            post(create_log),
+        )
+        .route(
+            "/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id/:log_id2",
+            post(append_log),
+        )
+        .route(
+            "/_apis/v1/TimeLineWebConsoleLog/:scope/:hub/:plan_id/:timeline_id/:record_id",
+            post(console_log),
+        )
+        .route(
+            "/_apis/v1/FinishJob/:scope/:hub/:plan_id",
+            post(finish_job),
+        )
         .layer(TraceLayer::new_for_http())
         .with_state(Arc::new(SharedState { state, shutdown }))
 }
@@ -629,6 +650,104 @@ async fn complete_job_inner(
         })
         .await;
     Ok(Json(record))
+}
+
+// ─── Phase E: Timeline, logs, completion ────────────────────────────────────
+
+/// PATCH timeline records — runner updates step/job state.
+async fn patch_timeline_records(
+    State(shared): State<Arc<SharedState>>,
+    Path((_scope, _hub, _plan_id, _timeline_id)): Path<(String, String, String, String)>,
+    Json(records): Json<Vec<azdo::TimelineRecord>>,
+) -> Json<serde_json::Value> {
+    for record in &records {
+        if let Some(state) = &record.state {
+            info!(
+                timeline_id = %_timeline_id,
+                record_id = %record.id,
+                name = record.display_name.as_deref().unwrap_or(""),
+                state = ?state,
+                "timeline record update"
+            );
+        }
+    }
+    Json(json!({ "ok": true }))
+}
+
+/// POST create log file — runner creates a log container.
+async fn create_log(
+    State(_shared): State<Arc<SharedState>>,
+    Path((_scope, _hub, _plan_id, _log_id)): Path<(String, String, String, String)>,
+) -> Json<serde_json::Value> {
+    Json(json!({ "ok": true }))
+}
+
+/// POST append log — runner appends lines to a log file.
+async fn append_log(
+    State(_shared): State<Arc<SharedState>>,
+    Path((_scope, _hub, _plan_id, _log_id, _log_id2)): Path<(String, String, String, String, String)>,
+    _body: Bytes,
+) -> StatusCode {
+    StatusCode::ACCEPTED
+}
+
+/// POST console log — runner streams live console output.
+async fn console_log(
+    State(_shared): State<Arc<SharedState>>,
+    Path((_scope, _hub, _plan_id, _timeline_id, _record_id)): Path<(String, String, String, String, String)>,
+    _body: Bytes,
+) -> StatusCode {
+    StatusCode::ACCEPTED
+}
+
+/// POST finish job — runner reports final result + outputs.
+async fn finish_job(
+    State(shared): State<Arc<SharedState>>,
+    Path((_scope, _hub, plan_id)): Path<(String, String, String)>,
+    Json(event): Json<azdo::JobCompletedEvent>,
+) -> Json<serde_json::Value> {
+    let mut inner = shared.state.inner.lock().await;
+
+    let status = match event.result {
+        azdo::TaskResult::Succeeded | azdo::TaskResult::SucceededWithIssues => ExecutionStatus::Success,
+        azdo::TaskResult::Failed => ExecutionStatus::Failure,
+        azdo::TaskResult::Cancelled => ExecutionStatus::Cancelled,
+        azdo::TaskResult::Skipped => ExecutionStatus::Skipped,
+    };
+
+    // Find the run and update job status
+    let run_id = plan_id.parse::<RunId>().ok();
+    let actual_run_id = if let Some(rid) = run_id {
+        if let Some(run) = inner.runs.get_mut(&rid) {
+            run.jobs.insert(JobId(event.job_id.to_string()), status);
+            run.status = summarize_run(run.jobs.values().copied());
+            rid
+        } else {
+            RunId::new()
+        }
+    } else {
+        RunId::new()
+    };
+
+    info!(
+        job_id = %event.job_id,
+        result = ?event.result,
+        outputs = ?event.outputs,
+        "job completed"
+    );
+
+    drop(inner);
+    shared
+        .state
+        .emit(NdjsonEvent::JobCompleted {
+            run_id: actual_run_id,
+            job_id: JobId(event.job_id.to_string()),
+            status,
+            outputs: event.outputs,
+        })
+        .await;
+
+    Json(json!({ "ok": true }))
 }
 
 fn summarize_run(statuses: impl Iterator<Item = ExecutionStatus>) -> ExecutionStatus {
