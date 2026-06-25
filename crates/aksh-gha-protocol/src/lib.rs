@@ -200,7 +200,7 @@ pub struct JobPlan {
     pub needs: Vec<JobId>,
     /// Matrix values for this expansion.
     #[serde(default)]
-    pub matrix: BTreeMap<String, serde_json::Value>,
+    pub matrix: IndexMap<String, serde_json::Value>,
     /// Job-level environment.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
