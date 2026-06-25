@@ -15,4 +15,10 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+aes.workspace = true
+cbc.workspace = true
+cipher = { workspace = true, features = ["alloc"] }
+rand.workspace = true
+rsa.workspace = true
+sha1 = "0.10"
 
