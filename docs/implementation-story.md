@@ -349,10 +349,45 @@ timeline persistence comes when we add the `RunStore` trait (Phase H).
 
 ---
 
-## Chapter 10: What Comes Next
+## Chapter 10: The Dependency Gate — Multi-Job Scheduling
 
-With the feedback loop in place, the remaining chapters cover:
+The initial FIFO queue dispatched every job immediately. But workflows
+with `needs` dependencies require jobs to wait for their prerequisites.
+Phase F replaced the FIFO with a dependency-gated scheduler.
 
-- **Phase F**: The needs DAG (multi-job scheduling)
-- **Phase G**: Trigger and matrix fidelity
-- **Phase H**: Actions, cache, artifacts
+### How It Works
+
+1. Jobs with no `needs` queue immediately
+2. Jobs with `needs` go to `pending_jobs`
+3. When a job completes, `promote_ready_jobs` checks if downstream
+   jobs can now be dispatched
+4. Fail-fast: if a dependency fails, dependent jobs stay pending
+
+---
+
+## Chapter 11: Trigger Fidelity — Matching GitHub Exactly
+
+The initial trigger matching was event-name only. Phase G added
+full GitHub Actions trigger syntax: `branches`/`branches-ignore`,
+`tags`/`tags-ignore`, `paths`/`paths-ignore` with glob matching.
+
+---
+
+## Chapter 12: What's Next
+
+All 8 phases of the fidelity-gap.md implementation plan are complete.
+The runner can:
+
+1. Discover endpoints (Phase B)
+2. Authenticate and create encrypted sessions (Phases B-C)
+3. Receive encrypted job messages (Phases D)
+4. Report status, logs, and completion (Phase E)
+5. Work with multi-job dependency graphs (Phase F)
+6. Match branch/tag/path triggers (Phase G)
+7. Fetch actions (Phase H)
+
+The next steps would be:
+- Integration testing with a real `Runner.Listener`
+- Timeline record persistence (RunStore trait)
+- Cache/artifact v2 blob protocols
+- Expression engine hardening (success/failure state-dependent functions)
