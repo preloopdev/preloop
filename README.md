@@ -1,33 +1,84 @@
-# Preloop Runner Server
+# aksh — GitHub Actions Control Plane
 
-Preloop is a macOS-first, Linux-capable local CI control plane for GitHub Actions-style jobs. This repository reimplements the host-side behavior of [`ChristopherHX/runner.server`](https://github.com/ChristopherHX/runner.server) in Rust so a `Runner.Listener` inside an ephemeral Preloop libkrun Linux microVM can register, poll, execute, and report jobs without consuming GitHub-hosted runner minutes.
+**aksh** is a faithful Rust reimplementation of the GitHub Actions control plane
+([`ChristopherHX/runner.server`](https://github.com/ChristopherHX/runner.server)). It
+speaks the official runner protocol so the unmodified `actions/runner` (`Runner.Listener`)
+can register, poll for jobs, execute, and report — without GitHub-hosted minutes.
 
-The implementation is intentionally split into crates that match durable product boundaries:
+aksh is **execution-agnostic**: it doesn't care whether runners live in containers, VMs,
+microVMs, or bare processes. The runner connects to aksh; aksh feeds it jobs.
 
-- `preloop-runner-server`: host-side HTTP service, runner-compatible APIs, run queue, cancellation, reruns, NDJSON event stream.
-- `preloop-runner-client`: CLI equivalent to `Runner.Client` for submitting workflows/events/payloads and inspecting runs.
-- `preloop-gha-parser`: typed GitHub Actions workflow parsing, trigger matching, job graph construction, matrix expansion.
-- `preloop-gha-expressions`: expression parser/evaluator used by workflows, matrices, `if`, contexts, and outputs.
-- `preloop-gha-protocol`: versioned domain and wire models, including redaction-safe secrets and runner session DTOs.
-- `preloop-cache`: local cache service compatible with the runner cache protocol shape.
-- `preloop-artifacts`: local artifact/container service compatible with runner upload/download behavior.
-- `preloop-conformance`: fixtures and harnesses that compare Preloop behavior with upstream `runner.server`.
+**[Preloop](https://github.com/preloop/preloop)** is a local CI product that combines
+aksh with libkrun microVM runner hosts. aksh is Preloop's control plane. But aksh is
+independently usable — anyone can `cargo install aksh` and point their own runners at it.
+
+## Crates
+
+- `aksh-server`: host-side HTTP service, runner-compatible APIs, run queue, cancellation,
+  reruns, NDJSON event stream.
+- `aksh-runner-client`: CLI equivalent to `Runner.Client` for submitting workflows and
+  inspecting runs.
+- `aksh-parser`: typed GitHub Actions workflow parsing, trigger matching, job graph
+  construction, matrix expansion.
+- `aksh-gha-expressions`: expression parser/evaluator for `${{ }}` in workflows, matrices,
+  `if`, contexts, and outputs.
+- `aksh-protocol`: versioned domain and wire models (AzDO wire DTOs, `SecretString`,
+  runner session DTOs, NDJSON events).
+- `aksh-cache`: local cache service compatible with the runner cache protocol shape.
+- `aksh-artifacts`: local artifact/container service compatible with runner
+  upload/download behavior.
+- `aksh-conformance`: fixtures and harnesses comparing aksh behavior with upstream
+  `runner.server`.
+
+## Why aksh Exists
+
+aksh keeps the upstream runner-server contract where it matters, but adds features useful
+for anyone building or testing GitHub Actions workflows outside GitHub:
+
+- single native Rust host process with a small distribution footprint
+- execution-agnostic: works with any runner substrate (containers, VMs, microVMs, bare)
+- NDJSON event output for AI agents and developer tooling
+- redaction-safe secret types in the protocol layer
+- pluggable backend traits (`RunnerProvider`, `RunStore`, `AuthProvider`, `SecretStore`)
+- local cache and artifact stores that work without GitHub-hosted infrastructure
+- runner-compatible HTTP surfaces compatible with the official `Runner.Listener`
 
 ## Current Status
 
-This is a Rust implementation scaffold with the core parser, expression evaluator, server, client, and conformance harness under active construction. The workspace forbids unsafe code by default. Protocol surfaces are versioned in `preloop-gha-protocol` and should gain golden fixtures before behavior is treated as stable.
+aksh is under active construction toward full fidelity with `runner.server`. The workspace
+forbids unsafe code by default. Protocol surfaces are versioned in `aksh-protocol` and
+should gain golden fixtures before behavior is treated as stable.
+
+See [docs/fidelity-gap.md](docs/fidelity-gap.md) for the complete compatibility scorecard
+and implementation roadmap.
 
 ## Toolchain
 
-The workspace targets Rust 1.86 or newer and uses `tokio`, `axum`, `serde_yaml`, `tracing`, `thiserror`, `anyhow`, and `clap`.
+The workspace targets Rust 1.86 or newer and uses `tokio`, `axum`, `serde_yaml`, `tracing`,
+`thiserror`, `anyhow`, and `clap`.
 
 ```sh
 cargo fmt --all
 cargo test --workspace
-cargo run -p preloop-runner-server -- serve --listen 127.0.0.1:8080
-cargo run -p preloop-runner-client -- submit --workflow .github/workflows/ci.yml --event push
+cargo run -p aksh-server -- serve --listen 127.0.0.1:8080
+cargo run -p aksh-runner-client -- submit --workflow .github/workflows/ci.yml --event push
 ```
 
 ## Upstream Reference
 
-The conformance target is `ChristopherHX/runner.server` at commit `992ccbbbf9afcde477c38c316e053b1af457ad40` unless `PRELOOP_UPSTREAM_RUNNER_SERVER_REF` is set. See [docs/reference/runner-server.md](docs/reference/runner-server.md) for the mapped surface and deliberate Preloop differences.
+The conformance target is `ChristopherHX/runner.server` at commit
+`992ccbbbf9afcde477c38c316e053b1af457ad40` unless `AKSH_UPSTREAM_RUNNER_SERVER_REF` is
+set. See [docs/reference/runner-server.md](docs/reference/runner-server.md) for the mapped
+surface and deliberate differences.
+
+## Architecture
+
+aksh exposes two protocol surfaces simultaneously:
+
+1. **Runner-compatible `_apis/...`** — the AzDO protocol the official runner speaks
+   (encrypted messages, timeline, logs, OAuth). This is the source of truth.
+2. **Agent-friendly `/api/v1/...`** — native REST + NDJSON for AI agents, CLIs, and
+   developer tools. A projection of the same internal state.
+
+Both read from and write to the same state; the native surface is strictly additive.
+See [docs/architecture.md](docs/architecture.md) for the design.

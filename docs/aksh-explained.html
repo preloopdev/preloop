@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>aksh — GitHub Actions Control Plane Explained</title>
+<style>
+  :root {
+    --bg: #0a0a0f;
+    --surface: #12121a;
+    --surface2: #1a1a26;
+    --border: #2a2a3a;
+    --text: #e8e8f0;
+    --text-dim: #8888a0;
+    --accent: #6c5ce7;
+    --accent2: #a29bfe;
+    --green: #00b894;
+    --red: #e17055;
+    --orange: #fdcb6e;
+    --blue: #74b9ff;
+    --radius: 12px;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.7;
+    overflow-x: hidden;
+  }
+  .hero {
+    text-align: center;
+    padding: 80px 20px 60px;
+    background: linear-gradient(135deg, #0a0a1a 0%, #12122a 50%, #1a0a2a 100%);
+    border-bottom: 1px solid var(--border);
+    position: relative;
+  }
+  .hero::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: radial-gradient(ellipse at 50% 0%, rgba(108,92,231,0.15) 0%, transparent 70%);
+    pointer-events: none;
+  }
+  .hero h1 {
+    font-size: 3.5rem;
+    font-weight: 800;
+    background: linear-gradient(135deg, var(--accent2), var(--blue));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    margin-bottom: 16px;
+    position: relative;
+  }
+  .hero .tagline {
+    font-size: 1.25rem;
+    color: var(--text-dim);
+    max-width: 680px;
+    margin: 0 auto 32px;
+    position: relative;
+  }
+  .hero .badge {
+    display: inline-block;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    padding: 6px 16px;
+    font-size: 0.85rem;
+    color: var(--accent2);
+    margin: 4px;
+    position: relative;
+  }
+  .container { max-width: 1100px; margin: 0 auto; padding: 0 24px; }
+  section { padding: 64px 0; }
+  section + section { border-top: 1px solid var(--border); }
+  h2 {
+    font-size: 2rem;
+    font-weight: 700;
+    margin-bottom: 12px;
+    color: var(--text);
+  }
+  h3 {
+    font-size: 1.35rem;
+    font-weight: 600;
+    margin: 32px 0 12px;
+    color: var(--accent2);
+  }
+  h4 {
+    font-size: 1.1rem;
+    font-weight: 600;
+    margin: 24px 0 8px;
+    color: var(--text);
+  }
+  p { margin-bottom: 16px; color: var(--text-dim); }
+  p strong { color: var(--text); }
+  .subtitle { color: var(--text-dim); margin-bottom: 32px; font-size: 1.05rem; }
+
+  /* Cards */
+  .card-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 20px;
+    margin: 24px 0;
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 28px;
+    transition: border-color 0.2s;
+  }
+  .card:hover { border-color: var(--accent); }
+  .card .icon { font-size: 2rem; margin-bottom: 12px; }
+  .card h4 { margin: 0 0 8px; color: var(--text); }
+  .card p { margin: 0; font-size: 0.95rem; }
+
+  /* Diagram */
+  .diagram-wrap {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 40px 32px;
+    margin: 32px 0;
+    overflow-x: auto;
+  }
+  .diagram-wrap pre {
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    font-size: 0.82rem;
+    line-height: 1.5;
+    color: var(--text-dim);
+    white-space: pre;
+  }
+  .diagram-wrap pre .hl { color: var(--accent2); font-weight: 600; }
+  .diagram-wrap pre .grn { color: var(--green); }
+  .diagram-wrap pre .red { color: var(--red); }
+  .diagram-wrap pre .blu { color: var(--blue); }
+  .diagram-wrap pre .org { color: var(--orange); }
+
+  /* Tables */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 24px 0;
+    font-size: 0.95rem;
+  }
+  th, td {
+    padding: 12px 16px;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+  }
+  th { color: var(--text); font-weight: 600; background: var(--surface); }
+  td { color: var(--text-dim); }
+  tr:hover td { color: var(--text); }
+
+  /* Score dots */
+  .score { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+  .score-red { background: var(--red); }
+  .score-orange { background: var(--orange); }
+  .score-green { background: var(--green); }
+
+  /* Code blocks */
+  code {
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    background: var(--surface2);
+    padding: 2px 7px;
+    border-radius: 4px;
+    font-size: 0.9em;
+    color: var(--accent2);
+  }
+  .code-block {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px 24px;
+    margin: 20px 0;
+    overflow-x: auto;
+  }
+  .code-block pre {
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    font-size: 0.85rem;
+    line-height: 1.6;
+    color: var(--text-dim);
+  }
+
+  /* Timeline */
+  .timeline {
+    position: relative;
+    margin: 32px 0;
+    padding-left: 32px;
+  }
+  .timeline::before {
+    content: '';
+    position: absolute;
+    left: 8px;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    background: var(--border);
+  }
+  .timeline-item {
+    position: relative;
+    margin-bottom: 28px;
+    padding: 20px 24px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+  }
+  .timeline-item::before {
+    content: '';
+    position: absolute;
+    left: -28px;
+    top: 24px;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: var(--accent);
+    border: 2px solid var(--bg);
+  }
+  .timeline-item .label {
+    font-size: 0.8rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--accent2);
+    margin-bottom: 6px;
+  }
+  .timeline-item h4 { margin: 0 0 6px; }
+  .timeline-item p { margin: 0; font-size: 0.92rem; }
+
+  /* Principle boxes */
+  .principle {
+    background: var(--surface);
+    border-left: 4px solid var(--accent);
+    border-radius: 0 var(--radius) var(--radius) 0;
+    padding: 20px 24px;
+    margin: 20px 0;
+  }
+  .principle p { margin: 0; }
+
+  /* Footer */
+  footer {
+    text-align: center;
+    padding: 40px 20px;
+    color: var(--text-dim);
+    font-size: 0.85rem;
+    border-top: 1px solid var(--border);
+  }
+  footer a { color: var(--accent2); text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
+
+  @media (max-width: 768px) {
+    .hero h1 { font-size: 2.2rem; }
+    .hero .tagline { font-size: 1rem; }
+    h2 { font-size: 1.5rem; }
+    .card-grid { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<div class="hero">
+  <h1>aksh</h1>
+  <div class="tagline">
+    A faithful Rust reimplementation of the GitHub Actions control plane.
+    The official <code>Runner.Listener</code> connects, polls, executes, and reports —
+    no GitHub-hosted minutes required.
+  </div>
+  <span class="badge">Rust</span>
+  <span class="badge">Tokio + Axum</span>
+  <span class="badge">Runner Protocol</span>
+  <span class="badge">Pluggable Backends</span>
+</div>
+
+<div class="container">
+
+<!-- ============================================================ -->
+<section>
+  <h2>What Problem Does aksh Solve?</h2>
+  <p class="subtitle">GitHub Actions workflows are defined in YAML, but running them locally has always been a lie.</p>
+
+  <div class="card-grid">
+    <div class="card">
+      <div class="icon">🚫</div>
+      <h4>Docker ≠ GitHub</h4>
+      <p>Most "local GHA" tools run steps in Docker. But GitHub Actions uses a runner that speaks a real protocol with encrypted messages, timeline records, annotations, OIDC tokens, and service endpoints. Docker doesn't model any of that.</p>
+    </div>
+    <div class="card">
+      <div class="icon">🔗</div>
+      <h4>runner.server Exists — But It's C#</h4>
+      <p><a href="https://github.com/ChristopherHX/runner.server" style="color:var(--accent2)">ChristopherHX/runner.server</a> proved this works: a local server that the official runner talks to. It works. But it's a .NET app with a 104MB footprint.</p>
+    </div>
+    <div class="card">
+      <div class="icon">🦀</div>
+      <h4>aksh: Same Protocol, Rust Speed</h4>
+      <p>aksh reimplements the control plane in Rust — 4.7MB binary, 8ms startup, 37K req/s. Same protocol fidelity, plus pluggable backends for any runner host (containers, VMs, microVMs, bare processes).</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <h2>The Core Insight: Control Plane ≠ Execution Engine</h2>
+  <p class="subtitle">The runner protocol already separates "what to run" from "how to run it."</p>
+
+  <p><strong>The official <code>actions/runner</code> is the execution engine.</strong> It boots, registers with a server, long-polls for jobs, receives an encrypted message containing everything it needs, executes steps, and streams results back. The server never reaches out to execute anything.</p>
+
+  <p>This means aksh's only job is to <strong>be a faithful server.</strong> It doesn't care whether runners live in containers, VMs, microVMs, or bare processes. The runner connects <em>in</em>; aksh feeds it jobs.</p>
+
+  <div class="principle">
+    <p><strong>Design principle:</strong> Model the Azure DevOps wire protocol as the source of truth. Layer aksh-specific features (NDJSON, secret redaction, agent-friendly REST) as read-model projections — never as protocol replacements.</p>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <h2>How It Works: The Runner Lifecycle</h2>
+  <p class="subtitle">What happens from the moment a workflow is submitted to the moment it finishes.</p>
+
+  <div class="diagram-wrap"><pre>
+<span class="blu">┌─────────────────────┐</span>                    <span class="grn">┌──────────────────────┐</span>
+<span class="blu">│   CLI / Agent / API  │</span>                    <span class="grn">│  Runner.Listener     │</span>
+<span class="blu">│  (submit workflow)   │</span>                    <span class="grn">│  (official binary)   │</span>
+<span class="blu">└──────────┬──────────┘</span>                    <span class="grn">└──────────┬───────────┘</span>
+           │                                        │
+           │  1. POST /api/v1/runs                   │  2. GET /runner/server/_apis/connectionData
+           │     { workflow_yaml, event }            │
+           ▼                                        ▼
+<span class="org">┌────────────────────────────────────────────────────────────────────┐</span>
+<span class="org">│                         aksh server                               │</span>
+<span class="org">│                                                                   │</span>
+<span class="org">│  ┌─────────────┐   ┌──────────────┐   ┌────────────────────────┐  │</span>
+<span class="org">│  │ Parser +    │──▶│  Scheduler   │──▶│  Message Queue          │  │</span>
+<span class="org">│  │ Evaluator   │   │  (needs DAG) │   │  (encrypted envelopes)  │  │</span>
+<span class="org">│  │             │   │              │   │                        │  │</span>
+<span class="org">│  │ • parse YAML│   │ • gate on    │   │  • AES-encrypted body   │  │</span>
+<span class="org">│  │ • resolve   │   │   needs      │   │  • long-poll with       │  │</span>
+<span class="org">│  │   ${{}} expr │   │ • emit       │   │    messageId/ack        │  │</span>
+<span class="org">│  │ • expand    │   │   JobCancel  │   │  • per-session AES key  │  │</span>
+<span class="org">│  │   matrix    │   │   on cancel  │   │                        │  │</span>
+<span class="org">│  └─────────────┘   └──────────────┘   └───────────┬────────────┘  │</span>
+<span class="org">│                                                    │               │</span>
+<span class="org">│  ┌─────────────────────────────────────────────────┼─────────────┐ │</span>
+<span class="org">│  │  Runner Protocol Surface (Azure DevOps)         │             │ │</span>
+<span class="org">│  │                                                 ▼             │ │</span>
+<span class="org">│  │  ┌──────────┐  ┌────────────┐  ┌──────────┐  ┌──────────┐   │ │</span>
+<span class="org">│  │  │ /auth    │  │ /sessions  │  │ /messages│  │ /timelines│   │ │</span>
+<span class="org">│  │  │ OAuth2   │  │ RSA/AES    │  │ long-poll│  │ records   │   │ │</span>
+<span class="org">│  │  │ bearer   │  │ key exch.  │  │ + DELETE │  │ + logs    │   │ │</span>
+<span class="org">│  │  └──────────┘  └────────────┘  └──────────┘  └──────────┘   │ │</span>
+<span class="org">│  └──────────────────────────────────────────────────────────────┘ │</span>
+<span class="org">│                                                                   │</span>
+<span class="org">│  ┌──────────────────────────────────────────────────────────────┐ │</span>
+<span class="org">│  │  Agent-Native Surface (/api/v1/)  — same state, nicer API   │ │</span>
+<span class="org">│  │  • NDJSON event feed (projection of timeline records)       │ │</span>
+<span class="org">│  │  • SecretString redaction on all outputs                    │ │</span>
+<span class="org">│  └──────────────────────────────────────────────────────────────┘ │</span>
+<span class="org">└───────────────────────────────────────────────────────────────────┘</span>
+           │                                        ▲
+           │  3. POST /api/v1/runners               │  4. GET /messages (long-poll)
+           │     (RSA public key)                   │     POST /timelines (step state)
+           │     POST /sessions (AES key wrap)      │     POST /logs (console output)
+           │     POST /plans/.../events              │     PATCH /plans/.../finish
+           │                                        │
+           ▼                                        │
+<span class="grn">┌──────────────────────┐</span>                    <span class="blu">┌─────────────────────┐</span>
+<span class="grn">│  Runner.Listener     │</span>  ─── boot ───▶   <span class="blu">│   aksh server       │</span>
+<span class="grn">│  (inside a container,│</span>                    <span class="blu">│   (speaks the       │</span>
+<span class="grn">│   VM, microVM, etc.) │</span>                    <span class="blu">│    same language)   │</span>
+<span class="grn">└──────────────────────┘</span>                    <span class="blu">└─────────────────────┘</span>
+  </pre></div>
+
+  <h3>Step by step</h3>
+
+  <div class="timeline">
+    <div class="timeline-item">
+      <div class="label">1. Submission</div>
+      <h4>Workflow arrives</h4>
+      <p>A CLI, agent, or API submits <code>POST /api/v1/runs</code> with the YAML workflow, event name, payload, secrets, and optional reusable workflow YAML. aksh parses it, checks the trigger matches, expands the matrix, and queues expanded jobs.</p>
+    </div>
+    <div class="timeline-item">
+      <div class="label">2. Runner Registration</div>
+      <h4>Runner connects and authenticates</h4>
+      <p>The runner first calls <code>GET /_apis/connectionData</code> to discover service endpoints. It registers via <code>POST /_apis/.../agents</code> (sending its RSA public key), then creates an encrypted session via <code>POST /_apis/.../sessions</code> — aksh generates a random AES key and RSA-wraps it for the runner.</p>
+    </div>
+    <div class="timeline-item">
+      <div class="label">3. Job Delivery</div>
+      <h4>Encrypted message via long-poll</h4>
+      <p>The runner long-polls <code>GET /_apis/.../messages?sessionId&lastMessageId</code>. When a job is ready, aksh builds a fully-resolved <code>AgentJobRequestMessage</code> (all <code>${{ }}</code> expressions evaluated, variables materialized, secrets masked, <code>maskHints</code> set, service endpoints attached), AES-encrypts the body, wraps it in a <code>TaskAgentMessage</code>, and delivers it. The runner decrypts with its session key and starts executing.</p>
+    </div>
+    <div class="timeline-item">
+      <div class="label">4. Execution Feedback</div>
+      <h4>Timeline, logs, annotations stream back</h4>
+      <p>As steps run, the runner PATCHes <code>TimelineRecord</code>s (step state, result, issues/annotations), creates and appends log files, streams live console lines, and reports job completion with outputs. aksh projects all of this into run state and emits NDJSON events for agents.</p>
+    </div>
+    <div class="timeline-item">
+      <div class="label">5. Completion</div>
+      <h4>Outputs, needs-gating, next jobs</h4>
+      <p>On <code>JobCompleted</code>, aksh persists the job's outputs and updates the run status. The scheduler checks if any downstream jobs' <code>needs</code> are now satisfied, evaluates their <code>if</code> conditions against real job-status functions, and dispatches the next eligible jobs.</p>
+    </div>
+    <div class="timeline-item">
+      <div class="label">6. Cleanup</div>
+      <h4>Ephemeral runner torn down</h4>
+      <p>If the runner was provisioned by an ephemeral provider, aksh tells the provider to terminate it. If BYO, the runner stays. Either way, the run record with all timeline data, logs, and annotations persists.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <h2>Pluggable Backends</h2>
+  <p class="subtitle">One control plane. Any execution substrate.</p>
+
+  <p>aksh doesn't hardcode how runners are created. It defines a <code>RunnerProvider</code> trait that any backend implements:</p>
+
+  <div class="code-block"><pre>
+<span style="color:var(--accent2)">pub trait</span> RunnerProvider: Send + Sync {
+    <span style="color:var(--text-dim)">/// Labels this provider can satisfy.</span>
+    <span style="color:var(--accent2)">fn</span> labels(&amp;self) -&gt; &amp;LabelMatcher;
+
+    <span style="color:var(--text-dim)">/// Start a runner that phones home via the normal protocol.</span>
+    <span style="color:var(--accent2)">async fn</span> provision(&amp;self, spec: &amp;RunnerSpec, reg: RunnerRegistration)
+        -&gt; Result&lt;RunnerHandle, ProviderError&gt;;
+
+    <span style="color:var(--text-dim)">/// Tear down (ephemeral cleanup).</span>
+    <span style="color:var(--accent2)">async fn</span> terminate(&amp;self, handle: &amp;RunnerHandle) -&gt; Result&lt;(), ProviderError&gt;;
+
+    <span style="color:var(--text-dim)">/// Optional capacity for backpressure.</span>
+    <span style="color:var(--accent2)">async fn</span> capacity(&amp;self) -&gt; Capacity { Capacity::unbounded() }
+}
+  </pre></div>
+
+  <p>The base case is <strong>BYO (Bring Your Own) — no provider needed.</strong> Self-hosted runners just register and poll. aksh works without any provider crate at all.</p>
+
+  <div class="card-grid">
+    <div class="card">
+      <div class="icon">⚙️</div>
+      <h4>Process Provider</h4>
+      <p>Spawns a <code>Runner.Listener</code> as a child process. Fastest, least isolation. Good for development.</p>
+    </div>
+    <div class="card">
+      <div class="icon">🐳</div>
+      <h4>Container Provider</h4>
+      <p>Docker or Podman. Each job gets its own container. Good isolation, fast startup.</p>
+    </div>
+    <div class="card">
+      <div class="icon">🖥️</div>
+      <h4>libkrun Provider</h4>
+      <p>MicroVM via libkrun. Hardware-level isolation with sub-second boot. What Preloop uses.</p>
+    </div>
+    <div class="card">
+      <div class="icon">☁️</div>
+      <h4>Cloud / Remote Provider</h4>
+      <p>Kubernetes pods, Firecracker VMs, cloud instances. For server-side use.</p>
+    </div>
+  </div>
+
+  <p>Adding a new backend = implement the trait. Zero control-plane edits.</p>
+
+  <h3>Local vs Server Profiles</h3>
+
+  <table>
+    <tr><th>Concern</th><th><code>--profile local</code></th><th><code>--profile server</code></th></tr>
+    <tr><td>Runner host</td><td>In-process: process/container/libkrun, ephemeral</td><td>Remote: k8s/Firecracker/cloud pools, or BYO</td></tr>
+    <tr><td>Persistence</td><td>In-memory</td><td>sqlx (SQLite/Postgres)</td></tr>
+    <tr><td>Auth</td><td>Loopback / dev token</td><td>OAuth + mTLS</td></tr>
+    <tr><td>Networking</td><td>127.0.0.1</td><td>Routable URL, token-scoped</td></tr>
+    <tr><td>Secrets</td><td>From submission payload</td><td>Vault / env / AWS SM</td></tr>
+  </table>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <h2>What Makes aksh Different</h2>
+  <p class="subtitle">Beyond just reimplementing runner.server.</p>
+
+  <div class="card-grid">
+    <div class="card">
+      <div class="icon">📊</div>
+      <h4>NDJSON Agent Feed</h4>
+      <p>A machine-readable event stream derived from timeline records. AI agents can subscribe and react to job status, step completions, annotations — in real time, no polling.</p>
+    </div>
+    <div class="card">
+      <div class="icon">🔒</div>
+      <h4>Redaction-Safe Secrets</h4>
+      <p><code>SecretString</code> type that can never accidentally log a secret value. <code>Debug</code>, <code>Display</code>, and <code>Serialize</code> all emit <code>&lt;redacted&gt;</code>. Raw access requires explicit <code>.expose()</code>.</p>
+    </div>
+    <div class="card">
+      <div class="icon">🧩</div>
+      <h4>Two Protocol Surfaces</h4>
+      <p>The runner-compatible <code>_apis/...</code> surface (source of truth) plus an agent-friendly native REST + NDJSON surface — both reading the same state.</p>
+    </div>
+    <div class="card">
+      <div class="icon">⚡</div>
+      <h4>Small & Fast</h4>
+      <p>4.7MB binary. 8ms startup. 37K req/s. No .NET runtime, no 104MB extraction. Single native process.</p>
+    </div>
+    <div class="card">
+      <div class="icon">🏗️</div>
+      <h4>Crate Boundaries</h4>
+      <p>Separate crates for protocol, parser, expressions, server, client, cache, artifacts, conformance. Each independently testable and replaceable.</p>
+    </div>
+    <div class="card">
+      <div class="icon">✅</div>
+      <h4>Zero Unsafe</h4>
+      <p><code>unsafe_code = "forbid"</code> at workspace level. All external protocol surfaces versioned with golden fixtures.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <h2>Implementation Roadmap</h2>
+  <p class="subtitle">Phased approach — each phase independently testable.</p>
+
+  <table>
+    <tr><th>Phase</th><th>Goal</th><th>Status</th></tr>
+    <tr>
+      <td><strong>A</strong> — AzDO Wire DTOs</td>
+      <td>Typed, golden-tested wire models for every protocol message</td>
+      <td><span class="score score-orange"></span>partial</td>
+    </tr>
+    <tr>
+      <td><strong>B</strong> — connectionData + Auth</td>
+      <td>Runner discovers endpoints and authenticates</td>
+      <td><span class="score score-red"></span>missing</td>
+    </tr>
+    <tr>
+      <td><strong>C</strong> — Session Crypto</td>
+      <td>RSA/AES key exchange, encrypted message queue</td>
+      <td><span class="score score-red"></span>missing</td>
+    </tr>
+    <tr>
+      <td><strong>D</strong> — Job Message Builder</td>
+      <td>Wire expression evaluator, build <code>AgentJobRequestMessage</code></td>
+      <td><span class="score score-red"></span>missing (engine exists, unwired)</td>
+    </tr>
+    <tr>
+      <td><strong>E</strong> — Timeline + Logs</td>
+      <td>Step status, logs, annotations stream back to server</td>
+      <td><span class="score score-red"></span>missing</td>
+    </tr>
+    <tr>
+      <td><strong>F</strong> — needs DAG + Outputs</td>
+      <td>Dependency-gated scheduling, output propagation</td>
+      <td><span class="score score-red"></span>missing</td>
+    </tr>
+    <tr>
+      <td><strong>G</strong> — Triggers + Matrix Fidelity</td>
+      <td>Branches/tags/paths matching, declaration-order matrix</td>
+      <td><span class="score score-orange"></span>partial</td>
+    </tr>
+    <tr>
+      <td><strong>H</strong> — Actions + Cache + Artifacts</td>
+      <td>Action download, cache/artifact v2 blob protocols</td>
+      <td><span class="score score-orange"></span>partial v1</td>
+    </tr>
+  </table>
+
+  <p>Critical path: <strong>A → B → C → D → E</strong> = first real runner runs one job. Then <strong>F → G → H</strong> = any in-scope workflow works exactly like GitHub.</p>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <h2>The Name</h2>
+  <p class="subtitle">aksh is the control plane. Preloop is the product.</p>
+
+  <div class="card-grid">
+    <div class="card" style="border-color: var(--accent);">
+      <h4>aksh (this repo)</h4>
+      <p>The GitHub Actions control plane. Reimplements the runner protocol in Rust. Anyone can use it — <code>cargo install aksh</code> — and point their own runners at it. Execution-agnostic.</p>
+    </div>
+    <div class="card">
+      <h4>Preloop (the product)</h4>
+      <p>Combines aksh + a libkrun microVM provider for local CI. The full "submit a workflow, run it in an ephemeral VM, get results" experience. Uses aksh as its control plane.</p>
+    </div>
+  </div>
+
+  <div class="principle">
+    <p><strong>aksh</strong> = the engine. <strong>Preloop</strong> = the car. You can put the engine in any car.</p>
+  </div>
+</section>
+
+</div>
+
+<footer>
+  <p>aksh — <a href="https://github.com/preloop/preloop">github.com/preloop/preloop</a> — faithful GitHub Actions control plane in Rust</p>
+  <p style="margin-top:8px">Upstream reference: <a href="https://github.com/ChristopherHX/runner.server">ChristopherHX/runner.server</a></p>
+</footer>
+
+</body>
+</html>
