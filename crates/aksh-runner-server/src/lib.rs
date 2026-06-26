@@ -85,6 +85,10 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             "/api/v1/runners/sessions/:session_id/messages",
             get(next_message),
         )
+        .route(
+            "/api/v1/runners/sessions/:session_id/messages/:message_id",
+            delete(delete_session_message),
+        )
         .route("/api/v1/jobs/complete", post(complete_job))
         .route("/api/v1/cache", post(cache_put))
         .route("/api/v1/cache", get(cache_get))
@@ -126,6 +130,10 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         .route(
             "/runner/server/_apis/distributedtask/pools/:pool_id/messages",
             get(next_message),
+        )
+        .route(
+            "/runner/server/_apis/distributedtask/pools/:pool_id/messages/:message_id",
+            delete(delete_pool_message),
         )
         .route(
             "/runner/server/_apis/distributedtask/hubs/actions/plans/:run_id/jobs/:job_id",
@@ -211,10 +219,12 @@ struct InnerState {
     sessions: BTreeMap<String, RunnerSession>,
     session_keys: BTreeMap<String, SessionEncryption>,
     agent_keypair: Option<AgentRsaKeypair>,
+    inflight_messages: BTreeMap<i64, azdo::TaskAgentMessage>,
     pending_caches: BTreeMap<i64, PendingCache>,
     artifacts: BTreeMap<String, ArtifactRecord>,
     next_runner_id: i64,
     next_cache_id: i64,
+    next_message_id: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -606,6 +616,10 @@ async fn next_message(
         .unwrap_or_else(|| "default".to_owned());
 
     let mut inner = shared.state.inner.lock().await;
+    if let Some(message) = inner.inflight_messages.values().next().cloned() {
+        return Ok(Json(Some(message)));
+    }
+
     let Some(queued) = inner.queue.pop_front() else {
         return Ok(Json(None));
     };
@@ -617,7 +631,9 @@ async fn next_message(
     }
 
     // Get the session's AES key for encryption
-    let session_key = inner.session_keys.get(&session_id)
+    let session_key = inner
+        .session_keys
+        .get(&session_id)
         .map(|s| s.key.clone())
         .unwrap_or_default();
 
@@ -635,10 +651,19 @@ async fn next_message(
         (body_json.into_bytes(), vec![0u8; 16])
     };
 
-    drop(inner);
+    inner.next_message_id += 1;
+    let message_id = inner.next_message_id;
+    let message = azdo::TaskAgentMessage {
+        message_id,
+        message_type: azdo::message_type::PIPELINE_AGENT_JOB_REQUEST.to_owned(),
+        body: base64::engine::general_purpose::STANDARD.encode(&encrypted_body),
+        iv: Some(iv),
+    };
+    inner.inflight_messages.insert(message_id, message.clone());
 
     let run_id = queued.run_id;
     let job_id = queued.job_id.clone();
+    drop(inner);
 
     shared
         .state
@@ -649,12 +674,27 @@ async fn next_message(
         })
         .await;
 
-    Ok(Json(Some(azdo::TaskAgentMessage {
-        message_id: 1,
-        message_type: "PipelineAgentJobRequest".to_owned(),
-        body: base64::engine::general_purpose::STANDARD.encode(&encrypted_body),
-        iv: Some(iv),
-    })))
+    Ok(Json(Some(message)))
+}
+
+async fn delete_session_message(
+    State(shared): State<Arc<SharedState>>,
+    Path((_session_id, message_id)): Path<(String, i64)>,
+) -> StatusCode {
+    ack_message(shared, message_id).await
+}
+
+async fn delete_pool_message(
+    State(shared): State<Arc<SharedState>>,
+    Path((_pool_id, message_id)): Path<(i64, i64)>,
+) -> StatusCode {
+    ack_message(shared, message_id).await
+}
+
+async fn ack_message(shared: Arc<SharedState>, message_id: i64) -> StatusCode {
+    let mut inner = shared.state.inner.lock().await;
+    inner.inflight_messages.remove(&message_id);
+    StatusCode::NO_CONTENT
 }
 
 async fn complete_job(
@@ -1286,6 +1326,74 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    #[tokio::test]
+    async fn messages_redeliver_until_delete_ack() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+
+        request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+"#,
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+
+        let first = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=default",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(first["messageId"], 1);
+
+        let redelivered = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=default",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(redelivered["messageId"], first["messageId"]);
+
+        let ack = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/runner/server/_apis/distributedtask/pools/1/messages/1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ack.status(), StatusCode::NO_CONTENT);
+
+        let empty = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=default",
+            Value::Null,
+        )
+        .await;
+        assert!(empty.is_null());
+    }
 
     #[tokio::test]
     async fn submit_run_uses_branch_and_path_filters() {
