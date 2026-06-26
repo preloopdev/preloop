@@ -496,6 +496,14 @@ Steps:
 4. **Crypto isolation:** all RSA/AES lives in one reviewed module (`protocol::crypto`);
 
    `unsafe` stays forbidden; use `rsa`/`aes-gcm`/`cbc` crates. Document algorithm choices.
+5. **Known FIPS gap:** upstream `actions/runner` uses RSA-OAEP-SHA1 by default but switches to
+
+   RSA-OAEP-SHA256 when `UseFipsEncryption` is enabled. aksh currently implements the default
+
+   SHA-1 OAEP path only; FIPS-mode runners require an explicit algorithm switch before they can
+
+   decrypt `TaskAgentSession.encryptionKey`.
+
 
 **Validate (Phase C):**
 
