@@ -57,8 +57,7 @@ pub fn build_agent_job_message(
     let steps: Vec<TaskStep> = plan
         .steps
         .iter()
-        .enumerate()
-        .map(|(i, step)| build_task_step(step, i, &expr_context))
+        .map(|step| build_task_step(step, &expr_context))
         .collect();
 
     // Materialize variables
@@ -183,7 +182,7 @@ pub fn build_agent_job_message(
 }
 
 /// Build a `TaskStep` from a `StepPlan`.
-fn build_task_step(step: &crate::StepPlan, index: usize, context: &Context) -> TaskStep {
+fn build_task_step(step: &crate::StepPlan, context: &Context) -> TaskStep {
     let step_id = uuid::Uuid::new_v4();
 
     // Resolve expressions in env and with
