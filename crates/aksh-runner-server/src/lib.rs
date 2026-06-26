@@ -12,9 +12,10 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use bytes::Bytes;
+use hmac::{Hmac, Mac};
 use aksh_artifacts::ArtifactStore;
 use aksh_cache::CacheStore;
 use aksh_gha_parser::{expand_jobs_with_reusables, parse_workflow};
@@ -31,6 +32,8 @@ use aksh_gha_protocol::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::Sha256;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, Mutex};
 use tokio_util::sync::CancellationToken;
@@ -136,6 +139,10 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         .route(
             "/_apis/v1/FinishJob/:scope/:hub/:plan_id",
             post(finish_job),
+        )
+        .route(
+            "/runner/server/_apis/distributedtask/hubs/actions/plans/:plan_id/jobs/:job_id/oidctoken",
+            get(oidc_token),
         )
         .route(
             "/_apis/v1/ActionDownloadInfo/:scope/:hub/:plan_id",
@@ -1029,6 +1036,65 @@ async fn oauth2_token(Json(_req): Json<TokenRequest>) -> Json<TokenResponse> {
     })
 }
 
+#[derive(Debug, Deserialize)]
+struct OidcTokenQuery {
+    audience: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct OidcTokenResponse {
+    value: String,
+}
+
+async fn oidc_token(
+    Path((plan_id, job_id)): Path<(String, String)>,
+    Query(query): Query<OidcTokenQuery>,
+) -> Result<Json<OidcTokenResponse>, ApiError> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| ApiError::bad_request(format!("system clock before epoch: {error}")))?
+        .as_secs();
+    let audience = query
+        .audience
+        .unwrap_or_else(|| "api://aksh".to_owned());
+    let header = json!({
+        "alg": "HS256",
+        "typ": "JWT",
+        "kid": "aksh-local"
+    });
+    let claims = json!({
+        "iss": "https://aksh.local",
+        "sub": format!("repo:local:job:{job_id}"),
+        "aud": audience,
+        "iat": now,
+        "nbf": now,
+        "exp": now + 600,
+        "jti": uuid::Uuid::new_v4().to_string(),
+        "job_id": job_id,
+        "plan_id": plan_id,
+    });
+
+    let signing_input = format!(
+        "{}.{}",
+        base64_url_json(&header)?,
+        base64_url_json(&claims)?
+    );
+    let mut mac = Hmac::<Sha256>::new_from_slice(b"aksh-local-oidc-signing-key")
+        .map_err(|error| ApiError::bad_request(format!("invalid signing key: {error}")))?;
+    mac.update(signing_input.as_bytes());
+    let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+
+    Ok(Json(OidcTokenResponse {
+        value: format!("{signing_input}.{signature}"),
+    }))
+}
+
+fn base64_url_json(value: &serde_json::Value) -> Result<String, ApiError> {
+    let bytes = serde_json::to_vec(value)
+        .map_err(|error| ApiError::bad_request(format!("failed to encode jwt json: {error}")))?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
 async fn cache_put(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<CachePutRequest>,
@@ -1372,6 +1438,32 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn oidc_endpoint_mints_jwt_with_requested_audience() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+
+        let token = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/distributedtask/hubs/actions/plans/plan-1/jobs/job-1/oidctoken?audience=api://custom",
+            Value::Null,
+        )
+        .await;
+        let jwt = token["value"].as_str().unwrap();
+        let parts: Vec<&str> = jwt.split('.').collect();
+        assert_eq!(parts.len(), 3);
+        let claims = URL_SAFE_NO_PAD.decode(parts[1]).unwrap();
+        let claims: Value = serde_json::from_slice(&claims).unwrap();
+
+        assert_eq!(claims["aud"], "api://custom");
+        assert_eq!(claims["job_id"], "job-1");
+        assert_eq!(claims["plan_id"], "plan-1");
     }
 
     #[tokio::test]
