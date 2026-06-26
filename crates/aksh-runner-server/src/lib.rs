@@ -26,8 +26,8 @@ use aksh_gha_protocol::{
         ServiceDefinition, TaskAgentSession as AzdoSession,
     },
     crypto::{AgentRsaKeypair, AgentRsaPublicKey, SessionEncryption},
-    event_to_ndjson, ExecutionStatus, JobCompletion, JobId, NdjsonEvent, RegisteredRunner,
-    RunAccepted, RunId, RunnerRegistrationRequest, RunnerSession,
+    event_to_ndjson, AnnotationLevel, ExecutionStatus, JobCompletion, JobId, NdjsonEvent,
+    RegisteredRunner, RunAccepted, RunId, RunnerRegistrationRequest, RunnerSession,
     RunnerSessionRequest, WorkflowSubmission, PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
@@ -253,6 +253,7 @@ struct InnerState {
     pending_caches: BTreeMap<i64, PendingCache>,
     artifacts: BTreeMap<String, ArtifactRecord>,
     logs: BTreeMap<String, Vec<u8>>,
+    timeline_events: BTreeMap<RunId, Vec<NdjsonEvent>>,
     next_runner_id: i64,
     next_cache_id: i64,
     next_message_id: i64,
@@ -596,6 +597,11 @@ async fn run_events(
             job_id: job_id.clone(),
             status: *status,
         })?);
+    }
+    if let Some(events) = inner.timeline_events.get(&run_id) {
+        for event in events {
+            out.push_str(&event_to_ndjson(event)?);
+        }
     }
     Ok(Response::builder()
         .header("content-type", "application/x-ndjson")
@@ -941,21 +947,76 @@ fn need_satisfied(run: &RunRecord, need: &JobId) -> bool {
 /// PATCH timeline records — runner updates step/job state.
 async fn patch_timeline_records(
     State(shared): State<Arc<SharedState>>,
-    Path((_scope, _hub, _plan_id, _timeline_id)): Path<(String, String, String, String)>,
+    Path((_scope, _hub, plan_id, timeline_id)): Path<(String, String, String, String)>,
     Json(records): Json<Vec<azdo::TimelineRecord>>,
 ) -> Json<serde_json::Value> {
+    let run_id = plan_id.parse::<RunId>().ok();
+    let mut projected = Vec::new();
     for record in &records {
         if let Some(state) = &record.state {
             info!(
-                timeline_id = %_timeline_id,
+                timeline_id = %timeline_id,
                 record_id = %record.id,
                 name = record.display_name.as_deref().unwrap_or(""),
                 state = ?state,
                 "timeline record update"
             );
         }
+        if let (Some(run_id), Some(status)) = (run_id, timeline_status(record)) {
+            projected.push(NdjsonEvent::JobStatus {
+                run_id,
+                job_id: JobId(record.id.to_string()),
+                status,
+            });
+        }
+        if let Some(run_id) = run_id {
+            for issue in &record.issues {
+                projected.push(NdjsonEvent::Annotation {
+                    run_id,
+                    job_id: JobId(record.id.to_string()),
+                    level: issue_level(issue.issue_type),
+                    message: issue.message.clone().unwrap_or_default(),
+                    file: issue.data.get("file").cloned(),
+                    line: issue.data.get("line").and_then(|line| line.parse().ok()),
+                });
+            }
+        }
+    }
+    if let Some(run_id) = run_id {
+        let mut inner = shared.state.inner.lock().await;
+        inner
+            .timeline_events
+            .entry(run_id)
+            .or_default()
+            .extend(projected.clone());
+    }
+    for event in projected {
+        shared.state.emit(event).await;
     }
     Json(json!({ "ok": true }))
+}
+
+fn timeline_status(record: &azdo::TimelineRecord) -> Option<ExecutionStatus> {
+    match record.result {
+        Some(azdo::TaskResult::Succeeded | azdo::TaskResult::SucceededWithIssues) => {
+            Some(ExecutionStatus::Success)
+        }
+        Some(azdo::TaskResult::Failed) => Some(ExecutionStatus::Failure),
+        Some(azdo::TaskResult::Cancelled) => Some(ExecutionStatus::Cancelled),
+        Some(azdo::TaskResult::Skipped) => Some(ExecutionStatus::Skipped),
+        None if record.state == Some(azdo::TimelineRecordState::InProgress) => {
+            Some(ExecutionStatus::InProgress)
+        }
+        _ => None,
+    }
+}
+
+fn issue_level(issue_type: azdo::IssueType) -> AnnotationLevel {
+    match issue_type {
+        azdo::IssueType::Error => AnnotationLevel::Error,
+        azdo::IssueType::Warning => AnnotationLevel::Warning,
+        azdo::IssueType::Info => AnnotationLevel::Notice,
+    }
 }
 
 /// POST create log file — runner creates a log container.
@@ -1566,6 +1627,70 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    #[tokio::test]
+    async fn timeline_patch_projects_annotations_to_run_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo annotated
+"#,
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id = accepted["run_id"].as_str().unwrap();
+        request_json(
+            &app,
+            Method::PATCH,
+            &format!("/_apis/v1/Timeline/scope/actions/{run_id}/timeline-1"),
+            json!([{
+                "id": "00000000-0000-0000-0000-000000000001",
+                "name": "build",
+                "type": "job",
+                "state": "completed",
+                "result": "failed",
+                "issues": [{
+                    "type": "error",
+                    "message": "boom",
+                    "data": {"file": "src/lib.rs", "line": "42"}
+                }]
+            }]),
+        )
+        .await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/v1/runs/{run_id}/events.ndjson"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let events = String::from_utf8(bytes.to_vec()).unwrap();
+
+        assert!(events.contains("\"type\":\"annotation\""));
+        assert!(events.contains("\"message\":\"boom\""));
+        assert!(events.contains("\"status\":\"failure\""));
+    }
 
     #[tokio::test]
     async fn log_append_persists_payload_bytes() {
