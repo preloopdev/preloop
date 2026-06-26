@@ -644,14 +644,21 @@ async fn complete_job_inner(
     completion: JobCompletion,
 ) -> Result<Json<RunRecord>, ApiError> {
     let mut inner = shared.state.inner.lock().await;
-    let run = inner
+    {
+        let run = inner
+            .runs
+            .get_mut(&completion.run_id)
+            .ok_or_else(|| ApiError::not_found("run not found"))?;
+        run.jobs
+            .insert(completion.job_id.clone(), completion.status);
+        run.status = summarize_run(run.jobs.values().copied());
+    }
+    promote_ready_jobs(&mut inner);
+    let record = inner
         .runs
-        .get_mut(&completion.run_id)
+        .get(&completion.run_id)
+        .cloned()
         .ok_or_else(|| ApiError::not_found("run not found"))?;
-    run.jobs
-        .insert(completion.job_id.clone(), completion.status);
-    run.status = summarize_run(run.jobs.values().copied());
-    let record = run.clone();
     drop(inner);
 
     shared
