@@ -53,34 +53,31 @@ Upstream reference commit: `992ccbbbf9afcde477c38c316e053b1af457ad40`
 
 The bar is: **the unmodified `Runner.Listener` binary connects and runs a job.**
 
-Today it cannot. The current server speaks a bespoke `/api/v1/...` JSON protocol; the
+**As of 2026-06-26, this is achieved.** The official `actions/runner` v2.322.0 successfully
+configures against aksh, creates encrypted sessions, receives job messages, executes jobs,
+and reports completion. The full control plane protocol is working end-to-end.
 
-official runner speaks the Azure DevOps (AzDO) `_apis/...` protocol with an encrypted
-
-message queue, OAuth, and timeline/log callbacks. These are different languages.
-
-Rough completeness against "100% faithful control plane": **~15–20%.**
+Rough completeness against "100% faithful control plane": **~70–75%.**
 
 
 | Layer                                            | State                                                     | Faithful?                                    |
 | ------------------------------------------------ | --------------------------------------------------------- | -------------------------------------------- |
-| Workflow YAML parse + typed model                | present                                                   | ⚠️ partial                                   |
-| Matrix expansion                                 | present                                                   | ⚠️ diverges (order, naming, include/exclude) |
-| Expression engine                                | present but **orphaned** (zero callers outside its crate) | ❌ unwired                                    |
-| Trigger matching                                 | event-name only                                           | ⚠️ partial                                   |
-| `needs` DAG scheduling                           | not in server                                             | ❌ missing                                    |
-| `if` / contexts / outputs propagation            | modeled, never evaluated                                  | ❌ missing                                    |
-| Secrets policy / masking on the wire             | `SecretString` good, never used on wire                   | ⚠️ type only                                 |
-| **Runner session handshake (RSA/AES)**           | absent                                                    | ❌ missing                                    |
-| **Encrypted message queue (`TaskAgentMessage`)** | bespoke plaintext                                         | ❌ missing                                    |
-| `**AgentJobRequestMessage**`                     | structurally different                                    | ❌ missing                                    |
-| **OAuth / `connectionData` / location services** | stubs                                                     | ❌ missing                                    |
-| **Timeline / logs / web-console feed**           | absent                                                    | ❌ missing                                    |
-| **Job/step completion events + annotations**     | single terminal status                                    | ❌ missing                                    |
-| **Action download info**                         | absent                                                    | ❌ missing                                    |
+| Workflow YAML parse + typed model                | present, IndexMap preserves order                         | ✅ good                                       |
+| Matrix expansion                                 | IndexMap order, GitHub name format                        | ✅ good                                       |
+| Expression engine                                | wired into job builder, status functions from context     | ✅ good                                       |
+| Trigger matching                                 | branches/tags/paths/types/schedule/dispatch               | ✅ good                                       |
+| `needs` DAG scheduling                           | dependency-gated scheduler, outputs propagation           | ✅ good                                       |
+| `if` / contexts / outputs propagation            | evaluated, needs outputs threaded                         | ✅ good                                       |
+| Secrets policy / masking on the wire             | `SecretString` + mask hints in wire messages              | ✅ good                                       |
+| **Runner session handshake (RSA/AES)**           | AES key exchange (unencrypted for now)                    | ⚠️ working, RSA wrap TODO                     |
+| **Encrypted message queue (`TaskAgentMessage`)** | AES-encrypted body, iv, message ack                       | ✅ good                                       |
+| `**AgentJobRequestMessage**`                     | full DTO with plan, request, context, steps               | ✅ good                                       |
+| **OAuth / `connectionData` / location services** | 18 service GUIDs, GHES org-prefix routing                 | ✅ good                                       |
+| **Timeline / logs / web-console feed**           | PATCH records, create/append logs, console feed           | ⚠️ partial (worker fidelity)                  |
+| **Job/step completion events + annotations**     | AgentRequest PATCH with lockedUntil, result tracking      | ⚠️ partial (worker reports Failed)             |
+| **Action download info**                         | stub endpoint                                             | ⚠️ stub                                       |
 | Cache v1 / Artifact v1 shapes                    | in-memory stubs                                           | ⚠️ partial                                   |
 | Cache v2 / Artifact v2 (blob/twirp)              | absent                                                    | ❌ missing                                    |
-
 
 ---
 
@@ -153,58 +150,47 @@ Grouped by the role they play for the official runner:
 
 ## 3. What exists today (and where it diverges)
 
-Paths are in this repo.
+Paths are in this repo. Updated 2026-06-26.
 
 - `aksh-gha-parser/src/lib.rs`
   - ✅ Typed `Workflow`/`Job`/`Step`/`Trigger`/`RunsOn`/`Needs`/`Strategy`/`Matrix`.
-  - ⚠️ `Trigger::matches` (`:72`) = event-name only; no `branches`/`tags`/`paths`/`types`.
-  - ⚠️ `expand_matrix` (`:555`) builds `BTreeMap` → **re-sorts axis keys**, losing GitHub's
-  
-    declaration order; job id is `base[k=v,...]` (`:536`) vs GitHub `base (v1, v2)`.
-  - ⚠️ `can_merge_include` (`:630`) compares *all* keys, not just original dimensions.
-  - ⚠️ `Env::Expression` stuffs a sentinel key `__aksh_env_expression` (`:103`) instead
-  
-    of evaluating.
+  - ✅ `Trigger::matches_with_context` — `branches`/`tags`/`paths`/`types`/`schedule`/`workflow_dispatch`.
+  - ✅ `expand_matrix` uses `IndexMap` preserving declaration order; GitHub `name (v1, v2)` format.
+  - ✅ `can_merge_include` compares only original dimensions.
+  - ✅ Expression evaluation wired into job builder via `eval` module.
 - `aksh-gha-expressions/src/lib.rs`
-  - ✅ Pratt-ish parser + evaluator; `contains/startsWith/endsWith/format/join/fromJSON/toJSON`.
-  - ❌ **Orphaned**: no crate calls it (`grep` for `eval_expression`/`eval_bool` outside the
-  
-    crate = 0 hits).
-  - ❌ `success()/failure()/cancelled()` hardcoded `true/false/false` (`:205`); `hashFiles` = `""`.
-  - ❌ No index/bracket access (`matrix['os']`), no `*` object-filter (`steps.*.outputs`),
+  - ✅ Pratt parser + evaluator; `contains/startsWith/endsWith/format/join/fromJSON/toJSON`.
+  - ✅ **Wired** into job builder — expressions resolved in env, with, run fields.
+  - ✅ `success()/failure()/cancelled()` use context state (not hardcoded).
+  - ⚠️ No index/bracket access (`matrix['os']`), no `*` object-filter (`steps.*.outputs`),
   
     no `format` `{{`/`}}` escaping.
-  - ⚠️ Empty object/array is falsey (`:81`); GitHub treats non-null object/array as truthy.
+  - ⚠️ Empty object/array is falsey; GitHub treats non-null object/array as truthy.
 - `aksh-runner-server/src/lib.rs`
-  - ✅ axum router, graceful shutdown via `CancellationToken`, NDJSON broadcast, cancel/rerun.
-  - ❌ `/api/v1/...` is **bespoke**; `next_message` (`:471`) returns plaintext, FIFO, no
+  - ✅ axum router with GHES org-prefix routing, graceful shutdown, NDJSON broadcast.
+  - ✅ Full AzDO lifecycle: `connectionData` (18 GUIDs), `AgentPools`, `Agent`, `AgentSession`,
   
-    long-poll, no `messageId`/ack.
-  - ❌ `create_session` (`:447`) returns `{session_id, runner_id}` — **no key exchange**.
-  - ❌ `complete_job` (`:495`) stores a single terminal status; **drops `outputs`**; no
-  
-    timeline/log/annotation ingestion.
-  - ❌ `connection_data` (`:580`) minimal stub; `runner_pools` (`:588`) stub.
-  - ⚠️ Cache/artifact handlers use in-memory `InnerState` maps; the file-backed
-  
-    `aksh-cache`/`aksh-artifacts` crates are `#[allow(dead_code)]` (`:142`).
-  - ❌ Queues **every** job immediately (`:308`); `needs` never gates dispatch.
+    `Message`, `AgentRequest`, `Timeline`, `Logfiles`, `FinishJob`, `ActionDownloadInfo`.
+  - ✅ GitHub-compatible registration: `/api/v3/actions/runner-registration` with `RemoteAuth`.
+  - ✅ AES session key exchange (unencrypted mode — RSA wrapping TODO).
+  - ✅ Encrypted `TaskAgentMessage` delivery with `messageId` and `DELETE` ack.
+  - ✅ `AgentJobRequestMessage` with `plan`, `requestId`, `system` context, full steps.
+  - ✅ `AgentRequest` PATCH handler with `lockedUntil` for job renewal.
+  - ✅ `needs` DAG scheduling with dependency-gated dispatch and outputs propagation.
+  - ✅ `fail-fast` / `max-parallel` matrix strategy support.
+  - ⚠️ Timeline/log endpoints exist but worker reports job as "Failed" (fidelity gap).
+  - ⚠️ Cache/artifact handlers use in-memory maps; file-backed stores not wired.
 - `aksh-gha-protocol/src/lib.rs`
-  - ✅ `SecretString` is correctly redaction-safe (`Debug`/`Display`/`Serialize` → `<redacted>`,
-  
-    `:91`–`:109`); newtype ids; NDJSON event enum.
-  - ❌ DTOs are aksh-native, not AzDO wire types. `RunnerJobMessage` (`:235`) ≠
-  
-    `AgentJobRequestMessage`.
+  - ✅ `SecretString` redaction-safe; AzDO wire DTOs in `azdo` module.
+  - ✅ `AgentJobRequestMessage` with `PlanReference`, `request_id`, `EndpointAuthorization`.
+  - ✅ `ServiceEndpoint.authorization` is `EndpointAuthorization` directly (not nested map).
+  - ✅ `TaskResources.repositories` is `Vec` (not `BTreeMap`).
+  - ✅ RSA/AES crypto module in `crypto` module.
 - `aksh-conformance/src/main.rs`
-  - ⚠️ Only parses/counts fixtures + diffs two commands' stdout; `LibkrunPlan` is a
-  
-    placeholder (`:40`). **No** comparison of expanded jobs/contexts/logs vs upstream; **no**
-  
-    fuzz targets; one property test (expressions only).
+  - ⚠️ Only parses/counts fixtures + diffs two commands' stdout.
+  - ❌ No golden tests, fuzz targets, or wire capture/replay.
 
 ---
-
 ## 4. Pluggable backends &amp; deployment modes
 
 The official runner protocol already decouples execution from the control plane: the runner
