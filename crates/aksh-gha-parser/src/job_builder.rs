@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use aksh_gha_protocol::azdo::{
     AgentJobRequestMessage, EndpointAuthorization, MaskHint, MaskType,
-    PipelineContextData, ServiceEndpoint, TaskResources, TaskStep,
+    PipelineContextData, PlanReference, ServiceEndpoint, TaskResources, TaskStep,
     TimelineReference, VariableValue,
 };
 
@@ -169,8 +169,15 @@ pub fn build_agent_job_message(
     // Actions download info
     let actions_download_info = BTreeMap::new();
 
+    let request_id = uuid::Uuid::new_v4();
+
     Ok(AgentJobRequestMessage {
         job_id,
+        request_id,
+        plan: PlanReference {
+            plan_id: job_id.to_string(),
+            plan_type: Some("Job".to_owned()),
+        },
         timeline: TimelineReference { id: timeline_id },
         display_name: Some(plan.name.clone()),
         condition: plan.if_condition.clone(),
