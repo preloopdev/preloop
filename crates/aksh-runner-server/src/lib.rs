@@ -2599,6 +2599,80 @@ jobs:
         assert_eq!(&bytes[..], b"hello");
     }
 
+    #[tokio::test]
+    async fn full_runner_lifecycle_register_session_poll_complete() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        // Non-asserting helper
+        async fn try_req(app: &Router, method: Method, uri: &str, body: Value) -> (StatusCode, Value) {
+            let mut builder = Request::builder().method(method).uri(uri);
+            if uri.starts_with("/_apis/") || uri.starts_with("/runner/server/_apis/") {
+                builder = builder.header(header::AUTHORIZATION, "Bearer aksh-system-token");
+            }
+            let request = if body.is_null() {
+                builder.body(Body::empty()).unwrap()
+            } else {
+                builder.header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()
+            };
+            let response = app.clone().oneshot(request).await.unwrap();
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let val = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            (status, val)
+        }
+
+        // 1. connectionData
+        let (s, conn) = try_req(&app, Method::GET, "/runner/server/_apis/connectionData", Value::Null).await;
+        assert!(s.is_success(), "1 connectionData: {}", s);
+        assert!(conn["locationServiceData"]["serviceDefinitions"].is_array());
+
+        // 2. OAuth token
+        let (s, _) = try_req(&app, Method::POST, "/_apis/v1/oauth2/token",
+            json!({"grant_type":"client_credentials","client_id":"t","client_secret":"t"})).await;
+        assert!(s.is_success(), "2 oauth2: {}", s);
+
+        // 3. Register runner
+        let (s, reg) = try_req(&app, Method::POST, "/api/v1/runners",
+            json!({"name":"test-runner","labels":["self-hosted","linux","x64"]})).await;
+        assert!(s.is_success(), "3 register: {} body={}", s, reg);
+        let runner_id = reg["id"].as_i64().unwrap();
+
+        // 4. Create session
+        let (s, sess) = try_req(&app, Method::POST, "/api/v1/runners/sessions",
+            json!({"runner_id": runner_id, "name": "test-runner"})).await;
+        assert!(s.is_success(), "4 session: {} body={}", s, sess);
+        let session_id = sess["sessionId"].as_str().unwrap().to_owned();
+
+        // 5. Submit a workflow
+        let (s, accepted) = try_req(&app, Method::POST, "/api/v1/runs",
+            json!({"workflow_yaml":"on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n","event":"push","repository":"owner/repo"})).await;
+        assert!(s.is_success(), "5 submit: {} body={}", s, accepted);
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        // 6. Poll for messages — the runner uses the AzDO Message endpoint
+        let (s, msg) = try_req(&app, Method::GET,
+            &format!("/api/v1/runners/sessions/{}/messages?sessionId={}&waitSeconds=0", session_id, session_id),
+            Value::Null).await;
+        assert!(s.is_success(), "6 poll: {} body={}", s, msg);
+
+        // 7. Get the job from the run
+        let inner = state.inner.lock().await;
+        let run_record = inner.runs.get(&run_id).unwrap();
+        let job_id = run_record.jobs.keys().next().unwrap().clone();
+        drop(inner);
+
+        // 8. Complete the job
+        let (s, _) = try_req(&app, Method::POST, "/api/v1/jobs/complete",
+            json!({"run_id": run_id, "job_id": job_id, "status": "success"})).await;
+        assert!(s.is_success(), "8 complete: {}", s);
+
+        // 9. Verify run succeeded
+        let (_, final_run) = try_req(&app, Method::GET, &format!("/api/v1/runs/{}", run_id), Value::Null).await;
+        assert_eq!(final_run["status"], "success");
+    }
+
     async fn request_json(app: &Router, method: Method, uri: &str, body: Value) -> Value {
         let mut builder = Request::builder().method(method).uri(uri);
         if uri.starts_with("/_apis/") || uri.starts_with("/runner/server/_apis/") {
