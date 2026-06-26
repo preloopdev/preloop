@@ -252,6 +252,7 @@ struct InnerState {
     cancellation_queue: VecDeque<QueuedCancellation>,
     pending_caches: BTreeMap<i64, PendingCache>,
     artifacts: BTreeMap<String, ArtifactRecord>,
+    logs: BTreeMap<String, Vec<u8>>,
     next_runner_id: i64,
     next_cache_id: i64,
     next_message_id: i64,
@@ -959,19 +960,29 @@ async fn patch_timeline_records(
 
 /// POST create log file — runner creates a log container.
 async fn create_log(
-    State(_shared): State<Arc<SharedState>>,
-    Path((_scope, _hub, _plan_id, _log_id)): Path<(String, String, String, String)>,
+    State(shared): State<Arc<SharedState>>,
+    Path((_scope, _hub, plan_id, log_id)): Path<(String, String, String, String)>,
 ) -> Json<serde_json::Value> {
+    let key = log_key(&plan_id, &log_id);
+    let mut inner = shared.state.inner.lock().await;
+    inner.logs.entry(key).or_default();
     Json(json!({ "ok": true }))
 }
 
 /// POST append log — runner appends lines to a log file.
 async fn append_log(
-    State(_shared): State<Arc<SharedState>>,
-    Path((_scope, _hub, _plan_id, _log_id, _log_id2)): Path<(String, String, String, String, String)>,
-    _body: Bytes,
+    State(shared): State<Arc<SharedState>>,
+    Path((_scope, _hub, plan_id, log_id, _log_id2)): Path<(String, String, String, String, String)>,
+    body: Bytes,
 ) -> StatusCode {
+    let key = log_key(&plan_id, &log_id);
+    let mut inner = shared.state.inner.lock().await;
+    inner.logs.entry(key).or_default().extend_from_slice(&body);
     StatusCode::ACCEPTED
+}
+
+fn log_key(plan_id: &str, log_id: &str) -> String {
+    format!("{plan_id}/{log_id}")
 }
 
 /// POST console log — runner streams live console output.
@@ -1529,6 +1540,40 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    #[tokio::test]
+    async fn log_append_persists_payload_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        request_json(
+            &app,
+            Method::POST,
+            "/_apis/v1/Logfiles/scope/actions/plan-1/log-1",
+            Value::Null,
+        )
+        .await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/_apis/v1/Logfiles/scope/actions/plan-1/log-1/append")
+                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                    .body(Body::from("hello log"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let inner = state.inner.lock().await;
+        assert_eq!(
+            inner.logs.get("plan-1/log-1").map(Vec::as_slice),
+            Some(&b"hello log"[..])
+        );
+    }
 
     #[tokio::test]
     async fn registration_persists_runner_public_key_material() {
