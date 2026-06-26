@@ -195,9 +195,9 @@ pub struct AgentJobRequestMessage {
     #[serde(rename = "jobId")]
     pub job_id: uuid::Uuid,
 
-    /// The request ID for this job dispatch.
+    /// The request ID for this job dispatch (a sequential integer).
     #[serde(rename = "requestId")]
-    pub request_id: uuid::Uuid,
+    pub request_id: i64,
 
     /// The plan reference — plan ID and type.
     #[serde(rename = "plan")]

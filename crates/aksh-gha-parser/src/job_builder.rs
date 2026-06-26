@@ -169,7 +169,7 @@ pub fn build_agent_job_message(
     // Actions download info
     let actions_download_info = BTreeMap::new();
 
-    let request_id = uuid::Uuid::new_v4();
+    let request_id: i64 = 1;
 
     Ok(AgentJobRequestMessage {
         job_id,
