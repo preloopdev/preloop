@@ -173,40 +173,46 @@ fn matches_filter(filter: &Value, value: &str) -> bool {
     }
 }
 
-/// Simple glob matching (supports * and **).
+/// Glob matching for trigger filters.
+///
+/// `*` matches within a single path segment; `**` matches across path
+/// separators. This intentionally keeps matching anchored to the whole value.
 fn glob_match(pattern: &str, value: &str) -> bool {
-    // Simple glob: * matches any characters, ** matches path separators too
-    if pattern == "*" {
-        return true;
-    }
-    if pattern.contains("**") {
-        // Double star: match across path separators
-        let parts: Vec<&str> = pattern.split("**").collect();
-        if parts.len() == 2 {
-            let prefix = parts[0].trim_end_matches('/');
-            let suffix = parts[1].trim_start_matches('/');
-            if !prefix.is_empty() && !value.starts_with(prefix) {
-                return false;
-            }
-            if !suffix.is_empty() {
-                let remaining = if prefix.is_empty() {
-                    value
-                } else {
-                    value.strip_prefix(prefix).unwrap_or(value)
-                };
-                return remaining.ends_with(suffix) || remaining.contains(suffix);
-            }
-            return true;
+    fn matches(pattern: &[char], value: &[char], pi: usize, vi: usize) -> bool {
+        if pi == pattern.len() {
+            return vi == value.len();
         }
+
+        if pattern[pi] == '*' {
+            let double_star = pattern.get(pi + 1) == Some(&'*');
+            let next_pi = if double_star { pi + 2 } else { pi + 1 };
+
+            if matches(pattern, value, next_pi, vi) {
+                return true;
+            }
+
+            let mut next_vi = vi;
+            while next_vi < value.len() {
+                if !double_star && value[next_vi] == '/' {
+                    break;
+                }
+                next_vi += 1;
+                if matches(pattern, value, next_pi, next_vi) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        vi < value.len()
+            && pattern[pi] == value[vi]
+            && matches(pattern, value, pi + 1, vi + 1)
     }
-    // Single star: match within a path segment
-    let parts: Vec<&str> = pattern.split('*').collect();
-    if parts.len() == 2 {
-        let prefix = parts[0];
-        let suffix = parts[1];
-        return value.starts_with(prefix) && value.ends_with(suffix);
-    }
-    pattern == value
+
+    let pattern: Vec<char> = pattern.chars().collect();
+    let value: Vec<char> = value.chars().collect();
+    matches(&pattern, &value, 0, 0)
 }
 
 /// Environment map with scalar values normalized to strings.
@@ -796,6 +802,14 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn glob_match_handles_multiple_wildcards() {
+        assert!(glob_match("feature/*/*", "feature/auth/login"));
+        assert!(glob_match("release-*-rc*", "release-2026-rc1"));
+        assert!(!glob_match("feature/*", "feature/auth/login"));
+        assert!(glob_match("src/**", "src/bin/main.rs"));
+    }
 
     #[test]
     fn parses_and_expands_matrix() {
