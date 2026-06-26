@@ -265,6 +265,7 @@ struct RunRecord {
     submission: WorkflowSubmission,
     jobs: BTreeMap<JobId, ExecutionStatus>,
     status: ExecutionStatus,
+    job_outputs: BTreeMap<JobId, BTreeMap<String, serde_json::Value>>,
 }
 
 #[derive(Debug, Clone)]
@@ -438,6 +439,7 @@ async fn submit_run(
                 run_id,
                 submission,
                 jobs: statuses,
+                job_outputs: BTreeMap::new(),
                 status: ExecutionStatus::Queued,
             },
         );
@@ -869,6 +871,10 @@ async fn complete_job_inner(
             .ok_or_else(|| ApiError::not_found("run not found"))?;
         run.jobs
             .insert(completion.job_id.clone(), completion.status);
+        run.job_outputs.insert(
+            completion.job_id.clone(),
+            completion.outputs.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        );
         run.status = summarize_run(run.jobs.values().copied());
     }
     let promoted_jobs = promote_ready_jobs(&mut inner);
@@ -905,13 +911,16 @@ fn promote_ready_jobs(inner: &mut InnerState) -> usize {
     let mut promoted = Vec::new();
     let mut remaining = VecDeque::new();
 
-    while let Some(job) = inner.pending_jobs.pop_front() {
+    while let Some(mut job) = inner.pending_jobs.pop_front() {
         let needs_satisfied = inner
             .runs
             .get(&job.run_id)
             .is_some_and(|run| job.needs.iter().all(|need| need_satisfied(run, need)));
 
         if needs_satisfied {
+            if let Some(run) = inner.runs.get(&job.run_id) {
+                hydrate_needs_context(&mut job, run);
+            }
             promoted.push(job);
         } else {
             remaining.push_back(job);
@@ -924,6 +933,77 @@ fn promote_ready_jobs(inner: &mut InnerState) -> usize {
         inner.queue.push_back(job);
     }
     promoted_count
+}
+
+fn hydrate_needs_context(job: &mut QueuedJob, run: &RunRecord) {
+    let needs = job
+        .needs
+        .iter()
+        .filter_map(|need| need_context(run, need).map(|context| (need.0.clone(), context)))
+        .collect();
+    job.message
+        .context_data
+        .insert("needs".to_owned(), azdo::PipelineContextData::Dict(needs));
+}
+
+fn need_context(run: &RunRecord, need: &JobId) -> Option<azdo::PipelineContextData> {
+    let mut result = None;
+    let mut outputs = BTreeMap::new();
+    let matrix_prefix = format!("{} (", need.0);
+
+    for (job_id, status) in &run.jobs {
+        if job_id == need || job_id.0.starts_with(&matrix_prefix) {
+            result = Some(status_string(*status));
+            if let Some(job_outputs) = run.job_outputs.get(job_id) {
+                for (key, value) in job_outputs {
+                    outputs.insert(key.clone(), json_to_context_data(value));
+                }
+            }
+        }
+    }
+
+    let mut context = BTreeMap::new();
+    context.insert(
+        "result".to_owned(),
+        azdo::PipelineContextData::String(result?),
+    );
+    context.insert(
+        "outputs".to_owned(),
+        azdo::PipelineContextData::Dict(outputs),
+    );
+    Some(azdo::PipelineContextData::Dict(context))
+}
+
+fn status_string(status: ExecutionStatus) -> String {
+    match status {
+        ExecutionStatus::Queued | ExecutionStatus::InProgress | ExecutionStatus::Success => {
+            "success"
+        }
+        ExecutionStatus::Failure => "failure",
+        ExecutionStatus::Skipped => "skipped",
+        ExecutionStatus::Cancelled => "cancelled",
+    }
+    .to_owned()
+}
+
+fn json_to_context_data(value: &serde_json::Value) -> azdo::PipelineContextData {
+    match value {
+        serde_json::Value::String(value) => azdo::PipelineContextData::String(value.clone()),
+        serde_json::Value::Bool(value) => azdo::PipelineContextData::Bool(*value),
+        serde_json::Value::Number(value) => {
+            azdo::PipelineContextData::Number(value.as_f64().unwrap_or_default())
+        }
+        serde_json::Value::Array(values) => {
+            azdo::PipelineContextData::Array(values.iter().map(json_to_context_data).collect())
+        }
+        serde_json::Value::Object(values) => azdo::PipelineContextData::Dict(
+            values
+                .iter()
+                .map(|(key, value)| (key.clone(), json_to_context_data(value)))
+                .collect(),
+        ),
+        serde_json::Value::Null => azdo::PipelineContextData::String(String::new()),
+    }
 }
 
 fn need_satisfied(run: &RunRecord, need: &JobId) -> bool {
@@ -1101,6 +1181,14 @@ async fn finish_job(
     let actual_run_id = if let Some(rid) = run_id {
         if let Some(run) = inner.runs.get_mut(&rid) {
             run.jobs.insert(JobId(event.job_id.to_string()), status);
+            run.job_outputs.insert(
+                JobId(event.job_id.to_string()),
+                event
+                    .outputs
+                    .iter()
+                    .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
+                    .collect(),
+            );
             run.status = summarize_run(run.jobs.values().copied());
             rid
         } else {
@@ -1627,6 +1715,72 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    #[tokio::test]
+    async fn needs_context_includes_completed_job_outputs() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo build
+  deploy:
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo deploy
+"#,
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        request_json(
+            &app,
+            Method::POST,
+            "/api/v1/jobs/complete",
+            json!({
+                "run_id": run_id,
+                "job_id": "build",
+                "status": "success",
+                "outputs": {"artifact": "dist.tgz"}
+            }),
+        )
+        .await;
+
+        let inner = state.inner.lock().await;
+        let deploy = inner
+            .queue
+            .iter()
+            .find(|job| job.job_id.0 == "deploy")
+            .expect("deploy job should be promoted");
+        let needs = deploy.message.context_data.get("needs").unwrap();
+        let azdo::PipelineContextData::Dict(needs) = needs else {
+            panic!("needs context should be a dict");
+        };
+        let azdo::PipelineContextData::Dict(build) = needs.get("build").unwrap() else {
+            panic!("build context should be a dict");
+        };
+        let azdo::PipelineContextData::Dict(outputs) = build.get("outputs").unwrap() else {
+            panic!("outputs context should be a dict");
+        };
+        assert!(matches!(
+            outputs.get("artifact"),
+            Some(azdo::PipelineContextData::String(value)) if value == "dist.tgz"
+        ));
+    }
 
     #[tokio::test]
     async fn timeline_patch_projects_annotations_to_run_events() {
