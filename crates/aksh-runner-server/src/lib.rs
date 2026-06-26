@@ -328,7 +328,14 @@ async fn submit_run(
     Json(submission): Json<WorkflowSubmission>,
 ) -> Result<Json<RunAccepted>, ApiError> {
     let workflow = parse_workflow(&submission.workflow_yaml)?;
-    if !workflow.on.matches(&submission.event) {
+    let (branch, tag) = git_ref_context(&submission.git_ref);
+    let changed_paths = changed_paths_from_payload(&submission.payload);
+    if !workflow.on.matches_with_context(
+        &submission.event,
+        branch.as_deref(),
+        tag.as_deref(),
+        &changed_paths,
+    ) {
         return Err(ApiError::bad_request(format!(
             "workflow does not match event `{}`",
             submission.event
@@ -397,6 +404,47 @@ async fn submit_run(
             queued_jobs,
         }))
     }
+}
+
+fn git_ref_context(git_ref: &str) -> (Option<String>, Option<String>) {
+    if let Some(branch) = git_ref.strip_prefix("refs/heads/") {
+        (Some(branch.to_owned()), None)
+    } else if let Some(tag) = git_ref.strip_prefix("refs/tags/") {
+        (None, Some(tag.to_owned()))
+    } else {
+        (None, None)
+    }
+}
+
+fn changed_paths_from_payload(payload: &serde_json::Value) -> Vec<String> {
+    let mut paths = Vec::new();
+
+    if let Some(values) = payload.get("paths").and_then(|value| value.as_array()) {
+        collect_string_array(values, &mut paths);
+    }
+
+    if let Some(commits) = payload.get("commits").and_then(|value| value.as_array()) {
+        for commit in commits {
+            for field in ["added", "modified", "removed"] {
+                if let Some(values) = commit.get(field).and_then(|value| value.as_array()) {
+                    collect_string_array(values, &mut paths);
+                }
+            }
+        }
+    }
+
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn collect_string_array(values: &[serde_json::Value], out: &mut Vec<String>) {
+    out.extend(
+        values
+            .iter()
+            .filter_map(|value| value.as_str())
+            .map(str::to_owned),
+    );
 }
 
 async fn get_run(
@@ -1238,6 +1286,79 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    #[tokio::test]
+    async fn submit_run_uses_branch_and_path_filters() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+on:
+  push:
+    branches: [main]
+    paths: ["src/**"]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+"#,
+                "event": "push",
+                "repository": "owner/repo",
+                "git_ref": "refs/heads/main",
+                "payload": {
+                    "commits": [
+                        { "added": [], "modified": ["src/lib.rs"], "removed": [] }
+                    ]
+                }
+            }),
+        )
+        .await;
+        assert!(accepted["run_id"].is_string());
+
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/runs")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({
+                        "workflow_yaml": r#"
+on:
+  push:
+    branches: [main]
+    paths: ["src/**"]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+"#,
+                        "event": "push",
+                        "repository": "owner/repo",
+                        "git_ref": "refs/heads/feature",
+                        "payload": {
+                            "commits": [
+                                { "added": [], "modified": ["docs/readme.md"], "removed": [] }
+                            ]
+                        }
+                    }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    }
 
     #[tokio::test]
     async fn cache_protocol_reserves_uploads_commits_and_restores() {
