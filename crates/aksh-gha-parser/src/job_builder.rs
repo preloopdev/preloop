@@ -99,10 +99,7 @@ pub fn build_agent_job_message(
         endpoint_type: Some("azdoserver".to_owned()),
         url: Some("http://localhost".to_owned()),
         authorization: EndpointAuthorization {
-            parameters: BTreeMap::from([(
-                "AccessToken".to_owned(),
-                "aksh-system-token".to_owned(),
-            )]),
+            parameters: BTreeMap::new(),
             scheme: Some("OAuth".to_owned()),
         },
         is_shared: Some(false),
