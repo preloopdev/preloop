@@ -598,6 +598,7 @@ pub fn expand_jobs(workflow: &Workflow) -> Result<Vec<JobPlan>, ParserError> {
                 if_condition: job.if_condition.clone(),
                 fail_fast: job.strategy.fail_fast.unwrap_or(true),
                 max_parallel: job.strategy.max_parallel,
+                secrets_inherit: false,
             });
         }
     }
@@ -631,6 +632,7 @@ pub fn expand_jobs_with_reusables(
                         .collect();
                     called_plan.env.extend(global_env.clone());
                     called_plan.env.extend(job.env.clone().into_strings());
+                    called_plan.secrets_inherit = is_secrets_inherit(&job.secrets);
                 }
                 plans.extend(called_plans);
                 continue;
@@ -653,6 +655,7 @@ pub fn expand_jobs_with_reusables(
                 if_condition: job.if_condition.clone(),
                 fail_fast: job.strategy.fail_fast.unwrap_or(true),
                 max_parallel: job.strategy.max_parallel,
+                secrets_inherit: false,
             });
         }
     }
@@ -661,6 +664,13 @@ pub fn expand_jobs_with_reusables(
 
 fn is_local_reusable_workflow(uses: &str) -> bool {
     uses.starts_with("./") || uses.starts_with(".github/")
+}
+
+fn is_secrets_inherit(secrets: &Option<Value>) -> bool {
+    match secrets {
+        Some(Value::String(s)) => s == "inherit",
+        _ => false,
+    }
 }
 
 fn normalize_reusable_path(uses: &str) -> String {
@@ -963,4 +973,37 @@ jobs:
         assert_eq!(jobs[0].id.0, "call/test");
         assert_eq!(jobs[0].runs_on, vec!["ubuntu-latest"]);
     }
+
+    #[test]
+    fn reusable_workflow_secrets_inherit_flag() {
+        let caller = parse_workflow(
+            r#"
+on: push
+jobs:
+  call:
+    uses: ./.github/workflows/reusable.yml
+    secrets: inherit
+"#,
+        )
+        .unwrap();
+        let mut reusable = BTreeMap::new();
+        reusable.insert(
+            ".github/workflows/reusable.yml".to_owned(),
+            r#"
+on:
+  workflow_call:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo reusable
+"#
+            .to_owned(),
+        );
+
+        let jobs = expand_jobs_with_reusables(&caller, &reusable).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert!(jobs[0].secrets_inherit);
+    }
 }
+
