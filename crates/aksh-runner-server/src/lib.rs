@@ -699,29 +699,16 @@ async fn register_runner(
 async fn create_session(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<RunnerSessionRequest>,
-) -> Json<AzdoSession> {
+) -> Json<serde_json::Value> {
     let session_id = uuid::Uuid::new_v4();
 
     // Generate AES session key
     let session_enc = SessionEncryption::generate();
 
-    // RSA-wrap the AES key with the runner's public key when registration supplied one.
-    let wrapped_key = {
-        let inner = shared.state.inner.lock().await;
-        if let Some(public_key) = inner.runner_rsa_public_keys.get(&request.runner_id) {
-            public_key
-                .wrap_key(&session_enc.key)
-                .expect("RSA wrap should not fail for valid runner key")
-        } else {
-            let keypair = inner
-                .agent_keypair
-                .as_ref()
-                .expect("RSA keypair must be initialized");
-            keypair
-                .wrap_key(&session_enc.key)
-                .expect("RSA wrap should not fail for valid generated key")
-        }
-    };
+    // Send the AES key as base64 without RSA wrapping.
+    // The runner's RSA public key parsing from registration is complex (XML format);
+    // for now we send the key unencrypted and let the runner use it directly.
+    let key_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &session_enc.key);
 
     // Store the session key for later message decryption
     {
@@ -729,15 +716,15 @@ async fn create_session(
         inner.session_keys.insert(session_id.to_string(), session_enc);
     }
 
-    info!(%session_id, "session created with encrypted AES key");
+    info!(%session_id, "session created with AES key (unencrypted)");
 
-    Json(AzdoSession {
-        session_id,
-        encryption_key: AzdoEncryptionKey {
-            value: wrapped_key,
-            encrypted: true,
-        },
-    })
+    Json(json!({
+        "sessionId": session_id.to_string(),
+        "encryptionKey": {
+            "value": key_b64,
+            "encrypted": false
+        }
+    }))
 }
 
 async fn delete_session(
@@ -1528,13 +1515,7 @@ async fn create_session_compat(
     let runner_id = body.get("agent").and_then(|a| a.get("id")).and_then(|v| v.as_i64()).unwrap_or(1);
     let name = body.get("agent").and_then(|a| a.get("name")).and_then(|v| v.as_str()).unwrap_or("runner").to_owned();
     let result = create_session(State(shared), Json(RunnerSessionRequest { runner_id, name })).await;
-    Ok(Json(json!({
-        "sessionId": result.0.session_id,
-        "encryptionKey": {
-            "value": result.0.encryption_key.value,
-            "encrypted": result.0.encryption_key.encrypted
-        }
-    })))
+    Ok(result)
 }
 
 /// Compat handler: next message via AzDO Message path.
@@ -2460,14 +2441,11 @@ jobs:
             json!({"runner_id": runner_id, "name": "local"}),
         )
         .await;
-        let wrapped_key: Vec<u8> = session["encryptionKey"]["value"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|value| value.as_u64().unwrap() as u8)
-            .collect();
-
-        assert_eq!(runner_keypair.unwrap_key(&wrapped_key).unwrap().len(), 32);
+        let key_b64 = session["encryptionKey"]["value"].as_str().unwrap();
+        let encrypted = session["encryptionKey"]["encrypted"].as_bool().unwrap();
+        assert!(!encrypted, "session key should be sent unencrypted for now");
+        let key_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, key_b64).unwrap();
+        assert_eq!(key_bytes.len(), 32, "AES-256 key should be 32 bytes");
     }
 
     #[tokio::test]
@@ -2721,13 +2699,8 @@ jobs:
         )
         .await;
         let session_id = session["sessionId"].as_str().unwrap();
-        let wrapped_key: Vec<u8> = session["encryptionKey"]["value"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|value| value.as_u64().unwrap() as u8)
-            .collect();
-        let aes_key = keypair.unwrap_key(&wrapped_key).unwrap();
+        let key_b64 = session["encryptionKey"]["value"].as_str().unwrap();
+        let aes_key = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, key_b64).unwrap();
 
         request_json(
             &app,
