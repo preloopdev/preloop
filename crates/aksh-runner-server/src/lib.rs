@@ -910,7 +910,7 @@ async fn agent_request_patch(
     info!(?body, "agent_request_patch received");
     // Check if this is a completion event
     if let Some(result) = body.get("result").and_then(|v| v.as_str()) {
-        // Try to extract the job ID and update the run
+        info!(result, "job request completed");
         let mut inner = shared.state.inner.lock().await;
         for run in inner.runs.values_mut() {
             for (job_id, status) in run.jobs.iter_mut() {
@@ -926,7 +926,12 @@ async fn agent_request_patch(
             }
         }
     }
-    Json(json!({}))
+    // Return a valid TaskAgentJobRequest response
+    Json(json!({
+        "requestId": _request_id,
+        "lockedUntil": "2099-12-31T23:59:59Z",
+        "result": body.get("result"),
+    }))
 }
 
 async fn complete_job_inner(
