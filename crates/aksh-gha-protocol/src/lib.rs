@@ -210,6 +210,16 @@ pub struct JobPlan {
     /// Optional `if` expression.
     #[serde(default)]
     pub if_condition: Option<String>,
+    /// Whether sibling matrix jobs should be cancelled after a failure.
+    #[serde(default = "default_fail_fast")]
+    pub fail_fast: bool,
+    /// Maximum concurrent matrix jobs for this base job.
+    #[serde(default)]
+    pub max_parallel: Option<u64>,
+}
+
+fn default_fail_fast() -> bool {
+    true
 }
 
 /// A workflow step after normalization.

@@ -266,13 +266,18 @@ struct RunRecord {
     jobs: BTreeMap<JobId, ExecutionStatus>,
     status: ExecutionStatus,
     job_outputs: BTreeMap<JobId, BTreeMap<String, serde_json::Value>>,
+    job_base_ids: BTreeMap<JobId, String>,
+    job_fail_fast: BTreeMap<String, bool>,
 }
 
 #[derive(Debug, Clone)]
 struct QueuedJob {
     run_id: RunId,
     job_id: JobId,
+    base_id: String,
     needs: Vec<JobId>,
+    fail_fast: bool,
+    max_parallel: Option<u64>,
     message: azdo::AgentJobRequestMessage,
 }
 
@@ -405,6 +410,9 @@ async fn submit_run(
         let mut inner = shared.state.inner.lock().await;
         let mut statuses = BTreeMap::new();
         let mut ready_jobs = 0usize;
+        let mut job_base_ids = BTreeMap::new();
+        let mut job_fail_fast = BTreeMap::new();
+        let mut ready_by_base: BTreeMap<String, u64> = BTreeMap::new();
         for job in jobs {
             let agent_msg = aksh_gha_parser::job_builder::build_agent_job_message(
                 &job,
@@ -417,14 +425,24 @@ async fn submit_run(
             let queued_job = QueuedJob {
                 run_id,
                 job_id: job.id.clone(),
+                base_id: job.base_id.clone(),
                 needs: job.needs.clone(),
+                fail_fast: job.fail_fast,
+                max_parallel: job.max_parallel,
                 message: agent_msg,
             };
+            job_base_ids.insert(job.id.clone(), job.base_id.clone());
+            job_fail_fast.insert(job.base_id.clone(), job.fail_fast);
 
             // Check if dependencies are met (no needs = ready immediately)
-            if job.needs.is_empty() {
+            if job.needs.is_empty()
+                && job
+                    .max_parallel
+                    .is_none_or(|max| ready_by_base.get(&job.base_id).copied().unwrap_or(0) < max)
+            {
                 statuses.insert(job.id.clone(), ExecutionStatus::Queued);
                 inner.queue.push_back(queued_job);
+                *ready_by_base.entry(job.base_id.clone()).or_default() += 1;
                 ready_jobs += 1;
             } else {
                 // Job has dependencies — queue it as pending
@@ -440,6 +458,8 @@ async fn submit_run(
                 submission,
                 jobs: statuses,
                 job_outputs: BTreeMap::new(),
+                job_base_ids,
+                job_fail_fast,
                 status: ExecutionStatus::Queued,
             },
         );
@@ -877,6 +897,9 @@ async fn complete_job_inner(
         );
         run.status = summarize_run(run.jobs.values().copied());
     }
+    if completion.status == ExecutionStatus::Failure {
+        apply_matrix_fail_fast(&mut inner, completion.run_id, &completion.job_id);
+    }
     let promoted_jobs = promote_ready_jobs(&mut inner);
     let record = inner
         .runs
@@ -915,7 +938,8 @@ fn promote_ready_jobs(inner: &mut InnerState) -> usize {
         let needs_satisfied = inner
             .runs
             .get(&job.run_id)
-            .is_some_and(|run| job.needs.iter().all(|need| need_satisfied(run, need)));
+            .is_some_and(|run| job.needs.iter().all(|need| need_satisfied(run, need)))
+            && under_max_parallel(inner, &job);
 
         if needs_satisfied {
             if let Some(run) = inner.runs.get(&job.run_id) {
@@ -933,6 +957,60 @@ fn promote_ready_jobs(inner: &mut InnerState) -> usize {
         inner.queue.push_back(job);
     }
     promoted_count
+}
+
+fn under_max_parallel(inner: &InnerState, job: &QueuedJob) -> bool {
+    let Some(max_parallel) = job.max_parallel else {
+        return true;
+    };
+    let active_in_queue = inner
+        .queue
+        .iter()
+        .filter(|queued| queued.run_id == job.run_id && queued.base_id == job.base_id)
+        .count() as u64;
+    let active_running = inner
+        .runs
+        .get(&job.run_id)
+        .map(|run| {
+            run.jobs
+                .iter()
+                .filter(|(job_id, status)| {
+                    run.job_base_ids.get(*job_id) == Some(&job.base_id)
+                        && matches!(status, ExecutionStatus::InProgress)
+                })
+                .count() as u64
+        })
+        .unwrap_or(0);
+
+    active_in_queue + active_running < max_parallel
+}
+
+fn apply_matrix_fail_fast(inner: &mut InnerState, run_id: RunId, failed_job: &JobId) {
+    let Some(run) = inner.runs.get_mut(&run_id) else {
+        return;
+    };
+    let Some(base_id) = run.job_base_ids.get(failed_job).cloned() else {
+        return;
+    };
+    if !run.job_fail_fast.get(&base_id).copied().unwrap_or(true) {
+        return;
+    }
+
+    for (job_id, status) in &mut run.jobs {
+        if job_id != failed_job
+            && run.job_base_ids.get(job_id) == Some(&base_id)
+            && matches!(status, ExecutionStatus::Queued | ExecutionStatus::InProgress)
+        {
+            *status = ExecutionStatus::Cancelled;
+        }
+    }
+    run.status = summarize_run(run.jobs.values().copied());
+    inner
+        .queue
+        .retain(|job| !(job.run_id == run_id && job.base_id == base_id));
+    inner
+        .pending_jobs
+        .retain(|job| !(job.run_id == run_id && job.base_id == base_id));
 }
 
 fn hydrate_needs_context(job: &mut QueuedJob, run: &RunRecord) {
@@ -1715,6 +1793,68 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    #[tokio::test]
+    async fn matrix_max_parallel_and_fail_fast_are_enforced() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      max-parallel: 1
+      matrix:
+        os: [ubuntu, macos, windows]
+    steps:
+      - run: echo matrix
+"#,
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+        let first_job = {
+            let inner = state.inner.lock().await;
+            assert_eq!(inner.queue.len(), 1);
+            assert_eq!(inner.pending_jobs.len(), 2);
+            inner.queue.front().unwrap().job_id.clone()
+        };
+
+        request_json(
+            &app,
+            Method::POST,
+            "/api/v1/jobs/complete",
+            json!({
+                "run_id": run_id,
+                "job_id": first_job,
+                "status": "failure"
+            }),
+        )
+        .await;
+
+        let inner = state.inner.lock().await;
+        assert!(inner.queue.is_empty());
+        assert!(inner.pending_jobs.is_empty());
+        let run = inner.runs.get(&run_id).unwrap();
+        assert_eq!(
+            run.jobs
+                .values()
+                .filter(|status| **status == ExecutionStatus::Cancelled)
+                .count(),
+            2
+        );
+    }
 
     #[tokio::test]
     async fn needs_context_includes_completed_job_outputs() {
