@@ -189,7 +189,8 @@ fn build_task_step(step: &crate::StepPlan, index: usize, context: &Context) -> T
         .with
         .iter()
         .map(|(k, v)| {
-            let resolved = resolve_string(&v.to_string(), context).unwrap_or_else(|_| v.to_string());
+            let input = step_input_to_string(v);
+            let resolved = resolve_string(&input, context).unwrap_or(input);
             (k.clone(), resolved)
         })
         .collect();
@@ -222,6 +223,13 @@ fn build_task_step(step: &crate::StepPlan, index: usize, context: &Context) -> T
         continue_on_error: None,
         working_directory: None,
         timeout_in_minutes: None,
+    }
+}
+
+fn step_input_to_string(value: &Value) -> String {
+    match value {
+        Value::String(value) => value.clone(),
+        other => other.to_string(),
     }
 }
 
@@ -304,6 +312,39 @@ jobs:
 
         // Matrix should be in context data
         assert!(msg.context_data.contains_key("matrix"));
+    }
+
+    #[test]
+    fn string_with_inputs_are_not_json_quoted() {
+        let yaml = r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/cache@v4
+        with:
+          path: target
+          fail-on-cache-miss: true
+"#;
+        let workflow = parse_workflow(yaml).unwrap();
+        let plans = crate::expand_jobs(&workflow).unwrap();
+        let github = serde_json::json!({"event_name": "push"});
+
+        let msg = build_agent_job_message(
+            &plans[0],
+            &github,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(msg.steps[0].inputs.get("path"), Some(&"target".to_owned()));
+        assert_eq!(
+            msg.steps[0].inputs.get("fail-on-cache-miss"),
+            Some(&"true".to_owned())
+        );
     }
 
     #[test]
