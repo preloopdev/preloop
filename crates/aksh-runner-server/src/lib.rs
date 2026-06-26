@@ -244,6 +244,7 @@ struct InnerState {
     sessions: BTreeMap<String, RunnerSession>,
     session_keys: BTreeMap<String, SessionEncryption>,
     agent_keypair: Option<AgentRsaKeypair>,
+    runner_public_keys: BTreeMap<i64, String>,
     inflight_messages: BTreeMap<i64, azdo::TaskAgentMessage>,
     pending_caches: BTreeMap<i64, PendingCache>,
     artifacts: BTreeMap<String, ArtifactRecord>,
@@ -579,12 +580,18 @@ async fn register_runner(
 ) -> Json<RegisteredRunner> {
     let mut inner = shared.state.inner.lock().await;
     inner.next_runner_id += 1;
+    let runner_id = inner.next_runner_id;
+    let public_key = request.public_key.clone();
     let runner = RegisteredRunner {
-        id: inner.next_runner_id,
+        id: runner_id,
         name: request.name,
         labels: request.labels,
         ephemeral: request.ephemeral,
+        public_key,
     };
+    if let Some(public_key) = &runner.public_key {
+        inner.runner_public_keys.insert(runner_id, public_key.clone());
+    }
     inner.runners.insert(runner.id, runner.clone());
     Json(runner)
 }
@@ -1417,6 +1424,32 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    #[tokio::test]
+    async fn registration_persists_runner_public_key_material() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let runner = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runners",
+            json!({
+                "name": "local",
+                "labels": ["self-hosted"],
+                "public_key": "<RSAKeyValue><Modulus>x</Modulus><Exponent>AQAB</Exponent></RSAKeyValue>"
+            }),
+        )
+        .await;
+        let runner_id = runner["id"].as_i64().unwrap();
+
+        let inner = state.inner.lock().await;
+        assert_eq!(
+            inner.runner_public_keys.get(&runner_id).map(String::as_str),
+            Some("<RSAKeyValue><Modulus>x</Modulus><Exponent>AQAB</Exponent></RSAKeyValue>")
+        );
+    }
 
     #[tokio::test]
     async fn protected_apis_require_bearer_token() {

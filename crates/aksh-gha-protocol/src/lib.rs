@@ -282,6 +282,9 @@ pub struct RunnerRegistrationRequest {
     /// Ephemeral runner flag.
     #[serde(default)]
     pub ephemeral: bool,
+    /// Runner RSA public key material (XML/JWK/PEM depending on client).
+    #[serde(default)]
+    pub public_key: Option<String>,
 }
 
 /// Registered runner state.
@@ -295,6 +298,9 @@ pub struct RegisteredRunner {
     pub labels: Vec<String>,
     /// Ephemeral runner flag.
     pub ephemeral: bool,
+    /// Runner RSA public key material, if supplied at registration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
 }
 
 /// Runner session creation request.
