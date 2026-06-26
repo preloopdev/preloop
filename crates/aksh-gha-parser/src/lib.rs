@@ -91,6 +91,7 @@ impl Trigger {
         branch: Option<&str>,
         tag: Option<&str>,
         paths: &[String],
+        activity_type: Option<&str>,
     ) -> bool {
         match self {
             Trigger::Single(value) => value == event,
@@ -102,6 +103,16 @@ impl Trigger {
                 // Check branch/tag/path filters
                 if let Some(config) = values.get(event) {
                     if let Some(obj) = config.as_object() {
+                        // activity types filter
+                        if let Some(types) = obj.get("types") {
+                            if let Some(activity_type) = activity_type {
+                                if !matches_filter(types, activity_type) {
+                                    return false;
+                                }
+                            } else {
+                                return false;
+                            }
+                        }
                         // branches filter
                         if let Some(branches) = obj.get("branches") {
                             if let Some(branch) = branch {
@@ -813,6 +824,30 @@ mod tests {
         assert!(glob_match("release-*-rc*", "release-2026-rc1"));
         assert!(!glob_match("feature/*", "feature/auth/login"));
         assert!(glob_match("src/**", "src/bin/main.rs"));
+    }
+
+    #[test]
+    fn trigger_context_matches_activity_types() {
+        let workflow = parse_workflow(
+            r#"
+on:
+  pull_request:
+    types: [opened, synchronize]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+"#,
+        )
+        .unwrap();
+
+        assert!(workflow
+            .on
+            .matches_with_context("pull_request", None, None, &[], Some("opened")));
+        assert!(!workflow
+            .on
+            .matches_with_context("pull_request", None, None, &[], Some("closed")));
     }
 
     #[test]

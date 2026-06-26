@@ -384,11 +384,13 @@ async fn submit_run(
     let workflow = parse_workflow(&submission.workflow_yaml)?;
     let (branch, tag) = git_ref_context(&submission.git_ref);
     let changed_paths = changed_paths_from_payload(&submission.payload);
+    let activity_type = submission.payload.get("action").and_then(|value| value.as_str());
     if !workflow.on.matches_with_context(
         &submission.event,
         branch.as_deref(),
         tag.as_deref(),
         &changed_paths,
+        activity_type,
     ) {
         return Err(ApiError::bad_request(format!(
             "workflow does not match event `{}`",
