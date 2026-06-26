@@ -101,7 +101,7 @@ pub fn build_agent_job_message(
         authorization: EndpointAuthorization {
             parameters: BTreeMap::from([(
                 "AccessToken".to_owned(),
-                "aksh-worker-token".to_owned(),
+                "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.e30.ZmFrZXNpZw".to_owned(),
             )]),
             scheme: Some("OAuth".to_owned()),
         },
