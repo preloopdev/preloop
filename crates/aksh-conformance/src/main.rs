@@ -58,6 +58,12 @@ enum CommandKind {
         #[arg(long, default_value = "fixtures/wire")]
         fixtures: PathBuf,
     },
+    /// Fuzz test the parser with random YAML inputs.
+    Fuzz {
+        /// Number of random inputs to test.
+        #[arg(long, default_value = "1000")]
+        iterations: usize,
+    },
     /// Placeholder for provider-based Runner.Listener integration tests.
     LibkrunPlan,
 }
@@ -74,6 +80,7 @@ async fn main() -> anyhow::Result<()> {
         CommandKind::Golden { fixtures } => golden_compare(fixtures).await,
         CommandKind::Record { upstream, output } => record_wire(upstream, output).await,
         CommandKind::Replay { fixtures } => replay_wire(fixtures).await,
+        CommandKind::Fuzz { iterations } => fuzz_parser(iterations),
         CommandKind::LibkrunPlan => {
             println!("{}", include_str!("libkrun-plan.md"));
             Ok(())
@@ -280,4 +287,90 @@ async fn replay_wire(fixtures: PathBuf) -> anyhow::Result<()> {
     eprintln!("  2. Run 'aksh-conformance replay --fixtures {}'", fixtures.display());
     eprintln!("  3. Each captured request/response is validated against our DTOs");
     Ok(())
+}
+
+/// Fuzz test the parser with random YAML inputs.
+/// Verifies the parser never panics on arbitrary input.
+fn fuzz_parser(iterations: usize) -> anyhow::Result<()> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut passed = 0usize;
+    let mut panics = 0usize;
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    for i in 0..iterations {
+        // Generate a pseudo-random YAML string
+        let mut hasher = DefaultHasher::new();
+        (seed, i).hash(&mut hasher);
+        let hash = hasher.finish();
+        let yaml = generate_random_yaml(hash);
+
+        // Parse should never panic
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            parse_workflow(&yaml)
+        }));
+
+        match result {
+            Ok(_) => passed += 1,
+            Err(_) => {
+                panics += 1;
+                eprintln!("PANIC on input #{i}: {:?}", &yaml[..yaml.len().min(100)]);
+            }
+        }
+    }
+
+    eprintln!("fuzz: {passed} passed, {panics} panics out of {iterations}");
+    if panics > 0 {
+        bail!("{panics} panics detected");
+    }
+    Ok(())
+}
+
+/// Generate a pseudo-random YAML string from a seed.
+fn generate_random_yaml(seed: u64) -> String {
+    let mut s = seed;
+    let mut next = || -> u64 {
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s
+    };
+
+    let name = format!("job-{}", next() % 1000);
+    let event = match next() % 4 {
+        0 => "push",
+        1 => "pull_request",
+        2 => "workflow_dispatch",
+        _ => "schedule",
+    };
+    let label = match next() % 3 {
+        0 => "ubuntu-latest",
+        1 => "self-hosted",
+        _ => "macos-latest",
+    };
+    let step_count = (next() % 5) + 1;
+
+    let mut yaml = format!("name: {name}\non: {event}\njobs:\n  build:\n    runs-on: [{label}]\n    steps:\n");
+    for _ in 0..step_count {
+        let cmd = match next() % 3 {
+            0 => "echo hello",
+            1 => "ls -la",
+            _ => "pwd",
+        };
+        yaml.push_str(&format!("      - run: {cmd}\n"));
+    }
+
+    // Randomly add matrix
+    if next() % 3 == 0 {
+        yaml.push_str("    strategy:\n      matrix:\n        os: [ubuntu, macos]\n");
+    }
+
+    // Randomly add needs
+    if next() % 4 == 0 {
+        yaml.push_str("  test:\n    needs: build\n    runs-on: [{label}]\n    steps:\n      - run: echo test\n");
+    }
+
+    yaml
 }
