@@ -33,9 +33,9 @@ use aksh_gha_protocol::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::Sha256;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
@@ -205,6 +205,7 @@ struct SharedState {
 pub struct AppState {
     inner: Arc<Mutex<InnerState>>,
     events: broadcast::Sender<NdjsonEvent>,
+    message_notify: Arc<Notify>,
     #[allow(dead_code)]
     cache: CacheStore,
     #[allow(dead_code)]
@@ -224,6 +225,7 @@ impl AppState {
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
             events,
+            message_notify: Arc::new(Notify::new()),
             cache,
             artifacts,
         })
@@ -392,6 +394,7 @@ async fn submit_run(
     {
         let mut inner = shared.state.inner.lock().await;
         let mut statuses = BTreeMap::new();
+        let mut ready_jobs = 0usize;
         for job in jobs {
             let agent_msg = aksh_gha_parser::job_builder::build_agent_job_message(
                 &job,
@@ -412,6 +415,7 @@ async fn submit_run(
             if job.needs.is_empty() {
                 statuses.insert(job.id.clone(), ExecutionStatus::Queued);
                 inner.queue.push_back(queued_job);
+                ready_jobs += 1;
             } else {
                 // Job has dependencies — queue it as pending
                 statuses.insert(job.id.clone(), ExecutionStatus::Queued);
@@ -429,6 +433,9 @@ async fn submit_run(
             },
         );
         drop(inner);
+        if ready_jobs > 0 {
+            shared.state.message_notify.notify_waiters();
+        }
         shared
             .state
             .emit(NdjsonEvent::RunAccepted {
@@ -663,69 +670,90 @@ async fn next_message(
     State(shared): State<Arc<SharedState>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Option<azdo::TaskAgentMessage>>, ApiError> {
-    let session_id = params.get("sessionId").cloned()
+    let session_id = params
+        .get("sessionId")
+        .cloned()
         .unwrap_or_else(|| "default".to_owned());
+    let wait_seconds = params
+        .get("waitSeconds")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(50);
 
-    let mut inner = shared.state.inner.lock().await;
-    if let Some(message) = inner.inflight_messages.values().next().cloned() {
+    loop {
+        let mut inner = shared.state.inner.lock().await;
+        if let Some(message) = inner.inflight_messages.values().next().cloned() {
+            return Ok(Json(Some(message)));
+        }
+
+        let Some(queued) = inner.queue.pop_front() else {
+            drop(inner);
+            if wait_seconds == 0 {
+                return Ok(Json(None));
+            }
+            if tokio::time::timeout(
+                Duration::from_secs(wait_seconds),
+                shared.state.message_notify.notified(),
+            )
+            .await
+            .is_err()
+            {
+                return Ok(Json(None));
+            }
+            continue;
+        };
+
+        // Update run status
+        if let Some(run) = inner.runs.get_mut(&queued.run_id) {
+            run.status = ExecutionStatus::InProgress;
+            run.jobs.insert(queued.job_id.clone(), ExecutionStatus::InProgress);
+        }
+
+        // Get the session's AES key for encryption
+        let session_key = inner
+            .session_keys
+            .get(&session_id)
+            .map(|s| s.key.clone())
+            .unwrap_or_default();
+
+        // Serialize the job message to JSON
+        let body_json = serde_json::to_string(&queued.message)
+            .map_err(|e| ApiError::bad_request(format!("failed to serialize job message: {e}")))?;
+
+        // Encrypt with session AES key
+        let (encrypted_body, iv) = if !session_key.is_empty() {
+            let enc = SessionEncryption::from_key(session_key);
+            enc.encrypt(body_json.as_bytes())
+                .map_err(|e| ApiError::bad_request(format!("encryption failed: {e}")))?
+        } else {
+            // No encryption key — send plaintext (for testing)
+            (body_json.into_bytes(), vec![0u8; 16])
+        };
+
+        inner.next_message_id += 1;
+        let message_id = inner.next_message_id;
+        let message = azdo::TaskAgentMessage {
+            message_id,
+            message_type: azdo::message_type::PIPELINE_AGENT_JOB_REQUEST.to_owned(),
+            body: base64::engine::general_purpose::STANDARD.encode(&encrypted_body),
+            iv: Some(iv),
+        };
+        inner.inflight_messages.insert(message_id, message.clone());
+
+        let run_id = queued.run_id;
+        let job_id = queued.job_id.clone();
+        drop(inner);
+
+        shared
+            .state
+            .emit(NdjsonEvent::JobStatus {
+                run_id,
+                job_id,
+                status: ExecutionStatus::InProgress,
+            })
+            .await;
+
         return Ok(Json(Some(message)));
     }
-
-    let Some(queued) = inner.queue.pop_front() else {
-        return Ok(Json(None));
-    };
-
-    // Update run status
-    if let Some(run) = inner.runs.get_mut(&queued.run_id) {
-        run.status = ExecutionStatus::InProgress;
-        run.jobs.insert(queued.job_id.clone(), ExecutionStatus::InProgress);
-    }
-
-    // Get the session's AES key for encryption
-    let session_key = inner
-        .session_keys
-        .get(&session_id)
-        .map(|s| s.key.clone())
-        .unwrap_or_default();
-
-    // Serialize the job message to JSON
-    let body_json = serde_json::to_string(&queued.message)
-        .map_err(|e| ApiError::bad_request(format!("failed to serialize job message: {e}")))?;
-
-    // Encrypt with session AES key
-    let (encrypted_body, iv) = if !session_key.is_empty() {
-        let enc = SessionEncryption::from_key(session_key);
-        enc.encrypt(body_json.as_bytes())
-            .map_err(|e| ApiError::bad_request(format!("encryption failed: {e}")))?
-    } else {
-        // No encryption key — send plaintext (for testing)
-        (body_json.into_bytes(), vec![0u8; 16])
-    };
-
-    inner.next_message_id += 1;
-    let message_id = inner.next_message_id;
-    let message = azdo::TaskAgentMessage {
-        message_id,
-        message_type: azdo::message_type::PIPELINE_AGENT_JOB_REQUEST.to_owned(),
-        body: base64::engine::general_purpose::STANDARD.encode(&encrypted_body),
-        iv: Some(iv),
-    };
-    inner.inflight_messages.insert(message_id, message.clone());
-
-    let run_id = queued.run_id;
-    let job_id = queued.job_id.clone();
-    drop(inner);
-
-    shared
-        .state
-        .emit(NdjsonEvent::JobStatus {
-            run_id,
-            job_id,
-            status: ExecutionStatus::InProgress,
-        })
-        .await;
-
-    Ok(Json(Some(message)))
 }
 
 async fn delete_session_message(
@@ -792,13 +820,16 @@ async fn complete_job_inner(
             .insert(completion.job_id.clone(), completion.status);
         run.status = summarize_run(run.jobs.values().copied());
     }
-    promote_ready_jobs(&mut inner);
+    let promoted_jobs = promote_ready_jobs(&mut inner);
     let record = inner
         .runs
         .get(&completion.run_id)
         .cloned()
         .ok_or_else(|| ApiError::not_found("run not found"))?;
     drop(inner);
+    if promoted_jobs > 0 {
+        shared.state.message_notify.notify_waiters();
+    }
 
     shared
         .state
@@ -819,7 +850,7 @@ async fn complete_job_inner(
 }
 
 /// Check if pending jobs can be dispatched and promote them to the queue.
-fn promote_ready_jobs(inner: &mut InnerState) {
+fn promote_ready_jobs(inner: &mut InnerState) -> usize {
     let mut promoted = Vec::new();
     let mut remaining = VecDeque::new();
 
@@ -836,10 +867,12 @@ fn promote_ready_jobs(inner: &mut InnerState) {
         }
     }
 
+    let promoted_count = promoted.len();
     inner.pending_jobs = remaining;
     for job in promoted {
         inner.queue.push_back(job);
     }
+    promoted_count
 }
 
 fn need_satisfied(run: &RunRecord, need: &JobId) -> bool {
@@ -936,7 +969,7 @@ async fn finish_job(
     };
 
     // Promote pending jobs whose dependencies are now met
-    promote_ready_jobs(&mut inner);
+    let promoted_jobs = promote_ready_jobs(&mut inner);
 
     info!(
         job_id = %event.job_id,
@@ -946,6 +979,9 @@ async fn finish_job(
     );
 
     drop(inner);
+    if promoted_jobs > 0 {
+        shared.state.message_notify.notify_waiters();
+    }
     shared
         .state
         .emit(NdjsonEvent::JobCompleted {
@@ -1627,11 +1663,53 @@ jobs:
         let empty = request_json(
             &app,
             Method::GET,
-            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=default",
+            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=default&waitSeconds=0",
             Value::Null,
         )
         .await;
         assert!(empty.is_null());
+    }
+
+    #[tokio::test]
+    async fn message_poll_waits_until_work_is_enqueued() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+        let poll_app = app.clone();
+        let poll = tokio::spawn(async move {
+            request_json(
+                &poll_app,
+                Method::GET,
+                "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=default&waitSeconds=2",
+                Value::Null,
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo waited
+"#,
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+
+        let message = poll.await.unwrap();
+        assert_eq!(message["messageId"], 1);
     }
 
     #[tokio::test]
