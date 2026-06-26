@@ -216,6 +216,9 @@ pub struct JobPlan {
     /// Maximum concurrent matrix jobs for this base job.
     #[serde(default)]
     pub max_parallel: Option<u64>,
+    /// Whether this job inherits all parent secrets (reusable workflow `secrets: inherit`).
+    #[serde(default)]
+    pub secrets_inherit: bool,
 }
 
 fn default_fail_fast() -> bool {
