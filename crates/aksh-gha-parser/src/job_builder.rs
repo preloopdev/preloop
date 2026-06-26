@@ -375,4 +375,38 @@ jobs:
         assert_eq!(secret.value.as_deref(), Some("s3cr3t"));
         assert_eq!(secret.is_secret, Some(true));
     }
+    #[test]
+    fn workflow_dispatch_inputs_are_in_event_context() {
+        let yaml = r#"
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ${{ github.event.inputs.greeting }}
+"#;
+        let workflow = parse_workflow(yaml).unwrap();
+        let plans = crate::expand_jobs(&workflow).unwrap();
+
+        let github = serde_json::json!({
+            "event_name": "workflow_dispatch",
+            "event": {
+                "inputs": {
+                    "greeting": "hello world"
+                }
+            },
+            "ref": "refs/heads/main"
+        });
+
+        let msg = build_agent_job_message(
+            &plans[0],
+            &github,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        assert!(!msg.steps.is_empty());
+    }
 }

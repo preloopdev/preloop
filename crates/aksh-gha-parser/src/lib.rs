@@ -851,6 +851,26 @@ jobs:
     }
 
     #[test]
+    fn schedule_trigger_matches_event_name() {
+        let workflow = parse_workflow(
+            r#"
+on:
+  schedule:
+    - cron: '0 0 * * *'
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+"#,
+        )
+        .unwrap();
+
+        assert!(workflow.on.matches("schedule"));
+        assert!(!workflow.on.matches("push"));
+    }
+
+    #[test]
     fn parses_and_expands_matrix() {
         let workflow = parse_workflow(
             r#"
