@@ -1396,6 +1396,75 @@ jobs:
     }
 
     #[tokio::test]
+    async fn session_message_flow_encrypts_decryptable_job_body() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let keypair = {
+            let inner = state.inner.lock().await;
+            inner.agent_keypair.clone().unwrap()
+        };
+        let app = app(state, CancellationToken::new());
+
+        let session = request_json(
+            &app,
+            Method::POST,
+            "/runner/server/_apis/distributedtask/pools/1/sessions",
+            json!({"runner_id": 1, "name": "local"}),
+        )
+        .await;
+        let session_id = session["sessionId"].as_str().unwrap();
+        let wrapped_key: Vec<u8> = session["encryptionKey"]["value"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_u64().unwrap() as u8)
+            .collect();
+        let aes_key = keypair.unwrap_key(&wrapped_key).unwrap();
+
+        request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo encrypted
+"#,
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+
+        let message = request_json(
+            &app,
+            Method::GET,
+            &format!("/runner/server/_apis/distributedtask/pools/1/messages?sessionId={session_id}"),
+            Value::Null,
+        )
+        .await;
+
+        let body = BASE64_STANDARD
+            .decode(message["body"].as_str().unwrap())
+            .unwrap();
+        let iv: Vec<u8> = message["iv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_u64().unwrap() as u8)
+            .collect();
+        let plaintext = SessionEncryption::from_key(aes_key).decrypt(&body, &iv).unwrap();
+        let job: azdo::AgentJobRequestMessage = serde_json::from_slice(&plaintext).unwrap();
+
+        assert_eq!(message["messageType"], azdo::message_type::PIPELINE_AGENT_JOB_REQUEST);
+        assert_eq!(job.steps[0].script.as_deref(), Some("echo encrypted"));
+    }
+
+    #[tokio::test]
     async fn submit_run_uses_branch_and_path_filters() {
         let temp = tempfile::tempdir().unwrap();
         let app = app(
