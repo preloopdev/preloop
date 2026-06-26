@@ -164,7 +164,7 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         .route("/:org/_apis/v1/AgentSession/:pool_id/:session_id", delete(delete_session_org))
         .route("/:org/_apis/v1/Message/:pool_id", get(next_message_compat_org))
         .route("/:org/_apis/v1/Message/:pool_id/:message_id", delete(delete_pool_message_org))
-        .route("/:org/_apis/v1/AgentRequest/:pool_id/:request_id", patch(complete_job_compat_org))
+        .route("/:org/_apis/v1/AgentRequest/:pool_id/:request_id", patch(agent_request_patch_org))
         .route("/:org/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id", patch(patch_timeline_records_org))
         .route("/:org/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id", post(create_log_org))
         .route("/:org/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id/:log_id2", post(append_log_org))
@@ -206,7 +206,7 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         .route("/_apis/v1/AgentSession/:pool_id/:session_id", delete(delete_session))
         .route("/_apis/v1/Message/:pool_id", get(next_message_compat))
         .route("/_apis/v1/Message/:pool_id/:message_id", delete(delete_pool_message))
-        .route("/_apis/v1/AgentRequest/:pool_id/:request_id", patch(complete_job_compat))
+        .route("/_apis/v1/AgentRequest/:pool_id/:request_id", patch(agent_request_patch))
         .merge(protected_apis)
         .layer(TraceLayer::new_for_http())
         .with_state(Arc::new(SharedState { state, shutdown }))
@@ -898,6 +898,35 @@ async fn complete_job_compat(
         },
     )
     .await
+}
+
+/// PATCH /_apis/v1/AgentRequest/:pool_id/:request_id — renew or complete job request.
+/// The runner sends this to renew the job lock or report completion.
+async fn agent_request_patch(
+    State(shared): State<Arc<SharedState>>,
+    Path((_pool_id, _request_id)): Path<(i64, i64)>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    // Check if this is a completion event
+    if let Some(result) = body.get("result").and_then(|v| v.as_str()) {
+        info!(result, "job request completed");
+        // Try to extract the job ID and update the run
+        let mut inner = shared.state.inner.lock().await;
+        for run in inner.runs.values_mut() {
+            for (job_id, status) in run.jobs.iter_mut() {
+                if *status == ExecutionStatus::InProgress {
+                    *status = match result {
+                        "succeeded" => ExecutionStatus::Success,
+                        "failed" => ExecutionStatus::Failure,
+                        "cancelled" => ExecutionStatus::Cancelled,
+                        _ => ExecutionStatus::Success,
+                    };
+                    info!(job_id = %job_id, result, "updated job status");
+                }
+            }
+        }
+    }
+    Json(json!({}))
 }
 
 async fn complete_job_inner(
@@ -1617,6 +1646,14 @@ async fn complete_job_compat_org(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<RunRecord>, ApiError> {
     complete_job_compat(State(shared), Path((run_id, job_id)), Json(body)).await
+}
+
+async fn agent_request_patch_org(
+    State(shared): State<Arc<SharedState>>,
+    Path((_org, pool_id, request_id)): Path<(String, i64, i64)>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    agent_request_patch(State(shared), Path((pool_id, request_id)), Json(body)).await
 }
 
 async fn patch_timeline_records_org(
