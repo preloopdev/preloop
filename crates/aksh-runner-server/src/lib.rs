@@ -238,9 +238,7 @@ pub struct AppState {
     inner: Arc<Mutex<InnerState>>,
     events: broadcast::Sender<NdjsonEvent>,
     message_notify: Arc<Notify>,
-    #[allow(dead_code)]
     cache: CacheStore,
-    #[allow(dead_code)]
     artifacts: ArtifactStore,
 }
 
