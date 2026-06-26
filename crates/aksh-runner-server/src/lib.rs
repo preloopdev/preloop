@@ -74,6 +74,7 @@ async fn shutdown_signal(shutdown: CancellationToken) {
 }
 
 /// Build the server router.
+
 pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
     let protected_apis = Router::new()
         .route("/_apis/artifactcache/cache", post(cache_reserve))
@@ -148,19 +149,27 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             "/_apis/v1/ActionDownloadInfo/:scope/:hub/:plan_id",
             post(action_download_info),
         )
-        // Runner lifecycle endpoints — connectionData advertises these paths.
-        .route("/_apis/v1/AgentPools", get(runner_pools))
-        .route("/_apis/v1/Agent/:pool_id/:agent_id", post(register_runner_compat))
-        .route("/_apis/v1/AgentSession/:pool_id/:session_id", post(create_session_compat))
-        .route("/_apis/v1/AgentSession/:pool_id/:session_id", delete(delete_session))
-        .route("/_apis/v1/Message/:pool_id", get(next_message_compat))
-        .route("/_apis/v1/Message/:pool_id/:message_id", delete(delete_pool_message))
-        .route("/_apis/v1/AgentRequest/:pool_id/:request_id", patch(complete_job_compat))
         .route_layer(middleware::from_fn(require_bearer));
-
 
     Router::new()
         .route("/healthz", get(healthz))
+        // GHES-style org-prefixed routes
+        .route("/:org/_apis/connectionData", get(connection_data))
+        .route("/:org/_apis/v1/oauth2/token", post(oauth2_token))
+        .route("/:org/_apis/v1/AgentPools", get(runner_pools))
+        .route("/:org/_apis/v1/Agent/:pool_id/:agent_id", get(agent_lookup_by_id_org).post(register_runner_compat_org_2))
+        .route("/:org/_apis/v1/Agent/:pool_id", get(agent_lookup_org).post(register_runner_compat_org))
+        .route("/:org/_apis/v1/AgentSession/:pool_id/:session_id", post(create_session_compat_org))
+        .route("/:org/_apis/v1/AgentSession/:pool_id/:session_id", delete(delete_session_org))
+        .route("/:org/_apis/v1/Message/:pool_id", get(next_message_compat_org))
+        .route("/:org/_apis/v1/Message/:pool_id/:message_id", delete(delete_pool_message_org))
+        .route("/:org/_apis/v1/AgentRequest/:pool_id/:request_id", patch(complete_job_compat_org))
+        .route("/:org/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id", patch(patch_timeline_records_org))
+        .route("/:org/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id", post(create_log_org))
+        .route("/:org/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id/:log_id2", post(append_log_org))
+        .route("/:org/_apis/v1/TimeLineWebConsoleLog/:scope/:hub/:plan_id/:timeline_id/:record_id", post(console_log_org))
+        .route("/:org/_apis/v1/FinishJob/:scope/:hub/:plan_id", post(finish_job_org))
+        .route("/:org/_apis/v1/ActionDownloadInfo/:scope/:hub/:plan_id", post(action_download_info_org))
         .route("/_apis/v1/oauth2/token", post(oauth2_token))
         .route("/api/v3/actions/runner-registration", post(github_registration_token))
         .route("/api/v3/orgs/:org/actions/runners/registration-token", post(github_registration_token))
@@ -188,6 +197,15 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         .route("/api/v1/cache", get(cache_get))
         .route("/api/v1/artifacts", post(artifact_put))
         .route("/api/v1/artifacts/:artifact_id", get(artifact_get))
+        // Runner lifecycle endpoints — public (runner may not have auth token yet)
+        .route("/_apis/v1/AgentPools", get(runner_pools))
+        .route("/_apis/v1/Agent/:pool_id/:agent_id", get(agent_lookup_by_id).post(register_runner_compat))
+        .route("/_apis/v1/Agent/:pool_id", get(agent_lookup).post(register_runner_compat_pool_only))
+        .route("/_apis/v1/AgentSession/:pool_id/:session_id", post(create_session_compat))
+        .route("/_apis/v1/AgentSession/:pool_id/:session_id", delete(delete_session))
+        .route("/_apis/v1/Message/:pool_id", get(next_message_compat))
+        .route("/_apis/v1/Message/:pool_id/:message_id", delete(delete_pool_message))
+        .route("/_apis/v1/AgentRequest/:pool_id/:request_id", patch(complete_job_compat))
         .merge(protected_apis)
         .layer(TraceLayer::new_for_http())
         .with_state(Arc::new(SharedState { state, shutdown }))
@@ -200,7 +218,6 @@ async fn require_bearer(request: Request, next: Next) -> Result<Response, ApiErr
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .is_some_and(|token| token == "aksh-system-token" || token.starts_with("aksh-"));
-
     if authorized {
         Ok(next.run(request).await)
     } else {
@@ -1391,20 +1408,62 @@ fn svc(name: &str, id: &str, location: &str) -> serde_json::Value {
         "identifier": id,
         "displayName": name,
         "relativePath": location,
+        "relativeToSetting": 2,
         "description": name,
         "toolId": name,
-        "locationMappings": [{
-            "accessMappingMoniker": "PublicAccessMapping",
-            "location": location
-        }]
+        "locationMappings": [],
+        "serviceOwner": "00000000-0000-0000-0000-000000000000",
+        "resourceVersion": 6,
+        "minVersion": "1.0",
+        "maxVersion": "12.0",
+        "status": 1,
+        "properties": {}
     })
 }
 
 
+/// GET /_apis/v1/Agent/:pool_id — look up runner by agentName query param.
+/// Returns 200 with the agent if found, or 200 with an empty array if not found.
+/// The runner treats a non-empty result as "agent exists" and empty as "needs registration".
+async fn agent_lookup(
+    State(shared): State<Arc<SharedState>>,
+    Path(_pool_id): Path<i64>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let agent_name = params.get("agentName").cloned().unwrap_or_default();
+    let inner = shared.state.inner.lock().await;
+    for runner in inner.runners.values() {
+        if runner.name == agent_name {
+            return Json(json!({"count": 1, "value": [{
+                "id": runner.id,
+                "name": runner.name,
+                "version": "2.322.0",
+                "osDescription": "Linux",
+                "enabled": true,
+                "status": "online",
+                "labels": runner.labels.iter().map(|l| json!({"name": l, "type": "user"})).collect::<Vec<_>>()
+            }]}));
+        }
+    }
+    // Return empty collection (not 404) — runner expects VssJsonCollectionWrapper format
+    Json(json!({"count": 0, "value": []}))
+}
+
+/// GET /_apis/v1/Agent/:pool_id/:agent_id — look up runner by agentId in path.
+/// The runner constructs URLs from the service definition template `{poolId}/{agentId}`.
+/// For lookups it uses agentId=0; for registration it POSTs.
+async fn agent_lookup_by_id(
+    State(shared): State<Arc<SharedState>>,
+    Path((_pool_id, _agent_id)): Path<(i64, i64)>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    agent_lookup(State(shared), Path(_pool_id), Query(params)).await
+}
+
 async fn runner_pools() -> Json<serde_json::Value> {
     Json(json!({
         "count": 1,
-        "value": [{"id": 1, "name": "Default", "isHosted": false}]
+        "value": [{"id": 1, "name": "Default", "isHosted": false, "poolType": 1}]
     }))
 }
 
@@ -1421,10 +1480,11 @@ async fn register_runner_compat(
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
         .unwrap_or_default();
+    let ephemeral = request.get("ephemeral").and_then(|v| v.as_bool()).unwrap_or(false);
     let reg_request = RunnerRegistrationRequest {
         name: name.clone(),
         labels,
-        ephemeral: false,
+        ephemeral,
         public_key: request.get("publicKey").and_then(|v| v.as_str()).map(str::to_owned),
     };
     let result = register_runner(State(shared), Json(reg_request)).await?;
@@ -1435,8 +1495,27 @@ async fn register_runner_compat(
         "osDescription": "Linux",
         "enabled": true,
         "status": "online",
-        "labels": result.0.labels.iter().map(|l| json!({"name": l, "type": "user"})).collect::<Vec<_>>()
+        "ephemeral": ephemeral,
+        "labels": result.0.labels.iter().map(|l| json!({"name": l, "type": "user"})).collect::<Vec<_>>(),
+        "authorization": {
+            "authorizationUrl": "http://127.0.0.1:9090",
+            "clientId": uuid::Uuid::new_v4().to_string(),
+            "publicKey": {
+                "exponent": "AQAB",
+                "modulus": "x9DRhIzTYGvMcPEZDjc7cKrIyb+EBMNtB8riHXxElnskMQuMYNRe7Ya2WsS/dctBUSeqhegDZGKcuDM6aab8bsiJoua/hNLNKdxBSz33nsuKdZYXah8r4Z1UIQf4oan8Mo4ePqqDXXFXdTG0peWyVPqjL4VU9n/EG3JoaGcwOoLrcbT/jT2Pz2v6AquPEzaFjty0OWGQ2gRKahHS1UUAI7VKfKMvvUT1ANn6YPIZ7Jdl6YSFMDI2AFwKOwOVQB6E5bIY8W6jwANqt0vlyMbeqii58pSuto9aAEoLsdLxGGrFFxvxGScPG+scVYSkXyj4mrdS0qSm4Z/UOhtnese7OQ==",
+                "keyId": uuid::Uuid::new_v4().to_string()
+            }
+        }
     })))
+}
+
+/// Compat handler: register runner via `/_apis/v1/Agent/:pool_id` (no agent_id in path).
+async fn register_runner_compat_pool_only(
+    State(shared): State<Arc<SharedState>>,
+    Path(_pool_id): Path<i64>,
+    Json(request): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    register_runner_compat(State(shared), Path((_pool_id, "0".to_owned())), Json(request)).await
 }
 
 /// Compat handler: create session via AzDO AgentSession path.
@@ -1464,6 +1543,126 @@ async fn next_message_compat(
     Query(mut params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Option<azdo::TaskAgentMessage>>, ApiError> {
     next_message(State(shared), Query(params)).await
+}
+
+// ─── GHES org-prefixed wrapper handlers ─────────────────────────────────────
+// These extract the extra `:org` path parameter and delegate to the real handlers.
+
+async fn agent_lookup_org(
+    State(shared): State<Arc<SharedState>>,
+    Path((_org, pool_id)): Path<(String, i64)>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    agent_lookup(State(shared), Path(pool_id), Query(params)).await
+}
+
+async fn agent_lookup_by_id_org(
+    State(shared): State<Arc<SharedState>>,
+    Path((_org, pool_id, agent_id)): Path<(String, i64, i64)>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    agent_lookup_by_id(State(shared), Path((pool_id, agent_id)), Query(params)).await
+}
+
+async fn register_runner_compat_org(
+    State(shared): State<Arc<SharedState>>,
+    Path((_org, pool_id)): Path<(String, i64)>,
+    Json(request): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    register_runner_compat_pool_only(State(shared), Path(pool_id), Json(request)).await
+}
+
+async fn register_runner_compat_org_2(
+    State(shared): State<Arc<SharedState>>,
+    Path((_org, pool_id, agent_id)): Path<(String, i64, String)>,
+    Json(request): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    register_runner_compat(State(shared), Path((pool_id, agent_id)), Json(request)).await
+}
+
+async fn create_session_compat_org(
+    State(shared): State<Arc<SharedState>>,
+    Path((_org, pool_id, session_id)): Path<(String, i64, String)>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    create_session_compat(State(shared), Path((pool_id, session_id)), Json(body)).await
+}
+
+async fn delete_session_org(
+    State(shared): State<Arc<SharedState>>,
+    Path((_org, pool_id, session_id)): Path<(String, i64, String)>,
+) -> StatusCode {
+    delete_session(State(shared), Path((pool_id, session_id))).await
+}
+
+async fn next_message_compat_org(
+    State(shared): State<Arc<SharedState>>,
+    Path((_org, pool_id)): Path<(String, i64)>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Option<azdo::TaskAgentMessage>>, ApiError> {
+    next_message_compat(State(shared), Path(pool_id), Query(params)).await
+}
+
+async fn delete_pool_message_org(
+    State(shared): State<Arc<SharedState>>,
+    Path((_org, pool_id, message_id)): Path<(String, i64, i64)>,
+) -> StatusCode {
+    delete_pool_message(State(shared), Path((pool_id, message_id))).await
+}
+
+async fn complete_job_compat_org(
+    State(shared): State<Arc<SharedState>>,
+    Path((_org, run_id, job_id)): Path<(String, RunId, String)>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<RunRecord>, ApiError> {
+    complete_job_compat(State(shared), Path((run_id, job_id)), Json(body)).await
+}
+
+async fn patch_timeline_records_org(
+    State(shared): State<Arc<SharedState>>,
+    Path((_org, scope, hub, plan_id, timeline_id)): Path<(String, String, String, String, String)>,
+    Json(records): Json<Vec<azdo::TimelineRecord>>,
+) -> Json<serde_json::Value> {
+    patch_timeline_records(State(shared), Path((scope, hub, plan_id, timeline_id)), Json(records)).await
+}
+
+async fn create_log_org(
+    State(shared): State<Arc<SharedState>>,
+    Path((_org, scope, hub, plan_id, log_id)): Path<(String, String, String, String, String)>,
+) -> Json<serde_json::Value> {
+    create_log(State(shared), Path((scope, hub, plan_id, log_id))).await
+}
+
+async fn append_log_org(
+    State(shared): State<Arc<SharedState>>,
+    Path((_org, scope, hub, plan_id, log_id, log_id2)): Path<(String, String, String, String, String, String)>,
+    body: Bytes,
+) -> StatusCode {
+    append_log(State(shared), Path((scope, hub, plan_id, log_id, log_id2)), body).await
+}
+
+async fn console_log_org(
+    State(shared): State<Arc<SharedState>>,
+    Path((_org, scope, hub, plan_id, timeline_id, record_id)): Path<(String, String, String, String, String, String)>,
+    body: Bytes,
+) -> StatusCode {
+    console_log(State(shared), Path((scope, hub, plan_id, timeline_id, record_id)), body).await
+}
+
+async fn finish_job_org(
+    State(shared): State<Arc<SharedState>>,
+    Path((_org, scope, hub, plan_id)): Path<(String, String, String, String)>,
+    Json(event): Json<azdo::JobCompletedEvent>,
+) -> Json<serde_json::Value> {
+    finish_job(State(shared), Path((scope, hub, plan_id)), Json(event)).await
+}
+
+async fn action_download_info_org(
+    State(shared): State<Arc<SharedState>>,
+    Path((_org, _scope, _hub, _plan_id)): Path<(String, String, String, String)>,
+    Json(request): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    action_download_info(State(shared), Json(request)).await
 }
 
 /// GitHub-compatible runner registration token endpoint.
