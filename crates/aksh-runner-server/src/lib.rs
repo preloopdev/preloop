@@ -25,7 +25,7 @@ use aksh_gha_protocol::{
         self, ConnectionData, EncryptionKey as AzdoEncryptionKey, LocationServiceData,
         ServiceDefinition, TaskAgentSession as AzdoSession,
     },
-    crypto::{AgentRsaKeypair, SessionEncryption},
+    crypto::{AgentRsaKeypair, AgentRsaPublicKey, SessionEncryption},
     event_to_ndjson, ExecutionStatus, JobCompletion, JobId, NdjsonEvent, RegisteredRunner,
     RunAccepted, RunId, RunnerRegistrationRequest, RunnerSession,
     RunnerSessionRequest, WorkflowSubmission, PROTOCOL_VERSION,
@@ -245,6 +245,7 @@ struct InnerState {
     session_keys: BTreeMap<String, SessionEncryption>,
     agent_keypair: Option<AgentRsaKeypair>,
     runner_public_keys: BTreeMap<i64, String>,
+    runner_rsa_public_keys: BTreeMap<i64, AgentRsaPublicKey>,
     inflight_messages: BTreeMap<i64, azdo::TaskAgentMessage>,
     pending_caches: BTreeMap<i64, PendingCache>,
     artifacts: BTreeMap<String, ArtifactRecord>,
@@ -577,7 +578,13 @@ async fn run_events(
 async fn register_runner(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<RunnerRegistrationRequest>,
-) -> Json<RegisteredRunner> {
+) -> Result<Json<RegisteredRunner>, ApiError> {
+    let parsed_public_key = request
+        .public_key
+        .as_deref()
+        .map(AgentRsaPublicKey::parse)
+        .transpose()
+        .map_err(ApiError::from)?;
     let mut inner = shared.state.inner.lock().await;
     inner.next_runner_id += 1;
     let runner_id = inner.next_runner_id;
@@ -592,26 +599,38 @@ async fn register_runner(
     if let Some(public_key) = &runner.public_key {
         inner.runner_public_keys.insert(runner_id, public_key.clone());
     }
+    if let Some(public_key) = parsed_public_key {
+        inner.runner_rsa_public_keys.insert(runner_id, public_key);
+    }
     inner.runners.insert(runner.id, runner.clone());
-    Json(runner)
+    Ok(Json(runner))
 }
 
 async fn create_session(
     State(shared): State<Arc<SharedState>>,
-    Json(_request): Json<RunnerSessionRequest>,
+    Json(request): Json<RunnerSessionRequest>,
 ) -> Json<AzdoSession> {
     let session_id = uuid::Uuid::new_v4();
 
     // Generate AES session key
     let session_enc = SessionEncryption::generate();
 
-    // RSA-wrap the AES key with the agent's public key
+    // RSA-wrap the AES key with the runner's public key when registration supplied one.
     let wrapped_key = {
         let inner = shared.state.inner.lock().await;
-        let keypair = inner.agent_keypair.as_ref()
-            .expect("RSA keypair must be initialized");
-        keypair.wrap_key(&session_enc.key)
-            .expect("RSA wrap should not fail for valid key")
+        if let Some(public_key) = inner.runner_rsa_public_keys.get(&request.runner_id) {
+            public_key
+                .wrap_key(&session_enc.key)
+                .expect("RSA wrap should not fail for valid runner key")
+        } else {
+            let keypair = inner
+                .agent_keypair
+                .as_ref()
+                .expect("RSA keypair must be initialized");
+            keypair
+                .wrap_key(&session_enc.key)
+                .expect("RSA wrap should not fail for valid generated key")
+        }
     };
 
     // Store the session key for later message decryption
@@ -1391,6 +1410,12 @@ impl From<aksh_gha_protocol::ProtocolError> for ApiError {
     }
 }
 
+impl From<aksh_gha_protocol::crypto::CryptoError> for ApiError {
+    fn from(value: aksh_gha_protocol::crypto::CryptoError) -> Self {
+        Self::bad_request(value.to_string())
+    }
+}
+
 impl From<aksh_cache::CacheError> for ApiError {
     fn from(value: aksh_cache::CacheError) -> Self {
         Self::bad_request(value.to_string())
@@ -1430,6 +1455,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
         let app = app(state.clone(), CancellationToken::new());
+        let public_key = AgentRsaKeypair::generate().unwrap().public_key_xml();
 
         let runner = request_json(
             &app,
@@ -1438,7 +1464,7 @@ mod tests {
             json!({
                 "name": "local",
                 "labels": ["self-hosted"],
-                "public_key": "<RSAKeyValue><Modulus>x</Modulus><Exponent>AQAB</Exponent></RSAKeyValue>"
+                "public_key": public_key
             }),
         )
         .await;
@@ -1446,9 +1472,49 @@ mod tests {
 
         let inner = state.inner.lock().await;
         assert_eq!(
-            inner.runner_public_keys.get(&runner_id).map(String::as_str),
-            Some("<RSAKeyValue><Modulus>x</Modulus><Exponent>AQAB</Exponent></RSAKeyValue>")
+            inner.runner_public_keys.get(&runner_id),
+            Some(&public_key)
         );
+        assert!(inner.runner_rsa_public_keys.contains_key(&runner_id));
+    }
+
+    #[tokio::test]
+    async fn session_key_uses_registered_runner_public_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner_keypair = AgentRsaKeypair::generate().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+
+        let runner = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runners",
+            json!({
+                "name": "local",
+                "labels": ["self-hosted"],
+                "public_key": runner_keypair.public_key_xml()
+            }),
+        )
+        .await;
+        let runner_id = runner["id"].as_i64().unwrap();
+
+        let session = request_json(
+            &app,
+            Method::POST,
+            "/runner/server/_apis/distributedtask/pools/1/sessions",
+            json!({"runner_id": runner_id, "name": "local"}),
+        )
+        .await;
+        let wrapped_key: Vec<u8> = session["encryptionKey"]["value"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_u64().unwrap() as u8)
+            .collect();
+
+        assert_eq!(runner_keypair.unwrap_key(&wrapped_key).unwrap().len(), 32);
     }
 
     #[tokio::test]
