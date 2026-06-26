@@ -907,9 +907,9 @@ async fn agent_request_patch(
     Path((_pool_id, _request_id)): Path<(i64, i64)>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    info!(?body, "agent_request_patch received");
     // Check if this is a completion event
     if let Some(result) = body.get("result").and_then(|v| v.as_str()) {
-        info!(result, "job request completed");
         // Try to extract the job ID and update the run
         let mut inner = shared.state.inner.lock().await;
         for run in inner.runs.values_mut() {
