@@ -977,12 +977,38 @@ async fn append_log(
 ) -> StatusCode {
     let key = log_key(&plan_id, &log_id);
     let mut inner = shared.state.inner.lock().await;
-    inner.logs.entry(key).or_default().extend_from_slice(&body);
+    let masked = mask_log_bytes(&inner, &plan_id, &body);
+    inner.logs.entry(key).or_default().extend_from_slice(&masked);
     StatusCode::ACCEPTED
 }
 
 fn log_key(plan_id: &str, log_id: &str) -> String {
     format!("{plan_id}/{log_id}")
+}
+
+fn mask_log_bytes(inner: &InnerState, plan_id: &str, body: &[u8]) -> Vec<u8> {
+    let mut text = String::from_utf8_lossy(body).into_owned();
+    let run_secrets = plan_id
+        .parse::<RunId>()
+        .ok()
+        .and_then(|run_id| inner.runs.get(&run_id))
+        .map(|run| run.submission.secrets.values().collect::<Vec<_>>())
+        .unwrap_or_else(|| {
+            inner
+                .runs
+                .values()
+                .flat_map(|run| run.submission.secrets.values())
+                .collect()
+        });
+
+    for secret in run_secrets {
+        let exposed = secret.expose();
+        if !exposed.is_empty() {
+            text = text.replace(exposed, "***");
+        }
+    }
+
+    text.into_bytes()
 }
 
 /// POST console log — runner streams live console output.
@@ -1572,6 +1598,53 @@ mod tests {
         assert_eq!(
             inner.logs.get("plan-1/log-1").map(Vec::as_slice),
             Some(&b"hello log"[..])
+        );
+    }
+
+    #[tokio::test]
+    async fn log_append_masks_submitted_secrets() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo masked
+"#,
+                "event": "push",
+                "repository": "owner/repo",
+                "secrets": {"TOKEN": "super-secret"}
+            }),
+        )
+        .await;
+        let run_id = accepted["run_id"].as_str().unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/_apis/v1/Logfiles/scope/actions/{run_id}/log-1/append"))
+                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                    .body(Body::from("token=super-secret"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let inner = state.inner.lock().await;
+        assert_eq!(
+            inner.logs.get(&format!("{run_id}/log-1")).map(Vec::as_slice),
+            Some(&b"token=***"[..])
         );
     }
 
