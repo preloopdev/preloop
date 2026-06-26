@@ -195,6 +195,14 @@ pub struct AgentJobRequestMessage {
     #[serde(rename = "jobId")]
     pub job_id: uuid::Uuid,
 
+    /// The request ID for this job dispatch.
+    #[serde(rename = "requestId")]
+    pub request_id: uuid::Uuid,
+
+    /// The plan reference — plan ID and type.
+    #[serde(rename = "plan")]
+    pub plan: PlanReference,
+
     /// The timeline reference for this job's records.
     #[serde(rename = "timeline")]
     pub timeline: TimelineReference,
@@ -248,6 +256,15 @@ pub struct AgentJobRequestMessage {
     /// Job timeout (seconds).
     #[serde(rename = "jobTimeout", skip_serializing_if = "Option::is_none")]
     pub job_timeout: Option<i64>,
+}
+
+/// Plan reference — identifies the orchestration plan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanReference {
+    #[serde(rename = "planId")]
+    pub plan_id: String,
+    #[serde(rename = "planType", skip_serializing_if = "Option::is_none")]
+    pub plan_type: Option<String>,
 }
 
 /// Task step — a single unit of work within a job.
