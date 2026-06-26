@@ -6,8 +6,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::extract::{Path, Query, Request, State};
+use axum::http::{header, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
@@ -71,29 +72,7 @@ async fn shutdown_signal(shutdown: CancellationToken) {
 
 /// Build the server router.
 pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
-    Router::new()
-        .route("/healthz", get(healthz))
-        .route("/_apis/v1/oauth2/token", post(oauth2_token))
-        .route("/api/v1/runs", post(submit_run))
-        .route("/api/v1/runs/:run_id", get(get_run))
-        .route("/api/v1/runs/:run_id/cancel", post(cancel_run))
-        .route("/api/v1/runs/:run_id/rerun", post(rerun_run))
-        .route("/api/v1/runs/:run_id/events.ndjson", get(run_events))
-        .route("/api/v1/runners", post(register_runner))
-        .route("/api/v1/runners/sessions", post(create_session))
-        .route(
-            "/api/v1/runners/sessions/:session_id/messages",
-            get(next_message),
-        )
-        .route(
-            "/api/v1/runners/sessions/:session_id/messages/:message_id",
-            delete(delete_session_message),
-        )
-        .route("/api/v1/jobs/complete", post(complete_job))
-        .route("/api/v1/cache", post(cache_put))
-        .route("/api/v1/cache", get(cache_get))
-        .route("/api/v1/artifacts", post(artifact_put))
-        .route("/api/v1/artifacts/:artifact_id", get(artifact_get))
+    let protected_apis = Router::new()
         .route("/_apis/artifactcache/cache", post(cache_reserve))
         .route("/_apis/artifactcache/cache", get(cache_lookup))
         .route("/_apis/artifactcache/cache/:cache_id", patch(cache_upload))
@@ -110,7 +89,6 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             "/_apis/pipelines/workflows/:run_id/artifacts/:artifact_id",
             get(artifact_get_compat),
         )
-        .route("/runner/server/_apis/connectionData", get(connection_data))
         .route(
             "/runner/server/_apis/distributedtask/pools",
             get(runner_pools),
@@ -139,7 +117,6 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             "/runner/server/_apis/distributedtask/hubs/actions/plans/:run_id/jobs/:job_id",
             patch(complete_job_compat),
         )
-        // Phase E: Timeline, logs, completion
         .route(
             "/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id",
             patch(patch_timeline_records),
@@ -160,13 +137,54 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             "/_apis/v1/FinishJob/:scope/:hub/:plan_id",
             post(finish_job),
         )
-        // Phase H: Action download info
         .route(
             "/_apis/v1/ActionDownloadInfo/:scope/:hub/:plan_id",
             post(action_download_info),
         )
+        .route_layer(middleware::from_fn(require_bearer));
+
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/_apis/v1/oauth2/token", post(oauth2_token))
+        .route("/runner/server/_apis/connectionData", get(connection_data))
+        .route("/api/v1/runs", post(submit_run))
+        .route("/api/v1/runs/:run_id", get(get_run))
+        .route("/api/v1/runs/:run_id/cancel", post(cancel_run))
+        .route("/api/v1/runs/:run_id/rerun", post(rerun_run))
+        .route("/api/v1/runs/:run_id/events.ndjson", get(run_events))
+        .route("/api/v1/runners", post(register_runner))
+        .route("/api/v1/runners/sessions", post(create_session))
+        .route(
+            "/api/v1/runners/sessions/:session_id/messages",
+            get(next_message),
+        )
+        .route(
+            "/api/v1/runners/sessions/:session_id/messages/:message_id",
+            delete(delete_session_message),
+        )
+        .route("/api/v1/jobs/complete", post(complete_job))
+        .route("/api/v1/cache", post(cache_put))
+        .route("/api/v1/cache", get(cache_get))
+        .route("/api/v1/artifacts", post(artifact_put))
+        .route("/api/v1/artifacts/:artifact_id", get(artifact_get))
+        .merge(protected_apis)
         .layer(TraceLayer::new_for_http())
         .with_state(Arc::new(SharedState { state, shutdown }))
+}
+
+async fn require_bearer(request: Request, next: Next) -> Result<Response, ApiError> {
+    let authorized = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|token| token == "aksh-system-token" || token.starts_with("aksh-"));
+
+    if authorized {
+        Ok(next.run(request).await)
+    } else {
+        Err(ApiError::unauthorized("missing or invalid bearer token"))
+    }
 }
 
 #[derive(Clone)]
@@ -1273,6 +1291,13 @@ impl ApiError {
         }
     }
 
+    fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: message.into(),
+        }
+    }
+
     fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
@@ -1328,6 +1353,28 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn protected_apis_require_bearer_token() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/_apis/artifactcache/cache?keys=x&version=v1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn messages_redeliver_until_delete_ack() {
         let temp = tempfile::tempdir().unwrap();
         let app = app(
@@ -1378,6 +1425,7 @@ jobs:
                 Request::builder()
                     .method(Method::DELETE)
                     .uri("/runner/server/_apis/distributedtask/pools/1/messages/1")
+                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1560,6 +1608,7 @@ jobs:
                 Request::builder()
                     .method(Method::PATCH)
                     .uri(format!("/_apis/artifactcache/cache/{cache_id}"))
+                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
                     .body(Body::from("cache-bytes"))
                     .unwrap(),
             )
@@ -1625,16 +1674,14 @@ jobs:
     }
 
     async fn request_json(app: &Router, method: Method, uri: &str, body: Value) -> Value {
-        let request = if method == Method::GET {
-            Request::builder()
-                .method(method)
-                .uri(uri)
-                .body(Body::empty())
-                .unwrap()
+        let mut builder = Request::builder().method(method).uri(uri);
+        if uri.starts_with("/_apis/") || uri.starts_with("/runner/server/_apis/") {
+            builder = builder.header(header::AUTHORIZATION, "Bearer aksh-system-token");
+        }
+        let request = if body.is_null() {
+            builder.body(Body::empty()).unwrap()
         } else {
-            Request::builder()
-                .method(method)
-                .uri(uri)
+            builder
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))
                 .unwrap()
