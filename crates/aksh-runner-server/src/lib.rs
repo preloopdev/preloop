@@ -249,6 +249,7 @@ struct InnerState {
     runner_public_keys: BTreeMap<i64, String>,
     runner_rsa_public_keys: BTreeMap<i64, AgentRsaPublicKey>,
     inflight_messages: BTreeMap<i64, azdo::TaskAgentMessage>,
+    cancellation_queue: VecDeque<QueuedCancellation>,
     pending_caches: BTreeMap<i64, PendingCache>,
     artifacts: BTreeMap<String, ArtifactRecord>,
     next_runner_id: i64,
@@ -270,6 +271,12 @@ struct QueuedJob {
     job_id: JobId,
     needs: Vec<JobId>,
     message: azdo::AgentJobRequestMessage,
+}
+
+#[derive(Debug, Clone)]
+struct QueuedCancellation {
+    run_id: RunId,
+    job_id: JobId,
 }
 
 #[derive(Debug, Clone)]
@@ -509,13 +516,20 @@ async fn cancel_run(
     Path(run_id): Path<RunId>,
 ) -> Result<Json<RunRecord>, ApiError> {
     let mut inner = shared.state.inner.lock().await;
+    let mut cancellations = Vec::new();
     {
         let record = inner
             .runs
             .get_mut(&run_id)
             .ok_or_else(|| ApiError::not_found("run not found"))?;
         record.status = ExecutionStatus::Cancelled;
-        for status in record.jobs.values_mut() {
+        for (job_id, status) in &mut record.jobs {
+            if matches!(*status, ExecutionStatus::InProgress) {
+                cancellations.push(QueuedCancellation {
+                    run_id,
+                    job_id: job_id.clone(),
+                });
+            }
             if matches!(
                 *status,
                 ExecutionStatus::Queued | ExecutionStatus::InProgress
@@ -525,12 +539,18 @@ async fn cancel_run(
         }
     }
     inner.queue.retain(|job| job.run_id != run_id);
+    inner.pending_jobs.retain(|job| job.run_id != run_id);
+    let cancellation_count = cancellations.len();
+    inner.cancellation_queue.extend(cancellations);
     let record = inner
         .runs
         .get(&run_id)
         .cloned()
         .ok_or_else(|| ApiError::not_found("run not found"))?;
     drop(inner);
+    if cancellation_count > 0 {
+        shared.state.message_notify.notify_waiters();
+    }
     shared
         .state
         .emit(NdjsonEvent::RunStatus {
@@ -685,6 +705,21 @@ async fn next_message(
             return Ok(Json(Some(message)));
         }
 
+        if let Some(cancellation) = inner.cancellation_queue.pop_front() {
+            let body_json = json!({
+                "runId": cancellation.run_id.to_string(),
+                "jobId": cancellation.job_id.to_string(),
+            })
+            .to_string();
+            let message = build_task_agent_message(
+                &mut inner,
+                &session_id,
+                azdo::message_type::JOB_CANCELLED,
+                body_json,
+            )?;
+            return Ok(Json(Some(message)));
+        }
+
         let Some(queued) = inner.queue.pop_front() else {
             drop(inner);
             if wait_seconds == 0 {
@@ -708,36 +743,14 @@ async fn next_message(
             run.jobs.insert(queued.job_id.clone(), ExecutionStatus::InProgress);
         }
 
-        // Get the session's AES key for encryption
-        let session_key = inner
-            .session_keys
-            .get(&session_id)
-            .map(|s| s.key.clone())
-            .unwrap_or_default();
-
-        // Serialize the job message to JSON
         let body_json = serde_json::to_string(&queued.message)
             .map_err(|e| ApiError::bad_request(format!("failed to serialize job message: {e}")))?;
-
-        // Encrypt with session AES key
-        let (encrypted_body, iv) = if !session_key.is_empty() {
-            let enc = SessionEncryption::from_key(session_key);
-            enc.encrypt(body_json.as_bytes())
-                .map_err(|e| ApiError::bad_request(format!("encryption failed: {e}")))?
-        } else {
-            // No encryption key — send plaintext (for testing)
-            (body_json.into_bytes(), vec![0u8; 16])
-        };
-
-        inner.next_message_id += 1;
-        let message_id = inner.next_message_id;
-        let message = azdo::TaskAgentMessage {
-            message_id,
-            message_type: azdo::message_type::PIPELINE_AGENT_JOB_REQUEST.to_owned(),
-            body: base64::engine::general_purpose::STANDARD.encode(&encrypted_body),
-            iv: Some(iv),
-        };
-        inner.inflight_messages.insert(message_id, message.clone());
+        let message = build_task_agent_message(
+            &mut inner,
+            &session_id,
+            azdo::message_type::PIPELINE_AGENT_JOB_REQUEST,
+            body_json,
+        )?;
 
         let run_id = queued.run_id;
         let job_id = queued.job_id.clone();
@@ -761,6 +774,37 @@ async fn delete_session_message(
     Path((_session_id, message_id)): Path<(String, i64)>,
 ) -> StatusCode {
     ack_message(shared, message_id).await
+}
+
+fn build_task_agent_message(
+    inner: &mut InnerState,
+    session_id: &str,
+    message_type: &str,
+    body_json: String,
+) -> Result<azdo::TaskAgentMessage, ApiError> {
+    let session_key = inner
+        .session_keys
+        .get(session_id)
+        .map(|s| s.key.clone())
+        .unwrap_or_default();
+    let (encrypted_body, iv) = if !session_key.is_empty() {
+        let enc = SessionEncryption::from_key(session_key);
+        enc.encrypt(body_json.as_bytes())
+            .map_err(|e| ApiError::bad_request(format!("encryption failed: {e}")))?
+    } else {
+        (body_json.into_bytes(), vec![0u8; 16])
+    };
+
+    inner.next_message_id += 1;
+    let message_id = inner.next_message_id;
+    let message = azdo::TaskAgentMessage {
+        message_id,
+        message_type: message_type.to_owned(),
+        body: BASE64_STANDARD.encode(&encrypted_body),
+        iv: Some(iv),
+    };
+    inner.inflight_messages.insert(message_id, message.clone());
+    Ok(message)
 }
 
 async fn delete_pool_message(
@@ -1668,6 +1712,80 @@ jobs:
         )
         .await;
         assert!(empty.is_null());
+    }
+
+    #[tokio::test]
+    async fn cancel_run_delivers_cancellation_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sleep 30
+"#,
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id = accepted["run_id"].as_str().unwrap();
+
+        let job_message = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=default",
+            Value::Null,
+        )
+        .await;
+        let message_id = job_message["messageId"].as_i64().unwrap();
+
+        let ack = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!(
+                        "/runner/server/_apis/distributedtask/pools/1/messages/{message_id}"
+                    ))
+                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ack.status(), StatusCode::NO_CONTENT);
+
+        request_json(
+            &app,
+            Method::POST,
+            &format!("/api/v1/runs/{run_id}/cancel"),
+            Value::Null,
+        )
+        .await;
+
+        let cancellation = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=default&waitSeconds=0",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            cancellation["messageType"],
+            azdo::message_type::JOB_CANCELLED
+        );
     }
 
     #[tokio::test]
