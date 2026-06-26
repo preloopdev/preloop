@@ -160,6 +160,7 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         .route("/:org/_apis/v1/Agent/:pool_id/:agent_id", get(agent_lookup_by_id_org).post(register_runner_compat_org_2))
         .route("/:org/_apis/v1/Agent/:pool_id", get(agent_lookup_org).post(register_runner_compat_org))
         .route("/:org/_apis/v1/AgentSession/:pool_id/:session_id", post(create_session_compat_org))
+        .route("/:org/_apis/v1/AgentSession/:pool_id", post(create_session_compat_org_pool_only))
         .route("/:org/_apis/v1/AgentSession/:pool_id/:session_id", delete(delete_session_org))
         .route("/:org/_apis/v1/Message/:pool_id", get(next_message_compat_org))
         .route("/:org/_apis/v1/Message/:pool_id/:message_id", delete(delete_pool_message_org))
@@ -200,8 +201,8 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         // Runner lifecycle endpoints — public (runner may not have auth token yet)
         .route("/_apis/v1/AgentPools", get(runner_pools))
         .route("/_apis/v1/Agent/:pool_id/:agent_id", get(agent_lookup_by_id).post(register_runner_compat))
-        .route("/_apis/v1/Agent/:pool_id", get(agent_lookup).post(register_runner_compat_pool_only))
         .route("/_apis/v1/AgentSession/:pool_id/:session_id", post(create_session_compat))
+        .route("/_apis/v1/AgentSession/:pool_id", post(create_session_compat_pool_only))
         .route("/_apis/v1/AgentSession/:pool_id/:session_id", delete(delete_session))
         .route("/_apis/v1/Message/:pool_id", get(next_message_compat))
         .route("/_apis/v1/Message/:pool_id/:message_id", delete(delete_pool_message))
@@ -1588,6 +1589,25 @@ async fn create_session_compat_org(
     create_session_compat(State(shared), Path((pool_id, session_id)), Json(body)).await
 }
 
+/// Session creation with only pool_id in path (no session_id — server generates it).
+async fn create_session_compat_pool_only(
+    State(shared): State<Arc<SharedState>>,
+    Path(_pool_id): Path<i64>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // Generate a session_id since the runner doesn't provide one
+    let session_id = uuid::Uuid::new_v4().to_string();
+    create_session_compat(State(shared), Path((_pool_id, session_id)), Json(body)).await
+}
+
+/// Org-prefixed session creation with only pool_id in path.
+async fn create_session_compat_org_pool_only(
+    State(shared): State<Arc<SharedState>>,
+    Path((_org, pool_id)): Path<(String, i64)>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    create_session_compat_pool_only(State(shared), Path(pool_id), Json(body)).await
+}
 async fn delete_session_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, pool_id, session_id)): Path<(String, i64, String)>,
