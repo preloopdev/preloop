@@ -585,6 +585,8 @@ pub fn expand_jobs(workflow: &Workflow) -> Result<Vec<JobPlan>, ParserError> {
                 env,
                 steps: job.steps.iter().cloned().map(step_plan).collect(),
                 if_condition: job.if_condition.clone(),
+                fail_fast: job.strategy.fail_fast.unwrap_or(true),
+                max_parallel: job.strategy.max_parallel,
             });
         }
     }
@@ -638,6 +640,8 @@ pub fn expand_jobs_with_reusables(
                 env,
                 steps: job.steps.iter().cloned().map(step_plan).collect(),
                 if_condition: job.if_condition.clone(),
+                fail_fast: job.strategy.fail_fast.unwrap_or(true),
+                max_parallel: job.strategy.max_parallel,
             });
         }
     }
