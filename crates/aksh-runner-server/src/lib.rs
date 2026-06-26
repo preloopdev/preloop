@@ -228,6 +228,8 @@ struct RunRecord {
 #[derive(Debug, Clone)]
 struct QueuedJob {
     run_id: RunId,
+    job_id: JobId,
+    needs: Vec<JobId>,
     message: azdo::AgentJobRequestMessage,
 }
 
@@ -357,6 +359,8 @@ async fn submit_run(
 
             let queued_job = QueuedJob {
                 run_id,
+                job_id: job.id.clone(),
+                needs: job.needs.clone(),
                 message: agent_msg,
             };
 
@@ -561,8 +565,7 @@ async fn next_message(
     // Update run status
     if let Some(run) = inner.runs.get_mut(&queued.run_id) {
         run.status = ExecutionStatus::InProgress;
-        run.jobs
-            .insert(JobId(queued.message.job_id.to_string()), ExecutionStatus::InProgress);
+        run.jobs.insert(queued.job_id.clone(), ExecutionStatus::InProgress);
     }
 
     // Get the session's AES key for encryption
@@ -587,7 +590,7 @@ async fn next_message(
     drop(inner);
 
     let run_id = queued.run_id;
-    let job_id = JobId(queued.message.job_id.to_string());
+    let job_id = queued.job_id.clone();
 
     shared
         .state
@@ -675,23 +678,10 @@ fn promote_ready_jobs(inner: &mut InnerState) {
     let mut remaining = VecDeque::new();
 
     while let Some(job) = inner.pending_jobs.pop_front() {
-        // Get the job's needs from the message
-        let needs_satisfied = {
-            let run = inner.runs.get(&job.run_id);
-            let job_id_str = job.message.job_id.to_string();
-            // Find the base job id from the expanded id
-            let base_id = job_id_str.split('[').next().unwrap_or(&job_id_str);
-
-            if let Some(run) = run {
-                // Check all needs are complete (success or skipped)
-                run.jobs.iter().any(|(dep_id, status)| {
-                    dep_id.0.starts_with(base_id)
-                        && matches!(status, ExecutionStatus::Success | ExecutionStatus::Skipped)
-                }) || run.jobs.values().all(|s| matches!(s, ExecutionStatus::Success | ExecutionStatus::Skipped))
-            } else {
-                false
-            }
-        };
+        let needs_satisfied = inner
+            .runs
+            .get(&job.run_id)
+            .is_some_and(|run| job.needs.iter().all(|need| need_satisfied(run, need)));
 
         if needs_satisfied {
             promoted.push(job);
@@ -704,6 +694,22 @@ fn promote_ready_jobs(inner: &mut InnerState) {
     for job in promoted {
         inner.queue.push_back(job);
     }
+}
+
+fn need_satisfied(run: &RunRecord, need: &JobId) -> bool {
+    let matrix_prefix = format!("{} (", need.0);
+    let mut matched = false;
+
+    for (job_id, status) in &run.jobs {
+        if job_id == need || job_id.0.starts_with(&matrix_prefix) {
+            matched = true;
+            if !matches!(status, ExecutionStatus::Success | ExecutionStatus::Skipped) {
+                return false;
+            }
+        }
+    }
+
+    matched
 }
 
 // ─── Phase E: Timeline, logs, completion ────────────────────────────────────
