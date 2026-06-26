@@ -23,30 +23,60 @@ use std::collections::BTreeMap;
 /// Upstream source: `ConnectionDataController.cs`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionData {
+    #[serde(rename = "instanceId", skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
     #[serde(rename = "locationServiceData", skip_serializing_if = "Option::is_none")]
     pub location_service_data: Option<LocationServiceData>,
+}
+
+/// Access mapping for location service resolution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccessMapping {
+    #[serde(rename = "moniker", skip_serializing_if = "Option::is_none")]
+    pub moniker: Option<String>,
+    #[serde(rename = "displayName", skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(rename = "accessPoint", skip_serializing_if = "Option::is_none")]
+    pub access_point: Option<String>,
 }
 
 /// Location service data — maps service GUIDs to URL locations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocationServiceData {
-    #[serde(
-        rename = "serviceDefinitions",
-        default,
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    #[serde(rename = "serviceDefinitions", default, skip_serializing_if = "Vec::is_empty")]
     pub service_definitions: Vec<ServiceDefinition>,
+    #[serde(rename = "accessMappings", default, skip_serializing_if = "Vec::is_empty")]
+    pub access_mappings: Vec<AccessMapping>,
+    #[serde(rename = "defaultAccessMappingMoniker", skip_serializing_if = "Option::is_none")]
+    pub default_access_mapping_moniker: Option<String>,
+}
+
+/// A location mapping for a service definition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocationMapping {
+    #[serde(rename = "accessMappingMoniker", skip_serializing_if = "Option::is_none")]
+    pub access_mapping_moniker: Option<String>,
+    #[serde(rename = "location", skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
 }
 
 /// A single service definition mapping a GUID to a URL location.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceDefinition {
+    #[serde(rename = "serviceType", skip_serializing_if = "Option::is_none")]
+    pub service_type: Option<String>,
     #[serde(rename = "identifier", skip_serializing_if = "Option::is_none")]
     pub identifier: Option<String>,
-    #[serde(rename = "locationMapping", skip_serializing_if = "Option::is_none")]
-    pub location_mapping: Option<BTreeMap<String, String>>,
     #[serde(rename = "displayName", skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    #[serde(rename = "relativePath", skip_serializing_if = "Option::is_none")]
+    pub relative_path: Option<String>,
+    #[serde(rename = "description", skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(rename = "toolId", skip_serializing_if = "Option::is_none")]
+    pub tool_id: Option<String>,
+    #[serde(rename = "locationMappings", skip_serializing_if = "Option::is_none")]
+    pub location_mappings: Option<Vec<LocationMapping>>,
 }
 
 /// Runner agent registration request.
