@@ -72,6 +72,9 @@ pub fn build_agent_job_message(
     for (k, v) in vars {
         variables.insert(k.clone(), VariableValue::new(v));
     }
+    for (k, v) in secrets {
+        variables.insert(k.clone(), VariableValue::secret(v));
+    }
 
     // System variables
     variables.insert(
@@ -348,7 +351,7 @@ jobs:
     }
 
     #[test]
-    fn secrets_become_mask_hints() {
+    fn secrets_become_variables_and_mask_hints() {
         let yaml = r#"
 on: push
 jobs:
@@ -369,5 +372,8 @@ jobs:
 
         assert!(!msg.mask_hints.is_empty());
         assert_eq!(msg.mask_hints[0].value, "s3cr3t");
+        let secret = msg.variables.get("MY_SECRET").unwrap();
+        assert_eq!(secret.value.as_deref(), Some("s3cr3t"));
+        assert_eq!(secret.is_secret, Some(true));
     }
 }
