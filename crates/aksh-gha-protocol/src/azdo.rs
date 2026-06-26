@@ -483,7 +483,7 @@ pub struct TaskResources {
     #[serde(rename = "endpoints", default)]
     pub endpoints: Vec<ServiceEndpoint>,
     #[serde(rename = "repositories", default)]
-    pub repositories: BTreeMap<String, RepositoryReference>,
+    pub repositories: Vec<RepositoryReference>,
 }
 
 /// A service endpoint — connection to an external service.
@@ -502,8 +502,8 @@ pub struct ServiceEndpoint {
     pub endpoint_type: Option<String>,
     #[serde(rename = "url", skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
-    #[serde(rename = "authorization", default)]
-    pub authorization: BTreeMap<String, EndpointAuthorization>,
+    #[serde(rename = "authorization")]
+    pub authorization: EndpointAuthorization,
     #[serde(rename = "isShared", skip_serializing_if = "Option::is_none")]
     pub is_shared: Option<bool>,
     #[serde(rename = "serviceOwner", skip_serializing_if = "Option::is_none")]

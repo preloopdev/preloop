@@ -98,27 +98,33 @@ pub fn build_agent_job_message(
         name: "SystemVssConnection".to_owned(),
         endpoint_type: Some("azdoserver".to_owned()),
         url: Some("http://localhost".to_owned()),
-        authorization: BTreeMap::from([(
-            "parameters".to_owned(),
-            EndpointAuthorization {
-                parameters: BTreeMap::from([(
-                    "AccessToken".to_owned(),
-                    "aksh-system-token".to_owned(),
-                )]),
-                scheme: Some("OAuth".to_owned()),
-            },
-        )]),
+        authorization: EndpointAuthorization {
+            parameters: BTreeMap::from([(
+                "AccessToken".to_owned(),
+                "aksh-system-token".to_owned(),
+            )]),
+            scheme: Some("OAuth".to_owned()),
+        },
         is_shared: Some(false),
         service_owner: Some("github".to_owned()),
     });
 
     let resources = TaskResources {
         endpoints,
-        repositories: BTreeMap::new(),
+        repositories: Vec::new(),
     };
+
+    // System context — runner needs these for job tracking
+    let mut system_ctx = BTreeMap::new();
+    system_ctx.insert("jobId".to_owned(), PipelineContextData::String(job_id.to_string()));
+    system_ctx.insert("timelineId".to_owned(), PipelineContextData::String(timeline_id.to_string()));
+    system_ctx.insert("planId".to_owned(), PipelineContextData::String(job_id.to_string()));
+    system_ctx.insert("jobDisplayName".to_owned(), PipelineContextData::String(plan.name.clone()));
+    system_ctx.insert("orchestrationId".to_owned(), PipelineContextData::String(job_id.to_string()));
 
     // Context data
     let mut context_data = BTreeMap::new();
+    context_data.insert("system".to_owned(), PipelineContextData::Dict(system_ctx));
     context_data.insert("github".to_owned(), to_context_data(github));
 
     let env_ctx: Map<String, Value> = plan
