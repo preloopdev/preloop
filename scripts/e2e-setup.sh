@@ -52,7 +52,7 @@ macos_setup() {
     tmp=$(mktemp)
     trap "rm -f '$tmp'" RETURN
     {
-        sudo pfctl -sn 2>/dev/null | grep -vE "rdr .*lo0.*port [= ]*80\b" || true
+        sudo pfctl -sn 2>/dev/null | grep -vE "rdr .*lo0.*port [= ]*80\b.*port [= ]*$AKSH_PORT\b" || true
         echo "$rule"
     } > "$tmp"
 
@@ -77,7 +77,7 @@ macos_teardown() {
     trap "rm -f '$tmp'" RETURN
 
     # Reload nat rules without our redirect
-    sudo pfctl -sn 2>/dev/null | grep -vE "rdr .*lo0.*port [= ]*80\b" > "$tmp" 2>/dev/null || true
+    sudo pfctl -sn 2>/dev/null | grep -vE "rdr .*lo0.*port [= ]*80\b.*port [= ]*$AKSH_PORT\b" > "$tmp" 2>/dev/null || true
     sudo pfctl -N -f "$tmp" 2>&1 | grep -vE "ALTQ|flushing|main ruleset|pf\.conf|^$" || true
 
     green "✓ redirect removed"
