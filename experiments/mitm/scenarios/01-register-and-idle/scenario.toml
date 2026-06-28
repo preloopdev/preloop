@@ -1,0 +1,6 @@
+description = "Runner idles, capturing long-poll traffic (config bypassed — needs TLS CA)"
+duration_seconds_max = 120
+
+[[steps]]
+kind = "wait_seconds"
+n = 60
