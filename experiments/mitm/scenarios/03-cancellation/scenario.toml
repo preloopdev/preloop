@@ -1,0 +1,23 @@
+description = "Submit a slow workflow and cancel it mid-run."
+duration_seconds_max = 300
+
+[[steps]]
+kind = "submit_workflow"
+path = "workflow.yml"
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_assigned"
+timeout = 120
+
+[[steps]]
+kind = "wait_seconds"
+n = 5
+
+[[steps]]
+kind = "cancel_workflow"
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_completed"
+timeout = 120

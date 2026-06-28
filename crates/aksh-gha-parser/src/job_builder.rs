@@ -6,13 +6,12 @@
 use std::collections::BTreeMap;
 
 use aksh_gha_protocol::azdo::{
-    AgentJobRequestMessage, EndpointAuthorization, MaskHint, MaskType,
-    PipelineContextData, ServiceEndpoint, TaskResources, TaskStep,
-    TimelineReference, VariableValue,
+    AgentJobRequestMessage, EndpointAuthorization, MaskHint, MaskType, PipelineContextData,
+    ServiceEndpoint, TaskResources, TaskStep, TimelineReference, VariableValue,
 };
 
-use crate::JobPlan;
 use crate::eval::{build_context, resolve_map, resolve_string};
+use crate::JobPlan;
 use aksh_gha_expressions::Context;
 use serde_json::Value;
 
@@ -67,7 +66,9 @@ pub fn build_agent_job_message(
         variables.insert(k.clone(), VariableValue::new(v));
     }
     for (k, v) in global_env {
-        variables.entry(k.clone()).or_insert_with(|| VariableValue::new(v));
+        variables
+            .entry(k.clone())
+            .or_insert_with(|| VariableValue::new(v));
     }
     for (k, v) in vars {
         variables.insert(k.clone(), VariableValue::new(v));
@@ -90,8 +91,7 @@ pub fn build_agent_job_message(
         .collect();
 
     // Service endpoints (SystemVssConnection)
-    let mut endpoints = Vec::new();
-    endpoints.push(ServiceEndpoint {
+    let endpoints = vec![ServiceEndpoint {
         data: BTreeMap::new(),
         name: "SystemVssConnection".to_owned(),
         endpoint_type: Some("azdoserver".to_owned()),
@@ -108,7 +108,7 @@ pub fn build_agent_job_message(
         )]),
         is_shared: Some(false),
         service_owner: Some("github".to_owned()),
-    });
+    }];
 
     let resources = TaskResources {
         endpoints,
@@ -153,10 +153,7 @@ pub fn build_agent_job_message(
         "needs".to_owned(),
         PipelineContextData::Dict(BTreeMap::new()),
     );
-    context_data.insert(
-        "strategy".to_owned(),
-        to_context_data(&strategy_value),
-    );
+    context_data.insert("strategy".to_owned(), to_context_data(&strategy_value));
 
     // Actions download info
     let actions_download_info = BTreeMap::new();
@@ -180,7 +177,7 @@ pub fn build_agent_job_message(
 }
 
 /// Build a `TaskStep` from a `StepPlan`.
-fn build_task_step(step: &crate::StepPlan, index: usize, context: &Context) -> TaskStep {
+fn build_task_step(step: &crate::StepPlan, _index: usize, context: &Context) -> TaskStep {
     let step_id = uuid::Uuid::new_v4();
 
     // Resolve expressions in env and with
@@ -189,7 +186,8 @@ fn build_task_step(step: &crate::StepPlan, index: usize, context: &Context) -> T
         .with
         .iter()
         .map(|(k, v)| {
-            let resolved = resolve_string(&v.to_string(), context).unwrap_or_else(|_| v.to_string());
+            let resolved =
+                resolve_string(&v.to_string(), context).unwrap_or_else(|_| v.to_string());
             (k.clone(), resolved)
         })
         .collect();
@@ -209,14 +207,15 @@ fn build_task_step(step: &crate::StepPlan, index: usize, context: &Context) -> T
         display_name: step.name.clone(),
         condition,
         script: run,
-        reference: step.uses.as_ref().map(|uses| {
-            aksh_gha_protocol::azdo::TaskReference {
+        reference: step
+            .uses
+            .as_ref()
+            .map(|uses| aksh_gha_protocol::azdo::TaskReference {
                 id: None,
                 name: Some(uses.clone()),
                 version: None,
                 reference_type: None,
-            }
-        }),
+            }),
         inputs: with,
         env,
         continue_on_error: None,
@@ -272,13 +271,23 @@ jobs:
             "sha": "abc123"
         });
 
-        let msg = build_agent_job_message(plan, &github, &BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new())
-            .unwrap();
+        let msg = build_agent_job_message(
+            plan,
+            &github,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
 
         assert!(!msg.steps.is_empty());
         assert!(msg.timeline.id != uuid::Uuid::nil());
         assert!(msg.job_id != uuid::Uuid::nil());
-        assert!(msg.resources.endpoints.iter().any(|e| e.name == "SystemVssConnection"));
+        assert!(msg
+            .resources
+            .endpoints
+            .iter()
+            .any(|e| e.name == "SystemVssConnection"));
     }
 
     #[test]
@@ -299,8 +308,14 @@ jobs:
         assert_eq!(plans.len(), 2);
 
         let github = serde_json::json!({"event_name": "push"});
-        let msg = build_agent_job_message(&plans[0], &github, &BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new())
-            .unwrap();
+        let msg = build_agent_job_message(
+            &plans[0],
+            &github,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
 
         // Matrix should be in context data
         assert!(msg.context_data.contains_key("matrix"));
@@ -323,8 +338,14 @@ jobs:
         secrets.insert("MY_SECRET".to_owned(), "s3cr3t".to_owned());
 
         let github = serde_json::json!({"event_name": "push"});
-        let msg = build_agent_job_message(&plans[0], &github, &BTreeMap::new(), &secrets, &BTreeMap::new())
-            .unwrap();
+        let msg = build_agent_job_message(
+            &plans[0],
+            &github,
+            &BTreeMap::new(),
+            &secrets,
+            &BTreeMap::new(),
+        )
+        .unwrap();
 
         assert!(!msg.mask_hints.is_empty());
         assert_eq!(msg.mask_hints[0].value, "s3cr3t");
