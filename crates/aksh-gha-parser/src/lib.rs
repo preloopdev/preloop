@@ -785,7 +785,7 @@ fn can_merge_include_indexed(
         .all(|(key, value)| candidate.get(key).is_none_or(|existing| existing == value))
 }
 
-fn object_entry(
+fn _object_entry(
     job_id: &str,
     field: &'static str,
     value: &Value,
@@ -810,7 +810,7 @@ fn matches_partial(candidate: &IndexMap<String, Value>, partial: &IndexMap<Strin
     })
 }
 
-fn can_merge_include(
+fn _can_merge_include(
     candidate: &IndexMap<String, Value>,
     include: &IndexMap<String, Value>,
 ) -> bool {
