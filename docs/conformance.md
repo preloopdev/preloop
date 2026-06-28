@@ -36,7 +36,7 @@ scope.
 ```sh
 cargo run -p aksh-conformance -- compare-command \
   --upstream /path/to/Runner.Client \
-  --preloop target/debug/aksh-runner-client \
+  --aksh target/debug/aksh-runner-client \
   -- -W fixtures/upstream-workflows/matrixtest.yml --event push
 ```
 
