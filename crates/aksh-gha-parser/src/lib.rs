@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use indexmap::IndexMap;
 use aksh_gha_protocol::{JobId, JobPlan, StepPlan};
+use indexmap::IndexMap;
 
 /// Expression evaluation for workflow fields.
 pub mod eval;
@@ -140,7 +140,9 @@ impl Trigger {
                         }
                         // paths filter
                         if let Some(path_filters) = obj.get("paths") {
-                            if !paths.is_empty() && !paths.iter().any(|p| matches_filter(path_filters, p)) {
+                            if !paths.is_empty()
+                                && !paths.iter().any(|p| matches_filter(path_filters, p))
+                            {
                                 return false;
                             }
                         }
@@ -742,10 +744,7 @@ fn object_entry_indexed(
             field,
         });
     };
-    Ok(map
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect())
+    Ok(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
 }
 
 fn can_merge_include_indexed(
@@ -757,7 +756,7 @@ fn can_merge_include_indexed(
         .all(|(key, value)| candidate.get(key).is_none_or(|existing| existing == value))
 }
 
-fn object_entry(
+fn _object_entry(
     job_id: &str,
     field: &'static str,
     value: &Value,
@@ -782,7 +781,7 @@ fn matches_partial(candidate: &IndexMap<String, Value>, partial: &IndexMap<Strin
     })
 }
 
-fn can_merge_include(
+fn _can_merge_include(
     candidate: &IndexMap<String, Value>,
     include: &IndexMap<String, Value>,
 ) -> bool {
