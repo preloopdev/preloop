@@ -231,7 +231,11 @@ fn build_task_step(step: &crate::StepPlan, context: &Context) -> TaskStep {
 
     // The runner always evaluates a step condition. Omitted conditions are
     // the same as GitHub's default `success()`.
-    let condition = Some(step.if_condition.clone().unwrap_or_else(|| "success()".to_owned()));
+    let condition = Some(
+        step.if_condition
+            .clone()
+            .unwrap_or_else(|| "success()".to_owned()),
+    );
 
     TaskStep {
         id: step_id,

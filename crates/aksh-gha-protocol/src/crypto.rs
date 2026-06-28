@@ -11,13 +11,13 @@
 //! Source: `MessageListener.cs` → `GetMessageDecryptor()`
 //! Source: `AgentSessionController.cs` → session creation
 
+use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
-use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use rsa::pkcs1::DecodeRsaPublicKey;
 use rsa::pkcs8::DecodePublicKey;
-use rsa::{BigUint, Oaep};
 use rsa::traits::PublicKeyParts;
+use rsa::{BigUint, Oaep};
 use sha1::Sha1;
 
 type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
@@ -55,7 +55,9 @@ impl AgentRsaPublicKey {
             rsa::RsaPublicKey::from_pkcs1_pem(trimmed)
                 .map_err(|e| CryptoError::ParseKey(e.to_string()))?
         } else {
-            return Err(CryptoError::ParseKey("unsupported public key format".to_owned()));
+            return Err(CryptoError::ParseKey(
+                "unsupported public key format".to_owned(),
+            ));
         };
 
         Ok(Self { public_key })
@@ -170,7 +172,6 @@ impl AgentRsaKeypair {
         )
     }
 }
-
 
 /// A session encryption context — holds the AES key for encrypting/decrypting
 /// message bodies within a session.

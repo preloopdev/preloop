@@ -3,9 +3,9 @@
 use std::path::PathBuf;
 use std::process::Stdio;
 
+use aksh_gha_parser::{expand_jobs, parse_workflow};
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
-use aksh_gha_parser::{expand_jobs, parse_workflow};
 use tokio::process::Command;
 use walkdir::WalkDir;
 
@@ -153,11 +153,7 @@ fn looks_like_workflow(text: &str) -> bool {
     })
 }
 
-async fn compare_command(
-    upstream: String,
-    aksh: String,
-    args: Vec<String>,
-) -> anyhow::Result<()> {
+async fn compare_command(upstream: String, aksh: String, args: Vec<String>) -> anyhow::Result<()> {
     let upstream_output = Command::new(&upstream)
         .args(&args)
         .stdout(Stdio::piped())
@@ -202,7 +198,12 @@ async fn golden_compare(fixtures: PathBuf) -> anyhow::Result<()> {
     for entry in WalkDir::new(&fixtures)
         .into_iter()
         .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_file() && e.path().extension().is_some_and(|ext| ext == "yml" || ext == "yaml"))
+        .filter(|e| {
+            e.file_type().is_file()
+                && e.path()
+                    .extension()
+                    .is_some_and(|ext| ext == "yml" || ext == "yaml")
+        })
     {
         let yaml_path = entry.path();
         let json_path = yaml_path.with_extension("json");
@@ -284,7 +285,10 @@ async fn replay_wire(fixtures: PathBuf) -> anyhow::Result<()> {
     eprintln!();
     eprintln!("To replay wire traffic:");
     eprintln!("  1. Record traffic with 'aksh-conformance record'");
-    eprintln!("  2. Run 'aksh-conformance replay --fixtures {}'", fixtures.display());
+    eprintln!(
+        "  2. Run 'aksh-conformance replay --fixtures {}'",
+        fixtures.display()
+    );
     eprintln!("  3. Each captured request/response is validated against our DTOs");
     Ok(())
 }
@@ -310,9 +314,8 @@ fn fuzz_parser(iterations: usize) -> anyhow::Result<()> {
         let yaml = generate_random_yaml(hash);
 
         // Parse should never panic
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            parse_workflow(&yaml)
-        }));
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parse_workflow(&yaml)));
 
         match result {
             Ok(_) => passed += 1,
@@ -334,7 +337,9 @@ fn fuzz_parser(iterations: usize) -> anyhow::Result<()> {
 fn generate_random_yaml(seed: u64) -> String {
     let mut s = seed;
     let mut next = || -> u64 {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         s
     };
 
@@ -352,7 +357,8 @@ fn generate_random_yaml(seed: u64) -> String {
     };
     let step_count = (next() % 5) + 1;
 
-    let mut yaml = format!("name: {name}\non: {event}\njobs:\n  build:\n    runs-on: [{label}]\n    steps:\n");
+    let mut yaml =
+        format!("name: {name}\non: {event}\njobs:\n  build:\n    runs-on: [{label}]\n    steps:\n");
     for _ in 0..step_count {
         let cmd = match next() % 3 {
             0 => "echo hello",

@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use indexmap::IndexMap;
 use aksh_gha_protocol::{JobId, JobPlan, StepPlan};
+use indexmap::IndexMap;
 
 /// Expression evaluation for workflow fields.
 pub mod eval;
@@ -151,7 +151,9 @@ impl Trigger {
                         }
                         // paths filter
                         if let Some(path_filters) = obj.get("paths") {
-                            if !paths.is_empty() && !paths.iter().any(|p| matches_filter(path_filters, p)) {
+                            if !paths.is_empty()
+                                && !paths.iter().any(|p| matches_filter(path_filters, p))
+                            {
                                 return false;
                             }
                         }
@@ -216,9 +218,7 @@ fn glob_match(pattern: &str, value: &str) -> bool {
             return false;
         }
 
-        vi < value.len()
-            && pattern[pi] == value[vi]
-            && matches(pattern, value, pi + 1, vi + 1)
+        vi < value.len() && pattern[pi] == value[vi] && matches(pattern, value, pi + 1, vi + 1)
     }
 
     let pattern: Vec<char> = pattern.chars().collect();
@@ -773,10 +773,7 @@ fn object_entry_indexed(
             field,
         });
     };
-    Ok(map
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect())
+    Ok(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
 }
 
 fn can_merge_include_indexed(
@@ -1006,4 +1003,3 @@ jobs:
         assert!(jobs[0].secrets_inherit);
     }
 }
-
