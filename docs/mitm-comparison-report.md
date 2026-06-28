@@ -1,4 +1,8 @@
 # MITM comparison: 01-register-and-idle
+> ⚠️ **Stale baseline**: This comparison used runner v2.317.0. The current official runner is
+> v2.335.1 and GitHub enforces v2.329.0+ minimum since March 2026. The protocol has changed
+> significantly — see `docs/fidelity-gap.md §1a` for the deep diff. Re-captures against
+> v2.329.0+ are needed before relying on these findings.
 
 **Official backend**: ok — 24 flows
 **Runner.server backend**: config_failed — 3 flows

@@ -1,4 +1,8 @@
 # MITM experiment — implementation status (no live capture)
+> ⚠️ **Stale baseline**: The `versions.toml` pins runner v2.317.0. The current official runner
+> is v2.335.1 and GitHub enforces v2.329.0+ minimum since March 2026. Update `runner_version`
+> in `versions.toml` to `2.329.0` or later before re-running experiments. See
+> `docs/fidelity-gap.md §1a` for what changed.
 
 > **This is an implementation-status report, not experimental results.**
 > No `dotnet-sdk` (needs `sudo`) and no GitHub runner registration token are
