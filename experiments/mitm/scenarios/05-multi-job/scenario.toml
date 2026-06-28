@@ -1,0 +1,24 @@
+description = "Submit two jobs in sequence to capture session reuse and multi-job behavior."
+duration_seconds_max = 600
+
+[[steps]]
+kind = "submit_workflow"
+path = "workflow-a.yml"
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_completed"
+timeout = 180
+
+[[steps]]
+kind = "wait_seconds"
+n = 5
+
+[[steps]]
+kind = "submit_workflow"
+path = "workflow-b.yml"
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_completed"
+timeout = 180

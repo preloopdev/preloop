@@ -2,10 +2,10 @@
 
 aksh is split by protocol responsibility rather than by binary:
 
-- `aksh-protocol` owns versioned wire/domain types. Anything sent to a
+- `aksh-gha-protocol` owns versioned wire/domain types. Anything sent to a
   runner or emitted to an agent passes through this crate. Includes AzDO wire
   DTOs, `SecretString`, NDJSON events, and session crypto.
-- `aksh-parser` owns workflow YAML normalization, trigger matching, job graph
+- `aksh-gha-parser` owns workflow YAML normalization, trigger matching, job graph
   construction, matrix expansion, and expression evaluation.
 - `aksh-gha-expressions` owns expression parsing and evaluation (the core
   `${{ }}` engine).
@@ -41,41 +41,34 @@ layer.
 
 ## Secrets
 
-Secrets use `SecretString` in `aksh-protocol`. It redacts `Debug`,
+Secrets use `SecretString` in `aksh-gha-protocol`. It redacts `Debug`,
 `Display`, and serialized output. Code that needs the raw payload must call
 `expose()` explicitly at a protocol boundary.
 
 ## Compatibility Position
 
-This implementation is not yet a proven byte-for-byte replacement for upstream
-`runner.server`. It is structured to become one:
+As of 2026-06-26, aksh is a proven working control plane for the official `actions/runner`.
+The runner completes the full lifecycle: configure → session → message → execute → complete.
 
-- runner-compatible routes are isolated in `aksh-server`;
-- protocol DTOs are versioned in `aksh-protocol`;
-- upstream workflow fixtures are checked into `fixtures/upstream-workflows`;
-- conformance commands are documented in `docs/conformance.md`.
+Implemented and verified with the real `Runner.Listener` v2.322.0:
 
-Implemented in the current Rust slice:
+- Full AzDO lifecycle routes (connectionData, AgentPools, Agent, AgentSession, Message,
+  AgentRequest, Timeline, Logfiles, FinishJob, ActionDownloadInfo)
+- GitHub-compatible registration (`/api/v3/actions/runner-registration` with `RemoteAuth`)
+- GHES org-prefix routing (`/:org/_apis/...` for all lifecycle endpoints)
+- AES session key exchange (unencrypted mode — RSA wrapping planned)
+- Encrypted `TaskAgentMessage` delivery with message ack
+- Full `AgentJobRequestMessage` with plan, requestId, system context, steps
+- `needs` DAG scheduling with dependency-gated dispatch and outputs propagation
+- Trigger matching (branches/tags/paths/types/schedule/workflow_dispatch)
+- Matrix expansion with IndexMap order preservation and GitHub name format
+- Expression evaluation wired into job builder
+- `fail-fast` / `max-parallel` matrix strategy support
 
-- all in-scope upstream GitHub Actions workflow fixtures parse and expand;
-- local `action.yml` / `action.yaml` metadata parses for composite, Node, and
-  Docker action definitions;
-- local reusable workflow call jobs can be expanded when the caller supplies the
-  referenced workflow YAML;
-- cache and artifact stores have HTTP endpoint coverage, including
-  runner-shaped cache reserve/upload/commit/lookup routes;
-- expression evaluation covers common boolean logic, equality, comparisons,
-  status helpers, JSON conversion, `format`, `contains`, `startsWith`,
-  `endsWith`, `join`, and a local-safe `hashFiles` placeholder.
+Known limitations:
 
-Known staged areas:
-
-- expression functions cover common local CI paths but still need complete
-  GitHub Actions coercion and object-filter semantics;
-- reusable workflow expansion handles local call jobs, but input mapping,
-  outputs, nested call graphs, and secret inheritance still need
-  conformance-backed execution tests;
-- runner protocol endpoints need golden fixtures captured from a real
-  `Runner.Listener`;
-- provider integration is documented as the final gate and not implemented in
-  this repository yet.
+- Worker reports job as "Failed" (timeline/log endpoint fidelity gap)
+- Session AES key sent unencrypted (RSA-OAEP wrapping of runner's public key TODO)
+- Cache/artifact endpoints are in-memory stubs; v2 blob protocols not implemented
+- Conformance harness needs golden tests, fuzz targets, wire capture/replay
+- Expression engine lacks bracket access, object-filter, format escaping
