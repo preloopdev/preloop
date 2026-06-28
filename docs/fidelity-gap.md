@@ -567,8 +567,8 @@ aksh/                              ← this repo (the control plane)
 ├── crates/
 │   ├── aksh-server            # axum service; protocol-only; provider-agnostic
 │   ├── aksh-orchestrator      # RunnerProvider/RunnerSpec traits + scheduler
-│   ├── aksh-protocol          # AzDO wire DTOs, SecretString, NDJSON, crypto
-│   ├── aksh-parser            # Workflow YAML parse + expression eval + matrix
+│   ├── aksh-gha-protocol      # AzDO wire DTOs, SecretString, NDJSON, crypto
+│   ├── aksh-gha-parser        # Workflow YAML parse + expression eval + matrix
 │   ├── aksh-cache             # Cache store trait + file-backed impl
 │   ├── aksh-artifacts         # Artifact store trait + file-backed impl
 │   └── aksh-conformance       # Differential tests vs upstream runner.server
@@ -615,7 +615,7 @@ or a new cloud backend later = a new crate, zero control-plane edits. BYO mode =
 
 Keep faithfulness and your added advantages **without forking semantics**:
 
-- Model the **AzDO/runner protocol as the source of truth** in `aksh-protocol`.
+- Model the **AzDO/runner protocol as the source of truth** in `aksh-gha-protocol`.
 - Layer aksh extras as **read-model projections / sidecars**, never as replacements:
   - **NDJSON agent feed** = a projection *derived from* timeline records, not a parallel
   
@@ -642,7 +642,7 @@ correctly. Make **small commits per step** with the tradeoff notes called out.
 
 Steps:
 
-1. Add `aksh-protocol::azdo` module: `ConnectionData`, `LocationServiceData`,
+1. Add `aksh-gha-protocol::azdo` module: `ConnectionData`, `LocationServiceData`,
 
    `TaskAgentSession`, `TaskAgent`, `TaskAgentMessage`, `AgentJobRequestMessage`,
 
@@ -737,7 +737,7 @@ single job.)
 
 Steps:
 
-1. Create `aksh-parser::eval` that **consumes `aksh-gha-expressions`** and produces
+1. Create `aksh-gha-parser::eval` that **consumes `aksh-gha-expressions`** and produces
 
    resolved job material:
   - interpolate `${{ }}` in `env`, `with`, `run`, `runs-on`, matrix values;
