@@ -297,9 +297,11 @@ struct InnerState {
     artifacts: BTreeMap<String, ArtifactRecord>,
     logs: BTreeMap<String, Vec<u8>>,
     timeline_events: BTreeMap<RunId, Vec<NdjsonEvent>>,
+    inflight_requests: BTreeMap<i64, (RunId, JobId)>,
     next_runner_id: i64,
     next_cache_id: i64,
     next_message_id: i64,
+    next_request_id: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -463,7 +465,7 @@ async fn submit_run(
         let mut job_fail_fast = BTreeMap::new();
         let mut ready_by_base: BTreeMap<String, u64> = BTreeMap::new();
         for job in jobs {
-            let agent_msg = aksh_gha_parser::job_builder::build_agent_job_message(
+            let mut agent_msg = aksh_gha_parser::job_builder::build_agent_job_message(
                 &job,
                 &github,
                 &job.env,
@@ -475,6 +477,15 @@ async fn submit_run(
                 &submission.vars,
             )
             .map_err(|e| ApiError::bad_request(format!("failed to build job message: {e}")))?;
+
+            // Give every dispatched job a unique requestId so PATCH
+            // /AgentRequest/:request_id can target exactly one job.
+            inner.next_request_id += 1;
+            let request_id = inner.next_request_id;
+            agent_msg.request_id = request_id;
+            inner
+                .inflight_requests
+                .insert(request_id, (run_id, job.id.clone()));
 
             let queued_job = QueuedJob {
                 run_id,
@@ -945,31 +956,34 @@ async fn complete_job_compat(
 /// The runner sends this to renew the job lock or report completion.
 async fn agent_request_patch(
     State(shared): State<Arc<SharedState>>,
-    Path((_pool_id, _request_id)): Path<(i64, i64)>,
+    Path((_pool_id, request_id)): Path<(i64, i64)>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     info!(?body, "agent_request_patch received");
-    // Check if this is a completion event
     if let Some(result) = body.get("result").and_then(|v| v.as_str()) {
-        info!(result, "job request completed");
+        let new_status = match result {
+            "succeeded" => ExecutionStatus::Success,
+            "failed" => ExecutionStatus::Failure,
+            "cancelled" => ExecutionStatus::Cancelled,
+            _ => ExecutionStatus::Success,
+        };
         let mut inner = shared.state.inner.lock().await;
-        for run in inner.runs.values_mut() {
-            for (job_id, status) in run.jobs.iter_mut() {
-                if *status == ExecutionStatus::InProgress {
-                    *status = match result {
-                        "succeeded" => ExecutionStatus::Success,
-                        "failed" => ExecutionStatus::Failure,
-                        "cancelled" => ExecutionStatus::Cancelled,
-                        _ => ExecutionStatus::Success,
-                    };
-                    info!(job_id = %job_id, result, "updated job status");
+        // Look up the (run_id, job_id) this request_id was assigned to at
+        // dispatch time. Without this mapping we'd mutate every InProgress
+        // job in every run.
+        if let Some((run_id, job_id)) = inner.inflight_requests.remove(&request_id) {
+            if let Some(run) = inner.runs.get_mut(&run_id) {
+                if let Some(status) = run.jobs.get_mut(&job_id) {
+                    *status = new_status;
+                    info!(%run_id, %job_id, result, "updated job status");
                 }
             }
+        } else {
+            info!(request_id, "no inflight job for request_id; ignoring result");
         }
     }
-    // Return a valid TaskAgentJobRequest response
     Json(json!({
-        "requestId": _request_id,
+        "requestId": request_id,
         "lockedUntil": "2099-12-31T23:59:59Z",
         "result": body.get("result"),
     }))
@@ -2352,6 +2366,75 @@ jobs:
                 .count(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn agent_request_patch_targets_only_the_request_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        // Two independent runs, both reach InProgress when their job is pulled.
+        let workflow = json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo"
+        });
+        let first = request_json(&app, Method::POST, "/api/v1/runs", workflow.clone()).await;
+        let second = request_json(&app, Method::POST, "/api/v1/runs", workflow).await;
+        let first_run: RunId = first["run_id"].as_str().unwrap().parse().unwrap();
+        let second_run: RunId = second["run_id"].as_str().unwrap().parse().unwrap();
+
+        // Pull both jobs so they are InProgress and each has a distinct request_id.
+        let first_msg = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=s1",
+            Value::Null,
+        )
+        .await;
+        let second_msg = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=s2",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(first_msg["messageType"], azdo::message_type::PIPELINE_AGENT_JOB_REQUEST);
+        assert_eq!(second_msg["messageType"], azdo::message_type::PIPELINE_AGENT_JOB_REQUEST);
+
+        // The mapping should have two entries — one per request_id.
+        let (first_req_id, _) = state
+            .inner
+            .lock()
+            .await
+            .inflight_requests
+            .iter()
+            .find(|(_, (rid, _))| *rid == first_run)
+            .map(|(k, v)| (*k, v.clone()))
+            .unwrap();
+
+        // PATCH only the first run's request_id.
+        request_json(
+            &app,
+            Method::PATCH,
+            &format!("/runner/server/_apis/v1/AgentRequest/1/{first_req_id}"),
+            json!({"result": "succeeded"}),
+        )
+        .await;
+
+        let inner = state.inner.lock().await;
+        let first = inner.runs.get(&first_run).unwrap();
+        let second = inner.runs.get(&second_run).unwrap();
+        assert!(first
+            .jobs
+            .values()
+            .all(|status| *status == ExecutionStatus::Success));
+        assert!(second
+            .jobs
+            .values()
+            .all(|status| *status == ExecutionStatus::InProgress));
+        assert!(!inner.inflight_requests.contains_key(&first_req_id));
     }
 
     #[tokio::test]
