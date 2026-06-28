@@ -9,7 +9,7 @@
 //! - `runner.server` (C# server side): `src/Runner.Server/Controllers/MessageController.cs`
 //! - `GitHub.DistributedTask.WebApi` NuGet package (shared DTOs)
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 
 // ─── Runner lifecycle DTOs ────────────────────────────────────────────────
@@ -25,7 +25,10 @@ use std::collections::BTreeMap;
 pub struct ConnectionData {
     #[serde(rename = "instanceId", skip_serializing_if = "Option::is_none")]
     pub instance_id: Option<String>,
-    #[serde(rename = "locationServiceData", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "locationServiceData",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub location_service_data: Option<LocationServiceData>,
 }
 
@@ -43,18 +46,32 @@ pub struct AccessMapping {
 /// Location service data — maps service GUIDs to URL locations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocationServiceData {
-    #[serde(rename = "serviceDefinitions", default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        rename = "serviceDefinitions",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub service_definitions: Vec<ServiceDefinition>,
-    #[serde(rename = "accessMappings", default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        rename = "accessMappings",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub access_mappings: Vec<AccessMapping>,
-    #[serde(rename = "defaultAccessMappingMoniker", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "defaultAccessMappingMoniker",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub default_access_mapping_moniker: Option<String>,
 }
 
 /// A location mapping for a service definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocationMapping {
-    #[serde(rename = "accessMappingMoniker", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "accessMappingMoniker",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub access_mapping_moniker: Option<String>,
     #[serde(rename = "location", skip_serializing_if = "Option::is_none")]
     pub location: Option<String>,
@@ -91,10 +108,7 @@ pub struct TaskAgent {
     pub name: Option<String>,
     #[serde(rename = "version", skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    #[serde(
-        rename = "osDescription",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "osDescription", skip_serializing_if = "Option::is_none")]
     pub os_description: Option<String>,
 }
 
@@ -268,7 +282,7 @@ pub struct PlanReference {
 }
 
 /// Task step — a single unit of work within a job.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TaskStep {
     #[serde(rename = "id")]
     pub id: uuid::Uuid,
@@ -300,6 +314,117 @@ pub struct TaskStep {
     /// Timeout in minutes.
     #[serde(rename = "timeoutInMinutes", skip_serializing_if = "Option::is_none")]
     pub timeout_in_minutes: Option<u32>,
+}
+
+impl Serialize for TaskStep {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let mut inputs = self.inputs.clone();
+        if let Some(script) = &self.script {
+            inputs.insert("script".to_owned(), script.clone());
+        }
+
+        let field_count = 5
+            + usize::from(self.name.is_some())
+            + usize::from(self.display_name.is_some())
+            + usize::from(self.condition.is_some())
+            + usize::from(self.continue_on_error.is_some())
+            + usize::from(self.timeout_in_minutes.is_some());
+        let mut map = serializer.serialize_map(Some(field_count))?;
+        map.serialize_entry("type", "action")?;
+        map.serialize_entry("reference", &SerializedActionReference { step: self })?;
+        map.serialize_entry("environment", &TemplateStringMap(&self.env))?;
+        map.serialize_entry("inputs", &TemplateStringMap(&inputs))?;
+        map.serialize_entry("id", &self.id)?;
+        if let Some(name) = &self.name {
+            map.serialize_entry("name", name)?;
+        }
+        if let Some(display_name) = &self.display_name {
+            map.serialize_entry("displayName", display_name)?;
+        }
+        if let Some(condition) = &self.condition {
+            map.serialize_entry("condition", condition)?;
+        }
+        if let Some(continue_on_error) = self.continue_on_error {
+            map.serialize_entry("continueOnError", &continue_on_error)?;
+        }
+        if let Some(timeout_in_minutes) = self.timeout_in_minutes {
+            map.serialize_entry("timeoutInMinutes", &timeout_in_minutes)?;
+        }
+        map.end()
+    }
+}
+
+struct SerializedActionReference<'a> {
+    step: &'a TaskStep,
+}
+
+impl Serialize for SerializedActionReference<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let Some(reference) = &self.step.reference else {
+            let mut map = serializer.serialize_map(Some(1))?;
+            map.serialize_entry("type", "script")?;
+            return map.end();
+        };
+
+        let field_count = 1
+            + usize::from(reference.name.is_some())
+            + usize::from(reference.version.is_some())
+            + usize::from(reference.reference_type.is_some());
+        let mut map = serializer.serialize_map(Some(field_count))?;
+        map.serialize_entry(
+            "type",
+            reference.reference_type.as_deref().unwrap_or("repository"),
+        )?;
+        if let Some(name) = &reference.name {
+            map.serialize_entry("name", name)?;
+        }
+        if let Some(version) = &reference.version {
+            map.serialize_entry("ref", version)?;
+        }
+        if reference.reference_type.is_none() {
+            map.serialize_entry("repositoryType", "GitHub")?;
+        }
+        map.end()
+    }
+}
+
+struct TemplateStringMap<'a>(&'a BTreeMap<String, String>);
+
+impl Serialize for TemplateStringMap<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let mut map = serializer.serialize_map(Some(if self.0.is_empty() { 1 } else { 2 }))?;
+        map.serialize_entry("type", &2)?;
+        if !self.0.is_empty() {
+            let pairs: Vec<TemplateStringMapPair<'_>> = self
+                .0
+                .iter()
+                .map(|(key, value)| TemplateStringMapPair { key, value })
+                .collect();
+            map.serialize_entry("map", &pairs)?;
+        }
+        map.end()
+    }
+}
+
+#[derive(Serialize)]
+struct TemplateStringMapPair<'a> {
+    key: &'a str,
+    value: &'a str,
 }
 
 /// Reference to an action or task.
@@ -479,7 +604,10 @@ pub struct Issue {
     pub message: Option<String>,
     #[serde(rename = "data", default)]
     pub data: BTreeMap<String, String>,
-    #[serde(rename = "isInfrastructureIssue", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "isInfrastructureIssue",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub is_infrastructure_issue: Option<bool>,
 }
 
@@ -565,14 +693,148 @@ pub struct RepositoryConnector {
 /// `ContextDictionary`. We model it as a tagged enum.
 ///
 /// Upstream source: `Pipelines.ContextData.PipelineContextData.cs`
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone)]
 pub enum PipelineContextData {
     String(String),
     Bool(bool),
     Number(f64),
     Array(Vec<PipelineContextData>),
     Dict(BTreeMap<String, PipelineContextData>),
+}
+
+impl Serialize for PipelineContextData {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::{SerializeMap, SerializeSeq};
+
+        match self {
+            PipelineContextData::String(value) => serializer.serialize_str(value),
+            PipelineContextData::Bool(value) => serializer.serialize_bool(*value),
+            PipelineContextData::Number(value) => serializer.serialize_f64(*value),
+            PipelineContextData::Array(values) => {
+                let mut map =
+                    serializer.serialize_map(Some(if values.is_empty() { 1 } else { 2 }))?;
+                map.serialize_entry("t", &1)?;
+                if !values.is_empty() {
+                    struct ArrayValues<'a>(&'a [PipelineContextData]);
+
+                    impl Serialize for ArrayValues<'_> {
+                        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+                        where
+                            S: Serializer,
+                        {
+                            let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+                            for value in self.0 {
+                                seq.serialize_element(value)?;
+                            }
+                            seq.end()
+                        }
+                    }
+
+                    map.serialize_entry("a", &ArrayValues(values))?;
+                }
+                map.end()
+            }
+            PipelineContextData::Dict(values) => {
+                let mut map =
+                    serializer.serialize_map(Some(if values.is_empty() { 1 } else { 2 }))?;
+                map.serialize_entry("t", &2)?;
+                if !values.is_empty() {
+                    let pairs: Vec<PipelineContextDataPair<'_>> = values
+                        .iter()
+                        .map(|(key, value)| PipelineContextDataPair { key, value })
+                        .collect();
+                    map.serialize_entry("d", &pairs)?;
+                }
+                map.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PipelineContextData {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        pipeline_context_from_json(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Serialize)]
+struct PipelineContextDataPair<'a> {
+    #[serde(rename = "k")]
+    key: &'a str,
+    #[serde(rename = "v")]
+    value: &'a PipelineContextData,
+}
+
+fn pipeline_context_from_json(value: serde_json::Value) -> Result<PipelineContextData, String> {
+    match value {
+        serde_json::Value::String(value) => Ok(PipelineContextData::String(value)),
+        serde_json::Value::Bool(value) => Ok(PipelineContextData::Bool(value)),
+        serde_json::Value::Number(value) => Ok(PipelineContextData::Number(
+            value.as_f64().unwrap_or_default(),
+        )),
+        serde_json::Value::Array(values) => values
+            .into_iter()
+            .map(pipeline_context_from_json)
+            .collect::<Result<Vec<_>, _>>()
+            .map(PipelineContextData::Array),
+        serde_json::Value::Object(mut object) => {
+            match object.remove("t").and_then(|value| value.as_i64()) {
+                None | Some(0) => Ok(PipelineContextData::String(
+                    object
+                        .remove("s")
+                        .and_then(|value| value.as_str().map(str::to_owned))
+                        .unwrap_or_default(),
+                )),
+                Some(1) => object
+                    .remove("a")
+                    .and_then(|value| value.as_array().cloned())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(pipeline_context_from_json)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(PipelineContextData::Array),
+                Some(2) | Some(5) => {
+                    let mut values = BTreeMap::new();
+                    let pairs = object
+                        .remove("d")
+                        .and_then(|value| value.as_array().cloned())
+                        .unwrap_or_default();
+                    for pair in pairs {
+                        let Some(pair) = pair.as_object() else {
+                            continue;
+                        };
+                        let Some(key) = pair.get("k").and_then(|value| value.as_str()) else {
+                            continue;
+                        };
+                        let value = pair.get("v").cloned().unwrap_or(serde_json::Value::Null);
+                        values.insert(key.to_owned(), pipeline_context_from_json(value)?);
+                    }
+                    Ok(PipelineContextData::Dict(values))
+                }
+                Some(3) => Ok(PipelineContextData::Bool(
+                    object
+                        .remove("b")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or_default(),
+                )),
+                Some(4) => Ok(PipelineContextData::Number(
+                    object
+                        .remove("n")
+                        .and_then(|value| value.as_f64())
+                        .unwrap_or_default(),
+                )),
+                Some(other) => Err(format!("unsupported PipelineContextData type {other}")),
+            }
+        }
+        serde_json::Value::Null => Ok(PipelineContextData::String(String::new())),
+    }
 }
 
 // ─── Job completion DTOs ──────────────────────────────────────────────────
@@ -698,6 +960,32 @@ mod tests {
     }
 
     #[test]
+    fn task_step_serializes_as_runner_action_step() {
+        let step = TaskStep {
+            id: uuid::Uuid::nil(),
+            name: None,
+            display_name: None,
+            condition: None,
+            script: Some("echo hi".to_owned()),
+            reference: None,
+            inputs: BTreeMap::new(),
+            env: BTreeMap::new(),
+            continue_on_error: None,
+            working_directory: None,
+            timeout_in_minutes: None,
+        };
+
+        let json = serde_json::to_value(&step).unwrap();
+
+        assert_eq!(json["type"], "action");
+        assert_eq!(json["reference"]["type"], "script");
+        assert_eq!(json["environment"]["type"], 2);
+        assert_eq!(json["inputs"]["type"], 2);
+        assert_eq!(json["inputs"]["map"][0]["key"], "script");
+        assert_eq!(json["inputs"]["map"][0]["value"], "echo hi");
+    }
+
+    #[test]
     fn pipeline_context_data_variants() {
         let json = r#""hello""#;
         let data: PipelineContextData = serde_json::from_str(json).unwrap();
@@ -714,6 +1002,33 @@ mod tests {
         let json = r#"["a","b"]"#;
         let data: PipelineContextData = serde_json::from_str(json).unwrap();
         assert!(matches!(data, PipelineContextData::Array(_)));
+    }
+
+    #[test]
+    fn pipeline_context_data_uses_runner_wire_shape_for_collections() {
+        let mut github = BTreeMap::new();
+        github.insert(
+            "event_name".to_owned(),
+            PipelineContextData::String("push".to_owned()),
+        );
+        github.insert("run_id".to_owned(), PipelineContextData::Number(42.0));
+
+        let json = serde_json::to_value(PipelineContextData::Dict(github)).unwrap();
+
+        assert_eq!(json["t"], 2);
+        assert_eq!(json["d"][0]["k"], "event_name");
+        assert_eq!(json["d"][0]["v"], "push");
+        assert_eq!(json["d"][1]["k"], "run_id");
+        assert_eq!(json["d"][1]["v"], 42.0);
+
+        let roundtrip: PipelineContextData = serde_json::from_value(json).unwrap();
+        let PipelineContextData::Dict(roundtrip) = roundtrip else {
+            panic!("expected dictionary context");
+        };
+        assert!(matches!(
+            roundtrip.get("event_name"),
+            Some(PipelineContextData::String(value)) if value == "push"
+        ));
     }
 
     #[test]
