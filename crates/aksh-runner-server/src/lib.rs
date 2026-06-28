@@ -176,37 +176,115 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         .route("/:org/_apis/connectionData", get(connection_data))
         .route("/:org/_apis/v1/oauth2/token", post(oauth2_token))
         .route("/:org/_apis/v1/AgentPools", get(runner_pools))
-        .route("/:org/_apis/v1/Agent/:pool_id/:agent_id", get(agent_lookup_by_id_org).post(register_runner_compat_org_2))
-        .route("/:org/_apis/v1/Agent/:pool_id", get(agent_lookup_org).post(register_runner_compat_org))
-        .route("/:org/_apis/v1/AgentSession/:pool_id/:session_id", post(create_session_compat_org))
-        .route("/:org/_apis/v1/AgentSession/:pool_id", post(create_session_compat_org_pool_only))
-        .route("/:org/_apis/v1/AgentSession/:pool_id/:session_id", delete(delete_session_org))
-        .route("/:org/_apis/v1/Message/:pool_id", get(next_message_compat_org))
-        .route("/:org/_apis/v1/Message/:pool_id/:message_id", delete(delete_pool_message_org))
-        .route("/:org/_apis/v1/AgentRequest/:pool_id/:request_id", patch(agent_request_patch_org))
-        .route("/:org/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id", patch(patch_timeline_records_org))
-        .route("/:org/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id", post(create_log_org))
-        .route("/:org/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id/:log_id2", post(append_log_org))
-        .route("/:org/_apis/v1/TimeLineWebConsoleLog/:scope/:hub/:plan_id/:timeline_id/:record_id", post(console_log_org))
-        .route("/:org/_apis/v1/FinishJob/:scope/:hub/:plan_id", post(finish_job_org))
-        .route("/:org/_apis/v1/ActionDownloadInfo/:scope/:hub/:plan_id", post(action_download_info_org))
+        .route(
+            "/:org/_apis/v1/Agent/:pool_id/:agent_id",
+            get(agent_lookup_by_id_org).post(register_runner_compat_org_2),
+        )
+        .route(
+            "/:org/_apis/v1/Agent/:pool_id",
+            get(agent_lookup_org).post(register_runner_compat_org),
+        )
+        .route(
+            "/:org/_apis/v1/AgentSession/:pool_id/:session_id",
+            post(create_session_compat_org),
+        )
+        .route(
+            "/:org/_apis/v1/AgentSession/:pool_id",
+            post(create_session_compat_org_pool_only),
+        )
+        .route(
+            "/:org/_apis/v1/AgentSession/:pool_id/:session_id",
+            delete(delete_session_org),
+        )
+        .route(
+            "/:org/_apis/v1/Message/:pool_id",
+            get(next_message_compat_org),
+        )
+        .route(
+            "/:org/_apis/v1/Message/:pool_id/:message_id",
+            delete(delete_pool_message_org),
+        )
+        .route(
+            "/:org/_apis/v1/AgentRequest/:pool_id/:request_id",
+            patch(agent_request_patch_org),
+        )
+        .route(
+            "/:org/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id",
+            patch(patch_timeline_records_org),
+        )
+        .route(
+            "/:org/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id",
+            post(create_log_org),
+        )
+        .route(
+            "/:org/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id/:log_id2",
+            post(append_log_org),
+        )
+        .route(
+            "/:org/_apis/v1/TimeLineWebConsoleLog/:scope/:hub/:plan_id/:timeline_id/:record_id",
+            post(console_log_org),
+        )
+        .route(
+            "/:org/_apis/v1/FinishJob/:scope/:hub/:plan_id",
+            post(finish_job_org),
+        )
+        .route(
+            "/:org/_apis/v1/ActionDownloadInfo/:scope/:hub/:plan_id",
+            post(action_download_info_org),
+        )
         .route("/_apis/v1/oauth2/token", post(oauth2_token))
-        .route("/api/v3/actions/runner-registration", post(github_registration_token))
-        .route("/api/v3/orgs/:org/actions/runners/registration-token", post(github_registration_token))
-        .route("/api/v3/repos/:owner/:repo/actions/runners/registration-token", post(github_registration_token))
+        .route(
+            "/api/v3/actions/runner-registration",
+            post(github_registration_token),
+        )
+        .route(
+            "/api/v3/orgs/:org/actions/runners/registration-token",
+            post(github_registration_token),
+        )
+        .route(
+            "/api/v3/repos/:owner/:repo/actions/runners/registration-token",
+            post(github_registration_token),
+        )
         .route("/runner/server/_apis/connectionData", get(connection_data))
         .route("/runner/server/_apis/v1/oauth2/token", post(oauth2_token))
         .route("/runner/server/_apis/v1/AgentPools", get(runner_pools))
-        .route("/runner/server/_apis/v1/Agent/:pool_id/:agent_id", get(agent_lookup_by_id).post(register_runner_compat))
-        .route("/runner/server/_apis/v1/Agent/:pool_id", get(agent_lookup).post(register_runner_compat_pool_only))
-        .route("/runner/server/_apis/v1/AgentSession/:pool_id/:session_id", post(create_session_compat))
-        .route("/runner/server/_apis/v1/AgentSession/:pool_id", post(create_session_compat_pool_only))
-        .route("/runner/server/_apis/v1/AgentSession/:pool_id/:session_id", delete(delete_session))
-        .route("/runner/server/_apis/v1/Message/:pool_id", get(next_message_compat))
-        .route("/runner/server/_apis/v1/Message/:pool_id/:message_id", delete(delete_pool_message))
-        .route("/runner/server/_apis/v1/AgentRequest/:pool_id/:request_id", patch(agent_request_patch))
+        .route(
+            "/runner/server/_apis/v1/Agent/:pool_id/:agent_id",
+            get(agent_lookup_by_id).post(register_runner_compat),
+        )
+        .route(
+            "/runner/server/_apis/v1/Agent/:pool_id",
+            get(agent_lookup).post(register_runner_compat_pool_only),
+        )
+        .route(
+            "/runner/server/_apis/v1/AgentSession/:pool_id/:session_id",
+            post(create_session_compat),
+        )
+        .route(
+            "/runner/server/_apis/v1/AgentSession/:pool_id",
+            post(create_session_compat_pool_only),
+        )
+        .route(
+            "/runner/server/_apis/v1/AgentSession/:pool_id/:session_id",
+            delete(delete_session),
+        )
+        .route(
+            "/runner/server/_apis/v1/Message/:pool_id",
+            get(next_message_compat),
+        )
+        .route(
+            "/runner/server/_apis/v1/Message/:pool_id/:message_id",
+            delete(delete_pool_message),
+        )
+        .route(
+            "/runner/server/_apis/v1/AgentRequest/:pool_id/:request_id",
+            patch(agent_request_patch),
+        )
         .route("/_apis/connectionData", get(connection_data))
-        .route("/_apis/", axum::routing::options(|| async { StatusCode::OK }))
+        .route(
+            "/_apis/",
+            axum::routing::options(|| async { StatusCode::OK }),
+        )
         .route("/api/v1/runs", post(submit_run))
         .route("/api/v1/runs/:run_id", get(get_run))
         .route("/api/v1/runs/:run_id/cancel", post(cancel_run))
@@ -229,13 +307,31 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         .route("/api/v1/artifacts/:artifact_id", get(artifact_get))
         // Runner lifecycle endpoints — public (runner may not have auth token yet)
         .route("/_apis/v1/AgentPools", get(runner_pools))
-        .route("/_apis/v1/Agent/:pool_id/:agent_id", get(agent_lookup_by_id).post(register_runner_compat))
-        .route("/_apis/v1/AgentSession/:pool_id/:session_id", post(create_session_compat))
-        .route("/_apis/v1/AgentSession/:pool_id", post(create_session_compat_pool_only))
-        .route("/_apis/v1/AgentSession/:pool_id/:session_id", delete(delete_session))
+        .route(
+            "/_apis/v1/Agent/:pool_id/:agent_id",
+            get(agent_lookup_by_id).post(register_runner_compat),
+        )
+        .route(
+            "/_apis/v1/AgentSession/:pool_id/:session_id",
+            post(create_session_compat),
+        )
+        .route(
+            "/_apis/v1/AgentSession/:pool_id",
+            post(create_session_compat_pool_only),
+        )
+        .route(
+            "/_apis/v1/AgentSession/:pool_id/:session_id",
+            delete(delete_session),
+        )
         .route("/_apis/v1/Message/:pool_id", get(next_message_compat))
-        .route("/_apis/v1/Message/:pool_id/:message_id", delete(delete_pool_message))
-        .route("/_apis/v1/AgentRequest/:pool_id/:request_id", patch(agent_request_patch))
+        .route(
+            "/_apis/v1/Message/:pool_id/:message_id",
+            delete(delete_pool_message),
+        )
+        .route(
+            "/_apis/v1/AgentRequest/:pool_id/:request_id",
+            patch(agent_request_patch),
+        )
         .merge(protected_apis)
         .layer(TraceLayer::new_for_http())
         .with_state(Arc::new(SharedState { state, shutdown }))
@@ -997,7 +1093,10 @@ async fn agent_request_patch(
                 }
             }
         } else {
-            info!(request_id, "no inflight job for request_id; ignoring result");
+            info!(
+                request_id,
+                "no inflight job for request_id; ignoring result"
+            );
         }
     }
     Json(json!({
@@ -1119,11 +1218,7 @@ fn under_max_parallel(inner: &InnerState, job: &QueuedJob) -> bool {
     active_in_queue + active_running < max_parallel
 }
 
-fn apply_matrix_fail_fast(
-    inner: &mut InnerState,
-    run_id: RunId,
-    failed_job: &JobId,
-) -> usize {
+fn apply_matrix_fail_fast(inner: &mut InnerState, run_id: RunId, failed_job: &JobId) -> usize {
     let Some(run) = inner.runs.get_mut(&run_id) else {
         return 0;
     };
@@ -2418,8 +2513,14 @@ jobs:
             Value::Null,
         )
         .await;
-        assert_eq!(first_msg["messageType"], azdo::message_type::PIPELINE_AGENT_JOB_REQUEST);
-        assert_eq!(second_msg["messageType"], azdo::message_type::PIPELINE_AGENT_JOB_REQUEST);
+        assert_eq!(
+            first_msg["messageType"],
+            azdo::message_type::PIPELINE_AGENT_JOB_REQUEST
+        );
+        assert_eq!(
+            second_msg["messageType"],
+            azdo::message_type::PIPELINE_AGENT_JOB_REQUEST
+        );
 
         // The mapping should have two entries — one per request_id.
         let (first_req_id, _) = state
@@ -2493,7 +2594,10 @@ jobs:
             Value::Null,
         )
         .await;
-        assert_eq!(first["messageType"], azdo::message_type::PIPELINE_AGENT_JOB_REQUEST);
+        assert_eq!(
+            first["messageType"],
+            azdo::message_type::PIPELINE_AGENT_JOB_REQUEST
+        );
         let second = request_json(
             &app,
             Method::GET,
@@ -2501,7 +2605,10 @@ jobs:
             Value::Null,
         )
         .await;
-        assert_eq!(second["messageType"], azdo::message_type::PIPELINE_AGENT_JOB_REQUEST);
+        assert_eq!(
+            second["messageType"],
+            azdo::message_type::PIPELINE_AGENT_JOB_REQUEST
+        );
 
         let failing_job = {
             let inner = state.inner.lock().await;
@@ -2859,9 +2966,15 @@ jobs:
             (Method::PATCH, "/runner/server/_apis/v1/Timeline/s/h/p/t"),
             (Method::POST, "/runner/server/_apis/v1/Logfiles/s/h/p/l"),
             (Method::POST, "/runner/server/_apis/v1/Logfiles/s/h/p/l/l2"),
-            (Method::POST, "/runner/server/_apis/v1/TimeLineWebConsoleLog/s/h/p/t/r"),
+            (
+                Method::POST,
+                "/runner/server/_apis/v1/TimeLineWebConsoleLog/s/h/p/t/r",
+            ),
             (Method::POST, "/runner/server/_apis/v1/FinishJob/s/h/p"),
-            (Method::POST, "/runner/server/_apis/v1/ActionDownloadInfo/s/h/p"),
+            (
+                Method::POST,
+                "/runner/server/_apis/v1/ActionDownloadInfo/s/h/p",
+            ),
         ];
         for (method, uri) in cases {
             let response = app
@@ -2960,7 +3073,9 @@ jobs:
             .oneshot(
                 Request::builder()
                     .method(Method::DELETE)
-                    .uri("/runner/server/_apis/distributedtask/pools/1/messages/1?sessionId=default")
+                    .uri(
+                        "/runner/server/_apis/distributedtask/pools/1/messages/1?sessionId=default",
+                    )
                     .header(header::AUTHORIZATION, "Bearer aksh-system-token")
                     .body(Body::empty())
                     .unwrap(),
