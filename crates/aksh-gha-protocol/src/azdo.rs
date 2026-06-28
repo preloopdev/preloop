@@ -282,37 +282,18 @@ pub struct PlanReference {
 }
 
 /// Task step — a single unit of work within a job.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct TaskStep {
-    #[serde(rename = "id")]
     pub id: uuid::Uuid,
-    #[serde(rename = "name", skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    #[serde(rename = "displayName", skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
-    /// The `if` condition expression. Runner evaluates this.
-    #[serde(rename = "condition", skip_serializing_if = "Option::is_none")]
     pub condition: Option<String>,
-    /// Shell script body for `run:` steps.
-    #[serde(rename = "script", skip_serializing_if = "Option::is_none")]
     pub script: Option<String>,
-    /// Action reference for `uses:` steps.
-    #[serde(rename = "reference", skip_serializing_if = "Option::is_none")]
     pub reference: Option<TaskReference>,
-    /// Step inputs (the `with:` block).
-    #[serde(rename = "inputs", default)]
     pub inputs: BTreeMap<String, String>,
-    /// Step environment variables.
-    #[serde(rename = "env", default)]
     pub env: BTreeMap<String, String>,
-    /// Whether this step should continue on error.
-    #[serde(rename = "continueOnError", skip_serializing_if = "Option::is_none")]
     pub continue_on_error: Option<bool>,
-    /// Working directory override.
-    #[serde(rename = "workingDirectory", skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<String>,
-    /// Timeout in minutes.
-    #[serde(rename = "timeoutInMinutes", skip_serializing_if = "Option::is_none")]
     pub timeout_in_minutes: Option<u32>,
 }
 
@@ -358,6 +339,94 @@ impl Serialize for TaskStep {
         map.end()
     }
 }
+
+impl<'de> Deserialize<'de> for TaskStep {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let obj = value
+            .as_object()
+            .ok_or_else(|| serde::de::Error::custom("expected object"))?;
+
+        let env = extract_template_map(obj.get("env")).unwrap_or_default();
+        let inputs = extract_template_map(obj.get("inputs")).unwrap_or_default();
+
+        // In the new serialization format, `script` lives inside the `inputs`
+        // TemplateToken map instead of as a top-level field.
+        let script = obj
+            .get("script")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .or_else(|| inputs.get("script").cloned());
+
+        Ok(TaskStep {
+            id: obj
+                .get("id")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_else(uuid::Uuid::nil),
+            name: obj.get("name").and_then(|v| v.as_str()).map(str::to_owned),
+            display_name: obj
+                .get("displayName")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned),
+            condition: obj
+                .get("condition")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned),
+            script,
+            reference: obj
+                .get("reference")
+                .and_then(|v| serde_json::from_value(v.clone()).ok()),
+            env,
+            inputs,
+            continue_on_error: obj.get("continueOnError").and_then(|v| v.as_bool()),
+            working_directory: obj
+                .get("workingDirectory")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned),
+            timeout_in_minutes: obj
+                .get("timeoutInMinutes")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32),
+        })
+    }
+}
+
+/// Extract a BTreeMap<String, String> from either a plain JSON object or a
+/// TemplateToken map of shape `{"type": 2, "map": [{"key": "k", "value": "v"}]}`.
+fn extract_template_map(value: Option<&serde_json::Value>) -> Option<BTreeMap<String, String>> {
+    let value = value?;
+    if value.as_object()?.is_empty() {
+        return Some(BTreeMap::new());
+    }
+    // TemplateToken map: {"type": 2, "map": [{"key": ..., "value": ...}]}
+    if let Some(pairs) = value.get("map").and_then(|v| v.as_array()) {
+        let mut map = BTreeMap::new();
+        for pair in pairs {
+            let key = pair.get("key").and_then(|v| v.as_str())?;
+            let val = pair.get("value").and_then(|v| v.as_str()).unwrap_or("");
+            map.insert(key.to_owned(), val.to_owned());
+        }
+        return Some(map);
+    }
+    // Plain map: {"KEY": "VALUE", ...}
+    if let Some(obj) = value.as_object() {
+        let mut map = BTreeMap::new();
+        for (k, v) in obj {
+            let val = v
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| v.to_string());
+            map.insert(k.clone(), val);
+        }
+        return Some(map);
+    }
+    None
+}
+
+/// Serializes environment/inputs as TemplateToken maps.
 
 struct SerializedActionReference<'a> {
     step: &'a TaskStep,

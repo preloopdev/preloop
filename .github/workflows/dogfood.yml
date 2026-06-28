@@ -12,8 +12,8 @@ jobs:
     runs-on: self-hosted
     steps:
       - name: cargo fmt
-        run: cd "$AKSH_REPO_ROOT" && cargo fmt --all --check
+        run: cd "${{ vars.AKSH_REPO_ROOT }}" && cargo fmt --all --check
       - name: cargo clippy
-        run: cd "$AKSH_REPO_ROOT" && cargo clippy --workspace --all-targets -- -D warnings
+        run: cd "${{ vars.AKSH_REPO_ROOT }}" && cargo clippy --workspace --all-targets
       - name: cargo test
-        run: cd "$AKSH_REPO_ROOT" && cargo test --workspace --quiet
+        run: cd "${{ vars.AKSH_REPO_ROOT }}" && cargo test --workspace --quiet

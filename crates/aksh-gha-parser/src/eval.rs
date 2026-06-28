@@ -10,8 +10,8 @@
 
 use std::collections::BTreeMap;
 
-use indexmap::IndexMap;
 use aksh_gha_expressions::{eval_expression, Context};
+use indexmap::IndexMap;
 use serde_json::{Map, Value};
 
 /// Resolve all `${{ }}` expressions in a string using the given context.
@@ -148,10 +148,8 @@ pub fn build_context(
         .collect();
     ctx.insert("vars", Value::Object(vars_value));
 
-    let matrix_value: Map<String, Value> = matrix
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+    let matrix_value: Map<String, Value> =
+        matrix.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     ctx.insert("matrix", Value::Object(matrix_value));
 
     ctx.insert("strategy", strategy.clone());
@@ -184,10 +182,7 @@ mod tests {
         let mut env = Map::new();
         env.insert("MY_VAR".to_owned(), Value::String("hello".to_owned()));
         ctx.insert("env", Value::Object(env));
-        ctx.insert(
-            "matrix",
-            json!({"os": "ubuntu-latest", "node": "18"}),
-        );
+        ctx.insert("matrix", json!({"os": "ubuntu-latest", "node": "18"}));
         ctx
     }
 
@@ -236,10 +231,7 @@ mod tests {
     #[test]
     fn resolve_env_value() {
         let ctx = make_context();
-        assert_eq!(
-            resolve_string("${{ env.MY_VAR }}", &ctx).unwrap(),
-            "hello"
-        );
+        assert_eq!(resolve_string("${{ env.MY_VAR }}", &ctx).unwrap(), "hello");
     }
 
     #[test]
