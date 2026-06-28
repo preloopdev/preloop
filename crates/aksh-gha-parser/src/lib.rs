@@ -140,7 +140,9 @@ impl Trigger {
                         }
                         // paths filter
                         if let Some(path_filters) = obj.get("paths") {
-                            if !paths.is_empty() && !paths.iter().any(|p| matches_filter(path_filters, p)) {
+                            if !paths.is_empty()
+                                && !paths.iter().any(|p| matches_filter(path_filters, p))
+                            {
                                 return false;
                             }
                         }
@@ -742,10 +744,7 @@ fn object_entry_indexed(
             field,
         });
     };
-    Ok(map
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect())
+    Ok(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
 }
 
 fn can_merge_include_indexed(
