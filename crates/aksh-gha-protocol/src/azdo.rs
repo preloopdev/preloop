@@ -23,13 +23,18 @@ use std::collections::BTreeMap;
 /// Upstream source: `ConnectionDataController.cs`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionData {
-    #[serde(rename = "locationServiceData", skip_serializing_if = "Option::is_none")]
+    /// Maps service GUIDs to their base URLs.
+    #[serde(
+        rename = "locationServiceData",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub location_service_data: Option<LocationServiceData>,
 }
 
 /// Location service data — maps service GUIDs to URL locations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocationServiceData {
+    /// Service definitions mapping GUIDs to URL locations.
     #[serde(
         rename = "serviceDefinitions",
         default,
@@ -41,30 +46,33 @@ pub struct LocationServiceData {
 /// A single service definition mapping a GUID to a URL location.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceDefinition {
+    /// Service GUID identifier.
     #[serde(rename = "identifier", skip_serializing_if = "Option::is_none")]
     pub identifier: Option<String>,
+    /// Maps location types to URL paths.
     #[serde(rename = "locationMapping", skip_serializing_if = "Option::is_none")]
     pub location_mapping: Option<BTreeMap<String, String>>,
+    /// Human-readable service name.
     #[serde(rename = "displayName", skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
 }
-
 /// Runner agent registration request.
 ///
 /// The runner sends its RSA public key during registration.
 /// Upstream source: `AgentController.cs`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskAgent {
+    /// Server-assigned runner agent ID.
     #[serde(rename = "id", skip_serializing_if = "Option::is_none")]
     pub id: Option<i64>,
+    /// Runner agent name (configured during `config.sh`).
     #[serde(rename = "name", skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Runner version string.
     #[serde(rename = "version", skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    #[serde(
-        rename = "osDescription",
-        skip_serializing_if = "Option::is_none"
-    )]
+    /// OS description (e.g. `Linux 5.15.0; Ubuntu 22.04`).
+    #[serde(rename = "osDescription", skip_serializing_if = "Option::is_none")]
     pub os_description: Option<String>,
 }
 
@@ -93,8 +101,10 @@ pub struct EncryptionKey {
 /// Upstream source: `AgentSessionController.cs`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskAgentSession {
+    /// Server-assigned session identifier.
     #[serde(rename = "sessionId")]
     pub session_id: uuid::Uuid,
+    /// AES encryption key (possibly RSA-wrapped) for message decryption.
     #[serde(rename = "encryptionKey")]
     pub encryption_key: EncryptionKey,
 }
@@ -102,8 +112,10 @@ pub struct TaskAgentSession {
 /// Runner session creation request body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateSessionRequest {
+    /// The runner agent metadata.
     #[serde(rename = "agent")]
     pub agent: TaskAgent,
+    /// Session display name.
     #[serde(rename = "sessionName", skip_serializing_if = "Option::is_none")]
     pub session_name: Option<String>,
 }
@@ -121,8 +133,10 @@ pub struct CreateSessionRequest {
 /// `MessageListener.cs` (runner)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskAgentMessage {
+    /// Server-assigned message ID (used for ack/long-poll).
     #[serde(rename = "messageId")]
     pub message_id: i64,
+    /// Message type (e.g. `PipelineAgentJobRequest`, `CancelJob`).
     #[serde(rename = "messageType")]
     pub message_type: String,
     /// Base64-encoded body. Encrypted if the session uses encryption.
@@ -223,10 +237,13 @@ pub struct AgentJobRequestMessage {
 /// Task step — a single unit of work within a job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskStep {
+    /// Step identifier.
     #[serde(rename = "id")]
     pub id: uuid::Uuid,
+    /// Step name (the `id:` field in YAML).
     #[serde(rename = "name", skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Human-readable display name.
     #[serde(rename = "displayName", skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     /// The `if` condition expression. Runner evaluates this.
@@ -258,23 +275,29 @@ pub struct TaskStep {
 /// Reference to an action or task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskReference {
+    /// Action/task GUID.
     #[serde(rename = "id", skip_serializing_if = "Option::is_none")]
     pub id: Option<uuid::Uuid>,
+    /// Action/task name (e.g. `actions/checkout`).
     #[serde(rename = "name", skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Pinned version string.
     #[serde(rename = "version", skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// Reference type (e.g. `git`, `registry`).
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub reference_type: Option<String>,
 }
-
 /// How to download an action's source.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionsDownloadInfo {
+    /// Download type (e.g. `actions`, `repository`).
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub download_type: Option<String>,
+    /// Download URL.
     #[serde(rename = "url", skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// Authentication token for the download.
     #[serde(rename = "auth", skip_serializing_if = "Option::is_none")]
     pub auth: Option<String>,
 }
@@ -285,17 +308,18 @@ pub struct ActionsDownloadInfo {
 ///
 /// Variables are sent to the runner as `VariableValue` objects.
 /// The runner uses `isSecret` to decide whether to mask the value in logs.
-///
-/// Upstream source: `VariableValue.cs`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VariableValue {
+    /// Variable value as a string.
     #[serde(rename = "value", skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
+    /// Whether this variable is a secret (masked in logs).
     #[serde(rename = "isSecret", skip_serializing_if = "Option::is_none")]
     pub is_secret: Option<bool>,
 }
 
 impl VariableValue {
+    /// Create a non-secret variable.
     pub fn new(value: impl Into<String>) -> Self {
         Self {
             value: Some(value.into()),
@@ -303,6 +327,7 @@ impl VariableValue {
         }
     }
 
+    /// Create a secret variable (masked in logs).
     pub fn secret(value: impl Into<String>) -> Self {
         Self {
             value: Some(value.into()),
@@ -318,8 +343,10 @@ impl VariableValue {
 /// Upstream source: `MaskHint.cs`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MaskHint {
+    /// Type of masking to apply.
     #[serde(rename = "type")]
     pub hint_type: MaskType,
+    /// Value to mask (may be a hash prefix).
     #[serde(rename = "value")]
     pub value: String,
 }
@@ -333,10 +360,10 @@ pub enum MaskType {
 }
 
 // ─── Timeline and recording DTOs ──────────────────────────────────────────
-
 /// Reference to a timeline — a collection of timeline records for a job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimelineReference {
+    /// Timeline identifier.
     #[serde(rename = "id")]
     pub id: uuid::Uuid,
 }
@@ -349,39 +376,55 @@ pub struct TimelineReference {
 /// Upstream source: `TimelineRecord.cs`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimelineRecord {
+    /// Unique record identifier.
     #[serde(rename = "id")]
     pub id: uuid::Uuid,
     /// Parent record ID (job → step relationship).
     #[serde(rename = "parentId", skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<uuid::Uuid>,
+    /// Record name (e.g. step id or job id).
     #[serde(rename = "name", skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Human-readable display name.
     #[serde(rename = "displayName", skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    /// Whether this record is a job, step, phase, or stage.
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub record_type: Option<TimelineRecordType>,
+    /// Current execution state.
     #[serde(rename = "state", skip_serializing_if = "Option::is_none")]
     pub state: Option<TimelineRecordState>,
+    /// Final result (set when completed).
     #[serde(rename = "result", skip_serializing_if = "Option::is_none")]
     pub result: Option<TaskResult>,
+    /// ISO-8601 start time.
     #[serde(rename = "startTime", skip_serializing_if = "Option::is_none")]
     pub start_time: Option<String>,
+    /// ISO-8601 finish time.
     #[serde(rename = "finishTime", skip_serializing_if = "Option::is_none")]
     pub finish_time: Option<String>,
+    /// Annotations (errors, warnings) attached to this record.
     #[serde(rename = "issues", default)]
     pub issues: Vec<Issue>,
+    /// Variables scoped to this record.
     #[serde(rename = "variables", default)]
     pub variables: BTreeMap<String, VariableValue>,
+    /// Current operation description (progress text).
     #[serde(rename = "currentOperation", skip_serializing_if = "Option::is_none")]
     pub current_operation: Option<String>,
+    /// Completion percentage (0–100).
     #[serde(rename = "percentComplete", skip_serializing_if = "Option::is_none")]
     pub percent_complete: Option<i32>,
+    /// Name of the worker executing this record.
     #[serde(rename = "workerName", skip_serializing_if = "Option::is_none")]
     pub worker_name: Option<String>,
+    /// Number of errors in this record.
     #[serde(rename = "errorCount", skip_serializing_if = "Option::is_none")]
     pub error_count: Option<i32>,
+    /// Number of warnings in this record.
     #[serde(rename = "warningCount", skip_serializing_if = "Option::is_none")]
     pub warning_count: Option<i32>,
+    /// Child step records (only populated on job-level records).
     #[serde(rename = "steps", default)]
     pub steps: Vec<TimelineRecord>,
 }
@@ -390,9 +433,13 @@ pub struct TimelineRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TimelineRecordType {
+    /// Top-level job record.
     Job,
+    /// Individual step within a job.
     Step,
+    /// Logical phase grouping steps.
     Phase,
+    /// Logical stage grouping jobs.
     Stage,
 }
 
@@ -400,8 +447,11 @@ pub enum TimelineRecordType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TimelineRecordState {
+    /// Not yet started.
     Pending,
+    /// Currently executing.
     InProgress,
+    /// Finished (success or failure).
     Completed,
 }
 
@@ -409,10 +459,15 @@ pub enum TimelineRecordState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TaskResult {
+    /// Completed successfully.
     Succeeded,
+    /// Completed with non-fatal issues.
     SucceededWithIssues,
+    /// Failed.
     Failed,
+    /// Cancelled by user or system.
     Cancelled,
+    /// Skipped due to condition or dependency.
     Skipped,
 }
 
@@ -424,15 +479,23 @@ pub enum TaskResult {
 /// Upstream source: `Issue.cs`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Issue {
+    /// Severity level (error, warning, info).
     #[serde(rename = "type")]
     pub issue_type: IssueType,
+    /// Issue category classifier.
     #[serde(rename = "category", skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
+    /// Human-readable issue message.
     #[serde(rename = "message", skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Additional key-value data for the issue.
     #[serde(rename = "data", default)]
     pub data: BTreeMap<String, String>,
-    #[serde(rename = "isInfrastructureIssue", skip_serializing_if = "Option::is_none")]
+    /// Whether this is an infrastructure-level issue (not user code).
+    #[serde(
+        rename = "isInfrastructureIssue",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub is_infrastructure_issue: Option<bool>,
 }
 
@@ -440,8 +503,11 @@ pub struct Issue {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum IssueType {
+    /// Error-level annotation.
     Error,
+    /// Warning-level annotation.
     Warning,
+    /// Informational annotation.
     Info,
 }
 
@@ -450,8 +516,10 @@ pub enum IssueType {
 /// Resources block in a job message — contains service endpoints.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskResources {
+    /// Service endpoints available to the job.
     #[serde(rename = "endpoints", default)]
     pub endpoints: Vec<ServiceEndpoint>,
+    /// Repository references keyed by alias.
     #[serde(rename = "repositories", default)]
     pub repositories: BTreeMap<String, RepositoryReference>,
 }
@@ -464,18 +532,25 @@ pub struct TaskResources {
 /// Upstream source: `ServiceEndpoint.cs`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceEndpoint {
+    /// Arbitrary key-value data for the endpoint.
     #[serde(rename = "data", default)]
     pub data: BTreeMap<String, String>,
+    /// Endpoint name (e.g. `SystemVssConnection`).
     #[serde(rename = "name")]
     pub name: String,
+    /// Endpoint type identifier.
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub endpoint_type: Option<String>,
+    /// Base URL of the endpoint.
     #[serde(rename = "url", skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// Authorization data keyed by auth scheme.
     #[serde(rename = "authorization", default)]
     pub authorization: BTreeMap<String, EndpointAuthorization>,
+    /// Whether this endpoint is shared across projects.
     #[serde(rename = "isShared", skip_serializing_if = "Option::is_none")]
     pub is_shared: Option<bool>,
+    /// Service owner identifier.
     #[serde(rename = "serviceOwner", skip_serializing_if = "Option::is_none")]
     pub service_owner: Option<String>,
 }
@@ -483,8 +558,10 @@ pub struct ServiceEndpoint {
 /// Authorization data for a service endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EndpointAuthorization {
+    /// Scheme-specific parameters (e.g. `AccessToken` for OAuth).
     #[serde(rename = "parameters", default)]
     pub parameters: BTreeMap<String, String>,
+    /// Authorization scheme name (e.g. `OAuth`, `InstallationToken`).
     #[serde(rename = "scheme", skip_serializing_if = "Option::is_none")]
     pub scheme: Option<String>,
 }
@@ -492,10 +569,13 @@ pub struct EndpointAuthorization {
 /// Repository reference in job resources.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepositoryReference {
+    /// Repository identifier or full name.
     #[serde(rename = "repository", skip_serializing_if = "Option::is_none")]
     pub repository: Option<String>,
+    /// Git ref (branch, tag, or SHA).
     #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
     pub git_ref: Option<String>,
+    /// Repository connector metadata.
     #[serde(rename = "connector", skip_serializing_if = "Option::is_none")]
     pub connector: Option<RepositoryConnector>,
 }
@@ -503,8 +583,10 @@ pub struct RepositoryReference {
 /// Connector for a repository reference.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepositoryConnector {
+    /// Connector identifier.
     #[serde(rename = "id", skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    /// Connector display name.
     #[serde(rename = "name", skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 }
@@ -521,10 +603,15 @@ pub struct RepositoryConnector {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum PipelineContextData {
+    /// String value.
     String(String),
+    /// Boolean value.
     Bool(bool),
+    /// Numeric value.
     Number(f64),
+    /// Array of context values.
     Array(Vec<PipelineContextData>),
+    /// Dictionary of context values.
     Dict(BTreeMap<String, PipelineContextData>),
 }
 
@@ -538,12 +625,16 @@ pub enum PipelineContextData {
 /// Upstream source: `FinishJobController.cs`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobCompletedEvent {
+    /// ID of the job that completed.
     #[serde(rename = "jobId")]
     pub job_id: uuid::Uuid,
+    /// Final result of the job.
     #[serde(rename = "result")]
     pub result: TaskResult,
+    /// Timeline ID associated with this job.
     #[serde(rename = "timelineId")]
     pub timeline_id: uuid::Uuid,
+    /// Output variables produced by the job.
     #[serde(rename = "outputs", default)]
     pub outputs: BTreeMap<String, String>,
 }
@@ -553,8 +644,10 @@ pub struct JobCompletedEvent {
 /// Log file reference — returned when creating a log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogReference {
+    /// Server-assigned log file ID.
     #[serde(rename = "id")]
     pub id: i64,
+    /// Server-relative path to the log file.
     #[serde(rename = "path", skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
 }
@@ -564,8 +657,10 @@ pub struct LogReference {
 /// Generic Azure DevOps error response envelope.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VssError {
+    /// Azure DevOps error code.
     #[serde(rename = "errorCode", skip_serializing_if = "Option::is_none")]
     pub error_code: Option<i64>,
+    /// Human-readable error message.
     #[serde(rename = "message", skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
