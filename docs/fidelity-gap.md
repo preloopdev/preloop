@@ -57,6 +57,11 @@ runner.server reference: `ChristopherHX/runner.server` v3.14.0 (commit `06964614
 configures against aksh, creates encrypted sessions, receives job messages, executes jobs,
 and reports completion. The full control plane protocol is working end-to-end.
 
+**As of 2026-06-26, this is achieved.** The official `actions/runner` v2.322.0 successfully
+configures against aksh, creates encrypted sessions, receives job messages, executes jobs,
+and reports completion. The full control plane protocol is working end-to-end.
+
+Rough completeness against "100% faithful control plane": **~70–75%.**
 **Note**: The scorecard below reflects aksh's state against v2.322.0. The deep diff in §1a
 documents what v2.335.1 (latest) requires that is not yet implemented. Runner versions
 v2.329.0+ are **enforced minimum** by GitHub since March 2026.
@@ -64,7 +69,6 @@ v2.329.0+ are **enforced minimum** by GitHub since March 2026.
 Rough completeness against "100% faithful control plane (v2.335.1)": **~55–60%** (was ~70–75%
 against v2.322.0; the gap widened because upstream added background steps, DAP debugger, and
 admin flow features).
-
 
 
 | Layer                                            | State                                                     | Faithful?                                    |
@@ -93,6 +97,8 @@ admin flow features).
 | **Server-enforced runner settings**              | absent                                                    | ❌ missing (new in v2.323.0)                  |
 | **Node 20→24 migration / deprecation warnings**  | absent                                                    | ❌ missing (new in v2.328.0)                  |
 
+<<<<<<< HEAD
+=======
 ---
 
 ## 1a. Deep source diff: runner.server v3.14.0 vs actions/runner v2.335.1
@@ -306,6 +312,7 @@ which may cause issues when aksh serves the official runner:
 | **P3** | `DisableStdoutMultilineLogPrefixing` env var | v2.335.0 | ❌ missing |
 | **P3** | Server-enforced runner settings | v2.323.0 | ❌ missing |
 
+>>>>>>> origin/main
 ---
 
 ## 2. Upstream surface we must emulate

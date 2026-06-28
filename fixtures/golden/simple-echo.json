@@ -1,0 +1,28 @@
+[
+  {
+    "base_id": "echo",
+    "env": {},
+    "fail_fast": true,
+    "id": "echo",
+    "if_condition": null,
+    "matrix": {},
+    "max_parallel": null,
+    "name": "echo",
+    "needs": [],
+    "runs_on": [
+      "self-hosted"
+    ],
+    "secrets_inherit": false,
+    "steps": [
+      {
+        "env": {},
+        "id": null,
+        "if_condition": null,
+        "name": null,
+        "run": "echo hello",
+        "uses": null,
+        "with": {}
+      }
+    ]
+  }
+]

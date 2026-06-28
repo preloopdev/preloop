@@ -1,0 +1,17 @@
+name: needs-dag
+on: push
+jobs:
+  build:
+    runs-on: [self-hosted]
+    steps:
+      - run: echo build
+  test:
+    needs: build
+    runs-on: [self-hosted]
+    steps:
+      - run: echo test
+  deploy:
+    needs: [build, test]
+    runs-on: [self-hosted]
+    steps:
+      - run: echo deploy

@@ -12,7 +12,12 @@
 //! Source: `AgentSessionController.cs` → session creation
 
 use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
-use rsa::Oaep;
+use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD};
+use base64::Engine;
+use rsa::pkcs1::DecodeRsaPublicKey;
+use rsa::pkcs8::DecodePublicKey;
+use rsa::traits::PublicKeyParts;
+use rsa::{BigUint, Oaep};
 use sha1::Sha1;
 
 type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
@@ -27,6 +32,98 @@ type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
 pub struct AgentRsaKeypair {
     private_key: rsa::RsaPrivateKey,
     public_key: rsa::RsaPublicKey,
+}
+
+/// An RSA public key supplied by a runner during registration.
+#[derive(Clone)]
+pub struct AgentRsaPublicKey {
+    public_key: rsa::RsaPublicKey,
+}
+
+impl AgentRsaPublicKey {
+    /// Parse runner public-key material from XML, JWK, or PEM.
+    pub fn parse(value: &str) -> Result<Self, CryptoError> {
+        let trimmed = value.trim();
+        let public_key = if trimmed.starts_with("<") {
+            parse_xml_public_key(trimmed)?
+        } else if trimmed.starts_with("{") {
+            parse_jwk_public_key(trimmed)?
+        } else if trimmed.contains("BEGIN PUBLIC KEY") {
+            rsa::RsaPublicKey::from_public_key_pem(trimmed)
+                .map_err(|e| CryptoError::ParseKey(e.to_string()))?
+        } else if trimmed.contains("BEGIN RSA PUBLIC KEY") {
+            rsa::RsaPublicKey::from_pkcs1_pem(trimmed)
+                .map_err(|e| CryptoError::ParseKey(e.to_string()))?
+        } else {
+            return Err(CryptoError::ParseKey(
+                "unsupported public key format".to_owned(),
+            ));
+        };
+
+        Ok(Self { public_key })
+    }
+
+    /// Wrap (encrypt) a symmetric key with this runner's public key.
+    pub fn wrap_key(&self, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        self.public_key
+            .encrypt(&mut rand::thread_rng(), Oaep::new::<Sha1>(), plaintext)
+            .map_err(|e| CryptoError::Wrap(e.to_string()))
+    }
+}
+
+fn parse_xml_public_key(value: &str) -> Result<rsa::RsaPublicKey, CryptoError> {
+    let modulus = xml_tag(value, "Modulus")
+        .ok_or_else(|| CryptoError::ParseKey("missing XML Modulus".to_owned()))?;
+    let exponent = xml_tag(value, "Exponent")
+        .ok_or_else(|| CryptoError::ParseKey("missing XML Exponent".to_owned()))?;
+    rsa_public_key_from_components(
+        &BASE64_STANDARD
+            .decode(modulus)
+            .map_err(|e| CryptoError::ParseKey(e.to_string()))?,
+        &BASE64_STANDARD
+            .decode(exponent)
+            .map_err(|e| CryptoError::ParseKey(e.to_string()))?,
+    )
+}
+
+fn parse_jwk_public_key(value: &str) -> Result<rsa::RsaPublicKey, CryptoError> {
+    let value: serde_json::Value =
+        serde_json::from_str(value).map_err(|e| CryptoError::ParseKey(e.to_string()))?;
+    let n = value
+        .get("n")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| CryptoError::ParseKey("missing JWK n".to_owned()))?;
+    let e = value
+        .get("e")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| CryptoError::ParseKey("missing JWK e".to_owned()))?;
+    rsa_public_key_from_components(
+        &URL_SAFE_NO_PAD
+            .decode(n)
+            .map_err(|e| CryptoError::ParseKey(e.to_string()))?,
+        &URL_SAFE_NO_PAD
+            .decode(e)
+            .map_err(|e| CryptoError::ParseKey(e.to_string()))?,
+    )
+}
+
+fn rsa_public_key_from_components(
+    modulus: &[u8],
+    exponent: &[u8],
+) -> Result<rsa::RsaPublicKey, CryptoError> {
+    rsa::RsaPublicKey::new(
+        BigUint::from_bytes_be(modulus),
+        BigUint::from_bytes_be(exponent),
+    )
+    .map_err(|e| CryptoError::ParseKey(e.to_string()))
+}
+
+fn xml_tag<'a>(value: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = value.find(&open)? + open.len();
+    let end = value[start..].find(&close)? + start;
+    Some(value[start..end].trim())
 }
 
 impl AgentRsaKeypair {
@@ -57,6 +154,22 @@ impl AgentRsaKeypair {
         self.private_key
             .decrypt(Oaep::new::<Sha1>(), ciphertext)
             .map_err(|e| CryptoError::Unwrap(e.to_string()))
+    }
+
+    /// Borrow this keypair's public key.
+    pub fn public_key(&self) -> AgentRsaPublicKey {
+        AgentRsaPublicKey {
+            public_key: self.public_key.clone(),
+        }
+    }
+
+    /// Export this keypair's public key in the XML shape the runner protocol accepts.
+    pub fn public_key_xml(&self) -> String {
+        format!(
+            "<RSAKeyValue><Modulus>{}</Modulus><Exponent>{}</Exponent></RSAKeyValue>",
+            BASE64_STANDARD.encode(self.public_key.n().to_bytes_be()),
+            BASE64_STANDARD.encode(self.public_key.e().to_bytes_be())
+        )
     }
 }
 
@@ -117,6 +230,9 @@ pub enum CryptoError {
     /// Key unwrapping failed.
     #[error("RSA key unwrap failed: {0}")]
     Unwrap(String),
+    /// RSA public-key parsing failed.
+    #[error("RSA public key parse failed: {0}")]
+    ParseKey(String),
     /// AES decryption failed.
     #[error("AES decryption failed: {0}")]
     Decrypt(String),
@@ -128,6 +244,7 @@ pub enum CryptoError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rsa::traits::PublicKeyParts;
 
     #[test]
     fn rsa_keypair_generation() {
@@ -142,6 +259,35 @@ mod tests {
         let wrapped = kp.wrap_key(&symmetric_key).unwrap();
         let unwrapped = kp.unwrap_key(&wrapped).unwrap();
         assert_eq!(symmetric_key, unwrapped);
+    }
+
+    #[test]
+    fn parses_xml_public_key_for_wrapping() {
+        let kp = AgentRsaKeypair::generate().unwrap();
+        let xml = format!(
+            "<RSAKeyValue><Modulus>{}</Modulus><Exponent>{}</Exponent></RSAKeyValue>",
+            BASE64_STANDARD.encode(kp.public_key.n().to_bytes_be()),
+            BASE64_STANDARD.encode(kp.public_key.e().to_bytes_be())
+        );
+        let public_key = AgentRsaPublicKey::parse(&xml).unwrap();
+
+        let wrapped = public_key.wrap_key(b"secret").unwrap();
+        assert_eq!(kp.unwrap_key(&wrapped).unwrap(), b"secret");
+    }
+
+    #[test]
+    fn parses_jwk_public_key_for_wrapping() {
+        let kp = AgentRsaKeypair::generate().unwrap();
+        let jwk = serde_json::json!({
+            "kty": "RSA",
+            "n": URL_SAFE_NO_PAD.encode(kp.public_key.n().to_bytes_be()),
+            "e": URL_SAFE_NO_PAD.encode(kp.public_key.e().to_bytes_be()),
+        })
+        .to_string();
+        let public_key = AgentRsaPublicKey::parse(&jwk).unwrap();
+
+        let wrapped = public_key.wrap_key(b"secret").unwrap();
+        assert_eq!(kp.unwrap_key(&wrapped).unwrap(), b"secret");
     }
 
     #[test]

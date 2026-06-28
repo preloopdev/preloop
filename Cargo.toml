@@ -38,6 +38,7 @@ rand = "0.8"
 serde_json = "1.0"
 serde_yaml = "0.9"
 sha2 = "0.10"
+hmac = "0.12"
 tempfile = "3.10"
 thiserror = "1.0"
 tokio = { version = "1.37", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "fs", "io-util", "process"] }
