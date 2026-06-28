@@ -7,3 +7,5 @@ dependencies = [
     "rich",
 ]
 
+[project.optional-dependencies]
+test = ["pytest>=7"]
