@@ -2,10 +2,10 @@
 
 aksh is split by protocol responsibility rather than by binary:
 
-- `aksh-protocol` owns versioned wire/domain types. Anything sent to a
+- `aksh-gha-protocol` owns versioned wire/domain types. Anything sent to a
   runner or emitted to an agent passes through this crate. Includes AzDO wire
   DTOs, `SecretString`, NDJSON events, and session crypto.
-- `aksh-parser` owns workflow YAML normalization, trigger matching, job graph
+- `aksh-gha-parser` owns workflow YAML normalization, trigger matching, job graph
   construction, matrix expansion, and expression evaluation.
 - `aksh-gha-expressions` owns expression parsing and evaluation (the core
   `${{ }}` engine).
@@ -41,7 +41,7 @@ layer.
 
 ## Secrets
 
-Secrets use `SecretString` in `aksh-protocol`. It redacts `Debug`,
+Secrets use `SecretString` in `aksh-gha-protocol`. It redacts `Debug`,
 `Display`, and serialized output. Code that needs the raw payload must call
 `expose()` explicitly at a protocol boundary.
 

@@ -30,7 +30,9 @@ Execution engine and runner host integrations live in **separate repos/crates**.
 
 is the control plane only.
 
-Upstream reference commit: `992ccbbbf9afcde477c38c316e053b1af457ad40`
+Upstream reference: `actions/runner` v2.335.1 (commit `7d737449ef346f6524f75688d0c9c95fa10ba10a`)
+
+runner.server reference: `ChristopherHX/runner.server` v3.14.0 (commit `069646146c90d649c74dfd7a34569c9420195838`)
 
 (overridable via `AKSH_UPSTREAM_RUNNER_SERVER_REF`).
 
@@ -51,13 +53,22 @@ Upstream reference commit: `992ccbbbf9afcde477c38c316e053b1af457ad40`
 
 ## 1. TL;DR scorecard
 
-The bar is: **the unmodified `Runner.Listener` binary connects and runs a job.**
+**As of 2026-06-26, this is achieved.** The official `actions/runner` v2.322.0 successfully
+configures against aksh, creates encrypted sessions, receives job messages, executes jobs,
+and reports completion. The full control plane protocol is working end-to-end.
 
 **As of 2026-06-26, this is achieved.** The official `actions/runner` v2.322.0 successfully
 configures against aksh, creates encrypted sessions, receives job messages, executes jobs,
 and reports completion. The full control plane protocol is working end-to-end.
 
 Rough completeness against "100% faithful control plane": **~70–75%.**
+**Note**: The scorecard below reflects aksh's state against v2.322.0. The deep diff in §1a
+documents what v2.335.1 (latest) requires that is not yet implemented. Runner versions
+v2.329.0+ are **enforced minimum** by GitHub since March 2026.
+
+Rough completeness against "100% faithful control plane (v2.335.1)": **~55–60%** (was ~70–75%
+against v2.322.0; the gap widened because upstream added background steps, DAP debugger, and
+admin flow features).
 
 
 | Layer                                            | State                                                     | Faithful?                                    |
@@ -78,7 +89,230 @@ Rough completeness against "100% faithful control plane": **~70–75%.**
 | **Action download info**                         | stub endpoint                                             | ⚠️ stub                                       |
 | Cache v1 / Artifact v1 shapes                    | in-memory stubs                                           | ⚠️ partial                                   |
 | Cache v2 / Artifact v2 (blob/twirp)              | absent                                                    | ❌ missing                                    |
+| **Background steps (concurrent execution)**      | absent                                                    | ❌ missing (new in v2.335.0)                  |
+| **DAP debugger integration**                     | absent                                                    | ❌ missing (new in v2.335.0)                  |
+| **Request acknowledgment**                       | absent                                                    | ❌ missing (new in v2.329.0)                  |
+| **V2 admin flow / Broker URL**                   | absent                                                    | ❌ missing (new in v2.329.0)                  |
+| **Runner config refresh**                        | absent                                                    | ❌ missing (new in v2.323.0)                  |
+| **Server-enforced runner settings**              | absent                                                    | ❌ missing (new in v2.323.0)                  |
+| **Node 20→24 migration / deprecation warnings**  | absent                                                    | ❌ missing (new in v2.328.0)                  |
 
+<<<<<<< HEAD
+=======
+---
+
+## 1a. Deep source diff: runner.server v3.14.0 vs actions/runner v2.335.1
+
+**Methodology**: Structural diff of `Runner.Listener/`, `Runner.Worker/`, `Runner.Common/`,
+`Runner.Sdk/`, and Chris's `Runner.Server/Controllers/` against the official v2.335.1 source.
+This is a C#-to-C# diff of the shared fork base, isolating protocol-relevant divergence.
+
+### 1a.1 What official v2.335.1 has that runner.server v3.14.0 does NOT
+
+These are features in the latest official runner that Chris's fork has not merged. Each one
+represents a protocol surface change aksh must eventually support.
+
+#### Background Steps (v2.335.0) — NEW execution model
+
+The official runner now supports **concurrent background steps** — steps that run in parallel
+with subsequent steps, coordinated via wait/cancel control-flow steps.
+
+**Files only in official** (absent from Chris):
+- `Runner.Worker/BackgroundStepCoordinator.cs` — coordinates concurrent step execution,
+  manages slots via `SemaphoreSlim`, handles wait-all/cancel with grace periods
+- `Runner.Worker/BackgroundStepControlFlowData.cs` — data class for control-flow step types:
+  `Wait`, `WaitAll`, `Cancel`
+
+**Files modified in official** (vs Chris):
+- `Runner.Worker/StepsRunner.cs` — background steps are queued via coordinator instead of
+  run synchronously; DAP debugger hooks wrap normal steps
+- `Runner.Worker/StepsContext.cs` — **thread-safety**: official adds `lock(_lock)` around all
+  step context mutations (GetStep, SetOutput, SetConclusion, SetOutcome); Chris has no locks
+- `Runner.Worker/ExecutionContext.cs` — adds `IsBackground`, `BackgroundControlType`,
+  `BackgroundControlStepIds`, `ParallelGroupId` fields on `TimelineRecord`
+- `Runner.Worker/JobRunner.cs` — adds safety net: waits for unwaited background steps before
+  post-hooks; integrates DAP debugger
+- `Runner.Worker/JobExtension.cs` — validates `BackgroundControlTypes` (Wait/WaitAll/Cancel)
+- `Runner.Common/JobServerQueue.cs` — merges `IsBackground`, `BackgroundControlType`,
+  `BackgroundControlStepIds`, `ParallelGroupId` into timeline records on PATCH
+
+**Protocol impact for aksh**: The runner sends `TimelineRecord` PATCHes with new fields:
+`isBackground`, `backgroundControlType`, `backgroundControlStepIds`, `parallelGroupId`.
+aksh's `TimelineController` must accept and store these fields. The `AgentJobRequestMessage`
+may contain steps with `background: true` and control-flow steps with `type: "wait"/"waitAll"/"cancel"`.
+
+**New SDK types** (in official, absent from Chris):
+- `Sdk/DTPipelines/Pipelines/BackgroundStepControl.cs` — `BackgroundControlTypes` constants
+- `Sdk/DTWebApi/WebApi/TimelineRecord.cs` — adds `BackgroundControlType`, `BackgroundControlStepIds`
+- `Sdk/RSWebApi/Contracts/StepResult.cs` — adds same fields
+
+#### DAP Debugger (v2.335.0) — NEW debugging protocol
+
+The official runner integrates a **Debug Adapter Protocol (DAP)** debugger for live job debugging.
+
+**Files only in official** (10 files in `Runner.Worker/Dap/`):
+- `DapDebugger.cs`, `IDapDebugger.cs` — debugger lifecycle (on step start/complete, job init)
+- `DapMessages.cs` — DAP protocol message types
+- `DapReplExecutor.cs` — REPL command execution inside job containers
+- `DapReplParser.cs` — REPL output parsing
+- `DapVariableProvider.cs` — variable inspection for debugger
+- `DebuggerConfig.cs` — debugger configuration
+- `WebSocketDapBridge.cs`, `IWebSocketDapBridge.cs` — WebSocket transport for DAP
+- `JobExecutionView.cs` — job execution state model for debugger UI
+
+**Protocol impact for aksh**: The runner connects to a debugger WebSocket endpoint. If aksh
+doesn't serve this, the runner simply doesn't enable debugging — **non-blocking**. But the
+feature flag `actions_runner_override_debugger_welcome_message` is checked, and the runner
+expects a `Debugger?.Enabled` flag in the job context. aksh should advertise debugger support
+as `false` to avoid the runner attempting connection.
+
+#### Request Acknowledgment (v2.329.0) — protocol change
+
+The official runner now sends an explicit **acknowledgment** after receiving a job message.
+
+**Both repos have this** (Chris merged it) — but the behavior differs:
+- Official: `RunnerJobRequestRef.ShouldAcknowledge` is a feature-flagged field
+- Chris: same field exists, same code path
+
+**Protocol impact for aksh**: The runner calls `AcknowledgeRunnerRequestAsync` on the broker
+server. aksh must handle this endpoint or the runner logs a warning (best-effort, non-fatal).
+
+#### V2 Admin Flow & Broker URL (v2.329.0) — new control plane surface
+
+The official runner splits management operations into two flows:
+- `UseV2Flow` — V2 API for runner deletion/management
+- `UseRunnerAdminFlow` — separate admin flow with its own auth URLs
+
+**Both repos have the config fields** (`UseV2Flow`, `UseRunnerAdminFlow`, `ServerUrlV2` in
+`ConfigurationStore.cs`). But Chris's `ConfigurationManager.cs` **skips the connection
+validation** for `UseRunnerAdminFlow`:
+```csharp
+// Official:
+if (!runnerSettings.UseRunnerAdminFlow)
+{
+    await _runnerServer.ConnectAsync(new Uri(runnerSettings.ServerUrl), creds);
+}
+
+// Chris:
+await _runnerServer.ConnectAsync(new Uri(runnerSettings.ServerUrl), creds);
+```
+
+**Protocol impact for aksh**: When the runner is configured with `UseRunnerAdminFlow`, it
+expects `auth_url` AND `auth_url_v2` in the connection data response. It uses a separate
+`BrokerUrl` for admin operations. aksh must populate these fields in `ConnectionDataController`.
+
+#### Runner Config Refresh (v2.323.0) — backend migration protocol
+
+**Both repos have `RunnerRefreshConfigMessage`** — Chris merged this. The runner handles a
+`RunnerRefreshConfig` message type that triggers config file exchange with the control plane.
+
+**Protocol impact for aksh**: If aksh sends a `RunnerRefreshConfig` message, the runner will
+attempt to exchange `.runner` and `.credentials` files. aksh can safely ignore this for now
+(don't send the message type), but must accept it if the runner sends a refresh request.
+
+#### Server-Enforced Runner Settings (v2.323.0)
+
+The official runner accepts settings pushed by the control plane. Chris has this merged.
+
+**Protocol impact for aksh**: aksh can optionally push settings to the runner. Low priority.
+
+#### Feature Flags & Environment Variables (v2.321.0–v2.335.0)
+
+Official v2.335.1 has these feature flags absent from Chris:
+
+| Flag | Purpose | Impact on aksh |
+---|---|---|
+| `RunnerVersionDeprecated` (7) | Version deprecation check | aksh should return this if runner is too old |
+| `ServiceContainerCommand` | Service container command support | Container actions may need this |
+| `SendJobLevelAnnotations` | Job-level annotation telemetry | Timeline records may include annotations |
+| `EmitCompositeMarkers` | Composite action markers | Debug/trace feature |
+| `BatchActionResolution` | Batch action download | Action download may use batch API |
+| `UseBearerTokenForCodeload` | Bearer auth for action tarballs | Action download auth change |
+| `OverrideDebuggerWelcomeMessage` | Custom debugger greeting | DAP feature |
+| `WarnOnNode20Flag` | Node 20 deprecation warning | Runner emits deprecation annotation |
+| `DeprecateLinuxArm32Flag` | ARM32 deprecation | Platform check |
+| `DisableStdoutMultilineLogPrefixing` | Log format control | Logging change |
+| `SymlinkCachedActions` | Symlink instead of copy cached actions | Performance optimization |
+
+**Environment variables only in official**:
+
+| Variable | Purpose |
+---|---|
+| `ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE` | Exit code for deprecated runner |
+| `ACTIONS_RUNNER_DISABLE_STDOUT_MULTILINE_LOG_PREFIXING` | Log format |
+| `ACTIONS_RUNNER_SYMLINK_CACHED_ACTIONS` | Cache optimization |
+| `ACTIONS_RUNNER_EMIT_COMPOSITE_MARKERS` | Debug markers |
+| `GITHUB_ACTIONS_RUNNER_FORCE_EMPTY_GITHUB_URL_IS_HOSTED` | Hosted runner inference |
+| `GITHUB_ACTIONS_RUNNER_FORCE_GHES` | Force GHES mode |
+
+#### JobDispatcher Changes
+
+Official `JobDispatcher.cs` returns `TaskResult` from `RunAsync()`; Chris returns `void`.
+Official tracks job result for hosted runner telemetry (`ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED`);
+Chris strips this. The `RunOnceJobCompleted` type changed from `TaskResult` to `bool`.
+
+**Protocol impact for aksh**: None directly — this is runner-internal. But it means Chris's
+fork doesn't support the "return job result for hosted" telemetry path.
+
+### 1a.2 What runner.server v3.14.0 has that official v2.335.1 does NOT
+
+Chris's additions (not relevant to aksh's control plane protocol):
+
+| File | Purpose |
+---|---|
+| `Runner.Worker/ExternalToolHelper.cs` | Chris's external tool utility |
+| `Runner.Worker/Handlers/GoActionHandler.cs` | Go action handler (Chris addition) |
+| `Runner.Sdk/GharunUtil.cs` | Chris's utility for gharun |
+
+### 1a.3 Chris's behavioral divergences from official
+
+These are places where Chris's code **differs in behavior** from the official runner,
+which may cause issues when aksh serves the official runner:
+
+1. **BrokerServer.cs**: Chris removes `VssUnauthorizedException` from the retry condition.
+   Official retries on `AccessDeniedException || VssUnauthorizedException || RunnerNotFoundException
+   || HostedRunnerDeprovisionedException`. Chris skips `VssUnauthorizedException`.
+   **Impact**: If aksh returns a 401, Chris's runner retries; official doesn't.
+
+2. **ConfigurationManager.cs**: Chris skips `UseRunnerAdminFlow` connection validation.
+   **Impact**: Chris's runner always validates connection; official skips for admin flow.
+
+3. **ConfigurationStore.cs**: Chris removes hosted-runner inference logic (checking
+   `ServerUrl`/`ServerUrlV2` against `*.actions.githubusercontent.com` etc.).
+   **Impact**: Chris's runner can't auto-detect if it's talking to GitHub-hosted infrastructure.
+
+4. **StepsContext.cs**: Chris has no thread-safety locks. Official wraps all mutations in
+   `lock(_lock)`. **Impact**: Concurrent background steps in official would race on Chris's
+   impl; irrelevant for aksh (control plane, not runner).
+
+5. **JobServerQueue.cs**: Chris adds `_webconsole_queue_all` variable controlled by
+   `system.runner.server.webconsole_queue_all`. This is a Chris-specific feature for
+   runner.server's web console. **Impact**: aksh doesn't need this.
+
+6. **Platform detection**: Chris replaces `#if OS_WINDOWS`/`#if OS_LINUX` preprocessor
+   directives with runtime `RuntimeInformation.IsOSPlatform()` checks. This makes Chris's
+   runner a single cross-platform binary instead of platform-specific builds.
+   **Impact**: None for aksh — this is runner-internal.
+
+### 1a.4 Summary: what aksh needs to implement (priority order)
+
+| Priority | Change | Upstream Version | aksh Status |
+---|---|---|---|
+| **P0** | Background step fields in TimelineRecord (`isBackground`, `backgroundControlType`, `backgroundControlStepIds`, `parallelGroupId`) | v2.335.0 | ❌ missing |
+| **P0** | Thread-safe StepsContext (lock-based) | v2.335.0 | N/A (runner-side) |
+| **P1** | Request acknowledgment endpoint (`AcknowledgeRunnerRequestAsync`) | v2.329.0 | ❌ missing |
+| **P1** | `auth_url_v2` and `BrokerUrl` in connectionData | v2.329.0 | ❌ missing |
+| **P1** | V2 admin flow support (`UseRunnerAdminFlow` response) | v2.329.0 | ❌ missing |
+| **P1** | `RunnerVersionDeprecated` feature flag response | v2.321.0 | ❌ missing |
+| **P2** | DAP debugger endpoint (WebSocket) | v2.335.0 | ❌ missing (non-blocking) |
+| **P2** | `SendJobLevelAnnotations` in timeline | v2.323.0 | ❌ missing |
+| **P2** | `BatchActionResolution` for action downloads | v2.328.0 | ❌ missing |
+| **P2** | `UseBearerTokenForCodeload` for action tarballs | v2.328.0 | ❌ missing |
+| **P3** | Node 20 deprecation warning annotation | v2.328.0 | ❌ missing |
+| **P3** | `DisableStdoutMultilineLogPrefixing` env var | v2.335.0 | ❌ missing |
+| **P3** | Server-enforced runner settings | v2.323.0 | ❌ missing |
+
+>>>>>>> origin/main
 ---
 
 ## 2. Upstream surface we must emulate
@@ -340,8 +574,8 @@ aksh/                              ← this repo (the control plane)
 ├── crates/
 │   ├── aksh-server            # axum service; protocol-only; provider-agnostic
 │   ├── aksh-orchestrator      # RunnerProvider/RunnerSpec traits + scheduler
-│   ├── aksh-protocol          # AzDO wire DTOs, SecretString, NDJSON, crypto
-│   ├── aksh-parser            # Workflow YAML parse + expression eval + matrix
+│   ├── aksh-gha-protocol      # AzDO wire DTOs, SecretString, NDJSON, crypto
+│   ├── aksh-gha-parser        # Workflow YAML parse + expression eval + matrix
 │   ├── aksh-cache             # Cache store trait + file-backed impl
 │   ├── aksh-artifacts         # Artifact store trait + file-backed impl
 │   └── aksh-conformance       # Differential tests vs upstream runner.server
@@ -388,7 +622,7 @@ or a new cloud backend later = a new crate, zero control-plane edits. BYO mode =
 
 Keep faithfulness and your added advantages **without forking semantics**:
 
-- Model the **AzDO/runner protocol as the source of truth** in `aksh-protocol`.
+- Model the **AzDO/runner protocol as the source of truth** in `aksh-gha-protocol`.
 - Layer aksh extras as **read-model projections / sidecars**, never as replacements:
   - **NDJSON agent feed** = a projection *derived from* timeline records, not a parallel
   
@@ -415,7 +649,7 @@ correctly. Make **small commits per step** with the tradeoff notes called out.
 
 Steps:
 
-1. Add `aksh-protocol::azdo` module: `ConnectionData`, `LocationServiceData`,
+1. Add `aksh-gha-protocol::azdo` module: `ConnectionData`, `LocationServiceData`,
 
    `TaskAgentSession`, `TaskAgent`, `TaskAgentMessage`, `AgentJobRequestMessage`,
 
@@ -510,7 +744,7 @@ single job.)
 
 Steps:
 
-1. Create `aksh-parser::eval` that **consumes `aksh-gha-expressions`** and produces
+1. Create `aksh-gha-parser::eval` that **consumes `aksh-gha-expressions`** and produces
 
    resolved job material:
   - interpolate `${{ }}` in `env`, `with`, `run`, `runs-on`, matrix values;
