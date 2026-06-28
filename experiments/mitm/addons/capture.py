@@ -13,6 +13,7 @@ from mitmproxy import http
 # Headers whose values are always redacted in the capture.
 REDACT_HEADERS = {
     "authorization",
+    "cookie",
     "set-cookie",
     "x-vss-session",
     "x-tfs-session",
