@@ -198,7 +198,7 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         .route("/runner/server/_apis/v1/oauth2/token", post(oauth2_token))
         .route("/runner/server/_apis/v1/AgentPools", get(runner_pools))
         .route("/runner/server/_apis/v1/Agent/:pool_id/:agent_id", get(agent_lookup_by_id).post(register_runner_compat))
-        .route("/runner/server/_apis/v1/Agent/:pool_id", get(agent_lookup).post(register_runner_compat))
+        .route("/runner/server/_apis/v1/Agent/:pool_id", get(agent_lookup).post(register_runner_compat_pool_only))
         .route("/runner/server/_apis/v1/AgentSession/:pool_id/:session_id", post(create_session_compat))
         .route("/runner/server/_apis/v1/AgentSession/:pool_id", post(create_session_compat_pool_only))
         .route("/runner/server/_apis/v1/AgentSession/:pool_id/:session_id", delete(delete_session))
