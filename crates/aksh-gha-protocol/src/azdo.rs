@@ -8,6 +8,7 @@
 //! - `actions/runner` (C# client side): `src/Runner.Common/Util/RunnerServer.cs`
 //! - `runner.server` (C# server side): `src/Runner.Server/Controllers/MessageController.cs`
 //! - `GitHub.DistributedTask.WebApi` NuGet package (shared DTOs)
+#![allow(missing_docs)]
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
@@ -427,7 +428,6 @@ fn extract_template_map(value: Option<&serde_json::Value>) -> Option<BTreeMap<St
 }
 
 /// Serializes environment/inputs as TemplateToken maps.
-
 struct SerializedActionReference<'a> {
     step: &'a TaskStep,
 }

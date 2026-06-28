@@ -9,11 +9,7 @@ use aksh_artifacts::ArtifactStore;
 use aksh_cache::CacheStore;
 use aksh_gha_parser::{expand_jobs_with_reusables, parse_workflow};
 use aksh_gha_protocol::{
-    self as protocol,
-    azdo::{
-        self, ConnectionData, EncryptionKey as AzdoEncryptionKey, LocationServiceData,
-        ServiceDefinition, TaskAgentSession as AzdoSession,
-    },
+    azdo,
     crypto::{AgentRsaKeypair, AgentRsaPublicKey, SessionEncryption},
     event_to_ndjson, AnnotationLevel, ExecutionStatus, JobCompletion, JobId, NdjsonEvent,
     RegisteredRunner, RunAccepted, RunId, RunnerRegistrationRequest, RunnerSession,
@@ -74,7 +70,6 @@ async fn shutdown_signal(shutdown: CancellationToken) {
 }
 
 /// Build the server router.
-
 pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
     let protected_apis = Router::new()
         .route("/_apis/artifactcache/cache", post(cache_reserve))
@@ -266,8 +261,10 @@ impl AppState {
         let (events, _) = broadcast::channel(1024);
         let keypair = AgentRsaKeypair::generate()
             .map_err(|e| anyhow::anyhow!("Failed to generate RSA keypair: {}", e))?;
-        let mut inner = InnerState::default();
-        inner.agent_keypair = Some(keypair);
+        let inner = InnerState {
+            agent_keypair: Some(keypair),
+            ..Default::default()
+        };
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
             events,
@@ -283,10 +280,10 @@ impl AppState {
 }
 
 #[derive(Default)]
+#[allow(dead_code)]
 struct InnerState {
     runs: BTreeMap<RunId, RunRecord>,
     queue: VecDeque<QueuedJob>,
-    /// Jobs waiting for their `needs` dependencies to complete.
     pending_jobs: VecDeque<QueuedJob>,
     runners: BTreeMap<i64, RegisteredRunner>,
     sessions: BTreeMap<String, RunnerSession>,
@@ -317,6 +314,7 @@ struct RunRecord {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct QueuedJob {
     run_id: RunId,
     job_id: JobId,
@@ -722,7 +720,7 @@ async fn register_runner(
 
 async fn create_session(
     State(shared): State<Arc<SharedState>>,
-    Json(request): Json<RunnerSessionRequest>,
+    Json(_request): Json<RunnerSessionRequest>,
 ) -> Json<serde_json::Value> {
     let session_id = uuid::Uuid::new_v4();
 
@@ -1408,7 +1406,7 @@ async fn finish_job(
 /// POST action download info — resolve action references to download URLs.
 async fn action_download_info(
     State(_shared): State<Arc<SharedState>>,
-    Json(request): Json<serde_json::Value>,
+    Json(_request): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     // For now, return empty info — actions will be downloaded from GitHub
     Json(json!({ "archiveDownloadTickets": {} }))
@@ -1538,8 +1536,8 @@ async fn runner_pools() -> Json<serde_json::Value> {
 /// Compat handler: register runner via AzDO Agent path.
 async fn register_runner_compat(
     State(shared): State<Arc<SharedState>>,
-    Path((_pool_id, agent_id)): Path<(i64, String)>,
-    Json(mut request): Json<serde_json::Value>,
+    Path((_pool_id, _agent_id)): Path<(i64, String)>,
+    Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // The runner sends a TaskAgent-style body; extract what we need.
     let name = request
@@ -1608,7 +1606,7 @@ async fn register_runner_compat_pool_only(
 /// Compat handler: create session via AzDO AgentSession path.
 async fn create_session_compat(
     State(shared): State<Arc<SharedState>>,
-    Path((_pool_id, session_id)): Path<(i64, String)>,
+    Path((_pool_id, _session_id)): Path<(i64, String)>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let runner_id = body
@@ -1633,8 +1631,8 @@ async fn create_session_compat(
 /// Compat handler: next message via AzDO Message path.
 async fn next_message_compat(
     State(shared): State<Arc<SharedState>>,
-    Path(pool_id): Path<i64>,
-    Query(mut params): Query<std::collections::HashMap<String, String>>,
+    Path(_pool_id): Path<i64>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Option<azdo::TaskAgentMessage>>, ApiError> {
     next_message(State(shared), Query(params)).await
 }
@@ -1723,6 +1721,7 @@ async fn delete_pool_message_org(
     delete_pool_message(State(shared), Path((pool_id, message_id))).await
 }
 
+#[allow(dead_code)]
 async fn complete_job_compat_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, run_id, job_id)): Path<(String, RunId, String)>,
@@ -2835,7 +2834,7 @@ jobs:
     async fn session_message_flow_encrypts_decryptable_job_body() {
         let temp = tempfile::tempdir().unwrap();
         let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
-        let keypair = {
+        let _keypair = {
             let inner = state.inner.lock().await;
             inner.agent_keypair.clone().unwrap()
         };
