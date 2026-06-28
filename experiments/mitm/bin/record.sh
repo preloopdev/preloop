@@ -7,16 +7,18 @@ MITM_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 CACHE="$MITM_DIR/.cache"
 
 usage() {
-    echo "Usage: $0 --backend {official|runner-server} --scenario <name>" >&2
+    echo "Usage: $0 --backend {official|runner-server|aksh} --scenario <name> [--non-interactive]" >&2
     exit 1
 }
 
 BACKEND=""
 SCENARIO=""
+NON_INTERACTIVE=false
 while [ $# -gt 0 ]; do
     case "$1" in
         --backend) BACKEND="$2"; shift 2 ;;
         --scenario) SCENARIO="$2"; shift 2 ;;
+        --non-interactive) NON_INTERACTIVE=true; shift ;;
         *) usage ;;
     esac
 done
@@ -33,6 +35,16 @@ mkdir -p "$CAPTURE_DIR"
 export MITM_CAPTURE_DIR="$CAPTURE_DIR"
 echo "capture dir: $CAPTURE_DIR"
 
+
+# Port conflict detection.
+if lsof -ti:8080 &>/dev/null; then
+    echo "port 8080 (mitmproxy) is already in use — stop it first or kill the process" >&2
+    exit 2
+fi
+if [ "$BACKEND" = "aksh" ] && lsof -ti:9090 &>/dev/null; then
+    echo "port 9090 (aksh) is already in use — run bin/down-aksh.sh first" >&2
+    exit 2
+fi
 STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 # Start mitmdump.
@@ -128,8 +140,14 @@ elif [ "$BACKEND" = "runner-server" ]; then
     if ! setup_runner "$RS_URL" "$RS_TOKEN" "mitm-runner-server"; then
         STATUS="config_failed"
     fi
+elif [ "$BACKEND" = "aksh" ]; then
+    AKSH_URL=$(cat "$CACHE/aksh.url")
+    AKSH_TOKEN=$(cat "$CACHE/aksh.token")
+    if ! setup_runner "$AKSH_URL" "$AKSH_TOKEN" "mitm-aksh"; then
+        STATUS="config_failed"
+    fi
 else
-    echo "unknown backend: $BACKEND" >&2
+    echo "unknown backend: $BACKEND (expected: official, runner-server, aksh)" >&2
     exit 1
 fi
 
@@ -150,6 +168,12 @@ if [ "$STATUS" != "config_failed" ]; then
         --mitm-dir "$MITM_DIR" \
         --run "true" 2>&1 | tee -a "$CAPTURE_DIR/runner.log"; then
         STATUS="scenario_failed"
+    fi
+else
+    echo "runner configuration failed — check output above" >&2
+    if [ -f "$CAPTURE_DIR/runner.log" ]; then
+        echo "--- last 20 lines of runner.log ---" >&2
+        tail -20 "$CAPTURE_DIR/runner.log" >&2
     fi
 fi
 
