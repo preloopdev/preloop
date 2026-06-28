@@ -8,8 +8,8 @@
 # runner can reach it on port 80 (the runner strips non-default HTTP ports
 # from URLs; the redirect makes port 80 work without root on aksh itself).
 #
-# Submits a 3-step echo workflow and measures wall-clock time from submission
-# to runner exit (job completed).
+# Submits .github/workflows/dogfood.yml and measures wall-clock time from
+# submission to the runner's JobCompletedEvent.
 #
 # Emits:
 #   METRIC e2e_latency_ms=<integer>   — submission → runner exit
@@ -23,7 +23,7 @@ unset all_proxy ALL_PROXY http_proxy https_proxy HTTP_PROXY HTTPS_PROXY \
       no_proxy NO_PROXY 2>/dev/null || true
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-AKSH_BIN="$HOME/rust-runner-server/target/release/aksh-runner-server"
+AKSH_BIN="$SCRIPT_DIR/target/release/aksh-runner-server"
 RUNNER_DIR="$HOME/mitm-proxy/experiments/mitm/.cache/runner-official"
 AKSH_PORT=9090
 # Clients use port 80 via pfctl redirect (runner strips non-default HTTP ports)
@@ -34,11 +34,16 @@ AKSH_PID=""
 RUNNER_PID=""
 
 cleanup() {
+    local status=$?
     [ -n "$AKSH_PID" ]   && kill "$AKSH_PID"   2>/dev/null || true
     [ -n "$RUNNER_PID" ] && kill "$RUNNER_PID" 2>/dev/null || true
     wait "$AKSH_PID"   2>/dev/null || true
     wait "$RUNNER_PID" 2>/dev/null || true
-    rm -rf "$STATE_DIR"
+    if [ "$status" -eq 0 ]; then
+        rm -rf "$STATE_DIR"
+    else
+        echo "Preserved debug state: $STATE_DIR" >&2
+    fi
 }
 trap cleanup EXIT
 
@@ -132,18 +137,26 @@ sleep 1   # let runner connect and start long-polling
 
 T_START=$(python3 -c "import time; print(int(time.time() * 1000))")
 
-resp=$(python3 - <<'PYEOF'
-import urllib.request, json
+resp=$(python3 - <<PYEOF
+import json
+import pathlib
+import urllib.request
+
+repo = pathlib.Path("$SCRIPT_DIR").resolve()
+workflow = repo.joinpath(".github", "workflows", "dogfood.yml").read_text()
 payload = json.dumps({
-    "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: self-hosted\n    steps:\n      - run: echo hello from aksh\n      - run: whoami\n      - run: date\n",
+    "workflow_yaml": workflow,
     "event": "push",
-    "repository": "owner/repo"
+    "repository": "owner/repo",
+    "vars": {
+        "AKSH_REPO_ROOT": str(repo),
+    },
 }).encode()
 req = urllib.request.Request(
-    "http://127.0.0.1:80/api/v1/runs",
+    "$CLIENT_URL/api/v1/runs",
     data=payload,
     headers={"Content-Type": "application/json"},
-    method="POST"
+    method="POST",
 )
 with urllib.request.urlopen(req, timeout=10) as r:
     print(r.read().decode())
@@ -153,11 +166,11 @@ RUN_ID=$(printf '%s' "$resp" | json_field run_id) \
     || die "workflow submission failed: $resp"
 
 # ── wait for job completion ──────────────────────────────────────────────────
-# run.status polling is unreliable (job_uuid_to_name lookup bug); detect
-# completion from the aksh log line "job completed" instead.
+# completion from the runner terminal line. The server also logs structured
+# completion, but the terminal line is stable across failed and succeeded jobs.
 
 deadline=$(python3 -c "import time; print(int(time.time()) + 90)")
-while ! grep -q "job completed" "$LOG" 2>/dev/null; do
+while ! grep -Eq "Job .* completed with result:" "$LOG" 2>/dev/null; do
     now=$(python3 -c "import time; print(int(time.time()))")
     [ "$now" -gt "$deadline" ] && { echo "runner timeout after 90s" >&2; exit 1; }
     sleep 0.2
@@ -166,8 +179,9 @@ done
 T_END=$(python3 -c "import time; print(int(time.time() * 1000))")
 LATENCY_MS=$(( T_END - T_START ))
 
-# Infer success: "job completed" with result=Succeeded
+# Infer success from either the runner terminal line or aksh's structured log.
 JOB_SUCCEEDED=0
-grep -q "result=Succeeded" "$LOG" 2>/dev/null && JOB_SUCCEEDED=1
+grep -Eq "completed with result: Succeeded|result=\"succeeded\"" "$LOG" 2>/dev/null && JOB_SUCCEEDED=1
 echo "METRIC e2e_latency_ms=${LATENCY_MS}"
 echo "METRIC job_succeeded=${JOB_SUCCEEDED}"
+[ "$JOB_SUCCEEDED" -eq 1 ] || die "dogfood workflow failed; see $LOG"
