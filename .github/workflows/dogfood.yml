@@ -6,13 +6,14 @@ on:
 
 # Runs against aksh locally. No checkout/toolchain actions — the repo is
 # already on disk at AKSH_REPO_ROOT (injected by the harness as a variable).
-# Steps run in the repo directory via `working-directory`.
 
 jobs:
   rust:
     runs-on: self-hosted
     steps:
-      - name: cargo check
-        run: cargo check --workspace
+      - name: cargo fmt
+        run: cd "$AKSH_REPO_ROOT" && cargo fmt --all --check
+      - name: cargo clippy
+        run: cd "$AKSH_REPO_ROOT" && cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test
-        run: cargo test --workspace --quiet
+        run: cd "$AKSH_REPO_ROOT" && cargo test --workspace --quiet

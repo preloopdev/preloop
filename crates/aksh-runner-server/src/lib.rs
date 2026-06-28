@@ -5,17 +5,6 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::body::Body;
-use axum::extract::{Path, Query, Request, State};
-use axum::http::{header, StatusCode};
-use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, patch, post};
-use axum::{Json, Router};
-use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD};
-use base64::Engine;
-use bytes::Bytes;
-use hmac::{Hmac, Mac};
 use aksh_artifacts::ArtifactStore;
 use aksh_cache::CacheStore;
 use aksh_gha_parser::{expand_jobs_with_reusables, parse_workflow};
@@ -30,6 +19,17 @@ use aksh_gha_protocol::{
     RegisteredRunner, RunAccepted, RunId, RunnerRegistrationRequest, RunnerSession,
     RunnerSessionRequest, WorkflowSubmission, PROTOCOL_VERSION,
 };
+use axum::body::Body;
+use axum::extract::{Path, Query, Request, State};
+use axum::http::{header, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{delete, get, patch, post};
+use axum::{Json, Router};
+use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD};
+use base64::Engine;
+use bytes::Bytes;
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::Sha256;
@@ -176,6 +176,22 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         .route("/api/v3/orgs/:org/actions/runners/registration-token", post(github_registration_token))
         .route("/api/v3/repos/:owner/:repo/actions/runners/registration-token", post(github_registration_token))
         .route("/runner/server/_apis/connectionData", get(connection_data))
+        .route("/runner/server/_apis/v1/oauth2/token", post(oauth2_token))
+        .route("/runner/server/_apis/v1/AgentPools", get(runner_pools))
+        .route("/runner/server/_apis/v1/Agent/:pool_id/:agent_id", get(agent_lookup_by_id).post(register_runner_compat))
+        .route("/runner/server/_apis/v1/Agent/:pool_id", get(agent_lookup).post(register_runner_compat))
+        .route("/runner/server/_apis/v1/AgentSession/:pool_id/:session_id", post(create_session_compat))
+        .route("/runner/server/_apis/v1/AgentSession/:pool_id", post(create_session_compat_pool_only))
+        .route("/runner/server/_apis/v1/AgentSession/:pool_id/:session_id", delete(delete_session))
+        .route("/runner/server/_apis/v1/Message/:pool_id", get(next_message_compat))
+        .route("/runner/server/_apis/v1/Message/:pool_id/:message_id", delete(delete_pool_message))
+        .route("/runner/server/_apis/v1/AgentRequest/:pool_id/:request_id", patch(agent_request_patch))
+        .route("/runner/server/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id", patch(patch_timeline_records))
+        .route("/runner/server/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id", post(create_log))
+        .route("/runner/server/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id/:log_id2", post(append_log))
+        .route("/runner/server/_apis/v1/TimeLineWebConsoleLog/:scope/:hub/:plan_id/:timeline_id/:record_id", post(console_log))
+        .route("/runner/server/_apis/v1/FinishJob/:scope/:hub/:plan_id", post(finish_job))
+        .route("/runner/server/_apis/v1/ActionDownloadInfo/:scope/:hub/:plan_id", post(action_download_info))
         .route("/_apis/connectionData", get(connection_data))
         .route("/_apis/", axum::routing::options(|| async { StatusCode::OK }))
         .route("/api/v1/runs", post(submit_run))
@@ -414,7 +430,10 @@ async fn submit_run(
     let workflow = parse_workflow(&submission.workflow_yaml)?;
     let (branch, tag) = git_ref_context(&submission.git_ref);
     let changed_paths = changed_paths_from_payload(&submission.payload);
-    let activity_type = submission.payload.get("action").and_then(|value| value.as_str());
+    let activity_type = submission
+        .payload
+        .get("action")
+        .and_then(|value| value.as_str());
     if !workflow.on.matches_with_context(
         &submission.event,
         branch.as_deref(),
@@ -450,9 +469,14 @@ async fn submit_run(
                 &job,
                 &github,
                 &job.env,
-                &submission.secrets.iter().map(|(k, v)| (k.clone(), v.expose().to_owned())).collect(),
+                &submission
+                    .secrets
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.expose().to_owned()))
+                    .collect(),
                 &submission.vars,
-            ).map_err(|e| ApiError::bad_request(format!("failed to build job message: {e}")))?;
+            )
+            .map_err(|e| ApiError::bad_request(format!("failed to build job message: {e}")))?;
 
             let queued_job = QueuedJob {
                 run_id,
@@ -685,7 +709,9 @@ async fn register_runner(
         public_key,
     };
     if let Some(public_key) = &runner.public_key {
-        inner.runner_public_keys.insert(runner_id, public_key.clone());
+        inner
+            .runner_public_keys
+            .insert(runner_id, public_key.clone());
     }
     if let Some(public_key) = parsed_public_key {
         inner.runner_rsa_public_keys.insert(runner_id, public_key);
@@ -706,12 +732,15 @@ async fn create_session(
     // Send the AES key as base64 without RSA wrapping.
     // The runner's RSA public key parsing from registration is complex (XML format);
     // for now we send the key unencrypted and let the runner use it directly.
-    let key_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &session_enc.key);
+    let key_b64 =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &session_enc.key);
 
     // Store the session key for later message decryption
     {
         let mut inner = shared.state.inner.lock().await;
-        inner.session_keys.insert(session_id.to_string(), session_enc);
+        inner
+            .session_keys
+            .insert(session_id.to_string(), session_enc);
     }
 
     info!(%session_id, "session created with AES key (unencrypted)");
@@ -788,7 +817,8 @@ async fn next_message(
         // Update run status
         if let Some(run) = inner.runs.get_mut(&queued.run_id) {
             run.status = ExecutionStatus::InProgress;
-            run.jobs.insert(queued.job_id.clone(), ExecutionStatus::InProgress);
+            run.jobs
+                .insert(queued.job_id.clone(), ExecutionStatus::InProgress);
         }
 
         let body_json = serde_json::to_string(&queued.message)
@@ -946,7 +976,11 @@ async fn complete_job_inner(
             .insert(completion.job_id.clone(), completion.status);
         run.job_outputs.insert(
             completion.job_id.clone(),
-            completion.outputs.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            completion
+                .outputs
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
         );
         run.status = summarize_run(run.jobs.values().copied());
     }
@@ -1052,7 +1086,10 @@ fn apply_matrix_fail_fast(inner: &mut InnerState, run_id: RunId, failed_job: &Jo
     for (job_id, status) in &mut run.jobs {
         if job_id != failed_job
             && run.job_base_ids.get(job_id) == Some(&base_id)
-            && matches!(status, ExecutionStatus::Queued | ExecutionStatus::InProgress)
+            && matches!(
+                status,
+                ExecutionStatus::Queued | ExecutionStatus::InProgress
+            )
         {
             *status = ExecutionStatus::Cancelled;
         }
@@ -1250,7 +1287,11 @@ async fn append_log(
     let key = log_key(&plan_id, &log_id);
     let mut inner = shared.state.inner.lock().await;
     let masked = mask_log_bytes(&inner, &plan_id, &body);
-    inner.logs.entry(key).or_default().extend_from_slice(&masked);
+    inner
+        .logs
+        .entry(key)
+        .or_default()
+        .extend_from_slice(&masked);
     StatusCode::ACCEPTED
 }
 
@@ -1286,7 +1327,13 @@ fn mask_log_bytes(inner: &InnerState, plan_id: &str, body: &[u8]) -> Vec<u8> {
 /// POST console log — runner streams live console output.
 async fn console_log(
     State(_shared): State<Arc<SharedState>>,
-    Path((_scope, _hub, _plan_id, _timeline_id, _record_id)): Path<(String, String, String, String, String)>,
+    Path((_scope, _hub, _plan_id, _timeline_id, _record_id)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
     _body: Bytes,
 ) -> StatusCode {
     StatusCode::ACCEPTED
@@ -1301,7 +1348,9 @@ async fn finish_job(
     let mut inner = shared.state.inner.lock().await;
 
     let status = match event.result {
-        azdo::TaskResult::Succeeded | azdo::TaskResult::SucceededWithIssues => ExecutionStatus::Success,
+        azdo::TaskResult::Succeeded | azdo::TaskResult::SucceededWithIssues => {
+            ExecutionStatus::Success
+        }
         azdo::TaskResult::Failed => ExecutionStatus::Failure,
         azdo::TaskResult::Cancelled => ExecutionStatus::Cancelled,
         azdo::TaskResult::Skipped => ExecutionStatus::Skipped,
@@ -1441,7 +1490,6 @@ fn svc(name: &str, id: &str, location: &str) -> serde_json::Value {
     })
 }
 
-
 /// GET /_apis/v1/Agent/:pool_id — look up runner by agentName query param.
 /// Returns 200 with the agent if found, or 200 with an empty array if not found.
 /// The runner treats a non-empty result as "agent exists" and empty as "needs registration".
@@ -1494,18 +1542,32 @@ async fn register_runner_compat(
     Json(mut request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // The runner sends a TaskAgent-style body; extract what we need.
-    let name = request.get("name").and_then(|v| v.as_str()).unwrap_or("runner").to_owned();
+    let name = request
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("runner")
+        .to_owned();
     let labels: Vec<String> = request
         .get("labels")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
         .unwrap_or_default();
-    let ephemeral = request.get("ephemeral").and_then(|v| v.as_bool()).unwrap_or(false);
+    let ephemeral = request
+        .get("ephemeral")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let reg_request = RunnerRegistrationRequest {
         name: name.clone(),
         labels,
         ephemeral,
-        public_key: request.get("publicKey").and_then(|v| v.as_str()).map(str::to_owned),
+        public_key: request
+            .get("publicKey")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
     };
     let result = register_runner(State(shared), Json(reg_request)).await?;
     Ok(Json(json!({
@@ -1535,7 +1597,12 @@ async fn register_runner_compat_pool_only(
     Path(_pool_id): Path<i64>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    register_runner_compat(State(shared), Path((_pool_id, "0".to_owned())), Json(request)).await
+    register_runner_compat(
+        State(shared),
+        Path((_pool_id, "0".to_owned())),
+        Json(request),
+    )
+    .await
 }
 
 /// Compat handler: create session via AzDO AgentSession path.
@@ -1544,9 +1611,22 @@ async fn create_session_compat(
     Path((_pool_id, session_id)): Path<(i64, String)>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let runner_id = body.get("agent").and_then(|a| a.get("id")).and_then(|v| v.as_i64()).unwrap_or(1);
-    let name = body.get("agent").and_then(|a| a.get("name")).and_then(|v| v.as_str()).unwrap_or("runner").to_owned();
-    let result = create_session(State(shared), Json(RunnerSessionRequest { runner_id, name })).await;
+    let runner_id = body
+        .get("agent")
+        .and_then(|a| a.get("id"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(1);
+    let name = body
+        .get("agent")
+        .and_then(|a| a.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("runner")
+        .to_owned();
+    let result = create_session(
+        State(shared),
+        Json(RunnerSessionRequest { runner_id, name }),
+    )
+    .await;
     Ok(result)
 }
 
@@ -1664,7 +1744,12 @@ async fn patch_timeline_records_org(
     Path((_org, scope, hub, plan_id, timeline_id)): Path<(String, String, String, String, String)>,
     Json(records): Json<Vec<azdo::TimelineRecord>>,
 ) -> Json<serde_json::Value> {
-    patch_timeline_records(State(shared), Path((scope, hub, plan_id, timeline_id)), Json(records)).await
+    patch_timeline_records(
+        State(shared),
+        Path((scope, hub, plan_id, timeline_id)),
+        Json(records),
+    )
+    .await
 }
 
 async fn create_log_org(
@@ -1676,18 +1761,42 @@ async fn create_log_org(
 
 async fn append_log_org(
     State(shared): State<Arc<SharedState>>,
-    Path((_org, scope, hub, plan_id, log_id, log_id2)): Path<(String, String, String, String, String, String)>,
+    Path((_org, scope, hub, plan_id, log_id, log_id2)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
     body: Bytes,
 ) -> StatusCode {
-    append_log(State(shared), Path((scope, hub, plan_id, log_id, log_id2)), body).await
+    append_log(
+        State(shared),
+        Path((scope, hub, plan_id, log_id, log_id2)),
+        body,
+    )
+    .await
 }
 
 async fn console_log_org(
     State(shared): State<Arc<SharedState>>,
-    Path((_org, scope, hub, plan_id, timeline_id, record_id)): Path<(String, String, String, String, String, String)>,
+    Path((_org, scope, hub, plan_id, timeline_id, record_id)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
     body: Bytes,
 ) -> StatusCode {
-    console_log(State(shared), Path((scope, hub, plan_id, timeline_id, record_id)), body).await
+    console_log(
+        State(shared),
+        Path((scope, hub, plan_id, timeline_id, record_id)),
+        body,
+    )
+    .await
 }
 
 async fn finish_job_org(
@@ -1781,9 +1890,7 @@ async fn oidc_token(
         .duration_since(UNIX_EPOCH)
         .map_err(|error| ApiError::bad_request(format!("system clock before epoch: {error}")))?
         .as_secs();
-    let audience = query
-        .audience
-        .unwrap_or_else(|| "api://aksh".to_owned());
+    let audience = query.audience.unwrap_or_else(|| "api://aksh".to_owned());
     let header = json!({
         "alg": "HS256",
         "typ": "JWT",
@@ -2408,7 +2515,9 @@ jobs:
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri(format!("/_apis/v1/Logfiles/scope/actions/{run_id}/log-1/append"))
+                    .uri(format!(
+                        "/_apis/v1/Logfiles/scope/actions/{run_id}/log-1/append"
+                    ))
                     .header(header::AUTHORIZATION, "Bearer aksh-system-token")
                     .body(Body::from("token=super-secret"))
                     .unwrap(),
@@ -2419,7 +2528,10 @@ jobs:
 
         let inner = state.inner.lock().await;
         assert_eq!(
-            inner.logs.get(&format!("{run_id}/log-1")).map(Vec::as_slice),
+            inner
+                .logs
+                .get(&format!("{run_id}/log-1"))
+                .map(Vec::as_slice),
             Some(&b"token=***"[..])
         );
     }
@@ -2445,10 +2557,7 @@ jobs:
         let runner_id = runner["id"].as_i64().unwrap();
 
         let inner = state.inner.lock().await;
-        assert_eq!(
-            inner.runner_public_keys.get(&runner_id),
-            Some(&public_key)
-        );
+        assert_eq!(inner.runner_public_keys.get(&runner_id), Some(&public_key));
         assert!(inner.runner_rsa_public_keys.contains_key(&runner_id));
     }
 
@@ -2484,7 +2593,8 @@ jobs:
         let key_b64 = session["encryptionKey"]["value"].as_str().unwrap();
         let encrypted = session["encryptionKey"]["encrypted"].as_bool().unwrap();
         assert!(!encrypted, "session key should be sent unencrypted for now");
-        let key_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, key_b64).unwrap();
+        let key_bytes =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, key_b64).unwrap();
         assert_eq!(key_bytes.len(), 32, "AES-256 key should be 32 bytes");
     }
 
@@ -2740,7 +2850,8 @@ jobs:
         .await;
         let session_id = session["sessionId"].as_str().unwrap();
         let key_b64 = session["encryptionKey"]["value"].as_str().unwrap();
-        let aes_key = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, key_b64).unwrap();
+        let aes_key =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, key_b64).unwrap();
 
         request_json(
             &app,
@@ -2764,7 +2875,9 @@ jobs:
         let message = request_json(
             &app,
             Method::GET,
-            &format!("/runner/server/_apis/distributedtask/pools/1/messages?sessionId={session_id}"),
+            &format!(
+                "/runner/server/_apis/distributedtask/pools/1/messages?sessionId={session_id}"
+            ),
             Value::Null,
         )
         .await;
@@ -2778,10 +2891,15 @@ jobs:
             .iter()
             .map(|value| value.as_u64().unwrap() as u8)
             .collect();
-        let plaintext = SessionEncryption::from_key(aes_key).decrypt(&body, &iv).unwrap();
+        let plaintext = SessionEncryption::from_key(aes_key)
+            .decrypt(&body, &iv)
+            .unwrap();
         let job: azdo::AgentJobRequestMessage = serde_json::from_slice(&plaintext).unwrap();
 
-        assert_eq!(message["messageType"], azdo::message_type::PIPELINE_AGENT_JOB_REQUEST);
+        assert_eq!(
+            message["messageType"],
+            azdo::message_type::PIPELINE_AGENT_JOB_REQUEST
+        );
         assert_eq!(job.steps[0].script.as_deref(), Some("echo encrypted"));
     }
 
@@ -2829,8 +2947,9 @@ jobs:
                     .method(Method::POST)
                     .uri("/api/v1/runs")
                     .header("content-type", "application/json")
-                    .body(Body::from(json!({
-                        "workflow_yaml": r#"
+                    .body(Body::from(
+                        json!({
+                            "workflow_yaml": r#"
 on:
   push:
     branches: [main]
@@ -2841,15 +2960,17 @@ jobs:
     steps:
       - run: echo ok
 "#,
-                        "event": "push",
-                        "repository": "owner/repo",
-                        "git_ref": "refs/heads/feature",
-                        "payload": {
-                            "commits": [
-                                { "added": [], "modified": ["docs/readme.md"], "removed": [] }
-                            ]
-                        }
-                    }).to_string()))
+                            "event": "push",
+                            "repository": "owner/repo",
+                            "git_ref": "refs/heads/feature",
+                            "payload": {
+                                "commits": [
+                                    { "added": [], "modified": ["docs/readme.md"], "removed": [] }
+                                ]
+                            }
+                        })
+                        .to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -2953,7 +3074,12 @@ jobs:
         let app = app(state.clone(), CancellationToken::new());
 
         // Non-asserting helper
-        async fn try_req(app: &Router, method: Method, uri: &str, body: Value) -> (StatusCode, Value) {
+        async fn try_req(
+            app: &Router,
+            method: Method,
+            uri: &str,
+            body: Value,
+        ) -> (StatusCode, Value) {
             let mut builder = Request::builder().method(method).uri(uri);
             if uri.starts_with("/_apis/") || uri.starts_with("/runner/server/_apis/") {
                 builder = builder.header(header::AUTHORIZATION, "Bearer aksh-system-token");
@@ -2961,7 +3087,10 @@ jobs:
             let request = if body.is_null() {
                 builder.body(Body::empty()).unwrap()
             } else {
-                builder.header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()
+                builder
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap()
             };
             let response = app.clone().oneshot(request).await.unwrap();
             let status = response.status();
@@ -2971,24 +3100,45 @@ jobs:
         }
 
         // 1. connectionData
-        let (s, conn) = try_req(&app, Method::GET, "/runner/server/_apis/connectionData", Value::Null).await;
+        let (s, conn) = try_req(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/connectionData",
+            Value::Null,
+        )
+        .await;
         assert!(s.is_success(), "1 connectionData: {}", s);
         assert!(conn["locationServiceData"]["serviceDefinitions"].is_array());
 
         // 2. OAuth token
-        let (s, _) = try_req(&app, Method::POST, "/_apis/v1/oauth2/token",
-            json!({"grant_type":"client_credentials","client_id":"t","client_secret":"t"})).await;
+        let (s, _) = try_req(
+            &app,
+            Method::POST,
+            "/_apis/v1/oauth2/token",
+            json!({"grant_type":"client_credentials","client_id":"t","client_secret":"t"}),
+        )
+        .await;
         assert!(s.is_success(), "2 oauth2: {}", s);
 
         // 3. Register runner
-        let (s, reg) = try_req(&app, Method::POST, "/api/v1/runners",
-            json!({"name":"test-runner","labels":["self-hosted","linux","x64"]})).await;
+        let (s, reg) = try_req(
+            &app,
+            Method::POST,
+            "/api/v1/runners",
+            json!({"name":"test-runner","labels":["self-hosted","linux","x64"]}),
+        )
+        .await;
         assert!(s.is_success(), "3 register: {} body={}", s, reg);
         let runner_id = reg["id"].as_i64().unwrap();
 
         // 4. Create session
-        let (s, sess) = try_req(&app, Method::POST, "/api/v1/runners/sessions",
-            json!({"runner_id": runner_id, "name": "test-runner"})).await;
+        let (s, sess) = try_req(
+            &app,
+            Method::POST,
+            "/api/v1/runners/sessions",
+            json!({"runner_id": runner_id, "name": "test-runner"}),
+        )
+        .await;
         assert!(s.is_success(), "4 session: {} body={}", s, sess);
         let session_id = sess["sessionId"].as_str().unwrap().to_owned();
 
@@ -2999,9 +3149,16 @@ jobs:
         let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
 
         // 6. Poll for messages — the runner uses the AzDO Message endpoint
-        let (s, msg) = try_req(&app, Method::GET,
-            &format!("/api/v1/runners/sessions/{}/messages?sessionId={}&waitSeconds=0", session_id, session_id),
-            Value::Null).await;
+        let (s, msg) = try_req(
+            &app,
+            Method::GET,
+            &format!(
+                "/api/v1/runners/sessions/{}/messages?sessionId={}&waitSeconds=0",
+                session_id, session_id
+            ),
+            Value::Null,
+        )
+        .await;
         assert!(s.is_success(), "6 poll: {} body={}", s, msg);
 
         // 7. Get the job from the run
@@ -3011,12 +3168,23 @@ jobs:
         drop(inner);
 
         // 8. Complete the job
-        let (s, _) = try_req(&app, Method::POST, "/api/v1/jobs/complete",
-            json!({"run_id": run_id, "job_id": job_id, "status": "success"})).await;
+        let (s, _) = try_req(
+            &app,
+            Method::POST,
+            "/api/v1/jobs/complete",
+            json!({"run_id": run_id, "job_id": job_id, "status": "success"}),
+        )
+        .await;
         assert!(s.is_success(), "8 complete: {}", s);
 
         // 9. Verify run succeeded
-        let (_, final_run) = try_req(&app, Method::GET, &format!("/api/v1/runs/{}", run_id), Value::Null).await;
+        let (_, final_run) = try_req(
+            &app,
+            Method::GET,
+            &format!("/api/v1/runs/{}", run_id),
+            Value::Null,
+        )
+        .await;
         assert_eq!(final_run["status"], "success");
     }
 
