@@ -144,6 +144,30 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             "/_apis/v1/ActionDownloadInfo/:scope/:hub/:plan_id",
             post(action_download_info),
         )
+        .route(
+            "/runner/server/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id",
+            patch(patch_timeline_records),
+        )
+        .route(
+            "/runner/server/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id",
+            post(create_log),
+        )
+        .route(
+            "/runner/server/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id/:log_id2",
+            post(append_log),
+        )
+        .route(
+            "/runner/server/_apis/v1/TimeLineWebConsoleLog/:scope/:hub/:plan_id/:timeline_id/:record_id",
+            post(console_log),
+        )
+        .route(
+            "/runner/server/_apis/v1/FinishJob/:scope/:hub/:plan_id",
+            post(finish_job),
+        )
+        .route(
+            "/runner/server/_apis/v1/ActionDownloadInfo/:scope/:hub/:plan_id",
+            post(action_download_info),
+        )
         .route_layer(middleware::from_fn(require_bearer));
 
     Router::new()
@@ -181,12 +205,6 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         .route("/runner/server/_apis/v1/Message/:pool_id", get(next_message_compat))
         .route("/runner/server/_apis/v1/Message/:pool_id/:message_id", delete(delete_pool_message))
         .route("/runner/server/_apis/v1/AgentRequest/:pool_id/:request_id", patch(agent_request_patch))
-        .route("/runner/server/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id", patch(patch_timeline_records))
-        .route("/runner/server/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id", post(create_log))
-        .route("/runner/server/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id/:log_id2", post(append_log))
-        .route("/runner/server/_apis/v1/TimeLineWebConsoleLog/:scope/:hub/:plan_id/:timeline_id/:record_id", post(console_log))
-        .route("/runner/server/_apis/v1/FinishJob/:scope/:hub/:plan_id", post(finish_job))
-        .route("/runner/server/_apis/v1/ActionDownloadInfo/:scope/:hub/:plan_id", post(action_download_info))
         .route("/_apis/connectionData", get(connection_data))
         .route("/_apis/", axum::routing::options(|| async { StatusCode::OK }))
         .route("/api/v1/runs", post(submit_run))
@@ -2824,6 +2842,46 @@ jobs:
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn runner_server_v1_sensitive_routes_require_bearer() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+
+        // These /runner/server/_apis/v1/* aliases were previously placed on
+        // the public router, letting unauthenticated callers mutate timelines,
+        // inject logs, and finish jobs. They MUST require a bearer token.
+        let cases = [
+            (Method::PATCH, "/runner/server/_apis/v1/Timeline/s/h/p/t"),
+            (Method::POST, "/runner/server/_apis/v1/Logfiles/s/h/p/l"),
+            (Method::POST, "/runner/server/_apis/v1/Logfiles/s/h/p/l/l2"),
+            (Method::POST, "/runner/server/_apis/v1/TimeLineWebConsoleLog/s/h/p/t/r"),
+            (Method::POST, "/runner/server/_apis/v1/FinishJob/s/h/p"),
+            (Method::POST, "/runner/server/_apis/v1/ActionDownloadInfo/s/h/p"),
+        ];
+        for (method, uri) in cases {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(uri)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri} should require bearer auth"
+            );
+        }
     }
 
     #[tokio::test]
