@@ -291,7 +291,7 @@ struct InnerState {
     agent_keypair: Option<AgentRsaKeypair>,
     runner_public_keys: BTreeMap<i64, String>,
     runner_rsa_public_keys: BTreeMap<i64, AgentRsaPublicKey>,
-    inflight_messages: BTreeMap<i64, azdo::TaskAgentMessage>,
+    inflight_messages: BTreeMap<String, BTreeMap<i64, azdo::TaskAgentMessage>>,
     cancellation_queue: VecDeque<QueuedCancellation>,
     pending_caches: BTreeMap<i64, PendingCache>,
     artifacts: BTreeMap<String, ArtifactRecord>,
@@ -776,7 +776,11 @@ async fn next_message(
 
     loop {
         let mut inner = shared.state.inner.lock().await;
-        if let Some(message) = inner.inflight_messages.values().next().cloned() {
+        if let Some(message) = inner
+            .inflight_messages
+            .get(&session_id)
+            .and_then(|messages| messages.values().next().cloned())
+        {
             return Ok(Json(Some(message)));
         }
 
@@ -847,9 +851,9 @@ async fn next_message(
 
 async fn delete_session_message(
     State(shared): State<Arc<SharedState>>,
-    Path((_session_id, message_id)): Path<(String, i64)>,
+    Path((session_id, message_id)): Path<(String, i64)>,
 ) -> StatusCode {
-    ack_message(shared, message_id).await
+    ack_message(shared, &session_id, message_id).await
 }
 
 fn build_task_agent_message(
@@ -879,20 +883,31 @@ fn build_task_agent_message(
         body: BASE64_STANDARD.encode(&encrypted_body),
         iv: Some(iv),
     };
-    inner.inflight_messages.insert(message_id, message.clone());
+    inner
+        .inflight_messages
+        .entry(session_id.to_owned())
+        .or_default()
+        .insert(message_id, message.clone());
     Ok(message)
 }
 
 async fn delete_pool_message(
     State(shared): State<Arc<SharedState>>,
     Path((_pool_id, message_id)): Path<(i64, i64)>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> StatusCode {
-    ack_message(shared, message_id).await
+    let session_id = params.get("sessionId").map(String::as_str).unwrap_or("");
+    ack_message(shared, session_id, message_id).await
 }
 
-async fn ack_message(shared: Arc<SharedState>, message_id: i64) -> StatusCode {
+async fn ack_message(shared: Arc<SharedState>, session_id: &str, message_id: i64) -> StatusCode {
     let mut inner = shared.state.inner.lock().await;
-    inner.inflight_messages.remove(&message_id);
+    if let Some(messages) = inner.inflight_messages.get_mut(session_id) {
+        messages.remove(&message_id);
+        if messages.is_empty() {
+            inner.inflight_messages.remove(session_id);
+        }
+    }
     StatusCode::NO_CONTENT
 }
 
@@ -1717,8 +1732,9 @@ async fn next_message_compat_org(
 async fn delete_pool_message_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, pool_id, message_id)): Path<(String, i64, i64)>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> StatusCode {
-    delete_pool_message(State(shared), Path((pool_id, message_id))).await
+    delete_pool_message(State(shared), Path((pool_id, message_id)), Query(params)).await
 }
 
 #[allow(dead_code)]
@@ -2695,7 +2711,7 @@ jobs:
             .oneshot(
                 Request::builder()
                     .method(Method::DELETE)
-                    .uri("/runner/server/_apis/distributedtask/pools/1/messages/1")
+                    .uri("/runner/server/_apis/distributedtask/pools/1/messages/1?sessionId=default")
                     .header(header::AUTHORIZATION, "Bearer aksh-system-token")
                     .body(Body::empty())
                     .unwrap(),
@@ -2757,7 +2773,7 @@ jobs:
                 Request::builder()
                     .method(Method::DELETE)
                     .uri(format!(
-                        "/runner/server/_apis/distributedtask/pools/1/messages/{message_id}"
+                        "/runner/server/_apis/distributedtask/pools/1/messages/{message_id}?sessionId=default"
                     ))
                     .header(header::AUTHORIZATION, "Bearer aksh-system-token")
                     .body(Body::empty())
