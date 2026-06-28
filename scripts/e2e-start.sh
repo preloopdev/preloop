@@ -190,8 +190,9 @@ run_runner() {
     info "Running runner against aksh..."
     cd "$RUNNER_DIR"
 
-    timeout 60 ./run.sh 2>&1 | tee -a "$LOG_FILE" | grep -E \
-        "Listening|Job|Step|completed|error|Error|Failed|Succeeded|Worker" | head -30 || true
+    # `timeout` is not available on macOS without coreutils; use perl as a portable substitute.
+    perl -e 'alarm 90; exec @ARGV' -- ./run.sh 2>&1 | tee -a "$LOG_FILE" | grep -E \
+        "Listening|Job|Step|completed|error|Error|Failed|Succeeded|Worker" | head -50 || true
 
     # Check result
     if [ -n "${RUN_ID:-}" ]; then
