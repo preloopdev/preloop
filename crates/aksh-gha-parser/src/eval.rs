@@ -27,7 +27,7 @@ pub fn resolve_string(input: &str, context: &Context) -> Result<String, String> 
         result.push_str(&remaining[..start]);
         remaining = &remaining[start + 3..];
 
-        let end = remaining.find("}}").ok_or("unclosed ${{ expression")?;
+        let end = find_expression_end(remaining).ok_or("unclosed ${{ expression")?;
         let expr = &remaining[..end].trim();
         remaining = &remaining[end + 2..];
 
@@ -37,6 +37,35 @@ pub fn resolve_string(input: &str, context: &Context) -> Result<String, String> 
 
     result.push_str(remaining);
     Ok(result)
+}
+
+fn find_expression_end(input: &str) -> Option<usize> {
+    let mut quote = None;
+    let mut escaped = false;
+
+    for (index, ch) in input.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+
+        if let Some(quote_ch) = quote {
+            if ch == '\\' {
+                escaped = true;
+            } else if ch == quote_ch {
+                quote = None;
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '}' if input[index..].starts_with("}}") => return Some(index),
+            _ => {}
+        }
+    }
+
+    None
 }
 
 /// Check if a string contains any `${{ }}` expressions.
@@ -182,6 +211,12 @@ mod tests {
             resolve_string("ref=${{ github.ref }}", &ctx).unwrap(),
             "ref=refs/heads/main"
         );
+    }
+
+    #[test]
+    fn expression_end_ignores_braces_inside_string_literals() {
+        let source = r#" format('value }} still inside') }}"#;
+        assert_eq!(find_expression_end(source), Some(source.len() - 2));
     }
 
     #[test]

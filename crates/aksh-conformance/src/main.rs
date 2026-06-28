@@ -37,6 +37,33 @@ enum CommandKind {
         #[arg(last = true)]
         args: Vec<String>,
     },
+    /// Compare workflow expansion against golden JSON fixtures.
+    Golden {
+        /// Fixture root containing .yml/.yaml workflows and .json expected outputs.
+        #[arg(long, default_value = "fixtures/golden")]
+        fixtures: PathBuf,
+    },
+    /// Record wire traffic from upstream runner.server (placeholder).
+    Record {
+        /// Upstream runner.server URL.
+        #[arg(long)]
+        upstream: String,
+        /// Output directory for captured fixtures.
+        #[arg(long, default_value = "fixtures/wire")]
+        output: PathBuf,
+    },
+    /// Replay recorded wire traffic through aksh DTOs (placeholder).
+    Replay {
+        /// Directory containing captured wire fixtures.
+        #[arg(long, default_value = "fixtures/wire")]
+        fixtures: PathBuf,
+    },
+    /// Fuzz test the parser with random YAML inputs.
+    Fuzz {
+        /// Number of random inputs to test.
+        #[arg(long, default_value = "1000")]
+        iterations: usize,
+    },
     /// Placeholder for provider-based Runner.Listener integration tests.
     LibkrunPlan,
 }
@@ -50,6 +77,10 @@ async fn main() -> anyhow::Result<()> {
             aksh,
             args,
         } => compare_command(upstream, aksh, args).await,
+        CommandKind::Golden { fixtures } => golden_compare(fixtures).await,
+        CommandKind::Record { upstream, output } => record_wire(upstream, output).await,
+        CommandKind::Replay { fixtures } => replay_wire(fixtures).await,
+        CommandKind::Fuzz { iterations } => fuzz_parser(iterations),
         CommandKind::LibkrunPlan => {
             println!("{}", include_str!("libkrun-plan.md"));
             Ok(())
@@ -153,4 +184,199 @@ async fn compare_command(upstream: String, aksh: String, args: Vec<String>) -> a
         );
     }
     Ok(())
+}
+
+/// Compare workflow expansion against golden JSON fixtures.
+///
+/// Each fixture is a pair: `<name>.yml` (workflow) + `<name>.json` (expected expanded jobs).
+/// The JSON contains the serialized `Vec<JobPlan>` we expect from `expand_jobs`.
+async fn golden_compare(fixtures: PathBuf) -> anyhow::Result<()> {
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+    let mut skipped = 0usize;
+
+    for entry in WalkDir::new(&fixtures)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_type().is_file()
+                && e.path()
+                    .extension()
+                    .is_some_and(|ext| ext == "yml" || ext == "yaml")
+        })
+    {
+        let yaml_path = entry.path();
+        let json_path = yaml_path.with_extension("json");
+
+        if !json_path.exists() {
+            skipped += 1;
+            continue;
+        }
+
+        let yaml_text = std::fs::read_to_string(yaml_path)?;
+        let json_text = std::fs::read_to_string(&json_path)?;
+
+        let workflow = match parse_workflow(&yaml_text) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("FAIL {}: parse error: {e}", yaml_path.display());
+                failed += 1;
+                continue;
+            }
+        };
+
+        let plans = match expand_jobs(&workflow) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("FAIL {}: expand error: {e}", yaml_path.display());
+                failed += 1;
+                continue;
+            }
+        };
+
+        let actual_json = serde_json::to_string_pretty(&plans)?;
+        let expected: serde_json::Value = serde_json::from_str(&json_text)?;
+        let actual: serde_json::Value = serde_json::from_str(&actual_json)?;
+
+        if expected == actual {
+            passed += 1;
+        } else {
+            eprintln!("FAIL {}: JSON mismatch", yaml_path.display());
+            // Show diff
+            let expected_str = serde_json::to_string_pretty(&expected)?;
+            let actual_str = serde_json::to_string_pretty(&actual)?;
+            for (i, (a, b)) in actual_str.lines().zip(expected_str.lines()).enumerate() {
+                if a != b {
+                    eprintln!("  line {}: got      {}", i + 1, a);
+                    eprintln!("  line {}: expected {}", i + 1, b);
+                }
+            }
+            failed += 1;
+        }
+    }
+
+    eprintln!("golden: {passed} passed, {failed} failed, {skipped} skipped");
+    if failed > 0 {
+        bail!("{failed} golden tests failed");
+    }
+    Ok(())
+}
+
+/// Record wire traffic from upstream runner.server.
+/// This is a placeholder — actual implementation needs mitmproxy or similar.
+async fn record_wire(upstream: String, output: PathBuf) -> anyhow::Result<()> {
+    eprintln!("record: not yet implemented");
+    eprintln!("  upstream: {upstream}");
+    eprintln!("  output: {}", output.display());
+    eprintln!();
+    eprintln!("To record wire traffic:");
+    eprintln!("  1. Start upstream runner.server at {upstream}");
+    eprintln!("  2. Run a Runner.Listener against it");
+    eprintln!("  3. Capture HTTP traffic with mitmproxy or similar");
+    eprintln!("  4. Save to {}/", output.display());
+    Ok(())
+}
+
+/// Replay recorded wire traffic through aksh DTOs.
+/// This is a placeholder — actual implementation needs captured fixtures.
+async fn replay_wire(fixtures: PathBuf) -> anyhow::Result<()> {
+    eprintln!("replay: not yet implemented");
+    eprintln!("  fixtures: {}", fixtures.display());
+    eprintln!();
+    eprintln!("To replay wire traffic:");
+    eprintln!("  1. Record traffic with 'aksh-conformance record'");
+    eprintln!(
+        "  2. Run 'aksh-conformance replay --fixtures {}'",
+        fixtures.display()
+    );
+    eprintln!("  3. Each captured request/response is validated against our DTOs");
+    Ok(())
+}
+
+/// Fuzz test the parser with random YAML inputs.
+/// Verifies the parser never panics on arbitrary input.
+fn fuzz_parser(iterations: usize) -> anyhow::Result<()> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut passed = 0usize;
+    let mut panics = 0usize;
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    for i in 0..iterations {
+        // Generate a pseudo-random YAML string
+        let mut hasher = DefaultHasher::new();
+        (seed, i).hash(&mut hasher);
+        let hash = hasher.finish();
+        let yaml = generate_random_yaml(hash);
+
+        // Parse should never panic
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parse_workflow(&yaml)));
+
+        match result {
+            Ok(_) => passed += 1,
+            Err(_) => {
+                panics += 1;
+                eprintln!("PANIC on input #{i}: {:?}", &yaml[..yaml.len().min(100)]);
+            }
+        }
+    }
+
+    eprintln!("fuzz: {passed} passed, {panics} panics out of {iterations}");
+    if panics > 0 {
+        bail!("{panics} panics detected");
+    }
+    Ok(())
+}
+
+/// Generate a pseudo-random YAML string from a seed.
+fn generate_random_yaml(seed: u64) -> String {
+    let mut s = seed;
+    let mut next = || -> u64 {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        s
+    };
+
+    let name = format!("job-{}", next() % 1000);
+    let event = match next() % 4 {
+        0 => "push",
+        1 => "pull_request",
+        2 => "workflow_dispatch",
+        _ => "schedule",
+    };
+    let label = match next() % 3 {
+        0 => "ubuntu-latest",
+        1 => "self-hosted",
+        _ => "macos-latest",
+    };
+    let step_count = (next() % 5) + 1;
+
+    let mut yaml =
+        format!("name: {name}\non: {event}\njobs:\n  build:\n    runs-on: [{label}]\n    steps:\n");
+    for _ in 0..step_count {
+        let cmd = match next() % 3 {
+            0 => "echo hello",
+            1 => "ls -la",
+            _ => "pwd",
+        };
+        yaml.push_str(&format!("      - run: {cmd}\n"));
+    }
+
+    // Randomly add matrix
+    if next() % 3 == 0 {
+        yaml.push_str("    strategy:\n      matrix:\n        os: [ubuntu, macos]\n");
+    }
+
+    // Randomly add needs
+    if next() % 4 == 0 {
+        yaml.push_str("  test:\n    needs: build\n    runs-on: [{label}]\n    steps:\n      - run: echo test\n");
+    }
+
+    yaml
 }
