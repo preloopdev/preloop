@@ -8,8 +8,9 @@
 //! - `actions/runner` (C# client side): `src/Runner.Common/Util/RunnerServer.cs`
 //! - `runner.server` (C# server side): `src/Runner.Server/Controllers/MessageController.cs`
 //! - `GitHub.DistributedTask.WebApi` NuGet package (shared DTOs)
+#![allow(missing_docs)]
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 
 // ─── Runner lifecycle DTOs ────────────────────────────────────────────────
@@ -23,7 +24,8 @@ use std::collections::BTreeMap;
 /// Upstream source: `ConnectionDataController.cs`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionData {
-    /// Maps service GUIDs to their base URLs.
+    #[serde(rename = "instanceId", skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
     #[serde(
         rename = "locationServiceData",
         skip_serializing_if = "Option::is_none"
@@ -31,47 +33,82 @@ pub struct ConnectionData {
     pub location_service_data: Option<LocationServiceData>,
 }
 
+/// Access mapping for location service resolution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccessMapping {
+    #[serde(rename = "moniker", skip_serializing_if = "Option::is_none")]
+    pub moniker: Option<String>,
+    #[serde(rename = "displayName", skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(rename = "accessPoint", skip_serializing_if = "Option::is_none")]
+    pub access_point: Option<String>,
+}
+
 /// Location service data — maps service GUIDs to URL locations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocationServiceData {
-    /// Service definitions mapping GUIDs to URL locations.
     #[serde(
         rename = "serviceDefinitions",
         default,
         skip_serializing_if = "Vec::is_empty"
     )]
     pub service_definitions: Vec<ServiceDefinition>,
+    #[serde(
+        rename = "accessMappings",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub access_mappings: Vec<AccessMapping>,
+    #[serde(
+        rename = "defaultAccessMappingMoniker",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub default_access_mapping_moniker: Option<String>,
+}
+
+/// A location mapping for a service definition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocationMapping {
+    #[serde(
+        rename = "accessMappingMoniker",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub access_mapping_moniker: Option<String>,
+    #[serde(rename = "location", skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
 }
 
 /// A single service definition mapping a GUID to a URL location.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceDefinition {
-    /// Service GUID identifier.
+    #[serde(rename = "serviceType", skip_serializing_if = "Option::is_none")]
+    pub service_type: Option<String>,
     #[serde(rename = "identifier", skip_serializing_if = "Option::is_none")]
     pub identifier: Option<String>,
-    /// Maps location types to URL paths.
-    #[serde(rename = "locationMapping", skip_serializing_if = "Option::is_none")]
-    pub location_mapping: Option<BTreeMap<String, String>>,
-    /// Human-readable service name.
     #[serde(rename = "displayName", skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    #[serde(rename = "relativePath", skip_serializing_if = "Option::is_none")]
+    pub relative_path: Option<String>,
+    #[serde(rename = "description", skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(rename = "toolId", skip_serializing_if = "Option::is_none")]
+    pub tool_id: Option<String>,
+    #[serde(rename = "locationMappings", skip_serializing_if = "Option::is_none")]
+    pub location_mappings: Option<Vec<LocationMapping>>,
 }
+
 /// Runner agent registration request.
 ///
 /// The runner sends its RSA public key during registration.
 /// Upstream source: `AgentController.cs`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskAgent {
-    /// Server-assigned runner agent ID.
     #[serde(rename = "id", skip_serializing_if = "Option::is_none")]
     pub id: Option<i64>,
-    /// Runner agent name (configured during `config.sh`).
     #[serde(rename = "name", skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// Runner version string.
     #[serde(rename = "version", skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    /// OS description (e.g. `Linux 5.15.0; Ubuntu 22.04`).
     #[serde(rename = "osDescription", skip_serializing_if = "Option::is_none")]
     pub os_description: Option<String>,
 }
@@ -101,10 +138,8 @@ pub struct EncryptionKey {
 /// Upstream source: `AgentSessionController.cs`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskAgentSession {
-    /// Server-assigned session identifier.
     #[serde(rename = "sessionId")]
     pub session_id: uuid::Uuid,
-    /// AES encryption key (possibly RSA-wrapped) for message decryption.
     #[serde(rename = "encryptionKey")]
     pub encryption_key: EncryptionKey,
 }
@@ -112,10 +147,8 @@ pub struct TaskAgentSession {
 /// Runner session creation request body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateSessionRequest {
-    /// The runner agent metadata.
     #[serde(rename = "agent")]
     pub agent: TaskAgent,
-    /// Session display name.
     #[serde(rename = "sessionName", skip_serializing_if = "Option::is_none")]
     pub session_name: Option<String>,
 }
@@ -133,10 +166,8 @@ pub struct CreateSessionRequest {
 /// `MessageListener.cs` (runner)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskAgentMessage {
-    /// Server-assigned message ID (used for ack/long-poll).
     #[serde(rename = "messageId")]
     pub message_id: i64,
-    /// Message type (e.g. `PipelineAgentJobRequest`, `CancelJob`).
     #[serde(rename = "messageType")]
     pub message_type: String,
     /// Base64-encoded body. Encrypted if the session uses encryption.
@@ -178,6 +209,14 @@ pub struct AgentJobRequestMessage {
     /// The orchestration plan reference (run ID + job ID).
     #[serde(rename = "jobId")]
     pub job_id: uuid::Uuid,
+
+    /// The request ID for this job dispatch (a sequential integer).
+    #[serde(rename = "requestId")]
+    pub request_id: i64,
+
+    /// The plan reference — plan ID and type.
+    #[serde(rename = "plan")]
+    pub plan: PlanReference,
 
     /// The timeline reference for this job's records.
     #[serde(rename = "timeline")]
@@ -234,70 +273,249 @@ pub struct AgentJobRequestMessage {
     pub job_timeout: Option<i64>,
 }
 
-/// Task step — a single unit of work within a job.
+/// Plan reference — identifies the orchestration plan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanReference {
+    #[serde(rename = "planId")]
+    pub plan_id: String,
+    #[serde(rename = "planType", skip_serializing_if = "Option::is_none")]
+    pub plan_type: Option<String>,
+}
+
+/// Task step — a single unit of work within a job.
+#[derive(Debug, Clone)]
 pub struct TaskStep {
-    /// Step identifier.
-    #[serde(rename = "id")]
     pub id: uuid::Uuid,
-    /// Step name (the `id:` field in YAML).
-    #[serde(rename = "name", skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// Human-readable display name.
-    #[serde(rename = "displayName", skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
-    /// The `if` condition expression. Runner evaluates this.
-    #[serde(rename = "condition", skip_serializing_if = "Option::is_none")]
     pub condition: Option<String>,
-    /// Shell script body for `run:` steps.
-    #[serde(rename = "script", skip_serializing_if = "Option::is_none")]
     pub script: Option<String>,
-    /// Action reference for `uses:` steps.
-    #[serde(rename = "reference", skip_serializing_if = "Option::is_none")]
     pub reference: Option<TaskReference>,
-    /// Step inputs (the `with:` block).
-    #[serde(rename = "inputs", default)]
     pub inputs: BTreeMap<String, String>,
-    /// Step environment variables.
-    #[serde(rename = "env", default)]
     pub env: BTreeMap<String, String>,
-    /// Whether this step should continue on error.
-    #[serde(rename = "continueOnError", skip_serializing_if = "Option::is_none")]
     pub continue_on_error: Option<bool>,
-    /// Working directory override.
-    #[serde(rename = "workingDirectory", skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<String>,
-    /// Timeout in minutes.
-    #[serde(rename = "timeoutInMinutes", skip_serializing_if = "Option::is_none")]
     pub timeout_in_minutes: Option<u32>,
+}
+
+impl Serialize for TaskStep {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let mut inputs = self.inputs.clone();
+        if let Some(script) = &self.script {
+            inputs.insert("script".to_owned(), script.clone());
+        }
+
+        let field_count = 5
+            + usize::from(self.name.is_some())
+            + usize::from(self.display_name.is_some())
+            + usize::from(self.condition.is_some())
+            + usize::from(self.continue_on_error.is_some())
+            + usize::from(self.timeout_in_minutes.is_some());
+        let mut map = serializer.serialize_map(Some(field_count))?;
+        map.serialize_entry("type", "action")?;
+        map.serialize_entry("reference", &SerializedActionReference { step: self })?;
+        map.serialize_entry("environment", &TemplateStringMap(&self.env))?;
+        map.serialize_entry("inputs", &TemplateStringMap(&inputs))?;
+        map.serialize_entry("id", &self.id)?;
+        if let Some(name) = &self.name {
+            map.serialize_entry("name", name)?;
+        }
+        if let Some(display_name) = &self.display_name {
+            map.serialize_entry("displayName", display_name)?;
+        }
+        if let Some(condition) = &self.condition {
+            map.serialize_entry("condition", condition)?;
+        }
+        if let Some(continue_on_error) = self.continue_on_error {
+            map.serialize_entry("continueOnError", &continue_on_error)?;
+        }
+        if let Some(timeout_in_minutes) = self.timeout_in_minutes {
+            map.serialize_entry("timeoutInMinutes", &timeout_in_minutes)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for TaskStep {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let obj = value
+            .as_object()
+            .ok_or_else(|| serde::de::Error::custom("expected object"))?;
+
+        let env = extract_template_map(obj.get("env")).unwrap_or_default();
+        let inputs = extract_template_map(obj.get("inputs")).unwrap_or_default();
+
+        // In the new serialization format, `script` lives inside the `inputs`
+        // TemplateToken map instead of as a top-level field.
+        let script = obj
+            .get("script")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .or_else(|| inputs.get("script").cloned());
+
+        Ok(TaskStep {
+            id: obj
+                .get("id")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_else(uuid::Uuid::nil),
+            name: obj.get("name").and_then(|v| v.as_str()).map(str::to_owned),
+            display_name: obj
+                .get("displayName")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned),
+            condition: obj
+                .get("condition")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned),
+            script,
+            reference: obj
+                .get("reference")
+                .and_then(|v| serde_json::from_value(v.clone()).ok()),
+            env,
+            inputs,
+            continue_on_error: obj.get("continueOnError").and_then(|v| v.as_bool()),
+            working_directory: obj
+                .get("workingDirectory")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned),
+            timeout_in_minutes: obj
+                .get("timeoutInMinutes")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32),
+        })
+    }
+}
+
+/// Extract a BTreeMap<String, String> from either a plain JSON object or a
+/// TemplateToken map of shape `{"type": 2, "map": [{"key": "k", "value": "v"}]}`.
+fn extract_template_map(value: Option<&serde_json::Value>) -> Option<BTreeMap<String, String>> {
+    let value = value?;
+    if value.as_object()?.is_empty() {
+        return Some(BTreeMap::new());
+    }
+    // TemplateToken map: {"type": 2, "map": [{"key": ..., "value": ...}]}
+    if let Some(pairs) = value.get("map").and_then(|v| v.as_array()) {
+        let mut map = BTreeMap::new();
+        for pair in pairs {
+            let key = pair.get("key").and_then(|v| v.as_str())?;
+            let val = pair.get("value").and_then(|v| v.as_str()).unwrap_or("");
+            map.insert(key.to_owned(), val.to_owned());
+        }
+        return Some(map);
+    }
+    // Plain map: {"KEY": "VALUE", ...}
+    if let Some(obj) = value.as_object() {
+        let mut map = BTreeMap::new();
+        for (k, v) in obj {
+            let val = v
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| v.to_string());
+            map.insert(k.clone(), val);
+        }
+        return Some(map);
+    }
+    None
+}
+
+/// Serializes environment/inputs as TemplateToken maps.
+struct SerializedActionReference<'a> {
+    step: &'a TaskStep,
+}
+
+impl Serialize for SerializedActionReference<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let Some(reference) = &self.step.reference else {
+            let mut map = serializer.serialize_map(Some(1))?;
+            map.serialize_entry("type", "script")?;
+            return map.end();
+        };
+
+        let field_count = 1
+            + usize::from(reference.name.is_some())
+            + usize::from(reference.version.is_some())
+            + usize::from(reference.reference_type.is_some());
+        let mut map = serializer.serialize_map(Some(field_count))?;
+        map.serialize_entry(
+            "type",
+            reference.reference_type.as_deref().unwrap_or("repository"),
+        )?;
+        if let Some(name) = &reference.name {
+            map.serialize_entry("name", name)?;
+        }
+        if let Some(version) = &reference.version {
+            map.serialize_entry("ref", version)?;
+        }
+        if reference.reference_type.is_none() {
+            map.serialize_entry("repositoryType", "GitHub")?;
+        }
+        map.end()
+    }
+}
+
+struct TemplateStringMap<'a>(&'a BTreeMap<String, String>);
+
+impl Serialize for TemplateStringMap<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let mut map = serializer.serialize_map(Some(if self.0.is_empty() { 1 } else { 2 }))?;
+        map.serialize_entry("type", &2)?;
+        if !self.0.is_empty() {
+            let pairs: Vec<TemplateStringMapPair<'_>> = self
+                .0
+                .iter()
+                .map(|(key, value)| TemplateStringMapPair { key, value })
+                .collect();
+            map.serialize_entry("map", &pairs)?;
+        }
+        map.end()
+    }
+}
+
+#[derive(Serialize)]
+struct TemplateStringMapPair<'a> {
+    key: &'a str,
+    value: &'a str,
 }
 
 /// Reference to an action or task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskReference {
-    /// Action/task GUID.
     #[serde(rename = "id", skip_serializing_if = "Option::is_none")]
     pub id: Option<uuid::Uuid>,
-    /// Action/task name (e.g. `actions/checkout`).
     #[serde(rename = "name", skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// Pinned version string.
     #[serde(rename = "version", skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    /// Reference type (e.g. `git`, `registry`).
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub reference_type: Option<String>,
 }
+
 /// How to download an action's source.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionsDownloadInfo {
-    /// Download type (e.g. `actions`, `repository`).
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub download_type: Option<String>,
-    /// Download URL.
     #[serde(rename = "url", skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
-    /// Authentication token for the download.
     #[serde(rename = "auth", skip_serializing_if = "Option::is_none")]
     pub auth: Option<String>,
 }
@@ -308,18 +526,17 @@ pub struct ActionsDownloadInfo {
 ///
 /// Variables are sent to the runner as `VariableValue` objects.
 /// The runner uses `isSecret` to decide whether to mask the value in logs.
+///
+/// Upstream source: `VariableValue.cs`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VariableValue {
-    /// Variable value as a string.
     #[serde(rename = "value", skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
-    /// Whether this variable is a secret (masked in logs).
     #[serde(rename = "isSecret", skip_serializing_if = "Option::is_none")]
     pub is_secret: Option<bool>,
 }
 
 impl VariableValue {
-    /// Create a non-secret variable.
     pub fn new(value: impl Into<String>) -> Self {
         Self {
             value: Some(value.into()),
@@ -327,7 +544,6 @@ impl VariableValue {
         }
     }
 
-    /// Create a secret variable (masked in logs).
     pub fn secret(value: impl Into<String>) -> Self {
         Self {
             value: Some(value.into()),
@@ -343,10 +559,8 @@ impl VariableValue {
 /// Upstream source: `MaskHint.cs`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MaskHint {
-    /// Type of masking to apply.
     #[serde(rename = "type")]
     pub hint_type: MaskType,
-    /// Value to mask (may be a hash prefix).
     #[serde(rename = "value")]
     pub value: String,
 }
@@ -360,10 +574,10 @@ pub enum MaskType {
 }
 
 // ─── Timeline and recording DTOs ──────────────────────────────────────────
+
 /// Reference to a timeline — a collection of timeline records for a job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimelineReference {
-    /// Timeline identifier.
     #[serde(rename = "id")]
     pub id: uuid::Uuid,
 }
@@ -376,55 +590,39 @@ pub struct TimelineReference {
 /// Upstream source: `TimelineRecord.cs`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimelineRecord {
-    /// Unique record identifier.
     #[serde(rename = "id")]
     pub id: uuid::Uuid,
     /// Parent record ID (job → step relationship).
     #[serde(rename = "parentId", skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<uuid::Uuid>,
-    /// Record name (e.g. step id or job id).
     #[serde(rename = "name", skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// Human-readable display name.
     #[serde(rename = "displayName", skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
-    /// Whether this record is a job, step, phase, or stage.
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub record_type: Option<TimelineRecordType>,
-    /// Current execution state.
     #[serde(rename = "state", skip_serializing_if = "Option::is_none")]
     pub state: Option<TimelineRecordState>,
-    /// Final result (set when completed).
     #[serde(rename = "result", skip_serializing_if = "Option::is_none")]
     pub result: Option<TaskResult>,
-    /// ISO-8601 start time.
     #[serde(rename = "startTime", skip_serializing_if = "Option::is_none")]
     pub start_time: Option<String>,
-    /// ISO-8601 finish time.
     #[serde(rename = "finishTime", skip_serializing_if = "Option::is_none")]
     pub finish_time: Option<String>,
-    /// Annotations (errors, warnings) attached to this record.
     #[serde(rename = "issues", default)]
     pub issues: Vec<Issue>,
-    /// Variables scoped to this record.
     #[serde(rename = "variables", default)]
     pub variables: BTreeMap<String, VariableValue>,
-    /// Current operation description (progress text).
     #[serde(rename = "currentOperation", skip_serializing_if = "Option::is_none")]
     pub current_operation: Option<String>,
-    /// Completion percentage (0–100).
     #[serde(rename = "percentComplete", skip_serializing_if = "Option::is_none")]
     pub percent_complete: Option<i32>,
-    /// Name of the worker executing this record.
     #[serde(rename = "workerName", skip_serializing_if = "Option::is_none")]
     pub worker_name: Option<String>,
-    /// Number of errors in this record.
     #[serde(rename = "errorCount", skip_serializing_if = "Option::is_none")]
     pub error_count: Option<i32>,
-    /// Number of warnings in this record.
     #[serde(rename = "warningCount", skip_serializing_if = "Option::is_none")]
     pub warning_count: Option<i32>,
-    /// Child step records (only populated on job-level records).
     #[serde(rename = "steps", default)]
     pub steps: Vec<TimelineRecord>,
 }
@@ -433,13 +631,9 @@ pub struct TimelineRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TimelineRecordType {
-    /// Top-level job record.
     Job,
-    /// Individual step within a job.
     Step,
-    /// Logical phase grouping steps.
     Phase,
-    /// Logical stage grouping jobs.
     Stage,
 }
 
@@ -447,11 +641,8 @@ pub enum TimelineRecordType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TimelineRecordState {
-    /// Not yet started.
     Pending,
-    /// Currently executing.
     InProgress,
-    /// Finished (success or failure).
     Completed,
 }
 
@@ -459,15 +650,10 @@ pub enum TimelineRecordState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TaskResult {
-    /// Completed successfully.
     Succeeded,
-    /// Completed with non-fatal issues.
     SucceededWithIssues,
-    /// Failed.
     Failed,
-    /// Cancelled by user or system.
     Cancelled,
-    /// Skipped due to condition or dependency.
     Skipped,
 }
 
@@ -479,19 +665,14 @@ pub enum TaskResult {
 /// Upstream source: `Issue.cs`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Issue {
-    /// Severity level (error, warning, info).
     #[serde(rename = "type")]
     pub issue_type: IssueType,
-    /// Issue category classifier.
     #[serde(rename = "category", skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
-    /// Human-readable issue message.
     #[serde(rename = "message", skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
-    /// Additional key-value data for the issue.
     #[serde(rename = "data", default)]
     pub data: BTreeMap<String, String>,
-    /// Whether this is an infrastructure-level issue (not user code).
     #[serde(
         rename = "isInfrastructureIssue",
         skip_serializing_if = "Option::is_none"
@@ -503,11 +684,8 @@ pub struct Issue {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum IssueType {
-    /// Error-level annotation.
     Error,
-    /// Warning-level annotation.
     Warning,
-    /// Informational annotation.
     Info,
 }
 
@@ -516,12 +694,10 @@ pub enum IssueType {
 /// Resources block in a job message — contains service endpoints.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskResources {
-    /// Service endpoints available to the job.
     #[serde(rename = "endpoints", default)]
     pub endpoints: Vec<ServiceEndpoint>,
-    /// Repository references keyed by alias.
     #[serde(rename = "repositories", default)]
-    pub repositories: BTreeMap<String, RepositoryReference>,
+    pub repositories: Vec<RepositoryReference>,
 }
 
 /// A service endpoint — connection to an external service.
@@ -532,25 +708,18 @@ pub struct TaskResources {
 /// Upstream source: `ServiceEndpoint.cs`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceEndpoint {
-    /// Arbitrary key-value data for the endpoint.
     #[serde(rename = "data", default)]
     pub data: BTreeMap<String, String>,
-    /// Endpoint name (e.g. `SystemVssConnection`).
     #[serde(rename = "name")]
     pub name: String,
-    /// Endpoint type identifier.
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub endpoint_type: Option<String>,
-    /// Base URL of the endpoint.
     #[serde(rename = "url", skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
-    /// Authorization data keyed by auth scheme.
-    #[serde(rename = "authorization", default)]
-    pub authorization: BTreeMap<String, EndpointAuthorization>,
-    /// Whether this endpoint is shared across projects.
+    #[serde(rename = "authorization")]
+    pub authorization: EndpointAuthorization,
     #[serde(rename = "isShared", skip_serializing_if = "Option::is_none")]
     pub is_shared: Option<bool>,
-    /// Service owner identifier.
     #[serde(rename = "serviceOwner", skip_serializing_if = "Option::is_none")]
     pub service_owner: Option<String>,
 }
@@ -558,10 +727,8 @@ pub struct ServiceEndpoint {
 /// Authorization data for a service endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EndpointAuthorization {
-    /// Scheme-specific parameters (e.g. `AccessToken` for OAuth).
     #[serde(rename = "parameters", default)]
     pub parameters: BTreeMap<String, String>,
-    /// Authorization scheme name (e.g. `OAuth`, `InstallationToken`).
     #[serde(rename = "scheme", skip_serializing_if = "Option::is_none")]
     pub scheme: Option<String>,
 }
@@ -569,13 +736,10 @@ pub struct EndpointAuthorization {
 /// Repository reference in job resources.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepositoryReference {
-    /// Repository identifier or full name.
     #[serde(rename = "repository", skip_serializing_if = "Option::is_none")]
     pub repository: Option<String>,
-    /// Git ref (branch, tag, or SHA).
     #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
     pub git_ref: Option<String>,
-    /// Repository connector metadata.
     #[serde(rename = "connector", skip_serializing_if = "Option::is_none")]
     pub connector: Option<RepositoryConnector>,
 }
@@ -583,10 +747,8 @@ pub struct RepositoryReference {
 /// Connector for a repository reference.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepositoryConnector {
-    /// Connector identifier.
     #[serde(rename = "id", skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    /// Connector display name.
     #[serde(rename = "name", skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 }
@@ -600,19 +762,148 @@ pub struct RepositoryConnector {
 /// `ContextDictionary`. We model it as a tagged enum.
 ///
 /// Upstream source: `Pipelines.ContextData.PipelineContextData.cs`
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone)]
 pub enum PipelineContextData {
-    /// String value.
     String(String),
-    /// Boolean value.
     Bool(bool),
-    /// Numeric value.
     Number(f64),
-    /// Array of context values.
     Array(Vec<PipelineContextData>),
-    /// Dictionary of context values.
     Dict(BTreeMap<String, PipelineContextData>),
+}
+
+impl Serialize for PipelineContextData {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::{SerializeMap, SerializeSeq};
+
+        match self {
+            PipelineContextData::String(value) => serializer.serialize_str(value),
+            PipelineContextData::Bool(value) => serializer.serialize_bool(*value),
+            PipelineContextData::Number(value) => serializer.serialize_f64(*value),
+            PipelineContextData::Array(values) => {
+                let mut map =
+                    serializer.serialize_map(Some(if values.is_empty() { 1 } else { 2 }))?;
+                map.serialize_entry("t", &1)?;
+                if !values.is_empty() {
+                    struct ArrayValues<'a>(&'a [PipelineContextData]);
+
+                    impl Serialize for ArrayValues<'_> {
+                        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+                        where
+                            S: Serializer,
+                        {
+                            let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+                            for value in self.0 {
+                                seq.serialize_element(value)?;
+                            }
+                            seq.end()
+                        }
+                    }
+
+                    map.serialize_entry("a", &ArrayValues(values))?;
+                }
+                map.end()
+            }
+            PipelineContextData::Dict(values) => {
+                let mut map =
+                    serializer.serialize_map(Some(if values.is_empty() { 1 } else { 2 }))?;
+                map.serialize_entry("t", &2)?;
+                if !values.is_empty() {
+                    let pairs: Vec<PipelineContextDataPair<'_>> = values
+                        .iter()
+                        .map(|(key, value)| PipelineContextDataPair { key, value })
+                        .collect();
+                    map.serialize_entry("d", &pairs)?;
+                }
+                map.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PipelineContextData {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        pipeline_context_from_json(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Serialize)]
+struct PipelineContextDataPair<'a> {
+    #[serde(rename = "k")]
+    key: &'a str,
+    #[serde(rename = "v")]
+    value: &'a PipelineContextData,
+}
+
+fn pipeline_context_from_json(value: serde_json::Value) -> Result<PipelineContextData, String> {
+    match value {
+        serde_json::Value::String(value) => Ok(PipelineContextData::String(value)),
+        serde_json::Value::Bool(value) => Ok(PipelineContextData::Bool(value)),
+        serde_json::Value::Number(value) => Ok(PipelineContextData::Number(
+            value.as_f64().unwrap_or_default(),
+        )),
+        serde_json::Value::Array(values) => values
+            .into_iter()
+            .map(pipeline_context_from_json)
+            .collect::<Result<Vec<_>, _>>()
+            .map(PipelineContextData::Array),
+        serde_json::Value::Object(mut object) => {
+            match object.remove("t").and_then(|value| value.as_i64()) {
+                None | Some(0) => Ok(PipelineContextData::String(
+                    object
+                        .remove("s")
+                        .and_then(|value| value.as_str().map(str::to_owned))
+                        .unwrap_or_default(),
+                )),
+                Some(1) => object
+                    .remove("a")
+                    .and_then(|value| value.as_array().cloned())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(pipeline_context_from_json)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(PipelineContextData::Array),
+                Some(2) | Some(5) => {
+                    let mut values = BTreeMap::new();
+                    let pairs = object
+                        .remove("d")
+                        .and_then(|value| value.as_array().cloned())
+                        .unwrap_or_default();
+                    for pair in pairs {
+                        let Some(pair) = pair.as_object() else {
+                            continue;
+                        };
+                        let Some(key) = pair.get("k").and_then(|value| value.as_str()) else {
+                            continue;
+                        };
+                        let value = pair.get("v").cloned().unwrap_or(serde_json::Value::Null);
+                        values.insert(key.to_owned(), pipeline_context_from_json(value)?);
+                    }
+                    Ok(PipelineContextData::Dict(values))
+                }
+                Some(3) => Ok(PipelineContextData::Bool(
+                    object
+                        .remove("b")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or_default(),
+                )),
+                Some(4) => Ok(PipelineContextData::Number(
+                    object
+                        .remove("n")
+                        .and_then(|value| value.as_f64())
+                        .unwrap_or_default(),
+                )),
+                Some(other) => Err(format!("unsupported PipelineContextData type {other}")),
+            }
+        }
+        serde_json::Value::Null => Ok(PipelineContextData::String(String::new())),
+    }
 }
 
 // ─── Job completion DTOs ──────────────────────────────────────────────────
@@ -625,16 +916,12 @@ pub enum PipelineContextData {
 /// Upstream source: `FinishJobController.cs`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobCompletedEvent {
-    /// ID of the job that completed.
     #[serde(rename = "jobId")]
     pub job_id: uuid::Uuid,
-    /// Final result of the job.
     #[serde(rename = "result")]
     pub result: TaskResult,
-    /// Timeline ID associated with this job.
     #[serde(rename = "timelineId")]
     pub timeline_id: uuid::Uuid,
-    /// Output variables produced by the job.
     #[serde(rename = "outputs", default)]
     pub outputs: BTreeMap<String, String>,
 }
@@ -644,10 +931,8 @@ pub struct JobCompletedEvent {
 /// Log file reference — returned when creating a log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogReference {
-    /// Server-assigned log file ID.
     #[serde(rename = "id")]
     pub id: i64,
-    /// Server-relative path to the log file.
     #[serde(rename = "path", skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
 }
@@ -657,10 +942,8 @@ pub struct LogReference {
 /// Generic Azure DevOps error response envelope.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VssError {
-    /// Azure DevOps error code.
     #[serde(rename = "errorCode", skip_serializing_if = "Option::is_none")]
     pub error_code: Option<i64>,
-    /// Human-readable error message.
     #[serde(rename = "message", skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
@@ -746,6 +1029,32 @@ mod tests {
     }
 
     #[test]
+    fn task_step_serializes_as_runner_action_step() {
+        let step = TaskStep {
+            id: uuid::Uuid::nil(),
+            name: None,
+            display_name: None,
+            condition: None,
+            script: Some("echo hi".to_owned()),
+            reference: None,
+            inputs: BTreeMap::new(),
+            env: BTreeMap::new(),
+            continue_on_error: None,
+            working_directory: None,
+            timeout_in_minutes: None,
+        };
+
+        let json = serde_json::to_value(&step).unwrap();
+
+        assert_eq!(json["type"], "action");
+        assert_eq!(json["reference"]["type"], "script");
+        assert_eq!(json["environment"]["type"], 2);
+        assert_eq!(json["inputs"]["type"], 2);
+        assert_eq!(json["inputs"]["map"][0]["key"], "script");
+        assert_eq!(json["inputs"]["map"][0]["value"], "echo hi");
+    }
+
+    #[test]
     fn pipeline_context_data_variants() {
         let json = r#""hello""#;
         let data: PipelineContextData = serde_json::from_str(json).unwrap();
@@ -762,6 +1071,33 @@ mod tests {
         let json = r#"["a","b"]"#;
         let data: PipelineContextData = serde_json::from_str(json).unwrap();
         assert!(matches!(data, PipelineContextData::Array(_)));
+    }
+
+    #[test]
+    fn pipeline_context_data_uses_runner_wire_shape_for_collections() {
+        let mut github = BTreeMap::new();
+        github.insert(
+            "event_name".to_owned(),
+            PipelineContextData::String("push".to_owned()),
+        );
+        github.insert("run_id".to_owned(), PipelineContextData::Number(42.0));
+
+        let json = serde_json::to_value(PipelineContextData::Dict(github)).unwrap();
+
+        assert_eq!(json["t"], 2);
+        assert_eq!(json["d"][0]["k"], "event_name");
+        assert_eq!(json["d"][0]["v"], "push");
+        assert_eq!(json["d"][1]["k"], "run_id");
+        assert_eq!(json["d"][1]["v"], 42.0);
+
+        let roundtrip: PipelineContextData = serde_json::from_value(json).unwrap();
+        let PipelineContextData::Dict(roundtrip) = roundtrip else {
+            panic!("expected dictionary context");
+        };
+        assert!(matches!(
+            roundtrip.get("event_name"),
+            Some(PipelineContextData::String(value)) if value == "push"
+        ));
     }
 
     #[test]

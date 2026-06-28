@@ -5,12 +5,28 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 
 /// Hierarchical expression context.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Context {
     roots: BTreeMap<String, Value>,
+    success: bool,
+    failure: bool,
+    cancelled: bool,
 }
 
 impl Context {
+    /// Create an empty context with default successful status.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set status-function values for this evaluation.
+    pub fn with_status(mut self, success: bool, failure: bool, cancelled: bool) -> Self {
+        self.success = success;
+        self.failure = failure;
+        self.cancelled = cancelled;
+        self
+    }
+
     /// Insert a root object.
     pub fn insert(&mut self, key: impl Into<String>, value: Value) {
         self.roots.insert(key.into(), value);
@@ -29,6 +45,17 @@ impl Context {
             };
         }
         current
+    }
+}
+
+impl Default for Context {
+    fn default() -> Self {
+        Self {
+            roots: BTreeMap::new(),
+            success: true,
+            failure: false,
+            cancelled: false,
+        }
     }
 }
 
@@ -203,9 +230,9 @@ fn eval_call(name: &str, args: &[Expr], context: &Context) -> Result<Value, Expr
 
     match lower.as_str() {
         "always" => Ok(Value::Bool(true)),
-        "success" => Ok(Value::Bool(true)),
-        "failure" => Ok(Value::Bool(false)),
-        "cancelled" => Ok(Value::Bool(false)),
+        "success" => Ok(Value::Bool(context.success)),
+        "failure" => Ok(Value::Bool(context.failure)),
+        "cancelled" => Ok(Value::Bool(context.cancelled)),
         "contains" => {
             Ok(Value::Bool(values.first().zip(values.get(1)).is_some_and(
                 |(haystack, needle)| contains(haystack, needle),
@@ -632,6 +659,15 @@ mod tests {
             Value::Bool(true)
         );
         assert!(eval_bool("contains(matrix.os, 'ubuntu') && success()", &context).unwrap());
+    }
+
+    #[test]
+    fn status_functions_use_context_state() {
+        let context = Context::default().with_status(false, true, false);
+        assert!(!eval_bool("success()", &context).unwrap());
+        assert!(eval_bool("failure()", &context).unwrap());
+        assert!(!eval_bool("cancelled()", &context).unwrap());
+        assert!(eval_bool("always()", &context).unwrap());
     }
 
     #[test]
