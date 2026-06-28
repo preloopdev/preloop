@@ -23,7 +23,10 @@ use std::collections::BTreeMap;
 /// Upstream source: `ConnectionDataController.cs`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionData {
-    #[serde(rename = "locationServiceData", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "locationServiceData",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub location_service_data: Option<LocationServiceData>,
 }
 
@@ -61,10 +64,7 @@ pub struct TaskAgent {
     pub name: Option<String>,
     #[serde(rename = "version", skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    #[serde(
-        rename = "osDescription",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "osDescription", skip_serializing_if = "Option::is_none")]
     pub os_description: Option<String>,
 }
 
@@ -432,7 +432,10 @@ pub struct Issue {
     pub message: Option<String>,
     #[serde(rename = "data", default)]
     pub data: BTreeMap<String, String>,
-    #[serde(rename = "isInfrastructureIssue", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "isInfrastructureIssue",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub is_infrastructure_issue: Option<bool>,
 }
 

@@ -6,8 +6,22 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aksh_artifacts::ArtifactStore;
+use aksh_artifacts::ArtifactStore;
+use aksh_cache::CacheStore;
 use aksh_cache::CacheStore;
 use aksh_gha_parser::{expand_jobs_with_reusables, parse_workflow};
+use aksh_gha_parser::{expand_jobs_with_reusables, parse_workflow};
+use aksh_gha_protocol::{
+    self as protocol,
+    azdo::{
+        self, ConnectionData, EncryptionKey as AzdoEncryptionKey, LocationServiceData,
+        ServiceDefinition, TaskAgentSession as AzdoSession,
+    },
+    crypto::{AgentRsaKeypair, SessionEncryption},
+    event_to_ndjson, ExecutionStatus, JobCompletion, JobId, NdjsonEvent, RegisteredRunner,
+    RunAccepted, RunId, RunnerRegistrationRequest, RunnerSession, RunnerSessionRequest,
+    WorkflowSubmission, PROTOCOL_VERSION,
+};
 use aksh_gha_protocol::{
     event_to_ndjson, ExecutionStatus, JobCompletion, JobId, NdjsonEvent, RegisteredRunner,
     RunAccepted, RunId, RunnerJobMessage, RunnerRegistrationRequest, RunnerSession,
@@ -22,20 +36,6 @@ use axum::{Json, Router};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use bytes::Bytes;
-use aksh_artifacts::ArtifactStore;
-use aksh_cache::CacheStore;
-use aksh_gha_parser::{expand_jobs_with_reusables, parse_workflow};
-use aksh_gha_protocol::{
-    self as protocol,
-    azdo::{
-        self, ConnectionData, EncryptionKey as AzdoEncryptionKey, LocationServiceData,
-        ServiceDefinition, TaskAgentSession as AzdoSession,
-    },
-    crypto::{AgentRsaKeypair, SessionEncryption},
-    event_to_ndjson, ExecutionStatus, JobCompletion, JobId, NdjsonEvent, RegisteredRunner,
-    RunAccepted, RunId, RunnerRegistrationRequest, RunnerSession,
-    RunnerSessionRequest, WorkflowSubmission, PROTOCOL_VERSION,
-};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::net::TcpListener;
@@ -156,10 +156,7 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             "/_apis/v1/TimeLineWebConsoleLog/:scope/:hub/:plan_id/:timeline_id/:record_id",
             post(console_log),
         )
-        .route(
-            "/_apis/v1/FinishJob/:scope/:hub/:plan_id",
-            post(finish_job),
-        )
+        .route("/_apis/v1/FinishJob/:scope/:hub/:plan_id", post(finish_job))
         // Phase H: Action download info
         .route(
             "/_apis/v1/ActionDownloadInfo/:scope/:hub/:plan_id",
@@ -359,9 +356,14 @@ async fn submit_run(
                 &job,
                 &github,
                 &job.env,
-                &submission.secrets.iter().map(|(k, v)| (k.clone(), v.expose().to_owned())).collect(),
+                &submission
+                    .secrets
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.expose().to_owned()))
+                    .collect(),
                 &submission.vars,
-            ).map_err(|e| ApiError::bad_request(format!("failed to build job message: {e}")))?;
+            )
+            .map_err(|e| ApiError::bad_request(format!("failed to build job message: {e}")))?;
 
             let queued_job = QueuedJob {
                 run_id,
@@ -522,16 +524,21 @@ async fn create_session(
     // RSA-wrap the AES key with the agent's public key
     let wrapped_key = {
         let inner = shared.state.inner.lock().await;
-        let keypair = inner.agent_keypair.as_ref()
+        let keypair = inner
+            .agent_keypair
+            .as_ref()
             .expect("RSA keypair must be initialized");
-        keypair.wrap_key(&session_enc.key)
+        keypair
+            .wrap_key(&session_enc.key)
             .expect("RSA wrap should not fail for valid key")
     };
 
     // Store the session key for later message decryption
     {
         let mut inner = shared.state.inner.lock().await;
-        inner.session_keys.insert(session_id.to_string(), session_enc);
+        inner
+            .session_keys
+            .insert(session_id.to_string(), session_enc);
     }
 
     info!(%session_id, "session created with encrypted AES key");
@@ -558,7 +565,9 @@ async fn next_message(
     State(shared): State<Arc<SharedState>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Option<azdo::TaskAgentMessage>>, ApiError> {
-    let session_id = params.get("sessionId").cloned()
+    let session_id = params
+        .get("sessionId")
+        .cloned()
         .unwrap_or_else(|| "default".to_owned());
 
     let mut inner = shared.state.inner.lock().await;
@@ -569,12 +578,16 @@ async fn next_message(
     // Update run status
     if let Some(run) = inner.runs.get_mut(&queued.run_id) {
         run.status = ExecutionStatus::InProgress;
-        run.jobs
-            .insert(JobId(queued.message.job_id.to_string()), ExecutionStatus::InProgress);
+        run.jobs.insert(
+            JobId(queued.message.job_id.to_string()),
+            ExecutionStatus::InProgress,
+        );
     }
 
     // Get the session's AES key for encryption
-    let session_key = inner.session_keys.get(&session_id)
+    let session_key = inner
+        .session_keys
+        .get(&session_id)
         .map(|s| s.key.clone())
         .unwrap_or_default();
 
@@ -695,7 +708,10 @@ fn promote_ready_jobs(inner: &mut InnerState) {
                 run.jobs.iter().any(|(dep_id, status)| {
                     dep_id.0.starts_with(base_id)
                         && matches!(status, ExecutionStatus::Success | ExecutionStatus::Skipped)
-                }) || run.jobs.values().all(|s| matches!(s, ExecutionStatus::Success | ExecutionStatus::Skipped))
+                }) || run
+                    .jobs
+                    .values()
+                    .all(|s| matches!(s, ExecutionStatus::Success | ExecutionStatus::Skipped))
             } else {
                 false
             }
@@ -747,7 +763,13 @@ async fn create_log(
 /// POST append log — runner appends lines to a log file.
 async fn append_log(
     State(_shared): State<Arc<SharedState>>,
-    Path((_scope, _hub, _plan_id, _log_id, _log_id2)): Path<(String, String, String, String, String)>,
+    Path((_scope, _hub, _plan_id, _log_id, _log_id2)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
     _body: Bytes,
 ) -> StatusCode {
     StatusCode::ACCEPTED
@@ -756,7 +778,13 @@ async fn append_log(
 /// POST console log — runner streams live console output.
 async fn console_log(
     State(_shared): State<Arc<SharedState>>,
-    Path((_scope, _hub, _plan_id, _timeline_id, _record_id)): Path<(String, String, String, String, String)>,
+    Path((_scope, _hub, _plan_id, _timeline_id, _record_id)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
     _body: Bytes,
 ) -> StatusCode {
     StatusCode::ACCEPTED
@@ -771,7 +799,9 @@ async fn finish_job(
     let mut inner = shared.state.inner.lock().await;
 
     let status = match event.result {
-        azdo::TaskResult::Succeeded | azdo::TaskResult::SucceededWithIssues => ExecutionStatus::Success,
+        azdo::TaskResult::Succeeded | azdo::TaskResult::SucceededWithIssues => {
+            ExecutionStatus::Success
+        }
         azdo::TaskResult::Failed => ExecutionStatus::Failure,
         azdo::TaskResult::Cancelled => ExecutionStatus::Cancelled,
         azdo::TaskResult::Skipped => ExecutionStatus::Skipped,
