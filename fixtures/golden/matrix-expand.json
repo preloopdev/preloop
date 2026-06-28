@@ -1,0 +1,98 @@
+[
+  {
+    "base_id": "build",
+    "env": {},
+    "fail_fast": true,
+    "id": "build (ubuntu-latest, 16)",
+    "if_condition": null,
+    "matrix": { "os": "ubuntu-latest", "node": 16 },
+    "max_parallel": null,
+    "name": "build",
+    "needs": [],
+    "runs_on": ["self-hosted"],
+    "secrets_inherit": false,
+    "steps": [
+      {
+        "env": {},
+        "id": null,
+        "if_condition": null,
+        "name": null,
+        "run": "echo ${{ matrix.os }} ${{ matrix.node }}",
+        "uses": null,
+        "with": {}
+      }
+    ]
+  },
+  {
+    "base_id": "build",
+    "env": {},
+    "fail_fast": true,
+    "id": "build (ubuntu-latest, 18)",
+    "if_condition": null,
+    "matrix": { "os": "ubuntu-latest", "node": 18 },
+    "max_parallel": null,
+    "name": "build",
+    "needs": [],
+    "runs_on": ["self-hosted"],
+    "secrets_inherit": false,
+    "steps": [
+      {
+        "env": {},
+        "id": null,
+        "if_condition": null,
+        "name": null,
+        "run": "echo ${{ matrix.os }} ${{ matrix.node }}",
+        "uses": null,
+        "with": {}
+      }
+    ]
+  },
+  {
+    "base_id": "build",
+    "env": {},
+    "fail_fast": true,
+    "id": "build (macos-latest, 16)",
+    "if_condition": null,
+    "matrix": { "os": "macos-latest", "node": 16 },
+    "max_parallel": null,
+    "name": "build",
+    "needs": [],
+    "runs_on": ["self-hosted"],
+    "secrets_inherit": false,
+    "steps": [
+      {
+        "env": {},
+        "id": null,
+        "if_condition": null,
+        "name": null,
+        "run": "echo ${{ matrix.os }} ${{ matrix.node }}",
+        "uses": null,
+        "with": {}
+      }
+    ]
+  },
+  {
+    "base_id": "build",
+    "env": {},
+    "fail_fast": true,
+    "id": "build (macos-latest, 18)",
+    "if_condition": null,
+    "matrix": { "os": "macos-latest", "node": 18 },
+    "max_parallel": null,
+    "name": "build",
+    "needs": [],
+    "runs_on": ["self-hosted"],
+    "secrets_inherit": false,
+    "steps": [
+      {
+        "env": {},
+        "id": null,
+        "if_condition": null,
+        "name": null,
+        "run": "echo ${{ matrix.os }} ${{ matrix.node }}",
+        "uses": null,
+        "with": {}
+      }
+    ]
+  }
+]

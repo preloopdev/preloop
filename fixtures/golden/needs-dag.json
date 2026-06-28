@@ -1,0 +1,74 @@
+[
+  {
+    "base_id": "build",
+    "env": {},
+    "fail_fast": true,
+    "id": "build",
+    "if_condition": null,
+    "matrix": {},
+    "max_parallel": null,
+    "name": "build",
+    "needs": [],
+    "runs_on": ["self-hosted"],
+    "secrets_inherit": false,
+    "steps": [
+      {
+        "env": {},
+        "id": null,
+        "if_condition": null,
+        "name": null,
+        "run": "echo build",
+        "uses": null,
+        "with": {}
+      }
+    ]
+  },
+  {
+    "base_id": "test",
+    "env": {},
+    "fail_fast": true,
+    "id": "test",
+    "if_condition": null,
+    "matrix": {},
+    "max_parallel": null,
+    "name": "test",
+    "needs": ["build"],
+    "runs_on": ["self-hosted"],
+    "secrets_inherit": false,
+    "steps": [
+      {
+        "env": {},
+        "id": null,
+        "if_condition": null,
+        "name": null,
+        "run": "echo test",
+        "uses": null,
+        "with": {}
+      }
+    ]
+  },
+  {
+    "base_id": "deploy",
+    "env": {},
+    "fail_fast": true,
+    "id": "deploy",
+    "if_condition": null,
+    "matrix": {},
+    "max_parallel": null,
+    "name": "deploy",
+    "needs": ["build", "test"],
+    "runs_on": ["self-hosted"],
+    "secrets_inherit": false,
+    "steps": [
+      {
+        "env": {},
+        "id": null,
+        "if_condition": null,
+        "name": null,
+        "run": "echo deploy",
+        "uses": null,
+        "with": {}
+      }
+    ]
+  }
+]

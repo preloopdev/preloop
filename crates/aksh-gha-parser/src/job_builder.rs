@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use aksh_gha_protocol::azdo::{
     AgentJobRequestMessage, EndpointAuthorization, MaskHint, MaskType, PipelineContextData,
-    ServiceEndpoint, TaskResources, TaskStep, TimelineReference, VariableValue,
+    PlanReference, ServiceEndpoint, TaskResources, TaskStep, TimelineReference, VariableValue,
 };
 
 use crate::eval::{build_context, resolve_map, resolve_string};
@@ -56,8 +56,7 @@ pub fn build_agent_job_message(
     let steps: Vec<TaskStep> = plan
         .steps
         .iter()
-        .enumerate()
-        .map(|(i, step)| build_task_step(step, i, &expr_context))
+        .map(|step| build_task_step(step, &expr_context))
         .collect();
 
     // Materialize variables
@@ -72,6 +71,9 @@ pub fn build_agent_job_message(
     }
     for (k, v) in vars {
         variables.insert(k.clone(), VariableValue::new(v));
+    }
+    for (k, v) in secrets {
+        variables.insert(k.clone(), VariableValue::secret(v));
     }
 
     // System variables
@@ -96,27 +98,48 @@ pub fn build_agent_job_message(
         name: "SystemVssConnection".to_owned(),
         endpoint_type: Some("azdoserver".to_owned()),
         url: Some("http://localhost".to_owned()),
-        authorization: BTreeMap::from([(
-            "parameters".to_owned(),
-            EndpointAuthorization {
-                parameters: BTreeMap::from([(
-                    "AccessToken".to_owned(),
-                    "aksh-system-token".to_owned(),
-                )]),
-                scheme: Some("OAuth".to_owned()),
-            },
-        )]),
+        authorization: EndpointAuthorization {
+            parameters: BTreeMap::from([(
+                "AccessToken".to_owned(),
+                "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.e30.ZmFrZXNpZw".to_owned(),
+            )]),
+            scheme: Some("OAuth".to_owned()),
+        },
         is_shared: Some(false),
         service_owner: Some("github".to_owned()),
     }];
 
     let resources = TaskResources {
         endpoints,
-        repositories: BTreeMap::new(),
+        repositories: Vec::new(),
     };
+
+    // System context — runner needs these for job tracking
+    let mut system_ctx = BTreeMap::new();
+    system_ctx.insert(
+        "jobId".to_owned(),
+        PipelineContextData::String(job_id.to_string()),
+    );
+    system_ctx.insert(
+        "timelineId".to_owned(),
+        PipelineContextData::String(timeline_id.to_string()),
+    );
+    system_ctx.insert(
+        "planId".to_owned(),
+        PipelineContextData::String(job_id.to_string()),
+    );
+    system_ctx.insert(
+        "jobDisplayName".to_owned(),
+        PipelineContextData::String(plan.name.clone()),
+    );
+    system_ctx.insert(
+        "orchestrationId".to_owned(),
+        PipelineContextData::String(job_id.to_string()),
+    );
 
     // Context data
     let mut context_data = BTreeMap::new();
+    context_data.insert("system".to_owned(), PipelineContextData::Dict(system_ctx));
     context_data.insert("github".to_owned(), to_context_data(github));
 
     let env_ctx: Map<String, Value> = plan
@@ -158,8 +181,15 @@ pub fn build_agent_job_message(
     // Actions download info
     let actions_download_info = BTreeMap::new();
 
+    let request_id: i64 = 1;
+
     Ok(AgentJobRequestMessage {
         job_id,
+        request_id,
+        plan: PlanReference {
+            plan_id: job_id.to_string(),
+            plan_type: Some("Job".to_owned()),
+        },
         timeline: TimelineReference { id: timeline_id },
         display_name: Some(plan.name.clone()),
         condition: plan.if_condition.clone(),
@@ -177,7 +207,7 @@ pub fn build_agent_job_message(
 }
 
 /// Build a `TaskStep` from a `StepPlan`.
-fn build_task_step(step: &crate::StepPlan, _index: usize, context: &Context) -> TaskStep {
+fn build_task_step(step: &crate::StepPlan, context: &Context) -> TaskStep {
     let step_id = uuid::Uuid::new_v4();
 
     // Resolve expressions in env and with
@@ -186,8 +216,8 @@ fn build_task_step(step: &crate::StepPlan, _index: usize, context: &Context) -> 
         .with
         .iter()
         .map(|(k, v)| {
-            let resolved =
-                resolve_string(&v.to_string(), context).unwrap_or_else(|_| v.to_string());
+            let input = step_input_to_string(v);
+            let resolved = resolve_string(&input, context).unwrap_or(input);
             (k.clone(), resolved)
         })
         .collect();
@@ -198,8 +228,13 @@ fn build_task_step(step: &crate::StepPlan, _index: usize, context: &Context) -> 
         .as_ref()
         .map(|r| resolve_string(r, context).unwrap_or_else(|_| r.clone()));
 
-    // Resolve if condition (pass through as expression string)
-    let condition = step.if_condition.clone();
+    // The runner always evaluates a step condition. Omitted conditions are
+    // the same as GitHub's default `success()`.
+    let condition = Some(
+        step.if_condition
+            .clone()
+            .unwrap_or_else(|| "success()".to_owned()),
+    );
 
     TaskStep {
         id: step_id,
@@ -221,6 +256,13 @@ fn build_task_step(step: &crate::StepPlan, _index: usize, context: &Context) -> 
         continue_on_error: None,
         working_directory: None,
         timeout_in_minutes: None,
+    }
+}
+
+fn step_input_to_string(value: &Value) -> String {
+    match value {
+        Value::String(value) => value.clone(),
+        other => other.to_string(),
     }
 }
 
@@ -281,6 +323,7 @@ jobs:
         .unwrap();
 
         assert!(!msg.steps.is_empty());
+        assert_eq!(msg.steps[0].condition.as_deref(), Some("success()"));
         assert!(msg.timeline.id != uuid::Uuid::nil());
         assert!(msg.job_id != uuid::Uuid::nil());
         assert!(msg
@@ -322,7 +365,40 @@ jobs:
     }
 
     #[test]
-    fn secrets_become_mask_hints() {
+    fn string_with_inputs_are_not_json_quoted() {
+        let yaml = r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/cache@v4
+        with:
+          path: target
+          fail-on-cache-miss: true
+"#;
+        let workflow = parse_workflow(yaml).unwrap();
+        let plans = crate::expand_jobs(&workflow).unwrap();
+        let github = serde_json::json!({"event_name": "push"});
+
+        let msg = build_agent_job_message(
+            &plans[0],
+            &github,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(msg.steps[0].inputs.get("path"), Some(&"target".to_owned()));
+        assert_eq!(
+            msg.steps[0].inputs.get("fail-on-cache-miss"),
+            Some(&"true".to_owned())
+        );
+    }
+
+    #[test]
+    fn secrets_become_variables_and_mask_hints() {
         let yaml = r#"
 on: push
 jobs:
@@ -349,5 +425,42 @@ jobs:
 
         assert!(!msg.mask_hints.is_empty());
         assert_eq!(msg.mask_hints[0].value, "s3cr3t");
+        let secret = msg.variables.get("MY_SECRET").unwrap();
+        assert_eq!(secret.value.as_deref(), Some("s3cr3t"));
+        assert_eq!(secret.is_secret, Some(true));
+    }
+    #[test]
+    fn workflow_dispatch_inputs_are_in_event_context() {
+        let yaml = r#"
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ${{ github.event.inputs.greeting }}
+"#;
+        let workflow = parse_workflow(yaml).unwrap();
+        let plans = crate::expand_jobs(&workflow).unwrap();
+
+        let github = serde_json::json!({
+            "event_name": "workflow_dispatch",
+            "event": {
+                "inputs": {
+                    "greeting": "hello world"
+                }
+            },
+            "ref": "refs/heads/main"
+        });
+
+        let msg = build_agent_job_message(
+            &plans[0],
+            &github,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        assert!(!msg.steps.is_empty());
     }
 }

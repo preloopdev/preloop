@@ -1,0 +1,11 @@
+name: matrix-expand
+on: push
+jobs:
+  build:
+    runs-on: [self-hosted]
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: [16, 18]
+    steps:
+      - run: echo ${{ matrix.os }} ${{ matrix.node }}

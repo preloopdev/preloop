@@ -4,15 +4,39 @@ on:
   push:
   pull_request:
 
+# ═══════════════════════════════════════════════════════════════════════════
+# aksh compatibility notes
+# ═══════════════════════════════════════════════════════════════════════════
+# This workflow runs on GitHub-hosted runners today. To run against aksh
+# locally, a harness injects vars (AKSH_REPO_ROOT, etc.) at submission time.
+#
+# Conflicts with aksh (see docs/fidelity-gap.md § Phase H):
+#   1. actions/checkout@v4    — blocked: action download not yet implemented
+#      (aksh doesn't populate actionsDownloadInfo or serve action tarballs)
+#   2. dtolnay/rust-toolchain — same blocker (repository-type action)
+#   3. runs-on: ubuntu-latest  — label matching is lenient (not enforced yet)
+#   4. -D warnings on clippy   — pre-existing missing_docs in azdo DTOs
+#      (repo-level issue, not an aksh gap)
+#
+# See .github/workflows/dogfood.yml for the locally-runnable version without
+# action dependencies.
+# ═══════════════════════════════════════════════════════════════════════════
+
 jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
+      # aksh gap: action download NYI (Phase H) — runner crashes on missing
+      # download info. Replace with explicit failure until implemented.
       - uses: actions/checkout@v4
+
+      # same gap — repository-type action, needs actionsDownloadInfo
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.86"
           components: rustfmt,clippy
+
+      # inline run steps work against aksh when injected with
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
