@@ -373,21 +373,75 @@ full GitHub Actions trigger syntax: `branches`/`branches-ignore`,
 
 ---
 
-## Chapter 12: What's Next
+## Chapter 12: The Real Runner — End-to-End Verification
 
-All 8 phases of the fidelity-gap.md implementation plan are complete.
-The runner can:
+The ultimate test: does the official `actions/runner` binary actually work against aksh?
 
-1. Discover endpoints (Phase B)
-2. Authenticate and create encrypted sessions (Phases B-C)
-3. Receive encrypted job messages (Phases D)
-4. Report status, logs, and completion (Phase E)
-5. Work with multi-job dependency graphs (Phase F)
-6. Match branch/tag/path triggers (Phase G)
-7. Fetch actions (Phase H)
+### The Configuration Challenge
 
-The next steps would be:
-- Integration testing with a real `Runner.Listener`
-- Timeline record persistence (RunStore trait)
-- Cache/artifact v2 blob protocols
-- Expression engine hardening (success/failure state-dependent functions)
+The runner's `config.sh` makes a specific sequence of HTTP calls:
+1. `POST /api/v3/actions/runner-registration` with `RemoteAuth` header
+2. `GET /_apis/connectionData` to discover service endpoints
+3. `GET /_apis/v1/AgentPools?poolType=Automation` to find the pool
+4. `GET /_apis/v1/Agent/:poolId?agentName=...` to check if runner exists
+5. `POST /_apis/v1/Agent/:poolId` to register
+6. `POST /_apis/v1/AgentSession/:poolId` to create session
+
+Each step revealed a new fidelity gap:
+- The runner uses GHES-style URLs with org prefix (`/test-org/_apis/...`)
+- `agent_lookup` must return 200 with empty array, not 404
+- `AgentPools` needs `poolType: 1` (Automation)
+- Registration response needs `authorization.publicKey` with RSA modulus
+- Session creation needs `POST /_apis/v1/AgentSession/:poolId` (no session_id in URL)
+
+### The Job Message Format
+
+Even after the runner connected and received messages, the job message format
+had multiple issues:
+- `ServiceEndpoint.authorization` was `BTreeMap<String, EndpointAuthorization>`
+  instead of `EndpointAuthorization` directly (double-nesting)
+- `TaskResources.repositories` was `BTreeMap` instead of `Vec`
+- Missing `requestId` (must be `i64`, not UUID)
+- Missing `plan` field (`PlanReference` with `planId`, `planType`)
+- Missing `system` context in `contextData`
+- `AccessToken` must be a valid JWT (runner parses it for orchestration ID)
+
+### The Result
+
+After fixing all these issues, the runner successfully:
+1. Configures against aksh (GHES-style org URL)
+2. Creates session with AES key exchange
+3. Receives and decrypts job messages
+4. Executes jobs ("Running job: echo")
+5. Reports completion ("Job echo completed with result: Failed")
+6. Cleans up in ephemeral mode
+
+The "Failed" result is because the worker process can't fully update timeline
+records — the control plane protocol works, but the worker-side fidelity needs
+more work. This is the next frontier.
+
+---
+
+## Chapter 13: What's Next
+
+The runner completes the full lifecycle against aksh. The remaining work:
+
+**Fidelity (why the worker reports "Failed"):**
+- Timeline/log endpoint response format (worker expects specific shapes)
+- Job request renewal response format (lockedUntil, result fields)
+- Worker-side API call authentication (OAuth token format)
+
+**Protocols:**
+- Cache v2 / Artifact v2 blob protocols
+- Wire file-backed stores (remove `#[allow(dead_code)]`)
+
+**Expression engine:**
+- Bracket access (`matrix['os']`)
+- Object-filter (`steps.*.outputs`)
+- Format escaping (`{{`/`}}`)
+
+**Conformance:**
+- Golden test fixtures from wire captures
+- Fuzz targets (`cargo-fuzz`)
+- Property tests
+- Wire capture/replay tool

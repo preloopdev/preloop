@@ -91,6 +91,7 @@ impl Trigger {
         branch: Option<&str>,
         tag: Option<&str>,
         paths: &[String],
+        activity_type: Option<&str>,
     ) -> bool {
         match self {
             Trigger::Single(value) => value == event,
@@ -102,6 +103,16 @@ impl Trigger {
                 // Check branch/tag/path filters
                 if let Some(config) = values.get(event) {
                     if let Some(obj) = config.as_object() {
+                        // activity types filter
+                        if let Some(types) = obj.get("types") {
+                            if let Some(activity_type) = activity_type {
+                                if !matches_filter(types, activity_type) {
+                                    return false;
+                                }
+                            } else {
+                                return false;
+                            }
+                        }
                         // branches filter
                         if let Some(branches) = obj.get("branches") {
                             if let Some(branch) = branch {
@@ -175,40 +186,44 @@ fn matches_filter(filter: &Value, value: &str) -> bool {
     }
 }
 
-/// Simple glob matching (supports * and **).
+/// Glob matching for trigger filters.
+///
+/// `*` matches within a single path segment; `**` matches across path
+/// separators. This intentionally keeps matching anchored to the whole value.
 fn glob_match(pattern: &str, value: &str) -> bool {
-    // Simple glob: * matches any characters, ** matches path separators too
-    if pattern == "*" {
-        return true;
-    }
-    if pattern.contains("**") {
-        // Double star: match across path separators
-        let parts: Vec<&str> = pattern.split("**").collect();
-        if parts.len() == 2 {
-            let prefix = parts[0].trim_end_matches('/');
-            let suffix = parts[1].trim_start_matches('/');
-            if !prefix.is_empty() && !value.starts_with(prefix) {
-                return false;
-            }
-            if !suffix.is_empty() {
-                let remaining = if prefix.is_empty() {
-                    value
-                } else {
-                    value.strip_prefix(prefix).unwrap_or(value)
-                };
-                return remaining.ends_with(suffix) || remaining.contains(suffix);
-            }
-            return true;
+    fn matches(pattern: &[char], value: &[char], pi: usize, vi: usize) -> bool {
+        if pi == pattern.len() {
+            return vi == value.len();
         }
+
+        if pattern[pi] == '*' {
+            let double_star = pattern.get(pi + 1) == Some(&'*');
+            let next_pi = if double_star { pi + 2 } else { pi + 1 };
+
+            if matches(pattern, value, next_pi, vi) {
+                return true;
+            }
+
+            let mut next_vi = vi;
+            while next_vi < value.len() {
+                if !double_star && value[next_vi] == '/' {
+                    break;
+                }
+                next_vi += 1;
+                if matches(pattern, value, next_pi, next_vi) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        vi < value.len() && pattern[pi] == value[vi] && matches(pattern, value, pi + 1, vi + 1)
     }
-    // Single star: match within a path segment
-    let parts: Vec<&str> = pattern.split('*').collect();
-    if parts.len() == 2 {
-        let prefix = parts[0];
-        let suffix = parts[1];
-        return value.starts_with(prefix) && value.ends_with(suffix);
-    }
-    pattern == value
+
+    let pattern: Vec<char> = pattern.chars().collect();
+    let value: Vec<char> = value.chars().collect();
+    matches(&pattern, &value, 0, 0)
 }
 
 /// Environment map with scalar values normalized to strings.
@@ -581,6 +596,9 @@ pub fn expand_jobs(workflow: &Workflow) -> Result<Vec<JobPlan>, ParserError> {
                 env,
                 steps: job.steps.iter().cloned().map(step_plan).collect(),
                 if_condition: job.if_condition.clone(),
+                fail_fast: job.strategy.fail_fast.unwrap_or(true),
+                max_parallel: job.strategy.max_parallel,
+                secrets_inherit: false,
             });
         }
     }
@@ -614,6 +632,7 @@ pub fn expand_jobs_with_reusables(
                         .collect();
                     called_plan.env.extend(global_env.clone());
                     called_plan.env.extend(job.env.clone().into_strings());
+                    called_plan.secrets_inherit = is_secrets_inherit(&job.secrets);
                 }
                 plans.extend(called_plans);
                 continue;
@@ -634,6 +653,9 @@ pub fn expand_jobs_with_reusables(
                 env,
                 steps: job.steps.iter().cloned().map(step_plan).collect(),
                 if_condition: job.if_condition.clone(),
+                fail_fast: job.strategy.fail_fast.unwrap_or(true),
+                max_parallel: job.strategy.max_parallel,
+                secrets_inherit: false,
             });
         }
     }
@@ -642,6 +664,13 @@ pub fn expand_jobs_with_reusables(
 
 fn is_local_reusable_workflow(uses: &str) -> bool {
     uses.starts_with("./") || uses.starts_with(".github/")
+}
+
+fn is_secrets_inherit(secrets: &Option<Value>) -> bool {
+    match secrets {
+        Some(Value::String(s)) => s == "inherit",
+        _ => false,
+    }
 }
 
 fn normalize_reusable_path(uses: &str) -> String {
@@ -797,6 +826,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn glob_match_handles_multiple_wildcards() {
+        assert!(glob_match("feature/*/*", "feature/auth/login"));
+        assert!(glob_match("release-*-rc*", "release-2026-rc1"));
+        assert!(!glob_match("feature/*", "feature/auth/login"));
+        assert!(glob_match("src/**", "src/bin/main.rs"));
+    }
+
+    #[test]
+    fn trigger_context_matches_activity_types() {
+        let workflow = parse_workflow(
+            r#"
+on:
+  pull_request:
+    types: [opened, synchronize]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+"#,
+        )
+        .unwrap();
+
+        assert!(workflow
+            .on
+            .matches_with_context("pull_request", None, None, &[], Some("opened")));
+        assert!(!workflow
+            .on
+            .matches_with_context("pull_request", None, None, &[], Some("closed")));
+    }
+
+    #[test]
+    fn schedule_trigger_matches_event_name() {
+        let workflow = parse_workflow(
+            r#"
+on:
+  schedule:
+    - cron: '0 0 * * *'
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+"#,
+        )
+        .unwrap();
+
+        assert!(workflow.on.matches("schedule"));
+        assert!(!workflow.on.matches("push"));
+    }
+
+    #[test]
     fn parses_and_expands_matrix() {
         let workflow = parse_workflow(
             r#"
@@ -888,5 +969,37 @@ jobs:
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].id.0, "call/test");
         assert_eq!(jobs[0].runs_on, vec!["ubuntu-latest"]);
+    }
+
+    #[test]
+    fn reusable_workflow_secrets_inherit_flag() {
+        let caller = parse_workflow(
+            r#"
+on: push
+jobs:
+  call:
+    uses: ./.github/workflows/reusable.yml
+    secrets: inherit
+"#,
+        )
+        .unwrap();
+        let mut reusable = BTreeMap::new();
+        reusable.insert(
+            ".github/workflows/reusable.yml".to_owned(),
+            r#"
+on:
+  workflow_call:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo reusable
+"#
+            .to_owned(),
+        );
+
+        let jobs = expand_jobs_with_reusables(&caller, &reusable).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert!(jobs[0].secrets_inherit);
     }
 }
