@@ -93,8 +93,7 @@ pub fn build_agent_job_message(
         .collect();
 
     // Service endpoints (SystemVssConnection)
-    let mut endpoints = Vec::new();
-    endpoints.push(ServiceEndpoint {
+    let endpoints = vec![ServiceEndpoint {
         data: BTreeMap::new(),
         name: "SystemVssConnection".to_owned(),
         endpoint_type: Some("azdoserver".to_owned()),
@@ -108,7 +107,7 @@ pub fn build_agent_job_message(
         },
         is_shared: Some(false),
         service_owner: Some("github".to_owned()),
-    });
+    }];
 
     let resources = TaskResources {
         endpoints,
