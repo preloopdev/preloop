@@ -91,8 +91,7 @@ pub fn build_agent_job_message(
         .collect();
 
     // Service endpoints (SystemVssConnection)
-    let mut endpoints = Vec::new();
-    endpoints.push(ServiceEndpoint {
+    let endpoints = vec![ServiceEndpoint {
         data: BTreeMap::new(),
         name: "SystemVssConnection".to_owned(),
         endpoint_type: Some("azdoserver".to_owned()),
@@ -109,7 +108,7 @@ pub fn build_agent_job_message(
         )]),
         is_shared: Some(false),
         service_owner: Some("github".to_owned()),
-    });
+    }];
 
     let resources = TaskResources {
         endpoints,
@@ -178,7 +177,7 @@ pub fn build_agent_job_message(
 }
 
 /// Build a `TaskStep` from a `StepPlan`.
-fn build_task_step(step: &crate::StepPlan, index: usize, context: &Context) -> TaskStep {
+fn build_task_step(step: &crate::StepPlan, _index: usize, context: &Context) -> TaskStep {
     let step_id = uuid::Uuid::new_v4();
 
     // Resolve expressions in env and with

@@ -6,13 +6,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aksh_artifacts::ArtifactStore;
-use aksh_artifacts::ArtifactStore;
 use aksh_cache::CacheStore;
-use aksh_cache::CacheStore;
-use aksh_gha_parser::{expand_jobs_with_reusables, parse_workflow};
 use aksh_gha_parser::{expand_jobs_with_reusables, parse_workflow};
 use aksh_gha_protocol::{
-    self as protocol,
     azdo::{
         self, ConnectionData, EncryptionKey as AzdoEncryptionKey, LocationServiceData,
         ServiceDefinition, TaskAgentSession as AzdoSession,
@@ -21,11 +17,6 @@ use aksh_gha_protocol::{
     event_to_ndjson, ExecutionStatus, JobCompletion, JobId, NdjsonEvent, RegisteredRunner,
     RunAccepted, RunId, RunnerRegistrationRequest, RunnerSession, RunnerSessionRequest,
     WorkflowSubmission, PROTOCOL_VERSION,
-};
-use aksh_gha_protocol::{
-    event_to_ndjson, ExecutionStatus, JobCompletion, JobId, NdjsonEvent, RegisteredRunner,
-    RunAccepted, RunId, RunnerJobMessage, RunnerRegistrationRequest, RunnerSession,
-    RunnerSessionRequest, WorkflowSubmission, PROTOCOL_VERSION,
 };
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
@@ -191,8 +182,10 @@ impl AppState {
         let (events, _) = broadcast::channel(1024);
         let keypair = AgentRsaKeypair::generate()
             .map_err(|e| anyhow::anyhow!("Failed to generate RSA keypair: {}", e))?;
-        let mut inner = InnerState::default();
-        inner.agent_keypair = Some(keypair);
+        let inner = InnerState {
+            agent_keypair: Some(keypair),
+            ..InnerState::default()
+        };
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
             events,
@@ -734,7 +727,7 @@ fn promote_ready_jobs(inner: &mut InnerState) {
 
 /// PATCH timeline records — runner updates step/job state.
 async fn patch_timeline_records(
-    State(shared): State<Arc<SharedState>>,
+    State(_shared): State<Arc<SharedState>>,
     Path((_scope, _hub, _plan_id, _timeline_id)): Path<(String, String, String, String)>,
     Json(records): Json<Vec<azdo::TimelineRecord>>,
 ) -> Json<serde_json::Value> {
@@ -848,7 +841,7 @@ async fn finish_job(
 /// POST action download info — resolve action references to download URLs.
 async fn action_download_info(
     State(_shared): State<Arc<SharedState>>,
-    Json(request): Json<serde_json::Value>,
+    Json(_request): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     // For now, return empty info — actions will be downloaded from GitHub
     Json(json!({ "archiveDownloadTickets": {} }))
