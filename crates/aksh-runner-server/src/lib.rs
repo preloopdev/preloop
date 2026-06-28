@@ -997,9 +997,11 @@ async fn complete_job_inner(
         );
         run.status = summarize_run(run.jobs.values().copied());
     }
-    if completion.status == ExecutionStatus::Failure {
-        apply_matrix_fail_fast(&mut inner, completion.run_id, &completion.job_id);
-    }
+    let cancelled_siblings = if completion.status == ExecutionStatus::Failure {
+        apply_matrix_fail_fast(&mut inner, completion.run_id, &completion.job_id)
+    } else {
+        0
+    };
     let promoted_jobs = promote_ready_jobs(&mut inner);
     let record = inner
         .runs
@@ -1007,7 +1009,7 @@ async fn complete_job_inner(
         .cloned()
         .ok_or_else(|| ApiError::not_found("run not found"))?;
     drop(inner);
-    if promoted_jobs > 0 {
+    if promoted_jobs > 0 || cancelled_siblings > 0 {
         shared.state.message_notify.notify_waiters();
     }
 
@@ -1085,17 +1087,25 @@ fn under_max_parallel(inner: &InnerState, job: &QueuedJob) -> bool {
     active_in_queue + active_running < max_parallel
 }
 
-fn apply_matrix_fail_fast(inner: &mut InnerState, run_id: RunId, failed_job: &JobId) {
+fn apply_matrix_fail_fast(
+    inner: &mut InnerState,
+    run_id: RunId,
+    failed_job: &JobId,
+) -> usize {
     let Some(run) = inner.runs.get_mut(&run_id) else {
-        return;
+        return 0;
     };
     let Some(base_id) = run.job_base_ids.get(failed_job).cloned() else {
-        return;
+        return 0;
     };
     if !run.job_fail_fast.get(&base_id).copied().unwrap_or(true) {
-        return;
+        return 0;
     }
 
+    // Track in-progress siblings: they need a JOB_CANCELLED message so the
+    // runner aborts the worker. Queued siblings only need their state flipped
+    // — they were never dispatched.
+    let mut cancellations = Vec::new();
     for (job_id, status) in &mut run.jobs {
         if job_id != failed_job
             && run.job_base_ids.get(job_id) == Some(&base_id)
@@ -1104,6 +1114,12 @@ fn apply_matrix_fail_fast(inner: &mut InnerState, run_id: RunId, failed_job: &Jo
                 ExecutionStatus::Queued | ExecutionStatus::InProgress
             )
         {
+            if matches!(status, ExecutionStatus::InProgress) {
+                cancellations.push(QueuedCancellation {
+                    run_id,
+                    job_id: job_id.clone(),
+                });
+            }
             *status = ExecutionStatus::Cancelled;
         }
     }
@@ -1114,6 +1130,9 @@ fn apply_matrix_fail_fast(inner: &mut InnerState, run_id: RunId, failed_job: &Jo
     inner
         .pending_jobs
         .retain(|job| !(job.run_id == run_id && job.base_id == base_id));
+    let count = cancellations.len();
+    inner.cancellation_queue.extend(cancellations);
+    count
 }
 
 fn hydrate_needs_context(job: &mut QueuedJob, run: &RunRecord) {
@@ -2332,6 +2351,95 @@ jobs:
                 .filter(|status| **status == ExecutionStatus::Cancelled)
                 .count(),
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_fail_fast_cancels_in_progress_siblings_via_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu, macos]
+    steps:
+      - run: echo matrix
+"#,
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        // Dispatch both siblings — both move to InProgress.
+        let first = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=default",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(first["messageType"], azdo::message_type::PIPELINE_AGENT_JOB_REQUEST);
+        let second = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=default",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(second["messageType"], azdo::message_type::PIPELINE_AGENT_JOB_REQUEST);
+
+        let failing_job = {
+            let inner = state.inner.lock().await;
+            inner
+                .runs
+                .get(&run_id)
+                .unwrap()
+                .jobs
+                .keys()
+                .next()
+                .unwrap()
+                .clone()
+        };
+
+        request_json(
+            &app,
+            Method::POST,
+            "/api/v1/jobs/complete",
+            json!({
+                "run_id": run_id,
+                "job_id": failing_job,
+                "status": "failure"
+            }),
+        )
+        .await;
+
+        // The fix: in-progress siblings get a cancellation enqueued so the
+        // runner receives a JOB_CANCELLED message. Inspect the queue directly
+        // since the matched siblings still have unACKed in-flight job messages.
+        let inner = state.inner.lock().await;
+        assert_eq!(inner.cancellation_queue.len(), 1);
+        let cancellation = inner.cancellation_queue.front().unwrap();
+        assert_eq!(cancellation.run_id, run_id);
+        assert_ne!(cancellation.job_id, failing_job);
+        // The sibling is now Cancelled in the run state.
+        let run = inner.runs.get(&run_id).unwrap();
+        assert_eq!(
+            run.jobs.get(&cancellation.job_id),
+            Some(&ExecutionStatus::Cancelled)
         );
     }
 
