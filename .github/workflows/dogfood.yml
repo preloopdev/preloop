@@ -1,0 +1,19 @@
+name: dogfood
+
+on:
+  push:
+  pull_request:
+
+# Runs against aksh locally. No checkout/toolchain actions — the repo is
+# already on disk at AKSH_REPO_ROOT (injected by the harness as a variable).
+
+jobs:
+  rust:
+    runs-on: self-hosted
+    steps:
+      - name: cargo fmt
+        run: cd "${{ vars.AKSH_REPO_ROOT }}" && cargo fmt --all --check
+      - name: cargo clippy
+        run: cd "${{ vars.AKSH_REPO_ROOT }}" && cargo clippy --workspace --all-targets
+      - name: cargo test
+        run: cd "${{ vars.AKSH_REPO_ROOT }}" && cargo test --workspace --quiet

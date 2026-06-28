@@ -1,0 +1,7 @@
+name: simple-echo
+on: push
+jobs:
+  echo:
+    runs-on: [self-hosted]
+    steps:
+      - run: echo hello
