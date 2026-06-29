@@ -144,6 +144,30 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             "/_apis/v1/ActionDownloadInfo/:scope/:hub/:plan_id",
             post(action_download_info),
         )
+        .route(
+            "/runner/server/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id",
+            patch(patch_timeline_records),
+        )
+        .route(
+            "/runner/server/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id",
+            post(create_log),
+        )
+        .route(
+            "/runner/server/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id/:log_id2",
+            post(append_log),
+        )
+        .route(
+            "/runner/server/_apis/v1/TimeLineWebConsoleLog/:scope/:hub/:plan_id/:timeline_id/:record_id",
+            post(console_log),
+        )
+        .route(
+            "/runner/server/_apis/v1/FinishJob/:scope/:hub/:plan_id",
+            post(finish_job),
+        )
+        .route(
+            "/runner/server/_apis/v1/ActionDownloadInfo/:scope/:hub/:plan_id",
+            post(action_download_info),
+        )
         .route_layer(middleware::from_fn(require_bearer));
 
     Router::new()
@@ -152,43 +176,115 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         .route("/:org/_apis/connectionData", get(connection_data))
         .route("/:org/_apis/v1/oauth2/token", post(oauth2_token))
         .route("/:org/_apis/v1/AgentPools", get(runner_pools))
-        .route("/:org/_apis/v1/Agent/:pool_id/:agent_id", get(agent_lookup_by_id_org).post(register_runner_compat_org_2))
-        .route("/:org/_apis/v1/Agent/:pool_id", get(agent_lookup_org).post(register_runner_compat_org))
-        .route("/:org/_apis/v1/AgentSession/:pool_id/:session_id", post(create_session_compat_org))
-        .route("/:org/_apis/v1/AgentSession/:pool_id", post(create_session_compat_org_pool_only))
-        .route("/:org/_apis/v1/AgentSession/:pool_id/:session_id", delete(delete_session_org))
-        .route("/:org/_apis/v1/Message/:pool_id", get(next_message_compat_org))
-        .route("/:org/_apis/v1/Message/:pool_id/:message_id", delete(delete_pool_message_org))
-        .route("/:org/_apis/v1/AgentRequest/:pool_id/:request_id", patch(agent_request_patch_org))
-        .route("/:org/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id", patch(patch_timeline_records_org))
-        .route("/:org/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id", post(create_log_org))
-        .route("/:org/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id/:log_id2", post(append_log_org))
-        .route("/:org/_apis/v1/TimeLineWebConsoleLog/:scope/:hub/:plan_id/:timeline_id/:record_id", post(console_log_org))
-        .route("/:org/_apis/v1/FinishJob/:scope/:hub/:plan_id", post(finish_job_org))
-        .route("/:org/_apis/v1/ActionDownloadInfo/:scope/:hub/:plan_id", post(action_download_info_org))
+        .route(
+            "/:org/_apis/v1/Agent/:pool_id/:agent_id",
+            get(agent_lookup_by_id_org).post(register_runner_compat_org_2),
+        )
+        .route(
+            "/:org/_apis/v1/Agent/:pool_id",
+            get(agent_lookup_org).post(register_runner_compat_org),
+        )
+        .route(
+            "/:org/_apis/v1/AgentSession/:pool_id/:session_id",
+            post(create_session_compat_org),
+        )
+        .route(
+            "/:org/_apis/v1/AgentSession/:pool_id",
+            post(create_session_compat_org_pool_only),
+        )
+        .route(
+            "/:org/_apis/v1/AgentSession/:pool_id/:session_id",
+            delete(delete_session_org),
+        )
+        .route(
+            "/:org/_apis/v1/Message/:pool_id",
+            get(next_message_compat_org),
+        )
+        .route(
+            "/:org/_apis/v1/Message/:pool_id/:message_id",
+            delete(delete_pool_message_org),
+        )
+        .route(
+            "/:org/_apis/v1/AgentRequest/:pool_id/:request_id",
+            patch(agent_request_patch_org),
+        )
+        .route(
+            "/:org/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id",
+            patch(patch_timeline_records_org),
+        )
+        .route(
+            "/:org/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id",
+            post(create_log_org),
+        )
+        .route(
+            "/:org/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id/:log_id2",
+            post(append_log_org),
+        )
+        .route(
+            "/:org/_apis/v1/TimeLineWebConsoleLog/:scope/:hub/:plan_id/:timeline_id/:record_id",
+            post(console_log_org),
+        )
+        .route(
+            "/:org/_apis/v1/FinishJob/:scope/:hub/:plan_id",
+            post(finish_job_org),
+        )
+        .route(
+            "/:org/_apis/v1/ActionDownloadInfo/:scope/:hub/:plan_id",
+            post(action_download_info_org),
+        )
         .route("/_apis/v1/oauth2/token", post(oauth2_token))
-        .route("/api/v3/actions/runner-registration", post(github_registration_token))
-        .route("/api/v3/orgs/:org/actions/runners/registration-token", post(github_registration_token))
-        .route("/api/v3/repos/:owner/:repo/actions/runners/registration-token", post(github_registration_token))
+        .route(
+            "/api/v3/actions/runner-registration",
+            post(github_registration_token),
+        )
+        .route(
+            "/api/v3/orgs/:org/actions/runners/registration-token",
+            post(github_registration_token),
+        )
+        .route(
+            "/api/v3/repos/:owner/:repo/actions/runners/registration-token",
+            post(github_registration_token),
+        )
         .route("/runner/server/_apis/connectionData", get(connection_data))
         .route("/runner/server/_apis/v1/oauth2/token", post(oauth2_token))
         .route("/runner/server/_apis/v1/AgentPools", get(runner_pools))
-        .route("/runner/server/_apis/v1/Agent/:pool_id/:agent_id", get(agent_lookup_by_id).post(register_runner_compat))
-        .route("/runner/server/_apis/v1/Agent/:pool_id", get(agent_lookup).post(register_runner_compat))
-        .route("/runner/server/_apis/v1/AgentSession/:pool_id/:session_id", post(create_session_compat))
-        .route("/runner/server/_apis/v1/AgentSession/:pool_id", post(create_session_compat_pool_only))
-        .route("/runner/server/_apis/v1/AgentSession/:pool_id/:session_id", delete(delete_session))
-        .route("/runner/server/_apis/v1/Message/:pool_id", get(next_message_compat))
-        .route("/runner/server/_apis/v1/Message/:pool_id/:message_id", delete(delete_pool_message))
-        .route("/runner/server/_apis/v1/AgentRequest/:pool_id/:request_id", patch(agent_request_patch))
-        .route("/runner/server/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id", patch(patch_timeline_records))
-        .route("/runner/server/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id", post(create_log))
-        .route("/runner/server/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id/:log_id2", post(append_log))
-        .route("/runner/server/_apis/v1/TimeLineWebConsoleLog/:scope/:hub/:plan_id/:timeline_id/:record_id", post(console_log))
-        .route("/runner/server/_apis/v1/FinishJob/:scope/:hub/:plan_id", post(finish_job))
-        .route("/runner/server/_apis/v1/ActionDownloadInfo/:scope/:hub/:plan_id", post(action_download_info))
+        .route(
+            "/runner/server/_apis/v1/Agent/:pool_id/:agent_id",
+            get(agent_lookup_by_id).post(register_runner_compat),
+        )
+        .route(
+            "/runner/server/_apis/v1/Agent/:pool_id",
+            get(agent_lookup).post(register_runner_compat_pool_only),
+        )
+        .route(
+            "/runner/server/_apis/v1/AgentSession/:pool_id/:session_id",
+            post(create_session_compat),
+        )
+        .route(
+            "/runner/server/_apis/v1/AgentSession/:pool_id",
+            post(create_session_compat_pool_only),
+        )
+        .route(
+            "/runner/server/_apis/v1/AgentSession/:pool_id/:session_id",
+            delete(delete_session),
+        )
+        .route(
+            "/runner/server/_apis/v1/Message/:pool_id",
+            get(next_message_compat),
+        )
+        .route(
+            "/runner/server/_apis/v1/Message/:pool_id/:message_id",
+            delete(delete_pool_message),
+        )
+        .route(
+            "/runner/server/_apis/v1/AgentRequest/:pool_id/:request_id",
+            patch(agent_request_patch),
+        )
         .route("/_apis/connectionData", get(connection_data))
-        .route("/_apis/", axum::routing::options(|| async { StatusCode::OK }))
+        .route(
+            "/_apis/",
+            axum::routing::options(|| async { StatusCode::OK }),
+        )
         .route("/api/v1/runs", post(submit_run))
         .route("/api/v1/runs/:run_id", get(get_run))
         .route("/api/v1/runs/:run_id/cancel", post(cancel_run))
@@ -211,13 +307,31 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         .route("/api/v1/artifacts/:artifact_id", get(artifact_get))
         // Runner lifecycle endpoints — public (runner may not have auth token yet)
         .route("/_apis/v1/AgentPools", get(runner_pools))
-        .route("/_apis/v1/Agent/:pool_id/:agent_id", get(agent_lookup_by_id).post(register_runner_compat))
-        .route("/_apis/v1/AgentSession/:pool_id/:session_id", post(create_session_compat))
-        .route("/_apis/v1/AgentSession/:pool_id", post(create_session_compat_pool_only))
-        .route("/_apis/v1/AgentSession/:pool_id/:session_id", delete(delete_session))
+        .route(
+            "/_apis/v1/Agent/:pool_id/:agent_id",
+            get(agent_lookup_by_id).post(register_runner_compat),
+        )
+        .route(
+            "/_apis/v1/AgentSession/:pool_id/:session_id",
+            post(create_session_compat),
+        )
+        .route(
+            "/_apis/v1/AgentSession/:pool_id",
+            post(create_session_compat_pool_only),
+        )
+        .route(
+            "/_apis/v1/AgentSession/:pool_id/:session_id",
+            delete(delete_session),
+        )
         .route("/_apis/v1/Message/:pool_id", get(next_message_compat))
-        .route("/_apis/v1/Message/:pool_id/:message_id", delete(delete_pool_message))
-        .route("/_apis/v1/AgentRequest/:pool_id/:request_id", patch(agent_request_patch))
+        .route(
+            "/_apis/v1/Message/:pool_id/:message_id",
+            delete(delete_pool_message),
+        )
+        .route(
+            "/_apis/v1/AgentRequest/:pool_id/:request_id",
+            patch(agent_request_patch),
+        )
         .merge(protected_apis)
         .layer(TraceLayer::new_for_http())
         .with_state(Arc::new(SharedState { state, shutdown }))
@@ -291,15 +405,17 @@ struct InnerState {
     agent_keypair: Option<AgentRsaKeypair>,
     runner_public_keys: BTreeMap<i64, String>,
     runner_rsa_public_keys: BTreeMap<i64, AgentRsaPublicKey>,
-    inflight_messages: BTreeMap<i64, azdo::TaskAgentMessage>,
+    inflight_messages: BTreeMap<String, BTreeMap<i64, azdo::TaskAgentMessage>>,
     cancellation_queue: VecDeque<QueuedCancellation>,
     pending_caches: BTreeMap<i64, PendingCache>,
     artifacts: BTreeMap<String, ArtifactRecord>,
     logs: BTreeMap<String, Vec<u8>>,
     timeline_events: BTreeMap<RunId, Vec<NdjsonEvent>>,
+    inflight_requests: BTreeMap<i64, (RunId, JobId)>,
     next_runner_id: i64,
     next_cache_id: i64,
     next_message_id: i64,
+    next_request_id: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -463,7 +579,7 @@ async fn submit_run(
         let mut job_fail_fast = BTreeMap::new();
         let mut ready_by_base: BTreeMap<String, u64> = BTreeMap::new();
         for job in jobs {
-            let agent_msg = aksh_gha_parser::job_builder::build_agent_job_message(
+            let mut agent_msg = aksh_gha_parser::job_builder::build_agent_job_message(
                 &job,
                 &github,
                 &job.env,
@@ -475,6 +591,15 @@ async fn submit_run(
                 &submission.vars,
             )
             .map_err(|e| ApiError::bad_request(format!("failed to build job message: {e}")))?;
+
+            // Give every dispatched job a unique requestId so PATCH
+            // /AgentRequest/:request_id can target exactly one job.
+            inner.next_request_id += 1;
+            let request_id = inner.next_request_id;
+            agent_msg.request_id = request_id;
+            inner
+                .inflight_requests
+                .insert(request_id, (run_id, job.id.clone()));
 
             let queued_job = QueuedJob {
                 run_id,
@@ -776,7 +901,11 @@ async fn next_message(
 
     loop {
         let mut inner = shared.state.inner.lock().await;
-        if let Some(message) = inner.inflight_messages.values().next().cloned() {
+        if let Some(message) = inner
+            .inflight_messages
+            .get(&session_id)
+            .and_then(|messages| messages.values().next().cloned())
+        {
             return Ok(Json(Some(message)));
         }
 
@@ -847,9 +976,9 @@ async fn next_message(
 
 async fn delete_session_message(
     State(shared): State<Arc<SharedState>>,
-    Path((_session_id, message_id)): Path<(String, i64)>,
+    Path((session_id, message_id)): Path<(String, i64)>,
 ) -> StatusCode {
-    ack_message(shared, message_id).await
+    ack_message(shared, &session_id, message_id).await
 }
 
 fn build_task_agent_message(
@@ -879,20 +1008,31 @@ fn build_task_agent_message(
         body: BASE64_STANDARD.encode(&encrypted_body),
         iv: Some(iv),
     };
-    inner.inflight_messages.insert(message_id, message.clone());
+    inner
+        .inflight_messages
+        .entry(session_id.to_owned())
+        .or_default()
+        .insert(message_id, message.clone());
     Ok(message)
 }
 
 async fn delete_pool_message(
     State(shared): State<Arc<SharedState>>,
     Path((_pool_id, message_id)): Path<(i64, i64)>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> StatusCode {
-    ack_message(shared, message_id).await
+    let session_id = params.get("sessionId").map(String::as_str).unwrap_or("");
+    ack_message(shared, session_id, message_id).await
 }
 
-async fn ack_message(shared: Arc<SharedState>, message_id: i64) -> StatusCode {
+async fn ack_message(shared: Arc<SharedState>, session_id: &str, message_id: i64) -> StatusCode {
     let mut inner = shared.state.inner.lock().await;
-    inner.inflight_messages.remove(&message_id);
+    if let Some(messages) = inner.inflight_messages.get_mut(session_id) {
+        messages.remove(&message_id);
+        if messages.is_empty() {
+            inner.inflight_messages.remove(session_id);
+        }
+    }
     StatusCode::NO_CONTENT
 }
 
@@ -930,31 +1070,37 @@ async fn complete_job_compat(
 /// The runner sends this to renew the job lock or report completion.
 async fn agent_request_patch(
     State(shared): State<Arc<SharedState>>,
-    Path((_pool_id, _request_id)): Path<(i64, i64)>,
+    Path((_pool_id, request_id)): Path<(i64, i64)>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     info!(?body, "agent_request_patch received");
-    // Check if this is a completion event
     if let Some(result) = body.get("result").and_then(|v| v.as_str()) {
-        info!(result, "job request completed");
+        let new_status = match result {
+            "succeeded" => ExecutionStatus::Success,
+            "failed" => ExecutionStatus::Failure,
+            "cancelled" => ExecutionStatus::Cancelled,
+            _ => ExecutionStatus::Success,
+        };
         let mut inner = shared.state.inner.lock().await;
-        for run in inner.runs.values_mut() {
-            for (job_id, status) in run.jobs.iter_mut() {
-                if *status == ExecutionStatus::InProgress {
-                    *status = match result {
-                        "succeeded" => ExecutionStatus::Success,
-                        "failed" => ExecutionStatus::Failure,
-                        "cancelled" => ExecutionStatus::Cancelled,
-                        _ => ExecutionStatus::Success,
-                    };
-                    info!(job_id = %job_id, result, "updated job status");
+        // Look up the (run_id, job_id) this request_id was assigned to at
+        // dispatch time. Without this mapping we'd mutate every InProgress
+        // job in every run.
+        if let Some((run_id, job_id)) = inner.inflight_requests.remove(&request_id) {
+            if let Some(run) = inner.runs.get_mut(&run_id) {
+                if let Some(status) = run.jobs.get_mut(&job_id) {
+                    *status = new_status;
+                    info!(%run_id, %job_id, result, "updated job status");
                 }
             }
+        } else {
+            info!(
+                request_id,
+                "no inflight job for request_id; ignoring result"
+            );
         }
     }
-    // Return a valid TaskAgentJobRequest response
     Json(json!({
-        "requestId": _request_id,
+        "requestId": request_id,
         "lockedUntil": "2099-12-31T23:59:59Z",
         "result": body.get("result"),
     }))
@@ -982,9 +1128,11 @@ async fn complete_job_inner(
         );
         run.status = summarize_run(run.jobs.values().copied());
     }
-    if completion.status == ExecutionStatus::Failure {
-        apply_matrix_fail_fast(&mut inner, completion.run_id, &completion.job_id);
-    }
+    let cancelled_siblings = if completion.status == ExecutionStatus::Failure {
+        apply_matrix_fail_fast(&mut inner, completion.run_id, &completion.job_id)
+    } else {
+        0
+    };
     let promoted_jobs = promote_ready_jobs(&mut inner);
     let record = inner
         .runs
@@ -992,7 +1140,7 @@ async fn complete_job_inner(
         .cloned()
         .ok_or_else(|| ApiError::not_found("run not found"))?;
     drop(inner);
-    if promoted_jobs > 0 {
+    if promoted_jobs > 0 || cancelled_siblings > 0 {
         shared.state.message_notify.notify_waiters();
     }
 
@@ -1070,17 +1218,21 @@ fn under_max_parallel(inner: &InnerState, job: &QueuedJob) -> bool {
     active_in_queue + active_running < max_parallel
 }
 
-fn apply_matrix_fail_fast(inner: &mut InnerState, run_id: RunId, failed_job: &JobId) {
+fn apply_matrix_fail_fast(inner: &mut InnerState, run_id: RunId, failed_job: &JobId) -> usize {
     let Some(run) = inner.runs.get_mut(&run_id) else {
-        return;
+        return 0;
     };
     let Some(base_id) = run.job_base_ids.get(failed_job).cloned() else {
-        return;
+        return 0;
     };
     if !run.job_fail_fast.get(&base_id).copied().unwrap_or(true) {
-        return;
+        return 0;
     }
 
+    // Track in-progress siblings: they need a JOB_CANCELLED message so the
+    // runner aborts the worker. Queued siblings only need their state flipped
+    // — they were never dispatched.
+    let mut cancellations = Vec::new();
     for (job_id, status) in &mut run.jobs {
         if job_id != failed_job
             && run.job_base_ids.get(job_id) == Some(&base_id)
@@ -1089,6 +1241,12 @@ fn apply_matrix_fail_fast(inner: &mut InnerState, run_id: RunId, failed_job: &Jo
                 ExecutionStatus::Queued | ExecutionStatus::InProgress
             )
         {
+            if matches!(status, ExecutionStatus::InProgress) {
+                cancellations.push(QueuedCancellation {
+                    run_id,
+                    job_id: job_id.clone(),
+                });
+            }
             *status = ExecutionStatus::Cancelled;
         }
     }
@@ -1099,6 +1257,9 @@ fn apply_matrix_fail_fast(inner: &mut InnerState, run_id: RunId, failed_job: &Jo
     inner
         .pending_jobs
         .retain(|job| !(job.run_id == run_id && job.base_id == base_id));
+    let count = cancellations.len();
+    inner.cancellation_queue.extend(cancellations);
+    count
 }
 
 fn hydrate_needs_context(job: &mut QueuedJob, run: &RunRecord) {
@@ -1717,8 +1878,9 @@ async fn next_message_compat_org(
 async fn delete_pool_message_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, pool_id, message_id)): Path<(String, i64, i64)>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> StatusCode {
-    delete_pool_message(State(shared), Path((pool_id, message_id))).await
+    delete_pool_message(State(shared), Path((pool_id, message_id)), Query(params)).await
 }
 
 #[allow(dead_code)]
@@ -2320,6 +2482,176 @@ jobs:
     }
 
     #[tokio::test]
+    async fn agent_request_patch_targets_only_the_request_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        // Two independent runs, both reach InProgress when their job is pulled.
+        let workflow = json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo"
+        });
+        let first = request_json(&app, Method::POST, "/api/v1/runs", workflow.clone()).await;
+        let second = request_json(&app, Method::POST, "/api/v1/runs", workflow).await;
+        let first_run: RunId = first["run_id"].as_str().unwrap().parse().unwrap();
+        let second_run: RunId = second["run_id"].as_str().unwrap().parse().unwrap();
+
+        // Pull both jobs so they are InProgress and each has a distinct request_id.
+        let first_msg = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=s1",
+            Value::Null,
+        )
+        .await;
+        let second_msg = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=s2",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            first_msg["messageType"],
+            azdo::message_type::PIPELINE_AGENT_JOB_REQUEST
+        );
+        assert_eq!(
+            second_msg["messageType"],
+            azdo::message_type::PIPELINE_AGENT_JOB_REQUEST
+        );
+
+        // The mapping should have two entries — one per request_id.
+        let (first_req_id, _) = state
+            .inner
+            .lock()
+            .await
+            .inflight_requests
+            .iter()
+            .find(|(_, (rid, _))| *rid == first_run)
+            .map(|(k, v)| (*k, v.clone()))
+            .unwrap();
+
+        // PATCH only the first run's request_id.
+        request_json(
+            &app,
+            Method::PATCH,
+            &format!("/runner/server/_apis/v1/AgentRequest/1/{first_req_id}"),
+            json!({"result": "succeeded"}),
+        )
+        .await;
+
+        let inner = state.inner.lock().await;
+        let first = inner.runs.get(&first_run).unwrap();
+        let second = inner.runs.get(&second_run).unwrap();
+        assert!(first
+            .jobs
+            .values()
+            .all(|status| *status == ExecutionStatus::Success));
+        assert!(second
+            .jobs
+            .values()
+            .all(|status| *status == ExecutionStatus::InProgress));
+        assert!(!inner.inflight_requests.contains_key(&first_req_id));
+    }
+
+    #[tokio::test]
+    async fn matrix_fail_fast_cancels_in_progress_siblings_via_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu, macos]
+    steps:
+      - run: echo matrix
+"#,
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        // Dispatch both siblings — both move to InProgress.
+        let first = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=default",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            first["messageType"],
+            azdo::message_type::PIPELINE_AGENT_JOB_REQUEST
+        );
+        let second = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=default",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            second["messageType"],
+            azdo::message_type::PIPELINE_AGENT_JOB_REQUEST
+        );
+
+        let failing_job = {
+            let inner = state.inner.lock().await;
+            inner
+                .runs
+                .get(&run_id)
+                .unwrap()
+                .jobs
+                .keys()
+                .next()
+                .unwrap()
+                .clone()
+        };
+
+        request_json(
+            &app,
+            Method::POST,
+            "/api/v1/jobs/complete",
+            json!({
+                "run_id": run_id,
+                "job_id": failing_job,
+                "status": "failure"
+            }),
+        )
+        .await;
+
+        // The fix: in-progress siblings get a cancellation enqueued so the
+        // runner receives a JOB_CANCELLED message. Inspect the queue directly
+        // since the matched siblings still have unACKed in-flight job messages.
+        let inner = state.inner.lock().await;
+        assert_eq!(inner.cancellation_queue.len(), 1);
+        let cancellation = inner.cancellation_queue.front().unwrap();
+        assert_eq!(cancellation.run_id, run_id);
+        assert_ne!(cancellation.job_id, failing_job);
+        // The sibling is now Cancelled in the run state.
+        let run = inner.runs.get(&run_id).unwrap();
+        assert_eq!(
+            run.jobs.get(&cancellation.job_id),
+            Some(&ExecutionStatus::Cancelled)
+        );
+    }
+
+    #[tokio::test]
     async fn needs_context_includes_completed_job_outputs() {
         let temp = tempfile::tempdir().unwrap();
         let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
@@ -2620,6 +2952,52 @@ jobs:
     }
 
     #[tokio::test]
+    async fn runner_server_v1_sensitive_routes_require_bearer() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+
+        // These /runner/server/_apis/v1/* aliases were previously placed on
+        // the public router, letting unauthenticated callers mutate timelines,
+        // inject logs, and finish jobs. They MUST require a bearer token.
+        let cases = [
+            (Method::PATCH, "/runner/server/_apis/v1/Timeline/s/h/p/t"),
+            (Method::POST, "/runner/server/_apis/v1/Logfiles/s/h/p/l"),
+            (Method::POST, "/runner/server/_apis/v1/Logfiles/s/h/p/l/l2"),
+            (
+                Method::POST,
+                "/runner/server/_apis/v1/TimeLineWebConsoleLog/s/h/p/t/r",
+            ),
+            (Method::POST, "/runner/server/_apis/v1/FinishJob/s/h/p"),
+            (
+                Method::POST,
+                "/runner/server/_apis/v1/ActionDownloadInfo/s/h/p",
+            ),
+        ];
+        for (method, uri) in cases {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(uri)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri} should require bearer auth"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn oidc_endpoint_mints_jwt_with_requested_audience() {
         let temp = tempfile::tempdir().unwrap();
         let app = app(
@@ -2695,7 +3073,9 @@ jobs:
             .oneshot(
                 Request::builder()
                     .method(Method::DELETE)
-                    .uri("/runner/server/_apis/distributedtask/pools/1/messages/1")
+                    .uri(
+                        "/runner/server/_apis/distributedtask/pools/1/messages/1?sessionId=default",
+                    )
                     .header(header::AUTHORIZATION, "Bearer aksh-system-token")
                     .body(Body::empty())
                     .unwrap(),
@@ -2757,7 +3137,7 @@ jobs:
                 Request::builder()
                     .method(Method::DELETE)
                     .uri(format!(
-                        "/runner/server/_apis/distributedtask/pools/1/messages/{message_id}"
+                        "/runner/server/_apis/distributedtask/pools/1/messages/{message_id}?sessionId=default"
                     ))
                     .header(header::AUTHORIZATION, "Bearer aksh-system-token")
                     .body(Body::empty())
