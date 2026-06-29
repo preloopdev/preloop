@@ -48,9 +48,13 @@ except Exception:
 }
 
 cleanup() {
-    pkill -f "aksh-runner-server serve" 2>/dev/null || true
-    pkill -f "Runner.Listener" 2>/dev/null || true
-    pkill -f socat 2>/dev/null || true
+    # Kill processes started by this script. Avoid broad `pkill -f` patterns
+    # that could match unrelated runners/servers on the same host.
+    if [[ -n "${AKSH_PID:-}" ]]; then
+        kill "$AKSH_PID" 2>/dev/null || true
+    fi
+    # Reap any remaining direct children (e.g. perl/run.sh) of this shell.
+    pkill -P $$ 2>/dev/null || true
 }
 trap cleanup EXIT
 
