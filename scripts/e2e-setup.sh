@@ -52,7 +52,7 @@ macos_setup() {
     tmp=$(mktemp)
     trap "rm -f '$tmp'" RETURN
     {
-        sudo pfctl -sn 2>/dev/null | grep -vE "rdr .*lo0.*port [= ]*80\b" || true
+        sudo pfctl -sn 2>/dev/null | grep -vE "rdr .*lo0.*port [= ]*80\b.*port [= ]*$AKSH_PORT\b" || true
         echo "$rule"
     } > "$tmp"
 
@@ -77,7 +77,7 @@ macos_teardown() {
     trap "rm -f '$tmp'" RETURN
 
     # Reload nat rules without our redirect
-    sudo pfctl -sn 2>/dev/null | grep -vE "rdr .*lo0.*port [= ]*80\b" > "$tmp" 2>/dev/null || true
+    sudo pfctl -sn 2>/dev/null | grep -vE "rdr .*lo0.*port [= ]*80\b.*port [= ]*$AKSH_PORT\b" > "$tmp" 2>/dev/null || true
     sudo pfctl -N -f "$tmp" 2>&1 | grep -vE "ALTQ|flushing|main ruleset|pf\.conf|^$" || true
 
     green "✓ redirect removed"
@@ -86,7 +86,11 @@ macos_teardown() {
 # ── Linux ────────────────────────────────────────────────────────────────────
 
 linux_status() {
-    if sudo iptables -t nat -L OUTPUT -n 2>/dev/null | grep -q "REDIRECT.*dpt:80.*:$AKSH_PORT"; then
+    # Check the exact rule the setup adds; -L output shows REDIRECT as
+    # "redir ports 9090" with no colon, so a grep for ":$AKSH_PORT" never
+    # matches. -C returns 0 iff an identical rule already exists.
+    if sudo iptables -t nat -C OUTPUT -p tcp -d 127.0.0.1 --dport 80 \
+        -j REDIRECT --to-port "$AKSH_PORT" 2>/dev/null; then
         green "✓ redirect active: 127.0.0.1:80 → 127.0.0.1:$AKSH_PORT"
         return 0
     fi
