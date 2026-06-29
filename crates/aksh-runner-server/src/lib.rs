@@ -121,11 +121,11 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             patch(patch_timeline_records),
         )
         .route(
-            "/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id",
+            "/_apis/v1/Logfiles/:scope/:hub/:plan_id",
             post(create_log),
         )
         .route(
-            "/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id/:log_id2",
+            "/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id",
             post(append_log),
         )
         .route(
@@ -149,11 +149,11 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             patch(patch_timeline_records),
         )
         .route(
-            "/runner/server/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id",
+            "/runner/server/_apis/v1/Logfiles/:scope/:hub/:plan_id",
             post(create_log),
         )
         .route(
-            "/runner/server/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id/:log_id2",
+            "/runner/server/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id",
             post(append_log),
         )
         .route(
@@ -213,11 +213,11 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             patch(patch_timeline_records_org),
         )
         .route(
-            "/:org/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id",
+            "/:org/_apis/v1/Logfiles/:scope/:hub/:plan_id",
             post(create_log_org),
         )
         .route(
-            "/:org/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id/:log_id2",
+            "/:org/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id",
             post(append_log_org),
         )
         .route(
@@ -415,6 +415,7 @@ struct InnerState {
     next_runner_id: i64,
     next_cache_id: i64,
     next_message_id: i64,
+    next_log_id: usize,
     next_request_id: i64,
 }
 
@@ -1074,35 +1075,47 @@ async fn agent_request_patch(
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     info!(?body, "agent_request_patch received");
+    // If this is a completion (has result), delegate to complete_job_inner
+    // so summarize_run, promote_ready_jobs, and notify_waiters all fire.
+    // The result field is only present on the final PATCH; renewals have no result.
     if let Some(result) = body.get("result").and_then(|v| v.as_str()) {
         let new_status = match result {
-            "succeeded" => ExecutionStatus::Success,
+            "succeeded" | "succeededWithIssues" => ExecutionStatus::Success,
             "failed" => ExecutionStatus::Failure,
             "cancelled" => ExecutionStatus::Cancelled,
-            _ => ExecutionStatus::Success,
+            "canceled" => ExecutionStatus::Cancelled,
+            _ => { info!(request_id, %result, "unknown agent_request_patch result; skipping completion"); return Json(json!({ "requestId": request_id, "lockedUntil": "2099-12-31T23:59:59Z" })); }
         };
-        let mut inner = shared.state.inner.lock().await;
-        // Look up the (run_id, job_id) this request_id was assigned to at
-        // dispatch time. Without this mapping we'd mutate every InProgress
-        // job in every run.
-        if let Some((run_id, job_id)) = inner.inflight_requests.remove(&request_id) {
-            if let Some(run) = inner.runs.get_mut(&run_id) {
-                if let Some(status) = run.jobs.get_mut(&job_id) {
-                    *status = new_status;
-                    info!(%run_id, %job_id, result, "updated job status");
-                }
+        // Look up (run_id, job_id) under the inner lock, then drop it before calling
+        // complete_job_inner which acquires the lock itself.
+        let completion = {
+            let mut inner = shared.state.inner.lock().await;
+            if let Some((run_id, job_id)) = inner.inflight_requests.remove(&request_id) {
+                info!(%run_id, %job_id, result, "job completed via agent_request_patch");
+                Some(JobCompletion {
+                    run_id,
+                    job_id,
+                    status: new_status,
+                    outputs: Default::default(),
+                })
+            } else {
+                info!(request_id, "no inflight job for request_id; ignoring result");
+                None
             }
-        } else {
-            info!(
-                request_id,
-                "no inflight job for request_id; ignoring result"
-            );
+        };
+        if let Some(c) = completion {
+            let _ = complete_job_inner(shared, c).await;
         }
+        return Json(json!({
+            "requestId": request_id,
+            "lockedUntil": "2099-12-31T23:59:59Z",
+            "result": body.get("result"),
+        }));
     }
+    // Renewal — runner is still working; just extend the lock.
     Json(json!({
         "requestId": request_id,
         "lockedUntil": "2099-12-31T23:59:59Z",
-        "result": body.get("result"),
     }))
 }
 
@@ -1355,8 +1368,10 @@ fn need_satisfied(run: &RunRecord, need: &JobId) -> bool {
 async fn patch_timeline_records(
     State(shared): State<Arc<SharedState>>,
     Path((_scope, _hub, plan_id, timeline_id)): Path<(String, String, String, String)>,
-    Json(records): Json<Vec<azdo::TimelineRecord>>,
+    Json(wrapper): Json<azdo::VssJsonCollectionWrapper<azdo::TimelineRecord>>,
 ) -> Json<serde_json::Value> {
+    let records = wrapper.value;
+    let count = records.len();
     let run_id = plan_id.parse::<RunId>().ok();
     let mut projected = Vec::new();
     for record in &records {
@@ -1400,7 +1415,7 @@ async fn patch_timeline_records(
     for event in projected {
         shared.state.emit(event).await;
     }
-    Json(json!({ "ok": true }))
+    Json(json!({ "count": count, "value": records }))
 }
 
 fn timeline_status(record: &azdo::TimelineRecord) -> Option<ExecutionStatus> {
@@ -1429,18 +1444,22 @@ fn issue_level(issue_type: azdo::IssueType) -> AnnotationLevel {
 /// POST create log file — runner creates a log container.
 async fn create_log(
     State(shared): State<Arc<SharedState>>,
-    Path((_scope, _hub, plan_id, log_id)): Path<(String, String, String, String)>,
+    Path((_scope, _hub, plan_id)): Path<(String, String, String)>,
+    Json(mut log): Json<azdo::TaskLog>,
 ) -> Json<serde_json::Value> {
-    let key = log_key(&plan_id, &log_id);
     let mut inner = shared.state.inner.lock().await;
+    let next_id = inner.next_log_id;
+    inner.next_log_id = next_id.wrapping_add(1);
+    log.id = next_id as i64;
+    let key = format!("{}/{}", plan_id, next_id);
     inner.logs.entry(key).or_default();
-    Json(json!({ "ok": true }))
+    Json(serde_json::to_value(&log).unwrap_or(json!({ "ok": true })))
 }
 
 /// POST append log — runner appends lines to a log file.
 async fn append_log(
     State(shared): State<Arc<SharedState>>,
-    Path((_scope, _hub, plan_id, log_id, _log_id2)): Path<(String, String, String, String, String)>,
+    Path((_scope, _hub, plan_id, log_id)): Path<(String, String, String, String)>,
     body: Bytes,
 ) -> StatusCode {
     let key = log_key(&plan_id, &log_id);
@@ -1495,7 +1514,7 @@ async fn console_log(
     )>,
     _body: Bytes,
 ) -> StatusCode {
-    StatusCode::ACCEPTED
+    StatusCode::OK
 }
 
 /// POST finish job — runner reports final result + outputs.
@@ -1903,27 +1922,27 @@ async fn agent_request_patch_org(
 async fn patch_timeline_records_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, scope, hub, plan_id, timeline_id)): Path<(String, String, String, String, String)>,
-    Json(records): Json<Vec<azdo::TimelineRecord>>,
+    Json(wrapper): Json<azdo::VssJsonCollectionWrapper<azdo::TimelineRecord>>,
 ) -> Json<serde_json::Value> {
     patch_timeline_records(
         State(shared),
         Path((scope, hub, plan_id, timeline_id)),
-        Json(records),
+        Json(wrapper),
     )
     .await
 }
 
 async fn create_log_org(
     State(shared): State<Arc<SharedState>>,
-    Path((_org, scope, hub, plan_id, log_id)): Path<(String, String, String, String, String)>,
+    Path((_org, scope, hub, plan_id)): Path<(String, String, String, String)>,
+    Json(log): Json<azdo::TaskLog>,
 ) -> Json<serde_json::Value> {
-    create_log(State(shared), Path((scope, hub, plan_id, log_id))).await
+    create_log(State(shared), Path((scope, hub, plan_id)), Json(log)).await
 }
 
 async fn append_log_org(
     State(shared): State<Arc<SharedState>>,
-    Path((_org, scope, hub, plan_id, log_id, log_id2)): Path<(
-        String,
+    Path((_org, scope, hub, plan_id, log_id)): Path<(
         String,
         String,
         String,
@@ -1934,7 +1953,7 @@ async fn append_log_org(
 ) -> StatusCode {
     append_log(
         State(shared),
-        Path((scope, hub, plan_id, log_id, log_id2)),
+        Path((scope, hub, plan_id, log_id)),
         body,
     )
     .await
@@ -2748,7 +2767,7 @@ jobs:
             &app,
             Method::PATCH,
             &format!("/_apis/v1/Timeline/scope/actions/{run_id}/timeline-1"),
-            json!([{
+            json!({"count": 1, "value": [{
                 "id": "00000000-0000-0000-0000-000000000001",
                 "name": "build",
                 "type": "job",
@@ -2759,7 +2778,7 @@ jobs:
                     "message": "boom",
                     "data": {"file": "src/lib.rs", "line": "42"}
                 }]
-            }]),
+            }]}),
         )
         .await;
 
@@ -2790,8 +2809,8 @@ jobs:
         request_json(
             &app,
             Method::POST,
-            "/_apis/v1/Logfiles/scope/actions/plan-1/log-1",
-            Value::Null,
+            "/_apis/v1/Logfiles/scope/actions/plan-1",
+            json!({"path": "log-1"}),
         )
         .await;
         let response = app
@@ -2799,7 +2818,7 @@ jobs:
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri("/_apis/v1/Logfiles/scope/actions/plan-1/log-1/append")
+                    .uri("/_apis/v1/Logfiles/scope/actions/plan-1/log-1")
                     .header(header::AUTHORIZATION, "Bearer aksh-system-token")
                     .body(Body::from("hello log"))
                     .unwrap(),
@@ -2847,7 +2866,7 @@ jobs:
                 Request::builder()
                     .method(Method::POST)
                     .uri(format!(
-                        "/_apis/v1/Logfiles/scope/actions/{run_id}/log-1/append"
+                        "/_apis/v1/Logfiles/scope/actions/{run_id}/log-1"
                     ))
                     .header(header::AUTHORIZATION, "Bearer aksh-system-token")
                     .body(Body::from("token=super-secret"))
@@ -2965,7 +2984,7 @@ jobs:
         let cases = [
             (Method::PATCH, "/runner/server/_apis/v1/Timeline/s/h/p/t"),
             (Method::POST, "/runner/server/_apis/v1/Logfiles/s/h/p/l"),
-            (Method::POST, "/runner/server/_apis/v1/Logfiles/s/h/p/l/l2"),
+            (Method::POST, "/runner/server/_apis/v1/Logfiles/s/h/p/l"),
             (
                 Method::POST,
                 "/runner/server/_apis/v1/TimeLineWebConsoleLog/s/h/p/t/r",

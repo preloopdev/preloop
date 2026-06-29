@@ -941,6 +941,45 @@ pub struct LogReference {
     pub path: Option<String>,
 }
 
+/// VSS JSON collection wrapper — the standard AzDO/REST envelope for arrays.
+///
+/// The official runner sends and expects timeline records, job events, and
+/// other collections wrapped as `{"count": N, "value": [...]}`.
+///
+/// This matches the C# `VssJsonCollectionWrapper<T>` from
+/// `Microsoft.VisualStudio.Services.WebApi`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VssJsonCollectionWrapper<T> {
+    pub count: usize,
+    pub value: Vec<T>,
+}
+
+/// Task log — sent by the runner when creating a log container.
+///
+/// The runner POSTs this to `/_apis/v1/Logfiles/{scope}/{hub}/{planId}`.
+/// The server assigns an `id` and returns the object.
+///
+/// Upstream source: `TaskLog.cs` in `GitHub.DistributedTask.WebApi`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskLog {
+    #[serde(rename = "id")]
+    #[serde(default)]
+    pub id: i64,
+    #[serde(rename = "path")]
+    pub path: String,
+    #[serde(rename = "createdOn", skip_serializing_if = "Option::is_none")]
+    pub created_on: Option<String>,
+    #[serde(rename = "lastChangedOn", skip_serializing_if = "Option::is_none")]
+    pub last_changed_on: Option<String>,
+    #[serde(rename = "lineCount")]
+    #[serde(default)]
+    pub line_count: i64,
+    #[serde(rename = "timelineId", skip_serializing_if = "Option::is_none")]
+    pub timeline_id: Option<uuid::Uuid>,
+    #[serde(rename = "location", skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+}
+
 // ─── Request/response helpers ─────────────────────────────────────────────
 
 /// Generic Azure DevOps error response envelope.
