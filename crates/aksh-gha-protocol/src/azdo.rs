@@ -315,6 +315,7 @@ impl Serialize for TaskStep {
             + usize::from(self.display_name.is_some())
             + usize::from(self.condition.is_some())
             + usize::from(self.continue_on_error.is_some())
+            + usize::from(self.working_directory.is_some())
             + usize::from(self.timeout_in_minutes.is_some());
         let mut map = serializer.serialize_map(Some(field_count))?;
         map.serialize_entry("type", "action")?;
@@ -333,6 +334,9 @@ impl Serialize for TaskStep {
         }
         if let Some(continue_on_error) = self.continue_on_error {
             map.serialize_entry("continueOnError", &continue_on_error)?;
+        }
+        if let Some(working_directory) = &self.working_directory {
+            map.serialize_entry("workingDirectory", working_directory)?;
         }
         if let Some(timeout_in_minutes) = self.timeout_in_minutes {
             map.serialize_entry("timeoutInMinutes", &timeout_in_minutes)?;
