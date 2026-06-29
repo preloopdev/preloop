@@ -206,7 +206,9 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         )
         .route(
             "/:org/_apis/v1/AgentRequest/:pool_id/:request_id",
-            patch(agent_request_patch_org),
+            get(agent_request_get_org)
+                .post(agent_request_ack_org)
+                .patch(agent_request_patch_org),
         )
         .route(
             "/:org/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id",
@@ -278,7 +280,9 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         )
         .route(
             "/runner/server/_apis/v1/AgentRequest/:pool_id/:request_id",
-            patch(agent_request_patch),
+            get(agent_request_get)
+                .post(agent_request_ack)
+                .patch(agent_request_patch),
         )
         .route("/_apis/connectionData", get(connection_data))
         .route(
@@ -330,7 +334,9 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         )
         .route(
             "/_apis/v1/AgentRequest/:pool_id/:request_id",
-            patch(agent_request_patch),
+            get(agent_request_get)
+                .post(agent_request_ack)
+                .patch(agent_request_patch),
         )
         .merge(protected_apis)
         .layer(TraceLayer::new_for_http())
@@ -412,6 +418,11 @@ struct InnerState {
     logs: BTreeMap<String, Vec<u8>>,
     timeline_events: BTreeMap<RunId, Vec<NdjsonEvent>>,
     inflight_requests: BTreeMap<i64, (RunId, JobId)>,
+    job_requests: BTreeMap<i64, TaskAgentJobRequestRecord>,
+    plan_requests: BTreeMap<String, i64>,
+    agent_job_requests: BTreeMap<uuid::Uuid, i64>,
+    timeline_requests: BTreeMap<uuid::Uuid, i64>,
+    session_active_requests: BTreeMap<String, i64>,
     next_runner_id: i64,
     next_cache_id: i64,
     next_message_id: i64,
@@ -428,6 +439,19 @@ struct RunRecord {
     job_outputs: BTreeMap<JobId, BTreeMap<String, serde_json::Value>>,
     job_base_ids: BTreeMap<JobId, String>,
     job_fail_fast: BTreeMap<String, bool>,
+}
+
+#[derive(Debug, Clone)]
+struct TaskAgentJobRequestRecord {
+    request_id: i64,
+    run_id: RunId,
+    job_id: JobId,
+    agent_job_id: uuid::Uuid,
+    plan_id: String,
+    plan_type: String,
+    timeline_id: uuid::Uuid,
+    result: Option<ExecutionStatus>,
+    locked_until: String,
 }
 
 #[derive(Debug, Clone)]
@@ -601,6 +625,31 @@ async fn submit_run(
             inner
                 .inflight_requests
                 .insert(request_id, (run_id, job.id.clone()));
+            let job_request = TaskAgentJobRequestRecord {
+                request_id,
+                run_id,
+                job_id: job.id.clone(),
+                agent_job_id: agent_msg.job_id,
+                plan_id: agent_msg.plan.plan_id.clone(),
+                plan_type: agent_msg
+                    .plan
+                    .plan_type
+                    .clone()
+                    .unwrap_or_else(|| "Job".to_owned()),
+                timeline_id: agent_msg.timeline.id,
+                result: None,
+                locked_until: agent_request_locked_until(),
+            };
+            inner
+                .plan_requests
+                .insert(job_request.plan_id.clone(), request_id);
+            inner
+                .agent_job_requests
+                .insert(job_request.agent_job_id, request_id);
+            inner
+                .timeline_requests
+                .insert(job_request.timeline_id, request_id);
+            inner.job_requests.insert(request_id, job_request);
 
             let queued_job = QueuedJob {
                 run_id,
@@ -925,6 +974,31 @@ async fn next_message(
             return Ok(Json(Some(message)));
         }
 
+        if let Some(request_id) = inner.session_active_requests.get(&session_id).copied() {
+            let request_finished = inner
+                .job_requests
+                .get(&request_id)
+                .is_none_or(|request| request.result.is_some());
+            if request_finished {
+                inner.session_active_requests.remove(&session_id);
+            } else {
+                drop(inner);
+                if wait_seconds == 0 {
+                    return Ok(Json(None));
+                }
+                if tokio::time::timeout(
+                    Duration::from_secs(wait_seconds),
+                    shared.state.message_notify.notified(),
+                )
+                .await
+                .is_err()
+                {
+                    return Ok(Json(None));
+                }
+                continue;
+            }
+        }
+
         let Some(queued) = inner.queue.pop_front() else {
             drop(inner);
             if wait_seconds == 0 {
@@ -951,6 +1025,9 @@ async fn next_message(
 
         let body_json = serde_json::to_string(&queued.message)
             .map_err(|e| ApiError::bad_request(format!("failed to serialize job message: {e}")))?;
+        inner
+            .session_active_requests
+            .insert(session_id.clone(), queued.message.request_id);
         let message = build_task_agent_message(
             &mut inner,
             &session_id,
@@ -1067,11 +1144,33 @@ async fn complete_job_compat(
     .await
 }
 
+/// GET /_apis/v1/AgentRequest/:pool_id/:request_id — query a job request lease/result.
+///
+/// The official listener calls this when another job arrives while the previous
+/// worker process may still be unwinding. Returning a completed `result` lets it
+/// safely move on; 404/405 makes it cancel the worker and can poison matrix runs.
+async fn agent_request_get(
+    State(shared): State<Arc<SharedState>>,
+    Path((pool_id, request_id)): Path<(i64, i64)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let inner = shared.state.inner.lock().await;
+    let request = inner
+        .job_requests
+        .get(&request_id)
+        .ok_or_else(|| ApiError::not_found("agent request not found"))?;
+    Ok(Json(agent_request_json(pool_id, request)))
+}
+
+/// POST /_apis/v1/AgentRequest/:pool_id/:request_id — best-effort request ack.
+async fn agent_request_ack(Path((_pool_id, _request_id)): Path<(i64, i64)>) -> StatusCode {
+    StatusCode::NO_CONTENT
+}
+
 /// PATCH /_apis/v1/AgentRequest/:pool_id/:request_id — renew or complete job request.
 /// The runner sends this to renew the job lock or report completion.
 async fn agent_request_patch(
     State(shared): State<Arc<SharedState>>,
-    Path((_pool_id, request_id)): Path<(i64, i64)>,
+    Path((pool_id, request_id)): Path<(i64, i64)>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     info!(?body, "agent_request_patch received");
@@ -1084,13 +1183,31 @@ async fn agent_request_patch(
             "failed" => ExecutionStatus::Failure,
             "cancelled" => ExecutionStatus::Cancelled,
             "canceled" => ExecutionStatus::Cancelled,
-            _ => { info!(request_id, %result, "unknown agent_request_patch result; skipping completion"); return Json(json!({ "requestId": request_id, "lockedUntil": "2099-12-31T23:59:59Z" })); }
+            _ => {
+                info!(request_id, %result, "unknown agent_request_patch result; skipping completion");
+                return Json(
+                    json!({ "requestId": request_id, "lockedUntil": "2099-12-31T23:59:59Z" }),
+                );
+            }
         };
         // Look up (run_id, job_id) under the inner lock, then drop it before calling
         // complete_job_inner which acquires the lock itself.
         let completion = {
             let mut inner = shared.state.inner.lock().await;
-            if let Some((run_id, job_id)) = inner.inflight_requests.remove(&request_id) {
+            let mut already_completed = false;
+            if let Some(request) = inner.job_requests.get_mut(&request_id) {
+                already_completed = request.result.is_some();
+                request.result = Some(new_status);
+                request.locked_until = agent_request_locked_until();
+            }
+            if already_completed {
+                inner.inflight_requests.remove(&request_id);
+                info!(
+                    request_id,
+                    result, "agent request already completed; refreshing result only"
+                );
+                None
+            } else if let Some((run_id, job_id)) = inner.inflight_requests.remove(&request_id) {
                 info!(%run_id, %job_id, result, "job completed via agent_request_patch");
                 Some(JobCompletion {
                     run_id,
@@ -1099,24 +1216,123 @@ async fn agent_request_patch(
                     outputs: Default::default(),
                 })
             } else {
-                info!(request_id, "no inflight job for request_id; ignoring result");
+                info!(
+                    request_id,
+                    "no inflight job for request_id; ignoring result"
+                );
                 None
             }
         };
         if let Some(c) = completion {
-            let _ = complete_job_inner(shared, c).await;
+            let _ = complete_job_inner(shared.clone(), c).await;
         }
-        return Json(json!({
-            "requestId": request_id,
-            "lockedUntil": "2099-12-31T23:59:59Z",
-            "result": body.get("result"),
-        }));
+        return Json(agent_request_response(&shared, pool_id, request_id).await);
     }
     // Renewal — runner is still working; just extend the lock.
-    Json(json!({
-        "requestId": request_id,
-        "lockedUntil": "2099-12-31T23:59:59Z",
-    }))
+    {
+        let mut inner = shared.state.inner.lock().await;
+        if let Some(request) = inner.job_requests.get_mut(&request_id) {
+            request.locked_until = agent_request_locked_until();
+        }
+    }
+    Json(agent_request_response(&shared, pool_id, request_id).await)
+}
+
+async fn agent_request_response(
+    shared: &Arc<SharedState>,
+    pool_id: i64,
+    request_id: i64,
+) -> serde_json::Value {
+    let inner = shared.state.inner.lock().await;
+    inner
+        .job_requests
+        .get(&request_id)
+        .map(|request| agent_request_json(pool_id, request))
+        .unwrap_or_else(|| {
+            json!({
+                "requestId": request_id,
+                "poolId": pool_id,
+                "lockedUntil": agent_request_locked_until(),
+            })
+        })
+}
+
+fn agent_request_json(pool_id: i64, request: &TaskAgentJobRequestRecord) -> serde_json::Value {
+    json!({
+        "requestId": request.request_id,
+        "poolId": pool_id,
+        "jobId": request.agent_job_id,
+        "jobName": request.job_id.to_string(),
+        "planId": request.plan_id,
+        "planType": request.plan_type,
+        "lockedUntil": request.locked_until,
+        "result": request.result.map(agent_request_result),
+    })
+}
+
+fn agent_request_result(status: ExecutionStatus) -> &'static str {
+    match status {
+        ExecutionStatus::Success => "succeeded",
+        ExecutionStatus::Failure => "failed",
+        ExecutionStatus::Cancelled => "canceled",
+        ExecutionStatus::Skipped => "skipped",
+        ExecutionStatus::Queued | ExecutionStatus::InProgress => "pending",
+    }
+}
+
+fn agent_request_locked_until() -> String {
+    "2099-12-31T23:59:59Z".to_owned()
+}
+
+fn task_result_status(result: azdo::TaskResult) -> ExecutionStatus {
+    match result {
+        azdo::TaskResult::Succeeded | azdo::TaskResult::SucceededWithIssues => {
+            ExecutionStatus::Success
+        }
+        azdo::TaskResult::Failed => ExecutionStatus::Failure,
+        azdo::TaskResult::Cancelled => ExecutionStatus::Cancelled,
+        azdo::TaskResult::Skipped => ExecutionStatus::Skipped,
+    }
+}
+
+fn resolve_callback_job(
+    inner: &InnerState,
+    plan_id: &str,
+    timeline_id: Option<uuid::Uuid>,
+    agent_job_id: Option<uuid::Uuid>,
+) -> Option<(i64, RunId, JobId)> {
+    let request_id = inner
+        .plan_requests
+        .get(plan_id)
+        .copied()
+        .or_else(|| timeline_id.and_then(|id| inner.timeline_requests.get(&id).copied()))
+        .or_else(|| agent_job_id.and_then(|id| inner.agent_job_requests.get(&id).copied()))?;
+    let request = inner.job_requests.get(&request_id)?;
+    Some((request_id, request.run_id, request.job_id.clone()))
+}
+
+fn sole_active_unfinished_request(inner: &InnerState) -> Option<i64> {
+    let mut active = inner
+        .session_active_requests
+        .values()
+        .copied()
+        .filter(|request_id| {
+            inner
+                .job_requests
+                .get(request_id)
+                .is_some_and(|request| request.result.is_none())
+        });
+    let request_id = active.next()?;
+    if active.next().is_none() {
+        Some(request_id)
+    } else {
+        None
+    }
+}
+
+fn job_request_tuple(inner: &InnerState, request_id: i64) -> Option<(i64, RunId, JobId)> {
+    let request = inner.job_requests.get(&request_id)?;
+    Some((request_id, request.run_id, request.job_id.clone()))
 }
 
 async fn complete_job_inner(
@@ -1372,7 +1588,15 @@ async fn patch_timeline_records(
 ) -> Json<serde_json::Value> {
     let records = wrapper.value;
     let count = records.len();
-    let run_id = plan_id.parse::<RunId>().ok();
+    let callback_job = {
+        let inner = shared.state.inner.lock().await;
+        resolve_callback_job(&inner, &plan_id, timeline_id.parse().ok(), None)
+    };
+    let run_id = callback_job
+        .as_ref()
+        .map(|(_, run_id, _)| *run_id)
+        .or_else(|| plan_id.parse::<RunId>().ok());
+    let logical_job_id = callback_job.as_ref().map(|(_, _, job_id)| job_id.clone());
     let mut projected = Vec::new();
     for record in &records {
         if let Some(state) = &record.state {
@@ -1387,7 +1611,9 @@ async fn patch_timeline_records(
         if let (Some(run_id), Some(status)) = (run_id, timeline_status(record)) {
             projected.push(NdjsonEvent::JobStatus {
                 run_id,
-                job_id: JobId(record.id.to_string()),
+                job_id: logical_job_id
+                    .clone()
+                    .unwrap_or_else(|| JobId(record.id.to_string())),
                 status,
             });
         }
@@ -1395,7 +1621,9 @@ async fn patch_timeline_records(
             for issue in &record.issues {
                 projected.push(NdjsonEvent::Annotation {
                     run_id,
-                    job_id: JobId(record.id.to_string()),
+                    job_id: logical_job_id
+                        .clone()
+                        .unwrap_or_else(|| JobId(record.id.to_string())),
                     level: issue_level(issue.issue_type),
                     message: issue.message.clone().unwrap_or_default(),
                     file: issue.data.get("file").cloned(),
@@ -1479,9 +1707,10 @@ fn log_key(plan_id: &str, log_id: &str) -> String {
 
 fn mask_log_bytes(inner: &InnerState, plan_id: &str, body: &[u8]) -> Vec<u8> {
     let mut text = String::from_utf8_lossy(body).into_owned();
-    let run_secrets = plan_id
-        .parse::<RunId>()
-        .ok()
+    let resolved_run_id = resolve_callback_job(inner, plan_id, None, None)
+        .map(|(_, run_id, _)| run_id)
+        .or_else(|| plan_id.parse::<RunId>().ok());
+    let run_secrets = resolved_run_id
         .and_then(|run_id| inner.runs.get(&run_id))
         .map(|run| run.submission.secrets.values().collect::<Vec<_>>())
         .unwrap_or_else(|| {
@@ -1523,41 +1752,43 @@ async fn finish_job(
     Path((_scope, _hub, plan_id)): Path<(String, String, String)>,
     Json(event): Json<azdo::JobCompletedEvent>,
 ) -> Json<serde_json::Value> {
-    let mut inner = shared.state.inner.lock().await;
-
-    let status = match event.result {
-        azdo::TaskResult::Succeeded | azdo::TaskResult::SucceededWithIssues => {
-            ExecutionStatus::Success
-        }
-        azdo::TaskResult::Failed => ExecutionStatus::Failure,
-        azdo::TaskResult::Cancelled => ExecutionStatus::Cancelled,
-        azdo::TaskResult::Skipped => ExecutionStatus::Skipped,
-    };
-
-    // Find the run and update job status
-    let run_id = plan_id.parse::<RunId>().ok();
-    let actual_run_id = if let Some(rid) = run_id {
-        if let Some(run) = inner.runs.get_mut(&rid) {
-            run.jobs.insert(JobId(event.job_id.to_string()), status);
-            run.job_outputs.insert(
-                JobId(event.job_id.to_string()),
-                event
-                    .outputs
-                    .iter()
-                    .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
-                    .collect(),
-            );
-            run.status = summarize_run(run.jobs.values().copied());
-            rid
+    let status = task_result_status(event.result);
+    let outputs = event
+        .outputs
+        .iter()
+        .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
+        .collect();
+    let completion = {
+        let mut inner = shared.state.inner.lock().await;
+        let callback_resolved = resolve_callback_job(
+            &inner,
+            &plan_id,
+            Some(event.timeline_id),
+            Some(event.job_id),
+        );
+        let active_resolved =
+            sole_active_unfinished_request(&inner).and_then(|id| job_request_tuple(&inner, id));
+        let resolved = callback_resolved.or(active_resolved).or_else(|| {
+            plan_id
+                .parse::<RunId>()
+                .ok()
+                .map(|run_id| (0, run_id, JobId(event.job_id.to_string())))
+        });
+        if let Some((request_id, run_id, job_id)) = resolved {
+            if let Some(request) = inner.job_requests.get_mut(&request_id) {
+                request.result = Some(status);
+                request.locked_until = agent_request_locked_until();
+            }
+            Some(JobCompletion {
+                run_id,
+                job_id,
+                status,
+                outputs,
+            })
         } else {
-            RunId::new()
+            None
         }
-    } else {
-        RunId::new()
     };
-
-    // Promote pending jobs whose dependencies are now met
-    let promoted_jobs = promote_ready_jobs(&mut inner);
 
     info!(
         job_id = %event.job_id,
@@ -1566,19 +1797,16 @@ async fn finish_job(
         "job completed"
     );
 
-    drop(inner);
-    if promoted_jobs > 0 {
-        shared.state.message_notify.notify_waiters();
+    if let Some(completion) = completion {
+        let _ = complete_job_inner(shared, completion).await;
+    } else {
+        warn!(
+            plan_id,
+            job_id = %event.job_id,
+            timeline_id = %event.timeline_id,
+            "finish_job could not resolve callback to a run/job"
+        );
     }
-    shared
-        .state
-        .emit(NdjsonEvent::JobCompleted {
-            run_id: actual_run_id,
-            job_id: JobId(event.job_id.to_string()),
-            status,
-            outputs: event.outputs,
-        })
-        .await;
 
     Json(json!({ "ok": true }))
 }
@@ -1902,6 +2130,19 @@ async fn delete_pool_message_org(
     delete_pool_message(State(shared), Path((pool_id, message_id)), Query(params)).await
 }
 
+async fn agent_request_get_org(
+    State(shared): State<Arc<SharedState>>,
+    Path((_org, pool_id, request_id)): Path<(String, i64, i64)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    agent_request_get(State(shared), Path((pool_id, request_id))).await
+}
+
+async fn agent_request_ack_org(
+    Path((_org, pool_id, request_id)): Path<(String, i64, i64)>,
+) -> StatusCode {
+    agent_request_ack(Path((pool_id, request_id))).await
+}
+
 #[allow(dead_code)]
 async fn complete_job_compat_org(
     State(shared): State<Arc<SharedState>>,
@@ -1942,21 +2183,10 @@ async fn create_log_org(
 
 async fn append_log_org(
     State(shared): State<Arc<SharedState>>,
-    Path((_org, scope, hub, plan_id, log_id)): Path<(
-        String,
-        String,
-        String,
-        String,
-        String,
-    )>,
+    Path((_org, scope, hub, plan_id, log_id)): Path<(String, String, String, String, String)>,
     body: Bytes,
 ) -> StatusCode {
-    append_log(
-        State(shared),
-        Path((scope, hub, plan_id, log_id)),
-        body,
-    )
-    .await
+    append_log(State(shared), Path((scope, hub, plan_id, log_id)), body).await
 }
 
 async fn console_log_org(
@@ -2576,6 +2806,316 @@ jobs:
     }
 
     #[tokio::test]
+    async fn agent_request_get_reports_completion_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        let _msg = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=s1",
+            Value::Null,
+        )
+        .await;
+        let request_id = {
+            let inner = state.inner.lock().await;
+            inner
+                .inflight_requests
+                .iter()
+                .find(|(_, (rid, _))| *rid == run_id)
+                .map(|(request_id, _)| *request_id)
+                .unwrap()
+        };
+
+        let before = request_json(
+            &app,
+            Method::GET,
+            &format!("/runner/server/_apis/v1/AgentRequest/1/{request_id}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(before["requestId"], request_id);
+        assert!(before["result"].is_null());
+
+        request_json(
+            &app,
+            Method::PATCH,
+            &format!("/runner/server/_apis/v1/AgentRequest/1/{request_id}"),
+            json!({"result": "succeeded"}),
+        )
+        .await;
+
+        let after = request_json(
+            &app,
+            Method::GET,
+            &format!("/runner/server/_apis/v1/AgentRequest/1/{request_id}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(after["result"], "succeeded");
+    }
+
+    #[tokio::test]
+    async fn same_session_waits_for_active_request_before_next_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        n: [1, 2]
+    steps:
+      - run: echo matrix
+"#,
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        let first = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=s1&waitSeconds=0",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            first["messageType"],
+            azdo::message_type::PIPELINE_AGENT_JOB_REQUEST
+        );
+        let first_message_id = first["messageId"].as_i64().unwrap();
+        request_json(
+            &app,
+            Method::DELETE,
+            &format!(
+                "/runner/server/_apis/distributedtask/pools/1/messages/{first_message_id}?sessionId=s1"
+            ),
+            Value::Null,
+        )
+        .await;
+
+        let first_request_id = {
+            let inner = state.inner.lock().await;
+            *inner.session_active_requests.get("s1").unwrap()
+        };
+
+        let withheld = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=s1&waitSeconds=0",
+            Value::Null,
+        )
+        .await;
+        assert!(withheld.is_null());
+
+        request_json(
+            &app,
+            Method::PATCH,
+            &format!("/runner/server/_apis/v1/AgentRequest/1/{first_request_id}"),
+            json!({"result": "succeeded"}),
+        )
+        .await;
+
+        let second = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=s1&waitSeconds=0",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            second["messageType"],
+            azdo::message_type::PIPELINE_AGENT_JOB_REQUEST
+        );
+
+        let inner = state.inner.lock().await;
+        let run = inner.runs.get(&run_id).unwrap();
+        assert_eq!(
+            run.jobs
+                .values()
+                .filter(|status| **status == ExecutionStatus::InProgress)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_job_resolves_plan_timeline_and_agent_job_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        let first = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=s1&waitSeconds=0",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            first["messageType"],
+            azdo::message_type::PIPELINE_AGENT_JOB_REQUEST
+        );
+
+        let request = {
+            let inner = state.inner.lock().await;
+            inner.job_requests.values().next().unwrap().clone()
+        };
+
+        request_json(
+            &app,
+            Method::POST,
+            &format!(
+                "/runner/server/_apis/v1/FinishJob/00000000-0000-0000-0000-000000000000/Job/{}",
+                request.plan_id
+            ),
+            json!({
+                "jobId": request.agent_job_id,
+                "result": "succeeded",
+                "timelineId": request.timeline_id,
+                "outputs": {"answer": "42"}
+            }),
+        )
+        .await;
+
+        let inner = state.inner.lock().await;
+        let run = inner.runs.get(&run_id).unwrap();
+        assert_eq!(
+            run.jobs.get(&request.job_id),
+            Some(&ExecutionStatus::Success)
+        );
+        assert!(!run
+            .jobs
+            .contains_key(&JobId(request.agent_job_id.to_string())));
+        assert_eq!(
+            run.job_outputs
+                .get(&request.job_id)
+                .and_then(|outputs| outputs.get("answer")),
+            Some(&json!("42"))
+        );
+        assert_eq!(
+            inner
+                .job_requests
+                .get(&request.request_id)
+                .and_then(|request| request.result),
+            Some(ExecutionStatus::Success)
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_job_falls_back_to_the_single_active_request_when_unresolved() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        n: [1, 2]
+    steps:
+      - run: echo matrix
+"#,
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=s1&waitSeconds=0",
+            Value::Null,
+        )
+        .await;
+
+        let active_request = {
+            let inner = state.inner.lock().await;
+            let active_id = *inner.session_active_requests.get("s1").unwrap();
+            inner.job_requests.get(&active_id).unwrap().clone()
+        };
+        let unknown_plan_id = uuid::Uuid::new_v4();
+        let unknown_job_id = uuid::Uuid::new_v4();
+        let unknown_timeline_id = uuid::Uuid::new_v4();
+
+        // If callback identifiers cannot be resolved at all, the only
+        // unfinished active request is the safest correlation available.
+        request_json(
+            &app,
+            Method::POST,
+            &format!(
+                "/runner/server/_apis/v1/FinishJob/00000000-0000-0000-0000-000000000000/Job/{}",
+                unknown_plan_id
+            ),
+            json!({
+                "jobId": unknown_job_id,
+                "result": "succeeded",
+                "timelineId": unknown_timeline_id,
+                "outputs": {}
+            }),
+        )
+        .await;
+
+        let inner = state.inner.lock().await;
+        let run = inner.runs.get(&run_id).unwrap();
+        assert_eq!(
+            run.jobs.get(&active_request.job_id),
+            Some(&ExecutionStatus::Success)
+        );
+    }
+
+    #[tokio::test]
     async fn matrix_fail_fast_cancels_in_progress_siblings_via_message() {
         let temp = tempfile::tempdir().unwrap();
         let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
@@ -2865,9 +3405,7 @@ jobs:
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri(format!(
-                        "/_apis/v1/Logfiles/scope/actions/{run_id}/log-1"
-                    ))
+                    .uri(format!("/_apis/v1/Logfiles/scope/actions/{run_id}/log-1"))
                     .header(header::AUTHORIZATION, "Bearer aksh-system-token")
                     .body(Body::from("token=super-secret"))
                     .unwrap(),

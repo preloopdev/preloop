@@ -657,6 +657,7 @@ pub enum TaskResult {
     Succeeded,
     SucceededWithIssues,
     Failed,
+    #[serde(rename = "canceled", alias = "cancelled")]
     Cancelled,
     Skipped,
 }
@@ -1067,7 +1068,11 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_string(&TaskResult::Cancelled).unwrap(),
-            "\"cancelled\""
+            "\"canceled\""
+        );
+        assert_eq!(
+            serde_json::from_str::<TaskResult>("\"cancelled\"").unwrap(),
+            TaskResult::Cancelled
         );
     }
 
