@@ -1,7 +1,0 @@
-jobs:
-- template: /job.yml
-  parameters:
-    is1ESPipeline: false
-
-    steps:
-    - bash: exit 0

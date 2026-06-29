@@ -1,6 +1,0 @@
-parameters:
-- name: y
-  type: stage
-variables:
-- name: Hello World
-  value: ${{ converttojson(parameters.y) }}
