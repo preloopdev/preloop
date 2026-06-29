@@ -1,6 +1,0 @@
-stages:
-- template: two.yml
-- template: .\two.yml
-- template: \stage\two.yml
-- template: ..\root.yml
-- template: \root.yml

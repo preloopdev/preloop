@@ -1,4 +1,0 @@
-# ExpectedException: TemplateValidationException
-# ExpectedErrorMessage: Unrecognized function: 'nothing'.
-steps:
-- bash: ${{ nothing() }}

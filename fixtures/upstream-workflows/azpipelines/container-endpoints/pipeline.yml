@@ -1,8 +1,0 @@
-jobs:
-- job: ContainerJob
-  container:
-    image: myregistry.azurecr.io/myimage:latest
-    endpoint: MyContainerRegistryConnection
-  steps:
-  - script: echo "Authenticated to the private container registry using the specified endpoint."
-    displayName: Validate Authentication
