@@ -51,6 +51,22 @@ cargo test -p aksh-runner-server current_runner_registration_to_broker_job_e2e
 
 All focused tests above passed before this log was written.
 
+## Final verification
+
+```sh
+cargo test -p aksh-runner-server
+cargo test -p aksh-gha-protocol crypto
+cargo test -p runner-watch
+cargo run -p runner-watch -- conform --runner v2.335.1 --aksh-url http://127.0.0.1:19090 --scenario 01-register-and-idle --skip-cargo-test
+```
+
+Observed results:
+
+- `cargo test -p aksh-runner-server`: 30 passed.
+- `cargo test -p aksh-gha-protocol crypto`: 8 passed.
+- `cargo test -p runner-watch`: 7 passed.
+- runner-watch conformance: `.runner-watch/conformance-report.md` reports `All 1 scenario(s) matched recorded baseline responses`; the refreshed `01-register-and-idle` report compares 52 official flows to 52 aksh responses with no missing endpoints and matching status sets.
+
 ## Follow-up boundary
 
 This work improves runner-observed control-plane fidelity without attempting byte-for-byte GitHub-hosted parity. Cache v2/blob-Twirp, full Azure signed blob URL body parity, DAP, server-enforced runner settings, and Node migration warnings remain separate `docs/fidelity-gap.md` items.

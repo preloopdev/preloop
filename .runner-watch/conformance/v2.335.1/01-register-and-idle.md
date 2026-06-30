@@ -7,8 +7,8 @@
 
 | method | normalized path | offi # | aksh # | offi mean ms | aksh mean ms | offi statuses | aksh statuses |
 |---|---|---|---|---|---|---|---|
-| GET | `/_apis/connectionData?connectOptions={n}&lastChangeId=-1&lastChangeId64=-1` | 3 | 3 | 78.2 | 0.9 | 200, 200, 200 | 200, 200, 200 |
-| GET | `/_apis/connectionData?connectOptions={n}&lastChangeId={n}&lastChangeId64={n}` | 3 | 3 | 37.0 | 0.8 | 200, 200, 200 | 200, 200, 200 |
+| GET | `/_apis/connectionData?connectOptions={n}&lastChangeId=-1&lastChangeId64=-1` | 3 | 3 | 78.2 | 1.3 | 200, 200, 200 | 200, 200, 200 |
+| GET | `/_apis/connectionData?connectOptions={n}&lastChangeId={n}&lastChangeId64={n}` | 3 | 3 | 37.0 | 0.2 | 200, 200, 200 | 200, 200, 200 |
 | GET | `/_apis/distributedtask/pools/{n}/agents?agentName=mitm-official&includeCapabilities=False` | 1 | 1 | 26.7 | 0.3 | 200 | 200 |
 | GET | `/_apis/distributedtask/pools/{n}/messages?sessionId={guid}&status=Online&runnerVersion=2.335.1&os=macOS&architecture=ARM64&disableUpdate=false&waitSeconds={n}` | 4 | 4 | 190.3 | 0.3 | 200, 200, 200, 200 | 200, 200, 200, 200 |
 | GET | `/_apis/distributedtask/pools?poolType=Automation` | 1 | 1 | 21.7 | 0.3 | 200 | 200 |
@@ -16,7 +16,7 @@
 | POST | `/_apis/distributedtask/pools/{n}/sessions` | 1 | 1 | 31.1 | 0.3 | 201 | 201 |
 | POST | `/_apis/v1/AgentRequest/{n}/{n}?sessionId={guid}&status=Online&runnerVersion=2.335.1&os=macOS&architecture=ARM64` | 4 | 4 | 41.6 | 0.2 | 200, 200, 200, 200 | 200, 200, 200, 200 |
 | POST | `/_apis/v1/oauth2/token` | 5 | 5 | 25.2 | 0.2 | 200, 200, 200, 200, 200 | 200, 200, 200, 200, 200 |
-| POST | `/api/v3/actions/runner-registration` | 1 | 1 | 300.4 | 0.3 | 200 | 200 |
+| POST | `/api/v3/actions/runner-registration` | 1 | 1 | 300.4 | 0.4 | 200 | 200 |
 | POST | `/broker/{n}/acquirejob` | 4 | 4 | 614.1 | 0.3 | 200, 200, 200, 200 | 200, 200, 200, 200 |
 | POST | `/broker/{n}/completejob` | 3 | 3 | 40.6 | 0.2 | 204, 204, 204 | 204, 204, 204 |
 | POST | `/broker/{n}/renewjob` | 4 | 4 | 43.8 | 0.2 | 200, 200, 200, 200 | 200, 200, 200, 200 |
@@ -36,19 +36,21 @@ _No endpoints present only in aksh._
 
 **Header key differences:**
 
-- official only: `{'strict-transport-security', 'x-tfs-processid', 'pragma', 'cache-control', 'activityid', 'x-vss-senderdeploymentid'}`
+- official only: `{'x-vss-senderdeploymentid', 'pragma', 'activityid', 'x-tfs-processid', 'cache-control', 'strict-transport-security'}`
 
 **Response body diff:**
 
 ```diff
 --- official
 +++ aksh
-@@ -1,1589 +1,303 @@
+@@ -1,885 +1,430 @@
  {
 -  "deploymentId": "fc1cfc90-fc40-edcb-6d0f-3b1380ee7b68",
 -  "deploymentType": "hosted",
 -  "instanceId": "9f1fe989-7d0d-4a9b-a9bf-11330ab257c1",
-+  "instanceId": "608167dd-cbdc-4f1e-917a-48713bfd8b1d",
++  "deploymentId": "00000000-0000-0000-0000-000000000000",
++  "deploymentType": "selfHosted",
++  "instanceId": "01b920b8-59bd-4040-acec-cca5e507e6b6",
    "locationServiceData": {
      "accessMappings": [
        {
@@ -59,12 +61,13 @@ _No endpoints present only in aksh._
 -      },
 -      {
 -        "accessPoint": "https://pipelines.actions.githubusercontent.com/***REDACTED***/",
--        "displayName": "Public Access Mapping",
--        "moniker": "PublicAccessMapping",
--        "serviceOwner": "00000000-0000-0000-0000-000000000000",
--        "virtualDirectory": ""
--      },
--      {
++        "accessPoint": "http://127.0.0.1:9090",
+         "displayName": "Public Access Mapping",
+         "moniker": "PublicAccessMapping",
+         "serviceOwner": "00000000-0000-0000-0000-000000000000",
+         "virtualDirectory": ""
+       },
+       {
 -        "accessPoint": "https://pipelinesghubeus7aks.eastus.cloudapp.azure.com/serviceHosts/9f1fe989-7d0d-4a9b-a9bf-11330ab257c1",
 -        "displayName": "Azure Instance Mapping",
 -        "moniker": "AzureInstanceMapping",
@@ -79,30 +82,32 @@ _No endpoints present only in aksh._
 -      },
 -      {
 -        "accessPoint": "https://pipelinesghubeus7.actions.githubusercontent.com/***REDACTED***/",
--        "displayName": "Scale Unit Access Mapping",
--        "moniker": "ScaleUnitMapping",
--        "serviceOwner": "00000000-0000-0000-0000-000000000000",
--        "virtualDirectory": ""
-+        "accessPoint": "http://127.0.0.1:9090",
-+        "displayName": "Default Access Mapping",
-+        "moniker": "PublicAccessMapping"
++        "accessPoint": "http://127.0.0.1:9090/runner/server",
+         "displayName": "Scale Unit Access Mapping",
+         "moniker": "ScaleUnitMapping",
+         "serviceOwner": "00000000-0000-0000-0000-000000000000",
+         "virtualDirectory": ""
        }
      ],
 -    "defaultAccessMappingMoniker": "ScaleUnitMapping",
 -    "lastChangeId": 4952065,
 -    "lastChangeId64": 4952065,
 +    "defaultAccessMappingMoniker": "PublicAccessMapping",
++    "lastChangeId": 1,
++    "lastChangeId64": 1,
      "serviceDefinitions": [
        {
 -        "description": "Location Service for GitHub Actions Server.",
--        "displayName": "Location Service",
--        "identifier": "9f1fe989-7d0d-4a9b-a9bf-11330ab257c1",
--        "locationMappings": [
--          {
--            "accessMappingMoniker": "PublicAccessMapping",
++        "description": "Location Service",
+         "displayName": "Location Service",
+         "identifier": "9f1fe989-7d0d-4a9b-a9bf-11330ab257c1",
+         "locationMappings": [
+           {
+             "accessMappingMoniker": "PublicAccessMapping",
 -            "location": "https://pipelines.actions.githubusercontent.com/***REDACTED***/"
--          },
--          {
++            "location": "http://127.0.0.1:9090"
+           },
+           {
 -            "accessMappingMoniker": "HostGuidAccessMapping",
 -            "location": "https://pipelines.actions.githubusercontent.com/serviceHosts/9f1fe989-7d0d-4a9b-a9bf-11330ab257c1"
 -          },
@@ -111,22 +116,24 @@ _No endpoints present only in aksh._
 -            "location": "https://pipelinesghubeus7aks.eastus.cloudapp.azure.com/serviceHosts/9f1fe989-7d0d-4a9b-a9bf-11330ab257c1"
 -          },
 -          {
--            "accessMappingMoniker": "ScaleUnitMapping",
+             "accessMappingMoniker": "ScaleUnitMapping",
 -            "location": "https://pipelinesghubeus7.actions.githubusercontent.com/***REDACTED***/"
--          }
--        ],
++            "location": "http://127.0.0.1:9090"
+           }
+         ],
 -        "properties": {
 -          "Microsoft.TeamFoundation.Location.CollectionName": {
 -            "$type": "System.String",
 -            "$value": "***REDACTED***"
 -          }
 -        },
--        "relativeToSetting": "fullyQualified",
--        "serviceOwner": "00000000-0000-0000-0000-000000000000",
--        "serviceType": "LocationService2",
--        "toolId": "Framework"
--      },
--      {
++        "properties": {},
+         "relativeToSetting": "fullyQualified",
+         "serviceOwner": "00000000-0000-0000-0000-000000000000",
+         "serviceType": "LocationService2",
+         "toolId": "Framework"
+       },
+       {
 -        "description": "Location Service for GitHub Actions Server.",
 -        "displayName": "Location Service",
 -        "identifier": "8d299418-9467-402b-a171-9165e2f703e2",
@@ -139,31 +146,35 @@ _No endpoints present only in aksh._
 -      },
 -      {
 -        "description": "Resource Area",
--        "displayName": "distributedtask",
--        "identifier": "a85b8835-c1a1-4aac-ae97-1c3d0ba72dbd",
--        "locationMappings": [
--          {
--            "accessMappingMoniker": "PublicAccessMapping",
++        "description": "distributedtask",
+         "displayName": "distributedtask",
+         "identifier": "a85b8835-c1a1-4aac-ae97-1c3d0ba72dbd",
+         "locationMappings": [
+           {
+             "accessMappingMoniker": "PublicAccessMapping",
 -            "location": "https://pipelines.actions.githubusercontent.com/***REDACTED***/"
--          },
--          {
++            "location": "http://127.0.0.1:9090/runner/server"
+           },
+           {
 -            "accessMappingMoniker": "HostGuidAccessMapping",
 -            "location": "https://pipelines.actions.githubusercontent.com/serviceHosts/9f1fe989-7d0d-4a9b-a9bf-11330ab257c1"
 -          },
 -          {
--            "accessMappingMoniker": "ScaleUnitMapping",
+             "accessMappingMoniker": "ScaleUnitMapping",
 -            "location": "https://pipelinesghubeus7.actions.githubusercontent.com/***REDACTED***/"
--          }
--        ],
++            "location": "http://127.0.0.1:9090/runner/server"
+           }
+         ],
 -        "parentIdentifier": "0000005a-0000-8888-8000-000000000000",
 -        "parentServiceType": "LocationService2",
--        "properties": {},
--        "relativeToSetting": "fullyQualified",
+         "properties": {},
+         "relativeToSetting": "fullyQualified",
 -        "serviceOwner": "00000000-0000-8888-8000-000000000000",
--        "serviceType": "LocationService2",
--        "toolId": "Framework"
--      },
--      {
++        "serviceOwner": "00000000-0000-0000-0000-000000000000",
+         "serviceType": "LocationService2",
+         "toolId": "Framework"
+       },
+       {
 -        "description": "Resource Area",
 -        "displayName": "build",
 -        "identifier": "5d6898bb-45ec-463f-95f9-54d49c71752e",
@@ -269,31 +280,35 @@ _No endpoints present only in aksh._
 -      },
 -      {
 -        "description": "Resource Area",
--        "displayName": "pipelines",
--        "identifier": "2e0bf237-8973-4ec9-a581-9c3d679d1776",
--        "locationMappings": [
--          {
--            "accessMappingMoniker": "PublicAccessMapping",
++        "description": "pipelines",
+         "displayName": "pipelines",
+         "identifier": "2e0bf237-8973-4ec9-a581-9c3d679d1776",
+         "locationMappings": [
+           {
+             "accessMappingMoniker": "PublicAccessMapping",
 -            "location": "https://pipelines.actions.githubusercontent.com/***REDACTED***/"
--          },
--          {
++            "location": "http://127.0.0.1:9090"
+           },
+           {
 -            "accessMappingMoniker": "HostGuidAccessMapping",
 -            "location": "https://pipelines.actions.githubusercontent.com/serviceHosts/9f1fe989-7d0d-4a9b-a9bf-11330ab257c1"
 -          },
 -          {
--            "accessMappingMoniker": "ScaleUnitMapping",
+             "accessMappingMoniker": "ScaleUnitMapping",
 -            "location": "https://pipelinesghubeus7.actions.githubusercontent.com/***REDACTED***/"
--          }
--        ],
++            "location": "http://127.0.0.1:9090"
+           }
+         ],
 -        "parentIdentifier": "0000005a-0000-8888-8000-000000000000",
 -        "parentServiceType": "LocationService2",
--        "properties": {},
--        "relativeToSetting": "fullyQualified",
+         "properties": {},
+         "relativeToSetting": "fullyQualified",
 -        "serviceOwner": "00000000-0000-8888-8000-000000000000",
--        "serviceType": "LocationService2",
--        "toolId": "Framework"
--      },
--      {
++        "serviceOwner": "00000000-0000-0000-0000-000000000000",
+         "serviceType": "LocationService2",
+         "toolId": "Framework"
+       },
+       {
 -        "description": "Resource Area",
 -        "displayName": "runner",
 -        "identifier": "73f6b305-6840-4983-b200-d72ccece0013",
@@ -317,31 +332,35 @@ _No endpoints present only in aksh._
 -      },
 -      {
 -        "description": "Resource Area",
--        "displayName": "oauth2",
--        "identifier": "a7b3b527-4f4f-4dac-8e84-f144fa6d554b",
--        "locationMappings": [
--          {
--            "accessMappingMoniker": "PublicAccessMapping",
++        "description": "oauth2",
+         "displayName": "oauth2",
+         "identifier": "a7b3b527-4f4f-4dac-8e84-f144fa6d554b",
+         "locationMappings": [
+           {
+             "accessMappingMoniker": "PublicAccessMapping",
 -            "location": "https://pipelines.actions.githubusercontent.com/***REDACTED***/"
--          },
--          {
++            "location": "http://127.0.0.1:9090/runner/server"
+           },
+           {
 -            "accessMappingMoniker": "HostGuidAccessMapping",
 -            "location": "https://pipelines.actions.githubusercontent.com/serviceHosts/9f1fe989-7d0d-4a9b-a9bf-11330ab257c1"
 -          },
 -          {
--            "accessMappingMoniker": "ScaleUnitMapping",
+             "accessMappingMoniker": "ScaleUnitMapping",
 -            "location": "https://pipelinesghubeus7.actions.githubusercontent.com/***REDACTED***/"
--          }
--        ],
++            "location": "http://127.0.0.1:9090/runner/server"
+           }
+         ],
 -        "parentIdentifier": "0000005a-0000-8888-8000-000000000000",
 -        "parentServiceType": "LocationService2",
--        "properties": {},
--        "relativeToSetting": "fullyQualified",
+         "properties": {},
+         "relativeToSetting": "fullyQualified",
 -        "serviceOwner": "00000000-0000-8888-8000-000000000000",
--        "serviceType": "LocationService2",
--        "toolId": "Framework"
--      },
--      {
++        "serviceOwner": "00000000-0000-0000-0000-000000000000",
+         "serviceType": "LocationService2",
+         "toolId": "Framework"
+       },
+       {
 -        "description": "Resource Area",
 -        "displayName": "actions",
 -        "identifier": "1644b0a3-b109-43d6-a0e7-f20d9dfb7508",
@@ -914,17 +933,95 @@ _No endpoints present only in aksh._
 -      },
 -      {
 -        "description": "Resource Location",
--        "displayName": "brokerlistener",
--        "identifier": "38f00041-0953-4d24-86c3-5432d23e2205",
--        "locationMappings": [],
--        "maxVersion": "6.0",
++        "maxVersion": "12.0",
++        "minVersion": "1.0",
++        "properties": {},
++        "relativePath": "/_apis/v1/Timeline/{scopeIdentifier}/{hubName}/{planId}/timeline/{timelineId}",
++        "relativeToSetting": 2,
++        "resourceVersion": 6,
++        "serviceOwner": "00000000-0000-0000-0000-000000000000",
++        "serviceType": "Timeline",
++        "status": 1,
++        "toolId": "Timeline"
++      },
++      {
++        "description": "CustomerIntelligence",
++        "displayName": "CustomerIntelligence",
++        "identifier": "b5cc35c2-ff2b-491d-a085-24b6e9f396fd",
++        "locationMappings": [],
++        "maxVersion": "12.0",
++        "minVersion": "1.0",
++        "properties": {},
++        "relativePath": "/_apis/v1/tasks",
++        "relativeToSetting": 2,
++        "resourceVersion": 6,
++        "serviceOwner": "00000000-0000-0000-0000-000000000000",
++        "serviceType": "CustomerIntelligence",
++        "status": 1,
++        "toolId": "CustomerIntelligence"
++      },
++      {
++        "description": "Tasks",
++        "displayName": "Tasks",
++        "identifier": "60aac929-f0cd-4bc8-9ce4-6b30e8f1b1bd",
++        "locationMappings": [],
++        "maxVersion": "12.0",
++        "minVersion": "1.0",
++        "properties": {},
++        "relativePath": "/_apis/v1/tasks/{taskId}/{versionString}",
++        "relativeToSetting": 2,
++        "resourceVersion": 6,
++        "serviceOwner": "00000000-0000-0000-0000-000000000000",
++        "serviceType": "Tasks",
++        "status": 1,
++        "toolId": "Tasks"
++      },
++      {
++        "description": "Cache",
++        "displayName": "Cache",
++        "identifier": "a7c78d38-31a8-417e-ba6b-7e58b352f304",
++        "locationMappings": [],
++        "maxVersion": "12.0",
++        "minVersion": "1.0",
++        "properties": {},
++        "relativePath": "_apis/artifactcache",
++        "relativeToSetting": 2,
++        "resourceVersion": 6,
++        "serviceOwner": "00000000-0000-0000-0000-000000000000",
++        "serviceType": "Cache",
++        "status": 1,
++        "toolId": "Cache"
++      },
++      {
++        "description": "BuildArtifacts",
++        "displayName": "BuildArtifacts",
++        "identifier": "1db06c96-014e-44e1-ac91-90b2d4b3e984",
++        "locationMappings": [],
++        "maxVersion": "12.0",
++        "minVersion": "1.0",
++        "properties": {},
++        "relativePath": "_apis/pipelines/workflows/{buildId}/artifacts",
++        "relativeToSetting": 2,
++        "resourceVersion": 6,
++        "serviceOwner": "00000000-0000-0000-0000-000000000000",
++        "serviceType": "BuildArtifacts",
++        "status": 1,
++        "toolId": "BuildArtifacts"
++      },
++      {
++        "description": "brokerlistener",
+         "displayName": "brokerlistener",
+         "identifier": "38f00041-0953-4d24-86c3-5432d23e2205",
+         "locationMappings": [],
+         "maxVersion": "6.0",
 -        "minVersion": "6.0",
--        "properties": {},
--        "relativePath": "_apis/{area}/{resource}",
--        "releasedVersion": "0.0",
--        "resourceVersion": 1,
--        "serviceOwner": "00000000-0000-0000-0000-000000000000",
--        "serviceType": "distributedtask",
++        "minVersion": "1.0",
+         "properties": {},
+         "relativePath": "_apis/{area}/{resource}",
+         "releasedVersion": "0.0",
+         "resourceVersion": 1,
+         "serviceOwner": "00000000-0000-0000-0000-000000000000",
+         "serviceType": "distributedtask",
 -        "toolId": "Framework"
 -      },
 -      {
@@ -974,17 +1071,23 @@ _No endpoints present only in aksh._
 -      },
 -      {
 -        "description": "Resource Location",
--        "displayName": "createdsession",
--        "identifier": "a4e1f2b5-0c3d-4e8a-9f6d-7b5c1a0e2d3f",
--        "locationMappings": [],
--        "maxVersion": "6.0",
++        "status": 1,
++        "toolId": "distributedtask"
++      },
++      {
++        "description": "createdsession",
+         "displayName": "createdsession",
+         "identifier": "a4e1f2b5-0c3d-4e8a-9f6d-7b5c1a0e2d3f",
+         "locationMappings": [],
+         "maxVersion": "6.0",
 -        "minVersion": "6.0",
--        "properties": {},
--        "relativePath": "_apis/{area}/brokerlistener/{resource}",
--        "releasedVersion": "0.0",
--        "resourceVersion": 1,
--        "serviceOwner": "00000000-0000-0000-0000-000000000000",
--        "serviceType": "distributedtask",
++        "minVersion": "1.0",
+         "properties": {},
+         "relativePath": "_apis/{area}/brokerlistener/{resource}",
+         "releasedVersion": "0.0",
+         "resourceVersion": 1,
+         "serviceOwner": "00000000-0000-0000-0000-000000000000",
+         "serviceType": "distributedtask",
 -        "toolId": "Framework"
 -      },
 -      {
@@ -1139,32 +1242,44 @@ _No endpoints present only in aksh._
 -      },
 -      {
 -        "description": "Resource Location",
--        "displayName": "runnermessages",
--        "identifier": "25adab70-1379-4186-be8e-b643061ebe3a",
--        "locationMappings": [],
--        "maxVersion": "6.0",
--        "minVersion": "1.0",
--        "properties": {},
--        "relativePath": "_apis/{area}/{resource}/{messageId}",
++        "status": 1,
++        "toolId": "distributedtask"
++      },
++      {
++        "description": "runnermessages",
+         "displayName": "runnermessages",
+         "identifier": "25adab70-1379-4186-be8e-b643061ebe3a",
+         "locationMappings": [],
+@@ -887,703 +432,93 @@
+         "minVersion": "1.0",
+         "properties": {},
+         "relativePath": "_apis/{area}/{resource}/{messageId}",
 -        "releasedVersion": "5.1",
--        "resourceVersion": 1,
--        "serviceOwner": "00000000-0000-0000-0000-000000000000",
--        "serviceType": "distributedtask",
++        "releasedVersion": "0.0",
+         "resourceVersion": 1,
+         "serviceOwner": "00000000-0000-0000-0000-000000000000",
+         "serviceType": "distributedtask",
 -        "toolId": "Framework"
 -      },
 -      {
 -        "description": "Resource Location",
--        "displayName": "runnerconfigrefresh",
--        "identifier": "13b5d709-74aa-470b-a8e9-bf9f3ded3f18",
--        "locationMappings": [],
--        "maxVersion": "6.0",
++        "status": 1,
++        "toolId": "distributedtask"
++      },
++      {
++        "description": "runnerconfigrefresh",
+         "displayName": "runnerconfigrefresh",
+         "identifier": "13b5d709-74aa-470b-a8e9-bf9f3ded3f18",
+         "locationMappings": [],
+         "maxVersion": "6.0",
 -        "minVersion": "6.0",
--        "properties": {},
--        "relativePath": "_apis/{area}/agents/{agentId}/{resource}/{configType}",
--        "releasedVersion": "0.0",
--        "resourceVersion": 1,
--        "serviceOwner": "00000000-0000-0000-0000-000000000000",
--        "serviceType": "distributedtask",
++        "minVersion": "1.0",
+         "properties": {},
+         "relativePath": "_apis/{area}/agents/{agentId}/{resource}/{configType}",
+         "releasedVersion": "0.0",
+         "resourceVersion": 1,
+         "serviceOwner": "00000000-0000-0000-0000-000000000000",
+         "serviceType": "distributedtask",
 -        "toolId": "Framework"
 -      },
 -      {
@@ -1349,17 +1464,24 @@ _No endpoints present only in aksh._
 -      },
 -      {
 -        "description": "Resource Location",
--        "displayName": "token",
--        "identifier": "10d13a60-2758-406c-8ab7-cffccb21fcf4",
--        "locationMappings": [],
--        "maxVersion": "6.0",
++        "status": 1,
++        "toolId": "distributedtask"
++      },
++      {
++        "description": "token",
+         "displayName": "token",
+         "identifier": "10d13a60-2758-406c-8ab7-cffccb21fcf4",
+         "locationMappings": [],
+         "maxVersion": "6.0",
 -        "minVersion": "0.0",
--        "properties": {},
--        "relativePath": "_apis/{area}/{resource}",
++        "minVersion": "1.0",
+         "properties": {},
+         "relativePath": "_apis/{area}/{resource}",
 -        "releasedVersion": "5.1",
--        "resourceVersion": 1,
--        "serviceOwner": "00000000-0000-0000-0000-000000000000",
--        "serviceType": "oauth2",
++        "releasedVersion": "0.0",
+         "resourceVersion": 1,
+         "serviceOwner": "00000000-0000-0000-0000-000000000000",
+         "serviceType": "oauth2",
 -        "toolId": "Framework"
 -      },
 -      {
@@ -1499,17 +1621,23 @@ _No endpoints present only in aksh._
 -      },
 -      {
 -        "description": "Resource Location",
--        "displayName": "steps",
--        "identifier": "99ea91b7-bbe9-4bd3-a924-874f13205b21",
--        "locationMappings": [],
--        "maxVersion": "6.0",
++        "status": 1,
++        "toolId": "oauth2"
++      },
++      {
++        "description": "steps",
+         "displayName": "steps",
+         "identifier": "99ea91b7-bbe9-4bd3-a924-874f13205b21",
+         "locationMappings": [],
+         "maxVersion": "6.0",
 -        "minVersion": "6.0",
--        "properties": {},
--        "relativePath": "_apis/{area}/plans/{planId}/jobs/{jobId}/{resource}",
--        "releasedVersion": "0.0",
--        "resourceVersion": 1,
--        "serviceOwner": "00000000-0000-0000-0000-000000000000",
--        "serviceType": "pipelines",
++        "minVersion": "1.0",
+         "properties": {},
+         "relativePath": "_apis/{area}/plans/{planId}/jobs/{jobId}/{resource}",
+         "releasedVersion": "0.0",
+         "resourceVersion": 1,
+         "serviceOwner": "00000000-0000-0000-0000-000000000000",
+         "serviceType": "pipelines",
 -        "toolId": "Framework"
 -      },
 -      {
@@ -1521,10 +1649,22 @@ _No endpoints present only in aksh._
 -        "minVersion": "6.0",
 -        "properties": {},
 -        "relativePath": "_apis/{area}/plans/{planId}/{resource}",
--        "releasedVersion": "0.0",
--        "resourceVersion": 1,
--        "serviceOwner": "00000000-0000-0000-0000-000000000000",
--        "serviceType": "pipelines",
++        "status": 1,
++        "toolId": "pipelines"
++      },
++      {
++        "description": "jobs",
++        "displayName": "jobs",
++        "identifier": "4818972d-29fa-4b86-92c1-de5ae7ef33f5",
++        "locationMappings": [],
++        "maxVersion": "6.0",
++        "minVersion": "1.0",
++        "properties": {},
++        "relativePath": "_apis/{area}/plans/{planId}/{resource}/{jobId}",
+         "releasedVersion": "0.0",
+         "resourceVersion": 1,
+         "serviceOwner": "00000000-0000-0000-0000-000000000000",
+         "serviceType": "pipelines",
 -        "toolId": "Framework"
 -      },
 -      {
@@ -1589,17 +1729,23 @@ _No endpoints present only in aksh._
 -      },
 -      {
 -        "description": "Resource Location",
--        "displayName": "logs",
--        "identifier": "fb1b6d27-3957-43d5-a14b-a2d70403e545",
--        "locationMappings": [],
--        "maxVersion": "6.0",
++        "status": 1,
++        "toolId": "pipelines"
++      },
++      {
++        "description": "logs",
+         "displayName": "logs",
+         "identifier": "fb1b6d27-3957-43d5-a14b-a2d70403e545",
+         "locationMappings": [],
+         "maxVersion": "6.0",
 -        "minVersion": "5.1",
--        "properties": {},
--        "relativePath": "{project}/_apis/{area}/{pipelineId}/runs/{runId}/{resource}/{logId}",
--        "releasedVersion": "0.0",
--        "resourceVersion": 1,
--        "serviceOwner": "00000000-0000-0000-0000-000000000000",
--        "serviceType": "pipelines",
++        "minVersion": "1.0",
+         "properties": {},
+         "relativePath": "{project}/_apis/{area}/{pipelineId}/runs/{runId}/{resource}/{logId}",
+         "releasedVersion": "0.0",
+         "resourceVersion": 1,
+         "serviceOwner": "00000000-0000-0000-0000-000000000000",
+         "serviceType": "pipelines",
 -        "toolId": "Framework"
 -      },
 -      {
@@ -1841,80 +1987,8 @@ _No endpoints present only in aksh._
 -        "serviceOwner": "00000000-0000-0000-0000-000000000000",
 -        "serviceType": "Servicing",
 -        "toolId": "Framework"
-+        "maxVersion": "12.0",
-+        "minVersion": "1.0",
-+        "properties": {},
-+        "relativePath": "/_apis/v1/Timeline/{scopeIdentifier}/{hubName}/{planId}/timeline/{timelineId}",
-+        "relativeToSetting": 2,
-+        "resourceVersion": 6,
-+        "serviceOwner": "00000000-0000-0000-0000-000000000000",
-+        "serviceType": "Timeline",
 +        "status": 1,
-+        "toolId": "Timeline"
-+      },
-+      {
-+        "description": "CustomerIntelligence",
-+        "displayName": "CustomerIntelligence",
-+        "identifier": "b5cc35c2-ff2b-491d-a085-24b6e9f396fd",
-+        "locationMappings": [],
-+        "maxVersion": "12.0",
-+        "minVersion": "1.0",
-+        "properties": {},
-+        "relativePath": "/_apis/v1/tasks",
-+        "relativeToSetting": 2,
-+        "resourceVersion": 6,
-+        "serviceOwner": "00000000-0000-0000-0000-000000000000",
-+        "serviceType": "CustomerIntelligence",
-+        "status": 1,
-+        "toolId": "CustomerIntelligence"
-+      },
-+      {
-+        "description": "Tasks",
-+        "displayName": "Tasks",
-+        "identifier": "60aac929-f0cd-4bc8-9ce4-6b30e8f1b1bd",
-+        "locationMappings": [],
-+        "maxVersion": "12.0",
-+        "minVersion": "1.0",
-+        "properties": {},
-+        "relativePath": "/_apis/v1/tasks/{taskId}/{versionString}",
-+        "relativeToSetting": 2,
-+        "resourceVersion": 6,
-+        "serviceOwner": "00000000-0000-0000-0000-000000000000",
-+        "serviceType": "Tasks",
-+        "status": 1,
-+        "toolId": "Tasks"
-+      },
-+      {
-+        "description": "Cache",
-+        "displayName": "Cache",
-+        "identifier": "a7c78d38-31a8-417e-ba6b-7e58b352f304",
-+        "locationMappings": [],
-+        "maxVersion": "12.0",
-+        "minVersion": "1.0",
-+        "properties": {},
-+        "relativePath": "_apis/artifactcache",
-+        "relativeToSetting": 2,
-+        "resourceVersion": 6,
-+        "serviceOwner": "00000000-0000-0000-0000-000000000000",
-+        "serviceType": "Cache",
-+        "status": 1,
-+        "toolId": "Cache"
-+      },
-+      {
-+        "description": "BuildArtifacts",
-+        "displayName": "BuildArtifacts",
-+        "identifier": "1db06c96-014e-44e1-ac91-90b2d4b3e984",
-+        "locationMappings": [],
-+        "maxVersion": "12.0",
-+        "minVersion": "1.0",
-+        "properties": {},
-+        "relativePath": "_apis/pipelines/workflows/{buildId}/artifacts",
-+        "relativeToSetting": 2,
-+        "resourceVersion": 6,
-+        "serviceOwner": "00000000-0000-0000-0000-000000000000",
-+        "serviceType": "BuildArtifacts",
-+        "status": 1,
-+        "toolId": "BuildArtifacts"
++        "toolId": "pipelines"
        }
 -    ],
 -    "serviceOwner": "0000005a-0000-8888-8000-000000000000"
@@ -1925,342 +1999,48 @@ _No endpoints present only in aksh._
 
 **Status codes:** official: [200, 200, 200] | aksh: [200, 200, 200]
 
-**Timing (ms):** p50: official 82.0 / aksh 0.9 | p95: official 98.5 / aksh 1.0
+**Timing (ms):** p50: official 82.0 / aksh 1.2 | p95: official 98.5 / aksh 1.4
 
 ### `GET /_apis/connectionData?connectOptions={n}&lastChangeId={n}&lastChangeId64={n}`
 
 **Header key differences:**
 
-- official only: `{'strict-transport-security', 'x-tfs-processid', 'pragma', 'cache-control', 'activityid', 'x-vss-senderdeploymentid'}`
+- official only: `{'x-vss-senderdeploymentid', 'pragma', 'activityid', 'x-tfs-processid', 'cache-control', 'strict-transport-security'}`
 
 **Response body diff:**
 
 ```diff
 --- official
 +++ aksh
-@@ -1,12 +1,303 @@
+@@ -1,12 +1,11 @@
  {
 -  "deploymentId": "fc1cfc90-fc40-edcb-6d0f-3b1380ee7b68",
 -  "deploymentType": "hosted",
 -  "instanceId": "9f1fe989-7d0d-4a9b-a9bf-11330ab257c1",
-+  "instanceId": "fc63bf56-6038-4278-9cd1-62fecca07119",
++  "deploymentId": "00000000-0000-0000-0000-000000000000",
++  "deploymentType": "selfHosted",
++  "instanceId": "76bda2f7-068e-446d-ad21-67575bf79b6f",
    "locationServiceData": {
--    "clientCacheFresh": true,
--    "defaultAccessMappingMoniker": "ScaleUnitMapping",
+     "clientCacheFresh": true,
+     "defaultAccessMappingMoniker": "ScaleUnitMapping",
 -    "lastChangeId": 4952065,
 -    "lastChangeId64": 4952065,
 -    "serviceOwner": "0000005a-0000-8888-8000-000000000000"
-+    "accessMappings": [
-+      {
-+        "accessPoint": "http://127.0.0.1:9090",
-+        "displayName": "Default Access Mapping",
-+        "moniker": "PublicAccessMapping"
-+      }
-+    ],
-+    "defaultAccessMappingMoniker": "PublicAccessMapping",
-+    "serviceDefinitions": [
-+      {
-+        "description": "AgentPools",
-+        "displayName": "AgentPools",
-+        "identifier": "a8c47e17-4d56-4a56-92bb-de7ea7dc65be",
-+        "locationMappings": [],
-+        "maxVersion": "12.0",
-+        "minVersion": "1.0",
-+        "properties": {},
-+        "relativePath": "/_apis/v1/AgentPools",
-+        "relativeToSetting": 2,
-+        "resourceVersion": 6,
-+        "serviceOwner": "00000000-0000-0000-0000-000000000000",
-+        "serviceType": "AgentPools",
-+        "status": 1,
-+        "toolId": "AgentPools"
-+      },
-+      {
-+        "description": "Agent",
-+        "displayName": "Agent",
-+        "identifier": "e298ef32-5878-4cab-993c-043836571f42",
-+        "locationMappings": [],
-+        "maxVersion": "12.0",
-+        "minVersion": "1.0",
-+        "properties": {},
-+        "relativePath": "/_apis/v1/Agent/{poolId}/{agentId}",
-+        "relativeToSetting": 2,
-+        "resourceVersion": 6,
-+        "serviceOwner": "00000000-0000-0000-0000-000000000000",
-+        "serviceType": "Agent",
-+        "status": 1,
-+        "toolId": "Agent"
-+      },
-+      {
-+        "description": "AgentSession",
-+        "displayName": "AgentSession",
-+        "identifier": "134e239e-2df3-4794-a6f6-24f1f19ec8dc",
-+        "locationMappings": [],
-+        "maxVersion": "12.0",
-+        "minVersion": "1.0",
-+        "properties": {},
-+        "relativePath": "/_apis/v1/AgentSession/{poolId}/{sessionId}",
-+        "relativeToSetting": 2,
-+        "resourceVersion": 6,
-+        "serviceOwner": "00000000-0000-0000-0000-000000000000",
-+        "serviceType": "AgentSession",
-+        "status": 1,
-+        "toolId": "AgentSession"
-+      },
-+      {
-+        "description": "Message",
-+        "displayName": "Message",
-+        "identifier": "c3a054f6-7a8a-49c0-944e-3a8e5d7adfd7",
-+        "locationMappings": [],
-+        "maxVersion": "12.0",
-+        "minVersion": "1.0",
-+        "properties": {},
-+        "relativePath": "/_apis/v1/Message/{poolId}/{messageId}",
-+        "relativeToSetting": 2,
-+        "resourceVersion": 6,
-+        "serviceOwner": "00000000-0000-0000-0000-000000000000",
-+        "serviceType": "Message",
-+        "status": 1,
-+        "toolId": "Message"
-+      },
-+      {
-+        "description": "AgentRequest",
-+        "displayName": "AgentRequest",
-+        "identifier": "fc825784-c92a-4299-9221-998a02d1b54f",
-+        "locationMappings": [],
-+        "maxVersion": "12.0",
-+        "minVersion": "1.0",
-+        "properties": {},
-+        "relativePath": "/_apis/v1/AgentRequest/{poolId}/{requestId}",
-+        "relativeToSetting": 2,
-+        "resourceVersion": 6,
-+        "serviceOwner": "00000000-0000-0000-0000-000000000000",
-+        "serviceType": "AgentRequest",
-+        "status": 1,
-+        "toolId": "AgentRequest"
-+      },
-+      {
-+        "description": "ActionDownloadInfo",
-+        "displayName": "ActionDownloadInfo",
-+        "identifier": "27d7f831-88c1-4719-8ca1-6a061dad90eb",
-+        "locationMappings": [],
-+        "maxVersion": "12.0",
-+        "minVersion": "1.0",
-+        "properties": {},
-+        "relativePath": "/_apis/v1/ActionDownloadInfo/{scopeIdentifier}/{hubName}/{planId}",
-+        "relativeToSetting": 2,
-+        "resourceVersion": 6,
-+        "serviceOwner": "00000000-0000-0000-0000-000000000000",
-+        "serviceType": "ActionDownloadInfo",
-+        "status": 1,
-+        "toolId": "ActionDownloadInfo"
-+      },
-+      {
-+        "description": "TimeLineWebConsoleLog",
-+        "displayName": "TimeLineWebConsoleLog",
-+        "identifier": "858983e4-19bd-4c5e-864c-507b59b58b12",
-+        "locationMappings": [],
-+        "maxVersion": "12.0",
-+        "minVersion": "1.0",
-+        "properties": {},
-+        "relativePath": "/_apis/v1/TimeLineWebConsoleLog/{scopeIdentifier}/{hubName}/{planId}/{timelineId}/{recordId}",
-+        "relativeToSetting": 2,
-+        "resourceVersion": 6,
-+        "serviceOwner": "00000000-0000-0000-0000-000000000000",
-+        "serviceType": "TimeLineWebConsoleLog",
-+        "status": 1,
-+        "toolId": "TimeLineWebConsoleLog"
-+      },
-+      {
-+        "description": "TimelineRecords",
-+        "displayName": "TimelineRecords",
-+        "identifier": "8893bc5b-35b2-4be7-83cb-99e683551db4",
-+        "locationMappings": [],
-+        "maxVersion": "12.0",
-+        "minVersion": "1.0",
-+        "properties": {},
-+        "relativePath": "/_apis/v1/Timeline/{scopeIdentifier}/{hubName}/{planId}/{timelineId}",
-+        "relativeToSetting": 2,
-+        "resourceVersion": 6,
-+        "serviceOwner": "00000000-0000-0000-0000-000000000000",
-+        "serviceType": "TimelineRecords",
-+        "status": 1,
-+        "toolId": "TimelineRecords"
-+      },
-+      {
-+        "description": "Logfiles",
-+        "displayName": "Logfiles",
-+        "identifier": "46f5667d-263a-4684-91b1-dff7fdcf64e2",
-+        "locationMappings": [],
-+        "maxVersion": "12.0",
-+        "minVersion": "1.0",
-+        "properties": {},
-+        "relativePath": "/_apis/v1/Logfiles/{scopeIdentifier}/{hubName}/{planId}/{logId}",
-+        "relativeToSetting": 2,
-+        "resourceVersion": 6,
-+        "serviceOwner": "00000000-0000-0000-0000-000000000000",
-+        "serviceType": "Logfiles",
-+        "status": 1,
-+        "toolId": "Logfiles"
-+      },
-+      {
-+        "description": "FinishJob",
-+        "displayName": "FinishJob",
-+        "identifier": "557624af-b29e-4c20-8ab0-0399d2204f3f",
-+        "locationMappings": [],
-+        "maxVersion": "12.0",
-+        "minVersion": "1.0",
-+        "properties": {},
-+        "relativePath": "/_apis/v1/FinishJob/{scopeIdentifier}/{hubName}/{planId}",
-+        "relativeToSetting": 2,
-+        "resourceVersion": 6,
-+        "serviceOwner": "00000000-0000-0000-0000-000000000000",
-+        "serviceType": "FinishJob",
-+        "status": 1,
-+        "toolId": "FinishJob"
-+      },
-+      {
-+        "description": "Artifact",
-+        "displayName": "Artifact",
-+        "identifier": "85023071-bd5e-4438-89b0-2a5bf362a19d",
-+        "locationMappings": [],
-+        "maxVersion": "12.0",
-+        "minVersion": "1.0",
-+        "properties": {},
-+        "relativePath": "/_apis/pipelines/workflows/{runId}/artifacts",
-+        "relativeToSetting": 2,
-+        "resourceVersion": 6,
-+        "serviceOwner": "00000000-0000-0000-0000-000000000000",
-+        "serviceType": "Artifact",
-+        "status": 1,
-+        "toolId": "Artifact"
-+      },
-+      {
-+        "description": "ArtifactFileContainer",
-+        "displayName": "ArtifactFileContainer",
-+        "identifier": "e4f5c81e-e250-447b-9fef-bd48471bea5e",
-+        "locationMappings": [],
-+        "maxVersion": "12.0",
-+        "minVersion": "1.0",
-+        "properties": {},
-+        "relativePath": "/_apis/pipelines/workflows/container/{containerId}",
-+        "relativeToSetting": 2,
-+        "resourceVersion": 6,
-+        "serviceOwner": "00000000-0000-0000-0000-000000000000",
-+        "serviceType": "ArtifactFileContainer",
-+        "status": 1,
-+        "toolId": "ArtifactFileContainer"
-+      },
-+      {
-+        "description": "TimelineAttachments",
-+        "displayName": "TimelineAttachments",
-+        "identifier": "7898f959-9cdf-4096-b29e-7f293031629e",
-+        "locationMappings": [],
-+        "maxVersion": "12.0",
-+        "minVersion": "1.0",
-+        "properties": {},
-+        "relativePath": "/_apis/v1/Timeline/{scopeIdentifier}/{hubName}/{planId}/{timelineId}/attachments/{recordId}/{type}/{name}",
-+        "relativeToSetting": 2,
-+        "resourceVersion": 6,
-+        "serviceOwner": "00000000-0000-0000-0000-000000000000",
-+        "serviceType": "TimelineAttachments",
-+        "status": 1,
-+        "toolId": "TimelineAttachments"
-+      },
-+      {
-+        "description": "Timeline",
-+        "displayName": "Timeline",
-+        "identifier": "83597576-cc2c-453c-bea6-2882ae6a1653",
-+        "locationMappings": [],
-+        "maxVersion": "12.0",
-+        "minVersion": "1.0",
-+        "properties": {},
-+        "relativePath": "/_apis/v1/Timeline/{scopeIdentifier}/{hubName}/{planId}/timeline/{timelineId}",
-+        "relativeToSetting": 2,
-+        "resourceVersion": 6,
-+        "serviceOwner": "00000000-0000-0000-0000-000000000000",
-+        "serviceType": "Timeline",
-+        "status": 1,
-+        "toolId": "Timeline"
-+      },
-+      {
-+        "description": "CustomerIntelligence",
-+        "displayName": "CustomerIntelligence",
-+        "identifier": "b5cc35c2-ff2b-491d-a085-24b6e9f396fd",
-+        "locationMappings": [],
-+        "maxVersion": "12.0",
-+        "minVersion": "1.0",
-+        "properties": {},
-+        "relativePath": "/_apis/v1/tasks",
-+        "relativeToSetting": 2,
-+        "resourceVersion": 6,
-+        "serviceOwner": "00000000-0000-0000-0000-000000000000",
-+        "serviceType": "CustomerIntelligence",
-+        "status": 1,
-+        "toolId": "CustomerIntelligence"
-+      },
-+      {
-+        "description": "Tasks",
-+        "displayName": "Tasks",
-+        "identifier": "60aac929-f0cd-4bc8-9ce4-6b30e8f1b1bd",
-+        "locationMappings": [],
-+        "maxVersion": "12.0",
-+        "minVersion": "1.0",
-+        "properties": {},
-+        "relativePath": "/_apis/v1/tasks/{taskId}/{versionString}",
-+        "relativeToSetting": 2,
-+        "resourceVersion": 6,
-+        "serviceOwner": "00000000-0000-0000-0000-000000000000",
-+        "serviceType": "Tasks",
-+        "status": 1,
-+        "toolId": "Tasks"
-+      },
-+      {
-+        "description": "Cache",
-+        "displayName": "Cache",
-+        "identifier": "a7c78d38-31a8-417e-ba6b-7e58b352f304",
-+        "locationMappings": [],
-+        "maxVersion": "12.0",
-+        "minVersion": "1.0",
-+        "properties": {},
-+        "relativePath": "_apis/artifactcache",
-+        "relativeToSetting": 2,
-+        "resourceVersion": 6,
-+        "serviceOwner": "00000000-0000-0000-0000-000000000000",
-+        "serviceType": "Cache",
-+        "status": 1,
-+        "toolId": "Cache"
-+      },
-+      {
-+        "description": "BuildArtifacts",
-+        "displayName": "BuildArtifacts",
-+        "identifier": "1db06c96-014e-44e1-ac91-90b2d4b3e984",
-+        "locationMappings": [],
-+        "maxVersion": "12.0",
-+        "minVersion": "1.0",
-+        "properties": {},
-+        "relativePath": "_apis/pipelines/workflows/{buildId}/artifacts",
-+        "relativeToSetting": 2,
-+        "resourceVersion": 6,
-+        "serviceOwner": "00000000-0000-0000-0000-000000000000",
-+        "serviceType": "BuildArtifacts",
-+        "status": 1,
-+        "toolId": "BuildArtifacts"
-+      }
-+    ]
++    "lastChangeId": 1,
++    "lastChangeId64": 1
    }
  }
 ```
 
 **Status codes:** official: [200, 200, 200] | aksh: [200, 200, 200]
 
-**Timing (ms):** p50: official 44.9 / aksh 0.8 | p95: official 46.1 / aksh 0.8
+**Timing (ms):** p50: official 44.9 / aksh 0.2 | p95: official 46.1 / aksh 0.2
 
 ### `GET /_apis/distributedtask/pools/{n}/agents?agentName=mitm-official&includeCapabilities=False`
 
 **Header key differences:**
 
-- official only: `{'strict-transport-security', 'x-tfs-processid', 'activityid', 'pragma', 'transfer-encoding', 'cache-control', 'x-frame-options', 'x-vss-senderdeploymentid'}`
+- official only: `{'x-vss-senderdeploymentid', 'x-frame-options', 'pragma', 'activityid', 'transfer-encoding', 'x-tfs-processid', 'cache-control', 'strict-transport-security'}`
 
 **Response body diff:**
 
@@ -2274,7 +2054,7 @@ _identical_
 
 **Header key differences:**
 
-- official only: `{'x-github-backend', 'x-github-request-id'}`
+- official only: `{'x-github-request-id', 'x-github-backend'}`
 
 **Response body diff:**
 
@@ -2285,8 +2065,8 @@ _identical_
  {
 -  "body": "{\"runner_request_id\":\"c76d4e37-60d1-5a84-8a2c-85f144d31a12\",\"run_service_url\":\"https://run-actions-3-azure-eastus.actions.githubusercontent.com/9/\",\"billing_owner_id\":\"O_kgDOEbddog\",\"should_acknowledge\":true}",
 -  "messageId": 8940805291766790408,
-+  "body": "{\"billing_owner_id\":\"local\",\"run_service_url\":\"http://127.0.0.1:9090/broker/1/\",\"runner_request_id\":\"c3ff271f-4142-411b-a8d5-ae075be7c4b9\",\"should_acknowledge\":true}",
-+  "messageId": "c3ff271f-4142-411b-a8d5-ae075be7c4b9",
++  "body": "{\"billing_owner_id\":\"local\",\"run_service_url\":\"http://127.0.0.1:9090/broker/1/\",\"runner_request_id\":\"368f4162-506b-47c1-ac4f-5d11af10cdc0\",\"should_acknowledge\":true}",
++  "messageId": "368f4162-506b-47c1-ac4f-5d11af10cdc0",
    "messageType": "RunnerJobRequest"
  }
 ```
@@ -2299,7 +2079,7 @@ _identical_
 
 **Header key differences:**
 
-- official only: `{'strict-transport-security', 'x-tfs-processid', 'activityid', 'pragma', 'transfer-encoding', 'cache-control', 'x-frame-options', 'x-vss-senderdeploymentid'}`
+- official only: `{'x-vss-senderdeploymentid', 'x-frame-options', 'pragma', 'activityid', 'transfer-encoding', 'x-tfs-processid', 'cache-control', 'strict-transport-security'}`
 
 **Response body diff:**
 
@@ -2348,7 +2128,7 @@ _identical_
 
 **Header key differences:**
 
-- official only: `{'strict-transport-security', 'x-tfs-processid', 'activityid', 'pragma', 'cache-control', 'x-frame-options', 'x-vss-senderdeploymentid'}`
+- official only: `{'x-vss-senderdeploymentid', 'x-frame-options', 'pragma', 'activityid', 'x-tfs-processid', 'cache-control', 'strict-transport-security'}`
 
 **Request body diff:**
 
@@ -2359,84 +2139,82 @@ _identical_
 ```diff
 --- official
 +++ aksh
-@@ -1,68 +1,19 @@
+@@ -1,38 +1,33 @@
  {
    "authorization": {
 -    "authorizationUrl": "https://tokenghub.actions.githubusercontent.com/_apis/oauth2/token/9f1fe989-7d0d-4a9b-a9bf-11330ab257c1",
 -    "clientId": "be762a47-a172-4543-a511-2a1ea626a8e8",
-+    "authorizationUrl": "http://127.0.0.1:9090",
-+    "clientId": "384566cf-20ff-4958-bb6a-5fc0bfffe88b",
++    "authorizationUrl": "http://127.0.0.1:9090/runner/server/_apis/v1/oauth2/token",
++    "clientId": "1a9624fe-e32b-44d3-970e-31d7d979b5a0",
      "publicKey": {
        "exponent": "AQAB",
--      "modulus": "***REDACTED***+TTPPSwlGtdEM+jIBwtgHKdP/q6pIHk/YxxmEX4YoUDuZ8U+lmA+ah36bym5kiRg4fCJ3wb5cuR/0XpJMPJtir0/JneZmG/UvaKKIhHe05a3o8nwgV+***REDACTED***+***REDACTED***/wtoZXtaAlXPw=="
-+      "keyId": "2dbddf35-6b1b-457b-a037-cbd493c71cac",
-+      "modulus": "x9DRhIzTYGvMcPEZDjc7cKrIyb+***REDACTED***/***REDACTED***/***REDACTED***/EG3JoaGcwOoLrcbT/***REDACTED***+scVYSkXyj4mrdS0qSm4Z/UOhtnese7OQ=="
+       "modulus": "***REDACTED***+TTPPSwlGtdEM+jIBwtgHKdP/q6pIHk/YxxmEX4YoUDuZ8U+lmA+ah36bym5kiRg4fCJ3wb5cuR/0XpJMPJtir0/JneZmG/UvaKKIhHe05a3o8nwgV+***REDACTED***+***REDACTED***/wtoZXtaAlXPw=="
      }
    },
 -  "createdOn": "2026-06-29T13:43:11.223Z",
--  "currentParallelism": 0,
--  "disableUpdate": false,
+   "currentParallelism": 0,
+   "disableUpdate": false,
    "enabled": true,
    "ephemeral": false,
 -  "id": 21,
--  "isElastic": false,
--  "isVirtual": false,
--  "labels": [
--    {
--      "id": 1,
--      "name": "self-hosted",
--      "type": "system"
--    },
--    {
--      "id": 2,
--      "name": "macOS",
--      "type": "system"
--    },
--    {
--      "id": 3,
--      "name": "ARM64",
--      "type": "system"
--    },
--    {
--      "id": 4,
--      "name": "mitm",
--      "type": "user"
--    }
--  ],
--  "maxParallelism": 1,
 +  "id": 1,
-+  "labels": [],
+   "isElastic": false,
+   "isVirtual": false,
+   "labels": [
+     {
+-      "id": 1,
+       "name": "self-hosted",
+-      "type": "system"
++      "type": "user"
+     },
+     {
+-      "id": 2,
+       "name": "macOS",
+-      "type": "system"
++      "type": "user"
+     },
+     {
+-      "id": 3,
+       "name": "ARM64",
+-      "type": "system"
++      "type": "user"
+     },
+     {
+-      "id": 4,
+       "name": "mitm",
+       "type": "user"
+     }
+@@ -40,7 +35,6 @@
+   "maxParallelism": 1,
    "name": "mitm-official",
--  "osDescription": "Darwin 25.4.0 Darwin Kernel Version 25.4.0: Thu Mar 19 19:33:25 PDT 2026; root:xnu-12377.101.15~1/RELEASE_ARM64_T6041",
+   "osDescription": "Darwin 25.4.0 Darwin Kernel Version 25.4.0: Thu Mar 19 19:33:25 PDT 2026; root:xnu-12377.101.15~1/RELEASE_ARM64_T6041",
 -  "owningTenant": null,
--  "properties": {
--    "RequireFipsCryptography": {
--      "$type": "System.Boolean",
--      "$value": true
--    },
--    "ServerUrl": {
--      "$type": "System.String",
+   "properties": {
+     "RequireFipsCryptography": {
+       "$type": "System.Boolean",
+@@ -48,11 +42,11 @@
+     },
+     "ServerUrl": {
+       "$type": "System.String",
 -      "$value": "https://pipelinesghubeus7.actions.githubusercontent.com/***REDACTED***/"
--    },
--    "ServerUrlV2": {
--      "$type": "System.String",
++      "$value": "http://127.0.0.1:9090/runner/server"
+     },
+     "ServerUrlV2": {
+       "$type": "System.String",
 -      "$value": "https://broker.actions.githubusercontent.com/"
--    },
--    "UseV2Flow": {
--      "$type": "System.Boolean",
--      "$value": true
--    }
--  },
--  "provisioningState": "Provisioned",
++      "$value": "http://127.0.0.1:9090/runner/server"
+     },
+     "UseV2Flow": {
+       "$type": "System.Boolean",
+@@ -60,7 +54,7 @@
+     }
+   },
+   "provisioningState": "Provisioned",
 -  "queueName": "taskagent-21",
--  "runnerGroupId": 1,
--  "runnerGroupName": null,
--  "status": "offline",
--  "version": "2.335.1"
-+  "osDescription": "Linux",
-+  "status": "online",
-+  "version": "2.322.0"
- }
++  "queueName": "taskagent-1",
+   "runnerGroupId": 1,
+   "runnerGroupName": null,
+   "status": "offline",
 ```
 
 **Status codes:** official: [200] | aksh: [200]
@@ -2447,7 +2225,7 @@ _identical_
 
 **Header key differences:**
 
-- official only: `{'x-github-backend', 'x-github-request-id'}`
+- official only: `{'x-github-request-id', 'x-github-backend'}`
 
 **Request body diff:**
 
@@ -2463,7 +2241,7 @@ _identical_
    "orchestrationId": "",
    "ownerName": "Nuraydias-Mac-Studio (PID: 80120)",
 -  "sessionId": "f05a0f24-1fe5-4fe6-8ab8-0c275b14fd18"
-+  "sessionId": "42edf535-6eb1-4c19-a102-3608ce0e517c"
++  "sessionId": "5ab7760f-5773-441b-b29f-f8ab5cc3b5a4"
  }
 ```
 
@@ -2475,7 +2253,7 @@ _identical_
 
 **Header key differences:**
 
-- official only: `{'x-github-backend', 'x-github-request-id'}`
+- official only: `{'x-github-request-id', 'x-github-backend'}`
 
 **Request body diff:**
 
@@ -2489,7 +2267,7 @@ _identical_
 
 **Header key differences:**
 
-- official only: `{'strict-transport-security', 'x-tfs-session', 'x-tfs-processid', 'pragma', 'cache-control', 'activityid', 'x-vss-senderdeploymentid'}`
+- official only: `{'x-vss-senderdeploymentid', 'pragma', 'activityid', 'x-tfs-processid', 'x-tfs-session', 'cache-control', 'strict-transport-security'}`
 
 **Response body diff:**
 
@@ -2499,23 +2277,21 @@ _identical_
 @@ -1,5 +1,5 @@
  {
 -  "access_token": "***REDACTED***",
--  "expires_in": 2999,
--  "token_type": "JWT"
-+  "access_token": "aksh-d23b6c78-128b-4773-ad8c-7708d4ce0e38",
-+  "expires_in": 3600,
-+  "token_type": "bearer"
++  "access_token": "***REDACTED***",
+   "expires_in": 2999,
+   "token_type": "JWT"
  }
 ```
 
 **Status codes:** official: [200, 200, 200, 200, 200] | aksh: [200, 200, 200, 200, 200]
 
-**Timing (ms):** p50: official 25.7 / aksh 0.2 | p95: official 27.2 / aksh 0.2
+**Timing (ms):** p50: official 25.7 / aksh 0.2 | p95: official 27.2 / aksh 0.3
 
 ### `POST /api/v3/actions/runner-registration`
 
 **Header key differences:**
 
-- official only: `{'x-github-media-type', 'access-control-allow-origin', 'x-content-type-options', 'cache-control', 'x-ratelimit-resource', 'referrer-policy', 'x-github-api-version-selected', 'access-control-expose-headers', 'strict-transport-security', 'etag', 'x-ratelimit-remaining', 'vary', 'x-github-request-id', 'x-ratelimit-limit', 'x-ratelimit-reset', 'x-ratelimit-used', 'x-xss-protection', 'x-frame-options', 'content-security-policy'}`
+- official only: `{'etag', 'x-content-type-options', 'x-frame-options', 'vary', 'x-xss-protection', 'x-ratelimit-remaining', 'content-security-policy', 'access-control-expose-headers', 'x-github-api-version-selected', 'cache-control', 'x-github-request-id', 'x-ratelimit-limit', 'access-control-allow-origin', 'x-ratelimit-used', 'strict-transport-security', 'x-ratelimit-resource', 'x-ratelimit-reset', 'x-github-media-type', 'referrer-policy'}`
 
 **Request body diff:**
 
@@ -2526,26 +2302,25 @@ _identical_
 ```diff
 --- official
 +++ aksh
-@@ -1,5 +1,6 @@
+@@ -1,5 +1,5 @@
  {
 -  "token": "***REDACTED***",
-+  "token": "aksh-jwt-13119781-f558-4802-9ad5-a15d65427b87",
++  "token": "***REDACTED***",
    "token_schema": "OAuthAccessToken",
 -  "url": "https://pipelinesghubeus7.actions.githubusercontent.com/***REDACTED***/"
-+  "url": "https://github.com/preloopdev/aksh",
-+  "use_v2_flow": false
++  "url": "http://127.0.0.1:9090/runner/server"
  }
 ```
 
 **Status codes:** official: [200] | aksh: [200]
 
-**Timing (ms):** p50: official 300.4 / aksh 0.3 | p95: official 300.4 / aksh 0.3
+**Timing (ms):** p50: official 300.4 / aksh 0.4 | p95: official 300.4 / aksh 0.4
 
 ### `POST /broker/{n}/acquirejob`
 
 **Header key differences:**
 
-- official only: `{'x-github-request-id', 'x-job-name', 'x-github-backend', 'transfer-encoding', 'x-github-actions-orchestration-id', 'x-plan-id'}`
+- official only: `{'x-github-actions-orchestration-id', 'transfer-encoding', 'x-plan-id', 'x-github-request-id', 'x-job-name', 'x-github-backend'}`
 
 **Request body diff:**
 
@@ -2659,7 +2434,7 @@ _identical_
 -        {
 -          "k": "event_name",
 -          "v": "push"
-+          "v": "be8a6e01-7f67-4bfc-9841-8f5bb2f1bf40"
++          "v": "3ea18ff8-c4e3-4bee-b896-81d267086171"
          },
          {
            "k": "server_url",
@@ -3589,25 +3364,25 @@ _identical_
 -          "k": "workflow_ref",
 -          "v": "preloopdev/aksh/.github/workflows/dogfood.yml@refs/heads/autoresearch/session-20260628"
 +          "k": "jobId",
-+          "v": "c3ff271f-4142-411b-a8d5-ae075be7c4b9"
++          "v": "368f4162-506b-47c1-ac4f-5d11af10cdc0"
          },
          {
 -          "k": "workflow_sha",
 -          "v": "***REDACTED***"
 +          "k": "orchestrationId",
-+          "v": "c3ff271f-4142-411b-a8d5-ae075be7c4b9"
++          "v": "368f4162-506b-47c1-ac4f-5d11af10cdc0"
          },
          {
 -          "k": "workflow_repository",
 -          "v": "preloopdev/aksh"
 +          "k": "planId",
-+          "v": "c3ff271f-4142-411b-a8d5-ae075be7c4b9"
++          "v": "368f4162-506b-47c1-ac4f-5d11af10cdc0"
          },
          {
 -          "k": "workflow_file_path",
 -          "v": ".github/workflows/dogfood.yml"
 +          "k": "timelineId",
-+          "v": "1c0618b5-abad-4766-b988-ebd1d9c86b7f"
++          "v": "8626da46-ab0f-4986-a85a-c42c27fe5acb"
          }
        ],
        "t": 2
@@ -3756,7 +3531,7 @@ _identical_
 -  "messageType": "RunnerJobRequest",
 +  "displayName": "replay_0",
 +  "jobDisplayName": "replay_0",
-+  "jobId": "c3ff271f-4142-411b-a8d5-ae075be7c4b9",
++  "jobId": "368f4162-506b-47c1-ac4f-5d11af10cdc0",
 +  "maskHints": [],
    "plan": {
 -    "artifactLocation": "",
@@ -3764,7 +3539,7 @@ _identical_
 -    "planId": "25667da9-97c8-4a6c-8823-7c020d6bd86e",
 -    "planType": "actions",
 -    "version": 0
-+    "planId": "c3ff271f-4142-411b-a8d5-ae075be7c4b9",
++    "planId": "368f4162-506b-47c1-ac4f-5d11af10cdc0",
 +    "planType": "Job"
    },
 -  "requestId": 0,
@@ -3818,7 +3593,7 @@ _identical_
 +        "type": 2
        },
 -      "id": "c0a06269-4fc3-47fb-bf0c-cf5ac3e5d305",
-+      "id": "ca48983f-04c2-4b7b-bdfa-1796a75e6fc5",
++      "id": "a0c88a64-7168-47b4-bdc7-9f09e700e5de",
        "inputs": {
          "map": [
            {
@@ -3925,7 +3700,7 @@ _identical_
 -    "changeId": 0,
 -    "id": "25667da9-97c8-4a6c-8823-7c020d6bd86e",
 -    "location": null
-+    "id": "1c0618b5-abad-4766-b988-ebd1d9c86b7f"
++    "id": "8626da46-ab0f-4986-a85a-c42c27fe5acb"
    },
    "variables": {
 -    "Actions.EnableHttpRedirects": {
@@ -4096,7 +3871,7 @@ _identical_
 
 **Header key differences:**
 
-- official only: `{'x-github-backend', 'x-github-request-id', 'x-plan-id', 'x-job-name'}`
+- official only: `{'x-job-name', 'x-github-request-id', 'x-plan-id', 'x-github-backend'}`
 
 **Request body diff:**
 
@@ -4110,7 +3885,7 @@ _identical_
 
 **Header key differences:**
 
-- official only: `{'x-github-backend', 'x-github-request-id', 'x-plan-id', 'x-job-name'}`
+- official only: `{'x-job-name', 'x-github-request-id', 'x-plan-id', 'x-github-backend'}`
 
 **Request body diff:**
 
@@ -4136,7 +3911,7 @@ _identical_
 
 **Header key differences:**
 
-- official only: `{'x-github-backend', 'x-github-request-id'}`
+- official only: `{'x-github-request-id', 'x-github-backend'}`
 
 **Request body diff:**
 
@@ -4148,13 +3923,13 @@ _identical_
 
 **Status codes:** official: [200, 200, 200] | aksh: [200, 200, 200]
 
-**Timing (ms):** p50: official 59.9 / aksh 0.2 | p95: official 350.9 / aksh 0.2
+**Timing (ms):** p50: official 59.9 / aksh 0.2 | p95: official 350.9 / aksh 0.3
 
 ### `POST /twirp/results.services.receiver.Receiver/GetJobLogsSignedBlobURL`
 
 **Header key differences:**
 
-- official only: `{'x-github-backend', 'x-github-request-id'}`
+- official only: `{'x-github-request-id', 'x-github-backend'}`
 
 **Request body diff:**
 
@@ -4181,7 +3956,7 @@ _identical_
 
 **Header key differences:**
 
-- official only: `{'x-github-backend', 'x-github-request-id'}`
+- official only: `{'x-github-request-id', 'x-github-backend'}`
 
 **Request body diff:**
 
