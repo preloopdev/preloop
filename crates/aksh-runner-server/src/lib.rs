@@ -911,7 +911,10 @@ async fn create_session(
 
     let runner_public_key = {
         let inner = shared.state.inner.lock().await;
-        inner.runner_rsa_public_keys.get(&request.runner_id).cloned()
+        inner
+            .runner_rsa_public_keys
+            .get(&request.runner_id)
+            .cloned()
     };
     let (key_bytes, encrypted) = if let Some(public_key) = runner_public_key {
         (public_key.wrap_key(&session_enc.key)?, true)
@@ -4092,7 +4095,10 @@ jobs:
         .await;
         assert_eq!(token["token_type"], "JWT");
         assert_eq!(token["expires_in"], 2999);
-        assert_eq!(token["access_token"].as_str().unwrap().split('.').count(), 3);
+        assert_eq!(
+            token["access_token"].as_str().unwrap().split('.').count(),
+            3
+        );
     }
 
     #[tokio::test]
@@ -4926,7 +4932,8 @@ jobs:
             {
                 builder = builder.header(header::AUTHORIZATION, "Bearer aksh-system-token");
             } else if uri.starts_with("/api/v3/actions/runner-registration") {
-                builder = builder.header(header::AUTHORIZATION, "RemoteAuth aksh-registration-token");
+                builder =
+                    builder.header(header::AUTHORIZATION, "RemoteAuth aksh-registration-token");
             }
             let request = if body.is_null() {
                 builder.body(Body::empty()).unwrap()
