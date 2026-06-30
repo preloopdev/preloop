@@ -94,11 +94,11 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         )
         .route(
             "/runner/server/_apis/distributedtask/pools/:pool_id/agents",
-            post(register_runner),
+            get(agent_lookup).post(register_runner_compat_pool_only),
         )
         .route(
             "/runner/server/_apis/distributedtask/pools/:pool_id/sessions",
-            post(create_session),
+            post(create_session_disttask),
         )
         .route(
             "/runner/server/_apis/distributedtask/pools/:pool_id/sessions/:session_id",
@@ -106,7 +106,7 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         )
         .route(
             "/runner/server/_apis/distributedtask/pools/:pool_id/messages",
-            get(next_message),
+            get(next_message_broker_ref),
         )
         .route(
             "/runner/server/_apis/distributedtask/pools/:pool_id/messages/:message_id",
@@ -116,6 +116,12 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             "/runner/server/_apis/distributedtask/hubs/actions/plans/:run_id/jobs/:job_id",
             patch(complete_job_compat),
         )
+        .route("/broker/:runner_id/acquirejob", post(broker_acquire_job))
+        .route("/broker/:runner_id/renewjob", post(broker_renew_job))
+        .route("/broker/:runner_id/completejob", post(broker_complete_job))
+        .route("/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate", post(twirp_workflow_steps_update))
+        .route("/twirp/results.services.receiver.Receiver/GetJobLogsSignedBlobURL", post(twirp_get_job_logs_signed_blob_url))
+        .route("/twirp/results.services.receiver.Receiver/GetStepLogsSignedBlobURL", post(twirp_get_step_logs_signed_blob_url))
         .route(
             "/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id",
             patch(patch_timeline_records),
@@ -412,6 +418,7 @@ struct InnerState {
     runner_public_keys: BTreeMap<i64, String>,
     runner_rsa_public_keys: BTreeMap<i64, AgentRsaPublicKey>,
     inflight_messages: BTreeMap<String, BTreeMap<i64, azdo::TaskAgentMessage>>,
+    broker_messages: BTreeMap<i64, azdo::AgentJobRequestMessage>,
     cancellation_queue: VecDeque<QueuedCancellation>,
     pending_caches: BTreeMap<i64, PendingCache>,
     artifacts: BTreeMap<String, ArtifactRecord>,
@@ -927,6 +934,47 @@ async fn create_session(
     }))
 }
 
+async fn create_session_disttask(
+    State(shared): State<Arc<SharedState>>,
+    Path(_pool_id): Path<i64>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let runner_id = body
+        .get("agent")
+        .and_then(|a| a.get("id"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(1);
+    let name = body
+        .get("agent")
+        .and_then(|a| a.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("runner")
+        .to_owned();
+    let response = create_session(
+        State(shared),
+        Json(RunnerSessionRequest { runner_id, name }),
+    )
+    .await;
+    let session_id = response["sessionId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let owner_name = body
+        .get("ownerName")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "sessionId": session_id,
+            "ownerName": owner_name,
+            "assignmentQueued": false,
+            "orchestrationId": ""
+        })),
+    ))
+}
+
 async fn delete_session(
     State(shared): State<Arc<SharedState>>,
     Path((_pool_id, session_id)): Path<(i64, String)>,
@@ -934,6 +982,237 @@ async fn delete_session(
     let mut inner = shared.state.inner.lock().await;
     inner.sessions.remove(&session_id);
     StatusCode::NO_CONTENT
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BrokerAcquireJobRequest {
+    job_message_id: uuid::Uuid,
+    #[allow(dead_code)]
+    billing_owner_id: Option<String>,
+    #[allow(dead_code)]
+    runner_os: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BrokerRenewJobRequest {
+    job_id: uuid::Uuid,
+    plan_id: String,
+}
+
+fn broker_run_service_url(runner_id: i64) -> String {
+    format!("http://127.0.0.1:9090/broker/{runner_id}/")
+}
+
+fn broker_job_ref(request: &TaskAgentJobRequestRecord, runner_id: i64) -> serde_json::Value {
+    json!({
+        "messageId": request.agent_job_id.to_string(),
+        "messageType": "RunnerJobRequest",
+        "body": serde_json::to_string(&json!({
+            "runner_request_id": request.agent_job_id.to_string(),
+            "run_service_url": broker_run_service_url(runner_id),
+            "billing_owner_id": "local",
+            "should_acknowledge": true
+        })).unwrap()
+    })
+}
+
+async fn next_message_broker_ref(
+    State(shared): State<Arc<SharedState>>,
+    Path(pool_id): Path<i64>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let session_id = params
+        .get("sessionId")
+        .cloned()
+        .unwrap_or_else(|| "default".to_owned());
+    let wait_seconds = params
+        .get("waitSeconds")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(50);
+
+    loop {
+        let mut inner = shared.state.inner.lock().await;
+        if let Some(request_id) = inner.session_active_requests.get(&session_id).copied() {
+            if let Some(request) = inner.job_requests.get(&request_id) {
+                if request.result.is_none() {
+                    return Ok(Json(broker_job_ref(request, pool_id)));
+                }
+            }
+            inner.session_active_requests.remove(&session_id);
+        }
+
+        let Some(queued) = inner.queue.pop_front() else {
+            drop(inner);
+            if wait_seconds == 0 {
+                return Ok(Json(json!({})));
+            }
+            if tokio::time::timeout(
+                Duration::from_secs(wait_seconds),
+                shared.state.message_notify.notified(),
+            )
+            .await
+            .is_err()
+            {
+                return Ok(Json(json!({})));
+            }
+            continue;
+        };
+
+        if let Some(run) = inner.runs.get_mut(&queued.run_id) {
+            run.status = ExecutionStatus::InProgress;
+            run.jobs
+                .insert(queued.job_id.clone(), ExecutionStatus::InProgress);
+        }
+
+        let request_id = queued.message.request_id;
+        inner
+            .session_active_requests
+            .insert(session_id.clone(), request_id);
+        inner
+            .broker_messages
+            .insert(request_id, queued.message.clone());
+        let request = inner
+            .job_requests
+            .get(&request_id)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("agent request not found"))?;
+
+        let run_id = queued.run_id;
+        let job_id = queued.job_id.clone();
+        drop(inner);
+
+        shared
+            .state
+            .emit(NdjsonEvent::JobStatus {
+                run_id,
+                job_id,
+                status: ExecutionStatus::InProgress,
+            })
+            .await;
+
+        return Ok(Json(broker_job_ref(&request, pool_id)));
+    }
+}
+
+async fn broker_acquire_job(
+    State(shared): State<Arc<SharedState>>,
+    Path(_runner_id): Path<i64>,
+    Json(request): Json<BrokerAcquireJobRequest>,
+) -> Result<Json<azdo::AgentJobRequestMessage>, ApiError> {
+    let inner = shared.state.inner.lock().await;
+    let request_id = inner
+        .agent_job_requests
+        .get(&request.job_message_id)
+        .copied()
+        .or_else(|| sole_active_unfinished_request(&inner))
+        .ok_or_else(|| ApiError::not_found("broker job message not found"))?;
+    let message = inner
+        .broker_messages
+        .get(&request_id)
+        .cloned()
+        .or_else(|| {
+            inner.job_requests.get(&request_id).and_then(|record| {
+                inner
+                    .agent_job_requests
+                    .get(&record.agent_job_id)
+                    .and_then(|_| {
+                        inner
+                            .queue
+                            .iter()
+                            .find(|queued| queued.message.request_id == request_id)
+                            .map(|queued| queued.message.clone())
+                    })
+            })
+        })
+        .ok_or_else(|| ApiError::not_found("broker job payload not found"))?;
+    Ok(Json(message))
+}
+
+async fn broker_renew_job(
+    State(shared): State<Arc<SharedState>>,
+    Path(_runner_id): Path<i64>,
+    Json(request): Json<BrokerRenewJobRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut inner = shared.state.inner.lock().await;
+    let request_id = inner
+        .agent_job_requests
+        .get(&request.job_id)
+        .copied()
+        .or_else(|| inner.plan_requests.get(&request.plan_id).copied())
+        .or_else(|| sole_active_unfinished_request(&inner))
+        .ok_or_else(|| ApiError::not_found("broker renew request not found"))?;
+    let record = inner
+        .job_requests
+        .get_mut(&request_id)
+        .ok_or_else(|| ApiError::not_found("agent request not found"))?;
+    record.locked_until = agent_request_locked_until();
+    Ok(Json(json!({"lockedUntil": record.locked_until})))
+}
+
+async fn broker_complete_job(
+    State(shared): State<Arc<SharedState>>,
+    Path(_runner_id): Path<i64>,
+    Json(request): Json<BrokerRenewJobRequest>,
+) -> Result<StatusCode, ApiError> {
+    let mut inner = shared.state.inner.lock().await;
+    let request_id = inner
+        .agent_job_requests
+        .get(&request.job_id)
+        .copied()
+        .or_else(|| inner.plan_requests.get(&request.plan_id).copied())
+        .or_else(|| sole_active_unfinished_request(&inner))
+        .ok_or_else(|| ApiError::not_found("broker complete request not found"))?;
+    if let Some(record) = inner.job_requests.get_mut(&request_id) {
+        record.result = Some(ExecutionStatus::Success);
+        record.locked_until = agent_request_locked_until();
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+struct JobLogsSignedBlobUrlRequest {
+    workflow_job_run_backend_id: String,
+    workflow_run_backend_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct StepLogsSignedBlobUrlRequest {
+    step_backend_id: String,
+    workflow_job_run_backend_id: String,
+    workflow_run_backend_id: String,
+}
+
+async fn twirp_workflow_steps_update(
+    Json(_request): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    Json(json!({"ok": true}))
+}
+
+async fn twirp_get_job_logs_signed_blob_url(
+    Json(request): Json<JobLogsSignedBlobUrlRequest>,
+) -> Json<serde_json::Value> {
+    Json(json!({
+        "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
+        "logs_url": format!(
+            "http://127.0.0.1:9090/replay/results/{}/{}/job-logs.txt",
+            request.workflow_run_backend_id, request.workflow_job_run_backend_id
+        )
+    }))
+}
+
+async fn twirp_get_step_logs_signed_blob_url(
+    Json(request): Json<StepLogsSignedBlobUrlRequest>,
+) -> Json<serde_json::Value> {
+    Json(json!({
+        "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
+        "logs_url": format!(
+            "http://127.0.0.1:9090/replay/results/{}/{}/step-{}.txt",
+            request.workflow_run_backend_id, request.workflow_job_run_backend_id, request.step_backend_id
+        ),
+        "soft_size_limit": "1048576"
+    }))
 }
 
 async fn next_message(
@@ -1163,7 +1442,7 @@ async fn agent_request_get(
 
 /// POST /_apis/v1/AgentRequest/:pool_id/:request_id — best-effort request ack.
 async fn agent_request_ack(Path((_pool_id, _request_id)): Path<(i64, i64)>) -> StatusCode {
-    StatusCode::NO_CONTENT
+    StatusCode::OK
 }
 
 /// PATCH /_apis/v1/AgentRequest/:pool_id/:request_id — renew or complete job request.
@@ -2256,16 +2535,6 @@ async fn github_registration_token(
     })))
 }
 
-#[derive(Deserialize)]
-struct TokenRequest {
-    #[allow(dead_code)]
-    grant_type: String,
-    #[allow(dead_code)]
-    client_id: Option<String>,
-    #[allow(dead_code)]
-    client_secret: Option<String>,
-}
-
 #[derive(Serialize)]
 struct TokenResponse {
     access_token: String,
@@ -2273,7 +2542,8 @@ struct TokenResponse {
     expires_in: u64,
 }
 
-async fn oauth2_token(Json(_req): Json<TokenRequest>) -> Json<TokenResponse> {
+async fn oauth2_token(_headers: axum::http::HeaderMap, body: bytes::Bytes) -> Json<TokenResponse> {
+    let _ = body;
     let token = format!("aksh-{}", uuid::Uuid::new_v4());
     Json(TokenResponse {
         access_token: token,
@@ -2751,14 +3021,14 @@ jobs:
         let first_msg = request_json(
             &app,
             Method::GET,
-            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=s1",
+            "/runner/server/_apis/v1/Message/1?sessionId=s1",
             Value::Null,
         )
         .await;
         let second_msg = request_json(
             &app,
             Method::GET,
-            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=s2",
+            "/runner/server/_apis/v1/Message/1?sessionId=s2",
             Value::Null,
         )
         .await;
@@ -2827,7 +3097,7 @@ jobs:
         let _msg = request_json(
             &app,
             Method::GET,
-            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=s1",
+            "/runner/server/_apis/v1/Message/1?sessionId=s1",
             Value::Null,
         )
         .await;
@@ -2902,7 +3172,7 @@ jobs:
         let first = request_json(
             &app,
             Method::GET,
-            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=s1&waitSeconds=0",
+            "/runner/server/_apis/v1/Message/1?sessionId=s1&waitSeconds=0",
             Value::Null,
         )
         .await;
@@ -2914,9 +3184,7 @@ jobs:
         request_json(
             &app,
             Method::DELETE,
-            &format!(
-                "/runner/server/_apis/distributedtask/pools/1/messages/{first_message_id}?sessionId=s1"
-            ),
+            &format!("/runner/server/_apis/v1/Message/1/{first_message_id}?sessionId=s1"),
             Value::Null,
         )
         .await;
@@ -2929,7 +3197,7 @@ jobs:
         let withheld = request_json(
             &app,
             Method::GET,
-            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=s1&waitSeconds=0",
+            "/runner/server/_apis/v1/Message/1?sessionId=s1&waitSeconds=0",
             Value::Null,
         )
         .await;
@@ -2946,7 +3214,7 @@ jobs:
         let second = request_json(
             &app,
             Method::GET,
-            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=s1&waitSeconds=0",
+            "/runner/server/_apis/v1/Message/1?sessionId=s1&waitSeconds=0",
             Value::Null,
         )
         .await;
@@ -2988,7 +3256,7 @@ jobs:
         let first = request_json(
             &app,
             Method::GET,
-            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=s1&waitSeconds=0",
+            "/runner/server/_apis/v1/Message/1?sessionId=s1&waitSeconds=0",
             Value::Null,
         )
         .await;
@@ -3075,7 +3343,7 @@ jobs:
         request_json(
             &app,
             Method::GET,
-            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=s1&waitSeconds=0",
+            "/runner/server/_apis/v1/Message/1?sessionId=s1&waitSeconds=0",
             Value::Null,
         )
         .await;
@@ -3149,7 +3417,7 @@ jobs:
         let first = request_json(
             &app,
             Method::GET,
-            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=default",
+            "/runner/server/_apis/v1/Message/1?sessionId=default",
             Value::Null,
         )
         .await;
@@ -3160,7 +3428,7 @@ jobs:
         let second = request_json(
             &app,
             Method::GET,
-            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=default",
+            "/runner/server/_apis/v1/Message/1?sessionId=default",
             Value::Null,
         )
         .await;
@@ -3474,7 +3742,7 @@ jobs:
         let session = request_json(
             &app,
             Method::POST,
-            "/runner/server/_apis/distributedtask/pools/1/sessions",
+            "/api/v1/runners/sessions",
             json!({"runner_id": runner_id, "name": "local"}),
         )
         .await;
@@ -3484,6 +3752,131 @@ jobs:
         let key_bytes =
             base64::Engine::decode(&base64::engine::general_purpose::STANDARD, key_b64).unwrap();
         assert_eq!(key_bytes.len(), 32, "AES-256 key should be 32 bytes");
+    }
+
+    #[tokio::test]
+    async fn current_service_broker_flow_uses_queued_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let workflow = "on:
+  push:
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+";
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": workflow,
+                "event": "push",
+                "payload": {"ref": "refs/heads/main", "commits": []},
+                "repository": "preloopdev/aksh",
+                "git_ref": "refs/heads/main",
+                "secrets": {},
+                "vars": {},
+                "reusable_workflows": {}
+            }),
+        )
+        .await;
+        assert_eq!(accepted["queued_jobs"], 1);
+
+        let session = request_json(
+            &app,
+            Method::POST,
+            "/runner/server/_apis/distributedtask/pools/1/sessions",
+            json!({
+                "agent": {"id": 1, "name": "runner-1"},
+                "ownerName": "owner",
+                "sessionId": "00000000-0000-0000-0000-000000000000",
+                "useFipsEncryption": false
+            }),
+        )
+        .await;
+        let session_id = session["sessionId"].as_str().unwrap();
+
+        let response = app.clone().oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/runner/server/_apis/distributedtask/pools/1/messages?sessionId={session_id}&waitSeconds=0"))
+                .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                .body(Body::empty())
+                .unwrap(),
+        ).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let message: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(message["messageType"], "RunnerJobRequest");
+        let body: Value = serde_json::from_str(message["body"].as_str().unwrap()).unwrap();
+        assert_eq!(body["should_acknowledge"], true);
+        let runner_request_id = body["runner_request_id"].as_str().unwrap();
+        assert!(body["run_service_url"]
+            .as_str()
+            .unwrap()
+            .contains("/broker/1/"));
+        assert_eq!(session["ownerName"], "owner");
+        assert_eq!(session["assignmentQueued"], false);
+        assert_eq!(session["orchestrationId"], "");
+
+        let acquired = request_json(
+            &app,
+            Method::POST,
+            "/broker/1/acquirejob",
+            json!({"jobMessageId": runner_request_id, "billingOwnerId": "local", "runnerOS": "macOS"}),
+        )
+        .await;
+        assert_eq!(acquired["requestId"].as_i64().unwrap(), 1);
+        assert!(acquired["plan"]["planId"].is_string());
+        assert!(acquired["jobId"].is_string());
+        assert!(acquired["steps"].is_array());
+
+        let renewed = request_json(
+            &app,
+            Method::POST,
+            "/broker/1/renewjob",
+            json!({"jobId": runner_request_id, "planId": acquired["plan"]["planId"]}),
+        )
+        .await;
+        assert!(renewed["lockedUntil"].as_str().unwrap().contains('T'));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/broker/1/completejob")
+                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"jobId": runner_request_id, "planId": acquired["plan"]["planId"]})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let ack = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/runner/server/_apis/v1/AgentRequest/1/1")
+                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ack.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -3610,7 +4003,7 @@ jobs:
         let first = request_json(
             &app,
             Method::GET,
-            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=default",
+            "/runner/server/_apis/v1/Message/1?sessionId=default",
             Value::Null,
         )
         .await;
@@ -3619,7 +4012,7 @@ jobs:
         let redelivered = request_json(
             &app,
             Method::GET,
-            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=default",
+            "/runner/server/_apis/v1/Message/1?sessionId=default",
             Value::Null,
         )
         .await;
@@ -3630,9 +4023,7 @@ jobs:
             .oneshot(
                 Request::builder()
                     .method(Method::DELETE)
-                    .uri(
-                        "/runner/server/_apis/distributedtask/pools/1/messages/1?sessionId=default",
-                    )
+                    .uri("/runner/server/_apis/v1/Message/1/1?sessionId=default")
                     .header(header::AUTHORIZATION, "Bearer aksh-system-token")
                     .body(Body::empty())
                     .unwrap(),
@@ -3644,7 +4035,7 @@ jobs:
         let empty = request_json(
             &app,
             Method::GET,
-            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=default&waitSeconds=0",
+            "/runner/server/_apis/v1/Message/1?sessionId=default&waitSeconds=0",
             Value::Null,
         )
         .await;
@@ -3679,14 +4070,14 @@ jobs:
         .await;
         let run_id = accepted["run_id"].as_str().unwrap();
 
-        let job_message = request_json(
+        let message = request_json(
             &app,
             Method::GET,
-            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=default",
+            "/runner/server/_apis/v1/Message/1?sessionId=default",
             Value::Null,
         )
         .await;
-        let message_id = job_message["messageId"].as_i64().unwrap();
+        let message_id = message["messageId"].as_i64().unwrap();
 
         let ack = app
             .clone()
@@ -3694,7 +4085,7 @@ jobs:
                 Request::builder()
                     .method(Method::DELETE)
                     .uri(format!(
-                        "/runner/server/_apis/distributedtask/pools/1/messages/{message_id}?sessionId=default"
+                        "/runner/server/_apis/v1/Message/1/{message_id}?sessionId=default"
                     ))
                     .header(header::AUTHORIZATION, "Bearer aksh-system-token")
                     .body(Body::empty())
@@ -3715,7 +4106,7 @@ jobs:
         let cancellation = request_json(
             &app,
             Method::GET,
-            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=default&waitSeconds=0",
+            "/runner/server/_apis/v1/Message/1?sessionId=default&waitSeconds=0",
             Value::Null,
         )
         .await;
@@ -3737,7 +4128,7 @@ jobs:
             request_json(
                 &poll_app,
                 Method::GET,
-                "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=default&waitSeconds=2",
+                "/runner/server/_apis/v1/Message/1?sessionId=default&waitSeconds=2",
                 Value::Null,
             )
             .await
@@ -3780,7 +4171,7 @@ jobs:
         let session = request_json(
             &app,
             Method::POST,
-            "/runner/server/_apis/distributedtask/pools/1/sessions",
+            "/api/v1/runners/sessions",
             json!({"runner_id": 1, "name": "local"}),
         )
         .await;
@@ -3811,9 +4202,7 @@ jobs:
         let message = request_json(
             &app,
             Method::GET,
-            &format!(
-                "/runner/server/_apis/distributedtask/pools/1/messages?sessionId={session_id}"
-            ),
+            &format!("/api/v1/runners/sessions/{session_id}/messages?sessionId={session_id}"),
             Value::Null,
         )
         .await;
@@ -4017,7 +4406,11 @@ jobs:
             body: Value,
         ) -> (StatusCode, Value) {
             let mut builder = Request::builder().method(method).uri(uri);
-            if uri.starts_with("/_apis/") || uri.starts_with("/runner/server/_apis/") {
+            if uri.starts_with("/_apis/")
+                || uri.starts_with("/runner/server/_apis/")
+                || uri.starts_with("/broker/")
+                || uri.starts_with("/twirp/")
+            {
                 builder = builder.header(header::AUTHORIZATION, "Bearer aksh-system-token");
             }
             let request = if body.is_null() {
@@ -4126,7 +4519,11 @@ jobs:
 
     async fn request_json(app: &Router, method: Method, uri: &str, body: Value) -> Value {
         let mut builder = Request::builder().method(method).uri(uri);
-        if uri.starts_with("/_apis/") || uri.starts_with("/runner/server/_apis/") {
+        if uri.starts_with("/_apis/")
+            || uri.starts_with("/runner/server/_apis/")
+            || uri.starts_with("/broker/")
+            || uri.starts_with("/twirp/")
+        {
             builder = builder.header(header::AUTHORIZATION, "Bearer aksh-system-token");
         }
         let request = if body.is_null() {
