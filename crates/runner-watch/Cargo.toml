@@ -20,3 +20,5 @@ serde_json.workspace = true
 tokio.workspace = true
 walkdir.workspace = true
 toml.workspace = true
+regex.workspace = true
+similar.workspace = true
