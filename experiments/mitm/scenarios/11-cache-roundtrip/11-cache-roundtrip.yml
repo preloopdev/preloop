@@ -1,0 +1,12 @@
+name: mitm cache
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: [self-hosted, mitm]
+    steps:
+      - run: mkdir -p .cache-dir && date > .cache-dir/stamp
+      - uses: actions/cache@v4
+        with:
+          path: .cache-dir
+          key: mitm-${{ github.run_id }}
+      - run: cat .cache-dir/stamp
