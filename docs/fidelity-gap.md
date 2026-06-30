@@ -85,12 +85,12 @@ service-location richness, and lower-priority/currently unexercised surfaces.
 | `needs` DAG scheduling | dependency-gated scheduler, outputs propagation | ✅ good |
 | `if` / contexts / outputs propagation | evaluated, needs outputs threaded | ✅ good |
 | Secrets policy / masking on the wire | `SecretString` + mask hints in wire messages | ✅ good |
-| Runner session handshake (legacy AzDO path) | AES key exchange works in local flow; RSA wrapping still TODO | ⚠️ partial |
-| Encrypted message queue (`TaskAgentMessage`) | proven for the older direct-message path; current v2.335.x mostly uses broker refs followed by broker acquire | ⚠️ compatibility path, not the primary target |
-| `AgentJobRequestMessage` | full DTO with plan, request, context, steps; reused by current broker acquire responses | ✅ good DTO; current-runner workflow E2E still needed |
-| `connectionData` / location services | v2.335.1 replay returns `200`, but aksh map is much smaller than official and lacks broker/results location fidelity | ⚠️ partial |
-| GitHub runner registration endpoint | route exists and replays as `200`, but response token/url values are local placeholders rather than official service values | ⚠️ partial |
-| OAuth token endpoint | route exists and replays as `200`, but token type/expiry/value differ from official | ⚠️ partial |
+| Runner session handshake (legacy AzDO path) | AES key exchange now RSA-wraps the session key with the runner's registered public key; plaintext is retained only as a no-key fallback | ✅ good |
+| Encrypted message queue (`TaskAgentMessage`) | older direct-message path remains AES-CBC encrypted; current v2.335.x broker-ref path is covered by a current-runner E2E test | ✅ good |
+| `AgentJobRequestMessage` | full DTO with plan, request, context, steps; reused by current broker acquire responses and covered by current-runner registration→broker E2E | ✅ good |
+| `connectionData` / location services | v2.335.1 replay returns `200`; aksh now includes current runner broker/OAuth/pipelines resource locations and query-aware fresh-cache responses | ⚠️ runner-compatible, not full hosted-service parity |
+| GitHub runner registration endpoint | route exists and replays as `200`; response now returns JWT-shaped local `OAuthAccessToken` plus aksh service URL instead of echoing GitHub repo URL | ⚠️ local token, runner-compatible |
+| OAuth token endpoint | route exists and replays as `200`; response now uses `token_type = JWT`, `expires_in = 2999`, and local signed JWT-shaped tokens | ⚠️ local token, runner-compatible |
 | DistributedTask pool/agent replay | runner-watch mapping is fixed and the latest replay returns `200` for pool discovery / agent lookup / agent registration | ✅ good |
 | DistributedTask session/message replay | mapped requests now reach aksh; session status matches `201`; incomplete Busy long-polls are filtered as non-comparable capture artifacts | ⚠️ partial |
 | AgentRequest acknowledgement | endpoint exists and now returns `200` like official v2.335.1 | ✅ good |
