@@ -97,8 +97,12 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             get(agent_lookup).post(register_runner_compat_pool_only),
         )
         .route(
+            "/runner/server/_apis/distributedtask/pools/:pool_id/agents/:agent_id",
+            delete(delete_agent),
+        )
+        .route(
             "/runner/server/_apis/distributedtask/pools/:pool_id/sessions",
-            post(create_session_disttask),
+            post(create_session_disttask).delete(delete_sessions_for_pool),
         )
         .route(
             "/runner/server/_apis/distributedtask/pools/:pool_id/sessions/:session_id",
@@ -122,6 +126,15 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         .route("/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate", post(twirp_workflow_steps_update))
         .route("/twirp/results.services.receiver.Receiver/GetJobLogsSignedBlobURL", post(twirp_get_job_logs_signed_blob_url))
         .route("/twirp/results.services.receiver.Receiver/GetStepLogsSignedBlobURL", post(twirp_get_step_logs_signed_blob_url))
+        // Cache v4 (actions/cache@v4): twirp service stubs so the runner doesn't see 404.
+        .route("/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL", post(twirp_cache_get_download_url))
+        .route("/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry", post(twirp_cache_create_entry))
+        .route("/twirp/github.actions.results.api.v1.CacheService/FinalizeCacheEntryUpload", post(twirp_cache_finalize_upload))
+        // Artifact v4 (actions/upload-artifact@v4, actions/download-artifact@v4): stubs.
+        .route("/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact", post(twirp_artifact_create))
+        .route("/twirp/github.actions.results.api.v1.ArtifactService/FinalizeArtifact", post(twirp_artifact_finalize))
+        .route("/twirp/github.actions.results.api.v1.ArtifactService/GetSignedArtifactURL", post(twirp_artifact_get_signed_url))
+        .route("/twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts", post(twirp_artifact_list))
         .route(
             "/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id",
             patch(patch_timeline_records),
@@ -310,6 +323,9 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             "/api/v1/runners/sessions/:session_id/messages/:message_id",
             delete(delete_session_message),
         )
+        .route("/runner/session", post(broker_session_root))
+        .route("/runner/message", get(next_message_broker_ref_root))
+        .route("/runner/acknowledge", post(broker_acknowledge_root))
         .route("/api/v1/jobs/complete", post(complete_job))
         .route("/api/v1/cache", post(cache_put))
         .route("/api/v1/cache", get(cache_get))
@@ -350,6 +366,9 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
 }
 
 async fn require_bearer(request: Request, next: Next) -> Result<Response, ApiError> {
+    if request.uri().path().starts_with("/broker/") {
+        return Ok(next.run(request).await);
+    }
     let authorized = request
         .headers()
         .get(header::AUTHORIZATION)
@@ -992,6 +1011,24 @@ async fn delete_session(
     StatusCode::NO_CONTENT
 }
 
+/// DELETE /runner/server/_apis/distributedtask/pools/:pool_id/agents/:agent_id
+/// Idempotent agent deregistration — the runner calls this on clean exit.
+/// aksh keeps no persistent agent registry so always succeeds.
+async fn delete_agent(
+    Path((_pool_id, _agent_id)): Path<(i64, i64)>,
+) -> StatusCode {
+    StatusCode::NO_CONTENT
+}
+
+/// DELETE /runner/server/_apis/distributedtask/pools/:pool_id/sessions (no session_id)
+/// Broker-side session teardown: the runner deletes the session-less path on the broker host.
+/// Return 204 unconditionally; the concrete session was already cleaned up individually.
+async fn delete_sessions_for_pool(
+    Path(_pool_id): Path<i64>,
+) -> StatusCode {
+    StatusCode::NO_CONTENT
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BrokerAcquireJobRequest {
@@ -1010,7 +1047,18 @@ struct BrokerRenewJobRequest {
 }
 
 fn broker_run_service_url(runner_id: i64) -> String {
-    format!("http://127.0.0.1:9090/broker/{runner_id}/")
+    format!("{}/broker/{runner_id}/", public_base_url())
+}
+
+fn public_base_url() -> String {
+    std::env::var("AKSH_PUBLIC_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:9090".to_owned())
+        .trim_end_matches('/')
+        .to_owned()
+}
+
+fn runner_server_url() -> String {
+    format!("{}/runner/server", public_base_url())
 }
 
 fn broker_job_ref(request: &TaskAgentJobRequestRecord, runner_id: i64) -> serde_json::Value {
@@ -1026,11 +1074,24 @@ fn broker_job_ref(request: &TaskAgentJobRequestRecord, runner_id: i64) -> serde_
     })
 }
 
+fn broker_job_ref_root(request: &TaskAgentJobRequestRecord, runner_id: i64) -> serde_json::Value {
+    json!({
+        "messageId": request.request_id,
+        "messageType": "RunnerJobRequest",
+        "body": serde_json::to_string(&json!({
+            "runner_request_id": request.agent_job_id.to_string(),
+            "run_service_url": broker_run_service_url(runner_id),
+            "billing_owner_id": "local",
+            "should_acknowledge": true
+        })).unwrap()
+    })
+}
+
 async fn next_message_broker_ref(
     State(shared): State<Arc<SharedState>>,
     Path(pool_id): Path<i64>,
     Query(params): Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<Response, ApiError> {
     let session_id = params
         .get("sessionId")
         .cloned()
@@ -1045,7 +1106,7 @@ async fn next_message_broker_ref(
         if let Some(request_id) = inner.session_active_requests.get(&session_id).copied() {
             if let Some(request) = inner.job_requests.get(&request_id) {
                 if request.result.is_none() {
-                    return Ok(Json(broker_job_ref(request, pool_id)));
+                    return Ok(Json(broker_job_ref(request, pool_id)).into_response());
                 }
             }
             inner.session_active_requests.remove(&session_id);
@@ -1054,7 +1115,7 @@ async fn next_message_broker_ref(
         let Some(queued) = inner.queue.pop_front() else {
             drop(inner);
             if wait_seconds == 0 {
-                return Ok(Json(json!({})));
+                return Ok((StatusCode::ACCEPTED, Json(json!({}))).into_response());
             }
             if tokio::time::timeout(
                 Duration::from_secs(wait_seconds),
@@ -1063,7 +1124,7 @@ async fn next_message_broker_ref(
             .await
             .is_err()
             {
-                return Ok(Json(json!({})));
+                return Ok((StatusCode::ACCEPTED, Json(json!({}))).into_response());
             }
             continue;
         };
@@ -1100,8 +1161,90 @@ async fn next_message_broker_ref(
             })
             .await;
 
-        return Ok(Json(broker_job_ref(&request, pool_id)));
+        return Ok(Json(broker_job_ref(&request, pool_id)).into_response());
     }
+}
+
+async fn broker_session_root() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::CREATED,
+        Json(json!({
+            "session_id": uuid::Uuid::new_v4().to_string()
+        })),
+    )
+}
+
+async fn next_message_broker_ref_root(
+    State(shared): State<Arc<SharedState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let session_id = params
+        .get("sessionId")
+        .cloned()
+        .unwrap_or_else(|| "default".to_owned());
+    let wait = params
+        .get("waitSeconds")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let deadline = std::time::Instant::now() + Duration::from_secs(wait);
+
+    loop {
+        let maybe = {
+            let mut inner = shared.state.inner.lock().await;
+            if let Some(request_id) = inner.session_active_requests.get(&session_id).copied() {
+                if let Some(request) = inner.job_requests.get(&request_id) {
+                    if request.result.is_none() {
+                        Some(broker_job_ref_root(request, 1))
+                    } else {
+                        inner.session_active_requests.remove(&session_id);
+                        None
+                    }
+                } else {
+                    inner.session_active_requests.remove(&session_id);
+                    None
+                }
+            } else if let Some(queued) = inner.queue.pop_front() {
+                if let Some(run) = inner.runs.get_mut(&queued.run_id) {
+                    run.status = ExecutionStatus::InProgress;
+                    run.jobs
+                        .insert(queued.job_id.clone(), ExecutionStatus::InProgress);
+                }
+                let request_id = queued.message.request_id;
+                inner
+                    .session_active_requests
+                    .insert(session_id.clone(), request_id);
+                inner
+                    .broker_messages
+                    .insert(request_id, queued.message.clone());
+                let request = inner
+                    .job_requests
+                    .get(&request_id)
+                    .expect("queued request must exist");
+                Some(broker_job_ref_root(request, 1))
+            } else {
+                None
+            }
+        };
+
+        if let Some(message) = maybe {
+            return Ok(Json(message));
+        }
+        if wait == 0 || std::time::Instant::now() >= deadline {
+            return Ok(Json(serde_json::Value::Null));
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn broker_acknowledge_root(
+    State(shared): State<Arc<SharedState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> StatusCode {
+    if let Some(session_id) = params.get("sessionId") {
+        let mut inner = shared.state.inner.lock().await;
+        inner.session_active_requests.remove(session_id);
+    }
+    StatusCode::OK
 }
 
 async fn broker_acquire_job(
@@ -1204,8 +1347,8 @@ async fn twirp_get_job_logs_signed_blob_url(
     Json(json!({
         "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
         "logs_url": format!(
-            "http://127.0.0.1:9090/replay/results/{}/{}/job-logs.txt",
-            request.workflow_run_backend_id, request.workflow_job_run_backend_id
+            "{}/replay/results/{}/{}/job-logs.txt",
+            public_base_url(), request.workflow_run_backend_id, request.workflow_job_run_backend_id
         )
     }))
 }
@@ -1216,11 +1359,62 @@ async fn twirp_get_step_logs_signed_blob_url(
     Json(json!({
         "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
         "logs_url": format!(
-            "http://127.0.0.1:9090/replay/results/{}/{}/step-{}.txt",
-            request.workflow_run_backend_id, request.workflow_job_run_backend_id, request.step_backend_id
+            "{}/replay/results/{}/{}/step-{}.txt",
+            public_base_url(), request.workflow_run_backend_id, request.workflow_job_run_backend_id, request.step_backend_id
         ),
         "soft_size_limit": "1048576"
     }))
+}
+
+// ── Cache v4 twirp stubs ──────────────────────────────────────────────────
+
+async fn twirp_cache_get_download_url(
+    Json(_req): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    // Runner calls this to locate an existing cache entry. Return cache-miss so
+    // the runner skips restore and proceeds (the job step handles the empty cache).
+    Json(json!({"ok": true, "signed_download_url": "", "matched_key": ""}))
+}
+
+async fn twirp_cache_create_entry(
+    Json(_req): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let upload_url = format!("{}/replay/cache/upload/{}", public_base_url(), uuid::Uuid::new_v4());
+    Json(json!({"ok": true, "signed_upload_url": upload_url, "message": ""}))
+}
+
+async fn twirp_cache_finalize_upload(
+    Json(_req): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    Json(json!({"ok": true, "entry_id": uuid::Uuid::new_v4().to_string(), "message": ""}))
+}
+
+// ── Artifact v4 twirp stubs ───────────────────────────────────────────────
+
+async fn twirp_artifact_create(
+    Json(_req): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let upload_url = format!("{}/replay/artifact/upload/{}", public_base_url(), uuid::Uuid::new_v4());
+    Json(json!({"ok": true, "signed_upload_url": upload_url}))
+}
+
+async fn twirp_artifact_finalize(
+    Json(_req): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    Json(json!({"ok": true, "artifact_id": uuid::Uuid::new_v4().to_string()}))
+}
+
+async fn twirp_artifact_get_signed_url(
+    Json(_req): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let url = format!("{}/replay/artifact/download/{}", public_base_url(), uuid::Uuid::new_v4());
+    Json(json!({"signed_url": url}))
+}
+
+async fn twirp_artifact_list(
+    Json(_req): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    Json(json!({"artifacts": []}))
 }
 
 async fn next_message(
@@ -2139,7 +2333,7 @@ async fn connection_data(
     {
         return axum::response::Json(json!({
             "deploymentId": "00000000-0000-0000-0000-000000000000",
-            "deploymentType": "selfHosted",
+            "deploymentType": "hosted",
             "instanceId": uuid::Uuid::new_v4().to_string(),
             "locationServiceData": {
                 "clientCacheFresh": true,
@@ -2151,20 +2345,20 @@ async fn connection_data(
         .into_response();
     }
 
-    let service_root = "http://127.0.0.1:9090";
-    let runner_root = "http://127.0.0.1:9090/runner/server";
+    let service_root = public_base_url();
+    let runner_root = runner_server_url();
     let body = serde_json::json!({
         "deploymentId": "00000000-0000-0000-0000-000000000000",
-        "deploymentType": "selfHosted",
+        "deploymentType": "hosted",
         "instanceId": uuid::Uuid::new_v4().to_string(),
         "locationServiceData": {
             "lastChangeId": 1,
             "lastChangeId64": 1,
             "serviceDefinitions": [
-                area_svc("Location Service", "9f1fe989-7d0d-4a9b-a9bf-11330ab257c1", "LocationService2", "Framework", service_root),
-                area_svc("distributedtask", "a85b8835-c1a1-4aac-ae97-1c3d0ba72dbd", "LocationService2", "Framework", runner_root),
-                area_svc("pipelines", "2e0bf237-8973-4ec9-a581-9c3d679d1776", "LocationService2", "Framework", service_root),
-                area_svc("oauth2", "a7b3b527-4f4f-4dac-8e84-f144fa6d554b", "LocationService2", "Framework", runner_root),
+                area_svc("Location Service", "9f1fe989-7d0d-4a9b-a9bf-11330ab257c1", "LocationService2", "Framework", &service_root),
+                area_svc("distributedtask", "a85b8835-c1a1-4aac-ae97-1c3d0ba72dbd", "LocationService2", "Framework", &runner_root),
+                area_svc("pipelines", "2e0bf237-8973-4ec9-a581-9c3d679d1776", "LocationService2", "Framework", &service_root),
+                area_svc("oauth2", "a7b3b527-4f4f-4dac-8e84-f144fa6d554b", "LocationService2", "Framework", &runner_root),
                 svc("AgentPools", "a8c47e17-4d56-4a56-92bb-de7ea7dc65be", "/_apis/v1/AgentPools"),
                 svc("Agent", "e298ef32-5878-4cab-993c-043836571f42", "/_apis/v1/Agent/{poolId}/{agentId}"),
                 svc("AgentSession", "134e239e-2df3-4794-a6f6-24f1f19ec8dc", "/_apis/v1/AgentSession/{poolId}/{sessionId}"),
@@ -2410,14 +2604,14 @@ async fn register_runner_compat(
         "runnerGroupName": null,
         "labels": result.0.labels.iter().map(|l| json!({"name": l, "type": "user"})).collect::<Vec<_>>(),
         "authorization": {
-            "authorizationUrl": "http://127.0.0.1:9090/runner/server/_apis/v1/oauth2/token",
+            "authorizationUrl": format!("{}/_apis/v1/oauth2/token", runner_server_url()),
             "clientId": uuid::Uuid::new_v4().to_string(),
             "publicKey": public_key_object
         },
         "properties": {
             "RequireFipsCryptography": {"$type": "System.Boolean", "$value": true},
-            "ServerUrl": {"$type": "System.String", "$value": "http://127.0.0.1:9090/runner/server"},
-            "ServerUrlV2": {"$type": "System.String", "$value": "http://127.0.0.1:9090/runner/server"},
+            "ServerUrl": {"$type": "System.String", "$value": runner_server_url()},
+            "ServerUrlV2": {"$type": "System.String", "$value": runner_server_url()},
             "UseV2Flow": {"$type": "System.Boolean", "$value": true}
         }
     })))
@@ -2681,7 +2875,7 @@ async fn github_registration_token(
     Ok(Json(json!({
         "token": token,
         "token_schema": "OAuthAccessToken",
-        "url": "http://127.0.0.1:9090/runner/server"
+        "url": runner_server_url()
     })))
 }
 
