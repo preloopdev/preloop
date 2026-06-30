@@ -902,18 +902,23 @@ async fn register_runner(
 
 async fn create_session(
     State(shared): State<Arc<SharedState>>,
-    Json(_request): Json<RunnerSessionRequest>,
-) -> Json<serde_json::Value> {
+    Json(request): Json<RunnerSessionRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let session_id = uuid::Uuid::new_v4();
 
     // Generate AES session key
     let session_enc = SessionEncryption::generate();
 
-    // Send the AES key as base64 without RSA wrapping.
-    // The runner's RSA public key parsing from registration is complex (XML format);
-    // for now we send the key unencrypted and let the runner use it directly.
-    let key_b64 =
-        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &session_enc.key);
+    let runner_public_key = {
+        let inner = shared.state.inner.lock().await;
+        inner.runner_rsa_public_keys.get(&request.runner_id).cloned()
+    };
+    let (key_bytes, encrypted) = if let Some(public_key) = runner_public_key {
+        (public_key.wrap_key(&session_enc.key)?, true)
+    } else {
+        (session_enc.key.clone(), false)
+    };
+    let key_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key_bytes);
 
     // Store the session key for later message decryption
     {
@@ -923,15 +928,15 @@ async fn create_session(
             .insert(session_id.to_string(), session_enc);
     }
 
-    info!(%session_id, "session created with AES key (unencrypted)");
+    info!(%session_id, runner_id = request.runner_id, encrypted, "session created with AES key");
 
-    Json(json!({
+    Ok(Json(json!({
         "sessionId": session_id.to_string(),
         "encryptionKey": {
             "value": key_b64,
-            "encrypted": false
+            "encrypted": encrypted
         }
-    }))
+    })))
 }
 
 async fn create_session_disttask(
@@ -954,7 +959,7 @@ async fn create_session_disttask(
         State(shared),
         Json(RunnerSessionRequest { runner_id, name }),
     )
-    .await;
+    .await?;
     let session_id = response["sessionId"]
         .as_str()
         .unwrap_or_default()
@@ -2175,6 +2180,29 @@ fn svc(name: &str, id: &str, location: &str) -> serde_json::Value {
     })
 }
 
+fn rsa_public_key_xml_from_value(value: &serde_json::Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        return Some(text.to_owned());
+    }
+    let modulus = value.get("modulus").and_then(|v| v.as_str())?;
+    let exponent = value.get("exponent").and_then(|v| v.as_str())?;
+    Some(format!(
+        "<RSAKeyValue><Modulus>{modulus}</Modulus><Exponent>{exponent}</Exponent></RSAKeyValue>"
+    ))
+}
+
+fn task_agent_public_key(request: &serde_json::Value) -> Option<String> {
+    request
+        .get("authorization")
+        .and_then(|authorization| authorization.get("publicKey"))
+        .and_then(rsa_public_key_xml_from_value)
+        .or_else(|| {
+            request
+                .get("publicKey")
+                .and_then(rsa_public_key_xml_from_value)
+        })
+}
+
 /// GET /_apis/v1/Agent/:pool_id — look up runner by agentName query param.
 /// Returns 200 with the agent if found, or 200 with an empty array if not found.
 /// The runner treats a non-empty result as "agent exists" and empty as "needs registration".
@@ -2249,10 +2277,7 @@ async fn register_runner_compat(
         name: name.clone(),
         labels,
         ephemeral,
-        public_key: request
-            .get("publicKey")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned),
+        public_key: task_agent_public_key(&request),
     };
     let result = register_runner(State(shared), Json(reg_request)).await?;
     Ok(Json(json!({
@@ -2311,7 +2336,7 @@ async fn create_session_compat(
         State(shared),
         Json(RunnerSessionRequest { runner_id, name }),
     )
-    .await;
+    .await?;
     Ok(result)
 }
 
@@ -3748,10 +3773,92 @@ jobs:
         .await;
         let key_b64 = session["encryptionKey"]["value"].as_str().unwrap();
         let encrypted = session["encryptionKey"]["encrypted"].as_bool().unwrap();
-        assert!(!encrypted, "session key should be sent unencrypted for now");
+        assert!(encrypted, "session key should be RSA wrapped");
+        let wrapped_key =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, key_b64).unwrap();
+        let key_bytes = runner_keypair.unwrap_key(&wrapped_key).unwrap();
+        assert_eq!(key_bytes.len(), 32, "AES-256 key should be 32 bytes");
+    }
+
+    #[tokio::test]
+    async fn session_key_falls_back_to_plaintext_without_registered_public_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+
+        let runner = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runners",
+            json!({
+                "name": "local",
+                "labels": ["self-hosted"]
+            }),
+        )
+        .await;
+        let runner_id = runner["id"].as_i64().unwrap();
+
+        let session = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runners/sessions",
+            json!({"runner_id": runner_id, "name": "local"}),
+        )
+        .await;
+        let key_b64 = session["encryptionKey"]["value"].as_str().unwrap();
+        let encrypted = session["encryptionKey"]["encrypted"].as_bool().unwrap();
+        assert!(
+            !encrypted,
+            "session key should remain plaintext only when the runner registered no key"
+        );
         let key_bytes =
             base64::Engine::decode(&base64::engine::general_purpose::STANDARD, key_b64).unwrap();
         assert_eq!(key_bytes.len(), 32, "AES-256 key should be 32 bytes");
+    }
+
+    #[tokio::test]
+    async fn task_agent_registration_extracts_nested_public_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let runner_keypair = AgentRsaKeypair::generate().unwrap();
+        let public_xml = runner_keypair.public_key_xml();
+        let modulus = public_xml
+            .split("<Modulus>")
+            .nth(1)
+            .unwrap()
+            .split("</Modulus>")
+            .next()
+            .unwrap();
+        let exponent = public_xml
+            .split("<Exponent>")
+            .nth(1)
+            .unwrap()
+            .split("</Exponent>")
+            .next()
+            .unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let runner = request_json(
+            &app,
+            Method::POST,
+            "/runner/server/_apis/distributedtask/pools/1/agents",
+            json!({
+                "name": "local",
+                "labels": [{"name": "self-hosted", "type": "system"}],
+                "authorization": {
+                    "publicKey": {
+                        "modulus": modulus,
+                        "exponent": exponent
+                    }
+                }
+            }),
+        )
+        .await;
+        let runner_id = runner["id"].as_i64().unwrap();
+        let inner = state.inner.lock().await;
+        assert!(inner.runner_rsa_public_keys.contains_key(&runner_id));
     }
 
     #[tokio::test]
