@@ -5,6 +5,8 @@ unset GITHUB_TOKEN 2>/dev/null || true
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MITM_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 CACHE="$MITM_DIR/.cache"
+MITM_PORT="${MITM_PORT:-8080}"
+MITM_URL="http://127.0.0.1:$MITM_PORT"
 
 usage() {
     echo "Usage: $0 --backend {official|runner-server|aksh} --scenario <name> [--non-interactive]" >&2
@@ -37,15 +39,21 @@ echo "capture dir: $CAPTURE_DIR"
 
 
 # Port conflict detection.
-if lsof -ti:8080 &>/dev/null; then
-    echo "port 8080 (mitmproxy) is already in use — stop it first or kill the process" >&2
+if lsof -ti:$MITM_PORT &>/dev/null; then
+    echo "port $MITM_PORT (mitmproxy) is already in use — stop it first or choose another MITM_PORT" >&2
     exit 2
 fi
-if [ "$BACKEND" = "aksh" ] && lsof -ti:9090 &>/dev/null; then
-    echo "port 9090 (aksh) is already in use — run bin/down-aksh.sh first" >&2
-    exit 2
+if [ "$BACKEND" = "aksh" ]; then
+    AKSH_BASE_URL="${AKSH_URL:-http://127.0.0.1:9090}"
+    if ! curl -fsS "$AKSH_BASE_URL/healthz" >/dev/null 2>&1; then
+        echo "aksh backend requires a running aksh on $AKSH_BASE_URL — run bin/up-aksh.sh first or set AKSH_URL" >&2
+        exit 2
+    fi
+    echo "$AKSH_BASE_URL/runner/server" > "$CACHE/aksh.url"
+    echo "ThisIsIgnored" > "$CACHE/aksh.token"
 fi
 STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+RUNNER_NAME="mitm-$BACKEND-$SCENARIO-$TIMESTAMP"
 
 # Start mitmdump.
 echo "starting mitmdump..."
@@ -53,7 +61,7 @@ CONFDIR="$CACHE/mitmproxy"
 mkdir -p "$CONFDIR"
 mitmdump \
     --listen-host 127.0.0.1 \
-    --listen-port 8080 \
+    --listen-port "$MITM_PORT" \
     --set confdir="$CONFDIR" \
     -s "$MITM_DIR/addons/capture.py" \
     --save-stream-file "$CAPTURE_DIR/flows.mitm" &
@@ -63,7 +71,7 @@ echo "$MITM_PID" > "$CAPTURE_DIR/mitmdump.pid"
 # Wait for mitmproxy.
 echo "waiting for mitmproxy..."
 for i in $(seq 1 30); do
-    if nc -z 127.0.0.1 8080 2>/dev/null; then
+    if nc -z 127.0.0.1 "$MITM_PORT" 2>/dev/null; then
         break
     fi
     if [ "$i" -eq 30 ]; then
@@ -94,12 +102,19 @@ setup_runner() {
 
     cd "$RUNNER_DIR"
 
+    if [ -f .runner ]; then
+        echo "removing existing runner configuration..."
+        ./config.sh remove --unattended --token "$config_token" >/dev/null 2>&1 || {
+            rm -f .runner .credentials .credentials_rsaparams
+        }
+    fi
+
     # Write .env for run.sh (sourced by env.sh at runner startup).
     cat > .env <<ENVEOF
-https_proxy=http://127.0.0.1:8080
-HTTPS_PROXY=http://127.0.0.1:8080
-http_proxy=http://127.0.0.1:8080
-HTTP_PROXY=http://127.0.0.1:8080
+https_proxy=$MITM_URL
+HTTPS_PROXY=$MITM_URL
+http_proxy=$MITM_URL
+HTTP_PROXY=$MITM_URL
 no_proxy=
 NO_PROXY=
 GITHUB_ACTIONS_RUNNER_TLS_NO_VERIFY=1
@@ -107,8 +122,8 @@ NODE_EXTRA_CA_CERTS=$MITM_DIR/.cache/mitmproxy/mitmproxy-ca-cert.pem
 SSL_CERT_FILE=$MITM_DIR/.cache/mitmproxy/mitmproxy-ca-cert.pem
 ENVEOF
 
-    export https_proxy=http://127.0.0.1:8080 HTTPS_PROXY=http://127.0.0.1:8080
-    export http_proxy=http://127.0.0.1:8080  HTTP_PROXY=http://127.0.0.1:8080
+    export https_proxy="$MITM_URL" HTTPS_PROXY="$MITM_URL"
+    export http_proxy="$MITM_URL"  HTTP_PROXY="$MITM_URL"
     export no_proxy= NO_PROXY=
     export GITHUB_ACTIONS_RUNNER_TLS_NO_VERIFY=1
 
@@ -131,19 +146,19 @@ if [ "$BACKEND" = "official" ]; then
     : "${GITHUB_REPO:?must set GITHUB_REPO}"
     : "${GITHUB_REF:?must set GITHUB_REF}"
     : "${GITHUB_RUNNER_TOKEN:?must set GITHUB_RUNNER_TOKEN}"
-    if ! setup_runner "https://github.com/$GITHUB_OWNER/$GITHUB_REPO" "$GITHUB_RUNNER_TOKEN" "mitm-official"; then
+    if ! setup_runner "https://github.com/$GITHUB_OWNER/$GITHUB_REPO" "$GITHUB_RUNNER_TOKEN" "$RUNNER_NAME"; then
         STATUS="config_failed"
     fi
 elif [ "$BACKEND" = "runner-server" ]; then
     RS_URL=$(cat "$CACHE/runner-server.url")
     RS_TOKEN=$(cat "$CACHE/runner-server.token")
-    if ! setup_runner "$RS_URL" "$RS_TOKEN" "mitm-runner-server"; then
+    if ! setup_runner "$RS_URL" "$RS_TOKEN" "$RUNNER_NAME"; then
         STATUS="config_failed"
     fi
 elif [ "$BACKEND" = "aksh" ]; then
     AKSH_URL=$(cat "$CACHE/aksh.url")
     AKSH_TOKEN=$(cat "$CACHE/aksh.token")
-    if ! setup_runner "$AKSH_URL" "$AKSH_TOKEN" "mitm-aksh"; then
+    if ! setup_runner "$AKSH_URL" "$AKSH_TOKEN" "$RUNNER_NAME"; then
         STATUS="config_failed"
     fi
 else
@@ -199,7 +214,11 @@ kill -INT "$MITM_PID" 2>/dev/null || true
 wait "$MITM_PID" 2>/dev/null || true
 
 ENDED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-FLOW_COUNT=$(wc -l < "$CAPTURE_DIR/flows.jsonl" 2>/dev/null || echo 0)
+if [ -f "$CAPTURE_DIR/flows.jsonl" ]; then
+    FLOW_COUNT=$(wc -l < "$CAPTURE_DIR/flows.jsonl")
+else
+    FLOW_COUNT=0
+fi
 
 cat > "$CAPTURE_DIR/summary.json" <<JSONEND
 {

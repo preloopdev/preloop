@@ -52,14 +52,16 @@ for sc in $SCENARIOS; do
     if "$SCRIPT_DIR/record.sh" --backend official --scenario "$sc" --non-interactive; then
         # Copy the latest capture to golden.
         LATEST="$MITM_DIR/captures/official/$sc/latest"
-        if [ -d "$LATEST" ]; then
+        STATUS="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("status",""))' "$LATEST/summary.json" 2>/dev/null || true)"
+        FLOWS_COUNT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("flows_count",0))' "$LATEST/summary.json" 2>/dev/null || echo 0)"
+        if [ -d "$LATEST" ] && [ "$STATUS" = "ok" ] && [ "$FLOWS_COUNT" -gt 0 ]; then
             DEST="$GOLDEN_DIR/$sc"
             rm -rf "$DEST"
             cp -r "$LATEST" "$DEST"
             echo "golden saved: $DEST"
             PASS=$((PASS + 1))
         else
-            echo "WARNING: no capture found for $sc" >&2
+            echo "WARNING: capture for $sc was not usable (status=$STATUS, flows=$FLOWS_COUNT)" >&2
             FAIL=$((FAIL + 1))
         fi
     else
