@@ -34,7 +34,7 @@ script that asks the question, and conformance checks whether aksh gives the sam
 
 ## Implemented scenario definitions
 
-The scenario definitions live in `../mitm-proxy/experiments/mitm/scenarios/`. Each new scenario uses
+The scenario definitions live in `experiments/mitm/scenarios/`. Each new scenario uses
 a unique workflow fixture basename matching the directory name because the official backend runs
 `gh workflow run <basename>`.
 
@@ -57,8 +57,8 @@ a unique workflow fixture basename matching the directory name because the offic
 
 For each scenario `NN-name`:
 
-- `../mitm-proxy/experiments/mitm/scenarios/NN-name/scenario.toml`
-- `../mitm-proxy/experiments/mitm/scenarios/NN-name/NN-name.yml`
+- `experiments/mitm/scenarios/NN-name/scenario.toml`
+- `experiments/mitm/scenarios/NN-name/NN-name.yml`
 
 `13-composite-action` also includes `actions/greet/action.yml` as the helper composite-action
 fixture to copy into the recording repository at `.github/actions/greet/action.yml` before official
@@ -83,7 +83,7 @@ export GITHUB_RUNNER_TOKEN=...
 Record a scenario with the MITM tooling:
 
 ```sh
-cd ../mitm-proxy/experiments/mitm
+cd experiments/mitm
 bin/record-golden.sh --scenario 06-multi-step --non-interactive
 ```
 
@@ -102,7 +102,7 @@ Repeat for `06-multi-step` through `15-oidc-id-token`. Defer `16-container-job` 
 Start aksh, then replay all imported goldens:
 
 ```sh
-../mitm-proxy/experiments/mitm/bin/up-aksh.sh
+experiments/mitm/bin/up-aksh.sh
 cargo run -p runner-watch -- conform --runner v2.335.1 --aksh-url http://127.0.0.1:9090
 ```
 
