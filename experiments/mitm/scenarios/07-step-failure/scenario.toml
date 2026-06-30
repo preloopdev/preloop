@@ -1,0 +1,16 @@
+description = "Submit a workflow with a failing step and conditional failure/success follow-up steps."
+duration_seconds_max = 300
+
+[[steps]]
+kind = "submit_workflow"
+path = "07-step-failure.yml"
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_assigned"
+timeout = 120
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_completed"
+timeout = 240
