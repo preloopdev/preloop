@@ -2,6 +2,8 @@
 /.preloop/
 /.runner-watch/repos/
 /.runner-watch/**/*.pid
+/.runner-watch/golden/
+/.runner-watch/conformance/
 *.db
 *.sqlite
 *.log
@@ -10,4 +12,5 @@
 experiments/mitm/.cache/
 experiments/mitm/captures/
 experiments/mitm/reports/
+experiments/mitm/golden/
 __pycache__/
