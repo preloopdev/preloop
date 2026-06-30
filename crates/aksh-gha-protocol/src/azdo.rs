@@ -627,6 +627,17 @@ pub struct TimelineRecord {
     pub error_count: Option<i32>,
     #[serde(rename = "warningCount", skip_serializing_if = "Option::is_none")]
     pub warning_count: Option<i32>,
+    #[serde(rename = "isBackground", skip_serializing_if = "Option::is_none")]
+    pub is_background: Option<bool>,
+    #[serde(
+        rename = "backgroundControlType",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub background_control_type: Option<String>,
+    #[serde(rename = "backgroundControlStepIds", default)]
+    pub background_control_step_ids: Vec<uuid::Uuid>,
+    #[serde(rename = "parallelGroupId", skip_serializing_if = "Option::is_none")]
+    pub parallel_group_id: Option<String>,
     #[serde(rename = "steps", default)]
     pub steps: Vec<TimelineRecord>,
 }
@@ -1049,11 +1060,39 @@ mod tests {
             worker_name: None,
             error_count: None,
             warning_count: None,
+            is_background: None,
+            background_control_type: None,
+            background_control_step_ids: vec![],
+            parallel_group_id: None,
             steps: vec![],
         };
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains("\"state\":\"inProgress\""));
         assert!(json.contains("\"type\":\"job\""));
+    }
+
+    #[test]
+    fn timeline_record_background_fields_roundtrip() {
+        let step_id = uuid::Uuid::new_v4();
+        let record: TimelineRecord = serde_json::from_value(serde_json::json!({
+            "id": uuid::Uuid::nil(),
+            "isBackground": true,
+            "backgroundControlType": "wait",
+            "backgroundControlStepIds": [step_id],
+            "parallelGroupId": "group-1"
+        }))
+        .unwrap();
+
+        assert_eq!(record.is_background, Some(true));
+        assert_eq!(record.background_control_type.as_deref(), Some("wait"));
+        assert_eq!(record.background_control_step_ids, vec![step_id]);
+        assert_eq!(record.parallel_group_id.as_deref(), Some("group-1"));
+
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains("\"isBackground\":true"));
+        assert!(json.contains("\"backgroundControlType\":\"wait\""));
+        assert!(json.contains("\"backgroundControlStepIds\""));
+        assert!(json.contains("\"parallelGroupId\":\"group-1\""));
     }
 
     #[test]
