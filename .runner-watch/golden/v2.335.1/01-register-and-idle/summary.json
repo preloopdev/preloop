@@ -1,0 +1,12 @@
+{
+  "backend": "official",
+  "scenario": "01-register-and-idle",
+  "started_at": "2026-06-29T13:43:03Z",
+  "ended_at": "2026-06-29T13:44:45Z",
+  "status": "ok",
+  "runner_exit_code": 143,
+  "flows_count":       68,
+  "runner_version": "2.335.1",
+  "runner_server_ref": "992ccbbbf9afcde477c38c316e053b1af457ad40",
+  "mitmproxy_version": "Mitmproxy: 12.2.3"
+}
