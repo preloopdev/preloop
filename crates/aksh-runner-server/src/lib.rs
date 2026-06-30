@@ -3802,6 +3802,326 @@ jobs:
     }
 
     #[tokio::test]
+    async fn scenario_06_multi_step_dispatches_all_steps() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+name: mitm multi step
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: [self-hosted, mitm]
+    steps:
+      - run: echo first
+      - run: echo "VAL=$VAL"
+        env:
+          VAL: hello
+      - run: |
+          echo line1
+          echo line2
+"#,
+                "event": "workflow_dispatch",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        let scripts = {
+            let inner = state.inner.lock().await;
+            let queued = inner.queue.front().expect("build job should be queued");
+            queued
+                .message
+                .steps
+                .iter()
+                .filter_map(|step| step.script.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(scripts.len(), 3);
+        assert!(scripts.contains(&"echo first".to_owned()));
+        assert!(scripts.contains(&"echo \"VAL=$VAL\"".to_owned()));
+        assert!(scripts
+            .iter()
+            .any(|script| script.contains("echo line1") && script.contains("echo line2")));
+
+        let message = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/v1/Message/1?sessionId=default",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            message["messageType"],
+            azdo::message_type::PIPELINE_AGENT_JOB_REQUEST
+        );
+
+        request_json(
+            &app,
+            Method::POST,
+            "/api/v1/jobs/complete",
+            json!({
+                "run_id": run_id,
+                "job_id": "build",
+                "status": "success"
+            }),
+        )
+        .await;
+
+        let inner = state.inner.lock().await;
+        let run = inner.runs.get(&run_id).unwrap();
+        assert_eq!(run.status, ExecutionStatus::Success);
+        assert_eq!(
+            run.jobs.get(&JobId("build".to_owned())),
+            Some(&ExecutionStatus::Success)
+        );
+    }
+
+    #[tokio::test]
+    async fn scenario_07_step_failure_summarizes_run_failed() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+name: mitm step failure
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: [self-hosted, mitm]
+    steps:
+      - run: exit 1
+      - run: echo ran-on-failure
+        if: failure()
+      - run: echo never
+        if: success()
+"#,
+                "event": "workflow_dispatch",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        let message = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/v1/Message/1?sessionId=default",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            message["messageType"],
+            azdo::message_type::PIPELINE_AGENT_JOB_REQUEST
+        );
+
+        request_json(
+            &app,
+            Method::POST,
+            "/api/v1/jobs/complete",
+            json!({
+                "run_id": run_id,
+                "job_id": "build",
+                "status": "failure"
+            }),
+        )
+        .await;
+
+        let inner = state.inner.lock().await;
+        let run = inner.runs.get(&run_id).unwrap();
+        assert_eq!(run.status, ExecutionStatus::Failure);
+        assert_eq!(
+            run.jobs.get(&JobId("build".to_owned())),
+            Some(&ExecutionStatus::Failure)
+        );
+    }
+
+    #[tokio::test]
+    async fn scenario_08_consumer_sees_producer_outputs() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+name: mitm job outputs
+on: workflow_dispatch
+jobs:
+  producer:
+    runs-on: [self-hosted, mitm]
+    outputs:
+      value: ${{ steps.gen.outputs.value }}
+    steps:
+      - id: gen
+        run: echo "value=42" >> "$GITHUB_OUTPUT"
+  consumer:
+    needs: producer
+    runs-on: [self-hosted, mitm]
+    steps:
+      - run: echo "got ${{ needs.producer.outputs.value }}"
+"#,
+                "event": "workflow_dispatch",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        request_json(
+            &app,
+            Method::POST,
+            "/api/v1/jobs/complete",
+            json!({
+                "run_id": run_id,
+                "job_id": "producer",
+                "status": "success",
+                "outputs": {"value": "42"}
+            }),
+        )
+        .await;
+
+        let inner = state.inner.lock().await;
+        let consumer = inner
+            .queue
+            .iter()
+            .find(|job| job.job_id.0 == "consumer")
+            .expect("consumer job should be promoted");
+        let azdo::PipelineContextData::Dict(needs) =
+            consumer.message.context_data.get("needs").unwrap()
+        else {
+            panic!("needs context should be a dict");
+        };
+        let azdo::PipelineContextData::Dict(producer) = needs.get("producer").unwrap() else {
+            panic!("producer needs entry should be a dict");
+        };
+        let azdo::PipelineContextData::Dict(outputs) = producer.get("outputs").unwrap() else {
+            panic!("producer outputs should be a dict");
+        };
+        assert!(matches!(
+            outputs.get("value"),
+            Some(azdo::PipelineContextData::String(value)) if value == "42"
+        ));
+    }
+
+    #[tokio::test]
+    async fn scenario_09_matrix_fail_fast_cancels_siblings() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+name: mitm matrix
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: [self-hosted, mitm]
+    strategy:
+      fail-fast: true
+      matrix:
+        n: [1, 2, 3]
+    steps:
+      - run: |
+          if [ "${{ matrix.n }}" = "1" ]; then exit 1; fi
+          sleep 20
+"#,
+                "event": "workflow_dispatch",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        for index in 0..3 {
+            let session_id = format!("matrix-{index}");
+            let message = request_json(
+                &app,
+                Method::GET,
+                &format!("/runner/server/_apis/v1/Message/1?sessionId={session_id}"),
+                Value::Null,
+            )
+            .await;
+            assert_eq!(
+                message["messageType"],
+                azdo::message_type::PIPELINE_AGENT_JOB_REQUEST
+            );
+            let message_id = message["messageId"].as_i64().unwrap();
+            let ack = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::DELETE)
+                        .uri(format!(
+                            "/runner/server/_apis/v1/Message/1/{message_id}?sessionId={session_id}"
+                        ))
+                        .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(ack.status(), StatusCode::NO_CONTENT);
+        }
+
+        let failing_job = {
+            let inner = state.inner.lock().await;
+            inner
+                .runs
+                .get(&run_id)
+                .unwrap()
+                .jobs
+                .iter()
+                .find_map(|(job_id, status)| {
+                    (*status == ExecutionStatus::InProgress).then(|| job_id.clone())
+                })
+                .expect("a matrix sibling should be in progress")
+        };
+
+        request_json(
+            &app,
+            Method::POST,
+            "/api/v1/jobs/complete",
+            json!({
+                "run_id": run_id,
+                "job_id": failing_job,
+                "status": "failure"
+            }),
+        )
+        .await;
+
+        let inner = state.inner.lock().await;
+        assert_eq!(inner.cancellation_queue.len(), 2);
+        let run = inner.runs.get(&run_id).unwrap();
+        for (job_id, status) in &run.jobs {
+            if job_id == &failing_job {
+                assert_eq!(*status, ExecutionStatus::Failure);
+            } else {
+                assert_eq!(*status, ExecutionStatus::Cancelled);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn timeline_patch_projects_annotations_to_run_events() {
         let temp = tempfile::tempdir().unwrap();
         let app = app(
@@ -4561,6 +4881,32 @@ jobs:
         assert_eq!(claims["aud"], "api://custom");
         assert_eq!(claims["job_id"], "job-1");
         assert_eq!(claims["plan_id"], "plan-1");
+    }
+
+    #[tokio::test]
+    async fn scenario_15_oidc_token_carries_requested_audience() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+
+        let token = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/distributedtask/hubs/actions/plans/plan-15/jobs/job-15/oidctoken?audience=api://aksh",
+            Value::Null,
+        )
+        .await;
+        let jwt = token["value"].as_str().unwrap();
+        let parts: Vec<&str> = jwt.split('.').collect();
+        assert_eq!(parts.len(), 3);
+        let claims = URL_SAFE_NO_PAD.decode(parts[1]).unwrap();
+        let claims: Value = serde_json::from_slice(&claims).unwrap();
+
+        assert_eq!(claims["aud"], "api://aksh");
+        assert_eq!(claims["job_id"], "job-15");
+        assert_eq!(claims["plan_id"], "plan-15");
     }
 
     #[tokio::test]
