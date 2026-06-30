@@ -4096,6 +4096,178 @@ jobs:
     }
 
     #[tokio::test]
+    async fn current_runner_registration_to_broker_job_e2e() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state, CancellationToken::new());
+        let runner_keypair = AgentRsaKeypair::generate().unwrap();
+        let public_xml = runner_keypair.public_key_xml();
+        let modulus = public_xml
+            .split("<Modulus>")
+            .nth(1)
+            .unwrap()
+            .split("</Modulus>")
+            .next()
+            .unwrap();
+        let exponent = public_xml
+            .split("<Exponent>")
+            .nth(1)
+            .unwrap()
+            .split("</Exponent>")
+            .next()
+            .unwrap();
+
+        let registration_auth = request_json(
+            &app,
+            Method::POST,
+            "/api/v3/actions/runner-registration",
+            json!({"url": "https://github.com/preloopdev/aksh", "runner_event": "register"}),
+        )
+        .await;
+        assert_eq!(
+            registration_auth["url"],
+            "http://127.0.0.1:9090/runner/server"
+        );
+
+        let connection = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/connectionData?connectOptions=1&lastChangeId=-1&lastChangeId64=-1",
+            Value::Null,
+        )
+        .await;
+        assert!(connection["locationServiceData"]["serviceDefinitions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|service| service["displayName"] == "brokerlistener"));
+
+        let agent = request_json(
+            &app,
+            Method::POST,
+            "/runner/server/_apis/distributedtask/pools/1/agents",
+            json!({
+                "name": "runner-1",
+                "version": "2.335.1",
+                "osDescription": "Darwin local",
+                "labels": [
+                    {"name": "self-hosted", "type": "system"},
+                    {"name": "macOS", "type": "system"},
+                    {"name": "ARM64", "type": "system"}
+                ],
+                "authorization": {
+                    "publicKey": {
+                        "modulus": modulus,
+                        "exponent": exponent
+                    }
+                }
+            }),
+        )
+        .await;
+        let runner_id = agent["id"].as_i64().unwrap();
+        assert_eq!(agent["properties"]["UseV2Flow"]["$value"], true);
+        assert_eq!(
+            agent["properties"]["ServerUrlV2"]["$value"],
+            "http://127.0.0.1:9090/runner/server"
+        );
+
+        let oauth = request_json(
+            &app,
+            Method::POST,
+            "/runner/server/_apis/v1/oauth2/token",
+            json!({"grant_type":"client_credentials","client_id":"t","client_secret":"t"}),
+        )
+        .await;
+        assert_eq!(oauth["token_type"], "JWT");
+
+        let session = request_json(
+            &app,
+            Method::POST,
+            "/runner/server/_apis/distributedtask/pools/1/sessions",
+            json!({
+                "agent": {"id": runner_id, "name": "runner-1", "version": "2.335.1"},
+                "ownerName": "local current runner",
+                "sessionId": "00000000-0000-0000-0000-000000000000",
+                "useFipsEncryption": false
+            }),
+        )
+        .await;
+        let session_id = session["sessionId"].as_str().unwrap();
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo current\n",
+                "event": "push",
+                "payload": {"ref": "refs/heads/main", "commits": []},
+                "repository": "preloopdev/aksh",
+                "git_ref": "refs/heads/main",
+                "secrets": {},
+                "vars": {},
+                "reusable_workflows": {}
+            }),
+        )
+        .await;
+        assert_eq!(accepted["queued_jobs"], 1);
+
+        let broker_ref = request_json(
+            &app,
+            Method::GET,
+            &format!("/runner/server/_apis/distributedtask/pools/1/messages?sessionId={session_id}&status=Online&runnerVersion=2.335.1&os=macOS&architecture=ARM64&waitSeconds=0"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(broker_ref["messageType"], "RunnerJobRequest");
+        let body: Value = serde_json::from_str(broker_ref["body"].as_str().unwrap()).unwrap();
+        assert_eq!(body["should_acknowledge"], true);
+        let runner_request_id = body["runner_request_id"].as_str().unwrap();
+
+        let acquired = request_json(
+            &app,
+            Method::POST,
+            &format!("/broker/{runner_id}/acquirejob"),
+            json!({"jobMessageId": runner_request_id, "billingOwnerId": "local", "runnerOS": "macOS"}),
+        )
+        .await;
+        assert_eq!(acquired["requestId"], 1);
+        assert!(acquired["contextData"]["github"].is_object());
+        assert!(
+            acquired["steps"].as_array().unwrap().iter().any(|step| {
+                step["inputs"]["script"].as_str() == Some("echo current")
+                    || step["inputs"]["script"]["expr"].as_str() == Some("echo current")
+                    || step["inputs"]["map"].as_array().is_some_and(|entries| {
+                        entries.iter().any(|entry| {
+                            entry["key"].as_str() == Some("script")
+                                && entry["value"].as_str() == Some("echo current")
+                        })
+                    })
+            }),
+            "steps={}",
+            acquired["steps"]
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/broker/{runner_id}/completejob"))
+                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"jobId": runner_request_id, "planId": acquired["plan"]["planId"]})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
     async fn current_service_broker_flow_uses_queued_job() {
         let temp = tempfile::tempdir().unwrap();
         let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
