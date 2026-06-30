@@ -3421,6 +3421,77 @@ jobs:
     }
 
     #[tokio::test]
+    async fn unacked_messages_are_scoped_to_their_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let workflow = json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo"
+        });
+        request_json(&app, Method::POST, "/api/v1/runs", workflow.clone()).await;
+        request_json(&app, Method::POST, "/api/v1/runs", workflow).await;
+
+        let first = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/v1/Message/1?sessionId=s1&waitSeconds=0",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            first["messageType"],
+            azdo::message_type::PIPELINE_AGENT_JOB_REQUEST
+        );
+        let first_message_id = first["messageId"].as_i64().unwrap();
+
+        let second = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/v1/Message/1?sessionId=s2&waitSeconds=0",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            second["messageType"],
+            azdo::message_type::PIPELINE_AGENT_JOB_REQUEST
+        );
+        let second_message_id = second["messageId"].as_i64().unwrap();
+        assert_ne!(first_message_id, second_message_id);
+
+        // ACKing s1's message through s2 must not remove it from s1. The next
+        // s1 poll should redeliver the same unacked message, not s2's message.
+        request_json(
+            &app,
+            Method::DELETE,
+            &format!("/runner/server/_apis/v1/Message/1/{first_message_id}?sessionId=s2"),
+            Value::Null,
+        )
+        .await;
+
+        let redelivered = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/v1/Message/1?sessionId=s1&waitSeconds=0",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(redelivered["messageId"], first_message_id);
+
+        let inner = state.inner.lock().await;
+        assert!(inner
+            .inflight_messages
+            .get("s1")
+            .is_some_and(|messages| messages.contains_key(&first_message_id)));
+        assert!(inner
+            .inflight_messages
+            .get("s2")
+            .is_some_and(|messages| messages.contains_key(&second_message_id)));
+    }
+
+    #[tokio::test]
     async fn finish_job_resolves_plan_timeline_and_agent_job_ids() {
         let temp = tempfile::tempdir().unwrap();
         let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
