@@ -8,6 +8,7 @@ members = [
     "crates/aksh-gha-protocol",
     "crates/aksh-runner-client",
     "crates/aksh-runner-server",
+    "crates/runner-watch",
 ]
 resolver = "2"
 
@@ -53,3 +54,4 @@ cbc = { version = "0.1", features = ["block-padding"] }
 cipher = { version = "0.4", features = ["block-padding", "alloc"] }
 rsa = "0.9"
 walkdir = "2.5"
+toml = "0.8"
