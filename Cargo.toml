@@ -55,3 +55,5 @@ cipher = { version = "0.4", features = ["block-padding", "alloc"] }
 rsa = "0.9"
 walkdir = "2.5"
 toml = "0.8"
+regex = "1.10"
+similar = "2.5"
