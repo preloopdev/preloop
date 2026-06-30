@@ -51,268 +51,146 @@ runner.server reference: `ChristopherHX/runner.server` v3.14.0 (commit `06964614
 
 ---
 
-## 1. TL;DR scorecard
+## 1. Current fidelity scorecard
 
-**As of 2026-06-26, this is achieved.** The official `actions/runner` v2.322.0 successfully
-configures against aksh, creates encrypted sessions, receives job messages, executes jobs,
-and reports completion. The full control plane protocol is working end-to-end.
+**Evidence basis (latest):** fresh official `actions/runner` v2.335.1 MITM capture for
+`01-register-and-idle`, recorded 2026-06-29 from GitHub's real service and replayed against
+aksh via runner-watch.
 
-**As of 2026-06-26, this is achieved.** The official `actions/runner` v2.322.0 successfully
-configures against aksh, creates encrypted sessions, receives job messages, executes jobs,
-and reports completion. The full control plane protocol is working end-to-end.
+- Raw official capture: `../mitm-proxy/experiments/mitm/captures/official/01-register-and-idle/latest/summary.json`
+  - `status = ok`
+  - `runner_version = 2.335.1`
+  - `flows_count = 68`
+- Filtered/mapped control-plane replay: `.runner-watch/conformance/v2.335.1/01-register-and-idle.md`
+  - official baseline: 56 replayed flows
+  - aksh capture: 56 responses captured
+  - result: **failed comparison**
 
-Rough completeness against "100% faithful control plane": **~70–75%.**
-**Note**: The scorecard below reflects aksh's state against v2.322.0. The deep diff in §1a
-documents what v2.335.1 (latest) requires that is not yet implemented. Runner versions
-v2.329.0+ are **enforced minimum** by GitHub since March 2026.
+The old v2.322.0 local-runner lifecycle still demonstrates that aksh can run jobs in the
+legacy/local flow. It is no longer enough to claim current-runner fidelity: v2.335.1 uses
+additional broker, OAuth, registration, and results-service surfaces.
 
-Rough completeness against "100% faithful control plane (v2.335.1)": **~55–60%** (was ~70–75%
-against v2.322.0; the gap widened because upstream added background steps, DAP debugger, and
-admin flow features).
+Rough completeness against "100% faithful control plane (v2.335.1)": **~65–70%**.
+The latest runner-watch replay now proves route coverage and status-code parity for every
+comparable request in the `01-register-and-idle` current-service capture. The remaining gap
+is no longer "can the runner reach the endpoint"; it is stricter response-body fidelity,
+service-location richness, and lower-priority/currently unexercised surfaces.
 
+| Layer | Current evidence | Faithful? |
+| --- | --- | --- |
+| Workflow YAML parse + typed model | present, IndexMap preserves order | ✅ good |
+| Matrix expansion | IndexMap order, GitHub name format | ✅ good |
+| Expression engine | wired into job builder, status functions from context | ✅ good |
+| Trigger matching | branches/tags/paths/types/schedule/dispatch | ✅ good |
+| `needs` DAG scheduling | dependency-gated scheduler, outputs propagation | ✅ good |
+| `if` / contexts / outputs propagation | evaluated, needs outputs threaded | ✅ good |
+| Secrets policy / masking on the wire | `SecretString` + mask hints in wire messages | ✅ good |
+| Runner session handshake (legacy AzDO path) | AES key exchange works in local flow; RSA wrapping still TODO | ⚠️ partial |
+| Encrypted message queue (`TaskAgentMessage`) | proven for the older direct-message path; current v2.335.x mostly uses broker refs followed by broker acquire | ⚠️ compatibility path, not the primary target |
+| `AgentJobRequestMessage` | full DTO with plan, request, context, steps; reused by current broker acquire responses | ✅ good DTO; current-runner workflow E2E still needed |
+| `connectionData` / location services | v2.335.1 replay returns `200`, but aksh map is much smaller than official and lacks broker/results location fidelity | ⚠️ partial |
+| GitHub runner registration endpoint | route exists and replays as `200`, but response token/url values are local placeholders rather than official service values | ⚠️ partial |
+| OAuth token endpoint | route exists and replays as `200`, but token type/expiry/value differ from official | ⚠️ partial |
+| DistributedTask pool/agent replay | runner-watch mapping is fixed and the latest replay returns `200` for pool discovery / agent lookup / agent registration | ✅ good |
+| DistributedTask session/message replay | mapped requests now reach aksh; session status matches `201`; incomplete Busy long-polls are filtered as non-comparable capture artifacts | ⚠️ partial |
+| AgentRequest acknowledgement | endpoint exists and now returns `200` like official v2.335.1 | ✅ good |
+| Broker acquire/renew/complete | queue-backed routes pass targeted E2E; runner-watch now materializes replay state and rewrites captured broker IDs so acquire/renew/complete statuses match official | ✅ good for status/protocol flow |
+| Results-service Twirp logs/update | endpoints now return `200`; bodies intentionally contain local aksh replay URLs instead of GitHub/Azure signed blob URLs | ⚠️ partial |
+| Timeline / logs / web-console feed | AzDO timeline/log routes exist; current service path now includes Twirp results surfaces, but the response payloads are not yet faithful | ⚠️ partial |
+| Job/step completion events + annotations | AgentRequest PATCH and broker complete paths exist; annotation/body fidelity remains partial | ⚠️ partial |
+| Action download info | stub endpoint; batch/bearer modes not implemented | ⚠️ stub |
+| Cache v1 / Artifact v1 shapes | in-memory stubs | ⚠️ partial |
+| Cache v2 / Artifact v2 / blob/Twirp | absent | ❌ missing |
+| Background steps | `TimelineRecord` DTO now accepts background-step fields; control-flow behavior remains unexercised by the idle replay | ⚠️ partial |
+| DAP debugger integration | absent; non-blocking unless debugging requested | ❌ missing |
+| Runner config refresh | not exercised in this replay; support remains incomplete/untested | ⚠️ unknown/partial |
+| Server-enforced runner settings | not implemented | ❌ missing |
+| Node 20→24 migration/deprecation warnings | not implemented/surfaced | ❌ missing |
 
-| Layer                                            | State                                                     | Faithful?                                    |
-| ------------------------------------------------ | --------------------------------------------------------- | -------------------------------------------- |
-| Workflow YAML parse + typed model                | present, IndexMap preserves order                         | ✅ good                                       |
-| Matrix expansion                                 | IndexMap order, GitHub name format                        | ✅ good                                       |
-| Expression engine                                | wired into job builder, status functions from context     | ✅ good                                       |
-| Trigger matching                                 | branches/tags/paths/types/schedule/dispatch               | ✅ good                                       |
-| `needs` DAG scheduling                           | dependency-gated scheduler, outputs propagation           | ✅ good                                       |
-| `if` / contexts / outputs propagation            | evaluated, needs outputs threaded                         | ✅ good                                       |
-| Secrets policy / masking on the wire             | `SecretString` + mask hints in wire messages              | ✅ good                                       |
-| **Runner session handshake (RSA/AES)**           | AES key exchange (unencrypted for now)                    | ⚠️ working, RSA wrap TODO                     |
-| **Encrypted message queue (`TaskAgentMessage`)** | AES-encrypted body, iv, message ack                       | ✅ good                                       |
-| `**AgentJobRequestMessage**`                     | full DTO with plan, request, context, steps               | ✅ good                                       |
-| **OAuth / `connectionData` / location services** | 18 service GUIDs, GHES org-prefix routing                 | ✅ good                                       |
-| **Timeline / logs / web-console feed**           | PATCH records, create/append logs, console feed           | ⚠️ partial (worker fidelity)                  |
-| **Job/step completion events + annotations**     | AgentRequest PATCH with lockedUntil, result tracking      | ⚠️ partial (worker reports Failed)             |
-| **Action download info**                         | stub endpoint                                             | ⚠️ stub                                       |
-| Cache v1 / Artifact v1 shapes                    | in-memory stubs                                           | ⚠️ partial                                   |
-| Cache v2 / Artifact v2 (blob/twirp)              | absent                                                    | ❌ missing                                    |
-| **Background steps (concurrent execution)**      | absent                                                    | ❌ missing (new in v2.335.0)                  |
-| **DAP debugger integration**                     | absent                                                    | ❌ missing (new in v2.335.0)                  |
-| **Request acknowledgment**                       | absent                                                    | ❌ missing (new in v2.329.0)                  |
-| **V2 admin flow / Broker URL**                   | absent                                                    | ❌ missing (new in v2.329.0)                  |
-| **Runner config refresh**                        | absent                                                    | ❌ missing (new in v2.323.0)                  |
-| **Server-enforced runner settings**              | absent                                                    | ❌ missing (new in v2.323.0)                  |
-| **Node 20→24 migration / deprecation warnings**  | absent                                                    | ❌ missing (new in v2.328.0)                  |
-
-<<<<<<< HEAD
-=======
 ---
 
-## 1a. Deep source diff: runner.server v3.14.0 vs actions/runner v2.335.1
+## 1a. v2.335.1 conformance findings from the real-service replay
 
-**Methodology**: Structural diff of `Runner.Listener/`, `Runner.Worker/`, `Runner.Common/`,
-`Runner.Sdk/`, and Chris's `Runner.Server/Controllers/` against the official v2.335.1 source.
-This is a C#-to-C# diff of the shared fork base, isolating protocol-relevant divergence.
+### 1a.1 What the 56-flow replay proves
 
-### 1a.1 What official v2.335.1 has that runner.server v3.14.0 does NOT
+runner-watch successfully replayed the filtered control-plane portion of the fresh official
+v2.335.1 capture: **56 official requests were sent to aksh and 56 aksh responses were
+captured**. The replay transport worked; the comparison failed because aksh responses differ
+from official responses.
 
-These are features in the latest official runner that Chris's fork has not merged. Each one
-represents a protocol surface change aksh must eventually support.
+The 56-flow baseline is intentionally filtered/mapped from the 68-flow raw capture:
 
-#### Background Steps (v2.335.0) — NEW execution model
+- dropped: repeated readiness/health probes (`token.actions.githubusercontent.com /ready`,
+  `broker.actions.githubusercontent.com /health`, `run.actions.githubusercontent.com /health`)
+- kept: registration, connectionData, distributedtask, OAuth, AgentRequest ack, broker job
+  lifecycle, and results-service Twirp flows
 
-The official runner now supports **concurrent background steps** — steps that run in parallel
-with subsequent steps, coordinated via wait/cancel control-flow steps.
+Artifacts:
 
-**Files only in official** (absent from Chris):
-- `Runner.Worker/BackgroundStepCoordinator.cs` — coordinates concurrent step execution,
-  manages slots via `SemaphoreSlim`, handles wait-all/cancel with grace periods
-- `Runner.Worker/BackgroundStepControlFlowData.cs` — data class for control-flow step types:
-  `Wait`, `WaitAll`, `Cancel`
+- official filtered baseline: `.runner-watch/conformance/v2.335.1/01-register-and-idle/official-filtered/flows.jsonl`
+- aksh replay capture: `.runner-watch/conformance/v2.335.1/01-register-and-idle/aksh/flows.jsonl`
+- report: `.runner-watch/conformance/v2.335.1/01-register-and-idle.md`
 
-**Files modified in official** (vs Chris):
-- `Runner.Worker/StepsRunner.cs` — background steps are queued via coordinator instead of
-  run synchronously; DAP debugger hooks wrap normal steps
-- `Runner.Worker/StepsContext.cs` — **thread-safety**: official adds `lock(_lock)` around all
-  step context mutations (GetStep, SetOutput, SetConclusion, SetOutcome); Chris has no locks
-- `Runner.Worker/ExecutionContext.cs` — adds `IsBackground`, `BackgroundControlType`,
-  `BackgroundControlStepIds`, `ParallelGroupId` fields on `TimelineRecord`
-- `Runner.Worker/JobRunner.cs` — adds safety net: waits for unwaited background steps before
-  post-hooks; integrates DAP debugger
-- `Runner.Worker/JobExtension.cs` — validates `BackgroundControlTypes` (Wait/WaitAll/Cancel)
-- `Runner.Common/JobServerQueue.cs` — merges `IsBackground`, `BackgroundControlType`,
-  `BackgroundControlStepIds`, `ParallelGroupId` into timeline records on PATCH
+### 1a.2 Failures that are replay-mapping issues first
 
-**Protocol impact for aksh**: The runner sends `TimelineRecord` PATCHes with new fields:
-`isBackground`, `backgroundControlType`, `backgroundControlStepIds`, `parallelGroupId`.
-aksh's `TimelineController` must accept and store these fields. The `AgentJobRequestMessage`
-may contain steps with `background: true` and control-flow steps with `type: "wait"/"waitAll"/"cancel"`.
+These rows were replay-mapping issues first and were fixed in runner-watch. The latest replay
+now reaches aksh's compat routes and returns `200` for the pool/agent surfaces.
 
-**New SDK types** (in official, absent from Chris):
-- `Sdk/DTPipelines/Pipelines/BackgroundStepControl.cs` — `BackgroundControlTypes` constants
-- `Sdk/DTWebApi/WebApi/TimelineRecord.cs` — adds `BackgroundControlType`, `BackgroundControlStepIds`
-- `Sdk/RSWebApi/Contracts/StepResult.cs` — adds same fields
+| Flow | Official status | Latest aksh status | Current interpretation |
+| --- | ---: | ---: | --- |
+| `GET /_apis/distributedtask/pools?poolType=Automation` | 200 | 200 | replay mapping fixed; row no longer blocks aksh evaluation |
+| `GET /_apis/distributedtask/pools/{pool}/agents?agentName=...` | 200 | 200 | replay mapping fixed; route exercised successfully |
+| `POST /_apis/distributedtask/pools/{pool}/agents` | 200 | 200 | replay mapping + compat parser fixed |
 
-#### DAP Debugger (v2.335.0) — NEW debugging protocol
+### 1a.3 Mapped requests with wrong aksh behavior
 
-The official runner integrates a **Debug Adapter Protocol (DAP)** debugger for live job debugging.
+These requests are either already mapped or target an aksh route, but the status/body differs
+from official.
 
-**Files only in official** (10 files in `Runner.Worker/Dap/`):
-- `DapDebugger.cs`, `IDapDebugger.cs` — debugger lifecycle (on step start/complete, job init)
-- `DapMessages.cs` — DAP protocol message types
-- `DapReplExecutor.cs` — REPL command execution inside job containers
-- `DapReplParser.cs` — REPL output parsing
-- `DapVariableProvider.cs` — variable inspection for debugger
-- `DebuggerConfig.cs` — debugger configuration
-- `WebSocketDapBridge.cs`, `IWebSocketDapBridge.cs` — WebSocket transport for DAP
-- `JobExecutionView.cs` — job execution state model for debugger UI
+| Priority | Flow | Official | aksh | What is wrong | Next action |
+| --- | --- | ---: | ---: | --- | --- |
+| P1 | `POST /api/v3/actions/runner-registration` | 200 | 200 | response token/url values are local placeholders, not official service values. | Tighten response shape only if strict fidelity is required. |
+| P1 | `POST /_apis/v1/oauth2/token` | 200 | 200 | response token type/expiry/value differ from official (`JWT`, `2999`). | Tighten response body if strict fidelity is required. |
+| P1 | `POST /_apis/distributedtask/pools/{pool}/sessions` | 201 | 201 | mapped session creation works and status matches; body still differs from official volatile/encryption fields. | Tighten body only if strict fidelity is required. |
+| P0 | `GET /_apis/distributedtask/pools/{pool}/messages?...` | 200 / long-poll | 200 | mapped message poll now emits local `RunnerJobRequest` refs for replay-materialized jobs; Busy no-response long-polls are filtered because no official HTTP response was captured. | Treat filtered Busy long-polls as harness timing unless strict long-poll parity is required. |
+| P2 | `POST /_apis/v1/AgentRequest/{pool}/{request}` | 200 | 200 | endpoint is implemented and status now matches official. | Tighten body only if strict fidelity is required. |
+| P2 | `GET /_apis/connectionData?...` | 200 | 200 | aksh response is much smaller than official and lacks current broker/results location metadata. | Add current service locations only where the runner uses them; keep volatile fields normalized in tests. |
 
-**Protocol impact for aksh**: The runner connects to a debugger WebSocket endpoint. If aksh
-doesn't serve this, the runner simply doesn't enable debugging — **non-blocking**. But the
-feature flag `actions_runner_override_debugger_welcome_message` is checked, and the runner
-expects a `Debugger?.Enabled` flag in the job context. aksh should advertise debugger support
-as `false` to avoid the runner attempting connection.
+### 1a.4 Missing aksh surfaces proven by the replay
 
-#### Request Acknowledgment (v2.329.0) — protocol change
+These endpoint families were the remaining high-priority gaps from the replay. Broker routes
+now exist in aksh, and runner-watch materializes matching queued state plus captured-ID rewrites
+so broker status codes match official. The Twirp routes now exist and return `200`, but the
+response bodies are placeholders rather than official signed-blob payloads.
 
-The official runner now sends an explicit **acknowledgment** after receiving a job message.
+| Priority | Flow | Official | aksh | Required surface |
+| --- | --- | ---: | ---: | --- |
+| P0 | `POST /broker/{runner}/acquirejob` | 200 | 200 in replay | Queue-backed production route exists and replay state materialization now maps captured official IDs to local queued requests. |
+| P0 | `POST /broker/{runner}/renewjob` | 200 | 200 in replay | Queue-backed production route exists and replay state materialization now maps captured official IDs to local queued requests. |
+| P0 | `POST /broker/{runner}/completejob` | 204 | 204 in replay | Queue-backed production route exists and replay state materialization now maps captured official IDs to local queued requests. |
+| P1 | `POST /twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate` | 200 | 200 | Route exists now; response shape still placeholder (`{\"ok\":true}` only). |
+| P1 | `POST /twirp/results.services.receiver.Receiver/GetJobLogsSignedBlobURL` | 200 | 200 | Route exists now; returns local placeholder URL rather than official signed blob URL. |
+| P1 | `POST /twirp/results.services.receiver.Receiver/GetStepLogsSignedBlobURL` | 200 | 200 | Route exists now; returns local placeholder URL/soft limit rather than official values. |
 
-**Both repos have this** (Chris merged it) — but the behavior differs:
-- Official: `RunnerJobRequestRef.ShouldAcknowledge` is a feature-flagged field
-- Chris: same field exists, same code path
+### 1a.5 Source-diff-only gaps not exercised by `01-register-and-idle`
 
-**Protocol impact for aksh**: The runner calls `AcknowledgeRunnerRequestAsync` on the broker
-server. aksh must handle this endpoint or the runner logs a warning (best-effort, non-fatal).
-
-#### V2 Admin Flow & Broker URL (v2.329.0) — new control plane surface
-
-The official runner splits management operations into two flows:
-- `UseV2Flow` — V2 API for runner deletion/management
-- `UseRunnerAdminFlow` — separate admin flow with its own auth URLs
-
-**Both repos have the config fields** (`UseV2Flow`, `UseRunnerAdminFlow`, `ServerUrlV2` in
-`ConfigurationStore.cs`). But Chris's `ConfigurationManager.cs` **skips the connection
-validation** for `UseRunnerAdminFlow`:
-```csharp
-// Official:
-if (!runnerSettings.UseRunnerAdminFlow)
-{
-    await _runnerServer.ConnectAsync(new Uri(runnerSettings.ServerUrl), creds);
-}
-
-// Chris:
-await _runnerServer.ConnectAsync(new Uri(runnerSettings.ServerUrl), creds);
-```
-
-**Protocol impact for aksh**: When the runner is configured with `UseRunnerAdminFlow`, it
-expects `auth_url` AND `auth_url_v2` in the connection data response. It uses a separate
-`BrokerUrl` for admin operations. aksh must populate these fields in `ConnectionDataController`.
-
-#### Runner Config Refresh (v2.323.0) — backend migration protocol
-
-**Both repos have `RunnerRefreshConfigMessage`** — Chris merged this. The runner handles a
-`RunnerRefreshConfig` message type that triggers config file exchange with the control plane.
-
-**Protocol impact for aksh**: If aksh sends a `RunnerRefreshConfig` message, the runner will
-attempt to exchange `.runner` and `.credentials` files. aksh can safely ignore this for now
-(don't send the message type), but must accept it if the runner sends a refresh request.
-
-#### Server-Enforced Runner Settings (v2.323.0)
-
-The official runner accepts settings pushed by the control plane. Chris has this merged.
-
-**Protocol impact for aksh**: aksh can optionally push settings to the runner. Low priority.
-
-#### Feature Flags & Environment Variables (v2.321.0–v2.335.0)
-
-Official v2.335.1 has these feature flags absent from Chris:
-
-| Flag | Purpose | Impact on aksh |
----|---|---|
-| `RunnerVersionDeprecated` (7) | Version deprecation check | aksh should return this if runner is too old |
-| `ServiceContainerCommand` | Service container command support | Container actions may need this |
-| `SendJobLevelAnnotations` | Job-level annotation telemetry | Timeline records may include annotations |
-| `EmitCompositeMarkers` | Composite action markers | Debug/trace feature |
-| `BatchActionResolution` | Batch action download | Action download may use batch API |
-| `UseBearerTokenForCodeload` | Bearer auth for action tarballs | Action download auth change |
-| `OverrideDebuggerWelcomeMessage` | Custom debugger greeting | DAP feature |
-| `WarnOnNode20Flag` | Node 20 deprecation warning | Runner emits deprecation annotation |
-| `DeprecateLinuxArm32Flag` | ARM32 deprecation | Platform check |
-| `DisableStdoutMultilineLogPrefixing` | Log format control | Logging change |
-| `SymlinkCachedActions` | Symlink instead of copy cached actions | Performance optimization |
-
-**Environment variables only in official**:
-
-| Variable | Purpose |
----|---|
-| `ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE` | Exit code for deprecated runner |
-| `ACTIONS_RUNNER_DISABLE_STDOUT_MULTILINE_LOG_PREFIXING` | Log format |
-| `ACTIONS_RUNNER_SYMLINK_CACHED_ACTIONS` | Cache optimization |
-| `ACTIONS_RUNNER_EMIT_COMPOSITE_MARKERS` | Debug markers |
-| `GITHUB_ACTIONS_RUNNER_FORCE_EMPTY_GITHUB_URL_IS_HOSTED` | Hosted runner inference |
-| `GITHUB_ACTIONS_RUNNER_FORCE_GHES` | Force GHES mode |
-
-#### JobDispatcher Changes
-
-Official `JobDispatcher.cs` returns `TaskResult` from `RunAsync()`; Chris returns `void`.
-Official tracks job result for hosted runner telemetry (`ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED`);
-Chris strips this. The `RunOnceJobCompleted` type changed from `TaskResult` to `bool`.
-
-**Protocol impact for aksh**: None directly — this is runner-internal. But it means Chris's
-fork doesn't support the "return job result for hosted" telemetry path.
-
-### 1a.2 What runner.server v3.14.0 has that official v2.335.1 does NOT
-
-Chris's additions (not relevant to aksh's control plane protocol):
-
-| File | Purpose |
----|---|
-| `Runner.Worker/ExternalToolHelper.cs` | Chris's external tool utility |
-| `Runner.Worker/Handlers/GoActionHandler.cs` | Go action handler (Chris addition) |
-| `Runner.Sdk/GharunUtil.cs` | Chris's utility for gharun |
-
-### 1a.3 Chris's behavioral divergences from official
-
-These are places where Chris's code **differs in behavior** from the official runner,
-which may cause issues when aksh serves the official runner:
-
-1. **BrokerServer.cs**: Chris removes `VssUnauthorizedException` from the retry condition.
-   Official retries on `AccessDeniedException || VssUnauthorizedException || RunnerNotFoundException
-   || HostedRunnerDeprovisionedException`. Chris skips `VssUnauthorizedException`.
-   **Impact**: If aksh returns a 401, Chris's runner retries; official doesn't.
-
-2. **ConfigurationManager.cs**: Chris skips `UseRunnerAdminFlow` connection validation.
-   **Impact**: Chris's runner always validates connection; official skips for admin flow.
-
-3. **ConfigurationStore.cs**: Chris removes hosted-runner inference logic (checking
-   `ServerUrl`/`ServerUrlV2` against `*.actions.githubusercontent.com` etc.).
-   **Impact**: Chris's runner can't auto-detect if it's talking to GitHub-hosted infrastructure.
-
-4. **StepsContext.cs**: Chris has no thread-safety locks. Official wraps all mutations in
-   `lock(_lock)`. **Impact**: Concurrent background steps in official would race on Chris's
-   impl; irrelevant for aksh (control plane, not runner).
-
-5. **JobServerQueue.cs**: Chris adds `_webconsole_queue_all` variable controlled by
-   `system.runner.server.webconsole_queue_all`. This is a Chris-specific feature for
-   runner.server's web console. **Impact**: aksh doesn't need this.
-
-6. **Platform detection**: Chris replaces `#if OS_WINDOWS`/`#if OS_LINUX` preprocessor
-   directives with runtime `RuntimeInformation.IsOSPlatform()` checks. This makes Chris's
-   runner a single cross-platform binary instead of platform-specific builds.
-   **Impact**: None for aksh — this is runner-internal.
-
-### 1a.4 Summary: what aksh needs to implement (priority order)
+The latest replay is an idle/control-plane scenario. It does not exercise every source-diff
+finding. Keep these tracked, but do not confuse them with observed replay failures:
 
 | Priority | Change | Upstream Version | aksh Status |
----|---|---|---|
-| **P0** | Background step fields in TimelineRecord (`isBackground`, `backgroundControlType`, `backgroundControlStepIds`, `parallelGroupId`) | v2.335.0 | ❌ missing |
-| **P0** | Thread-safe StepsContext (lock-based) | v2.335.0 | N/A (runner-side) |
-| **P1** | Request acknowledgment endpoint (`AcknowledgeRunnerRequestAsync`) | v2.329.0 | ❌ missing |
-| **P1** | `auth_url_v2` and `BrokerUrl` in connectionData | v2.329.0 | ❌ missing |
-| **P1** | V2 admin flow support (`UseRunnerAdminFlow` response) | v2.329.0 | ❌ missing |
-| **P1** | `RunnerVersionDeprecated` feature flag response | v2.321.0 | ❌ missing |
-| **P2** | DAP debugger endpoint (WebSocket) | v2.335.0 | ❌ missing (non-blocking) |
-| **P2** | `SendJobLevelAnnotations` in timeline | v2.323.0 | ❌ missing |
-| **P2** | `BatchActionResolution` for action downloads | v2.328.0 | ❌ missing |
-| **P2** | `UseBearerTokenForCodeload` for action tarballs | v2.328.0 | ❌ missing |
-| **P3** | Node 20 deprecation warning annotation | v2.328.0 | ❌ missing |
-| **P3** | `DisableStdoutMultilineLogPrefixing` env var | v2.335.0 | ❌ missing |
-| **P3** | Server-enforced runner settings | v2.323.0 | ❌ missing |
+| --- | --- | --- | --- |
+| P0 | Background step fields in `TimelineRecord` (`isBackground`, `backgroundControlType`, `backgroundControlStepIds`, `parallelGroupId`) | v2.335.0 | ⚠️ DTO implemented; control-flow behavior unexercised by idle replay |
+| P0 | Thread-safe `StepsContext` lock changes | v2.335.0 | N/A runner-side |
+| P1 | `auth_url_v2`, `BrokerUrl`, `UseRunnerAdminFlow` capability/location fidelity | v2.329.0 | ⚠️ partial; broker endpoints now pass replay by status, location/capability bodies remain local |
+| P1 | `RunnerVersionDeprecated` feature flag response | v2.321.0 | ❌ missing |
+| P2 | DAP debugger endpoint/WebSocket support | v2.335.0 | ❌ missing, non-blocking unless debugging requested |
+| P2 | `SendJobLevelAnnotations` in timeline | v2.323.0 | ❌ missing/untested in idle replay |
+| P2 | `BatchActionResolution` for action downloads | v2.328.0 | ❌ missing/untested in idle replay |
+| P2 | `UseBearerTokenForCodeload` for action tarballs | v2.328.0 | ❌ missing/untested in idle replay |
+| P3 | Node 20 deprecation warning annotation | v2.328.0 | ❌ missing/untested in idle replay |
+| P3 | `DisableStdoutMultilineLogPrefixing` env var | v2.335.0 | ❌ missing/runner-side unless aksh injects env |
+| P3 | Server-enforced runner settings | v2.323.0 | ❌ missing |
 
->>>>>>> origin/main
 ---
 
 ## 2. Upstream surface we must emulate
@@ -384,7 +262,7 @@ Grouped by the role they play for the official runner:
 
 ## 3. What exists today (and where it diverges)
 
-Paths are in this repo. Updated 2026-06-26.
+Paths are in this repo. Updated 2026-06-29 after the v2.335.1 56-flow runner-watch replay.
 
 - `aksh-gha-parser/src/lib.rs`
   - ✅ Typed `Workflow`/`Job`/`Step`/`Trigger`/`RunsOn`/`Needs`/`Strategy`/`Matrix`.
@@ -402,10 +280,23 @@ Paths are in this repo. Updated 2026-06-26.
   - ⚠️ Empty object/array is falsey; GitHub treats non-null object/array as truthy.
 - `aksh-runner-server/src/lib.rs`
   - ✅ axum router with GHES org-prefix routing, graceful shutdown, NDJSON broadcast.
-  - ✅ Full AzDO lifecycle: `connectionData` (18 GUIDs), `AgentPools`, `Agent`, `AgentSession`,
-  
-    `Message`, `AgentRequest`, `Timeline`, `Logfiles`, `FinishJob`, `ActionDownloadInfo`.
-  - ✅ GitHub-compatible registration: `/api/v3/actions/runner-registration` with `RemoteAuth`.
+  - ⚠️ Legacy/local AzDO lifecycle routes exist for `connectionData`, `AgentPools`, `Agent`,
+
+    `AgentSession`, `Message`, `AgentRequest`, `Timeline`, `Logfiles`, `FinishJob`, and
+    `ActionDownloadInfo`, but the v2.335.1 replay shows current-service auth/path semantics
+    are not fully faithful.
+  - ⚠️ GitHub-compatible registration route exists (`/api/v3/actions/runner-registration`) and
+    now replays as `200`, but the returned token/url values are local placeholders rather than
+    the official service values.
+  - ⚠️ OAuth token route exists and now replays as `200`, but the returned token type/expiry/value
+    are still not official-fidelity.
+  - ⚠️ Mapped DistributedTask `sessions`/`messages` now replay with matching `201`/`200`
+    statuses for comparable captured responses; incomplete Busy long-polls are filtered.
+  - ✅ AgentRequest acknowledgement exists and returns `200` like official v2.335.1.
+  - ✅ Broker acquire/renew/complete endpoints pass targeted E2E and now match official replay
+    statuses after runner-watch materializes queued jobs and rewrites captured broker IDs.
+  - ⚠️ Results-service Twirp log/update endpoints now exist and return `200`, but their response
+    bodies are placeholder/local values rather than official signed-blob payloads.
   - ✅ AES session key exchange (unencrypted mode — RSA wrapping TODO).
   - ✅ Encrypted `TaskAgentMessage` delivery with `messageId` and `DELETE` ack.
   - ✅ `AgentJobRequestMessage` with `plan`, `requestId`, `system` context, full steps.
@@ -422,7 +313,12 @@ Paths are in this repo. Updated 2026-06-26.
   - ✅ RSA/AES crypto module in `crypto` module.
 - `aksh-conformance/src/main.rs`
   - ⚠️ Only parses/counts fixtures + diffs two commands' stdout.
-  - ❌ No golden tests, fuzz targets, or wire capture/replay.
+- `runner-watch`
+  - ✅ Records/diffs upstream runner releases and emits `.runner-watch/delta.json`.
+  - ✅ Generates protocol-sync specs under `.runner-watch/specs/v{version}/`.
+  - ✅ Replays fresh official v2.335.1 MITM captures into aksh and writes comparison reports.
+  - ⚠️ Replay mapper still needs better service-location/path mapping for DistributedTask
+    pool discovery and agent registration before those rows can be judged as aksh gaps.
 
 ---
 ## 4. Pluggable backends &amp; deployment modes
@@ -966,3 +862,50 @@ Phases A–E are the critical path to "a real runner runs one job." F–H reach
 "a real runner runs *any* in-scope workflow exactly like GitHub." Provider integration
 
 (step 10) closes the loop for Preloop and every other host.
+
+<!-- runner-watch-sync -->
+## runner-watch generated scorecard for v2.335.1
+
+This section is generated from the latest runner-watch artifacts and hand-normalized from the
+fresh v2.335.1 `01-register-and-idle` replay. It replaces older broad missing/not-missing
+claims with the more precise current state.
+
+### Confirmed by 56-flow replay
+
+| Priority | Endpoint / surface | Observed official | Observed aksh | Status | Spec / follow-up |
+| --- | --- | ---: | ---: | --- | --- |
+| P1 | `/api/v3/actions/runner-registration` | 200 | 200 | route works now, but token/url values are placeholder/local | add/update registration spec |
+| P1 | `/_apis/v1/oauth2/token` | 200 | 200 | route works now, but token type/expiry/value differ from official | add/update OAuth spec |
+| P0 | DistributedTask sessions/messages | 201 / 200 | 201 / 200 | mapped route family exists and status matches for comparable captured responses; incomplete Busy long-polls are filtered | add auth/session replay spec |
+| P0 | `/broker/{runner}/acquirejob` | 200 | 200 in replay | route exists; replay materializes queued state and maps captured broker IDs | `.runner-watch/specs/v2.335.1/v2-admin-broker-connection.toml` |
+| P0 | `/broker/{runner}/renewjob` | 200 | 200 in replay | route exists; replay materializes queued state and maps captured broker IDs | `.runner-watch/specs/v2.335.1/v2-admin-broker-connection.toml` |
+| P0 | `/broker/{runner}/completejob` | 204 | 204 in replay | route exists; replay materializes queued state and maps captured broker IDs | `.runner-watch/specs/v2.335.1/v2-admin-broker-connection.toml` |
+| P1 | `WorkflowStepUpdateService/WorkflowStepsUpdate` | 200 | 200 | implemented with placeholder response; still not official-fidelity | add results-service spec |
+| P1 | `GetJobLogsSignedBlobURL` | 200 | 200 | implemented with local placeholder URL; still not official-fidelity | add results-service spec |
+| P1 | `GetStepLogsSignedBlobURL` | 200 | 200 | implemented with local placeholder URL; still not official-fidelity | add results-service spec |
+| P2 | `POST /_apis/v1/AgentRequest/{pool}/{request}` | 200 | 204 | implemented, status differs; no longer missing | `.runner-watch/specs/v2.335.1/request-ack.toml` |
+| P2 | `/_apis/connectionData` | 200 | 200 | route works; body/location map is incomplete for broker/results service | `.runner-watch/specs/v2.335.1/v2-admin-broker-connection.toml` |
+
+### Replay mapper work before judging aksh
+
+| Flow | Current issue |
+| --- | --- |
+| `GET /_apis/distributedtask/pools?poolType=Automation` | runner-watch still replays the raw root path; should map to `/runner/server/_apis/distributedtask/pools...`. |
+| `GET /_apis/distributedtask/pools/{pool}/agents?...` | same mapping issue. |
+| `POST /_apis/distributedtask/pools/{pool}/agents` | same mapping issue. |
+
+### Source-diff specs not exercised by idle replay
+
+| Change | Category | Spec |
+|---|---|---|
+| background-step-timeline-fields | blocker | `.runner-watch/specs/v2.335.1/background-step-timeline-fields.toml` |
+| batch-action-resolution | feature | `.runner-watch/specs/v2.335.1/batch-action-resolution.toml` |
+| dap-debugger-endpoint | feature | `.runner-watch/specs/v2.335.1/dap-debugger-endpoint.toml` |
+| disable-stdout-multiline-log-prefixing | nit | `.runner-watch/specs/v2.335.1/disable-stdout-multiline-log-prefixing.toml` |
+| node20-deprecation-warning | nit | `.runner-watch/specs/v2.335.1/node20-deprecation-warning.toml` |
+| runner-version-deprecated | concern | `.runner-watch/specs/v2.335.1/runner-version-deprecated.toml` |
+| send-job-level-annotations | feature | `.runner-watch/specs/v2.335.1/send-job-level-annotations.toml` |
+| server-enforced-runner-settings | nit | `.runner-watch/specs/v2.335.1/server-enforced-runner-settings.toml` |
+| use-bearer-token-for-codeload | feature | `.runner-watch/specs/v2.335.1/use-bearer-token-for-codeload.toml` |
+| use-runner-admin-flow | concern | `.runner-watch/specs/v2.335.1/use-runner-admin-flow.toml` |
+
