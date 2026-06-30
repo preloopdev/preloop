@@ -1,5 +1,7 @@
 /target/
 /.preloop/
+/.runner-watch/repos/
+/.runner-watch/**/*.pid
 *.db
 *.sqlite
 *.log
