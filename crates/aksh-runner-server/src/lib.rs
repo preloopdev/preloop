@@ -2126,11 +2126,42 @@ fn summarize_run(statuses: impl Iterator<Item = ExecutionStatus>) -> ExecutionSt
     }
 }
 
-async fn connection_data() -> axum::response::Response {
+async fn connection_data(
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    if params.get("connectOptions").map(String::as_str) == Some("0")
+        && params
+            .get("lastChangeId")
+            .is_some_and(|last_change_id| last_change_id != "-1")
+    {
+        return axum::response::Json(json!({
+            "deploymentId": "00000000-0000-0000-0000-000000000000",
+            "deploymentType": "selfHosted",
+            "instanceId": uuid::Uuid::new_v4().to_string(),
+            "locationServiceData": {
+                "clientCacheFresh": true,
+                "defaultAccessMappingMoniker": "ScaleUnitMapping",
+                "lastChangeId": 1,
+                "lastChangeId64": 1
+            }
+        }))
+        .into_response();
+    }
+
+    let service_root = "http://127.0.0.1:9090";
+    let runner_root = "http://127.0.0.1:9090/runner/server";
     let body = serde_json::json!({
+        "deploymentId": "00000000-0000-0000-0000-000000000000",
+        "deploymentType": "selfHosted",
         "instanceId": uuid::Uuid::new_v4().to_string(),
         "locationServiceData": {
+            "lastChangeId": 1,
+            "lastChangeId64": 1,
             "serviceDefinitions": [
+                area_svc("Location Service", "9f1fe989-7d0d-4a9b-a9bf-11330ab257c1", "LocationService2", "Framework", service_root),
+                area_svc("distributedtask", "a85b8835-c1a1-4aac-ae97-1c3d0ba72dbd", "LocationService2", "Framework", runner_root),
+                area_svc("pipelines", "2e0bf237-8973-4ec9-a581-9c3d679d1776", "LocationService2", "Framework", service_root),
+                area_svc("oauth2", "a7b3b527-4f4f-4dac-8e84-f144fa6d554b", "LocationService2", "Framework", runner_root),
                 svc("AgentPools", "a8c47e17-4d56-4a56-92bb-de7ea7dc65be", "/_apis/v1/AgentPools"),
                 svc("Agent", "e298ef32-5878-4cab-993c-043836571f42", "/_apis/v1/Agent/{poolId}/{agentId}"),
                 svc("AgentSession", "134e239e-2df3-4794-a6f6-24f1f19ec8dc", "/_apis/v1/AgentSession/{poolId}/{sessionId}"),
@@ -2149,16 +2180,77 @@ async fn connection_data() -> axum::response::Response {
                 svc("Tasks", "60aac929-f0cd-4bc8-9ce4-6b30e8f1b1bd", "/_apis/v1/tasks/{taskId}/{versionString}"),
                 svc("Cache", "a7c78d38-31a8-417e-ba6b-7e58b352f304", "_apis/artifactcache"),
                 svc("BuildArtifacts", "1db06c96-014e-44e1-ac91-90b2d4b3e984", "_apis/pipelines/workflows/{buildId}/artifacts"),
+                resource_svc("brokerlistener", "38f00041-0953-4d24-86c3-5432d23e2205", "distributedtask", "_apis/{area}/{resource}"),
+                resource_svc("createdsession", "a4e1f2b5-0c3d-4e8a-9f6d-7b5c1a0e2d3f", "distributedtask", "_apis/{area}/brokerlistener/{resource}"),
+                resource_svc("runnermessages", "25adab70-1379-4186-be8e-b643061ebe3a", "distributedtask", "_apis/{area}/{resource}/{messageId}"),
+                resource_svc("runnerconfigrefresh", "13b5d709-74aa-470b-a8e9-bf9f3ded3f18", "distributedtask", "_apis/{area}/agents/{agentId}/{resource}/{configType}"),
+                resource_svc("token", "10d13a60-2758-406c-8ab7-cffccb21fcf4", "oauth2", "_apis/{area}/{resource}"),
+                resource_svc("steps", "99ea91b7-bbe9-4bd3-a924-874f13205b21", "pipelines", "_apis/{area}/plans/{planId}/jobs/{jobId}/{resource}"),
+                resource_svc("jobs", "4818972d-29fa-4b86-92c1-de5ae7ef33f5", "pipelines", "_apis/{area}/plans/{planId}/{resource}/{jobId}"),
+                resource_svc("logs", "fb1b6d27-3957-43d5-a14b-a2d70403e545", "pipelines", "{project}/_apis/{area}/{pipelineId}/runs/{runId}/{resource}/{logId}"),
             ],
-            "accessMappings": [{
-                "moniker": "PublicAccessMapping",
-                "displayName": "Default Access Mapping",
-                "accessPoint": "http://127.0.0.1:9090"
-            }],
+            "accessMappings": [
+                {
+                    "moniker": "PublicAccessMapping",
+                    "displayName": "Public Access Mapping",
+                    "accessPoint": service_root,
+                    "serviceOwner": "00000000-0000-0000-0000-000000000000",
+                    "virtualDirectory": ""
+                },
+                {
+                    "moniker": "ScaleUnitMapping",
+                    "displayName": "Scale Unit Access Mapping",
+                    "accessPoint": runner_root,
+                    "serviceOwner": "00000000-0000-0000-0000-000000000000",
+                    "virtualDirectory": ""
+                }
+            ],
             "defaultAccessMappingMoniker": "PublicAccessMapping"
         }
     });
     axum::response::Json(body).into_response()
+}
+
+fn area_svc(
+    display_name: &str,
+    id: &str,
+    service_type: &str,
+    tool_id: &str,
+    location: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "serviceType": service_type,
+        "identifier": id,
+        "displayName": display_name,
+        "description": display_name,
+        "toolId": tool_id,
+        "relativeToSetting": "fullyQualified",
+        "locationMappings": [
+            {"accessMappingMoniker": "PublicAccessMapping", "location": location},
+            {"accessMappingMoniker": "ScaleUnitMapping", "location": location}
+        ],
+        "serviceOwner": "00000000-0000-0000-0000-000000000000",
+        "properties": {}
+    })
+}
+
+fn resource_svc(name: &str, id: &str, area: &str, location: &str) -> serde_json::Value {
+    serde_json::json!({
+        "serviceType": area,
+        "identifier": id,
+        "displayName": name,
+        "relativePath": location,
+        "description": name,
+        "toolId": area,
+        "locationMappings": [],
+        "serviceOwner": "00000000-0000-0000-0000-000000000000",
+        "resourceVersion": 1,
+        "minVersion": "1.0",
+        "maxVersion": "6.0",
+        "releasedVersion": "0.0",
+        "status": 1,
+        "properties": {}
+    })
 }
 
 fn svc(name: &str, id: &str, location: &str) -> serde_json::Value {
@@ -2265,7 +2357,11 @@ async fn register_runner_compat(
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
+                .filter_map(|v| {
+                    v.as_str()
+                        .or_else(|| v.get("name").and_then(|name| name.as_str()))
+                        .map(str::to_owned)
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -2273,30 +2369,53 @@ async fn register_runner_compat(
         .get("ephemeral")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let public_key_xml = task_agent_public_key(&request);
+    let public_key_object = request
+        .get("authorization")
+        .and_then(|authorization| authorization.get("publicKey"))
+        .cloned()
+        .or_else(|| request.get("publicKey").cloned())
+        .unwrap_or_else(|| {
+            json!({
+                "exponent": "AQAB",
+                "modulus": ""
+            })
+        });
     let reg_request = RunnerRegistrationRequest {
         name: name.clone(),
         labels,
         ephemeral,
-        public_key: task_agent_public_key(&request),
+        public_key: public_key_xml,
     };
     let result = register_runner(State(shared), Json(reg_request)).await?;
     Ok(Json(json!({
         "id": result.0.id,
         "name": result.0.name,
-        "version": "2.322.0",
-        "osDescription": "Linux",
+        "version": request.get("version").and_then(|v| v.as_str()).unwrap_or("2.335.1"),
+        "osDescription": request.get("osDescription").and_then(|v| v.as_str()).unwrap_or("Linux"),
         "enabled": true,
-        "status": "online",
+        "status": "offline",
         "ephemeral": ephemeral,
+        "maxParallelism": 1,
+        "currentParallelism": 0,
+        "disableUpdate": false,
+        "isElastic": false,
+        "isVirtual": false,
+        "provisioningState": "Provisioned",
+        "queueName": format!("taskagent-{}", result.0.id),
+        "runnerGroupId": 1,
+        "runnerGroupName": null,
         "labels": result.0.labels.iter().map(|l| json!({"name": l, "type": "user"})).collect::<Vec<_>>(),
         "authorization": {
-            "authorizationUrl": "http://127.0.0.1:9090",
+            "authorizationUrl": "http://127.0.0.1:9090/runner/server/_apis/v1/oauth2/token",
             "clientId": uuid::Uuid::new_v4().to_string(),
-            "publicKey": {
-                "exponent": "AQAB",
-                "modulus": "x9DRhIzTYGvMcPEZDjc7cKrIyb+EBMNtB8riHXxElnskMQuMYNRe7Ya2WsS/dctBUSeqhegDZGKcuDM6aab8bsiJoua/hNLNKdxBSz33nsuKdZYXah8r4Z1UIQf4oan8Mo4ePqqDXXFXdTG0peWyVPqjL4VU9n/EG3JoaGcwOoLrcbT/jT2Pz2v6AquPEzaFjty0OWGQ2gRKahHS1UUAI7VKfKMvvUT1ANn6YPIZ7Jdl6YSFMDI2AFwKOwOVQB6E5bIY8W6jwANqt0vlyMbeqii58pSuto9aAEoLsdLxGGrFFxvxGScPG+scVYSkXyj4mrdS0qSm4Z/UOhtnese7OQ==",
-                "keyId": uuid::Uuid::new_v4().to_string()
-            }
+            "publicKey": public_key_object
+        },
+        "properties": {
+            "RequireFipsCryptography": {"$type": "System.Boolean", "$value": true},
+            "ServerUrl": {"$type": "System.String", "$value": "http://127.0.0.1:9090/runner/server"},
+            "ServerUrlV2": {"$type": "System.String", "$value": "http://127.0.0.1:9090/runner/server"},
+            "UseV2Flow": {"$type": "System.Boolean", "$value": true}
         }
     })))
 }
@@ -2546,8 +2665,12 @@ async fn github_registration_token(
         return Err(ApiError::unauthorized("missing Authorization header"));
     }
 
-    let token = format!("aksh-jwt-{}", uuid::Uuid::new_v4());
-    let url_str = payload
+    let token = local_jwt(json!({
+        "sub": "aksh-runner-registration",
+        "scp": "ActionsRuntime.RunnerManage Framework.GenericRead Identity.ReadRefs LocationService.Connect",
+        "jti": uuid::Uuid::new_v4().to_string()
+    }))?;
+    let _requested_url = payload
         .get("url")
         .and_then(|v| v.as_str())
         .unwrap_or("http://127.0.0.1")
@@ -2555,8 +2678,7 @@ async fn github_registration_token(
     Ok(Json(json!({
         "token": token,
         "token_schema": "OAuthAccessToken",
-        "url": url_str,
-        "use_v2_flow": false
+        "url": "http://127.0.0.1:9090/runner/server"
     })))
 }
 
@@ -2567,14 +2689,50 @@ struct TokenResponse {
     expires_in: u64,
 }
 
-async fn oauth2_token(_headers: axum::http::HeaderMap, body: bytes::Bytes) -> Json<TokenResponse> {
+async fn oauth2_token(
+    _headers: axum::http::HeaderMap,
+    body: bytes::Bytes,
+) -> Result<Json<TokenResponse>, ApiError> {
     let _ = body;
-    let token = format!("aksh-{}", uuid::Uuid::new_v4());
-    Json(TokenResponse {
+    let token = local_jwt(json!({
+        "sub": "aksh-runner-listen",
+        "scp": "ActionsRuntime.RunnerListen Framework.GenericRead Identity.ReadRefs LocationService.Connect",
+        "jti": uuid::Uuid::new_v4().to_string()
+    }))?;
+    Ok(Json(TokenResponse {
         access_token: token,
-        token_type: "bearer".to_owned(),
-        expires_in: 3600,
-    })
+        token_type: "JWT".to_owned(),
+        expires_in: 2999,
+    }))
+}
+
+fn local_jwt(mut claims: serde_json::Value) -> Result<String, ApiError> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| ApiError::bad_request(format!("system clock before epoch: {error}")))?
+        .as_secs();
+    let claims = claims
+        .as_object_mut()
+        .ok_or_else(|| ApiError::bad_request("JWT claims must be an object"))?;
+    claims.insert("iss".to_owned(), json!("https://aksh.local"));
+    claims.insert("iat".to_owned(), json!(now));
+    claims.insert("nbf".to_owned(), json!(now));
+    claims.insert("exp".to_owned(), json!(now + 2999));
+    let header = json!({
+        "alg": "HS256",
+        "typ": "JWT",
+        "kid": "aksh-local"
+    });
+    let signing_input = format!(
+        "{}.{}",
+        base64_url_json(&header)?,
+        base64_url_json(&serde_json::Value::Object(claims.clone()))?
+    );
+    let mut mac = Hmac::<Sha256>::new_from_slice(b"aksh-local-runner-signing-key")
+        .map_err(|error| ApiError::bad_request(format!("invalid signing key: {error}")))?;
+    mac.update(signing_input.as_bytes());
+    let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    Ok(format!("{signing_input}.{signature}"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -3862,6 +4020,82 @@ jobs:
     }
 
     #[tokio::test]
+    async fn connection_data_exposes_current_runner_service_locations() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+
+        let conn = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/connectionData?connectOptions=1&lastChangeId=-1&lastChangeId64=-1",
+            Value::Null,
+        )
+        .await;
+        let services = conn["locationServiceData"]["serviceDefinitions"]
+            .as_array()
+            .unwrap();
+        let service_ids = services
+            .iter()
+            .filter_map(|service| service["identifier"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(service_ids.contains("38f00041-0953-4d24-86c3-5432d23e2205"));
+        assert!(service_ids.contains("a4e1f2b5-0c3d-4e8a-9f6d-7b5c1a0e2d3f"));
+        assert!(service_ids.contains("10d13a60-2758-406c-8ab7-cffccb21fcf4"));
+        assert_eq!(
+            conn["locationServiceData"]["defaultAccessMappingMoniker"],
+            "PublicAccessMapping"
+        );
+
+        let fresh = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/connectionData?connectOptions=0&lastChangeId=1&lastChangeId64=1",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(fresh["locationServiceData"]["clientCacheFresh"], true);
+        assert!(fresh["locationServiceData"]["serviceDefinitions"].is_null());
+    }
+
+    #[tokio::test]
+    async fn registration_and_oauth_return_runner_compatible_tokens() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+
+        let registration = request_json(
+            &app,
+            Method::POST,
+            "/api/v3/actions/runner-registration",
+            json!({"url": "https://github.com/preloopdev/aksh", "runner_event": "register"}),
+        )
+        .await;
+        assert_eq!(registration["token_schema"], "OAuthAccessToken");
+        assert_eq!(registration["url"], "http://127.0.0.1:9090/runner/server");
+        assert_eq!(
+            registration["token"].as_str().unwrap().split('.').count(),
+            3
+        );
+        assert!(registration.get("use_v2_flow").is_none());
+
+        let token = request_json(
+            &app,
+            Method::POST,
+            "/runner/server/_apis/v1/oauth2/token",
+            json!({"grant_type":"client_credentials","client_id":"t","client_secret":"t"}),
+        )
+        .await;
+        assert_eq!(token["token_type"], "JWT");
+        assert_eq!(token["expires_in"], 2999);
+        assert_eq!(token["access_token"].as_str().unwrap().split('.').count(), 3);
+    }
+
+    #[tokio::test]
     async fn current_service_broker_flow_uses_queued_job() {
         let temp = tempfile::tempdir().unwrap();
         let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
@@ -4519,6 +4753,8 @@ jobs:
                 || uri.starts_with("/twirp/")
             {
                 builder = builder.header(header::AUTHORIZATION, "Bearer aksh-system-token");
+            } else if uri.starts_with("/api/v3/actions/runner-registration") {
+                builder = builder.header(header::AUTHORIZATION, "RemoteAuth aksh-registration-token");
             }
             let request = if body.is_null() {
                 builder.body(Body::empty()).unwrap()
@@ -4632,6 +4868,8 @@ jobs:
             || uri.starts_with("/twirp/")
         {
             builder = builder.header(header::AUTHORIZATION, "Bearer aksh-system-token");
+        } else if uri.starts_with("/api/v3/actions/runner-registration") {
+            builder = builder.header(header::AUTHORIZATION, "RemoteAuth aksh-registration-token");
         }
         let request = if body.is_null() {
             builder.body(Body::empty()).unwrap()
