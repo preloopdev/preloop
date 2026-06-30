@@ -1,0 +1,118 @@
+You are implementing an aksh protocol-sync spec. Follow existing Rust patterns exactly. Run cargo check and relevant tests, but do not run formatters or project-wide lint.
+
+Spec:
+```toml
+change_id = "request-ack"
+upstream_version = "v2.335.1"
+category = "concern"
+tags = ["protocol", "endpoint"]
+ai_status = "deterministic-known-fidelity-gap"
+
+[description]
+what = '''
+Runner sends an explicit acknowledgement after receiving a job request.
+'''
+why = '''
+Broker flow uses acknowledgements to confirm the runner accepted a leased request.
+'''
+runner_behavior = '''
+POST /_apis/v1/AgentRequest/{poolId}/{requestId} after decrypting a RunnerJobRequest.
+'''
+failure_mode = '''
+warning-only in current captures; missing endpoint causes 404 noise and may affect broker leases.
+'''
+
+[feature_flag]
+name = "UseBrokerFlow"
+where = "connectionData or broker capability response"
+default = false
+
+[wire]
+request = '''
+POST /_apis/v1/AgentRequest/{poolId}/{requestId}?api-version=6.0
+{}
+'''
+expected_response = "204 No Content"
+
+[aksh_targets]
+files = [
+  { crate = "aksh-runner-server", path = "crates/aksh-runner-server/src/lib.rs", area = "AgentRequest routes" },
+]
+
+[implementation]
+approach = '''
+Add POST handler for all AgentRequest route prefixes; accept empty/JSON body and return 204.
+'''
+test = "POST to AgentRequest endpoint returns 204."
+
+[[source_entries]]
+file = "src/Runner.Common/BrokerServer.cs"
+change_type = "protocol_keyword_added"
+fields = ["Task", "AcknowledgeRunnerRequestAsync", "runnerRequestId", "Guid", "sessionId", "TaskAgentStatus", "CancellationToken"]
+snippet = '''
+
+        Task<TaskAgentMessage> GetRunnerMessageAsync(Guid? sessionId, TaskAgentStatus status, string version, string os, string architecture, bool disableUpdate, CancellationToken token);
+
+        Task AcknowledgeRunnerRequestAsync(string runnerRequestId, Guid? sessionId, TaskAgentStatus status, string version, string os, string architecture, CancellationToken token);
+
+        Task UpdateConnectionIfNeeded(Uri serverUri, VssCredentials credentials);
+
+'''
+
+[[source_entries]]
+file = "src/Runner.Common/BrokerServer.cs"
+change_type = "protocol_keyword_added"
+fields = ["Task", "AcknowledgeRunnerRequestAsync", "runnerRequestId", "Guid", "sessionId", "TaskAgentStatus", "CancellationToken", "cancellationToken"]
+snippet = '''
+            return brokerSession;
+        }
+
+        public async Task AcknowledgeRunnerRequestAsync(string runnerRequestId, Guid? sessionId, TaskAgentStatus status, string version, string os, string architecture, CancellationToken cancellationToken)
+        {
+            CheckConnection();
+
+'''
+
+[[source_entries]]
+file = "src/Runner.Common/BrokerServer.cs"
+change_type = "protocol_keyword_added"
+fields = ["_brokerHttpClient", "AcknowledgeRunnerRequestAsync", "runnerRequestId", "sessionId", "cancellationToken"]
+snippet = '''
+            CheckConnection();
+
+            // No retries
+            await _brokerHttpClient.AcknowledgeRunnerRequestAsync(runnerRequestId, sessionId, version, status, os, architecture, cancellationToken);
+        }
+
+        public async Task DeleteSessionAsync(CancellationToken cancellationToken)
+'''
+
+[[source_entries]]
+file = "src/Runner.Listener/BrokerMessageListener.cs"
+change_type = "protocol_keyword_added"
+fields = ["_brokerServer", "AcknowledgeRunnerRequestAsync"]
+snippet = '''
+            using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5)); // Short timeout
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token);
+            Trace.Info($"Acknowledging runner request '{runnerRequestId}'.");
+            await _brokerServer.AcknowledgeRunnerRequestAsync(
+                runnerRequestId,
+                _session.SessionId,
+                _runnerStatus,
+'''
+
+[[source_entries]]
+file = "src/Runner.Listener/MessageListener.cs"
+change_type = "protocol_keyword_added"
+fields = ["_brokerServer", "AcknowledgeRunnerRequestAsync"]
+snippet = '''
+            using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5)); // Short timeout
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token);
+            Trace.Info($"Acknowledging runner request '{runnerRequestId}'.");
+            await _brokerServer.AcknowledgeRunnerRequestAsync(
+                runnerRequestId,
+                _session.SessionId,
+                _runnerStatus,
+'''
+
+```

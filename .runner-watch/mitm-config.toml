@@ -1,0 +1,22 @@
+[general]
+runner_repo = "actions/runner"
+aksh_worktree = "."
+golden_dir = ".runner-watch/golden"
+mitm_dir = "../mitm-proxy/experiments/mitm"
+max_review_rounds = 3
+max_conformance_rounds = 2
+max_implement_iterations = 10
+
+[agents]
+triage = "claude"
+implement = "codex"
+review = "claude"
+
+[surface_map]
+path = "docs/aksh-surface.toml"
+
+[tracked_dirs]
+dirs = ["src/Runner.Listener", "src/Runner.Worker", "src/Runner.Common", "src/Runner.Sdk"]
+
+[skip_paths]
+patterns = ["src/Test/**", "src/Misc/**", ".github/**", "*.md", "*.yml", "*.yaml", "dev/**"]
