@@ -1,0 +1,17 @@
+# deferred: requires Linux+Docker runner host
+description = "Deferred: submit a workflow that runs inside a job container on a Linux Docker runner."
+duration_seconds_max = 600
+
+[[steps]]
+kind = "submit_workflow"
+path = "16-container-job.yml"
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_assigned"
+timeout = 120
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_completed"
+timeout = 240

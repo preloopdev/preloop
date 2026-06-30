@@ -1,0 +1,21 @@
+description = "Submit a fail-fast matrix workflow that fans out and cancels sibling jobs after one failure."
+duration_seconds_max = 400
+
+[[steps]]
+kind = "submit_workflow"
+path = "09-matrix-fan-out.yml"
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_assigned"
+timeout = 120
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_completed"
+timeout = 240
+
+# Give fail-fast cancellation and any sibling completions time to reach the proxy after the first completed matrix job.
+[[steps]]
+kind = "wait_seconds"
+n = 30

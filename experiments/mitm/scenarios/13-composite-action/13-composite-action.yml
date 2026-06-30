@@ -1,0 +1,9 @@
+name: mitm composite
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: [self-hosted, mitm]
+    steps:
+      - uses: ./.github/actions/greet
+        with:
+          who: world
