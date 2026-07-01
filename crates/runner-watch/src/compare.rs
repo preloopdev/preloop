@@ -49,8 +49,8 @@ pub fn normalize_path(path: &str) -> String {
         if let Some(slash) = rest.find('/') {
             let seg = &rest[..slash];
             let tail = &rest[slash..]; // starts with /
-            // Only strip if the tail continues with /_apis/ and the segment
-            // is purely alphanumeric+hyphen (no dots — avoids stripping hostnames).
+                                       // Only strip if the tail continues with /_apis/ and the segment
+                                       // is purely alphanumeric+hyphen (no dots — avoids stripping hostnames).
             if tail.starts_with("/_apis/")
                 && !seg.is_empty()
                 && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
@@ -67,10 +67,9 @@ pub fn normalize_path(path: &str) -> String {
     };
 
     // Replace GUIDs (8-4-4-4-12 hex digits).
-    let guid_re = Regex::new(
-        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
-    )
-    .expect("static regex");
+    let guid_re =
+        Regex::new(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+            .expect("static regex");
     let path = guid_re.replace_all(path, "{guid}");
 
     // Split into base path and query string.
@@ -83,10 +82,12 @@ pub fn normalize_path(path: &str) -> String {
     // Replace all-digit path segments with {n}.
     let normalised_base = base
         .split('/')
-        .map(|seg| if seg.chars().all(|c| c.is_ascii_digit()) && !seg.is_empty() {
-            "{n}"
-        } else {
-            seg
+        .map(|seg| {
+            if seg.chars().all(|c| c.is_ascii_digit()) && !seg.is_empty() {
+                "{n}"
+            } else {
+                seg
+            }
         })
         .collect::<Vec<_>>()
         .join("/");
@@ -127,10 +128,8 @@ pub fn normalize_path(path: &str) -> String {
 /// Redact JWTs and long high-entropy tokens from a report string.
 pub fn redact_report(s: &str) -> String {
     // Redact JWT tokens (three base64url segments separated by dots).
-    let jwt_re = Regex::new(
-        r"eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}",
-    )
-    .expect("static regex");
+    let jwt_re = Regex::new(r"eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}")
+        .expect("static regex");
     let s = jwt_re.replace_all(s, "***REDACTED***");
 
     // Redact long alphanumeric strings with high character diversity.
@@ -155,8 +154,8 @@ fn load_flows(dir: &Path) -> Result<Vec<Value>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     text.lines()
         .filter(|l| !l.trim().is_empty())
         .map(|l| serde_json::from_str(l).with_context(|| format!("parse flow: {l}")))
@@ -192,7 +191,7 @@ fn group_flows(flows: &[Value]) -> Groups {
 // ── label abbreviation ───────────────────────────────────────────────────────
 
 fn short_label(label: &str) -> String {
-    let cleaned = label.to_lowercase().replace('-', " ").replace('_', " ");
+    let cleaned = label.to_lowercase().replace(['-', '_'], " ");
     let parts: Vec<&str> = cleaned.split_whitespace().collect();
     if parts.len() == 1 {
         parts[0].chars().take(4).collect()
@@ -375,13 +374,19 @@ pub fn render_report(args: &Args) -> Result<()> {
     lines.push(format!(
         "**{}**: {} — {} flows",
         args.left_label,
-        left_summary.get("status").and_then(Value::as_str).unwrap_or("N/A"),
+        left_summary
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("N/A"),
         left_flows.len()
     ));
     lines.push(format!(
         "**{}**: {} — {} flows",
         args.right_label,
-        right_summary.get("status").and_then(Value::as_str).unwrap_or("N/A"),
+        right_summary
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("N/A"),
         right_flows.len()
     ));
     lines.push(String::new());
@@ -683,7 +688,7 @@ mod tests {
     fn statuses_sorted_handles_none() {
         let flows = vec![
             serde_json::json!({"status": 200}),
-            serde_json::json!({}),          // missing status → "None"
+            serde_json::json!({}), // missing status → "None"
             serde_json::json!({"status": serde_json::Value::Null}),
         ];
         let s = statuses_sorted(&flows);
