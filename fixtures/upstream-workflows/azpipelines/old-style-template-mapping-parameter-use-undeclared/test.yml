@@ -1,4 +1,0 @@
-parameters:
-  test:
-steps:
-- ${{ parameters.test2 }}

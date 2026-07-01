@@ -56,13 +56,13 @@ def match_event(event: str, flows: list[dict]) -> bool:
                 return True
         elif event == "job_assigned":
             resp = f.get("response_body_json")
-            if resp and isinstance(resp, dict) and resp.get("messageType") == "PipelineAgentJobRequest":
+            if resp and isinstance(resp, dict) and resp.get("messageType") in ("PipelineAgentJobRequest", "RunnerJobRequest"):
                 return True
             body = _b64_decode(f.get("response_body_b64", ""))
-            if "PipelineAgentJobRequest" in body:
+            if "PipelineAgentJobRequest" in body or "RunnerJobRequest" in body:
                 return True
         elif event == "job_completed":
-            if "/jobrequests/" in path:
+            if "/jobrequests/" in path or path.endswith("/completejob"):
                 return True
             body = _b64_decode(f.get("request_body_b64", "")) + _b64_decode(f.get("response_body_b64", ""))
             if "JobCompleted" in body:
@@ -85,12 +85,27 @@ def submit_workflow_official(workflow_path: str) -> str | None:
     repo = os.environ["GITHUB_REPO"]
     ref = os.environ.get("GITHUB_REF", "main")
     basename = os.path.basename(workflow_path)
+    gh_env = os.environ.copy()
+    for key in (
+        "GITHUB_TOKEN",
+        "https_proxy",
+        "HTTPS_PROXY",
+        "http_proxy",
+        "HTTP_PROXY",
+        "all_proxy",
+        "ALL_PROXY",
+    ):
+        gh_env.pop(key, None)
     log(f"submitting workflow {basename} to {owner}/{repo}@{ref}")
-    subprocess.run(["gh", "workflow", "run", basename, "-R", f"{owner}/{repo}", "--ref", ref], check=True)
+    subprocess.run(
+        ["gh", "workflow", "run", basename, "-R", f"{owner}/{repo}", "--ref", ref],
+        check=True,
+        env=gh_env,
+    )
     time.sleep(3)
     result = subprocess.run(
         ["gh", "run", "list", "-R", f"{owner}/{repo}", "--workflow", basename, "--limit", "1", "--json", "databaseId", "--jq", ".[0].databaseId"],
-        check=True, capture_output=True, text=True,
+        check=True, capture_output=True, text=True, env=gh_env,
     )
     run_id = result.stdout.strip()
     log(f"run id: {run_id}", "ok")
@@ -133,6 +148,8 @@ def submit_workflow_aksh(workflow_path: str) -> str | None:
     """Submit a workflow to aksh via its native REST API."""
     wf_abs = str(Path(workflow_path).resolve())
     wf_yaml = Path(wf_abs).read_text()
+    aksh_url = os.environ.get("AKSH_API_URL") or os.environ.get("AKSH_URL", "http://127.0.0.1:9090")
+    aksh_url = aksh_url.removesuffix("/runner/server").rstrip("/")
     payload = json.dumps({
         "workflow_yaml": wf_yaml,
         "event": "workflow_dispatch",
@@ -141,7 +158,7 @@ def submit_workflow_aksh(workflow_path: str) -> str | None:
     }).encode()
     log(f"submitting workflow {Path(workflow_path).name} to aksh")
     req = urllib.request.Request(
-        "http://127.0.0.1:9090/api/v1/runs",
+        f"{aksh_url}/api/v1/runs",
         data=payload,
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -155,7 +172,9 @@ def submit_workflow_aksh(workflow_path: str) -> str | None:
 
 def cancel_workflow_aksh(run_id: str):
     """Cancel a run via aksh's native REST API."""
-    url = f"http://127.0.0.1:9090/api/v1/runs/{run_id}/cancel"
+    aksh_url = os.environ.get("AKSH_API_URL") or os.environ.get("AKSH_URL", "http://127.0.0.1:9090")
+    aksh_url = aksh_url.removesuffix("/runner/server").rstrip("/")
+    url = f"{aksh_url}/api/v1/runs/{run_id}/cancel"
     log(f"cancelling run {run_id} via {url}")
     req = urllib.request.Request(url, method="POST", data=b"")
     urllib.request.urlopen(req)

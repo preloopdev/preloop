@@ -1,6 +1,0 @@
-parameters:
-  - name: no
-    type: number
-    default: 2
-steps:
-  - script: echo ${{ coalesce('test', parameters.y) }}

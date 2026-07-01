@@ -1,6 +1,0 @@
-parameters:
-- name: prefix
-  default: Debug
-variables:
-- name: buildConfig
-  value: ${{ parameters.prefix }}

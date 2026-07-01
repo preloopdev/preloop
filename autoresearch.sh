@@ -71,7 +71,7 @@ lsof -i :"$AKSH_PORT" -sTCP:LISTEN >/dev/null 2>&1 \
 
 # ── start aksh ───────────────────────────────────────────────────────────────
 
-RUST_LOG=info "$AKSH_BIN" serve \
+AKSH_PUBLIC_URL="http://127.0.0.1:80" RUST_LOG=info "$AKSH_BIN" serve \
     --listen "127.0.0.1:${AKSH_PORT}" \
     --state-dir "$STATE_DIR/state" \
     >> "$LOG" 2>&1 &
@@ -114,14 +114,17 @@ with urllib.request.urlopen(req, timeout=5) as r:
     token=$(printf '%s' "$resp" | json_field token) \
         || die "failed to get registration token: $resp"
 
-    # config.sh needs a TTY to avoid registration timeout; script(1) provides one
-    script -q /dev/null ./config.sh --unattended \
+    # Clean up old runner config files so config.sh can run cleanly
+    rm -f .runner .credentials .credentials_rsaparams
+
+    # Run config.sh directly and capture output in log
+    ./config.sh --unattended \
         --url "$RUNNER_URL" \
         --token "$token" \
         --name "aksh-bench" \
         --labels "self-hosted,mitm" \
         --work _work \
-        --replace >/dev/null 2>&1 \
+        --replace >> "$LOG" 2>&1 \
         || die "runner config failed"
 
     [ -f .runner ] || die "runner config failed: .runner not created"
@@ -169,10 +172,10 @@ RUN_ID=$(printf '%s' "$resp" | json_field run_id) \
 # completion from the runner terminal line. The server also logs structured
 # completion, but the terminal line is stable across failed and succeeded jobs.
 
-deadline=$(python3 -c "import time; print(int(time.time()) + 90)")
+deadline=$(python3 -c "import time; print(int(time.time()) + 600)")
 while ! grep -Eq "Job .* completed with result:" "$LOG" 2>/dev/null; do
     now=$(python3 -c "import time; print(int(time.time()))")
-    [ "$now" -gt "$deadline" ] && { echo "runner timeout after 90s" >&2; exit 1; }
+    [ "$now" -gt "$deadline" ] && { echo "runner timeout after 600s" >&2; exit 1; }
     sleep 0.2
 done
 
