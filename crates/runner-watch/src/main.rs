@@ -1732,6 +1732,8 @@ async fn replay_flows_to_aksh(
     let mut baseline = tokio::fs::File::create(baseline_dir.join("flows.jsonl")).await?;
     let mut count = 0usize;
     let mut broker_job_ids: HashMap<String, String> = HashMap::new();
+    let mut official_broker_job_ids = Vec::new();
+    let mut aksh_broker_job_ids = Vec::new();
     for line in flows.lines().filter(|l| !l.trim().is_empty()) {
         let flow: Value = serde_json::from_str(line)?;
         let method = flow.get("method").and_then(Value::as_str).unwrap_or("GET");
@@ -1820,10 +1822,16 @@ async fn replay_flows_to_aksh(
                 captured["response_headers"] = json!(headers);
                 if let Ok(body_json) = serde_json::from_str::<Value>(&text) {
                     if let Some(official_id) = official_runner_request_id {
-                        if let Some(aksh_id) = extract_runner_request_id_from_message(&body_json) {
-                            broker_job_ids.insert(official_id, aksh_id);
-                        }
+                        official_broker_job_ids.push(official_id);
                     }
+                    if let Some(aksh_id) = extract_runner_request_id_from_message(&body_json) {
+                        aksh_broker_job_ids.push(aksh_id);
+                    }
+                    sync_broker_job_id_map(
+                        &official_broker_job_ids,
+                        &aksh_broker_job_ids,
+                        &mut broker_job_ids,
+                    );
                     captured["response_body_json"] = body_json;
                 } else {
                     captured["response_body"] = json!(text);
@@ -1866,6 +1874,18 @@ fn extract_runner_request_id_from_message(message: &Value) -> Option<String> {
         .get("runner_request_id")?
         .as_str()
         .map(str::to_owned)
+}
+
+fn sync_broker_job_id_map(
+    official_broker_job_ids: &[String],
+    aksh_broker_job_ids: &[String],
+    broker_job_ids: &mut HashMap<String, String>,
+) {
+    for (official_id, aksh_id) in official_broker_job_ids.iter().zip(aksh_broker_job_ids) {
+        broker_job_ids
+            .entry(official_id.clone())
+            .or_insert_with(|| aksh_id.clone());
+    }
 }
 
 fn rewrite_replay_body(body: &mut Vec<u8>, broker_job_ids: &HashMap<String, String>) {
@@ -2747,6 +2767,41 @@ mod tests {
         assert_eq!(body["jobId"], "aksh-job");
         assert_eq!(body["runnerRequestId"], "aksh-job");
         assert_eq!(body["other"], "kept");
+    }
+
+    #[test]
+    fn broker_job_ids_are_correlated_by_delivery_order() {
+        let official_ids = vec!["official-first".to_string()];
+        let mut aksh_ids = vec!["aksh-first".to_string(), "aksh-second".to_string()];
+        let mut ids = HashMap::new();
+
+        sync_broker_job_id_map(&official_ids, &aksh_ids, &mut ids);
+
+        assert_eq!(
+            ids.get("official-first").map(String::as_str),
+            Some("aksh-first")
+        );
+        assert!(!ids.values().any(|id| id == "aksh-second"));
+
+        let official_ids = vec!["official-first".to_string(), "official-second".to_string()];
+        sync_broker_job_id_map(&official_ids, &aksh_ids, &mut ids);
+
+        assert_eq!(
+            ids.get("official-first").map(String::as_str),
+            Some("aksh-first")
+        );
+        assert_eq!(
+            ids.get("official-second").map(String::as_str),
+            Some("aksh-second")
+        );
+
+        aksh_ids[0] = "changed".to_string();
+        sync_broker_job_id_map(&official_ids, &aksh_ids, &mut ids);
+
+        assert_eq!(
+            ids.get("official-first").map(String::as_str),
+            Some("aksh-first")
+        );
     }
 
     #[test]
