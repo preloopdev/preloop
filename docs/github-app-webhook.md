@@ -34,6 +34,14 @@ The system is configured using the following environment variables:
 | `AKSH_LOCAL_WORKSPACE` | Path to a local clone of the repository to fetch workflows from offline. | `/path/to/my-repo` |
 | `AKSH_GITHUB_TOKEN` | GitHub Personal Access Token or App Installation Token to fetch workflows and update check runs. | `ghp_...` or `ghs_...` |
 
+### Security Best Practices
+
+*   **Git-Ignore Credentials**: Never check `.env`, `*.pem`, or `*.key` files into Git. These files are excluded in the root `.gitignore`.
+   
+*   **Production Key Management**: In production, do not write private keys or secrets to plaintext files on the server disk. Instead:
+    - Load them directly into memory at runtime using a Secrets Manager (e.g. HashiCorp Vault, AWS Secrets Manager, or Kubernetes Secrets).
+    - Inject the configuration as environment variables directly to the running process without file-based middleware.
+
 ---
 
 ## 3. Webhook signature verification (`X-Hub-Signature-256`)
