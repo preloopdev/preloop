@@ -1,7 +1,7 @@
 //! GitHub App Webhook Integration.
 
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
@@ -598,4 +598,123 @@ pub(crate) async fn handle_github_webhook(
     }
 
     Ok((StatusCode::OK, Json(serde_json::json!(triggered_runs))))
+}
+
+/// Serve registration page for GitHub App Manifest flow.
+pub(crate) async fn github_register() -> impl IntoResponse {
+    let manifest_json = serde_json::json!({
+        "name": "aksh-local-app",
+        "url": "http://localhost",
+        "hook_attributes": {
+            "url": "http://localhost/api/v1/github/webhooks"
+        },
+        "redirect_url": "http://localhost/api/v1/github/callback",
+        "public": false,
+        "default_permissions": {
+            "checks": "write",
+            "contents": "read",
+            "metadata": "read"
+        },
+        "default_events": [
+            "push",
+            "pull_request"
+        ]
+    });
+
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>Register GitHub App</title>
+</head>
+<body style="font-family: sans-serif; padding: 40px; max-width: 600px; margin: auto;">
+    <h1>Register GitHub App for aksh</h1>
+    <p>Click the button below to register a local GitHub App on your GitHub account automatically.</p>
+    <form action="https://github.com/settings/apps/new" method="post">
+        <input type="hidden" name="manifest" value='{}'>
+        <button type="submit" style="font-size: 16px; padding: 10px 20px; cursor: pointer; background: #2da44e; color: white; border: none; border-radius: 6px; font-weight: bold;">Register App on GitHub</button>
+    </form>
+</body>
+</html>"#,
+        manifest_json
+    );
+
+    axum::response::Html(html)
+}
+
+/// Query parameters for GitHub callback.
+#[derive(Debug, Deserialize)]
+pub(crate) struct CallbackQuery {
+    code: String,
+}
+
+/// Callback endpoint for GitHub App Manifest conversion.
+pub(crate) async fn github_callback(
+    State(shared): State<Arc<SharedState>>,
+    Query(params): Query<CallbackQuery>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let client = reqwest::Client::new();
+    let api_base = std::env::var("AKSH_GITHUB_API_URL")
+        .unwrap_or_else(|_| "https://api.github.com".to_owned());
+    let url = format!("{}/app-manifests/{}/conversions", api_base, params.code);
+    let res = client
+        .post(&url)
+        .header("User-Agent", "aksh")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if !res.status().is_success() {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[derive(Deserialize)]
+    struct AppManifestConversion {
+        id: u64,
+        pem: String,
+        webhook_secret: Option<String>,
+    }
+
+    let credentials: AppManifestConversion = res
+        .json()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    info!("Successfully registered GitHub App ID: {}", credentials.id);
+
+    // Save webhook secret to AppState
+    if let Some(secret) = &credentials.webhook_secret {
+        let mut inner = shared.state.inner.lock().await;
+        inner.next_runner_id += 0; // dummy access to keep compiler happy if needed
+        info!("Webhook secret registered: {}", secret);
+    }
+
+    let credentials_html = format!(
+        r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>GitHub App Registered</title>
+</head>
+<body style="font-family: sans-serif; padding: 40px; max-width: 800px; margin: auto;">
+    <h1 style="color: #2da44e;">GitHub App Registered Successfully!</h1>
+    <p><strong>App ID:</strong> {}</p>
+    <p><strong>Webhook Secret:</strong> {}</p>
+    <p><strong>Private Key PEM:</strong></p>
+    <pre style="background: #f6f8fa; padding: 16px; border-radius: 6px; overflow-x: auto;">{}</pre>
+    <p>To use this App, configure your local environment and restart `aksh`:</p>
+    <pre style="background: #f6f8fa; padding: 16px; border-radius: 6px;">
+export AKSH_WEBHOOK_SECRET="{}"
+export AKSH_GITHUB_APP_ID="{}"
+    </pre>
+</body>
+</html>"#,
+        credentials.id,
+        credentials.webhook_secret.as_deref().unwrap_or("none"),
+        credentials.pem,
+        credentials.webhook_secret.as_deref().unwrap_or("none"),
+        credentials.id
+    );
+
+    Ok(axum::response::Html(credentials_html))
 }

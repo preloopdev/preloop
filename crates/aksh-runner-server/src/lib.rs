@@ -450,6 +450,8 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             "/api/v1/github/webhooks",
             post(github::handle_github_webhook),
         )
+        .route("/api/v1/github/register", get(github::github_register))
+        .route("/api/v1/github/callback", get(github::github_callback))
         .route("/api/v1/runs/:run_id", get(get_run))
         .route("/api/v1/runs/:run_id/cancel", post(cancel_run))
         .route("/api/v1/runs/:run_id/rerun", post(rerun_run))
@@ -6341,5 +6343,79 @@ jobs:
         assert_eq!(run_record.submission.event, "pull_request");
         assert_eq!(run_record.submission.git_ref, "refs/pull/42/merge");
         assert_eq!(run_record.job_check_run_ids.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn github_app_manifest_registration_flow() {
+        let temp = tempfile::tempdir().unwrap();
+
+        // 1. Setup a local mock GitHub API server for manifest conversion
+        let mock_app = Router::new().route(
+            "/app-manifests/:code/conversions",
+            post(|Path(code): Path<String>| async move {
+                assert_eq!(code, "mock_code_123");
+                Json(json!({
+                    "id": 987654,
+                    "pem": "-----BEGIN RSA PRIVATE KEY-----\nMOCK-KEY-DATA\n-----END RSA PRIVATE KEY-----",
+                    "webhook_secret": Some("mock-webhook-secret-xyz")
+                }))
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, mock_app).await.unwrap();
+        });
+
+        // 2. Configure mock API URL in environment
+        std::env::set_var("AKSH_GITHUB_API_URL", format!("http://127.0.0.1:{}", port));
+
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        // 3. Request registration form (GET /api/v1/github/register)
+        let response_reg = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/v1/github/register")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response_reg.status(), StatusCode::OK);
+        let bytes = to_bytes(response_reg.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(html.contains("https://github.com/settings/apps/new"));
+        assert!(html.contains("aksh-local-app"));
+
+        // 4. Request callback conversion (GET /api/v1/github/callback?code=mock_code_123)
+        let response_callback = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/v1/github/callback?code=mock_code_123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response_callback.status(), StatusCode::OK);
+        let bytes_callback = to_bytes(response_callback.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html_callback = String::from_utf8(bytes_callback.to_vec()).unwrap();
+        assert!(html_callback.contains("GitHub App Registered Successfully!"));
+        assert!(html_callback.contains("987654"));
+        assert!(html_callback.contains("mock-webhook-secret-xyz"));
+
+        // Clean up
+        std::env::remove_var("AKSH_GITHUB_API_URL");
     }
 }
