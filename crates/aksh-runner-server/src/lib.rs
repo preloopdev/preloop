@@ -94,11 +94,15 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         )
         .route(
             "/runner/server/_apis/distributedtask/pools/:pool_id/agents",
-            post(register_runner),
+            get(agent_lookup).post(register_runner_compat_pool_only),
+        )
+        .route(
+            "/runner/server/_apis/distributedtask/pools/:pool_id/agents/:agent_id",
+            delete(delete_agent),
         )
         .route(
             "/runner/server/_apis/distributedtask/pools/:pool_id/sessions",
-            post(create_session),
+            post(create_session_disttask).delete(delete_sessions_for_pool),
         )
         .route(
             "/runner/server/_apis/distributedtask/pools/:pool_id/sessions/:session_id",
@@ -106,7 +110,7 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         )
         .route(
             "/runner/server/_apis/distributedtask/pools/:pool_id/messages",
-            get(next_message),
+            get(next_message_broker_ref),
         )
         .route(
             "/runner/server/_apis/distributedtask/pools/:pool_id/messages/:message_id",
@@ -116,16 +120,31 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             "/runner/server/_apis/distributedtask/hubs/actions/plans/:run_id/jobs/:job_id",
             patch(complete_job_compat),
         )
+        .route("/broker/:runner_id/acquirejob", post(broker_acquire_job))
+        .route("/broker/:runner_id/renewjob", post(broker_renew_job))
+        .route("/broker/:runner_id/completejob", post(broker_complete_job))
+        .route("/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate", post(twirp_workflow_steps_update))
+        .route("/twirp/results.services.receiver.Receiver/GetJobLogsSignedBlobURL", post(twirp_get_job_logs_signed_blob_url))
+        .route("/twirp/results.services.receiver.Receiver/GetStepLogsSignedBlobURL", post(twirp_get_step_logs_signed_blob_url))
+        // Cache v4 (actions/cache@v4): twirp service stubs so the runner doesn't see 404.
+        .route("/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL", post(twirp_cache_get_download_url))
+        .route("/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry", post(twirp_cache_create_entry))
+        .route("/twirp/github.actions.results.api.v1.CacheService/FinalizeCacheEntryUpload", post(twirp_cache_finalize_upload))
+        // Artifact v4 (actions/upload-artifact@v4, actions/download-artifact@v4): stubs.
+        .route("/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact", post(twirp_artifact_create))
+        .route("/twirp/github.actions.results.api.v1.ArtifactService/FinalizeArtifact", post(twirp_artifact_finalize))
+        .route("/twirp/github.actions.results.api.v1.ArtifactService/GetSignedArtifactURL", post(twirp_artifact_get_signed_url))
+        .route("/twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts", post(twirp_artifact_list))
         .route(
             "/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id",
             patch(patch_timeline_records),
         )
         .route(
-            "/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id",
+            "/_apis/v1/Logfiles/:scope/:hub/:plan_id",
             post(create_log),
         )
         .route(
-            "/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id/:log_id2",
+            "/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id",
             post(append_log),
         )
         .route(
@@ -149,11 +168,11 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             patch(patch_timeline_records),
         )
         .route(
-            "/runner/server/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id",
+            "/runner/server/_apis/v1/Logfiles/:scope/:hub/:plan_id",
             post(create_log),
         )
         .route(
-            "/runner/server/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id/:log_id2",
+            "/runner/server/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id",
             post(append_log),
         )
         .route(
@@ -206,18 +225,20 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         )
         .route(
             "/:org/_apis/v1/AgentRequest/:pool_id/:request_id",
-            patch(agent_request_patch_org),
+            get(agent_request_get_org)
+                .post(agent_request_ack_org)
+                .patch(agent_request_patch_org),
         )
         .route(
             "/:org/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id",
             patch(patch_timeline_records_org),
         )
         .route(
-            "/:org/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id",
+            "/:org/_apis/v1/Logfiles/:scope/:hub/:plan_id",
             post(create_log_org),
         )
         .route(
-            "/:org/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id/:log_id2",
+            "/:org/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id",
             post(append_log_org),
         )
         .route(
@@ -250,7 +271,9 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         .route("/runner/server/_apis/v1/AgentPools", get(runner_pools))
         .route(
             "/runner/server/_apis/v1/Agent/:pool_id/:agent_id",
-            get(agent_lookup_by_id).post(register_runner_compat),
+            get(agent_lookup_by_id)
+                .post(register_runner_compat)
+                .put(register_runner_compat),
         )
         .route(
             "/runner/server/_apis/v1/Agent/:pool_id",
@@ -278,7 +301,9 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         )
         .route(
             "/runner/server/_apis/v1/AgentRequest/:pool_id/:request_id",
-            patch(agent_request_patch),
+            get(agent_request_get)
+                .post(agent_request_ack)
+                .patch(agent_request_patch),
         )
         .route("/_apis/connectionData", get(connection_data))
         .route(
@@ -300,6 +325,36 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             "/api/v1/runners/sessions/:session_id/messages/:message_id",
             delete(delete_session_message),
         )
+        .route(
+            "/runner/session",
+            post(broker_session_root).delete(broker_delete_session_root),
+        )
+        .route("/runner/message", get(next_message_broker_ref_root))
+        .route("/runner/acknowledge", post(broker_acknowledge_root))
+        .route(
+            "/runner/server/runner/session",
+            post(broker_session_root).delete(broker_delete_session_root),
+        )
+        .route(
+            "/runner/server/runner/message",
+            get(next_message_broker_ref_root),
+        )
+        .route(
+            "/runner/server/runner/acknowledge",
+            post(broker_acknowledge_root),
+        )
+        .route(
+            "/session",
+            post(broker_session_root).delete(broker_delete_session_root),
+        )
+        .route("/message", get(next_message_broker_ref_root))
+        .route("/acknowledge", post(broker_acknowledge_root))
+        .route(
+            "/runner/server/session",
+            post(broker_session_root).delete(broker_delete_session_root),
+        )
+        .route("/runner/server/message", get(next_message_broker_ref_root))
+        .route("/runner/server/acknowledge", post(broker_acknowledge_root))
         .route("/api/v1/jobs/complete", post(complete_job))
         .route("/api/v1/cache", post(cache_put))
         .route("/api/v1/cache", get(cache_get))
@@ -330,7 +385,9 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         )
         .route(
             "/_apis/v1/AgentRequest/:pool_id/:request_id",
-            patch(agent_request_patch),
+            get(agent_request_get)
+                .post(agent_request_ack)
+                .patch(agent_request_patch),
         )
         .merge(protected_apis)
         .layer(TraceLayer::new_for_http())
@@ -338,6 +395,9 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
 }
 
 async fn require_bearer(request: Request, next: Next) -> Result<Response, ApiError> {
+    if request.uri().path().starts_with("/broker/") {
+        return Ok(next.run(request).await);
+    }
     let authorized = request
         .headers()
         .get(header::AUTHORIZATION)
@@ -406,15 +466,22 @@ struct InnerState {
     runner_public_keys: BTreeMap<i64, String>,
     runner_rsa_public_keys: BTreeMap<i64, AgentRsaPublicKey>,
     inflight_messages: BTreeMap<String, BTreeMap<i64, azdo::TaskAgentMessage>>,
+    broker_messages: BTreeMap<i64, azdo::AgentJobRequestMessage>,
     cancellation_queue: VecDeque<QueuedCancellation>,
     pending_caches: BTreeMap<i64, PendingCache>,
     artifacts: BTreeMap<String, ArtifactRecord>,
     logs: BTreeMap<String, Vec<u8>>,
     timeline_events: BTreeMap<RunId, Vec<NdjsonEvent>>,
     inflight_requests: BTreeMap<i64, (RunId, JobId)>,
+    job_requests: BTreeMap<i64, TaskAgentJobRequestRecord>,
+    plan_requests: BTreeMap<String, i64>,
+    agent_job_requests: BTreeMap<uuid::Uuid, i64>,
+    timeline_requests: BTreeMap<uuid::Uuid, i64>,
+    session_active_requests: BTreeMap<String, i64>,
     next_runner_id: i64,
     next_cache_id: i64,
     next_message_id: i64,
+    next_log_id: usize,
     next_request_id: i64,
 }
 
@@ -427,6 +494,19 @@ struct RunRecord {
     job_outputs: BTreeMap<JobId, BTreeMap<String, serde_json::Value>>,
     job_base_ids: BTreeMap<JobId, String>,
     job_fail_fast: BTreeMap<String, bool>,
+}
+
+#[derive(Debug, Clone)]
+struct TaskAgentJobRequestRecord {
+    request_id: i64,
+    run_id: RunId,
+    job_id: JobId,
+    agent_job_id: uuid::Uuid,
+    plan_id: String,
+    plan_type: String,
+    timeline_id: uuid::Uuid,
+    result: Option<ExecutionStatus>,
+    locked_until: String,
 }
 
 #[derive(Debug, Clone)]
@@ -600,6 +680,31 @@ async fn submit_run(
             inner
                 .inflight_requests
                 .insert(request_id, (run_id, job.id.clone()));
+            let job_request = TaskAgentJobRequestRecord {
+                request_id,
+                run_id,
+                job_id: job.id.clone(),
+                agent_job_id: agent_msg.job_id,
+                plan_id: agent_msg.plan.plan_id.clone(),
+                plan_type: agent_msg
+                    .plan
+                    .plan_type
+                    .clone()
+                    .unwrap_or_else(|| "Job".to_owned()),
+                timeline_id: agent_msg.timeline.id,
+                result: None,
+                locked_until: agent_request_locked_until(),
+            };
+            inner
+                .plan_requests
+                .insert(job_request.plan_id.clone(), request_id);
+            inner
+                .agent_job_requests
+                .insert(job_request.agent_job_id, request_id);
+            inner
+                .timeline_requests
+                .insert(job_request.timeline_id, request_id);
+            inner.job_requests.insert(request_id, job_request);
 
             let queued_job = QueuedJob {
                 run_id,
@@ -845,18 +950,26 @@ async fn register_runner(
 
 async fn create_session(
     State(shared): State<Arc<SharedState>>,
-    Json(_request): Json<RunnerSessionRequest>,
-) -> Json<serde_json::Value> {
+    Json(request): Json<RunnerSessionRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let session_id = uuid::Uuid::new_v4();
 
     // Generate AES session key
     let session_enc = SessionEncryption::generate();
 
-    // Send the AES key as base64 without RSA wrapping.
-    // The runner's RSA public key parsing from registration is complex (XML format);
-    // for now we send the key unencrypted and let the runner use it directly.
-    let key_b64 =
-        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &session_enc.key);
+    let runner_public_key = {
+        let inner = shared.state.inner.lock().await;
+        inner
+            .runner_rsa_public_keys
+            .get(&request.runner_id)
+            .cloned()
+    };
+    let (key_bytes, encrypted) = if let Some(public_key) = runner_public_key {
+        (public_key.wrap_key(&session_enc.key)?, true)
+    } else {
+        (session_enc.key.clone(), false)
+    };
+    let key_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key_bytes);
 
     // Store the session key for later message decryption
     {
@@ -866,15 +979,56 @@ async fn create_session(
             .insert(session_id.to_string(), session_enc);
     }
 
-    info!(%session_id, "session created with AES key (unencrypted)");
+    info!(%session_id, runner_id = request.runner_id, encrypted, "session created with AES key");
 
-    Json(json!({
+    Ok(Json(json!({
         "sessionId": session_id.to_string(),
         "encryptionKey": {
             "value": key_b64,
-            "encrypted": false
+            "encrypted": encrypted
         }
-    }))
+    })))
+}
+
+async fn create_session_disttask(
+    State(shared): State<Arc<SharedState>>,
+    Path(_pool_id): Path<i64>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let runner_id = body
+        .get("agent")
+        .and_then(|a| a.get("id"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(1);
+    let name = body
+        .get("agent")
+        .and_then(|a| a.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("runner")
+        .to_owned();
+    let response = create_session(
+        State(shared),
+        Json(RunnerSessionRequest { runner_id, name }),
+    )
+    .await?;
+    let session_id = response["sessionId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let owner_name = body
+        .get("ownerName")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "sessionId": session_id,
+            "ownerName": owner_name,
+            "assignmentQueued": false,
+            "orchestrationId": ""
+        })),
+    ))
 }
 
 async fn delete_session(
@@ -884,6 +1038,467 @@ async fn delete_session(
     let mut inner = shared.state.inner.lock().await;
     inner.sessions.remove(&session_id);
     StatusCode::NO_CONTENT
+}
+
+/// DELETE /runner/server/_apis/distributedtask/pools/:pool_id/agents/:agent_id
+/// Idempotent agent deregistration — the runner calls this on clean exit.
+/// aksh keeps no persistent agent registry so always succeeds.
+async fn delete_agent(Path((_pool_id, _agent_id)): Path<(i64, i64)>) -> StatusCode {
+    StatusCode::NO_CONTENT
+}
+
+/// DELETE /runner/server/_apis/distributedtask/pools/:pool_id/sessions (no session_id)
+/// Broker-side session teardown: the runner deletes the session-less path on the broker host.
+/// Return 204 unconditionally; the concrete session was already cleaned up individually.
+async fn delete_sessions_for_pool(Path(_pool_id): Path<i64>) -> StatusCode {
+    StatusCode::NO_CONTENT
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BrokerAcquireJobRequest {
+    job_message_id: uuid::Uuid,
+    #[allow(dead_code)]
+    billing_owner_id: Option<String>,
+    #[allow(dead_code)]
+    runner_os: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BrokerRenewJobRequest {
+    job_id: uuid::Uuid,
+    plan_id: String,
+    conclusion: Option<String>,
+}
+
+fn execution_status_from_runner_result(result: &str) -> Option<ExecutionStatus> {
+    match result {
+        "success" | "succeeded" | "succeededWithIssues" => Some(ExecutionStatus::Success),
+        "failure" | "failed" => Some(ExecutionStatus::Failure),
+        "cancelled" | "canceled" => Some(ExecutionStatus::Cancelled),
+        _ => None,
+    }
+}
+
+fn broker_run_service_url(runner_id: i64) -> String {
+    format!("{}/broker/{runner_id}/", public_base_url())
+}
+
+fn public_base_url() -> String {
+    std::env::var("AKSH_PUBLIC_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:9090".to_owned())
+        .trim_end_matches('/')
+        .to_owned()
+}
+
+fn runner_server_url() -> String {
+    format!("{}/runner/server", public_base_url())
+}
+
+fn broker_job_ref(request: &TaskAgentJobRequestRecord, runner_id: i64) -> serde_json::Value {
+    json!({
+        "messageId": request.agent_job_id.to_string(),
+        "messageType": "RunnerJobRequest",
+        "body": serde_json::to_string(&json!({
+            "runner_request_id": request.agent_job_id.to_string(),
+            "run_service_url": broker_run_service_url(runner_id),
+            "billing_owner_id": "local",
+            "should_acknowledge": true
+        })).unwrap()
+    })
+}
+
+fn broker_job_ref_root(request: &TaskAgentJobRequestRecord, runner_id: i64) -> serde_json::Value {
+    json!({
+        "messageId": request.request_id,
+        "messageType": "RunnerJobRequest",
+        "body": serde_json::to_string(&json!({
+            "runner_request_id": request.agent_job_id.to_string(),
+            "run_service_url": broker_run_service_url(runner_id),
+            "billing_owner_id": "local",
+            "should_acknowledge": true
+        })).unwrap()
+    })
+}
+
+async fn next_message_broker_ref(
+    State(shared): State<Arc<SharedState>>,
+    Path(pool_id): Path<i64>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    let session_id = params
+        .get("sessionId")
+        .cloned()
+        .unwrap_or_else(|| "default".to_owned());
+    let wait_seconds = params
+        .get("waitSeconds")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(50);
+
+    loop {
+        let mut inner = shared.state.inner.lock().await;
+        if let Some(request_id) = inner.session_active_requests.get(&session_id).copied() {
+            if let Some(request) = inner.job_requests.get(&request_id) {
+                if request.result.is_none() {
+                    return Ok(Json(broker_job_ref(request, pool_id)).into_response());
+                }
+            }
+            inner.session_active_requests.remove(&session_id);
+        }
+
+        let Some(queued) = inner.queue.pop_front() else {
+            drop(inner);
+            if wait_seconds == 0 {
+                return Ok((StatusCode::ACCEPTED, Json(json!({}))).into_response());
+            }
+            if tokio::time::timeout(
+                Duration::from_secs(wait_seconds),
+                shared.state.message_notify.notified(),
+            )
+            .await
+            .is_err()
+            {
+                return Ok((StatusCode::ACCEPTED, Json(json!({}))).into_response());
+            }
+            continue;
+        };
+
+        if let Some(run) = inner.runs.get_mut(&queued.run_id) {
+            run.status = ExecutionStatus::InProgress;
+            run.jobs
+                .insert(queued.job_id.clone(), ExecutionStatus::InProgress);
+        }
+
+        let request_id = queued.message.request_id;
+        inner
+            .session_active_requests
+            .insert(session_id.clone(), request_id);
+        inner
+            .broker_messages
+            .insert(request_id, queued.message.clone());
+        let request = inner
+            .job_requests
+            .get(&request_id)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("agent request not found"))?;
+
+        let run_id = queued.run_id;
+        let job_id = queued.job_id.clone();
+        drop(inner);
+
+        shared
+            .state
+            .emit(NdjsonEvent::JobStatus {
+                run_id,
+                job_id,
+                status: ExecutionStatus::InProgress,
+            })
+            .await;
+
+        return Ok(Json(broker_job_ref(&request, pool_id)).into_response());
+    }
+}
+
+async fn broker_session_root() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::CREATED,
+        Json(json!({
+            "sessionId": uuid::Uuid::new_v4().to_string(),
+            "ownerName": "aksh-runner",
+            "assignmentQueued": false,
+            "orchestrationId": ""
+        })),
+    )
+}
+
+async fn broker_delete_session_root() -> StatusCode {
+    StatusCode::NO_CONTENT
+}
+
+async fn next_message_broker_ref_root(
+    State(shared): State<Arc<SharedState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let session_id = params
+        .get("sessionId")
+        .cloned()
+        .unwrap_or_else(|| "default".to_owned());
+    let wait = params
+        .get("waitSeconds")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(wait);
+
+    loop {
+        let maybe = {
+            let mut inner = shared.state.inner.lock().await;
+            if let Some(request_id) = inner.session_active_requests.get(&session_id).copied() {
+                if let Some(request) = inner.job_requests.get(&request_id) {
+                    if request.result.is_none() {
+                        Some(broker_job_ref_root(request, 1))
+                    } else {
+                        inner.session_active_requests.remove(&session_id);
+                        None
+                    }
+                } else {
+                    inner.session_active_requests.remove(&session_id);
+                    None
+                }
+            } else if let Some(queued) = inner.queue.pop_front() {
+                if let Some(run) = inner.runs.get_mut(&queued.run_id) {
+                    run.status = ExecutionStatus::InProgress;
+                    run.jobs
+                        .insert(queued.job_id.clone(), ExecutionStatus::InProgress);
+                }
+                let request_id = queued.message.request_id;
+                inner
+                    .session_active_requests
+                    .insert(session_id.clone(), request_id);
+                inner
+                    .broker_messages
+                    .insert(request_id, queued.message.clone());
+                let request = inner
+                    .job_requests
+                    .get(&request_id)
+                    .expect("queued request must exist");
+                Some(broker_job_ref_root(request, 1))
+            } else {
+                None
+            }
+        };
+
+        if let Some(message) = maybe {
+            return Ok(Json(message));
+        }
+        if wait == 0 || std::time::Instant::now() >= deadline {
+            return Ok(Json(serde_json::Value::Null));
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn broker_acknowledge_root(
+    State(shared): State<Arc<SharedState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> StatusCode {
+    if let Some(session_id) = params.get("sessionId") {
+        let mut inner = shared.state.inner.lock().await;
+        inner.session_active_requests.remove(session_id);
+    }
+    StatusCode::OK
+}
+
+async fn broker_acquire_job(
+    State(shared): State<Arc<SharedState>>,
+    Path(runner_id): Path<i64>,
+    Json(request): Json<BrokerAcquireJobRequest>,
+) -> Result<Json<azdo::AgentJobRequestMessage>, ApiError> {
+    let inner = shared.state.inner.lock().await;
+    let request_id = inner
+        .agent_job_requests
+        .get(&request.job_message_id)
+        .copied()
+        .or_else(|| sole_active_unfinished_request(&inner))
+        .ok_or_else(|| ApiError::not_found("broker job message not found"))?;
+    let mut message = inner
+        .broker_messages
+        .get(&request_id)
+        .cloned()
+        .or_else(|| {
+            inner.job_requests.get(&request_id).and_then(|record| {
+                inner
+                    .agent_job_requests
+                    .get(&record.agent_job_id)
+                    .and_then(|_| {
+                        inner
+                            .queue
+                            .iter()
+                            .find(|queued| queued.message.request_id == request_id)
+                            .map(|queued| queued.message.clone())
+                    })
+            })
+        })
+        .ok_or_else(|| ApiError::not_found("broker job payload not found"))?;
+    message.message_type = Some(azdo::message_type::RUNNER_JOB_REQUEST.to_owned());
+    let run_service_url = broker_run_service_url(runner_id);
+    for endpoint in &mut message.resources.endpoints {
+        if endpoint.name.eq_ignore_ascii_case("SystemVssConnection") {
+            endpoint.url = Some(run_service_url.clone());
+            endpoint
+                .data
+                .insert("ResultsServiceUrl".to_owned(), public_base_url());
+            endpoint
+                .data
+                .insert("PipelinesServiceUrl".to_owned(), runner_server_url());
+            endpoint
+                .data
+                .insert("CacheServerUrl".to_owned(), public_base_url());
+        }
+    }
+    Ok(Json(message))
+}
+
+async fn broker_renew_job(
+    State(shared): State<Arc<SharedState>>,
+    Path(_runner_id): Path<i64>,
+    Json(request): Json<BrokerRenewJobRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut inner = shared.state.inner.lock().await;
+    let request_id = inner
+        .agent_job_requests
+        .get(&request.job_id)
+        .copied()
+        .or_else(|| inner.plan_requests.get(&request.plan_id).copied())
+        .or_else(|| sole_active_unfinished_request(&inner))
+        .ok_or_else(|| ApiError::not_found("broker renew request not found"))?;
+    let record = inner
+        .job_requests
+        .get_mut(&request_id)
+        .ok_or_else(|| ApiError::not_found("agent request not found"))?;
+    record.locked_until = agent_request_locked_until();
+    Ok(Json(json!({"lockedUntil": record.locked_until})))
+}
+
+async fn broker_complete_job(
+    State(shared): State<Arc<SharedState>>,
+    Path(_runner_id): Path<i64>,
+    Json(request): Json<BrokerRenewJobRequest>,
+) -> Result<StatusCode, ApiError> {
+    let status = request
+        .conclusion
+        .as_deref()
+        .and_then(execution_status_from_runner_result)
+        .unwrap_or(ExecutionStatus::Success);
+    let completion = {
+        let mut inner = shared.state.inner.lock().await;
+        let request_id = inner
+            .agent_job_requests
+            .get(&request.job_id)
+            .copied()
+            .or_else(|| inner.plan_requests.get(&request.plan_id).copied())
+            .or_else(|| sole_active_unfinished_request(&inner))
+            .ok_or_else(|| ApiError::not_found("broker complete request not found"))?;
+        if let Some(record) = inner.job_requests.get_mut(&request_id) {
+            record.result = Some(status);
+            record.locked_until = agent_request_locked_until();
+        }
+        inner
+            .inflight_requests
+            .remove(&request_id)
+            .or_else(|| {
+                job_request_tuple(&inner, request_id).map(|(_, run_id, job_id)| (run_id, job_id))
+            })
+            .map(|(run_id, job_id)| JobCompletion {
+                run_id,
+                job_id,
+                status,
+                outputs: Default::default(),
+            })
+    };
+    if let Some(completion) = completion {
+        let _ = complete_job_inner(shared, completion).await?;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+struct JobLogsSignedBlobUrlRequest {
+    workflow_job_run_backend_id: String,
+    workflow_run_backend_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct StepLogsSignedBlobUrlRequest {
+    step_backend_id: String,
+    workflow_job_run_backend_id: String,
+    workflow_run_backend_id: String,
+}
+
+async fn twirp_workflow_steps_update(
+    Json(_request): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    Json(json!({"ok": true}))
+}
+
+async fn twirp_get_job_logs_signed_blob_url(
+    Json(request): Json<JobLogsSignedBlobUrlRequest>,
+) -> Json<serde_json::Value> {
+    Json(json!({
+        "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
+        "logs_url": format!(
+            "{}/replay/results/{}/{}/job-logs.txt",
+            public_base_url(), request.workflow_run_backend_id, request.workflow_job_run_backend_id
+        )
+    }))
+}
+
+async fn twirp_get_step_logs_signed_blob_url(
+    Json(request): Json<StepLogsSignedBlobUrlRequest>,
+) -> Json<serde_json::Value> {
+    Json(json!({
+        "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
+        "logs_url": format!(
+            "{}/replay/results/{}/{}/step-{}.txt",
+            public_base_url(), request.workflow_run_backend_id, request.workflow_job_run_backend_id, request.step_backend_id
+        ),
+        "soft_size_limit": "1048576"
+    }))
+}
+
+// ── Cache v4 twirp stubs ──────────────────────────────────────────────────
+
+async fn twirp_cache_get_download_url(
+    Json(_req): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    // Runner calls this to locate an existing cache entry. Return cache-miss so
+    // the runner skips restore and proceeds (the job step handles the empty cache).
+    Json(json!({"ok": true, "signed_download_url": "", "matched_key": ""}))
+}
+
+async fn twirp_cache_create_entry(Json(_req): Json<serde_json::Value>) -> Json<serde_json::Value> {
+    let upload_url = format!(
+        "{}/replay/cache/upload/{}",
+        public_base_url(),
+        uuid::Uuid::new_v4()
+    );
+    Json(json!({"ok": true, "signed_upload_url": upload_url, "message": ""}))
+}
+
+async fn twirp_cache_finalize_upload(
+    Json(_req): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    Json(json!({"ok": true, "entry_id": uuid::Uuid::new_v4().to_string(), "message": ""}))
+}
+
+// ── Artifact v4 twirp stubs ───────────────────────────────────────────────
+
+async fn twirp_artifact_create(Json(_req): Json<serde_json::Value>) -> Json<serde_json::Value> {
+    let upload_url = format!(
+        "{}/replay/artifact/upload/{}",
+        public_base_url(),
+        uuid::Uuid::new_v4()
+    );
+    Json(json!({"ok": true, "signed_upload_url": upload_url}))
+}
+
+async fn twirp_artifact_finalize(Json(_req): Json<serde_json::Value>) -> Json<serde_json::Value> {
+    Json(json!({"ok": true, "artifact_id": uuid::Uuid::new_v4().to_string()}))
+}
+
+async fn twirp_artifact_get_signed_url(
+    Json(_req): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let url = format!(
+        "{}/replay/artifact/download/{}",
+        public_base_url(),
+        uuid::Uuid::new_v4()
+    );
+    Json(json!({"signed_url": url}))
+}
+
+async fn twirp_artifact_list(Json(_req): Json<serde_json::Value>) -> Json<serde_json::Value> {
+    Json(json!({"artifacts": []}))
 }
 
 async fn next_message(
@@ -924,6 +1539,31 @@ async fn next_message(
             return Ok(Json(Some(message)));
         }
 
+        if let Some(request_id) = inner.session_active_requests.get(&session_id).copied() {
+            let request_finished = inner
+                .job_requests
+                .get(&request_id)
+                .is_none_or(|request| request.result.is_some());
+            if request_finished {
+                inner.session_active_requests.remove(&session_id);
+            } else {
+                drop(inner);
+                if wait_seconds == 0 {
+                    return Ok(Json(None));
+                }
+                if tokio::time::timeout(
+                    Duration::from_secs(wait_seconds),
+                    shared.state.message_notify.notified(),
+                )
+                .await
+                .is_err()
+                {
+                    return Ok(Json(None));
+                }
+                continue;
+            }
+        }
+
         let Some(queued) = inner.queue.pop_front() else {
             drop(inner);
             if wait_seconds == 0 {
@@ -950,6 +1590,9 @@ async fn next_message(
 
         let body_json = serde_json::to_string(&queued.message)
             .map_err(|e| ApiError::bad_request(format!("failed to serialize job message: {e}")))?;
+        inner
+            .session_active_requests
+            .insert(session_id.clone(), queued.message.request_id);
         let message = build_task_agent_message(
             &mut inner,
             &session_id,
@@ -1066,44 +1709,192 @@ async fn complete_job_compat(
     .await
 }
 
+/// GET /_apis/v1/AgentRequest/:pool_id/:request_id — query a job request lease/result.
+///
+/// The official listener calls this when another job arrives while the previous
+/// worker process may still be unwinding. Returning a completed `result` lets it
+/// safely move on; 404/405 makes it cancel the worker and can poison matrix runs.
+async fn agent_request_get(
+    State(shared): State<Arc<SharedState>>,
+    Path((pool_id, request_id)): Path<(i64, i64)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let inner = shared.state.inner.lock().await;
+    let request = inner
+        .job_requests
+        .get(&request_id)
+        .ok_or_else(|| ApiError::not_found("agent request not found"))?;
+    Ok(Json(agent_request_json(pool_id, request)))
+}
+
+/// POST /_apis/v1/AgentRequest/:pool_id/:request_id — best-effort request ack.
+async fn agent_request_ack(Path((_pool_id, _request_id)): Path<(i64, i64)>) -> StatusCode {
+    StatusCode::OK
+}
+
 /// PATCH /_apis/v1/AgentRequest/:pool_id/:request_id — renew or complete job request.
 /// The runner sends this to renew the job lock or report completion.
 async fn agent_request_patch(
     State(shared): State<Arc<SharedState>>,
-    Path((_pool_id, request_id)): Path<(i64, i64)>,
+    Path((pool_id, request_id)): Path<(i64, i64)>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     info!(?body, "agent_request_patch received");
+    // If this is a completion (has result), delegate to complete_job_inner
+    // so summarize_run, promote_ready_jobs, and notify_waiters all fire.
+    // The result field is only present on the final PATCH; renewals have no result.
     if let Some(result) = body.get("result").and_then(|v| v.as_str()) {
-        let new_status = match result {
-            "succeeded" => ExecutionStatus::Success,
-            "failed" => ExecutionStatus::Failure,
-            "cancelled" => ExecutionStatus::Cancelled,
-            _ => ExecutionStatus::Success,
-        };
-        let mut inner = shared.state.inner.lock().await;
-        // Look up the (run_id, job_id) this request_id was assigned to at
-        // dispatch time. Without this mapping we'd mutate every InProgress
-        // job in every run.
-        if let Some((run_id, job_id)) = inner.inflight_requests.remove(&request_id) {
-            if let Some(run) = inner.runs.get_mut(&run_id) {
-                if let Some(status) = run.jobs.get_mut(&job_id) {
-                    *status = new_status;
-                    info!(%run_id, %job_id, result, "updated job status");
-                }
+        let new_status = match execution_status_from_runner_result(result) {
+            Some(status) => status,
+            None => {
+                info!(request_id, %result, "unknown agent_request_patch result; skipping completion");
+                return Json(
+                    json!({ "requestId": request_id, "lockedUntil": "2099-12-31T23:59:59Z" }),
+                );
             }
-        } else {
-            info!(
-                request_id,
-                "no inflight job for request_id; ignoring result"
-            );
+        };
+        // Look up (run_id, job_id) under the inner lock, then drop it before calling
+        // complete_job_inner which acquires the lock itself.
+        let completion = {
+            let mut inner = shared.state.inner.lock().await;
+            let mut already_completed = false;
+            if let Some(request) = inner.job_requests.get_mut(&request_id) {
+                already_completed = request.result.is_some();
+                request.result = Some(new_status);
+                request.locked_until = agent_request_locked_until();
+            }
+            if already_completed {
+                inner.inflight_requests.remove(&request_id);
+                info!(
+                    request_id,
+                    result, "agent request already completed; refreshing result only"
+                );
+                None
+            } else if let Some((run_id, job_id)) = inner.inflight_requests.remove(&request_id) {
+                info!(%run_id, %job_id, result, "job completed via agent_request_patch");
+                Some(JobCompletion {
+                    run_id,
+                    job_id,
+                    status: new_status,
+                    outputs: Default::default(),
+                })
+            } else {
+                info!(
+                    request_id,
+                    "no inflight job for request_id; ignoring result"
+                );
+                None
+            }
+        };
+        if let Some(c) = completion {
+            let _ = complete_job_inner(shared.clone(), c).await;
+        }
+        return Json(agent_request_response(&shared, pool_id, request_id).await);
+    }
+    // Renewal — runner is still working; just extend the lock.
+    {
+        let mut inner = shared.state.inner.lock().await;
+        if let Some(request) = inner.job_requests.get_mut(&request_id) {
+            request.locked_until = agent_request_locked_until();
         }
     }
-    Json(json!({
-        "requestId": request_id,
-        "lockedUntil": "2099-12-31T23:59:59Z",
-        "result": body.get("result"),
-    }))
+    Json(agent_request_response(&shared, pool_id, request_id).await)
+}
+
+async fn agent_request_response(
+    shared: &Arc<SharedState>,
+    pool_id: i64,
+    request_id: i64,
+) -> serde_json::Value {
+    let inner = shared.state.inner.lock().await;
+    inner
+        .job_requests
+        .get(&request_id)
+        .map(|request| agent_request_json(pool_id, request))
+        .unwrap_or_else(|| {
+            json!({
+                "requestId": request_id,
+                "poolId": pool_id,
+                "lockedUntil": agent_request_locked_until(),
+            })
+        })
+}
+
+fn agent_request_json(pool_id: i64, request: &TaskAgentJobRequestRecord) -> serde_json::Value {
+    json!({
+        "requestId": request.request_id,
+        "poolId": pool_id,
+        "jobId": request.agent_job_id,
+        "jobName": request.job_id.to_string(),
+        "planId": request.plan_id,
+        "planType": request.plan_type,
+        "lockedUntil": request.locked_until,
+        "result": request.result.map(agent_request_result),
+    })
+}
+
+fn agent_request_result(status: ExecutionStatus) -> &'static str {
+    match status {
+        ExecutionStatus::Success => "succeeded",
+        ExecutionStatus::Failure => "failed",
+        ExecutionStatus::Cancelled => "canceled",
+        ExecutionStatus::Skipped => "skipped",
+        ExecutionStatus::Queued | ExecutionStatus::InProgress => "pending",
+    }
+}
+
+fn agent_request_locked_until() -> String {
+    "2099-12-31T23:59:59Z".to_owned()
+}
+
+fn task_result_status(result: azdo::TaskResult) -> ExecutionStatus {
+    match result {
+        azdo::TaskResult::Succeeded | azdo::TaskResult::SucceededWithIssues => {
+            ExecutionStatus::Success
+        }
+        azdo::TaskResult::Failed => ExecutionStatus::Failure,
+        azdo::TaskResult::Cancelled => ExecutionStatus::Cancelled,
+        azdo::TaskResult::Skipped => ExecutionStatus::Skipped,
+    }
+}
+
+fn resolve_callback_job(
+    inner: &InnerState,
+    plan_id: &str,
+    timeline_id: Option<uuid::Uuid>,
+    agent_job_id: Option<uuid::Uuid>,
+) -> Option<(i64, RunId, JobId)> {
+    let request_id = inner
+        .plan_requests
+        .get(plan_id)
+        .copied()
+        .or_else(|| timeline_id.and_then(|id| inner.timeline_requests.get(&id).copied()))
+        .or_else(|| agent_job_id.and_then(|id| inner.agent_job_requests.get(&id).copied()))?;
+    let request = inner.job_requests.get(&request_id)?;
+    Some((request_id, request.run_id, request.job_id.clone()))
+}
+
+fn sole_active_unfinished_request(inner: &InnerState) -> Option<i64> {
+    let mut active = inner
+        .session_active_requests
+        .values()
+        .copied()
+        .filter(|request_id| {
+            inner
+                .job_requests
+                .get(request_id)
+                .is_some_and(|request| request.result.is_none())
+        });
+    let request_id = active.next()?;
+    if active.next().is_none() {
+        Some(request_id)
+    } else {
+        None
+    }
+}
+
+fn job_request_tuple(inner: &InnerState, request_id: i64) -> Option<(i64, RunId, JobId)> {
+    let request = inner.job_requests.get(&request_id)?;
+    Some((request_id, request.run_id, request.job_id.clone()))
 }
 
 async fn complete_job_inner(
@@ -1355,9 +2146,19 @@ fn need_satisfied(run: &RunRecord, need: &JobId) -> bool {
 async fn patch_timeline_records(
     State(shared): State<Arc<SharedState>>,
     Path((_scope, _hub, plan_id, timeline_id)): Path<(String, String, String, String)>,
-    Json(records): Json<Vec<azdo::TimelineRecord>>,
+    Json(wrapper): Json<azdo::VssJsonCollectionWrapper<azdo::TimelineRecord>>,
 ) -> Json<serde_json::Value> {
-    let run_id = plan_id.parse::<RunId>().ok();
+    let records = wrapper.value;
+    let count = records.len();
+    let callback_job = {
+        let inner = shared.state.inner.lock().await;
+        resolve_callback_job(&inner, &plan_id, timeline_id.parse().ok(), None)
+    };
+    let run_id = callback_job
+        .as_ref()
+        .map(|(_, run_id, _)| *run_id)
+        .or_else(|| plan_id.parse::<RunId>().ok());
+    let logical_job_id = callback_job.as_ref().map(|(_, _, job_id)| job_id.clone());
     let mut projected = Vec::new();
     for record in &records {
         if let Some(state) = &record.state {
@@ -1372,7 +2173,9 @@ async fn patch_timeline_records(
         if let (Some(run_id), Some(status)) = (run_id, timeline_status(record)) {
             projected.push(NdjsonEvent::JobStatus {
                 run_id,
-                job_id: JobId(record.id.to_string()),
+                job_id: logical_job_id
+                    .clone()
+                    .unwrap_or_else(|| JobId(record.id.to_string())),
                 status,
             });
         }
@@ -1380,7 +2183,9 @@ async fn patch_timeline_records(
             for issue in &record.issues {
                 projected.push(NdjsonEvent::Annotation {
                     run_id,
-                    job_id: JobId(record.id.to_string()),
+                    job_id: logical_job_id
+                        .clone()
+                        .unwrap_or_else(|| JobId(record.id.to_string())),
                     level: issue_level(issue.issue_type),
                     message: issue.message.clone().unwrap_or_default(),
                     file: issue.data.get("file").cloned(),
@@ -1400,7 +2205,7 @@ async fn patch_timeline_records(
     for event in projected {
         shared.state.emit(event).await;
     }
-    Json(json!({ "ok": true }))
+    Json(json!({ "count": count, "value": records }))
 }
 
 fn timeline_status(record: &azdo::TimelineRecord) -> Option<ExecutionStatus> {
@@ -1429,18 +2234,22 @@ fn issue_level(issue_type: azdo::IssueType) -> AnnotationLevel {
 /// POST create log file — runner creates a log container.
 async fn create_log(
     State(shared): State<Arc<SharedState>>,
-    Path((_scope, _hub, plan_id, log_id)): Path<(String, String, String, String)>,
+    Path((_scope, _hub, plan_id)): Path<(String, String, String)>,
+    Json(mut log): Json<azdo::TaskLog>,
 ) -> Json<serde_json::Value> {
-    let key = log_key(&plan_id, &log_id);
     let mut inner = shared.state.inner.lock().await;
+    let next_id = inner.next_log_id;
+    inner.next_log_id = next_id.wrapping_add(1);
+    log.id = next_id as i64;
+    let key = format!("{}/{}", plan_id, next_id);
     inner.logs.entry(key).or_default();
-    Json(json!({ "ok": true }))
+    Json(serde_json::to_value(&log).unwrap_or(json!({ "ok": true })))
 }
 
 /// POST append log — runner appends lines to a log file.
 async fn append_log(
     State(shared): State<Arc<SharedState>>,
-    Path((_scope, _hub, plan_id, log_id, _log_id2)): Path<(String, String, String, String, String)>,
+    Path((_scope, _hub, plan_id, log_id)): Path<(String, String, String, String)>,
     body: Bytes,
 ) -> StatusCode {
     let key = log_key(&plan_id, &log_id);
@@ -1460,9 +2269,10 @@ fn log_key(plan_id: &str, log_id: &str) -> String {
 
 fn mask_log_bytes(inner: &InnerState, plan_id: &str, body: &[u8]) -> Vec<u8> {
     let mut text = String::from_utf8_lossy(body).into_owned();
-    let run_secrets = plan_id
-        .parse::<RunId>()
-        .ok()
+    let resolved_run_id = resolve_callback_job(inner, plan_id, None, None)
+        .map(|(_, run_id, _)| run_id)
+        .or_else(|| plan_id.parse::<RunId>().ok());
+    let run_secrets = resolved_run_id
         .and_then(|run_id| inner.runs.get(&run_id))
         .map(|run| run.submission.secrets.values().collect::<Vec<_>>())
         .unwrap_or_else(|| {
@@ -1495,7 +2305,7 @@ async fn console_log(
     )>,
     _body: Bytes,
 ) -> StatusCode {
-    StatusCode::ACCEPTED
+    StatusCode::OK
 }
 
 /// POST finish job — runner reports final result + outputs.
@@ -1504,41 +2314,43 @@ async fn finish_job(
     Path((_scope, _hub, plan_id)): Path<(String, String, String)>,
     Json(event): Json<azdo::JobCompletedEvent>,
 ) -> Json<serde_json::Value> {
-    let mut inner = shared.state.inner.lock().await;
-
-    let status = match event.result {
-        azdo::TaskResult::Succeeded | azdo::TaskResult::SucceededWithIssues => {
-            ExecutionStatus::Success
-        }
-        azdo::TaskResult::Failed => ExecutionStatus::Failure,
-        azdo::TaskResult::Cancelled => ExecutionStatus::Cancelled,
-        azdo::TaskResult::Skipped => ExecutionStatus::Skipped,
-    };
-
-    // Find the run and update job status
-    let run_id = plan_id.parse::<RunId>().ok();
-    let actual_run_id = if let Some(rid) = run_id {
-        if let Some(run) = inner.runs.get_mut(&rid) {
-            run.jobs.insert(JobId(event.job_id.to_string()), status);
-            run.job_outputs.insert(
-                JobId(event.job_id.to_string()),
-                event
-                    .outputs
-                    .iter()
-                    .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
-                    .collect(),
-            );
-            run.status = summarize_run(run.jobs.values().copied());
-            rid
+    let status = task_result_status(event.result);
+    let outputs = event
+        .outputs
+        .iter()
+        .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
+        .collect();
+    let completion = {
+        let mut inner = shared.state.inner.lock().await;
+        let callback_resolved = resolve_callback_job(
+            &inner,
+            &plan_id,
+            Some(event.timeline_id),
+            Some(event.job_id),
+        );
+        let active_resolved =
+            sole_active_unfinished_request(&inner).and_then(|id| job_request_tuple(&inner, id));
+        let resolved = callback_resolved.or(active_resolved).or_else(|| {
+            plan_id
+                .parse::<RunId>()
+                .ok()
+                .map(|run_id| (0, run_id, JobId(event.job_id.to_string())))
+        });
+        if let Some((request_id, run_id, job_id)) = resolved {
+            if let Some(request) = inner.job_requests.get_mut(&request_id) {
+                request.result = Some(status);
+                request.locked_until = agent_request_locked_until();
+            }
+            Some(JobCompletion {
+                run_id,
+                job_id,
+                status,
+                outputs,
+            })
         } else {
-            RunId::new()
+            None
         }
-    } else {
-        RunId::new()
     };
-
-    // Promote pending jobs whose dependencies are now met
-    let promoted_jobs = promote_ready_jobs(&mut inner);
 
     info!(
         job_id = %event.job_id,
@@ -1547,19 +2359,16 @@ async fn finish_job(
         "job completed"
     );
 
-    drop(inner);
-    if promoted_jobs > 0 {
-        shared.state.message_notify.notify_waiters();
+    if let Some(completion) = completion {
+        let _ = complete_job_inner(shared, completion).await;
+    } else {
+        warn!(
+            plan_id,
+            job_id = %event.job_id,
+            timeline_id = %event.timeline_id,
+            "finish_job could not resolve callback to a run/job"
+        );
     }
-    shared
-        .state
-        .emit(NdjsonEvent::JobCompleted {
-            run_id: actual_run_id,
-            job_id: JobId(event.job_id.to_string()),
-            status,
-            outputs: event.outputs,
-        })
-        .await;
 
     Json(json!({ "ok": true }))
 }
@@ -1595,11 +2404,47 @@ fn summarize_run(statuses: impl Iterator<Item = ExecutionStatus>) -> ExecutionSt
     }
 }
 
-async fn connection_data() -> axum::response::Response {
+async fn connection_data(
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    if params.get("connectOptions").map(String::as_str) == Some("0")
+        && params
+            .get("lastChangeId")
+            .is_some_and(|last_change_id| last_change_id != "-1")
+    {
+        return axum::response::Json(json!({
+            "deploymentId": "00000000-0000-0000-0000-000000000000",
+            "deploymentType": "hosted",
+            "instanceId": uuid::Uuid::new_v4().to_string(),
+            "locationServiceData": {
+                "clientCacheFresh": true,
+                "defaultAccessMappingMoniker": "ScaleUnitMapping",
+                "lastChangeId": 1,
+                "lastChangeId64": 1
+            }
+        }))
+        .into_response();
+    }
+
+    let service_root = public_base_url();
+    let runner_root = runner_server_url();
     let body = serde_json::json!({
+        "deploymentId": "00000000-0000-0000-0000-000000000000",
+        "deploymentType": "hosted",
         "instanceId": uuid::Uuid::new_v4().to_string(),
+        "serverUrlV2": runner_root,
+        "brokerUrl": public_base_url(),
+        "resultsServiceUrl": runner_root,
         "locationServiceData": {
+            "lastChangeId": 1,
+            "lastChangeId64": 1,
+            "clientCacheFresh": true,
+            "serviceOwner": "00000000-0000-0000-0000-000000000000",
             "serviceDefinitions": [
+                area_svc("Location Service", "9f1fe989-7d0d-4a9b-a9bf-11330ab257c1", "LocationService2", "Framework", &service_root),
+                area_svc("distributedtask", "a85b8835-c1a1-4aac-ae97-1c3d0ba72dbd", "LocationService2", "Framework", &runner_root),
+                area_svc("pipelines", "2e0bf237-8973-4ec9-a581-9c3d679d1776", "LocationService2", "Framework", &service_root),
+                area_svc("oauth2", "a7b3b527-4f4f-4dac-8e84-f144fa6d554b", "LocationService2", "Framework", &runner_root),
                 svc("AgentPools", "a8c47e17-4d56-4a56-92bb-de7ea7dc65be", "/_apis/v1/AgentPools"),
                 svc("Agent", "e298ef32-5878-4cab-993c-043836571f42", "/_apis/v1/Agent/{poolId}/{agentId}"),
                 svc("AgentSession", "134e239e-2df3-4794-a6f6-24f1f19ec8dc", "/_apis/v1/AgentSession/{poolId}/{sessionId}"),
@@ -1618,16 +2463,79 @@ async fn connection_data() -> axum::response::Response {
                 svc("Tasks", "60aac929-f0cd-4bc8-9ce4-6b30e8f1b1bd", "/_apis/v1/tasks/{taskId}/{versionString}"),
                 svc("Cache", "a7c78d38-31a8-417e-ba6b-7e58b352f304", "_apis/artifactcache"),
                 svc("BuildArtifacts", "1db06c96-014e-44e1-ac91-90b2d4b3e984", "_apis/pipelines/workflows/{buildId}/artifacts"),
+                resource_svc("brokerlistener", "38f00041-0953-4d24-86c3-5432d23e2205", "distributedtask", "_apis/{area}/{resource}"),
+                resource_svc("createdsession", "a4e1f2b5-0c3d-4e8a-9f6d-7b5c1a0e2d3f", "distributedtask", "_apis/{area}/brokerlistener/{resource}"),
+                resource_svc("runnermessages", "25adab70-1379-4186-be8e-b643061ebe3a", "distributedtask", "_apis/{area}/{resource}/{messageId}"),
+                resource_svc("runnerconfigrefresh", "13b5d709-74aa-470b-a8e9-bf9f3ded3f18", "distributedtask", "_apis/{area}/agents/{agentId}/{resource}/{configType}"),
+                resource_svc("token", "10d13a60-2758-406c-8ab7-cffccb21fcf4", "oauth2", "_apis/{area}/{resource}"),
+                resource_svc("steps", "99ea91b7-bbe9-4bd3-a924-874f13205b21", "pipelines", "_apis/{area}/plans/{planId}/jobs/{jobId}/{resource}"),
+                resource_svc("jobs", "4818972d-29fa-4b86-92c1-de5ae7ef33f5", "pipelines", "_apis/{area}/plans/{planId}/{resource}/{jobId}"),
+                resource_svc("logs", "fb1b6d27-3957-43d5-a14b-a2d70403e545", "pipelines", "{project}/_apis/{area}/{pipelineId}/runs/{runId}/{resource}/{logId}"),
             ],
-            "accessMappings": [{
-                "moniker": "PublicAccessMapping",
-                "displayName": "Default Access Mapping",
-                "accessPoint": "http://127.0.0.1:9090"
-            }],
-            "defaultAccessMappingMoniker": "PublicAccessMapping"
+            "accessMappings": [
+                {
+                    "moniker": "PublicAccessMapping",
+                    "displayName": "Public Access Mapping",
+                    "accessPoint": service_root,
+                    "serviceOwner": "00000000-0000-0000-0000-000000000000",
+                    "virtualDirectory": ""
+                },
+                {
+                    "moniker": "ScaleUnitMapping",
+                    "displayName": "Scale Unit Access Mapping",
+                    "accessPoint": runner_root,
+                    "serviceOwner": "00000000-0000-0000-0000-000000000000",
+                    "virtualDirectory": ""
+                }
+            ],
+            "defaultAccessMappingMoniker": "ScaleUnitMapping",
+            "clientCacheFresh": true,
+            "serviceOwner": "00000000-0000-0000-0000-000000000000"
         }
     });
     axum::response::Json(body).into_response()
+}
+
+fn area_svc(
+    display_name: &str,
+    id: &str,
+    service_type: &str,
+    tool_id: &str,
+    location: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "serviceType": service_type,
+        "identifier": id,
+        "displayName": display_name,
+        "description": display_name,
+        "toolId": tool_id,
+        "relativeToSetting": "fullyQualified",
+        "locationMappings": [
+            {"accessMappingMoniker": "PublicAccessMapping", "location": location},
+            {"accessMappingMoniker": "ScaleUnitMapping", "location": location}
+        ],
+        "serviceOwner": "00000000-0000-0000-0000-000000000000",
+        "properties": {}
+    })
+}
+
+fn resource_svc(name: &str, id: &str, area: &str, location: &str) -> serde_json::Value {
+    serde_json::json!({
+        "serviceType": area,
+        "identifier": id,
+        "displayName": name,
+        "relativePath": location,
+        "description": name,
+        "toolId": area,
+        "locationMappings": [],
+        "serviceOwner": "00000000-0000-0000-0000-000000000000",
+        "resourceVersion": 1,
+        "minVersion": "1.0",
+        "maxVersion": "6.0",
+        "releasedVersion": "0.0",
+        "status": 1,
+        "properties": {}
+    })
 }
 
 fn svc(name: &str, id: &str, location: &str) -> serde_json::Value {
@@ -1639,7 +2547,10 @@ fn svc(name: &str, id: &str, location: &str) -> serde_json::Value {
         "relativeToSetting": 2,
         "description": name,
         "toolId": name,
-        "locationMappings": [],
+        "locationMappings": [
+            {"accessMappingMoniker": "ScaleUnitMapping", "location": runner_server_url()},
+            {"accessMappingMoniker": "PublicAccessMapping", "location": public_base_url()}
+        ],
         "serviceOwner": "00000000-0000-0000-0000-000000000000",
         "resourceVersion": 6,
         "minVersion": "1.0",
@@ -1647,6 +2558,29 @@ fn svc(name: &str, id: &str, location: &str) -> serde_json::Value {
         "status": 1,
         "properties": {}
     })
+}
+
+fn rsa_public_key_xml_from_value(value: &serde_json::Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        return Some(text.to_owned());
+    }
+    let modulus = value.get("modulus").and_then(|v| v.as_str())?;
+    let exponent = value.get("exponent").and_then(|v| v.as_str())?;
+    Some(format!(
+        "<RSAKeyValue><Modulus>{modulus}</Modulus><Exponent>{exponent}</Exponent></RSAKeyValue>"
+    ))
+}
+
+fn task_agent_public_key(request: &serde_json::Value) -> Option<String> {
+    request
+        .get("authorization")
+        .and_then(|authorization| authorization.get("publicKey"))
+        .and_then(rsa_public_key_xml_from_value)
+        .or_else(|| {
+            request
+                .get("publicKey")
+                .and_then(rsa_public_key_xml_from_value)
+        })
 }
 
 /// GET /_apis/v1/Agent/:pool_id — look up runner by agentName query param.
@@ -1711,7 +2645,11 @@ async fn register_runner_compat(
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
+                .filter_map(|v| {
+                    v.as_str()
+                        .or_else(|| v.get("name").and_then(|name| name.as_str()))
+                        .map(str::to_owned)
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -1719,33 +2657,53 @@ async fn register_runner_compat(
         .get("ephemeral")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let public_key_xml = task_agent_public_key(&request);
+    let public_key_object = request
+        .get("authorization")
+        .and_then(|authorization| authorization.get("publicKey"))
+        .cloned()
+        .or_else(|| request.get("publicKey").cloned())
+        .unwrap_or_else(|| {
+            json!({
+                "exponent": "AQAB",
+                "modulus": ""
+            })
+        });
     let reg_request = RunnerRegistrationRequest {
         name: name.clone(),
         labels,
         ephemeral,
-        public_key: request
-            .get("publicKey")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned),
+        public_key: public_key_xml,
     };
     let result = register_runner(State(shared), Json(reg_request)).await?;
     Ok(Json(json!({
         "id": result.0.id,
         "name": result.0.name,
-        "version": "2.322.0",
-        "osDescription": "Linux",
+        "version": request.get("version").and_then(|v| v.as_str()).unwrap_or("2.335.1"),
+        "osDescription": request.get("osDescription").and_then(|v| v.as_str()).unwrap_or("Linux"),
         "enabled": true,
-        "status": "online",
+        "status": "offline",
         "ephemeral": ephemeral,
+        "maxParallelism": 1,
+        "currentParallelism": 0,
+        "disableUpdate": false,
+        "isElastic": false,
+        "isVirtual": false,
+        "provisioningState": "Provisioned",
+        "queueName": format!("taskagent-{}", result.0.id),
+        "runnerGroupId": 1,
+        "runnerGroupName": null,
         "labels": result.0.labels.iter().map(|l| json!({"name": l, "type": "user"})).collect::<Vec<_>>(),
         "authorization": {
-            "authorizationUrl": "http://127.0.0.1:9090",
+            "authorizationUrl": format!("{}/_apis/v1/oauth2/token", runner_server_url()),
             "clientId": uuid::Uuid::new_v4().to_string(),
-            "publicKey": {
-                "exponent": "AQAB",
-                "modulus": "x9DRhIzTYGvMcPEZDjc7cKrIyb+EBMNtB8riHXxElnskMQuMYNRe7Ya2WsS/dctBUSeqhegDZGKcuDM6aab8bsiJoua/hNLNKdxBSz33nsuKdZYXah8r4Z1UIQf4oan8Mo4ePqqDXXFXdTG0peWyVPqjL4VU9n/EG3JoaGcwOoLrcbT/jT2Pz2v6AquPEzaFjty0OWGQ2gRKahHS1UUAI7VKfKMvvUT1ANn6YPIZ7Jdl6YSFMDI2AFwKOwOVQB6E5bIY8W6jwANqt0vlyMbeqii58pSuto9aAEoLsdLxGGrFFxvxGScPG+scVYSkXyj4mrdS0qSm4Z/UOhtnese7OQ==",
-                "keyId": uuid::Uuid::new_v4().to_string()
-            }
+            "publicKey": public_key_object
+        },
+        "properties": {
+            "RequireFipsCryptography": {"$type": "System.Boolean", "$value": true},
+            "ServerUrl": {"$type": "System.String", "$value": runner_server_url()},
+            "ServerUrlV2": {"$type": "System.String", "$value": runner_server_url()},
+            "UseV2Flow": {"$type": "System.Boolean", "$value": true}
         }
     })))
 }
@@ -1785,7 +2743,7 @@ async fn create_session_compat(
         State(shared),
         Json(RunnerSessionRequest { runner_id, name }),
     )
-    .await;
+    .await?;
     Ok(result)
 }
 
@@ -1883,6 +2841,19 @@ async fn delete_pool_message_org(
     delete_pool_message(State(shared), Path((pool_id, message_id)), Query(params)).await
 }
 
+async fn agent_request_get_org(
+    State(shared): State<Arc<SharedState>>,
+    Path((_org, pool_id, request_id)): Path<(String, i64, i64)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    agent_request_get(State(shared), Path((pool_id, request_id))).await
+}
+
+async fn agent_request_ack_org(
+    Path((_org, pool_id, request_id)): Path<(String, i64, i64)>,
+) -> StatusCode {
+    agent_request_ack(Path((pool_id, request_id))).await
+}
+
 #[allow(dead_code)]
 async fn complete_job_compat_org(
     State(shared): State<Arc<SharedState>>,
@@ -1903,41 +2874,30 @@ async fn agent_request_patch_org(
 async fn patch_timeline_records_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, scope, hub, plan_id, timeline_id)): Path<(String, String, String, String, String)>,
-    Json(records): Json<Vec<azdo::TimelineRecord>>,
+    Json(wrapper): Json<azdo::VssJsonCollectionWrapper<azdo::TimelineRecord>>,
 ) -> Json<serde_json::Value> {
     patch_timeline_records(
         State(shared),
         Path((scope, hub, plan_id, timeline_id)),
-        Json(records),
+        Json(wrapper),
     )
     .await
 }
 
 async fn create_log_org(
     State(shared): State<Arc<SharedState>>,
-    Path((_org, scope, hub, plan_id, log_id)): Path<(String, String, String, String, String)>,
+    Path((_org, scope, hub, plan_id)): Path<(String, String, String, String)>,
+    Json(log): Json<azdo::TaskLog>,
 ) -> Json<serde_json::Value> {
-    create_log(State(shared), Path((scope, hub, plan_id, log_id))).await
+    create_log(State(shared), Path((scope, hub, plan_id)), Json(log)).await
 }
 
 async fn append_log_org(
     State(shared): State<Arc<SharedState>>,
-    Path((_org, scope, hub, plan_id, log_id, log_id2)): Path<(
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-    )>,
+    Path((_org, scope, hub, plan_id, log_id)): Path<(String, String, String, String, String)>,
     body: Bytes,
 ) -> StatusCode {
-    append_log(
-        State(shared),
-        Path((scope, hub, plan_id, log_id, log_id2)),
-        body,
-    )
-    .await
+    append_log(State(shared), Path((scope, hub, plan_id, log_id)), body).await
 }
 
 async fn console_log_org(
@@ -1993,8 +2953,12 @@ async fn github_registration_token(
         return Err(ApiError::unauthorized("missing Authorization header"));
     }
 
-    let token = format!("aksh-jwt-{}", uuid::Uuid::new_v4());
-    let url_str = payload
+    let token = local_jwt(json!({
+        "sub": "aksh-runner-registration",
+        "scp": "ActionsRuntime.RunnerManage Framework.GenericRead Identity.ReadRefs LocationService.Connect",
+        "jti": uuid::Uuid::new_v4().to_string()
+    }))?;
+    let _requested_url = payload
         .get("url")
         .and_then(|v| v.as_str())
         .unwrap_or("http://127.0.0.1")
@@ -2002,19 +2966,8 @@ async fn github_registration_token(
     Ok(Json(json!({
         "token": token,
         "token_schema": "OAuthAccessToken",
-        "url": url_str,
-        "use_v2_flow": false
+        "url": runner_server_url()
     })))
-}
-
-#[derive(Deserialize)]
-struct TokenRequest {
-    #[allow(dead_code)]
-    grant_type: String,
-    #[allow(dead_code)]
-    client_id: Option<String>,
-    #[allow(dead_code)]
-    client_secret: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -2024,13 +2977,50 @@ struct TokenResponse {
     expires_in: u64,
 }
 
-async fn oauth2_token(Json(_req): Json<TokenRequest>) -> Json<TokenResponse> {
-    let token = format!("aksh-{}", uuid::Uuid::new_v4());
-    Json(TokenResponse {
+async fn oauth2_token(
+    _headers: axum::http::HeaderMap,
+    body: bytes::Bytes,
+) -> Result<Json<TokenResponse>, ApiError> {
+    let _ = body;
+    let token = local_jwt(json!({
+        "sub": "aksh-runner-listen",
+        "scp": "ActionsRuntime.RunnerListen Framework.GenericRead Identity.ReadRefs LocationService.Connect",
+        "jti": uuid::Uuid::new_v4().to_string()
+    }))?;
+    Ok(Json(TokenResponse {
         access_token: token,
-        token_type: "bearer".to_owned(),
-        expires_in: 3600,
-    })
+        token_type: "JWT".to_owned(),
+        expires_in: 2999,
+    }))
+}
+
+fn local_jwt(mut claims: serde_json::Value) -> Result<String, ApiError> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| ApiError::bad_request(format!("system clock before epoch: {error}")))?
+        .as_secs();
+    let claims = claims
+        .as_object_mut()
+        .ok_or_else(|| ApiError::bad_request("JWT claims must be an object"))?;
+    claims.insert("iss".to_owned(), json!("https://aksh.local"));
+    claims.insert("iat".to_owned(), json!(now));
+    claims.insert("nbf".to_owned(), json!(now));
+    claims.insert("exp".to_owned(), json!(now + 2999));
+    let header = json!({
+        "alg": "HS256",
+        "typ": "JWT",
+        "kid": "aksh-local"
+    });
+    let signing_input = format!(
+        "{}.{}",
+        base64_url_json(&header)?,
+        base64_url_json(&serde_json::Value::Object(claims.clone()))?
+    );
+    let mut mac = Hmac::<Sha256>::new_from_slice(b"aksh-local-runner-signing-key")
+        .map_err(|error| ApiError::bad_request(format!("invalid signing key: {error}")))?;
+    mac.update(signing_input.as_bytes());
+    let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    Ok(format!("{signing_input}.{signature}"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2502,14 +3492,14 @@ jobs:
         let first_msg = request_json(
             &app,
             Method::GET,
-            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=s1",
+            "/runner/server/_apis/v1/Message/1?sessionId=s1",
             Value::Null,
         )
         .await;
         let second_msg = request_json(
             &app,
             Method::GET,
-            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=s2",
+            "/runner/server/_apis/v1/Message/1?sessionId=s2",
             Value::Null,
         )
         .await;
@@ -2557,6 +3547,385 @@ jobs:
     }
 
     #[tokio::test]
+    async fn agent_request_get_reports_completion_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        let _msg = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/v1/Message/1?sessionId=s1",
+            Value::Null,
+        )
+        .await;
+        let request_id = {
+            let inner = state.inner.lock().await;
+            inner
+                .inflight_requests
+                .iter()
+                .find(|(_, (rid, _))| *rid == run_id)
+                .map(|(request_id, _)| *request_id)
+                .unwrap()
+        };
+
+        let before = request_json(
+            &app,
+            Method::GET,
+            &format!("/runner/server/_apis/v1/AgentRequest/1/{request_id}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(before["requestId"], request_id);
+        assert!(before["result"].is_null());
+
+        request_json(
+            &app,
+            Method::PATCH,
+            &format!("/runner/server/_apis/v1/AgentRequest/1/{request_id}"),
+            json!({"result": "succeeded"}),
+        )
+        .await;
+
+        let after = request_json(
+            &app,
+            Method::GET,
+            &format!("/runner/server/_apis/v1/AgentRequest/1/{request_id}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(after["result"], "succeeded");
+    }
+
+    #[tokio::test]
+    async fn same_session_waits_for_active_request_before_next_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        n: [1, 2]
+    steps:
+      - run: echo matrix
+"#,
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        let first = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/v1/Message/1?sessionId=s1&waitSeconds=0",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            first["messageType"],
+            azdo::message_type::PIPELINE_AGENT_JOB_REQUEST
+        );
+        let first_message_id = first["messageId"].as_i64().unwrap();
+        request_json(
+            &app,
+            Method::DELETE,
+            &format!("/runner/server/_apis/v1/Message/1/{first_message_id}?sessionId=s1"),
+            Value::Null,
+        )
+        .await;
+
+        let first_request_id = {
+            let inner = state.inner.lock().await;
+            *inner.session_active_requests.get("s1").unwrap()
+        };
+
+        let withheld = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/v1/Message/1?sessionId=s1&waitSeconds=0",
+            Value::Null,
+        )
+        .await;
+        assert!(withheld.is_null());
+
+        request_json(
+            &app,
+            Method::PATCH,
+            &format!("/runner/server/_apis/v1/AgentRequest/1/{first_request_id}"),
+            json!({"result": "succeeded"}),
+        )
+        .await;
+
+        let second = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/v1/Message/1?sessionId=s1&waitSeconds=0",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            second["messageType"],
+            azdo::message_type::PIPELINE_AGENT_JOB_REQUEST
+        );
+
+        let inner = state.inner.lock().await;
+        let run = inner.runs.get(&run_id).unwrap();
+        assert_eq!(
+            run.jobs
+                .values()
+                .filter(|status| **status == ExecutionStatus::InProgress)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn unacked_messages_are_scoped_to_their_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let workflow = json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo"
+        });
+        request_json(&app, Method::POST, "/api/v1/runs", workflow.clone()).await;
+        request_json(&app, Method::POST, "/api/v1/runs", workflow).await;
+
+        let first = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/v1/Message/1?sessionId=s1&waitSeconds=0",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            first["messageType"],
+            azdo::message_type::PIPELINE_AGENT_JOB_REQUEST
+        );
+        let first_message_id = first["messageId"].as_i64().unwrap();
+
+        let second = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/v1/Message/1?sessionId=s2&waitSeconds=0",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            second["messageType"],
+            azdo::message_type::PIPELINE_AGENT_JOB_REQUEST
+        );
+        let second_message_id = second["messageId"].as_i64().unwrap();
+        assert_ne!(first_message_id, second_message_id);
+
+        // ACKing s1's message through s2 must not remove it from s1. The next
+        // s1 poll should redeliver the same unacked message, not s2's message.
+        request_json(
+            &app,
+            Method::DELETE,
+            &format!("/runner/server/_apis/v1/Message/1/{first_message_id}?sessionId=s2"),
+            Value::Null,
+        )
+        .await;
+
+        let redelivered = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/v1/Message/1?sessionId=s1&waitSeconds=0",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(redelivered["messageId"], first_message_id);
+
+        let inner = state.inner.lock().await;
+        assert!(inner
+            .inflight_messages
+            .get("s1")
+            .is_some_and(|messages| messages.contains_key(&first_message_id)));
+        assert!(inner
+            .inflight_messages
+            .get("s2")
+            .is_some_and(|messages| messages.contains_key(&second_message_id)));
+    }
+
+    #[tokio::test]
+    async fn finish_job_resolves_plan_timeline_and_agent_job_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        let first = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/v1/Message/1?sessionId=s1&waitSeconds=0",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            first["messageType"],
+            azdo::message_type::PIPELINE_AGENT_JOB_REQUEST
+        );
+
+        let request = {
+            let inner = state.inner.lock().await;
+            inner.job_requests.values().next().unwrap().clone()
+        };
+
+        request_json(
+            &app,
+            Method::POST,
+            &format!(
+                "/runner/server/_apis/v1/FinishJob/00000000-0000-0000-0000-000000000000/Job/{}",
+                request.plan_id
+            ),
+            json!({
+                "jobId": request.agent_job_id,
+                "result": "succeeded",
+                "timelineId": request.timeline_id,
+                "outputs": {"answer": "42"}
+            }),
+        )
+        .await;
+
+        let inner = state.inner.lock().await;
+        let run = inner.runs.get(&run_id).unwrap();
+        assert_eq!(
+            run.jobs.get(&request.job_id),
+            Some(&ExecutionStatus::Success)
+        );
+        assert!(!run
+            .jobs
+            .contains_key(&JobId(request.agent_job_id.to_string())));
+        assert_eq!(
+            run.job_outputs
+                .get(&request.job_id)
+                .and_then(|outputs| outputs.get("answer")),
+            Some(&json!("42"))
+        );
+        assert_eq!(
+            inner
+                .job_requests
+                .get(&request.request_id)
+                .and_then(|request| request.result),
+            Some(ExecutionStatus::Success)
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_job_falls_back_to_the_single_active_request_when_unresolved() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        n: [1, 2]
+    steps:
+      - run: echo matrix
+"#,
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/v1/Message/1?sessionId=s1&waitSeconds=0",
+            Value::Null,
+        )
+        .await;
+
+        let active_request = {
+            let inner = state.inner.lock().await;
+            let active_id = *inner.session_active_requests.get("s1").unwrap();
+            inner.job_requests.get(&active_id).unwrap().clone()
+        };
+        let unknown_plan_id = uuid::Uuid::new_v4();
+        let unknown_job_id = uuid::Uuid::new_v4();
+        let unknown_timeline_id = uuid::Uuid::new_v4();
+
+        // If callback identifiers cannot be resolved at all, the only
+        // unfinished active request is the safest correlation available.
+        request_json(
+            &app,
+            Method::POST,
+            &format!(
+                "/runner/server/_apis/v1/FinishJob/00000000-0000-0000-0000-000000000000/Job/{}",
+                unknown_plan_id
+            ),
+            json!({
+                "jobId": unknown_job_id,
+                "result": "succeeded",
+                "timelineId": unknown_timeline_id,
+                "outputs": {}
+            }),
+        )
+        .await;
+
+        let inner = state.inner.lock().await;
+        let run = inner.runs.get(&run_id).unwrap();
+        assert_eq!(
+            run.jobs.get(&active_request.job_id),
+            Some(&ExecutionStatus::Success)
+        );
+    }
+
+    #[tokio::test]
     async fn matrix_fail_fast_cancels_in_progress_siblings_via_message() {
         let temp = tempfile::tempdir().unwrap();
         let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
@@ -2590,7 +3959,7 @@ jobs:
         let first = request_json(
             &app,
             Method::GET,
-            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=default",
+            "/runner/server/_apis/v1/Message/1?sessionId=default",
             Value::Null,
         )
         .await;
@@ -2601,7 +3970,7 @@ jobs:
         let second = request_json(
             &app,
             Method::GET,
-            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=default",
+            "/runner/server/_apis/v1/Message/1?sessionId=default",
             Value::Null,
         )
         .await;
@@ -2718,6 +4087,326 @@ jobs:
     }
 
     #[tokio::test]
+    async fn scenario_06_multi_step_dispatches_all_steps() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+name: mitm multi step
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: [self-hosted, mitm]
+    steps:
+      - run: echo first
+      - run: echo "VAL=$VAL"
+        env:
+          VAL: hello
+      - run: |
+          echo line1
+          echo line2
+"#,
+                "event": "workflow_dispatch",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        let scripts = {
+            let inner = state.inner.lock().await;
+            let queued = inner.queue.front().expect("build job should be queued");
+            queued
+                .message
+                .steps
+                .iter()
+                .filter_map(|step| step.script.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(scripts.len(), 3);
+        assert!(scripts.contains(&"echo first".to_owned()));
+        assert!(scripts.contains(&"echo \"VAL=$VAL\"".to_owned()));
+        assert!(scripts
+            .iter()
+            .any(|script| script.contains("echo line1") && script.contains("echo line2")));
+
+        let message = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/v1/Message/1?sessionId=default",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            message["messageType"],
+            azdo::message_type::PIPELINE_AGENT_JOB_REQUEST
+        );
+
+        request_json(
+            &app,
+            Method::POST,
+            "/api/v1/jobs/complete",
+            json!({
+                "run_id": run_id,
+                "job_id": "build",
+                "status": "success"
+            }),
+        )
+        .await;
+
+        let inner = state.inner.lock().await;
+        let run = inner.runs.get(&run_id).unwrap();
+        assert_eq!(run.status, ExecutionStatus::Success);
+        assert_eq!(
+            run.jobs.get(&JobId("build".to_owned())),
+            Some(&ExecutionStatus::Success)
+        );
+    }
+
+    #[tokio::test]
+    async fn scenario_07_step_failure_summarizes_run_failed() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+name: mitm step failure
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: [self-hosted, mitm]
+    steps:
+      - run: exit 1
+      - run: echo ran-on-failure
+        if: failure()
+      - run: echo never
+        if: success()
+"#,
+                "event": "workflow_dispatch",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        let message = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/v1/Message/1?sessionId=default",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            message["messageType"],
+            azdo::message_type::PIPELINE_AGENT_JOB_REQUEST
+        );
+
+        request_json(
+            &app,
+            Method::POST,
+            "/api/v1/jobs/complete",
+            json!({
+                "run_id": run_id,
+                "job_id": "build",
+                "status": "failure"
+            }),
+        )
+        .await;
+
+        let inner = state.inner.lock().await;
+        let run = inner.runs.get(&run_id).unwrap();
+        assert_eq!(run.status, ExecutionStatus::Failure);
+        assert_eq!(
+            run.jobs.get(&JobId("build".to_owned())),
+            Some(&ExecutionStatus::Failure)
+        );
+    }
+
+    #[tokio::test]
+    async fn scenario_08_consumer_sees_producer_outputs() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+name: mitm job outputs
+on: workflow_dispatch
+jobs:
+  producer:
+    runs-on: [self-hosted, mitm]
+    outputs:
+      value: ${{ steps.gen.outputs.value }}
+    steps:
+      - id: gen
+        run: echo "value=42" >> "$GITHUB_OUTPUT"
+  consumer:
+    needs: producer
+    runs-on: [self-hosted, mitm]
+    steps:
+      - run: echo "got ${{ needs.producer.outputs.value }}"
+"#,
+                "event": "workflow_dispatch",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        request_json(
+            &app,
+            Method::POST,
+            "/api/v1/jobs/complete",
+            json!({
+                "run_id": run_id,
+                "job_id": "producer",
+                "status": "success",
+                "outputs": {"value": "42"}
+            }),
+        )
+        .await;
+
+        let inner = state.inner.lock().await;
+        let consumer = inner
+            .queue
+            .iter()
+            .find(|job| job.job_id.0 == "consumer")
+            .expect("consumer job should be promoted");
+        let azdo::PipelineContextData::Dict(needs) =
+            consumer.message.context_data.get("needs").unwrap()
+        else {
+            panic!("needs context should be a dict");
+        };
+        let azdo::PipelineContextData::Dict(producer) = needs.get("producer").unwrap() else {
+            panic!("producer needs entry should be a dict");
+        };
+        let azdo::PipelineContextData::Dict(outputs) = producer.get("outputs").unwrap() else {
+            panic!("producer outputs should be a dict");
+        };
+        assert!(matches!(
+            outputs.get("value"),
+            Some(azdo::PipelineContextData::String(value)) if value == "42"
+        ));
+    }
+
+    #[tokio::test]
+    async fn scenario_09_matrix_fail_fast_cancels_siblings() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+name: mitm matrix
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: [self-hosted, mitm]
+    strategy:
+      fail-fast: true
+      matrix:
+        n: [1, 2, 3]
+    steps:
+      - run: |
+          if [ "${{ matrix.n }}" = "1" ]; then exit 1; fi
+          sleep 20
+"#,
+                "event": "workflow_dispatch",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        for index in 0..3 {
+            let session_id = format!("matrix-{index}");
+            let message = request_json(
+                &app,
+                Method::GET,
+                &format!("/runner/server/_apis/v1/Message/1?sessionId={session_id}"),
+                Value::Null,
+            )
+            .await;
+            assert_eq!(
+                message["messageType"],
+                azdo::message_type::PIPELINE_AGENT_JOB_REQUEST
+            );
+            let message_id = message["messageId"].as_i64().unwrap();
+            let ack = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::DELETE)
+                        .uri(format!(
+                            "/runner/server/_apis/v1/Message/1/{message_id}?sessionId={session_id}"
+                        ))
+                        .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(ack.status(), StatusCode::NO_CONTENT);
+        }
+
+        let failing_job = {
+            let inner = state.inner.lock().await;
+            inner
+                .runs
+                .get(&run_id)
+                .unwrap()
+                .jobs
+                .iter()
+                .find_map(|(job_id, status)| {
+                    (*status == ExecutionStatus::InProgress).then(|| job_id.clone())
+                })
+                .expect("a matrix sibling should be in progress")
+        };
+
+        request_json(
+            &app,
+            Method::POST,
+            "/api/v1/jobs/complete",
+            json!({
+                "run_id": run_id,
+                "job_id": failing_job,
+                "status": "failure"
+            }),
+        )
+        .await;
+
+        let inner = state.inner.lock().await;
+        assert_eq!(inner.cancellation_queue.len(), 2);
+        let run = inner.runs.get(&run_id).unwrap();
+        for (job_id, status) in &run.jobs {
+            if job_id == &failing_job {
+                assert_eq!(*status, ExecutionStatus::Failure);
+            } else {
+                assert_eq!(*status, ExecutionStatus::Cancelled);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn timeline_patch_projects_annotations_to_run_events() {
         let temp = tempfile::tempdir().unwrap();
         let app = app(
@@ -2748,7 +4437,7 @@ jobs:
             &app,
             Method::PATCH,
             &format!("/_apis/v1/Timeline/scope/actions/{run_id}/timeline-1"),
-            json!([{
+            json!({"count": 1, "value": [{
                 "id": "00000000-0000-0000-0000-000000000001",
                 "name": "build",
                 "type": "job",
@@ -2759,7 +4448,7 @@ jobs:
                     "message": "boom",
                     "data": {"file": "src/lib.rs", "line": "42"}
                 }]
-            }]),
+            }]}),
         )
         .await;
 
@@ -2790,8 +4479,8 @@ jobs:
         request_json(
             &app,
             Method::POST,
-            "/_apis/v1/Logfiles/scope/actions/plan-1/log-1",
-            Value::Null,
+            "/_apis/v1/Logfiles/scope/actions/plan-1",
+            json!({"path": "log-1"}),
         )
         .await;
         let response = app
@@ -2799,7 +4488,7 @@ jobs:
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri("/_apis/v1/Logfiles/scope/actions/plan-1/log-1/append")
+                    .uri("/_apis/v1/Logfiles/scope/actions/plan-1/log-1")
                     .header(header::AUTHORIZATION, "Bearer aksh-system-token")
                     .body(Body::from("hello log"))
                     .unwrap(),
@@ -2846,9 +4535,7 @@ jobs:
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri(format!(
-                        "/_apis/v1/Logfiles/scope/actions/{run_id}/log-1/append"
-                    ))
+                    .uri(format!("/_apis/v1/Logfiles/scope/actions/{run_id}/log-1"))
                     .header(header::AUTHORIZATION, "Bearer aksh-system-token")
                     .body(Body::from("token=super-secret"))
                     .unwrap(),
@@ -2917,16 +4604,499 @@ jobs:
         let session = request_json(
             &app,
             Method::POST,
-            "/runner/server/_apis/distributedtask/pools/1/sessions",
+            "/api/v1/runners/sessions",
             json!({"runner_id": runner_id, "name": "local"}),
         )
         .await;
         let key_b64 = session["encryptionKey"]["value"].as_str().unwrap();
         let encrypted = session["encryptionKey"]["encrypted"].as_bool().unwrap();
-        assert!(!encrypted, "session key should be sent unencrypted for now");
+        assert!(encrypted, "session key should be RSA wrapped");
+        let wrapped_key =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, key_b64).unwrap();
+        let key_bytes = runner_keypair.unwrap_key(&wrapped_key).unwrap();
+        assert_eq!(key_bytes.len(), 32, "AES-256 key should be 32 bytes");
+    }
+
+    #[tokio::test]
+    async fn session_key_falls_back_to_plaintext_without_registered_public_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+
+        let runner = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runners",
+            json!({
+                "name": "local",
+                "labels": ["self-hosted"]
+            }),
+        )
+        .await;
+        let runner_id = runner["id"].as_i64().unwrap();
+
+        let session = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runners/sessions",
+            json!({"runner_id": runner_id, "name": "local"}),
+        )
+        .await;
+        let key_b64 = session["encryptionKey"]["value"].as_str().unwrap();
+        let encrypted = session["encryptionKey"]["encrypted"].as_bool().unwrap();
+        assert!(
+            !encrypted,
+            "session key should remain plaintext only when the runner registered no key"
+        );
         let key_bytes =
             base64::Engine::decode(&base64::engine::general_purpose::STANDARD, key_b64).unwrap();
         assert_eq!(key_bytes.len(), 32, "AES-256 key should be 32 bytes");
+    }
+
+    #[tokio::test]
+    async fn task_agent_registration_extracts_nested_public_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let runner_keypair = AgentRsaKeypair::generate().unwrap();
+        let public_xml = runner_keypair.public_key_xml();
+        let modulus = public_xml
+            .split("<Modulus>")
+            .nth(1)
+            .unwrap()
+            .split("</Modulus>")
+            .next()
+            .unwrap();
+        let exponent = public_xml
+            .split("<Exponent>")
+            .nth(1)
+            .unwrap()
+            .split("</Exponent>")
+            .next()
+            .unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let runner = request_json(
+            &app,
+            Method::POST,
+            "/runner/server/_apis/distributedtask/pools/1/agents",
+            json!({
+                "name": "local",
+                "labels": [{"name": "self-hosted", "type": "system"}],
+                "authorization": {
+                    "publicKey": {
+                        "modulus": modulus,
+                        "exponent": exponent
+                    }
+                }
+            }),
+        )
+        .await;
+        let runner_id = runner["id"].as_i64().unwrap();
+        let inner = state.inner.lock().await;
+        assert!(inner.runner_rsa_public_keys.contains_key(&runner_id));
+    }
+
+    #[tokio::test]
+    async fn connection_data_exposes_current_runner_service_locations() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+
+        let conn = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/connectionData?connectOptions=1&lastChangeId=-1&lastChangeId64=-1",
+            Value::Null,
+        )
+        .await;
+        let services = conn["locationServiceData"]["serviceDefinitions"]
+            .as_array()
+            .unwrap();
+        let service_ids = services
+            .iter()
+            .filter_map(|service| service["identifier"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(service_ids.contains("38f00041-0953-4d24-86c3-5432d23e2205"));
+        assert!(service_ids.contains("a4e1f2b5-0c3d-4e8a-9f6d-7b5c1a0e2d3f"));
+        assert!(service_ids.contains("10d13a60-2758-406c-8ab7-cffccb21fcf4"));
+        assert_eq!(
+            conn["locationServiceData"]["defaultAccessMappingMoniker"],
+            "ScaleUnitMapping"
+        );
+
+        let fresh = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/connectionData?connectOptions=0&lastChangeId=1&lastChangeId64=1",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(fresh["locationServiceData"]["clientCacheFresh"], true);
+        assert!(fresh["locationServiceData"]["serviceDefinitions"].is_null());
+    }
+
+    #[tokio::test]
+    async fn registration_and_oauth_return_runner_compatible_tokens() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+
+        let registration = request_json(
+            &app,
+            Method::POST,
+            "/api/v3/actions/runner-registration",
+            json!({"url": "https://github.com/preloopdev/aksh", "runner_event": "register"}),
+        )
+        .await;
+        assert_eq!(registration["token_schema"], "OAuthAccessToken");
+        assert_eq!(registration["url"], "http://127.0.0.1:9090/runner/server");
+        assert_eq!(
+            registration["token"].as_str().unwrap().split('.').count(),
+            3
+        );
+        assert!(registration.get("use_v2_flow").is_none());
+
+        let token = request_json(
+            &app,
+            Method::POST,
+            "/runner/server/_apis/v1/oauth2/token",
+            json!({"grant_type":"client_credentials","client_id":"t","client_secret":"t"}),
+        )
+        .await;
+        assert_eq!(token["token_type"], "JWT");
+        assert_eq!(token["expires_in"], 2999);
+        assert_eq!(
+            token["access_token"].as_str().unwrap().split('.').count(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn current_runner_registration_to_broker_job_e2e() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state, CancellationToken::new());
+        let runner_keypair = AgentRsaKeypair::generate().unwrap();
+        let public_xml = runner_keypair.public_key_xml();
+        let modulus = public_xml
+            .split("<Modulus>")
+            .nth(1)
+            .unwrap()
+            .split("</Modulus>")
+            .next()
+            .unwrap();
+        let exponent = public_xml
+            .split("<Exponent>")
+            .nth(1)
+            .unwrap()
+            .split("</Exponent>")
+            .next()
+            .unwrap();
+
+        let registration_auth = request_json(
+            &app,
+            Method::POST,
+            "/api/v3/actions/runner-registration",
+            json!({"url": "https://github.com/preloopdev/aksh", "runner_event": "register"}),
+        )
+        .await;
+        assert_eq!(
+            registration_auth["url"],
+            "http://127.0.0.1:9090/runner/server"
+        );
+
+        let connection = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/connectionData?connectOptions=1&lastChangeId=-1&lastChangeId64=-1",
+            Value::Null,
+        )
+        .await;
+        assert!(connection["locationServiceData"]["serviceDefinitions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|service| service["displayName"] == "brokerlistener"));
+
+        let agent = request_json(
+            &app,
+            Method::POST,
+            "/runner/server/_apis/distributedtask/pools/1/agents",
+            json!({
+                "name": "runner-1",
+                "version": "2.335.1",
+                "osDescription": "Darwin local",
+                "labels": [
+                    {"name": "self-hosted", "type": "system"},
+                    {"name": "macOS", "type": "system"},
+                    {"name": "ARM64", "type": "system"}
+                ],
+                "authorization": {
+                    "publicKey": {
+                        "modulus": modulus,
+                        "exponent": exponent
+                    }
+                }
+            }),
+        )
+        .await;
+        let runner_id = agent["id"].as_i64().unwrap();
+        assert_eq!(agent["properties"]["UseV2Flow"]["$value"], true);
+        assert_eq!(
+            agent["properties"]["ServerUrlV2"]["$value"],
+            "http://127.0.0.1:9090/runner/server"
+        );
+
+        let oauth = request_json(
+            &app,
+            Method::POST,
+            "/runner/server/_apis/v1/oauth2/token",
+            json!({"grant_type":"client_credentials","client_id":"t","client_secret":"t"}),
+        )
+        .await;
+        assert_eq!(oauth["token_type"], "JWT");
+
+        let session = request_json(
+            &app,
+            Method::POST,
+            "/runner/server/_apis/distributedtask/pools/1/sessions",
+            json!({
+                "agent": {"id": runner_id, "name": "runner-1", "version": "2.335.1"},
+                "ownerName": "local current runner",
+                "sessionId": "00000000-0000-0000-0000-000000000000",
+                "useFipsEncryption": false
+            }),
+        )
+        .await;
+        let session_id = session["sessionId"].as_str().unwrap();
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo current\n",
+                "event": "push",
+                "payload": {"ref": "refs/heads/main", "commits": []},
+                "repository": "preloopdev/aksh",
+                "git_ref": "refs/heads/main",
+                "secrets": {},
+                "vars": {},
+                "reusable_workflows": {}
+            }),
+        )
+        .await;
+        assert_eq!(accepted["queued_jobs"], 1);
+
+        let broker_ref = request_json(
+            &app,
+            Method::GET,
+            &format!("/runner/server/_apis/distributedtask/pools/1/messages?sessionId={session_id}&status=Online&runnerVersion=2.335.1&os=macOS&architecture=ARM64&waitSeconds=0"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(broker_ref["messageType"], "RunnerJobRequest");
+        let body: Value = serde_json::from_str(broker_ref["body"].as_str().unwrap()).unwrap();
+        assert_eq!(body["should_acknowledge"], true);
+        let runner_request_id = body["runner_request_id"].as_str().unwrap();
+
+        let acquired = request_json(
+            &app,
+            Method::POST,
+            &format!("/broker/{runner_id}/acquirejob"),
+            json!({"jobMessageId": runner_request_id, "billingOwnerId": "local", "runnerOS": "macOS"}),
+        )
+        .await;
+        assert_eq!(acquired["requestId"], 1);
+        assert_eq!(
+            acquired["messageType"],
+            azdo::message_type::RUNNER_JOB_REQUEST
+        );
+        assert_eq!(
+            acquired["resources"]["endpoints"][0]["url"],
+            format!("http://127.0.0.1:9090/broker/{runner_id}/")
+        );
+        assert!(acquired["contextData"]["github"].is_object());
+        assert!(
+            acquired["steps"].as_array().unwrap().iter().any(|step| {
+                step["inputs"]["script"].as_str() == Some("echo current")
+                    || step["inputs"]["script"]["expr"].as_str() == Some("echo current")
+                    || step["inputs"]["map"].as_array().is_some_and(|entries| {
+                        entries.iter().any(|entry| {
+                            entry["key"].as_str() == Some("script")
+                                && entry["value"].as_str() == Some("echo current")
+                        })
+                    })
+            }),
+            "steps={}",
+            acquired["steps"]
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/broker/{runner_id}/completejob"))
+                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"jobId": runner_request_id, "planId": acquired["plan"]["planId"]})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn current_service_broker_flow_uses_queued_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let workflow = "on:
+  push:
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+";
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": workflow,
+                "event": "push",
+                "payload": {"ref": "refs/heads/main", "commits": []},
+                "repository": "preloopdev/aksh",
+                "git_ref": "refs/heads/main",
+                "secrets": {},
+                "vars": {},
+                "reusable_workflows": {}
+            }),
+        )
+        .await;
+        assert_eq!(accepted["queued_jobs"], 1);
+
+        let session = request_json(
+            &app,
+            Method::POST,
+            "/runner/server/_apis/distributedtask/pools/1/sessions",
+            json!({
+                "agent": {"id": 1, "name": "runner-1"},
+                "ownerName": "owner",
+                "sessionId": "00000000-0000-0000-0000-000000000000",
+                "useFipsEncryption": false
+            }),
+        )
+        .await;
+        let session_id = session["sessionId"].as_str().unwrap();
+
+        let response = app.clone().oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/runner/server/_apis/distributedtask/pools/1/messages?sessionId={session_id}&waitSeconds=0"))
+                .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                .body(Body::empty())
+                .unwrap(),
+        ).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let message: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(message["messageType"], "RunnerJobRequest");
+        let body: Value = serde_json::from_str(message["body"].as_str().unwrap()).unwrap();
+        assert_eq!(body["should_acknowledge"], true);
+        let runner_request_id = body["runner_request_id"].as_str().unwrap();
+        assert!(body["run_service_url"]
+            .as_str()
+            .unwrap()
+            .contains("/broker/1/"));
+        assert_eq!(session["ownerName"], "owner");
+        assert_eq!(session["assignmentQueued"], false);
+        assert_eq!(session["orchestrationId"], "");
+
+        let acquired = request_json(
+            &app,
+            Method::POST,
+            "/broker/1/acquirejob",
+            json!({"jobMessageId": runner_request_id, "billingOwnerId": "local", "runnerOS": "macOS"}),
+        )
+        .await;
+        assert_eq!(acquired["requestId"].as_i64().unwrap(), 1);
+        assert_eq!(
+            acquired["messageType"],
+            azdo::message_type::RUNNER_JOB_REQUEST
+        );
+        assert_eq!(
+            acquired["resources"]["endpoints"][0]["url"],
+            "http://127.0.0.1:9090/broker/1/"
+        );
+        assert!(acquired["plan"]["planId"].is_string());
+        assert!(acquired["jobId"].is_string());
+        assert!(acquired["steps"].is_array());
+
+        let renewed = request_json(
+            &app,
+            Method::POST,
+            "/broker/1/renewjob",
+            json!({"jobId": runner_request_id, "planId": acquired["plan"]["planId"]}),
+        )
+        .await;
+        assert!(renewed["lockedUntil"].as_str().unwrap().contains('T'));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/broker/1/completejob")
+                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"jobId": runner_request_id, "planId": acquired["plan"]["planId"]})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let completed_run = request_json(
+            &app,
+            Method::GET,
+            &format!("/api/v1/runs/{}", accepted["run_id"].as_str().unwrap()),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(completed_run["status"], "success");
+        assert_eq!(completed_run["jobs"]["rust"], "success");
+
+        let ack = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/runner/server/_apis/v1/AgentRequest/1/1")
+                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ack.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -2965,7 +5135,7 @@ jobs:
         let cases = [
             (Method::PATCH, "/runner/server/_apis/v1/Timeline/s/h/p/t"),
             (Method::POST, "/runner/server/_apis/v1/Logfiles/s/h/p/l"),
-            (Method::POST, "/runner/server/_apis/v1/Logfiles/s/h/p/l/l2"),
+            (Method::POST, "/runner/server/_apis/v1/Logfiles/s/h/p/l"),
             (
                 Method::POST,
                 "/runner/server/_apis/v1/TimeLineWebConsoleLog/s/h/p/t/r",
@@ -3024,6 +5194,32 @@ jobs:
     }
 
     #[tokio::test]
+    async fn scenario_15_oidc_token_carries_requested_audience() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+
+        let token = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/distributedtask/hubs/actions/plans/plan-15/jobs/job-15/oidctoken?audience=api://aksh",
+            Value::Null,
+        )
+        .await;
+        let jwt = token["value"].as_str().unwrap();
+        let parts: Vec<&str> = jwt.split('.').collect();
+        assert_eq!(parts.len(), 3);
+        let claims = URL_SAFE_NO_PAD.decode(parts[1]).unwrap();
+        let claims: Value = serde_json::from_slice(&claims).unwrap();
+
+        assert_eq!(claims["aud"], "api://aksh");
+        assert_eq!(claims["job_id"], "job-15");
+        assert_eq!(claims["plan_id"], "plan-15");
+    }
+
+    #[tokio::test]
     async fn messages_redeliver_until_delete_ack() {
         let temp = tempfile::tempdir().unwrap();
         let app = app(
@@ -3053,7 +5249,7 @@ jobs:
         let first = request_json(
             &app,
             Method::GET,
-            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=default",
+            "/runner/server/_apis/v1/Message/1?sessionId=default",
             Value::Null,
         )
         .await;
@@ -3062,7 +5258,7 @@ jobs:
         let redelivered = request_json(
             &app,
             Method::GET,
-            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=default",
+            "/runner/server/_apis/v1/Message/1?sessionId=default",
             Value::Null,
         )
         .await;
@@ -3073,9 +5269,7 @@ jobs:
             .oneshot(
                 Request::builder()
                     .method(Method::DELETE)
-                    .uri(
-                        "/runner/server/_apis/distributedtask/pools/1/messages/1?sessionId=default",
-                    )
+                    .uri("/runner/server/_apis/v1/Message/1/1?sessionId=default")
                     .header(header::AUTHORIZATION, "Bearer aksh-system-token")
                     .body(Body::empty())
                     .unwrap(),
@@ -3087,7 +5281,7 @@ jobs:
         let empty = request_json(
             &app,
             Method::GET,
-            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=default&waitSeconds=0",
+            "/runner/server/_apis/v1/Message/1?sessionId=default&waitSeconds=0",
             Value::Null,
         )
         .await;
@@ -3122,14 +5316,14 @@ jobs:
         .await;
         let run_id = accepted["run_id"].as_str().unwrap();
 
-        let job_message = request_json(
+        let message = request_json(
             &app,
             Method::GET,
-            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=default",
+            "/runner/server/_apis/v1/Message/1?sessionId=default",
             Value::Null,
         )
         .await;
-        let message_id = job_message["messageId"].as_i64().unwrap();
+        let message_id = message["messageId"].as_i64().unwrap();
 
         let ack = app
             .clone()
@@ -3137,7 +5331,7 @@ jobs:
                 Request::builder()
                     .method(Method::DELETE)
                     .uri(format!(
-                        "/runner/server/_apis/distributedtask/pools/1/messages/{message_id}?sessionId=default"
+                        "/runner/server/_apis/v1/Message/1/{message_id}?sessionId=default"
                     ))
                     .header(header::AUTHORIZATION, "Bearer aksh-system-token")
                     .body(Body::empty())
@@ -3158,7 +5352,7 @@ jobs:
         let cancellation = request_json(
             &app,
             Method::GET,
-            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=default&waitSeconds=0",
+            "/runner/server/_apis/v1/Message/1?sessionId=default&waitSeconds=0",
             Value::Null,
         )
         .await;
@@ -3180,7 +5374,7 @@ jobs:
             request_json(
                 &poll_app,
                 Method::GET,
-                "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=default&waitSeconds=2",
+                "/runner/server/_apis/v1/Message/1?sessionId=default&waitSeconds=2",
                 Value::Null,
             )
             .await
@@ -3223,7 +5417,7 @@ jobs:
         let session = request_json(
             &app,
             Method::POST,
-            "/runner/server/_apis/distributedtask/pools/1/sessions",
+            "/api/v1/runners/sessions",
             json!({"runner_id": 1, "name": "local"}),
         )
         .await;
@@ -3254,9 +5448,7 @@ jobs:
         let message = request_json(
             &app,
             Method::GET,
-            &format!(
-                "/runner/server/_apis/distributedtask/pools/1/messages?sessionId={session_id}"
-            ),
+            &format!("/api/v1/runners/sessions/{session_id}/messages?sessionId={session_id}"),
             Value::Null,
         )
         .await;
@@ -3460,8 +5652,15 @@ jobs:
             body: Value,
         ) -> (StatusCode, Value) {
             let mut builder = Request::builder().method(method).uri(uri);
-            if uri.starts_with("/_apis/") || uri.starts_with("/runner/server/_apis/") {
+            if uri.starts_with("/_apis/")
+                || uri.starts_with("/runner/server/_apis/")
+                || uri.starts_with("/broker/")
+                || uri.starts_with("/twirp/")
+            {
                 builder = builder.header(header::AUTHORIZATION, "Bearer aksh-system-token");
+            } else if uri.starts_with("/api/v3/actions/runner-registration") {
+                builder =
+                    builder.header(header::AUTHORIZATION, "RemoteAuth aksh-registration-token");
             }
             let request = if body.is_null() {
                 builder.body(Body::empty()).unwrap()
@@ -3569,8 +5768,14 @@ jobs:
 
     async fn request_json(app: &Router, method: Method, uri: &str, body: Value) -> Value {
         let mut builder = Request::builder().method(method).uri(uri);
-        if uri.starts_with("/_apis/") || uri.starts_with("/runner/server/_apis/") {
+        if uri.starts_with("/_apis/")
+            || uri.starts_with("/runner/server/_apis/")
+            || uri.starts_with("/broker/")
+            || uri.starts_with("/twirp/")
+        {
             builder = builder.header(header::AUTHORIZATION, "Bearer aksh-system-token");
+        } else if uri.starts_with("/api/v3/actions/runner-registration") {
+            builder = builder.header(header::AUTHORIZATION, "RemoteAuth aksh-registration-token");
         }
         let request = if body.is_null() {
             builder.body(Body::empty()).unwrap()

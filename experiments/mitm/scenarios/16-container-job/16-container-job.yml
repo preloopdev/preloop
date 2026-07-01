@@ -1,0 +1,8 @@
+name: mitm container job
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: [self-hosted, mitm]
+    container: node:20
+    steps:
+      - run: node -v

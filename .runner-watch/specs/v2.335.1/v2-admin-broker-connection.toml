@@ -1,0 +1,155 @@
+change_id = "v2-admin-broker-connection"
+upstream_version = "v2.335.1"
+category = "concern"
+tags = ["protocol", "broker"]
+ai_status = "deterministic-known-fidelity-gap"
+
+[description]
+what = '''
+Runner v2 admin flow discovers auth_url_v2 and BrokerUrl values.
+'''
+why = '''
+v2.329.0 introduced broker/admin paths used by newer hosted runner flows.
+'''
+runner_behavior = '''
+connectionData/location data and admin responses can advertise auth_url_v2, BrokerUrl, and UseRunnerAdminFlow.
+'''
+failure_mode = '''
+Runner can fall back today, but newer flows warn or skip broker features when absent.
+'''
+
+[feature_flag]
+name = "UseRunnerAdminFlow"
+where = "admin/connection response"
+default = false
+
+[wire]
+request = '''
+GET /_apis/connectionData and runner admin capability requests
+'''
+expected_response = "JSON containing auth_url_v2/BrokerUrl when enabled"
+
+[aksh_targets]
+files = [
+  { crate = "aksh-runner-server", path = "crates/aksh-runner-server/src/lib.rs", area = "connectionData payload" },
+  { crate = "aksh-runner-server", path = "crates/aksh-runner-server/src/lib.rs", area = "broker/admin flow" },
+]
+
+[implementation]
+approach = '''
+Extend connection/admin DTOs and route responses without changing legacy defaults.
+'''
+test = "connectionData/admin response includes optional v2 fields only when configured."
+
+[[source_entries]]
+file = "src/Runner.Common/ConfigurationStore.cs"
+change_type = "env_var_added"
+fields = ["StringUtil", "ConvertToBoolean", "Environment", "GetEnvironmentVariable", "GITHUB_ACTIONS_RUNNER_FORCE_GHES"]
+snippet = '''
+
+                    // GitHubUrl will be empty for jit configured runner
+                    // We will try to infer it from the ServerUrl/ServerUrlV2
+                    if (StringUtil.ConvertToBoolean(Environment.GetEnvironmentVariable("GITHUB_ACTIONS_RUNNER_FORCE_GHES")))
+                    {
+                        // Allow env to override and force GHES in case the inference logic is wrong.
+                        return false;
+'''
+
+[[source_entries]]
+file = "src/Runner.Common/ConfigurationStore.cs"
+change_type = "field_added"
+struct = "RunnerSettings"
+fields = ["UseRunnerAdminFlow"]
+snippet = '''
+        public bool UseV2Flow { get; set; }
+
+        [DataMember(EmitDefaultValue = false)]
+        public bool UseRunnerAdminFlow { get; set; }
+
+        [DataMember(EmitDefaultValue = false)]
+        public string ServerUrlV2 { get; set; }
+'''
+
+[[source_entries]]
+file = "src/Runner.Common/ConfigurationStore.cs"
+change_type = "protocol_keyword_added"
+fields = ["UseRunnerAdminFlow"]
+snippet = '''
+        public bool UseV2Flow { get; set; }
+
+        [DataMember(EmitDefaultValue = false)]
+        public bool UseRunnerAdminFlow { get; set; }
+
+        [DataMember(EmitDefaultValue = false)]
+        public string ServerUrlV2 { get; set; }
+'''
+
+[[source_entries]]
+file = "src/Runner.Listener/Configuration/ConfigurationManager.cs"
+change_type = "protocol_keyword_added"
+fields = ["runnerSettings", "ServerUrlV2", "serverUrlV2"]
+snippet = '''
+                !string.IsNullOrEmpty(serverUrlV2))
+            {
+                Trace.Info($"Service enforced serverUrlV2: {serverUrlV2}");
+                runnerSettings.ServerUrlV2 = serverUrlV2;
+            }
+
+            if (agent.Properties.TryGetValue("UseV2Flow", out bool useV2Flow) && useV2Flow)
+'''
+
+[[source_entries]]
+file = "src/Runner.Listener/Configuration/ConfigurationManager.cs"
+change_type = "protocol_keyword_added"
+fields = ["runnerSettings", "UseRunnerAdminFlow"]
+snippet = '''
+
+                        try
+                        {
+                            if (runnerSettings.UseRunnerAdminFlow)
+                            {
+                                var runner = await _dotcomServer.ReplaceRunnerAsync(runnerSettings.PoolId, agent, runnerSettings.GitHubUrl, registerToken, publicKeyXML);
+                                runnerSettings.ServerUrlV2 = runner.RunnerAuthorization.ServerUrl;
+'''
+
+[[source_entries]]
+file = "src/Runner.Listener/Configuration/ConfigurationManager.cs"
+change_type = "protocol_keyword_added"
+fields = ["runnerSettings", "UseRunnerAdminFlow"]
+snippet = '''
+
+                    try
+                    {
+                        if (runnerSettings.UseRunnerAdminFlow)
+                        {
+                            var runner = await _dotcomServer.AddRunnerAsync(runnerSettings.PoolId, agent, runnerSettings.GitHubUrl, registerToken, publicKeyXML);
+                            runnerSettings.ServerUrlV2 = runner.RunnerAuthorization.ServerUrl;
+'''
+
+[[source_entries]]
+file = "src/Runner.Listener/Configuration/ConfigurationManager.cs"
+change_type = "protocol_keyword_added"
+fields = ["runnerSettings", "UseV2Flow"]
+snippet = '''
+                            {
+                                var runner = await _dotcomServer.ReplaceRunnerAsync(runnerSettings.PoolId, agent, runnerSettings.GitHubUrl, registerToken, publicKeyXML);
+                                runnerSettings.ServerUrlV2 = runner.RunnerAuthorization.ServerUrl;
+                                runnerSettings.UseV2Flow = true; // if we are using runner admin, we also need to hit broker
+
+                                agent.Id = runner.Id;
+                                agent.Authorization = new TaskAgentAuthorization()
+'''
+
+[[source_entries]]
+file = "src/Runner.Listener/Configuration/ConfigurationManager.cs"
+change_type = "protocol_keyword_added"
+fields = ["runnerSettings", "UseV2Flow"]
+snippet = '''
+                        {
+                            var runner = await _dotcomServer.AddRunnerAsync(runnerSettings.PoolId, agent, runnerSettings.GitHubUrl, registerToken, publicKeyXML);
+                            runnerSettings.ServerUrlV2 = runner.RunnerAuthorization.ServerUrl;
+                            runnerSettings.UseV2Flow = true; // if we are using runner admin, we also need to hit broker
+
+                            agent.Id = runner.Id;
+                            agent.Authorization = new TaskAgentAuthorization()
+'''
