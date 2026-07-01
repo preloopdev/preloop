@@ -631,12 +631,9 @@ pub(crate) async fn github_register(headers: HeaderMap) -> impl IntoResponse {
 
     if !is_local {
         manifest_json["hook_attributes"] = serde_json::json!({
-            "url": format!("{}/api/v1/github/webhooks", base_url)
-    });
-        manifest_json["default_events"] = serde_json::json!([
-            "push",
-            "pull_request"
-        ]);
+                "url": format!("{}/api/v1/github/webhooks", base_url)
+        });
+        manifest_json["default_events"] = serde_json::json!(["push", "pull_request"]);
     }
 
     let html = format!(
@@ -654,7 +651,7 @@ pub(crate) async fn github_register(headers: HeaderMap) -> impl IntoResponse {
     </form>
 </body>
 </html>"#,
-        manifest_json.to_string()
+        manifest_json
     );
 
     axum::response::Html(html)
