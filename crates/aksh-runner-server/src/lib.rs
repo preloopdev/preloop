@@ -6294,7 +6294,7 @@ jobs:
             .unwrap();
 
         let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
-        state.webhook_secret = None; // Disable signature check for this test
+        state.webhook_secret = Some("super-secret".to_owned());
         state.local_workspace = Some(ws_dir.clone());
 
         let app = app(state.clone(), CancellationToken::new());
@@ -6321,12 +6321,26 @@ jobs:
 
         let payload_bytes = serde_json::to_vec(&payload).unwrap();
 
+        // Compute signature
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        type HmacSha256 = Hmac<Sha256>;
+        let mut mac = HmacSha256::new_from_slice(b"super-secret").unwrap();
+        mac.update(&payload_bytes);
+        let sig_bytes = mac.finalize().into_bytes();
+        let sig_hex = sig_bytes
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>();
+        let signature_header = format!("sha256={}", sig_hex);
+
         let response = app
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
                     .uri("/api/v1/github/webhooks")
                     .header("x-github-event", "pull_request")
+                    .header("x-hub-signature-256", signature_header)
                     .header("content-type", "application/json")
                     .body(Body::from(payload_bytes))
                     .unwrap(),
