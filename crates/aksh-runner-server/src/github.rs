@@ -417,32 +417,44 @@ async fn get_pr_changed_files(
     pr_number: u64,
 ) -> anyhow::Result<Vec<String>> {
     let client = reqwest::Client::new();
-    let url = format!(
-        "https://api.github.com/repos/{}/pulls/{}/files",
-        repo, pr_number
-    );
-    let response = client
-        .get(&url)
-        .header("User-Agent", "aksh")
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        return Err(anyhow::anyhow!(
-            "GitHub API returned status: {}",
-            response.status()
-        ));
-    }
+    let mut page = 1;
+    let mut all_files = Vec::new();
 
     #[derive(Deserialize)]
     struct GitHubFileItem {
         filename: String,
     }
 
-    let files: Vec<GitHubFileItem> = response.json().await?;
-    Ok(files.into_iter().map(|f| f.filename).collect())
+    loop {
+        let url = format!(
+            "https://api.github.com/repos/{}/pulls/{}/files?per_page=100&page={}",
+            repo, pr_number, page
+        );
+        let response = client
+            .get(&url)
+            .header("User-Agent", "aksh")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(anyhow::anyhow!(
+                "GitHub API returned status: {}",
+                response.status()
+            ));
+        }
+
+        let files: Vec<GitHubFileItem> = response.json().await?;
+        if files.is_empty() {
+            break;
+        }
+
+        all_files.extend(files.into_iter().map(|f| f.filename));
+        page += 1;
+    }
+
+    Ok(all_files)
 }
 
 /// Route handler for GitHub App Webhooks.
