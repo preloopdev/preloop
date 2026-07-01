@@ -1,0 +1,21 @@
+description = "Submit a two-job workflow where a consumer reads outputs through the needs context."
+duration_seconds_max = 300
+
+[[steps]]
+kind = "submit_workflow"
+path = "08-job-outputs-needs.yml"
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_assigned"
+timeout = 120
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_completed"
+timeout = 240
+
+# The driver matches historical events, so do not repeat wait_for_event here. Leave time for the needs-dependent consumer job traffic to be captured after the producer completes.
+[[steps]]
+kind = "wait_seconds"
+n = 60

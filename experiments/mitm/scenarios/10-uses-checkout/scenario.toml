@@ -1,0 +1,16 @@
+description = "Submit a workflow that resolves and downloads actions/checkout@v4."
+duration_seconds_max = 300
+
+[[steps]]
+kind = "submit_workflow"
+path = "10-uses-checkout.yml"
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_assigned"
+timeout = 120
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_completed"
+timeout = 240

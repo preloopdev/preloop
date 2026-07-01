@@ -1,0 +1,16 @@
+description = "Submit a workflow that uploads and downloads an artifact using the v4 artifact actions."
+duration_seconds_max = 300
+
+[[steps]]
+kind = "submit_workflow"
+path = "12-artifact.yml"
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_assigned"
+timeout = 120
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_completed"
+timeout = 240

@@ -1,8 +1,0 @@
-parameters:
-- name: status
-  type: string
-  default: success
-
-steps:
-- ${{ if ne(length(parameters.status), 7) }}:
-  - assert: failure

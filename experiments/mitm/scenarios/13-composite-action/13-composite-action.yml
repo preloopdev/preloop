@@ -1,0 +1,10 @@
+name: mitm composite
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: [self-hosted, mitm]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/greet
+        with:
+          who: world

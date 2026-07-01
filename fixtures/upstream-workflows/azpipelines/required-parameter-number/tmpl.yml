@@ -1,5 +1,0 @@
-parameters:
-  - name: no
-    type: number
-steps:
-  - script: echo ok

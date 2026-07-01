@@ -1,3 +1,0 @@
-variables:
-- name: I_MUST_EXIST
-  value: expected-value

@@ -1,0 +1,13 @@
+name: mitm multi step
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: [self-hosted, mitm]
+    steps:
+      - run: echo first
+      - run: echo "VAL=$VAL"
+        env:
+          VAL: hello
+      - run: |
+          echo line1
+          echo line2

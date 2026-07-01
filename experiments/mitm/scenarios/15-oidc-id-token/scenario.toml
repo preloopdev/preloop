@@ -1,0 +1,16 @@
+description = "Submit a workflow that requests an OIDC ID token with a custom audience."
+duration_seconds_max = 300
+
+[[steps]]
+kind = "submit_workflow"
+path = "15-oidc-id-token.yml"
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_assigned"
+timeout = 120
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_completed"
+timeout = 240
