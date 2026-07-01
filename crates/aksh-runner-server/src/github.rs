@@ -601,14 +601,27 @@ pub(crate) async fn handle_github_webhook(
 }
 
 /// Serve registration page for GitHub App Manifest flow.
-pub(crate) async fn github_register() -> impl IntoResponse {
+pub(crate) async fn github_register(headers: HeaderMap) -> impl IntoResponse {
+    let host = headers
+        .get("host")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("localhost:9090");
+
+    let scheme = if host.contains("localhost") || host.contains("127.0.0.1") {
+        "http"
+    } else {
+        "https"
+    };
+
+    let base_url = format!("{}://{}", scheme, host);
+
     let manifest_json = serde_json::json!({
         "name": "aksh-local-app",
-        "url": "http://localhost",
+        "url": base_url,
         "hook_attributes": {
-            "url": "http://localhost/api/v1/github/webhooks"
+            "url": format!("{}/api/v1/github/webhooks", base_url)
         },
-        "redirect_url": "http://localhost/api/v1/github/callback",
+        "redirect_url": format!("{}/api/v1/github/callback", base_url),
         "public": false,
         "default_permissions": {
             "checks": "write",
