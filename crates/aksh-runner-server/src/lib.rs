@@ -1797,7 +1797,6 @@ async fn next_message(
             .insert(session_id.clone(), request_id);
         if let Some(request) = inner.job_requests.get_mut(&request_id) {
             request.started_at = Some(std::time::SystemTime::now());
-            request.last_renewed_at = Some(std::time::SystemTime::now());
         }
         let message = build_task_agent_message(
             &mut inner,
