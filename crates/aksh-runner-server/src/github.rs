@@ -614,25 +614,32 @@ pub(crate) async fn github_register(headers: HeaderMap) -> impl IntoResponse {
     };
 
     let base_url = format!("{}://{}", scheme, host);
+    let is_local = host.contains("localhost") || host.contains("127.0.0.1");
 
-    let manifest_json = serde_json::json!({
+    let mut manifest_json = serde_json::json!({
         "name": "aksh-local-app",
         "url": base_url,
-        "hook_attributes": {
-            "url": format!("{}/api/v1/github/webhooks", base_url)
-        },
         "redirect_url": format!("{}/api/v1/github/callback", base_url),
         "public": false,
         "default_permissions": {
             "checks": "write",
             "contents": "read",
-            "metadata": "read"
+            "metadata": "read",
+            "pull_requests": "read"
         },
         "default_events": [
             "push",
             "pull_request"
         ]
     });
+
+    if is_local {
+        manifest_json["webhook_active"] = serde_json::json!(false);
+    } else {
+        manifest_json["hook_attributes"] = serde_json::json!({
+            "url": format!("{}/api/v1/github/webhooks", base_url)
+    });
+    }
 
     let html = format!(
         r#"<!DOCTYPE html>
@@ -649,7 +656,7 @@ pub(crate) async fn github_register(headers: HeaderMap) -> impl IntoResponse {
     </form>
 </body>
 </html>"#,
-        manifest_json
+        manifest_json.to_string()
     );
 
     axum::response::Html(html)
