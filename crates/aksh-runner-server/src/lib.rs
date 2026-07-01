@@ -5,6 +5,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+pub mod github;
+
 use aksh_artifacts::ArtifactStore;
 use aksh_cache::CacheStore;
 use aksh_gha_parser::{expand_jobs_with_reusables, parse_workflow};
@@ -45,12 +47,145 @@ pub struct ServerConfig {
     pub state_dir: PathBuf,
 }
 
+async fn reap_once(shared: &Arc<SharedState>) {
+    let mut inner = shared.state.inner.lock().await;
+    let now = SystemTime::now();
+    let mut cancellations = Vec::new();
+    let mut disconnected_completions = Vec::new();
+
+    let mut active_reqs = Vec::new();
+    for (request_id, request) in &inner.job_requests {
+        if request.result.is_none() {
+            active_reqs.push((
+                *request_id,
+                request.run_id,
+                request.job_id.clone(),
+                request.started_at,
+                request.last_renewed_at,
+                request.timeout_triggered,
+            ));
+        }
+    }
+
+    for (request_id, run_id, job_id, started_at, last_renewed_at, timeout_triggered) in active_reqs
+    {
+        // 1. Check Timeout Enforcement
+        if let Some(started_at) = started_at {
+            if !timeout_triggered {
+                let elapsed = now.duration_since(started_at).unwrap_or_default();
+                let job_timeout = inner
+                    .broker_messages
+                    .get(&request_id)
+                    .and_then(|msg| msg.job_timeout)
+                    .unwrap_or(21600); // 360 minutes in seconds
+
+                if elapsed >= Duration::from_secs(job_timeout as u64) {
+                    info!(
+                        %run_id,
+                        %job_id,
+                        request_id,
+                        "Job timed out after {}s",
+                        job_timeout
+                    );
+                    if let Some(req) = inner.job_requests.get_mut(&request_id) {
+                        req.timeout_triggered = true;
+                    }
+                    cancellations.push(QueuedCancellation {
+                        run_id,
+                        job_id: job_id.clone(),
+                    });
+                }
+            }
+        }
+
+        // 2. Check Lease Expiration / Disconnect Reaper
+        if let Some(last_renewed_at) = last_renewed_at {
+            let elapsed = now.duration_since(last_renewed_at).unwrap_or_default();
+            // 120 seconds disconnect threshold
+            if elapsed >= Duration::from_secs(120) {
+                info!(
+                    %run_id,
+                    %job_id,
+                    request_id,
+                    "Runner lease expired (last renewed {}s ago). Marking job as failed.",
+                    elapsed.as_secs()
+                );
+                if let Some(req) = inner.job_requests.get_mut(&request_id) {
+                    req.result = Some(ExecutionStatus::Failure);
+                }
+                disconnected_completions.push((
+                    request_id,
+                    JobCompletion {
+                        run_id,
+                        job_id: job_id.clone(),
+                        status: ExecutionStatus::Failure,
+                        outputs: Default::default(),
+                    },
+                ));
+            }
+        }
+    }
+
+    // Cleanup session and inflight maps for disconnected runners
+    for (request_id, _) in &disconnected_completions {
+        inner.inflight_requests.remove(request_id);
+        inner
+            .session_active_requests
+            .retain(|_, &mut v| v != *request_id);
+    }
+
+    // Apply cancellations
+    let cancellation_count = cancellations.len();
+    if cancellation_count > 0 {
+        inner.cancellation_queue.extend(cancellations);
+    }
+
+    drop(inner);
+
+    // Notify if cancellations occurred
+    if cancellation_count > 0 {
+        shared.state.message_notify.notify_waiters();
+    }
+
+    // Process completions for disconnected runners
+    for (_, completion) in disconnected_completions {
+        let _ = complete_job_inner(shared.clone(), completion).await;
+    }
+}
+
+async fn run_background_reaper(shared: Arc<SharedState>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(10));
+    // Skip the first tick
+    interval.tick().await;
+
+    while !shared.shutdown.is_cancelled() {
+        tokio::select! {
+            _ = interval.tick() => {
+                reap_once(&shared).await;
+            }
+            _ = shared.shutdown.cancelled() => {
+                break;
+            }
+        }
+    }
+}
+
 /// Start the server and block until shutdown.
 pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     let state = AppState::new(config.state_dir).await?;
     let shutdown = CancellationToken::new();
-    let router = app(state, shutdown.clone());
+    let router = app(state.clone(), shutdown.clone());
     let listener = TcpListener::bind(config.listen).await?;
+
+    let shared = Arc::new(SharedState {
+        state,
+        shutdown: shutdown.clone(),
+    });
+
+    let checker_shared = shared.clone();
+    tokio::spawn(async move {
+        run_background_reaper(checker_shared).await;
+    });
 
     info!(listen = %config.listen, "aksh runner server listening");
     axum::serve(listener, router)
@@ -311,6 +446,12 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             axum::routing::options(|| async { StatusCode::OK }),
         )
         .route("/api/v1/runs", post(submit_run))
+        .route(
+            "/api/v1/github/webhooks",
+            post(github::handle_github_webhook),
+        )
+        .route("/api/v1/github/register", get(github::github_register))
+        .route("/api/v1/github/callback", get(github::github_callback))
         .route("/api/v1/runs/:run_id", get(get_run))
         .route("/api/v1/runs/:run_id/cancel", post(cancel_run))
         .route("/api/v1/runs/:run_id/rerun", post(rerun_run))
@@ -425,6 +566,10 @@ pub struct AppState {
     message_notify: Arc<Notify>,
     cache: CacheStore,
     artifacts: ArtifactStore,
+    /// Optional GitHub App Webhook Secret for signature verification.
+    pub webhook_secret: Option<String>,
+    /// Optional local workspace path to load workflows from.
+    pub local_workspace: Option<PathBuf>,
 }
 
 impl AppState {
@@ -439,12 +584,18 @@ impl AppState {
             agent_keypair: Some(keypair),
             ..Default::default()
         };
+        let webhook_secret = std::env::var("AKSH_WEBHOOK_SECRET").ok();
+        let local_workspace = std::env::var("AKSH_LOCAL_WORKSPACE")
+            .ok()
+            .map(PathBuf::from);
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
             events,
             message_notify: Arc::new(Notify::new()),
             cache,
             artifacts,
+            webhook_secret,
+            local_workspace,
         })
     }
 
@@ -486,14 +637,16 @@ struct InnerState {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct RunRecord {
-    run_id: RunId,
-    submission: WorkflowSubmission,
-    jobs: BTreeMap<JobId, ExecutionStatus>,
-    status: ExecutionStatus,
-    job_outputs: BTreeMap<JobId, BTreeMap<String, serde_json::Value>>,
-    job_base_ids: BTreeMap<JobId, String>,
-    job_fail_fast: BTreeMap<String, bool>,
+pub(crate) struct RunRecord {
+    pub(crate) run_id: RunId,
+    pub(crate) submission: WorkflowSubmission,
+    pub(crate) jobs: BTreeMap<JobId, ExecutionStatus>,
+    pub(crate) status: ExecutionStatus,
+    pub(crate) job_outputs: BTreeMap<JobId, BTreeMap<String, serde_json::Value>>,
+    pub(crate) job_base_ids: BTreeMap<JobId, String>,
+    pub(crate) job_fail_fast: BTreeMap<String, bool>,
+    #[serde(default)]
+    pub(crate) job_check_run_ids: BTreeMap<JobId, u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -507,6 +660,9 @@ struct TaskAgentJobRequestRecord {
     timeline_id: uuid::Uuid,
     result: Option<ExecutionStatus>,
     locked_until: String,
+    started_at: Option<std::time::SystemTime>,
+    last_renewed_at: Option<std::time::SystemTime>,
+    timeout_triggered: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -617,10 +773,10 @@ async fn healthz(State(shared): State<Arc<SharedState>>) -> Json<serde_json::Val
     }))
 }
 
-async fn submit_run(
-    State(shared): State<Arc<SharedState>>,
-    Json(submission): Json<WorkflowSubmission>,
-) -> Result<Json<RunAccepted>, ApiError> {
+pub(crate) async fn submit_run_inner(
+    shared: &Arc<SharedState>,
+    submission: WorkflowSubmission,
+) -> Result<RunAccepted, ApiError> {
     let workflow = parse_workflow(&submission.workflow_yaml)?;
     let (branch, tag) = git_ref_context(&submission.git_ref);
     let changed_paths = changed_paths_from_payload(&submission.payload);
@@ -694,6 +850,9 @@ async fn submit_run(
                 timeline_id: agent_msg.timeline.id,
                 result: None,
                 locked_until: agent_request_locked_until(),
+                started_at: None,
+                last_renewed_at: None,
+                timeout_triggered: false,
             };
             inner
                 .plan_requests
@@ -745,6 +904,7 @@ async fn submit_run(
                 job_base_ids,
                 job_fail_fast,
                 status: ExecutionStatus::Queued,
+                job_check_run_ids: BTreeMap::new(),
             },
         );
         drop(inner);
@@ -758,11 +918,18 @@ async fn submit_run(
                 queued_jobs,
             })
             .await;
-        Ok(Json(RunAccepted {
+        Ok(RunAccepted {
             run_id,
             queued_jobs,
-        }))
+        })
     }
+}
+
+async fn submit_run(
+    State(shared): State<Arc<SharedState>>,
+    Json(submission): Json<WorkflowSubmission>,
+) -> Result<Json<RunAccepted>, ApiError> {
+    submit_run_inner(&shared, submission).await.map(Json)
 }
 
 fn git_ref_context(git_ref: &str) -> (Option<String>, Option<String>) {
@@ -1138,8 +1305,35 @@ async fn next_message_broker_ref(
 
     loop {
         let mut inner = shared.state.inner.lock().await;
+        if let Some(message) = inner
+            .inflight_messages
+            .get(&session_id)
+            .and_then(|messages| messages.values().next().cloned())
+        {
+            return Ok(Json(message).into_response());
+        }
+
         if let Some(request_id) = inner.session_active_requests.get(&session_id).copied() {
             if let Some(request) = inner.job_requests.get(&request_id) {
+                if let Some(pos) = inner
+                    .cancellation_queue
+                    .iter()
+                    .position(|c| c.run_id == request.run_id && c.job_id == request.job_id)
+                {
+                    let cancellation = inner.cancellation_queue.remove(pos).unwrap();
+                    let message = build_broker_plaintext_message(
+                        &mut inner,
+                        &session_id,
+                        azdo::message_type::JOB_CANCELLED,
+                        json!({
+                            "runId": cancellation.run_id.to_string(),
+                            "jobId": cancellation.job_id.to_string(),
+                        })
+                        .to_string(),
+                    );
+                    return Ok(Json(message).into_response());
+                }
+
                 if request.result.is_none() {
                     return Ok(Json(broker_job_ref(request, pool_id)).into_response());
                 }
@@ -1174,6 +1368,10 @@ async fn next_message_broker_ref(
         inner
             .session_active_requests
             .insert(session_id.clone(), request_id);
+        if let Some(request) = inner.job_requests.get_mut(&request_id) {
+            request.started_at = Some(std::time::SystemTime::now());
+            request.last_renewed_at = Some(std::time::SystemTime::now());
+        }
         inner
             .broker_messages
             .insert(request_id, queued.message.clone());
@@ -1186,6 +1384,8 @@ async fn next_message_broker_ref(
         let run_id = queued.run_id;
         let job_id = queued.job_id.clone();
         drop(inner);
+
+        github::report_check_run_in_progress(&shared, run_id, &job_id).await;
 
         shared
             .state
@@ -1357,6 +1557,7 @@ async fn broker_renew_job(
         .get_mut(&request_id)
         .ok_or_else(|| ApiError::not_found("agent request not found"))?;
     record.locked_until = agent_request_locked_until();
+    record.last_renewed_at = Some(std::time::SystemTime::now());
     Ok(Json(json!({"lockedUntil": record.locked_until})))
 }
 
@@ -1590,9 +1791,13 @@ async fn next_message(
 
         let body_json = serde_json::to_string(&queued.message)
             .map_err(|e| ApiError::bad_request(format!("failed to serialize job message: {e}")))?;
+        let request_id = queued.message.request_id;
         inner
             .session_active_requests
-            .insert(session_id.clone(), queued.message.request_id);
+            .insert(session_id.clone(), request_id);
+        if let Some(request) = inner.job_requests.get_mut(&request_id) {
+            request.started_at = Some(std::time::SystemTime::now());
+        }
         let message = build_task_agent_message(
             &mut inner,
             &session_id,
@@ -1603,6 +1808,8 @@ async fn next_message(
         let run_id = queued.run_id;
         let job_id = queued.job_id.clone();
         drop(inner);
+
+        github::report_check_run_in_progress(&shared, run_id, &job_id).await;
 
         shared
             .state
@@ -1657,6 +1864,28 @@ fn build_task_agent_message(
         .or_default()
         .insert(message_id, message.clone());
     Ok(message)
+}
+
+fn build_broker_plaintext_message(
+    inner: &mut InnerState,
+    session_id: &str,
+    message_type: &str,
+    body_json: String,
+) -> azdo::TaskAgentMessage {
+    inner.next_message_id += 1;
+    let message_id = inner.next_message_id;
+    let message = azdo::TaskAgentMessage {
+        message_id,
+        message_type: message_type.to_owned(),
+        body: body_json,
+        iv: None,
+    };
+    inner
+        .inflight_messages
+        .entry(session_id.to_owned())
+        .or_default()
+        .insert(message_id, message.clone());
+    message
 }
 
 async fn delete_pool_message(
@@ -1795,6 +2024,7 @@ async fn agent_request_patch(
         let mut inner = shared.state.inner.lock().await;
         if let Some(request) = inner.job_requests.get_mut(&request_id) {
             request.locked_until = agent_request_locked_until();
+            request.last_renewed_at = Some(std::time::SystemTime::now());
         }
     }
     Json(agent_request_response(&shared, pool_id, request_id).await)
@@ -1931,6 +2161,15 @@ async fn complete_job_inner(
         .cloned()
         .ok_or_else(|| ApiError::not_found("run not found"))?;
     drop(inner);
+
+    github::report_check_run_completed(
+        &shared,
+        completion.run_id,
+        &completion.job_id,
+        completion.status,
+    )
+    .await;
+
     if promoted_jobs > 0 || cancelled_siblings > 0 {
         shared.state.message_notify.notify_waiters();
     }
@@ -5797,5 +6036,399 @@ jobs:
         } else {
             serde_json::from_slice(&bytes).unwrap()
         }
+    }
+
+    #[tokio::test]
+    async fn job_timeout_enforcement_cancels_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let shutdown = CancellationToken::new();
+        let app = app(state.clone(), shutdown.clone());
+        let shared = Arc::new(SharedState {
+            state: state.clone(),
+            shutdown,
+        });
+
+        // 1. Submit run
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: sleep 10\n",
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        // 2. Poll to start job (transitions status to InProgress and sets started_at)
+        let _msg = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/v1/Message/1?sessionId=default",
+            Value::Null,
+        )
+        .await;
+
+        let request_id = {
+            let inner = state.inner.lock().await;
+            *inner.job_requests.keys().next().unwrap()
+        };
+
+        // 3. Override started_at to be in the past (beyond 360m/21600s default timeout)
+        {
+            let mut inner = state.inner.lock().await;
+            let request = inner.job_requests.get_mut(&request_id).unwrap();
+            request.started_at = Some(SystemTime::now() - Duration::from_secs(22000));
+        }
+
+        // 4. Run reaper tick
+        reap_once(&shared).await;
+
+        // 5. Verify cancellation is enqueued
+        {
+            let inner = state.inner.lock().await;
+            let request = inner.job_requests.get(&request_id).unwrap();
+            assert!(request.timeout_triggered);
+            assert_eq!(inner.cancellation_queue.len(), 1);
+            assert_eq!(inner.cancellation_queue[0].run_id, run_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn runner_lease_expiration_disconnect_reaper() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let shutdown = CancellationToken::new();
+        let app = app(state.clone(), shutdown.clone());
+        let shared = Arc::new(SharedState {
+            state: state.clone(),
+            shutdown,
+        });
+
+        // 1. Submit run
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: sleep 10\n",
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        // 2. Poll to start job (sets last_renewed_at)
+        let _msg = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/v1/Message/1?sessionId=default",
+            Value::Null,
+        )
+        .await;
+
+        let request_id = {
+            let inner = state.inner.lock().await;
+            *inner.job_requests.keys().next().unwrap()
+        };
+
+        // 3. Override last_renewed_at to be in the past (beyond 120s threshold)
+        {
+            let mut inner = state.inner.lock().await;
+            let request = inner.job_requests.get_mut(&request_id).unwrap();
+            request.last_renewed_at = Some(SystemTime::now() - Duration::from_secs(130));
+        }
+
+        // 4. Run reaper tick
+        reap_once(&shared).await;
+
+        // 5. Verify the job was marked failed and run completes as failed
+        {
+            let inner = state.inner.lock().await;
+            let request = inner.job_requests.get(&request_id).unwrap();
+            assert_eq!(request.result, Some(ExecutionStatus::Failure));
+            assert!(inner.inflight_requests.is_empty());
+            assert!(inner.session_active_requests.is_empty());
+
+            let run = inner.runs.get(&run_id).unwrap();
+            assert_eq!(run.status, ExecutionStatus::Failure);
+        }
+    }
+
+    #[tokio::test]
+    async fn github_webhook_flows_with_signature_and_check_runs() {
+        let temp = tempfile::tempdir().unwrap();
+
+        // 1. Create a dummy workflow file in a local workspace
+        let ws_dir = temp.path().join("workspace");
+        tokio::fs::create_dir_all(ws_dir.join(".github/workflows"))
+            .await
+            .unwrap();
+        let workflow_content = r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hello
+"#;
+        tokio::fs::write(ws_dir.join(".github/workflows/build.yml"), workflow_content)
+            .await
+            .unwrap();
+
+        let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        state.webhook_secret = Some("super-secret".to_owned());
+        state.local_workspace = Some(ws_dir.clone());
+
+        assert_eq!(state.webhook_secret.as_deref(), Some("super-secret"));
+        assert_eq!(state.local_workspace.as_ref(), Some(&ws_dir));
+
+        let app = app(state.clone(), CancellationToken::new());
+
+        // 2. Prepare mock webhook push payload
+        let payload = serde_json::json!({
+            "ref": "refs/heads/main",
+            "before": "0000000000000000000000000000000000000000",
+            "after": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+            "repository": {
+                "full_name": "owner/repo",
+                "default_branch": "main"
+            },
+            "commits": [
+                {
+                    "id": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+                    "added": ["src/main.rs"],
+                    "modified": [],
+                    "removed": []
+                }
+            ]
+        });
+
+        let payload_bytes = serde_json::to_vec(&payload).unwrap();
+
+        // 3. Compute correct signature
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        type HmacSha256 = Hmac<Sha256>;
+        let mut mac = HmacSha256::new_from_slice(b"super-secret").unwrap();
+        mac.update(&payload_bytes);
+        let sig_bytes = mac.finalize().into_bytes();
+        let sig_hex = sig_bytes
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>();
+        let signature_header = format!("sha256={}", sig_hex);
+
+        // 4. Send request with WRONG signature -> should fail with 401
+        let response_401 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/github/webhooks")
+                    .header("x-github-event", "push")
+                    .header("x-hub-signature-256", "sha256=invalid")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload_bytes.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response_401.status(), StatusCode::UNAUTHORIZED);
+
+        // 5. Send request with CORRECT signature -> should succeed with 200
+        let response_200 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/github/webhooks")
+                    .header("x-github-event", "push")
+                    .header("x-hub-signature-256", signature_header)
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload_bytes))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response_200.status(), StatusCode::OK);
+
+        // 6. Verify that a run was triggered and check runs are queued
+        let inner = state.inner.lock().await;
+        assert_eq!(inner.runs.len(), 1);
+        let (_, run_record) = inner.runs.iter().next().unwrap();
+        assert_eq!(run_record.submission.event, "push");
+        assert_eq!(run_record.submission.repository, "owner/repo");
+        assert_eq!(run_record.submission.git_ref, "refs/heads/main");
+
+        // Verify that check_run_ids are created/queued in the record
+        assert_eq!(run_record.job_check_run_ids.len(), 1);
+        let (job_id, check_run_id) = run_record.job_check_run_ids.iter().next().unwrap();
+        assert_eq!(job_id.to_string(), "build");
+        assert!(*check_run_id > 0);
+    }
+
+    #[tokio::test]
+    async fn github_webhook_pull_request_event() {
+        let temp = tempfile::tempdir().unwrap();
+
+        // Create a dummy workflow file in a local workspace
+        let ws_dir = temp.path().join("workspace");
+        tokio::fs::create_dir_all(ws_dir.join(".github/workflows"))
+            .await
+            .unwrap();
+        let workflow_content = r#"
+on: pull_request
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: make test
+"#;
+        tokio::fs::write(ws_dir.join(".github/workflows/test.yml"), workflow_content)
+            .await
+            .unwrap();
+
+        let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        state.webhook_secret = Some("super-secret".to_owned());
+        state.local_workspace = Some(ws_dir.clone());
+
+        let app = app(state.clone(), CancellationToken::new());
+
+        // Prepare PR payload
+        let payload = serde_json::json!({
+            "action": "opened",
+            "number": 42,
+            "pull_request": {
+                "head": {
+                    "ref": "feature-branch",
+                    "sha": "b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3"
+                },
+                "base": {
+                    "ref": "main",
+                    "sha": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+                }
+            },
+            "repository": {
+                "full_name": "owner/repo",
+                "default_branch": "main"
+            }
+        });
+
+        let payload_bytes = serde_json::to_vec(&payload).unwrap();
+
+        // Compute signature
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        type HmacSha256 = Hmac<Sha256>;
+        let mut mac = HmacSha256::new_from_slice(b"super-secret").unwrap();
+        mac.update(&payload_bytes);
+        let sig_bytes = mac.finalize().into_bytes();
+        let sig_hex = sig_bytes
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>();
+        let signature_header = format!("sha256={}", sig_hex);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/github/webhooks")
+                    .header("x-github-event", "pull_request")
+                    .header("x-hub-signature-256", signature_header)
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload_bytes))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Verify triggered run
+        let inner = state.inner.lock().await;
+        assert_eq!(inner.runs.len(), 1);
+        let (_, run_record) = inner.runs.iter().next().unwrap();
+        assert_eq!(run_record.submission.event, "pull_request");
+        assert_eq!(run_record.submission.git_ref, "refs/pull/42/merge");
+        assert_eq!(run_record.job_check_run_ids.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn github_app_manifest_registration_flow() {
+        let temp = tempfile::tempdir().unwrap();
+
+        // 1. Setup a local mock GitHub API server for manifest conversion
+        let mock_app = Router::new().route(
+            "/app-manifests/:code/conversions",
+            post(|Path(code): Path<String>| async move {
+                assert_eq!(code, "mock_code_123");
+                Json(json!({
+                    "id": 987654,
+                    "pem": "-----BEGIN RSA PRIVATE KEY-----\nMOCK-KEY-DATA\n-----END RSA PRIVATE KEY-----",
+                    "webhook_secret": Some("mock-webhook-secret-xyz")
+                }))
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, mock_app).await.unwrap();
+        });
+
+        // 2. Configure mock API URL in environment
+        std::env::set_var("AKSH_GITHUB_API_URL", format!("http://127.0.0.1:{}", port));
+
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        // 3. Request registration form (GET /api/v1/github/register)
+        let response_reg = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/v1/github/register")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response_reg.status(), StatusCode::OK);
+        let bytes = to_bytes(response_reg.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(html.contains("https://github.com/settings/apps/new"));
+        assert!(html.contains("aksh-local-app"));
+
+        // 4. Request callback conversion (GET /api/v1/github/callback?code=mock_code_123)
+        let response_callback = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/v1/github/callback?code=mock_code_123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response_callback.status(), StatusCode::OK);
+        let bytes_callback = to_bytes(response_callback.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html_callback = String::from_utf8(bytes_callback.to_vec()).unwrap();
+        assert!(html_callback.contains("GitHub App Registered Successfully!"));
+        assert!(html_callback.contains("987654"));
+        assert!(html_callback.contains("mock-webhook-secret-xyz"));
+
+        // Clean up
+        std::env::remove_var("AKSH_GITHUB_API_URL");
     }
 }
