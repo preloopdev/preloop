@@ -452,15 +452,18 @@ pub(crate) async fn handle_github_webhook(
     body: bytes::Bytes,
 ) -> Result<impl IntoResponse, StatusCode> {
     // 1. Verify Signature
-    if let Some(secret) = &shared.state.webhook_secret {
-        let sig_header = headers
-            .get("x-hub-signature-256")
-            .and_then(|h| h.to_str().ok())
-            .ok_or(StatusCode::UNAUTHORIZED)?;
+    let secret = shared.state.webhook_secret.as_ref().ok_or_else(|| {
+        warn!("Webhook secret not configured on server, rejecting request");
+        StatusCode::UNAUTHORIZED
+    })?;
 
-        if !verify_signature(secret, &body, sig_header) {
-            return Err(StatusCode::UNAUTHORIZED);
-        }
+    let sig_header = headers
+        .get("x-hub-signature-256")
+        .and_then(|h| h.to_str().ok())
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    if !verify_signature(secret, &body, sig_header) {
+        return Err(StatusCode::UNAUTHORIZED);
     }
 
     // 2. Get event type
