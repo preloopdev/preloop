@@ -1,0 +1,182 @@
+change_id = "background-step-timeline-fields"
+upstream_version = "v2.335.1"
+category = "blocker"
+tags = ["protocol", "timeline"]
+ai_status = "deterministic-known-fidelity-gap"
+
+[description]
+what = '''
+Runner can send background-step metadata in timeline records.
+'''
+why = '''
+v2.335.0 records concurrent background steps and control-flow waits/cancels in timeline PATCH payloads.
+'''
+runner_behavior = '''
+PATCH timeline records may include isBackground, backgroundControlType, backgroundControlStepIds, and parallelGroupId.
+'''
+failure_mode = '''
+Aksh must accept and preserve unknown timeline metadata; strict DTOs or storage projections can silently lose fidelity.
+'''
+
+[feature_flag]
+name = ""
+where = ""
+
+[wire]
+request = '''
+PATCH /_apis/v1/Timeline/{scope}/{hub}/{planId}/{timelineId}
+{"value":[{"isBackground":true,"backgroundControlType":"waitAll","backgroundControlStepIds":["..."],"parallelGroupId":"..."}]}
+'''
+expected_response = "200 JSON timeline record collection"
+
+[aksh_targets]
+files = [
+  { crate = "aksh-gha-protocol", path = "crates/aksh-gha-protocol/src/azdo.rs", area = "TimelineRecord DTO" },
+  { crate = "aksh-runner-server", path = "crates/aksh-runner-server/src/lib.rs", area = "timeline handlers" },
+]
+
+[implementation]
+approach = '''
+Add optional serde fields to TimelineRecord and ensure timeline PATCH handlers round-trip/store them.
+'''
+test = "Serde test for camelCase optional background fields and handler test for timeline PATCH accepting them."
+
+[[source_entries]]
+file = "src/Runner.Common/JobServerQueue.cs"
+change_type = "protocol_keyword_added"
+fields = ["IsBackground"]
+snippet = '''
+                    }
+
+                    // Merge background step metadata
+                    if (rec.IsBackground)
+                    {
+                        timelineRecord.IsBackground = rec.IsBackground;
+                    }
+'''
+
+[[source_entries]]
+file = "src/Runner.Common/JobServerQueue.cs"
+change_type = "protocol_keyword_added"
+fields = ["timelineRecord", "BackgroundControlStepIds", "BackgroundControlStepIds", "timelineRecord", "BackgroundControlStepIds"]
+snippet = '''
+                        timelineRecord.IsBackground = rec.IsBackground;
+                    }
+                    timelineRecord.BackgroundControlType = rec.BackgroundControlType ?? timelineRecord.BackgroundControlType;
+                    timelineRecord.BackgroundControlStepIds = rec.BackgroundControlStepIds ?? timelineRecord.BackgroundControlStepIds;
+                    timelineRecord.ParallelGroupId = rec.ParallelGroupId ?? timelineRecord.ParallelGroupId;
+                }
+                else
+'''
+
+[[source_entries]]
+file = "src/Runner.Common/JobServerQueue.cs"
+change_type = "protocol_keyword_added"
+fields = ["timelineRecord", "BackgroundControlType", "BackgroundControlType", "timelineRecord", "BackgroundControlType"]
+snippet = '''
+                    {
+                        timelineRecord.IsBackground = rec.IsBackground;
+                    }
+                    timelineRecord.BackgroundControlType = rec.BackgroundControlType ?? timelineRecord.BackgroundControlType;
+                    timelineRecord.BackgroundControlStepIds = rec.BackgroundControlStepIds ?? timelineRecord.BackgroundControlStepIds;
+                    timelineRecord.ParallelGroupId = rec.ParallelGroupId ?? timelineRecord.ParallelGroupId;
+                }
+'''
+
+[[source_entries]]
+file = "src/Runner.Common/JobServerQueue.cs"
+change_type = "protocol_keyword_added"
+fields = ["timelineRecord", "IsBackground", "IsBackground"]
+snippet = '''
+                    // Merge background step metadata
+                    if (rec.IsBackground)
+                    {
+                        timelineRecord.IsBackground = rec.IsBackground;
+                    }
+                    timelineRecord.BackgroundControlType = rec.BackgroundControlType ?? timelineRecord.BackgroundControlType;
+                    timelineRecord.BackgroundControlStepIds = rec.BackgroundControlStepIds ?? timelineRecord.BackgroundControlStepIds;
+'''
+
+[[source_entries]]
+file = "src/Runner.Common/JobServerQueue.cs"
+change_type = "protocol_keyword_added"
+fields = ["timelineRecord", "ParallelGroupId", "ParallelGroupId", "timelineRecord", "ParallelGroupId"]
+snippet = '''
+                    }
+                    timelineRecord.BackgroundControlType = rec.BackgroundControlType ?? timelineRecord.BackgroundControlType;
+                    timelineRecord.BackgroundControlStepIds = rec.BackgroundControlStepIds ?? timelineRecord.BackgroundControlStepIds;
+                    timelineRecord.ParallelGroupId = rec.ParallelGroupId ?? timelineRecord.ParallelGroupId;
+                }
+                else
+                {
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/ExecutionContext.cs"
+change_type = "protocol_keyword_added"
+fields = ["BackgroundControlStepIds", "_record", "BackgroundControlStepIds"]
+snippet = '''
+                    // Populate background step metadata from timeline record fields
+                    IsBackground = _record.IsBackground,
+                    BackgroundControlType = _record.BackgroundControlType,
+                    BackgroundControlStepIds = _record.BackgroundControlStepIds
+                };
+
+                _record.Issues?.ForEach(issue =>
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/ExecutionContext.cs"
+change_type = "protocol_keyword_added"
+fields = ["BackgroundControlType", "_record", "BackgroundControlType"]
+snippet = '''
+                    Annotations = new List<Annotation>(),
+                    // Populate background step metadata from timeline record fields
+                    IsBackground = _record.IsBackground,
+                    BackgroundControlType = _record.BackgroundControlType,
+                    BackgroundControlStepIds = _record.BackgroundControlStepIds
+                };
+
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/ExecutionContext.cs"
+change_type = "protocol_keyword_added"
+fields = ["IsBackground", "_record", "IsBackground"]
+snippet = '''
+                    CompletedAt = _record.FinishTime,
+                    Annotations = new List<Annotation>(),
+                    // Populate background step metadata from timeline record fields
+                    IsBackground = _record.IsBackground,
+                    BackgroundControlType = _record.BackgroundControlType,
+                    BackgroundControlStepIds = _record.BackgroundControlStepIds
+                };
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/ExecutionContext.cs"
+change_type = "protocol_keyword_added"
+fields = ["_record", "IsBackground", "isBackground"]
+snippet = '''
+            // Set background step metadata before InitializeTimelineRecord so it's included in the first update
+            if (isBackground || backgroundControlType != null || parallelGroupId != null)
+            {
+                child._record.IsBackground = isBackground;
+                child._record.BackgroundControlType = backgroundControlType;
+                child._record.BackgroundControlStepIds = backgroundControlStepIds;
+                child._record.ParallelGroupId = parallelGroupId;
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/ExecutionContext.cs"
+change_type = "protocol_keyword_added"
+fields = ["isBackground", "backgroundControlType", "parallelGroupId"]
+snippet = '''
+            child.EchoOnActionCommand = EchoOnActionCommand;
+
+            // Set background step metadata before InitializeTimelineRecord so it's included in the first update
+            if (isBackground || backgroundControlType != null || parallelGroupId != null)
+            {
+                child._record.IsBackground = isBackground;
+                child._record.BackgroundControlType = backgroundControlType;
+'''

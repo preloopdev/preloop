@@ -1,0 +1,75 @@
+You are implementing an aksh protocol-sync spec. Follow existing Rust patterns exactly. Run cargo check and relevant tests, but do not run formatters or project-wide lint.
+
+Spec:
+```toml
+change_id = "use-bearer-token-for-codeload"
+upstream_version = "v2.335.1"
+category = "feature"
+tags = ["actions", "download"]
+ai_status = "deterministic-known-fidelity-gap"
+
+[description]
+what = '''
+Runner can resolve action downloads in batches and optionally use bearer tokens for codeload.
+'''
+why = '''
+v2.328.0 optimized action download resolution and codeload authentication.
+'''
+runner_behavior = '''
+Calls ActionDownloadInfo with batch requests and may attach bearer token semantics to tarball URLs.
+'''
+failure_mode = '''
+Existing action download stubs work for simple cases but miss newer auth/download behavior.
+'''
+
+[feature_flag]
+name = "UseBearerTokenForCodeload"
+where = "action download feature flags"
+default = false
+
+[wire]
+request = '''
+POST /_apis/v1/ActionDownloadInfo/{scope}/{hub}/{planId}
+'''
+expected_response = "JSON action download info"
+
+[aksh_targets]
+files = [
+  { crate = "aksh-runner-server", path = "crates/aksh-runner-server/src/lib.rs", area = "action download handler" },
+]
+
+[implementation]
+approach = '''
+Extend action download handler to accept batch wire shape and token mode.
+'''
+test = "Batch ActionDownloadInfo request returns per-action entries."
+
+[[source_entries]]
+file = "src/Runner.Worker/ActionManager.cs"
+change_type = "feature_flag_added"
+fields = ["executionContext", "Global", "Variables", "GetBoolean", "Constants", "Runner", "Features", "UseBearerTokenForCodeload"]
+snippet = '''
+                return null;
+            }
+
+            if (executionContext.Global.Variables.GetBoolean(Constants.Runner.Features.UseBearerTokenForCodeload) == true &&
+                Uri.TryCreate(downloadUrl, UriKind.Absolute, out var parsedUrl) &&
+                !string.IsNullOrEmpty(parsedUrl?.Host) &&
+                !string.IsNullOrEmpty(parsedUrl?.PathAndQuery) &&
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/ActionManager.cs"
+change_type = "protocol_keyword_added"
+fields = ["executionContext", "Global", "Variables", "GetBoolean", "Constants", "Runner", "Features", "UseBearerTokenForCodeload"]
+snippet = '''
+                return null;
+            }
+
+            if (executionContext.Global.Variables.GetBoolean(Constants.Runner.Features.UseBearerTokenForCodeload) == true &&
+                Uri.TryCreate(downloadUrl, UriKind.Absolute, out var parsedUrl) &&
+                !string.IsNullOrEmpty(parsedUrl?.Host) &&
+                !string.IsNullOrEmpty(parsedUrl?.PathAndQuery) &&
+'''
+
+```

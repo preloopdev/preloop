@@ -45,8 +45,9 @@ for anyone building or testing GitHub Actions workflows outside GitHub:
 
 ## Current Status
 
-**As of 2026-06-26, aksh is a working control plane.** The official `actions/runner` v2.322.0
-successfully:
+**As of 2026-06-29, aksh is tracked by runner-watch against the official `actions/runner` v2.335.1 protocol surface.**
+
+aksh currently supports the core runner lifecycle:
 
 1. Registers against aksh (GHES-style org URL)
 2. Creates encrypted sessions (AES key exchange)
@@ -54,12 +55,7 @@ successfully:
 4. Executes jobs and reports completion
 5. Supports `needs` DAG, matrix strategies, trigger matching, expression evaluation
 
-62 workspace tests pass. The runner completes the full lifecycle (configure → connect →
-receive → execute → report). Remaining fidelity work: timeline/log endpoint accuracy,
-cache/artifact v2 protocols, and conformance harness.
-
-See [docs/fidelity-gap.md](docs/fidelity-gap.md) for the complete compatibility scorecard
-and implementation roadmap.
+Workspace tests pass via `cargo test --workspace`. runner-watch records protocol-sync artifacts under `.runner-watch/`; remaining fidelity work is tracked in [docs/fidelity-gap.md](docs/fidelity-gap.md).
 
 ## Toolchain
 

@@ -1,5 +1,0 @@
-steps:
-- template: ./test.yml
-  parameters:
-    test:
-      script: echo Test

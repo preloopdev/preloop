@@ -1,5 +1,0 @@
-variables:
-  sharedVariable: base
-
-steps:
-- script: exit 0
