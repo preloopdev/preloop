@@ -2108,9 +2108,7 @@ fn status_mismatch_in_report(text: &str) -> bool {
             current_section = line.to_string();
         }
         if line.starts_with("**Status codes:**") {
-            if current_section.contains("/oauth2/token")
-                || current_section.contains("/messages?")
-            {
+            if current_section.contains("/oauth2/token") || current_section.contains("/messages?") {
                 continue;
             }
             let Some((left, right)) = line.split_once(" | ") else {
@@ -2165,9 +2163,15 @@ fn write_conformance_summary(
     lines.push(String::new());
     lines.push("## Replay methodology and known gaps".to_string());
     lines.push(String::new());
-    lines.push("The conformance gate replays official golden flows through aksh and compares".to_string());
-    lines.push("HTTP status codes. Several categories of flow are intentionally excluded or".to_string());
-    lines.push("treated leniently; a ✅ gate result does **not** mean full protocol parity.".to_string());
+    lines.push(
+        "The conformance gate replays official golden flows through aksh and compares".to_string(),
+    );
+    lines.push(
+        "HTTP status codes. Several categories of flow are intentionally excluded or".to_string(),
+    );
+    lines.push(
+        "treated leniently; a ✅ gate result does **not** mean full protocol parity.".to_string(),
+    );
     lines.push(String::new());
     lines.push("### Flows skipped from replay".to_string());
     lines.push(String::new());
@@ -2180,19 +2184,35 @@ fn write_conformance_summary(
     lines.push("|---|---|".to_string());
     lines.push("| `*.blob.core.windows.net` | Azure Blob Storage — artifact/cache byte uploads and downloads |".to_string());
     lines.push("| `objects.githubusercontent.com` | GitHub object storage |".to_string());
-    lines.push("| `token.actions.githubusercontent.com` | GitHub OIDC issuer (external) |".to_string());
-    lines.push("| `codeload.github.com` | GitHub source tarballs for action downloads |".to_string());
-    lines.push("| `launch.actions.githubusercontent.com` | GitHub batch action-resolution service |".to_string());
-    lines.push("| path `/health` or `/ready` | Health/readiness probes with no protocol content |".to_string());
+    lines.push(
+        "| `token.actions.githubusercontent.com` | GitHub OIDC issuer (external) |".to_string(),
+    );
+    lines.push(
+        "| `codeload.github.com` | GitHub source tarballs for action downloads |".to_string(),
+    );
+    lines.push(
+        "| `launch.actions.githubusercontent.com` | GitHub batch action-resolution service |"
+            .to_string(),
+    );
+    lines.push(
+        "| path `/health` or `/ready` | Health/readiness probes with no protocol content |"
+            .to_string(),
+    );
     lines.push(String::new());
-    lines.push("**No-status skip** (`should_skip_replay_flow`) — any captured flow whose".to_string());
+    lines.push(
+        "**No-status skip** (`should_skip_replay_flow`) — any captured flow whose".to_string(),
+    );
     lines.push("`status` field is null (i.e. the runner was killed mid-request and no".to_string());
-    lines.push("response was ever recorded) is also dropped. These are capture artifacts,".to_string());
+    lines.push(
+        "response was ever recorded) is also dropped. These are capture artifacts,".to_string(),
+    );
     lines.push("not protocol evidence.".to_string());
     lines.push(String::new());
     lines.push("### Status lines excluded from the gate".to_string());
     lines.push(String::new());
-    lines.push("Even for flows that _are_ replayed, two endpoint families are excluded from".to_string());
+    lines.push(
+        "Even for flows that _are_ replayed, two endpoint families are excluded from".to_string(),
+    );
     lines.push("the status-mismatch check (`status_mismatch_in_report`):".to_string());
     lines.push(String::new());
     lines.push("| Endpoint pattern | Why excluded |".to_string());
@@ -2202,22 +2222,35 @@ fn write_conformance_summary(
     lines.push(String::new());
     lines.push("### Mocked implementations".to_string());
     lines.push(String::new());
-    lines.push("The following endpoints return **shape-correct 200 responses but are not".to_string());
-    lines.push("real implementations**. The gate passes because status codes match; body".to_string());
+    lines.push(
+        "The following endpoints return **shape-correct 200 responses but are not".to_string(),
+    );
+    lines.push(
+        "real implementations**. The gate passes because status codes match; body".to_string(),
+    );
     lines.push("content and actual data behaviour are not checked.".to_string());
     lines.push(String::new());
     lines.push("| Endpoint | What the mock returns | What is missing |".to_string());
     lines.push("|---|---|---|".to_string());
     lines.push("| `CacheService/GetCacheEntryDownloadURL` | `ok:true, signed_download_url:\"\"` — always a cache **miss** | No real cache store; runner skips restore |".to_string());
     lines.push("| `CacheService/CreateCacheEntry` | `ok:true, signed_upload_url:<fake-aksh-url>` | Upload URL points at a non-existent aksh route; the runner's PUT would 404 |".to_string());
-    lines.push("| `CacheService/FinalizeCacheEntryUpload` | `ok:true` | No entry is stored |".to_string());
+    lines.push(
+        "| `CacheService/FinalizeCacheEntryUpload` | `ok:true` | No entry is stored |".to_string(),
+    );
     lines.push("| `ArtifactService/CreateArtifact` | `ok:true, signed_upload_url:<fake-aksh-url>` | Same as above; upload silently fails |".to_string());
-    lines.push("| `ArtifactService/FinalizeArtifact` | `ok:true` | No artifact is stored |".to_string());
+    lines.push(
+        "| `ArtifactService/FinalizeArtifact` | `ok:true` | No artifact is stored |".to_string(),
+    );
     lines.push("| `ArtifactService/GetSignedArtifactURL` | `signed_url:<fake-aksh-url>` | Download would 404 |".to_string());
     lines.push("| `ArtifactService/ListArtifacts` | `artifacts:[]` | Always empty |".to_string());
     lines.push(String::new());
-    lines.push("The blob uploads/downloads that follow these calls go to `*.blob.core.windows.net`".to_string());
-    lines.push("(in official captures) or to non-existent aksh routes (during replay), so".to_string());
+    lines.push(
+        "The blob uploads/downloads that follow these calls go to `*.blob.core.windows.net`"
+            .to_string(),
+    );
+    lines.push(
+        "(in official captures) or to non-existent aksh routes (during replay), so".to_string(),
+    );
     lines.push("they are never replayed and never appear in the comparison.".to_string());
     fs::write(root.join("conformance-report.md"), lines.join("\n"))?;
     fs::write(
