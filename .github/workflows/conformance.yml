@@ -1,0 +1,52 @@
+name: conformance
+
+on:
+  pull_request:
+  push:
+
+# Replays the committed official runner goldens (.runner-watch/golden/v2.335.1)
+# against a locally-started aksh and fails the PR on endpoint/status regressions.
+#
+# This is pure Rust HTTP replay: no official runner binary, no mitmproxy, no
+# port-80 redirect, no sudo. See docs/conformance-scenarios.md — the gate is
+# endpoint-coverage + status-code parity, not full response-body fidelity.
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.86
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build aksh + runner-watch
+        run: cargo build -p aksh-runner-server -p runner-watch
+
+      - name: Start aksh
+        run: |
+          target/debug/aksh-runner-server serve \
+            --listen 127.0.0.1:9090 --state-dir /tmp/aksh-ci-state &
+          for i in $(seq 1 40); do
+            if curl -sf http://127.0.0.1:9090/healthz >/dev/null; then
+              echo "aksh ready"; exit 0
+            fi
+            sleep 0.25
+          done
+          echo "aksh did not become healthy" >&2
+          exit 1
+
+      - name: Run conformance replay
+        run: |
+          cargo run -p runner-watch -- conform \
+            --runner v2.335.1 \
+            --aksh-url http://127.0.0.1:9090 \
+            --skip-cargo-test
+
+      - name: Upload conformance reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-reports
+          path: .runner-watch/conformance/**

@@ -2,8 +2,11 @@
 /.preloop/
 /.runner-watch/repos/
 /.runner-watch/**/*.pid
-/.runner-watch/golden/
 /.runner-watch/conformance/
+# Conformance goldens: keep the replayable flows.jsonl fixtures in git so CI can
+# run `runner-watch conform`, but drop the heavy raw captures and binary bodies.
+/.runner-watch/golden/**/*.mitm
+/.runner-watch/golden/**/*.bin
 *.db
 *.sqlite
 *.log
