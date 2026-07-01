@@ -48,6 +48,51 @@ runner.server reference: `ChristopherHX/runner.server` v3.14.0 (commit `06964614
 | **Runner.Provider** | Pluggable trait: creates/destroys runners (any substrate)                      |
 | **Runner.Listener** | The unmodified official `actions/runner` binary                                |
 
+## 0a. Product parity target
+
+The target is **not** byte-for-byte hosted GitHub/Azure implementation parity.
+aksh should be faithful where the unmodified official runner, user workflows, or
+GitHub PR/check UX depend on it, and intentionally local everywhere else.
+
+The product target is:
+
+> Users can keep their existing, unmodified `.github/workflows/*.yml` files.
+> Preloop/aksh evaluates those workflows, schedules jobs on local/self-hosted
+> runner capacity, and reports status/log/artifact links back to the existing
+> GitHub PR/checks UI.
+
+That means three compatibility bars:
+
+1. **Runner protocol compatibility** — the official `actions/runner` can register,
+   create sessions, poll for work, acquire/renew/complete broker jobs, upload logs,
+   consume actions/cache/artifact URLs, and settle runs without knowing it is not
+   talking to GitHub-hosted Actions.
+2. **Workflow semantic compatibility** — existing GitHub Actions YAML behaves the
+   same from the developer's perspective: triggers, contexts, expressions, matrix,
+   `needs`, outputs, secrets/vars, cancellation, cache, artifacts, and common
+   `uses:` actions work without editing the workflow file.
+3. **GitHub integration compatibility** — for the self-hosted control-plane mode,
+   a GitHub App receives webhooks, fetches workflow files and refs, supplies a
+   scoped `GITHUB_TOKEN`/installation token, and updates Checks/commit statuses so
+   pull requests still show normal pass/fail feedback in GitHub's UI.
+
+Local equivalents are acceptable, and preferred, for implementation details the
+runner/user cannot observe directly:
+
+- local result/log storage instead of GitHub's result service backend;
+- local filesystem/S3/MinIO cache and artifact stores instead of Azure Blob;
+- local JWTs or installation tokens instead of GitHub's internal token service;
+- local service URLs instead of GitHub/Azure signed URLs, as long as the runner
+  and actions can use them successfully;
+- Preloop's own run/details UI linked from GitHub Checks, rather than reproducing
+  every internal GitHub Actions page.
+
+Conformance should therefore assert **semantic equivalence** with explicit
+normalizers for volatile/local fields. It should not require exact hosted-service
+hostnames, token bytes, Azure blob URL shapes, billing metadata, or internal
+location-service topology unless the official runner or common actions require
+those details.
+
 
 ---
 
@@ -836,7 +881,7 @@ A run is faithful when, with the **unmodified official `actions/runner`**:
 
    aksh's added value, layered on a faithful core.
 
-### Provider integration (step 10)
+### Product acceptance for Preloop/local and self-hosted control-plane modes
 
 Once 1–9 hold against a local `Runner.Listener`:
 
@@ -845,6 +890,17 @@ Once 1–9 hold against a local `Runner.Listener`:
     to close the integration loop. The `RunnerProvider` trait is validated by running the
 
     same golden fixtures through a real provider and confirming identical timeline/results.
+
+11. In GitHub App/self-hosted control-plane mode, a repository can keep its existing
+    `.github/workflows/*.yml` files unchanged. A push or pull-request webhook causes aksh
+    to fetch the workflow at the target ref, evaluate the same trigger semantics GitHub
+    Actions would use, run the selected jobs on local/self-hosted capacity, and update the
+    existing GitHub PR/checks UI with queued/in-progress/success/failure/cancelled states.
+
+12. GitHub Checks created by aksh link to Preloop/aksh-hosted logs, artifacts, and run
+    details. The storage and URLs may be local equivalents; the user-visible contract is
+    that developers can review CI status from the same GitHub PR interface while execution
+    and data storage are controlled by aksh/Preloop.
 
 ---
 
@@ -859,9 +915,9 @@ conformance harness grows alongside, asserting each phase against recorded upstr
 
 Phases A–E are the critical path to "a real runner runs one job." F–H reach
 
-"a real runner runs *any* in-scope workflow exactly like GitHub." Provider integration
-
-(step 10) closes the loop for Preloop and every other host.
+"a real runner runs *any* in-scope workflow with GitHub Actions-compatible
+semantics." Provider integration and GitHub App/checks integration (steps 10–12)
+close the loop for Preloop and self-hosted control-plane use.
 
 <!-- runner-watch-sync -->
 ## runner-watch generated scorecard for v2.335.1

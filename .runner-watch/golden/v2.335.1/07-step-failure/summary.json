@@ -1,0 +1,12 @@
+{
+  "backend": "official",
+  "scenario": "07-step-failure",
+  "started_at": "2026-06-30T15:37:03Z",
+  "ended_at": "2026-06-30T15:38:18Z",
+  "status": "ok",
+  "runner_exit_code": 143,
+  "flows_count":       50,
+  "runner_version": "2.335.1",
+  "runner_server_ref": "992ccbbbf9afcde477c38c316e053b1af457ad40",
+  "mitmproxy_version": "Mitmproxy: 12.2.3"
+}
