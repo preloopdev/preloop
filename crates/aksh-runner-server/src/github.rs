@@ -626,17 +626,17 @@ pub(crate) async fn github_register(headers: HeaderMap) -> impl IntoResponse {
             "contents": "read",
             "metadata": "read",
             "pull_requests": "read"
-        },
-        "default_events": [
-            "push",
-            "pull_request"
-        ]
+    }
     });
 
     if !is_local {
         manifest_json["hook_attributes"] = serde_json::json!({
             "url": format!("{}/api/v1/github/webhooks", base_url)
     });
+        manifest_json["default_events"] = serde_json::json!([
+            "push",
+            "pull_request"
+        ]);
     }
 
     let html = format!(
