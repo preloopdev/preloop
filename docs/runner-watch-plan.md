@@ -8,7 +8,7 @@ aksh must stay compatible with the official `actions/runner` binary. Upstream re
 
 flags, new crypto. Today this is tracked manually via hand-written analysis in
 
-`fidelity-gap.md §1a`. That analysis took hours and is already stale (aksh targets v2.322.0;
+`fidelity-gap.md §1a`. That analysis took hours and is already stale (aksh targets v2.335.0;
 
 GitHub enforces v2.329.0+ since March 2026).
 
@@ -22,18 +22,18 @@ draft PRs — with no human intervention until the final PR review.
 
 1. **Deterministic where possible, AI where necessary.** Git diff, path filtering, struct
 
-   extraction, conformance replay, and PR creation are all mechanical. AI handles protocol
+  extraction, conformance replay, and PR creation are all mechanical. AI handles protocol
 
    semantics (what does this change mean?) and code generation (write the Rust).
 2. **Two-agent adversarial pattern.** Claude fills semantic specs and reviews code. Codex
 
-   implements Rust. Different training distributions catch different blind spots.
+  implements Rust. Different training distributions catch different blind spots.
 3. **Neither agent grades their own homework.** The conformance gate runs recorded mitm
 
-   replay bytes that neither agent can modify. The orchestrator owns the golden capture.
+  replay bytes that neither agent can modify. The orchestrator owns the golden capture.
 4. **Everything is inspectable.** Every phase produces an artifact (JSON, TOML, markdown)
 
-   that a human can read. No black boxes.
+  that a human can read. No black boxes.
 5. **Draft PRs, never auto-merge.** Even nits. C#-to-Rust translation is non-mechanical.
 
 ## Agent assignment
@@ -198,10 +198,10 @@ For each entry in `delta.json`:
 
 1. **Path filter:** skip entries in `.github/`, `Test/`, `Misc/`, `dev/`, dependency files,
 
-   CI config, README changes
+  CI config, README changes
 2. **Surface map:** map C# struct/file → aksh file via `aksh-surface.toml` (static mapping
 
-   table). If the entry touches a mapped aksh surface → keep. If purely runner-internal
+  table). If the entry touches a mapped aksh surface → keep. If purely runner-internal
 
    (Worker execution logic, CLI args, dotnet SDK bumps) → tag `skip` without AI.
 3. **Feature flag detection:** extract flag name from enum if present.
@@ -304,7 +304,7 @@ For each spec, in priority order (blocker → concern → feature → nit):
 
 1. Invoke Codex with the spec TOML, relevant aksh source files (from `aksh_targets`),
 
-   and existing patterns (serde attribute conventions, handler shape, test patterns).
+  and existing patterns (serde attribute conventions, handler shape, test patterns).
 2. Codex writes Rust code following existing patterns exactly.
 3. Codex runs `cargo check`. If errors, feeds them back and retries.
 4. Codex runs `cargo test --workspace`. If failures, feeds them back and retries.
@@ -353,13 +353,13 @@ Claude reads the spec (what was requested) and the diff (what Codex wrote). Chec
 
 1. **Spec conformance:** Does the code implement exactly what the spec describes?
 
-   Wire shapes, field names, endpoint paths.
+  Wire shapes, field names, endpoint paths.
 2. **Pattern compliance:** Does it follow existing aksh patterns? Serde attributes,
 
-   handler structure, error handling.
+  handler structure, error handling.
 3. **Edge cases:** Missing null checks, wrong defaults, missing `skip_serializing_if`,
 
-   incorrect `Option` vs non-optional.
+  incorrect `Option` vs non-optional.
 4. **Security:** Crypto changes reviewed carefully. Auth fields not leaked in logs.
 5. **Cargo test:** Claude runs `cargo test --workspace` independently to verify.
 
@@ -430,10 +430,10 @@ comparison script. The orchestrator owns both.
 2. Start aksh server on localhost
 3. `mitmdump --server-replay .runner-watch/golden/v{N}/flows.mitm` — replay recorded
 
-   official requests against aksh
+  official requests against aksh
 4. `_compare.py` — diff aksh responses against recorded official responses using the
 
-   existing normalizer (GUID replacement, path normalization, volatile field stripping)
+  existing normalizer (GUID replacement, path normalization, volatile field stripping)
 5. Report: which endpoints match, which diverge, with JSON diffs
 
 ### Gate
@@ -692,7 +692,7 @@ docs/
 
 1. **Live capture is a baseline refresh, not a per-release gate.** The runner contacts
 
-   `api.github.com` and `pipelinesghub…` even when pointed at another control plane
+  `api.github.com` and `pipelinesghub…` even when pointed at another control plane
 
    (discovered in mitm live capture report, finding #6). Registration tokens are
 
@@ -701,54 +701,56 @@ docs/
    bumping runner version.
 2. **Source diff discovers, wire diff validates.** Feature-flag-gated behavior is
 
-   invisible on the wire until the control plane advertises the capability. Source diff
+  invisible on the wire until the control plane advertises the capability. Source diff
 
    catches those (it found the §1a.4 table). Wire replay validates that implemented
 
    changes actually work. Different tools for different jobs.
 3. **Spec before code, not diff-to-code.** `aksh-gha-protocol` already has structural
 
-   divergences from C# (`EndpointAuthorization` is a direct field, `TaskResources.repositories`
+  divergences from C# (`EndpointAuthorization` is a direct field, `TaskResources.repositories`
 
    is `Vec` not `BTreeMap`). An AI translating C# diffs directly will fight existing
 
    conventions. The spec is the guard rail.
 4. **Conformance baseline drifts with runner version.** Bumping runner version invalidates
 
-   the golden capture. The tool must re-record the golden when it bumps, or the gate
+  the golden capture. The tool must re-record the golden when it bumps, or the gate
 
    tests against dead bytes.
 5. **Neither agent can modify the golden capture.** This is the single most important
 
-   constraint. The orchestrator owns the golden bytes and `_compare.py`. The implementing
+  constraint. The orchestrator owns the golden bytes and `_compare.py`. The implementing
 
    agent can iterate on `cargo test` freely, but the conformance replay is read-only
 
    with respect to the test data.
 6. **C#-to-Rust translation is non-mechanical.** Nullable reference types, `Task[[ORCA_RAW_HTML_INLINE:%3CT%3E]]`,
 
-   Newtonsoft attrs → `Option`, `async fn`, serde. Even "nit" renames can shift wire
+  Newtonsoft attrs → `Option`, `async fn`, serde. Even "nit" renames can shift wire
 
    field names. Nothing auto-merges.
 7. **Two upstreams, two roles.** `actions/runner` = the contract (what the runner sends
 
-   and requires). `ChristopherHX/runner.server` = the reference implementation (how
+  and requires). `ChristopherHX/runner.server` = the reference implementation (how
 
    someone else built the server). Watch `actions/runner` for obligations; use
 
    `runner.server` diffs only as implementation hints.
 
-
 ## Known upstream defects (actions/runner)
 
 These are bugs in the official `actions/runner` binary that we work around in aksh
+
 rather than fixing upstream (issue creation is restricted on the repo).
 
 ### Port stripped from HTTP URLs (ConfigurationManager.cs)
 
 **File:** `Runner.Listener/Configuration/ConfigurationManager.cs`  
 **Root cause:** Token-fetch URL constructions use `gitHubUrlBuilder.Host` which
+
 drops non-default ports. `UriBuilder.Host` returns only the hostname, discarding
+
 `:port` for any port that isn't the scheme default.
 
 ```
@@ -759,18 +761,24 @@ Line 768: $"...://api.{gitHubUrlBuilder.Host}/..."       ← port dropped
 ```
 
 Compare with `GetTenantCredential` (lines 835, 840) which correctly uses
+
 `gitHubUrlBuilder.ToString()` — preserving the port. The worker side
+
 (`JobExtension.cs:204-208`) also handles ports explicitly with `IsDefaultPort`.
 
 **Impact:** `--url http://example.com:9090` results in the runner dialing
+
 `example.com:80` for token-fetch endpoints. HTTPS paths preserve the port.
 
 **Fix (6 lines in C#):**
+
 ```csharp
 var port = gitHubUrlBuilder.Uri.IsDefaultPort ? "" : $":{gitHubUrlBuilder.Port}";
 githubApiUrl = $"{gitHubUrlBuilder.Scheme}://{gitHubUrlBuilder.Host}{port}/api/v3/...";
 ```
 
 **aksh workaround (see `scripts/e2e-setup.sh`):** macOS `pfctl` port 80→9090
+
 redirect, Linux `iptables` redirect, or `setcap cap_net_bind_service` on aksh.
+
 Alternate: use HTTPS (runner preserves the port for HTTPS URLs).
