@@ -633,9 +633,7 @@ pub(crate) async fn github_register(headers: HeaderMap) -> impl IntoResponse {
         ]
     });
 
-    if is_local {
-        manifest_json["webhook_active"] = serde_json::json!(false);
-    } else {
+    if !is_local {
         manifest_json["hook_attributes"] = serde_json::json!({
             "url": format!("{}/api/v1/github/webhooks", base_url)
     });
