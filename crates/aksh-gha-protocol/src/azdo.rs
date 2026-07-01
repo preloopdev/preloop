@@ -183,6 +183,8 @@ pub struct TaskAgentMessage {
 pub mod message_type {
     /// A job request — body contains an encrypted `AgentJobRequestMessage`.
     pub const PIPELINE_AGENT_JOB_REQUEST: &str = "PipelineAgentJobRequest";
+    /// A run-service job request returned from the broker `acquirejob` API.
+    pub const RUNNER_JOB_REQUEST: &str = "RunnerJobRequest";
     /// Cancellation signal — runner should abort the current job.
     pub const CANCEL_JOB: &str = "CancelJob";
     /// Job cancellation (newer API).
@@ -206,6 +208,12 @@ pub mod message_type {
 /// Upstream source: `AgentJobRequestMessage.cs` in the WebApi package
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentJobRequestMessage {
+    /// The concrete job transport. Broker `acquirejob` responses must use
+    /// `RunnerJobRequest` so the official runner renews the job through the
+    /// run-service broker instead of the legacy AgentRequest API.
+    #[serde(rename = "messageType", skip_serializing_if = "Option::is_none")]
+    pub message_type: Option<String>,
+
     /// The orchestration plan reference (run ID + job ID).
     #[serde(rename = "jobId")]
     pub job_id: uuid::Uuid,
