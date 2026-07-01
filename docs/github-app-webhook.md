@@ -46,7 +46,7 @@ The system is configured using the following environment variables:
 
 ## 3. Webhook signature verification (`X-Hub-Signature-256`)
 
-<!-- Trigger Webhook Event Test 2026-07-01 -->
+<!-- Trigger Webhook Event Test 2026-07-01 13:38 -->
 
 `aksh` verifies that incoming webhooks are authentic:
 - When `AKSH_WEBHOOK_SECRET` is set, `aksh` computes the HMAC-SHA256 signature of the raw request body and verifies it against the `x-hub-signature-256` header.
