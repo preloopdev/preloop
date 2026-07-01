@@ -45,12 +45,145 @@ pub struct ServerConfig {
     pub state_dir: PathBuf,
 }
 
+async fn reap_once(shared: &Arc<SharedState>) {
+    let mut inner = shared.state.inner.lock().await;
+    let now = SystemTime::now();
+    let mut cancellations = Vec::new();
+    let mut disconnected_completions = Vec::new();
+
+    let mut active_reqs = Vec::new();
+    for (request_id, request) in &inner.job_requests {
+        if request.result.is_none() {
+            active_reqs.push((
+                *request_id,
+                request.run_id,
+                request.job_id.clone(),
+                request.started_at,
+                request.last_renewed_at,
+                request.timeout_triggered,
+            ));
+        }
+    }
+
+    for (request_id, run_id, job_id, started_at, last_renewed_at, timeout_triggered) in active_reqs
+    {
+        // 1. Check Timeout Enforcement
+        if let Some(started_at) = started_at {
+            if !timeout_triggered {
+                let elapsed = now.duration_since(started_at).unwrap_or_default();
+                let job_timeout = inner
+                    .broker_messages
+                    .get(&request_id)
+                    .and_then(|msg| msg.job_timeout)
+                    .unwrap_or(21600); // 360 minutes in seconds
+
+                if elapsed >= Duration::from_secs(job_timeout as u64) {
+                    info!(
+                        %run_id,
+                        %job_id,
+                        request_id,
+                        "Job timed out after {}s",
+                        job_timeout
+                    );
+                    if let Some(req) = inner.job_requests.get_mut(&request_id) {
+                        req.timeout_triggered = true;
+                    }
+                    cancellations.push(QueuedCancellation {
+                        run_id,
+                        job_id: job_id.clone(),
+                    });
+                }
+            }
+        }
+
+        // 2. Check Lease Expiration / Disconnect Reaper
+        if let Some(last_renewed_at) = last_renewed_at {
+            let elapsed = now.duration_since(last_renewed_at).unwrap_or_default();
+            // 120 seconds disconnect threshold
+            if elapsed >= Duration::from_secs(120) {
+                info!(
+                    %run_id,
+                    %job_id,
+                    request_id,
+                    "Runner lease expired (last renewed {}s ago). Marking job as failed.",
+                    elapsed.as_secs()
+                );
+                if let Some(req) = inner.job_requests.get_mut(&request_id) {
+                    req.result = Some(ExecutionStatus::Failure);
+                }
+                disconnected_completions.push((
+                    request_id,
+                    JobCompletion {
+                        run_id,
+                        job_id: job_id.clone(),
+                        status: ExecutionStatus::Failure,
+                        outputs: Default::default(),
+                    },
+                ));
+            }
+        }
+    }
+
+    // Cleanup session and inflight maps for disconnected runners
+    for (request_id, _) in &disconnected_completions {
+        inner.inflight_requests.remove(request_id);
+        inner
+            .session_active_requests
+            .retain(|_, &mut v| v != *request_id);
+    }
+
+    // Apply cancellations
+    let cancellation_count = cancellations.len();
+    if cancellation_count > 0 {
+        inner.cancellation_queue.extend(cancellations);
+    }
+
+    drop(inner);
+
+    // Notify if cancellations occurred
+    if cancellation_count > 0 {
+        shared.state.message_notify.notify_waiters();
+    }
+
+    // Process completions for disconnected runners
+    for (_, completion) in disconnected_completions {
+        let _ = complete_job_inner(shared.clone(), completion).await;
+    }
+}
+
+async fn run_background_reaper(shared: Arc<SharedState>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(10));
+    // Skip the first tick
+    interval.tick().await;
+
+    while !shared.shutdown.is_cancelled() {
+        tokio::select! {
+            _ = interval.tick() => {
+                reap_once(&shared).await;
+            }
+            _ = shared.shutdown.cancelled() => {
+                break;
+            }
+        }
+    }
+}
+
 /// Start the server and block until shutdown.
 pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     let state = AppState::new(config.state_dir).await?;
     let shutdown = CancellationToken::new();
-    let router = app(state, shutdown.clone());
+    let router = app(state.clone(), shutdown.clone());
     let listener = TcpListener::bind(config.listen).await?;
+
+    let shared = Arc::new(SharedState {
+        state,
+        shutdown: shutdown.clone(),
+    });
+
+    let checker_shared = shared.clone();
+    tokio::spawn(async move {
+        run_background_reaper(checker_shared).await;
+    });
 
     info!(listen = %config.listen, "aksh runner server listening");
     axum::serve(listener, router)
@@ -507,6 +640,9 @@ struct TaskAgentJobRequestRecord {
     timeline_id: uuid::Uuid,
     result: Option<ExecutionStatus>,
     locked_until: String,
+    started_at: Option<std::time::SystemTime>,
+    last_renewed_at: Option<std::time::SystemTime>,
+    timeout_triggered: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -694,6 +830,9 @@ async fn submit_run(
                 timeline_id: agent_msg.timeline.id,
                 result: None,
                 locked_until: agent_request_locked_until(),
+                started_at: None,
+                last_renewed_at: None,
+                timeout_triggered: false,
             };
             inner
                 .plan_requests
@@ -1138,8 +1277,35 @@ async fn next_message_broker_ref(
 
     loop {
         let mut inner = shared.state.inner.lock().await;
+        if let Some(message) = inner
+            .inflight_messages
+            .get(&session_id)
+            .and_then(|messages| messages.values().next().cloned())
+        {
+            return Ok(Json(message).into_response());
+        }
+
         if let Some(request_id) = inner.session_active_requests.get(&session_id).copied() {
             if let Some(request) = inner.job_requests.get(&request_id) {
+                if let Some(pos) = inner
+                    .cancellation_queue
+                    .iter()
+                    .position(|c| c.run_id == request.run_id && c.job_id == request.job_id)
+                {
+                    let cancellation = inner.cancellation_queue.remove(pos).unwrap();
+                    let message = build_broker_plaintext_message(
+                        &mut inner,
+                        &session_id,
+                        azdo::message_type::JOB_CANCELLED,
+                        json!({
+                            "runId": cancellation.run_id.to_string(),
+                            "jobId": cancellation.job_id.to_string(),
+                        })
+                        .to_string(),
+                    );
+                    return Ok(Json(message).into_response());
+                }
+
                 if request.result.is_none() {
                     return Ok(Json(broker_job_ref(request, pool_id)).into_response());
                 }
@@ -1174,6 +1340,10 @@ async fn next_message_broker_ref(
         inner
             .session_active_requests
             .insert(session_id.clone(), request_id);
+        if let Some(request) = inner.job_requests.get_mut(&request_id) {
+            request.started_at = Some(std::time::SystemTime::now());
+            request.last_renewed_at = Some(std::time::SystemTime::now());
+        }
         inner
             .broker_messages
             .insert(request_id, queued.message.clone());
@@ -1357,6 +1527,7 @@ async fn broker_renew_job(
         .get_mut(&request_id)
         .ok_or_else(|| ApiError::not_found("agent request not found"))?;
     record.locked_until = agent_request_locked_until();
+    record.last_renewed_at = Some(std::time::SystemTime::now());
     Ok(Json(json!({"lockedUntil": record.locked_until})))
 }
 
@@ -1590,9 +1761,14 @@ async fn next_message(
 
         let body_json = serde_json::to_string(&queued.message)
             .map_err(|e| ApiError::bad_request(format!("failed to serialize job message: {e}")))?;
+        let request_id = queued.message.request_id;
         inner
             .session_active_requests
-            .insert(session_id.clone(), queued.message.request_id);
+            .insert(session_id.clone(), request_id);
+        if let Some(request) = inner.job_requests.get_mut(&request_id) {
+            request.started_at = Some(std::time::SystemTime::now());
+            request.last_renewed_at = Some(std::time::SystemTime::now());
+        }
         let message = build_task_agent_message(
             &mut inner,
             &session_id,
@@ -1657,6 +1833,28 @@ fn build_task_agent_message(
         .or_default()
         .insert(message_id, message.clone());
     Ok(message)
+}
+
+fn build_broker_plaintext_message(
+    inner: &mut InnerState,
+    session_id: &str,
+    message_type: &str,
+    body_json: String,
+) -> azdo::TaskAgentMessage {
+    inner.next_message_id += 1;
+    let message_id = inner.next_message_id;
+    let message = azdo::TaskAgentMessage {
+        message_id,
+        message_type: message_type.to_owned(),
+        body: body_json,
+        iv: None,
+    };
+    inner
+        .inflight_messages
+        .entry(session_id.to_owned())
+        .or_default()
+        .insert(message_id, message.clone());
+    message
 }
 
 async fn delete_pool_message(
@@ -1795,6 +1993,7 @@ async fn agent_request_patch(
         let mut inner = shared.state.inner.lock().await;
         if let Some(request) = inner.job_requests.get_mut(&request_id) {
             request.locked_until = agent_request_locked_until();
+            request.last_renewed_at = Some(std::time::SystemTime::now());
         }
     }
     Json(agent_request_response(&shared, pool_id, request_id).await)
@@ -5796,6 +5995,127 @@ jobs:
             Value::Null
         } else {
             serde_json::from_slice(&bytes).unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn job_timeout_enforcement_cancels_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let shutdown = CancellationToken::new();
+        let app = app(state.clone(), shutdown.clone());
+        let shared = Arc::new(SharedState {
+            state: state.clone(),
+            shutdown,
+        });
+
+        // 1. Submit run
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: sleep 10\n",
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        // 2. Poll to start job (transitions status to InProgress and sets started_at)
+        let _msg = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/v1/Message/1?sessionId=default",
+            Value::Null,
+        )
+        .await;
+
+        let request_id = {
+            let inner = state.inner.lock().await;
+            *inner.job_requests.keys().next().unwrap()
+        };
+
+        // 3. Override started_at to be in the past (beyond 360m/21600s default timeout)
+        {
+            let mut inner = state.inner.lock().await;
+            let request = inner.job_requests.get_mut(&request_id).unwrap();
+            request.started_at = Some(SystemTime::now() - Duration::from_secs(22000));
+        }
+
+        // 4. Run reaper tick
+        reap_once(&shared).await;
+
+        // 5. Verify cancellation is enqueued
+        {
+            let inner = state.inner.lock().await;
+            let request = inner.job_requests.get(&request_id).unwrap();
+            assert!(request.timeout_triggered);
+            assert_eq!(inner.cancellation_queue.len(), 1);
+            assert_eq!(inner.cancellation_queue[0].run_id, run_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn runner_lease_expiration_disconnect_reaper() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let shutdown = CancellationToken::new();
+        let app = app(state.clone(), shutdown.clone());
+        let shared = Arc::new(SharedState {
+            state: state.clone(),
+            shutdown,
+        });
+
+        // 1. Submit run
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: sleep 10\n",
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        // 2. Poll to start job (sets last_renewed_at)
+        let _msg = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/v1/Message/1?sessionId=default",
+            Value::Null,
+        )
+        .await;
+
+        let request_id = {
+            let inner = state.inner.lock().await;
+            *inner.job_requests.keys().next().unwrap()
+        };
+
+        // 3. Override last_renewed_at to be in the past (beyond 120s threshold)
+        {
+            let mut inner = state.inner.lock().await;
+            let request = inner.job_requests.get_mut(&request_id).unwrap();
+            request.last_renewed_at = Some(SystemTime::now() - Duration::from_secs(130));
+        }
+
+        // 4. Run reaper tick
+        reap_once(&shared).await;
+
+        // 5. Verify the job was marked failed and run completes as failed
+        {
+            let inner = state.inner.lock().await;
+            let request = inner.job_requests.get(&request_id).unwrap();
+            assert_eq!(request.result, Some(ExecutionStatus::Failure));
+            assert!(inner.inflight_requests.is_empty());
+            assert!(inner.session_active_requests.is_empty());
+
+            let run = inner.runs.get(&run_id).unwrap();
+            assert_eq!(run.status, ExecutionStatus::Failure);
         }
     }
 }

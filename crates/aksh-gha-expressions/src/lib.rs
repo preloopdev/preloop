@@ -709,6 +709,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn handles_escaped_single_quotes_in_literals() {
+        let context = Context::default();
+        assert_eq!(
+            eval_expression("'It''s a string'", &context).unwrap(),
+            Value::String("It's a string".to_owned())
+        );
+        assert_eq!(
+            eval_expression("''", &context).unwrap(),
+            Value::String("".to_owned())
+        );
+        assert_eq!(
+            eval_expression("''''", &context).unwrap(),
+            Value::String("'".to_owned())
+        );
+        assert_eq!(
+            eval_expression("'a''b''c'", &context).unwrap(),
+            Value::String("a'b'c".to_owned())
+        );
+    }
+
     proptest! {
         #[test]
         fn string_equality_is_case_insensitive(value in "[A-Za-z]{1,24}") {
