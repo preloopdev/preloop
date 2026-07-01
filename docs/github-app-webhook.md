@@ -17,7 +17,7 @@ graph TD
     Auth -->|JWT / App Private Key| GH
     GH -->|Installation Token| Fetch[Workflow Fetcher]
     Fetch -->|3. Fetch .github/workflows/*.yml| AST[Workflow Evaluator]
-    AST -->|Matches? -> trigger_run_from_submission| Core[aksh Control Plane]
+    AST -->|Matches? -> submit_run_inner| Core[aksh Control Plane]
     Core -->|4. Job InProgress/Done| Report[Checks Reporter]
     Report -->|Checks API / Commit Status| GH
 ```
