@@ -1,0 +1,175 @@
+You are implementing an aksh protocol-sync spec. Follow existing Rust patterns exactly. Run cargo check and relevant tests, but do not run formatters or project-wide lint.
+
+Spec:
+```toml
+change_id = "use-runner-admin-flow"
+upstream_version = "v2.335.1"
+category = "concern"
+tags = ["protocol", "broker"]
+ai_status = "deterministic-known-fidelity-gap"
+
+[description]
+what = '''
+Runner v2 admin flow discovers auth_url_v2 and BrokerUrl values.
+'''
+why = '''
+v2.329.0 introduced broker/admin paths used by newer hosted runner flows.
+'''
+runner_behavior = '''
+connectionData/location data and admin responses can advertise auth_url_v2, BrokerUrl, and UseRunnerAdminFlow.
+'''
+failure_mode = '''
+Runner can fall back today, but newer flows warn or skip broker features when absent.
+'''
+
+[feature_flag]
+name = "UseRunnerAdminFlow"
+where = "admin/connection response"
+default = false
+
+[wire]
+request = '''
+GET /_apis/connectionData and runner admin capability requests
+'''
+expected_response = "JSON containing auth_url_v2/BrokerUrl when enabled"
+
+[aksh_targets]
+files = [
+  { crate = "aksh-runner-server", path = "crates/aksh-runner-server/src/lib.rs", area = "connectionData payload" },
+  { crate = "aksh-runner-server", path = "crates/aksh-runner-server/src/lib.rs", area = "broker/admin flow" },
+]
+
+[implementation]
+approach = '''
+Extend connection/admin DTOs and route responses without changing legacy defaults.
+'''
+test = "connectionData/admin response includes optional v2 fields only when configured."
+
+[[source_entries]]
+file = "src/Runner.Listener/Configuration/ConfigurationManager.cs"
+change_type = "protocol_keyword_added"
+fields = ["Trace", "Info", "Using", "runnerSettings", "UseRunnerAdminFlow"]
+snippet = '''
+                    GitHubAuthResult authResult = await GetTenantCredential(inputUrl, registerToken, Constants.RunnerEvent.Register);
+                    runnerSettings.ServerUrl = authResult.TenantUrl;
+                    runnerSettings.UseRunnerAdminFlow = authResult.UseRunnerAdminFlow;
+                    Trace.Info($"Using runner-admin flow: {runnerSettings.UseRunnerAdminFlow}");
+                    creds = authResult.ToVssCredentials();
+                    Trace.Info("cred retrieved via GitHub auth");
+                }
+'''
+
+[[source_entries]]
+file = "src/Runner.Listener/Configuration/ConfigurationManager.cs"
+change_type = "protocol_keyword_added"
+fields = ["UseRunnerAdminFlow"]
+snippet = '''
+                {
+                    RunnerSettings settings = _store.GetSettings();
+
+                    if (settings.UseRunnerAdminFlow)
+                    {
+                        var deletionToken = await GetRunnerTokenAsync(command, settings.GitHubUrl, "remove");
+                        await _dotcomServer.DeleteRunnerAsync(settings.GitHubUrl, deletionToken, settings.AgentId);
+'''
+
+[[source_entries]]
+file = "src/Runner.Listener/Configuration/ConfigurationManager.cs"
+change_type = "protocol_keyword_added"
+fields = ["runnerSettings", "UseRunnerAdminFlow"]
+snippet = '''
+
+                    // Validate can connect using the obtained vss credentials.
+                    // In Runner Admin flow there's nothing new to test connection to at this point as registerToken is already validated via GetTenantCredential.
+                    if (!runnerSettings.UseRunnerAdminFlow)
+                    {
+                        await _runnerServer.ConnectAsync(new Uri(runnerSettings.ServerUrl), creds);
+                    }
+'''
+
+[[source_entries]]
+file = "src/Runner.Listener/Configuration/ConfigurationManager.cs"
+change_type = "protocol_keyword_added"
+fields = ["runnerSettings", "UseRunnerAdminFlow"]
+snippet = '''
+            string poolName = null;
+            TaskAgentPool agentPool = null;
+            List<TaskAgentPool> agentPools;
+            if (runnerSettings.UseRunnerAdminFlow)
+            {
+                agentPools = await _dotcomServer.GetRunnerGroupsAsync(runnerSettings.GitHubUrl, registerToken);
+            }
+'''
+
+[[source_entries]]
+file = "src/Runner.Listener/Configuration/ConfigurationManager.cs"
+change_type = "protocol_keyword_added"
+fields = ["runnerSettings", "UseRunnerAdminFlow"]
+snippet = '''
+                var userLabels = command.GetLabels();
+                _term.WriteLine();
+                List<TaskAgent> agents;
+                if (runnerSettings.UseRunnerAdminFlow)
+                {
+                    agents = await _dotcomServer.GetRunnerByNameAsync(runnerSettings.GitHubUrl, registerToken, runnerSettings.AgentName);
+                }
+'''
+
+[[source_entries]]
+file = "src/Runner.Listener/Configuration/ConfigurationManager.cs"
+change_type = "protocol_keyword_added"
+fields = ["runnerSettings", "UseRunnerAdminFlow", "authResult", "UseRunnerAdminFlow"]
+snippet = '''
+                    registerToken = await GetRunnerTokenAsync(command, inputUrl, "registration");
+                    GitHubAuthResult authResult = await GetTenantCredential(inputUrl, registerToken, Constants.RunnerEvent.Register);
+                    runnerSettings.ServerUrl = authResult.TenantUrl;
+                    runnerSettings.UseRunnerAdminFlow = authResult.UseRunnerAdminFlow;
+                    Trace.Info($"Using runner-admin flow: {runnerSettings.UseRunnerAdminFlow}");
+                    creds = authResult.ToVssCredentials();
+                    Trace.Info("cred retrieved via GitHub auth");
+'''
+
+[[source_entries]]
+file = "src/Runner.Listener/Configuration/ConfigurationManager.cs"
+change_type = "protocol_keyword_added"
+fields = ["runnerSettings", "UseV2Flow", "runnerSettings", "UseRunnerAdminFlow"]
+snippet = '''
+
+            // Testing agent connection, detect any potential connection issue, like local clock skew that cause OAuth token expired.
+
+            if (!runnerSettings.UseV2Flow && !runnerSettings.UseRunnerAdminFlow)
+            {
+                var credMgr = HostContext.GetService<ICredentialManager>();
+                VssCredentials credential = credMgr.LoadCredentials(allowAuthUrlV2: false);
+'''
+
+[[source_entries]]
+file = "src/Runner.Listener/Configuration/CredentialManager.cs"
+change_type = "field_added"
+struct = "GitHubAuthResult"
+fields = ["UseRunnerAdminFlow"]
+snippet = '''
+        public string Token { get; set; }
+
+        [DataMember(Name = "use_v2_flow")]
+        public bool UseRunnerAdminFlow { get; set; }
+
+        public VssCredentials ToVssCredentials()
+        {
+'''
+
+[[source_entries]]
+file = "src/Runner.Listener/Configuration/CredentialManager.cs"
+change_type = "protocol_keyword_added"
+fields = ["UseRunnerAdminFlow"]
+snippet = '''
+        public string Token { get; set; }
+
+        [DataMember(Name = "use_v2_flow")]
+        public bool UseRunnerAdminFlow { get; set; }
+
+        public VssCredentials ToVssCredentials()
+        {
+'''
+
+```

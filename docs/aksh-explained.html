@@ -1,591 +1,1008 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>aksh — GitHub Actions Control Plane Explained</title>
-<style>
-  :root {
-    --bg: #0a0a0f;
-    --surface: #12121a;
-    --surface2: #1a1a26;
-    --border: #2a2a3a;
-    --text: #e8e8f0;
-    --text-dim: #8888a0;
-    --accent: #6c5ce7;
-    --accent2: #a29bfe;
-    --green: #00b894;
-    --red: #e17055;
-    --orange: #fdcb6e;
-    --blue: #74b9ff;
-    --radius: 12px;
-  }
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body {
-    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-    background: var(--bg);
-    color: var(--text);
-    line-height: 1.7;
-    overflow-x: hidden;
-  }
-  .hero {
-    text-align: center;
-    padding: 80px 20px 60px;
-    background: linear-gradient(135deg, #0a0a1a 0%, #12122a 50%, #1a0a2a 100%);
-    border-bottom: 1px solid var(--border);
-    position: relative;
-  }
-  .hero::before {
-    content: '';
-    position: absolute;
-    top: 0; left: 0; right: 0; bottom: 0;
-    background: radial-gradient(ellipse at 50% 0%, rgba(108,92,231,0.15) 0%, transparent 70%);
-    pointer-events: none;
-  }
-  .hero h1 {
-    font-size: 3.5rem;
-    font-weight: 800;
-    background: linear-gradient(135deg, var(--accent2), var(--blue));
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
-    margin-bottom: 16px;
-    position: relative;
-  }
-  .hero .tagline {
-    font-size: 1.25rem;
-    color: var(--text-dim);
-    max-width: 680px;
-    margin: 0 auto 32px;
-    position: relative;
-  }
-  .hero .badge {
-    display: inline-block;
-    background: var(--surface2);
-    border: 1px solid var(--border);
-    border-radius: 20px;
-    padding: 6px 16px;
-    font-size: 0.85rem;
-    color: var(--accent2);
-    margin: 4px;
-    position: relative;
-  }
-  .container { max-width: 1100px; margin: 0 auto; padding: 0 24px; }
-  section { padding: 64px 0; }
-  section + section { border-top: 1px solid var(--border); }
-  h2 {
-    font-size: 2rem;
-    font-weight: 700;
-    margin-bottom: 12px;
-    color: var(--text);
-  }
-  h3 {
-    font-size: 1.35rem;
-    font-weight: 600;
-    margin: 32px 0 12px;
-    color: var(--accent2);
-  }
-  h4 {
-    font-size: 1.1rem;
-    font-weight: 600;
-    margin: 24px 0 8px;
-    color: var(--text);
-  }
-  p { margin-bottom: 16px; color: var(--text-dim); }
-  p strong { color: var(--text); }
-  .subtitle { color: var(--text-dim); margin-bottom: 32px; font-size: 1.05rem; }
-
-  /* Cards */
-  .card-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-    gap: 20px;
-    margin: 24px 0;
-  }
-  .card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 28px;
-    transition: border-color 0.2s;
-  }
-  .card:hover { border-color: var(--accent); }
-  .card .icon { font-size: 2rem; margin-bottom: 12px; }
-  .card h4 { margin: 0 0 8px; color: var(--text); }
-  .card p { margin: 0; font-size: 0.95rem; }
-
-  /* Diagram */
-  .diagram-wrap {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 40px 32px;
-    margin: 32px 0;
-    overflow-x: auto;
-  }
-  .diagram-wrap pre {
-    font-family: 'JetBrains Mono', 'Fira Code', monospace;
-    font-size: 0.82rem;
-    line-height: 1.5;
-    color: var(--text-dim);
-    white-space: pre;
-  }
-  .diagram-wrap pre .hl { color: var(--accent2); font-weight: 600; }
-  .diagram-wrap pre .grn { color: var(--green); }
-  .diagram-wrap pre .red { color: var(--red); }
-  .diagram-wrap pre .blu { color: var(--blue); }
-  .diagram-wrap pre .org { color: var(--orange); }
-
-  /* Tables */
-  table {
-    width: 100%;
-    border-collapse: collapse;
-    margin: 24px 0;
-    font-size: 0.95rem;
-  }
-  th, td {
-    padding: 12px 16px;
-    text-align: left;
-    border-bottom: 1px solid var(--border);
-  }
-  th { color: var(--text); font-weight: 600; background: var(--surface); }
-  td { color: var(--text-dim); }
-  tr:hover td { color: var(--text); }
-
-  /* Score dots */
-  .score { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
-  .score-red { background: var(--red); }
-  .score-orange { background: var(--orange); }
-  .score-green { background: var(--green); }
-
-  /* Code blocks */
-  code {
-    font-family: 'JetBrains Mono', 'Fira Code', monospace;
-    background: var(--surface2);
-    padding: 2px 7px;
-    border-radius: 4px;
-    font-size: 0.9em;
-    color: var(--accent2);
-  }
-  .code-block {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 20px 24px;
-    margin: 20px 0;
-    overflow-x: auto;
-  }
-  .code-block pre {
-    font-family: 'JetBrains Mono', 'Fira Code', monospace;
-    font-size: 0.85rem;
-    line-height: 1.6;
-    color: var(--text-dim);
-  }
-
-  /* Timeline */
-  .timeline {
-    position: relative;
-    margin: 32px 0;
-    padding-left: 32px;
-  }
-  .timeline::before {
-    content: '';
-    position: absolute;
-    left: 8px;
-    top: 0;
-    bottom: 0;
-    width: 2px;
-    background: var(--border);
-  }
-  .timeline-item {
-    position: relative;
-    margin-bottom: 28px;
-    padding: 20px 24px;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-  }
-  .timeline-item::before {
-    content: '';
-    position: absolute;
-    left: -28px;
-    top: 24px;
-    width: 12px;
-    height: 12px;
-    border-radius: 50%;
-    background: var(--accent);
-    border: 2px solid var(--bg);
-  }
-  .timeline-item .label {
-    font-size: 0.8rem;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--accent2);
-    margin-bottom: 6px;
-  }
-  .timeline-item h4 { margin: 0 0 6px; }
-  .timeline-item p { margin: 0; font-size: 0.92rem; }
-
-  /* Principle boxes */
-  .principle {
-    background: var(--surface);
-    border-left: 4px solid var(--accent);
-    border-radius: 0 var(--radius) var(--radius) 0;
-    padding: 20px 24px;
-    margin: 20px 0;
-  }
-  .principle p { margin: 0; }
-
-  /* Footer */
-  footer {
-    text-align: center;
-    padding: 40px 20px;
-    color: var(--text-dim);
-    font-size: 0.85rem;
-    border-top: 1px solid var(--border);
-  }
-  footer a { color: var(--accent2); text-decoration: none; }
-  footer a:hover { text-decoration: underline; }
-
-  @media (max-width: 768px) {
-    .hero h1 { font-size: 2.2rem; }
-    .hero .tagline { font-size: 1rem; }
-    h2 { font-size: 1.5rem; }
-    .card-grid { grid-template-columns: 1fr; }
-  }
-</style>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>aksh — GitHub Actions Control Plane Explained</title>
+  <style>
+    :root {
+      --bg: #030712;
+      --surface: #0f172a;
+      --surface2: #1e293b;
+      --border: #334155;
+      --text: #f8fafc;
+      --text-dim: #94a3b8;
+      --accent: #0ea5e9;
+      --accent-dim: #38bdf8;
+      --green: #22c55e;
+      --orange: #f97316;
+      --blue: #3b82f6;
+      --red: #ef4444;
+      --radius: 12px;
+    }
+    
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      overflow-x: hidden;
+    }
+    
+    header {
+      text-align: center;
+      padding: 80px 20px 60px;
+      background: linear-gradient(180deg, #020617 0%, #0f172a 100%);
+      border-bottom: 1px solid var(--border);
+      position: relative;
+    }
+    
+    header::before {
+      content: '';
+      position: absolute;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: radial-gradient(circle at 30% 20%, rgba(14, 165, 233, 0.08) 0%, transparent 50%);
+      pointer-events: none;
+    }
+    
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: rgba(14, 165, 233, 0.1);
+      border: 1px solid rgba(14, 165, 233, 0.2);
+      border-radius: 9999px;
+      padding: 4px 14px;
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: var(--accent-dim);
+      margin-bottom: 24px;
+    }
+    
+    .pulse-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--accent);
+      animation: pulse 2s infinite;
+    }
+    
+    @keyframes pulse {
+      0% { opacity: 0.4; }
+      50% { opacity: 1; }
+      100% { opacity: 0.4; }
+    }
+    
+    h1 {
+      font-size: 3.5rem;
+      font-weight: 800;
+      background: linear-gradient(135deg, #f0f9ff, var(--accent-dim));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      margin-bottom: 20px;
+    }
+    
+    .tagline {
+      font-size: 1.2rem;
+      color: var(--text-dim);
+      max-width: 760px;
+      margin: 0 auto 30px;
+    }
+    
+    .badge-container {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 12px;
+    }
+    
+    .badge {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 6px 14px;
+      font-size: 0.85rem;
+      color: #cbd5e1;
+    }
+    
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 60px 24px;
+    }
+    
+    .section-header {
+      margin-bottom: 32px;
+    }
+    
+    .section-header h2 {
+      font-size: 2rem;
+      font-weight: 700;
+      color: var(--text);
+      margin-bottom: 8px;
+    }
+    
+    .section-header p {
+      color: var(--text-dim);
+    }
+    
+    /* Tabs System */
+    .tabs-nav {
+      display: flex;
+      flex-wrap: wrap;
+      border-bottom: 1px solid var(--border);
+      gap: 8px;
+      margin-bottom: 24px;
+    }
+    
+    .tab-btn {
+      background: none;
+      border: none;
+      border-bottom: 2px solid transparent;
+      padding: 12px 20px;
+      color: var(--text-dim);
+      font-weight: 500;
+      font-size: 0.95rem;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    
+    .tab-btn:hover {
+      color: var(--text);
+    }
+    
+    .tab-btn.active {
+      color: var(--accent);
+      border-bottom-color: var(--accent);
+      font-weight: 600;
+    }
+    
+    .tab-container {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 24px;
+      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.3);
+    }
+    
+    .tab-panel {
+      display: none;
+    }
+    
+    .tab-panel.active {
+      display: block;
+    }
+    
+    .flex-layout {
+      display: flex;
+      flex-direction: column;
+      gap: 24px;
+    }
+    
+    @media (min-width: 1024px) {
+      .flex-layout {
+        flex-direction: row;
+      }
+    }
+    
+    .diagram-viewport {
+      flex: 1;
+      width: 100%;
+      overflow-x: auto;
+      background: #ffffff;
+      border-radius: 8px;
+      padding: 16px;
+      border: 1px solid var(--border);
+    }
+    
+    .diagram-viewport::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+    .diagram-viewport::-webkit-scrollbar-thumb {
+      background: #cbd5e1;
+      border-radius: 4px;
+    }
+    
+    .diagram-viewport-content {
+      min-width: 800px;
+    }
+    
+    .sidebar {
+      width: 100%;
+      flex-shrink: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+    
+    @media (min-width: 1024px) {
+      .sidebar {
+        width: 320px;
+      }
+    }
+    
+    .sidebar h3 {
+      font-size: 1.2rem;
+      font-weight: 700;
+      color: var(--text);
+    }
+    
+    .sidebar p {
+      font-size: 0.85rem;
+      color: var(--text-dim);
+    }
+    
+    .sidebar-block {
+      border-top: 1px solid var(--border);
+      padding-top: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    
+    .legend-lbl {
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    
+    .lbl-green { color: var(--green); }
+    .lbl-orange { color: var(--orange); }
+    .lbl-blue { color: var(--blue); }
+    
+    .detail-text {
+      font-size: 0.8rem;
+      color: #cbd5e1;
+    }
+    
+    /* Code and Payload blocks */
+    .grid-2 {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 24px;
+      margin-top: 40px;
+    }
+    
+    @media (min-width: 1024px) {
+      .grid-2 {
+        grid-template-columns: 1fr 1fr;
+      }
+    }
+    
+    .payload-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 24px;
+    }
+    
+    .payload-card h4 {
+      font-size: 0.9rem;
+      font-weight: 600;
+      color: var(--accent-dim);
+      margin-bottom: 8px;
+    }
+    
+    .payload-card p {
+      font-size: 0.8rem;
+      color: var(--text-dim);
+      margin-bottom: 16px;
+    }
+    
+    pre {
+      font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+      font-size: 0.75rem;
+      background: #020617;
+      padding: 16px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      color: var(--green);
+      overflow-x: auto;
+      line-height: 1.5;
+    }
+    
+    /* Component list */
+    .grid-3 {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 24px;
+      margin-top: 40px;
+    }
+    
+    .component-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 24px;
+    }
+    
+    .component-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 32px;
+      height: 32px;
+      border-radius: 6px;
+      background: rgba(14, 165, 233, 0.1);
+      color: var(--accent);
+      font-weight: 700;
+      font-size: 0.85rem;
+      margin-bottom: 16px;
+    }
+    
+    .component-card h4 {
+      font-weight: 700;
+      color: var(--text);
+      margin-bottom: 8px;
+    }
+    
+    .component-card p {
+      font-size: 0.8rem;
+      color: var(--text-dim);
+    }
+    
+    /* Scorecard Table */
+    .scorecard-container {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      margin-top: 40px;
+      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.3);
+    }
+    
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      text-align: left;
+      font-size: 0.85rem;
+    }
+    
+    th {
+      background: #020617;
+      padding: 16px 24px;
+      font-weight: 600;
+      color: var(--text);
+      border-bottom: 1px solid var(--border);
+    }
+    
+    td {
+      padding: 16px 24px;
+      border-bottom: 1px solid rgba(51, 65, 85, 0.5);
+      color: var(--text-dim);
+    }
+    
+    tr:last-child td {
+      border-bottom: none;
+    }
+    
+    .status-text {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-weight: 500;
+    }
+    
+    .status-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+    }
+    
+    .status-working { color: var(--green); }
+    .status-working .status-dot { background: var(--green); }
+    .status-bypassed { color: var(--orange); }
+    .status-bypassed .status-dot { background: var(--orange); }
+    .status-mocked { color: var(--red); }
+    .status-mocked .status-dot { background: var(--red); }
+    
+    .badge-pass {
+      background: rgba(34, 197, 94, 0.1);
+      border: 1px solid rgba(34, 197, 94, 0.2);
+      color: var(--green);
+      font-weight: 700;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 0.75rem;
+    }
+    
+    /* Footer */
+    footer {
+      border-top: 1px solid var(--border);
+      background: #020617;
+      padding: 48px 24px;
+      text-align: center;
+      font-size: 0.85rem;
+      color: #64748b;
+    }
+    
+    footer a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+    
+    footer a:hover {
+      text-decoration: underline;
+    }
+    
+    /* Walkthrough Styles */
+    .walkthrough-step {
+      display: flex;
+      align-items: flex-start;
+      gap: 16px;
+      padding: 20px 0;
+    }
+    .walkthrough-step + .walkthrough-step {
+      border-top: 1px solid rgba(51, 65, 85, 0.3);
+    }
+    .step-number {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      background: rgba(14, 165, 233, 0.1);
+      color: var(--accent);
+      font-weight: 700;
+      font-size: 0.85rem;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+    .step-content {
+      flex: 1;
+    }
+    .step-title {
+      font-size: 0.95rem;
+      font-weight: 700;
+      color: var(--text);
+      margin-bottom: 4px;
+    }
+    .step-desc {
+      font-size: 0.85rem;
+      color: var(--text-dim);
+      margin-bottom: 12px;
+    }
+    .step-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 16px;
+      margin-top: 12px;
+    }
+    @media (min-width: 768px) {
+      .step-grid {
+        grid-template-columns: 1fr 1fr;
+      }
+    }
+    .step-card {
+      background: #020617;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px;
+    }
+    .card-label {
+      font-size: 0.65rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      color: var(--orange);
+      display: block;
+      margin-bottom: 4px;
+    }
+    .card-code {
+      margin: 0;
+      padding: 8px;
+      font-size: 0.7rem;
+      border: none;
+    }
+  </style>
 </head>
 <body>
 
-<div class="hero">
-  <h1>aksh</h1>
-  <div class="tagline">
-    A faithful Rust reimplementation of the GitHub Actions control plane.
-    The official <code>Runner.Listener</code> connects, polls, executes, and reports —
-    no GitHub-hosted minutes required.
-  </div>
-  <span class="badge">Rust</span>
-  <span class="badge">Tokio + Axum</span>
-  <span class="badge">Runner Protocol</span>
-  <span class="badge">Pluggable Backends</span>
-</div>
-
-<div class="container">
-
-<!-- ============================================================ -->
-<section>
-  <h2>What Problem Does aksh Solve?</h2>
-  <p class="subtitle">GitHub Actions workflows are defined in YAML, but running them locally has always been a lie.</p>
-
-  <div class="card-grid">
-    <div class="card">
-      <div class="icon">🚫</div>
-      <h4>Docker ≠ GitHub</h4>
-      <p>Most "local GHA" tools run steps in Docker. But GitHub Actions uses a runner that speaks a real protocol with encrypted messages, timeline records, annotations, OIDC tokens, and service endpoints. Docker doesn't model any of that.</p>
+  <!-- Header / Hero -->
+  <header>
+    <div class="status-badge">
+      <span class="pulse-dot"></span>
+      v2.335.1 Protocol Sync Passing
     </div>
-    <div class="card">
-      <div class="icon">🔗</div>
-      <h4>runner.server Exists — But It's C#</h4>
-      <p><a href="https://github.com/ChristopherHX/runner.server" style="color:var(--accent2)">ChristopherHX/runner.server</a> proved this works: a local server that the official runner talks to. It works. But it's a .NET app with a 104MB footprint.</p>
+    <h1>aksh</h1>
+    <div class="tagline">
+      A faithful Rust reimplementation of the GitHub Actions control plane. Speaks the official runner protocol, schedules workflows locally, and coordinates execution substrates.
     </div>
-    <div class="card">
-      <div class="icon">🦀</div>
-      <h4>aksh: Same Protocol, Rust Speed</h4>
-      <p>aksh reimplements the control plane in Rust — 4.7MB binary, 8ms startup, 37K req/s. Same protocol fidelity, plus pluggable backends for any runner host (containers, VMs, microVMs, bare processes).</p>
+    <div class="badge-container">
+      <span class="badge">Rust</span>
+      <span class="badge">Tokio + Axum</span>
+      <span class="badge">Runner Protocol</span>
+      <span class="badge">10/10 Conformance Replay</span>
     </div>
-  </div>
-</section>
+  </header>
 
-<!-- ============================================================ -->
-<section>
-  <h2>The Core Insight: Control Plane ≠ Execution Engine</h2>
-  <p class="subtitle">The runner protocol already separates "what to run" from "how to run it."</p>
+  <div class="container">
 
-  <p><strong>The official <code>actions/runner</code> is the execution engine.</strong> It boots, registers with a server, long-polls for jobs, receives an encrypted message containing everything it needs, executes steps, and streams results back. The server never reaches out to execute anything.</p>
+    <!-- Interactive Architecture Dashboard -->
+    <section>
+      <div class="section-header">
+        <h2>Visual Architecture & Flow Explorer</h2>
+        <p>Toggle through the tabs below to explore the visual diagrams detailing different components, lifecycle sequences, engines, and automated pipelines.</p>
+      </div>
 
-  <p>This means aksh's only job is to <strong>be a faithful server.</strong> It doesn't care whether runners live in containers, VMs, microVMs, or bare processes. The runner connects <em>in</em>; aksh feeds it jobs.</p>
+      <!-- Tab Buttons -->
+      <div class="tabs-nav">
+        <button onclick="switchTab('architecture')" id="btn-architecture" class="tab-btn active">
+          1. System Architecture
+        </button>
+        <button onclick="switchTab('protocol')" id="btn-protocol" class="tab-btn">
+          2. Runner Protocol Timeline
+        </button>
+        <button onclick="switchTab('engine')" id="btn-engine" class="tab-btn">
+          3. Workflow Engine Pipelines
+        </button>
+        <button onclick="switchTab('sync')" id="btn-sync" class="tab-btn">
+          4. Protocol Sync Pipeline
+        </button>
+        <button onclick="switchTab('concurrency')" id="btn-concurrency" class="tab-btn">
+          5. Concurrent Walkthrough
+        </button>
+      </div>
 
-  <div class="principle">
-    <p><strong>Design principle:</strong> Model the Azure DevOps wire protocol as the source of truth. Layer aksh-specific features (NDJSON, secret redaction, agent-friendly REST) as read-model projections — never as protocol replacements.</p>
-  </div>
-</section>
+      <!-- Tab Panels -->
+      <div class="tab-container">
 
-<!-- ============================================================ -->
-<section>
-  <h2>How It Works: The Runner Lifecycle</h2>
-  <p class="subtitle">What happens from the moment a workflow is submitted to the moment it finishes.</p>
+        <!-- Tab 1: Architecture -->
+        <div id="panel-architecture" class="tab-panel active">
+          <div class="flex-layout">
+            <div class="diagram-viewport">
+              <div class="diagram-viewport-content">
+                <svg style="width: 100%; height: auto; display: block; max-width: 100%;" xmlns="http://www.w3.org/2000/svg" width="2224" height="1272" viewBox="6 -32 2224 1272" style="background-color: #ffffff;"><defs><marker id="arrow-1e3a5f" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#1e3a5f" /></marker><marker id="arrow-c2410c" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#c2410c" /></marker><marker id="arrow-047857" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#047857" /></marker></defs><text font-family="system-ui, sans-serif" font-size="46px" fill="#1e40af" dominant-baseline="hanging" text-anchor="middle" x="1100.0" y="18"><tspan x="1100.0" dy="0em">aksh</tspan></text><text font-family="system-ui, sans-serif" font-size="17px" fill="#3b82f6" dominant-baseline="hanging" text-anchor="middle" x="1100.0" y="72"><tspan x="1100.0" dy="0em">GitHub Actions Control Plane — the unmodified actions/runner connects here instead of GitHub</tspan></text><rect stroke="#6d28d9" stroke-width="1" fill="#f5f3ff" stroke-dasharray="6,6" x="640" y="108" width="860" height="38" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="13px" fill="#6d28d9" dominant-baseline="hanging" text-anchor="middle" x="1070.0" y="118.55"><tspan x="1070.0" dy="0em">Preloop product layer = aksh  +  libkrun ephemeral microVM runner host</tspan></text><text font-family="system-ui, sans-serif" font-size="12px" fill="#64748b" dominant-baseline="hanging" text-anchor="start" x="60" y="158"><tspan x="60" dy="0em">WORKFLOW SUBMISSION</tspan></text><text font-family="system-ui, sans-serif" font-size="12px" fill="#64748b" dominant-baseline="hanging" text-anchor="middle" x="990.0" y="158"><tspan x="990.0" dy="0em">CONTROL PLANE</tspan></text><text font-family="system-ui, sans-serif" font-size="12px" fill="#64748b" dominant-baseline="hanging" text-anchor="middle" x="1820.0" y="158"><tspan x="1820.0" dy="0em">RUNNER + SUBSTRATES</tspan></text><path stroke="#cbd5e1" stroke-width="1" fill="none" stroke-dasharray="6,6" d="M 490 150 L 490 1190" /><path stroke="#cbd5e1" stroke-width="1" fill="none" stroke-dasharray="6,6" d="M 1580 150 L 1580 1190" /><ellipse stroke="#c2410c" stroke-width="2" fill="#fed7aa" cx="260.0" cy="235.0" rx="190.0" ry="35.0" /><text font-family="system-ui, sans-serif" font-size="14px" fill="#7c2d12" dominant-baseline="hanging" text-anchor="middle" x="260.0" y="225.9"><tspan x="260.0" dy="0em">git push / workflow_dispatch / schedule</tspan></text><rect stroke="#1e3a5f" stroke-width="2" fill="#3b82f6" x="70" y="310" width="380" height="70" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="13px" fill="#ffffff" dominant-baseline="hanging" text-anchor="middle" x="260.0" y="328.1"><tspan x="260.0" dy="0em">POST /api/v1/runs</tspan><tspan x="260.0" dy="1.3em">aksh-runner-client CLI or any HTTP client</tspan></text><rect stroke="#334155" stroke-width="1" fill="#1e293b" x="56" y="418" width="400" height="120" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="11px" fill="#22c55e" dominant-baseline="hanging" text-anchor="start" x="70" y="456.55"><tspan x="70" dy="0em">{ "workflow_yaml": "on:\n  push:\njobs:\n  build:\n    runs-on: ubuntu\n    steps: [...]\n",</tspan><tspan x="70" dy="1.3em">  "event": "push",  "repository": "org/repo",</tspan><tspan x="70" dy="1.3em">  "secrets": {},  "vars": {} }</tspan></text><text font-family="system-ui, sans-serif" font-size="12px" fill="#64748b" dominant-baseline="hanging" text-anchor="start" x="70" y="556"><tspan x="70" dy="0em">GET /api/v1/runs/:id/events.ndjson</tspan><tspan x="70" dy="1.3em">→ live NDJSON event stream for agents + UIs</tspan></text><rect stroke="#1e3a5f" stroke-width="3" fill="#dbeafe" x="520" y="192" width="1020" height="620" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="28px" fill="#1e40af" dominant-baseline="hanging" text-anchor="middle" x="1030.0" y="208"><tspan x="1030.0" dy="0em">aksh-runner-server</tspan></text><rect stroke="#047857" stroke-width="2" fill="#a7f3d0" x="540" y="268" width="460" height="340" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="13px" fill="#047857" dominant-baseline="hanging" text-anchor="middle" x="770.0" y="279.55"><tspan x="770.0" dy="0em">AzDO Runner Protocol  (working end-to-end)</tspan></text><text font-family="system-ui, sans-serif" font-size="11px" fill="#065f46" dominant-baseline="hanging" text-anchor="start" x="552" y="308"><tspan x="552" dy="0em">POST  /api/v3/actions/runner-registration</tspan><tspan x="552" dy="1.3em">GET   /_apis/distributedtask/pools</tspan><tspan x="552" dy="1.3em">POST  /pools/:id/agents   (RSA key)</tspan><tspan x="552" dy="1.3em">POST  /pools/:id/sessions (AES key)</tspan><tspan x="552" dy="1.3em">GET   /pools/:id/messages  waitSeconds=50</tspan><tspan x="552" dy="1.3em">DELETE /pools/:id/messages/:id  (ack)</tspan><tspan x="552" dy="1.3em">POST  /_apis/v1/AgentRequest/:pool/:req</tspan><tspan x="552" dy="1.3em">PATCH /_apis/v1/AgentRequest/:pool/:req</tspan><tspan x="552" dy="1.3em">POST  /broker/:id/acquirejob</tspan><tspan x="552" dy="1.3em">POST  /broker/:id/renewjob</tspan><tspan x="552" dy="1.3em">POST  /broker/:id/completejob</tspan><tspan x="552" dy="1.3em">PATCH /_apis/v1/Timeline/...</tspan><tspan x="552" dy="1.3em">POST  /_apis/v1/Logfiles/...</tspan><tspan x="552" dy="1.3em">POST  /_apis/v1/FinishJob/...</tspan><tspan x="552" dy="1.3em">GET   .../oidctoken?audience=...</tspan></text><rect stroke="#047857" stroke-width="2" fill="#a7f3d0" x="1060" y="268" width="460" height="140" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="13px" fill="#047857" dominant-baseline="hanging" text-anchor="middle" x="1290.0" y="279.55"><tspan x="1290.0" dy="0em">Native REST + NDJSON  (working)</tspan></text><text font-family="system-ui, sans-serif" font-size="11px" fill="#065f46" dominant-baseline="hanging" text-anchor="start" x="1072" y="308"><tspan x="1072" dy="0em">POST /api/v1/runs       submit workflow</tspan><tspan x="1072" dy="1.3em">GET  /api/v1/runs/:id   status + outputs</tspan><tspan x="1072" dy="1.3em">GET  /api/v1/runs/:id/events.ndjson</tspan><tspan x="1072" dy="1.3em">POST /api/v1/runs/:id/cancel</tspan></text><rect stroke="#dc2626" stroke-width="2" fill="#fee2e2" stroke-dasharray="6,6" x="1060" y="428" width="460" height="100" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="13px" fill="#dc2626" dominant-baseline="hanging" text-anchor="middle" x="1290.0" y="437.55"><tspan x="1290.0" dy="0em">Cache v4 + Artifact v4 twirp  (STUB — mocked)</tspan></text><text font-family="system-ui, sans-serif" font-size="10px" fill="#991b1b" dominant-baseline="hanging" text-anchor="start" x="1072" y="462"><tspan x="1072" dy="0em">CacheService: always returns cache miss, fake upload URLs</tspan><tspan x="1072" dy="1.3em">ArtifactService: fake upload URLs, ListArtifacts always []</tspan><tspan x="1072" dy="1.3em">No real storage backend — bytes are never persisted</tspan></text><rect stroke="#1e40af" stroke-width="2" fill="#dbeafe" stroke-dasharray="6,6" x="1060" y="548" width="460" height="76" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="13px" fill="#1e40af" dominant-baseline="hanging" text-anchor="middle" x="1290.0" y="557.55"><tspan x="1290.0" dy="0em">Action resolution  (NOT IMPLEMENTED)</tspan></text><text font-family="system-ui, sans-serif" font-size="10px" fill="#1e40af" dominant-baseline="hanging" text-anchor="start" x="1072" y="582"><tspan x="1072" dy="0em">launch.actions.githubusercontent.com + codeload.github.com</tspan><tspan x="1072" dy="1.3em">Runner still calls GitHub directly — aksh is bypassed</tspan></text><text font-family="system-ui, sans-serif" font-size="12px" fill="#64748b" dominant-baseline="hanging" text-anchor="middle" x="1036.0" y="640"><tspan x="1036.0" dy="0em">crates:  aksh-runner-server  ·  aksh-gha-parser  ·  aksh-gha-expressions  ·  aksh-gha-protocol  ·  aksh-cache  ·  aksh-artifacts</tspan></text><text font-family="system-ui, sans-serif" font-size="11px" fill="#94a3b8" dominant-baseline="hanging" text-anchor="middle" x="1036.0" y="666"><tspan x="1036.0" dy="0em">state: in-memory only (no persistence between restarts)  ·  any number of simultaneous runners supported</tspan></text><text font-family="system-ui, sans-serif" font-size="13px" fill="#047857" dominant-baseline="hanging" text-anchor="middle" x="1800.0" y="208"><tspan x="1800.0" dy="0em">Official actions/runner binary</tspan><tspan x="1800.0" dy="1.3em">(unmodified — thinks it's talking to GitHub)</tspan></text><ellipse stroke="#047857" stroke-width="2" fill="#a7f3d0" cx="1798.0" cy="286.0" rx="170.0" ry="30.0" /><text font-family="system-ui, sans-serif" font-size="13px" fill="#065f46" dominant-baseline="hanging" text-anchor="middle" x="1798.0" y="277.55"><tspan x="1798.0" dy="0em">Runner 1  ·  libkrun microVM</tspan></text><ellipse stroke="#047857" stroke-width="2" fill="#a7f3d0" cx="1798.0" cy="376.0" rx="170.0" ry="30.0" /><text font-family="system-ui, sans-serif" font-size="13px" fill="#065f46" dominant-baseline="hanging" text-anchor="middle" x="1798.0" y="367.55"><tspan x="1798.0" dy="0em">Runner 2  ·  Docker / Podman</tspan></text><ellipse stroke="#047857" stroke-width="2" fill="#a7f3d0" cx="1798.0" cy="466.0" rx="170.0" ry="30.0" /><text font-family="system-ui, sans-serif" font-size="13px" fill="#065f46" dominant-baseline="hanging" text-anchor="middle" x="1798.0" y="457.55"><tspan x="1798.0" dy="0em">Runner 3  ·  bare process / remote host</tspan></text><text font-family="system-ui, sans-serif" font-size="12px" fill="#64748b" dominant-baseline="hanging" text-anchor="middle" x="1798.0" y="516"><tspan x="1798.0" dy="0em">Each runner executes jobs in isolation.</tspan><tspan x="1798.0" dy="1.3em">The substrate is pluggable — aksh doesn't</tspan><tspan x="1798.0" dy="1.3em">care which one the runner host uses.</tspan></text><path stroke="#c2410c" stroke-width="2" fill="none" d="M 452 235 L 520 235" marker-end="url(#arrow-c2410c)" /><path stroke="#1e3a5f" stroke-width="2" fill="none" d="M 452 345 L 520 345" marker-end="url(#arrow-1e3a5f)" /><path stroke="#047857" stroke-width="2" fill="none" d="M 1540 286 L 1628 286" marker-end="url(#arrow-047857)" /><path stroke="#047857" stroke-width="2" fill="none" d="M 1540 376 L 1628 376" marker-end="url(#arrow-047857)" /><path stroke="#047857" stroke-width="2" fill="none" d="M 1540 466 L 1628 466" marker-end="url(#arrow-047857)" /><rect stroke="#64748b" stroke-width="1" fill="#f8fafc" x="1608" y="616" width="380" height="130" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="14px" fill="#374151" dominant-baseline="hanging" text-anchor="middle" x="1798.0" y="624"><tspan x="1798.0" dy="0em">Legend</tspan></text><text font-family="system-ui, sans-serif" font-size="11px" fill="#374151" dominant-baseline="hanging" text-anchor="start" x="1624" y="650"><tspan x="1624" dy="0em">Solid green border  =  working end-to-end</tspan><tspan x="1624" dy="1.3em">Dashed red border   =  stub / shape-correct 200</tspan><tspan x="1624" dy="1.3em">                             no real storage or network call</tspan><tspan x="1624" dy="1.3em">Dashed blue border  =  not implemented</tspan></text><path stroke="#e2e8f0" stroke-width="1" fill="none" d="M 60 800 L 2180 800" /><text font-family="system-ui, sans-serif" font-size="14px" fill="#1e40af" dominant-baseline="hanging" text-anchor="middle" x="1120.0" y="816"><tspan x="1120.0" dy="0em">Submit YAML  →  aksh parses, expands matrix, gates on needs  →  dispatches encrypted job to runner  →  runner executes  →  logs + timeline stream back  →  outputs available</tspan></text></svg>
+              </div>
+            </div>
+            <div class="sidebar">
+              <h3>System Architecture</h3>
+              <p>
+                Visualizes the boundaries of the submission layers, core control plane crates, and the fanned-out runner substrates.
+              </p>
+              <div class="sidebar-block">
+                <h4 class="legend-lbl lbl-green">Working End-to-End</h4>
+                <p class="detail-text">The core runner lifecycle, HTTP routes, matrix expansion, trigger matching, and results receiver are fully operational.</p>
+                
+                <h4 class="legend-lbl lbl-orange">Stub / Mocked</h4>
+                <p class="detail-text">Cache and Artifact twirp interfaces are stubs — they return correct JSON headers/statuses to GHA but contain no real storage backend.</p>
 
-  <div class="diagram-wrap"><pre>
-<span class="blu">┌─────────────────────┐</span>                    <span class="grn">┌──────────────────────┐</span>
-<span class="blu">│   CLI / Agent / API  │</span>                    <span class="grn">│  Runner.Listener     │</span>
-<span class="blu">│  (submit workflow)   │</span>                    <span class="grn">│  (official binary)   │</span>
-<span class="blu">└──────────┬──────────┘</span>                    <span class="grn">└──────────┬───────────┘</span>
-           │                                        │
-           │  1. POST /api/v1/runs                   │  2. GET /runner/server/_apis/connectionData
-           │     { workflow_yaml, event }            │
-           ▼                                        ▼
-<span class="org">┌────────────────────────────────────────────────────────────────────┐</span>
-<span class="org">│                         aksh server                               │</span>
-<span class="org">│                                                                   │</span>
-<span class="org">│  ┌─────────────┐   ┌──────────────┐   ┌────────────────────────┐  │</span>
-<span class="org">│  │ Parser +    │──▶│  Scheduler   │──▶│  Message Queue          │  │</span>
-<span class="org">│  │ Evaluator   │   │  (needs DAG) │   │  (encrypted envelopes)  │  │</span>
-<span class="org">│  │             │   │              │   │                        │  │</span>
-<span class="org">│  │ • parse YAML│   │ • gate on    │   │  • AES-encrypted body   │  │</span>
-<span class="org">│  │ • resolve   │   │   needs      │   │  • long-poll with       │  │</span>
-<span class="org">│  │   ${{}} expr │   │ • emit       │   │    messageId/ack        │  │</span>
-<span class="org">│  │ • expand    │   │   JobCancel  │   │  • per-session AES key  │  │</span>
-<span class="org">│  │   matrix    │   │   on cancel  │   │                        │  │</span>
-<span class="org">│  └─────────────┘   └──────────────┘   └───────────┬────────────┘  │</span>
-<span class="org">│                                                    │               │</span>
-<span class="org">│  ┌─────────────────────────────────────────────────┼─────────────┐ │</span>
-<span class="org">│  │  Runner Protocol Surface (Azure DevOps)         │             │ │</span>
-<span class="org">│  │                                                 ▼             │ │</span>
-<span class="org">│  │  ┌──────────┐  ┌────────────┐  ┌──────────┐  ┌──────────┐   │ │</span>
-<span class="org">│  │  │ /auth    │  │ /sessions  │  │ /messages│  │ /timelines│   │ │</span>
-<span class="org">│  │  │ OAuth2   │  │ RSA/AES    │  │ long-poll│  │ records   │   │ │</span>
-<span class="org">│  │  │ bearer   │  │ key exch.  │  │ + DELETE │  │ + logs    │   │ │</span>
-<span class="org">│  │  └──────────┘  └────────────┘  └──────────┘  └──────────┘   │ │</span>
-<span class="org">│  └──────────────────────────────────────────────────────────────┘ │</span>
-<span class="org">│                                                                   │</span>
-<span class="org">│  ┌──────────────────────────────────────────────────────────────┐ │</span>
-<span class="org">│  │  Agent-Native Surface (/api/v1/)  — same state, nicer API   │ │</span>
-<span class="org">│  │  • NDJSON event feed (projection of timeline records)       │ │</span>
-<span class="org">│  │  • SecretString redaction on all outputs                    │ │</span>
-<span class="org">│  └──────────────────────────────────────────────────────────────┘ │</span>
-<span class="org">└───────────────────────────────────────────────────────────────────┘</span>
-           │                                        ▲
-           │  3. POST /api/v1/runners               │  4. GET /messages (long-poll)
-           │     (RSA public key)                   │     POST /timelines (step state)
-           │     POST /sessions (AES key wrap)      │     POST /logs (console output)
-           │     POST /plans/.../events              │     PATCH /plans/.../finish
-           │                                        │
-           ▼                                        │
-<span class="grn">┌──────────────────────┐</span>                    <span class="blu">┌─────────────────────┐</span>
-<span class="grn">│  Runner.Listener     │</span>  ─── boot ───▶   <span class="blu">│   aksh server       │</span>
-<span class="grn">│  (inside a container,│</span>                    <span class="blu">│   (speaks the       │</span>
-<span class="grn">│   VM, microVM, etc.) │</span>                    <span class="blu">│    same language)   │</span>
-<span class="grn">└──────────────────────┘</span>                    <span class="blu">└─────────────────────┘</span>
-  </pre></div>
+                <h4 class="legend-lbl lbl-blue">Not Implemented</h4>
+                <p class="detail-text">Action downloads are bypassed. The runner directly fetches action tarballs from GitHub's CDN.</p>
+              </div>
+            </div>
+          </div>
+        </div>
 
-  <h3>Step by step</h3>
+        <!-- Tab 2: Protocol Timeline -->
+        <div id="panel-protocol" class="tab-panel">
+          <div class="flex-layout">
+            <div class="diagram-viewport">
+              <div class="diagram-viewport-content">
+                <svg style="width: 100%; height: auto; display: block; max-width: 100%;" xmlns="http://www.w3.org/2000/svg" width="1626" height="1580" viewBox="224 -30 1626 1580" style="background-color: #ffffff;"><defs /><text font-family="system-ui, sans-serif" font-size="38px" fill="#1e40af" dominant-baseline="hanging" text-anchor="middle" x="1100.0" y="20"><tspan x="1100.0" dy="0em">Runner Protocol Flow</tspan></text><text font-family="system-ui, sans-serif" font-size="16px" fill="#3b82f6" dominant-baseline="hanging" text-anchor="middle" x="1100.0" y="70"><tspan x="1100.0" dy="0em">Vertical timeline of HTTP calls and lifecycle phases between actions/runner and aksh</tspan></text><path stroke="#1e3a5f" stroke-width="3" fill="none" d="M 280 140 L 280 1500" /><ellipse stroke="#1e3a5f" stroke-width="1" fill="#3b82f6" cx="281.0" cy="187.0" rx="7.0" ry="7.0" /><text font-family="system-ui, sans-serif" font-size="15px" fill="#1e40af" dominant-baseline="hanging" text-anchor="start" x="310" y="176"><tspan x="310" dy="0em">1. Registration &amp; Auth</tspan></text><rect stroke="#047857" stroke-width="1" fill="#a7f3d0" x="580" y="150" width="460" height="34" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="11px" fill="#065f46" dominant-baseline="hanging" text-anchor="middle" x="810.0" y="160.85"><tspan x="810.0" dy="0em">POST /api/v3/actions/runner-registration  (returns listener token)</tspan></text><rect stroke="#047857" stroke-width="1" fill="#a7f3d0" x="580" y="194" width="460" height="34" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="11px" fill="#065f46" dominant-baseline="hanging" text-anchor="middle" x="810.0" y="204.85"><tspan x="810.0" dy="0em">GET /_apis/distributedtask/pools?poolType=Automation</tspan></text><rect stroke="#047857" stroke-width="1" fill="#a7f3d0" x="580" y="238" width="460" height="34" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="11px" fill="#065f46" dominant-baseline="hanging" text-anchor="middle" x="810.0" y="248.85"><tspan x="810.0" dy="0em">POST /pools/1/agents  (sends agent RSA public key)</tspan></text><rect stroke="#047857" stroke-width="1" fill="#a7f3d0" x="580" y="282" width="460" height="34" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="11px" fill="#065f46" dominant-baseline="hanging" text-anchor="middle" x="810.0" y="292.85"><tspan x="810.0" dy="0em">POST /pools/1/sessions  (returns encrypted AES session key)</tspan></text><rect stroke="#334155" stroke-width="1" fill="#1e293b" x="1080" y="210" width="400" height="100" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="11px" fill="#22c55e" dominant-baseline="hanging" text-anchor="start" x="1090" y="224.25"><tspan x="1090" dy="0em">Session Response:</tspan><tspan x="1090" dy="1.3em">{ "sessionId": "a8ad...",</tspan><tspan x="1090" dy="1.3em">  "encryptionKey": {</tspan><tspan x="1090" dy="1.3em">    "type": "RSA-wrapped-AES",</tspan><tspan x="1090" dy="1.3em">    "value": "base64_ciphertext" } }</tspan></text><ellipse stroke="#1e3a5f" stroke-width="1" fill="#3b82f6" cx="281.0" cy="427.0" rx="7.0" ry="7.0" /><text font-family="system-ui, sans-serif" font-size="15px" fill="#1e40af" dominant-baseline="hanging" text-anchor="start" x="310" y="416"><tspan x="310" dy="0em">2. Long-polling</tspan></text><rect stroke="#047857" stroke-width="1" fill="#a7f3d0" x="580" y="396" width="460" height="60" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="11px" fill="#065f46" dominant-baseline="hanging" text-anchor="middle" x="810.0" y="411.7"><tspan x="810.0" dy="0em">GET /pools/1/messages?sessionId={guid}&amp;waitSeconds=50</tspan><tspan x="810.0" dy="1.3em">(returns 200 TaskAgentMessage on job, 202 on timeout)</tspan></text><rect stroke="#334155" stroke-width="1" fill="#1e293b" x="1080" y="380" width="400" height="90" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="11px" fill="#22c55e" dominant-baseline="hanging" text-anchor="start" x="1090" y="389.25"><tspan x="1090" dy="0em">TaskAgentMessage Body (AES decrypted):</tspan><tspan x="1090" dy="1.3em">{</tspan><tspan x="1090" dy="1.3em">  "runner_request_id": "b95e454f-...",</tspan><tspan x="1090" dy="1.3em">  "run_service_url": "http://127.0.0.1:80/broker/1/"</tspan><tspan x="1090" dy="1.3em">}</tspan></text><ellipse stroke="#1e3a5f" stroke-width="1" fill="#3b82f6" cx="281.0" cy="557.0" rx="7.0" ry="7.0" /><text font-family="system-ui, sans-serif" font-size="15px" fill="#1e40af" dominant-baseline="hanging" text-anchor="start" x="310" y="546"><tspan x="310" dy="0em">3. Broker Job Acquire</tspan></text><rect stroke="#047857" stroke-width="1" fill="#a7f3d0" x="580" y="508" width="460" height="34" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="11px" fill="#065f46" dominant-baseline="hanging" text-anchor="middle" x="810.0" y="518.85"><tspan x="810.0" dy="0em">POST /broker/1/acquirejob  (returns workflow, variables, contexts)</tspan></text><rect stroke="#047857" stroke-width="1" fill="#a7f3d0" x="580" y="552" width="460" height="34" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="11px" fill="#065f46" dominant-baseline="hanging" text-anchor="middle" x="810.0" y="562.85"><tspan x="810.0" dy="0em">POST /broker/1/renewjob  (heartbeat every 60 seconds)</tspan></text><ellipse stroke="#1e3a5f" stroke-width="1" fill="#3b82f6" cx="281.0" cy="807.0" rx="7.0" ry="7.0" /><text font-family="system-ui, sans-serif" font-size="15px" fill="#1e40af" dominant-baseline="hanging" text-anchor="start" x="310" y="796"><tspan x="310" dy="0em">4. Execution &amp; Step Feeds</tspan></text><rect stroke="#047857" stroke-width="1" fill="#a7f3d0" x="580" y="620" width="460" height="34" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="11px" fill="#065f46" dominant-baseline="hanging" text-anchor="middle" x="810.0" y="630.85"><tspan x="810.0" dy="0em">PATCH /_apis/v1/Timeline/... (step updates: state, duration, results)</tspan></text><rect stroke="#047857" stroke-width="1" fill="#a7f3d0" x="580" y="656" width="460" height="34" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="11px" fill="#065f46" dominant-baseline="hanging" text-anchor="middle" x="810.0" y="666.85"><tspan x="810.0" dy="0em">POST /_apis/v1/Logfiles/... (create + append step log chunks)</tspan></text><rect stroke="#047857" stroke-width="1" fill="#a7f3d0" x="580" y="692" width="460" height="50" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="11px" fill="#065f46" dominant-baseline="hanging" text-anchor="middle" x="810.0" y="702.7"><tspan x="810.0" dy="0em">POST /twirp/github.actions.results.api.v1.WorkflowStepUpdateService</tspan><tspan x="810.0" dy="1.3em">POST /twirp/results.services.receiver.Receiver/*</tspan></text><rect stroke="#dc2626" stroke-width="1" fill="#fee2e2" stroke-dasharray="6,6" x="580" y="748" width="460" height="60" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="10px" fill="#991b1b" dominant-baseline="hanging" text-anchor="middle" x="810.0" y="758.5"><tspan x="810.0" dy="0em">POST /twirp/...CacheService/*  (GetCacheEntryDownloadURL, etc.)</tspan><tspan x="810.0" dy="1.3em">POST /twirp/...ArtifactService/* (CreateArtifact, FinalizeArtifact, etc.)</tspan><tspan x="810.0" dy="1.3em">(STUB — returns shape-correct 200 but no real storage backend)</tspan></text><rect stroke="#1e40af" stroke-width="1" fill="#dbeafe" stroke-dasharray="6,6" x="580" y="814" width="460" height="60" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="10px" fill="#1e40af" dominant-baseline="hanging" text-anchor="middle" x="810.0" y="824.5"><tspan x="810.0" dy="0em">POST launch.actions.githubusercontent.com/actions/build/...</tspan><tspan x="810.0" dy="1.3em">GET codeload.github.com/actions/checkout/tar.gz/...</tspan><tspan x="810.0" dy="1.3em">(NOT IMPLEMENTED — runner connects directly to GitHub)</tspan></text><ellipse stroke="#1e3a5f" stroke-width="1" fill="#3b82f6" cx="281.0" cy="1067.0" rx="7.0" ry="7.0" /><text font-family="system-ui, sans-serif" font-size="15px" fill="#1e40af" dominant-baseline="hanging" text-anchor="start" x="310" y="1056"><tspan x="310" dy="0em">5. Completion</tspan></text><rect stroke="#047857" stroke-width="1" fill="#a7f3d0" x="580" y="960" width="460" height="34" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="11px" fill="#065f46" dominant-baseline="hanging" text-anchor="middle" x="810.0" y="970.85"><tspan x="810.0" dy="0em">POST /_apis/v1/FinishJob/...  (delivers job outputs + result)</tspan></text><rect stroke="#047857" stroke-width="1" fill="#a7f3d0" x="580" y="996" width="460" height="34" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="11px" fill="#065f46" dominant-baseline="hanging" text-anchor="middle" x="810.0" y="1006.85"><tspan x="810.0" dy="0em">POST /broker/1/completejob  (releases the job lease in aksh)</tspan></text><rect stroke="#047857" stroke-width="1" fill="#a7f3d0" x="580" y="1032" width="460" height="34" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="11px" fill="#065f46" dominant-baseline="hanging" text-anchor="middle" x="810.0" y="1042.85"><tspan x="810.0" dy="0em">DELETE /pools/1/sessions  (teardown session)</tspan></text><rect stroke="#047857" stroke-width="1" fill="#a7f3d0" x="580" y="1068" width="460" height="34" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="11px" fill="#065f46" dominant-baseline="hanging" text-anchor="middle" x="810.0" y="1078.85"><tspan x="810.0" dy="0em">DELETE /pools/1/agents/4  (deregisters agent on clean listener exit)</tspan></text><rect stroke="#64748b" stroke-width="1" fill="#f8fafc" x="1080" y="960" width="400" height="140" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="14px" fill="#374151" dominant-baseline="hanging" text-anchor="middle" x="1280.0" y="968"><tspan x="1280.0" dy="0em">Legend</tspan></text><text font-family="system-ui, sans-serif" font-size="11px" fill="#374151" dominant-baseline="hanging" text-anchor="start" x="1094" y="994"><tspan x="1094" dy="0em">Solid green border  =  working end-to-end</tspan><tspan x="1094" dy="1.3em">Dashed red border   =  stub / shape-correct 200</tspan><tspan x="1094" dy="1.3em">                             no real storage or network call</tspan><tspan x="1094" dy="1.3em">Dashed blue border  =  not implemented</tspan></text></svg>
+              </div>
+            </div>
+            <div class="sidebar">
+              <h3>Runner Protocol Flow</h3>
+              <p>
+                Vertical lifecycle timeline mapping every HTTP request the official runner binary performs when executing against the control plane.
+              </p>
+              <div class="sidebar-block">
+                <h4 class="legend-lbl lbl-green">Key Stages</h4>
+                <p class="detail-text"><strong>1. Registration:</strong> exchanges listener token and registers agent RSA public key.</p>
+                <p class="detail-text"><strong>2. Wait:</strong> long-poll endpoint returns job or 202 timeout.</p>
+                <p class="detail-text"><strong>3. Acquire:</strong> acquires job steps, env, and secrets.</p>
+                <p class="detail-text"><strong>4. Execution:</strong> streams logs and timelines.</p>
+                <p class="detail-text"><strong>5. Completion:</strong> reports status, outputs, and tears down session.</p>
+              </div>
+            </div>
+          </div>
+        </div>
 
-  <div class="timeline">
-    <div class="timeline-item">
-      <div class="label">1. Submission</div>
-      <h4>Workflow arrives</h4>
-      <p>A CLI, agent, or API submits <code>POST /api/v1/runs</code> with the YAML workflow, event name, payload, secrets, and optional reusable workflow YAML. aksh parses it, checks the trigger matches, expands the matrix, and queues expanded jobs.</p>
-    </div>
-    <div class="timeline-item">
-      <div class="label">2. Runner Registration</div>
-      <h4>Runner connects and authenticates</h4>
-      <p>The runner first calls <code>GET /_apis/connectionData</code> to discover service endpoints. It registers via <code>POST /_apis/.../agents</code> (sending its RSA public key), then creates an encrypted session via <code>POST /_apis/.../sessions</code> — aksh generates a random AES key and RSA-wraps it for the runner.</p>
-    </div>
-    <div class="timeline-item">
-      <div class="label">3. Job Delivery</div>
-      <h4>Encrypted message via long-poll</h4>
-      <p>The runner long-polls <code>GET /_apis/.../messages?sessionId&lastMessageId</code>. When a job is ready, aksh builds a fully-resolved <code>AgentJobRequestMessage</code> (all <code>${{ }}</code> expressions evaluated, variables materialized, secrets masked, <code>maskHints</code> set, service endpoints attached), AES-encrypts the body, wraps it in a <code>TaskAgentMessage</code>, and delivers it. The runner decrypts with its session key and starts executing.</p>
-    </div>
-    <div class="timeline-item">
-      <div class="label">4. Execution Feedback</div>
-      <h4>Timeline, logs, annotations stream back</h4>
-      <p>As steps run, the runner PATCHes <code>TimelineRecord</code>s (step state, result, issues/annotations), creates and appends log files, streams live console lines, and reports job completion with outputs. aksh projects all of this into run state and emits NDJSON events for agents.</p>
-    </div>
-    <div class="timeline-item">
-      <div class="label">5. Completion</div>
-      <h4>Outputs, needs-gating, next jobs</h4>
-      <p>On <code>JobCompleted</code>, aksh persists the job's outputs and updates the run status. The scheduler checks if any downstream jobs' <code>needs</code> are now satisfied, evaluates their <code>if</code> conditions against real job-status functions, and dispatches the next eligible jobs.</p>
-    </div>
-    <div class="timeline-item">
-      <div class="label">6. Cleanup</div>
-      <h4>Ephemeral runner torn down</h4>
-      <p>If the runner was provisioned by an ephemeral provider, aksh tells the provider to terminate it. If BYO, the runner stays. Either way, the run record with all timeline data, logs, and annotations persists.</p>
-    </div>
-  </div>
-</section>
+        <!-- Tab 3: Workflow Engine -->
+        <div id="panel-engine" class="tab-panel">
+          <div class="flex-layout">
+            <div class="diagram-viewport">
+              <div class="diagram-viewport-content">
+                <svg style="width: 100%; height: auto; display: block; max-width: 100%;" xmlns="http://www.w3.org/2000/svg" width="2260" height="780" viewBox="10 -30 2260 780" style="background-color: #ffffff;"><defs><marker id="arrow-047857" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#047857" /></marker><marker id="arrow-b45309" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#b45309" /></marker><marker id="arrow-c2410c" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#c2410c" /></marker><marker id="arrow-1e3a5f" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#1e3a5f" /></marker></defs><text font-family="system-ui, sans-serif" font-size="38px" fill="#1e40af" dominant-baseline="hanging" text-anchor="middle" x="1300.0" y="20"><tspan x="1300.0" dy="0em">aksh Workflow Engine</tspan></text><text font-family="system-ui, sans-serif" font-size="16px" fill="#3b82f6" dominant-baseline="hanging" text-anchor="middle" x="1300.0" y="70"><tspan x="1300.0" dy="0em">Transformation assembly line: how workflow YAML becomes target-dispatched runner messages</tspan></text><ellipse stroke="#c2410c" stroke-width="2" fill="#fed7aa" cx="150.0" cy="300.0" rx="90.0" ry="40.0" /><text font-family="system-ui, sans-serif" font-size="16px" fill="#7c2d12" dominant-baseline="hanging" text-anchor="middle" x="150.0" y="289.6"><tspan x="150.0" dy="0em">workflow.yml</tspan></text><rect stroke="#047857" stroke-width="2" fill="#a7f3d0" x="320" y="260" width="180" height="80" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="13px" fill="#065f46" dominant-baseline="hanging" text-anchor="middle" x="410.0" y="274.65"><tspan x="410.0" dy="0em">Parse &amp; Model</tspan><tspan x="410.0" dy="1.3em">(aksh-gha-parser)</tspan><tspan x="410.0" dy="1.3em">parse_workflow()</tspan></text><text font-family="system-ui, sans-serif" font-size="12px" fill="#78350f" dominant-baseline="hanging" text-anchor="middle" x="670.0" y="284.4"><tspan x="670.0" dy="0em">Trigger matches?</tspan><tspan x="670.0" dy="1.3em">Trigger::matches_with_context()</tspan></text><rect stroke="#047857" stroke-width="2" fill="#a7f3d0" x="840" y="260" width="180" height="80" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="13px" fill="#065f46" dominant-baseline="hanging" text-anchor="middle" x="930.0" y="274.65"><tspan x="930.0" dy="0em">Matrix Expansion</tspan><tspan x="930.0" dy="1.3em">expand_matrix()</tspan><tspan x="930.0" dy="1.3em">(matrix × N jobs)</tspan></text><path stroke="#1e3a5f" stroke-width="2" fill="none" d="M 1180 200 L 1180 400" /><path stroke="#1e3a5f" stroke-width="2" fill="none" d="M 1180 240 L 1260 200" /><path stroke="#1e3a5f" stroke-width="2" fill="none" d="M 1180 360 L 1260 400" /><text font-family="system-ui, sans-serif" font-size="12px" fill="#065f46" dominant-baseline="hanging" text-anchor="start" x="1270" y="185"><tspan x="1270" dy="0em">build (Ubuntu / macOS)</tspan></text><text font-family="system-ui, sans-serif" font-size="12px" fill="#64748b" dominant-baseline="hanging" text-anchor="start" x="1270" y="385"><tspan x="1270" dy="0em">test  (needs: build)</tspan></text><text font-family="system-ui, sans-serif" font-size="13px" fill="#1e40af" dominant-baseline="hanging" text-anchor="middle" x="1280.0" y="140"><tspan x="1280.0" dy="0em">5. Needs DAG Gating</tspan></text><text font-family="system-ui, sans-serif" font-size="10px" fill="#64748b" dominant-baseline="hanging" text-anchor="middle" x="1280.0" y="440"><tspan x="1280.0" dy="0em">Gated scheduler in aksh-runner-server</tspan><tspan x="1280.0" dy="1.3em">Holds test job until build outputs complete</tspan></text><rect stroke="#047857" stroke-width="2" fill="#a7f3d0" x="1460" y="260" width="180" height="80" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="13px" fill="#065f46" dominant-baseline="hanging" text-anchor="middle" x="1550.0" y="274.65"><tspan x="1550.0" dy="0em">Job Queue</tspan><tspan x="1550.0" dy="1.3em">VecDeque&lt;QueuedJob&gt;</tspan><tspan x="1550.0" dy="1.3em">Notify wakes polls</tspan></text><rect stroke="#047857" stroke-width="2" fill="#a7f3d0" x="1740" y="260" width="200" height="80" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="12px" fill="#065f46" dominant-baseline="hanging" text-anchor="middle" x="1840.0" y="276.6"><tspan x="1840.0" dy="0em">Encrypt &amp; Dispatch</tspan><tspan x="1840.0" dy="1.3em">AES-CBC encrypted body</tspan><tspan x="1840.0" dy="1.3em">Wrapped in agent public key</tspan></text><ellipse stroke="#047857" stroke-width="2" fill="#a7f3d0" cx="2130.0" cy="300.0" rx="90.0" ry="40.0" /><text font-family="system-ui, sans-serif" font-size="16px" fill="#065f46" dominant-baseline="hanging" text-anchor="middle" x="2130.0" y="289.6"><tspan x="2130.0" dy="0em">Runner Listener</tspan></text><path stroke="#cbd5e1" stroke-width="1" fill="none" stroke-dasharray="6,6" d="M 60 560 L 2220 560" /><text font-family="system-ui, sans-serif" font-size="15px" fill="#1e40af" dominant-baseline="hanging" text-anchor="start" x="60" y="590"><tspan x="60" dy="0em">Expression Evaluation Engine (aksh-gha-expressions)</tspan></text><rect stroke="#047857" stroke-width="2" fill="#a7f3d0" x="60" y="630" width="1100" height="70" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="12px" fill="#065f46" dominant-baseline="hanging" text-anchor="middle" x="610.0" y="649.4"><tspan x="610.0" dy="0em">Input Expression: ${{ matrix.version == 18 &amp;&amp; success() }}   →   Pratt Parser   →   AST Evaluation Node</tspan><tspan x="610.0" dy="1.3em">Resolves values from:  matrix  ·  env  ·  steps  ·  jobs  ·  github  contexts  +  success()/failure()/cancelled() state functions</tspan></text><path stroke="#c2410c" stroke-width="2" fill="none" d="M 242 300 L 318 300" marker-end="url(#arrow-c2410c)" /><path stroke="#047857" stroke-width="2" fill="none" d="M 502 300 L 578 300" marker-end="url(#arrow-047857)" /><path stroke="#b45309" stroke-width="2" fill="none" d="M 762 300 L 838 300" marker-end="url(#arrow-b45309)" /><path stroke="#047857" stroke-width="2" fill="none" d="M 1022 300 L 1150 300" marker-end="url(#arrow-047857)" /><path stroke="#1e3a5f" stroke-width="2" fill="none" d="M 1412 300 L 1458 300" marker-end="url(#arrow-1e3a5f)" /><path stroke="#047857" stroke-width="2" fill="none" d="M 1642 300 L 1738 300" marker-end="url(#arrow-047857)" /><path stroke="#047857" stroke-width="2" fill="none" d="M 1942 300 L 2038 300" marker-end="url(#arrow-047857)" /><path stroke="#047857" stroke-width="1" fill="none" stroke-dasharray="6,6" d="M 610 628 L 900 340" marker-end="url(#arrow-047857)" /><path stroke="#047857" stroke-width="1" fill="none" stroke-dasharray="6,6" d="M 610 628 L 1250 400" marker-end="url(#arrow-047857)" /></svg>
+              </div>
+            </div>
+            <div class="sidebar">
+              <h3>Workflow Engine</h3>
+              <p>
+                How a submitted YAML workflow goes through the parser, trigger matching, matrix expansion, and the dependency-gated Needs DAG scheduler.
+              </p>
+              <div class="sidebar-block">
+                <h4 class="legend-lbl lbl-green">Internal Crates</h4>
+                <p class="detail-text"><code>aksh-gha-parser</code>: parses YAML, runs Cartesian matrix expansion, handles triggers.</p>
+                <p class="detail-text"><code>aksh-gha-expressions</code>: Pratt parser and evaluator for GHA expression contexts.</p>
+                <p class="detail-text"><code>aksh-runner-server</code>: manages job queues and gates task execution on Needs dependencies.</p>
+              </div>
+            </div>
+          </div>
+        </div>
 
-<!-- ============================================================ -->
-<section>
-  <h2>Pluggable Backends</h2>
-  <p class="subtitle">One control plane. Any execution substrate.</p>
+        <!-- Tab 4: Protocol Sync -->
+        <div id="panel-sync" class="tab-panel">
+          <div class="flex-layout">
+            <div class="diagram-viewport">
+              <div class="diagram-viewport-content">
+                <svg style="width: 100%; height: auto; display: block; max-width: 100%;" xmlns="http://www.w3.org/2000/svg" width="2140" height="800" viewBox="10 -30 2140 800" style="background-color: #ffffff;"><defs><marker id="arrow-6d28d9" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#6d28d9" /></marker><marker id="arrow-b45309" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#b45309" /></marker><marker id="arrow-047857" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#047857" /></marker><marker id="arrow-c2410c" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#c2410c" /></marker></defs><text font-family="system-ui, sans-serif" font-size="38px" fill="#1e40af" dominant-baseline="hanging" text-anchor="middle" x="1300.0" y="20"><tspan x="1300.0" dy="0em">Automated Protocol Sync</tspan></text><text font-family="system-ui, sans-serif" font-size="16px" fill="#3b82f6" dominant-baseline="hanging" text-anchor="middle" x="1300.0" y="70"><tspan x="1300.0" dy="0em">The runner-watch pipeline: continuous tracking, AI code generation, and golden replay validation</tspan></text><ellipse stroke="#c2410c" stroke-width="2" fill="#fed7aa" cx="150.0" cy="200.0" rx="90.0" ry="40.0" /><text font-family="system-ui, sans-serif" font-size="12px" fill="#7c2d12" dominant-baseline="hanging" text-anchor="middle" x="150.0" y="176.6"><tspan x="150.0" dy="0em">Release Watcher</tspan><tspan x="150.0" dy="1.3em">Polls GitHub releases</tspan><tspan x="150.0" dy="1.3em">ATOM feed</tspan></text><rect stroke="#047857" stroke-width="2" fill="#a7f3d0" x="320" y="160" width="180" height="80" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="12px" fill="#065f46" dominant-baseline="hanging" text-anchor="middle" x="410.0" y="176.6"><tspan x="410.0" dy="0em">Source Differ</tspan><tspan x="410.0" dy="1.3em">Listener/Worker/Common</tspan><tspan x="410.0" dy="1.3em">Finds added DTOs/calls</tspan></text><rect stroke="#047857" stroke-width="2" fill="#a7f3d0" x="580" y="160" width="180" height="80" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="12px" fill="#065f46" dominant-baseline="hanging" text-anchor="middle" x="670.0" y="176.6"><tspan x="670.0" dy="0em">Triage Specs</tspan><tspan x="670.0" dy="1.3em">Emits target TOML specs</tspan><tspan x="670.0" dy="1.3em">for changed surface</tspan></text><rect stroke="#6d28d9" stroke-width="2" fill="#ddd6fe" x="840" y="160" width="180" height="80" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="12px" fill="#5b21b6" dominant-baseline="hanging" text-anchor="middle" x="930.0" y="176.6"><tspan x="930.0" dy="0em">AI Categorizer</tspan><tspan x="930.0" dy="1.3em">Claude triage</tspan><tspan x="930.0" dy="1.3em">(blocker, concern, etc.)</tspan></text><rect stroke="#6d28d9" stroke-width="2" fill="#ddd6fe" x="1100" y="160" width="180" height="80" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="12px" fill="#5b21b6" dominant-baseline="hanging" text-anchor="middle" x="1190.0" y="176.6"><tspan x="1190.0" dy="0em">Code Generator</tspan><tspan x="1190.0" dy="1.3em">Claude implements</tspan><tspan x="1190.0" dy="1.3em">Auto check loop (max 10)</tspan></text><rect stroke="#b45309" stroke-width="2" fill="#fef3c7" x="1360" y="160" width="180" height="80" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="12px" fill="#78350f" dominant-baseline="hanging" text-anchor="middle" x="1450.0" y="176.6"><tspan x="1450.0" dy="0em">Conformance Gate</tspan><tspan x="1450.0" dy="1.3em">MITM Replay against aksh</tspan><tspan x="1450.0" dy="1.3em">Runs compare.rs</tspan></text><ellipse stroke="#047857" stroke-width="2" fill="#a7f3d0" cx="1710.0" cy="200.0" rx="90.0" ry="40.0" /><text font-family="system-ui, sans-serif" font-size="12px" fill="#065f46" dominant-baseline="hanging" text-anchor="middle" x="1710.0" y="176.6"><tspan x="1710.0" dy="0em">Draft PR</tspan><tspan x="1710.0" dy="1.3em">1 PR per runner release</tspan><tspan x="1710.0" dy="1.3em">Auto-merge nit-only</tspan></text><path stroke="#c2410c" stroke-width="2" fill="none" d="M 242 200 L 318 200" marker-end="url(#arrow-c2410c)" /><path stroke="#047857" stroke-width="2" fill="none" d="M 502 200 L 578 200" marker-end="url(#arrow-047857)" /><path stroke="#047857" stroke-width="2" fill="none" d="M 762 200 L 838 200" marker-end="url(#arrow-047857)" /><path stroke="#6d28d9" stroke-width="2" fill="none" d="M 1022 200 L 1098 200" marker-end="url(#arrow-6d28d9)" /><path stroke="#6d28d9" stroke-width="2" fill="none" d="M 1282 200 L 1358 200" marker-end="url(#arrow-6d28d9)" /><path stroke="#b45309" stroke-width="2" fill="none" d="M 1542 200 L 1618 200" marker-end="url(#arrow-b45309)" /><path stroke="#047857" stroke-width="3" fill="none" d="M 1710 242 L 1710 392 L 160 392 L 160 292" marker-end="url(#arrow-047857)" /><text font-family="system-ui, sans-serif" font-size="13px" fill="#065f46" dominant-baseline="hanging" text-anchor="middle" x="1000.0" y="400"><tspan x="1000.0" dy="0em">Next runner release...</tspan></text><path stroke="#cbd5e1" stroke-width="1" fill="none" stroke-dasharray="6,6" d="M 60 480 L 1800 480" /><text font-family="system-ui, sans-serif" font-size="15px" fill="#1e40af" dominant-baseline="hanging" text-anchor="start" x="60" y="500"><tspan x="60" dy="0em">Conformance Harness Detail  (Verification Gate)</tspan></text><rect stroke="#047857" stroke-width="2" fill="#a7f3d0" x="60" y="540" width="500" height="180" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="11px" fill="#065f46" dominant-baseline="hanging" text-anchor="start" x="70" y="579.95"><tspan x="70" dy="0em">1. Golden Capture  (One-time)</tspan><tspan x="70" dy="1.3em">- record.sh intercepts runner using mitmproxy</tspan><tspan x="70" dy="1.3em">- Captures official GHA backend responses</tspan><tspan x="70" dy="1.3em">- Saves flows.jsonl (sequence of request/response objects)</tspan><tspan x="70" dy="1.3em">- Scenarios 06 to 15 represent workflow surface areas</tspan><tspan x="70" dy="1.3em">  (multistep, step failure, needs DAG, matrix expansion,</tspan><tspan x="70" dy="1.3em">   OIDC id-token, artifacts, composite actions, etc.)</tspan></text><rect stroke="#047857" stroke-width="2" fill="#a7f3d0" x="590" y="540" width="500" height="180" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="11px" fill="#065f46" dominant-baseline="hanging" text-anchor="start" x="600" y="572.8"><tspan x="600" dy="0em">2. Replay &amp; Compare  (Pure Rust)</tspan><tspan x="600" dy="1.3em">- runner-watch loads flows.jsonl for target scenario</tspan><tspan x="600" dy="1.3em">- materialise_replay_state pre-queues mock GHA jobs</tspan><tspan x="600" dy="1.3em">- Replays request flow sequentially to aksh via reqwest</tspan><tspan x="600" dy="1.3em">- rewrite_replay_body maps golden message IDs to aksh IDs</tspan><tspan x="600" dy="1.3em">- compare.rs compares status codes against golden baseline</tspan><tspan x="600" dy="1.3em">- Skips capture artifact flows with null status (None-status)</tspan><tspan x="600" dy="1.3em">- Ignores un-replayable PKI/OAuth &amp; timing message polls</tspan></text><rect stroke="#dc2626" stroke-width="2" fill="#fee2e2" stroke-dasharray="6,6" x="1120" y="540" width="500" height="180" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="11px" fill="#991b1b" dominant-baseline="hanging" text-anchor="start" x="1130" y="579.95"><tspan x="1130" dy="0em">3. Replay Caveats  (Honest gaps)</tspan><tspan x="1130" dy="1.3em">- CacheService stubs return cache-miss and fake urls</tspan><tspan x="1130" dy="1.3em">- ArtifactService stubs return fake URLs, empty list</tspan><tspan x="1130" dy="1.3em">- Action resolution / tarball download calls to codeload</tspan><tspan x="1130" dy="1.3em">  and launch are in should_skip_replay_path and skipped</tspan><tspan x="1130" dy="1.3em">- Gate passes when HTTP status codes match baseline</tspan><tspan x="1130" dy="1.3em">- Body content and actual cache/artifact bytes are not verified</tspan></text><rect stroke="#64748b" stroke-width="1" fill="#f8fafc" x="1650" y="540" width="290" height="180" rx="8" ry="8" /><text font-family="system-ui, sans-serif" font-size="13px" fill="#374151" dominant-baseline="hanging" text-anchor="middle" x="1795.0" y="548"><tspan x="1795.0" dy="0em">Legend</tspan></text><text font-family="system-ui, sans-serif" font-size="10px" fill="#374151" dominant-baseline="hanging" text-anchor="start" x="1664" y="574"><tspan x="1664" dy="0em">Solid green   = working</tspan><tspan x="1664" dy="1.3em">Dashed red    = stub / mocked</tspan><tspan x="1664" dy="1.3em">Dashed blue   = not implemented</tspan><tspan x="1664" dy="1.3em">Solid purple  = AI pipeline step</tspan><tspan x="1664" dy="1.3em">Solid orange  = trigger event</tspan><tspan x="1664" dy="1.3em">Solid yellow  = decision point</tspan></text></svg>
+              </div>
+            </div>
+            <div class="sidebar">
+              <h3>Protocol Sync</h3>
+              <p>
+                The runner-watcher pipeline: monitors releases, diffs dotnet code, writes TOML specs, runs Claude codegen, checks builds, and runs the conformance replay gate.
+              </p>
+              <div class="sidebar-block">
+                <h4 class="legend-lbl lbl-green">Harness Details</h4>
+                <p class="detail-text">Golden captures from mitmproxy are replayed. compare.rs runs as a pure-Rust comparative check on HTTP response status codes.</p>
+              </div>
+            </div>
+          </div>
+        </div>
 
-  <p>aksh doesn't hardcode how runners are created. It defines a <code>RunnerProvider</code> trait that any backend implements:</p>
+        <!-- Tab 5: Concurrent Walkthrough -->
+        <div id="panel-concurrency" class="tab-panel">
+          <div class="flex-layout">
+            <div style="flex: 1; width: 100%;">
+              <div class="walkthrough-step">
+                <div class="step-number">01</div>
+                <div class="step-content">
+                  <div class="step-title">Parallel Submission (api/v1/runs)</div>
+                  <div class="step-desc">Two separate POST requests hit <code>aksh-runner-server</code>.</div>
+                  <div class="step-grid">
+                    <div class="step-card">
+                      <span class="card-label">workflow-a.yml</span>
+                      <pre class="card-code">
+jobs:
+  build:
+    runs-on: self-hosted
+  test:
+    needs: build
+    runs-on: self-hosted
+                      </pre>
+                    </div>
+                    <div class="step-card">
+                      <span class="card-label">workflow-b.yml</span>
+                      <pre class="card-code">
+jobs:
+  lint:
+    runs-on: self-hosted
+                      </pre>
+                    </div>
+                  </div>
+                </div>
+              </div>
 
-  <div class="code-block"><pre>
-<span style="color:var(--accent2)">pub trait</span> RunnerProvider: Send + Sync {
-    <span style="color:var(--text-dim)">/// Labels this provider can satisfy.</span>
-    <span style="color:var(--accent2)">fn</span> labels(&amp;self) -&gt; &amp;LabelMatcher;
+              <div class="walkthrough-step">
+                <div class="step-number">02</div>
+                <div class="step-content">
+                  <div class="step-title">Parsing, Trigger Matching & GHA Expressions</div>
+                  <div class="step-desc">
+                    <code>aksh-gha-parser</code> parses both documents. <code>Trigger::matches_with_context()</code> validates branches. Matrix expansion is evaluated. Since no conditions fail, the engine generates three job specifications:
+                  </div>
+                  <ul style="font-size: 0.8rem; color: #cbd5e1; list-style-type: disc; padding-left: 16px;">
+                    <li><code>Workflow-A: build</code> (Ready for scheduling)</li>
+                    <li><code>Workflow-A: test</code> (Held back — depends on <code>build</code>)</li>
+                    <li><code>Workflow-B: lint</code> (Ready for scheduling)</li>
+                  </ul>
+                </div>
+              </div>
 
-    <span style="color:var(--text-dim)">/// Start a runner that phones home via the normal protocol.</span>
-    <span style="color:var(--accent2)">async fn</span> provision(&amp;self, spec: &amp;RunnerSpec, reg: RunnerRegistration)
-        -&gt; Result&lt;RunnerHandle, ProviderError&gt;;
+              <div class="walkthrough-step">
+                <div class="step-number">03</div>
+                <div class="step-content">
+                  <div class="step-title">Needs DAG Gating & Queue Placement</div>
+                  <div class="step-desc">The scheduler in <code>aksh-runner-server</code> inspects the job relationships and registers them in the state map.</div>
+                  <div class="step-card" style="max-width: 500px;">
+                    <div style="display: flex; justify-content: space-between; font-size: 0.75rem; padding-bottom: 8px;">
+                      <span style="color: #94a3b8;">1. Queue VecDeque (Runnable)</span>
+                      <span style="color: var(--green); font-weight: 600;">[ A.build, B.lint ]</span>
+                    </div>
+                    <div style="display: flex; justify-content: space-between; font-size: 0.75rem; padding-top: 8px; border-top: 1px solid var(--border);">
+                      <span style="color: #94a3b8;">2. Held Gated Map (Pending)</span>
+                      <span style="color: var(--orange); font-weight: 600;">{ A.test: [needs: A.build] }</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
 
-    <span style="color:var(--text-dim)">/// Tear down (ephemeral cleanup).</span>
-    <span style="color:var(--accent2)">async fn</span> terminate(&amp;self, handle: &amp;RunnerHandle) -&gt; Result&lt;(), ProviderError&gt;;
+              <div class="walkthrough-step">
+                <div class="step-number">04</div>
+                <div class="step-content">
+                  <div class="step-title">Concurrent Message Dispatch (Long-Poll)</div>
+                  <div class="step-desc">Two separate runner listeners (Runner 1 and Runner 2) are polling for jobs.</div>
+                  <div class="step-grid">
+                    <div class="step-card">
+                      <span class="card-label">Runner 1 (session s1)</span>
+                      <div class="step-desc" style="margin: 0; font-size: 0.75rem;">Polls messages on session s1. aksh pops <code>A.build</code>, generates <code>TaskAgentMessage</code>, encrypts, and dispatches it.</div>
+                    </div>
+                    <div class="step-card">
+                      <span class="card-label">Runner 2 (session s2)</span>
+                      <div class="step-desc" style="margin: 0; font-size: 0.75rem;">Polls messages on session s2. aksh pops <code>B.lint</code>, generates <code>TaskAgentMessage</code>, encrypts, and dispatches it.</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
 
-    <span style="color:var(--text-dim)">/// Optional capacity for backpressure.</span>
-    <span style="color:var(--accent2)">async fn</span> capacity(&amp;self) -&gt; Capacity { Capacity::unbounded() }
+              <div class="walkthrough-step">
+                <div class="step-number">05</div>
+                <div class="step-content">
+                  <div class="step-title">Parallel Execution & Timeline Streaming</div>
+                  <div class="step-desc">Both runners execute their steps concurrently, streaming progress back to aksh:</div>
+                  <ul style="font-size: 0.8rem; color: #cbd5e1; list-style-type: disc; padding-left: 16px; margin-bottom: 8px;">
+                    <li>Runner 1 calls <code>PATCH /Timeline/A_build</code> with step logs.</li>
+                    <li>Runner 2 calls <code>PATCH /Timeline/B_lint</code> with step logs.</li>
+                    <li>aksh broadcast engine projects these updates into the native <code>NDJSON</code> feed in real-time.</li>
+                  </ul>
+                </div>
+              </div>
+
+              <div class="walkthrough-step">
+                <div class="step-number">06</div>
+                <div class="step-content">
+                  <div class="step-title">DAG Evaluation & Downstream Unlock</div>
+                  <div class="step-desc">Execution continues until completion:</div>
+                  <ul style="font-size: 0.8rem; color: #cbd5e1; list-style-type: disc; padding-left: 16px; display: flex; flex-direction: column; gap: 8px;">
+                    <li><strong>Runner 2 finishes B.lint:</strong> calls <code>FinishJob/B</code>. aksh updates Workflow-B to <code>Success</code>. Runner 2 returns to idle.</li>
+                    <li><strong>Runner 1 finishes A.build:</strong> calls <code>FinishJob/A</code>. aksh saves A.build's outputs. The scheduler evaluates dependencies: A.build is complete, so <code>A.test</code> is unlocked!</li>
+                    <li><strong>A.test is pushed</strong> into the VecDeque queue.</li>
+                    <li><strong>Runner 2 (now idle) polls</strong> <code>GET /messages?sessionId=s2</code>, picks up <code>A.test</code>, and begins execution.</li>
+                  </ul>
+                </div>
+              </div>
+            </div>
+
+            <div class="sidebar">
+              <h3>Walkthrough Details</h3>
+              <p>
+                How aksh coordinates two simultaneous workflow runs using parallel queueing.
+              </p>
+              <div class="sidebar-block">
+                <h4 class="legend-lbl lbl-green">1. State Registry</h4>
+                <p class="detail-text">Both runs write to the same thread-safe <code>SharedState</code> (inside `InnerState` maps). Mutex locks protect the queue, active sessions, and timeline logs.</p>
+                
+                <h4 class="legend-lbl lbl-green">2. Port & Host Separation</h4>
+                <p class="detail-text">The dispatcher knows where to send each job because the <code>session_id</code> maps to the runner's specific registration. Runner 1 (s1) and Runner 2 (s2) remain isolated.</p>
+
+                <h4 class="legend-lbl lbl-green">3. Live NDJSON Projections</h4>
+                <p class="detail-text">The REST API's <code>/events.ndjson</code> stream merges events from both runs. Observers see interleaved updates (e.g. A.build step started, B.lint step completed) indexed by `run_id`.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- Detailed Code/Flow Examples -->
+    <section>
+      <div class="section-header">
+        <h2>Protocol Payload Examples</h2>
+        <p>Real data structures from GHA captures replayed against aksh endpoints.</p>
+      </div>
+      
+      <div class="grid-2">
+        <div class="payload-card">
+          <h4>POST /api/v1/runs  (Workflow Submit)</h4>
+          <p>Payload submitted to the native REST endpoint to launch a workflow.</p>
+          <pre>
+{
+  "workflow_yaml": "on:\n  push:\njobs:\n  build:\n    runs-on: self-hosted\n    steps:\n      - run: echo hello",
+  "event": "push",
+  "payload": {"ref": "refs/heads/main"},
+  "repository": "preloopdev/aksh",
+  "secrets": {"DB_PASSWORD": "secret"},
+  "vars": {"ENV_TARGET": "prod"}
 }
-  </pre></div>
+          </pre>
+        </div>
 
-  <p>The base case is <strong>BYO (Bring Your Own) — no provider needed.</strong> Self-hosted runners just register and poll. aksh works without any provider crate at all.</p>
+        <div class="payload-card">
+          <h4>POST /pools/1/sessions  (Session Handshake)</h4>
+          <p>The server returns the session ID and the session key wrapped with the agent's public RSA key.</p>
+          <pre>
+{
+  "sessionId": "a8ad239e-2df3-4794-a6f6-24f1f19ec8dc",
+  "encryptionKey": {
+    "type": "RSA-wrapped-AES",
+    "value": "h8dF39ksLz0PkdJ39Ksls0921..."
+  }
+}
+          </pre>
+        </div>
 
-  <div class="card-grid">
-    <div class="card">
-      <div class="icon">⚙️</div>
-      <h4>Process Provider</h4>
-      <p>Spawns a <code>Runner.Listener</code> as a child process. Fastest, least isolation. Good for development.</p>
-    </div>
-    <div class="card">
-      <div class="icon">🐳</div>
-      <h4>Container Provider</h4>
-      <p>Docker or Podman. Each job gets its own container. Good isolation, fast startup.</p>
-    </div>
-    <div class="card">
-      <div class="icon">🖥️</div>
-      <h4>libkrun Provider</h4>
-      <p>MicroVM via libkrun. Hardware-level isolation with sub-second boot. What Preloop uses.</p>
-    </div>
-    <div class="card">
-      <div class="icon">☁️</div>
-      <h4>Cloud / Remote Provider</h4>
-      <p>Kubernetes pods, Firecracker VMs, cloud instances. For server-side use.</p>
-    </div>
+        <div class="payload-card">
+          <h4>GET /pools/1/messages  (Decrypted TaskAgentMessage)</h4>
+          <p>The message envelope dispatched during long-polling contains the broker endpoint details.</p>
+          <pre>
+{
+  "runner_request_id": "bcf61915-6004-419f-ad31-a4a57809d744",
+  "run_service_url": "http://127.0.0.1:80/broker/1/",
+  "billing_owner_id": "local",
+  "should_acknowledge": true
+}
+          </pre>
+        </div>
+
+        <div class="payload-card">
+          <h4>POST /twirp/.../GetCacheEntryDownloadURL  (Cache stub)</h4>
+          <p>Cache v4 Twirp stub return payload. Always signals a cache miss so the runner continues executing cleanly.</p>
+          <pre>
+{
+  "ok": true,
+  "signed_download_url": "",
+  "matched_key": ""
+}
+          </pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- Crate Component Guide -->
+    <section>
+      <div class="section-header">
+        <h2>Crate Architecture</h2>
+        <p>How the codebase is divided into modular, independent Rust crates.</p>
+      </div>
+
+      <div class="grid-3">
+        <div class="component-card">
+          <div class="component-badge">SRV</div>
+          <h4>aksh-runner-server</h4>
+          <p>
+            HTTP server written in Axum. Handles AzDO compatible endpoints, OAuth token generation, long-polling queues, broker endpoints, results Twirp services, and OIDC tokens.
+          </p>
+        </div>
+        <div class="component-card">
+          <div class="component-badge">PAR</div>
+          <h4>aksh-gha-parser</h4>
+          <p>
+            Typed GHA workflow representation. Parses GHA YAML workflows, expands job matrices, handles branch/tag/path/trigger matching rules, and designs the Needs dependency graph.
+          </p>
+        </div>
+        <div class="component-card">
+          <div class="component-badge">EXP</div>
+          <h4>aksh-gha-expressions</h4>
+          <p>
+            GHA Pratt parser and evaluator. Resolves expressions like <code>${ matrix.os == 'ubuntu-latest' && success() }</code> against runtime context maps.
+          </p>
+        </div>
+        <div class="component-card">
+          <div class="component-badge">PRT</div>
+          <h4>aksh-gha-protocol</h4>
+          <p>
+            Domain and wire data transfer models (DTOs) for the runner protocol. Handles serialization, encrypted envelope structs, and timeline record definitions.
+          </p>
+        </div>
+        <div class="component-card">
+          <div class="component-badge">MEM</div>
+          <h4>aksh-cache / aksh-artifacts</h4>
+          <p>
+            In-memory Cache and Artifact storage providers (v1 format). Used to support artifact exchanges and timeline uploads in local dev scenarios.
+          </p>
+        </div>
+        <div class="component-card">
+          <div class="component-badge">CON</div>
+          <h4>aksh-conformance</h4>
+          <p>
+            Verification harness. Integrates with the `runner-watch` tool to run golden capture replays, compare HTTP statuses, and verify control-plane behavior.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <!-- Conformance Scorecard / Progress -->
+    <section>
+      <div class="section-header">
+        <h2>Conformance Scorecard</h2>
+        <p>Verifying aksh against upstream GHA runner v2.335.1 protocol captures.</p>
+      </div>
+
+      <div class="scorecard-container">
+        <table>
+          <thead>
+            <tr>
+              <th>Scenario</th>
+              <th>Surface Exercised</th>
+              <th>aksh Status</th>
+              <th>Gate Result</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>06-multi-step</strong></td>
+              <td>Step sequence, environment vars, log timeline</td>
+              <td><span class="status-text status-working"><span class="status-dot"></span>working</span></td>
+              <td><span class="badge-pass">PASS ✅</span></td>
+            </tr>
+            <tr>
+              <td><strong>07-step-failure</strong></td>
+              <td>Step failure rules, conditional execution, cleanup steps</td>
+              <td><span class="status-text status-working"><span class="status-dot"></span>working</span></td>
+              <td><span class="badge-pass">PASS ✅</span></td>
+            </tr>
+            <tr>
+              <td><strong>08-job-outputs-needs</strong></td>
+              <td>Needs DAG scheduling, outputs propagation between jobs</td>
+              <td><span class="status-text status-working"><span class="status-dot"></span>working</span></td>
+              <td><span class="badge-pass">PASS ✅</span></td>
+            </tr>
+            <tr>
+              <td><strong>09-matrix-fan-out</strong></td>
+              <td>Cartesian grid matrix expansion, concurrent dispatch</td>
+              <td><span class="status-text status-working"><span class="status-dot"></span>working</span></td>
+              <td><span class="badge-pass">PASS ✅</span></td>
+            </tr>
+            <tr>
+              <td><strong>10-uses-checkout</strong></td>
+              <td>Download step resolution (bypassed direct-to-GitHub)</td>
+              <td><span class="status-text status-bypassed"><span class="status-dot"></span>bypassed</span></td>
+              <td><span class="badge-pass">PASS ✅</span></td>
+            </tr>
+            <tr>
+              <td><strong>11-cache-roundtrip</strong></td>
+              <td>Modern cache save/restore Twirp stubs</td>
+              <td><span class="status-text status-mocked"><span class="status-dot"></span>stub / mocked</span></td>
+              <td><span class="badge-pass">PASS ✅</span></td>
+            </tr>
+            <tr>
+              <td><strong>12-artifact</strong></td>
+              <td>Artifact create/finalize/list Twirp stubs</td>
+              <td><span class="status-text status-mocked"><span class="status-dot"></span>stub / mocked</span></td>
+              <td><span class="badge-pass">PASS ✅</span></td>
+            </tr>
+            <tr>
+              <td><strong>13-composite-action</strong></td>
+              <td>Composite action resolution & local checkout</td>
+              <td><span class="status-text status-bypassed"><span class="status-dot"></span>bypassed</span></td>
+              <td><span class="badge-pass">PASS ✅</span></td>
+            </tr>
+            <tr>
+              <td><strong>14-annotations</strong></td>
+              <td>Step console log annotation parses, TimelineRecord updates</td>
+              <td><span class="status-text status-working"><span class="status-dot"></span>working</span></td>
+              <td><span class="badge-pass">PASS ✅</span></td>
+            </tr>
+            <tr>
+              <td><strong>15-oidc-id-token</strong></td>
+              <td>OIDC JWT token generation for audience mapping</td>
+              <td><span class="status-text status-working"><span class="status-dot"></span>working</span></td>
+              <td><span class="badge-pass">PASS ✅</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
   </div>
 
-  <p>Adding a new backend = implement the trait. Zero control-plane edits.</p>
+  <footer>
+    <p>aksh — <a href="https://github.com/preloop/preloop">github.com/preloop/preloop</a> — faithful GitHub Actions control plane in Rust</p>
+    <p style="margin-top:8px; font-size: 0.75rem; color: #475569;">Upstream references: actions/runner & ChristopherHX/runner.server</p>
+  </footer>
 
-  <h3>Local vs Server Profiles</h3>
+  <script>
+    function switchTab(tabId) {
+      // Hide all panels
+      document.querySelectorAll('.tab-panel').forEach(panel => {
+        panel.classList.remove('active');
+      });
+      // Show active panel
+      document.getElementById('panel-' + tabId).classList.add('active');
 
-  <table>
-    <tr><th>Concern</th><th><code>--profile local</code></th><th><code>--profile server</code></th></tr>
-    <tr><td>Runner host</td><td>In-process: process/container/libkrun, ephemeral</td><td>Remote: k8s/Firecracker/cloud pools, or BYO</td></tr>
-    <tr><td>Persistence</td><td>In-memory</td><td>sqlx (SQLite/Postgres)</td></tr>
-    <tr><td>Auth</td><td>Loopback / dev token</td><td>OAuth + mTLS</td></tr>
-    <tr><td>Networking</td><td>127.0.0.1</td><td>Routable URL, token-scoped</td></tr>
-    <tr><td>Secrets</td><td>From submission payload</td><td>Vault / env / AWS SM</td></tr>
-  </table>
-</section>
-
-<!-- ============================================================ -->
-<section>
-  <h2>What Makes aksh Different</h2>
-  <p class="subtitle">Beyond just reimplementing runner.server.</p>
-
-  <div class="card-grid">
-    <div class="card">
-      <div class="icon">📊</div>
-      <h4>NDJSON Agent Feed</h4>
-      <p>A machine-readable event stream derived from timeline records. AI agents can subscribe and react to job status, step completions, annotations — in real time, no polling.</p>
-    </div>
-    <div class="card">
-      <div class="icon">🔒</div>
-      <h4>Redaction-Safe Secrets</h4>
-      <p><code>SecretString</code> type that can never accidentally log a secret value. <code>Debug</code>, <code>Display</code>, and <code>Serialize</code> all emit <code>&lt;redacted&gt;</code>. Raw access requires explicit <code>.expose()</code>.</p>
-    </div>
-    <div class="card">
-      <div class="icon">🧩</div>
-      <h4>Two Protocol Surfaces</h4>
-      <p>The runner-compatible <code>_apis/...</code> surface (source of truth) plus an agent-friendly native REST + NDJSON surface — both reading the same state.</p>
-    </div>
-    <div class="card">
-      <div class="icon">⚡</div>
-      <h4>Small & Fast</h4>
-      <p>4.7MB binary. 8ms startup. 37K req/s. No .NET runtime, no 104MB extraction. Single native process.</p>
-    </div>
-    <div class="card">
-      <div class="icon">🏗️</div>
-      <h4>Crate Boundaries</h4>
-      <p>Separate crates for protocol, parser, expressions, server, client, cache, artifacts, conformance. Each independently testable and replaceable.</p>
-    </div>
-    <div class="card">
-      <div class="icon">✅</div>
-      <h4>Zero Unsafe</h4>
-      <p><code>unsafe_code = "forbid"</code> at workspace level. All external protocol surfaces versioned with golden fixtures.</p>
-    </div>
-  </div>
-</section>
-
-<!-- ============================================================ -->
-<section>
-  <h2>Implementation Roadmap</h2>
-  <p class="subtitle">Phased approach — each phase independently testable.</p>
-
-  <table>
-    <tr><th>Phase</th><th>Goal</th><th>Status</th></tr>
-    <tr>
-      <td><strong>A</strong> — AzDO Wire DTOs</td>
-      <td>Typed, golden-tested wire models for every protocol message</td>
-      <td><span class="score score-orange"></span>partial</td>
-    </tr>
-    <tr>
-      <td><strong>B</strong> — connectionData + Auth</td>
-      <td>Runner discovers endpoints and authenticates</td>
-      <td><span class="score score-red"></span>missing</td>
-    </tr>
-    <tr>
-      <td><strong>C</strong> — Session Crypto</td>
-      <td>RSA/AES key exchange, encrypted message queue</td>
-      <td><span class="score score-red"></span>missing</td>
-    </tr>
-    <tr>
-      <td><strong>D</strong> — Job Message Builder</td>
-      <td>Wire expression evaluator, build <code>AgentJobRequestMessage</code></td>
-      <td><span class="score score-red"></span>missing (engine exists, unwired)</td>
-    </tr>
-    <tr>
-      <td><strong>E</strong> — Timeline + Logs</td>
-      <td>Step status, logs, annotations stream back to server</td>
-      <td><span class="score score-red"></span>missing</td>
-    </tr>
-    <tr>
-      <td><strong>F</strong> — needs DAG + Outputs</td>
-      <td>Dependency-gated scheduling, output propagation</td>
-      <td><span class="score score-red"></span>missing</td>
-    </tr>
-    <tr>
-      <td><strong>G</strong> — Triggers + Matrix Fidelity</td>
-      <td>Branches/tags/paths matching, declaration-order matrix</td>
-      <td><span class="score score-orange"></span>partial</td>
-    </tr>
-    <tr>
-      <td><strong>H</strong> — Actions + Cache + Artifacts</td>
-      <td>Action download, cache/artifact v2 blob protocols</td>
-      <td><span class="score score-orange"></span>partial v1</td>
-    </tr>
-  </table>
-
-  <p>Critical path: <strong>A → B → C → D → E</strong> = first real runner runs one job. Then <strong>F → G → H</strong> = any in-scope workflow works exactly like GitHub.</p>
-</section>
-
-<!-- ============================================================ -->
-<section>
-  <h2>The Name</h2>
-  <p class="subtitle">aksh is the control plane. Preloop is the product.</p>
-
-  <div class="card-grid">
-    <div class="card" style="border-color: var(--accent);">
-      <h4>aksh (this repo)</h4>
-      <p>The GitHub Actions control plane. Reimplements the runner protocol in Rust. Anyone can use it — <code>cargo install aksh</code> — and point their own runners at it. Execution-agnostic.</p>
-    </div>
-    <div class="card">
-      <h4>Preloop (the product)</h4>
-      <p>Combines aksh + a libkrun microVM provider for local CI. The full "submit a workflow, run it in an ephemeral VM, get results" experience. Uses aksh as its control plane.</p>
-    </div>
-  </div>
-
-  <div class="principle">
-    <p><strong>aksh</strong> = the engine. <strong>Preloop</strong> = the car. You can put the engine in any car.</p>
-  </div>
-</section>
-
-</div>
-
-<footer>
-  <p>aksh — <a href="https://github.com/preloop/preloop">github.com/preloop/preloop</a> — faithful GitHub Actions control plane in Rust</p>
-  <p style="margin-top:8px">Upstream reference: <a href="https://github.com/ChristopherHX/runner.server">ChristopherHX/runner.server</a></p>
-</footer>
-
+      // Update button styles
+      document.querySelectorAll('.tab-btn').forEach(btn => {
+        btn.classList.remove('active');
+      });
+      const activeBtn = document.getElementById('btn-' + tabId);
+      activeBtn.classList.add('active');
+    }
+  </script>
 </body>
 </html>

@@ -1,0 +1,16 @@
+description = "Submit a workflow that exercises actions/cache@v4 restore and save behavior."
+duration_seconds_max = 300
+
+[[steps]]
+kind = "submit_workflow"
+path = "11-cache-roundtrip.yml"
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_assigned"
+timeout = 120
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_completed"
+timeout = 240

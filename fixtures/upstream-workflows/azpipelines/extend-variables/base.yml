@@ -1,6 +1,0 @@
-# not supported:
-#variables:
-#  provided: value
-
-steps:
-- script: exit 0
