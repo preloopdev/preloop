@@ -1,0 +1,35 @@
+[[mappings]]
+upstream = "TimelineRecord"
+crate_name = "aksh-gha-protocol"
+path = "crates/aksh-gha-protocol/src/azdo.rs"
+area = "TimelineRecord DTO"
+
+[[mappings]]
+upstream = "AgentRequest"
+crate_name = "aksh-runner-server"
+path = "crates/aksh-runner-server/src/lib.rs"
+area = "AgentRequest routes"
+
+[[mappings]]
+upstream = "ConnectionData"
+crate_name = "aksh-runner-server"
+path = "crates/aksh-runner-server/src/lib.rs"
+area = "connectionData payload"
+
+[[mappings]]
+upstream = "ActionDownloadInfo"
+crate_name = "aksh-runner-server"
+path = "crates/aksh-runner-server/src/lib.rs"
+area = "action download handler"
+
+[[mappings]]
+upstream = "Timeline"
+crate_name = "aksh-runner-server"
+path = "crates/aksh-runner-server/src/lib.rs"
+area = "timeline handlers"
+
+[[mappings]]
+upstream = "Broker"
+crate_name = "aksh-runner-server"
+path = "crates/aksh-runner-server/src/lib.rs"
+area = "broker/admin flow"

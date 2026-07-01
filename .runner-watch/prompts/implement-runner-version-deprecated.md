@@ -1,0 +1,117 @@
+You are implementing an aksh protocol-sync spec. Follow existing Rust patterns exactly. Run cargo check and relevant tests, but do not run formatters or project-wide lint.
+
+Spec:
+```toml
+change_id = "runner-version-deprecated"
+upstream_version = "v2.335.1"
+category = "concern"
+tags = ["protocol", "feature-flag"]
+ai_status = "deterministic-known-fidelity-gap"
+
+[description]
+what = '''
+Server can tell the runner its version is deprecated.
+'''
+why = '''
+GitHub enforces minimum runner versions and reports deprecation through feature/capability responses.
+'''
+runner_behavior = '''
+Runner reads RunnerVersionDeprecated and emits upgrade/deprecation behavior.
+'''
+failure_mode = '''
+Ignoring it hides an upstream control-plane signal; not needed for local aksh execution.
+'''
+
+[feature_flag]
+name = "RunnerVersionDeprecated"
+where = "feature flag response"
+default = false
+
+[wire]
+request = '''
+GET feature/connection capability endpoints
+'''
+expected_response = "JSON flag value"
+
+[aksh_targets]
+files = [
+  { crate = "aksh-runner-server", path = "crates/aksh-runner-server/src/lib.rs", area = "connectionData payload" },
+]
+
+[implementation]
+approach = '''
+Model the flag in capability responses with a safe false default.
+'''
+test = "Capability serialization uses RunnerVersionDeprecated wire name."
+
+[[source_entries]]
+file = "src/Runner.Common/Constants.cs"
+change_type = "protocol_keyword_added"
+fields = ["RunnerVersionDeprecated"]
+snippet = '''
+                // and the runner should be restarted. This is a temporary code and will be removed in the future after
+                // the runner is migrated to runner admin.
+                public const int RunnerConfigurationRefreshed = 6;
+                public const int RunnerVersionDeprecated = 7;
+            }
+
+            public static class Features
+'''
+
+[[source_entries]]
+file = "src/Runner.Listener/Program.cs"
+change_type = "env_var_added"
+fields = ["StringUtil", "ConvertToBoolean", "Environment", "GetEnvironmentVariable", "Constants", "Variables", "Actions", "ReturnVersionDeprecatedExitCode"]
+snippet = '''
+
+        private static int GetRunnerVersionDeprecatedExitCode()
+        {
+            if (StringUtil.ConvertToBoolean(Environment.GetEnvironmentVariable(Constants.Variables.Actions.ReturnVersionDeprecatedExitCode)))
+            {
+                return Constants.Runner.ReturnCode.RunnerVersionDeprecated;
+            }
+'''
+
+[[source_entries]]
+file = "src/Runner.Listener/Program.cs"
+change_type = "protocol_keyword_added"
+fields = ["Constants", "Runner", "ReturnCode", "RunnerVersionDeprecated"]
+snippet = '''
+        {
+            if (StringUtil.ConvertToBoolean(Environment.GetEnvironmentVariable(Constants.Variables.Actions.ReturnVersionDeprecatedExitCode)))
+            {
+                return Constants.Runner.ReturnCode.RunnerVersionDeprecated;
+            }
+
+            return Constants.Runner.ReturnCode.TerminatedError;
+'''
+
+[[source_entries]]
+file = "src/Runner.Listener/Program.cs"
+change_type = "protocol_keyword_added"
+fields = ["GetRunnerVersionDeprecatedExitCode"]
+snippet = '''
+            {
+                terminal.WriteError($"An error occurred: {e.Message}");
+                trace.Error(e);
+                return GetRunnerVersionDeprecatedExitCode();
+            }
+            catch (RunnerNotFoundException e)
+            {
+'''
+
+[[source_entries]]
+file = "src/Runner.Listener/Program.cs"
+change_type = "protocol_keyword_added"
+fields = ["GetRunnerVersionDeprecatedExitCode"]
+snippet = '''
+            }
+        }
+
+        private static int GetRunnerVersionDeprecatedExitCode()
+        {
+            if (StringUtil.ConvertToBoolean(Environment.GetEnvironmentVariable(Constants.Variables.Actions.ReturnVersionDeprecatedExitCode)))
+            {
+'''
+
+```
