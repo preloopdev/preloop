@@ -184,6 +184,7 @@ pub fn build_agent_job_message(
     let request_id: i64 = 1;
 
     Ok(AgentJobRequestMessage {
+        message_type: None,
         job_id,
         request_id,
         plan: PlanReference {

@@ -271,7 +271,9 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         .route("/runner/server/_apis/v1/AgentPools", get(runner_pools))
         .route(
             "/runner/server/_apis/v1/Agent/:pool_id/:agent_id",
-            get(agent_lookup_by_id).post(register_runner_compat),
+            get(agent_lookup_by_id)
+                .post(register_runner_compat)
+                .put(register_runner_compat),
         )
         .route(
             "/runner/server/_apis/v1/Agent/:pool_id",
@@ -323,9 +325,36 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             "/api/v1/runners/sessions/:session_id/messages/:message_id",
             delete(delete_session_message),
         )
-        .route("/runner/session", post(broker_session_root))
+        .route(
+            "/runner/session",
+            post(broker_session_root).delete(broker_delete_session_root),
+        )
         .route("/runner/message", get(next_message_broker_ref_root))
         .route("/runner/acknowledge", post(broker_acknowledge_root))
+        .route(
+            "/runner/server/runner/session",
+            post(broker_session_root).delete(broker_delete_session_root),
+        )
+        .route(
+            "/runner/server/runner/message",
+            get(next_message_broker_ref_root),
+        )
+        .route(
+            "/runner/server/runner/acknowledge",
+            post(broker_acknowledge_root),
+        )
+        .route(
+            "/session",
+            post(broker_session_root).delete(broker_delete_session_root),
+        )
+        .route("/message", get(next_message_broker_ref_root))
+        .route("/acknowledge", post(broker_acknowledge_root))
+        .route(
+            "/runner/server/session",
+            post(broker_session_root).delete(broker_delete_session_root),
+        )
+        .route("/runner/server/message", get(next_message_broker_ref_root))
+        .route("/runner/server/acknowledge", post(broker_acknowledge_root))
         .route("/api/v1/jobs/complete", post(complete_job))
         .route("/api/v1/cache", post(cache_put))
         .route("/api/v1/cache", get(cache_get))
@@ -1014,18 +1043,14 @@ async fn delete_session(
 /// DELETE /runner/server/_apis/distributedtask/pools/:pool_id/agents/:agent_id
 /// Idempotent agent deregistration — the runner calls this on clean exit.
 /// aksh keeps no persistent agent registry so always succeeds.
-async fn delete_agent(
-    Path((_pool_id, _agent_id)): Path<(i64, i64)>,
-) -> StatusCode {
+async fn delete_agent(Path((_pool_id, _agent_id)): Path<(i64, i64)>) -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
 /// DELETE /runner/server/_apis/distributedtask/pools/:pool_id/sessions (no session_id)
 /// Broker-side session teardown: the runner deletes the session-less path on the broker host.
 /// Return 204 unconditionally; the concrete session was already cleaned up individually.
-async fn delete_sessions_for_pool(
-    Path(_pool_id): Path<i64>,
-) -> StatusCode {
+async fn delete_sessions_for_pool(Path(_pool_id): Path<i64>) -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
@@ -1044,6 +1069,16 @@ struct BrokerAcquireJobRequest {
 struct BrokerRenewJobRequest {
     job_id: uuid::Uuid,
     plan_id: String,
+    conclusion: Option<String>,
+}
+
+fn execution_status_from_runner_result(result: &str) -> Option<ExecutionStatus> {
+    match result {
+        "success" | "succeeded" | "succeededWithIssues" => Some(ExecutionStatus::Success),
+        "failure" | "failed" => Some(ExecutionStatus::Failure),
+        "cancelled" | "canceled" => Some(ExecutionStatus::Cancelled),
+        _ => None,
+    }
 }
 
 fn broker_run_service_url(runner_id: i64) -> String {
@@ -1169,9 +1204,16 @@ async fn broker_session_root() -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::CREATED,
         Json(json!({
-            "session_id": uuid::Uuid::new_v4().to_string()
+            "sessionId": uuid::Uuid::new_v4().to_string(),
+            "ownerName": "aksh-runner",
+            "assignmentQueued": false,
+            "orchestrationId": ""
         })),
     )
+}
+
+async fn broker_delete_session_root() -> StatusCode {
+    StatusCode::NO_CONTENT
 }
 
 async fn next_message_broker_ref_root(
@@ -1185,7 +1227,7 @@ async fn next_message_broker_ref_root(
     let wait = params
         .get("waitSeconds")
         .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(0);
+        .unwrap_or(5);
     let deadline = std::time::Instant::now() + Duration::from_secs(wait);
 
     loop {
@@ -1249,7 +1291,7 @@ async fn broker_acknowledge_root(
 
 async fn broker_acquire_job(
     State(shared): State<Arc<SharedState>>,
-    Path(_runner_id): Path<i64>,
+    Path(runner_id): Path<i64>,
     Json(request): Json<BrokerAcquireJobRequest>,
 ) -> Result<Json<azdo::AgentJobRequestMessage>, ApiError> {
     let inner = shared.state.inner.lock().await;
@@ -1259,7 +1301,7 @@ async fn broker_acquire_job(
         .copied()
         .or_else(|| sole_active_unfinished_request(&inner))
         .ok_or_else(|| ApiError::not_found("broker job message not found"))?;
-    let message = inner
+    let mut message = inner
         .broker_messages
         .get(&request_id)
         .cloned()
@@ -1278,6 +1320,22 @@ async fn broker_acquire_job(
             })
         })
         .ok_or_else(|| ApiError::not_found("broker job payload not found"))?;
+    message.message_type = Some(azdo::message_type::RUNNER_JOB_REQUEST.to_owned());
+    let run_service_url = broker_run_service_url(runner_id);
+    for endpoint in &mut message.resources.endpoints {
+        if endpoint.name.eq_ignore_ascii_case("SystemVssConnection") {
+            endpoint.url = Some(run_service_url.clone());
+            endpoint
+                .data
+                .insert("ResultsServiceUrl".to_owned(), public_base_url());
+            endpoint
+                .data
+                .insert("PipelinesServiceUrl".to_owned(), runner_server_url());
+            endpoint
+                .data
+                .insert("CacheServerUrl".to_owned(), public_base_url());
+        }
+    }
     Ok(Json(message))
 }
 
@@ -1307,17 +1365,39 @@ async fn broker_complete_job(
     Path(_runner_id): Path<i64>,
     Json(request): Json<BrokerRenewJobRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let mut inner = shared.state.inner.lock().await;
-    let request_id = inner
-        .agent_job_requests
-        .get(&request.job_id)
-        .copied()
-        .or_else(|| inner.plan_requests.get(&request.plan_id).copied())
-        .or_else(|| sole_active_unfinished_request(&inner))
-        .ok_or_else(|| ApiError::not_found("broker complete request not found"))?;
-    if let Some(record) = inner.job_requests.get_mut(&request_id) {
-        record.result = Some(ExecutionStatus::Success);
-        record.locked_until = agent_request_locked_until();
+    let status = request
+        .conclusion
+        .as_deref()
+        .and_then(execution_status_from_runner_result)
+        .unwrap_or(ExecutionStatus::Success);
+    let completion = {
+        let mut inner = shared.state.inner.lock().await;
+        let request_id = inner
+            .agent_job_requests
+            .get(&request.job_id)
+            .copied()
+            .or_else(|| inner.plan_requests.get(&request.plan_id).copied())
+            .or_else(|| sole_active_unfinished_request(&inner))
+            .ok_or_else(|| ApiError::not_found("broker complete request not found"))?;
+        if let Some(record) = inner.job_requests.get_mut(&request_id) {
+            record.result = Some(status);
+            record.locked_until = agent_request_locked_until();
+        }
+        inner
+            .inflight_requests
+            .remove(&request_id)
+            .or_else(|| {
+                job_request_tuple(&inner, request_id).map(|(_, run_id, job_id)| (run_id, job_id))
+            })
+            .map(|(run_id, job_id)| JobCompletion {
+                run_id,
+                job_id,
+                status,
+                outputs: Default::default(),
+            })
+    };
+    if let Some(completion) = completion {
+        let _ = complete_job_inner(shared, completion).await?;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1376,10 +1456,12 @@ async fn twirp_cache_get_download_url(
     Json(json!({"ok": true, "signed_download_url": "", "matched_key": ""}))
 }
 
-async fn twirp_cache_create_entry(
-    Json(_req): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
-    let upload_url = format!("{}/replay/cache/upload/{}", public_base_url(), uuid::Uuid::new_v4());
+async fn twirp_cache_create_entry(Json(_req): Json<serde_json::Value>) -> Json<serde_json::Value> {
+    let upload_url = format!(
+        "{}/replay/cache/upload/{}",
+        public_base_url(),
+        uuid::Uuid::new_v4()
+    );
     Json(json!({"ok": true, "signed_upload_url": upload_url, "message": ""}))
 }
 
@@ -1391,29 +1473,31 @@ async fn twirp_cache_finalize_upload(
 
 // ── Artifact v4 twirp stubs ───────────────────────────────────────────────
 
-async fn twirp_artifact_create(
-    Json(_req): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
-    let upload_url = format!("{}/replay/artifact/upload/{}", public_base_url(), uuid::Uuid::new_v4());
+async fn twirp_artifact_create(Json(_req): Json<serde_json::Value>) -> Json<serde_json::Value> {
+    let upload_url = format!(
+        "{}/replay/artifact/upload/{}",
+        public_base_url(),
+        uuid::Uuid::new_v4()
+    );
     Json(json!({"ok": true, "signed_upload_url": upload_url}))
 }
 
-async fn twirp_artifact_finalize(
-    Json(_req): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
+async fn twirp_artifact_finalize(Json(_req): Json<serde_json::Value>) -> Json<serde_json::Value> {
     Json(json!({"ok": true, "artifact_id": uuid::Uuid::new_v4().to_string()}))
 }
 
 async fn twirp_artifact_get_signed_url(
     Json(_req): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-    let url = format!("{}/replay/artifact/download/{}", public_base_url(), uuid::Uuid::new_v4());
+    let url = format!(
+        "{}/replay/artifact/download/{}",
+        public_base_url(),
+        uuid::Uuid::new_v4()
+    );
     Json(json!({"signed_url": url}))
 }
 
-async fn twirp_artifact_list(
-    Json(_req): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
+async fn twirp_artifact_list(Json(_req): Json<serde_json::Value>) -> Json<serde_json::Value> {
     Json(json!({"artifacts": []}))
 }
 
@@ -1659,12 +1743,9 @@ async fn agent_request_patch(
     // so summarize_run, promote_ready_jobs, and notify_waiters all fire.
     // The result field is only present on the final PATCH; renewals have no result.
     if let Some(result) = body.get("result").and_then(|v| v.as_str()) {
-        let new_status = match result {
-            "succeeded" | "succeededWithIssues" => ExecutionStatus::Success,
-            "failed" => ExecutionStatus::Failure,
-            "cancelled" => ExecutionStatus::Cancelled,
-            "canceled" => ExecutionStatus::Cancelled,
-            _ => {
+        let new_status = match execution_status_from_runner_result(result) {
+            Some(status) => status,
+            None => {
                 info!(request_id, %result, "unknown agent_request_patch result; skipping completion");
                 return Json(
                     json!({ "requestId": request_id, "lockedUntil": "2099-12-31T23:59:59Z" }),
@@ -2351,9 +2432,14 @@ async fn connection_data(
         "deploymentId": "00000000-0000-0000-0000-000000000000",
         "deploymentType": "hosted",
         "instanceId": uuid::Uuid::new_v4().to_string(),
+        "serverUrlV2": runner_root,
+        "brokerUrl": public_base_url(),
+        "resultsServiceUrl": runner_root,
         "locationServiceData": {
             "lastChangeId": 1,
             "lastChangeId64": 1,
+            "clientCacheFresh": true,
+            "serviceOwner": "00000000-0000-0000-0000-000000000000",
             "serviceDefinitions": [
                 area_svc("Location Service", "9f1fe989-7d0d-4a9b-a9bf-11330ab257c1", "LocationService2", "Framework", &service_root),
                 area_svc("distributedtask", "a85b8835-c1a1-4aac-ae97-1c3d0ba72dbd", "LocationService2", "Framework", &runner_root),
@@ -2402,7 +2488,9 @@ async fn connection_data(
                     "virtualDirectory": ""
                 }
             ],
-            "defaultAccessMappingMoniker": "PublicAccessMapping"
+            "defaultAccessMappingMoniker": "ScaleUnitMapping",
+            "clientCacheFresh": true,
+            "serviceOwner": "00000000-0000-0000-0000-000000000000"
         }
     });
     axum::response::Json(body).into_response()
@@ -2459,7 +2547,10 @@ fn svc(name: &str, id: &str, location: &str) -> serde_json::Value {
         "relativeToSetting": 2,
         "description": name,
         "toolId": name,
-        "locationMappings": [],
+        "locationMappings": [
+            {"accessMappingMoniker": "ScaleUnitMapping", "location": runner_server_url()},
+            {"accessMappingMoniker": "PublicAccessMapping", "location": public_base_url()}
+        ],
         "serviceOwner": "00000000-0000-0000-0000-000000000000",
         "resourceVersion": 6,
         "minVersion": "1.0",
@@ -4634,7 +4725,7 @@ jobs:
         assert!(service_ids.contains("10d13a60-2758-406c-8ab7-cffccb21fcf4"));
         assert_eq!(
             conn["locationServiceData"]["defaultAccessMappingMoniker"],
-            "PublicAccessMapping"
+            "ScaleUnitMapping"
         );
 
         let fresh = request_json(
@@ -4823,6 +4914,14 @@ jobs:
         )
         .await;
         assert_eq!(acquired["requestId"], 1);
+        assert_eq!(
+            acquired["messageType"],
+            azdo::message_type::RUNNER_JOB_REQUEST
+        );
+        assert_eq!(
+            acquired["resources"]["endpoints"][0]["url"],
+            format!("http://127.0.0.1:9090/broker/{runner_id}/")
+        );
         assert!(acquired["contextData"]["github"].is_object());
         assert!(
             acquired["steps"].as_array().unwrap().iter().any(|step| {
@@ -4937,6 +5036,14 @@ jobs:
         )
         .await;
         assert_eq!(acquired["requestId"].as_i64().unwrap(), 1);
+        assert_eq!(
+            acquired["messageType"],
+            azdo::message_type::RUNNER_JOB_REQUEST
+        );
+        assert_eq!(
+            acquired["resources"]["endpoints"][0]["url"],
+            "http://127.0.0.1:9090/broker/1/"
+        );
         assert!(acquired["plan"]["planId"].is_string());
         assert!(acquired["jobId"].is_string());
         assert!(acquired["steps"].is_array());
@@ -4967,6 +5074,15 @@ jobs:
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let completed_run = request_json(
+            &app,
+            Method::GET,
+            &format!("/api/v1/runs/{}", accepted["run_id"].as_str().unwrap()),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(completed_run["status"], "success");
+        assert_eq!(completed_run["jobs"]["rust"], "success");
 
         let ack = app
             .clone()
