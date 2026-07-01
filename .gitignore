@@ -17,3 +17,8 @@ experiments/mitm/captures/
 experiments/mitm/reports/
 experiments/mitm/golden/
 __pycache__/
+
+# Credentials & Local Environment
+.env
+*.pem
+*.key
