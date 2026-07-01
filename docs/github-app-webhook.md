@@ -96,3 +96,30 @@ Push a commit or open a pull request. `aksh` will:
 - Match filters (branches, tags, paths).
 - Queue jobs for any registered runners matching `runs-on` labels.
 - Create check runs on GitHub.
+
+---
+
+## 7. Automated One-Click App Registration (Manifest Flow)
+
+To simplify local development and testing, `aksh` supports the official **GitHub App Manifest** flow:
+
+1. **Open the Registration page**:
+   Start `aksh-runner-server` and navigate to:
+   `http://localhost:9090/api/v1/github/register`
+
+2. **Click "Register App on GitHub"**:
+   You will be redirected to GitHub to register the app under your personal account or organization with all required permissions and webhook events pre-configured.
+
+3. **Callback Conversion**:
+   After clicking "Create", GitHub redirects back to:
+   `http://localhost:9090/api/v1/github/callback?code=...`
+   
+   `aksh` exchanges the temporary code for your new App ID, Webhook Secret, and Private Key PEM, displaying them directly on-screen and logging them to the terminal.
+
+4. **Save and Restart**:
+   Copy the displayed credentials into your local environment:
+   ```sh
+   export AKSH_WEBHOOK_SECRET="your-new-webhook-secret"
+   export AKSH_GITHUB_APP_ID="your-new-app-id"
+   ```
+   And restart `aksh`!
