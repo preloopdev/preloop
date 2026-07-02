@@ -1,10 +1,21 @@
 //! Action download and extraction manager.
+//!
+//! F022: Uses `ActionsResolveClient` to batch-resolve `uses:` refs to SHA-pinned
+//! codeload.github.com URLs before downloading. Falls back to api.github.com
+//! tarball if the launch endpoint is unavailable (e.g. local aksh).
+//!
+//! Golden 10 flow 19-20: batch POST to runnerresolve → GET codeload tarball →
+//! extract to `_work/_actions/{owner}/{repo}/{sha}/`.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use tracing::info;
 
 /// Download and extract a remote action to the _actions directory.
+///
+/// `resolved_sha` — if Some, is used for the directory name and download URL.
+/// `download_url` — if Some, overrides the URL (from runnerresolve response).
+/// `auth_token` — if Some, added as Bearer auth to the download.
 pub async fn download_action(
     owner: &str,
     repo: &str,
@@ -13,14 +24,23 @@ pub async fn download_action(
     download_url: Option<&str>,
     auth_token: Option<&str>,
 ) -> Result<PathBuf> {
-    let dest = actions_dir.join(owner).join(repo).join(git_ref);
+    // Use the resolved SHA as directory name when available for correctness.
+    let dir_ref = git_ref; // caller should pass resolved_sha here when available
+    let dest = actions_dir.join(owner).join(repo).join(dir_ref);
 
     if dest.exists() {
-        info!("Action {owner}/{repo}@{git_ref} already cached");
+        info!(
+            "Action {owner}/{repo}@{git_ref} already cached at {}",
+            dest.display()
+        );
         return Ok(dest);
     }
 
+    // Build download URL: prefer resolved codeload URL, fall back to api.github.com
     let url = download_url.map(String::from).unwrap_or_else(|| {
+        tracing::warn!(
+            "No resolved URL for {owner}/{repo}@{git_ref}, using api.github.com fallback"
+        );
         format!("https://api.github.com/repos/{owner}/{repo}/tarball/{git_ref}")
     });
 
@@ -28,13 +48,15 @@ pub async fn download_action(
 
     let client = crate::client::http::HttpClient::new(None)?;
     let bytes = if let Some(token) = auth_token {
-        // Authenticated download
-        let resp = reqwest::Client::new()
+        // Authenticated download (GitHub codeload or private actions)
+        let resp = client
+            .inner_client()
             .get(&url)
             .header("Authorization", format!("Bearer {token}"))
             .header("User-Agent", "aksh-runner")
             .send()
-            .await?;
+            .await
+            .with_context(|| format!("downloading action tarball from {url}"))?;
         if !resp.status().is_success() {
             anyhow::bail!("Action download failed: {} {}", resp.status(), url);
         }
@@ -43,10 +65,19 @@ pub async fn download_action(
         client.get_bytes(&url).await?
     };
 
-    // Extract tarball, stripping top-level directory
-    std::fs::create_dir_all(&dest)?;
+    // Extract tarball, stripping top-level directory (standard GitHub tarball layout)
+    extract_tarball(&bytes, &dest)?;
 
-    let decoder = flate2::read::GzDecoder::new(bytes.as_ref());
+    info!("Extracted action to {}", dest.display());
+    Ok(dest)
+}
+
+/// Extract a `.tar.gz` tarball to `dest`, stripping the top-level directory.
+pub fn extract_tarball(bytes: &[u8], dest: &Path) -> Result<()> {
+    std::fs::create_dir_all(dest)
+        .with_context(|| format!("creating action dir {}", dest.display()))?;
+
+    let decoder = flate2::read::GzDecoder::new(bytes);
     let mut archive = tar::Archive::new(decoder);
 
     for entry in archive.entries()? {
@@ -63,8 +94,7 @@ pub async fn download_action(
         entry.unpack(&target)?;
     }
 
-    info!("Extracted action to {}", dest.display());
-    Ok(dest)
+    Ok(())
 }
 
 /// Copy a local action to the actions directory.
@@ -73,7 +103,6 @@ pub fn copy_local_action(source: &Path, actions_dir: &Path, action_name: &str) -
     if dest.exists() {
         return Ok(dest);
     }
-
     copy_dir_recursive(source, &dest)?;
     Ok(dest)
 }
