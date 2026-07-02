@@ -83,11 +83,6 @@ pub async fn run_job(
     // Inject GITHUB_* environment variables
     super::job_extension::inject_github_env(&mut job_ctx, &job_message);
 
-    // Build step list (F023: includes pre/post from already-downloaded manifests)
-    let main_steps = super::job_extension::build_step_list(&steps, &job_message);
-    let ordered_steps =
-        super::job_extension::build_step_list_with_lifecycle(main_steps, &workspace);
-
     // Extract plan ID
     let plan_id = job_message
         .get("plan")
@@ -95,6 +90,18 @@ pub async fn run_job(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+
+    let main_steps = super::job_extension::build_step_list(&steps, &job_message);
+
+    // F022/F023: download remote actions before lifecycle discovery so pre/post
+    // manifests are available and action execution uses SHA-pinned directories.
+    let action_paths =
+        prepare_remote_actions(&job_message, &workspace, &main_steps, &plan_id).await?;
+    job_ctx.action_paths = action_paths.clone();
+
+    // Build step list (F023: includes pre/post from downloaded manifests)
+    let ordered_steps =
+        super::job_extension::build_step_list_with_lifecycle(main_steps, &workspace, &action_paths);
 
     // Set up reporting context (F018/F019/F020)
     let reporting = if let Some((service_url, access_token)) =
@@ -115,11 +122,9 @@ pub async fn run_job(
     };
 
     // F018: Spawn renew loop
-    let renew_handle = if let Some(ref rpt) = reporting {
-        Some(spawn_renew_loop(rpt.clone(), cancel_rx.clone()))
-    } else {
-        None
-    };
+    let renew_handle = reporting
+        .as_ref()
+        .map(|rpt| spawn_renew_loop(rpt.clone(), cancel_rx.clone()));
 
     // Create the server queue for step status tracking
     let queue = Arc::new(Mutex::new(ServerQueue::new(
@@ -154,23 +159,9 @@ pub async fn run_job(
         }
     };
 
-    // F019: Send final WorkflowStepsUpdate with all steps completed
+    // F019: Flush any final WorkflowStepsUpdate entries.
     if let Some(ref rpt) = reporting {
-        let mut q = queue.lock().await;
-        if let Some(body) = q.take_steps_update_body() {
-            let body_json = serde_json::to_value(&body).unwrap_or_default();
-            match rpt
-                .results
-                .update_workflow_steps(&rpt.access_token, &body_json)
-                .await
-            {
-                Ok(_) => info!(
-                    "Final WorkflowStepsUpdate sent ({} steps)",
-                    body.steps.len()
-                ),
-                Err(e) => warn!("WorkflowStepsUpdate failed (non-fatal): {e:#}"),
-            }
-        }
+        flush_step_updates(rpt, &queue).await;
     }
 
     // F020: Upload job log (concatenation of all step logs)
@@ -204,22 +195,18 @@ pub async fn run_job(
 
 // ── Renew loop (F018) ────────────────────────────────────────────────
 
-/// Spawn a background task that renews the job lock every 60 seconds.
+/// Spawn a background task that renews the job lock.
 ///
-/// Golden 06 flow 24: POST {run-service}/renewjob with `{planId, jobId}`.
-/// Response contains `{lockedUntil: "..."}`. Interval is lock_duration/2
-/// in the official runner; we use 60s as a safe default.
+/// Golden 10 renews immediately after acquire and then continues before the
+/// lease expires. We renew once immediately for parity, then every 60 seconds as
+/// the fallback interval until `lockedUntil` parsing is made exact.
 fn spawn_renew_loop(
     rpt: Arc<ReportingContext>,
     cancel_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-        interval.tick().await; // skip immediate first tick
-
+        let mut cancel_rx = cancel_rx;
         loop {
-            interval.tick().await;
-
             if *cancel_rx.borrow() {
                 info!("Renew loop: job cancelled, stopping");
                 break;
@@ -240,11 +227,44 @@ fn spawn_renew_loop(
                 }
                 Err(e) => {
                     warn!("renewjob failed: {e:#}");
-                    // Don't abort on transient failure — keep trying
+                }
+            }
+
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+                changed = cancel_rx.changed() => {
+                    if changed.is_err() || *cancel_rx.borrow() {
+                        info!("Renew loop: cancellation channel closed/signaled, stopping");
+                        break;
+                    }
                 }
             }
         }
     })
+}
+
+/// Flush queued WorkflowStepsUpdate entries without holding the queue lock across I/O.
+pub async fn flush_step_updates(rpt: &ReportingContext, queue: &Arc<Mutex<ServerQueue>>) {
+    let body = {
+        let mut q = queue.lock().await;
+        q.take_steps_update_body()
+    };
+
+    if let Some(body) = body {
+        let body_json = serde_json::to_value(&body).unwrap_or_default();
+        match rpt
+            .results
+            .update_workflow_steps(&rpt.access_token, &body_json)
+            .await
+        {
+            Ok(_) => info!(
+                "WorkflowStepsUpdate sent ({} steps, change_order={})",
+                body.steps.len(),
+                body.change_order
+            ),
+            Err(e) => warn!("WorkflowStepsUpdate failed (non-fatal): {e:#}"),
+        }
+    }
 }
 
 // ── Log upload (F020) ────────────────────────────────────────────────
@@ -334,6 +354,128 @@ async fn upload_job_log(rpt: &ReportingContext, content: &str) {
     }
 }
 
+async fn prepare_remote_actions(
+    job_message: &serde_json::Value,
+    workspace: &str,
+    steps: &[Step],
+    plan_id: &str,
+) -> Result<std::collections::HashMap<String, String>> {
+    let mut refs = Vec::new();
+    for step in steps {
+        let StepType::Action { uses, .. } = &step.step_type else {
+            continue;
+        };
+        if uses.starts_with("./") || uses.starts_with("../") || uses.starts_with("docker://") {
+            continue;
+        }
+        if let Some(parsed) = parse_remote_uses(uses) {
+            refs.push((uses.clone(), parsed));
+        }
+    }
+
+    if refs.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let job_id = job_message
+        .get("jobId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let access_token = extract_service_endpoint(job_message)
+        .map(|(_, token)| token)
+        .unwrap_or_default();
+    let launch_url =
+        message_variable(job_message, "system.github.launch_endpoint").map(str::to_string);
+
+    let http = HttpClient::new(None)?;
+    let resolver = crate::client::actions_download::ActionsResolveClient::new(http, launch_url);
+    let action_pairs: Vec<(String, String)> = refs
+        .iter()
+        .map(|(_, parsed)| (parsed.action_name.clone(), parsed.git_ref.clone()))
+        .collect();
+    let action_pair_refs: Vec<(&str, &str)> = action_pairs
+        .iter()
+        .map(|(action, version)| (action.as_str(), version.as_str()))
+        .collect();
+    let resolved = if !access_token.is_empty() {
+        resolver
+            .resolve_batch(&access_token, plan_id, job_id, &action_pair_refs)
+            .await?
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    let actions_dir = std::path::Path::new(workspace)
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("_actions");
+    let mut action_paths = std::collections::HashMap::new();
+
+    for (uses, parsed) in refs {
+        let key = format!("{}@{}", parsed.action_name, parsed.git_ref);
+        let meta = resolved.get(&key);
+        let dir_ref = meta
+            .map(|m| m.resolved_sha.as_str())
+            .filter(|sha| !sha.is_empty())
+            .unwrap_or(parsed.git_ref.as_str());
+        let download_url = meta
+            .map(|m| m.tar_url.as_str())
+            .filter(|url| !url.is_empty());
+        let auth_token = meta.and_then(|m| m.auth_token.as_deref());
+
+        let action_root = super::actions::manager::download_action(
+            &parsed.owner,
+            &parsed.repo,
+            dir_ref,
+            &actions_dir,
+            download_url,
+            auth_token,
+        )
+        .await?;
+
+        let action_dir = if parsed.subpath.is_empty() {
+            action_root
+        } else {
+            action_root.join(&parsed.subpath)
+        };
+        action_paths.insert(uses, action_dir.to_string_lossy().to_string());
+    }
+
+    Ok(action_paths)
+}
+
+struct ParsedUses {
+    owner: String,
+    repo: String,
+    subpath: String,
+    git_ref: String,
+    action_name: String,
+}
+
+fn parse_remote_uses(uses: &str) -> Option<ParsedUses> {
+    let (repo_part, git_ref) = uses.split_once('@')?;
+    let mut parts = repo_part.split('/');
+    let owner = parts.next()?.to_string();
+    let repo = parts.next()?.to_string();
+    let rest: Vec<&str> = parts.collect();
+    let subpath = rest.join("/");
+    Some(ParsedUses {
+        owner: owner.clone(),
+        repo: repo.clone(),
+        subpath,
+        git_ref: git_ref.to_string(),
+        action_name: repo_part.to_string(),
+    })
+}
+
+fn message_variable<'a>(job_message: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    job_message
+        .get("variables")
+        .and_then(|v| v.get(key))
+        .and_then(|v| v.get("value"))
+        .and_then(|v| v.as_str())
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────
 
 /// Extract the run-service base URL and access token from the job message.
@@ -362,10 +504,31 @@ fn extract_service_endpoint(job_message: &serde_json::Value) -> Option<(String, 
     None
 }
 
-/// Extract the results service URL from job message variables.
+/// Extract the results service URL from endpoint data or job message variables.
 ///
-/// Golden 06: `system.github.results_endpoint` = `https://results-receiver.actions.githubusercontent.com/`
+/// Golden 06: `system.github.results_endpoint` = `https://results-receiver.actions.githubusercontent.com/`.
+/// Current acquire payloads can also carry `resources.endpoints[].data.ResultsServiceUrl`.
 fn extract_results_url(job_message: &serde_json::Value) -> Option<String> {
+    if let Some(endpoints) = job_message
+        .get("resources")
+        .and_then(|r| r.get("endpoints"))
+        .and_then(|e| e.as_array())
+    {
+        for ep in endpoints {
+            let name = ep.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if name.eq_ignore_ascii_case("SystemVssConnection") {
+                if let Some(url) = ep
+                    .get("data")
+                    .and_then(|d| d.get("ResultsServiceUrl"))
+                    .and_then(|v| v.as_str())
+                    .filter(|url| !url.is_empty())
+                {
+                    return Some(url.trim_end_matches('/').to_string());
+                }
+            }
+        }
+    }
+
     let vars = job_message.get("variables")?.as_object()?;
     let url = vars
         .get("system.github.results_endpoint")
@@ -699,4 +862,32 @@ async fn report_completion(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn results_url_prefers_system_vss_endpoint_data() {
+        let msg = serde_json::json!({
+            "resources": {
+                "endpoints": [{
+                    "name": "SystemVssConnection",
+                    "url": "http://127.0.0.1:9191/broker/1",
+                    "data": {
+                        "ResultsServiceUrl": "http://127.0.0.1:9191/"
+                    }
+                }]
+            },
+            "variables": {
+                "system.github.results_endpoint": { "value": "http://wrong.example/" }
+            }
+        });
+
+        assert_eq!(
+            extract_results_url(&msg).as_deref(),
+            Some("http://127.0.0.1:9191")
+        );
+    }
 }
