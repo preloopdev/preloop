@@ -1,0 +1,270 @@
+//! Workflow command parser.
+//!
+//! Parses `::name key=val,key2=val2::data` and legacy `##[name]data` lines
+//! from step output, with the official unescaping rules.
+
+use std::collections::HashMap;
+
+/// A parsed workflow command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowCommand {
+    pub name: String,
+    pub properties: HashMap<String, String>,
+    pub data: String,
+}
+
+/// Parse a single line for workflow commands.
+///
+/// Returns `Some(command)` if the line is a workflow command, `None` otherwise.
+pub fn parse_command(line: &str) -> Option<WorkflowCommand> {
+    // Try new format: ::name key=val::data
+    if let Some(cmd) = parse_double_colon(line) {
+        return Some(cmd);
+    }
+    // Try legacy format: ##[name]data
+    if let Some(cmd) = parse_legacy(line) {
+        return Some(cmd);
+    }
+    None
+}
+
+/// Parse `::name key=val,key2=val2::data` format.
+fn parse_double_colon(line: &str) -> Option<WorkflowCommand> {
+    let line = line.trim();
+    if !line.starts_with("::") {
+        return None;
+    }
+
+    let rest = &line[2..];
+    let end_pos = rest.find("::")?;
+    let command_part = &rest[..end_pos];
+    let data = if end_pos + 2 < rest.len() {
+        &rest[end_pos + 2..]
+    } else {
+        ""
+    };
+
+    // Split command_part into name and properties
+    let (name, props_str) = if let Some(space_pos) = command_part.find(' ') {
+        (
+            &command_part[..space_pos],
+            Some(&command_part[space_pos + 1..]),
+        )
+    } else {
+        (command_part, None)
+    };
+
+    if name.is_empty() {
+        return None;
+    }
+
+    let mut properties = HashMap::new();
+    if let Some(props) = props_str {
+        for pair in props.split(',') {
+            if let Some(eq_pos) = pair.find('=') {
+                let key = &pair[..eq_pos];
+                let val = &pair[eq_pos + 1..];
+                properties.insert(key.to_string(), unescape_property(val));
+            }
+        }
+    }
+
+    Some(WorkflowCommand {
+        name: name.to_string(),
+        properties,
+        data: unescape_data(data),
+    })
+}
+
+/// Parse legacy `##[name]data` format.
+fn parse_legacy(line: &str) -> Option<WorkflowCommand> {
+    let line = line.trim();
+    if !line.starts_with("##[") {
+        return None;
+    }
+    let close = line.find(']')?;
+    let name = &line[3..close];
+    let data = &line[close + 1..];
+
+    Some(WorkflowCommand {
+        name: name.to_string(),
+        properties: HashMap::new(),
+        data: data.to_string(),
+    })
+}
+
+/// Unescape data values per official runner rules.
+/// `%25` → `%`, `%0D` → `\r`, `%0A` → `\n`
+fn unescape_data(s: &str) -> String {
+    s.replace("%0A", "\n")
+        .replace("%0D", "\r")
+        .replace("%25", "%")
+}
+
+/// Unescape property values per official runner rules.
+/// Same as data, plus: `%3A` → `:`, `%2C` → `,`
+fn unescape_property(s: &str) -> String {
+    s.replace("%3A", ":")
+        .replace("%2C", ",")
+        .replace("%0A", "\n")
+        .replace("%0D", "\r")
+        .replace("%25", "%")
+}
+
+/// Process a workflow command against the step/job context.
+pub fn handle_command(
+    cmd: &WorkflowCommand,
+    ctx: &mut crate::worker::execution_context::StepContext<'_>,
+) {
+    match cmd.name.as_str() {
+        "add-mask" => {
+            ctx.job.add_mask(&cmd.data);
+        }
+        "add-path" => {
+            ctx.job.extra_path.insert(0, cmd.data.clone());
+        }
+        "debug" => {
+            ctx.log(&format!("##[debug]{}", cmd.data));
+        }
+        "error" => {
+            let annotation = build_annotation(
+                crate::worker::execution_context::AnnotationLevel::Error,
+                cmd,
+            );
+            ctx.annotate(annotation);
+            ctx.log(&format!("##[error]{}", cmd.data));
+        }
+        "warning" => {
+            let annotation = build_annotation(
+                crate::worker::execution_context::AnnotationLevel::Warning,
+                cmd,
+            );
+            ctx.annotate(annotation);
+            ctx.log(&format!("##[warning]{}", cmd.data));
+        }
+        "notice" => {
+            let annotation = build_annotation(
+                crate::worker::execution_context::AnnotationLevel::Notice,
+                cmd,
+            );
+            ctx.annotate(annotation);
+            ctx.log(&format!("##[notice]{}", cmd.data));
+        }
+        "group" => {
+            ctx.log(&format!("##[group]{}", cmd.data));
+        }
+        "endgroup" => {
+            ctx.log("##[endgroup]");
+        }
+        "echo" => {
+            // echo on/off controls command echoing
+            match cmd.data.as_str() {
+                "on" => ctx.debug = true,
+                "off" => ctx.debug = false,
+                _ => {}
+            }
+        }
+        "set-output" => {
+            // Legacy: ::set-output name=key::value
+            // Emit deprecation warning
+            ctx.log("##[warning]The `set-output` command is deprecated and will be disabled soon. Please upgrade to using Environment Files. For more information see: https://github.blog/changelog/2022-10-11-github-actions-deprecating-save-state-and-set-output-commands/");
+            if let Some(name) = cmd.properties.get("name") {
+                ctx.env.insert(format!("OUTPUT_{name}"), cmd.data.clone());
+            }
+        }
+        "save-state" => {
+            // Legacy: ::save-state name=key::value
+            ctx.log("##[warning]The `save-state` command is deprecated and will be disabled soon. Please upgrade to using Environment Files.");
+            if let Some(name) = cmd.properties.get("name") {
+                let state = ctx.job.state.entry(ctx.step_id.clone()).or_default();
+                state.insert(name.clone(), cmd.data.clone());
+            }
+        }
+        "stop-commands" | "add-matcher" | "remove-matcher" => {
+            // stop-commands: handled at a higher level (M10)
+            // matchers: handled in M10
+        }
+        _ => {
+            tracing::debug!("Unknown workflow command: {}", cmd.name);
+        }
+    }
+}
+
+fn build_annotation(
+    level: crate::worker::execution_context::AnnotationLevel,
+    cmd: &WorkflowCommand,
+) -> crate::worker::execution_context::Annotation {
+    crate::worker::execution_context::Annotation {
+        level,
+        message: cmd.data.clone(),
+        title: cmd.properties.get("title").cloned(),
+        file: cmd.properties.get("file").cloned(),
+        line: cmd.properties.get("line").and_then(|v| v.parse().ok()),
+        end_line: cmd.properties.get("endLine").and_then(|v| v.parse().ok()),
+        col: cmd.properties.get("col").and_then(|v| v.parse().ok()),
+        end_column: cmd.properties.get("endColumn").and_then(|v| v.parse().ok()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_simple_command() {
+        let cmd = parse_command("::debug::some message").unwrap();
+        assert_eq!(cmd.name, "debug");
+        assert_eq!(cmd.data, "some message");
+        assert!(cmd.properties.is_empty());
+    }
+
+    #[test]
+    fn parse_command_with_properties() {
+        let cmd = parse_command("::error file=app.js,line=10,col=5::Something went wrong").unwrap();
+        assert_eq!(cmd.name, "error");
+        assert_eq!(cmd.data, "Something went wrong");
+        assert_eq!(cmd.properties.get("file").unwrap(), "app.js");
+        assert_eq!(cmd.properties.get("line").unwrap(), "10");
+        assert_eq!(cmd.properties.get("col").unwrap(), "5");
+    }
+
+    #[test]
+    fn parse_add_mask() {
+        let cmd = parse_command("::add-mask::my secret value").unwrap();
+        assert_eq!(cmd.name, "add-mask");
+        assert_eq!(cmd.data, "my secret value");
+    }
+
+    #[test]
+    fn parse_legacy_format() {
+        let cmd = parse_command("##[error]Something failed").unwrap();
+        assert_eq!(cmd.name, "error");
+        assert_eq!(cmd.data, "Something failed");
+    }
+
+    #[test]
+    fn unescape_data_values() {
+        let cmd = parse_command("::debug::line1%0Aline2%0Dcarriage%25percent").unwrap();
+        assert_eq!(cmd.data, "line1\nline2\rcarriage%percent");
+    }
+
+    #[test]
+    fn unescape_property_values() {
+        let cmd = parse_command("::error file=path%3Ato%2Cfile::msg").unwrap();
+        assert_eq!(cmd.properties.get("file").unwrap(), "path:to,file");
+    }
+
+    #[test]
+    fn not_a_command() {
+        assert!(parse_command("just a normal line").is_none());
+        assert!(parse_command("").is_none());
+    }
+
+    #[test]
+    fn set_output_legacy() {
+        let cmd = parse_command("::set-output name=result::hello world").unwrap();
+        assert_eq!(cmd.name, "set-output");
+        assert_eq!(cmd.properties.get("name").unwrap(), "result");
+        assert_eq!(cmd.data, "hello world");
+    }
+}
