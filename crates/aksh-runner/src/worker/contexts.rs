@@ -3,6 +3,8 @@
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 
+use crate::worker::execution_context::Annotation;
+
 /// The top-level job context holding all sub-contexts and accumulated state.
 #[derive(Debug, Clone)]
 pub struct JobContext {
@@ -26,6 +28,8 @@ pub struct JobContext {
     pub job_status: JobStatus,
     /// State values saved by steps (for post-steps).
     pub state: HashMap<String, HashMap<String, String>>,
+    /// Annotations collected per step_id (F025).
+    pub step_annotations: HashMap<String, Vec<Annotation>>,
 }
 
 /// Result of a completed step.
@@ -61,6 +65,14 @@ impl JobContext {
                     if let Some(val) = v.get("value").and_then(|s| s.as_str()) {
                         if !val.is_empty() {
                             masks.insert(val.to_string());
+                            // Also mask trimmed variant and base64-encoded form (F028)
+                            let trimmed = val.trim();
+                            if trimmed != val {
+                                masks.insert(trimmed.to_string());
+                            }
+                            use base64::engine::Engine as _;
+                            let b64 = base64::engine::general_purpose::STANDARD.encode(val);
+                            masks.insert(b64);
                         }
                     }
                 }
@@ -80,6 +92,7 @@ impl JobContext {
             outputs: HashMap::new(),
             job_status: JobStatus::Success,
             state: HashMap::new(),
+            step_annotations: HashMap::new(),
         }
     }
 
@@ -98,13 +111,15 @@ impl JobContext {
         }
     }
 
-    /// Mask secret values in a string.
+    /// Mask secret values in a string (longest secrets first to prevent partial matches).
     pub fn mask_secrets(&self, input: &str) -> String {
         let mut result = input.to_string();
-        for secret in &self.masks {
-            if !secret.is_empty() {
-                result = result.replace(secret, "***");
-            }
+        // Sort by length descending so longer secrets are replaced before
+        // shorter ones that might be a subset (e.g. trimmed variant).
+        let mut secrets: Vec<&String> = self.masks.iter().filter(|s| !s.is_empty()).collect();
+        secrets.sort_by(|a, b| b.len().cmp(&a.len()));
+        for secret in secrets {
+            result = result.replace(secret.as_str(), "***");
         }
         result
     }
@@ -166,6 +181,23 @@ impl JobContext {
             .collect();
         ctx.insert("env", env_map);
 
+        // secrets context — from isSecret variables (F028)
+        if let Some(vars) = self.variables.as_object() {
+            let mut secrets_map = serde_json::Map::new();
+            for (key, val) in vars {
+                let is_secret = val
+                    .get("isSecret")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if is_secret {
+                    if let Some(value) = val.get("value").and_then(|v| v.as_str()) {
+                        secrets_map.insert(key.clone(), serde_json::json!(value));
+                    }
+                }
+            }
+            ctx.insert("secrets", serde_json::Value::Object(secrets_map));
+        }
+
         // matrix/needs/strategy/vars/inputs from contextData
         for key in ["matrix", "needs", "strategy", "vars", "inputs"] {
             if let Some(val) = self.context_data.get(key) {
@@ -173,12 +205,15 @@ impl JobContext {
             }
         }
 
-        // Set status function values
-        let ctx = ctx.with_status(
+        // Set status function values, and pass workspace for hashFiles() (F027)
+        let mut ctx = ctx.with_status(
             self.job_status == JobStatus::Success,
             self.job_status == JobStatus::Failure,
             self.job_status == JobStatus::Cancelled,
         );
+        if let Some(ws) = &self.workspace {
+            ctx = ctx.with_workspace(ws.clone());
+        }
 
         ctx
     }

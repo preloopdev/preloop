@@ -15,8 +15,9 @@
 use std::collections::HashMap;
 use tracing::debug;
 
-/// Step status values matching the Twirp proto enum.
 pub mod step_status {
+    /// Step is in progress.
+    pub const IN_PROGRESS: u32 = 2;
     /// Step has completed.
     pub const COMPLETED: u32 = 6;
 }
@@ -78,6 +79,8 @@ pub struct StepLog {
 pub struct ServerQueue {
     pending_updates: Vec<StepUpdate>,
     pending_logs: HashMap<String, Vec<String>>,
+    /// Accumulated log content per step (never drained — used for job log).
+    accumulated_logs: Vec<(String, Vec<String>)>,
     change_order: u64,
     job_id: String,
     plan_id: String,
@@ -89,6 +92,7 @@ impl ServerQueue {
         Self {
             pending_updates: Vec::new(),
             pending_logs: HashMap::new(),
+            accumulated_logs: Vec::new(),
             change_order: 0,
             job_id,
             plan_id,
@@ -143,6 +147,23 @@ impl ServerQueue {
             "cancelled" | "canceled" => step_conclusion::FAILED, // Twirp has no cancel value
             _ => step_conclusion::SUCCEEDED,
         }
+    }
+
+    /// Record completed step logs into the accumulated store (for job log assembly).
+    pub fn record_step_logs(&mut self, step_id: &str, lines: Vec<String>) {
+        self.accumulated_logs.push((step_id.to_string(), lines));
+    }
+
+    /// Return concatenated content of all accumulated step logs (for job log upload).
+    pub fn all_step_log_content(&self) -> String {
+        let mut out = String::new();
+        for (_, lines) in &self.accumulated_logs {
+            for line in lines {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        out
     }
 }
 

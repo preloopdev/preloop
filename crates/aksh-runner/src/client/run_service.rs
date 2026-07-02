@@ -19,6 +19,11 @@ impl RunServiceClient {
         }
     }
 
+    /// Return the base URL (for constructing endpoint paths in job_runner).
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     /// Acquire a job (POST acquirejob).
     pub async fn acquire_job(
         &self,
