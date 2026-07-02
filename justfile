@@ -56,3 +56,17 @@ submit-ci:
 
 submit-dogfood:
     cargo run -p aksh-runner-client -- submit -W .github/workflows/dogfood.yml
+
+# ── runner ─────────────────────────────────────────────────────────────────
+
+build-runner:
+    cargo build --release -p aksh-runner
+
+runner-e2e WF:
+    cargo run -p aksh-conformance -- runner-e2e --runner-bin target/release/aksh-runner --workflow {{WF}}
+
+conform-runner S:
+    cargo run -p aksh-conformance -- runner-diff --scenario {{S}} --target github
+
+conform-local S:
+    cargo run -p aksh-conformance -- runner-diff --scenario {{S}} --target aksh
