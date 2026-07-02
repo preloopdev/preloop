@@ -16,9 +16,10 @@ pub async fn run_node_action(
     workspace: &str,
     ctx: &mut StepContext<'_>,
 ) -> Result<()> {
-    let main = manifest
-        .runs_main
-        .as_deref()
+    let main = with
+        .get("__aksh_entry")
+        .and_then(|v| v.as_str())
+        .or(manifest.runs_main.as_deref())
         .context("node action missing runs.main")?;
 
     let entry_point = action_dir.join(main);
@@ -53,6 +54,9 @@ pub async fn run_node_action(
     let mut env = ctx.build_env();
     if let Some(inputs) = with.as_object() {
         for (key, value) in inputs {
+            if key.starts_with("__aksh_") {
+                continue;
+            }
             let env_key = format!("INPUT_{}", key.to_uppercase().replace(' ', "_"));
             if let Some(val_str) = value.as_str() {
                 env.insert(env_key, val_str.to_string());
@@ -66,10 +70,8 @@ pub async fn run_node_action(
     if let Some(manifest_inputs) = &manifest.inputs {
         for (key, input_def) in manifest_inputs {
             let env_key = format!("INPUT_{}", key.to_uppercase().replace(' ', "_"));
-            if !env.contains_key(&env_key) {
-                if let Some(default) = input_def.get("default").and_then(|v| v.as_str()) {
-                    env.insert(env_key, default.to_string());
-                }
+            if let Some(default) = input_def.get("default").and_then(|v| v.as_str()) {
+                env.entry(env_key).or_insert_with(|| default.to_string());
             }
         }
     }
