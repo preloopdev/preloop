@@ -1,0 +1,242 @@
+//! Background server reporting queue.
+//!
+//! Batches step status updates and log uploads to the server,
+//! flushing periodically and at step boundaries.
+//!
+//! F014: The WorkflowStepsUpdate Twirp body uses these fields (from golden flow 24):
+//! - `steps[{external_id, number, name, status, started_at, completed_at, conclusion}]`
+//! - `change_order` (monotonic counter)
+//! - `workflow_job_run_backend_id` (= jobId from the job message)
+//! - `workflow_run_backend_id` (= planId from the job message)
+//!
+//! Status enum: 6 = completed
+//! Conclusion enum: 2 = succeeded, 3 = failed, 7 = skipped
+
+use std::collections::HashMap;
+use tracing::debug;
+
+/// Step status values matching the Twirp proto enum.
+pub mod step_status {
+    /// Step has completed.
+    pub const COMPLETED: u32 = 6;
+}
+
+/// Step conclusion values matching the Twirp proto enum.
+pub mod step_conclusion {
+    /// Step succeeded.
+    pub const SUCCEEDED: u32 = 2;
+    /// Step failed.
+    pub const FAILED: u32 = 3;
+    /// Step was skipped.
+    pub const SKIPPED: u32 = 7;
+}
+
+/// A step update matching the WorkflowStepsUpdate Twirp schema.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StepUpdate {
+    /// Step external ID (UUID from the job message step).
+    pub external_id: String,
+    /// Step ordinal number (1-based).
+    pub number: u32,
+    /// Step display name.
+    pub name: String,
+    /// Step status (see `step_status` constants).
+    pub status: u32,
+    /// ISO 8601 timestamp when the step started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    /// ISO 8601 timestamp when the step completed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+    /// Step conclusion (see `step_conclusion` constants).
+    pub conclusion: u32,
+}
+
+/// The full WorkflowStepsUpdate request body.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WorkflowStepsUpdateBody {
+    /// Step updates.
+    pub steps: Vec<StepUpdate>,
+    /// Monotonically increasing change counter.
+    pub change_order: u64,
+    /// Job ID from the job message.
+    pub workflow_job_run_backend_id: String,
+    /// Plan ID from the job message.
+    pub workflow_run_backend_id: String,
+}
+
+/// Queued log lines for a step.
+#[derive(Debug, Clone)]
+pub struct StepLog {
+    /// Step external ID.
+    pub step_id: String,
+    /// Log lines.
+    pub lines: Vec<String>,
+}
+
+/// The server reporting queue.
+pub struct ServerQueue {
+    pending_updates: Vec<StepUpdate>,
+    pending_logs: HashMap<String, Vec<String>>,
+    change_order: u64,
+    job_id: String,
+    plan_id: String,
+}
+
+impl ServerQueue {
+    /// Create a new server queue for a specific job.
+    pub fn new(job_id: String, plan_id: String) -> Self {
+        Self {
+            pending_updates: Vec::new(),
+            pending_logs: HashMap::new(),
+            change_order: 0,
+            job_id,
+            plan_id,
+        }
+    }
+
+    /// Queue a step status update.
+    pub fn queue_update(&mut self, update: StepUpdate) {
+        debug!(
+            "Queued update for step {}: status={} conclusion={}",
+            update.external_id, update.status, update.conclusion
+        );
+        self.pending_updates.push(update);
+    }
+
+    /// Queue log lines for a step.
+    pub fn queue_log_lines(&mut self, step_id: &str, lines: Vec<String>) {
+        let entry = self.pending_logs.entry(step_id.to_string()).or_default();
+        entry.extend(lines);
+    }
+
+    /// Build the WorkflowStepsUpdate request body and drain pending updates.
+    pub fn take_steps_update_body(&mut self) -> Option<WorkflowStepsUpdateBody> {
+        if self.pending_updates.is_empty() {
+            return None;
+        }
+        self.change_order += 1;
+        Some(WorkflowStepsUpdateBody {
+            steps: std::mem::take(&mut self.pending_updates),
+            change_order: self.change_order,
+            workflow_job_run_backend_id: self.job_id.clone(),
+            workflow_run_backend_id: self.plan_id.clone(),
+        })
+    }
+
+    /// Take all pending logs (drains the queue).
+    pub fn take_logs(&mut self) -> HashMap<String, Vec<String>> {
+        std::mem::take(&mut self.pending_logs)
+    }
+
+    /// Check if there are any pending items.
+    pub fn has_pending(&self) -> bool {
+        !self.pending_updates.is_empty() || !self.pending_logs.is_empty()
+    }
+
+    /// Map a conclusion string to the proto enum value.
+    pub fn conclusion_to_proto(conclusion: &str) -> u32 {
+        match conclusion.to_lowercase().as_str() {
+            "success" | "succeeded" => step_conclusion::SUCCEEDED,
+            "failure" | "failed" => step_conclusion::FAILED,
+            "skipped" => step_conclusion::SKIPPED,
+            "cancelled" | "canceled" => step_conclusion::FAILED, // Twirp has no cancel value
+            _ => step_conclusion::SUCCEEDED,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queue_and_take_steps_update() {
+        let mut q = ServerQueue::new("job-1".into(), "plan-1".into());
+        assert!(!q.has_pending());
+
+        q.queue_update(StepUpdate {
+            external_id: "step-uuid-1".into(),
+            number: 1,
+            name: "Set up job".into(),
+            status: step_status::COMPLETED,
+            started_at: Some("2024-01-01T00:00:00Z".into()),
+            completed_at: Some("2024-01-01T00:00:01Z".into()),
+            conclusion: step_conclusion::SUCCEEDED,
+        });
+        assert!(q.has_pending());
+
+        let body = q.take_steps_update_body().unwrap();
+        assert_eq!(body.steps.len(), 1);
+        assert_eq!(body.steps[0].external_id, "step-uuid-1");
+        assert_eq!(body.steps[0].status, 6);
+        assert_eq!(body.steps[0].conclusion, 2);
+        assert_eq!(body.change_order, 1);
+        assert_eq!(body.workflow_job_run_backend_id, "job-1");
+        assert_eq!(body.workflow_run_backend_id, "plan-1");
+        assert!(!q.has_pending());
+
+        // Serializes correctly
+        let json = serde_json::to_value(&body).unwrap();
+        assert!(json.get("change_order").is_some());
+        assert!(json.get("workflow_job_run_backend_id").is_some());
+        assert!(json.get("workflow_run_backend_id").is_some());
+    }
+
+    #[test]
+    fn queue_and_take_logs() {
+        let mut q = ServerQueue::new("j".into(), "p".into());
+        q.queue_log_lines("s1", vec!["line1".into(), "line2".into()]);
+        q.queue_log_lines("s1", vec!["line3".into()]);
+        q.queue_log_lines("s2", vec!["other".into()]);
+
+        assert!(q.has_pending());
+        let logs = q.take_logs();
+        assert_eq!(logs.get("s1").unwrap().len(), 3);
+        assert_eq!(logs.get("s2").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn change_order_increments() {
+        let mut q = ServerQueue::new("j".into(), "p".into());
+        q.queue_update(StepUpdate {
+            external_id: "a".into(),
+            number: 1,
+            name: "step".into(),
+            status: step_status::COMPLETED,
+            started_at: None,
+            completed_at: None,
+            conclusion: step_conclusion::SUCCEEDED,
+        });
+        let b1 = q.take_steps_update_body().unwrap();
+        assert_eq!(b1.change_order, 1);
+
+        q.queue_update(StepUpdate {
+            external_id: "b".into(),
+            number: 2,
+            name: "step 2".into(),
+            status: step_status::COMPLETED,
+            started_at: None,
+            completed_at: None,
+            conclusion: step_conclusion::FAILED,
+        });
+        let b2 = q.take_steps_update_body().unwrap();
+        assert_eq!(b2.change_order, 2);
+    }
+
+    #[test]
+    fn conclusion_mapping() {
+        assert_eq!(
+            ServerQueue::conclusion_to_proto("Success"),
+            step_conclusion::SUCCEEDED
+        );
+        assert_eq!(
+            ServerQueue::conclusion_to_proto("Failure"),
+            step_conclusion::FAILED
+        );
+        assert_eq!(
+            ServerQueue::conclusion_to_proto("Skipped"),
+            step_conclusion::SKIPPED
+        );
+    }
+}
