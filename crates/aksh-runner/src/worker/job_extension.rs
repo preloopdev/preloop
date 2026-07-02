@@ -195,10 +195,7 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
         let mappings: &[(&str, &str)] = &[
             ("system.github.results_endpoint", "ACTIONS_RESULTS_URL"),
             ("system.github.results_endpoint", "ACTIONS_CACHE_URL"),
-            (
-                "system.github.cache_service_v2",
-                "ACTIONS_CACHE_SERVICE_V2",
-            ),
+            ("system.github.cache_service_v2", "ACTIONS_CACHE_SERVICE_V2"),
             (
                 "system.github.id_token_request_url",
                 "ACTIONS_ID_TOKEN_REQUEST_URL",
@@ -320,6 +317,117 @@ pub fn build_step_list(steps: &[serde_json::Value], _job_message: &serde_json::V
         });
     }
 
+    result
+}
+
+/// Discover pre/post steps from action manifests and return the full ordered list.
+///
+/// F023: Official runner builds three lists:
+///   - pre steps: declared order, `pre-if` defaults to `always()`
+///   - main steps: the workflow steps
+///   - post steps: LIFO (reverse of main-step order), `post-if` defaults to `always()`
+///
+/// State context (`GITHUB_STATE` file) is wired so pre can communicate to post
+/// via `save-state`; that part is already handled by `file_commands.rs` +
+/// `JobContext::state`.
+///
+/// This function operates on already-downloaded manifests only — actions not yet
+/// on disk are run without pre/post (the download happens lazily in action::run_action).
+pub fn build_step_list_with_lifecycle(main_steps: Vec<Step>, workspace: &str) -> Vec<Step> {
+    let actions_dir = std::path::Path::new(workspace)
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("_actions");
+
+    let mut pre_steps: Vec<Step> = Vec::new();
+    let mut post_steps: Vec<Step> = Vec::new();
+
+    for step in &main_steps {
+        let StepType::Action { ref uses, ref with } = step.step_type else {
+            continue;
+        };
+
+        // Resolve the action directory (mirrors action::resolve_remote_action logic)
+        let action_dir = if uses.starts_with("./") || uses.starts_with("../") {
+            std::path::Path::new(workspace).join(uses)
+        } else if let Some((repo_part, git_ref)) = uses.split_once('@') {
+            let parts: Vec<&str> = repo_part.splitn(3, '/').collect();
+            if parts.len() >= 2 {
+                let owner = parts[0];
+                let repo = parts[1];
+                let subpath = if parts.len() > 2 { parts[2] } else { "" };
+                let base = actions_dir.join(owner).join(repo).join(git_ref);
+                if subpath.is_empty() {
+                    base
+                } else {
+                    base.join(subpath)
+                }
+            } else {
+                continue;
+            }
+        } else {
+            continue;
+        };
+
+        let manifest = match super::handlers::factory::load_action_manifest(&action_dir) {
+            Ok(m) => m,
+            Err(_) => continue, // action not yet on disk — skip pre/post
+        };
+
+        // Pre step
+        if let Some(pre_main) = &manifest.runs_pre {
+            let pre_if = manifest.runs_pre_if.as_deref().unwrap_or("always()");
+            let pre_id = format!("__pre_{}", step.id);
+            pre_steps.push(Step {
+                id: pre_id.clone(),
+                display_name: format!("Pre {}", step.display_name),
+                step_type: StepType::Action {
+                    uses: uses.clone(),
+                    with: with.clone(),
+                },
+                condition: Some(pre_if.to_string()),
+                continue_on_error: step.continue_on_error,
+                timeout_minutes: step.timeout_minutes,
+                env: step.env.clone(),
+                raw: serde_json::json!({
+                    "__pre": true,
+                    "__pre_main": pre_main,
+                    "uses": uses,
+                }),
+            });
+        }
+
+        // Post step (will be reversed into LIFO)
+        if let Some(post_main) = &manifest.runs_post {
+            let post_if = manifest.runs_post_if.as_deref().unwrap_or("always()");
+            let post_id = format!("__post_{}", step.id);
+            post_steps.push(Step {
+                id: post_id.clone(),
+                display_name: format!("Post {}", step.display_name),
+                step_type: StepType::Action {
+                    uses: uses.clone(),
+                    with: with.clone(),
+                },
+                condition: Some(post_if.to_string()),
+                continue_on_error: true, // post steps shouldn't block other posts
+                timeout_minutes: step.timeout_minutes,
+                env: step.env.clone(),
+                raw: serde_json::json!({
+                    "__post": true,
+                    "__post_main": post_main,
+                    "uses": uses,
+                }),
+            });
+        }
+    }
+
+    // LIFO for post: reverse post_steps
+    post_steps.reverse();
+
+    // Assemble: pre → main → post
+    let mut result = pre_steps;
+    result.extend(main_steps);
+    result.extend(post_steps);
     result
 }
 

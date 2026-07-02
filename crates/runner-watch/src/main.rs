@@ -2242,9 +2242,7 @@ fn write_conformance_summary(
     lines.push(String::new());
     lines.push("### Unsupported protocol surfaces".to_string());
     lines.push(String::new());
-    lines.push(
-        "Cache v4 and artifact v4 endpoints are intentionally **not mocked**.".to_string(),
-    );
+    lines.push("Cache v4 and artifact v4 endpoints are intentionally **not mocked**.".to_string());
     lines.push(
         "If a golden capture exercises one of these endpoints before aksh has a real".to_string(),
     );
@@ -2264,18 +2262,15 @@ fn write_conformance_summary(
     lines.push(
         "they are external storage traffic, not aksh HTTP endpoints. Skipping those".to_string(),
     );
-    lines.push(
-        "flows does not waive the aksh Twirp control-plane endpoints above.".to_string(),
-    );
+    lines.push("flows does not waive the aksh Twirp control-plane endpoints above.".to_string());
     lines.push(String::new());
     lines.push("#### Roadmap: Removing Exclusions & Verifying Side Effects".to_string());
     lines.push(String::new());
     lines.push(
         "Once local equivalents for storage (blob), cache, and OIDC are implemented".to_string(),
     );
-    lines.push(
-        "in their respective crates, we will remove them from these skip lists.".to_string(),
-    );
+    lines
+        .push("in their respective crates, we will remove them from these skip lists.".to_string());
     lines.push(
         "Because captured Azure SAS signatures expire and direct external connections".to_string(),
     );
@@ -2283,26 +2278,25 @@ fn write_conformance_summary(
         "cannot authenticate during static playbacks, the replayer must be updated".to_string(),
     );
     lines.push(
-        "to rewrite external hosts (e.g. `*.blob.core.windows.net`) to the local `aksh`".to_string(),
+        "to rewrite external hosts (e.g. `*.blob.core.windows.net`) to the local `aksh`"
+            .to_string(),
     );
     lines.push(
-        "server's endpoints, allowing verification of the local storage implementation.".to_string(),
+        "server's endpoints, allowing verification of the local storage implementation."
+            .to_string(),
     );
     lines.push(String::new());
     lines.push(
         "Additionally, the conformance pipeline will be expanded to verify stateful".to_string(),
     );
-    lines.push(
-        "side effects directly rather than relying solely on HTTP responses:".to_string(),
-    );
+    lines.push("side effects directly rather than relying solely on HTTP responses:".to_string());
     lines.push(
         "- **Cache validation**: Verify that actual cache archives are written to disk".to_string(),
     );
+    lines.push("  and are retrievable during subsequent restore calls.".to_string());
     lines.push(
-        "  and are retrievable during subsequent restore calls.".to_string(),
-    );
-    lines.push(
-        "- **OIDC token verification**: Validate that generated tokens carry the requested".to_string(),
+        "- **OIDC token verification**: Validate that generated tokens carry the requested"
+            .to_string(),
     );
     lines.push(
         "  audience, correct claims, and valid signatures that the server accepts.".to_string(),
@@ -2313,9 +2307,7 @@ fn write_conformance_summary(
     lines.push(
         "The conformance checker compares the local `aksh` server against the official".to_string(),
     );
-    lines.push(
-        "recorded golden baseline. For each non-skipped flow, it compares:".to_string(),
-    );
+    lines.push("recorded golden baseline. For each non-skipped flow, it compares:".to_string());
     lines.push(String::new());
     lines.push(
         "1. **HTTP Status Codes**: Verifies status codes match exactly (e.g. `200` vs `200`, `204` vs `204`). Any mismatch fails the scenario.".to_string(),
