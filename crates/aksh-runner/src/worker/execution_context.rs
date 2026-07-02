@@ -1,0 +1,174 @@
+//! Per-step execution context.
+//!
+//! Wraps the job context with step-specific state: env stack,
+//! secret masking, issue/annotation collection, debug flag.
+
+use std::collections::HashMap;
+
+use super::contexts::JobContext;
+
+/// Per-step execution context.
+pub struct StepContext<'a> {
+    pub job: &'a mut JobContext,
+    pub step_id: String,
+    pub step_name: String,
+    /// Step-level env overrides.
+    pub env: HashMap<String, String>,
+    /// Annotations collected during step execution.
+    pub annotations: Vec<Annotation>,
+    /// Whether debug output is enabled.
+    pub debug: bool,
+    /// Log lines collected during step execution.
+    pub log_lines: Vec<String>,
+    /// Whether the step was cancelled.
+    pub cancelled: bool,
+}
+
+/// A workflow annotation (error/warning/notice).
+#[derive(Debug, Clone)]
+pub struct Annotation {
+    pub level: AnnotationLevel,
+    pub message: String,
+    pub title: Option<String>,
+    pub file: Option<String>,
+    pub line: Option<u32>,
+    pub end_line: Option<u32>,
+    pub col: Option<u32>,
+    pub end_column: Option<u32>,
+}
+
+/// Annotation severity level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnnotationLevel {
+    Notice,
+    Warning,
+    Error,
+}
+
+impl<'a> StepContext<'a> {
+    /// Create a new step context.
+    pub fn new(job: &'a mut JobContext, step_id: String, step_name: String) -> Self {
+        let debug = std::env::var("ACTIONS_STEP_DEBUG")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        Self {
+            job,
+            step_id,
+            step_name,
+            env: HashMap::new(),
+            annotations: Vec::new(),
+            debug,
+            log_lines: Vec::new(),
+            cancelled: false,
+        }
+    }
+
+    /// Add a log line, applying secret masking.
+    pub fn log(&mut self, line: &str) {
+        let masked = self.job.mask_secrets(line);
+        self.log_lines.push(masked);
+    }
+
+    /// Add an annotation.
+    pub fn annotate(&mut self, annotation: Annotation) {
+        self.annotations.push(annotation);
+    }
+
+    /// Build the full environment for process execution.
+    pub fn build_env(&self) -> HashMap<String, String> {
+        let mut env = self.job.env.clone();
+        // Step env overrides job env
+        for (k, v) in &self.env {
+            env.insert(k.clone(), v.clone());
+        }
+        // Add PATH extensions
+        if !self.job.extra_path.is_empty() {
+            let current_path = std::env::var("PATH").unwrap_or_default();
+            let mut parts: Vec<&str> = self.job.extra_path.iter().map(|s| s.as_str()).collect();
+            parts.push(&current_path);
+            env.insert("PATH".to_string(), parts.join(":"));
+        }
+        env
+    }
+
+    /// Get all collected log content as a single string.
+    pub fn log_content(&self) -> String {
+        self.log_lines.join("\n")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worker::contexts::JobContext;
+
+    fn make_job() -> JobContext {
+        let mut job = JobContext::new(
+            "j1".into(),
+            "Test".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        job.env.insert("JOB_VAR".into(), "from_job".into());
+        job.add_mask("secret-value");
+        job
+    }
+
+    #[test]
+    fn build_env_merges_job_and_step() {
+        let mut job = make_job();
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step 1".into());
+        ctx.env.insert("STEP_VAR".into(), "from_step".into());
+        ctx.env.insert("JOB_VAR".into(), "overridden".into());
+
+        let env = ctx.build_env();
+        assert_eq!(env.get("STEP_VAR").unwrap(), "from_step");
+        assert_eq!(env.get("JOB_VAR").unwrap(), "overridden");
+    }
+
+    #[test]
+    fn build_env_includes_extra_path() {
+        let mut job = make_job();
+        job.extra_path.push("/custom/bin".into());
+        let ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+
+        let env = ctx.build_env();
+        let path = env.get("PATH").unwrap();
+        assert!(path.starts_with("/custom/bin:"));
+    }
+
+    #[test]
+    fn log_masks_secrets() {
+        let mut job = make_job();
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        ctx.log("token is secret-value here");
+        assert_eq!(ctx.log_lines[0], "token is *** here");
+    }
+
+    #[test]
+    fn log_content_joins_lines() {
+        let mut job = make_job();
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        ctx.log("line1");
+        ctx.log("line2");
+        assert_eq!(ctx.log_content(), "line1\nline2");
+    }
+
+    #[test]
+    fn annotations_collected() {
+        let mut job = make_job();
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        ctx.annotate(Annotation {
+            level: AnnotationLevel::Error,
+            message: "test error".into(),
+            title: Some("Title".into()),
+            file: Some("src/main.rs".into()),
+            line: Some(42),
+            end_line: None,
+            col: None,
+            end_column: None,
+        });
+        assert_eq!(ctx.annotations.len(), 1);
+        assert_eq!(ctx.annotations[0].message, "test error");
+    }
+}
