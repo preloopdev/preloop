@@ -17,6 +17,10 @@ aksh is split by protocol responsibility rather than by binary:
 - `aksh-cache` and `aksh-artifacts` own file-backed protocol storage.
 - `aksh-conformance` owns comparisons against the pinned
   `ChristopherHX/runner.server` reference.
+- `aksh-runner` is the Rust reimplementation of the GitHub Actions runner
+  (Listener + Worker). Single binary with `configure`/`run`/`worker` subcommands;
+  the listener spawns a worker child process per job via stdin NDJSON IPC.
+  See `docs/runner/00-architecture.md` for the full module map.
 
 ## Pluggable backends
 
