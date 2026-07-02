@@ -81,6 +81,17 @@ impl<'a> StepContext<'a> {
         for (k, v) in &self.env {
             env.insert(k.clone(), v.clone());
         }
+        // Post action steps receive state saved by their paired main step via
+        // GITHUB_STATE. A post step is named `__post_<main-step-id>`.
+        let state_step_id = self
+            .step_id
+            .strip_prefix("__post_")
+            .unwrap_or(self.step_id.as_str());
+        if let Some(state) = self.job.state.get(state_step_id) {
+            for (k, v) in state {
+                env.insert(format!("STATE_{k}"), v.clone());
+            }
+        }
         // Add PATH extensions
         if !self.job.extra_path.is_empty() {
             let current_path = std::env::var("PATH").unwrap_or_default();
@@ -170,5 +181,22 @@ mod tests {
         });
         assert_eq!(ctx.annotations.len(), 1);
         assert_eq!(ctx.annotations[0].message, "test error");
+    }
+
+    #[test]
+    fn post_step_env_exposes_saved_state_from_main_step() {
+        let mut job = make_job();
+        job.state
+            .entry("checkout".into())
+            .or_default()
+            .insert("repository".into(), "owner/repo".into());
+
+        let ctx = StepContext::new(&mut job, "__post_checkout".into(), "Post checkout".into());
+        let env = ctx.build_env();
+
+        assert_eq!(
+            env.get("STATE_repository").map(String::as_str),
+            Some("owner/repo")
+        );
     }
 }
