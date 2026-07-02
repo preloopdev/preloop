@@ -535,6 +535,9 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         .with_state(Arc::new(SharedState { state, shutdown }))
 }
 
+/// HMAC key used for local JWT signing/verification.
+const LOCAL_JWT_KEY: &[u8] = b"aksh-local-runner-signing-key";
+
 async fn require_bearer(request: Request, next: Next) -> Result<Response, ApiError> {
     if request.uri().path().starts_with("/broker/") {
         return Ok(next.run(request).await);
@@ -544,12 +547,30 @@ async fn require_bearer(request: Request, next: Next) -> Result<Response, ApiErr
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|token| token == "aksh-system-token" || token.starts_with("aksh-"));
+        .is_some_and(|token| {
+            token == "aksh-system-token" || token.starts_with("aksh-") || verify_local_jwt(token)
+        });
     if authorized {
         Ok(next.run(request).await)
     } else {
         Err(ApiError::unauthorized("missing or invalid bearer token"))
     }
+}
+
+/// Verify an HS256 JWT issued by this server's `local_jwt()`.
+fn verify_local_jwt(token: &str) -> bool {
+    let parts: Vec<&str> = token.splitn(3, '.').collect();
+    if parts.len() != 3 {
+        return false;
+    }
+    let signing_input = format!("{}.{}", parts[0], parts[1]);
+    let mut mac = match Hmac::<Sha256>::new_from_slice(LOCAL_JWT_KEY) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    mac.update(signing_input.as_bytes());
+    let expected = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    expected == parts[2]
 }
 
 #[derive(Clone)]
@@ -1424,10 +1445,11 @@ async fn next_message_broker_ref_root(
         .get("sessionId")
         .cloned()
         .unwrap_or_else(|| "default".to_owned());
+    // Default to 50s long-poll (golden flows show ~50s waits between jobs)
     let wait = params
         .get("waitSeconds")
         .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(5);
+        .unwrap_or(50);
     let deadline = std::time::Instant::now() + Duration::from_secs(wait);
 
     loop {
@@ -3255,7 +3277,7 @@ fn local_jwt(mut claims: serde_json::Value) -> Result<String, ApiError> {
         base64_url_json(&header)?,
         base64_url_json(&serde_json::Value::Object(claims.clone()))?
     );
-    let mut mac = Hmac::<Sha256>::new_from_slice(b"aksh-local-runner-signing-key")
+    let mut mac = Hmac::<Sha256>::new_from_slice(LOCAL_JWT_KEY)
         .map_err(|error| ApiError::bad_request(format!("invalid signing key: {error}")))?;
     mac.update(signing_input.as_bytes());
     let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
