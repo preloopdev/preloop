@@ -83,6 +83,10 @@ The compatibility oracle is **live GitHub runs** first, then local aksh, using t
 - Process group signal propagation.
 - Step timeout enforcement (`timeout-minutes`).
 
+### Pre-bundled & Offline Support
+- Skip-if-present check: check for existing `externals/node20/bin/node` before triggering dynamic download at configure time.
+- Add `--offline` flag to `aksh-runner configure` to fail early if local `externals/` are missing, blocking any network fetch.
+- Archive-level packaging: bundle the compiled binary and pre-downloaded Node binaries for the target OS/Arch into a single release archive (`aksh-runner-bundle-<os>-<arch>.tar.gz`).
 ---
 
 ## Legend & Status
