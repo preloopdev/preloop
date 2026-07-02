@@ -39,6 +39,29 @@ Reuse these; do not reinvent:
 - Workflow fixtures: `fixtures/upstream-workflows/*.yml`, `fixtures/golden/{simple-echo,matrix-expand,needs-dag}.yml+json`.
 - E2E orchestration to copy from: `scripts/e2e-start.sh` (registration-token → `config.sh` → submit → `run.sh` → assert), `autoresearch.sh` (METRIC emission), `scripts/e2e-setup.sh` (port-80→9090 pfctl redirect — needed **only** for the official runner against local aksh, which strips non-default ports; the Rust runner must NOT strip ports).
 
+## Implementation status — audited 2026-07-02
+
+Full-code audit of `crates/aksh-runner` vs this plan, the goldens, and upstream v2.335.1. Per-gap detail lives in `docs/runner/roadmap.md` (priorities P0–P2) and `docs/runner/runner_fidelity_gap.md` (F001–F017 fixed; F018+ pending). **No Tier-1/Tier-2 gate has run yet — the H1/H2 harness is unbuilt.**
+
+| Milestone | Status | Fixed / verified | Pending |
+|---|---|---|---|
+| M0 scaffolding | ✅ Done | crate, CLI, module tree, `runner-watch` lib.rs, justfile `build-runner` | docs index accuracy (corrected 2026-07-02) |
+| M1 config/registration | ✅ Done (verified vs golden 01) | F002–F007 registration/DTO/dotfile fixes | `--replace` agent DELETE; rsaparams XML export brittleness |
+| M2 OAuth/session/message loop | ✅ Done (verified vs golden 01) | F001 PS256 JWT; F009–F011, F016–F017 broker poll/ack fixes | F008 connectionData→broker URL; BrokerMigration stub; ErrorThrottler retry/backoff; 401 session recreate |
+| M3 worker & job lifecycle | ⚠️ Partial | acquirejob + completejob wire shapes (F012–F014), worker IPC/exit codes, F015 process-group kill | **F018 renewjob never called; F019 step updates never sent; F020 logs never uploaded** |
+| M4 contexts/expressions | ⚠️ Partial | context roots, PipelineContextData decode, status functions, steps context, per-step timeout | **F027 bracket access / `a.*.b` filter / hashFiles stub; F028 secrets context root + masking variants**; runner.tool_cache/workspace; format() escaping |
+| M5 script steps/commands | ⚠️ Mostly done | shell resolution, ProcessInvoker, command parsing/unescaping, file commands, workspace layout | **F025 annotations never uploaded; F035 summary never uploaded; F034 11 missing GITHUB_*/RUNNER_* vars**; log timestamp prefix; ##[debug] |
+| M6 actions | ⚠️ Partial | tarball extract, manifest structure, node/composite/docker dispatch, INPUT_*, local actions | **F022 runnerresolve resolution missing; F023 pre/post lifecycle missing; F024 composite outputs/hoisting missing** |
+| M7 containers | ❌ Not wired | `container_ops.rs` helpers exist | **F026: never called from job flow; services zero code; docker-exec path unused** |
+| M8 cache/artifacts env | ❌ Missing | — | **F021 ACTIONS_* runtime vars never injected** |
+| M9 AzDO compat | ❌ Reporting unwired | message dispatch branch, DTOs, client methods | **F030 Timeline/Logfiles/console/FinishJob have 0 call sites; FinishJob wrong DTO** |
+| M10 cancellation/OIDC/matchers | ⚠️ Partial | cancel IPC + process-group kill, step timeout | **F031 no always()/post continuation, no grace kill, no job timeout; F032 matchers dead code; F033 no retry/backoff, no ephemeral unregister** |
+| M11 benchmarks | ⚠️ Partial | size + `--version` cold start in `bench-results.json` | dispatch latency, throughput, RSS, configure-time metrics |
+| M12 fidelity audit | ⚠️ Rewritten 2026-07-02 | scorecard corrected to audit reality | Tier-1 evidence links (blocked on H1/H2) |
+| H1 `runner-e2e` | ❌ Missing | — | entire orchestrator |
+| H2 `runner-diff` + `--record-flows` | ❌ Missing | `runner-watch` compare engine ready | subcommand + server middleware |
+| H3 `fixtures/runner/` corpus | ❌ Missing | 50+ inline unit tests exist | corpus tree + upstream L0 ports |
+
 ## Approach
 
 Milestones are ordered; each ends green (`just test-ci` passes) and each has a doc + gates. **Every milestone has two gate tiers:**
