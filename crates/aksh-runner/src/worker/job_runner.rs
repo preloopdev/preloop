@@ -19,7 +19,7 @@ use tokio::sync::{watch, Mutex};
 use tracing::{error, info, warn};
 
 use super::execution_context::Annotation;
-use super::server_queue::{step_conclusion, step_status, ServerQueue, StepUpdate};
+use super::server_queue::ServerQueue;
 use super::steps_runner::{Step, StepType};
 use crate::cli::ProtocolPath;
 use crate::client::http::HttpClient;
@@ -83,8 +83,10 @@ pub async fn run_job(
     // Inject GITHUB_* environment variables
     super::job_extension::inject_github_env(&mut job_ctx, &job_message);
 
-    // Build step list
-    let ordered_steps = super::job_extension::build_step_list(&steps, &job_message);
+    // Build step list (F023: includes pre/post from already-downloaded manifests)
+    let main_steps = super::job_extension::build_step_list(&steps, &job_message);
+    let ordered_steps =
+        super::job_extension::build_step_list_with_lifecycle(main_steps, &workspace);
 
     // Extract plan ID
     let plan_id = job_message
@@ -162,7 +164,10 @@ pub async fn run_job(
                 .update_workflow_steps(&rpt.access_token, &body_json)
                 .await
             {
-                Ok(_) => info!("Final WorkflowStepsUpdate sent ({} steps)", body.steps.len()),
+                Ok(_) => info!(
+                    "Final WorkflowStepsUpdate sent ({} steps)",
+                    body.steps.len()
+                ),
                 Err(e) => warn!("WorkflowStepsUpdate failed (non-fatal): {e:#}"),
             }
         }
@@ -225,11 +230,7 @@ fn spawn_renew_loop(
                 "jobId": rpt.job_id,
             });
 
-            match rpt
-                .run_service
-                .renew_job(&rpt.access_token, &body)
-                .await
-            {
+            match rpt.run_service.renew_job(&rpt.access_token, &body).await {
                 Ok(resp) => {
                     let locked_until = resp
                         .get("lockedUntil")
@@ -251,11 +252,7 @@ fn spawn_renew_loop(
 /// Upload a single step's log content via signed blob URL.
 ///
 /// Golden 06 flow 28-36: POST GetStepLogsSignedBlobURL → PUT blob.
-pub async fn upload_step_log(
-    rpt: &ReportingContext,
-    step_id: &str,
-    content: &str,
-) {
+pub async fn upload_step_log(rpt: &ReportingContext, step_id: &str, content: &str) {
     if content.is_empty() {
         return;
     }
@@ -594,12 +591,9 @@ async fn report_completion(
         .unwrap_or("");
 
     // Collect annotations from step contexts stored in the job context
-    let step_annotations = job_ctx
-        .step_annotations
-        .clone();
+    let step_annotations = job_ctx.step_annotations.clone();
 
-    let step_results =
-        build_completejob_step_results(ordered_steps, job_ctx, &step_annotations);
+    let step_results = build_completejob_step_results(ordered_steps, job_ctx, &step_annotations);
 
     let mut outputs = serde_json::Map::new();
     for (_, step) in &job_ctx.steps {
@@ -623,15 +617,16 @@ async fn report_completion(
     if let Some(rpt) = reporting {
         match via {
             ProtocolPath::Broker => {
-                let url = format!(
-                    "{}/completejob",
-                    rpt.run_service.base_url()
-                );
+                let url = format!("{}/completejob", rpt.run_service.base_url());
                 info!("Reporting completion to {url}");
                 match rpt
                     .results
                     .http()
-                    .post_json_bearer::<serde_json::Value>(&url, &completion_body, &rpt.access_token)
+                    .post_json_bearer::<serde_json::Value>(
+                        &url,
+                        &completion_body,
+                        &rpt.access_token,
+                    )
                     .await
                 {
                     Ok(_) => info!("Job completion reported successfully"),

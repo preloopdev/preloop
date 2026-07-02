@@ -1235,7 +1235,9 @@ async fn delete_session(
 /// Idempotent agent deregistration — the runner calls this on clean exit.
 /// aksh keeps no persistent agent registry so always succeeds.
 /// Returns null response body in JSON to match official.
-async fn delete_agent(Path((_pool_id, _agent_id)): Path<(i64, i64)>) -> (StatusCode, Json<serde_json::Value>) {
+async fn delete_agent(
+    Path((_pool_id, _agent_id)): Path<(i64, i64)>,
+) -> (StatusCode, Json<serde_json::Value>) {
     (StatusCode::NO_CONTENT, Json(serde_json::Value::Null))
 }
 
@@ -1243,7 +1245,9 @@ async fn delete_agent(Path((_pool_id, _agent_id)): Path<(i64, i64)>) -> (StatusC
 /// Broker-side session teardown: the runner deletes the session-less path on the broker host.
 /// Return 204 unconditionally; the concrete session was already cleaned up individually.
 /// Returns null response body in JSON to match official.
-async fn delete_sessions_for_pool(Path(_pool_id): Path<i64>) -> (StatusCode, Json<serde_json::Value>) {
+async fn delete_sessions_for_pool(
+    Path(_pool_id): Path<i64>,
+) -> (StatusCode, Json<serde_json::Value>) {
     (StatusCode::NO_CONTENT, Json(serde_json::Value::Null))
 }
 
@@ -1673,7 +1677,6 @@ async fn twirp_get_step_logs_signed_blob_url(
         "soft_size_limit": "1048576"
     }))
 }
-
 
 async fn next_message(
     State(shared): State<Arc<SharedState>>,
