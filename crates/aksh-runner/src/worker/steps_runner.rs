@@ -55,7 +55,7 @@ pub async fn run_steps(
     steps: &[Step],
     job: &mut JobContext,
     workspace: &str,
-    mut cancel_rx: tokio::sync::watch::Receiver<bool>,
+    cancel_rx: tokio::sync::watch::Receiver<bool>,
     queue: Arc<Mutex<ServerQueue>>,
     reporting: Option<&crate::worker::job_runner::ReportingContext>,
 ) -> Result<String> {
@@ -75,6 +75,9 @@ pub async fn run_steps(
             completed_at: Some(now.clone()),
             conclusion: step_conclusion::SUCCEEDED,
         });
+    }
+    if let Some(rpt) = reporting {
+        crate::worker::job_runner::flush_step_updates(rpt, &queue).await;
     }
 
     for (idx, step) in steps.iter().enumerate() {
@@ -100,16 +103,21 @@ pub async fn run_steps(
             );
             // F019: Queue skipped step
             let ts = crate::worker::job_runner::iso_now();
-            let mut q = queue.lock().await;
-            q.queue_update(StepUpdate {
-                external_id: step.id.clone(),
-                number: step_number,
-                name: step.display_name.clone(),
-                status: step_status::COMPLETED,
-                started_at: Some(ts.clone()),
-                completed_at: Some(ts),
-                conclusion: step_conclusion::SKIPPED,
-            });
+            {
+                let mut q = queue.lock().await;
+                q.queue_update(StepUpdate {
+                    external_id: step.id.clone(),
+                    number: step_number,
+                    name: step.display_name.clone(),
+                    status: step_status::COMPLETED,
+                    started_at: Some(ts.clone()),
+                    completed_at: Some(ts),
+                    conclusion: step_conclusion::SKIPPED,
+                });
+            }
+            if let Some(rpt) = reporting {
+                crate::worker::job_runner::flush_step_updates(rpt, &queue).await;
+            }
             continue;
         }
 
@@ -129,11 +137,26 @@ pub async fn run_steps(
                 conclusion: 0,
             });
         }
+        if let Some(rpt) = reporting {
+            crate::worker::job_runner::flush_step_updates(rpt, &queue).await;
+        }
 
         let mut step_ctx = StepContext::new(job, step.id.clone(), step.display_name.clone());
         for (k, v) in &step.env {
             step_ctx.env.insert(k.clone(), v.clone());
         }
+
+        let file_command_paths = {
+            let temp_dir = std::path::Path::new(workspace)
+                .parent()
+                .unwrap_or(std::path::Path::new("."))
+                .join("_temp");
+            let paths = super::file_commands::create_file_commands(&temp_dir)?;
+            for (k, v) in super::file_commands::file_command_env(&paths) {
+                step_ctx.env.insert(k, v);
+            }
+            paths
+        };
 
         // Execute step — cancel_rx is threaded into process::invoke which
         // kills the process group on cancel. No outer select! that drops futures.
@@ -196,21 +219,26 @@ pub async fn run_steps(
                 .insert(step.id.clone(), annotations);
         }
 
-        // Record step result
-        let step_outputs = std::mem::take(&mut step_ctx.env)
-            .into_iter()
-            .filter(|(k, _)| k.starts_with("OUTPUT_"))
-            .map(|(k, v)| (k.strip_prefix("OUTPUT_").unwrap_or(&k).to_string(), v))
-            .collect();
-
+        // Record a step result before applying file commands so GITHUB_OUTPUT can
+        // attach outputs to this step.
         step_ctx.job.steps.insert(
             step.id.clone(),
             StepResult {
                 outcome: outcome_str.clone(),
                 conclusion: conclusion_str.clone(),
-                outputs: step_outputs,
+                outputs: std::collections::HashMap::new(),
             },
         );
+
+        if let Err(e) =
+            super::file_commands::apply_file_commands(&file_command_paths, &step.id, step_ctx.job)
+        {
+            warn!(
+                "Applying file commands for step '{}' failed: {e:#}",
+                step.display_name
+            );
+        }
+        super::file_commands::cleanup_file_commands(&file_command_paths);
 
         if conclusion_str == "Failure" {
             any_failed = true;
@@ -237,6 +265,9 @@ pub async fn run_steps(
                 q.record_step_logs(&step.id, log_lines.clone());
             }
         }
+        if let Some(rpt) = reporting {
+            crate::worker::job_runner::flush_step_updates(rpt, &queue).await;
+        }
 
         // F020: Upload step log immediately after completion
         if let Some(rpt) = reporting {
@@ -250,9 +281,7 @@ pub async fn run_steps(
     // F019: Queue "Complete job" step
     let ts = crate::worker::job_runner::iso_now();
     let total_steps = steps.len() + 2;
-    let final_conclusion = if cancelled {
-        step_conclusion::FAILED
-    } else if any_failed {
+    let final_conclusion = if cancelled || any_failed {
         step_conclusion::FAILED
     } else {
         step_conclusion::SUCCEEDED
@@ -268,6 +297,9 @@ pub async fn run_steps(
             completed_at: Some(ts),
             conclusion: final_conclusion,
         });
+    }
+    if let Some(rpt) = reporting {
+        crate::worker::job_runner::flush_step_updates(rpt, &queue).await;
     }
 
     Ok(if cancelled {
@@ -308,7 +340,7 @@ async fn execute_step(
         StepType::Script {
             script,
             shell,
-            working_directory,
+            working_directory: _,
         } => {
             super::handlers::script::run_script(
                 script,
