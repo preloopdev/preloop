@@ -24,7 +24,7 @@ pub fn run_action<'a>(
             let action_dir = std::path::Path::new(workspace).join(uses);
             run_action_from_dir(&action_dir, with, workspace, ctx).await
         } else {
-            let action_dir = resolve_remote_action(uses, workspace)?;
+            let action_dir = resolve_remote_action(uses, workspace, ctx)?;
             run_action_from_dir(&action_dir, with, workspace, ctx).await
         }
     })
@@ -68,7 +68,14 @@ async fn run_action_from_dir(
 }
 
 /// Resolve a remote action reference to a local directory.
-fn resolve_remote_action(uses: &str, workspace: &str) -> Result<std::path::PathBuf> {
+fn resolve_remote_action(
+    uses: &str,
+    workspace: &str,
+    ctx: &StepContext<'_>,
+) -> Result<std::path::PathBuf> {
+    if let Some(path) = ctx.job.action_paths.get(uses) {
+        return Ok(std::path::PathBuf::from(path));
+    }
     let (repo_part, git_ref) = uses
         .split_once('@')
         .context("action reference must contain @ref")?;
