@@ -2240,38 +2240,92 @@ fn write_conformance_summary(
     lines.push("| `…/oauth2/token` | Official validates PSA256 client assertions and rejects job-scoped credentials; aksh is its own CA and accepts all. Unverifiable in replay. |".to_string());
     lines.push("| `…/messages?…` | Broker proactively invalidates sessions via concurrent two-session pattern; timing-based and not reproducible from a static golden. |".to_string());
     lines.push(String::new());
-    lines.push("### Mocked implementations".to_string());
+    lines.push("### Unsupported protocol surfaces".to_string());
     lines.push(String::new());
     lines.push(
-        "The following endpoints return **shape-correct 200 responses but are not".to_string(),
+        "Cache v4 and artifact v4 endpoints are intentionally **not mocked**.".to_string(),
     );
     lines.push(
-        "real implementations**. The gate passes because status codes match; body".to_string(),
+        "If a golden capture exercises one of these endpoints before aksh has a real".to_string(),
     );
-    lines.push("content and actual data behaviour are not checked.".to_string());
+    lines.push(
+        "implementation, replay must report a status mismatch instead of pretending".to_string(),
+    );
+    lines.push("the scenario works.".to_string());
     lines.push(String::new());
-    lines.push("| Endpoint | What the mock returns | What is missing |".to_string());
+    lines.push("| Endpoint family | Current truth | Expected replay signal |".to_string());
     lines.push("|---|---|---|".to_string());
-    lines.push("| `CacheService/GetCacheEntryDownloadURL` | `ok:true, signed_download_url:\"\"` — always a cache **miss** | No real cache store; runner skips restore |".to_string());
-    lines.push("| `CacheService/CreateCacheEntry` | `ok:true, signed_upload_url:<fake-aksh-url>` | Upload URL points at a non-existent aksh route; the runner's PUT would 404 |".to_string());
-    lines.push(
-        "| `CacheService/FinalizeCacheEntryUpload` | `ok:true` | No entry is stored |".to_string(),
-    );
-    lines.push("| `ArtifactService/CreateArtifact` | `ok:true, signed_upload_url:<fake-aksh-url>` | Same as above; upload silently fails |".to_string());
-    lines.push(
-        "| `ArtifactService/FinalizeArtifact` | `ok:true` | No artifact is stored |".to_string(),
-    );
-    lines.push("| `ArtifactService/GetSignedArtifactURL` | `signed_url:<fake-aksh-url>` | Download would 404 |".to_string());
-    lines.push("| `ArtifactService/ListArtifacts` | `artifacts:[]` | Always empty |".to_string());
+    lines.push("| `CacheService/*` | Not implemented | 404/status mismatch until backed by the cache store |".to_string());
+    lines.push("| `ArtifactService/*` | Not implemented | 404/status mismatch until backed by the artifact store |".to_string());
     lines.push(String::new());
     lines.push(
-        "The blob uploads/downloads that follow these calls go to `*.blob.core.windows.net`"
-            .to_string(),
+        "Blob uploads/downloads to `*.blob.core.windows.net` remain skipped because".to_string(),
     );
     lines.push(
-        "(in official captures) or to non-existent aksh routes (during replay), so".to_string(),
+        "they are external storage traffic, not aksh HTTP endpoints. Skipping those".to_string(),
     );
-    lines.push("they are never replayed and never appear in the comparison.".to_string());
+    lines.push(
+        "flows does not waive the aksh Twirp control-plane endpoints above.".to_string(),
+    );
+    lines.push(String::new());
+    lines.push("#### Roadmap: Removing Exclusions & Verifying Side Effects".to_string());
+    lines.push(String::new());
+    lines.push(
+        "Once local equivalents for storage (blob), cache, and OIDC are implemented".to_string(),
+    );
+    lines.push(
+        "in their respective crates, we will remove them from these skip lists.".to_string(),
+    );
+    lines.push(
+        "Because captured Azure SAS signatures expire and direct external connections".to_string(),
+    );
+    lines.push(
+        "cannot authenticate during static playbacks, the replayer must be updated".to_string(),
+    );
+    lines.push(
+        "to rewrite external hosts (e.g. `*.blob.core.windows.net`) to the local `aksh`".to_string(),
+    );
+    lines.push(
+        "server's endpoints, allowing verification of the local storage implementation.".to_string(),
+    );
+    lines.push(String::new());
+    lines.push(
+        "Additionally, the conformance pipeline will be expanded to verify stateful".to_string(),
+    );
+    lines.push(
+        "side effects directly rather than relying solely on HTTP responses:".to_string(),
+    );
+    lines.push(
+        "- **Cache validation**: Verify that actual cache archives are written to disk".to_string(),
+    );
+    lines.push(
+        "  and are retrievable during subsequent restore calls.".to_string(),
+    );
+    lines.push(
+        "- **OIDC token verification**: Validate that generated tokens carry the requested".to_string(),
+    );
+    lines.push(
+        "  audience, correct claims, and valid signatures that the server accepts.".to_string(),
+    );
+    lines.push(String::new());
+    lines.push("### How Wire Compliance is Checked".to_string());
+    lines.push(String::new());
+    lines.push(
+        "The conformance checker compares the local `aksh` server against the official".to_string(),
+    );
+    lines.push(
+        "recorded golden baseline. For each non-skipped flow, it compares:".to_string(),
+    );
+    lines.push(String::new());
+    lines.push(
+        "1. **HTTP Status Codes**: Verifies status codes match exactly (e.g. `200` vs `200`, `204` vs `204`). Any mismatch fails the scenario.".to_string(),
+    );
+    lines.push(
+        "2. **Request & Response Bodies**: Compares JSON structure and values using unified diffs. Volatile segments (like session IDs, timestamps, and authentication tokens) are redacted or normalized beforehand.".to_string(),
+    );
+    lines.push(
+        "3. **Header Keys**: Checks for differences in HTTP header names (e.g., verifying that expected content types or authentication headers are present).".to_string(),
+    );
     fs::write(root.join("conformance-report.md"), lines.join("\n"))?;
     fs::write(
         PathBuf::from(DEFAULT_ROOT).join("conformance-report.md"),

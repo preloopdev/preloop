@@ -13,6 +13,8 @@ workspace = true
 indexmap.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+sha2.workspace = true
+glob.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
