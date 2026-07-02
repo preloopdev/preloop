@@ -30,6 +30,8 @@ pub struct JobContext {
     pub state: HashMap<String, HashMap<String, String>>,
     /// Annotations collected per step_id (F025).
     pub step_annotations: HashMap<String, Vec<Annotation>>,
+    /// Resolved action directories keyed by the original `uses:` reference.
+    pub action_paths: HashMap<String, String>,
 }
 
 /// Result of a completed step.
@@ -71,8 +73,14 @@ impl JobContext {
                                 masks.insert(trimmed.to_string());
                             }
                             use base64::engine::Engine as _;
-                            let b64 = base64::engine::general_purpose::STANDARD.encode(val);
-                            masks.insert(b64);
+                            masks.insert(base64::engine::general_purpose::STANDARD.encode(val));
+                            masks.insert(
+                                base64::engine::general_purpose::STANDARD_NO_PAD.encode(val),
+                            );
+                            masks.insert(base64::engine::general_purpose::URL_SAFE.encode(val));
+                            masks.insert(
+                                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(val),
+                            );
                         }
                     }
                 }
@@ -93,6 +101,7 @@ impl JobContext {
             job_status: JobStatus::Success,
             state: HashMap::new(),
             step_annotations: HashMap::new(),
+            action_paths: HashMap::new(),
         }
     }
 
@@ -117,7 +126,7 @@ impl JobContext {
         // Sort by length descending so longer secrets are replaced before
         // shorter ones that might be a subset (e.g. trimmed variant).
         let mut secrets: Vec<&String> = self.masks.iter().filter(|s| !s.is_empty()).collect();
-        secrets.sort_by(|a, b| b.len().cmp(&a.len()));
+        secrets.sort_by_key(|b| std::cmp::Reverse(b.len()));
         for secret in secrets {
             result = result.replace(secret.as_str(), "***");
         }
@@ -355,7 +364,7 @@ mod tests {
 
         // Verify success() evaluates correctly
         let success = aksh_gha_expressions::eval_bool("success()", &expr_ctx);
-        assert_eq!(success.unwrap(), true);
+        assert!(success.unwrap());
     }
 
     #[test]
