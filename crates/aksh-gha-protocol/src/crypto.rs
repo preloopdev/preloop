@@ -173,6 +173,155 @@ impl AgentRsaKeypair {
     }
 }
 
+/// Trait for RSA parameter sources (settings::RsaParameters, etc.).
+pub trait RsaParamsLike {
+    /// Base64 `D` private exponent.
+    fn d(&self) -> &str;
+    /// Base64 `Exponent` public exponent.
+    fn exponent(&self) -> &str;
+    /// Base64 `Modulus`.
+    fn modulus(&self) -> &str;
+    /// Base64 `P` prime.
+    fn p(&self) -> &str;
+    /// Base64 `Q` prime.
+    fn q(&self) -> &str;
+}
+
+/// Exported RSA parameters (C# RSAParameters format).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RsaParametersExport {
+    #[serde(rename = "D")]
+    pub d: String,
+    #[serde(rename = "DP")]
+    pub dp: String,
+    #[serde(rename = "DQ")]
+    pub dq: String,
+    #[serde(rename = "Exponent")]
+    pub exponent: String,
+    #[serde(rename = "InverseQ")]
+    pub inverse_q: String,
+    #[serde(rename = "Modulus")]
+    pub modulus: String,
+    #[serde(rename = "P")]
+    pub p: String,
+    #[serde(rename = "Q")]
+    pub q: String,
+}
+
+impl RsaParamsLike for RsaParametersExport {
+    fn d(&self) -> &str {
+        &self.d
+    }
+    fn exponent(&self) -> &str {
+        &self.exponent
+    }
+    fn modulus(&self) -> &str {
+        &self.modulus
+    }
+    fn p(&self) -> &str {
+        &self.p
+    }
+    fn q(&self) -> &str {
+        &self.q
+    }
+}
+
+impl AgentRsaKeypair {
+    /// Export this keypair as C# `RSAParameters`-compatible JSON fields.
+    pub fn to_rsaparams(&self) -> RsaParametersExport {
+        use rsa::traits::PrivateKeyParts;
+        let primes = self.private_key.primes();
+        let p = &primes[0];
+        let q = &primes[1];
+        let dp = self.private_key.dp().cloned().unwrap_or_default();
+        let dq = self.private_key.dq().cloned().unwrap_or_default();
+        let qi = self
+            .private_key
+            .qinv()
+            .cloned()
+            .and_then(|v| v.to_biguint())
+            .unwrap_or_default();
+
+        RsaParametersExport {
+            d: BASE64_STANDARD.encode(self.private_key.d().to_bytes_be()),
+            dp: BASE64_STANDARD.encode(dp.to_bytes_be()),
+            dq: BASE64_STANDARD.encode(dq.to_bytes_be()),
+            exponent: BASE64_STANDARD.encode(self.public_key.e().to_bytes_be()),
+            inverse_q: BASE64_STANDARD.encode(qi.to_bytes_be()),
+            modulus: BASE64_STANDARD.encode(self.public_key.n().to_bytes_be()),
+            p: BASE64_STANDARD.encode(p.to_bytes_be()),
+            q: BASE64_STANDARD.encode(q.to_bytes_be()),
+        }
+    }
+
+    /// Import a keypair from C# `RSAParameters`-format fields.
+    pub fn from_rsaparams(params: &dyn RsaParamsLike) -> Result<Self, CryptoError> {
+        let n = BigUint::from_bytes_be(
+            &BASE64_STANDARD
+                .decode(params.modulus())
+                .map_err(|e| CryptoError::KeyGen(e.to_string()))?,
+        );
+        let e = BigUint::from_bytes_be(
+            &BASE64_STANDARD
+                .decode(params.exponent())
+                .map_err(|e| CryptoError::KeyGen(e.to_string()))?,
+        );
+        let d = BigUint::from_bytes_be(
+            &BASE64_STANDARD
+                .decode(params.d())
+                .map_err(|e| CryptoError::KeyGen(e.to_string()))?,
+        );
+        let p_val = BigUint::from_bytes_be(
+            &BASE64_STANDARD
+                .decode(params.p())
+                .map_err(|e| CryptoError::KeyGen(e.to_string()))?,
+        );
+        let q_val = BigUint::from_bytes_be(
+            &BASE64_STANDARD
+                .decode(params.q())
+                .map_err(|e| CryptoError::KeyGen(e.to_string()))?,
+        );
+
+        let public_key = rsa::RsaPublicKey::new(n.clone(), e)
+            .map_err(|err| CryptoError::KeyGen(err.to_string()))?;
+        let private_key =
+            rsa::RsaPrivateKey::from_components(n, public_key.e().clone(), d, vec![p_val, q_val])
+                .map_err(|err| CryptoError::KeyGen(err.to_string()))?;
+
+        Ok(Self {
+            private_key,
+            public_key,
+        })
+    }
+}
+
+/// Sign a JWT with PS256 (RSA-PSS SHA-256) — the algorithm the official runner uses.
+///
+/// Produces: base64url(header).base64url(claims).base64url(signature)
+pub fn sign_jwt_ps256(
+    header: &serde_json::Value,
+    claims: &serde_json::Value,
+    params: &dyn RsaParamsLike,
+) -> Result<String, anyhow::Error> {
+    use rsa::pss::SigningKey;
+    use rsa::signature::RandomizedSigner;
+    use sha2::Sha256;
+
+    let keypair = AgentRsaKeypair::from_rsaparams(params)?;
+
+    let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_string(header)?.as_bytes());
+    let claims_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_string(claims)?.as_bytes());
+    let signing_input = format!("{header_b64}.{claims_b64}");
+
+    let signing_key = SigningKey::<Sha256>::new(keypair.private_key);
+    let mut rng = rand::thread_rng();
+    let signature = signing_key.sign_with_rng(&mut rng, signing_input.as_bytes());
+    let sig_bytes: Box<[u8]> = signature.into();
+    let sig_b64 = URL_SAFE_NO_PAD.encode(&*sig_bytes);
+
+    Ok(format!("{signing_input}.{sig_b64}"))
+}
+
 /// A session encryption context — holds the AES key for encrypting/decrypting
 /// message bodies within a session.
 pub struct SessionEncryption {
@@ -335,5 +484,82 @@ mod tests {
         // Server decrypts
         let decrypted = session.decrypt(&ciphertext, &iv).unwrap();
         assert_eq!(decrypted, body.as_bytes());
+    }
+
+    #[test]
+    fn rsa_params_roundtrip() {
+        let kp = AgentRsaKeypair::generate().unwrap();
+        let params = kp.to_rsaparams();
+
+        // Verify field names are populated
+        assert!(!params.d.is_empty());
+        assert!(!params.modulus.is_empty());
+        assert!(!params.exponent.is_empty());
+        assert!(!params.p.is_empty());
+        assert!(!params.q.is_empty());
+
+        // Round-trip: reconstruct keypair from params
+        let kp2 = AgentRsaKeypair::from_rsaparams(&params).unwrap();
+
+        // Verify the reconstructed keypair can wrap/unwrap
+        let data = vec![1u8; 32];
+        let wrapped = kp2.wrap_key(&data).unwrap();
+        let unwrapped = kp2.unwrap_key(&wrapped).unwrap();
+        assert_eq!(data, unwrapped);
+
+        // Verify cross-compatibility: encrypt with original, decrypt with reconstructed
+        let wrapped2 = kp.wrap_key(&data).unwrap();
+        let unwrapped2 = kp2.unwrap_key(&wrapped2).unwrap();
+        assert_eq!(data, unwrapped2);
+    }
+
+    #[test]
+    fn rsa_params_serde_field_names() {
+        let kp = AgentRsaKeypair::generate().unwrap();
+        let params = kp.to_rsaparams();
+        let json = serde_json::to_string(&params).unwrap();
+        // Verify C# RSAParameters field naming
+        assert!(json.contains("\"D\""));
+        assert!(json.contains("\"DP\""));
+        assert!(json.contains("\"DQ\""));
+        assert!(json.contains("\"Exponent\""));
+        assert!(json.contains("\"InverseQ\""));
+        assert!(json.contains("\"Modulus\""));
+        assert!(json.contains("\"P\""));
+        assert!(json.contains("\"Q\""));
+    }
+
+    #[test]
+    fn sign_jwt_ps256_produces_three_parts() {
+        let kp = AgentRsaKeypair::generate().unwrap();
+        let params = kp.to_rsaparams();
+
+        let header = serde_json::json!({"typ": "JWT", "alg": "PS256"});
+        let claims = serde_json::json!({
+            "sub": "client-id",
+            "iss": "client-id",
+            "aud": "https://vstoken.example.com",
+            "jti": "unique-id",
+            "nbf": 1700000000u64,
+            "exp": 1700000300u64,
+        });
+
+        let jwt = super::sign_jwt_ps256(&header, &claims, &params).unwrap();
+        let parts: Vec<&str> = jwt.split('.').collect();
+        assert_eq!(parts.len(), 3, "JWT should have 3 dot-separated parts");
+        assert!(!parts[0].is_empty(), "header segment should not be empty");
+        assert!(!parts[1].is_empty(), "claims segment should not be empty");
+        assert!(
+            !parts[2].is_empty(),
+            "signature segment should not be empty"
+        );
+
+        // Verify header decodes correctly
+        let decoded_header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(parts[0])
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&decoded_header).unwrap();
+        assert_eq!(parsed["alg"], "PS256");
+        assert_eq!(parsed["typ"], "JWT");
     }
 }
