@@ -34,6 +34,11 @@ impl HttpClient {
         Ok(Self { inner: client })
     }
 
+    /// Expose the underlying reqwest::Client for cases that need direct HTTP control.
+    pub fn inner_client(&self) -> &reqwest::Client {
+        &self.inner
+    }
+
     /// GET request returning JSON.
     pub async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
         let resp = self
