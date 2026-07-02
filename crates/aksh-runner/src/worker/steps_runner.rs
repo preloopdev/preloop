@@ -13,7 +13,6 @@ use tracing::{info, warn};
 
 use super::contexts::{JobContext, JobStatus, StepResult};
 use super::execution_context::StepContext;
-use super::handlers;
 use super::server_queue::{step_conclusion, step_status, ServerQueue, StepUpdate};
 
 /// A step to execute, with its metadata.
