@@ -236,11 +236,23 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             delete(delete_agent),
         )
         .route(
+            "/_apis/distributedtask/pools/:pool_id/agents/:agent_id",
+            delete(delete_agent),
+        )
+        .route(
             "/runner/server/_apis/distributedtask/pools/:pool_id/sessions",
             post(create_session_disttask).delete(delete_sessions_for_pool),
         )
         .route(
+            "/_apis/distributedtask/pools/:pool_id/sessions",
+            post(create_session_disttask).delete(delete_sessions_for_pool),
+        )
+        .route(
             "/runner/server/_apis/distributedtask/pools/:pool_id/sessions/:session_id",
+            delete(delete_session),
+        )
+        .route(
+            "/_apis/distributedtask/pools/:pool_id/sessions/:session_id",
             delete(delete_session),
         )
         .route(
@@ -261,15 +273,6 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         .route("/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate", post(twirp_workflow_steps_update))
         .route("/twirp/results.services.receiver.Receiver/GetJobLogsSignedBlobURL", post(twirp_get_job_logs_signed_blob_url))
         .route("/twirp/results.services.receiver.Receiver/GetStepLogsSignedBlobURL", post(twirp_get_step_logs_signed_blob_url))
-        // Cache v4 (actions/cache@v4): twirp service stubs so the runner doesn't see 404.
-        .route("/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL", post(twirp_cache_get_download_url))
-        .route("/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry", post(twirp_cache_create_entry))
-        .route("/twirp/github.actions.results.api.v1.CacheService/FinalizeCacheEntryUpload", post(twirp_cache_finalize_upload))
-        // Artifact v4 (actions/upload-artifact@v4, actions/download-artifact@v4): stubs.
-        .route("/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact", post(twirp_artifact_create))
-        .route("/twirp/github.actions.results.api.v1.ArtifactService/FinalizeArtifact", post(twirp_artifact_finalize))
-        .route("/twirp/github.actions.results.api.v1.ArtifactService/GetSignedArtifactURL", post(twirp_artifact_get_signed_url))
-        .route("/twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts", post(twirp_artifact_list))
         .route(
             "/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id",
             patch(patch_timeline_records),
@@ -1231,15 +1234,17 @@ async fn delete_session(
 /// DELETE /runner/server/_apis/distributedtask/pools/:pool_id/agents/:agent_id
 /// Idempotent agent deregistration — the runner calls this on clean exit.
 /// aksh keeps no persistent agent registry so always succeeds.
-async fn delete_agent(Path((_pool_id, _agent_id)): Path<(i64, i64)>) -> StatusCode {
-    StatusCode::NO_CONTENT
+/// Returns null response body in JSON to match official.
+async fn delete_agent(Path((_pool_id, _agent_id)): Path<(i64, i64)>) -> (StatusCode, Json<serde_json::Value>) {
+    (StatusCode::NO_CONTENT, Json(serde_json::Value::Null))
 }
 
 /// DELETE /runner/server/_apis/distributedtask/pools/:pool_id/sessions (no session_id)
 /// Broker-side session teardown: the runner deletes the session-less path on the broker host.
 /// Return 204 unconditionally; the concrete session was already cleaned up individually.
-async fn delete_sessions_for_pool(Path(_pool_id): Path<i64>) -> StatusCode {
-    StatusCode::NO_CONTENT
+/// Returns null response body in JSON to match official.
+async fn delete_sessions_for_pool(Path(_pool_id): Path<i64>) -> (StatusCode, Json<serde_json::Value>) {
+    (StatusCode::NO_CONTENT, Json(serde_json::Value::Null))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1669,60 +1674,6 @@ async fn twirp_get_step_logs_signed_blob_url(
     }))
 }
 
-// ── Cache v4 twirp stubs ──────────────────────────────────────────────────
-
-async fn twirp_cache_get_download_url(
-    Json(_req): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
-    // Runner calls this to locate an existing cache entry. Return cache-miss so
-    // the runner skips restore and proceeds (the job step handles the empty cache).
-    Json(json!({"ok": true, "signed_download_url": "", "matched_key": ""}))
-}
-
-async fn twirp_cache_create_entry(Json(_req): Json<serde_json::Value>) -> Json<serde_json::Value> {
-    let upload_url = format!(
-        "{}/replay/cache/upload/{}",
-        public_base_url(),
-        uuid::Uuid::new_v4()
-    );
-    Json(json!({"ok": true, "signed_upload_url": upload_url, "message": ""}))
-}
-
-async fn twirp_cache_finalize_upload(
-    Json(_req): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
-    Json(json!({"ok": true, "entry_id": uuid::Uuid::new_v4().to_string(), "message": ""}))
-}
-
-// ── Artifact v4 twirp stubs ───────────────────────────────────────────────
-
-async fn twirp_artifact_create(Json(_req): Json<serde_json::Value>) -> Json<serde_json::Value> {
-    let upload_url = format!(
-        "{}/replay/artifact/upload/{}",
-        public_base_url(),
-        uuid::Uuid::new_v4()
-    );
-    Json(json!({"ok": true, "signed_upload_url": upload_url}))
-}
-
-async fn twirp_artifact_finalize(Json(_req): Json<serde_json::Value>) -> Json<serde_json::Value> {
-    Json(json!({"ok": true, "artifact_id": uuid::Uuid::new_v4().to_string()}))
-}
-
-async fn twirp_artifact_get_signed_url(
-    Json(_req): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
-    let url = format!(
-        "{}/replay/artifact/download/{}",
-        public_base_url(),
-        uuid::Uuid::new_v4()
-    );
-    Json(json!({"signed_url": url}))
-}
-
-async fn twirp_artifact_list(Json(_req): Json<serde_json::Value>) -> Json<serde_json::Value> {
-    Json(json!({"artifacts": []}))
-}
 
 async fn next_message(
     State(shared): State<Arc<SharedState>>,

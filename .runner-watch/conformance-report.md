@@ -1,17 +1,8 @@
 # runner-watch conformance report
 
-✅ All 10 scenario(s) matched recorded baseline responses (see replay caveats below).
+❌ 1 of 1 scenario(s) diverged.
 
-- [06-multi-step](.runner-watch/conformance/v2.335.1/06-multi-step.md)
-- [07-step-failure](.runner-watch/conformance/v2.335.1/07-step-failure.md)
-- [08-job-outputs-needs](.runner-watch/conformance/v2.335.1/08-job-outputs-needs.md)
-- [09-matrix-fan-out](.runner-watch/conformance/v2.335.1/09-matrix-fan-out.md)
-- [10-uses-checkout](.runner-watch/conformance/v2.335.1/10-uses-checkout.md)
 - [11-cache-roundtrip](.runner-watch/conformance/v2.335.1/11-cache-roundtrip.md)
-- [12-artifact](.runner-watch/conformance/v2.335.1/12-artifact.md)
-- [13-composite-action](.runner-watch/conformance/v2.335.1/13-composite-action.md)
-- [14-annotations](.runner-watch/conformance/v2.335.1/14-annotations.md)
-- [15-oidc-id-token](.runner-watch/conformance/v2.335.1/15-oidc-id-token.md)
 
 ## Replay methodology and known gaps
 
@@ -50,22 +41,43 @@ the status-mismatch check (`status_mismatch_in_report`):
 | `…/oauth2/token` | Official validates PSA256 client assertions and rejects job-scoped credentials; aksh is its own CA and accepts all. Unverifiable in replay. |
 | `…/messages?…` | Broker proactively invalidates sessions via concurrent two-session pattern; timing-based and not reproducible from a static golden. |
 
-### Mocked implementations
+### Unsupported protocol surfaces
 
-The following endpoints return **shape-correct 200 responses but are not
-real implementations**. The gate passes because status codes match; body
-content and actual data behaviour are not checked.
+Cache v4 and artifact v4 endpoints are intentionally **not mocked**.
+If a golden capture exercises one of these endpoints before aksh has a real
+implementation, replay must report a status mismatch instead of pretending
+the scenario works.
 
-| Endpoint | What the mock returns | What is missing |
+| Endpoint family | Current truth | Expected replay signal |
 |---|---|---|
-| `CacheService/GetCacheEntryDownloadURL` | `ok:true, signed_download_url:""` — always a cache **miss** | No real cache store; runner skips restore |
-| `CacheService/CreateCacheEntry` | `ok:true, signed_upload_url:<fake-aksh-url>` | Upload URL points at a non-existent aksh route; the runner's PUT would 404 |
-| `CacheService/FinalizeCacheEntryUpload` | `ok:true` | No entry is stored |
-| `ArtifactService/CreateArtifact` | `ok:true, signed_upload_url:<fake-aksh-url>` | Same as above; upload silently fails |
-| `ArtifactService/FinalizeArtifact` | `ok:true` | No artifact is stored |
-| `ArtifactService/GetSignedArtifactURL` | `signed_url:<fake-aksh-url>` | Download would 404 |
-| `ArtifactService/ListArtifacts` | `artifacts:[]` | Always empty |
+| `CacheService/*` | Not implemented | 404/status mismatch until backed by the cache store |
+| `ArtifactService/*` | Not implemented | 404/status mismatch until backed by the artifact store |
 
-The blob uploads/downloads that follow these calls go to `*.blob.core.windows.net`
-(in official captures) or to non-existent aksh routes (during replay), so
-they are never replayed and never appear in the comparison.
+Blob uploads/downloads to `*.blob.core.windows.net` remain skipped because
+they are external storage traffic, not aksh HTTP endpoints. Skipping those
+flows does not waive the aksh Twirp control-plane endpoints above.
+
+#### Roadmap: Removing Exclusions & Verifying Side Effects
+
+Once local equivalents for storage (blob), cache, and OIDC are implemented
+in their respective crates, we will remove them from these skip lists.
+Because captured Azure SAS signatures expire and direct external connections
+cannot authenticate during static playbacks, the replayer must be updated
+to rewrite external hosts (e.g. `*.blob.core.windows.net`) to the local `aksh`
+server's endpoints, allowing verification of the local storage implementation.
+
+Additionally, the conformance pipeline will be expanded to verify stateful
+side effects directly rather than relying solely on HTTP responses:
+- **Cache validation**: Verify that actual cache archives are written to disk
+  and are retrievable during subsequent restore calls.
+- **OIDC token verification**: Validate that generated tokens carry the requested
+  audience, correct claims, and valid signatures that the server accepts.
+
+### How Wire Compliance is Checked
+
+The conformance checker compares the local `aksh` server against the official
+recorded golden baseline. For each non-skipped flow, it compares:
+
+1. **HTTP Status Codes**: Verifies status codes match exactly (e.g. `200` vs `200`, `204` vs `204`). Any mismatch fails the scenario.
+2. **Request & Response Bodies**: Compares JSON structure and values using unified diffs. Volatile segments (like session IDs, timestamps, and authentication tokens) are redacted or normalized beforehand.
+3. **Header Keys**: Checks for differences in HTTP header names (e.g., verifying that expected content types or authentication headers are present).

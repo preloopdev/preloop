@@ -11,6 +11,8 @@ pub struct Context {
     success: bool,
     failure: bool,
     cancelled: bool,
+    /// Workspace directory for hashFiles() evaluation.
+    workspace_dir: Option<String>,
 }
 
 impl Context {
@@ -27,25 +29,60 @@ impl Context {
         self
     }
 
+    /// Set workspace directory for hashFiles() evaluation (F027).
+    pub fn with_workspace(mut self, dir: String) -> Self {
+        self.workspace_dir = Some(dir);
+        self
+    }
+
     /// Insert a root object.
     pub fn insert(&mut self, key: impl Into<String>, value: Value) {
         self.roots.insert(key.into(), value);
     }
 
     /// Resolve a dotted path such as `github.event_name`.
+    /// Resolve a path such as `github.event_name`, with bracket access and wildcard support.
+    ///
+    /// - Numeric segment: array index (e.g. path built from `a[0]`)
+    /// - `*` segment: collect all values from an object/array, then apply next segment
     pub fn resolve(&self, path: &[String]) -> Value {
         let Some((first, rest)) = path.split_first() else {
             return Value::Null;
         };
         let mut current = self.roots.get(first).cloned().unwrap_or(Value::Null);
         for segment in rest {
+            if segment == "*" {
+                // Object filter: collect values from object or array
+                current = match current {
+                    Value::Object(map) => Value::Array(map.into_values().collect()),
+                    Value::Array(arr) => Value::Array(arr),
+                    _ => Value::Null,
+                };
+                continue;
+            }
             current = match current {
                 Value::Object(map) => map.get(segment).cloned().unwrap_or(Value::Null),
+                // After a wildcard, apply the next segment to each element
+                Value::Array(arr) => Value::Array(
+                    arr.into_iter()
+                        .filter_map(|v| match v {
+                            Value::Object(ref m) => m.get(segment).cloned(),
+                            Value::Array(ref a) => segment
+                                .parse::<usize>()
+                                .ok()
+                                .and_then(|i| a.get(i))
+                                .cloned(),
+                            _ => None,
+                        })
+                        .collect(),
+                ),
+                // Numeric index into array (from bracket access `a[0]`)
                 _ => Value::Null,
             };
         }
         current
     }
+
 }
 
 impl Default for Context {
@@ -55,6 +92,7 @@ impl Default for Context {
             success: true,
             failure: false,
             cancelled: false,
+            workspace_dir: None,
         }
     }
 }
@@ -250,7 +288,7 @@ fn eval_call(name: &str, args: &[Expr], context: &Context) -> Result<Value, Expr
             .and_then(|value| serde_json::from_str(&string_value(value)).ok())
             .unwrap_or(Value::Null)),
         "join" => Ok(Value::String(join_args(&values))),
-        "hashfiles" => Ok(Value::String(String::new())),
+        "hashfiles" => Ok(Value::String(hash_files(&values, context))),
         "tojson" => Ok(Value::String(
             serde_json::to_string(values.first().unwrap_or(&Value::Null)).unwrap_or_default(),
         )),
@@ -303,6 +341,70 @@ fn join_args(values: &[Value]) -> String {
     }
 }
 
+/// Implementation of `hashFiles(pattern, ...)` (F027).
+///
+/// Globs each argument pattern relative to `context.workspace_dir`, collects
+/// all matching file paths (sorted), SHA-256 hashes each file, then
+/// SHA-256 hashes the concatenated hex digests. Returns `""` on no match.
+fn hash_files(values: &[Value], context: &Context) -> String {
+    use sha2::{Digest, Sha256};
+
+    let workspace = match &context.workspace_dir {
+        Some(dir) => dir.as_str(),
+        None => return String::new(),
+    };
+
+    let mut all_paths: Vec<std::path::PathBuf> = Vec::new();
+    for val in values {
+        let pattern = string_value(val);
+        if pattern.is_empty() {
+            continue;
+        }
+        // Make pattern relative to workspace
+        let abs_pattern = if std::path::Path::new(&pattern).is_absolute() {
+            pattern.clone()
+        } else {
+            format!("{workspace}/{pattern}")
+        };
+        match glob::glob(&abs_pattern) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    if entry.is_file() {
+                        all_paths.push(entry);
+                    }
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+
+    if all_paths.is_empty() {
+        return String::new();
+    }
+
+    all_paths.sort();
+
+    // Hash each file, collect hex digests
+    let mut combined = String::new();
+    for path in &all_paths {
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                let digest = Sha256::digest(&bytes);
+                combined.push_str(&format!("{digest:x}"));
+            }
+            Err(_) => continue,
+        }
+    }
+
+    if combined.is_empty() {
+        return String::new();
+    }
+
+    // Hash the concatenated hex digests
+    let final_hash = Sha256::digest(combined.as_bytes());
+    format!("{final_hash:x}")
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum Token {
     Ident(String),
@@ -314,6 +416,9 @@ enum Token {
     Comma,
     LParen,
     RParen,
+    LBracket,
+    RBracket,
+    Star,
     Bang,
     And,
     Or,
@@ -425,6 +530,18 @@ impl<'a> Lexer<'a> {
                     } else {
                         return Err(ExpressionError::Unexpected("|".to_owned()));
                     }
+                }
+                '*' => {
+                    self.bump();
+                    tokens.push(Token::Star);
+                }
+                '[' => {
+                    self.bump();
+                    tokens.push(Token::LBracket);
+                }
+                ']' => {
+                    self.bump();
+                    tokens.push(Token::RBracket);
                 }
                 other => return Err(ExpressionError::Unexpected(other.to_string())),
             }
@@ -611,13 +728,50 @@ impl Parser {
             Ok(Expr::Call { name, args })
         } else {
             let mut path = vec![name];
-            while matches!(self.current(), Token::Dot) {
-                self.advance();
-                let Token::Ident(segment) = self.current().clone() else {
-                    return Err(ExpressionError::Unexpected(format!("{:?}", self.current())));
-                };
-                self.advance();
-                path.push(segment);
+            loop {
+                match self.current() {
+                    // Dot access: a.b or a.*
+                    Token::Dot => {
+                        self.advance();
+                        match self.current().clone() {
+                            Token::Ident(segment) => {
+                                self.advance();
+                                path.push(segment);
+                            }
+                            Token::Star => {
+                                self.advance();
+                                path.push("*".to_string());
+                            }
+                            other => {
+                                return Err(ExpressionError::Unexpected(format!("{other:?}")));
+                            }
+                        }
+                    }
+                    // Bracket access: a['key'] or a[0]
+                    Token::LBracket => {
+                        self.advance();
+                        let segment = match self.current().clone() {
+                            Token::String(s) => {
+                                self.advance();
+                                s
+                            }
+                            Token::Number(n) => {
+                                self.advance();
+                                n
+                            }
+                            Token::Ident(s) => {
+                                self.advance();
+                                s
+                            }
+                            other => {
+                                return Err(ExpressionError::Unexpected(format!("{other:?}")));
+                            }
+                        };
+                        self.expect(Token::RBracket)?;
+                        path.push(segment);
+                    }
+                    _ => break,
+                }
             }
             Ok(Expr::Path(path))
         }
