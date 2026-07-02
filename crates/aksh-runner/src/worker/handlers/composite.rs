@@ -65,10 +65,10 @@ fn run_composite_action_inner<'a>(
         if let Some(manifest_inputs) = &manifest.inputs {
             for (key, input_def) in manifest_inputs {
                 let env_key = format!("INPUT_{}", key.to_uppercase().replace(' ', "_"));
-                if !input_env.contains_key(&env_key) {
-                    if let Some(default) = input_def.get("default").and_then(|v| v.as_str()) {
-                        input_env.insert(env_key, default.to_string());
-                    }
+                if let Some(default) = input_def.get("default").and_then(|v| v.as_str()) {
+                    input_env
+                        .entry(env_key)
+                        .or_insert_with(|| default.to_string());
                 }
             }
         }
@@ -104,6 +104,20 @@ fn run_composite_action_inner<'a>(
                 .unwrap_or("composite step");
 
             info!("  Composite step: {step_name}");
+
+            let temp_dir = Path::new(workspace)
+                .parent()
+                .unwrap_or(Path::new("."))
+                .join("_temp");
+            let file_commands = crate::worker::file_commands::create_file_commands(&temp_dir)?;
+            let file_env = crate::worker::file_commands::file_command_env(&file_commands);
+            let saved_file_env: Vec<(String, Option<String>)> = file_env
+                .keys()
+                .map(|key| (key.clone(), ctx.env.get(key).cloned()))
+                .collect();
+            for (k, v) in file_env {
+                ctx.env.insert(k, v);
+            }
 
             let outcome = if let Some(script) = step_run {
                 super::script::run_script(script, step_shell, workspace, ctx, None)
@@ -144,26 +158,25 @@ fn run_composite_action_inner<'a>(
                 Ok("Skipped".to_string())
             };
 
-            let conclusion = match outcome {
-                Ok(ref s) => s.clone(),
-                Err(ref e) => {
+            let step_outputs =
+                crate::worker::file_commands::parse_kv_file(&file_commands.output_file)
+                    .unwrap_or_default();
+            crate::worker::file_commands::cleanup_file_commands(&file_commands);
+            for (key, value) in saved_file_env {
+                if let Some(value) = value {
+                    ctx.env.insert(key, value);
+                } else {
+                    ctx.env.remove(&key);
+                }
+            }
+
+            let conclusion = match &outcome {
+                Ok(s) => s.clone(),
+                Err(e) => {
                     warn!("Composite step '{step_name}' failed: {e:#}");
                     "Failure".to_string()
                 }
             };
-
-            // Collect outputs from the step's env (OUTPUT_* vars set via GITHUB_OUTPUT)
-            let step_outputs: std::collections::HashMap<String, String> = ctx
-                .env
-                .iter()
-                .filter(|(k, _)| k.starts_with("OUTPUT_"))
-                .map(|(k, v)| {
-                    (
-                        k.strip_prefix("OUTPUT_").unwrap_or(k).to_string(),
-                        v.clone(),
-                    )
-                })
-                .collect();
 
             nested_step_results.insert(
                 step_id.clone(),
@@ -224,10 +237,23 @@ fn run_composite_action_inner<'a>(
                                 serde_json::Value::String(s) => s,
                                 other => serde_json::to_string(&other).unwrap_or_default(),
                             };
-                            // Set as OUTPUT_* env var so the parent step picks it up
-                            let env_key =
-                                format!("OUTPUT_{}", output_name.to_uppercase().replace('-', "_"));
-                            ctx.env.insert(env_key, val_str);
+                            if let Some(output_path) = ctx.env.get("GITHUB_OUTPUT") {
+                                use std::io::Write as _;
+                                let mut file = std::fs::OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open(output_path)
+                                    .with_context(|| {
+                                        format!("opening GITHUB_OUTPUT {output_path}")
+                                    })?;
+                                writeln!(file, "{output_name}={val_str}")?;
+                            } else {
+                                let env_key = format!(
+                                    "OUTPUT_{}",
+                                    output_name.to_uppercase().replace('-', "_")
+                                );
+                                ctx.env.insert(env_key, val_str);
+                            }
                         }
                         Err(e) => {
                             warn!(

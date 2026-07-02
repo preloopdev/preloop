@@ -116,10 +116,5 @@ pub async fn run_worker(args: WorkerArgs) -> Result<()> {
     });
 
     // Run the job with cancellation support.
-    let result = job_runner::run_job(job_body, args.via, cancel_rx).await;
-
-    // Detached stdin reader exits on EOF/cancel/shutdown. If it is blocked on
-    // stdin, process exit will terminate it.
-
-    result
+    job_runner::run_job(job_body, args.via, cancel_rx).await
 }
