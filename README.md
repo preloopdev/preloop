@@ -29,6 +29,8 @@ independently usable — anyone can `cargo install aksh` and point their own run
   upload/download behavior.
 - `aksh-conformance`: fixtures and harnesses comparing aksh behavior with upstream
   `runner.server`.
+- `aksh-runner`: Rust reimplementation of the GitHub Actions runner (Listener + Worker),
+  faithful to `actions/runner` v2.335.1. Registers, polls, executes workflows, reports results.
 
 ## Why aksh Exists
 
