@@ -155,6 +155,67 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
             }
         }
     }
+
+    // F021: ACTIONS_* runtime env plumbing
+    // Extract SystemVssConnection endpoint for ACTIONS_RUNTIME_URL / TOKEN
+    if let Some(endpoints) = msg
+        .get("resources")
+        .and_then(|r| r.get("endpoints"))
+        .and_then(|e| e.as_array())
+    {
+        for ep in endpoints {
+            if ep.get("name").and_then(|v| v.as_str()) == Some("SystemVssConnection") {
+                if let Some(url) = ep.get("url").and_then(|v| v.as_str()) {
+                    job.env
+                        .insert("ACTIONS_RUNTIME_URL".to_string(), url.to_string());
+                }
+                if let Some(token) = ep
+                    .get("authorization")
+                    .and_then(|a| a.get("parameters"))
+                    .and_then(|p| p.get("AccessToken"))
+                    .and_then(|v| v.as_str())
+                {
+                    job.env
+                        .insert("ACTIONS_RUNTIME_TOKEN".to_string(), token.to_string());
+                    job.env.insert(
+                        "ACTIONS_ID_TOKEN_REQUEST_TOKEN".to_string(),
+                        token.to_string(),
+                    );
+                    // Mask the runtime token (it's a short-lived access token)
+                    job.add_mask(token);
+                }
+                break;
+            }
+        }
+    }
+
+    // Extract results/cache/OIDC URLs from system.* variables
+    // Golden 06: system.github.results_endpoint = https://results-receiver.actions.githubusercontent.com/
+    if let Some(vars) = msg.get("variables").and_then(|v| v.as_object()) {
+        let mappings: &[(&str, &str)] = &[
+            ("system.github.results_endpoint", "ACTIONS_RESULTS_URL"),
+            ("system.github.results_endpoint", "ACTIONS_CACHE_URL"),
+            (
+                "system.github.cache_service_v2",
+                "ACTIONS_CACHE_SERVICE_V2",
+            ),
+            (
+                "system.github.id_token_request_url",
+                "ACTIONS_ID_TOKEN_REQUEST_URL",
+            ),
+        ];
+        for (var_key, env_key) in mappings {
+            if let Some(value) = vars
+                .get(*var_key)
+                .and_then(|v| v.get("value"))
+                .and_then(|v| v.as_str())
+            {
+                if !value.is_empty() {
+                    job.env.insert(env_key.to_string(), value.to_string());
+                }
+            }
+        }
+    }
 }
 
 /// Build the ordered step list from the job message steps.

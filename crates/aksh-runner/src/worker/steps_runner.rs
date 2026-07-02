@@ -1,12 +1,20 @@
 //! Sequential step execution with condition evaluation.
+//!
+//! Each step is tracked through its lifecycle:
+//!   InProgress → queue update → execute → Completed → queue update → upload log
+//!
+//! The `ReportingContext` from `job_runner` is threaded through so log upload
+//! can happen right after each step completes (F019 + F020).
 
 use anyhow::Result;
-use tokio::sync::watch;
+use std::sync::Arc;
+use tokio::sync::{watch, Mutex};
 use tracing::{info, warn};
 
 use super::contexts::{JobContext, JobStatus, StepResult};
 use super::execution_context::StepContext;
 use super::handlers;
+use super::server_queue::{step_conclusion, step_status, ServerQueue, StepUpdate};
 
 /// A step to execute, with its metadata.
 #[derive(Debug, Clone)]
@@ -40,18 +48,39 @@ pub enum StepType {
 /// Run all steps sequentially, returning the job conclusion.
 ///
 /// Watches `cancel_rx` — when it becomes `true`, the current step is abandoned
-/// and remaining steps evaluate under `cancelled()` semantics. Post/always()
-/// steps still run per official behavior.
+/// and remaining steps evaluate under `cancelled()` semantics.
+///
+/// F019: Queues WorkflowStepsUpdate for each step transition (InProgress + Completed).
+/// F020: Uploads step logs right after each step completes.
 pub async fn run_steps(
     steps: &[Step],
     job: &mut JobContext,
     workspace: &str,
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
+    queue: Arc<Mutex<ServerQueue>>,
+    reporting: Option<&crate::worker::job_runner::ReportingContext>,
 ) -> Result<String> {
     let mut any_failed = false;
     let mut cancelled = false;
+    let now = crate::worker::job_runner::iso_now();
 
-    for step in steps {
+    // F019: Queue initial "Set up job" step as completed (number 1, official convention)
+    {
+        let mut q = queue.lock().await;
+        q.queue_update(StepUpdate {
+            external_id: uuid::Uuid::new_v4().to_string(),
+            number: 1,
+            name: "Set up job".to_string(),
+            status: step_status::COMPLETED,
+            started_at: Some(now.clone()),
+            completed_at: Some(now.clone()),
+            conclusion: step_conclusion::SUCCEEDED,
+        });
+    }
+
+    for (idx, step) in steps.iter().enumerate() {
+        let step_number = (idx + 2) as u32; // 1-based, starting at 2 (after "Set up job")
+
         // Check for cancellation
         if *cancel_rx.borrow() && !cancelled {
             cancelled = true;
@@ -70,10 +99,37 @@ pub async fn run_steps(
                     outputs: std::collections::HashMap::new(),
                 },
             );
+            // F019: Queue skipped step
+            let ts = crate::worker::job_runner::iso_now();
+            let mut q = queue.lock().await;
+            q.queue_update(StepUpdate {
+                external_id: step.id.clone(),
+                number: step_number,
+                name: step.display_name.clone(),
+                status: step_status::COMPLETED,
+                started_at: Some(ts.clone()),
+                completed_at: Some(ts),
+                conclusion: step_conclusion::SKIPPED,
+            });
             continue;
         }
 
         info!("Running step: {}", step.display_name);
+        let step_start = crate::worker::job_runner::iso_now();
+
+        // F019: Queue InProgress update
+        {
+            let mut q = queue.lock().await;
+            q.queue_update(StepUpdate {
+                external_id: step.id.clone(),
+                number: step_number,
+                name: step.display_name.clone(),
+                status: step_status::IN_PROGRESS,
+                started_at: Some(step_start.clone()),
+                completed_at: None,
+                conclusion: 0,
+            });
+        }
 
         let mut step_ctx = StepContext::new(job, step.id.clone(), step.display_name.clone());
         for (k, v) in &step.env {
@@ -126,6 +182,21 @@ pub async fn run_steps(
             }
         };
 
+        let step_end = crate::worker::job_runner::iso_now();
+        let conclusion_proto = ServerQueue::conclusion_to_proto(&conclusion_str);
+
+        // Collect annotations before consuming step_ctx
+        let annotations = step_ctx.annotations.clone();
+        let log_lines = step_ctx.log_lines.clone();
+
+        // F025: Store annotations in job context
+        if !annotations.is_empty() {
+            step_ctx
+                .job
+                .step_annotations
+                .insert(step.id.clone(), annotations);
+        }
+
         // Record step result
         let step_outputs = std::mem::take(&mut step_ctx.env)
             .into_iter()
@@ -149,6 +220,55 @@ pub async fn run_steps(
             cancelled = true;
             step_ctx.job.job_status = JobStatus::Cancelled;
         }
+
+        // F019: Queue Completed update
+        {
+            let mut q = queue.lock().await;
+            q.queue_update(StepUpdate {
+                external_id: step.id.clone(),
+                number: step_number,
+                name: step.display_name.clone(),
+                status: step_status::COMPLETED,
+                started_at: Some(step_start.clone()),
+                completed_at: Some(step_end.clone()),
+                conclusion: conclusion_proto,
+            });
+            // Record logs for job log assembly
+            if !log_lines.is_empty() {
+                q.record_step_logs(&step.id, log_lines.clone());
+            }
+        }
+
+        // F020: Upload step log immediately after completion
+        if let Some(rpt) = reporting {
+            if !log_lines.is_empty() {
+                let content = log_lines.join("\n");
+                crate::worker::job_runner::upload_step_log(rpt, &step.id, &content).await;
+            }
+        }
+    }
+
+    // F019: Queue "Complete job" step
+    let ts = crate::worker::job_runner::iso_now();
+    let total_steps = steps.len() + 2;
+    let final_conclusion = if cancelled {
+        step_conclusion::FAILED
+    } else if any_failed {
+        step_conclusion::FAILED
+    } else {
+        step_conclusion::SUCCEEDED
+    };
+    {
+        let mut q = queue.lock().await;
+        q.queue_update(StepUpdate {
+            external_id: uuid::Uuid::new_v4().to_string(),
+            number: total_steps as u32,
+            name: "Complete job".to_string(),
+            status: step_status::COMPLETED,
+            started_at: Some(ts.clone()),
+            completed_at: Some(ts),
+            conclusion: final_conclusion,
+        });
     }
 
     Ok(if cancelled {
@@ -163,20 +283,17 @@ pub async fn run_steps(
 /// Evaluate whether a step should run based on its condition.
 fn should_run_step(step: &Step, job: &JobContext) -> bool {
     let condition = match &step.condition {
-        Some(c) => c.clone(),
-        None => "success()".to_string(),
+        Some(c) if !c.is_empty() => c.as_str(),
+        _ => "success()",
     };
 
     let ctx = job.build_expression_context();
-
-    match aksh_gha_expressions::eval_bool(&condition, &ctx) {
+    match aksh_gha_expressions::eval_bool(condition, &ctx) {
         Ok(result) => result,
-        Err(e) => {
-            warn!(
-                "Failed to evaluate condition for step '{}': {e:#}. Defaulting to skip.",
-                step.display_name
-            );
-            false
+        Err(_) => {
+            // Try stripping ${{ }} markers (conditions sometimes come pre-wrapped)
+            let stripped = aksh_gha_expressions::trim_expression_markers(condition);
+            aksh_gha_expressions::eval_bool(stripped, &ctx).unwrap_or(false)
         }
     }
 }
@@ -194,17 +311,17 @@ async fn execute_step(
             shell,
             working_directory,
         } => {
-            handlers::script::run_script(
+            super::handlers::script::run_script(
                 script,
                 shell.as_deref(),
-                working_directory.as_deref().unwrap_or(workspace),
+                workspace,
                 ctx,
                 Some(cancel_rx),
             )
             .await
         }
         StepType::Action { uses, with } => {
-            handlers::action::run_action(uses, with, workspace, ctx).await
+            super::handlers::action::run_action(uses, with, workspace, ctx).await
         }
     }
 }
