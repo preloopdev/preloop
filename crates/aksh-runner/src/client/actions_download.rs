@@ -72,11 +72,10 @@ impl ActionsResolveClient {
 
         let body = serde_json::json!({ "actions": action_list });
 
-        // URL format from golden 10 flow 19 path:
-        // /actions/build/{hash}/{orchestration_id}/jobs/{job_id}/runner
-        // We use a simplified path that the GitHub service accepts:
+        // URL format from golden 10 flow 19:
+        // /actions/build/{plan_id}/jobs/{job_id}/runnerresolve/actions
         let url = format!(
-            "{}/actions/resolve/{orchestration_id}/jobs/{job_id}/runner",
+            "{}/actions/build/{orchestration_id}/jobs/{job_id}/runnerresolve/actions",
             base.trim_end_matches('/')
         );
 
