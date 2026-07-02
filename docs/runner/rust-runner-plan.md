@@ -41,19 +41,19 @@ Reuse these; do not reinvent:
 
 ## Implementation status — audited 2026-07-02
 
-Full-code audit of `crates/aksh-runner` vs this plan, the goldens, and upstream v2.335.1. Per-gap detail lives in `docs/runner/roadmap.md` (priorities P0–P2) and `docs/runner/runner_fidelity_gap.md` (F001–F017 fixed; F018+ pending). **No Tier-1/Tier-2 gate has run yet — the H1/H2 harness is unbuilt.**
+Full-code audit of `crates/aksh-runner` vs this plan, the goldens, and upstream v2.335.1. Per-gap detail lives in `docs/runner/roadmap.md` (priorities P0–P2) and `docs/runner/runner_fidelity_gap.md` (F001–F025/F027/F028 fixed; F026/F029+ pending). **Tier-1 live GitHub gates and H1/H2 generated reports are still pending.** A local aksh simple-echo smoke test passed after the P0 fixes; aksh-side Twirp URL/replay fidelity remains secondary.
 
 | Milestone | Status | Fixed / verified | Pending |
 |---|---|---|---|
 | M0 scaffolding | ✅ Done | crate, CLI, module tree, `runner-watch` lib.rs, justfile `build-runner` | docs index accuracy (corrected 2026-07-02) |
 | M1 config/registration | ✅ Done (verified vs golden 01) | F002–F007 registration/DTO/dotfile fixes | `--replace` agent DELETE; rsaparams XML export brittleness |
 | M2 OAuth/session/message loop | ✅ Done (verified vs golden 01) | F001 PS256 JWT; F009–F011, F016–F017 broker poll/ack fixes | F008 connectionData→broker URL; BrokerMigration stub; ErrorThrottler retry/backoff; 401 session recreate |
-| M3 worker & job lifecycle | ⚠️ Partial | acquirejob + completejob wire shapes (F012–F014), worker IPC/exit codes, F015 process-group kill | **F018 renewjob never called; F019 step updates never sent; F020 logs never uploaded** |
-| M4 contexts/expressions | ⚠️ Partial | context roots, PipelineContextData decode, status functions, steps context, per-step timeout | **F027 bracket access / `a.*.b` filter / hashFiles stub; F028 secrets context root + masking variants**; runner.tool_cache/workspace; format() escaping |
-| M5 script steps/commands | ⚠️ Mostly done | shell resolution, ProcessInvoker, command parsing/unescaping, file commands, workspace layout | **F025 annotations never uploaded; F035 summary never uploaded; F034 11 missing GITHUB_*/RUNNER_* vars**; log timestamp prefix; ##[debug] |
-| M6 actions | ⚠️ Partial | tarball extract, manifest structure, node/composite/docker dispatch, INPUT_*, local actions | **F022 runnerresolve resolution missing; F023 pre/post lifecycle missing; F024 composite outputs/hoisting missing** |
+| M3 worker & job lifecycle | ✅ P0 implemented | acquirejob + completejob wire shapes (F012–F014), F015 process-group kill, F018 renew loop, F019 step updates, F020 log upload | live GitHub long-job/log-viewer flow diff |
+| M4 contexts/expressions | ✅ P0 implemented | context roots, PipelineContextData decode, status functions, steps context, per-step timeout, F027 bracket/filter/hashFiles, F028 secrets/masking | runner.tool_cache/workspace; format() escaping |
+| M5 script steps/commands | ✅ P0 implemented | shell resolution, ProcessInvoker, command parsing/unescaping, file commands, F025 annotation payloads | F035 summary upload; F034 11 missing GITHUB_*/RUNNER_* vars; log timestamp prefix; ##[debug] |
+| M6 actions | ✅ P0 implemented | tarball extract, manifest structure, node/composite/docker dispatch, INPUT_*, local actions, F022 runnerresolve, F023 pre/post state, F024 composite outputs | live checkout/cache/composite GitHub validation |
 | M7 containers | ❌ Not wired | `container_ops.rs` helpers exist | **F026: never called from job flow; services zero code; docker-exec path unused** |
-| M8 cache/artifacts env | ❌ Missing | — | **F021 ACTIONS_* runtime vars never injected** |
+| M8 cache/artifacts env | ✅ P0 implemented | F021 ACTIONS_* runtime env plumbing | live cache/artifact/OIDC GitHub validation |
 | M9 AzDO compat | ❌ Reporting unwired | message dispatch branch, DTOs, client methods | **F030 Timeline/Logfiles/console/FinishJob have 0 call sites; FinishJob wrong DTO** |
 | M10 cancellation/OIDC/matchers | ⚠️ Partial | cancel IPC + process-group kill, step timeout | **F031 no always()/post continuation, no grace kill, no job timeout; F032 matchers dead code; F033 no retry/backoff, no ephemeral unregister** |
 | M11 benchmarks | ⚠️ Partial | size + `--version` cold start in `bench-results.json` | dispatch latency, throughput, RSS, configure-time metrics |

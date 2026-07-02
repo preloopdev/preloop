@@ -140,7 +140,7 @@ service-location richness, and lower-priority/currently unexercised surfaces.
 | DistributedTask session/message replay | mapped requests now reach aksh; session status matches `201`; incomplete Busy long-polls are filtered as non-comparable capture artifacts | ⚠️ partial |
 | AgentRequest acknowledgement | endpoint exists and now returns `200` like official v2.335.1 | ✅ good |
 | Broker acquire/renew/complete | queue-backed routes pass targeted E2E; runner-watch now materializes replay state and rewrites captured broker IDs so acquire/renew/complete statuses match official | ✅ good for status/protocol flow |
-| Results-service Twirp logs/update | endpoints now return `200`; bodies intentionally contain local aksh replay URLs instead of GitHub/Azure signed blob URLs | ⚠️ partial |
+| Results-service Twirp logs/update | replay endpoints can return `200`, but a live aksh smoke with the Rust runner currently gets `401` from root `/twirp/...` using the job's `SystemVssConnection` bearer; bodies are placeholder/local when accepted | ⚠️ partial/token-fidelity gap |
 | Timeline / logs / web-console feed | AzDO timeline/log routes exist; current service path now includes Twirp results surfaces, but the response payloads are not yet faithful | ⚠️ partial |
 | Job/step completion events + annotations | AgentRequest PATCH and broker complete paths exist; annotation/body fidelity remains partial | ⚠️ partial |
 | Action download info | stub endpoint; batch/bearer modes not implemented | ⚠️ stub |
@@ -205,17 +205,17 @@ from official.
 
 These endpoint families were the remaining high-priority gaps from the replay. Broker routes
 now exist in aksh, and runner-watch materializes matching queued state plus captured-ID rewrites
-so broker status codes match official. The Twirp routes now exist and return `200`, but the
-response bodies are placeholders rather than official signed-blob payloads.
+so broker status codes match official. The Twirp routes exist in replay, but a live Rust-runner
+smoke currently gets `401` from root `/twirp/...` with the job's `SystemVssConnection` bearer.
 
 | Priority | Flow | Official | aksh | Required surface |
 | --- | --- | ---: | ---: | --- |
 | P0 | `POST /broker/{runner}/acquirejob` | 200 | 200 in replay | Queue-backed production route exists and replay state materialization now maps captured official IDs to local queued requests. |
 | P0 | `POST /broker/{runner}/renewjob` | 200 | 200 in replay | Queue-backed production route exists and replay state materialization now maps captured official IDs to local queued requests. |
 | P0 | `POST /broker/{runner}/completejob` | 204 | 204 in replay | Queue-backed production route exists and replay state materialization now maps captured official IDs to local queued requests. |
-| P1 | `POST /twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate` | 200 | 200 | Route exists now; response shape still placeholder (`{\"ok\":true}` only). |
-| P1 | `POST /twirp/results.services.receiver.Receiver/GetJobLogsSignedBlobURL` | 200 | 200 | Route exists now; returns local placeholder URL rather than official signed blob URL. |
-| P1 | `POST /twirp/results.services.receiver.Receiver/GetStepLogsSignedBlobURL` | 200 | 200 | Route exists now; returns local placeholder URL/soft limit rather than official values. |
+| P1 | `POST /twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate` | 200 | 200 in replay / 401 in live Rust-runner smoke | Route exists; align bearer-token acceptance and response body (`{\"ok\":true}` is still placeholder). |
+| P1 | `POST /twirp/results.services.receiver.Receiver/GetJobLogsSignedBlobURL` | 200 | 200 in replay / 401 in live Rust-runner smoke | Accept the job runtime bearer and return local signed/opaque upload URLs. |
+| P1 | `POST /twirp/results.services.receiver.Receiver/GetStepLogsSignedBlobURL` | 200 | 200 in replay / 401 in live Rust-runner smoke | Accept the job runtime bearer and return local signed/opaque upload URLs/limits. |
 
 ### 1a.5 Source-diff-only gaps not exercised by `01-register-and-idle`
 
@@ -340,8 +340,8 @@ Paths are in this repo. Updated 2026-06-29 after the v2.335.1 56-flow runner-wat
   - ✅ AgentRequest acknowledgement exists and returns `200` like official v2.335.1.
   - ✅ Broker acquire/renew/complete endpoints pass targeted E2E and now match official replay
     statuses after runner-watch materializes queued jobs and rewrites captured broker IDs.
-  - ⚠️ Results-service Twirp log/update endpoints now exist and return `200`, but their response
-    bodies are placeholder/local values rather than official signed-blob payloads.
+  - ⚠️ Results-service Twirp log/update endpoints exist in replay, but a live Rust-runner smoke
+    currently gets `401` from `/twirp/...`; accepted response bodies remain placeholder/local.
   - ✅ AES session key exchange (unencrypted mode — RSA wrapping TODO).
   - ✅ Encrypted `TaskAgentMessage` delivery with `messageId` and `DELETE` ack.
   - ✅ `AgentJobRequestMessage` with `plan`, `requestId`, `system` context, full steps.

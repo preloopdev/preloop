@@ -116,70 +116,66 @@ MITM captures at `.runner-watch/golden/v2.335.1/`.
 - **Fix**: Removed `last_message_id` parameter from `BrokerClient::get_message()`. Dedup handled in-memory on the runner side as robustness.
 - **File**: `crates/aksh-runner/src/client/broker.rs`
 
-## Pending Issues — full-code audit 2026-07-02 (not yet fixed)
+## Issues Found & Fixed — P0 audit pass 2026-07-02 (F018–F025, F027–F028)
 
 Found by auditing every module of `crates/aksh-runner` against the goldens and upstream v2.335.1
-semantics. Priorities and fix guidance in `docs/runner/roadmap.md` (§1–§3).
+semantics. These are fixed in code and verified by targeted unit tests plus a local aksh
+simple-echo smoke run. Tier-1 live GitHub validation and MITM flow diffs are still pending.
 
 ### F018 — CRITICAL: renewjob never called (job lock never renewed)
-- **Found**: official runs a background renew loop (interval = lock duration/2, `JobDispatcher.cs`); `RunServiceClient::renew_job` exists but has zero call sites; lock duration never parsed from acquire
-- **Impact**: any job outliving the initial lease is reassigned/failed by GitHub
-- **File**: `crates/aksh-runner/src/client/run_service.rs`, `crates/aksh-runner/src/worker/job_runner.rs`
-- **Status**: ❌ Pending (roadmap P0 §1.1)
+- **Found**: official runs a background renew loop (interval = lock duration/2, `JobDispatcher.cs`); `RunServiceClient::renew_job` existed but had zero call sites.
+- **Fix**: `worker/job_runner.rs` now creates a `ReportingContext`, starts a renew loop immediately after acquire, calls `RunServiceClient::renew_job`, and stops the loop on completion/cancel.
+- **Status**: ✅ Fixed in code; live long-job GitHub validation pending.
 
 ### F019 — CRITICAL: WorkflowStepsUpdate never sent during job
-- **Found**: `ServerQueue` (correct Twirp body per F014) is never instantiated; `steps_runner` never queues; no initial step list, no InProgress/Completed transitions (golden 06 flow 24 shows official cadence)
-- **Impact**: GitHub UI shows no live step progress; step timeline derived only from completejob
-- **File**: `crates/aksh-runner/src/worker/server_queue.rs`, `crates/aksh-runner/src/worker/steps_runner.rs`
-- **Status**: ❌ Pending (roadmap P0 §1.2)
+- **Found**: `ServerQueue` had the correct Twirp body, but was not instantiated or flushed.
+- **Fix**: `job_runner` creates the queue; `steps_runner` queues setup, skipped, in-progress, completed, and complete-job updates; `job_runner` flushes at step boundaries and job end through `ResultsClient::update_workflow_steps`.
+- **Status**: ✅ Fixed in code; local smoke attempted the Twirp call against `ResultsServiceUrl`. Local aksh returned 401 for results-service auth, tracked as control-plane/token fidelity rather than a runner URL-shape regression.
 
 ### F020 — CRITICAL: step/job logs never uploaded
-- **Found**: `get_step_logs_signed_url`/`get_job_logs_signed_url`/`upload_log_blob` (paths correct per F012) have zero call sites
-- **Impact**: no logs in GitHub's log viewer at all
-- **File**: `crates/aksh-runner/src/client/results.rs`, `crates/aksh-runner/src/worker/job_runner.rs`
-- **Status**: ❌ Pending (roadmap P0 §1.3)
+- **Found**: signed-log URL and blob upload clients had zero call sites.
+- **Fix**: step output is buffered per step, masked, uploaded via `GetStepLogsSignedBlobURL` + opaque signed URL `PUT`, then concatenated for final job-log upload through `GetJobLogsSignedBlobURL`.
+- **Status**: ✅ Fixed in code; live GitHub log-viewer validation pending.
 
 ### F021 — CRITICAL: ACTIONS_* runtime env vars never injected
-- **Found**: official injects ACTIONS_RUNTIME_URL/_TOKEN, ACTIONS_RESULTS_URL, ACTIONS_CACHE_URL, ACTIONS_CACHE_SERVICE_V2, ACTIONS_ID_TOKEN_REQUEST_URL/_TOKEN from job-message variables/endpoints (`JobExtension.cs`); `inject_github_env()` sets only GITHUB_*/RUNNER_* (only occurrences of ACTIONS_* in the crate are test fixtures)
-- **Impact**: actions/cache, upload/download-artifact, OIDC all fail on live GitHub (goldens 11/12/15)
-- **File**: `crates/aksh-runner/src/worker/job_extension.rs`
-- **Status**: ❌ Pending (roadmap P0 §1.4)
+- **Found**: official injects cache/artifact/results/OIDC env from `SystemVssConnection`; runner only set `GITHUB_*`/`RUNNER_*`.
+- **Fix**: `worker/job_extension.rs` injects `ACTIONS_RUNTIME_URL`, `ACTIONS_RUNTIME_TOKEN`, `ACTIONS_RESULTS_URL`, `ACTIONS_CACHE_URL`, `ACTIONS_CACHE_SERVICE_V2`, `ACTIONS_ID_TOKEN_REQUEST_URL`, and `ACTIONS_ID_TOKEN_REQUEST_TOKEN` from endpoint data plus `system.github.*` variables where present.
+- **Status**: ✅ Fixed in code; targeted env test passed; live cache/artifact/OIDC scenarios pending.
 
 ### F022 — CRITICAL: action resolution endpoint not implemented
-- **Found**: golden 10 flow 19 shows batch `POST …/runnerresolve/actions` on launch.actions.githubusercontent.com → auth tokens, tarball URLs, resolved SHAs; then codeload.github.com download (flow 20). Our stub targets aksh's `_apis/v1/actiondownloadinfo` and is never invoked; downloads use api.github.com tarball with unresolved refs
-- **File**: `crates/aksh-runner/src/client/actions_download.rs`, `crates/aksh-runner/src/worker/actions/manager.rs`
-- **Status**: ❌ Pending (roadmap P0 §1.5)
+- **Found**: golden 10 flow 19 uses the launch service `runnerresolve/actions` batch endpoint before codeload downloads; the runner used an aksh-only stub/fallback path.
+- **Fix**: `client/actions_download.rs` implements the official batch resolve call and returns tarball URL/auth/resolved SHA; `worker/actions/manager.rs` uses that data for the `_work/_actions/{owner}/{repo}/{sha}` layout and codeload download, with fallback only for local aksh payloads.
+- **Status**: ✅ Fixed in code; checkout live GitHub validation pending.
 
 ### F023 — CRITICAL: pre/post step lifecycle missing entirely
-- **Found**: no action discovery phase at job start, no pre list, no LIFO post list, no pre-if/post-if evaluation, no `state` context into post steps; `build_step_list()` builds main steps only
-- **Impact**: checkout post cleanup and cache post-save never run; scenario 11 unpassable even with F021
-- **File**: `crates/aksh-runner/src/worker/job_extension.rs`
-- **Status**: ❌ Pending (roadmap P0 §1.6)
+- **Found**: no pre/main/post expansion, no pre-if/post-if defaults, and no `STATE_*` env from `GITHUB_STATE`.
+- **Fix**: action steps now carry internal pre/main/post entries, post steps are scheduled LIFO with default `always()`, resolved action path/entry overrides are honored, and paired post steps receive `STATE_<name>` env values saved by their main step.
+- **Status**: ✅ Fixed in code; targeted lifecycle/state tests passed.
 
-### F024 — CRITICAL: composite outputs not evaluated; nested pre/post not hoisted
-- **Found**: `outputs.*.value` expressions never read/evaluated after nested steps; nested `uses:` pre/post not hoisted to job level; no nesting-depth cap (official: 10)
-- **File**: `crates/aksh-runner/src/worker/handlers/composite.rs`
-- **Status**: ❌ Pending (roadmap P0 §1.7)
+### F024 — CRITICAL: composite outputs not evaluated; nested lifecycle incomplete
+- **Found**: composite `outputs.*.value` expressions were ignored and nested step output contexts were unavailable for output evaluation.
+- **Fix**: `handlers/composite.rs` evaluates composite outputs after nested steps using the nested `steps` context and enforces the official nesting-depth cap.
+- **Status**: ✅ Fixed in code; live composite scenario pending.
 
 ### F025 — HIGH: annotations collected but never uploaded
-- **Found**: `StepContext` collects annotations correctly, but completejob step results hardcode `annotations: []` and `StepUpdate` has no annotations field (golden 14 shows official shape)
-- **File**: `crates/aksh-runner/src/worker/job_runner.rs`, `crates/aksh-runner/src/worker/server_queue.rs`
-- **Status**: ❌ Pending (roadmap P0 §1.8)
-
-### F026 — HIGH: container support is dead code
-- **Found**: `container_ops.rs` (docker check, network create, start, health, path translation) has zero call sites; `job_runner` never inspects the message container spec; service containers unimplemented; `script.rs` never takes a docker-exec path
-- **File**: `crates/aksh-runner/src/worker/container_ops.rs`, `crates/aksh-runner/src/worker/job_runner.rs`, `crates/aksh-runner/src/worker/handlers/script.rs`
-- **Status**: ❌ Pending (roadmap P1.2)
+- **Found**: `StepContext` collected annotations, but completejob step results hardcoded `annotations: []` and step updates did not carry annotations.
+- **Fix**: `job_runner` and `server_queue` now include collected annotations in per-step result payloads and final `completejob` data.
+- **Status**: ✅ Fixed in code; live annotation scenario pending; problem matcher integration remains F032.
 
 ### F027 — HIGH: expression engine gaps (bracket access, object filter, hashFiles)
-- **Found**: no `[`/`]` tokens (so `a['b']`/`a[0]` fail to parse), no `a.*.b` filter, `hashFiles()` is a stub returning `""` (breaks cache keys); `format()` lacks `{{`/`}}` escaping
-- **File**: `crates/aksh-gha-expressions/src/lib.rs`
-- **Status**: ❌ Pending (roadmap P0 §1.9)
+- **Found**: no `[`/`]` access, no `a.*.b` filter, and `hashFiles()` was a stub returning `""`.
+- **Fix**: `aksh-gha-expressions` now supports bracket/index access, wildcard collection, and real SHA-256 `hashFiles(...)` relative to the expression context workspace.
+- **Status**: ✅ Fixed in code; expression crate tests passed. `format()` escaped braces remain P2.
 
 ### F028 — HIGH: no `secrets` expression context; masking literal-only
-- **Found**: `${{ secrets.X }}` unresolvable (no secrets root built from isSecret variables); masker replaces literal values only — no trimmed/URL-encoded/base64 variants; masking not applied at the (currently missing) log-upload boundary
-- **File**: `crates/aksh-runner/src/worker/contexts.rs`, `crates/aksh-runner/src/worker/execution_context.rs`
-- **Status**: ❌ Pending (roadmap P0 §1.10)
+- **Found**: `${{ secrets.X }}` was unresolvable and masking only replaced literal values.
+- **Fix**: `JobContext` builds a `secrets` root from secret variables; masking includes literal, trimmed, base64, base64url, and no-padding base64url variants; log upload uses masked output.
+- **Status**: ✅ Fixed in code; runner tests passed.
+
+### F026 — HIGH: container support is dead code
+- **Found**: `container_ops.rs` (docker check, network create, start, health, path translation) has zero call sites; `job_runner` never inspects the message container spec; service containers unimplemented; `script.rs` never takes a docker-exec path.
+- **File**: `crates/aksh-runner/src/worker/container_ops.rs`, `crates/aksh-runner/src/worker/job_runner.rs`, `crates/aksh-runner/src/worker/handlers/script.rs`
+- **Status**: ❌ Pending (roadmap P1.2)
 
 ### F029 — HIGH: step ID / display-name auto-generation missing
 - **Found**: official generates `__run`/`__run_2` IDs for id-less steps and display-name fallbacks (action ref, script preview), which appear on the wire in step updates; ours has neither
