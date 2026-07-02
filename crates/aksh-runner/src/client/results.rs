@@ -16,6 +16,11 @@ impl ResultsClient {
         Self { http, base_url }
     }
 
+    /// Expose the underlying HTTP client for direct requests.
+    pub fn http(&self) -> &crate::client::http::HttpClient {
+        &self.http
+    }
+
     /// Report step status updates via Twirp.
     pub async fn update_workflow_steps(
         &self,
