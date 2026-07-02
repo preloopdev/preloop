@@ -156,8 +156,9 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
         }
     }
 
-    // F021: ACTIONS_* runtime env plumbing
-    // Extract SystemVssConnection endpoint for ACTIONS_RUNTIME_URL / TOKEN
+    // F021: ACTIONS_* runtime env plumbing.
+    // SystemVssConnection carries both the run-service URL/token and data URLs
+    // used by cache, artifact, results, and OIDC actions.
     if let Some(endpoints) = msg
         .get("resources")
         .and_then(|r| r.get("endpoints"))
@@ -181,20 +182,40 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
                         "ACTIONS_ID_TOKEN_REQUEST_TOKEN".to_string(),
                         token.to_string(),
                     );
-                    // Mask the runtime token (it's a short-lived access token)
                     job.add_mask(token);
+                }
+
+                if let Some(data) = ep.get("data").and_then(|v| v.as_object()) {
+                    if let Some(url) = data.get("ResultsServiceUrl").and_then(|v| v.as_str()) {
+                        job.env
+                            .insert("ACTIONS_RESULTS_URL".to_string(), url.to_string());
+                    }
+                    if let Some(url) = data.get("CacheServerUrl").and_then(|v| v.as_str()) {
+                        job.env
+                            .insert("ACTIONS_CACHE_URL".to_string(), url.to_string());
+                        job.env
+                            .entry("ACTIONS_CACHE_SERVICE_V2".to_string())
+                            .or_insert_with(|| "true".to_string());
+                    }
+                    if let Some(url) = data.get("GenerateIdTokenUrl").and_then(|v| v.as_str()) {
+                        if !url.is_empty() {
+                            job.env.insert(
+                                "ACTIONS_ID_TOKEN_REQUEST_URL".to_string(),
+                                url.to_string(),
+                            );
+                        }
+                    }
                 }
                 break;
             }
         }
     }
 
-    // Extract results/cache/OIDC URLs from system.* variables
-    // Golden 06: system.github.results_endpoint = https://results-receiver.actions.githubusercontent.com/
+    // Some services also arrive as system.github.* variables. Let those fill
+    // gaps without overwriting endpoint data.
     if let Some(vars) = msg.get("variables").and_then(|v| v.as_object()) {
         let mappings: &[(&str, &str)] = &[
             ("system.github.results_endpoint", "ACTIONS_RESULTS_URL"),
-            ("system.github.results_endpoint", "ACTIONS_CACHE_URL"),
             ("system.github.cache_service_v2", "ACTIONS_CACHE_SERVICE_V2"),
             (
                 "system.github.id_token_request_url",
@@ -202,6 +223,9 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
             ),
         ];
         for (var_key, env_key) in mappings {
+            if job.env.contains_key(*env_key) {
+                continue;
+            }
             if let Some(value) = vars
                 .get(*var_key)
                 .and_then(|v| v.get("value"))
@@ -328,17 +352,16 @@ pub fn build_step_list(steps: &[serde_json::Value], _job_message: &serde_json::V
 ///   - post steps: LIFO (reverse of main-step order), `post-if` defaults to `always()`
 ///
 /// State context (`GITHUB_STATE` file) is wired so pre can communicate to post
-/// via `save-state`; that part is already handled by `file_commands.rs` +
-/// `JobContext::state`.
+/// via `save-state`; `StepContext::build_env()` exposes those values as
+/// `STATE_*` for `__post_<step-id>` steps.
 ///
-/// This function operates on already-downloaded manifests only — actions not yet
-/// on disk are run without pre/post (the download happens lazily in action::run_action).
-pub fn build_step_list_with_lifecycle(main_steps: Vec<Step>, workspace: &str) -> Vec<Step> {
-    let actions_dir = std::path::Path::new(workspace)
-        .parent()
-        .unwrap_or(std::path::Path::new("."))
-        .join("_actions");
-
+/// Remote actions must be downloaded before this runs; `action_paths` maps the
+/// original `uses:` ref to the resolved manifest directory.
+pub fn build_step_list_with_lifecycle(
+    main_steps: Vec<Step>,
+    workspace: &str,
+    action_paths: &std::collections::HashMap<String, String>,
+) -> Vec<Step> {
     let mut pre_steps: Vec<Step> = Vec::new();
     let mut post_steps: Vec<Step> = Vec::new();
 
@@ -347,24 +370,12 @@ pub fn build_step_list_with_lifecycle(main_steps: Vec<Step>, workspace: &str) ->
             continue;
         };
 
-        // Resolve the action directory (mirrors action::resolve_remote_action logic)
-        let action_dir = if uses.starts_with("./") || uses.starts_with("../") {
+        // Resolve the action directory. Prefer the SHA-pinned path discovered
+        // during the setup/download phase; fall back to local action paths.
+        let action_dir = if let Some(path) = action_paths.get(uses) {
+            std::path::PathBuf::from(path)
+        } else if uses.starts_with("./") || uses.starts_with("../") {
             std::path::Path::new(workspace).join(uses)
-        } else if let Some((repo_part, git_ref)) = uses.split_once('@') {
-            let parts: Vec<&str> = repo_part.splitn(3, '/').collect();
-            if parts.len() >= 2 {
-                let owner = parts[0];
-                let repo = parts[1];
-                let subpath = if parts.len() > 2 { parts[2] } else { "" };
-                let base = actions_dir.join(owner).join(repo).join(git_ref);
-                if subpath.is_empty() {
-                    base
-                } else {
-                    base.join(subpath)
-                }
-            } else {
-                continue;
-            }
         } else {
             continue;
         };
@@ -383,7 +394,7 @@ pub fn build_step_list_with_lifecycle(main_steps: Vec<Step>, workspace: &str) ->
                 display_name: format!("Pre {}", step.display_name),
                 step_type: StepType::Action {
                     uses: uses.clone(),
-                    with: with.clone(),
+                    with: with_internal_entry(with, pre_main),
                 },
                 condition: Some(pre_if.to_string()),
                 continue_on_error: step.continue_on_error,
@@ -406,7 +417,7 @@ pub fn build_step_list_with_lifecycle(main_steps: Vec<Step>, workspace: &str) ->
                 display_name: format!("Post {}", step.display_name),
                 step_type: StepType::Action {
                     uses: uses.clone(),
-                    with: with.clone(),
+                    with: with_internal_entry(with, post_main),
                 },
                 condition: Some(post_if.to_string()),
                 continue_on_error: true, // post steps shouldn't block other posts
@@ -429,6 +440,15 @@ pub fn build_step_list_with_lifecycle(main_steps: Vec<Step>, workspace: &str) ->
     result.extend(main_steps);
     result.extend(post_steps);
     result
+}
+
+fn with_internal_entry(with: &serde_json::Value, entry: &str) -> serde_json::Value {
+    let mut obj = with.as_object().cloned().unwrap_or_default();
+    obj.insert(
+        "__aksh_entry".to_string(),
+        serde_json::Value::String(entry.to_string()),
+    );
+    serde_json::Value::Object(obj)
 }
 
 fn extract_step_env(step: &serde_json::Value) -> HashMap<String, String> {
@@ -699,5 +719,131 @@ mod tests {
 
         let result = build_step_list(&steps, &serde_json::json!({}));
         assert!(result[0].continue_on_error);
+    }
+
+    #[test]
+    fn inject_actions_env_from_system_vss_endpoint_data() {
+        let mut job = JobContext::new(
+            "j1".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        job.workspace = Some("_work/repo/repo".into());
+
+        let msg = serde_json::json!({
+            "resources": {
+                "endpoints": [{
+                    "name": "SystemVssConnection",
+                    "url": "https://run-actions.example/45/",
+                    "authorization": {
+                        "parameters": {
+                            "AccessToken": "runtime-token"
+                        }
+                    },
+                    "data": {
+                        "ResultsServiceUrl": "https://results.example/",
+                        "CacheServerUrl": "https://cache.example/",
+                        "GenerateIdTokenUrl": "https://run-actions.example/idtoken"
+                    }
+                }]
+            }
+        });
+
+        inject_github_env(&mut job, &msg);
+
+        assert_eq!(
+            job.env.get("ACTIONS_RUNTIME_URL").map(String::as_str),
+            Some("https://run-actions.example/45/")
+        );
+        assert_eq!(
+            job.env.get("ACTIONS_RUNTIME_TOKEN").map(String::as_str),
+            Some("runtime-token")
+        );
+        assert_eq!(
+            job.env
+                .get("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+                .map(String::as_str),
+            Some("runtime-token")
+        );
+        assert_eq!(
+            job.env.get("ACTIONS_RESULTS_URL").map(String::as_str),
+            Some("https://results.example/")
+        );
+        assert_eq!(
+            job.env.get("ACTIONS_CACHE_URL").map(String::as_str),
+            Some("https://cache.example/")
+        );
+        assert_eq!(
+            job.env.get("ACTIONS_CACHE_SERVICE_V2").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            job.env
+                .get("ACTIONS_ID_TOKEN_REQUEST_URL")
+                .map(String::as_str),
+            Some("https://run-actions.example/idtoken")
+        );
+        assert!(job.mask_secrets("runtime-token").contains("***"));
+    }
+
+    #[test]
+    fn lifecycle_uses_resolved_action_path_and_entry_overrides() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let workspace = temp.path().join("_work/repo/repo");
+        let action_dir = temp
+            .path()
+            .join("_work/_actions/actions/example/0123456789abcdef");
+        std::fs::create_dir_all(&action_dir).unwrap();
+        std::fs::write(
+            action_dir.join("action.yml"),
+            r#"
+name: example
+runs:
+  using: node20
+  main: main.js
+  pre: pre.js
+  post: cleanup.js
+"#,
+        )
+        .unwrap();
+
+        let main_steps = vec![Step {
+            id: "main-action".into(),
+            display_name: "Example".into(),
+            step_type: StepType::Action {
+                uses: "actions/example@v1".into(),
+                with: serde_json::json!({"token": "x"}),
+            },
+            condition: Some("success()".into()),
+            continue_on_error: false,
+            timeout_minutes: None,
+            env: std::collections::HashMap::new(),
+            raw: serde_json::json!({}),
+        }];
+        let mut action_paths = std::collections::HashMap::new();
+        action_paths.insert(
+            "actions/example@v1".to_string(),
+            action_dir.to_string_lossy().to_string(),
+        );
+
+        let ordered =
+            build_step_list_with_lifecycle(main_steps, workspace.to_str().unwrap(), &action_paths);
+
+        assert_eq!(ordered.len(), 3);
+        assert_eq!(ordered[0].id, "__pre_main-action");
+        assert_eq!(ordered[1].id, "main-action");
+        assert_eq!(ordered[2].id, "__post_main-action");
+        assert!(matches!(
+            &ordered[0].step_type,
+            StepType::Action { with, .. }
+                if with.get("__aksh_entry").and_then(|v| v.as_str()) == Some("pre.js")
+        ));
+        assert!(matches!(
+            &ordered[2].step_type,
+            StepType::Action { with, .. }
+                if with.get("__aksh_entry").and_then(|v| v.as_str()) == Some("cleanup.js")
+        ));
+        assert_eq!(ordered[2].condition.as_deref(), Some("always()"));
     }
 }
