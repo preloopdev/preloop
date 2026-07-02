@@ -82,7 +82,6 @@ impl Context {
         }
         current
     }
-
 }
 
 impl Default for Context {
