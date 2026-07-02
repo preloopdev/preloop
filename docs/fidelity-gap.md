@@ -26,9 +26,9 @@ ephemeral runner host for local CI. aksh is its control plane. But aksh is indep
 
 usable: anyone can `cargo install aksh` and point their own runners at it.
 
-Execution engine and runner host integrations live in **separate repos/crates**. This repo
+Runner *provisioning* integrations live in separate repos/crates. The Rust runner
 
-is the control plane only.
+protocol client (`aksh-runner`) lives in this workspace alongside the control plane.
 
 Upstream reference: `actions/runner` v2.335.1 (commit `7d737449ef346f6524f75688d0c9c95fa10ba10a`)
 
