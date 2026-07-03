@@ -11,7 +11,7 @@ Last full-code audit: **2026-07-02** (all of `crates/aksh-runner` diffed against
 | Subsystem | Status | Blocking gaps |
 |---|---|---|
 | Configuration & registration (M1) | ✅ Verified vs golden 01 | `--replace` no agent DELETE (P2) |
-| OAuth PS256 / broker session / message poll (M2) | ✅ Verified vs golden 01 | connectionData unparsed → broker URL (F008); BrokerMigration stub; no retry/backoff |
+| OAuth PS256 / broker session / message poll (M2) | ✅ Verified vs golden 01 | BrokerMigration stub; no session recovery |
 | acquirejob / completejob (M3) | ✅ Shapes verified vs golden 06; local smoke green | live GitHub flow diff pending |
 | **renewjob lock renewal (M3)** | ✅ Implemented | live GitHub long-job validation pending |
 | **In-progress step updates — Twirp WorkflowStepsUpdate (M3)** | ✅ Implemented | live GitHub flow diff pending; local aksh auth/body fidelity may still reject results calls |
@@ -88,20 +88,20 @@ These were the blockers identified by the 2026-07-02 full-code audit. They are n
 
 | ID | Item | Detail | Ref |
 |---|---|---|---|
-| P1.1 | Broker URL from connectionData | Still falls back to `.runner` `serverUrl`; must parse `connectionData` serviceDefinitions/location mappings for `broker.actions.githubusercontent.com` (golden 01 flow 11) | F008 (pending) |
+| ~~P1.1~~ | ~~Broker URL from connectionData~~ | ✅ Fixed: derived from agent response properties.ServerUrlV2 and persisted as serverUrlV2 in settings | F008 |
 | P1.2 | Job/service containers not wired | `container_ops.rs` (network create, start, health poll, path translation) is **dead code**; `job_runner.rs` never inspects the message's container resources; `handlers/script.rs` never takes the `docker exec` path; service containers have zero code | F026 |
 | P1.3 | AzDO compat reporting (`--via azdo`) | `client/azdo.rs` has `patch_agent_request`, `update_timeline`, `create_log`/`append_log`, `post_console_log`, `finish_job` — **all 0 call sites**; `report_completion()` builds a non-`JobCompletedEvent` shape; `TimelineRecord` missing `order` population | F030 |
-| P1.4 | Cancellation completeness | On cancel: remaining steps are not re-evaluated under `cancelled()` semantics (`always()` steps and post steps don't run), no grace window before hard kill in `job_dispatcher::kill()`; official runs always/post steps then reports Canceled | F031 |
-| P1.5 | Job-level `timeout-minutes` | Default 360 min never read or enforced (step-level timeout works) | F031 |
-| P1.6 | Problem matchers dead code | `matchers.rs` registry/matching exists but has **no call sites**: `::add-matcher::`/`::remove-matcher::` not wired in `commands.rs`, log lines never fed through, multi-line `loop:` patterns unimplemented, `fromPath`/`defaultSeverity` untested | F032 |
-| P1.7 | Retry/backoff + session recovery | No retry on any HTTP call site (official: transient 5xx ×3 exponential, `ErrorThrottler`); no session re-create on 401/session-gone mid-poll; listener dies on server restart | F033 |
-| P1.8 | Ephemeral unregister | `--once` exits but never DELETEs the agent registration (official ephemeral runners unregister) | F033 |
+| ~~P1.4~~ | ~~Cancellation completeness~~ | ✅ Fixed: runs always/post steps on cancel before timeout / hard kill | F031 |
+| ~~P1.5~~ | ~~Job-level `timeout-minutes`~~ | ✅ Fixed: defaults to 360 min; wrapped with cancel-channel timer (orphan-safe) | F031 |
+| ~~P1.6~~ | ~~Problem matchers dead code~~ | ✅ Fixed: wired registry, parsed commands, stopped commands token suspension, group passthrough | F032 |
+| ~~P1.7~~ | ~~Retry/backoff + session recovery~~ | ✅ Fixed: 3x HTTP retry on 5xx/network errors; session recovery loop re-creates session on 401/404 | F033 |
+| ~~P1.8~~ | ~~Ephemeral unregister~~ | ✅ Fixed: unregister helper called on all once/cancel paths; config --ephemeral auto-removal supported | F033 |
 | ~~P1.9~~ | ~~GITHUB_*/RUNNER_* env completeness~~ | ✅ Fixed: added all 11 missing env vars (GITHUB_REF_PROTECTED, REPOSITORY_ID, REPOSITORY_OWNER_ID, TRIGGERING_ACTOR, WORKFLOW_REF, WORKFLOW_SHA, RETENTION_DAYS, RUNNER_DEBUG, RUNNER_ENVIRONMENT, RUNNER_PERFLOG, RUNNER_TRACKING_ID) | F034 |
-| P1.10 | Step summary upload | `GITHUB_STEP_SUMMARY` file created + size-capped but never uploaded to the results service | F035 |
-| P1.11 | Step ID/display-name generation | No `__run`/`__run_2` auto-ID for id-less steps, no display-name fallback (action ref / script preview); step naming must match official for wire parity in step updates | F029 |
-| P1.12 | `runner`/`job` context completeness | `runner.tool_cache` and `runner.workspace` missing (4/6 fields); `job` context only has `status` (no `container`/`services`) | — |
+| ~~P1.10~~ | ~~Step summary upload~~ | ✅ Fixed: summary uploaded to results service, CreateStepSummaryMetadata finalized | F035 |
+| ~~P1.11~~ | ~~Step ID/display-name generation~~ | ✅ Fixed: contextName split, __run/__run_N auto-IDs, displayName truncation | F029 |
+| ~~P1.12~~ | ~~runner/job context completeness~~ | ✅ Fixed: runner.tool_cache/workspace, runner.name, job.container/services | — |
 | ~~P1.13~~ | ~~Node handler precision~~ | ✅ Partial: node12/16 deprecation warnings added; remaining INPUT_* edge cases deferred | — |
-| P1.14 | Manifest fields | `inputs.*.deprecationMessage` not surfaced as warning; `outputs.*.value` not extracted (see F024); `pre-if`/`post-if` parsed but no `always()` default applied | — |
+| ~~P1.14~~ | ~~Manifest fields~~ | ✅ Fixed: deprecationMessage warning emitted, runs_pre_if/runs_post_if defaults | — |
 | ~~P1.15~~ | ~~Log upload fails on Azure Blob Storage~~ | ✅ Fixed: added `x-ms-blob-type: BlockBlob` header | F036 |
 | ~~P1.16~~ | ~~completejob outputs payload has wrong schema~~ | ✅ Fixed: outputs wrapped in `{"value": v}` | F037 |
 | ~~P1.17~~ | ~~completejob fails with connection closed error~~ | ✅ Fixed: annotations always include `startLine`/`endLine` | F038 |
