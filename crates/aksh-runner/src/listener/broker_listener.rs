@@ -194,7 +194,27 @@ pub async fn run_broker_loop(
                             "JobCancellation" => {
                                 if let Some(job) = &mut active_job {
                                     info!("Cancelling active job {}", job.request_id);
-                                    job.kill().await;
+                                    // F031/P1.4: Graceful cancel first — sends IPC cancel
+                                    // message so worker can run always()/post steps and
+                                    // flush reporting. Hard kill after 5-minute grace period
+                                    // (matching upstream's default cancel timeout).
+                                    job.cancel(300).await;
+                                    let grace = std::time::Duration::from_secs(300);
+                                    match tokio::time::timeout(grace, job.wait()).await {
+                                        Ok(_) => {
+                                            info!("Worker exited gracefully after cancel");
+                                        }
+                                        Err(_) => {
+                                            warn!("Worker did not exit within grace period — killing");
+                                            job.kill().await;
+                                        }
+                                    }
+                                    if once {
+                                        info!("--once: exiting after cancelled job");
+                                        ephemeral_unregister(http, config, &token).await;
+                                        let _ = client.delete_session(&token, &session_id).await;
+                                        return Ok(());
+                                    }
                                     active_job = None;
                                 } else {
                                     debug!("Received cancellation but no active job");
