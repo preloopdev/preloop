@@ -57,8 +57,11 @@ dependencies = [
  "aksh-gha-protocol",
  "anyhow",
  "clap",
+ "reqwest",
+ "runner-watch",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "walkdir",
 ]

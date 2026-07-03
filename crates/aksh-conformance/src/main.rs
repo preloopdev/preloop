@@ -66,6 +66,26 @@ enum CommandKind {
     },
     /// Placeholder for provider-based Runner.Listener integration tests.
     LibkrunPlan,
+    /// H1: Boot local runner, submit workflow, wait for completion, generate verdict JSON.
+    #[command(name = "runner-e2e")]
+    RunnerE2e {
+        /// Path to the runner executable.
+        #[arg(long, default_value = "target/release/aksh-runner")]
+        runner_bin: PathBuf,
+        /// Path to the GHA workflow file to run.
+        #[arg(long)]
+        workflow: PathBuf,
+    },
+    /// H2: Generate a flow diff report against the golden scenario captures.
+    #[command(name = "runner-diff")]
+    RunnerDiff {
+        /// Golden scenario name.
+        #[arg(long)]
+        scenario: String,
+        /// Target environment (e.g. github, aksh).
+        #[arg(long)]
+        target: String,
+    },
 }
 
 #[tokio::main]
@@ -85,6 +105,8 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", include_str!("libkrun-plan.md"));
             Ok(())
         }
+        CommandKind::RunnerE2e { runner_bin, workflow } => run_runner_e2e(runner_bin, workflow).await,
+        CommandKind::RunnerDiff { scenario, target } => run_runner_diff(scenario, target).await,
     }
 }
 
@@ -379,4 +401,161 @@ fn generate_random_yaml(seed: u64) -> String {
     }
 
     yaml
+}
+
+async fn run_runner_e2e(runner_bin: PathBuf, workflow: PathBuf) -> anyhow::Result<()> {
+    use std::time::Duration;
+
+    // Check binaries
+    if !runner_bin.exists() {
+        anyhow::bail!("runner binary not found: {}", runner_bin.display());
+    }
+    if !workflow.exists() {
+        anyhow::bail!("workflow file not found: {}", workflow.display());
+    }
+
+    let server_bin = if std::path::Path::new("target/release/aksh-runner-server").exists() {
+        "target/release/aksh-runner-server"
+    } else {
+        "target/debug/aksh-runner-server"
+    };
+    if !std::path::Path::new(server_bin).exists() {
+        anyhow::bail!("server binary not found: please build aksh-runner-server");
+    }
+
+    let client_bin = if std::path::Path::new("target/release/aksh-runner-client").exists() {
+        "target/release/aksh-runner-client"
+    } else {
+        "target/debug/aksh-runner-client"
+    };
+    if !std::path::Path::new(client_bin).exists() {
+        anyhow::bail!("client binary not found: please build aksh-runner-client");
+    }
+
+    // Temporary directories
+    let temp_dir = tempfile::TempDir::new()?;
+    let state_dir = temp_dir.path().join("state");
+    let runner_root = temp_dir.path().join("runner-root");
+    std::fs::create_dir_all(&state_dir)?;
+    std::fs::create_dir_all(&runner_root)?;
+
+    // Start server in background on port 9191
+    let mut server = Command::new(server_bin)
+        .arg("serve")
+        .arg("--listen")
+        .arg("127.0.0.1:9191")
+        .arg("--state-dir")
+        .arg(state_dir.to_str().unwrap())
+        .spawn()?;
+
+    // Wait for server to listen
+    let client = reqwest::Client::new();
+    let mut ready = false;
+    for _ in 0..30 {
+        if client.get("http://127.0.0.1:9191/").send().await.is_ok() {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if !ready {
+        let _ = server.kill().await;
+        anyhow::bail!("aksh-runner-server failed to start on port 9191");
+    }
+
+    // Configure the runner
+    let configure_status = Command::new(&runner_bin)
+        .arg("--runner-root")
+        .arg(&runner_root)
+        .arg("configure")
+        .args([
+            "--url", "http://127.0.0.1:9191",
+            "--token", "dummy-token",
+            "--name", "e2e-runner",
+            "--work", "_work",
+            "--no-externals",
+            "--unattended",
+            "--replace",
+        ])
+        .status()
+        .await?;
+    if !configure_status.success() {
+        let _ = server.kill().await;
+        anyhow::bail!("runner configure failed");
+    }
+
+    // Submit workflow
+    let submit_output = Command::new(client_bin)
+        .args(["--server", "http://127.0.0.1:9191", "submit", "-W"])
+        .arg(&workflow)
+        .output()
+        .await?;
+    if !submit_output.status.success() {
+        let err = String::from_utf8_lossy(&submit_output.stderr);
+        let _ = server.kill().await;
+        anyhow::bail!("workflow submission failed: {err}");
+    }
+    let output = String::from_utf8_lossy(&submit_output.stdout);
+    let v: serde_json::Value = serde_json::from_str(&output)?;
+    let run_id = v.get("run_id")
+        .and_then(|v| v.as_str())
+        .context("missing run_id")?
+        .to_string();
+
+    // Start runner once
+    let runner_status = Command::new(&runner_bin)
+        .arg("--runner-root")
+        .arg(&runner_root)
+        .arg("run")
+        .arg("--once")
+        .status()
+        .await?;
+
+    // Check completion and verdict
+    let run_status_url = format!("http://127.0.0.1:9191/api/v1/runs/{}", run_id);
+    let mut run_success = false;
+    let mut run_status = "unknown".to_string();
+    if let Ok(resp) = client.get(&run_status_url).send().await {
+        if let Ok(v) = resp.json::<serde_json::Value>().await {
+            if let Some(status) = v.get("status").and_then(|v| v.as_str()) {
+                run_status = status.to_string();
+                if status == "completed" || status == "success" {
+                    run_success = true;
+                }
+            }
+        }
+    }
+    if runner_status.success() {
+        run_success = true;
+    }
+
+    let verdict = serde_json::json!({
+        "success": run_success,
+        "run_id": run_id,
+        "status": run_status,
+    });
+    println!("{}", serde_json::to_string_pretty(&verdict)?);
+
+    let _ = server.kill().await;
+    Ok(())
+}
+
+async fn run_runner_diff(scenario: String, target: String) -> anyhow::Result<()> {
+    let left_dir = format!(".runner-watch/golden/v2.335.1/{scenario}");
+    let right_dir = format!(".runner-watch/conformance/v2.335.1/{scenario}/{target}");
+    let output_dir = ".runner-watch/runner-conformance";
+    std::fs::create_dir_all(output_dir)?;
+    let output_path = format!("{output_dir}/{scenario}.md");
+
+    runner_watch::compare::render_report(&runner_watch::compare::Args {
+        scenario: &scenario,
+        left_dir: std::path::Path::new(&left_dir),
+        right_dir: std::path::Path::new(&right_dir),
+        output: std::path::Path::new(&output_path),
+        left_label: "official",
+        right_label: &target,
+    })?;
+
+    println!("Report written to {output_path}");
+    Ok(())
 }
