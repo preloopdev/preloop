@@ -132,16 +132,79 @@ pub async fn run_job(
         plan_id.clone(),
     )));
 
-    // Execute steps with reporting
+    // F031/P1.5: Job-level timeout enforcement.
+    // For self-hosted runners on github.com, the server enforces `timeout-minutes`
+    // and sends a cancellation message. The local timer is a safety net matching
+    // the official runner's 360-minute default. If the job message ever carries
+    // the timeout (e.g. `jobTimeout` or `plan.jobTimeoutInMinutes`), we'll use it.
+    let job_timeout_minutes: u64 = job_message
+        .get("jobTimeout")
+        .and_then(|v| v.as_u64())
+        .or_else(|| {
+            job_message
+                .get("plan")
+                .and_then(|p| p.get("jobTimeoutInMinutes"))
+                .and_then(|v| v.as_u64())
+        })
+        .unwrap_or(360);
+
+    info!("Job timeout: {job_timeout_minutes} minutes");
+
+    // Instead of wrapping run_steps in tokio::time::timeout (which would drop
+    // the future and orphan child processes — the bug F015 fixed), we create a
+    // derived cancel channel that merges the parent cancel with a timeout timer.
+    // When the timer fires, cancel_tx trips and process::invoke kills the
+    // process group, then run_steps unwinds through normal cancel semantics.
+    let (job_cancel_tx, job_cancel_rx) = watch::channel(false);
+    let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Forward parent cancel → job cancel
+    let fwd_tx = job_cancel_tx.clone();
+    let mut fwd_rx = cancel_rx.clone();
+    let forward_handle = tokio::spawn(async move {
+        while fwd_rx.changed().await.is_ok() {
+            if *fwd_rx.borrow() {
+                let _ = fwd_tx.send(true);
+                return;
+            }
+        }
+    });
+
+    // Spawn job-timeout timer that trips cancel and sets the timed_out flag
+    let timeout_tx = job_cancel_tx.clone();
+    let timeout_flag = timed_out.clone();
+    let timeout_handle = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(job_timeout_minutes * 60)).await;
+        warn!("Job timeout ({job_timeout_minutes} minutes) reached — cancelling");
+        timeout_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = timeout_tx.send(true);
+    });
+
+    // Execute steps with the derived cancel channel
     let job_result = super::steps_runner::run_steps(
         &ordered_steps,
         &mut job_ctx,
         &workspace,
-        cancel_rx,
+        job_cancel_rx,
         queue.clone(),
         reporting.as_deref(),
     )
     .await;
+
+    // Check if we timed out (must check before aborting the timer)
+    let was_timeout = timed_out.load(std::sync::atomic::Ordering::SeqCst);
+
+    // Clean up timer/forward tasks
+    timeout_handle.abort();
+    forward_handle.abort();
+
+    // If the job timed out, override status to Failure with timeout message
+    if was_timeout {
+        error!(
+            "Job {job_name} exceeded the maximum execution time of {job_timeout_minutes} minutes"
+        );
+        job_ctx.job_status = super::contexts::JobStatus::Failure;
+    }
 
     // F018: Stop renew loop
     if let Some(handle) = renew_handle {
