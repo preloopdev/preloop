@@ -52,23 +52,32 @@ fn run_composite_action_inner<'a>(
 
         // Set up INPUT_* env from `with` inputs
         let mut input_env = std::collections::HashMap::new();
+        let expr_ctx_for_inputs = ctx.job.build_expression_context();
         if let Some(inputs) = with.as_object() {
             for (key, value) in inputs {
-                if let Some(val_str) = value.as_str() {
-                    let env_key = format!("INPUT_{}", key.to_uppercase().replace(' ', "_"));
-                    input_env.insert(env_key, val_str.to_string());
-                }
+                let env_key = format!("INPUT_{}", key.to_uppercase().replace(' ', "_"));
+                let raw = if let Some(val_str) = value.as_str() {
+                    val_str.to_string()
+                } else {
+                    value.to_string()
+                };
+                let evaluated =
+                    crate::worker::template::evaluate_template(&raw, &expr_ctx_for_inputs)
+                        .unwrap_or(raw);
+                input_env.insert(env_key, evaluated);
             }
         }
 
-        // Apply defaults from manifest for missing inputs
+        // Apply defaults from manifest for missing inputs, evaluating ${{ }} expressions
         if let Some(manifest_inputs) = &manifest.inputs {
+            let expr_ctx = ctx.job.build_expression_context();
             for (key, input_def) in manifest_inputs {
                 let env_key = format!("INPUT_{}", key.to_uppercase().replace(' ', "_"));
                 if let Some(default) = input_def.get("default").and_then(|v| v.as_str()) {
-                    input_env
-                        .entry(env_key)
-                        .or_insert_with(|| default.to_string());
+                    input_env.entry(env_key).or_insert_with(|| {
+                        crate::worker::template::evaluate_template(default, &expr_ctx)
+                            .unwrap_or_else(|_| default.to_string())
+                    });
                 }
             }
         }
