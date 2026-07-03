@@ -413,16 +413,30 @@ pub fn build_step_list(steps: &[serde_json::Value], _job_message: &serde_json::V
                     }
                 }
                 _ => {
-                    // Action reference — combine name and ref (GitHub sends them separately)
-                    let name = ref_val
-                        .get("name")
+                    // Action reference — check for local (self) vs remote
+                    let repo_type = ref_val
+                        .get("repositoryType")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    let action_ref = ref_val.get("ref").and_then(|v| v.as_str());
-                    let uses = if name.contains('@') || action_ref.is_none() {
-                        name.to_string()
+                    let uses = if repo_type == "self" {
+                        // Local action: uses the `path` field (e.g. "./.github/actions/greet")
+                        ref_val
+                            .get("path")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string()
                     } else {
-                        format!("{name}@{}", action_ref.unwrap())
+                        // Remote action: combine name + @ref
+                        let name = ref_val
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let action_ref = ref_val.get("ref").and_then(|v| v.as_str());
+                        if name.contains('@') || action_ref.is_none() {
+                            name.to_string()
+                        } else {
+                            format!("{name}@{}", action_ref.unwrap())
+                        }
                     };
                     let with =
                         serde_json::to_value(&inputs).unwrap_or_else(|_| serde_json::json!({}));
