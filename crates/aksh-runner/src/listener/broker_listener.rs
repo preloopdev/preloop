@@ -17,50 +17,27 @@ use crate::settings::RunnerConfig;
 pub async fn run_broker_loop(
     http: &HttpClient,
     config: &RunnerConfig,
-    token: &str,
+    initial_token: &str,
     once: bool,
     runner_root: &std::path::Path,
 ) -> Result<()> {
-    // GitHub broker endpoints live on a dedicated host. The official runner gets this
-    // from service-location state; for github.com use the observed public broker host.
-    // Local aksh keeps broker routes on the configured server URL.
-    let broker_url = if config
+    // P1.1: Derive broker URL from settings.server_url_v2 (extracted from agent
+    // response properties.ServerUrlV2 at configure time). This is
+    // "https://broker.actions.githubusercontent.com/" for github.com, and the
+    // server's own URL for local aksh / self-hosted instances.
+    // Fall back to server_url if server_url_v2 is absent (pre-P1.1 configs).
+    let broker_url = config
         .settings
-        .server_url
-        .contains(".actions.githubusercontent.com")
-        || config.settings.git_hub_url.contains("github.com")
-    {
-        "https://broker.actions.githubusercontent.com".to_string()
-    } else {
-        config.settings.server_url.clone()
-    };
+        .server_url_v2
+        .clone()
+        .unwrap_or_else(|| config.settings.server_url.clone())
+        .trim_end_matches('/')
+        .to_string();
     let client = BrokerClient::new(http.clone(), broker_url);
 
-    let session_body = serde_json::json!({
-        "sessionId": uuid::Uuid::new_v4().to_string(),
-        "ownerName": format!("{} (PID: {})", hostname::get()
-            .ok()
-            .and_then(|h| h.into_string().ok())
-            .unwrap_or_else(|| "aksh-runner".to_string()),
-            std::process::id()),
-        "agent": {
-            "id": config.settings.agent_id,
-            "name": config.settings.agent_name,
-        },
-        "useFipsEncryption": false,
-    });
-
-    let session_resp = client.create_session(token, &session_body).await?;
-    let session_id = session_resp
-        .get("sessionId")
-        .and_then(|v| v.as_str())
-        .context("missing sessionId in broker response")?
-        .to_string();
-
-    // F011: session key is optional — GitHub broker doesn't send one.
-    let session_key = extract_session_key_if_present(&session_resp, config);
-
-    info!("Broker session created: {session_id}");
+    let mut token = initial_token.to_string();
+    let mut session_id = String::new();
+    let mut session_key: Option<Vec<u8>> = None;
 
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
@@ -69,6 +46,9 @@ pub async fn run_broker_loop(
         std::collections::HashSet::new();
     let mut consecutive_errors: u32 = 0;
     let mut active_job: Option<RunningJob> = None;
+
+    // We start in a "need session" state.
+    let mut need_session = true;
 
     loop {
         // Check if active job has finished (non-blocking)
@@ -83,7 +63,10 @@ pub async fn run_broker_loop(
                     }
                     if once {
                         info!("--once: exiting after first job");
-                        let _ = client.delete_session(token, &session_id).await;
+                        ephemeral_unregister(http, config, &token).await;
+                        if !session_id.is_empty() {
+                            let _ = client.delete_session(&token, &session_id).await;
+                        }
                         return Ok(());
                     }
                     active_job = None;
@@ -92,6 +75,65 @@ pub async fn run_broker_loop(
                 Err(e) => {
                     warn!("Error checking worker status: {e:#}");
                     active_job = None;
+                }
+            }
+        }
+
+        // If we need a new session, establish it here
+        if need_session {
+            info!("Establishing broker session...");
+            let session_body = serde_json::json!({
+                "sessionId": uuid::Uuid::new_v4().to_string(),
+                "ownerName": format!("{} (PID: {})", hostname::get()
+                    .ok()
+                    .and_then(|h| h.into_string().ok())
+                    .unwrap_or_else(|| "aksh-runner".to_string()),
+                    std::process::id()),
+                "agent": {
+                    "id": config.settings.agent_id,
+                    "name": config.settings.agent_name,
+                },
+                "useFipsEncryption": false,
+            });
+
+            match client.create_session(&token, &session_body).await {
+                Ok(session_resp) => {
+                    if let Some(sid) = session_resp.get("sessionId").and_then(|v| v.as_str()) {
+                        session_id = sid.to_string();
+                        session_key = extract_session_key_if_present(&session_resp, config);
+                        info!("Broker session created: {session_id}");
+                        need_session = false;
+                        consecutive_errors = 0;
+                    } else {
+                        warn!("Session response missing sessionId");
+                        consecutive_errors += 1;
+                        let delay = std::cmp::min(consecutive_errors * 5, 60);
+                        tokio::time::sleep(std::time::Duration::from_secs(delay as u64)).await;
+                    }
+                }
+                Err(e) => {
+                    if is_unauthorized(&e) {
+                        info!("OAuth token expired during session creation. Re-acquiring token...");
+                        match crate::listener::oauth::get_oauth_token(http, config).await {
+                            Ok(t) => {
+                                token = t;
+                                consecutive_errors = 0;
+                            }
+                            Err(oe) => {
+                                warn!("Failed to re-acquire OAuth token: {oe:#}");
+                                consecutive_errors += 1;
+                                let delay = std::cmp::min(consecutive_errors * 5, 60);
+                                tokio::time::sleep(std::time::Duration::from_secs(delay as u64))
+                                    .await;
+                            }
+                        }
+                    } else {
+                        consecutive_errors += 1;
+                        let delay = std::cmp::min(consecutive_errors * 5, 60);
+                        warn!("Failed to create broker session: {e:#}. Retrying in {delay}s");
+                        tokio::time::sleep(std::time::Duration::from_secs(delay as u64)).await;
+                    }
+                    continue;
                 }
             }
         }
@@ -105,10 +147,15 @@ pub async fn run_broker_loop(
                     info!("Killing active worker");
                     job.kill().await;
                 }
-                let _ = client.delete_session(token, &session_id).await;
+                if once {
+                    ephemeral_unregister(http, config, &token).await;
+                }
+                if !session_id.is_empty() {
+                    let _ = client.delete_session(&token, &session_id).await;
+                }
                 return Ok(());
             }
-            result = client.get_message(token, &session_id, busy) => {
+            result = client.get_message(&token, &session_id, busy) => {
                 match result {
                     Ok(Some(msg)) => {
                         consecutive_errors = 0;
@@ -148,7 +195,7 @@ pub async fn run_broker_loop(
                             .to_string();
 
                         if !runner_request_id.is_empty() {
-                            let _ = client.acknowledge(token, &session_id, &runner_request_id).await;
+                            let _ = client.acknowledge(&token, &session_id, &runner_request_id).await;
                         }
 
                         match message_type.as_str() {
@@ -157,25 +204,13 @@ pub async fn run_broker_loop(
                                     warn!("Received job while another is running — ignoring");
                                     continue;
                                 }
-                                let job = acquire_job_from_ref(&body, http, token).await?;
+                                let job = acquire_job_from_ref(&body, http, &token).await?;
                                 if let Some(job_msg) = job {
-                                    let mut running = job_dispatcher::spawn_job(
+                                    let running = job_dispatcher::spawn_job(
                                         job_msg,
                                         runner_root,
                                         crate::cli::ProtocolPath::Broker,
                                     ).await?;
-                                    if once {
-                                        // --once: wait for the job, then exit
-                                        let success = running.wait().await.unwrap_or(false);
-                                        if success {
-                                            info!("Worker completed job {} successfully", running.request_id);
-                                        } else {
-                                            warn!("Worker failed for job {}", running.request_id);
-                                        }
-                                        info!("--once: exiting after first job");
-                                        let _ = client.delete_session(token, &session_id).await;
-                                        return Ok(());
-                                    }
                                     active_job = Some(running);
                                 }
                             }
