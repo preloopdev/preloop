@@ -212,6 +212,36 @@ simple-echo smoke run. Tier-1 live GitHub validation and MITM flow diffs are sti
 - **File**: `crates/aksh-runner/src/worker/file_commands.rs`, `crates/aksh-runner/src/worker/job_runner.rs`
 - **Status**: ❌ Pending (roadmap P1.10)
 
+### F036 — HIGH: Log upload fails on Azure Blob Storage due to missing `x-ms-blob-type` header
+- **Found**: E2E live GitHub run failed to upload step/job logs to production Azure Blob Storage URL (`PUT https://productionresultssa17.blob.core.windows.net/...`). Azure responded with `400 Bad Request` and `MissingRequiredHeader`, specifying that `x-ms-blob-type` is a mandatory header.
+- **File**: `crates/aksh-runner/src/client/results.rs`
+- **Status**: ✅ Fixed (2026-07-03) — added `x-ms-blob-type: BlockBlob` header to `put_bytes()`. Verified: live GitHub run 28631466481 uploaded logs successfully.
+
+### F037 — HIGH: completejob outputs payload has wrong schema (not wrapped in value object)
+- **Found**: E2E live GitHub run for `08-job-outputs-needs` failed `/completejob` with `400 Bad Request` when job outputs were present. Golden captures show outputs must be structured as `{"outputs": { "<name>": { "value": "<val>" } }}` rather than `{"outputs": { "<name>": "<val>" }}`.
+- **File**: `crates/aksh-runner/src/worker/job_runner.rs`
+- **Status**: ✅ Fixed (2026-07-03) — wrapped each output in `{"value": v}`. Verified: live GitHub run 28631470474 (producer+consumer both succeeded).
+
+### F038 — MEDIUM: completejob fails with connection closed error on annotations
+- **Found**: E2E live GitHub run for `14-annotations` failed `/completejob` with a connection closed error (`SendRequest`) when step annotations were reported.
+- **File**: `crates/aksh-runner/src/worker/job_runner.rs`
+- **Status**: ✅ Fixed (2026-07-03) — annotations now always include `startLine`/`endLine` (defaulting to 1 when no source line present). Verified: live GitHub run 28631483737 completed successfully.
+
+### F039 — HIGH: Action manifest input defaults containing expressions are not evaluated
+- **Found**: E2E live GitHub run for `10-uses-checkout` failed because `actions/checkout` requires `INPUT_TOKEN` to contain a valid GitHub token. The runner loaded the default value `"${{ github.token }}"` literally from the action's manifest and set `INPUT_TOKEN="${{ github.token }}"` in the environment instead of evaluating the expression, causing git authentication to fail.
+- **File**: `crates/aksh-runner/src/worker/handlers/node.rs`, `crates/aksh-runner/src/worker/handlers/composite.rs`
+- **Status**: ✅ Fixed (2026-07-03) — defaults are now evaluated via `evaluate_template()` against the job expression context. Verified: live GitHub run 28631474708 (checkout now fails on Node 26, not on expression evaluation).
+
+### F040 — HIGH: Trailing slash in CacheServerUrl causes CacheService API calls to fail
+- **Found**: E2E live GitHub runs for `11-cache-roundtrip` failed because `ACTIONS_CACHE_URL` was set to the raw `CacheServerUrl` from GitHub which contains a trailing slash. When the `@actions/cache` library constructed the request URL, it resulted in a double slash (e.g. `...//_apis/artifactcache/...`), which the API gateway rejected.
+- **File**: `crates/aksh-runner/src/worker/job_extension.rs`
+- **Status**: ✅ Fixed (2026-07-03) — `CacheServerUrl` is now trimmed via `trim_end_matches('/')`. Verified: live GitHub run 28631476809 no longer has double-slash URL errors.
+
+### F041 — HIGH: Action reference missing @version from job message
+- **Found**: GitHub job messages send action references with `name` and `ref` as separate fields in `reference` (e.g. `{"name": "actions/checkout", "ref": "v4"}`). The runner's step parser only read `name`, producing `"actions/checkout"` without `@v4`, which caused `parse_remote_uses` to fail and the action to never be downloaded.
+- **File**: `crates/aksh-runner/src/worker/job_extension.rs`
+- **Status**: ✅ Fixed (2026-07-03) — step parser now combines `reference.name` and `reference.ref` into `uses@ref`. Verified: live GitHub run 28632740507 downloads and executes `actions/checkout@v4` via codeload.github.com.
+
 ---
 
 ## Remaining Known Gaps (deferred)
