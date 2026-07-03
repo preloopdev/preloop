@@ -997,4 +997,83 @@ runs:
         ));
         assert_eq!(ordered[2].condition.as_deref(), Some("always()"));
     }
+
+    #[test]
+    fn test_golden_acquirejob_payloads_parsing() {
+        let scenarios = &[
+            "06-multi-step",
+            "08-job-outputs-needs",
+            "10-uses-checkout",
+            "11-cache-roundtrip",
+            "12-artifact",
+            "13-composite-action",
+            "14-annotations",
+            "15-oidc-id-token",
+        ];
+
+        for scenario in scenarios {
+            let msg = load_golden_acquirejob(scenario)
+                .unwrap_or_else(|| panic!("failed to load golden acquirejob for {scenario}"));
+
+            // 1. Build step list from raw steps
+            let steps = msg.get("steps").and_then(|v| v.as_array()).expect("missing steps in golden");
+            let parsed_steps = build_step_list(steps, &msg);
+            assert!(!parsed_steps.is_empty(), "parsed steps must not be empty for {scenario}");
+
+            // 2. Inject environment and verify GITHUB_REPOSITORY is parsed
+            let mut job = JobContext::new(
+                "job1".into(),
+                "test-job".into(),
+                serde_json::json!({}),
+                serde_json::json!({}),
+            );
+            job.workspace = Some("_work/repo/repo".into());
+            inject_github_env(&mut job, &msg);
+
+            // GITHUB_REPOSITORY must be set and not empty (from contextData.github.repository)
+            let repo = job.env.get("GITHUB_REPOSITORY").map(|s| s.as_str());
+            assert_eq!(repo, Some("preloopdev/aksh-conformance-sample"), "mismatched GITHUB_REPOSITORY in {scenario}");
+
+            // GITHUB_TOKEN must be set and not empty
+            let token = job.env.get("GITHUB_TOKEN").map(|s| s.as_str());
+            assert!(token.is_some() && !token.unwrap().is_empty(), "GITHUB_TOKEN must not be empty in {scenario}");
+
+            // 3. Scenario-specific checks
+            if *scenario == "10-uses-checkout" {
+                // Verify actions/checkout has @v4 ref combined
+                let checkout_step = parsed_steps.iter().find(|s| match &s.step_type {
+                    StepType::Action { uses, .. } => uses.starts_with("actions/checkout"),
+                    _ => false,
+                }).expect("missing checkout step");
+                if let StepType::Action { uses, .. } = &checkout_step.step_type {
+                    assert_eq!(uses, "actions/checkout@v4");
+                }
+            } else if *scenario == "13-composite-action" {
+                // Verify local action has repositoryType=self path
+                let composite_step = parsed_steps.iter().find(|s| match &s.step_type {
+                    StepType::Action { uses, .. } => uses.starts_with("./"),
+                    _ => false,
+                }).expect("missing composite step");
+                if let StepType::Action { uses, .. } = &composite_step.step_type {
+                    assert_eq!(uses, "./.github/actions/greet");
+                }
+            }
+        }
+    }
+
+    fn load_golden_acquirejob(scenario: &str) -> Option<serde_json::Value> {
+        use std::fs::File;
+        use std::io::{BufRead, BufReader};
+        let path = format!("../../.runner-watch/golden/v2.335.1/{scenario}/flows.jsonl");
+        let file = File::open(path).ok()?;
+        let reader = BufReader::new(file);
+        for line in reader.lines() {
+            let line = line.ok()?;
+            let d: serde_json::Value = serde_json::from_str(&line).ok()?;
+            if d.get("path").and_then(|v| v.as_str()).map(|s| s.contains("acquirejob")).unwrap_or(false) {
+                return d.get("response_body_json").cloned();
+            }
+        }
+        None
+    }
 }
