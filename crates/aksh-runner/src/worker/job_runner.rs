@@ -370,6 +370,8 @@ async fn prepare_remote_actions(
         }
         if let Some(parsed) = parse_remote_uses(uses) {
             refs.push((uses.clone(), parsed));
+        } else {
+            warn!("Cannot parse remote action ref (missing @version?): {uses:?}");
         }
     }
 
@@ -624,18 +626,21 @@ fn annotation_to_json(ann: &Annotation, step_number: u32) -> serde_json::Value {
         AnnotationLevel::Error => "failure",
     };
 
+    // Golden 14 always includes startLine/endLine; default to 1 when the
+    // annotation carries no source-file line info.
+    let start_line = ann.line.unwrap_or(1);
+    let end_line = ann.end_line.unwrap_or(start_line);
+
     let mut obj = serde_json::json!({
         "level": level,
         "message": ann.message,
         "stepNumber": step_number,
+        "startLine": start_line,
+        "endLine": end_line,
     });
 
-    if let Some(ref title) = ann.title {
+    if let Some(title) = &ann.title {
         obj["title"] = serde_json::json!(title);
-    }
-    if let Some(line) = ann.line {
-        obj["startLine"] = serde_json::json!(line);
-        obj["endLine"] = serde_json::json!(ann.end_line.unwrap_or(line));
     }
     if let Some(col) = ann.col {
         obj["startColumn"] = serde_json::json!(col);
@@ -761,7 +766,7 @@ async fn report_completion(
     let mut outputs = serde_json::Map::new();
     for (_, step) in &job_ctx.steps {
         for (k, v) in &step.outputs {
-            outputs.insert(k.clone(), serde_json::json!(v));
+            outputs.insert(k.clone(), serde_json::json!({"value": v}));
         }
     }
 

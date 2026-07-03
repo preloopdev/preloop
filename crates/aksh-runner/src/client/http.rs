@@ -261,6 +261,7 @@ impl HttpClient {
             .inner
             .put(url)
             .header(CONTENT_TYPE, content_type)
+            .header("x-ms-blob-type", "BlockBlob")
             .body(data)
             .send()
             .await

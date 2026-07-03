@@ -342,8 +342,13 @@ async fn execute_step(
             shell,
             working_directory: _,
         } => {
+            // Evaluate ${{ }} expressions in the script body
+            let expr_ctx = ctx.job.build_expression_context();
+            let evaluated_script =
+                crate::worker::template::evaluate_template(script, &expr_ctx)
+                    .unwrap_or_else(|_| script.clone());
             super::handlers::script::run_script(
-                script,
+                &evaluated_script,
                 shell.as_deref(),
                 workspace,
                 ctx,
