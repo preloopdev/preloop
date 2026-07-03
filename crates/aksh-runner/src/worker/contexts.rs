@@ -4,6 +4,7 @@ use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 
 use crate::worker::execution_context::Annotation;
+use crate::worker::matchers::MatcherRegistry;
 
 /// The top-level job context holding all sub-contexts and accumulated state.
 #[derive(Debug, Clone)]
@@ -32,6 +33,8 @@ pub struct JobContext {
     pub step_annotations: HashMap<String, Vec<Annotation>>,
     /// Resolved action directories keyed by the original `uses:` reference.
     pub action_paths: HashMap<String, String>,
+    /// P1.6: Active problem matchers (cross-step, registered by actions like setup-node).
+    pub matchers: MatcherRegistry,
 }
 
 /// Result of a completed step.
@@ -102,6 +105,7 @@ impl JobContext {
             state: HashMap::new(),
             step_annotations: HashMap::new(),
             action_paths: HashMap::new(),
+            matchers: MatcherRegistry::new(),
         }
     }
 
@@ -141,7 +145,12 @@ impl JobContext {
         if let Some(github) = self.context_data.get("github") {
             let mut gh = super::job_extension::decode_typed_value(github);
             // Token is often in variables, not contextData; inject it if missing
-            if gh.get("token").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+            if gh
+                .get("token")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .is_empty()
+            {
                 if let Some(token) = self.env.get("GITHUB_TOKEN") {
                     if let Some(obj) = gh.as_object_mut() {
                         obj.insert("token".to_string(), serde_json::json!(token));
@@ -151,12 +160,35 @@ impl JobContext {
             ctx.insert("github", gh);
         }
 
-        // runner context
+        // runner context — P1.12: add tool_cache and workspace
+        let tool_cache = std::env::var("RUNNER_TOOL_CACHE").unwrap_or_else(|_| {
+            // Default: runner root / _work / _tool
+            self.workspace
+                .as_deref()
+                .map(|w| {
+                    std::path::Path::new(w)
+                        .parent()
+                        .unwrap_or(std::path::Path::new("."))
+                        .join("_tool")
+                        .to_string_lossy()
+                        .to_string()
+                })
+                .unwrap_or_default()
+        });
+        let runner_workspace = self.workspace.clone().unwrap_or_default();
+        let runner_name = self.env.get("RUNNER_NAME").cloned().unwrap_or_else(|| {
+            crate::settings::RunnerConfig::load(std::path::Path::new("."))
+                .ok()
+                .map(|c| c.settings.agent_name)
+                .unwrap_or_else(|| self.job_name.clone())
+        });
         let runner_ctx = serde_json::json!({
-            "name": self.job_name,
+            "name": runner_name,
             "os": current_os(),
             "arch": current_arch(),
             "temp": std::env::temp_dir().to_string_lossy().to_string(),
+            "tool_cache": tool_cache,
+            "workspace": runner_workspace,
         });
         ctx.insert("runner", runner_ctx);
 
@@ -181,13 +213,27 @@ impl JobContext {
         }
         ctx.insert("steps", serde_json::Value::Object(steps_map));
 
-        // job context
+        // job context — P1.12: add container and services (empty objects when not containerized)
+        let job_container = self
+            .context_data
+            .get("job")
+            .and_then(|j| j.get("container"))
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
+        let job_services = self
+            .context_data
+            .get("job")
+            .and_then(|j| j.get("services"))
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
         let job_ctx = serde_json::json!({
             "status": match self.job_status {
                 JobStatus::Success => "success",
                 JobStatus::Failure => "failure",
                 JobStatus::Cancelled => "cancelled",
             },
+            "container": job_container,
+            "services": job_services,
         });
         ctx.insert("job", job_ctx);
 
