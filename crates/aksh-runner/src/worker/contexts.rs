@@ -162,17 +162,11 @@ impl JobContext {
 
         // runner context — P1.12: add tool_cache and workspace
         let tool_cache = std::env::var("RUNNER_TOOL_CACHE").unwrap_or_else(|_| {
-            // Default: runner root / _work / _tool
+            // Default: runner root / _work / _tool, matching inject_github_env.
             self.workspace
                 .as_deref()
-                .map(|w| {
-                    std::path::Path::new(w)
-                        .parent()
-                        .unwrap_or(std::path::Path::new("."))
-                        .join("_tool")
-                        .to_string_lossy()
-                        .to_string()
-                })
+                .and_then(|w| std::path::Path::new(w).parent().and_then(|p| p.parent()))
+                .map(|p| p.join("_tool").to_string_lossy().to_string())
                 .unwrap_or_default()
         });
         let runner_workspace = self.workspace.clone().unwrap_or_default();

@@ -94,7 +94,41 @@ Run a local end-to-end smoke test using the compiled binaries.
 
 ---
 
-## 3. Live GitHub E2E Test Suite (All 10 Workflows)
+## 3. 2026-07-03 Rerun After DR Fixes
+
+### Local protocol replay
+
+- Command: `cargo run -p runner-watch -- conform --runner v2.335.1 --aksh-url http://127.0.0.1:9191 --skip-cargo-test`
+- Result: 9/11 scenarios matched after allowing static replay session IDs on message-poll paths.
+- Remaining divergences: known unsupported `CacheService/*` and `ArtifactService/*` control-plane endpoints.
+- Regression caught and fixed during rerun: message polling returned `400` for recorded official UUID `sessionId` values until `aksh-runner-server` stopped rejecting unknown replay session IDs.
+
+### Local runner E2E smoke
+
+- Command: `cargo run -p aksh-conformance -- runner-e2e --runner-bin target/debug/aksh-runner --workflow fixtures/golden/simple-echo.yml`
+- Result: `success: true`, run `6c5243f8-ff31-4324-896b-42a257c12a7f`.
+
+### Live GitHub rerun
+
+- Repository: `preloopdev/aksh-conformance-sample`
+- Initial issue: dispatched jobs remained queued because runner agent `72` was registered without the workflow-required `mitm` label.
+- Fix: deleted agent `72`, re-registered `aksh-live-validate-20260703` as agent `73` with labels `self-hosted, mitm, macOS, ARM64`.
+- Cleanup: deleted temporary runner agent `73` after verification.
+
+| Workflow | Run ID | Result |
+|---|---:|---|
+| `mitm multi step` | 28667882368 | ✅ success |
+| `mitm composite` | 28667884236 | ✅ success |
+| `mitm step summary` | 28667886172 | ✅ success |
+| `mitm step ids` | 28667888259 | ✅ success |
+| `mitm job timeout` | 28667890064 | ✅ cancelled (expected) |
+| `mitm cancel semantics` | 28667891885 | ✅ cancelled (expected) |
+| `mitm context fields` | 28667893813 | ✅ success |
+| `mitm problem matcher` | 28667895498 | ✅ success |
+
+---
+
+## 4. Live GitHub E2E Test Suite (All 10 Workflows)
 
 > 💡 **Update (All Resolved)**: The issues identified during this initial E2E test suite run (F036 through F040) have been resolved. In subsequent live runs against GitHub with these fixes and Node 20 configured, all workflows execute and report successfully.
 
@@ -172,7 +206,7 @@ target/debug/aksh-runner --runner-root ~/github-runner-root run
 
 ---
 
-## 4. Discovered Gaps & Issues Logged (All Resolved)
+## 5. Discovered Gaps & Issues Logged (All Resolved)
 
 ### F036 — HIGH: Log upload fails on Azure Blob Storage due to missing `x-ms-blob-type` header
 *   **Status**: ✅ **Resolved**
@@ -186,8 +220,8 @@ target/debug/aksh-runner --runner-root ~/github-runner-root run
 
 ### F038 — MEDIUM: completejob fails with connection closed error on annotations
 *   **Status**: ✅ **Resolved**
-*   **Problem**: Reporting annotations in `completejob` causes the server gateway to drop the connection without a response, indicating a protocol format mismatch in the annotations structure.
-*   **Fix**: Updated `crates/aksh-runner/src/worker/job_runner.rs` to send `[]` for annotations payload.
+*   **Problem**: Reporting annotations in `completejob` caused the server gateway to drop the connection without a response, indicating a protocol format mismatch in the annotations structure.
+*   **Fix**: Updated `crates/aksh-runner/src/worker/job_runner.rs` so reported annotations always include `startLine` and `endLine` fields, defaulting to `1` when no source line is present.
 
 ### F039 — HIGH: Action manifest input defaults containing expressions are not evaluated
 *   **Status**: ✅ **Resolved**
