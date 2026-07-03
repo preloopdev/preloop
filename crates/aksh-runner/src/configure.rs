@@ -126,6 +126,16 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
         "requireFipsCryptography".to_string(),
         serde_json::json!("True"),
     );
+    // P1.1: Extract broker URL from agent response properties.ServerUrlV2
+    // GitHub returns `properties.ServerUrlV2.$value` = "https://broker.actions.githubusercontent.com/"
+    // aksh returns it set to its own server URL. Fall back to registration service URL.
+    let server_url_v2 = agent_response
+        .get("properties")
+        .and_then(|p| p.get("ServerUrlV2"))
+        .and_then(|v| v.get("$value").or(Some(v)))
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| registration.service_url.clone());
 
     let config = RunnerConfig {
         settings: RunnerSettings {
@@ -143,7 +153,7 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
             // F007: new fields
             is_hosted_server: false,
             use_v2_flow: true,
-            server_url_v2: Some(registration.service_url.clone()),
+            server_url_v2: Some(server_url_v2),
         },
         credentials: CredentialData {
             scheme: "OAuth".to_string(),
