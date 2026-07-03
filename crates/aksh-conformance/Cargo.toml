@@ -19,3 +19,6 @@ serde_json.workspace = true
 tokio.workspace = true
 walkdir.workspace = true
 
+runner-watch = { path = "../runner-watch" }
+tempfile.workspace = true
+reqwest.workspace = true
