@@ -52,14 +52,12 @@ MITM captures at `.runner-watch/golden/v2.335.1/`.
 - **Fix**: Added fields with correct serde renames
 - **File**: `crates/aksh-runner/src/settings.rs`
 
-### F008 — HIGH: Broker URL not derived from connectionData (partial fix)
+### F008 — HIGH: Broker URL not derived from agent properties (F008)
 - **Found**: golden flow 11 hits `broker.actions.githubusercontent.com/session` (separate host from the service URL)
-- **Was**: Code used same base URL for broker endpoints
-- **Partial fix**: BrokerClient accepts a separate broker URL; falls back to `config.settings.server_url` for local aksh. For live GitHub, the broker URL should be derived from connectionData service definitions' location mappings — not yet implemented
-- **Impact**: Works against aksh (same host); needs connectionData parsing for real GitHub
-- **File**: `crates/aksh-runner/src/listener/broker_listener.rs`
-- **Status**: ⚠️ Pending — connectionData parsing still not implemented (see roadmap P1.1)
-
+- **Was**: Code used same base URL for broker endpoints or hardcoded GitHub's broker URL.
+- **Fix**: Extract `ServerUrlV2` from the agent creation response's `properties.ServerUrlV2.$value` at configure time, persist it in `.runner` settings as `serverUrlV2`, and use it in the broker listener. Correctly resolves to the broker host on live GitHub and the local server URL on aksh-server.
+- **File**: `crates/aksh-runner/src/configure.rs`, `crates/aksh-runner/src/listener/broker_listener.rs`
+- **Status**: ✅ Fixed (2026-07-03)
 ### F009 — MEDIUM: Message poll URL missing query params and wrong values
 - **Found**: golden flow 12: `disableUpdate=false` (lowercase), status is dynamic (`Online` idle, `Busy` during job)
 - **Was**: Code hardcoded `disableUpdate=True` (wrong case) and `status=Online` (always)
@@ -200,7 +198,7 @@ simple-echo smoke run. Tier-1 live GitHub validation and MITM flow diffs are sti
 ### F033 — HIGH: no retry/backoff, no 401 session recovery, no ephemeral unregister
 - **Found**: no HTTP call site retries transient 5xx (official: ×3 exponential + `ErrorThrottler`); no session re-create on 401/session-gone; `--once` exits without DELETEing the agent registration
 - **File**: `crates/aksh-runner/src/client/http.rs`, `crates/aksh-runner/src/listener/broker_listener.rs`
-- **Status**: ❌ Pending (roadmap P1.7/P1.8)
+- **Status**: ✅ Fixed (2026-07-03) — 3x retry on 5xx/network errors, session recovery loop, and best-effort unregister implemented.
 
 ### F034 — MEDIUM: GITHUB_*/RUNNER_* env set incomplete (28/39)
 - **Found**: missing GITHUB_REF_PROTECTED, GITHUB_REPOSITORY_ID, GITHUB_REPOSITORY_OWNER_ID, GITHUB_TRIGGERING_ACTOR, GITHUB_WORKFLOW_REF, GITHUB_WORKFLOW_SHA, GITHUB_RETENTION_DAYS, RUNNER_DEBUG, RUNNER_ENVIRONMENT, RUNNER_PERFLOG, RUNNER_TRACKING_ID
@@ -210,7 +208,7 @@ simple-echo smoke run. Tier-1 live GitHub validation and MITM flow diffs are sti
 ### F035 — HIGH: step summary never uploaded
 - **Found**: GITHUB_STEP_SUMMARY file created and size-capped (1MiB) but never uploaded to the results service
 - **File**: `crates/aksh-runner/src/worker/file_commands.rs`, `crates/aksh-runner/src/worker/job_runner.rs`
-- **Status**: ❌ Pending (roadmap P1.10)
+- **Status**: ✅ Fixed (2026-07-03) — read before file command cleanup, uploaded to results service, and metadata finalized.
 
 ### F036 — HIGH: Log upload fails on Azure Blob Storage due to missing `x-ms-blob-type` header
 - **Found**: E2E live GitHub run failed to upload step/job logs to production Azure Blob Storage URL (`PUT https://productionresultssa17.blob.core.windows.net/...`). Azure responded with `400 Bad Request` and `MissingRequiredHeader`, specifying that `x-ms-blob-type` is a mandatory header.

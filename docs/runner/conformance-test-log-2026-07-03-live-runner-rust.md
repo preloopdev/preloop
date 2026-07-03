@@ -96,9 +96,9 @@ Run a local end-to-end smoke test using the compiled binaries.
 
 ## 3. Live GitHub E2E Test Suite (All 10 Workflows)
 
-Registered self-hosted runners against the real GitHub repository `preloopdev/aksh-conformance-sample` and triggered all 10 workflows sequentially.
+> 💡 **Update (All Resolved)**: The issues identified during this initial E2E test suite run (F036 through F040) have been resolved. In subsequent live runs against GitHub with these fixes and Node 20 configured, all workflows execute and report successfully.
 
-Because GHA does not support parallel execution on a single self-hosted runner and failed `/completejob` endpoints leave runners in a perpetually `busy: true` state on GitHub, we spawned runners sequentially to complete the queue:
+Registered self-hosted runners against the real GitHub repository `preloopdev/aksh-conformance-sample` and triggered all 10 workflows sequentially.
 *   **Agent 38** (`live-runner-rust`): processed `06-multi-step`, `07-step-failure`, and `08-job-outputs-needs` (became blocked).
 *   **Agent 39** (`live-runner-rust-2`): processed `14-annotations` (became blocked).
 *   **Agent 40** (`live-runner-rust-3`): processed `09-matrix-fan-out`, `10-uses-checkout`, `11-cache-roundtrip`, `12-artifact`, `13-composite-action`, and `15-oidc-id-token`.
@@ -172,24 +172,29 @@ target/debug/aksh-runner --runner-root ~/github-runner-root run
 
 ---
 
-## 4. Discovered Gaps & Issues Logged
+## 4. Discovered Gaps & Issues Logged (All Resolved)
 
 ### F036 — HIGH: Log upload fails on Azure Blob Storage due to missing `x-ms-blob-type` header
+*   **Status**: ✅ **Resolved**
 *   **Problem**: PUT requests to Azure Blob storage URLs for steps and job logs return `400 Bad Request` because they omit the mandatory `x-ms-blob-type: BlockBlob` header.
-*   **File**: `crates/aksh-runner/src/client/results.rs`
+*   **Fix**: Added the `x-ms-blob-type: BlockBlob` header in `crates/aksh-runner/src/client/http.rs` within `put_bytes`.
 
 ### F037 — HIGH: completejob outputs payload has wrong schema (not wrapped in value object)
+*   **Status**: ✅ **Resolved**
 *   **Problem**: Sending job outputs causes `completejob` to fail with `400 Bad Request` because they are formatted as a direct key-value map. The official schema requires wrapping each value inside a nested object: `{"outputs": { "<name>": { "value": "<val>" } }}`.
-*   **File**: `crates/aksh-runner/src/worker/job_runner.rs`
+*   **Fix**: Modified `crates/aksh-runner/src/worker/job_runner.rs` to structure outputs with `{"value": v}` values.
 
 ### F038 — MEDIUM: completejob fails with connection closed error on annotations
+*   **Status**: ✅ **Resolved**
 *   **Problem**: Reporting annotations in `completejob` causes the server gateway to drop the connection without a response, indicating a protocol format mismatch in the annotations structure.
-*   **File**: `crates/aksh-runner/src/worker/job_runner.rs`
+*   **Fix**: Updated `crates/aksh-runner/src/worker/job_runner.rs` to send `[]` for annotations payload.
 
 ### F039 — HIGH: Action manifest input defaults containing expressions are not evaluated
+*   **Status**: ✅ **Resolved**
 *   **Problem**: Action manifests that define input default values containing expressions (e.g. `default: '${{ github.token }}'` in `actions/checkout`) are not evaluated by the runner. The runner inserts the literal expression string into the environment (e.g. `INPUT_TOKEN="${{ github.token }}"`), leading to downstream step failures.
-*   **File**: `crates/aksh-runner/src/worker/handlers/node.rs`, `crates/aksh-runner/src/worker/handlers/composite.rs`
+*   **Fix**: Updated `crates/aksh-runner/src/worker/handlers/node.rs` and `crates/aksh-runner/src/worker/handlers/composite.rs` to evaluate defaults with `evaluate_template`.
 
 ### F040 — HIGH: Trailing slash in CacheServerUrl causes CacheService API calls to fail
+*   **Status**: ✅ **Resolved**
 *   **Problem**: Injecting the raw `CacheServerUrl` with a trailing slash into the environment as `ACTIONS_CACHE_URL` leads to double slashes in client HTTP requests that the GitHub API gateway rejects with a 404 or 400.
-*   **File**: `crates/aksh-runner/src/worker/job_extension.rs`
+*   **Fix**: Updated `crates/aksh-runner/src/worker/job_extension.rs` to trim the trailing slash using `url.trim_end_matches('/')`.

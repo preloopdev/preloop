@@ -105,7 +105,10 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", include_str!("libkrun-plan.md"));
             Ok(())
         }
-        CommandKind::RunnerE2e { runner_bin, workflow } => run_runner_e2e(runner_bin, workflow).await,
+        CommandKind::RunnerE2e {
+            runner_bin,
+            workflow,
+        } => run_runner_e2e(runner_bin, workflow).await,
         CommandKind::RunnerDiff { scenario, target } => run_runner_diff(scenario, target).await,
     }
 }
@@ -470,10 +473,14 @@ async fn run_runner_e2e(runner_bin: PathBuf, workflow: PathBuf) -> anyhow::Resul
         .arg(&runner_root)
         .arg("configure")
         .args([
-            "--url", "http://127.0.0.1:9191",
-            "--token", "dummy-token",
-            "--name", "e2e-runner",
-            "--work", "_work",
+            "--url",
+            "http://127.0.0.1:9191",
+            "--token",
+            "dummy-token",
+            "--name",
+            "e2e-runner",
+            "--work",
+            "_work",
             "--no-externals",
             "--unattended",
             "--replace",
@@ -498,7 +505,8 @@ async fn run_runner_e2e(runner_bin: PathBuf, workflow: PathBuf) -> anyhow::Resul
     }
     let output = String::from_utf8_lossy(&submit_output.stdout);
     let v: serde_json::Value = serde_json::from_str(&output)?;
-    let run_id = v.get("run_id")
+    let run_id = v
+        .get("run_id")
         .and_then(|v| v.as_str())
         .context("missing run_id")?
         .to_string();
