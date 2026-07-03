@@ -129,7 +129,21 @@ fn run_composite_action_inner<'a>(
             }
 
             let outcome = if let Some(script) = step_run {
-                super::script::run_script(script, step_shell, workspace, ctx, None)
+                // Evaluate ${{ }} expressions in composite step scripts.
+                // Build an expression context that includes `inputs.*` from the
+                // INPUT_* env vars set above (stripping the INPUT_ prefix and lowercasing).
+                let mut expr_ctx = ctx.job.build_expression_context();
+                let mut inputs_map = serde_json::Map::new();
+                for (k, v) in &input_env {
+                    if let Some(name) = k.strip_prefix("INPUT_") {
+                        inputs_map.insert(name.to_lowercase(), serde_json::json!(v));
+                    }
+                }
+                expr_ctx.insert("inputs", serde_json::Value::Object(inputs_map));
+                let evaluated =
+                    crate::worker::template::evaluate_template(script, &expr_ctx)
+                        .unwrap_or_else(|_| script.to_string());
+                super::script::run_script(&evaluated, step_shell, workspace, ctx, None)
                     .await
                     .map(|_| "Success".to_string())
             } else if let Some(uses) = step_uses {
