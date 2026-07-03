@@ -97,25 +97,28 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
             str_from_json_or(&github, "graphql_url", "https://api.github.com/graphql"),
         ),
         ("GITHUB_ACTION", str_from_json(&github, "action")),
-        (
-            "GITHUB_TOKEN",
-            {
-                let token = str_from_json(&github, "token");
-                if token.is_empty() {
-                    // Fall back to variables.system.github.token
-                    msg.get("variables")
-                        .and_then(|v| v.get("system.github.token"))
-                        .and_then(|v| v.get("value"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string()
-                } else {
-                    token
-                }
-            },
-        ),
-        // Runner variables
-        ("RUNNER_NAME", job.job_name.clone()),
+        ("GITHUB_TOKEN", {
+            let token = str_from_json(&github, "token");
+            if token.is_empty() {
+                // Fall back to variables.system.github.token
+                msg.get("variables")
+                    .and_then(|v| v.get("system.github.token"))
+                    .and_then(|v| v.get("value"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            } else {
+                token
+            }
+        }),
+        // Runner variables — P1.12: runner name from .runner settings, not job name
+        ("RUNNER_NAME", {
+            // Read from .runner settings file (CWD = runner root from spawn_job)
+            crate::settings::RunnerConfig::load(std::path::Path::new("."))
+                .ok()
+                .map(|c| c.settings.agent_name)
+                .unwrap_or_else(|| job.job_name.clone())
+        }),
         ("RUNNER_OS", runner_os().to_string()),
         ("RUNNER_ARCH", runner_arch().to_string()),
         (
@@ -165,10 +168,7 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
         ),
         ("RUNNER_ENVIRONMENT", "self-hosted".to_string()),
         ("RUNNER_PERFLOG", String::new()),
-        (
-            "RUNNER_TRACKING_ID",
-            str_from_json(&github, "tracking_id"),
-        ),
+        ("RUNNER_TRACKING_ID", str_from_json(&github, "tracking_id")),
     ];
 
     for (key, value) in vars {
