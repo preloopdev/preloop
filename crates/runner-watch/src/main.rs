@@ -1659,6 +1659,7 @@ async fn conform(config: &Config, args: &ConformArgs) -> anyhow::Result<()> {
                 && text.contains("official:")
                 && text.contains("aksh:")
                 && status_mismatch_in_report(&text)
+            || schema_mismatch_in_report(&text)
         {
             failures.push((scenario.clone(), report.display().to_string()));
         }
@@ -2146,6 +2147,24 @@ fn bracketed_statuses(text: &str) -> Option<&str> {
     let start = text.find('[')?;
     let end = text[start..].find(']')? + start;
     Some(text[start..=end].trim())
+}
+
+fn schema_mismatch_in_report(text: &str) -> bool {
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        if line.starts_with("**Request body schema diff:**") {
+            if let Some(next_line) = lines.next() {
+                if next_line.trim().is_empty() {
+                    if let Some(content_line) = lines.next() {
+                        if content_line != "_identical_" {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 fn write_conformance_summary(

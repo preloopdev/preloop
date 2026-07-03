@@ -239,6 +239,39 @@ fn json_diff(a: &Value, b: &Value, left_label: &str, right_label: &str) -> Strin
         .to_string()
 }
 
+/// Convert a JSON Value to a value-agnostic schema shape.
+pub fn to_schema_value(val: &Value) -> Value {
+    match val {
+        Value::Null => Value::String("null".to_owned()),
+        Value::Bool(_) => Value::String("boolean".to_owned()),
+        Value::Number(_) => Value::String("number".to_owned()),
+        Value::String(_) => Value::String("string".to_owned()),
+        Value::Array(arr) => {
+            let mut unique_schemas = Vec::new();
+            for item in arr {
+                let item_schema = to_schema_value(item);
+                if !unique_schemas.contains(&item_schema) {
+                    unique_schemas.push(item_schema);
+                }
+            }
+            Value::Array(unique_schemas)
+        }
+        Value::Object(map) => {
+            let mut new_map = serde_json::Map::new();
+            for (k, v) in map {
+                new_map.insert(k.clone(), to_schema_value(v));
+            }
+            Value::Object(new_map)
+        }
+    }
+}
+
+fn json_schema_diff(a: &Value, b: &Value, left_label: &str, right_label: &str) -> String {
+    let schema_a = to_schema_value(a);
+    let schema_b = to_schema_value(b);
+    json_diff(&schema_a, &schema_b, left_label, right_label)
+}
+
 // ── header key collection ────────────────────────────────────────────────────
 
 fn header_keys(flows: &[Value]) -> BTreeSet<String> {
@@ -514,6 +547,18 @@ pub fn render_report(args: &Args) -> Result<()> {
                     lines.push("```".to_owned());
                 }
                 lines.push(String::new());
+
+                lines.push("**Request body schema diff:**".to_owned());
+                lines.push(String::new());
+                let schema_diff = json_schema_diff(a, b, args.left_label, args.right_label);
+                if schema_diff.is_empty() {
+                    lines.push("_identical_".to_owned());
+                } else {
+                    lines.push("```diff".to_owned());
+                    lines.push(schema_diff.trim_end().to_owned());
+                    lines.push("```".to_owned());
+                }
+                lines.push(String::new());
             }
 
             // Response body diff (first flow only).
@@ -531,6 +576,18 @@ pub fn render_report(args: &Args) -> Result<()> {
                 } else {
                     lines.push("```diff".to_owned());
                     lines.push(diff.trim_end().to_owned());
+                    lines.push("```".to_owned());
+                }
+                lines.push(String::new());
+
+                lines.push("**Response body schema diff:**".to_owned());
+                lines.push(String::new());
+                let schema_diff = json_schema_diff(a, b, args.left_label, args.right_label);
+                if schema_diff.is_empty() {
+                    lines.push("_identical_".to_owned());
+                } else {
+                    lines.push("```diff".to_owned());
+                    lines.push(schema_diff.trim_end().to_owned());
                     lines.push("```".to_owned());
                 }
                 lines.push(String::new());
