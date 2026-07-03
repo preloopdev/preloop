@@ -140,9 +140,8 @@ fn run_composite_action_inner<'a>(
                     }
                 }
                 expr_ctx.insert("inputs", serde_json::Value::Object(inputs_map));
-                let evaluated =
-                    crate::worker::template::evaluate_template(script, &expr_ctx)
-                        .unwrap_or_else(|_| script.to_string());
+                let evaluated = crate::worker::template::evaluate_template(script, &expr_ctx)
+                    .unwrap_or_else(|_| script.to_string());
                 super::script::run_script(&evaluated, step_shell, workspace, ctx, None)
                     .await
                     .map(|_| "Success".to_string())
