@@ -184,31 +184,51 @@ pub async fn run_steps(
         };
 
         // Execute step — cancel_rx is threaded into process::invoke which
-        // kills the process group on cancel. No outer select! that drops futures.
-        let outcome = if let Some(timeout_min) = step.timeout_minutes {
-            let duration = std::time::Duration::from_secs(timeout_min * 60);
-            match tokio::time::timeout(
-                duration,
-                execute_step(&step.step_type, &mut step_ctx, workspace, step_cancel_rx),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    warn!(
-                        "Step '{}' timed out after {timeout_min} minutes",
-                        step.display_name
-                    );
-                    step_ctx.log(&format!(
-                        "##[error]The step '{}' timed out",
-                        step.display_name
-                    ));
-                    Err(anyhow::anyhow!("step timed out"))
+        // kills the process group on cancel. Step timeout is implemented by
+        // signalling cancellation rather than wrapping the future in
+        // tokio::time::timeout, which would drop the future and can orphan
+        // child processes.
+        let timed_out = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut timeout_handle = None;
+        let exec_cancel_rx = if let Some(timeout_min) = step.timeout_minutes {
+            let (timeout_tx, timeout_rx) = watch::channel(false);
+            let mut base_rx = step_cancel_rx.clone();
+            let timeout_flag = timed_out.clone();
+            timeout_handle = Some(tokio::spawn(async move {
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(timeout_min * 60)) => {
+                        timeout_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        let _ = timeout_tx.send(true);
+                    }
+                    changed = base_rx.changed() => {
+                        if changed.is_ok() && *base_rx.borrow() {
+                            let _ = timeout_tx.send(true);
+                        }
+                    }
                 }
-            }
+            }));
+            timeout_rx
         } else {
-            execute_step(&step.step_type, &mut step_ctx, workspace, step_cancel_rx).await
+            step_cancel_rx
         };
+
+        let mut outcome =
+            execute_step(&step.step_type, &mut step_ctx, workspace, exec_cancel_rx).await;
+        if let Some(handle) = timeout_handle {
+            handle.abort();
+        }
+        if timed_out.load(std::sync::atomic::Ordering::SeqCst) {
+            warn!(
+                "Step '{}' timed out after {} minutes",
+                step.display_name,
+                step.timeout_minutes.unwrap_or_default()
+            );
+            step_ctx.log(&format!(
+                "##[error]The step '{}' timed out",
+                step.display_name
+            ));
+            outcome = Err(anyhow::anyhow!("step timed out"));
+        }
 
         // Determine outcome and conclusion
         let (outcome_str, conclusion_str) = match &outcome {
@@ -391,7 +411,7 @@ async fn execute_step(
             .await
         }
         StepType::Action { uses, with } => {
-            super::handlers::action::run_action(uses, with, workspace, ctx).await
+            super::handlers::action::run_action(uses, with, workspace, ctx, cancel_rx).await
         }
     }
 }

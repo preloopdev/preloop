@@ -11,19 +11,19 @@ Last full-code audit: **2026-07-02** (all of `crates/aksh-runner` diffed against
 | Subsystem | Status | Blocking gaps |
 |---|---|---|
 | Configuration & registration (M1) | ✅ Verified vs golden 01 | `--replace` no agent DELETE (P2) |
-| OAuth PS256 / broker session / message poll (M2) | ✅ Verified vs golden 01 | BrokerMigration stub; no session recovery |
-| acquirejob / completejob (M3) | ✅ Shapes verified vs golden 06; local smoke green | live GitHub flow diff pending |
+| OAuth PS256 / broker session / message poll (M2) | ✅ Verified vs golden 01 | BrokerMigration stub |
+| acquirejob / completejob (M3) | ✅ Shapes verified vs golden 06; local smoke green; live rerun green for multi-step/composite/summary/context/matcher | flow diff still pending |
 | **renewjob lock renewal (M3)** | ✅ Implemented | live GitHub long-job validation pending |
-| **In-progress step updates — Twirp WorkflowStepsUpdate (M3)** | ✅ Implemented | live GitHub flow diff pending; local aksh auth/body fidelity may still reject results calls |
+| **In-progress step updates — Twirp WorkflowStepsUpdate (M3)** | ✅ Implemented; live step-id/context reruns green | flow diff pending; local aksh auth/body fidelity may still reject results calls |
 | **Step/job log upload — signed blob (M3)** | ✅ Implemented | live GitHub log-viewer validation pending |
-| Contexts (github/matrix/needs/strategy/vars/inputs/secrets) (M4) | ✅ P0 complete | runner.tool_cache/workspace still incomplete |
+| Contexts (github/matrix/needs/strategy/vars/inputs/secrets) (M4) | ✅ P0/P1 complete | `format()` `{{`/`}}` escaping remains P2 |
 | Expression engine (M4) | ✅ P0 complete | `format()` `{{`/`}}` escaping remains P2 |
-| Script steps / process invoker / commands / file commands (M5) | ✅ P0 complete | summary upload (F035), env-var completeness (F034) |
-| **Actions: resolution + pre/post lifecycle (M6)** | ✅ P0 implemented | live checkout/cache/composite validation pending |
+| Script steps / process invoker / commands / file commands (M5) | ✅ P0/P1 complete | env-var edge cases remain P2 |
+| **Actions: resolution + pre/post lifecycle (M6)** | ✅ P0 implemented; live composite rerun green | live checkout/cache validation pending |
 | **Containers (M7)** | ❌ Helpers exist, never wired | F026 |
 | **Cache/artifact/OIDC env plumbing (M8)** | ✅ P0 implemented | live cache/artifact/OIDC validation pending |
 | AzDO compat reporting (M9) | ❌ Dispatch only; reporting endpoints have 0 call sites | F030 |
-| Cancellation / job timeout / matchers / hardening (M10) | ⚠️ Partial | F031, F032, F033 |
+| Cancellation / job timeout / matchers / hardening (M10) | ✅ P1 complete | BrokerMigration and AzDO reporting remain separate gaps |
 | Benchmarks (M11) | ⚠️ Size + cold start only | dispatch latency, throughput, RSS missing |
 | **Conformance harness (H1–H3)** | ❌ `runner-e2e`, `runner-diff`, `--record-flows`, `fixtures/runner/` all missing | §4 |
 
