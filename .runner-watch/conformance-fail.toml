@@ -4,3 +4,9 @@ expected_status = 0
 actual_status = 0
 diff = "See .runner-watch/conformance/v2.335.1/11-cache-roundtrip.md"
 
+[[failures]]
+endpoint = "scenario:12-artifact"
+expected_status = 0
+actual_status = 0
+diff = "See .runner-watch/conformance/v2.335.1/12-artifact.md"
+
