@@ -51,7 +51,7 @@ struct MatcherDefinition {
 }
 
 /// Registry of active problem matchers.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct MatcherRegistry {
     matchers: HashMap<String, ProblemMatcher>,
 }
