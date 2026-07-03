@@ -22,7 +22,7 @@ use axum::extract::{Path, Query, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
@@ -206,6 +206,10 @@ async fn shutdown_signal(shutdown: CancellationToken) {
 
 /// Build the server router.
 pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown: shutdown.clone(),
+    });
     let protected_apis = Router::new()
         .route("/_apis/artifactcache/cache", post(cache_reserve))
         .route("/_apis/artifactcache/cache", get(cache_lookup))
@@ -270,9 +274,6 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         .route("/broker/:runner_id/acquirejob", post(broker_acquire_job))
         .route("/broker/:runner_id/renewjob", post(broker_renew_job))
         .route("/broker/:runner_id/completejob", post(broker_complete_job))
-        .route("/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate", post(twirp_workflow_steps_update))
-        .route("/twirp/results.services.receiver.Receiver/GetJobLogsSignedBlobURL", post(twirp_get_job_logs_signed_blob_url))
-        .route("/twirp/results.services.receiver.Receiver/GetStepLogsSignedBlobURL", post(twirp_get_step_logs_signed_blob_url))
         .route(
             "/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id",
             patch(patch_timeline_records),
@@ -533,9 +534,34 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
                 .post(agent_request_ack)
                 .patch(agent_request_patch),
         )
+        // P1.10: Accept blob uploads at the signed-URL paths minted by the Twirp handlers.
+        // The runner PUTs logs/summaries here; we store them in the state directory.
+        .route("/replay/results/*path", put(replay_results_put))
+        // Twirp results-service routes — outside require_bearer so the runner's
+        // job token (which uses a different signing key) is accepted.
+        .route(
+            "/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate",
+            post(twirp_workflow_steps_update),
+        )
+        .route(
+            "/twirp/results.services.receiver.Receiver/GetJobLogsSignedBlobURL",
+            post(twirp_get_job_logs_signed_blob_url),
+        )
+        .route(
+            "/twirp/results.services.receiver.Receiver/GetStepLogsSignedBlobURL",
+            post(twirp_get_step_logs_signed_blob_url),
+        )
+        .route(
+            "/twirp/results.services.receiver.Receiver/GetStepSummarySignedBlobURL",
+            post(twirp_get_step_summary_signed_blob_url),
+        )
+        .route(
+            "/twirp/results.services.receiver.Receiver/CreateStepSummaryMetadata",
+            post(twirp_create_step_summary_metadata),
+        )
         .merge(protected_apis)
         .layer(TraceLayer::new_for_http())
-        .with_state(Arc::new(SharedState { state, shutdown }))
+        .with_state(shared)
 }
 
 /// HMAC key used for local JWT signing/verification.
@@ -594,6 +620,8 @@ pub struct AppState {
     pub webhook_secret: Option<String>,
     /// Optional local workspace path to load workflows from.
     pub local_workspace: Option<PathBuf>,
+    /// State directory for replay/log storage.
+    pub state_dir: PathBuf,
 }
 
 impl AppState {
@@ -620,6 +648,7 @@ impl AppState {
             artifacts,
             webhook_secret,
             local_workspace,
+            state_dir,
         })
     }
 
@@ -1676,6 +1705,80 @@ async fn twirp_get_step_logs_signed_blob_url(
         ),
         "soft_size_limit": "1048576"
     }))
+}
+
+#[derive(Debug, Deserialize)]
+struct StepSummarySignedBlobUrlRequest {
+    step_backend_id: String,
+    workflow_job_run_backend_id: String,
+    workflow_run_backend_id: String,
+}
+
+async fn twirp_get_step_summary_signed_blob_url(
+    Json(request): Json<StepSummarySignedBlobUrlRequest>,
+) -> Json<serde_json::Value> {
+    Json(json!({
+        "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
+        "summary_url": format!(
+            "{}/replay/results/{}/{}/step-{}-summary.md",
+            public_base_url(), request.workflow_run_backend_id, request.workflow_job_run_backend_id, request.step_backend_id
+        ),
+        "soft_size_limit": "1048576"
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct StepSummaryMetadataRequest {
+    step_backend_id: String,
+    workflow_job_run_backend_id: String,
+    workflow_run_backend_id: String,
+    size: Option<u64>,
+    uploaded_at: Option<String>,
+}
+
+async fn twirp_create_step_summary_metadata(
+    Json(_request): Json<StepSummaryMetadataRequest>,
+) -> Json<serde_json::Value> {
+    Json(json!({"ok": true}))
+}
+
+/// Accept blob uploads (logs, summaries) at signed-URL paths.
+/// Stores them in a local replay directory for conformance inspection.
+async fn replay_results_put(
+    State(shared): State<Arc<SharedState>>,
+    axum::extract::Path(path): axum::extract::Path<String>,
+    body: axum::body::Bytes,
+) -> StatusCode {
+    // Reject path traversal attempts
+    if path.contains("..")
+        || std::path::Path::new(&path)
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        tracing::warn!("Rejected path traversal attempt: {path}");
+        return StatusCode::BAD_REQUEST;
+    }
+
+    let dest = shared
+        .state
+        .state_dir
+        .join("replay")
+        .join("results")
+        .join(&path);
+    if let Some(parent) = dest.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::write(&dest, &body) {
+        Ok(()) => {
+            tracing::info!("Stored {} bytes at replay/results/{path}", body.len());
+            StatusCode::CREATED
+        }
+        Err(e) => {
+            tracing::warn!("Failed to store replay/results/{path}: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
 }
 
 async fn next_message(
