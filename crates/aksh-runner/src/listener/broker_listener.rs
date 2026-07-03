@@ -61,9 +61,11 @@ pub async fn run_broker_loop(
                     } else {
                         warn!("Worker failed for job {id}");
                     }
-                    if once {
-                        info!("--once: exiting after first job");
-                        ephemeral_unregister(http, config, &token).await;
+                    if once || config.settings.ephemeral {
+                        info!("exiting after first job");
+                        if config.settings.ephemeral {
+                            ephemeral_unregister(http, config, &token).await;
+                        }
                         if !session_id.is_empty() {
                             let _ = client.delete_session(&token, &session_id).await;
                         }
@@ -147,7 +149,7 @@ pub async fn run_broker_loop(
                     info!("Killing active worker");
                     job.kill().await;
                 }
-                if once {
+                if once && config.settings.ephemeral {
                     ephemeral_unregister(http, config, &token).await;
                 }
                 if !session_id.is_empty() {
@@ -244,9 +246,11 @@ pub async fn run_broker_loop(
                                             job.kill().await;
                                         }
                                     }
-                                    if once {
-                                        info!("--once: exiting after cancelled job");
-                                        ephemeral_unregister(http, config, &token).await;
+                                    if once || config.settings.ephemeral {
+                                        info!("exiting after cancelled job");
+                                        if config.settings.ephemeral {
+                                            ephemeral_unregister(http, config, &token).await;
+                                        }
                                         let _ = client.delete_session(&token, &session_id).await;
                                         return Ok(());
                                     }

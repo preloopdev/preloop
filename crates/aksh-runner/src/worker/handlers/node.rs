@@ -15,6 +15,7 @@ pub async fn run_node_action(
     with: &serde_json::Value,
     workspace: &str,
     ctx: &mut StepContext<'_>,
+    cancel_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let main = with
         .get("__aksh_entry")
@@ -122,7 +123,7 @@ pub async fn run_node_action(
         Path::new(workspace),
         &env,
         None,
-        None,
+        Some(cancel_rx),
     )
     .await?;
 

@@ -176,9 +176,9 @@ simple-echo smoke run. Tier-1 live GitHub validation and MITM flow diffs are sti
 - **Status**: ❌ Pending (roadmap P1.2)
 
 ### F029 — HIGH: step ID / display-name auto-generation missing
-- **Found**: official generates `__run`/`__run_2` IDs for id-less steps and display-name fallbacks (action ref, script preview), which appear on the wire in step updates; ours has neither
+- **Found**: official generates `__run`/`__run_2` IDs for id-less steps and display-name fallbacks (action ref, script preview), which appear on the wire in step updates; ours had neither.
 - **File**: `crates/aksh-runner/src/worker/job_extension.rs`
-- **Status**: ❌ Pending (roadmap P1.11)
+- **Status**: ✅ Fixed (2026-07-03) — split wire `id` from `contextName`, generated `__run`/action context names, and verified live runs 28641527947 / 28641641045.
 
 ### F030 — HIGH: AzDO compat reporting unwired (`--via azdo`)
 - **Found**: `patch_agent_request`, `update_timeline`, `create_log`/`append_log`, `post_console_log`, `finish_job` all have zero call sites; `report_completion()` builds a non-`JobCompletedEvent` shape; `TimelineRecord.order` never populated
@@ -186,14 +186,14 @@ simple-echo smoke run. Tier-1 live GitHub validation and MITM flow diffs are sti
 - **Status**: ❌ Pending (roadmap P1.3)
 
 ### F031 — HIGH: cancellation semantics incomplete; job timeout missing
-- **Found**: cancel kills the current step (F015) but remaining steps are not re-evaluated under `cancelled()` semantics (`always()`/post steps don't run), no grace window before hard kill in `job_dispatcher::kill()`, job-level `timeout-minutes` (default 360) never enforced
-- **File**: `crates/aksh-runner/src/worker/steps_runner.rs`, `crates/aksh-runner/src/listener/job_dispatcher.rs`
-- **Status**: ❌ Pending (roadmap P1.4/P1.5)
+- **Found**: cancel kills the current step (F015) but remaining steps were not re-evaluated under `cancelled()` semantics (`always()`/post steps didn't run), no grace window before hard kill in `job_dispatcher::kill()`, and job-level `timeout-minutes` (default 360) was not enforced.
+- **File**: `crates/aksh-runner/src/worker/steps_runner.rs`, `crates/aksh-runner/src/listener/job_dispatcher.rs`, `crates/aksh-runner/src/worker/job_runner.rs`
+- **Status**: ✅ Fixed (2026-07-03) — cancel now unwinds through remaining `always()`/`cancelled()`/post steps with grace-bounded cancellation; review fix DR-002/DR-003 threads cancellation into action/composite processes and implements step timeout through cancellation signalling.
 
 ### F032 — HIGH: problem matchers are dead code
-- **Found**: `MatcherRegistry` exists but has zero call sites; `::add-matcher::`/`::remove-matcher::` not wired in `commands.rs`; log lines never fed through; multi-line `loop:` patterns unimplemented
+- **Found**: `MatcherRegistry` existed but had zero call sites; `::add-matcher::`/`::remove-matcher::` were not wired in `commands.rs`; log lines were never fed through; multi-line `loop:` patterns remain deferred.
 - **File**: `crates/aksh-runner/src/worker/matchers.rs`, `crates/aksh-runner/src/worker/commands.rs`
-- **Status**: ❌ Pending (roadmap P1.6)
+- **Status**: ✅ Fixed (2026-07-03) — matcher registry is job-scoped, add/remove commands are wired, log lines feed matchers, and live run 28655734365 produced GitHub UI annotations.
 
 ### F033 — HIGH: no retry/backoff, no 401 session recovery, no ephemeral unregister
 - **Found**: no HTTP call site retries transient 5xx (official: ×3 exponential + `ErrorThrottler`); no session re-create on 401/session-gone; `--once` exits without DELETEing the agent registration
@@ -202,8 +202,8 @@ simple-echo smoke run. Tier-1 live GitHub validation and MITM flow diffs are sti
 
 ### F034 — MEDIUM: GITHUB_*/RUNNER_* env set incomplete (28/39)
 - **Found**: missing GITHUB_REF_PROTECTED, GITHUB_REPOSITORY_ID, GITHUB_REPOSITORY_OWNER_ID, GITHUB_TRIGGERING_ACTOR, GITHUB_WORKFLOW_REF, GITHUB_WORKFLOW_SHA, GITHUB_RETENTION_DAYS, RUNNER_DEBUG, RUNNER_ENVIRONMENT, RUNNER_PERFLOG, RUNNER_TRACKING_ID
-- **File**: `crates/aksh-runner/src/worker/job_extension.rs`
-- **Status**: ❌ Pending (roadmap P1.9)
+- **File**: `crates/aksh-runner/src/worker/job_extension.rs`, `crates/aksh-runner/src/worker/contexts.rs`
+- **Status**: ✅ Fixed (2026-07-03) — missing env keys were added; review fix DR-005 aligned `runner.tool_cache` context with `RUNNER_TOOL_CACHE` derivation.
 
 ### F035 — HIGH: step summary never uploaded
 - **Found**: GITHUB_STEP_SUMMARY file created and size-capped (1MiB) but never uploaded to the results service
