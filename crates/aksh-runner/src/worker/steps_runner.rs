@@ -289,6 +289,11 @@ pub async fn run_steps(
                 let content = log_lines.join("\n");
                 crate::worker::job_runner::upload_step_log(rpt, &step.id, &content).await;
             }
+            // F035: Upload step summary if non-empty
+            if !summary_content.is_empty() {
+                crate::worker::job_runner::upload_step_summary(rpt, &step.id, &summary_content)
+                    .await;
+            }
         }
     }
 
