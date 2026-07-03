@@ -314,6 +314,79 @@ pub async fn upload_step_log(rpt: &ReportingContext, step_id: &str, content: &st
     }
 }
 
+/// F035: Upload step summary content to the results service.
+///
+/// GetStepSummarySignedBlobURL → PUT blob → CreateStepSummaryMetadata.
+/// Official runner rejects oversized summaries rather than truncating; we warn
+/// and skip if content exceeds 1 MiB.
+pub async fn upload_step_summary(rpt: &ReportingContext, step_id: &str, content: &str) {
+    if content.is_empty() {
+        return;
+    }
+
+    if content.len() > 1_048_576 {
+        warn!("Step summary exceeds 1MiB limit for step {step_id}, skipping upload");
+        return;
+    }
+
+    let body = serde_json::json!({
+        "workflow_job_run_backend_id": rpt.job_id,
+        "workflow_run_backend_id": rpt.plan_id,
+        "step_backend_id": step_id,
+    });
+
+    let signed_url = match rpt
+        .results
+        .get_step_summary_signed_url(&rpt.access_token, &body)
+        .await
+    {
+        Ok(resp) => resp
+            .get("summary_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        Err(e) => {
+            warn!("GetStepSummarySignedBlobURL failed for step {step_id}: {e:#}");
+            return;
+        }
+    };
+
+    if signed_url.is_empty() {
+        warn!("Empty signed URL for step summary {step_id}");
+        return;
+    }
+
+    let byte_count = content.len();
+    match rpt
+        .results
+        .upload_log_blob(&signed_url, content.as_bytes().to_vec())
+        .await
+    {
+        Ok(()) => info!("Uploaded summary for step {step_id} ({byte_count} bytes)"),
+        Err(e) => {
+            warn!("Summary upload failed for step {step_id}: {e:#}");
+            return;
+        }
+    }
+
+    // Finalize: CreateStepSummaryMetadata
+    let metadata = serde_json::json!({
+        "workflow_job_run_backend_id": rpt.job_id,
+        "workflow_run_backend_id": rpt.plan_id,
+        "step_backend_id": step_id,
+        "size": byte_count,
+        "uploaded_at": iso_now(),
+    });
+    match rpt
+        .results
+        .create_step_summary_metadata(&rpt.access_token, &metadata)
+        .await
+    {
+        Ok(_) => info!("CreateStepSummaryMetadata succeeded for step {step_id}"),
+        Err(e) => warn!("CreateStepSummaryMetadata failed for step {step_id}: {e:#}"),
+    }
+}
+
 /// Upload the full job log (concatenation of all step logs).
 ///
 /// Golden 06 flow 37: POST GetJobLogsSignedBlobURL → PUT blob.

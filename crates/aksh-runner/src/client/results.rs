@@ -69,6 +69,38 @@ impl ResultsClient {
             .context("getting job logs signed URL")
     }
 
+    /// Get a signed blob URL for step summary upload.
+    pub async fn get_step_summary_signed_url(
+        &self,
+        token: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let url = format!(
+            "{}/twirp/results.services.receiver.Receiver/GetStepSummarySignedBlobURL",
+            self.base_url
+        );
+        self.http
+            .post_json_bearer(&url, body, token)
+            .await
+            .context("getting step summary signed URL")
+    }
+
+    /// Finalize step summary metadata after blob upload.
+    pub async fn create_step_summary_metadata(
+        &self,
+        token: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let url = format!(
+            "{}/twirp/results.services.receiver.Receiver/CreateStepSummaryMetadata",
+            self.base_url
+        );
+        self.http
+            .post_json_bearer(&url, body, token)
+            .await
+            .context("creating step summary metadata")
+    }
+
     /// Upload log content to a signed blob URL.
     pub async fn upload_log_blob(&self, signed_url: &str, content: Vec<u8>) -> Result<()> {
         self.http
