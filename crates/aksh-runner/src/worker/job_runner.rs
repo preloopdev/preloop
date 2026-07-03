@@ -211,14 +211,18 @@ pub async fn run_job(
         handle.abort();
     }
 
-    let (result_str, conclusion) = match &job_result {
-        Ok(conclusion) => {
-            info!("Job {job_name} completed: {conclusion}");
-            (conclusion.clone(), conclusion.clone())
-        }
-        Err(e) => {
-            error!("Job {job_name} failed: {e:#}");
-            ("Failed".to_string(), "Failed".to_string())
+    let (result_str, conclusion) = if was_timeout {
+        ("Failed".to_string(), "Failed".to_string())
+    } else {
+        match &job_result {
+            Ok(conclusion) => {
+                info!("Job {job_name} completed: {conclusion}");
+                (conclusion.clone(), conclusion.clone())
+            }
+            Err(e) => {
+                error!("Job {job_name} failed: {e:#}");
+                ("Failed".to_string(), "Failed".to_string())
+            }
         }
     };
 
