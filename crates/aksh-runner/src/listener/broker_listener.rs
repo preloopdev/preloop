@@ -213,6 +213,7 @@ pub async fn run_broker_loop(
                     }
                     Ok(None) => {
                         consecutive_errors = 0;
+                        debug!("Broker poll returned no message (idle cycle)");
                     }
                     Err(e) => {
                         consecutive_errors += 1;

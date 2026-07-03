@@ -48,11 +48,16 @@ pub fn setup_workspace(job_message: &serde_json::Value) -> anyhow::Result<String
 
 /// Inject GITHUB_* and RUNNER_* environment variables into the job context.
 pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
-    let github = msg
+    let raw_github = msg
         .get("contextData")
         .and_then(|cd| cd.get("github"))
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
+
+    // GitHub sends contextData in Azure DevOps typed-dictionary format:
+    // {"t": 2, "d": [{"k": "key", "v": value}, ...]}
+    // Decode to a flat JSON object.
+    let github = decode_typed_value(&raw_github);
 
     let workspace = job.workspace.as_deref().unwrap_or("_work/default/default");
 
@@ -92,7 +97,23 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
             str_from_json_or(&github, "graphql_url", "https://api.github.com/graphql"),
         ),
         ("GITHUB_ACTION", str_from_json(&github, "action")),
-        ("GITHUB_TOKEN", str_from_json(&github, "token")),
+        (
+            "GITHUB_TOKEN",
+            {
+                let token = str_from_json(&github, "token");
+                if token.is_empty() {
+                    // Fall back to variables.system.github.token
+                    msg.get("variables")
+                        .and_then(|v| v.get("system.github.token"))
+                        .and_then(|v| v.get("value"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                } else {
+                    token
+                }
+            },
+        ),
         // Runner variables
         ("RUNNER_NAME", job.job_name.clone()),
         ("RUNNER_OS", runner_os().to_string()),
@@ -113,6 +134,41 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
                 .map(|p| p.join("_tool").to_string_lossy().to_string())
                 .unwrap_or_else(|| "/tmp".to_string()),
         ),
+        // P1.9: Missing GITHUB_*/RUNNER_* env vars (F034)
+        (
+            "GITHUB_REF_PROTECTED",
+            str_from_json_or(&github, "ref_protected", "false"),
+        ),
+        (
+            "GITHUB_REPOSITORY_ID",
+            str_from_json(&github, "repository_id"),
+        ),
+        (
+            "GITHUB_REPOSITORY_OWNER_ID",
+            str_from_json(&github, "repository_owner_id"),
+        ),
+        (
+            "GITHUB_TRIGGERING_ACTOR",
+            str_from_json(&github, "triggering_actor"),
+        ),
+        (
+            "GITHUB_WORKFLOW_REF",
+            str_from_json(&github, "workflow_ref"),
+        ),
+        (
+            "GITHUB_WORKFLOW_SHA",
+            str_from_json(&github, "workflow_sha"),
+        ),
+        (
+            "GITHUB_RETENTION_DAYS",
+            str_from_json_or(&github, "retention_days", "90"),
+        ),
+        ("RUNNER_ENVIRONMENT", "self-hosted".to_string()),
+        ("RUNNER_PERFLOG", String::new()),
+        (
+            "RUNNER_TRACKING_ID",
+            str_from_json(&github, "tracking_id"),
+        ),
     ];
 
     for (key, value) in vars {
@@ -120,6 +176,17 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
             job.env.insert(key.to_string(), value);
         }
     }
+
+    // P1.9: RUNNER_DEBUG from system.debug variable
+    let runner_debug = msg
+        .get("variables")
+        .and_then(|v| v.get("system.debug"))
+        .and_then(|v| v.get("value"))
+        .and_then(|v| v.as_str())
+        .map(|v| if v == "true" { "1" } else { "0" })
+        .unwrap_or("0");
+    job.env
+        .insert("RUNNER_DEBUG".to_string(), runner_debug.to_string());
 
     // Write event payload to GITHUB_EVENT_PATH
     if let Some(event) = github.get("event") {
@@ -191,8 +258,10 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
                             .insert("ACTIONS_RESULTS_URL".to_string(), url.to_string());
                     }
                     if let Some(url) = data.get("CacheServerUrl").and_then(|v| v.as_str()) {
-                        job.env
-                            .insert("ACTIONS_CACHE_URL".to_string(), url.to_string());
+                        job.env.insert(
+                            "ACTIONS_CACHE_URL".to_string(),
+                            url.trim_end_matches('/').to_string(),
+                        );
                         job.env
                             .entry("ACTIONS_CACHE_SERVICE_V2".to_string())
                             .or_insert_with(|| "true".to_string());
@@ -235,6 +304,61 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
                     job.env.insert(env_key.to_string(), value.to_string());
                 }
             }
+        }
+    }
+}
+
+/// Decode an Azure DevOps typed-dictionary value.
+///
+/// GitHub/AzDO contextData uses `{"t": TYPE, "d": DATA}` encoding:
+/// - `t=1` (string): `{"t": 1, "d": "value"}` → `"value"`
+/// - `t=2` (dictionary): `{"t": 2, "d": [{"k": "key", "v": VALUE}, ...]}` → `{"key": decoded(VALUE), ...}`
+/// - `t=3` (array): `{"t": 3, "d": [VALUE, ...]}` → `[decoded(VALUE), ...]`
+/// - `t=4` (bool): `{"t": 4, "d": true/false}` → `true/false`
+/// - `t=5` (number): `{"t": 5, "d": N}` → `N`
+///
+/// If the value is already a plain JSON object (e.g. from local aksh), it is returned as-is.
+pub(crate) fn decode_typed_value(val: &serde_json::Value) -> serde_json::Value {
+    match val.get("t").and_then(|t| t.as_u64()) {
+        Some(1) => {
+            // String
+            val.get("d").cloned().unwrap_or(serde_json::Value::Null)
+        }
+        Some(2) => {
+            // Dictionary
+            let mut obj = serde_json::Map::new();
+            if let Some(entries) = val.get("d").and_then(|d| d.as_array()) {
+                for entry in entries {
+                    if let Some(key) = entry.get("k").and_then(|k| k.as_str()) {
+                        let value = entry
+                            .get("v")
+                            .map(decode_typed_value)
+                            .unwrap_or(serde_json::Value::Null);
+                        obj.insert(key.to_string(), value);
+                    }
+                }
+            }
+            serde_json::Value::Object(obj)
+        }
+        Some(3) => {
+            // Array
+            if let Some(items) = val.get("d").and_then(|d| d.as_array()) {
+                serde_json::Value::Array(items.iter().map(decode_typed_value).collect())
+            } else {
+                serde_json::Value::Array(vec![])
+            }
+        }
+        Some(4) => {
+            // Boolean
+            val.get("d").cloned().unwrap_or(serde_json::Value::Null)
+        }
+        Some(5) => {
+            // Number
+            val.get("d").cloned().unwrap_or(serde_json::Value::Null)
+        }
+        _ => {
+            // Not typed — return as-is (plain JSON from aksh)
+            val.clone()
         }
     }
 }
@@ -289,12 +413,17 @@ pub fn build_step_list(steps: &[serde_json::Value], _job_message: &serde_json::V
                     }
                 }
                 _ => {
-                    // Action reference
-                    let uses = ref_val
+                    // Action reference — combine name and ref (GitHub sends them separately)
+                    let name = ref_val
                         .get("name")
                         .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
+                        .unwrap_or("");
+                    let action_ref = ref_val.get("ref").and_then(|v| v.as_str());
+                    let uses = if name.contains('@') || action_ref.is_none() {
+                        name.to_string()
+                    } else {
+                        format!("{name}@{}", action_ref.unwrap())
+                    };
                     let with =
                         serde_json::to_value(&inputs).unwrap_or_else(|_| serde_json::json!({}));
                     StepType::Action { uses, with }
@@ -499,6 +628,14 @@ fn template_scalar(value: &serde_json::Value) -> Option<String> {
         .as_str()
         .map(String::from)
         .or_else(|| value.get("lit").and_then(|v| v.as_str()).map(String::from))
+        .or_else(|| {
+            // type=3 is an expression: {"type": 3, "expr": "..."}
+            // Return the expression wrapped in ${{ }} for later evaluation
+            value
+                .get("expr")
+                .and_then(|v| v.as_str())
+                .map(|expr| format!("${{{{ {expr} }}}}"))
+        })
 }
 
 fn display_name_for_step(id: &str, step_type: &StepType) -> String {
@@ -772,7 +909,7 @@ mod tests {
         );
         assert_eq!(
             job.env.get("ACTIONS_CACHE_URL").map(String::as_str),
-            Some("https://cache.example/")
+            Some("https://cache.example")
         );
         assert_eq!(
             job.env.get("ACTIONS_CACHE_SERVICE_V2").map(String::as_str),
