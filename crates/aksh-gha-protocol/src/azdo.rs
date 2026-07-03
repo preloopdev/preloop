@@ -294,7 +294,11 @@ pub struct PlanReference {
 #[derive(Debug, Clone)]
 pub struct TaskStep {
     pub id: uuid::Uuid,
+    /// User-facing step name (from workflow `name:` field).
     pub name: Option<String>,
+    /// Expression context key — user `id:` or auto-generated `__run`/`__run_N`.
+    /// Serialized as `contextName` to match GitHub's wire format.
+    pub context_name: Option<String>,
     pub display_name: Option<String>,
     pub condition: Option<String>,
     pub script: Option<String>,
@@ -320,6 +324,7 @@ impl Serialize for TaskStep {
 
         let field_count = 5
             + usize::from(self.name.is_some())
+            + usize::from(self.context_name.is_some())
             + usize::from(self.display_name.is_some())
             + usize::from(self.condition.is_some())
             + usize::from(self.continue_on_error.is_some())
@@ -333,6 +338,9 @@ impl Serialize for TaskStep {
         map.serialize_entry("id", &self.id)?;
         if let Some(name) = &self.name {
             map.serialize_entry("name", name)?;
+        }
+        if let Some(context_name) = &self.context_name {
+            map.serialize_entry("contextName", context_name)?;
         }
         if let Some(display_name) = &self.display_name {
             map.serialize_entry("displayName", display_name)?;
@@ -380,6 +388,10 @@ impl<'de> Deserialize<'de> for TaskStep {
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
                 .unwrap_or_else(uuid::Uuid::nil),
             name: obj.get("name").and_then(|v| v.as_str()).map(str::to_owned),
+            context_name: obj
+                .get("contextName")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned),
             display_name: obj
                 .get("displayName")
                 .and_then(|v| v.as_str())
@@ -1128,6 +1140,7 @@ mod tests {
         let step = TaskStep {
             id: uuid::Uuid::nil(),
             name: None,
+            context_name: None,
             display_name: None,
             condition: None,
             script: Some("echo hi".to_owned()),

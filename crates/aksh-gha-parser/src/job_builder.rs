@@ -52,12 +52,52 @@ pub fn build_agent_job_message(
         secrets,
     );
 
-    // Resolve expressions in step env and with
-    let steps: Vec<TaskStep> = plan
-        .steps
-        .iter()
-        .map(|step| build_task_step(step, &expr_context))
-        .collect();
+    // Resolve expressions in step env and with.
+    // Generate contextName for each step matching GitHub's wire format:
+    //   - Script steps: __run, __run_2, __run_3 (separate counter)
+    //   - Action steps: __<sanitized_action>, __<sanitized_action>_2 (per-action counter)
+    //   - User `id:` is used verbatim when present
+    let mut run_counter: usize = 0;
+    let mut action_counters: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut used_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut steps: Vec<TaskStep> = Vec::new();
+    for step in &plan.steps {
+        let is_script = step.uses.is_none() && step.run.is_some();
+        let context_name = if let Some(ref user_id) = step.id {
+            user_id.clone()
+        } else if is_script {
+            run_counter += 1;
+            if run_counter == 1 {
+                "__run".to_string()
+            } else {
+                format!("__run_{run_counter}")
+            }
+        } else if let Some(ref uses) = step.uses {
+            // Action steps: __<sanitized_action>, __<sanitized_action>_2, etc.
+            let base = uses.split('@').next().unwrap_or(uses).replace('/', "_");
+            let counter = action_counters.entry(base.clone()).or_insert(0);
+            *counter += 1;
+            if *counter == 1 {
+                format!("__{base}")
+            } else {
+                format!("__{base}_{counter}")
+            }
+        } else {
+            format!("__step_{}", steps.len())
+        };
+        // Dedupe: if a user-supplied id collides with an auto-generated name,
+        // the auto-generated one gets a suffix (shouldn't happen in practice).
+        let final_name = if used_names.contains(&context_name) {
+            format!("{context_name}_{}", steps.len())
+        } else {
+            context_name
+        };
+        used_names.insert(final_name.clone());
+        let mut task_step = build_task_step(step, &expr_context);
+        task_step.context_name = Some(final_name);
+        steps.push(task_step);
+    }
 
     // Materialize variables
     let mut variables = BTreeMap::new();
@@ -240,6 +280,7 @@ fn build_task_step(step: &crate::StepPlan, context: &Context) -> TaskStep {
     TaskStep {
         id: step_id,
         name: step.name.clone(),
+        context_name: None, // Set by caller after construction
         display_name: step.name.clone(),
         condition,
         script: run,
