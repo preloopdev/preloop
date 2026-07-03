@@ -167,13 +167,29 @@ pub async fn run_steps(
             paths
         };
 
+        // P1.4: When we're in cancel-unwind mode (cancelled=true), steps that
+        // still run (always/cancelled conditions) must NOT be immediately killed
+        // by the still-active cancel channel. Give them a fresh cancel receiver
+        // bounded by a grace budget (5 minutes, matching upstream's default
+        // cancel timeout) so a hung always() step can still be killed.
+        let step_cancel_rx = if cancelled {
+            let (grace_tx, grace_rx) = watch::channel(false);
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                let _ = grace_tx.send(true);
+            });
+            grace_rx
+        } else {
+            cancel_rx.clone()
+        };
+
         // Execute step — cancel_rx is threaded into process::invoke which
         // kills the process group on cancel. No outer select! that drops futures.
         let outcome = if let Some(timeout_min) = step.timeout_minutes {
             let duration = std::time::Duration::from_secs(timeout_min * 60);
             match tokio::time::timeout(
                 duration,
-                execute_step(&step.step_type, &mut step_ctx, workspace, cancel_rx.clone()),
+                execute_step(&step.step_type, &mut step_ctx, workspace, step_cancel_rx),
             )
             .await
             {
@@ -191,7 +207,7 @@ pub async fn run_steps(
                 }
             }
         } else {
-            execute_step(&step.step_type, &mut step_ctx, workspace, cancel_rx.clone()).await
+            execute_step(&step.step_type, &mut step_ctx, workspace, step_cancel_rx).await
         };
 
         // Determine outcome and conclusion
@@ -363,9 +379,8 @@ async fn execute_step(
         } => {
             // Evaluate ${{ }} expressions in the script body
             let expr_ctx = ctx.job.build_expression_context();
-            let evaluated_script =
-                crate::worker::template::evaluate_template(script, &expr_ctx)
-                    .unwrap_or_else(|_| script.clone());
+            let evaluated_script = crate::worker::template::evaluate_template(script, &expr_ctx)
+                .unwrap_or_else(|_| script.clone());
             super::handlers::script::run_script(
                 &evaluated_script,
                 shell.as_deref(),

@@ -78,29 +78,36 @@ pub async fn invoke(
             result = child.wait() => {
                 result.with_context(|| format!("waiting for {program}"))?
             }
-            _ = rx.changed() => {
-                // Cancel received — kill the entire process group
-                tracing::info!("Killing process group for {program} (cancelled)");
-                if let Err(e) = child.kill().await {
-                    tracing::warn!("Failed to kill process group: {e}");
-                }
-                // Reap the process after killing
-                let _ = child.wait().await;
-
-                // Still collect whatever output was produced
-                let mut lines = Vec::new();
-                if let Some(h) = stdout_handle {
-                    lines.extend(h.await.unwrap_or_default());
-                }
-                if let Some(h) = stderr_handle {
-                    lines.extend(h.await.unwrap_or_default());
-                }
-                for line in &lines {
-                    if let Some(cb) = &mut on_line {
-                        cb(line);
+            res = rx.changed() => {
+                // P1.4: Only kill if the cancel value is actually true.
+                // Err(Closed) means the sender was dropped (e.g., grace timer task
+                // aborted) — treat as "no cancel" and wait for process normally.
+                if res.is_err() || !*rx.borrow() {
+                    child.wait().await.with_context(|| format!("waiting for {program}"))?
+                } else {
+                    // Cancel received — kill the entire process group
+                    tracing::info!("Killing process group for {program} (cancelled)");
+                    if let Err(e) = child.kill().await {
+                        tracing::warn!("Failed to kill process group: {e}");
                     }
+                    // Reap the process after killing
+                    let _ = child.wait().await;
+
+                    // Still collect whatever output was produced
+                    let mut lines = Vec::new();
+                    if let Some(h) = stdout_handle {
+                        lines.extend(h.await.unwrap_or_default());
+                    }
+                    if let Some(h) = stderr_handle {
+                        lines.extend(h.await.unwrap_or_default());
+                    }
+                    for line in &lines {
+                        if let Some(cb) = &mut on_line {
+                            cb(line);
+                        }
+                    }
+                    return Err(anyhow::anyhow!("process cancelled"));
                 }
-                return Err(anyhow::anyhow!("process cancelled"));
             }
         }
     } else {
