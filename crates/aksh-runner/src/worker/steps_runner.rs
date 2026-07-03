@@ -16,9 +16,17 @@ use super::execution_context::StepContext;
 use super::server_queue::{step_conclusion, step_status, ServerQueue, StepUpdate};
 
 /// A step to execute, with its metadata.
+///
+/// F029: `id` is the wire GUID (used as `external_id` in step updates, `step_backend_id` in
+/// log uploads). `context_name` is the human-readable key (e.g. `__run`, `__run_2`,
+/// `__actions_checkout`, or the user's explicit `id:`) used in the `steps.<name>.outputs`
+/// expression context, state, file commands, and `__pre_`/`__post_` naming.
 #[derive(Debug, Clone)]
 pub struct Step {
+    /// Wire ID — GUID on live GitHub, context name on aksh-native payloads.
     pub id: String,
+    /// Expression context key — `__run`, `__run_2`, user `id:`, etc.
+    pub context_name: String,
     pub display_name: String,
     pub step_type: StepType,
     pub condition: Option<String>,
@@ -94,7 +102,7 @@ pub async fn run_steps(
         if !should_run_step(step, job) {
             info!("Skipping step '{}' (condition not met)", step.display_name);
             job.steps.insert(
-                step.id.clone(),
+                step.context_name.clone(),
                 StepResult {
                     outcome: "Skipped".to_string(),
                     conclusion: "Skipped".to_string(),
@@ -141,7 +149,8 @@ pub async fn run_steps(
             crate::worker::job_runner::flush_step_updates(rpt, &queue).await;
         }
 
-        let mut step_ctx = StepContext::new(job, step.id.clone(), step.display_name.clone());
+        let mut step_ctx =
+            StepContext::new(job, step.context_name.clone(), step.display_name.clone());
         for (k, v) in &step.env {
             step_ctx.env.insert(k.clone(), v.clone());
         }
@@ -216,13 +225,13 @@ pub async fn run_steps(
             step_ctx
                 .job
                 .step_annotations
-                .insert(step.id.clone(), annotations);
+                .insert(step.context_name.clone(), annotations);
         }
 
         // Record a step result before applying file commands so GITHUB_OUTPUT can
         // attach outputs to this step.
         step_ctx.job.steps.insert(
-            step.id.clone(),
+            step.context_name.clone(),
             StepResult {
                 outcome: outcome_str.clone(),
                 conclusion: conclusion_str.clone(),
@@ -230,14 +239,19 @@ pub async fn run_steps(
             },
         );
 
-        if let Err(e) =
-            super::file_commands::apply_file_commands(&file_command_paths, &step.id, step_ctx.job)
-        {
+        if let Err(e) = super::file_commands::apply_file_commands(
+            &file_command_paths,
+            &step.context_name,
+            step_ctx.job,
+        ) {
             warn!(
                 "Applying file commands for step '{}' failed: {e:#}",
                 step.display_name
             );
         }
+        // F035: Read step summary content before cleanup deletes the file
+        let summary_content =
+            std::fs::read_to_string(&file_command_paths.summary_file).unwrap_or_default();
         super::file_commands::cleanup_file_commands(&file_command_paths);
 
         if conclusion_str == "Failure" {
