@@ -22,6 +22,8 @@ pub struct StepContext<'a> {
     pub log_lines: Vec<String>,
     /// Whether the step was cancelled.
     pub cancelled: bool,
+    /// stop-commands token: when set, all commands are suspended until `::{token}::` is seen.
+    pub stop_commands_token: Option<String>,
 }
 
 /// A workflow annotation (error/warning/notice).
@@ -60,12 +62,62 @@ impl<'a> StepContext<'a> {
             debug,
             log_lines: Vec::new(),
             cancelled: false,
+            stop_commands_token: None,
         }
     }
 
-    /// Add a log line, applying secret masking.
+    /// Add a log line: parse workflow commands, apply masking, feed problem matchers.
     pub fn log(&mut self, line: &str) {
+        // stop-commands: if a token is set, only look for the resume command
+        if let Some(ref token) = self.stop_commands_token.clone() {
+            if line.trim() == format!("::{token}::") {
+                self.stop_commands_token = None;
+                return;
+            }
+            // All commands suspended — just log the line
+            let masked = self.job.mask_secrets(line);
+            self.log_lines.push(masked);
+            return;
+        }
+
+        // Parse and handle workflow commands (::add-matcher::, ::error::, etc.)
+        if let Some(cmd) = super::commands::parse_command(line) {
+            // stop-commands: record the token and consume the line
+            if cmd.name == "stop-commands" && !cmd.data.is_empty() {
+                self.stop_commands_token = Some(cmd.data.clone());
+                return;
+            }
+
+            super::commands::handle_command(&cmd, self);
+
+            // Consumed commands: don't log them
+            if matches!(
+                cmd.name.as_str(),
+                "add-matcher" | "remove-matcher" | "add-mask" | "save-state" | "set-output"
+            ) {
+                return;
+            }
+            // group/endgroup/debug/error/warning/notice are already logged
+            // by handle_command via log_raw(), so don't double-log
+            if matches!(
+                cmd.name.as_str(),
+                "group" | "endgroup" | "debug" | "error" | "warning" | "notice"
+            ) {
+                return;
+            }
+        }
+
+        self.log_raw(line);
+    }
+
+    /// Log a line directly (no command parsing). Applies masking and problem matchers.
+    pub fn log_raw(&mut self, line: &str) {
         let masked = self.job.mask_secrets(line);
+        // P1.6: Feed through job-level problem matchers to produce annotations
+        let matched_annotations = self.job.matchers.match_line(&masked);
+        for ann in matched_annotations {
+            self.annotations.push(ann);
+        }
         self.log_lines.push(masked);
     }
 
