@@ -366,14 +366,48 @@ pub(crate) fn decode_typed_value(val: &serde_json::Value) -> serde_json::Value {
 /// Build the ordered step list from the job message steps.
 pub fn build_step_list(steps: &[serde_json::Value], _job_message: &serde_json::Value) -> Vec<Step> {
     let mut result = Vec::new();
+    let mut run_counter: usize = 0; // F029: counts id-less script steps for __run / __run_N
 
     for (i, step) in steps.iter().enumerate() {
-        let id = step
-            .get("id")
-            .or_else(|| step.get("contextName"))
-            .and_then(|v| v.as_str())
-            .unwrap_or(&format!("step_{i}"))
-            .to_string();
+        // Determine step type first so we know if it's a script step (needed for auto-ID)
+        let reference = step.get("reference");
+        let inputs = extract_template_map(step.get("inputs").unwrap_or(&serde_json::Value::Null));
+        let is_script = match reference {
+            Some(ref_val) => {
+                let ref_type = ref_val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                matches!(ref_type, "script" | "Script")
+            }
+            None => step
+                .get("run")
+                .and_then(|v| v.as_str())
+                .is_some_and(|r| !r.is_empty()),
+        };
+
+        // F029: Split wire ID (GUID) from context name (human-readable key).
+        // Live GitHub sends both `id` (GUID) and `contextName` (__run, __run_2, etc.).
+        // aksh-native payloads may only have `id` (which IS the context name).
+        let raw_context_name = step.get("contextName").and_then(|v| v.as_str());
+        let raw_id = step.get("id").and_then(|v| v.as_str());
+
+        // Context name: prefer contextName, then auto-generate __run/__run_N for scripts
+        let context_name = if let Some(cn) = raw_context_name {
+            cn.to_string()
+        } else if let Some(eid) = raw_id {
+            // aksh-native: id IS the context name
+            eid.to_string()
+        } else if is_script {
+            run_counter += 1;
+            if run_counter == 1 {
+                "__run".to_string()
+            } else {
+                format!("__run_{run_counter}")
+            }
+        } else {
+            format!("step_{i}")
+        };
+
+        // Wire ID: prefer id (GUID on live GitHub), fall back to context_name
+        let id = raw_id.unwrap_or(&context_name).to_string();
 
         let display_name_override = step
             .get("displayName")
@@ -392,13 +426,9 @@ pub fn build_step_list(steps: &[serde_json::Value], _job_message: &serde_json::V
 
         let timeout_minutes = step.get("timeoutInMinutes").and_then(|v| v.as_u64());
 
-        // Extract step env
-        let inputs = extract_template_map(step.get("inputs").unwrap_or(&serde_json::Value::Null));
-
         let env = extract_step_env(step);
 
-        // Determine step type
-        let reference = step.get("reference");
+        // Determine step type (reuse `reference` from above)
         let step_type = if let Some(ref_val) = reference {
             let ref_type = ref_val.get("type").and_then(|v| v.as_str()).unwrap_or("");
             match ref_type {
@@ -427,10 +457,7 @@ pub fn build_step_list(steps: &[serde_json::Value], _job_message: &serde_json::V
                             .to_string()
                     } else {
                         // Remote action: combine name + @ref
-                        let name = ref_val
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
+                        let name = ref_val.get("name").and_then(|v| v.as_str()).unwrap_or("");
                         let action_ref = ref_val.get("ref").and_then(|v| v.as_str());
                         if name.contains('@') || action_ref.is_none() {
                             name.to_string()
@@ -469,11 +496,12 @@ pub fn build_step_list(steps: &[serde_json::Value], _job_message: &serde_json::V
             }
         };
 
-        let display_name =
-            display_name_override.unwrap_or_else(|| display_name_for_step(&id, &step_type));
+        let display_name = display_name_override
+            .unwrap_or_else(|| display_name_for_step(&context_name, &step_type));
 
         result.push(Step {
             id,
+            context_name,
             display_name,
             step_type,
             condition,
@@ -531,9 +559,11 @@ pub fn build_step_list_with_lifecycle(
         // Pre step
         if let Some(pre_main) = &manifest.runs_pre {
             let pre_if = manifest.runs_pre_if.as_deref().unwrap_or("always()");
+            let pre_context = format!("__pre_{}", step.context_name);
             let pre_id = format!("__pre_{}", step.id);
             pre_steps.push(Step {
-                id: pre_id.clone(),
+                id: pre_id,
+                context_name: pre_context,
                 display_name: format!("Pre {}", step.display_name),
                 step_type: StepType::Action {
                     uses: uses.clone(),
@@ -554,9 +584,11 @@ pub fn build_step_list_with_lifecycle(
         // Post step (will be reversed into LIFO)
         if let Some(post_main) = &manifest.runs_post {
             let post_if = manifest.runs_post_if.as_deref().unwrap_or("always()");
+            let post_context = format!("__post_{}", step.context_name);
             let post_id = format!("__post_{}", step.id);
             post_steps.push(Step {
-                id: post_id.clone(),
+                id: post_id,
+                context_name: post_context,
                 display_name: format!("Post {}", step.display_name),
                 step_type: StepType::Action {
                     uses: uses.clone(),
@@ -652,11 +684,20 @@ fn template_scalar(value: &serde_json::Value) -> Option<String> {
         })
 }
 
+/// F029: Generate display names matching official runner conventions.
+/// Script steps: "Run {first_line}" truncated to 80 chars.
+/// Action steps: the full `uses` ref (e.g. "actions/checkout@v4").
 fn display_name_for_step(id: &str, step_type: &StepType) -> String {
     match step_type {
         StepType::Script { script, .. } if !script.trim().is_empty() => {
             let first_line = script.lines().next().unwrap_or("").trim();
-            format!("Run {first_line}")
+            // Official runner truncates display names; 80 chars is the practical limit
+            if first_line.chars().count() > 80 {
+                let truncated: String = first_line.chars().take(80).collect();
+                format!("Run {truncated}…")
+            } else {
+                format!("Run {first_line}")
+            }
         }
         StepType::Action { uses, .. } if !uses.is_empty() => uses.clone(),
         _ => id.to_string(),
@@ -961,6 +1002,7 @@ runs:
 
         let main_steps = vec![Step {
             id: "main-action".into(),
+            context_name: "main-action".into(),
             display_name: "Example".into(),
             step_type: StepType::Action {
                 uses: "actions/example@v1".into(),
@@ -1016,9 +1058,15 @@ runs:
                 .unwrap_or_else(|| panic!("failed to load golden acquirejob for {scenario}"));
 
             // 1. Build step list from raw steps
-            let steps = msg.get("steps").and_then(|v| v.as_array()).expect("missing steps in golden");
+            let steps = msg
+                .get("steps")
+                .and_then(|v| v.as_array())
+                .expect("missing steps in golden");
             let parsed_steps = build_step_list(steps, &msg);
-            assert!(!parsed_steps.is_empty(), "parsed steps must not be empty for {scenario}");
+            assert!(
+                !parsed_steps.is_empty(),
+                "parsed steps must not be empty for {scenario}"
+            );
 
             // 2. Inject environment and verify GITHUB_REPOSITORY is parsed
             let mut job = JobContext::new(
@@ -1032,28 +1080,41 @@ runs:
 
             // GITHUB_REPOSITORY must be set and not empty (from contextData.github.repository)
             let repo = job.env.get("GITHUB_REPOSITORY").map(|s| s.as_str());
-            assert_eq!(repo, Some("preloopdev/aksh-conformance-sample"), "mismatched GITHUB_REPOSITORY in {scenario}");
+            assert_eq!(
+                repo,
+                Some("preloopdev/aksh-conformance-sample"),
+                "mismatched GITHUB_REPOSITORY in {scenario}"
+            );
 
             // GITHUB_TOKEN must be set and not empty
             let token = job.env.get("GITHUB_TOKEN").map(|s| s.as_str());
-            assert!(token.is_some() && !token.unwrap().is_empty(), "GITHUB_TOKEN must not be empty in {scenario}");
+            assert!(
+                token.is_some() && !token.unwrap().is_empty(),
+                "GITHUB_TOKEN must not be empty in {scenario}"
+            );
 
             // 3. Scenario-specific checks
             if *scenario == "10-uses-checkout" {
                 // Verify actions/checkout has @v4 ref combined
-                let checkout_step = parsed_steps.iter().find(|s| match &s.step_type {
-                    StepType::Action { uses, .. } => uses.starts_with("actions/checkout"),
-                    _ => false,
-                }).expect("missing checkout step");
+                let checkout_step = parsed_steps
+                    .iter()
+                    .find(|s| match &s.step_type {
+                        StepType::Action { uses, .. } => uses.starts_with("actions/checkout"),
+                        _ => false,
+                    })
+                    .expect("missing checkout step");
                 if let StepType::Action { uses, .. } = &checkout_step.step_type {
                     assert_eq!(uses, "actions/checkout@v4");
                 }
             } else if *scenario == "13-composite-action" {
                 // Verify local action has repositoryType=self path
-                let composite_step = parsed_steps.iter().find(|s| match &s.step_type {
-                    StepType::Action { uses, .. } => uses.starts_with("./"),
-                    _ => false,
-                }).expect("missing composite step");
+                let composite_step = parsed_steps
+                    .iter()
+                    .find(|s| match &s.step_type {
+                        StepType::Action { uses, .. } => uses.starts_with("./"),
+                        _ => false,
+                    })
+                    .expect("missing composite step");
                 if let StepType::Action { uses, .. } = &composite_step.step_type {
                     assert_eq!(uses, "./.github/actions/greet");
                 }
@@ -1070,7 +1131,11 @@ runs:
         for line in reader.lines() {
             let line = line.ok()?;
             let d: serde_json::Value = serde_json::from_str(&line).ok()?;
-            if d.get("path").and_then(|v| v.as_str()).map(|s| s.contains("acquirejob")).unwrap_or(false) {
+            if d.get("path")
+                .and_then(|v| v.as_str())
+                .map(|s| s.contains("acquirejob"))
+                .unwrap_or(false)
+            {
                 return d.get("response_body_json").cloned();
             }
         }
