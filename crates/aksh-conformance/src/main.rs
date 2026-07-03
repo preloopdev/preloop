@@ -441,6 +441,7 @@ async fn run_runner_e2e(runner_bin: PathBuf, workflow: PathBuf) -> anyhow::Resul
 
     // Start server in background on port 9191
     let mut server = Command::new(server_bin)
+        .env("AKSH_PUBLIC_URL", "http://127.0.0.1:9191")
         .arg("serve")
         .arg("--listen")
         .arg("127.0.0.1:9191")
