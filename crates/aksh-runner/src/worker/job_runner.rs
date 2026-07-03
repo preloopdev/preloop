@@ -569,7 +569,7 @@ fn build_completejob_step_results(
     for (idx, step) in ordered_steps.iter().enumerate() {
         let conclusion = job_ctx
             .steps
-            .get(&step.id)
+            .get(&step.context_name)
             .map(|result| runner_conclusion(&result.conclusion))
             .unwrap_or("skipped");
 
@@ -578,7 +578,7 @@ fn build_completejob_step_results(
         // F025: Include annotations for this step
         let step_number = (idx + 2) as u32;
         let annotations: Vec<serde_json::Value> = step_annotations
-            .get(&step.id)
+            .get(&step.context_name)
             .map(|anns| {
                 anns.iter()
                     .map(|a| annotation_to_json(a, step_number))
