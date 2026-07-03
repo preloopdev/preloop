@@ -23,8 +23,9 @@ pub async fn run_composite_action(
     with: &serde_json::Value,
     workspace: &str,
     ctx: &mut StepContext<'_>,
+    cancel_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
-    run_composite_action_inner(manifest, action_dir, with, workspace, ctx, 0).await
+    run_composite_action_inner(manifest, action_dir, with, workspace, ctx, 0, cancel_rx).await
 }
 
 fn run_composite_action_inner<'a>(
@@ -34,6 +35,7 @@ fn run_composite_action_inner<'a>(
     workspace: &'a str,
     ctx: &'a mut StepContext<'_>,
     depth: u32,
+    cancel_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
         if depth >= MAX_COMPOSITE_DEPTH {
@@ -142,9 +144,15 @@ fn run_composite_action_inner<'a>(
                 expr_ctx.insert("inputs", serde_json::Value::Object(inputs_map));
                 let evaluated = crate::worker::template::evaluate_template(script, &expr_ctx)
                     .unwrap_or_else(|_| script.to_string());
-                super::script::run_script(&evaluated, step_shell, workspace, ctx, None)
-                    .await
-                    .map(|_| "Success".to_string())
+                super::script::run_script(
+                    &evaluated,
+                    step_shell,
+                    workspace,
+                    ctx,
+                    Some(cancel_rx.clone()),
+                )
+                .await
+                .map(|_| "Success".to_string())
             } else if let Some(uses) = step_uses {
                 let inner_with = step
                     .get("with")
@@ -163,16 +171,23 @@ fn run_composite_action_inner<'a>(
                                 workspace,
                                 ctx,
                                 depth + 1,
+                                cancel_rx.clone(),
                             )
                             .await
                             .map(|_| "Success".to_string())
                         }
-                        _ => super::action::run_action(uses, &inner_with, workspace, ctx)
-                            .await
-                            .map(|_| "Success".to_string()),
+                        _ => super::action::run_action(
+                            uses,
+                            &inner_with,
+                            workspace,
+                            ctx,
+                            cancel_rx.clone(),
+                        )
+                        .await
+                        .map(|_| "Success".to_string()),
                     }
                 } else {
-                    super::action::run_action(uses, &inner_with, workspace, ctx)
+                    super::action::run_action(uses, &inner_with, workspace, ctx, cancel_rx.clone())
                         .await
                         .map(|_| "Success".to_string())
                 }

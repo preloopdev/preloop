@@ -67,8 +67,6 @@ Started: 2026-07-03
 
 | Item | Reason |
 |------|--------|
-| P1.1 — Broker URL from connectionData | Hardcoded URL works for github.com |
-| P1.7 remainder — Session recovery | Requires broker_listener refactoring |
 | P1.2 — Containers (F026) | Dead code, needs docker integration |
 | P1.3 — AzDO compat reporting (F030) | 0 call sites, not GitHub-relevant |
 | Multi-line `loop:` patterns in matchers | Single-pattern matchers work; loop needs state machine |
@@ -87,6 +85,14 @@ Started: 2026-07-03
 | 23-context-fields | 28643232151 | ✅ Pass | P1.12 runner/job context |
 | 24-problem-matcher | 28655734365 | ✅ Pass | P1.6 annotations |
 | 24 (ephemeral) | 28655290764 | ✅ Pass | P1.8 auto-removal |
+| 06-multi-step | 28667882368 | ✅ Pass | Live rerun after DR fixes |
+| 13-composite-action | 28667884236 | ✅ Pass | Composite nested action/script cancellation plumbing smoke |
+| 19-step-summary | 28667886172 | ✅ Pass | Summary upload rerun |
+| 20-step-ids | 28667888259 | ✅ Pass | Step `contextName`/outputs rerun |
+| 21-job-timeout | 28667890064 | ✅ Cancel | Timeout/cancel rerun |
+| 22-cancel-semantics | 28667891885 | ✅ Cancel | Cancellation semantics rerun |
+| 23-context-fields | 28667893813 | ✅ Pass | Runner/job context rerun |
+| 24-problem-matcher | 28667895498 | ✅ Pass | Problem matcher annotations rerun |
 
 ## Local aksh Conformance
 
@@ -95,3 +101,5 @@ Started: 2026-07-03
 - All Twirp calls succeed (no 401s after moving routes out of require_bearer).
 - `contextName` emitted in step JSON (verified via runner log: steps use auto-IDs).
 - Known gap: `${{ steps.*.outputs.* }}` empty on native path (parser pre-evaluates at submit time).
+- 2026-07-03 rerun: `runner-watch conform --runner v2.335.1 --aksh-url http://127.0.0.1:9191 --skip-cargo-test` matched 9/11 scenarios; only known unsupported `CacheService/*` and `ArtifactService/*` scenarios diverged.
+- 2026-07-03 local runner smoke: `cargo run -p aksh-conformance -- runner-e2e --runner-bin target/debug/aksh-runner --workflow fixtures/golden/simple-echo.yml` returned `success: true` for run `6c5243f8-ff31-4324-896b-42a257c12a7f`.

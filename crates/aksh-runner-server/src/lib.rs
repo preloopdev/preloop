@@ -474,11 +474,19 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             "/runner/session",
             post(broker_session_root).delete(broker_delete_session_root),
         )
+        .route(
+            "/runner/session/:session_id",
+            delete(broker_delete_session_by_path),
+        )
         .route("/runner/message", get(next_message_broker_ref_root))
         .route("/runner/acknowledge", post(broker_acknowledge_root))
         .route(
             "/runner/server/runner/session",
             post(broker_session_root).delete(broker_delete_session_root),
+        )
+        .route(
+            "/runner/server/runner/session/:session_id",
+            delete(broker_delete_session_by_path),
         )
         .route(
             "/runner/server/runner/message",
@@ -492,11 +500,19 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             "/session",
             post(broker_session_root).delete(broker_delete_session_root),
         )
+        .route(
+            "/session/:session_id",
+            delete(broker_delete_session_by_path),
+        )
         .route("/message", get(next_message_broker_ref_root))
         .route("/acknowledge", post(broker_acknowledge_root))
         .route(
             "/runner/server/session",
             post(broker_session_root).delete(broker_delete_session_root),
+        )
+        .route(
+            "/runner/server/session/:session_id",
+            delete(broker_delete_session_by_path),
         )
         .route("/runner/server/message", get(next_message_broker_ref_root))
         .route("/runner/server/acknowledge", post(broker_acknowledge_root))
@@ -1357,15 +1373,6 @@ async fn next_message_broker_ref(
         .cloned()
         .unwrap_or_else(|| "default".to_owned());
 
-    {
-        let inner = shared.state.inner.lock().await;
-        let is_uuid = session_id.len() == 36 && session_id.contains('-');
-        if is_uuid && !inner.session_keys.contains_key(&session_id) {
-            return Err(ApiError::bad_request(format!(
-                "session {session_id} not found"
-            )));
-        }
-    }
     let wait_seconds = params
         .get("waitSeconds")
         .and_then(|value| value.parse::<u64>().ok())
@@ -1496,7 +1503,18 @@ async fn broker_delete_session_root(
     if let Some(session_id) = params.get("sessionId") {
         let mut inner = shared.state.inner.lock().await;
         inner.session_keys.remove(session_id);
+        inner.session_active_requests.remove(session_id);
     }
+    StatusCode::NO_CONTENT
+}
+
+async fn broker_delete_session_by_path(
+    State(shared): State<Arc<SharedState>>,
+    Path(session_id): Path<String>,
+) -> StatusCode {
+    let mut inner = shared.state.inner.lock().await;
+    inner.session_keys.remove(&session_id);
+    inner.session_active_requests.remove(&session_id);
     StatusCode::NO_CONTENT
 }
 
@@ -1508,16 +1526,6 @@ async fn next_message_broker_ref_root(
         .get("sessionId")
         .cloned()
         .unwrap_or_else(|| "default".to_owned());
-
-    {
-        let inner = shared.state.inner.lock().await;
-        let is_uuid = session_id.len() == 36 && session_id.contains('-');
-        if is_uuid && !inner.session_keys.contains_key(&session_id) {
-            return Err(ApiError::bad_request(format!(
-                "session {session_id} not found"
-            )));
-        }
-    }
 
     // Default to 50s long-poll (golden flows show ~50s waits between jobs)
     let wait = params
@@ -1580,17 +1588,8 @@ async fn broker_acknowledge_root(
 ) -> StatusCode {
     let session_id = params.get("sessionId").map(String::as_str).unwrap_or("");
     if !session_id.is_empty() {
-        let is_uuid = session_id.len() == 36 && session_id.contains('-');
-        if is_uuid {
-            let mut inner = shared.state.inner.lock().await;
-            if !inner.session_keys.contains_key(session_id) {
-                return StatusCode::BAD_REQUEST;
-            }
-            inner.session_active_requests.remove(session_id);
-        } else {
-            let mut inner = shared.state.inner.lock().await;
-            inner.session_active_requests.remove(session_id);
-        }
+        let mut inner = shared.state.inner.lock().await;
+        inner.session_active_requests.remove(session_id);
     }
     StatusCode::OK
 }
@@ -1835,16 +1834,6 @@ async fn next_message(
         .get("sessionId")
         .cloned()
         .unwrap_or_else(|| "default".to_owned());
-
-    {
-        let inner = shared.state.inner.lock().await;
-        let is_uuid = session_id.len() == 36 && session_id.contains('-');
-        if is_uuid && !inner.session_keys.contains_key(&session_id) {
-            return Err(ApiError::bad_request(format!(
-                "session {session_id} not found"
-            )));
-        }
-    }
 
     let wait_seconds = params
         .get("waitSeconds")
