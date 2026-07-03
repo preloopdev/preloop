@@ -124,37 +124,43 @@ pub fn handle_command(
             ctx.job.extra_path.insert(0, cmd.data.clone());
         }
         "debug" => {
-            ctx.log(&format!("##[debug]{}", cmd.data));
+            ctx.log_raw(&format!("##[debug]{}", cmd.data));
         }
         "error" => {
+            let masked_data = ctx.job.mask_secrets(&cmd.data);
             let annotation = build_annotation(
                 crate::worker::execution_context::AnnotationLevel::Error,
                 cmd,
+                &masked_data,
             );
             ctx.annotate(annotation);
-            ctx.log(&format!("##[error]{}", cmd.data));
+            ctx.log_raw(&format!("##[error]{masked_data}"));
         }
         "warning" => {
+            let masked_data = ctx.job.mask_secrets(&cmd.data);
             let annotation = build_annotation(
                 crate::worker::execution_context::AnnotationLevel::Warning,
                 cmd,
+                &masked_data,
             );
             ctx.annotate(annotation);
-            ctx.log(&format!("##[warning]{}", cmd.data));
+            ctx.log_raw(&format!("##[warning]{masked_data}"));
         }
         "notice" => {
+            let masked_data = ctx.job.mask_secrets(&cmd.data);
             let annotation = build_annotation(
                 crate::worker::execution_context::AnnotationLevel::Notice,
                 cmd,
+                &masked_data,
             );
             ctx.annotate(annotation);
-            ctx.log(&format!("##[notice]{}", cmd.data));
+            ctx.log_raw(&format!("##[notice]{masked_data}"));
         }
         "group" => {
-            ctx.log(&format!("##[group]{}", cmd.data));
+            ctx.log_raw(&format!("##[group]{}", cmd.data));
         }
         "endgroup" => {
-            ctx.log("##[endgroup]");
+            ctx.log_raw("##[endgroup]");
         }
         "echo" => {
             // echo on/off controls command echoing
@@ -180,9 +186,20 @@ pub fn handle_command(
                 state.insert(name.clone(), cmd.data.clone());
             }
         }
-        "stop-commands" | "add-matcher" | "remove-matcher" => {
+        "stop-commands" => {
             // stop-commands: handled at a higher level (M10)
-            // matchers: handled in M10
+        }
+        "add-matcher" => {
+            // P1.6: Register problem matcher from JSON file
+            let path = std::path::Path::new(&cmd.data);
+            if let Err(e) = ctx.job.matchers.add_from_file(path) {
+                tracing::warn!("Failed to add problem matcher from {}: {e:#}", cmd.data);
+            }
+        }
+        "remove-matcher" => {
+            // P1.6: Unregister problem matcher by owner name
+            let owner = cmd.properties.get("owner").unwrap_or(&cmd.data);
+            ctx.job.matchers.remove(owner);
         }
         _ => {
             tracing::debug!("Unknown workflow command: {}", cmd.name);
@@ -193,10 +210,11 @@ pub fn handle_command(
 fn build_annotation(
     level: crate::worker::execution_context::AnnotationLevel,
     cmd: &WorkflowCommand,
+    masked_message: &str,
 ) -> crate::worker::execution_context::Annotation {
     crate::worker::execution_context::Annotation {
         level,
-        message: cmd.data.clone(),
+        message: masked_message.to_string(),
         title: cmd.properties.get("title").cloned(),
         file: cmd.properties.get("file").cloned(),
         line: cmd.properties.get("line").and_then(|v| v.parse().ok()),
