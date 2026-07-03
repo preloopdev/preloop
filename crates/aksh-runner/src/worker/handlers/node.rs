@@ -91,6 +91,23 @@ pub async fn run_node_action(
         }
     }
 
+    // P1.14: Emit deprecation warnings for inputs with deprecationMessage
+    if let Some(manifest_inputs) = &manifest.inputs {
+        for (key, input_def) in manifest_inputs {
+            if let Some(msg) = input_def.get("deprecationMessage").and_then(|v| v.as_str()) {
+                if !msg.is_empty() {
+                    let env_key = format!("INPUT_{}", key.to_uppercase().replace(' ', "_"));
+                    if env.contains_key(&env_key) {
+                        tracing::warn!("Input '{key}' has been deprecated: {msg}");
+                        ctx.log(&format!(
+                            "::warning::Input '{key}' has been deprecated with message: {msg}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     // Set GITHUB_ACTION_PATH
     env.insert(
         "GITHUB_ACTION_PATH".to_string(),
