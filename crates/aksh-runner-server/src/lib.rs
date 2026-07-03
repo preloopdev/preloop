@@ -1347,7 +1347,6 @@ fn broker_job_ref_root(request: &TaskAgentJobRequestRecord, runner_id: i64) -> s
         })).unwrap()
     })
 }
-
 async fn next_message_broker_ref(
     State(shared): State<Arc<SharedState>>,
     Path(pool_id): Path<i64>,
@@ -1357,6 +1356,16 @@ async fn next_message_broker_ref(
         .get("sessionId")
         .cloned()
         .unwrap_or_else(|| "default".to_owned());
+
+    {
+        let inner = shared.state.inner.lock().await;
+        let is_uuid = session_id.len() == 36 && session_id.contains('-');
+        if is_uuid && !inner.session_keys.contains_key(&session_id) {
+            return Err(ApiError::bad_request(format!(
+                "session {session_id} not found"
+            )));
+        }
+    }
     let wait_seconds = params
         .get("waitSeconds")
         .and_then(|value| value.parse::<u64>().ok())
@@ -1459,11 +1468,20 @@ async fn next_message_broker_ref(
     }
 }
 
-async fn broker_session_root() -> (StatusCode, Json<serde_json::Value>) {
+async fn broker_session_root(
+    State(shared): State<Arc<SharedState>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let session_id = uuid::Uuid::new_v4().to_string();
+    {
+        let mut inner = shared.state.inner.lock().await;
+        inner
+            .session_keys
+            .insert(session_id.clone(), SessionEncryption::generate());
+    }
     (
         StatusCode::CREATED,
         Json(json!({
-            "sessionId": uuid::Uuid::new_v4().to_string(),
+            "sessionId": session_id,
             "ownerName": "aksh-runner",
             "assignmentQueued": false,
             "orchestrationId": ""
@@ -1471,7 +1489,14 @@ async fn broker_session_root() -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
-async fn broker_delete_session_root() -> StatusCode {
+async fn broker_delete_session_root(
+    State(shared): State<Arc<SharedState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> StatusCode {
+    if let Some(session_id) = params.get("sessionId") {
+        let mut inner = shared.state.inner.lock().await;
+        inner.session_keys.remove(session_id);
+    }
     StatusCode::NO_CONTENT
 }
 
@@ -1483,6 +1508,17 @@ async fn next_message_broker_ref_root(
         .get("sessionId")
         .cloned()
         .unwrap_or_else(|| "default".to_owned());
+
+    {
+        let inner = shared.state.inner.lock().await;
+        let is_uuid = session_id.len() == 36 && session_id.contains('-');
+        if is_uuid && !inner.session_keys.contains_key(&session_id) {
+            return Err(ApiError::bad_request(format!(
+                "session {session_id} not found"
+            )));
+        }
+    }
+
     // Default to 50s long-poll (golden flows show ~50s waits between jobs)
     let wait = params
         .get("waitSeconds")
@@ -1542,9 +1578,19 @@ async fn broker_acknowledge_root(
     State(shared): State<Arc<SharedState>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> StatusCode {
-    if let Some(session_id) = params.get("sessionId") {
-        let mut inner = shared.state.inner.lock().await;
-        inner.session_active_requests.remove(session_id);
+    let session_id = params.get("sessionId").map(String::as_str).unwrap_or("");
+    if !session_id.is_empty() {
+        let is_uuid = session_id.len() == 36 && session_id.contains('-');
+        if is_uuid {
+            let mut inner = shared.state.inner.lock().await;
+            if !inner.session_keys.contains_key(session_id) {
+                return StatusCode::BAD_REQUEST;
+            }
+            inner.session_active_requests.remove(session_id);
+        } else {
+            let mut inner = shared.state.inner.lock().await;
+            inner.session_active_requests.remove(session_id);
+        }
     }
     StatusCode::OK
 }
@@ -1789,6 +1835,17 @@ async fn next_message(
         .get("sessionId")
         .cloned()
         .unwrap_or_else(|| "default".to_owned());
+
+    {
+        let inner = shared.state.inner.lock().await;
+        let is_uuid = session_id.len() == 36 && session_id.contains('-');
+        if is_uuid && !inner.session_keys.contains_key(&session_id) {
+            return Err(ApiError::bad_request(format!(
+                "session {session_id} not found"
+            )));
+        }
+    }
+
     let wait_seconds = params
         .get("waitSeconds")
         .and_then(|value| value.parse::<u64>().ok())

@@ -271,14 +271,73 @@ pub async fn run_broker_loop(
                         debug!("Broker poll returned no message (idle cycle)");
                     }
                     Err(e) => {
-                        consecutive_errors += 1;
-                        let delay = std::cmp::min(consecutive_errors * 5, 60);
-                        warn!("Broker poll error ({consecutive_errors}): {e:#}. Retrying in {delay}s");
-                        tokio::time::sleep(std::time::Duration::from_secs(delay as u64)).await;
+                        if is_unauthorized(&e) {
+                            info!("OAuth token expired during message poll. Re-acquiring token...");
+                            match crate::listener::oauth::get_oauth_token(http, config).await {
+                                Ok(t) => {
+                                    token = t;
+                                    consecutive_errors = 0;
+                                    // Try to recreate the session with the new token
+                                    need_session = true;
+                                }
+                                Err(oe) => {
+                                    warn!("Failed to re-acquire OAuth token: {oe:#}");
+                                    consecutive_errors += 1;
+                                    let delay = std::cmp::min(consecutive_errors * 5, 60);
+                                    tokio::time::sleep(std::time::Duration::from_secs(delay as u64)).await;
+                                }
+                            }
+                        } else if is_session_expired(&e) {
+                            warn!("Broker session expired or invalid. Re-creating session...");
+                            need_session = true;
+                        } else {
+                            consecutive_errors += 1;
+                            let delay = std::cmp::min(consecutive_errors * 5, 60);
+                            warn!("Broker poll error ({consecutive_errors}): {e:#}. Retrying in {delay}s");
+                            tokio::time::sleep(std::time::Duration::from_secs(delay as u64)).await;
+                        }
                     }
                 }
             }
         }
+    }
+}
+
+fn is_unauthorized(err: &anyhow::Error) -> bool {
+    if let Some(http_err) = err.downcast_ref::<crate::client::http::HttpError>() {
+        match http_err {
+            crate::client::http::HttpError::Status { status, .. } => {
+                *status == reqwest::StatusCode::UNAUTHORIZED
+            }
+        }
+    } else {
+        false
+    }
+}
+
+fn is_session_expired(err: &anyhow::Error) -> bool {
+    if let Some(http_err) = err.downcast_ref::<crate::client::http::HttpError>() {
+        match http_err {
+            crate::client::http::HttpError::Status { status, .. } => {
+                *status == reqwest::StatusCode::NOT_FOUND
+                    || *status == reqwest::StatusCode::BAD_REQUEST
+            }
+        }
+    } else {
+        false
+    }
+}
+
+/// P1.8: Unregister the agent on ephemeral (--once) exit.
+async fn ephemeral_unregister(http: &HttpClient, config: &RunnerConfig, token: &str) {
+    let delete_url = format!(
+        "{}/_apis/distributedtask/pools/{}/agents/{}?api-version=6.0-preview",
+        config.settings.server_url, config.settings.pool_id, config.settings.agent_id
+    );
+    if let Err(e) = http.delete_with_token(&delete_url, token).await {
+        warn!("Failed to unregister agent: {e:#}");
+    } else {
+        info!("Agent unregistered (ephemeral --once cleanup)");
     }
 }
 

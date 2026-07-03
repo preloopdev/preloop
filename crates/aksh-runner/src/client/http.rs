@@ -5,6 +5,15 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use std::path::Path;
 use std::time::Duration;
 
+#[derive(Debug, thiserror::Error)]
+pub enum HttpError {
+    #[error("HTTP status {status}: {body}")]
+    Status {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+}
+
 /// Shared HTTP client wrapping reqwest with CA bundle, proxy, and auth.
 #[derive(Clone)]
 pub struct HttpClient {
@@ -125,28 +134,55 @@ impl HttpClient {
     }
 
     /// POST JSON with custom authorization header, returning JSON.
+    /// P1.7: Retries up to 3 times on transient 5xx or network errors with exponential backoff.
     pub async fn post_json_with_auth<T: serde::de::DeserializeOwned>(
         &self,
         url: &str,
         body: &serde_json::Value,
         auth: &str,
     ) -> Result<T> {
-        let resp = self
-            .inner
-            .post(url)
-            .header(CONTENT_TYPE, "application/json")
-            .header(ACCEPT, "application/json")
-            .header(AUTHORIZATION, auth)
-            .json(body)
-            .send()
-            .await
-            .with_context(|| format!("POST {url}"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("POST {url} returned {status}: {body}");
+        let mut last_err = None;
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                let delay = Duration::from_secs(1 << attempt); // 2s, 4s
+                tracing::warn!(
+                    "Retrying POST {url} (attempt {}, backoff {delay:?})",
+                    attempt + 1
+                );
+                tokio::time::sleep(delay).await;
+            }
+            let resp = match self
+                .inner
+                .post(url)
+                .header(CONTENT_TYPE, "application/json")
+                .header(ACCEPT, "application/json")
+                .header(AUTHORIZATION, auth)
+                .json(body)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    last_err = Some(anyhow::anyhow!("POST {url}: {e}"));
+                    continue;
+                }
+            };
+            let status = resp.status();
+            if status.is_server_error() {
+                let body_text = resp.text().await.unwrap_or_default();
+                last_err = Some(anyhow::anyhow!("POST {url} returned {status}: {body_text}"));
+                continue;
+            }
+            if !status.is_success() {
+                let body_text = resp.text().await.unwrap_or_default();
+                return Err(anyhow::Error::new(HttpError::Status {
+                    status,
+                    body: body_text,
+                }));
+            }
+            return json_or_null(resp, &format!("parsing POST {url}")).await;
         }
-        json_or_null(resp, &format!("parsing POST {url}")).await
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("POST {url} failed after 3 retries")))
     }
 
     /// POST JSON with custom authorization, Accept, and Content-Type headers.
@@ -171,7 +207,7 @@ impl HttpClient {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("POST {url} returned {status}: {body}");
+            return Err(anyhow::Error::new(HttpError::Status { status, body }));
         }
         json_or_null(resp, &format!("parsing POST {url}")).await
     }
@@ -193,7 +229,7 @@ impl HttpClient {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("POST form {url} returned {status}: {body}");
+            return Err(anyhow::Error::new(HttpError::Status { status, body }));
         }
         resp.json()
             .await
@@ -231,7 +267,7 @@ impl HttpClient {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("PATCH {url} returned {status}: {body}");
+            return Err(anyhow::Error::new(HttpError::Status { status, body }));
         }
         resp.json()
             .await
@@ -250,28 +286,52 @@ impl HttpClient {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("DELETE {url} returned {status}: {body}");
+            return Err(anyhow::Error::new(HttpError::Status { status, body }));
         }
         Ok(())
     }
 
     /// PUT raw bytes with content type.
+    /// P1.7: Retries up to 3 times on transient 5xx or network errors.
     pub async fn put_bytes(&self, url: &str, data: Vec<u8>, content_type: &str) -> Result<()> {
-        let resp = self
-            .inner
-            .put(url)
-            .header(CONTENT_TYPE, content_type)
-            .header("x-ms-blob-type", "BlockBlob")
-            .body(data)
-            .send()
-            .await
-            .with_context(|| format!("PUT {url}"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("PUT {url} returned {status}: {body}");
+        let mut last_err = None;
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                let delay = Duration::from_secs(1 << attempt);
+                tracing::warn!(
+                    "Retrying PUT {url} (attempt {}, backoff {delay:?})",
+                    attempt + 1
+                );
+                tokio::time::sleep(delay).await;
+            }
+            let resp = match self
+                .inner
+                .put(url)
+                .header(CONTENT_TYPE, content_type)
+                .header("x-ms-blob-type", "BlockBlob")
+                .body(data.clone())
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    last_err = Some(anyhow::anyhow!("PUT {url}: {e}"));
+                    continue;
+                }
+            };
+            let status = resp.status();
+            if status.is_server_error() {
+                let body = resp.text().await.unwrap_or_default();
+                last_err = Some(anyhow::anyhow!("PUT {url} returned {status}: {body}"));
+                continue;
+            }
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(anyhow::Error::new(HttpError::Status { status, body }));
+            }
+            return Ok(());
         }
-        Ok(())
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("PUT {url} failed after 3 retries")))
     }
 
     /// Build a long-poll GET request with timeout.
@@ -302,7 +362,7 @@ impl HttpClient {
                     Ok(None)
                 } else {
                     let body = r.text().await.unwrap_or_default();
-                    anyhow::bail!("long-poll {url} returned {status}: {body}");
+                    return Err(anyhow::Error::new(HttpError::Status { status, body }));
                 }
             }
             Err(e) if e.is_timeout() => Ok(None),
