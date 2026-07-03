@@ -137,9 +137,18 @@ impl JobContext {
     pub fn build_expression_context(&self) -> aksh_gha_expressions::Context {
         let mut ctx = aksh_gha_expressions::Context::new();
 
-        // github context from contextData
+        // github context from contextData (may be typed-dict encoded)
         if let Some(github) = self.context_data.get("github") {
-            ctx.insert("github", github.clone());
+            let mut gh = super::job_extension::decode_typed_value(github);
+            // Token is often in variables, not contextData; inject it if missing
+            if gh.get("token").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+                if let Some(token) = self.env.get("GITHUB_TOKEN") {
+                    if let Some(obj) = gh.as_object_mut() {
+                        obj.insert("token".to_string(), serde_json::json!(token));
+                    }
+                }
+            }
+            ctx.insert("github", gh);
         }
 
         // runner context

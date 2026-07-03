@@ -27,8 +27,15 @@ pub async fn run_node_action(
         anyhow::bail!("action entry point not found: {}", entry_point.display());
     }
 
-    // Resolve node binary
-    let node_version = match manifest.runs_using.as_str() {
+    // Resolve node binary; warn on deprecated node versions
+    let runs_using = manifest.runs_using.as_str();
+    if runs_using == "node12" || runs_using == "node16" {
+        tracing::warn!(
+            "Node.js {} actions are deprecated. Action authors should update to use node20 or later.",
+            &runs_using[4..]
+        );
+    }
+    let node_version = match runs_using {
         "node24" => "node24",
         _ => "node20", // node12/16 mapped to node20
     };
@@ -50,28 +57,36 @@ pub async fn run_node_action(
         "node".to_string()
     };
 
-    // Build environment with INPUT_* variables
+    // Build environment with INPUT_* variables, evaluating any ${{ }} expressions
     let mut env = ctx.build_env();
+    let expr_ctx_for_inputs = ctx.job.build_expression_context();
     if let Some(inputs) = with.as_object() {
         for (key, value) in inputs {
             if key.starts_with("__aksh_") {
                 continue;
             }
             let env_key = format!("INPUT_{}", key.to_uppercase().replace(' ', "_"));
-            if let Some(val_str) = value.as_str() {
-                env.insert(env_key, val_str.to_string());
+            let raw = if let Some(val_str) = value.as_str() {
+                val_str.to_string()
             } else {
-                env.insert(env_key, value.to_string());
-            }
+                value.to_string()
+            };
+            let evaluated = crate::worker::template::evaluate_template(&raw, &expr_ctx_for_inputs)
+                .unwrap_or(raw);
+            env.insert(env_key, evaluated);
         }
     }
 
-    // Apply defaults from manifest inputs
+    // Apply defaults from manifest inputs, evaluating any ${{ }} expressions
     if let Some(manifest_inputs) = &manifest.inputs {
+        let expr_ctx = ctx.job.build_expression_context();
         for (key, input_def) in manifest_inputs {
             let env_key = format!("INPUT_{}", key.to_uppercase().replace(' ', "_"));
             if let Some(default) = input_def.get("default").and_then(|v| v.as_str()) {
-                env.entry(env_key).or_insert_with(|| default.to_string());
+                env.entry(env_key).or_insert_with(|| {
+                    crate::worker::template::evaluate_template(default, &expr_ctx)
+                        .unwrap_or_else(|_| default.to_string())
+                });
             }
         }
     }
