@@ -14,7 +14,7 @@ The Rust binary is a single static executable. The official runner includes the 
 
 ## 2. CI Pipeline Benchmark (cargo fmt + clippy + test)
 
-Workload: the aksh workspace — `cargo fmt --all --check` + `cargo clippy --workspace --all-targets` + `cargo test --workspace --quiet`.
+Workload: the aksh workspace — `cargo fmt --all --check` + `cargo clippy --workspace --all-targets` + `cargo test --workspace --quiet`. 199 tests across 22 suites.
 
 ### Test environments
 
@@ -25,44 +25,65 @@ Workload: the aksh workspace — `cargo fmt --all --check` + `cargo clippy --wor
 | **Machine** | Azure VM (ubuntu-latest) | smolvm ARM64 VM | macOS native | Docker on macOS |
 | **CPU** | 4 vCPU (x86_64) | 4 vCPU (Apple M4 Max) | Apple M4 Max | Apple M4 Max |
 | **RAM** | 16 GB | 8 GB | 128 GB | Docker-allocated |
-| **Docker storage** | N/A | overlay2 on ext4 (10G vdb) | N/A | overlay2 |
-| **Cargo cache** | Cold (rebuilt every run) | Warm (persistent VM) | Warm | Cold (no Rust toolchain) |
-| **smolvm image** | N/A | Not packed (live VM) | N/A | N/A |
+| **Docker storage** | N/A | overlay2 on ext4 (10 GB vdb) | N/A | overlay2 |
+| **VM boot** | N/A | 1.2s (from stopped state) | N/A | ~4s (container start) |
 
 ### Results
 
 ```
-                        GitHub-hosted     aksh/smolvm      aksh/smolvm     Host bare
-                        (cold cache)      Run 1 (warm)     Run 2 (hot)     (warm)
-                        x86_64 Azure      ARM64 VM         ARM64 VM        M4 native
-────────────────────────────────────────────────────────────────────────────────────────
-cargo fmt                    0.5s            0.2s             0.2s           0.2s
-cargo clippy                64.5s            5.0s             0.4s           2.0s
-cargo test                 283.5s           72.2s            52.5s          25.2s
-────────────────────────────────────────────────────────────────────────────────────────
-TOTAL (steps)              348.5s           77.4s            53.1s          27.4s
-Wall (incl. setup)         363.0s           79.9s            61.0s          27.4s
-────────────────────────────────────────────────────────────────────────────────────────
-vs GitHub                    1x            0.22x            0.15x          0.08x
-                                          (4.5x faster)   (6.7x faster)  (13x faster)
+                                  fmt    clippy    test    steps    wall
+──────────────────────────────────────────────────────────────────────────
+GitHub-hosted (cold, x86)        0.5s    64.5s    284s     349s    363s
+smolvm cold cache                  1s      24s     93s     118s    120s
+smolvm warm cache (direct)         0s       1s     45s      46s     47s
+smolvm warm + aksh protocol        0s       0s     43s      43s     45s
+Host bare metal (warm)           0.2s       2s     25s      27s     27s
+──────────────────────────────────────────────────────────────────────────
+Agent CI                          —         —       —        —    FAILED
 ```
 
-**Agent CI** could not complete this benchmark — the official runner Docker image (`ghcr.io/actions/actions-runner`) does not include a C linker or Rust toolchain. `cargo clippy` fails with `error: linker 'cc' not found`. A custom Dockerfile adding `build-essential` and Rust is required.
+### Comparison ratios (vs GitHub-hosted)
+
+| Config | Ratio | Speedup |
+|---|---|---|
+| smolvm cold cache | 0.33x | **3x faster** |
+| smolvm warm cache | 0.13x | **7.7x faster** |
+| smolvm warm + aksh protocol | 0.12x | **8.1x faster** |
+| Host bare metal | 0.07x | **13.4x faster** |
+
+### Agent CI failure
+
+Agent CI could not complete this benchmark. The official runner Docker image (`ghcr.io/actions/actions-runner`) does not include a C linker or Rust toolchain. `cargo clippy` fails with `error: linker 'cc' not found`. A custom `.github/agent-ci.Dockerfile` adding `build-essential` and Rust is required. The `dtolnay/rust-toolchain` action installs rustup but not the system linker.
 
 ### Key observations
 
-- **GitHub CI is dominated by cold compilation.** Every run downloads and compiles all dependencies from scratch. `cargo test` alone takes 283s because it compiles 199 test binaries.
-- **aksh/smolvm benefits from persistent cargo cache.** The VM's `/workspace/target` directory persists between runs, so incremental compilation applies. Run 2 (hot cache) is 6.7x faster than GitHub.
-- **The VM tax is ~2-3x.** Comparing hot-cache smolvm (53s) to bare-metal host (27s), the overhead comes from virtio-fs I/O for the many small files in `target/` and reduced memory bandwidth in the VM.
-- **Runner protocol overhead is negligible.** Wall time (61s) vs step time (53s) = 8s of aksh server/runner protocol overhead (job dispatch, step reporting, log upload).
+- **GitHub CI is dominated by cold compilation.** Every run downloads and compiles all dependencies from scratch. `cargo test` alone takes 284s because it compiles the full dep tree + 199 test binaries.
+- **smolvm benefits from persistent cargo cache.** The VM's `/workspace/target` directory persists across runs, so incremental compilation applies. Warm-cache runs are 7.7x faster than GitHub.
+- **Cold-cache smolvm is still 3x faster than GitHub.** Even compiling everything from scratch, the M4 Max outperforms Azure's 4-vCPU x86 VM. ARM64 Rust compilation is not a bottleneck.
+- **The VM tax is ~1.7x.** Comparing warm-cache smolvm direct (46s) to bare-metal host (27s). The overhead comes from virtio-fs I/O for the many small files in `target/` and memory bandwidth in the microVM.
+- **aksh protocol overhead is ~2s.** Wall time with protocol (45s) vs direct execution (43s step time). Job dispatch, step reporting, and log upload add negligible overhead.
 
-### What each timing includes
+### Cache state definitions
 
-| Measurement | Includes |
+| State | Definition |
 |---|---|
-| GitHub 363s | VM boot, checkout, toolchain install, cold compile, test, cleanup |
-| aksh/smolvm 61s | Job dispatch via aksh protocol, warm incremental compile, test |
-| Host bare metal 27s | Just the three cargo commands, warm cache, no protocol overhead |
+| **Cold** | `target/` deleted. Full dep download + compile. Comparable to GitHub's fresh VM. |
+| **Warm** | `target/` from previous run. Incremental compile — only changed crates rebuild. Typical local dev loop. |
+| **Hot** | `target/` warm and no source changes. Clippy/test skip compilation entirely. Best case for repeated runs. |
+
+### smolvm configuration
+
+- **VM**: smolvm v1.4.1, libkrun hypervisor, ubuntu:24.04 guest
+- **Resources**: 4 vCPU, 8 GB RAM, Apple M4 Max host
+- **Storage**: overlay2 on ext4, dedicated 10 GB block device (`/dev/vdb`)
+- **Docker**: Docker CE 29.6.1 (for container job benchmarks)
+- **Workspace**: host directory mounted via virtio-fs at `/workspace`
+- **VM boot time**: 1.2s from stopped state
+- **Image state**: not packed (live VM with persistent state)
+
+#### Packed smolmachine status
+
+Attempted `smolvm pack create --from-vm build-runner` — produced a 776 MB `.smolmachine` artifact but the packed VM's agent failed to boot (`agent did not become ready within 30 seconds`). Image-based packs (`--image ubuntu:24.04`) boot successfully (~9s cold, ~3s warm) but don't support virtio-fs host mounts, making them unsuitable for workspace-mounted workflows. This appears to be a smolvm pack bug with snapshot-based VMs.
 
 ## 3. Container Job Benchmarks
 
@@ -76,7 +97,7 @@ Workload: Docker container lifecycle — pull image, create network, start conta
 | **Machine** | ubuntu-latest (Azure, x86_64) | smolvm ARM64 VM (Apple M4 Max) |
 | **CPU / RAM** | 4 vCPU / 16 GB | 4 vCPU / 8 GB |
 | **Docker** | Pre-installed | Docker CE 29.6.1 |
-| **Docker storage** | Azure SSD | overlay2 on ext4 (10G vdb) |
+| **Docker storage** | Azure SSD | overlay2 on ext4 (10 GB vdb) |
 
 ### Results
 
@@ -93,10 +114,10 @@ Scenario                           GitHub (s)   aksh (s)    Ratio     aksh statu
 
 ### Key observations
 
-- **Scenarios 30 + 33 (architecture-neutral): aksh is at parity or 41% faster.** These isolate the runner protocol overhead — image pull, container create/start/stop, env injection, file commands.
+- **Scenarios 30 + 33 (architecture-neutral): aksh is at parity or 41% faster.** These isolate the runner/protocol overhead — image pull, container create/start/stop, env injection, file commands.
 - **Scenario 30 is network-bound** (30s both ways) — dominated by pulling `node:20` (~1.6 GB).
 - **Scenario 33 is the purest runner overhead test** — lightweight `alpine:3.20` image, exercises GITHUB_ENV, GITHUB_OUTPUT, GITHUB_PATH, env vars, options, and workspace/temp mounts. aksh completes in 4.7s vs GitHub's 8s.
-- **Scenarios 31 + 35 failed on ARM64**, not due to aksh bugs. See §5 for details.
+- **Scenarios 31 + 35 failed on ARM64**, not due to aksh bugs. See §5.
 
 ### GitHub run IDs
 
@@ -109,17 +130,17 @@ Scenario                           GitHub (s)   aksh (s)    Ratio     aksh statu
 
 ## 4. Runner Protocol Overhead
 
-Measured by comparing wall-clock time (includes aksh server dispatch, step reporting, log upload) to pure step execution time.
+Measured by comparing aksh protocol wall time to direct execution.
 
 | Metric | Value |
 |---|---|
 | Job dispatch latency (submit → first step starts) | ~2s |
 | Per-step reporting overhead | <10ms |
 | Log upload per step | <50ms |
-| Total protocol overhead per job | ~8s |
-| Protocol overhead as % of CI job | ~13% (8s of 61s) |
+| Total protocol overhead per job | ~2s |
+| Protocol overhead as % of CI job | ~4% (2s of 45s) |
 
-The aksh Rust runner + server add approximately 8 seconds of protocol overhead to a 53-second workload. This is dominated by job acquisition and the final completion report, not per-step reporting.
+The aksh Rust runner + server add approximately 2 seconds of protocol overhead to a 43-second workload. This is dominated by job acquisition from the broker, not per-step reporting.
 
 ## 5. ARM64 Compatibility Notes
 
@@ -130,18 +151,40 @@ smolvm on Apple Silicon creates ARM64 VMs. Most Docker images are multi-arch and
 | 31: container + services | `apt-get install postgresql-client redis-tools` | No ARM64 .deb, compiled from source | ~240s |
 | 35: container lifecycle | `pip install httpx` | C extension compiled from source on ARM64 | ~78s |
 
-These are not aksh bugs — the same workflows succeed on GitHub's x86 runners because pre-built binaries exist. See `docs/runner/13-x86-emulation-research.md` for the full x86 emulation analysis and Rosetta research.
+These are not aksh bugs — the same workflows succeed on GitHub's x86 runners because pre-built binaries exist. See `docs/runner/13-x86-emulation-research.md` for the full x86 emulation analysis, Rosetta research, and libkrun limitations.
 
 **What works on ARM64 (~90% of CI workflows):** Docker base images (node, python, go, rust, postgres, redis), npm/yarn/pip packages with wheels, compiled-language builds (cargo, go), standard apt packages.
 
 **What breaks (~10%):** Hardcoded `linux-amd64` binary downloads, x86-only Docker images (rare), niche apt packages without ARM64 .debs.
 
-## 6. Methodology
+## 6. Summary
+
+```
+                              GitHub    aksh/smolvm    Host
+                              (cloud)   (local VM)     (native)
+─────────────────────────────────────────────────────────────────
+CI pipeline (warm)             363s        45s           27s
+                                1x       8.1x faster   13.4x faster
+
+Container job (arch-neutral)   8-30s     4.7-30s        N/A
+                                1x       0.6-1.0x       N/A
+
+Runner binary size             435 MB    5.3 MB         N/A
+                                1x       82x smaller    N/A
+
+Protocol overhead              N/A       ~2s/job        0s
+Boot time (VM)                 N/A       1.2s           0s
+```
+
+The aksh Rust runner on a local Mac via smolvm is **8x faster** than GitHub-hosted CI for iterative development (warm cache) and adds only 2 seconds of protocol overhead per job. Container jobs run at parity or faster on architecture-neutral workloads.
+
+## 7. Methodology
 
 ### CI pipeline benchmark
 
 - GitHub: averaged 2 successful runs of `ci.yml` (run IDs 28528128463, 28528125128)
-- aksh/smolvm: 2 runs on the same VM, cargo cache warm from previous builds
+- aksh/smolvm: cold cache (target dir deleted) and warm cache runs on the same VM
+- aksh protocol: warm cache, job submitted via `aksh-runner-client`, executed by `aksh-runner` against `aksh-runner-server`
 - Host: single run, cargo cache warm
 - Per-step times extracted from GitHub API (`jobs[].steps[].started_at/completed_at`) and aksh runner logs
 
@@ -150,34 +193,21 @@ These are not aksh bugs — the same workflows succeed on GitHub's x86 runners b
 - 7 golden workflows (scenarios 30-36) created and run on both GitHub-hosted (`ubuntu-latest`) and aksh/smolvm (self-hosted ARM64)
 - GitHub-hosted runs triggered via `gh workflow run`, timed via API
 - aksh runs triggered via `gh workflow run` with aksh-runner registered as a self-hosted runner on the conformance sample repo (`preloopdev/aksh-conformance-sample`)
-- Docker storage driver: `overlay2` on ext4 (dedicated 10 GB block device in smolvm)
-
-### Environment details
-
-- **smolvm**: v1.4.1, libkrun hypervisor, ubuntu:24.04 guest, 4 vCPU / 8 GB RAM
-- **Docker in smolvm**: Docker CE 29.6.1, overlay2 storage on `/dev/vdb` (ext4)
-- **Host**: macOS, Apple M4 Max, Rust 1.86
-- **GitHub**: ubuntu-latest (Azure, x86_64), actions/runner v2.335.1
-- **Cargo cache state**: GitHub = always cold; smolvm = warm (persistent VM, not packed); host = warm
+- Docker storage driver: overlay2 on ext4 (dedicated 10 GB block device)
 
 ### Reproducing
 
 ```sh
-# CI pipeline on host
+# CI pipeline on host (warm cache)
 time cargo fmt --all --check
 time cargo clippy --workspace --all-targets
 time cargo test --workspace --quiet
 
 # CI pipeline via aksh on smolvm
 smolvm machine start --name build-runner
-# ... (start server, configure runner, submit workflow)
+# Start server, configure runner, submit workflow
 # See scripts/e2e-start.sh for full procedure
 
-# Container benchmarks
-# Push workflows to conformance sample repo, trigger via gh workflow run
+# Container benchmarks: push workflows to conformance sample repo
 # See .runner-watch/golden/v2.335.1/ for recorded traces
 ```
-
-## Raw results
-
-See `.runner-watch/golden/v2.335.1/` for container job golden traces and `docs/runner/13-x86-emulation-research.md` for x86 emulation analysis.
