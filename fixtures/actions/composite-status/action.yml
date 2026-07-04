@@ -1,0 +1,21 @@
+name: composite-status
+description: Validate github.action_status inside composite actions.
+outputs:
+  status-before:
+    description: github.action_status before nested steps run
+    value: ${{ steps.before.outputs.status }}
+  status-after:
+    description: github.action_status after a successful nested step
+    value: ${{ steps.after.outputs.status }}
+runs:
+  using: composite
+  steps:
+    - id: before
+      shell: bash
+      run: echo "status=${{ github.action_status }}" >> "$GITHUB_OUTPUT"
+    - id: ok
+      shell: bash
+      run: echo "nested step ok"
+    - id: after
+      shell: bash
+      run: echo "status=${{ github.action_status }}" >> "$GITHUB_OUTPUT"

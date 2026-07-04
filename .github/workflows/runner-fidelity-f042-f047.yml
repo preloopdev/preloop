@@ -1,0 +1,40 @@
+name: runner-fidelity-f042-f047
+
+on:
+  workflow_dispatch:
+
+jobs:
+  docker-and-composite-fidelity:
+    name: Docker lifecycle and composite status
+    runs-on: self-hosted
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reset fidelity markers
+        shell: bash
+        run: rm -rf .aksh-fidelity && mkdir -p .aksh-fidelity
+
+      - id: composite-status
+        name: Validate composite action_status context
+        uses: ./fixtures/actions/composite-status
+
+      - name: Assert composite action_status
+        shell: bash
+        run: |
+          test "${{ steps.composite-status.outputs.status-before }}" = "success"
+          test -n "${{ steps.composite-status.outputs.status-after }}"
+
+      - name: Validate Docker manifest lifecycle and fields
+        uses: ./fixtures/actions/docker-manifest-lifecycle
+        with:
+          arg-one: alpha
+          env-value: beta
+
+      - name: Assert Docker lifecycle and manifest fields
+        shell: bash
+        run: |
+          cat .aksh-fidelity/docker-lifecycle.log
+          grep -Fx 'pre|env=beta|arg=alpha' .aksh-fidelity/docker-lifecycle.log
+          grep -Fx 'main|env=beta|arg=alpha' .aksh-fidelity/docker-lifecycle.log
+          grep -Fx 'post|env=beta|arg=alpha' .aksh-fidelity/docker-lifecycle.log
