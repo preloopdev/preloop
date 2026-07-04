@@ -76,7 +76,8 @@ impl<'a> StepContext<'a> {
             }
             // All commands suspended — just log the line
             let masked = self.job.mask_secrets(line);
-            self.log_lines.push(masked);
+            let ts = crate::worker::job_runner::iso_now();
+            self.log_lines.push(format!("{ts} {masked}"));
             return;
         }
 
@@ -118,7 +119,8 @@ impl<'a> StepContext<'a> {
         for ann in matched_annotations {
             self.annotations.push(ann);
         }
-        self.log_lines.push(masked);
+        let ts = crate::worker::job_runner::iso_now();
+        self.log_lines.push(format!("{ts} {masked}"));
     }
 
     /// Add an annotation.
@@ -205,7 +207,7 @@ mod tests {
         let mut job = make_job();
         let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
         ctx.log("token is secret-value here");
-        assert_eq!(ctx.log_lines[0], "token is *** here");
+        assert!(ctx.log_lines[0].ends_with("token is *** here"));
     }
 
     #[test]
@@ -214,7 +216,8 @@ mod tests {
         let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
         ctx.log("line1");
         ctx.log("line2");
-        assert_eq!(ctx.log_content(), "line1\nline2");
+        let lines: Vec<&str> = ctx.log_lines.iter().map(|l| l.splitn(2, ' ').nth(1).unwrap_or("")).collect();
+        assert_eq!(lines, vec!["line1", "line2"]);
     }
 
     #[test]
