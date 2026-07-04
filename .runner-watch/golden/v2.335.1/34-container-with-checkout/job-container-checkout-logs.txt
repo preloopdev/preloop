@@ -1,0 +1,410 @@
+﻿2026-07-04T03:43:05.2162767Z Current runner version: '2.335.1'
+2026-07-04T03:43:05.2240291Z ##[group]Runner Image Provisioner
+2026-07-04T03:43:05.2241493Z Hosted Compute Agent
+2026-07-04T03:43:05.2242362Z Version: 20260624.560
+2026-07-04T03:43:05.2243467Z Commit: 925d229a51159bc391ae97e54a2dd1fe20af789d
+2026-07-04T03:43:05.2244615Z Build Date: 2026-06-24T18:26:47Z
+2026-07-04T03:43:05.2245782Z Worker ID: {69bcb5b0-1e48-49b5-96fd-d69e0601c4d6}
+2026-07-04T03:43:05.2246929Z Azure Region: eastus2
+2026-07-04T03:43:05.2247801Z ##[endgroup]
+2026-07-04T03:43:05.2290397Z ##[group]Operating System
+2026-07-04T03:43:05.2291376Z Ubuntu
+2026-07-04T03:43:05.2292325Z 24.04.4
+2026-07-04T03:43:05.2293117Z LTS
+2026-07-04T03:43:05.2293971Z ##[endgroup]
+2026-07-04T03:43:05.2294901Z ##[group]Runner Image
+2026-07-04T03:43:05.2295848Z Image: ubuntu-24.04
+2026-07-04T03:43:05.2296837Z Version: 20260628.225.1
+2026-07-04T03:43:05.2299157Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260628.225/images/ubuntu/Ubuntu2404-Readme.md
+2026-07-04T03:43:05.2301835Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260628.225
+2026-07-04T03:43:05.2303379Z ##[endgroup]
+2026-07-04T03:43:05.2305296Z ##[group]GITHUB_TOKEN Permissions
+2026-07-04T03:43:05.2329462Z Contents: read
+2026-07-04T03:43:05.2330567Z Metadata: read
+2026-07-04T03:43:05.2331454Z Packages: read
+2026-07-04T03:43:05.2332430Z ##[endgroup]
+2026-07-04T03:43:05.2335518Z Secret source: Actions
+2026-07-04T03:43:05.2336743Z Prepare workflow directory
+2026-07-04T03:43:05.3494882Z Prepare all required actions
+2026-07-04T03:43:05.3593856Z Getting action download info
+2026-07-04T03:43:05.5927319Z Download action repository 'actions/checkout@v4' (SHA:34e114876b0b11c390a56381ad16ebd13914f8d5)
+2026-07-04T03:43:05.7786576Z Complete job name: container-checkout
+2026-07-04T03:43:05.8375449Z ##[group]Checking docker version
+2026-07-04T03:43:05.8388962Z ##[command]/usr/bin/docker version --format '{{.Server.APIVersion}}'
+2026-07-04T03:43:05.9135770Z '1.48'
+2026-07-04T03:43:05.9143684Z Docker daemon API version: '1.48'
+2026-07-04T03:43:05.9144460Z ##[command]/usr/bin/docker version --format '{{.Client.APIVersion}}'
+2026-07-04T03:43:05.9338767Z '1.48'
+2026-07-04T03:43:05.9343224Z Docker client API version: '1.48'
+2026-07-04T03:43:05.9349438Z ##[endgroup]
+2026-07-04T03:43:05.9352329Z ##[group]Clean up resources from previous jobs
+2026-07-04T03:43:05.9357627Z ##[command]/usr/bin/docker ps --all --quiet --no-trunc --filter "label=60bdd1"
+2026-07-04T03:43:05.9512553Z ##[command]/usr/bin/docker network prune --force --filter "label=60bdd1"
+2026-07-04T03:43:05.9653906Z ##[endgroup]
+2026-07-04T03:43:05.9654440Z ##[group]Create local container network
+2026-07-04T03:43:05.9665591Z ##[command]/usr/bin/docker network create --label 60bdd1 github_network_fb7bbb15cf7e4a069d548896bb553138
+2026-07-04T03:43:06.0343105Z 62da1c35e9405b030fb88bc9457c31969301e1dd51ca9c8d243e601b72e20e98
+2026-07-04T03:43:06.0354254Z ##[endgroup]
+2026-07-04T03:43:06.0378346Z ##[group]Starting job container
+2026-07-04T03:43:06.0400652Z ##[command]/usr/bin/docker pull ubuntu:24.04
+2026-07-04T03:43:06.3476613Z 24.04: Pulling from library/ubuntu
+2026-07-04T03:43:06.4413931Z ca2678b20700: Pulling fs layer
+2026-07-04T03:43:06.6731384Z ca2678b20700: Verifying Checksum
+2026-07-04T03:43:06.6732146Z ca2678b20700: Download complete
+2026-07-04T03:43:08.0225646Z ca2678b20700: Pull complete
+2026-07-04T03:43:08.0274951Z Digest: sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90
+2026-07-04T03:43:08.0285596Z Status: Downloaded newer image for ubuntu:24.04
+2026-07-04T03:43:08.0299740Z docker.io/library/ubuntu:24.04
+2026-07-04T03:43:08.0402426Z ##[command]/usr/bin/docker create --name 1732a07e5406450d9f0824002538fbfe_ubuntu2404_75aaee --label 60bdd1 --workdir /__w/aksh-conformance-sample/aksh-conformance-sample --network github_network_fb7bbb15cf7e4a069d548896bb553138  -e "HOME=/github/home" -e GITHUB_ACTIONS=true -e CI=true -v "/var/run/docker.sock":"/var/run/docker.sock" -v "/home/runner/work":"/__w" -v "/home/runner/actions-runner/cached/2.335.1/externals":"/__e":ro -v "/home/runner/work/_temp":"/__w/_temp" -v "/home/runner/work/_actions":"/__w/_actions" -v "/opt/hostedtoolcache":"/__t" -v "/home/runner/work/_temp/_github_home":"/github/home" -v "/home/runner/work/_temp/_github_workflow":"/github/workflow" --entrypoint "tail" ubuntu:24.04 "-f" "/dev/null"
+2026-07-04T03:43:09.7737612Z fe8289f6e8dd4ef99cd93ffa1079aa04eff919d8bf913d6172545f66b3456dd6
+2026-07-04T03:43:09.7765320Z ##[command]/usr/bin/docker start fe8289f6e8dd4ef99cd93ffa1079aa04eff919d8bf913d6172545f66b3456dd6
+2026-07-04T03:43:10.0010800Z fe8289f6e8dd4ef99cd93ffa1079aa04eff919d8bf913d6172545f66b3456dd6
+2026-07-04T03:43:10.0046913Z ##[command]/usr/bin/docker ps --all --filter id=fe8289f6e8dd4ef99cd93ffa1079aa04eff919d8bf913d6172545f66b3456dd6 --filter status=running --no-trunc --format "{{.ID}} {{.Status}}"
+2026-07-04T03:43:10.0199192Z fe8289f6e8dd4ef99cd93ffa1079aa04eff919d8bf913d6172545f66b3456dd6 Up Less than a second
+2026-07-04T03:43:10.0224898Z ##[command]/usr/bin/docker inspect --format "{{range .Config.Env}}{{println .}}{{end}}" fe8289f6e8dd4ef99cd93ffa1079aa04eff919d8bf913d6172545f66b3456dd6
+2026-07-04T03:43:10.0366277Z HOME=/github/home
+2026-07-04T03:43:10.0366623Z GITHUB_ACTIONS=true
+2026-07-04T03:43:10.0366885Z CI=true
+2026-07-04T03:43:10.0367255Z PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+2026-07-04T03:43:10.0388451Z ##[endgroup]
+2026-07-04T03:43:10.0398218Z ##[group]Waiting for all services to be ready
+2026-07-04T03:43:10.0400132Z ##[endgroup]
+2026-07-04T03:43:10.0600395Z ##[group]Run apt-get update -qq
+2026-07-04T03:43:10.0600860Z [36;1mapt-get update -qq[0m
+2026-07-04T03:43:10.0601308Z [36;1mapt-get install -y --no-install-recommends git ca-certificates[0m
+2026-07-04T03:43:10.0605271Z shell: sh -e {0}
+2026-07-04T03:43:10.0605812Z ##[endgroup]
+2026-07-04T03:43:13.2091090Z Reading package lists...
+2026-07-04T03:43:13.4183935Z Building dependency tree...
+2026-07-04T03:43:13.4185824Z Reading state information...
+2026-07-04T03:43:13.6259514Z The following additional packages will be installed:
+2026-07-04T03:43:13.6263651Z   git-man libbrotli1 libcurl3t64-gnutls liberror-perl libexpat1
+2026-07-04T03:43:13.6274793Z   libgdbm-compat4t64 libgdbm6t64 libgssapi-krb5-2 libk5crypto3 libkeyutils1
+2026-07-04T03:43:13.6276004Z   libkrb5-3 libkrb5support0 libldap2 libnghttp2-14 libperl5.38t64 libpsl5t64
+2026-07-04T03:43:13.6279023Z   librtmp1 libsasl2-2 libsasl2-modules-db libssh-4 openssl perl perl-base
+2026-07-04T03:43:13.6280329Z   perl-modules-5.38
+2026-07-04T03:43:13.6281005Z Suggested packages:
+2026-07-04T03:43:13.6281767Z   gettext-base git-daemon-run | git-daemon-sysvinit git-doc git-email git-gui
+2026-07-04T03:43:13.6282769Z   gitk gitweb git-cvs git-mediawiki git-svn gdbm-l10n krb5-doc krb5-user
+2026-07-04T03:43:13.6283802Z   perl-doc libterm-readline-gnu-perl | libterm-readline-perl-perl make
+2026-07-04T03:43:13.6284933Z   libtap-harness-archive-perl
+2026-07-04T03:43:13.6285609Z Recommended packages:
+2026-07-04T03:43:13.6286339Z   patch less ssh-client krb5-locales libldap-common publicsuffix
+2026-07-04T03:43:13.6287123Z   libsasl2-modules netbase
+2026-07-04T03:43:13.6963616Z The following NEW packages will be installed:
+2026-07-04T03:43:13.6964647Z   ca-certificates git git-man libbrotli1 libcurl3t64-gnutls liberror-perl
+2026-07-04T03:43:13.6969600Z   libexpat1 libgdbm-compat4t64 libgdbm6t64 libgssapi-krb5-2 libk5crypto3
+2026-07-04T03:43:13.6970519Z   libkeyutils1 libkrb5-3 libkrb5support0 libldap2 libnghttp2-14 libperl5.38t64
+2026-07-04T03:43:13.6982435Z   libpsl5t64 librtmp1 libsasl2-2 libsasl2-modules-db libssh-4 openssl perl
+2026-07-04T03:43:13.6983468Z   perl-modules-5.38
+2026-07-04T03:43:13.6994888Z The following packages will be upgraded:
+2026-07-04T03:43:13.6996516Z   perl-base
+2026-07-04T03:43:13.7402941Z 1 upgraded, 25 newly installed, 0 to remove and 5 not upgraded.
+2026-07-04T03:43:13.7403668Z Need to get 18.1 MB of archives.
+2026-07-04T03:43:13.7404260Z After this operation, 83.1 MB of additional disk space will be used.
+2026-07-04T03:43:13.7406820Z Get:1 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 perl-base amd64 5.38.2-3.2ubuntu0.3 [1827 kB]
+2026-07-04T03:43:13.7980504Z Get:2 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 perl-modules-5.38 all 5.38.2-3.2ubuntu0.3 [3110 kB]
+2026-07-04T03:43:13.8249657Z Get:3 http://archive.ubuntu.com/ubuntu noble/main amd64 libgdbm6t64 amd64 1.23-5.1build1 [34.4 kB]
+2026-07-04T03:43:13.8354602Z Get:4 http://archive.ubuntu.com/ubuntu noble/main amd64 libgdbm-compat4t64 amd64 1.23-5.1build1 [6710 B]
+2026-07-04T03:43:13.8502243Z Get:5 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libperl5.38t64 amd64 5.38.2-3.2ubuntu0.3 [4876 kB]
+2026-07-04T03:43:13.8921860Z Get:6 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 perl amd64 5.38.2-3.2ubuntu0.3 [231 kB]
+2026-07-04T03:43:13.9042001Z Get:7 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 openssl amd64 3.0.13-0ubuntu3.11 [1003 kB]
+2026-07-04T03:43:13.9192141Z Get:8 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 ca-certificates all 20260601~24.04.1 [139 kB]
+2026-07-04T03:43:13.9319604Z Get:9 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libexpat1 amd64 2.6.1-2ubuntu0.4 [88.2 kB]
+2026-07-04T03:43:13.9406051Z Get:10 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libkrb5support0 amd64 1.20.1-6ubuntu2.6 [34.4 kB]
+2026-07-04T03:43:13.9494961Z Get:11 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libk5crypto3 amd64 1.20.1-6ubuntu2.6 [82.0 kB]
+2026-07-04T03:43:13.9572093Z Get:12 http://archive.ubuntu.com/ubuntu noble/main amd64 libkeyutils1 amd64 1.6.3-3build1 [9490 B]
+2026-07-04T03:43:13.9664142Z Get:13 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libkrb5-3 amd64 1.20.1-6ubuntu2.6 [348 kB]
+2026-07-04T03:43:13.9774117Z Get:14 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libgssapi-krb5-2 amd64 1.20.1-6ubuntu2.6 [143 kB]
+2026-07-04T03:43:13.9882617Z Get:15 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libnghttp2-14 amd64 1.59.0-1ubuntu0.4 [74.6 kB]
+2026-07-04T03:43:13.9989244Z Get:16 http://archive.ubuntu.com/ubuntu noble/main amd64 libpsl5t64 amd64 0.21.2-1.1build1 [57.1 kB]
+2026-07-04T03:43:14.0088809Z Get:17 http://archive.ubuntu.com/ubuntu noble/main amd64 libbrotli1 amd64 1.1.0-2build2 [331 kB]
+2026-07-04T03:43:14.0228401Z Get:18 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libsasl2-modules-db amd64 2.1.28+dfsg1-5ubuntu3.1 [20.4 kB]
+2026-07-04T03:43:14.0319653Z Get:19 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libsasl2-2 amd64 2.1.28+dfsg1-5ubuntu3.1 [53.2 kB]
+2026-07-04T03:43:14.0421982Z Get:20 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libldap2 amd64 2.6.10+dfsg-0ubuntu0.24.04.1 [198 kB]
+2026-07-04T03:43:14.0526027Z Get:21 http://archive.ubuntu.com/ubuntu noble/main amd64 librtmp1 amd64 2.4+20151223.gitfa8646d.1-2build7 [56.3 kB]
+2026-07-04T03:43:14.0595369Z Get:22 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libssh-4 amd64 0.10.6-2ubuntu0.4 [190 kB]
+2026-07-04T03:43:14.0676697Z Get:23 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libcurl3t64-gnutls amd64 8.5.0-2ubuntu10.10 [335 kB]
+2026-07-04T03:43:14.0769689Z Get:24 http://archive.ubuntu.com/ubuntu noble/main amd64 liberror-perl all 0.17029-2 [25.6 kB]
+2026-07-04T03:43:14.0868475Z Get:25 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 git-man all 1:2.43.0-1ubuntu7.3 [1100 kB]
+2026-07-04T03:43:14.0992820Z Get:26 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 git amd64 1:2.43.0-1ubuntu7.3 [3680 kB]
+2026-07-04T03:43:14.2419301Z debconf: delaying package configuration, since apt-utils is not installed
+2026-07-04T03:43:14.2708158Z Fetched 18.1 MB in 0s (43.3 MB/s)
+2026-07-04T03:43:14.2859928Z (Reading database ... 
+2026-07-04T03:43:14.2871357Z (Reading database ... 5%
+2026-07-04T03:43:14.2872605Z (Reading database ... 10%
+2026-07-04T03:43:14.2873520Z (Reading database ... 15%
+2026-07-04T03:43:14.2874361Z (Reading database ... 20%
+2026-07-04T03:43:14.2875164Z (Reading database ... 25%
+2026-07-04T03:43:14.2876839Z (Reading database ... 30%
+2026-07-04T03:43:14.2890586Z (Reading database ... 35%
+2026-07-04T03:43:14.2909477Z (Reading database ... 40%
+2026-07-04T03:43:14.2929885Z (Reading database ... 45%
+2026-07-04T03:43:14.2938624Z (Reading database ... 50%
+2026-07-04T03:43:14.2949278Z (Reading database ... 55%
+2026-07-04T03:43:14.2972923Z (Reading database ... 60%
+2026-07-04T03:43:14.2988686Z (Reading database ... 65%
+2026-07-04T03:43:14.2994209Z (Reading database ... 70%
+2026-07-04T03:43:14.2994953Z (Reading database ... 75%
+2026-07-04T03:43:14.2995522Z (Reading database ... 80%
+2026-07-04T03:43:14.2996051Z (Reading database ... 85%
+2026-07-04T03:43:14.2996597Z (Reading database ... 90%
+2026-07-04T03:43:14.2997124Z (Reading database ... 95%
+2026-07-04T03:43:14.2997650Z (Reading database ... 100%
+2026-07-04T03:43:14.2998578Z (Reading database ... 4381 files and directories currently installed.)
+2026-07-04T03:43:14.2999505Z Preparing to unpack .../perl-base_5.38.2-3.2ubuntu0.3_amd64.deb ...
+2026-07-04T03:43:14.3065620Z Unpacking perl-base (5.38.2-3.2ubuntu0.3) over (5.38.2-3.2ubuntu0.2) ...
+2026-07-04T03:43:14.9095670Z Setting up perl-base (5.38.2-3.2ubuntu0.3) ...
+2026-07-04T03:43:14.9287556Z Selecting previously unselected package perl-modules-5.38.
+2026-07-04T03:43:14.9319511Z (Reading database ... 
+2026-07-04T03:43:14.9321067Z (Reading database ... 5%
+2026-07-04T03:43:14.9340061Z (Reading database ... 10%
+2026-07-04T03:43:14.9340725Z (Reading database ... 15%
+2026-07-04T03:43:14.9341063Z (Reading database ... 20%
+2026-07-04T03:43:14.9341771Z (Reading database ... 25%
+2026-07-04T03:43:14.9342135Z (Reading database ... 30%
+2026-07-04T03:43:14.9342476Z (Reading database ... 35%
+2026-07-04T03:43:14.9342782Z (Reading database ... 40%
+2026-07-04T03:43:14.9343109Z (Reading database ... 45%
+2026-07-04T03:43:14.9343438Z (Reading database ... 50%
+2026-07-04T03:43:14.9343776Z (Reading database ... 55%
+2026-07-04T03:43:14.9344104Z (Reading database ... 60%
+2026-07-04T03:43:14.9344433Z (Reading database ... 65%
+2026-07-04T03:43:14.9358185Z (Reading database ... 70%
+2026-07-04T03:43:14.9366388Z (Reading database ... 75%
+2026-07-04T03:43:14.9371421Z (Reading database ... 80%
+2026-07-04T03:43:14.9376808Z (Reading database ... 85%
+2026-07-04T03:43:14.9382728Z (Reading database ... 90%
+2026-07-04T03:43:14.9393341Z (Reading database ... 95%
+2026-07-04T03:43:14.9394010Z (Reading database ... 100%
+2026-07-04T03:43:14.9399921Z (Reading database ... 4381 files and directories currently installed.)
+2026-07-04T03:43:14.9406575Z Preparing to unpack .../00-perl-modules-5.38_5.38.2-3.2ubuntu0.3_all.deb ...
+2026-07-04T03:43:14.9415072Z Unpacking perl-modules-5.38 (5.38.2-3.2ubuntu0.3) ...
+2026-07-04T03:43:15.2246111Z Selecting previously unselected package libgdbm6t64:amd64.
+2026-07-04T03:43:15.2260704Z Preparing to unpack .../01-libgdbm6t64_1.23-5.1build1_amd64.deb ...
+2026-07-04T03:43:15.2276237Z Unpacking libgdbm6t64:amd64 (1.23-5.1build1) ...
+2026-07-04T03:43:15.2411252Z Selecting previously unselected package libgdbm-compat4t64:amd64.
+2026-07-04T03:43:15.2423277Z Preparing to unpack .../02-libgdbm-compat4t64_1.23-5.1build1_amd64.deb ...
+2026-07-04T03:43:15.2432454Z Unpacking libgdbm-compat4t64:amd64 (1.23-5.1build1) ...
+2026-07-04T03:43:15.2570696Z Selecting previously unselected package libperl5.38t64:amd64.
+2026-07-04T03:43:15.2583975Z Preparing to unpack .../03-libperl5.38t64_5.38.2-3.2ubuntu0.3_amd64.deb ...
+2026-07-04T03:43:15.2591658Z Unpacking libperl5.38t64:amd64 (5.38.2-3.2ubuntu0.3) ...
+2026-07-04T03:43:15.4490191Z Selecting previously unselected package perl.
+2026-07-04T03:43:15.4504880Z Preparing to unpack .../04-perl_5.38.2-3.2ubuntu0.3_amd64.deb ...
+2026-07-04T03:43:15.4553906Z Unpacking perl (5.38.2-3.2ubuntu0.3) ...
+2026-07-04T03:43:15.4780441Z Selecting previously unselected package openssl.
+2026-07-04T03:43:15.4793383Z Preparing to unpack .../05-openssl_3.0.13-0ubuntu3.11_amd64.deb ...
+2026-07-04T03:43:15.4800774Z Unpacking openssl (3.0.13-0ubuntu3.11) ...
+2026-07-04T03:43:15.5180720Z Selecting previously unselected package ca-certificates.
+2026-07-04T03:43:15.5181740Z Preparing to unpack .../06-ca-certificates_20260601~24.04.1_all.deb ...
+2026-07-04T03:43:15.5190230Z Unpacking ca-certificates (20260601~24.04.1) ...
+2026-07-04T03:43:15.5550228Z Selecting previously unselected package libexpat1:amd64.
+2026-07-04T03:43:15.5563152Z Preparing to unpack .../07-libexpat1_2.6.1-2ubuntu0.4_amd64.deb ...
+2026-07-04T03:43:15.5570911Z Unpacking libexpat1:amd64 (2.6.1-2ubuntu0.4) ...
+2026-07-04T03:43:15.5719761Z Selecting previously unselected package libkrb5support0:amd64.
+2026-07-04T03:43:15.5734402Z Preparing to unpack .../08-libkrb5support0_1.20.1-6ubuntu2.6_amd64.deb ...
+2026-07-04T03:43:15.5746147Z Unpacking libkrb5support0:amd64 (1.20.1-6ubuntu2.6) ...
+2026-07-04T03:43:15.5886415Z Selecting previously unselected package libk5crypto3:amd64.
+2026-07-04T03:43:15.5901223Z Preparing to unpack .../09-libk5crypto3_1.20.1-6ubuntu2.6_amd64.deb ...
+2026-07-04T03:43:15.5910749Z Unpacking libk5crypto3:amd64 (1.20.1-6ubuntu2.6) ...
+2026-07-04T03:43:15.6049808Z Selecting previously unselected package libkeyutils1:amd64.
+2026-07-04T03:43:15.6064359Z Preparing to unpack .../10-libkeyutils1_1.6.3-3build1_amd64.deb ...
+2026-07-04T03:43:15.6073346Z Unpacking libkeyutils1:amd64 (1.6.3-3build1) ...
+2026-07-04T03:43:15.6204321Z Selecting previously unselected package libkrb5-3:amd64.
+2026-07-04T03:43:15.6219968Z Preparing to unpack .../11-libkrb5-3_1.20.1-6ubuntu2.6_amd64.deb ...
+2026-07-04T03:43:15.6228627Z Unpacking libkrb5-3:amd64 (1.20.1-6ubuntu2.6) ...
+2026-07-04T03:43:15.6429963Z Selecting previously unselected package libgssapi-krb5-2:amd64.
+2026-07-04T03:43:15.6440948Z Preparing to unpack .../12-libgssapi-krb5-2_1.20.1-6ubuntu2.6_amd64.deb ...
+2026-07-04T03:43:15.6454963Z Unpacking libgssapi-krb5-2:amd64 (1.20.1-6ubuntu2.6) ...
+2026-07-04T03:43:15.6629801Z Selecting previously unselected package libnghttp2-14:amd64.
+2026-07-04T03:43:15.6641868Z Preparing to unpack .../13-libnghttp2-14_1.59.0-1ubuntu0.4_amd64.deb ...
+2026-07-04T03:43:15.6648781Z Unpacking libnghttp2-14:amd64 (1.59.0-1ubuntu0.4) ...
+2026-07-04T03:43:15.6797850Z Selecting previously unselected package libpsl5t64:amd64.
+2026-07-04T03:43:15.6799098Z Preparing to unpack .../14-libpsl5t64_0.21.2-1.1build1_amd64.deb ...
+2026-07-04T03:43:15.6810171Z Unpacking libpsl5t64:amd64 (0.21.2-1.1build1) ...
+2026-07-04T03:43:15.6947851Z Selecting previously unselected package libbrotli1:amd64.
+2026-07-04T03:43:15.6961724Z Preparing to unpack .../15-libbrotli1_1.1.0-2build2_amd64.deb ...
+2026-07-04T03:43:15.6966908Z Unpacking libbrotli1:amd64 (1.1.0-2build2) ...
+2026-07-04T03:43:15.7158787Z Selecting previously unselected package libsasl2-modules-db:amd64.
+2026-07-04T03:43:15.7159655Z Preparing to unpack .../16-libsasl2-modules-db_2.1.28+dfsg1-5ubuntu3.1_amd64.deb ...
+2026-07-04T03:43:15.7167147Z Unpacking libsasl2-modules-db:amd64 (2.1.28+dfsg1-5ubuntu3.1) ...
+2026-07-04T03:43:15.7294781Z Selecting previously unselected package libsasl2-2:amd64.
+2026-07-04T03:43:15.7304293Z Preparing to unpack .../17-libsasl2-2_2.1.28+dfsg1-5ubuntu3.1_amd64.deb ...
+2026-07-04T03:43:15.7313861Z Unpacking libsasl2-2:amd64 (2.1.28+dfsg1-5ubuntu3.1) ...
+2026-07-04T03:43:15.7451048Z Selecting previously unselected package libldap2:amd64.
+2026-07-04T03:43:15.7461588Z Preparing to unpack .../18-libldap2_2.6.10+dfsg-0ubuntu0.24.04.1_amd64.deb ...
+2026-07-04T03:43:15.7472440Z Unpacking libldap2:amd64 (2.6.10+dfsg-0ubuntu0.24.04.1) ...
+2026-07-04T03:43:15.7626751Z Selecting previously unselected package librtmp1:amd64.
+2026-07-04T03:43:15.7638708Z Preparing to unpack .../19-librtmp1_2.4+20151223.gitfa8646d.1-2build7_amd64.deb ...
+2026-07-04T03:43:15.7648448Z Unpacking librtmp1:amd64 (2.4+20151223.gitfa8646d.1-2build7) ...
+2026-07-04T03:43:15.7781566Z Selecting previously unselected package libssh-4:amd64.
+2026-07-04T03:43:15.7793861Z Preparing to unpack .../20-libssh-4_0.10.6-2ubuntu0.4_amd64.deb ...
+2026-07-04T03:43:15.7804395Z Unpacking libssh-4:amd64 (0.10.6-2ubuntu0.4) ...
+2026-07-04T03:43:15.7959210Z Selecting previously unselected package libcurl3t64-gnutls:amd64.
+2026-07-04T03:43:15.7972133Z Preparing to unpack .../21-libcurl3t64-gnutls_8.5.0-2ubuntu10.10_amd64.deb ...
+2026-07-04T03:43:15.7993010Z Unpacking libcurl3t64-gnutls:amd64 (8.5.0-2ubuntu10.10) ...
+2026-07-04T03:43:15.8151509Z Selecting previously unselected package liberror-perl.
+2026-07-04T03:43:15.8162670Z Preparing to unpack .../22-liberror-perl_0.17029-2_all.deb ...
+2026-07-04T03:43:15.8169089Z Unpacking liberror-perl (0.17029-2) ...
+2026-07-04T03:43:15.8299970Z Selecting previously unselected package git-man.
+2026-07-04T03:43:15.8313482Z Preparing to unpack .../23-git-man_1%3a2.43.0-1ubuntu7.3_all.deb ...
+2026-07-04T03:43:15.8322756Z Unpacking git-man (1:2.43.0-1ubuntu7.3) ...
+2026-07-04T03:43:15.8579660Z Selecting previously unselected package git.
+2026-07-04T03:43:15.8594011Z Preparing to unpack .../24-git_1%3a2.43.0-1ubuntu7.3_amd64.deb ...
+2026-07-04T03:43:15.8646801Z Unpacking git (1:2.43.0-1ubuntu7.3) ...
+2026-07-04T03:43:16.0152837Z Setting up libexpat1:amd64 (2.6.1-2ubuntu0.4) ...
+2026-07-04T03:43:16.0174741Z Setting up libkeyutils1:amd64 (1.6.3-3build1) ...
+2026-07-04T03:43:16.0196384Z Setting up libgdbm6t64:amd64 (1.23-5.1build1) ...
+2026-07-04T03:43:16.0221445Z Setting up libgdbm-compat4t64:amd64 (1.23-5.1build1) ...
+2026-07-04T03:43:16.0248716Z Setting up libbrotli1:amd64 (1.1.0-2build2) ...
+2026-07-04T03:43:16.0270643Z Setting up libpsl5t64:amd64 (0.21.2-1.1build1) ...
+2026-07-04T03:43:16.0303189Z Setting up libnghttp2-14:amd64 (1.59.0-1ubuntu0.4) ...
+2026-07-04T03:43:16.0332141Z Setting up libkrb5support0:amd64 (1.20.1-6ubuntu2.6) ...
+2026-07-04T03:43:16.0350996Z Setting up libsasl2-modules-db:amd64 (2.1.28+dfsg1-5ubuntu3.1) ...
+2026-07-04T03:43:16.0368149Z Setting up librtmp1:amd64 (2.4+20151223.gitfa8646d.1-2build7) ...
+2026-07-04T03:43:16.0388586Z Setting up perl-modules-5.38 (5.38.2-3.2ubuntu0.3) ...
+2026-07-04T03:43:16.0407638Z Setting up libk5crypto3:amd64 (1.20.1-6ubuntu2.6) ...
+2026-07-04T03:43:16.0428589Z Setting up libsasl2-2:amd64 (2.1.28+dfsg1-5ubuntu3.1) ...
+2026-07-04T03:43:16.0446865Z Setting up git-man (1:2.43.0-1ubuntu7.3) ...
+2026-07-04T03:43:16.0466255Z Setting up libkrb5-3:amd64 (1.20.1-6ubuntu2.6) ...
+2026-07-04T03:43:16.0488575Z Setting up libperl5.38t64:amd64 (5.38.2-3.2ubuntu0.3) ...
+2026-07-04T03:43:16.0507245Z Setting up openssl (3.0.13-0ubuntu3.11) ...
+2026-07-04T03:43:16.0547555Z Setting up libldap2:amd64 (2.6.10+dfsg-0ubuntu0.24.04.1) ...
+2026-07-04T03:43:16.0567073Z Setting up ca-certificates (20260601~24.04.1) ...
+2026-07-04T03:43:16.1210714Z debconf: unable to initialize frontend: Dialog
+2026-07-04T03:43:16.1211714Z debconf: (TERM is not set, so the dialog frontend is not usable.)
+2026-07-04T03:43:16.1212551Z debconf: falling back to frontend: Readline
+2026-07-04T03:43:16.1270349Z debconf: unable to initialize frontend: Readline
+2026-07-04T03:43:16.1270931Z debconf: (This frontend requires a controlling tty.)
+2026-07-04T03:43:16.1271459Z debconf: falling back to frontend: Teletype
+2026-07-04T03:43:16.4922167Z Updating certificates in /etc/ssl/certs...
+2026-07-04T03:43:16.9876103Z 121 added, 0 removed; done.
+2026-07-04T03:43:17.0001956Z Setting up perl (5.38.2-3.2ubuntu0.3) ...
+2026-07-04T03:43:17.0084832Z Setting up libgssapi-krb5-2:amd64 (1.20.1-6ubuntu2.6) ...
+2026-07-04T03:43:17.0116012Z Setting up libssh-4:amd64 (0.10.6-2ubuntu0.4) ...
+2026-07-04T03:43:17.0136855Z Setting up libcurl3t64-gnutls:amd64 (8.5.0-2ubuntu10.10) ...
+2026-07-04T03:43:17.0159836Z Setting up liberror-perl (0.17029-2) ...
+2026-07-04T03:43:17.0180562Z Setting up git (1:2.43.0-1ubuntu7.3) ...
+2026-07-04T03:43:17.0250811Z Processing triggers for libc-bin (2.39-0ubuntu8.7) ...
+2026-07-04T03:43:17.0357675Z Processing triggers for ca-certificates (20260601~24.04.1) ...
+2026-07-04T03:43:17.0398909Z Updating certificates in /etc/ssl/certs...
+2026-07-04T03:43:17.4304165Z 0 added, 0 removed; done.
+2026-07-04T03:43:17.4311465Z Running hooks in /etc/ca-certificates/update.d...
+2026-07-04T03:43:17.4319660Z done.
+2026-07-04T03:43:17.4801374Z Node 20 is being deprecated. This workflow is running with Node 24 by default. If you need to temporarily use Node 20, you can set the ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true environment variable. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+2026-07-04T03:43:17.4808591Z ##[group]Run actions/checkout@v4
+2026-07-04T03:43:17.4808868Z with:
+2026-07-04T03:43:17.4809123Z   repository: preloopdev/aksh-conformance-sample
+2026-07-04T03:43:17.4811490Z   token: ***
+2026-07-04T03:43:17.4811703Z   ssh-strict: true
+2026-07-04T03:43:17.4811915Z   ssh-user: git
+2026-07-04T03:43:17.4812129Z   persist-credentials: true
+2026-07-04T03:43:17.4812361Z   clean: true
+2026-07-04T03:43:17.4812569Z   sparse-checkout-cone-mode: true
+2026-07-04T03:43:17.4812820Z   fetch-depth: 1
+2026-07-04T03:43:17.4813014Z   fetch-tags: false
+2026-07-04T03:43:17.4813219Z   show-progress: true
+2026-07-04T03:43:17.4813420Z   lfs: false
+2026-07-04T03:43:17.4813644Z   submodules: false
+2026-07-04T03:43:17.4813857Z   set-safe-directory: true
+2026-07-04T03:43:17.4814087Z ##[endgroup]
+2026-07-04T03:43:17.4859528Z ##[command]/usr/bin/docker exec  fe8289f6e8dd4ef99cd93ffa1079aa04eff919d8bf913d6172545f66b3456dd6 sh -c "cat /etc/*release | grep ^ID"
+2026-07-04T03:43:17.7426679Z Syncing repository: preloopdev/aksh-conformance-sample
+2026-07-04T03:43:17.7429751Z ##[group]Getting Git version info
+2026-07-04T03:43:17.7430414Z Working directory is '/__w/aksh-conformance-sample/aksh-conformance-sample'
+2026-07-04T03:43:17.7444737Z [command]/usr/bin/git version
+2026-07-04T03:43:17.7447443Z git version 2.43.0
+2026-07-04T03:43:17.7468627Z ##[endgroup]
+2026-07-04T03:43:17.7473805Z Temporarily overriding HOME='/__w/_temp/8796e34a-dd9c-4dbd-9afa-d0b4e7fab496' before making global git config changes
+2026-07-04T03:43:17.7475100Z Adding repository directory to the temporary git global config as a safe directory
+2026-07-04T03:43:17.7476357Z [command]/usr/bin/git config --global --add safe.directory /__w/aksh-conformance-sample/aksh-conformance-sample
+2026-07-04T03:43:17.7483021Z Deleting the contents of '/__w/aksh-conformance-sample/aksh-conformance-sample'
+2026-07-04T03:43:17.7484250Z ##[group]Initializing the repository
+2026-07-04T03:43:17.7487107Z [command]/usr/bin/git init /__w/aksh-conformance-sample/aksh-conformance-sample
+2026-07-04T03:43:17.7548033Z hint: Using 'master' as the name for the initial branch. This default branch name
+2026-07-04T03:43:17.7568761Z hint: is subject to change. To configure the initial branch name to use in all
+2026-07-04T03:43:17.7574446Z hint: of your new repositories, which will suppress this warning, call:
+2026-07-04T03:43:17.7575139Z hint: 
+2026-07-04T03:43:17.7575674Z hint: 	git config --global init.defaultBranch <name>
+2026-07-04T03:43:17.7576274Z hint: 
+2026-07-04T03:43:17.7576854Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+2026-07-04T03:43:17.7577821Z hint: 'development'. The just-created branch can be renamed via this command:
+2026-07-04T03:43:17.7598626Z hint: 
+2026-07-04T03:43:17.7615966Z hint: 	git branch -m <name>
+2026-07-04T03:43:17.7638805Z Initialized empty Git repository in /__w/aksh-conformance-sample/aksh-conformance-sample/.git/
+2026-07-04T03:43:17.7659293Z [command]/usr/bin/git remote add origin https://github.com/preloopdev/aksh-conformance-sample
+2026-07-04T03:43:17.7661141Z ##[endgroup]
+2026-07-04T03:43:17.7661841Z ##[group]Disabling automatic garbage collection
+2026-07-04T03:43:17.7662475Z [command]/usr/bin/git config --local gc.auto 0
+2026-07-04T03:43:17.7679476Z ##[endgroup]
+2026-07-04T03:43:17.7683261Z ##[group]Setting up auth
+2026-07-04T03:43:17.7694675Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-07-04T03:43:17.7747084Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-07-04T03:43:17.8061726Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-07-04T03:43:17.8112042Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-07-04T03:43:17.8471758Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-07-04T03:43:17.8522745Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-07-04T03:43:17.8849363Z [command]/usr/bin/git config --local http.https://github.com/.extraheader AUTHORIZATION: basic ***
+2026-07-04T03:43:17.8900658Z ##[endgroup]
+2026-07-04T03:43:17.8901269Z ##[group]Fetching the repository
+2026-07-04T03:43:17.8902517Z [command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +cd9a6f4adb9bddf629d573171780ac8c02900cff:refs/remotes/origin/main
+2026-07-04T03:43:18.1056872Z From https://github.com/preloopdev/aksh-conformance-sample
+2026-07-04T03:43:18.1058823Z  * [new ref]         cd9a6f4adb9bddf629d573171780ac8c02900cff -> origin/main
+2026-07-04T03:43:18.1111758Z ##[endgroup]
+2026-07-04T03:43:18.1119489Z ##[group]Determining the checkout info
+2026-07-04T03:43:18.1130495Z ##[endgroup]
+2026-07-04T03:43:18.1146078Z [command]/usr/bin/git sparse-checkout disable
+2026-07-04T03:43:18.1234142Z [command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+2026-07-04T03:43:18.1305521Z ##[group]Checking out the ref
+2026-07-04T03:43:18.1319948Z [command]/usr/bin/git checkout --progress --force -B main refs/remotes/origin/main
+2026-07-04T03:43:18.1437115Z Switched to a new branch 'main'
+2026-07-04T03:43:18.1447842Z branch 'main' set up to track 'origin/main'.
+2026-07-04T03:43:18.1464007Z ##[endgroup]
+2026-07-04T03:43:18.1518277Z [command]/usr/bin/git log -1 --format=%H
+2026-07-04T03:43:18.1560421Z cd9a6f4adb9bddf629d573171780ac8c02900cff
+2026-07-04T03:43:18.1756033Z ##[group]Run test -f .github/workflows/34-container-with-checkout.yml
+2026-07-04T03:43:18.1756556Z [36;1mtest -f .github/workflows/34-container-with-checkout.yml[0m
+2026-07-04T03:43:18.1756918Z [36;1mecho "Checkout successful"[0m
+2026-07-04T03:43:18.1757168Z [36;1mls -la[0m
+2026-07-04T03:43:18.1757483Z shell: sh -e {0}
+2026-07-04T03:43:18.1757694Z ##[endgroup]
+2026-07-04T03:43:18.2346773Z Checkout successful
+2026-07-04T03:43:18.2361094Z total 28
+2026-07-04T03:43:18.2361554Z drwxr-xr-x 5 1001 1001 4096 Jul  4 03:43 .
+2026-07-04T03:43:18.2362542Z drwxr-xr-x 3 1001 1001 4096 Jul  4 03:43 ..
+2026-07-04T03:43:18.2363656Z drwxr-xr-x 8 root root 4096 Jul  4 03:43 .git
+2026-07-04T03:43:18.2364221Z drwxr-xr-x 4 root root 4096 Jul  4 03:43 .github
+2026-07-04T03:43:18.2364751Z -rw-r--r-- 1 root root  192 Jul  4 03:43 README.md
+2026-07-04T03:43:18.2365320Z -rw-r--r-- 1 root root  125 Jul  4 03:43 package.json
+2026-07-04T03:43:18.2365835Z drwxr-xr-x 2 root root 4096 Jul  4 03:43 src
+2026-07-04T03:43:18.2440349Z ##[group]Run git config --global --add safe.directory "$GITHUB_WORKSPACE"
+2026-07-04T03:43:18.2440897Z [36;1mgit config --global --add safe.directory "$GITHUB_WORKSPACE"[0m
+2026-07-04T03:43:18.2441255Z [36;1mgit log --oneline -3[0m
+2026-07-04T03:43:18.2441609Z shell: sh -e {0}
+2026-07-04T03:43:18.2441825Z ##[endgroup]
+2026-07-04T03:43:18.3078739Z cd9a6f4 Add container/service golden recording workflows (30-36)
+2026-07-04T03:43:18.3233860Z Node 20 is being deprecated. This workflow is running with Node 24 by default. If you need to temporarily use Node 20, you can set the ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true environment variable. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+2026-07-04T03:43:18.3235275Z Post job cleanup.
+2026-07-04T03:43:18.3242424Z ##[command]/usr/bin/docker exec  fe8289f6e8dd4ef99cd93ffa1079aa04eff919d8bf913d6172545f66b3456dd6 sh -c "cat /etc/*release | grep ^ID"
+2026-07-04T03:43:18.5355070Z [command]/usr/bin/git version
+2026-07-04T03:43:18.5442269Z git version 2.43.0
+2026-07-04T03:43:18.5509501Z Copying '/github/home/.gitconfig' to '/__w/_temp/ac3e2528-2cfd-4344-8462-5ae2b201af37/.gitconfig'
+2026-07-04T03:43:18.5523298Z Temporarily overriding HOME='/__w/_temp/ac3e2528-2cfd-4344-8462-5ae2b201af37' before making global git config changes
+2026-07-04T03:43:18.5532898Z Adding repository directory to the temporary git global config as a safe directory
+2026-07-04T03:43:18.5542315Z [command]/usr/bin/git config --global --add safe.directory /__w/aksh-conformance-sample/aksh-conformance-sample
+2026-07-04T03:43:18.5639118Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-07-04T03:43:18.5739995Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-07-04T03:43:18.7464518Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-07-04T03:43:18.7626417Z http.https://github.com/.extraheader
+2026-07-04T03:43:18.7632181Z [command]/usr/bin/git config --local --unset-all http.https://github.com/.extraheader
+2026-07-04T03:43:18.7634938Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-07-04T03:43:18.7926596Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-07-04T03:43:18.7996183Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-07-04T03:43:18.8560071Z Stop and remove container: 1732a07e5406450d9f0824002538fbfe_ubuntu2404_75aaee
+2026-07-04T03:43:18.8564625Z ##[command]/usr/bin/docker rm --force fe8289f6e8dd4ef99cd93ffa1079aa04eff919d8bf913d6172545f66b3456dd6
+2026-07-04T03:43:19.4743181Z fe8289f6e8dd4ef99cd93ffa1079aa04eff919d8bf913d6172545f66b3456dd6
+2026-07-04T03:43:19.4777307Z Remove container network: github_network_fb7bbb15cf7e4a069d548896bb553138
+2026-07-04T03:43:19.4781890Z ##[command]/usr/bin/docker network rm github_network_fb7bbb15cf7e4a069d548896bb553138
+2026-07-04T03:43:19.5514801Z github_network_fb7bbb15cf7e4a069d548896bb553138
+2026-07-04T03:43:19.5590618Z Cleaning up orphan processes
+2026-07-04T03:43:19.5942727Z ##[warning]Node.js 20 is deprecated. The following actions target Node.js 20 but are being forced to run on Node.js 24: actions/checkout@v4. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/

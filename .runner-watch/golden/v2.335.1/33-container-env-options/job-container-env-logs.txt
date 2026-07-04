@@ -1,0 +1,157 @@
+﻿2026-07-04T03:43:04.8952502Z Current runner version: '2.335.1'
+2026-07-04T03:43:04.8990801Z ##[group]Runner Image Provisioner
+2026-07-04T03:43:04.8992225Z Hosted Compute Agent
+2026-07-04T03:43:04.8993403Z Version: 20260624.560
+2026-07-04T03:43:04.8994514Z Commit: 925d229a51159bc391ae97e54a2dd1fe20af789d
+2026-07-04T03:43:04.8995916Z Build Date: 2026-06-24T18:26:47Z
+2026-07-04T03:43:04.8997173Z Worker ID: {fc83cd0c-210b-4ce5-95f9-a6c4d3f8f939}
+2026-07-04T03:43:04.8998384Z Azure Region: westus
+2026-07-04T03:43:04.8999908Z ##[endgroup]
+2026-07-04T03:43:04.9002237Z ##[group]Operating System
+2026-07-04T03:43:04.9003309Z Ubuntu
+2026-07-04T03:43:04.9004345Z 24.04.4
+2026-07-04T03:43:04.9005234Z LTS
+2026-07-04T03:43:04.9006179Z ##[endgroup]
+2026-07-04T03:43:04.9007114Z ##[group]Runner Image
+2026-07-04T03:43:04.9008175Z Image: ubuntu-24.04
+2026-07-04T03:43:04.9009635Z Version: 20260628.225.1
+2026-07-04T03:43:04.9011779Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260628.225/images/ubuntu/Ubuntu2404-Readme.md
+2026-07-04T03:43:04.9014761Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260628.225
+2026-07-04T03:43:04.9016646Z ##[endgroup]
+2026-07-04T03:43:04.9019348Z ##[group]GITHUB_TOKEN Permissions
+2026-07-04T03:43:04.9022100Z Contents: read
+2026-07-04T03:43:04.9023234Z Metadata: read
+2026-07-04T03:43:04.9024266Z Packages: read
+2026-07-04T03:43:04.9025290Z ##[endgroup]
+2026-07-04T03:43:04.9029138Z Secret source: Actions
+2026-07-04T03:43:04.9030419Z Prepare workflow directory
+2026-07-04T03:43:04.9874119Z Prepare all required actions
+2026-07-04T03:43:05.2444182Z Complete job name: container-env
+2026-07-04T03:43:05.3270341Z ##[group]Checking docker version
+2026-07-04T03:43:05.3284431Z ##[command]/usr/bin/docker version --format '{{.Server.APIVersion}}'
+2026-07-04T03:43:06.1248360Z '1.48'
+2026-07-04T03:43:06.1295494Z Docker daemon API version: '1.48'
+2026-07-04T03:43:06.1296659Z ##[command]/usr/bin/docker version --format '{{.Client.APIVersion}}'
+2026-07-04T03:43:06.1579300Z '1.48'
+2026-07-04T03:43:06.1612324Z Docker client API version: '1.48'
+2026-07-04T03:43:06.1619680Z ##[endgroup]
+2026-07-04T03:43:06.1623695Z ##[group]Clean up resources from previous jobs
+2026-07-04T03:43:06.1631091Z ##[command]/usr/bin/docker ps --all --quiet --no-trunc --filter "label=f4fd45"
+2026-07-04T03:43:06.1857195Z ##[command]/usr/bin/docker network prune --force --filter "label=f4fd45"
+2026-07-04T03:43:06.2070625Z ##[endgroup]
+2026-07-04T03:43:06.2071422Z ##[group]Create local container network
+2026-07-04T03:43:06.2104578Z ##[command]/usr/bin/docker network create --label f4fd45 github_network_e4c70e55bad749bb83e30ccaed179c14
+2026-07-04T03:43:06.3006532Z 6f560265b74ea38a49dc138406d87379d5aea0e9f671f2deb7224fa60fb977f6
+2026-07-04T03:43:06.3016561Z ##[endgroup]
+2026-07-04T03:43:06.3091704Z ##[group]Starting job container
+2026-07-04T03:43:06.3139959Z ##[command]/usr/bin/docker pull alpine:3.20
+2026-07-04T03:43:07.2532827Z 3.20: Pulling from library/alpine
+2026-07-04T03:43:07.5481445Z 25f1d6b1951a: Pulling fs layer
+2026-07-04T03:43:07.7898881Z 25f1d6b1951a: Download complete
+2026-07-04T03:43:07.9183969Z 25f1d6b1951a: Pull complete
+2026-07-04T03:43:07.9250748Z Digest: sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+2026-07-04T03:43:07.9263777Z Status: Downloaded newer image for alpine:3.20
+2026-07-04T03:43:07.9272805Z docker.io/library/alpine:3.20
+2026-07-04T03:43:07.9356606Z ##[command]/usr/bin/docker create --name b058c901e85b4b1d9fbc4614b5b68a6a_alpine320_25053e --label f4fd45 --workdir /__w/aksh-conformance-sample/aksh-conformance-sample --network github_network_e4c70e55bad749bb83e30ccaed179c14 --cpus 1 -e "CUSTOM_VAR=hello-from-container" -e "NODE_ENV=test" -e "HOME=/github/home" -e GITHUB_ACTIONS=true -e CI=true -v "/var/run/docker.sock":"/var/run/docker.sock" -v "/home/runner/work":"/__w" -v "/home/runner/actions-runner/cached/2.335.1/externals":"/__e":ro -v "/home/runner/work/_temp":"/__w/_temp" -v "/home/runner/work/_actions":"/__w/_actions" -v "/opt/hostedtoolcache":"/__t" -v "/home/runner/work/_temp/_github_home":"/github/home" -v "/home/runner/work/_temp/_github_workflow":"/github/workflow" --entrypoint "tail" alpine:3.20 "-f" "/dev/null"
+2026-07-04T03:43:09.2908188Z fa4756d650d984f94392c875535bea7180a9302599c17aadd5889f720a16d32e
+2026-07-04T03:43:09.2932517Z ##[command]/usr/bin/docker start fa4756d650d984f94392c875535bea7180a9302599c17aadd5889f720a16d32e
+2026-07-04T03:43:09.5319736Z fa4756d650d984f94392c875535bea7180a9302599c17aadd5889f720a16d32e
+2026-07-04T03:43:09.5343483Z ##[command]/usr/bin/docker ps --all --filter id=fa4756d650d984f94392c875535bea7180a9302599c17aadd5889f720a16d32e --filter status=running --no-trunc --format "{{.ID}} {{.Status}}"
+2026-07-04T03:43:09.5474990Z fa4756d650d984f94392c875535bea7180a9302599c17aadd5889f720a16d32e Up Less than a second
+2026-07-04T03:43:09.5493038Z ##[command]/usr/bin/docker inspect --format "{{range .Config.Env}}{{println .}}{{end}}" fa4756d650d984f94392c875535bea7180a9302599c17aadd5889f720a16d32e
+2026-07-04T03:43:09.5624802Z CUSTOM_VAR=hello-from-container
+2026-07-04T03:43:09.5625667Z NODE_ENV=test
+2026-07-04T03:43:09.5637938Z HOME=/github/home
+2026-07-04T03:43:09.5638413Z GITHUB_ACTIONS=true
+2026-07-04T03:43:09.5639136Z CI=true
+2026-07-04T03:43:09.5639666Z PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+2026-07-04T03:43:09.5648985Z ##[endgroup]
+2026-07-04T03:43:09.5658141Z ##[group]Waiting for all services to be ready
+2026-07-04T03:43:09.5660459Z ##[endgroup]
+2026-07-04T03:43:09.5879421Z ##[group]Run test "$CUSTOM_VAR" = "hello-from-container"
+2026-07-04T03:43:09.5879997Z [36;1mtest "$CUSTOM_VAR" = "hello-from-container"[0m
+2026-07-04T03:43:09.5880375Z [36;1mecho "CUSTOM_VAR=$CUSTOM_VAR"[0m
+2026-07-04T03:43:09.5884136Z shell: sh -e {0}
+2026-07-04T03:43:09.5884683Z ##[endgroup]
+2026-07-04T03:43:09.6546072Z CUSTOM_VAR=hello-from-container
+2026-07-04T03:43:09.6653970Z ##[group]Run test "$NODE_ENV" = "test"
+2026-07-04T03:43:09.6654403Z [36;1mtest "$NODE_ENV" = "test"[0m
+2026-07-04T03:43:09.6654712Z [36;1mecho "NODE_ENV=$NODE_ENV"[0m
+2026-07-04T03:43:09.6655103Z shell: sh -e {0}
+2026-07-04T03:43:09.6655355Z ##[endgroup]
+2026-07-04T03:43:09.7194884Z NODE_ENV=test
+2026-07-04T03:43:09.7266815Z ##[group]Run echo "DYNAMIC_VAR=set-at-runtime" >> "$GITHUB_ENV"
+2026-07-04T03:43:09.7267387Z [36;1mecho "DYNAMIC_VAR=set-at-runtime" >> "$GITHUB_ENV"[0m
+2026-07-04T03:43:09.7267859Z shell: sh -e {0}
+2026-07-04T03:43:09.7268095Z ##[endgroup]
+2026-07-04T03:43:09.7919688Z ##[group]Run test "$DYNAMIC_VAR" = "set-at-runtime"
+2026-07-04T03:43:09.7920190Z [36;1mtest "$DYNAMIC_VAR" = "set-at-runtime"[0m
+2026-07-04T03:43:09.7920560Z [36;1mecho "DYNAMIC_VAR=$DYNAMIC_VAR"[0m
+2026-07-04T03:43:09.7920954Z shell: sh -e {0}
+2026-07-04T03:43:09.7921191Z env:
+2026-07-04T03:43:09.7921415Z   DYNAMIC_VAR: set-at-runtime
+2026-07-04T03:43:09.7921682Z ##[endgroup]
+2026-07-04T03:43:09.8473363Z DYNAMIC_VAR=set-at-runtime
+2026-07-04T03:43:09.8547566Z ##[group]Run echo "result=success" >> "$GITHUB_OUTPUT"
+2026-07-04T03:43:09.8548057Z [36;1mecho "result=success" >> "$GITHUB_OUTPUT"[0m
+2026-07-04T03:43:09.8548760Z [36;1mecho "multi_line<<EOF" >> "$GITHUB_OUTPUT"[0m
+2026-07-04T03:43:09.8549201Z [36;1mecho "line1" >> "$GITHUB_OUTPUT"[0m
+2026-07-04T03:43:09.8549529Z [36;1mecho "line2" >> "$GITHUB_OUTPUT"[0m
+2026-07-04T03:43:09.8549841Z [36;1mecho "EOF" >> "$GITHUB_OUTPUT"[0m
+2026-07-04T03:43:09.8550241Z shell: sh -e {0}
+2026-07-04T03:43:09.8550472Z env:
+2026-07-04T03:43:09.8550703Z   DYNAMIC_VAR: set-at-runtime
+2026-07-04T03:43:09.8550978Z ##[endgroup]
+2026-07-04T03:43:09.9234977Z ##[group]Run test "success" = "success"
+2026-07-04T03:43:09.9235582Z [36;1mtest "success" = "success"[0m
+2026-07-04T03:43:09.9236068Z [36;1mecho "result=success"[0m
+2026-07-04T03:43:09.9236538Z [36;1mecho "multi_line=line1[0m
+2026-07-04T03:43:09.9236996Z [36;1mline2"[0m
+2026-07-04T03:43:09.9237522Z shell: sh -e {0}
+2026-07-04T03:43:09.9237922Z env:
+2026-07-04T03:43:09.9238331Z   DYNAMIC_VAR: set-at-runtime
+2026-07-04T03:43:09.9239062Z ##[endgroup]
+2026-07-04T03:43:09.9805400Z result=success
+2026-07-04T03:43:09.9843803Z multi_line=line1
+2026-07-04T03:43:09.9844255Z line2
+2026-07-04T03:43:09.9874368Z ##[group]Run mkdir -p /tmp/custom-bin
+2026-07-04T03:43:09.9874781Z [36;1mmkdir -p /tmp/custom-bin[0m
+2026-07-04T03:43:09.9875119Z [36;1mecho '#!/bin/sh' > /tmp/custom-bin/my-tool[0m
+2026-07-04T03:43:09.9933556Z [36;1mecho 'echo my-tool-output' >> /tmp/custom-bin/my-tool[0m
+2026-07-04T03:43:09.9934342Z [36;1mchmod +x /tmp/custom-bin/my-tool[0m
+2026-07-04T03:43:09.9934932Z [36;1mecho "/tmp/custom-bin" >> "$GITHUB_PATH"[0m
+2026-07-04T03:43:09.9935689Z shell: sh -e {0}
+2026-07-04T03:43:09.9936108Z env:
+2026-07-04T03:43:09.9936511Z   DYNAMIC_VAR: set-at-runtime
+2026-07-04T03:43:09.9936956Z ##[endgroup]
+2026-07-04T03:43:10.0626283Z ##[group]Run my-tool | grep -q my-tool-output
+2026-07-04T03:43:10.0626904Z [36;1mmy-tool | grep -q my-tool-output[0m
+2026-07-04T03:43:10.0627583Z shell: sh -e {0}
+2026-07-04T03:43:10.0627938Z env:
+2026-07-04T03:43:10.0628287Z   DYNAMIC_VAR: set-at-runtime
+2026-07-04T03:43:10.0628722Z ##[endgroup]
+2026-07-04T03:43:10.1287165Z ##[group]Run test -d "$GITHUB_WORKSPACE"
+2026-07-04T03:43:10.1287597Z [36;1mtest -d "$GITHUB_WORKSPACE"[0m
+2026-07-04T03:43:10.1287920Z [36;1mls -la "$GITHUB_WORKSPACE"[0m
+2026-07-04T03:43:10.1288303Z shell: sh -e {0}
+2026-07-04T03:43:10.1289006Z env:
+2026-07-04T03:43:10.1289330Z   DYNAMIC_VAR: set-at-runtime
+2026-07-04T03:43:10.1289623Z ##[endgroup]
+2026-07-04T03:43:10.1841382Z total 8
+2026-07-04T03:43:10.1842612Z drwxr-xr-x    2 1001     1001          4096 Jul  4 03:43 .
+2026-07-04T03:43:10.1849016Z drwxr-xr-x    3 1001     1001          4096 Jul  4 03:43 ..
+2026-07-04T03:43:10.1914897Z ##[group]Run test -d "$RUNNER_TEMP"
+2026-07-04T03:43:10.1915290Z [36;1mtest -d "$RUNNER_TEMP"[0m
+2026-07-04T03:43:10.1915594Z [36;1mecho "RUNNER_TEMP=$RUNNER_TEMP"[0m
+2026-07-04T03:43:10.1916003Z shell: sh -e {0}
+2026-07-04T03:43:10.1916231Z env:
+2026-07-04T03:43:10.1916462Z   DYNAMIC_VAR: set-at-runtime
+2026-07-04T03:43:10.1916736Z ##[endgroup]
+2026-07-04T03:43:10.2681057Z RUNNER_TEMP=/__w/_temp
+2026-07-04T03:43:10.2769365Z Stop and remove container: b058c901e85b4b1d9fbc4614b5b68a6a_alpine320_25053e
+2026-07-04T03:43:10.2773851Z ##[command]/usr/bin/docker rm --force fa4756d650d984f94392c875535bea7180a9302599c17aadd5889f720a16d32e
+2026-07-04T03:43:10.3903270Z fa4756d650d984f94392c875535bea7180a9302599c17aadd5889f720a16d32e
+2026-07-04T03:43:10.3932316Z Remove container network: github_network_e4c70e55bad749bb83e30ccaed179c14
+2026-07-04T03:43:10.3950724Z ##[command]/usr/bin/docker network rm github_network_e4c70e55bad749bb83e30ccaed179c14
+2026-07-04T03:43:10.4716183Z github_network_e4c70e55bad749bb83e30ccaed179c14
+2026-07-04T03:43:10.4791071Z Cleaning up orphan processes

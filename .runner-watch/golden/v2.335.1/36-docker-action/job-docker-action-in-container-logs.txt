@@ -1,0 +1,98 @@
+﻿2026-07-04T03:43:10.5348508Z Current runner version: '2.335.1'
+2026-07-04T03:43:10.5386553Z ##[group]Runner Image Provisioner
+2026-07-04T03:43:10.5388125Z Hosted Compute Agent
+2026-07-04T03:43:10.5389123Z Version: 20260624.560
+2026-07-04T03:43:10.5390224Z Commit: 925d229a51159bc391ae97e54a2dd1fe20af789d
+2026-07-04T03:43:10.5391992Z Build Date: 2026-06-24T18:26:47Z
+2026-07-04T03:43:10.5393245Z Worker ID: {595d0e03-d752-4b0a-9e68-b370e93bd1ec}
+2026-07-04T03:43:10.5394656Z Azure Region: westus3
+2026-07-04T03:43:10.5395726Z ##[endgroup]
+2026-07-04T03:43:10.5398606Z ##[group]Operating System
+2026-07-04T03:43:10.5399774Z Ubuntu
+2026-07-04T03:43:10.5400611Z 24.04.4
+2026-07-04T03:43:10.5401972Z LTS
+2026-07-04T03:43:10.5402965Z ##[endgroup]
+2026-07-04T03:43:10.5403858Z ##[group]Runner Image
+2026-07-04T03:43:10.5404990Z Image: ubuntu-24.04
+2026-07-04T03:43:10.5406032Z Version: 20260628.225.1
+2026-07-04T03:43:10.5408328Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260628.225/images/ubuntu/Ubuntu2404-Readme.md
+2026-07-04T03:43:10.5411456Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260628.225
+2026-07-04T03:43:10.5413274Z ##[endgroup]
+2026-07-04T03:43:10.5415359Z ##[group]GITHUB_TOKEN Permissions
+2026-07-04T03:43:10.5418621Z Contents: read
+2026-07-04T03:43:10.5419584Z Metadata: read
+2026-07-04T03:43:10.5420503Z Packages: read
+2026-07-04T03:43:10.5422118Z ##[endgroup]
+2026-07-04T03:43:10.5425399Z Secret source: Actions
+2026-07-04T03:43:10.5426733Z Prepare workflow directory
+2026-07-04T03:43:10.6306870Z Prepare all required actions
+2026-07-04T03:43:11.4238393Z Complete job name: docker-action-in-container
+2026-07-04T03:43:11.4873181Z ##[group]Pull down action image 'alpine:3.20'
+2026-07-04T03:43:11.4905087Z ##[command]/usr/bin/docker pull alpine:3.20
+2026-07-04T03:43:13.2567082Z 3.20: Pulling from library/alpine
+2026-07-04T03:43:13.4755362Z 25f1d6b1951a: Pulling fs layer
+2026-07-04T03:43:13.6885636Z 25f1d6b1951a: Verifying Checksum
+2026-07-04T03:43:13.6898132Z 25f1d6b1951a: Download complete
+2026-07-04T03:43:13.8190313Z 25f1d6b1951a: Pull complete
+2026-07-04T03:43:13.8241555Z Digest: sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+2026-07-04T03:43:13.8257387Z Status: Downloaded newer image for alpine:3.20
+2026-07-04T03:43:13.8263731Z docker.io/library/alpine:3.20
+2026-07-04T03:43:13.8298338Z ##[endgroup]
+2026-07-04T03:43:13.8373759Z ##[group]Checking docker version
+2026-07-04T03:43:13.8386307Z ##[command]/usr/bin/docker version --format '{{.Server.APIVersion}}'
+2026-07-04T03:43:13.8634093Z '1.48'
+2026-07-04T03:43:13.8741190Z Docker daemon API version: '1.48'
+2026-07-04T03:43:13.8742079Z ##[command]/usr/bin/docker version --format '{{.Client.APIVersion}}'
+2026-07-04T03:43:13.8945186Z '1.48'
+2026-07-04T03:43:13.8961920Z Docker client API version: '1.48'
+2026-07-04T03:43:13.8973301Z ##[endgroup]
+2026-07-04T03:43:13.8978732Z ##[group]Clean up resources from previous jobs
+2026-07-04T03:43:13.8985239Z ##[command]/usr/bin/docker ps --all --quiet --no-trunc --filter "label=69c893"
+2026-07-04T03:43:13.9142540Z ##[command]/usr/bin/docker network prune --force --filter "label=69c893"
+2026-07-04T03:43:13.9289149Z ##[endgroup]
+2026-07-04T03:43:13.9289508Z ##[group]Create local container network
+2026-07-04T03:43:13.9300151Z ##[command]/usr/bin/docker network create --label 69c893 github_network_12a61d90737e4bf39665383512c58167
+2026-07-04T03:43:13.9932283Z 90027c280d17d7b4534aad7a6553f9167db9af824d6556372ef27392832ff68f
+2026-07-04T03:43:13.9955278Z ##[endgroup]
+2026-07-04T03:43:13.9982559Z ##[group]Starting job container
+2026-07-04T03:43:14.0002309Z ##[command]/usr/bin/docker pull ubuntu:24.04
+2026-07-04T03:43:14.8045946Z 24.04: Pulling from library/ubuntu
+2026-07-04T03:43:15.0415895Z ca2678b20700: Pulling fs layer
+2026-07-04T03:43:15.3309687Z ca2678b20700: Verifying Checksum
+2026-07-04T03:43:15.3310536Z ca2678b20700: Download complete
+2026-07-04T03:43:16.5924486Z ca2678b20700: Pull complete
+2026-07-04T03:43:16.5973724Z Digest: sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90
+2026-07-04T03:43:16.5989640Z Status: Downloaded newer image for ubuntu:24.04
+2026-07-04T03:43:16.5999931Z docker.io/library/ubuntu:24.04
+2026-07-04T03:43:16.6082692Z ##[command]/usr/bin/docker create --name 91dce5319479468885203a4e5f5b9eb8_ubuntu2404_8573a3 --label 69c893 --workdir /__w/aksh-conformance-sample/aksh-conformance-sample --network github_network_12a61d90737e4bf39665383512c58167  -e "HOME=/github/home" -e GITHUB_ACTIONS=true -e CI=true -v "/var/run/docker.sock":"/var/run/docker.sock" -v "/home/runner/work":"/__w" -v "/home/runner/actions-runner/cached/2.335.1/externals":"/__e":ro -v "/home/runner/work/_temp":"/__w/_temp" -v "/home/runner/work/_actions":"/__w/_actions" -v "/opt/hostedtoolcache":"/__t" -v "/home/runner/work/_temp/_github_home":"/github/home" -v "/home/runner/work/_temp/_github_workflow":"/github/workflow" --entrypoint "tail" ubuntu:24.04 "-f" "/dev/null"
+2026-07-04T03:43:18.1584771Z 2a67b5dbac44f735de7a741a4c3bfac55d6c291c4f472fadea337a5a53f80f30
+2026-07-04T03:43:18.1610216Z ##[command]/usr/bin/docker start 2a67b5dbac44f735de7a741a4c3bfac55d6c291c4f472fadea337a5a53f80f30
+2026-07-04T03:43:18.6746051Z 2a67b5dbac44f735de7a741a4c3bfac55d6c291c4f472fadea337a5a53f80f30
+2026-07-04T03:43:18.6769821Z ##[command]/usr/bin/docker ps --all --filter id=2a67b5dbac44f735de7a741a4c3bfac55d6c291c4f472fadea337a5a53f80f30 --filter status=running --no-trunc --format "{{.ID}} {{.Status}}"
+2026-07-04T03:43:18.6907054Z 2a67b5dbac44f735de7a741a4c3bfac55d6c291c4f472fadea337a5a53f80f30 Up Less than a second
+2026-07-04T03:43:18.6927874Z ##[command]/usr/bin/docker inspect --format "{{range .Config.Env}}{{println .}}{{end}}" 2a67b5dbac44f735de7a741a4c3bfac55d6c291c4f472fadea337a5a53f80f30
+2026-07-04T03:43:18.7082269Z HOME=/github/home
+2026-07-04T03:43:18.7083118Z GITHUB_ACTIONS=true
+2026-07-04T03:43:18.7084256Z CI=true
+2026-07-04T03:43:18.7084835Z PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+2026-07-04T03:43:18.7094580Z ##[endgroup]
+2026-07-04T03:43:18.7104725Z ##[group]Waiting for all services to be ready
+2026-07-04T03:43:18.7106497Z ##[endgroup]
+2026-07-04T03:43:18.7314964Z ##[group]Run test -f /.dockerenv && echo "inside container"
+2026-07-04T03:43:18.7315494Z [36;1mtest -f /.dockerenv && echo "inside container"[0m
+2026-07-04T03:43:18.7319110Z shell: sh -e {0}
+2026-07-04T03:43:18.7319603Z ##[endgroup]
+2026-07-04T03:43:18.7989276Z inside container
+2026-07-04T03:43:18.8121191Z ##[group]Run docker://alpine:3.20
+2026-07-04T03:43:18.8121522Z with:
+2026-07-04T03:43:18.8121809Z   args: echo "docker action from inside container job"
+2026-07-04T03:43:18.8122144Z ##[endgroup]
+2026-07-04T03:43:18.8398591Z ##[command]/usr/bin/docker run --name alpine320_df968d --label 69c893 --workdir /github/workspace --rm -e "INPUT_ARGS" -e "HOME" -e "GITHUB_JOB" -e "GITHUB_REF" -e "GITHUB_SHA" -e "GITHUB_REPOSITORY" -e "GITHUB_REPOSITORY_OWNER" -e "GITHUB_REPOSITORY_OWNER_ID" -e "GITHUB_RUN_ID" -e "GITHUB_RUN_NUMBER" -e "GITHUB_RETENTION_DAYS" -e "GITHUB_RUN_ATTEMPT" -e "GITHUB_ACTOR_ID" -e "GITHUB_ACTOR" -e "GITHUB_WORKFLOW" -e "GITHUB_HEAD_REF" -e "GITHUB_BASE_REF" -e "GITHUB_EVENT_NAME" -e "GITHUB_SERVER_URL" -e "GITHUB_API_URL" -e "GITHUB_GRAPHQL_URL" -e "GITHUB_REF_NAME" -e "GITHUB_REF_PROTECTED" -e "GITHUB_REF_TYPE" -e "GITHUB_WORKFLOW_REF" -e "GITHUB_WORKFLOW_SHA" -e "GITHUB_REPOSITORY_ID" -e "GITHUB_TRIGGERING_ACTOR" -e "GITHUB_WORKSPACE" -e "GITHUB_ACTION" -e "GITHUB_EVENT_PATH" -e "GITHUB_ACTION_REPOSITORY" -e "GITHUB_ACTION_REF" -e "GITHUB_PATH" -e "GITHUB_ENV" -e "GITHUB_STEP_SUMMARY" -e "GITHUB_STATE" -e "GITHUB_OUTPUT" -e "RUNNER_OS" -e "RUNNER_ARCH" -e "RUNNER_NAME" -e "RUNNER_ENVIRONMENT" -e "RUNNER_TOOL_CACHE" -e "RUNNER_TEMP" -e "RUNNER_WORKSPACE" -e "ACTIONS_RUNTIME_URL" -e "ACTIONS_RUNTIME_TOKEN" -e "ACTIONS_CACHE_URL" -e "ACTIONS_RESULTS_URL" -e "ACTIONS_ORCHESTRATION_ID" -e GITHUB_ACTIONS=true -e CI=true --network github_network_12a61d90737e4bf39665383512c58167 -v "/var/run/docker.sock":"/var/run/docker.sock" -v "/home/runner/work/_temp":"/github/runner_temp" -v "/home/runner/work/_temp/_github_home":"/github/home" -v "/home/runner/work/_temp/_github_workflow":"/github/workflow" -v "/home/runner/work/_temp/_runner_file_commands":"/github/file_commands" -v "/home/runner/work/aksh-conformance-sample/aksh-conformance-sample":"/github/workspace" alpine:3.20 echo "docker action from inside container job"
+2026-07-04T03:43:19.0181940Z docker action from inside container job
+2026-07-04T03:43:19.1168365Z Stop and remove container: 91dce5319479468885203a4e5f5b9eb8_ubuntu2404_8573a3
+2026-07-04T03:43:19.1175658Z ##[command]/usr/bin/docker rm --force 2a67b5dbac44f735de7a741a4c3bfac55d6c291c4f472fadea337a5a53f80f30
+2026-07-04T03:43:19.2269393Z 2a67b5dbac44f735de7a741a4c3bfac55d6c291c4f472fadea337a5a53f80f30
+2026-07-04T03:43:19.2323456Z Remove container network: github_network_12a61d90737e4bf39665383512c58167
+2026-07-04T03:43:19.2331497Z ##[command]/usr/bin/docker network rm github_network_12a61d90737e4bf39665383512c58167
+2026-07-04T03:43:19.3112915Z github_network_12a61d90737e4bf39665383512c58167
+2026-07-04T03:43:19.3187841Z Cleaning up orphan processes

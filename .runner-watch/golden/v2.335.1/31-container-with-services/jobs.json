@@ -1,0 +1,113 @@
+{
+  "total_count": 1,
+  "jobs": [
+    {
+      "id": 85100027416,
+      "run_id": 28693866707,
+      "workflow_name": "golden: container-with-services",
+      "head_branch": "main",
+      "run_url": "https://api.github.com/repos/preloopdev/aksh-conformance-sample/actions/runs/28693866707",
+      "run_attempt": 1,
+      "node_id": "CR_kwDOTJqUK88AAAAT0FteGA",
+      "head_sha": "cd9a6f4adb9bddf629d573171780ac8c02900cff",
+      "url": "https://api.github.com/repos/preloopdev/aksh-conformance-sample/actions/jobs/85100027416",
+      "html_url": "https://github.com/preloopdev/aksh-conformance-sample/actions/runs/28693866707/job/85100027416",
+      "status": "completed",
+      "conclusion": "success",
+      "created_at": "2026-07-04T03:42:55Z",
+      "started_at": "2026-07-04T03:42:57Z",
+      "completed_at": "2026-07-04T03:43:44Z",
+      "name": "container-services",
+      "steps": [
+        {
+          "name": "Set up job",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 1,
+          "started_at": "2026-07-04T03:42:58Z",
+          "completed_at": "2026-07-04T03:42:58Z"
+        },
+        {
+          "name": "Initialize containers",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 2,
+          "started_at": "2026-07-04T03:42:58Z",
+          "completed_at": "2026-07-04T03:43:36Z"
+        },
+        {
+          "name": "Install clients",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 3,
+          "started_at": "2026-07-04T03:43:36Z",
+          "completed_at": "2026-07-04T03:43:40Z"
+        },
+        {
+          "name": "Connect to Postgres via service alias",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 4,
+          "started_at": "2026-07-04T03:43:40Z",
+          "completed_at": "2026-07-04T03:43:40Z"
+        },
+        {
+          "name": "Create table and insert row",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 5,
+          "started_at": "2026-07-04T03:43:40Z",
+          "completed_at": "2026-07-04T03:43:40Z"
+        },
+        {
+          "name": "Query row back",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 6,
+          "started_at": "2026-07-04T03:43:40Z",
+          "completed_at": "2026-07-04T03:43:40Z"
+        },
+        {
+          "name": "Connect to Redis via service alias",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 7,
+          "started_at": "2026-07-04T03:43:40Z",
+          "completed_at": "2026-07-04T03:43:40Z"
+        },
+        {
+          "name": "Dump service context",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 8,
+          "started_at": "2026-07-04T03:43:40Z",
+          "completed_at": "2026-07-04T03:43:40Z"
+        },
+        {
+          "name": "Stop containers",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 16,
+          "started_at": "2026-07-04T03:43:40Z",
+          "completed_at": "2026-07-04T03:43:41Z"
+        },
+        {
+          "name": "Complete job",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 17,
+          "started_at": "2026-07-04T03:43:41Z",
+          "completed_at": "2026-07-04T03:43:41Z"
+        }
+      ],
+      "check_run_url": "https://api.github.com/repos/preloopdev/aksh-conformance-sample/check-runs/85100027416",
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "runner_id": 1000000098,
+      "runner_name": "GitHub Actions 1000000098",
+      "runner_group_id": 0,
+      "runner_group_name": "GitHub Actions"
+    }
+  ]
+}

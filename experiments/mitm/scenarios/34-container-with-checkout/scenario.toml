@@ -1,0 +1,16 @@
+description = "Container job with actions/checkout: git inside container, workspace verification."
+duration_seconds_max = 600
+
+[[steps]]
+kind = "submit_workflow"
+path = "34-container-with-checkout.yml"
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_assigned"
+timeout = 120
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_completed"
+timeout = 300
