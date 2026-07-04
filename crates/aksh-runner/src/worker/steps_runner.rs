@@ -119,6 +119,12 @@ pub async fn run_steps(
         )
         .await;
 
+        // Extract logs from the result (Ok holds logs, Err means init failed)
+        let init_logs = match &init_result {
+            Ok(logs) => logs.clone(),
+            Err(_) => Vec::new(),
+        };
+
         let init_end = crate::worker::job_runner::iso_now();
         let init_conclusion = if init_result.is_ok() {
             step_conclusion::SUCCEEDED
@@ -138,9 +144,18 @@ pub async fn run_steps(
                 completed_at: Some(init_end),
                 conclusion: init_conclusion,
             });
+            // Attach init logs to synthetic step
+            if !init_logs.is_empty() {
+                q.record_step_logs(&init_step_id, init_logs.clone());
+            }
         }
         if let Some(rpt) = reporting {
             crate::worker::job_runner::flush_step_updates(rpt, &queue).await;
+            // Upload init container logs
+            if !init_logs.is_empty() {
+                let content = init_logs.join("\n");
+                crate::worker::job_runner::upload_step_log(rpt, &init_step_id, &content).await;
+            }
         }
 
         if init_result.is_err() {
@@ -423,8 +438,8 @@ pub async fn run_steps(
         }
 
         // Run cleanup
+        let mut cleanup_log = Vec::new();
         if let Some(state) = &job.container_state {
-            let mut cleanup_log = Vec::new();
             if let Err(e) = super::container_ops::cleanup_containers(state, &mut cleanup_log).await
             {
                 warn!("Container cleanup failed: {e:#}");
@@ -438,7 +453,7 @@ pub async fn run_steps(
         {
             let mut q = queue.lock().await;
             q.queue_update(StepUpdate {
-                external_id: stop_step_id,
+                external_id: stop_step_id.clone(),
                 number: stop_step_number,
                 name: "Stop containers".to_string(),
                 status: step_status::COMPLETED,
@@ -446,9 +461,18 @@ pub async fn run_steps(
                 completed_at: Some(stop_end),
                 conclusion: step_conclusion::SUCCEEDED,
             });
+            // Attach cleanup logs to synthetic step
+            if !cleanup_log.is_empty() {
+                q.record_step_logs(&stop_step_id, cleanup_log.clone());
+            }
         }
         if let Some(rpt) = reporting {
             crate::worker::job_runner::flush_step_updates(rpt, &queue).await;
+            // Upload cleanup logs
+            if !cleanup_log.is_empty() {
+                let content = cleanup_log.join("\n");
+                crate::worker::job_runner::upload_step_log(rpt, &stop_step_id, &content).await;
+            }
         }
     }
 
@@ -566,7 +590,7 @@ async fn initialize_containers(
     service_specs: &[super::container_ops::ServiceSpec],
     workspace: &str,
     job: &mut JobContext,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     use super::container_ops::*;
 
     let mut log = Vec::new();
@@ -660,13 +684,58 @@ async fn initialize_containers(
         service_containers,
     });
 
-    // Publish service context data (job.services.<alias>.id, etc.)
+    // Populate job.container and job.services in context_data so
+    // build_expression_context() can resolve ${{ job.container.id }},
+    // ${{ job.services.<alias>.id }}, ${{ job.services.<alias>.ports['N'] }}, etc.
     if let Some(state) = &job.container_state {
+        let mut job_ctx = job
+            .context_data
+            .get("job")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let job_obj = job_ctx.as_object_mut().unwrap();
+
+        // job.container context
         if let Some(id) = &state.job_container_id {
-            // Set job.container.id and job.container.network in env
+            job_obj.insert(
+                "container".to_string(),
+                serde_json::json!({
+                    "id": id,
+                    "network": state.network,
+                }),
+            );
             job.env.insert("JOB_CONTAINER_ID".to_string(), id.clone());
             job.env
                 .insert("JOB_CONTAINER_NETWORK".to_string(), state.network.clone());
+        }
+
+        // job.services context — each alias gets id, network, ports
+        let mut services_ctx = serde_json::Map::new();
+        for (alias, container_id, _) in &state.service_containers {
+            let port_mappings = get_port_mappings(container_id).await;
+            let mut ports_obj = serde_json::Map::new();
+            for (container_port, host_port) in &port_mappings {
+                ports_obj.insert(container_port.clone(), serde_json::json!(host_port));
+            }
+            services_ctx.insert(
+                alias.clone(),
+                serde_json::json!({
+                    "id": container_id,
+                    "network": state.network,
+                    "ports": serde_json::Value::Object(ports_obj),
+                }),
+            );
+        }
+        if !services_ctx.is_empty() {
+            job_obj.insert(
+                "services".to_string(),
+                serde_json::Value::Object(services_ctx),
+            );
+        }
+
+        // Write back to context_data
+        if let Some(cd) = job.context_data.as_object_mut() {
+            cd.insert("job".to_string(), job_ctx);
         }
     }
 
@@ -674,5 +743,5 @@ async fn initialize_containers(
         info!("{line}");
     }
 
-    Ok(())
+    Ok(log)
 }
