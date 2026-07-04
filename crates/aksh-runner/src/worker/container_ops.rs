@@ -51,10 +51,77 @@ pub struct ContainerState {
     pub service_containers: Vec<(String, String, String)>, // (alias, container_id, container_name)
 }
 
+// ── TemplateToken decoding ──────────────────────────────────────────
+
+/// Decode a GitHub TemplateToken JSON value into plain JSON.
+///
+/// GitHub's control plane sends container/service specs as TemplateTokens:
+/// - type 0: string literal → `"lit"` field
+/// - type 1: sequence → `"seq"` array of tokens
+/// - type 2: mapping → `"map"` array of `{"Key": token, "Value": token}`
+///
+/// If the value is already plain JSON (e.g. from aksh-native payloads), return as-is.
+fn decode_template_token(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) if map.contains_key("type") => {
+            let tt = map.get("type").and_then(|v| v.as_u64()).unwrap_or(99);
+            match tt {
+                0 => {
+                    // String literal
+                    let lit = map.get("lit").and_then(|v| v.as_str()).unwrap_or("");
+                    serde_json::Value::String(lit.to_string())
+                }
+                1 => {
+                    // Sequence
+                    let seq = map
+                        .get("seq")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    serde_json::Value::Array(seq.iter().map(decode_template_token).collect())
+                }
+                2 => {
+                    // Mapping
+                    let entries = map
+                        .get("map")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    let mut result = serde_json::Map::new();
+                    for entry in &entries {
+                        let key = entry
+                            .get("Key")
+                            .or_else(|| entry.get("key"))
+                            .map(decode_template_token);
+                        let val = entry
+                            .get("Value")
+                            .or_else(|| entry.get("value"))
+                            .map(decode_template_token);
+                        if let (Some(serde_json::Value::String(k)), Some(v)) = (key, val) {
+                            result.insert(k, v);
+                        }
+                    }
+                    serde_json::Value::Object(result)
+                }
+                _ => value.clone(),
+            }
+        }
+        // Already plain JSON — pass through
+        _ => value.clone(),
+    }
+}
+
 // ── Parsing ──────────────────────────────────────────────────────────
 
-/// Parse a `jobContainer` value (string or mapping) into a ContainerSpec.
+/// Parse a `jobContainer` value (string, mapping, or TemplateToken) into a ContainerSpec.
 pub fn parse_container_spec(value: &serde_json::Value) -> Option<ContainerSpec> {
+    // Decode TemplateToken if present
+    let decoded = decode_template_token(value);
+    parse_container_spec_plain(&decoded)
+}
+
+/// Parse a plain (non-TemplateToken) container spec value.
+fn parse_container_spec_plain(value: &serde_json::Value) -> Option<ContainerSpec> {
     match value {
         serde_json::Value::String(image) if !image.is_empty() => Some(ContainerSpec {
             image: image.clone(),
@@ -89,11 +156,16 @@ pub fn parse_container_spec(value: &serde_json::Value) -> Option<ContainerSpec> 
 }
 
 /// Parse `jobServiceContainers` value into a list of ServiceSpecs.
+///
+/// Handles both TemplateToken format (from GitHub) and plain JSON (from aksh).
 pub fn parse_service_specs(value: &serde_json::Value) -> Vec<ServiceSpec> {
+    // Decode TemplateToken if present
+    let decoded = decode_template_token(value);
+
     let mut services = Vec::new();
-    if let Some(map) = value.as_object() {
+    if let Some(map) = decoded.as_object() {
         for (alias, spec) in map {
-            if let Some(container) = parse_container_spec(spec) {
+            if let Some(container) = parse_container_spec_plain(spec) {
                 services.push(ServiceSpec {
                     alias: alias.clone(),
                     image: container.image,
