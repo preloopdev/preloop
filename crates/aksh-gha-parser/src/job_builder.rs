@@ -244,7 +244,17 @@ pub fn build_agent_job_message(
         retry_count: None,
         pre_job_timeout: None,
         job_timeout: None,
+        job_container: plan.container.clone(),
+        job_service_containers: non_empty_services(plan.services.clone()),
     })
+}
+
+/// Omit empty `services: {}` to match `EmitDefaultValue=false` behavior.
+fn non_empty_services(services: Option<serde_json::Value>) -> Option<serde_json::Value> {
+    match &services {
+        Some(serde_json::Value::Object(m)) if m.is_empty() => None,
+        _ => services,
+    }
 }
 
 /// Build a `TaskStep` from a `StepPlan`.
