@@ -1,0 +1,8 @@
+name: hello-world
+on: push
+jobs:
+  say-hello:
+    runs-on: self-hosted
+    steps:
+      - name: Hello step
+        run: echo "Hello, Conformance!"
