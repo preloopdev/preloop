@@ -1065,8 +1065,8 @@ name: docker action
 runs:
   using: docker
   image: Dockerfile
-  pre: pre-entrypoint.sh
-  post: post-entrypoint.sh
+  pre-entrypoint: pre-entrypoint.sh
+  post-entrypoint: post-entrypoint.sh
   post-if: always()
 "#,
         )

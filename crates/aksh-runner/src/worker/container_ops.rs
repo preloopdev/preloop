@@ -11,7 +11,7 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::Path;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::process;
 
