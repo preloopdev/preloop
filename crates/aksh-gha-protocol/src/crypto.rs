@@ -119,11 +119,36 @@ fn rsa_public_key_from_components(
 }
 
 fn xml_tag<'a>(value: &'a str, tag: &str) -> Option<&'a str> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let start = value.find(&open)? + open.len();
-    let end = value[start..].find(&close)? + start;
-    Some(value[start..end].trim())
+    let mut search_idx = 0;
+    while let Some(pos) = value[search_idx..].find('<') {
+        let tag_start = search_idx + pos + 1;
+        if let Some(tag_end) = value[tag_start..].find('>') {
+            let full_tag = value[tag_start..tag_start + tag_end].trim();
+            let base_tag = full_tag.split_whitespace().next().unwrap_or("");
+            if base_tag == tag || base_tag.ends_with(&format!(":{tag}")) {
+                let content_start = tag_start + tag_end + 1;
+                let close_str = format!("</");
+                let mut close_search_idx = content_start;
+                while let Some(close_pos) = value[close_search_idx..].find(&close_str) {
+                    let close_tag_start = close_search_idx + close_pos + 2;
+                    if let Some(close_tag_end) = value[close_tag_start..].find('>') {
+                        let full_close_tag = value[close_tag_start..close_tag_start + close_tag_end].trim();
+                        let base_close_tag = full_close_tag.split_whitespace().next().unwrap_or("");
+                        if base_close_tag == tag || base_close_tag.ends_with(&format!(":{tag}")) {
+                            return Some(value[content_start..close_search_idx + close_pos].trim());
+                        }
+                        close_search_idx = close_tag_start + close_tag_end + 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            search_idx = tag_start + tag_end + 1;
+        } else {
+            break;
+        }
+    }
+    None
 }
 
 impl AgentRsaKeypair {
@@ -422,6 +447,15 @@ mod tests {
 
         let wrapped = public_key.wrap_key(b"secret").unwrap();
         assert_eq!(kp.unwrap_key(&wrapped).unwrap(), b"secret");
+    }
+    #[test]
+    fn parses_xml_public_key_with_namespaces_and_attributes() {
+        let xml = "<ds:RSAKeyValue xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">\
+            <ds:Modulus attr=\"val\">AAAA</ds:Modulus>\
+            <ds:Exponent >AQAB</ds:Exponent>\
+            </ds:RSAKeyValue>";
+        assert_eq!(xml_tag(xml, "Modulus").unwrap(), "AAAA");
+        assert_eq!(xml_tag(xml, "Exponent").unwrap(), "AQAB");
     }
 
     #[test]
