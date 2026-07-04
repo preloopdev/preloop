@@ -304,9 +304,11 @@ impl JobContext {
         }
 
         // matrix/needs/strategy/vars/inputs from contextData
+        // GitHub sends these in Azure DevOps typed-dictionary format;
+        // decode before inserting so expression evaluation sees flat objects.
         for key in ["matrix", "needs", "strategy", "vars", "inputs"] {
             if let Some(val) = self.context_data.get(key) {
-                ctx.insert(key, val.clone());
+                ctx.insert(key, super::job_extension::decode_typed_value(val));
             }
         }
 
@@ -587,5 +589,32 @@ mod tests {
 
         job.set_github_context_value("action_repository", Some(serde_json::Value::Null));
         assert!(!job.env.contains_key("GITHUB_ACTION_REPOSITORY"));
+    }
+
+    #[test]
+    fn vars_context_decodes_typed_dict_format() {
+        // GitHub sends contextData.vars in Azure DevOps typed-dictionary format:
+        // {"t": 2, "d": [{"k": "AKSH_REPO_ROOT", "v": {"t": 1, "d": "/workspace"}}]}
+        let ctx = JobContext::new(
+            "j1".into(),
+            "Test".into(),
+            serde_json::json!({}),
+            serde_json::json!({
+                "github": {"repository": "owner/repo"},
+                "vars": {
+                    "t": 2,
+                    "d": [
+                        {"k": "AKSH_REPO_ROOT", "v": {"t": 1, "d": "/workspace"}},
+                        {"k": "OTHER_VAR", "v": {"t": 1, "d": "hello"}}
+                    ]
+                }
+            }),
+        );
+
+        let expr = ctx.build_expression_context();
+        let val = aksh_gha_expressions::eval_expression("vars.AKSH_REPO_ROOT", &expr);
+        assert_eq!(val.unwrap().as_str(), Some("/workspace"));
+        let val2 = aksh_gha_expressions::eval_expression("vars.OTHER_VAR", &expr);
+        assert_eq!(val2.unwrap().as_str(), Some("hello"));
     }
 }
