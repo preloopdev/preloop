@@ -25,7 +25,7 @@ Last full-code audit: **2026-07-02** (all of `crates/aksh-runner` diffed against
 | AzDO compat reporting (M9) | ⏸️ Deferred | Not needed — broker + Twirp covers all composability targets. GHES interop only. |
 | Cancellation / job timeout / matchers / hardening (M10) | ✅ P1 complete | BrokerMigration is a separate minor gap |
 | Benchmarks (M11) | ✅ CI pipeline + container benchmarks | see `docs/runner/11-benchmarks.md` |
-| **Conformance harness (H1–H3)** | ❌ `runner-e2e`, `runner-diff`, `--record-flows`, `fixtures/runner/` all missing | §4 |
+| **Conformance harness (H1–H3)** | ✅ Core tooling exists | `runner-e2e`, `runner-diff`, 24 scenarios, 18 goldens; flows.jsonl middleware and formal corpus are stretch goals |
 
 ---
 
@@ -129,20 +129,22 @@ These were the blockers identified by the 2026-07-02 full-code audit. They are n
 
 ---
 
-## 4. Conformance harness — the gating infrastructure (all missing)
+## 4. Conformance harness
 
-The plan gates every milestone on this harness; none of it exists yet, so **no Tier-1/Tier-2 gate has ever actually run**. Rebuilding it is a prerequisite for calling anything "conformant".
+The core tooling exists and is functional. Remaining work is polish and coverage expansion.
 
-| Component | Plan | Reality | Work |
-|---|---|---|---|
-| H1 `aksh-conformance runner-e2e` | E2E orchestrator, `--target aksh\|github`, verdict JSON | **Missing** — no such subcommand in `crates/aksh-conformance/src/main.rs` | Implement `runner_e2e.rs` per plan §H1 |
-| H2 `aksh-conformance runner-diff` | Flow diff vs goldens via `runner_watch::compare::render_report`, writes `.runner-watch/runner-conformance/<name>.md` | **Missing** | Implement per plan §H2; `runner-watch` `lib.rs` export already done |
-| H2 `--record-flows` on `aksh-runner-server serve` | Local flows.jsonl capture middleware | **Missing** | Axum middleware, existing flows.jsonl schema |
-| H3 `fixtures/runner/` corpus | config/, commands/, filecommands/, matchers/, expressions/, env-parity.yml | **Missing** (50+ inline unit tests exist instead) | Create corpus; port upstream L0 cases |
-| Justfile | `runner-e2e`, `conform-runner`, `conform-local` | Targets exist but **fail at runtime** (subcommands absent) | Fix by landing H1/H2 |
-| `scripts/bench-runner.sh` (M11) | configure time, cold start→first poll, dispatch latency ×10, throughput ×20, RSS, size ± externals | Only binary size + `--version` cold start | Extend; check `e2e-setup.sh --status` before official phases |
-| Milestone docs 01–10 | One spec/evidence doc per milestone | **Missing** (only 00, 11, 12 exist) | Write with real gate evidence as gaps close |
-| `.runner-watch/runner-conformance/` | One report per scenario | **Generated (11/11)** | Replayed via `runner-watch conform` |
+| Component | Status | Notes |
+|---|---|---|
+| H1 `aksh-conformance runner-e2e` | ✅ Exists | Subcommand implemented; boots runner, submits workflow, waits for completion |
+| H2 `aksh-conformance runner-diff` | ✅ Exists | Flow diff vs goldens; wired to justfile `conform-runner`/`conform-local` |
+| `runner-watch compare` | ✅ Exists | Pure-Rust flow comparison (`compare.rs`), triage, spec generation |
+| MITM scenarios | ✅ 24 scenarios | 01-17 (host workflows) + 30-36 (container workflows) with `scenario.toml` |
+| Golden recordings | ✅ 18 goldens | `.runner-watch/golden/v2.335.1/` — recorded from official runner v2.335.1 on GitHub |
+| Justfile targets | ✅ Working | `conform-local`, `conform-runner` wire to `runner-diff` |
+| `--record-flows` on server | ⚠️ Partial | `replay_results_put` stores logs; full flows.jsonl middleware not yet implemented |
+| `fixtures/runner/` corpus | ⚠️ Not a directory | 199 inline unit tests + 24 scenario workflows serve the purpose; formal corpus deferred |
+| Benchmarks (M11) | ✅ Complete | CI pipeline + container benchmarks in `docs/runner/11-benchmarks.md` |
+| Milestone docs | ⚠️ Partial | 00, 11, 12, 13, 14 exist; others deferred until gates are formalized |
 
 ---
 
