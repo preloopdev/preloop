@@ -1,0 +1,35 @@
+name: "golden: docker-action"
+on: workflow_dispatch
+
+jobs:
+  docker-action-host:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run docker:// action (alpine)
+        uses: docker://alpine:3.20
+        with:
+          args: echo "hello from docker action"
+      - name: Run docker:// action (busybox)
+        uses: docker://busybox:latest
+        with:
+          args: echo "busybox action ok"
+      - name: Docker build and run on host
+        run: |
+          cat > /tmp/Dockerfile <<'EOF'
+          FROM alpine:3.20
+          RUN echo "built" > /built.txt
+          CMD ["cat", "/built.txt"]
+          EOF
+          docker build -t golden-test /tmp/
+          docker run --rm golden-test | grep -q built
+
+  docker-action-in-container:
+    runs-on: ubuntu-latest
+    container: ubuntu:24.04
+    steps:
+      - name: Verify inside container
+        run: test -f /.dockerenv && echo "inside container"
+      - name: Run docker:// action from container job
+        uses: docker://alpine:3.20
+        with:
+          args: echo "docker action from inside container job"

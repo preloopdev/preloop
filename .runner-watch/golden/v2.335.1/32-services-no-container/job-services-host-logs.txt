@@ -1,0 +1,311 @@
+﻿2026-07-04T03:43:01.3140938Z Current runner version: '2.335.1'
+2026-07-04T03:43:01.3179810Z ##[group]Runner Image Provisioner
+2026-07-04T03:43:01.3181664Z Hosted Compute Agent
+2026-07-04T03:43:01.3182741Z Version: 20260624.560
+2026-07-04T03:43:01.3184068Z Commit: 925d229a51159bc391ae97e54a2dd1fe20af789d
+2026-07-04T03:43:01.3185382Z Build Date: 2026-06-24T18:26:47Z
+2026-07-04T03:43:01.3186736Z Worker ID: {c3d705f8-4e6c-4978-9690-0eff185c3e67}
+2026-07-04T03:43:01.3188106Z Azure Region: westus
+2026-07-04T03:43:01.3189092Z ##[endgroup]
+2026-07-04T03:43:01.3192573Z ##[group]Operating System
+2026-07-04T03:43:01.3193619Z Ubuntu
+2026-07-04T03:43:01.3194459Z 24.04.4
+2026-07-04T03:43:01.3195457Z LTS
+2026-07-04T03:43:01.3196287Z ##[endgroup]
+2026-07-04T03:43:01.3197214Z ##[group]Runner Image
+2026-07-04T03:43:01.3198291Z Image: ubuntu-24.04
+2026-07-04T03:43:01.3199222Z Version: 20260628.225.1
+2026-07-04T03:43:01.3201761Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260628.225/images/ubuntu/Ubuntu2404-Readme.md
+2026-07-04T03:43:01.3204609Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260628.225
+2026-07-04T03:43:01.3206577Z ##[endgroup]
+2026-07-04T03:43:01.3208779Z ##[group]GITHUB_TOKEN Permissions
+2026-07-04T03:43:01.3212397Z Contents: read
+2026-07-04T03:43:01.3213443Z Metadata: read
+2026-07-04T03:43:01.3214576Z Packages: read
+2026-07-04T03:43:01.3215663Z ##[endgroup]
+2026-07-04T03:43:01.3218935Z Secret source: Actions
+2026-07-04T03:43:01.3220360Z Prepare workflow directory
+2026-07-04T03:43:01.4115454Z Prepare all required actions
+2026-07-04T03:43:01.5240058Z Complete job name: services-host
+2026-07-04T03:43:01.6214053Z ##[group]Checking docker version
+2026-07-04T03:43:01.6234628Z ##[command]/usr/bin/docker version --format '{{.Server.APIVersion}}'
+2026-07-04T03:43:01.7535231Z '1.48'
+2026-07-04T03:43:01.7556948Z Docker daemon API version: '1.48'
+2026-07-04T03:43:01.7557897Z ##[command]/usr/bin/docker version --format '{{.Client.APIVersion}}'
+2026-07-04T03:43:01.7992199Z '1.48'
+2026-07-04T03:43:01.7995998Z Docker client API version: '1.48'
+2026-07-04T03:43:01.8003084Z ##[endgroup]
+2026-07-04T03:43:01.8008345Z ##[group]Clean up resources from previous jobs
+2026-07-04T03:43:01.8015929Z ##[command]/usr/bin/docker ps --all --quiet --no-trunc --filter "label=43a6a9"
+2026-07-04T03:43:01.8282905Z ##[command]/usr/bin/docker network prune --force --filter "label=43a6a9"
+2026-07-04T03:43:01.8502170Z ##[endgroup]
+2026-07-04T03:43:01.8503137Z ##[group]Create local container network
+2026-07-04T03:43:01.8514319Z ##[command]/usr/bin/docker network create --label 43a6a9 github_network_ae41f353e2eb471fba23b0213c8be9e5
+2026-07-04T03:43:01.9291118Z 78882f5e40fa76306e6b44bbe983e9c23730be67b6d2d597837aba223d0b7a16
+2026-07-04T03:43:01.9312416Z ##[endgroup]
+2026-07-04T03:43:01.9337487Z ##[group]Starting nginx service container
+2026-07-04T03:43:01.9360810Z ##[command]/usr/bin/docker pull nginx:1.27-alpine
+2026-07-04T03:43:02.8569176Z 1.27-alpine: Pulling from library/nginx
+2026-07-04T03:43:03.1169310Z f18232174bc9: Pulling fs layer
+2026-07-04T03:43:03.1170394Z 61ca4f733c80: Pulling fs layer
+2026-07-04T03:43:03.1171539Z b464cfdf2a63: Pulling fs layer
+2026-07-04T03:43:03.1172669Z d7e507024086: Pulling fs layer
+2026-07-04T03:43:03.1173429Z 81bd8ed7ec67: Pulling fs layer
+2026-07-04T03:43:03.1174155Z 197eb75867ef: Pulling fs layer
+2026-07-04T03:43:03.1174946Z 34a64644b756: Pulling fs layer
+2026-07-04T03:43:03.1175533Z 39c2ddfd6010: Pulling fs layer
+2026-07-04T03:43:03.1176290Z 197eb75867ef: Waiting
+2026-07-04T03:43:03.1176836Z 34a64644b756: Waiting
+2026-07-04T03:43:03.1177583Z 39c2ddfd6010: Waiting
+2026-07-04T03:43:03.1178753Z d7e507024086: Waiting
+2026-07-04T03:43:03.1179999Z 81bd8ed7ec67: Waiting
+2026-07-04T03:43:03.3417909Z b464cfdf2a63: Download complete
+2026-07-04T03:43:03.3605184Z 61ca4f733c80: Verifying Checksum
+2026-07-04T03:43:03.3607340Z 61ca4f733c80: Download complete
+2026-07-04T03:43:03.3638040Z f18232174bc9: Verifying Checksum
+2026-07-04T03:43:03.3642766Z f18232174bc9: Download complete
+2026-07-04T03:43:03.5013618Z f18232174bc9: Pull complete
+2026-07-04T03:43:03.5713189Z 81bd8ed7ec67: Verifying Checksum
+2026-07-04T03:43:03.5732869Z 81bd8ed7ec67: Download complete
+2026-07-04T03:43:03.5857702Z 197eb75867ef: Verifying Checksum
+2026-07-04T03:43:03.5888057Z 197eb75867ef: Download complete
+2026-07-04T03:43:03.5896800Z d7e507024086: Verifying Checksum
+2026-07-04T03:43:03.5899966Z d7e507024086: Download complete
+2026-07-04T03:43:03.7666536Z 61ca4f733c80: Pull complete
+2026-07-04T03:43:03.8029991Z 34a64644b756: Verifying Checksum
+2026-07-04T03:43:03.8037866Z 34a64644b756: Download complete
+2026-07-04T03:43:03.8246439Z b464cfdf2a63: Pull complete
+2026-07-04T03:43:03.8463980Z d7e507024086: Pull complete
+2026-07-04T03:43:03.8635877Z 81bd8ed7ec67: Pull complete
+2026-07-04T03:43:03.8869413Z 197eb75867ef: Pull complete
+2026-07-04T03:43:03.9041802Z 34a64644b756: Pull complete
+2026-07-04T03:43:03.9044909Z 39c2ddfd6010: Verifying Checksum
+2026-07-04T03:43:03.9047135Z 39c2ddfd6010: Download complete
+2026-07-04T03:43:04.4627357Z 39c2ddfd6010: Pull complete
+2026-07-04T03:43:04.4670849Z Digest: sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
+2026-07-04T03:43:04.4688381Z Status: Downloaded newer image for nginx:1.27-alpine
+2026-07-04T03:43:04.4704607Z docker.io/library/nginx:1.27-alpine
+2026-07-04T03:43:04.4749838Z ##[command]/usr/bin/docker create --name 9ca2578b332a4d91adf7ef94a787edc6_nginx127alpine_f669ed --label 43a6a9 --network github_network_ae41f353e2eb471fba23b0213c8be9e5 --network-alias nginx -p 8080:80 --health-cmd "curl -sf http://localhost/ || exit 1" --health-interval 5s --health-timeout 5s --health-retries 10 -e GITHUB_ACTIONS=true -e CI=true nginx:1.27-alpine
+2026-07-04T03:43:04.5039976Z 39a91c7a9c24d5c38beb9ed021f8a3200c72bd9446e3b793b21541a75c58399b
+2026-07-04T03:43:04.5065691Z ##[command]/usr/bin/docker start 39a91c7a9c24d5c38beb9ed021f8a3200c72bd9446e3b793b21541a75c58399b
+2026-07-04T03:43:04.8003288Z 39a91c7a9c24d5c38beb9ed021f8a3200c72bd9446e3b793b21541a75c58399b
+2026-07-04T03:43:04.8028215Z ##[command]/usr/bin/docker ps --all --filter id=39a91c7a9c24d5c38beb9ed021f8a3200c72bd9446e3b793b21541a75c58399b --filter status=running --no-trunc --format "{{.ID}} {{.Status}}"
+2026-07-04T03:43:04.8227982Z 39a91c7a9c24d5c38beb9ed021f8a3200c72bd9446e3b793b21541a75c58399b Up Less than a second (health: starting)
+2026-07-04T03:43:04.8275237Z ##[command]/usr/bin/docker port 39a91c7a9c24d5c38beb9ed021f8a3200c72bd9446e3b793b21541a75c58399b
+2026-07-04T03:43:04.8483542Z 80/tcp -> 0.0.0.0:8080
+2026-07-04T03:43:04.8492183Z 80/tcp -> [::]:8080
+2026-07-04T03:43:04.8535137Z ##[endgroup]
+2026-07-04T03:43:04.8536472Z ##[group]Starting redis service container
+2026-07-04T03:43:04.8537854Z ##[command]/usr/bin/docker pull redis:7-alpine
+2026-07-04T03:43:05.7014409Z 7-alpine: Pulling from library/redis
+2026-07-04T03:43:05.9796339Z 897d797d2723: Pulling fs layer
+2026-07-04T03:43:05.9804186Z c14c7509f545: Pulling fs layer
+2026-07-04T03:43:05.9805209Z f546396032e0: Pulling fs layer
+2026-07-04T03:43:05.9805901Z a300455a02bb: Pulling fs layer
+2026-07-04T03:43:05.9813229Z 941ebb020cf0: Pulling fs layer
+2026-07-04T03:43:05.9814155Z 4f4fb700ef54: Pulling fs layer
+2026-07-04T03:43:05.9815907Z 677c7c5aa821: Pulling fs layer
+2026-07-04T03:43:05.9827920Z a300455a02bb: Waiting
+2026-07-04T03:43:05.9829080Z 941ebb020cf0: Waiting
+2026-07-04T03:43:05.9830068Z 4f4fb700ef54: Waiting
+2026-07-04T03:43:05.9830865Z 677c7c5aa821: Waiting
+2026-07-04T03:43:06.2133594Z 897d797d2723: Verifying Checksum
+2026-07-04T03:43:06.2135114Z 897d797d2723: Download complete
+2026-07-04T03:43:06.2248032Z f546396032e0: Verifying Checksum
+2026-07-04T03:43:06.2252232Z f546396032e0: Download complete
+2026-07-04T03:43:06.2638094Z c14c7509f545: Verifying Checksum
+2026-07-04T03:43:06.2644560Z c14c7509f545: Download complete
+2026-07-04T03:43:06.3650255Z 897d797d2723: Pull complete
+2026-07-04T03:43:06.3921523Z c14c7509f545: Pull complete
+2026-07-04T03:43:06.4340326Z 941ebb020cf0: Verifying Checksum
+2026-07-04T03:43:06.4343491Z 941ebb020cf0: Download complete
+2026-07-04T03:43:06.5103583Z a300455a02bb: Verifying Checksum
+2026-07-04T03:43:06.5108000Z a300455a02bb: Download complete
+2026-07-04T03:43:06.5218523Z 4f4fb700ef54: Verifying Checksum
+2026-07-04T03:43:06.5220704Z 4f4fb700ef54: Download complete
+2026-07-04T03:43:06.5915981Z f546396032e0: Pull complete
+2026-07-04T03:43:06.6698630Z 677c7c5aa821: Verifying Checksum
+2026-07-04T03:43:06.6700264Z 677c7c5aa821: Download complete
+2026-07-04T03:43:06.8548112Z a300455a02bb: Pull complete
+2026-07-04T03:43:06.8700194Z 941ebb020cf0: Pull complete
+2026-07-04T03:43:06.8790516Z 4f4fb700ef54: Pull complete
+2026-07-04T03:43:06.8907975Z 677c7c5aa821: Pull complete
+2026-07-04T03:43:06.8951949Z Digest: sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+2026-07-04T03:43:06.8967219Z Status: Downloaded newer image for redis:7-alpine
+2026-07-04T03:43:06.8975376Z docker.io/library/redis:7-alpine
+2026-07-04T03:43:06.8993784Z ##[command]/usr/bin/docker create --name 4b93dc05e02445ec82ff7bd16f2f296b_redis7alpine_4a8f07 --label 43a6a9 --network github_network_ae41f353e2eb471fba23b0213c8be9e5 --network-alias redis -p 6379:6379 --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 5s --health-retries 10 -e GITHUB_ACTIONS=true -e CI=true redis:7-alpine
+2026-07-04T03:43:06.9269477Z f26d9332104d6be5f5619cac78616fafcfd9353409523f0e8ce2f47e9fd9d071
+2026-07-04T03:43:06.9285643Z ##[command]/usr/bin/docker start f26d9332104d6be5f5619cac78616fafcfd9353409523f0e8ce2f47e9fd9d071
+2026-07-04T03:43:07.0956397Z f26d9332104d6be5f5619cac78616fafcfd9353409523f0e8ce2f47e9fd9d071
+2026-07-04T03:43:07.0978427Z ##[command]/usr/bin/docker ps --all --filter id=f26d9332104d6be5f5619cac78616fafcfd9353409523f0e8ce2f47e9fd9d071 --filter status=running --no-trunc --format "{{.ID}} {{.Status}}"
+2026-07-04T03:43:07.1177071Z f26d9332104d6be5f5619cac78616fafcfd9353409523f0e8ce2f47e9fd9d071 Up Less than a second (health: starting)
+2026-07-04T03:43:07.1209306Z ##[command]/usr/bin/docker port f26d9332104d6be5f5619cac78616fafcfd9353409523f0e8ce2f47e9fd9d071
+2026-07-04T03:43:07.1393634Z 6379/tcp -> 0.0.0.0:6379
+2026-07-04T03:43:07.1397308Z 6379/tcp -> [::]:6379
+2026-07-04T03:43:07.1408798Z ##[endgroup]
+2026-07-04T03:43:07.1419030Z ##[group]Waiting for all services to be ready
+2026-07-04T03:43:07.1433587Z ##[command]/usr/bin/docker inspect --format="{{if .Config.Healthcheck}}{{print .State.Health.Status}}{{end}}" 39a91c7a9c24d5c38beb9ed021f8a3200c72bd9446e3b793b21541a75c58399b
+2026-07-04T03:43:07.1583506Z starting
+2026-07-04T03:43:07.1606814Z nginx service is starting, waiting 2 seconds before checking again.
+2026-07-04T03:43:09.1605881Z ##[command]/usr/bin/docker inspect --format="{{if .Config.Healthcheck}}{{print .State.Health.Status}}{{end}}" 39a91c7a9c24d5c38beb9ed021f8a3200c72bd9446e3b793b21541a75c58399b
+2026-07-04T03:43:09.1757975Z starting
+2026-07-04T03:43:09.1773605Z nginx service is starting, waiting 3 seconds before checking again.
+2026-07-04T03:43:12.8835830Z ##[command]/usr/bin/docker inspect --format="{{if .Config.Healthcheck}}{{print .State.Health.Status}}{{end}}" 39a91c7a9c24d5c38beb9ed021f8a3200c72bd9446e3b793b21541a75c58399b
+2026-07-04T03:43:12.8984081Z healthy
+2026-07-04T03:43:12.9002008Z nginx service is healthy.
+2026-07-04T03:43:12.9003323Z ##[command]/usr/bin/docker inspect --format="{{if .Config.Healthcheck}}{{print .State.Health.Status}}{{end}}" f26d9332104d6be5f5619cac78616fafcfd9353409523f0e8ce2f47e9fd9d071
+2026-07-04T03:43:12.9136947Z healthy
+2026-07-04T03:43:12.9150233Z redis service is healthy.
+2026-07-04T03:43:12.9151428Z ##[endgroup]
+2026-07-04T03:43:12.9377442Z ##[group]Run curl -sf http://localhost:8080
+2026-07-04T03:43:12.9377931Z [36;1mcurl -sf http://localhost:8080[0m
+2026-07-04T03:43:12.9378259Z [36;1mecho "nginx OK"[0m
+2026-07-04T03:43:12.9419003Z shell: /usr/bin/bash -e {0}
+2026-07-04T03:43:12.9419592Z ##[endgroup]
+2026-07-04T03:43:12.9657540Z <!DOCTYPE html>
+2026-07-04T03:43:12.9657877Z <html>
+2026-07-04T03:43:12.9658748Z <head>
+2026-07-04T03:43:12.9659679Z <title>Welcome to nginx!</title>
+2026-07-04T03:43:12.9660311Z <style>
+2026-07-04T03:43:12.9661025Z html { color-scheme: light dark; }
+2026-07-04T03:43:12.9661946Z body { width: 35em; margin: 0 auto;
+2026-07-04T03:43:12.9662460Z font-family: Tahoma, Verdana, Arial, sans-serif; }
+2026-07-04T03:43:12.9662967Z </style>
+2026-07-04T03:43:12.9663272Z </head>
+2026-07-04T03:43:12.9663555Z <body>
+2026-07-04T03:43:12.9663866Z <h1>Welcome to nginx!</h1>
+2026-07-04T03:43:12.9664466Z <p>If you see this page, the nginx web server is successfully installed and
+2026-07-04T03:43:12.9665098Z working. Further configuration is required.</p>
+2026-07-04T03:43:12.9665326Z 
+2026-07-04T03:43:12.9665523Z <p>For online documentation and support please refer to
+2026-07-04T03:43:12.9665901Z <a href="http://nginx.org/">nginx.org</a>.<br/>
+2026-07-04T03:43:12.9666217Z Commercial support is available at
+2026-07-04T03:43:12.9666508Z <a href="http://nginx.com/">nginx.com</a>.</p>
+2026-07-04T03:43:12.9666709Z 
+2026-07-04T03:43:12.9666817Z <p><em>Thank you for using nginx.</em></p>
+2026-07-04T03:43:12.9667074Z </body>
+2026-07-04T03:43:12.9667244Z </html>
+2026-07-04T03:43:12.9667524Z nginx OK
+2026-07-04T03:43:12.9744483Z ##[group]Run sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends redis-tools
+2026-07-04T03:43:12.9745265Z [36;1msudo apt-get update -qq && sudo apt-get install -y --no-install-recommends redis-tools[0m
+2026-07-04T03:43:12.9745806Z [36;1mredis-cli -h 127.0.0.1 -p 6379 PING | grep -q PONG[0m
+2026-07-04T03:43:12.9780232Z shell: /usr/bin/bash -e {0}
+2026-07-04T03:43:12.9780495Z ##[endgroup]
+2026-07-04T03:43:19.9507199Z Reading package lists...
+2026-07-04T03:43:20.1413222Z Building dependency tree...
+2026-07-04T03:43:20.1422796Z Reading state information...
+2026-07-04T03:43:20.3166083Z The following additional packages will be installed:
+2026-07-04T03:43:20.3173060Z   libjemalloc2 liblzf1
+2026-07-04T03:43:20.3180237Z Suggested packages:
+2026-07-04T03:43:20.3180850Z   ruby-redis
+2026-07-04T03:43:20.3362381Z The following NEW packages will be installed:
+2026-07-04T03:43:20.3367318Z   libjemalloc2 liblzf1 redis-tools
+2026-07-04T03:43:20.3590247Z 0 upgraded, 3 newly installed, 0 to remove and 31 not upgraded.
+2026-07-04T03:43:20.3591588Z Need to get 1430 kB of archives.
+2026-07-04T03:43:20.3592800Z After this operation, 7381 kB of additional disk space will be used.
+2026-07-04T03:43:20.3593919Z Get:1 file:/etc/apt/apt-mirrors.txt Mirrorlist [144 B]
+2026-07-04T03:43:20.4486337Z Get:2 http://azure.archive.ubuntu.com/ubuntu noble/universe amd64 libjemalloc2 amd64 5.3.0-2build1 [256 kB]
+2026-07-04T03:43:20.5242794Z Get:3 http://azure.archive.ubuntu.com/ubuntu noble/universe amd64 liblzf1 amd64 3.6-4 [7624 B]
+2026-07-04T03:43:20.5957552Z Get:4 http://azure.archive.ubuntu.com/ubuntu noble-updates/universe amd64 redis-tools amd64 5:7.0.15-1ubuntu0.24.04.4 [1166 kB]
+2026-07-04T03:43:20.9402210Z Fetched 1430 kB in 0s (4448 kB/s)
+2026-07-04T03:43:20.9663498Z Selecting previously unselected package libjemalloc2:amd64.
+2026-07-04T03:43:20.9949143Z (Reading database ... 
+2026-07-04T03:43:20.9950389Z (Reading database ... 5%
+2026-07-04T03:43:20.9950835Z (Reading database ... 10%
+2026-07-04T03:43:20.9951439Z (Reading database ... 15%
+2026-07-04T03:43:20.9951826Z (Reading database ... 20%
+2026-07-04T03:43:20.9952214Z (Reading database ... 25%
+2026-07-04T03:43:20.9952588Z (Reading database ... 30%
+2026-07-04T03:43:20.9952964Z (Reading database ... 35%
+2026-07-04T03:43:20.9953343Z (Reading database ... 40%
+2026-07-04T03:43:20.9953715Z (Reading database ... 45%
+2026-07-04T03:43:20.9954084Z (Reading database ... 50%
+2026-07-04T03:43:21.0027306Z (Reading database ... 55%
+2026-07-04T03:43:21.1657072Z (Reading database ... 60%
+2026-07-04T03:43:21.3159128Z (Reading database ... 65%
+2026-07-04T03:43:21.5233157Z (Reading database ... 70%
+2026-07-04T03:43:21.6016705Z (Reading database ... 75%
+2026-07-04T03:43:21.7018044Z (Reading database ... 80%
+2026-07-04T03:43:21.8850928Z (Reading database ... 85%
+2026-07-04T03:43:22.0605247Z (Reading database ... 90%
+2026-07-04T03:43:22.2682472Z (Reading database ... 95%
+2026-07-04T03:43:22.2683746Z (Reading database ... 100%
+2026-07-04T03:43:22.2684500Z (Reading database ... 202513 files and directories currently installed.)
+2026-07-04T03:43:22.2701997Z Preparing to unpack .../libjemalloc2_5.3.0-2build1_amd64.deb ...
+2026-07-04T03:43:22.2747619Z Unpacking libjemalloc2:amd64 (5.3.0-2build1) ...
+2026-07-04T03:43:22.3052900Z Selecting previously unselected package liblzf1:amd64.
+2026-07-04T03:43:22.3181553Z Preparing to unpack .../liblzf1_3.6-4_amd64.deb ...
+2026-07-04T03:43:22.3203549Z Unpacking liblzf1:amd64 (3.6-4) ...
+2026-07-04T03:43:22.3479193Z Selecting previously unselected package redis-tools.
+2026-07-04T03:43:22.3612382Z Preparing to unpack .../redis-tools_5%3a7.0.15-1ubuntu0.24.04.4_amd64.deb ...
+2026-07-04T03:43:22.3627064Z Unpacking redis-tools (5:7.0.15-1ubuntu0.24.04.4) ...
+2026-07-04T03:43:22.4357127Z Setting up libjemalloc2:amd64 (5.3.0-2build1) ...
+2026-07-04T03:43:22.4387052Z Setting up liblzf1:amd64 (3.6-4) ...
+2026-07-04T03:43:22.4421143Z Setting up redis-tools (5:7.0.15-1ubuntu0.24.04.4) ...
+2026-07-04T03:43:22.5711160Z Processing triggers for man-db (2.12.0-4build2) ...
+2026-07-04T03:43:22.5733607Z Not building database; man-db/auto-update is not 'true'.
+2026-07-04T03:43:22.5752854Z Processing triggers for libc-bin (2.39-0ubuntu8.7) ...
+2026-07-04T03:43:23.2879903Z 
+2026-07-04T03:43:23.2880709Z Running kernel seems to be up-to-date.
+2026-07-04T03:43:23.2881658Z 
+2026-07-04T03:43:23.2882237Z No services need to be restarted.
+2026-07-04T03:43:23.2882893Z 
+2026-07-04T03:43:23.2883397Z No containers need to be restarted.
+2026-07-04T03:43:23.2883898Z 
+2026-07-04T03:43:23.2884291Z No user sessions are running outdated binaries.
+2026-07-04T03:43:23.2884811Z 
+2026-07-04T03:43:23.2885304Z No VM guests are running outdated hypervisor (qemu) binaries on this host.
+2026-07-04T03:43:24.2882207Z ##[group]Run echo "nginx.id=39a91c7a9c24d5c38beb9ed021f8a3200c72bd9446e3b793b21541a75c58399b"
+2026-07-04T03:43:24.2882967Z [36;1mecho "nginx.id=39a91c7a9c24d5c38beb9ed021f8a3200c72bd9446e3b793b21541a75c58399b"[0m
+2026-07-04T03:43:24.2883459Z [36;1mecho "nginx.ports[80]=8080"[0m
+2026-07-04T03:43:24.2883896Z [36;1mecho "redis.id=f26d9332104d6be5f5619cac78616fafcfd9353409523f0e8ce2f47e9fd9d071"[0m
+2026-07-04T03:43:24.2884359Z [36;1mecho "redis.ports[6379]=6379"[0m
+2026-07-04T03:43:24.2917791Z shell: /usr/bin/bash -e {0}
+2026-07-04T03:43:24.2918051Z ##[endgroup]
+2026-07-04T03:43:24.2972375Z nginx.id=39a91c7a9c24d5c38beb9ed021f8a3200c72bd9446e3b793b21541a75c58399b
+2026-07-04T03:43:24.2974208Z nginx.ports[80]=8080
+2026-07-04T03:43:24.2974936Z redis.id=f26d9332104d6be5f5619cac78616fafcfd9353409523f0e8ce2f47e9fd9d071
+2026-07-04T03:43:24.2975611Z redis.ports[6379]=6379
+2026-07-04T03:43:24.3087169Z Print service container logs: 9ca2578b332a4d91adf7ef94a787edc6_nginx127alpine_f669ed
+2026-07-04T03:43:24.3093889Z ##[command]/usr/bin/docker logs --details 39a91c7a9c24d5c38beb9ed021f8a3200c72bd9446e3b793b21541a75c58399b
+2026-07-04T03:43:24.3252803Z  2026/07/04 03:43:04 [notice] 1#1: using the "epoll" event method
+2026-07-04T03:43:24.3253454Z  /docker-entrypoint.sh: /docker-entrypoint.d/ is not empty, will attempt to perform configuration
+2026-07-04T03:43:24.3254334Z  2026/07/04 03:43:04 [notice] 1#1: nginx/1.27.5
+2026-07-04T03:43:24.3254863Z  /docker-entrypoint.sh: Looking for shell scripts in /docker-entrypoint.d/
+2026-07-04T03:43:24.3255603Z  2026/07/04 03:43:04 [notice] 1#1: built by gcc 14.2.0 (Alpine 14.2.0) 
+2026-07-04T03:43:24.3256626Z  2026/07/04 03:43:04 [notice] 1#1: OS: Linux 6.17.0-1018-azure
+2026-07-04T03:43:24.3257455Z  2026/07/04 03:43:04 [notice] 1#1: getrlimit(RLIMIT_NOFILE): 65536:65536
+2026-07-04T03:43:24.3258365Z  2026/07/04 03:43:04 [notice] 1#1: start worker processes
+2026-07-04T03:43:24.3259118Z  2026/07/04 03:43:04 [notice] 1#1: start worker process 30
+2026-07-04T03:43:24.3259843Z  2026/07/04 03:43:04 [notice] 1#1: start worker process 31
+2026-07-04T03:43:24.3269106Z  /docker-entrypoint.sh: Launching /docker-entrypoint.d/10-listen-on-ipv6-by-default.sh
+2026-07-04T03:43:24.3270206Z  10-listen-on-ipv6-by-default.sh: info: Getting the checksum of /etc/nginx/conf.d/default.conf
+2026-07-04T03:43:24.3271910Z  10-listen-on-ipv6-by-default.sh: info: Enabled listen on IPv6 in /etc/nginx/conf.d/default.conf
+2026-07-04T03:43:24.3272919Z  /docker-entrypoint.sh: Sourcing /docker-entrypoint.d/15-local-resolvers.envsh
+2026-07-04T03:43:24.3273665Z  /docker-entrypoint.sh: Launching /docker-entrypoint.d/20-envsubst-on-templates.sh
+2026-07-04T03:43:24.3274270Z  /docker-entrypoint.sh: Launching /docker-entrypoint.d/30-tune-worker-processes.sh
+2026-07-04T03:43:24.3274785Z  /docker-entrypoint.sh: Configuration complete; ready for start up
+2026-07-04T03:43:24.3275275Z  ::1 - - [04/Jul/2026:03:43:09 +0000] "GET / HTTP/1.1" 200 615 "-" "curl/8.12.1" "-"
+2026-07-04T03:43:24.3275765Z  172.18.0.1 - - [04/Jul/2026:03:43:12 +0000] "GET / HTTP/1.1" 200 615 "-" "curl/8.5.0" "-"
+2026-07-04T03:43:24.3276225Z  ::1 - - [04/Jul/2026:03:43:14 +0000] "GET / HTTP/1.1" 200 615 "-" "curl/8.12.1" "-"
+2026-07-04T03:43:24.3276648Z  ::1 - - [04/Jul/2026:03:43:19 +0000] "GET / HTTP/1.1" 200 615 "-" "curl/8.12.1" "-"
+2026-07-04T03:43:24.3285117Z Stop and remove container: 9ca2578b332a4d91adf7ef94a787edc6_nginx127alpine_f669ed
+2026-07-04T03:43:24.3290087Z ##[command]/usr/bin/docker rm --force 39a91c7a9c24d5c38beb9ed021f8a3200c72bd9446e3b793b21541a75c58399b
+2026-07-04T03:43:25.0695793Z 39a91c7a9c24d5c38beb9ed021f8a3200c72bd9446e3b793b21541a75c58399b
+2026-07-04T03:43:25.0719971Z Print service container logs: 4b93dc05e02445ec82ff7bd16f2f296b_redis7alpine_4a8f07
+2026-07-04T03:43:25.0721571Z ##[command]/usr/bin/docker logs --details f26d9332104d6be5f5619cac78616fafcfd9353409523f0e8ce2f47e9fd9d071
+2026-07-04T03:43:25.0876282Z  1:C 04 Jul 2026 03:43:07.103 # WARNING Memory overcommit must be enabled! Without it, a background save or replication may fail under low memory condition. Being disabled, it can also cause failures without low memory condition, see https://github.com/jemalloc/jemalloc/issues/1328. To fix this issue add 'vm.overcommit_memory = 1' to /etc/sysctl.conf and then reboot or run the command 'sysctl vm.overcommit_memory=1' for this to take effect.
+2026-07-04T03:43:25.0905053Z  1:C 04 Jul 2026 03:43:07.103 * oO0OoO0OoO0Oo Redis is starting oO0OoO0OoO0Oo
+2026-07-04T03:43:25.0906491Z  1:C 04 Jul 2026 03:43:07.103 * Redis version=7.4.9, bits=64, commit=00000000, modified=0, pid=1, just started
+2026-07-04T03:43:25.0908319Z  1:C 04 Jul 2026 03:43:07.103 # Warning: no config file specified, using the default config. In order to specify a config file use redis-server /path/to/redis.conf
+2026-07-04T03:43:25.0912035Z  1:M 04 Jul 2026 03:43:07.103 * monotonic clock: POSIX clock_gettime
+2026-07-04T03:43:25.0913359Z  1:M 04 Jul 2026 03:43:07.104 * Running mode=standalone, port=6379.
+2026-07-04T03:43:25.0914149Z  1:M 04 Jul 2026 03:43:07.105 * Server initialized
+2026-07-04T03:43:25.0914831Z  1:M 04 Jul 2026 03:43:07.105 * Ready to accept connections tcp
+2026-07-04T03:43:25.0928150Z Stop and remove container: 4b93dc05e02445ec82ff7bd16f2f296b_redis7alpine_4a8f07
+2026-07-04T03:43:25.0929914Z ##[command]/usr/bin/docker rm --force f26d9332104d6be5f5619cac78616fafcfd9353409523f0e8ce2f47e9fd9d071
+2026-07-04T03:43:25.2184094Z f26d9332104d6be5f5619cac78616fafcfd9353409523f0e8ce2f47e9fd9d071
+2026-07-04T03:43:25.2243090Z Remove container network: github_network_ae41f353e2eb471fba23b0213c8be9e5
+2026-07-04T03:43:25.2264729Z ##[command]/usr/bin/docker network rm github_network_ae41f353e2eb471fba23b0213c8be9e5
+2026-07-04T03:43:25.3066117Z github_network_ae41f353e2eb471fba23b0213c8be9e5
+2026-07-04T03:43:25.3144610Z Cleaning up orphan processes

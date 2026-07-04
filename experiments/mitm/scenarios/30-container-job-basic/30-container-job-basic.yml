@@ -1,0 +1,25 @@
+name: "golden: container-job-basic"
+on: workflow_dispatch
+
+jobs:
+  container-basic:
+    runs-on: ubuntu-latest
+    container: node:20-bookworm
+    steps:
+      - name: Node version
+        run: node --version
+      - name: NPM version
+        run: npm --version
+      - name: Verify running inside container
+        run: |
+          # The job container should have /.dockerenv
+          test -f /.dockerenv
+          echo "Running inside Docker container"
+      - name: Check environment variables
+        run: |
+          echo "HOME=$HOME"
+          echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
+          echo "RUNNER_TEMP=$RUNNER_TEMP"
+          echo "GITHUB_ACTION=$GITHUB_ACTION"
+      - name: Write a file in workspace
+        run: echo "hello from container" > /tmp/test-output.txt && cat /tmp/test-output.txt
