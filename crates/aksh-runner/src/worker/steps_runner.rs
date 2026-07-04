@@ -111,13 +111,8 @@ pub async fn run_steps(
             crate::worker::job_runner::flush_step_updates(rpt, &queue).await;
         }
 
-        let init_result = initialize_containers(
-            container_spec,
-            service_specs,
-            workspace,
-            job,
-        )
-        .await;
+        let init_result =
+            initialize_containers(container_spec, service_specs, workspace, job).await;
 
         // Extract logs from the result (Ok holds logs, Err means init failed)
         let init_logs = match &init_result {
@@ -665,8 +660,7 @@ async fn initialize_containers(
     let mut service_containers = Vec::new();
     for service in service_specs {
         let name = container_name(&service.image, &label);
-        let id =
-            start_service_container(service, &name, &label, &network, &mut log).await?;
+        let id = start_service_container(service, &name, &label, &network, &mut log).await?;
         service_containers.push((service.alias.clone(), id, name));
     }
 
