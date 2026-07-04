@@ -132,7 +132,8 @@ fn xml_tag<'a>(value: &'a str, tag: &str) -> Option<&'a str> {
                 while let Some(close_pos) = value[close_search_idx..].find(&close_str) {
                     let close_tag_start = close_search_idx + close_pos + 2;
                     if let Some(close_tag_end) = value[close_tag_start..].find('>') {
-                        let full_close_tag = value[close_tag_start..close_tag_start + close_tag_end].trim();
+                        let full_close_tag =
+                            value[close_tag_start..close_tag_start + close_tag_end].trim();
                         let base_close_tag = full_close_tag.split_whitespace().next().unwrap_or("");
                         if base_close_tag == tag || base_close_tag.ends_with(&format!(":{tag}")) {
                             return Some(value[content_start..close_search_idx + close_pos].trim());

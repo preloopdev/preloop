@@ -168,8 +168,9 @@ pub async fn run_steps(
         let step_number = (idx as u32) + step_offset;
 
         let expr_ctx = job.build_expression_context();
-        let resolved_display_name = crate::worker::template::evaluate_template(&step.display_name, &expr_ctx)
-            .unwrap_or_else(|_| step.display_name.clone());
+        let resolved_display_name =
+            crate::worker::template::evaluate_template(&step.display_name, &expr_ctx)
+                .unwrap_or_else(|_| step.display_name.clone());
         // Check for cancellation
         if *cancel_rx.borrow() && !cancelled {
             cancelled = true;
@@ -179,7 +180,10 @@ pub async fn run_steps(
 
         // Evaluate the step condition
         if !should_run_step(step, job) {
-            info!("Skipping step '{}' (condition not met)", resolved_display_name);
+            info!(
+                "Skipping step '{}' (condition not met)",
+                resolved_display_name
+            );
             job.steps.insert(
                 step.context_name.clone(),
                 StepResult {
@@ -228,8 +232,11 @@ pub async fn run_steps(
             crate::worker::job_runner::flush_step_updates(rpt, &queue).await;
         }
 
-        let mut step_ctx =
-            StepContext::new(job, step.context_name.clone(), resolved_display_name.clone());
+        let mut step_ctx = StepContext::new(
+            job,
+            step.context_name.clone(),
+            resolved_display_name.clone(),
+        );
         for (k, v) in &step.env {
             step_ctx.env.insert(k.clone(), v.clone());
         }
@@ -249,7 +256,10 @@ pub async fn run_steps(
 
         // P2.2: Emit debug logs for condition evaluation
         let condition = step.condition.as_deref().unwrap_or("success()");
-        step_ctx.debug(&format!("Evaluating condition for step: '{}'", resolved_display_name));
+        step_ctx.debug(&format!(
+            "Evaluating condition for step: '{}'",
+            resolved_display_name
+        ));
         step_ctx.debug(&format!("Evaluating: {condition}"));
         step_ctx.debug("Result: true");
 
