@@ -125,7 +125,7 @@ impl<'a> StepContext<'a> {
         // P1.6: Feed through job-level problem matchers to produce annotations
         let matched_annotations = self.job.matchers.match_line(&masked);
         for ann in matched_annotations {
-            self.annotations.push(ann);
+            self.annotate(ann);
         }
         let ts = crate::worker::job_runner::iso_now();
         self.log_lines.push(format!("{ts} {masked}"));
@@ -133,7 +133,9 @@ impl<'a> StepContext<'a> {
 
     /// Add an annotation.
     pub fn annotate(&mut self, annotation: Annotation) {
-        self.annotations.push(annotation);
+        if self.annotations.len() < 10 {
+            self.annotations.push(annotation);
+        }
     }
 
     /// Update the debug flag based on step environment overrides.
@@ -263,6 +265,25 @@ mod tests {
         });
         assert_eq!(ctx.annotations.len(), 1);
         assert_eq!(ctx.annotations[0].message, "test error");
+    }
+    #[test]
+    fn annotations_cap_enforced() {
+        let mut job = make_job();
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        for i in 0..15 {
+            ctx.annotate(Annotation {
+                level: AnnotationLevel::Warning,
+                message: format!("warning {i}"),
+                title: None,
+                file: None,
+                line: None,
+                end_line: None,
+                col: None,
+                end_column: None,
+            });
+        }
+        assert_eq!(ctx.annotations.len(), 10);
+        assert_eq!(ctx.annotations[9].message, "warning 9");
     }
 
     #[test]
