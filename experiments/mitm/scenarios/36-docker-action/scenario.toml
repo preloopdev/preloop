@@ -1,0 +1,16 @@
+description = "Docker:// container actions: alpine and busybox actions on host and inside container job."
+duration_seconds_max = 600
+
+[[steps]]
+kind = "submit_workflow"
+path = "36-docker-action.yml"
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_assigned"
+timeout = 120
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_completed"
+timeout = 300

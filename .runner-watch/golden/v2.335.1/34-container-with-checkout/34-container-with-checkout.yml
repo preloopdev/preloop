@@ -1,0 +1,22 @@
+name: "golden: container-with-checkout"
+on: workflow_dispatch
+
+jobs:
+  container-checkout:
+    runs-on: ubuntu-latest
+    container: ubuntu:24.04
+    steps:
+      - name: Install git (needed by checkout in container)
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends git ca-certificates
+      - uses: actions/checkout@v4
+      - name: Verify repo was checked out
+        run: |
+          test -f .github/workflows/34-container-with-checkout.yml
+          echo "Checkout successful"
+          ls -la
+      - name: Show git info in container
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git log --oneline -3
