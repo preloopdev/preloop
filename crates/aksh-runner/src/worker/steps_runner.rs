@@ -66,7 +66,10 @@ pub async fn run_steps(
     cancel_rx: tokio::sync::watch::Receiver<bool>,
     queue: Arc<Mutex<ServerQueue>>,
     reporting: Option<&crate::worker::job_runner::ReportingContext>,
+    container_spec: Option<&super::container_ops::ContainerSpec>,
+    service_specs: &[super::container_ops::ServiceSpec],
 ) -> Result<String> {
+    let has_containers = container_spec.is_some() || !service_specs.is_empty();
     let mut any_failed = false;
     let mut cancelled = false;
     let now = crate::worker::job_runner::iso_now();
@@ -88,8 +91,71 @@ pub async fn run_steps(
         crate::worker::job_runner::flush_step_updates(rpt, &queue).await;
     }
 
+    // Phase 2: Initialize containers step (step 2 when containers present)
+    let step_offset: u32 = if has_containers {
+        let init_start = crate::worker::job_runner::iso_now();
+        let init_step_id = uuid::Uuid::new_v4().to_string();
+        {
+            let mut q = queue.lock().await;
+            q.queue_update(StepUpdate {
+                external_id: init_step_id.clone(),
+                number: 2,
+                name: "Initialize containers".to_string(),
+                status: step_status::IN_PROGRESS,
+                started_at: Some(init_start.clone()),
+                completed_at: None,
+                conclusion: 0,
+            });
+        }
+        if let Some(rpt) = reporting {
+            crate::worker::job_runner::flush_step_updates(rpt, &queue).await;
+        }
+
+        let init_result = initialize_containers(
+            container_spec,
+            service_specs,
+            workspace,
+            job,
+        )
+        .await;
+
+        let init_end = crate::worker::job_runner::iso_now();
+        let init_conclusion = if init_result.is_ok() {
+            step_conclusion::SUCCEEDED
+        } else {
+            any_failed = true;
+            job.job_status = JobStatus::Failure;
+            step_conclusion::FAILED
+        };
+        {
+            let mut q = queue.lock().await;
+            q.queue_update(StepUpdate {
+                external_id: init_step_id.clone(),
+                number: 2,
+                name: "Initialize containers".to_string(),
+                status: step_status::COMPLETED,
+                started_at: Some(init_start),
+                completed_at: Some(init_end),
+                conclusion: init_conclusion,
+            });
+        }
+        if let Some(rpt) = reporting {
+            crate::worker::job_runner::flush_step_updates(rpt, &queue).await;
+        }
+
+        if init_result.is_err() {
+            warn!("Container initialization failed: {:?}", init_result.err());
+        }
+
+        // User steps start at 3 (after Set up job + Initialize containers)
+        3
+    } else {
+        // User steps start at 2 (after Set up job)
+        2
+    };
+
     for (idx, step) in steps.iter().enumerate() {
-        let step_number = (idx + 2) as u32; // 1-based, starting at 2 (after "Set up job")
+        let step_number = (idx as u32) + step_offset;
 
         // Check for cancellation
         if *cancel_rx.borrow() && !cancelled {
@@ -333,9 +399,63 @@ pub async fn run_steps(
         }
     }
 
+    // Phase 2: Stop containers step (always runs, like post-job)
+    let mut extra_steps = 0u32;
+    if has_containers {
+        extra_steps += 1;
+        let stop_start = crate::worker::job_runner::iso_now();
+        let stop_step_number = step_offset + steps.len() as u32;
+        let stop_step_id = uuid::Uuid::new_v4().to_string();
+        {
+            let mut q = queue.lock().await;
+            q.queue_update(StepUpdate {
+                external_id: stop_step_id.clone(),
+                number: stop_step_number,
+                name: "Stop containers".to_string(),
+                status: step_status::IN_PROGRESS,
+                started_at: Some(stop_start.clone()),
+                completed_at: None,
+                conclusion: 0,
+            });
+        }
+        if let Some(rpt) = reporting {
+            crate::worker::job_runner::flush_step_updates(rpt, &queue).await;
+        }
+
+        // Run cleanup
+        if let Some(state) = &job.container_state {
+            let mut cleanup_log = Vec::new();
+            if let Err(e) = super::container_ops::cleanup_containers(state, &mut cleanup_log).await
+            {
+                warn!("Container cleanup failed: {e:#}");
+            }
+            for line in &cleanup_log {
+                info!("{line}");
+            }
+        }
+
+        let stop_end = crate::worker::job_runner::iso_now();
+        {
+            let mut q = queue.lock().await;
+            q.queue_update(StepUpdate {
+                external_id: stop_step_id,
+                number: stop_step_number,
+                name: "Stop containers".to_string(),
+                status: step_status::COMPLETED,
+                started_at: Some(stop_start),
+                completed_at: Some(stop_end),
+                conclusion: step_conclusion::SUCCEEDED,
+            });
+        }
+        if let Some(rpt) = reporting {
+            crate::worker::job_runner::flush_step_updates(rpt, &queue).await;
+        }
+    }
+
     // F019: Queue "Complete job" step
     let ts = crate::worker::job_runner::iso_now();
-    let total_steps = steps.len() + 2;
+    // Step number: step_offset + user_steps + extra_steps (stop containers) + 1
+    let complete_step_number = step_offset + steps.len() as u32 + extra_steps;
     let final_conclusion = if cancelled || any_failed {
         step_conclusion::FAILED
     } else {
@@ -345,7 +465,7 @@ pub async fn run_steps(
         let mut q = queue.lock().await;
         q.queue_update(StepUpdate {
             external_id: uuid::Uuid::new_v4().to_string(),
-            number: total_steps as u32,
+            number: complete_step_number,
             name: "Complete job".to_string(),
             status: step_status::COMPLETED,
             started_at: Some(ts.clone()),
@@ -385,6 +505,8 @@ fn should_run_step(step: &Step, job: &JobContext) -> bool {
 }
 
 /// Execute a single step, threading cancel_rx to the process invoker.
+///
+/// When a job container is active, script steps are routed through `docker exec`.
 async fn execute_step(
     step_type: &StepType,
     ctx: &mut StepContext<'_>,
@@ -401,6 +523,25 @@ async fn execute_step(
             let expr_ctx = ctx.job.build_expression_context();
             let evaluated_script = crate::worker::template::evaluate_template(script, &expr_ctx)
                 .unwrap_or_else(|_| script.clone());
+
+            // Phase 2: Route through docker exec when job container is active
+            let container_id = ctx
+                .job
+                .container_state
+                .as_ref()
+                .and_then(|s| s.job_container_id.clone());
+            if let Some(cid) = container_id {
+                return super::handlers::script::run_script_in_container(
+                    &evaluated_script,
+                    shell.as_deref(),
+                    workspace,
+                    &cid,
+                    ctx,
+                    Some(cancel_rx),
+                )
+                .await;
+            }
+
             super::handlers::script::run_script(
                 &evaluated_script,
                 shell.as_deref(),
@@ -414,4 +555,124 @@ async fn execute_step(
             super::handlers::action::run_action(uses, with, workspace, ctx, cancel_rx).await
         }
     }
+}
+
+/// Initialize containers for a container job.
+///
+/// Matches golden trace sequence: check docker → cleanup stale → create network →
+/// start job container → start service containers → wait for health checks.
+async fn initialize_containers(
+    container_spec: Option<&super::container_ops::ContainerSpec>,
+    service_specs: &[super::container_ops::ServiceSpec],
+    workspace: &str,
+    job: &mut JobContext,
+) -> Result<()> {
+    use super::container_ops::*;
+
+    let mut log = Vec::new();
+
+    // Check Docker availability
+    if !check_docker(&mut log).await? {
+        anyhow::bail!("Docker is not available");
+    }
+
+    let label = generate_label();
+    let network = generate_network_name();
+
+    // Clean up stale containers from previous runs
+    cleanup_stale(&label, &mut log).await?;
+
+    // Create job network
+    create_network(&network, &label, &mut log).await?;
+
+    // Derive workspace paths
+    let runner_work = std::path::Path::new(workspace)
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| workspace.to_string());
+    let runner_temp = format!(
+        "{}/_temp",
+        std::path::Path::new(workspace)
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_string_lossy()
+    );
+    let runner_externals = format!("{runner_work}/../externals");
+    let runner_actions = format!(
+        "{}/_actions",
+        std::path::Path::new(workspace)
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_string_lossy()
+    );
+    // Toolcache: use /opt/hostedtoolcache on Linux, or a local fallback
+    let toolcache = if std::path::Path::new("/opt/hostedtoolcache").exists() {
+        "/opt/hostedtoolcache".to_string()
+    } else {
+        format!("{runner_work}/_tool")
+    };
+
+    let mut job_container_id = None;
+    let mut job_container_name = None;
+
+    // Start job container if specified
+    if let Some(spec) = container_spec {
+        let name = container_name(&spec.image, &label);
+        let id = start_job_container(
+            spec,
+            &name,
+            &label,
+            &network,
+            workspace,
+            &runner_work,
+            &runner_temp,
+            &runner_externals,
+            &runner_actions,
+            &toolcache,
+            &mut log,
+        )
+        .await?;
+        job_container_id = Some(id);
+        job_container_name = Some(name);
+    }
+
+    // Start service containers
+    let mut service_containers = Vec::new();
+    for service in service_specs {
+        let name = container_name(&service.image, &label);
+        let id =
+            start_service_container(service, &name, &label, &network, &mut log).await?;
+        service_containers.push((service.alias.clone(), id, name));
+    }
+
+    // Wait for health checks
+    if !service_containers.is_empty() {
+        wait_for_services_healthy(&service_containers, &mut log).await?;
+    }
+
+    // Store container state in job context
+    job.container_state = Some(ContainerState {
+        label,
+        network,
+        job_container_id,
+        job_container_name,
+        service_containers,
+    });
+
+    // Publish service context data (job.services.<alias>.id, etc.)
+    if let Some(state) = &job.container_state {
+        if let Some(id) = &state.job_container_id {
+            // Set job.container.id and job.container.network in env
+            job.env.insert("JOB_CONTAINER_ID".to_string(), id.clone());
+            job.env
+                .insert("JOB_CONTAINER_NETWORK".to_string(), state.network.clone());
+        }
+    }
+
+    for line in &log {
+        info!("{line}");
+    }
+
+    Ok(())
 }
