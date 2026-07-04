@@ -1,0 +1,18 @@
+name: bench-ci
+on: push
+jobs:
+  rust:
+    runs-on: self-hosted
+    steps:
+      - name: cargo fmt
+        run: |
+          export PATH="/root/.cargo/bin:$PATH"
+          cd /workspace && cargo fmt --all --check
+      - name: cargo clippy
+        run: |
+          export PATH="/root/.cargo/bin:$PATH"
+          cd /workspace && cargo clippy --workspace --all-targets
+      - name: cargo test
+        run: |
+          export PATH="/root/.cargo/bin:$PATH"
+          cd /workspace && cargo test --workspace --quiet
