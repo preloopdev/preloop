@@ -140,6 +140,50 @@ impl JobContext {
         result
     }
 
+    /// Read one key from the mutable GitHub context.
+    pub fn github_context_value(&self, key: &str) -> Option<serde_json::Value> {
+        self.context_data
+            .get("github")
+            .map(super::job_extension::decode_typed_value)
+            .and_then(|github| github.get(key).cloned())
+    }
+
+    /// Set or remove one key in the mutable GitHub context.
+    ///
+    /// The official runner's `SetGitHubContext` also affects exported
+    /// `GITHUB_*` environment variables for allow-listed string/bool values, so
+    /// keep `job.env` in sync for action-scoped fields.
+    pub fn set_github_context_value(&mut self, key: &str, value: Option<serde_json::Value>) {
+        let mut github = self
+            .context_data
+            .get("github")
+            .map(super::job_extension::decode_typed_value)
+            .unwrap_or_else(|| serde_json::json!({}));
+        if !github.is_object() {
+            github = serde_json::json!({});
+        }
+
+        if let Some(obj) = github.as_object_mut() {
+            match value {
+                Some(value) => {
+                    sync_github_env(&mut self.env, key, &value);
+                    obj.insert(key.to_string(), value);
+                }
+                None => {
+                    remove_github_env(&mut self.env, key);
+                    obj.remove(key);
+                }
+            }
+        }
+
+        if !self.context_data.is_object() {
+            self.context_data = serde_json::json!({});
+        }
+        if let Some(obj) = self.context_data.as_object_mut() {
+            obj.insert("github".to_string(), github);
+        }
+    }
+
     /// Build the expression evaluation context for condition evaluation.
     pub fn build_expression_context(&self) -> aksh_gha_expressions::Context {
         let mut ctx = aksh_gha_expressions::Context::new();
@@ -278,6 +322,29 @@ impl JobContext {
 
         ctx
     }
+}
+
+fn sync_github_env(env: &mut HashMap<String, String>, key: &str, value: &serde_json::Value) {
+    let env_key = github_env_key(key);
+    match value {
+        serde_json::Value::String(s) => {
+            env.insert(env_key, s.clone());
+        }
+        serde_json::Value::Bool(b) => {
+            env.insert(env_key, b.to_string());
+        }
+        _ => {
+            env.remove(&env_key);
+        }
+    }
+}
+
+fn remove_github_env(env: &mut HashMap<String, String>, key: &str) {
+    env.remove(&github_env_key(key));
+}
+
+fn github_env_key(key: &str) -> String {
+    format!("GITHUB_{}", key.to_ascii_uppercase())
 }
 
 fn current_os() -> &'static str {
@@ -434,5 +501,44 @@ mod tests {
         assert!(!success);
         let failure = aksh_gha_expressions::eval_bool("failure()", &expr_ctx).unwrap();
         assert!(failure);
+    }
+
+    #[test]
+    fn set_github_context_value_updates_context_and_env() {
+        let mut job = JobContext::new(
+            "j1".into(),
+            "Test".into(),
+            serde_json::json!({}),
+            serde_json::json!({"github": {"repository": "owner/repo"}}),
+        );
+
+        job.set_github_context_value(
+            "action_repository",
+            Some(serde_json::json!("actions/checkout")),
+        );
+        job.set_github_context_value("action_ref", Some(serde_json::json!("v4")));
+
+        let expr = job.build_expression_context();
+        assert_eq!(
+            expr.resolve(&["github".to_string(), "action_repository".to_string()])
+                .as_str(),
+            Some("actions/checkout")
+        );
+        assert_eq!(
+            expr.resolve(&["github".to_string(), "action_ref".to_string()])
+                .as_str(),
+            Some("v4")
+        );
+        assert_eq!(
+            job.env.get("GITHUB_ACTION_REPOSITORY").map(String::as_str),
+            Some("actions/checkout")
+        );
+        assert_eq!(
+            job.env.get("GITHUB_ACTION_REF").map(String::as_str),
+            Some("v4")
+        );
+
+        job.set_github_context_value("action_repository", Some(serde_json::Value::Null));
+        assert!(!job.env.contains_key("GITHUB_ACTION_REPOSITORY"));
     }
 }

@@ -19,7 +19,11 @@ pub fn run_action<'a>(
     Box::pin(async move {
         info!("Running action: {uses}");
 
-        if uses.starts_with("docker://") {
+        let previous_repository = ctx.job.github_context_value("action_repository");
+        let previous_ref = ctx.job.github_context_value("action_ref");
+        set_action_repository_context(ctx, uses);
+
+        let result = if uses.starts_with("docker://") {
             super::container::run_docker_action(uses, with, workspace, ctx).await
         } else if uses.starts_with("./") || uses.starts_with("../") {
             let action_dir = std::path::Path::new(workspace).join(uses);
@@ -27,7 +31,13 @@ pub fn run_action<'a>(
         } else {
             let action_dir = resolve_remote_action(uses, workspace, ctx)?;
             run_action_from_dir(&action_dir, with, workspace, ctx, cancel_rx).await
-        }
+        };
+
+        ctx.job
+            .set_github_context_value("action_repository", previous_repository);
+        ctx.job.set_github_context_value("action_ref", previous_ref);
+
+        result
     })
 }
 
@@ -103,5 +113,56 @@ fn resolve_remote_action(
         Ok(action_dir.join(subpath))
     } else {
         Ok(action_dir)
+    }
+}
+
+fn set_action_repository_context(ctx: &mut StepContext<'_>, uses: &str) {
+    if let Some((repository, git_ref)) = action_repository_context(uses) {
+        ctx.job.set_github_context_value(
+            "action_repository",
+            Some(serde_json::Value::String(repository)),
+        );
+        ctx.job
+            .set_github_context_value("action_ref", Some(serde_json::Value::String(git_ref)));
+    } else {
+        ctx.job
+            .set_github_context_value("action_repository", Some(serde_json::Value::Null));
+        ctx.job
+            .set_github_context_value("action_ref", Some(serde_json::Value::Null));
+    }
+}
+
+fn action_repository_context(uses: &str) -> Option<(String, String)> {
+    if uses.starts_with("docker://") || uses.starts_with("./") || uses.starts_with("../") {
+        return None;
+    }
+
+    let (repo_part, git_ref) = uses.split_once('@')?;
+    let mut parts = repo_part.split('/');
+    let owner = parts.next()?;
+    let repo = parts.next()?;
+    if owner.is_empty() || repo.is_empty() || git_ref.is_empty() {
+        return None;
+    }
+
+    Some((format!("{owner}/{repo}"), git_ref.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn action_repository_context_extracts_repository_and_ref() {
+        assert_eq!(
+            action_repository_context("actions/checkout/path@v4"),
+            Some(("actions/checkout".to_string(), "v4".to_string()))
+        );
+    }
+
+    #[test]
+    fn action_repository_context_is_empty_for_local_and_docker_actions() {
+        assert_eq!(action_repository_context("./.github/actions/local"), None);
+        assert_eq!(action_repository_context("docker://alpine:3.20"), None);
     }
 }
