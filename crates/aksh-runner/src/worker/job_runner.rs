@@ -83,6 +83,24 @@ pub async fn run_job(
     // Inject GITHUB_* environment variables
     super::job_extension::inject_github_env(&mut job_ctx, &job_message);
 
+    // Phase 2: Parse container/service specs from job message
+    let job_container_spec = job_message
+        .get("jobContainer")
+        .and_then(super::container_ops::parse_container_spec);
+    let service_specs = job_message
+        .get("jobServiceContainers")
+        .map(super::container_ops::parse_service_specs)
+        .unwrap_or_default();
+
+    let has_containers = job_container_spec.is_some() || !service_specs.is_empty();
+    if has_containers {
+        info!(
+            "Container job: container={}, services={}",
+            job_container_spec.is_some(),
+            service_specs.len()
+        );
+    }
+
     // Extract plan ID
     let plan_id = job_message
         .get("plan")
@@ -188,6 +206,8 @@ pub async fn run_job(
         job_cancel_rx,
         queue.clone(),
         reporting.as_deref(),
+        job_container_spec.as_ref(),
+        &service_specs,
     )
     .await;
 

@@ -35,6 +35,8 @@ pub struct JobContext {
     pub action_paths: HashMap<String, String>,
     /// P1.6: Active problem matchers (cross-step, registered by actions like setup-node).
     pub matchers: MatcherRegistry,
+    /// Container state for job/service containers (Phase 2).
+    pub container_state: Option<super::container_ops::ContainerState>,
 }
 
 /// Result of a completed step.
@@ -106,6 +108,7 @@ impl JobContext {
             step_annotations: HashMap::new(),
             action_paths: HashMap::new(),
             matchers: MatcherRegistry::new(),
+            container_state: None,
         }
     }
 
