@@ -38,8 +38,17 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve { listen, state_dir, record_flows } => {
-            serve(ServerConfig { listen, state_dir, record_flows }).await?;
+        Command::Serve {
+            listen,
+            state_dir,
+            record_flows,
+        } => {
+            serve(ServerConfig {
+                listen,
+                state_dir,
+                record_flows,
+            })
+            .await?;
         }
     }
     Ok(())

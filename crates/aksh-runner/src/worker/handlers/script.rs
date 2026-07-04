@@ -164,7 +164,9 @@ pub async fn run_script_in_container(
 
     let container_args_ref: Vec<&str> = container_args.iter().map(|s| s.as_str()).collect();
     ctx.debug(&format!("Shell resolved: {}", container_program));
-    ctx.debug(&format!("Command line: docker exec -i {container_id} {container_program} {container_args_ref:?}"));
+    ctx.debug(&format!(
+        "Command line: docker exec -i {container_id} {container_program} {container_args_ref:?}"
+    ));
     let result = crate::worker::container_ops::docker_exec(
         container_id,
         &container_program,
