@@ -81,6 +81,106 @@ pub async fn run_script(
     Ok(())
 }
 
+/// Run an inline script step inside a job container via `docker exec`.
+///
+/// The script is written to the host temp dir (which is bind-mounted into the
+/// container as `/__w/_temp`), then executed via `docker exec` with path
+/// translation.
+pub async fn run_script_in_container(
+    script: &str,
+    shell: Option<&str>,
+    working_directory: &str,
+    container_id: &str,
+    ctx: &mut StepContext<'_>,
+    cancel_rx: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<()> {
+    // Write script to host temp dir (mounted as /__w/_temp in container)
+    let temp_dir = Path::new(working_directory)
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("_temp");
+    std::fs::create_dir_all(&temp_dir)?;
+
+    let script_id = uuid::Uuid::new_v4();
+    let (script_path, program, args) = resolve_shell(shell, &temp_dir, &script_id)?;
+
+    // Write the script content
+    std::fs::write(&script_path, script)
+        .with_context(|| format!("writing script to {}", script_path.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    // Translate paths to container paths
+    let host_work = Path::new(working_directory)
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let container_workdir =
+        crate::worker::container_ops::translate_to_container_path(working_directory, &host_work);
+    let container_program =
+        crate::worker::container_ops::translate_to_container_path(&program, &host_work);
+    let container_args: Vec<String> = args
+        .iter()
+        .map(|a| crate::worker::container_ops::translate_to_container_path(a, &host_work))
+        .collect();
+
+    debug!("Running script in container: docker exec {container_id} {container_program} {container_args:?}");
+
+    // Build environment and translate path-valued vars
+    let mut env = ctx.build_env();
+    for key in &[
+        "GITHUB_WORKSPACE",
+        "GITHUB_ENV",
+        "GITHUB_PATH",
+        "GITHUB_OUTPUT",
+        "GITHUB_STATE",
+        "GITHUB_STEP_SUMMARY",
+        "RUNNER_TEMP",
+        "RUNNER_TOOL_CACHE",
+    ] {
+        if let Some(val) = env.get(*key).cloned() {
+            env.insert(
+                key.to_string(),
+                crate::worker::container_ops::translate_to_container_path(&val, &host_work),
+            );
+        }
+    }
+    env.insert("HOME".to_string(), "/github/home".to_string());
+
+    let container_args_ref: Vec<&str> = container_args.iter().map(|s| s.as_str()).collect();
+    let result = crate::worker::container_ops::docker_exec(
+        container_id,
+        &container_program,
+        &container_args_ref,
+        &container_workdir,
+        &env,
+        cancel_rx,
+    )
+    .await?;
+
+    // Collect log lines
+    for line in &result.lines {
+        ctx.log(line);
+    }
+
+    // Check exit code
+    if result.exit_code != 0 {
+        ctx.log(&format!(
+            "##[error]Process completed with exit code {}.",
+            result.exit_code
+        ));
+        anyhow::bail!("process exit code {}", result.exit_code);
+    }
+
+    Ok(())
+}
+
 /// Resolve the shell to use and return (script_path, program, args).
 fn resolve_shell(
     shell: Option<&str>,
