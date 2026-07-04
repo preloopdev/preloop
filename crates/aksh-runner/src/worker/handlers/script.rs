@@ -38,12 +38,11 @@ pub async fn run_script(
         std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
     }
 
-    debug!("Running script: {program} {args:?}");
+    ctx.debug(&format!("Shell resolved: {}", program));
+    ctx.debug(&format!("Command line: {} {:?}", program, args));
 
     // Build environment
     let env = ctx.build_env();
-
-    // Execute
     let result = process::invoke(
         &program,
         &args.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
@@ -156,6 +155,8 @@ pub async fn run_script_in_container(
     env.insert("HOME".to_string(), "/github/home".to_string());
 
     let container_args_ref: Vec<&str> = container_args.iter().map(|s| s.as_str()).collect();
+    ctx.debug(&format!("Shell resolved: {}", container_program));
+    ctx.debug(&format!("Command line: docker exec -i {container_id} {container_program} {container_args_ref:?}"));
     let result = crate::worker::container_ops::docker_exec(
         container_id,
         &container_program,
