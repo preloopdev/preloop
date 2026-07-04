@@ -219,7 +219,7 @@ simple-echo smoke run. Tier-1 live GitHub validation and MITM flow diffs are sti
 
 - **Found**: `patch_agent_request`, `update_timeline`, `create_log`/`append_log`, `post_console_log`, `finish_job` all have zero call sites; `report_completion()` builds a non-`JobCompletedEvent` shape; `TimelineRecord.order` never populated
 - **File**: `crates/aksh-runner/src/client/azdo.rs`, `crates/aksh-runner/src/worker/job_runner.rs`
-- **Status**: ❌ Pending (roadmap P1.3)
+- **Status**: ❌ Defferred (roadmap P1.3)
 
 ### F031 — HIGH: cancellation semantics incomplete; job timeout missing
 
@@ -286,6 +286,142 @@ simple-echo smoke run. Tier-1 live GitHub validation and MITM flow diffs are sti
 - **Found**: GitHub job messages send action references with `name` and `ref` as separate fields in `reference` (e.g. `{"name": "actions/checkout", "ref": "v4"}`). The runner's step parser only read `name`, producing `"actions/checkout"` without `@v4`, which caused `parse_remote_uses` to fail and the action to never be downloaded.
 - **File**: `crates/aksh-runner/src/worker/job_extension.rs`
 - **Status**: ✅ Fixed (2026-07-03) — step parser now combines `reference.name` and `reference.ref` into `uses@ref`. Verified: live GitHub run 28632740507 downloads and executes `actions/checkout@v4` via codeload.github.com.
+
+---
+
+## New Gaps Found — v2.335.1 upstream source audit 2026-07-04 (F042–F056)
+
+Found by diffing every module of `crates/aksh-runner` against the official `actions/runner` v2.335.1
+C# source (cloned at tag `v2.335.1`). These are behavioral differences NOT covered by F001–F041.
+
+### F042 — CRITICAL: Process cancel uses immediate kill — no SIGINT→SIGTERM grace sequence
+
+- **Found**: official sends SIGINT (7.5s timeout), then SIGTERM (2.5s timeout), then hard kill. Our previous implementation called `child.kill().await` immediately.
+- **Impact**: Processes could not run cleanup/shutdown handlers, trap handlers, or finally blocks. Affected builds, test suites, anything with graceful shutdown.
+- **Upstream**: `Runner.Sdk/ProcessInvoker.cs:32-33` (timeout constants), `Runner.Sdk/ProcessInvoker.cs:443-464` (`CancelAndKillProcessTree` — SIGINT→SIGTERM→kill sequence)
+- **File**: `crates/aksh-runner/src/process.rs`
+- **Status**: ✅ Fixed (2026-07-04, commit `1ac32cb`) — process cancellation now sends SIGINT, waits 7.5s, sends SIGTERM, waits 2.5s, then hard-kills/reaps the process group. Verified by targeted process cancellation tests and `cargo check -p aksh-runner`.
+
+### F043 — CRITICAL: Docker exec env vars leak secrets in CLI args
+
+- **Found**: official uses `-e KEY` (no value) for docker run/exec so secrets inherit from the process environment without appearing in `docker inspect` or process listings. Our previous implementation always used `-e KEY=VALUE`.
+- **Impact**: Secret values were visible in `docker inspect`, process listings, and audit logs. Security issue for container jobs.
+- **Upstream**: `Runner.Worker/Container/DockerCommandManager.cs:204-209` (`DockerRun` uses `-e KEY` for all env vars), `Runner.Worker/Container/DockerCommandManager.cs:130-145` (`DockerCreate` checks empty values)
+- **File**: `crates/aksh-runner/src/worker/container_ops.rs`, `crates/aksh-runner/src/worker/handlers/container.rs`
+- **Status**: ✅ Fixed (2026-07-04, commit `0dcadb0`) — Docker create/exec/run now use `-e KEY` inherited-env form where possible so values are passed through the command environment, not CLI args. Verified by focused docker env secrecy tests and `cargo check -p aksh-runner`.
+
+### F044 — HIGH: `github.action_repository` / `github.action_ref` contexts never set
+
+- **Found**: official calls `SetGitHubContext("action_repository", ...)` and `SetGitHubContext("action_ref", ...)` on every action step execution. Our handlers did not set these.
+- **Impact**: `${{ github.action_repository }}` and `${{ github.action_ref }}` returned empty in action steps.
+- **Upstream**: `Runner.Worker/ActionRunner.cs:147-153` (sets `action_repository` and `action_ref` from `repoPathReferenceAction.Name`/`.Ref`)
+- **File**: `crates/aksh-runner/src/worker/handlers/action.rs`, `crates/aksh-runner/src/worker/contexts.rs`
+- **Status**: ✅ Fixed (2026-07-04, commit `45ac510`) — action handlers set action-scoped `github.action_repository`/`github.action_ref` while executing remote actions and restore previous values afterwards. Verified by focused context/env-sync tests and `cargo check -p aksh-runner`.
+
+### F045 — HIGH: `github.action_status` context not set on composite nested steps
+
+- **Found**: official sets `action_status` before each nested step and updates it on cancel. Our composite handler did not set this.
+- **Impact**: `success()`/`failure()` in nested composite steps evaluated against job status, not parent action status.
+- **Upstream**: `Runner.Worker/Handlers/CompositeActionHandler.cs:246-248` (set before each step), `Runner.Worker/Handlers/CompositeActionHandler.cs:339-340` (updated on cancel)
+- **File**: `crates/aksh-runner/src/worker/handlers/composite.rs`
+- **Status**: ✅ Fixed (2026-07-04, commit `81838e4`) — composite handler now updates `github.action_status` before nested steps and preserves success/cancel/failure semantics across composite execution. Verified by focused composite action-status tests and `cargo check -p aksh-runner`.
+
+### F046 — HIGH: Container action `runs.pre-entrypoint`/`runs.post-entrypoint` lifecycle not registered
+
+- **Found**: official registers pre/post lifecycle steps for container actions from `pre-entrypoint`/`post-entrypoint` (LIFO, same as node). Our previous `build_step_list_with_lifecycle` only handled node/composite actions, then the first Docker fix parsed non-official `pre`/`post` keys.
+- **Impact**: Container actions with cleanup logic (`runs.post-entrypoint`) never executed post steps.
+- **Upstream**: `Runner.Worker/ActionManifestManager.cs:414-425` (Docker metadata keys), `Runner.Worker/ActionRunner.cs` (pre/post registration logic), `Runner.Worker/Handlers/HandlerFactory.cs` (container handler instantiation with pre/post support)
+- **File**: `crates/aksh-runner/src/worker/job_extension.rs`, `crates/aksh-runner/src/worker/handlers/factory.rs`
+- **Status**: ✅ Fixed (2026-07-04, commits `2b45924` + `dda4616`) — lifecycle expansion now recognizes `runs.using: docker`, parses official `pre-entrypoint`/`post-entrypoint`, registers container pre/main/post entries, and preserves LIFO cleanup ordering. Verified by focused parser/lifecycle tests and `cargo check -p aksh-runner`.
+
+### F047 — HIGH: Container action `runs.entrypoint`/`runs.args`/`runs.env` from manifest not applied
+
+- **Found**: official evaluates `runs.entrypoint`, `runs.args`, and `runs.env` from the action manifest with expression context (`inputs.*`) and injects them into the docker run invocation. Our container handler ignored these manifest fields.
+- **Impact**: Container actions with custom entry points, arguments, or environment templating from manifest were silently broken.
+- **Upstream**: `Runner.Worker/Handlers/ContainerActionHandler.cs` (evaluates entrypoint/args/env with template context), `Runner.Worker/ActionManifestManager.cs` (manifest evaluation helpers)
+- **File**: `crates/aksh-runner/src/worker/handlers/container.rs`, `crates/aksh-runner/src/worker/handlers/factory.rs`, `crates/aksh-runner/src/worker/handlers/composite.rs`
+- **Status**: ✅ Fixed (2026-07-04, commit `281d750`) — container actions now evaluate manifest `runs.env`, `runs.entrypoint`, and `runs.args` against inputs/context and apply them to `docker run` while preserving secret-safe inherited env passing. Verified by focused manifest-field/lifecycle regressions and `cargo check -p aksh-runner`.
+
+#### F042–F047 validation notes — 2026-07-04
+
+- **Unit/focused tests**: `process::tests::cancel_` (2 tests), `docker_exec_env_args_do_not_include_secret_values`, `docker_create_env_uses_inherit_form_for_empty_values`, `inherited_env_args_do_not_include_secret_values`, `action_repository_context_*`, `set_github_context_value_updates_context_and_env`, `composite_steps_receive_action_status_context`, `github_status_success_failure_cancelled`, `load_docker_action_manifest`, `lifecycle_registers_docker_action_pre_and_post`, `manifest_env_entrypoint_and_args_evaluate_against_inputs`, and `docker_run_args_apply_entrypoint_args_and_hide_env_values` passed.
+- **Build/check**: `cargo fmt --all --check`, `cargo check -p aksh-runner`, and release builds for host macOS arm64 plus smolvm Linux arm64 passed with existing warnings.
+- **Live GitHub smolvm smoke**: runner `aksh-smolvm-fidelity-0704` on ARM64 Linux registered against `preloopdev/aksh` and processed GitHub run `28720263632`. Broker/session/acquirejob/renewjob/WorkflowStepsUpdate/log-upload/completejob all succeeded. The job result was failed because existing `dogfood.yml` expanded unset `vars.AKSH_REPO_ROOT` to `cd ""`; this is workflow configuration, not an F042–F047 runner protocol failure.
+- **Dedicated live workflow**: `.github/workflows/runner-fidelity-f042-f047.yml` and `fixtures/actions/*` were added in commit `b531312` to validate Docker lifecycle/manifest fields and composite `github.action_status` on a self-hosted runner. GitHub refused branch-only `workflow_dispatch` because the workflow file is not on the default branch yet, so this remains a manual live gate after merge.
+- **Local aksh smoke**: `aksh-conformance runner-e2e --workflow crates/aksh-conformance/fixtures/hello-world.yml --record-flows /tmp/smoke-flows.jsonl` returned `{"status":"success","success":true}`; rerun emitted `Address already in use` because a previous failed attempt left port 9191 occupied.
+- **Golden replay**: `runner-watch conform --runner v2.335.1 --aksh-url http://127.0.0.1:9090 --skip-cargo-test` failed only known unsupported storage scenarios: `11-cache-roundtrip` (CacheService Twirp 404) and `12-artifact` (ArtifactService Twirp 404).
+
+### F048 — HIGH: Job-level annotations hardcoded to `[]` in completejob
+
+- **Found**: official collects infrastructure failure annotations at the job level in `GlobalContext.JobAnnotations` and passes them to `CompleteJobAsync`. Our implementation hardcodes the top-level `annotations` field to `[]` — F025 only fixed per-step annotations in `stepResults`.
+- **Impact**: Infrastructure failures and job-level issues not visible in GitHub UI.
+- **Upstream**: `Runner.Worker/JobRunner.cs` (`GlobalContext.JobAnnotations` collection and `CompleteJobAsync` call)
+- **File**: `crates/aksh-runner/src/worker/job_runner.rs`
+- **Status**: ❌ Open (partial regression of F025)
+
+### F049 — HIGH: Web proxy env not injected into containers
+
+- **Found**: official injects `HTTP_PROXY`/`http_proxy`, `HTTPS_PROXY`/`https_proxy`, `NO_PROXY`/`no_proxy` (both cases) from runner web proxy config into container environment. Our `container_ops.rs` has no proxy handling.
+- **Impact**: Container workflows behind corporate proxies fail on Docker image pulls and network access.
+- **Upstream**: `Runner.Worker/Container/ContainerInfo.cs:253-271` (`UpdateWebProxyEnv` method — `TryAdd` for each proxy var in both upper/lower case)
+- **File**: `crates/aksh-runner/src/worker/container_ops.rs`
+- **Status**: ❌ Open
+
+### F050 — MEDIUM: `github.action` context not set from step action name
+
+- **Found**: official calls `SetGitHubContext("action", actionStep.Action.Name)` before each action step. Our steps_runner has no equivalent.
+- **Impact**: `${{ github.action }}` returns empty for action steps.
+- **Upstream**: `Runner.Worker/StepsRunner.cs:118` (`SetGitHubContext("action", actionStep.Action.Name)`)
+- **File**: `crates/aksh-runner/src/worker/steps_runner.rs`
+- **Status**: ❌ Open
+
+### F051 — MEDIUM: Problem matcher `fromPath` field not supported
+
+- **Found**: official uses `fromPath` as a base directory for resolving relative file paths in matcher output. Our `matchers.rs` does not parse or use this field.
+- **Impact**: Relative file paths in annotations resolved incorrectly or dropped.
+- **Upstream**: `Runner.Worker/Handlers/OutputManager.cs:297-303` (resolves relative paths against `fromPath`), `Runner.Worker/IssueMatcher.cs:210` (`FromPath` property)
+- **File**: `crates/aksh-runner/src/worker/matchers.rs`
+- **Status**: ❌ Open
+
+### F052 — MEDIUM: Missing `.runner` settings fields
+
+- **Found**: official persists `DisableUpdate`, `UseRunnerAdminFlow`, `SkipSessionRecover`, `MonitorSocketAddress` in `.runner`. Our `settings.rs` does not include these fields.
+- **Impact**: `SkipSessionRecover` affects session recovery behavior; others are minor runtime flags.
+- **Upstream**: `Runner.Common/ConfigurationStore.cs` (`RunnerSettings` class — all four fields with `[DataMember]` attributes)
+- **File**: `crates/aksh-runner/src/settings.rs`
+- **Status**: ❌ Open
+
+### F053 — MEDIUM: Missing credential data fields for auth migration
+
+- **Found**: official reads `authorizationUrlV2`, `enableAuthMigrationByDefault`, `oauthEndpointUrl` from `.credentials` data block. Our `configure.rs` does not extract these from the agent response and our OAuth exchange ignores them.
+- **Impact**: Auth migration to V2 URLs not supported; `oauthEndpointUrl` fallback missing.
+- **Upstream**: `Runner.Listener/Configuration/OAuthCredential.cs` (reads all three fields from `CredentialData.Data` dictionary and selects auth URL accordingly)
+- **File**: `crates/aksh-runner/src/configure.rs`, `crates/aksh-runner/src/listener/oauth.rs`
+- **Status**: ❌ Open
+
+### F054 — MEDIUM: Diagnostic log upload missing
+
+- **Found**: official collects runner/worker diagnostic logs from `_diag/`, zips with metadata, and uploads via the results service `CreateResultsDiagnosticLogsAsync`. No equivalent in our codebase.
+- **Impact**: No runner diagnostic telemetry collected. Not a workflow blocker but affects debugging.
+- **Upstream**: `Runner.Worker/DiagnosticLogManager.cs` (full class — collects `_diag/*.log`, filters by job start time, creates zip with metadata JSON, uploads via results service signed URL)
+- **File**: N/A (not implemented)
+- **Status**: ❌ Open
+
+### F055 — MEDIUM: `hashFiles()` doesn't support `--follow-symbolic-links` flag
+
+- **Found**: official parses `--follow-symbolic-links` as a flag argument. Our expression engine does not handle this flag.
+- **Impact**: Symbolic links silently ignored in cache keys when flag is used.
+- **Upstream**: `Runner.Worker/Expressions/HashFilesFunction.cs:44-51` (parses `--follow-symbolic-links` from first argument, passes to `Globber` options)
+- **File**: `crates/aksh-gha-expressions/src/lib.rs`
+- **Status**: ❌ Open
+
+### F056 — LOW: `requireFipsCryptography` hardcoded to `"True"`
+
+- **Found**: official reads `properties.RequireFipsCryptography` from agent response. Our `configure.rs` hardcodes `"True"`.
+- **Impact**: Minor; always enables FIPS regardless of server preference.
+- **Upstream**: `Runner.Listener/Configuration/ConfigurationManager.cs` (reads `RequireFipsCryptography` from agent creation response `properties` block)
+- **File**: `crates/aksh-runner/src/configure.rs`
+- **Status**: ❌ Open
 
 ---
 
