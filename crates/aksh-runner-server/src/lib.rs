@@ -588,7 +588,10 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         )
         .merge(protected_apis)
         .layer(TraceLayer::new_for_http())
-        .layer(middleware::from_fn_with_state(state.clone(), record_flows_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            record_flows_middleware,
+        ))
         .with_state(shared)
 }
 
@@ -3792,9 +3795,14 @@ async fn record_flows_middleware(
 
     let method = request.method().to_string();
     let uri = request.uri();
-    let path = uri.path_and_query().map(|pq| pq.to_string()).unwrap_or_else(|| uri.path().to_string());
+    let path = uri
+        .path_and_query()
+        .map(|pq| pq.to_string())
+        .unwrap_or_else(|| uri.path().to_string());
     let scheme = uri.scheme_str().unwrap_or("http").to_string();
-    let host = request.headers().get(header::HOST)
+    let host = request
+        .headers()
+        .get(header::HOST)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("localhost")
         .to_string();
@@ -3895,7 +3903,6 @@ fn server_iso_now() -> String {
 
     format!("{y:04}-{m:02}-{d:02}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z")
 }
-
 
 #[cfg(test)]
 mod tests {

@@ -55,7 +55,10 @@ impl<'a> StepContext<'a> {
         let is_debug = |v: &str| v == "true" || v == "1";
         let debug = std::env::var("ACTIONS_STEP_DEBUG").is_ok_and(|v| is_debug(&v))
             || std::env::var("RUNNER_DEBUG").is_ok_and(|v| is_debug(&v))
-            || job.env.get("ACTIONS_STEP_DEBUG").is_some_and(|v| is_debug(v))
+            || job
+                .env
+                .get("ACTIONS_STEP_DEBUG")
+                .is_some_and(|v| is_debug(v))
             || job.env.get("RUNNER_DEBUG").is_some_and(|v| is_debug(v));
         Self {
             job,
@@ -144,9 +147,20 @@ impl<'a> StepContext<'a> {
         self.debug = self.debug
             || std::env::var("ACTIONS_STEP_DEBUG").is_ok_and(|v| is_debug(&v))
             || std::env::var("RUNNER_DEBUG").is_ok_and(|v| is_debug(&v))
-            || self.job.env.get("ACTIONS_STEP_DEBUG").is_some_and(|v| is_debug(v))
-            || self.job.env.get("RUNNER_DEBUG").is_some_and(|v| is_debug(v))
-            || self.env.get("ACTIONS_STEP_DEBUG").is_some_and(|v| is_debug(v))
+            || self
+                .job
+                .env
+                .get("ACTIONS_STEP_DEBUG")
+                .is_some_and(|v| is_debug(v))
+            || self
+                .job
+                .env
+                .get("RUNNER_DEBUG")
+                .is_some_and(|v| is_debug(v))
+            || self
+                .env
+                .get("ACTIONS_STEP_DEBUG")
+                .is_some_and(|v| is_debug(v))
             || self.env.get("RUNNER_DEBUG").is_some_and(|v| is_debug(v));
     }
 
@@ -245,7 +259,11 @@ mod tests {
         let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
         ctx.log("line1");
         ctx.log("line2");
-        let lines: Vec<&str> = ctx.log_lines.iter().map(|l| l.splitn(2, ' ').nth(1).unwrap_or("")).collect();
+        let lines: Vec<&str> = ctx
+            .log_lines
+            .iter()
+            .map(|l| l.splitn(2, ' ').nth(1).unwrap_or(""))
+            .collect();
         assert_eq!(lines, vec!["line1", "line2"]);
     }
 
