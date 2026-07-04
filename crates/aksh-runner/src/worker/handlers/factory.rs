@@ -64,12 +64,20 @@ pub fn load_action_manifest(action_dir: &Path) -> Result<ActionManifest> {
         .unwrap_or("")
         .to_string();
     let runs_main = runs.get("main").and_then(|v| v.as_str()).map(String::from);
-    let runs_pre = runs.get("pre").and_then(|v| v.as_str()).map(String::from);
+    let runs_pre = runs
+        .get("pre")
+        .or_else(|| runs.get("pre-entrypoint"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
     let runs_pre_if = runs
         .get("pre-if")
         .and_then(|v| v.as_str())
         .map(String::from);
-    let runs_post = runs.get("post").and_then(|v| v.as_str()).map(String::from);
+    let runs_post = runs
+        .get("post")
+        .or_else(|| runs.get("post-entrypoint"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
     let runs_post_if = runs
         .get("post-if")
         .and_then(|v| v.as_str())
@@ -197,6 +205,10 @@ runs:
   args:
     - --flag
     - value
+  pre-entrypoint: /pre.sh
+  pre-if: success()
+  post-entrypoint: /post.sh
+  post-if: always()
 "#,
         )
         .unwrap();
@@ -206,6 +218,10 @@ runs:
         assert_eq!(manifest.runs_image.as_deref(), Some("Dockerfile"));
         assert_eq!(manifest.runs_entrypoint.as_deref(), Some("/entrypoint.sh"));
         assert_eq!(manifest.runs_args.as_ref().unwrap(), &["--flag", "value"]);
+        assert_eq!(manifest.runs_pre.as_deref(), Some("/pre.sh"));
+        assert_eq!(manifest.runs_pre_if.as_deref(), Some("success()"));
+        assert_eq!(manifest.runs_post.as_deref(), Some("/post.sh"));
+        assert_eq!(manifest.runs_post_if.as_deref(), Some("always()"));
     }
 
     #[test]
