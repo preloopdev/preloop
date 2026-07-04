@@ -337,6 +337,7 @@ mod tests {
             runs_image: None,
             runs_entrypoint: None,
             runs_args: None,
+            runs_env: None,
             inputs: None,
             outputs: None,
         }
