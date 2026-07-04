@@ -217,6 +217,14 @@ pub fn build_agent_job_message(
         PipelineContextData::Dict(BTreeMap::new()),
     );
     context_data.insert("strategy".to_owned(), to_context_data(&strategy_value));
+    context_data.insert(
+        "vars".to_owned(),
+        PipelineContextData::Dict(
+            vars.iter()
+                .map(|(k, v)| (k.clone(), PipelineContextData::String(v.clone())))
+                .collect(),
+        ),
+    );
 
     // Actions download info
     let actions_download_info = BTreeMap::new();
