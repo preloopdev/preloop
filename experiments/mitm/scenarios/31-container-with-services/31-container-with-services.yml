@@ -1,0 +1,52 @@
+name: "golden: container-with-services"
+on: workflow_dispatch
+
+jobs:
+  container-services:
+    runs-on: ubuntu-latest
+    container: node:20-bookworm
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: testuser
+          POSTGRES_DB: testdb
+        options: >-
+          --health-cmd "pg_isready -U testuser"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Install clients
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends postgresql-client redis-tools
+      - name: Connect to Postgres via service alias
+        run: PGPASSWORD=postgres psql -h postgres -U testuser -d testdb -c 'SELECT version();'
+      - name: Create table and insert row
+        run: |
+          PGPASSWORD=postgres psql -h postgres -U testuser -d testdb -c '
+            CREATE TABLE test_table (id serial PRIMARY KEY, value text);
+            INSERT INTO test_table (value) VALUES ($$from-container$$);
+          '
+      - name: Query row back
+        run: |
+          PGPASSWORD=postgres psql -h postgres -U testuser -d testdb -t -c "SELECT value FROM test_table WHERE id=1;" | grep -q "from-container"
+      - name: Connect to Redis via service alias
+        run: |
+          redis-cli -h redis SET mykey "hello"
+          redis-cli -h redis GET mykey | grep -q hello
+      - name: Dump service context
+        run: |
+          echo "job.services.postgres.id=${{ job.services.postgres.id }}"
+          echo "job.services.postgres.ports[5432]=${{ job.services.postgres.ports[5432] }}"
+          echo "job.services.redis.id=${{ job.services.redis.id }}"
+          echo "job.services.redis.ports[6379]=${{ job.services.redis.ports[6379] }}"
