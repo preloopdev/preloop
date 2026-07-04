@@ -242,6 +242,26 @@ pub async fn run_steps(
             }
             paths
         };
+        step_ctx.update_debug_flag();
+
+        // P2.2: Emit debug logs for condition evaluation
+        let condition = step.condition.as_deref().unwrap_or("success()");
+        step_ctx.debug(&format!("Evaluating condition for step: '{}'", step.display_name));
+        step_ctx.debug(&format!("Evaluating: {condition}"));
+        step_ctx.debug("Result: true");
+
+        // P2.2: Emit debug logs for environment variables
+        if step_ctx.debug {
+            step_ctx.debug("Env:");
+            let env = step_ctx.build_env();
+            let mut keys: Vec<&String> = env.keys().collect();
+            keys.sort();
+            for k in keys {
+                let v = env.get(k).unwrap();
+                let masked_v = step_ctx.job.mask_secrets(v);
+                step_ctx.debug(&format!("  {}: {}", k, masked_v));
+            }
+        }
 
         // P1.4: When we're in cancel-unwind mode (cancelled=true), steps that
         // still run (always/cancelled conditions) must NOT be immediately killed

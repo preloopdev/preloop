@@ -124,7 +124,7 @@ pub fn handle_command(
             ctx.job.extra_path.insert(0, cmd.data.clone());
         }
         "debug" => {
-            ctx.log_raw(&format!("##[debug]{}", cmd.data));
+            ctx.debug(&cmd.data);
         }
         "error" => {
             let masked_data = ctx.job.mask_secrets(&cmd.data);
@@ -165,8 +165,8 @@ pub fn handle_command(
         "echo" => {
             // echo on/off controls command echoing
             match cmd.data.as_str() {
-                "on" => ctx.debug = true,
-                "off" => ctx.debug = false,
+                "on" => ctx.echo = true,
+                "off" => ctx.echo = false,
                 _ => {}
             }
         }
