@@ -324,6 +324,9 @@ fn format_args(values: &[Value]) -> String {
     for (index, value) in values.iter().enumerate().skip(1) {
         out = out.replace(&format!("{{{}}}", index - 1), &string_value(value));
     }
+    // Handle escaped braces: {{ → { and }} → }
+    // (matches C#'s String.Format / GitHub Actions format() behavior)
+    out = out.replace("{{", "{").replace("}}", "}");
     out
 }
 
