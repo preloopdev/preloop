@@ -75,6 +75,9 @@ enum CommandKind {
         /// Path to the GHA workflow file to run.
         #[arg(long)]
         workflow: PathBuf,
+        /// Optional path to write recorded HTTP flows to.
+        #[arg(long)]
+        record_flows: Option<PathBuf>,
     },
     /// H2: Generate a flow diff report against the golden scenario captures.
     #[command(name = "runner-diff")]
@@ -108,7 +111,8 @@ async fn main() -> anyhow::Result<()> {
         CommandKind::RunnerE2e {
             runner_bin,
             workflow,
-        } => run_runner_e2e(runner_bin, workflow).await,
+            record_flows,
+        } => run_runner_e2e(runner_bin, workflow, record_flows).await,
         CommandKind::RunnerDiff { scenario, target } => run_runner_diff(scenario, target).await,
     }
 }
@@ -406,7 +410,7 @@ fn generate_random_yaml(seed: u64) -> String {
     yaml
 }
 
-async fn run_runner_e2e(runner_bin: PathBuf, workflow: PathBuf) -> anyhow::Result<()> {
+async fn run_runner_e2e(runner_bin: PathBuf, workflow: PathBuf, record_flows: Option<PathBuf>) -> anyhow::Result<()> {
     use std::time::Duration;
 
     // Check binaries
@@ -443,14 +447,20 @@ async fn run_runner_e2e(runner_bin: PathBuf, workflow: PathBuf) -> anyhow::Resul
     std::fs::create_dir_all(&runner_root)?;
 
     // Start server in background on port 9191
-    let mut server = Command::new(server_bin)
+    let mut server_cmd = Command::new(server_bin);
+    server_cmd
         .env("AKSH_PUBLIC_URL", "http://127.0.0.1:9191")
         .arg("serve")
         .arg("--listen")
         .arg("127.0.0.1:9191")
         .arg("--state-dir")
-        .arg(state_dir.to_str().unwrap())
-        .spawn()?;
+        .arg(state_dir.to_str().unwrap());
+
+    if let Some(path) = &record_flows {
+        server_cmd.arg("--record-flows").arg(path);
+    }
+
+    let mut server = server_cmd.spawn()?;
 
     // Wait for server to listen
     let client = reqwest::Client::new();
