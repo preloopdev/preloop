@@ -1,0 +1,16 @@
+description = "Container with env vars, options, file commands: GITHUB_ENV, GITHUB_OUTPUT, GITHUB_PATH from container."
+duration_seconds_max = 600
+
+[[steps]]
+kind = "submit_workflow"
+path = "33-container-env-options.yml"
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_assigned"
+timeout = 120
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_completed"
+timeout = 300

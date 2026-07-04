@@ -1,0 +1,16 @@
+description = "Container job with postgres and redis services: DNS alias resolution, health checks, data queries."
+duration_seconds_max = 600
+
+[[steps]]
+kind = "submit_workflow"
+path = "31-container-with-services.yml"
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_assigned"
+timeout = 120
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_completed"
+timeout = 300

@@ -1,0 +1,58 @@
+name: "golden: container-env-options"
+on: workflow_dispatch
+
+jobs:
+  container-env:
+    runs-on: ubuntu-latest
+    container:
+      image: alpine:3.20
+      env:
+        CUSTOM_VAR: "hello-from-container"
+        NODE_ENV: "test"
+      options: --cpus 1
+    steps:
+      - name: Verify custom env var
+        run: |
+          test "$CUSTOM_VAR" = "hello-from-container"
+          echo "CUSTOM_VAR=$CUSTOM_VAR"
+      - name: Verify NODE_ENV
+        run: |
+          test "$NODE_ENV" = "test"
+          echo "NODE_ENV=$NODE_ENV"
+      - name: Write GITHUB_ENV
+        run: |
+          echo "DYNAMIC_VAR=set-at-runtime" >> "$GITHUB_ENV"
+      - name: Read GITHUB_ENV value
+        run: |
+          test "$DYNAMIC_VAR" = "set-at-runtime"
+          echo "DYNAMIC_VAR=$DYNAMIC_VAR"
+      - name: Write GITHUB_OUTPUT
+        id: gen
+        run: |
+          echo "result=success" >> "$GITHUB_OUTPUT"
+          echo "multi_line<<EOF" >> "$GITHUB_OUTPUT"
+          echo "line1" >> "$GITHUB_OUTPUT"
+          echo "line2" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+      - name: Read GITHUB_OUTPUT
+        run: |
+          test "${{ steps.gen.outputs.result }}" = "success"
+          echo "result=${{ steps.gen.outputs.result }}"
+          echo "multi_line=${{ steps.gen.outputs.multi_line }}"
+      - name: Write GITHUB_PATH
+        run: |
+          mkdir -p /tmp/custom-bin
+          echo '#!/bin/sh' > /tmp/custom-bin/my-tool
+          echo 'echo my-tool-output' >> /tmp/custom-bin/my-tool
+          chmod +x /tmp/custom-bin/my-tool
+          echo "/tmp/custom-bin" >> "$GITHUB_PATH"
+      - name: Use custom path tool
+        run: my-tool | grep -q my-tool-output
+      - name: Check workspace mount
+        run: |
+          test -d "$GITHUB_WORKSPACE"
+          ls -la "$GITHUB_WORKSPACE"
+      - name: Check runner temp mount
+        run: |
+          test -d "$RUNNER_TEMP"
+          echo "RUNNER_TEMP=$RUNNER_TEMP"
