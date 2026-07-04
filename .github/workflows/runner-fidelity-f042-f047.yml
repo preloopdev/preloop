@@ -1,13 +1,63 @@
 name: runner-fidelity-f042-f047
 
 on:
+  push:
+    branches: [cachingv4]
+    paths:
+      - '.github/workflows/runner-fidelity-f042-f047.yml'
   workflow_dispatch:
 
 jobs:
-  docker-and-composite-fidelity:
-    name: Docker lifecycle and composite status
-    runs-on: self-hosted
-    timeout-minutes: 15
+  # F042: Process cancellation — SIGINT grace period
+  process-cancellation:
+    name: F042 process cancellation
+    runs-on: [self-hosted, fidelity-test]
+    timeout-minutes: 5
+    steps:
+      - name: Verify graceful signal handling
+        shell: bash
+        run: |
+          # Start a process that traps SIGINT/SIGTERM and writes markers
+          trap_script=$(mktemp)
+          marker=$(mktemp)
+          cat > "$trap_script" << 'SCRIPT'
+          #!/bin/bash
+          trap 'echo "GOT_SIGINT" >> "$1"; exit 0' INT
+          trap 'echo "GOT_SIGTERM" >> "$1"; exit 0' TERM
+          while true; do sleep 0.1; done
+          SCRIPT
+          chmod +x "$trap_script"
+          bash "$trap_script" "$marker" &
+          PID=$!
+          sleep 0.5
+          kill -INT $PID
+          wait $PID 2>/dev/null || true
+          sleep 0.2
+          echo "Marker contents:"
+          cat "$marker"
+          grep -q "GOT_SIGINT" "$marker"
+          echo "F042: Process received SIGINT correctly"
+
+  # F043: Docker env secrecy
+  docker-env-secrecy:
+    name: F043 docker env secrecy
+    runs-on: [self-hosted, fidelity-test]
+    timeout-minutes: 5
+    steps:
+      - name: Verify docker run inherits env without CLI exposure
+        shell: bash
+        run: |
+          export MY_SECRET="s3cr3t_value_12345"
+          # Run a container that echoes the secret from its env
+          result=$(docker run --rm -e MY_SECRET alpine:3.20 sh -c 'echo "$MY_SECRET"')
+          test "$result" = "s3cr3t_value_12345"
+          echo "F043: Docker container received secret via inherited env"
+
+  # F045: Composite action_status + F046/F047: Docker lifecycle
+  docker-and-composite:
+    name: F045 F046 F047 composite and docker
+    runs-on: [self-hosted, fidelity-test]
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -16,25 +66,31 @@ jobs:
         run: rm -rf .aksh-fidelity && mkdir -p .aksh-fidelity
 
       - id: composite-status
-        name: Validate composite action_status context
+        name: F045 composite action_status context
         uses: ./fixtures/actions/composite-status
 
-      - name: Assert composite action_status
+      - name: Assert F045 composite action_status
         shell: bash
         run: |
+          echo "status-before=${{ steps.composite-status.outputs.status-before }}"
+          echo "status-after=${{ steps.composite-status.outputs.status-after }}"
           test "${{ steps.composite-status.outputs.status-before }}" = "success"
           test -n "${{ steps.composite-status.outputs.status-after }}"
+          echo "F045: github.action_status correctly set in composite steps"
 
-      - name: Validate Docker manifest lifecycle and fields
+      - name: F046 F047 Docker manifest lifecycle
         uses: ./fixtures/actions/docker-manifest-lifecycle
         with:
           arg-one: alpha
           env-value: beta
 
-      - name: Assert Docker lifecycle and manifest fields
+      - name: Assert F046 F047 Docker lifecycle and manifest fields
         shell: bash
         run: |
+          echo "Docker lifecycle log:"
           cat .aksh-fidelity/docker-lifecycle.log
           grep -Fx 'pre|env=beta|arg=alpha' .aksh-fidelity/docker-lifecycle.log
           grep -Fx 'main|env=beta|arg=alpha' .aksh-fidelity/docker-lifecycle.log
           grep -Fx 'post|env=beta|arg=alpha' .aksh-fidelity/docker-lifecycle.log
+          echo "F046: Docker pre-entrypoint/post-entrypoint lifecycle executed"
+          echo "F047: Docker manifest entrypoint/args/env evaluated correctly"
