@@ -92,12 +92,6 @@ Host bare metal (warm)           0.2s       2s     25s      27s     27s
 - **Docker**: Docker CE 29.6.1 (for container job benchmarks)
 - **Workspace**: host directory mounted via virtio-fs at `/workspace`
 - **VM boot time**: 1.2s from stopped state
-- **Image state**: not packed (live VM with persistent state)
-
-#### Packed smolmachine status
-
-Attempted `smolvm pack create --from-vm build-runner` — produced a 776 MB `.smolmachine` artifact but the packed VM's agent failed to boot (`agent did not become ready within 30 seconds`). Image-based packs (`--image ubuntu:24.04`) boot successfully (~9s cold, ~3s warm) but don't support virtio-fs host mounts, making them unsuitable for workspace-mounted workflows. This appears to be a smolvm pack bug with snapshot-based VMs.
-
 ## 3. Container Job Benchmarks
 
 Workload: Docker container lifecycle — pull image, create network, start container, execute steps inside, health checks, cleanup.
