@@ -22,8 +22,8 @@ Last full-code audit: **2026-07-02** (all of `crates/aksh-runner` diffed against
 | **Actions: resolution + pre/post lifecycle (M6)** | ✅ P0 implemented; live composite rerun green | live checkout/cache validation pending |
 | **Containers (M7)** | ✅ Implemented and E2E validated | job containers, service containers, health checks, docker exec, TemplateToken decoding, `job.container`/`job.services` contexts |
 | **Cache/artifact/OIDC env plumbing (M8)** | ✅ P0 implemented | live cache/artifact/OIDC validation pending; cache v2/artifact v2 Twirp protocol missing |
-| AzDO compat reporting (M9) | ❌ Dispatch only; reporting endpoints have 0 call sites | F030 — blocks local aksh CI reporting |
-| Cancellation / job timeout / matchers / hardening (M10) | ✅ P1 complete | BrokerMigration and AzDO reporting remain separate gaps |
+| AzDO compat reporting (M9) | ⏸️ Deferred | Not needed — broker + Twirp covers all composability targets. GHES interop only. |
+| Cancellation / job timeout / matchers / hardening (M10) | ✅ P1 complete | BrokerMigration is a separate minor gap |
 | Benchmarks (M11) | ✅ CI pipeline + container benchmarks | see `docs/runner/11-benchmarks.md` |
 | **Conformance harness (H1–H3)** | ❌ `runner-e2e`, `runner-diff`, `--record-flows`, `fixtures/runner/` all missing | §4 |
 
@@ -90,7 +90,7 @@ These were the blockers identified by the 2026-07-02 full-code audit. They are n
 |---|---|---|---|
 | ~~P1.1~~ | ~~Broker URL from connectionData~~ | ✅ Fixed: derived from agent response properties.ServerUrlV2 and persisted as serverUrlV2 in settings | F008 |
 | ~~P1.2~~ | ~~Job/service containers not wired~~ | ✅ Fixed: full Docker engine lifecycle — job containers, service containers, health checks, docker exec routing, cleanup, TemplateToken decoding, `job.container`/`job.services` runtime contexts. E2E validated against live GitHub (scenarios 30-36) and aksh-server. | ~~F026~~ |
-| P1.3 | AzDO compat reporting (`--via azdo`) | `client/azdo.rs` has `patch_agent_request`, `update_timeline`, `create_log`/`append_log`, `post_console_log`, `finish_job` — **all 0 call sites**; `report_completion()` builds a non-`JobCompletedEvent` shape; `TimelineRecord` missing `order` population | F030 |
+| ~~P1.3~~ | ~~AzDO compat reporting (`--via azdo`)~~ | **Deferred.** GitHub enforces v2.329.0+ minimum (broker path). All composability targets (aksh-runner↔GitHub, official-runner↔aksh-server, aksh-runner↔aksh-server) use broker + Twirp. AzDO path only needed for GHES interop — deferred until demand materializes. Code exists in `client/azdo.rs` but has 0 call sites. | F030 |
 | ~~P1.4~~ | ~~Cancellation completeness~~ | ✅ Fixed: runs always/post steps on cancel before timeout / hard kill | F031 |
 | ~~P1.5~~ | ~~Job-level `timeout-minutes`~~ | ✅ Fixed: defaults to 360 min; wrapped with cancel-channel timer (orphan-safe) | F031 |
 | ~~P1.6~~ | ~~Problem matchers dead code~~ | ✅ Fixed: wired registry, parsed commands, stopped commands token suspension, group passthrough | F032 |
