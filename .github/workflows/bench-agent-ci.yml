@@ -1,0 +1,22 @@
+name: "bench: agent-ci"
+on: push
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.86"
+          components: rustfmt,clippy
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets
+
+      - name: cargo test
+        run: cargo test --workspace --quiet
