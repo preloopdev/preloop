@@ -8,6 +8,17 @@ Updated architecture decision: **Docker engine compatibility is the primary impl
 
 The main plan for local macos ci is to use Smolvm. THey bundle a kernel that supports all thats needed to run nested docker i.e cgroups, overlayfs2
 
+## Implementation Status (2026-07-04)
+
+| Phase | Status | Evidence |
+|---|---|---|
+| Phase 0 — Record official goldens | ✅ Complete | 7 scenarios (30-36) recorded under `.runner-watch/golden/v2.335.1/` |
+| Phase 1 — Control plane emits container fields | ✅ Complete | `container`/`services` fields in Job, JobPlan, AgentJobRequestMessage |
+| Phase 2 — Runner container execution | ✅ Complete | Full Docker lifecycle, TemplateToken decoding, runtime contexts, synthetic steps |
+| E2E validation (GitHub) | ✅ Passed | Scenarios 30, 31, 33, 35, 36 on live GitHub; container-contexts test (run 28706488417) |
+| E2E validation (aksh-server) | ✅ Passed | Container job via aksh-runner-client → aksh-runner-server → aksh-runner on smolvm |
+| Review fixes | ✅ Applied | Runtime contexts, service volumes, synthetic step logs, format brace escaping, template parser |
+
 Decisions locked:
 
 - **Compatibility first**: match official `actions/runner` container behavior by driving Docker-compatible commands first.
