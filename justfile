@@ -70,3 +70,15 @@ conform-runner S:
 
 conform-local S:
     cargo run -p aksh-conformance -- runner-diff --scenario {{S}} --target aksh
+
+conform-smoke: build-runner build
+    cargo run -p aksh-conformance -- runner-e2e --runner-bin target/release/aksh-runner --workflow crates/aksh-conformance/fixtures/hello-world.yml --record-flows /tmp/smoke-flows.jsonl
+
+conform-ci: build-all
+    cargo run --release -p aksh-runner-server -- serve --listen 127.0.0.1:9090 & \
+    SERVER_PID=$! ; \
+    sleep 2 ; \
+    cargo run -p runner-watch -- conform --runner v2.335.1 --aksh-url http://127.0.0.1:9090 ; \
+    STATUS=$? ; \
+    kill $SERVER_PID ; \
+    exit $STATUS
