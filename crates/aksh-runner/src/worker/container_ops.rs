@@ -469,6 +469,12 @@ pub async fn start_service_container(
         args.push(port.clone());
     }
 
+    // User volumes
+    for vol in &service.volumes {
+        args.push("-v".into());
+        args.push(vol.clone());
+    }
+
     args.push(service.image.clone());
 
     let result = docker_cmd(
