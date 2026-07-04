@@ -310,10 +310,11 @@ pub async fn start_job_container(
         }
     }
 
-    // User env vars first (matching golden ordering)
+    // User env vars first (matching golden ordering). Docker create uses
+    // KEY=VALUE for non-empty values, but `-e KEY` for empty values to match
+    // the official runner's inherit-from-host behavior.
     for (k, v) in &spec.env {
-        args.push("-e".into());
-        args.push(format!("{k}={v}"));
+        push_docker_create_env(&mut args, k, v);
     }
 
     // Auto-injected env vars
@@ -449,8 +450,7 @@ pub async fn start_service_container(
 
     // Service env vars
     for (k, v) in &service.env {
-        args.push("-e".into());
-        args.push(format!("{k}={v}"));
+        push_docker_create_env(&mut args, k, v);
     }
 
     // Auto-injected env
@@ -582,29 +582,10 @@ pub async fn docker_exec(
     env: &HashMap<String, String>,
     cancel_rx: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<process::ProcessOutput> {
-    let mut exec_args: Vec<String> = vec!["exec".into(), "-w".into(), workdir.into()];
-
-    for (k, v) in env {
-        exec_args.push("-e".into());
-        exec_args.push(format!("{k}={v}"));
-    }
-
-    exec_args.push(container_id.into());
-    exec_args.push(program.into());
-    for arg in args {
-        exec_args.push((*arg).into());
-    }
-
+    let exec_args = build_docker_exec_args(container_id, program, args, workdir, env);
     let args_ref: Vec<&str> = exec_args.iter().map(|s| s.as_str()).collect();
-    process::invoke(
-        "docker",
-        &args_ref,
-        Path::new("."),
-        &HashMap::new(),
-        None,
-        cancel_rx,
-    )
-    .await
+
+    process::invoke("docker", &args_ref, Path::new("."), env, None, cancel_rx).await
 }
 
 /// Get port mappings for a service container.
@@ -738,6 +719,45 @@ async fn docker_cmd(args: &[&str], log: &mut Vec<String>) -> Result<Vec<String>>
     Ok(result.lines)
 }
 
+fn push_docker_create_env(args: &mut Vec<String>, key: &str, value: &str) {
+    args.push("-e".into());
+    if value.is_empty() {
+        args.push(key.to_string());
+    } else {
+        args.push(format!("{key}={value}"));
+    }
+}
+
+fn push_docker_inherited_env(args: &mut Vec<String>, key: &str) {
+    args.push("-e".into());
+    args.push(key.to_string());
+}
+
+fn build_docker_exec_args(
+    container_id: &str,
+    program: &str,
+    args: &[&str],
+    workdir: &str,
+    env: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut exec_args: Vec<String> = vec!["exec".into(), "-w".into(), workdir.into()];
+
+    for key in env.keys() {
+        // Match official StepHost: pass only the key on the Docker CLI and put
+        // the value in the docker client process environment, avoiding secret
+        // values in argv and docker inspect output.
+        push_docker_inherited_env(&mut exec_args, key);
+    }
+
+    exec_args.push(container_id.into());
+    exec_args.push(program.into());
+    for arg in args {
+        exec_args.push((*arg).into());
+    }
+
+    exec_args
+}
+
 /// Split Docker options string into individual arguments.
 /// Handles simple quoting for health-check commands.
 fn split_options(options: &str) -> Vec<String> {
@@ -846,6 +866,7 @@ mod tests {
                 "image": "redis:7"
             }
         });
+
         let services = parse_service_specs(&v);
         assert_eq!(services.len(), 2);
     }
@@ -869,5 +890,33 @@ mod tests {
         let v = serde_json::json!({});
         let specs = parse_service_specs(&v);
         assert!(specs.is_empty());
+    }
+
+    #[test]
+    fn docker_create_env_uses_inherit_form_for_empty_values() {
+        let mut args = Vec::new();
+
+        push_docker_create_env(&mut args, "EMPTY_VAR", "");
+        push_docker_create_env(&mut args, "SET_VAR", "visible");
+
+        assert_eq!(
+            args,
+            vec![
+                "-e".to_string(),
+                "EMPTY_VAR".to_string(),
+                "-e".to_string(),
+                "SET_VAR=visible".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn docker_exec_env_args_do_not_include_secret_values() {
+        let env = HashMap::from([("MY_SECRET".to_string(), "s3cr3t".to_string())]);
+
+        let args = build_docker_exec_args("container-id", "sh", &["-c", "true"], "/__w/repo", &env);
+
+        assert!(args.windows(2).any(|pair| pair == ["-e", "MY_SECRET"]));
+        assert!(!args.iter().any(|arg| arg.contains("s3cr3t")));
     }
 }
