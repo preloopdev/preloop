@@ -18,6 +18,8 @@ pub struct StepContext<'a> {
     pub annotations: Vec<Annotation>,
     /// Whether debug output is enabled.
     pub debug: bool,
+    /// Whether command echoing is enabled.
+    pub echo: bool,
     /// Log lines collected during step execution.
     pub log_lines: Vec<String>,
     /// Whether the step was cancelled.
@@ -50,9 +52,11 @@ pub enum AnnotationLevel {
 impl<'a> StepContext<'a> {
     /// Create a new step context.
     pub fn new(job: &'a mut JobContext, step_id: String, step_name: String) -> Self {
-        let debug = std::env::var("ACTIONS_STEP_DEBUG")
-            .map(|v| v == "true")
-            .unwrap_or(false);
+        let is_debug = |v: &str| v == "true" || v == "1";
+        let debug = std::env::var("ACTIONS_STEP_DEBUG").is_ok_and(|v| is_debug(&v))
+            || std::env::var("RUNNER_DEBUG").is_ok_and(|v| is_debug(&v))
+            || job.env.get("ACTIONS_STEP_DEBUG").is_some_and(|v| is_debug(v))
+            || job.env.get("RUNNER_DEBUG").is_some_and(|v| is_debug(v));
         Self {
             job,
             step_id,
@@ -60,6 +64,7 @@ impl<'a> StepContext<'a> {
             env: HashMap::new(),
             annotations: Vec::new(),
             debug,
+            echo: false,
             log_lines: Vec::new(),
             cancelled: false,
             stop_commands_token: None,
@@ -91,11 +96,14 @@ impl<'a> StepContext<'a> {
 
             super::commands::handle_command(&cmd, self);
 
-            // Consumed commands: don't log them
+            // Consumed commands: don't log them unless echo is enabled
             if matches!(
                 cmd.name.as_str(),
                 "add-matcher" | "remove-matcher" | "add-mask" | "save-state" | "set-output"
             ) {
+                if self.echo {
+                    self.log_raw(line);
+                }
                 return;
             }
             // group/endgroup/debug/error/warning/notice are already logged
@@ -126,6 +134,25 @@ impl<'a> StepContext<'a> {
     /// Add an annotation.
     pub fn annotate(&mut self, annotation: Annotation) {
         self.annotations.push(annotation);
+    }
+
+    /// Update the debug flag based on step environment overrides.
+    pub fn update_debug_flag(&mut self) {
+        let is_debug = |v: &str| v == "true" || v == "1";
+        self.debug = self.debug
+            || std::env::var("ACTIONS_STEP_DEBUG").is_ok_and(|v| is_debug(&v))
+            || std::env::var("RUNNER_DEBUG").is_ok_and(|v| is_debug(&v))
+            || self.job.env.get("ACTIONS_STEP_DEBUG").is_some_and(|v| is_debug(v))
+            || self.job.env.get("RUNNER_DEBUG").is_some_and(|v| is_debug(v))
+            || self.env.get("ACTIONS_STEP_DEBUG").is_some_and(|v| is_debug(v))
+            || self.env.get("RUNNER_DEBUG").is_some_and(|v| is_debug(v));
+    }
+
+    /// Log a debug line if debug mode is active.
+    pub fn debug(&mut self, message: &str) {
+        if self.debug {
+            self.log_raw(&format!("##[debug]{}", message));
+        }
     }
 
     /// Build the full environment for process execution.
