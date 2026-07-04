@@ -21,52 +21,9 @@ pub async fn run_docker_action(
 
     info!("Running docker action: {image}");
 
-    let mut env = ctx.build_env();
-    let mut docker_args = vec![
-        "run".to_string(),
-        "--rm".to_string(),
-        "-v".to_string(),
-        format!("{workspace}:/github/workspace"),
-        "--workdir".to_string(),
-        "/github/workspace".to_string(),
-    ];
-
-    // Phase 2: Attach to job network if container state exists
-    if let Some(state) = &ctx.job.container_state {
-        docker_args.push("--network".to_string());
-        docker_args.push(state.network.clone());
-        docker_args.push("--label".to_string());
-        docker_args.push(state.label.clone());
-    }
-
-    // Add action inputs as INPUT_* env vars to the docker client process
-    // environment. Docker receives only `-e KEY`, matching the official runner
-    // and keeping secret values out of command-line args.
-    if let Some(inputs) = with.as_object() {
-        for (key, value) in inputs {
-            let env_key = format!("INPUT_{}", key.to_uppercase().replace(' ', "_"));
-            let val = value.as_str().unwrap_or(&value.to_string()).to_string();
-            env.insert(env_key, val);
-        }
-    }
-
-    push_inherited_env_args(&mut docker_args, &env);
-
-    docker_args.push(image.to_string());
-
-    let args_ref: Vec<&str> = docker_args.iter().map(|s| s.as_str()).collect();
-    let result =
-        process::invoke("docker", &args_ref, Path::new(workspace), &env, None, None).await?;
-
-    for line in &result.lines {
-        ctx.log(line);
-    }
-
-    if result.exit_code != 0 {
-        anyhow::bail!("docker action exited with code {}", result.exit_code);
-    }
-
-    Ok(())
+    let inputs = evaluated_inputs(None, with, ctx);
+    let env = container_action_env(ctx, &inputs, None, None)?;
+    run_docker_image(image, workspace, ctx, env, None, Vec::new()).await
 }
 
 /// Run a docker action from a manifest (Dockerfile or image).
@@ -82,7 +39,7 @@ pub async fn run_docker_action_from_manifest(
         .as_deref()
         .context("docker action missing runs.image")?;
 
-    if image.starts_with("Dockerfile") || image.starts_with("./") {
+    let image = if image.starts_with("Dockerfile") || image.starts_with("./") {
         // Build from Dockerfile
         let dockerfile = action_dir.join(image);
         let tag = format!("action-{}", uuid::Uuid::new_v4());
@@ -113,11 +70,196 @@ pub async fn run_docker_action_from_manifest(
             );
         }
 
-        run_docker_action(&format!("docker://{tag}"), with, workspace, ctx).await
+        tag
     } else {
-        // Direct image reference
-        run_docker_action(&format!("docker://{image}"), with, workspace, ctx).await
+        image.to_string()
+    };
+
+    let inputs = evaluated_inputs(Some(manifest), with, ctx);
+    let mut expr_ctx = ctx.job.build_expression_context();
+    expr_ctx.insert("inputs", inputs_to_json(&inputs));
+    let manifest_env = evaluate_manifest_env(manifest.runs_env.as_ref(), &expr_ctx)?;
+    let env = container_action_env(ctx, &inputs, Some(manifest_env), Some(&expr_ctx))?;
+    let entrypoint = lifecycle_entry(with)
+        .or(manifest.runs_entrypoint.as_deref())
+        .map(|entry| evaluate_template_value(entry, &expr_ctx))
+        .transpose()?;
+    let args = evaluate_manifest_args(manifest.runs_args.as_ref(), &expr_ctx)?;
+
+    run_docker_image(&image, workspace, ctx, env, entrypoint, args).await
+}
+
+async fn run_docker_image(
+    image: &str,
+    workspace: &str,
+    ctx: &mut StepContext<'_>,
+    env: std::collections::HashMap<String, String>,
+    entrypoint: Option<String>,
+    args: Vec<String>,
+) -> Result<()> {
+    let docker_args =
+        build_docker_run_args(workspace, ctx, &env, image, entrypoint.as_deref(), &args);
+    let args_ref: Vec<&str> = docker_args.iter().map(|s| s.as_str()).collect();
+    let result =
+        process::invoke("docker", &args_ref, Path::new(workspace), &env, None, None).await?;
+
+    for line in &result.lines {
+        ctx.log(line);
     }
+
+    if result.exit_code != 0 {
+        anyhow::bail!("docker action exited with code {}", result.exit_code);
+    }
+
+    Ok(())
+}
+
+fn build_docker_run_args(
+    workspace: &str,
+    ctx: &StepContext<'_>,
+    env: &std::collections::HashMap<String, String>,
+    image: &str,
+    entrypoint: Option<&str>,
+    entrypoint_args: &[String],
+) -> Vec<String> {
+    let mut docker_args = vec![
+        "run".to_string(),
+        "--rm".to_string(),
+        "-v".to_string(),
+        format!("{workspace}:/github/workspace"),
+        "--workdir".to_string(),
+        "/github/workspace".to_string(),
+    ];
+
+    // Phase 2: Attach to job network if container state exists
+    if let Some(state) = &ctx.job.container_state {
+        docker_args.push("--network".to_string());
+        docker_args.push(state.network.clone());
+        docker_args.push("--label".to_string());
+        docker_args.push(state.label.clone());
+    }
+
+    if let Some(entrypoint) = entrypoint {
+        docker_args.push("--entrypoint".to_string());
+        docker_args.push(entrypoint.to_string());
+    }
+
+    push_inherited_env_args(&mut docker_args, env);
+    docker_args.push(image.to_string());
+    docker_args.extend(entrypoint_args.iter().cloned());
+    docker_args
+}
+
+fn evaluated_inputs(
+    manifest: Option<&ActionManifest>,
+    with: &serde_json::Value,
+    ctx: &StepContext<'_>,
+) -> std::collections::HashMap<String, String> {
+    let mut inputs = std::collections::HashMap::new();
+    if let Some(obj) = with.as_object() {
+        for (key, value) in obj {
+            if key.starts_with("__aksh_") {
+                continue;
+            }
+            inputs.insert(key.clone(), value_to_string(value));
+        }
+    }
+
+    if let Some(manifest) = manifest {
+        if let Some(manifest_inputs) = &manifest.inputs {
+            let expr_ctx = ctx.job.build_expression_context();
+            for (key, input_def) in manifest_inputs {
+                if inputs.contains_key(key) {
+                    continue;
+                }
+                if let Some(default) = input_def.get("default").and_then(|v| v.as_str()) {
+                    let evaluated = crate::worker::template::evaluate_template(default, &expr_ctx)
+                        .unwrap_or_else(|_| default.to_string());
+                    inputs.insert(key.clone(), evaluated);
+                }
+            }
+        }
+    }
+
+    inputs
+}
+
+fn container_action_env(
+    ctx: &StepContext<'_>,
+    inputs: &std::collections::HashMap<String, String>,
+    manifest_env: Option<std::collections::HashMap<String, String>>,
+    _expr_ctx: Option<&aksh_gha_expressions::Context>,
+) -> Result<std::collections::HashMap<String, String>> {
+    let mut env = ctx.build_env();
+
+    for (key, value) in inputs {
+        let env_key = format!("INPUT_{}", key.to_uppercase().replace(' ', "_"));
+        env.insert(env_key, value.clone());
+    }
+
+    if let Some(manifest_env) = manifest_env {
+        for (key, value) in manifest_env {
+            env.entry(key).or_insert(value);
+        }
+    }
+
+    Ok(env)
+}
+
+fn evaluate_manifest_env(
+    env: Option<&serde_json::Map<String, serde_json::Value>>,
+    expr_ctx: &aksh_gha_expressions::Context,
+) -> Result<std::collections::HashMap<String, String>> {
+    let mut evaluated = std::collections::HashMap::new();
+    if let Some(env) = env {
+        for (key, value) in env {
+            evaluated.insert(
+                key.clone(),
+                evaluate_template_value(&value_to_string(value), expr_ctx)?,
+            );
+        }
+    }
+    Ok(evaluated)
+}
+
+fn evaluate_manifest_args(
+    args: Option<&Vec<String>>,
+    expr_ctx: &aksh_gha_expressions::Context,
+) -> Result<Vec<String>> {
+    args.map(|args| {
+        args.iter()
+            .map(|arg| evaluate_template_value(arg, expr_ctx))
+            .collect()
+    })
+    .unwrap_or_else(|| Ok(Vec::new()))
+}
+
+fn evaluate_template_value(
+    value: &str,
+    expr_ctx: &aksh_gha_expressions::Context,
+) -> Result<String> {
+    crate::worker::template::evaluate_template(value, expr_ctx)
+        .with_context(|| format!("evaluating container manifest value {value:?}"))
+}
+
+fn inputs_to_json(inputs: &std::collections::HashMap<String, String>) -> serde_json::Value {
+    serde_json::Value::Object(
+        inputs
+            .iter()
+            .map(|(key, value)| (key.clone(), serde_json::json!(value)))
+            .collect(),
+    )
+}
+
+fn lifecycle_entry(with: &serde_json::Value) -> Option<&str> {
+    with.get("__aksh_entry").and_then(|v| v.as_str())
+}
+
+fn value_to_string(value: &serde_json::Value) -> String {
+    value
+        .as_str()
+        .map(String::from)
+        .unwrap_or_else(|| value.to_string())
 }
 
 fn push_inherited_env_args(
@@ -144,5 +286,107 @@ mod tests {
 
         assert_eq!(args, vec!["-e".to_string(), "MY_SECRET".to_string()]);
         assert!(!args.iter().any(|arg| arg.contains("s3cr3t")));
+    }
+
+    fn test_manifest() -> ActionManifest {
+        ActionManifest {
+            name: "docker".into(),
+            description: String::new(),
+            runs_using: "docker".into(),
+            runs_main: None,
+            runs_pre: None,
+            runs_pre_if: None,
+            runs_post: None,
+            runs_post_if: None,
+            runs_steps: None,
+            runs_image: Some("alpine:3.20".into()),
+            runs_entrypoint: Some("${{ inputs.entrypoint }}".into()),
+            runs_args: Some(vec!["${{ inputs.message }}".into(), "literal".into()]),
+            runs_env: Some(serde_json::Map::from_iter([(
+                "MANIFEST_ENV".to_string(),
+                serde_json::json!("hello-${{ inputs.message }}"),
+            )])),
+            inputs: Some(serde_json::Map::from_iter([
+                (
+                    "entrypoint".to_string(),
+                    serde_json::json!({"default": "default-entry"}),
+                ),
+                (
+                    "message".to_string(),
+                    serde_json::json!({"default": "world"}),
+                ),
+            ])),
+            outputs: None,
+        }
+    }
+
+    fn test_step_context<'a>(job: &'a mut crate::worker::contexts::JobContext) -> StepContext<'a> {
+        StepContext::new(job, "container".into(), "Container".into())
+    }
+
+    #[test]
+    fn manifest_env_entrypoint_and_args_evaluate_against_inputs() {
+        let manifest = test_manifest();
+        let mut job = crate::worker::contexts::JobContext::new(
+            "job".into(),
+            "job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let ctx = test_step_context(&mut job);
+        let inputs = evaluated_inputs(
+            Some(&manifest),
+            &serde_json::json!({"message": "from-input", "entrypoint": "run.sh"}),
+            &ctx,
+        );
+        let mut expr_ctx = ctx.job.build_expression_context();
+        expr_ctx.insert("inputs", inputs_to_json(&inputs));
+
+        assert_eq!(
+            evaluate_template_value(manifest.runs_entrypoint.as_deref().unwrap(), &expr_ctx)
+                .unwrap(),
+            "run.sh"
+        );
+        assert_eq!(
+            evaluate_manifest_args(manifest.runs_args.as_ref(), &expr_ctx).unwrap(),
+            vec!["from-input".to_string(), "literal".to_string()]
+        );
+        assert_eq!(
+            evaluate_manifest_env(manifest.runs_env.as_ref(), &expr_ctx)
+                .unwrap()
+                .get("MANIFEST_ENV")
+                .map(String::as_str),
+            Some("hello-from-input")
+        );
+    }
+
+    #[test]
+    fn docker_run_args_apply_entrypoint_args_and_hide_env_values() {
+        let mut job = crate::worker::contexts::JobContext::new(
+            "job".into(),
+            "job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let ctx = test_step_context(&mut job);
+        let env = HashMap::from([("MY_SECRET".to_string(), "s3cr3t".to_string())]);
+        let entrypoint_args = vec!["arg1".to_string(), "arg2".to_string()];
+
+        let args = build_docker_run_args(
+            "/tmp/work",
+            &ctx,
+            &env,
+            "alpine:3.20",
+            Some("run.sh"),
+            &entrypoint_args,
+        );
+
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--entrypoint", "run.sh"]));
+        assert!(args.windows(2).any(|pair| pair == ["-e", "MY_SECRET"]));
+        assert!(!args.iter().any(|arg| arg.contains("s3cr3t")));
+        let image_index = args.iter().position(|arg| arg == "alpine:3.20").unwrap();
+        assert_eq!(&args[image_index + 1..], ["arg1", "arg2"]);
     }
 }

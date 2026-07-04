@@ -18,6 +18,7 @@ pub struct ActionManifest {
     pub runs_image: Option<String>,
     pub runs_entrypoint: Option<String>,
     pub runs_args: Option<Vec<String>>,
+    pub runs_env: Option<serde_json::Map<String, serde_json::Value>>,
     pub inputs: Option<serde_json::Map<String, serde_json::Value>>,
     pub outputs: Option<serde_json::Map<String, serde_json::Value>>,
 }
@@ -86,6 +87,7 @@ pub fn load_action_manifest(action_dir: &Path) -> Result<ActionManifest> {
                 .collect()
         })
     });
+    let runs_env = runs.get("env").and_then(|v| v.as_object()).cloned();
 
     let inputs = doc.get("inputs").and_then(|v| v.as_object()).cloned();
     let outputs = doc.get("outputs").and_then(|v| v.as_object()).cloned();
@@ -104,6 +106,7 @@ pub fn load_action_manifest(action_dir: &Path) -> Result<ActionManifest> {
         runs_entrypoint,
         runs_args,
         inputs,
+        runs_env,
         outputs,
     })
 }
