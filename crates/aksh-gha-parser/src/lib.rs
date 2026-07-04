@@ -312,6 +312,12 @@ pub struct Job {
     /// Secrets policy for reusable workflows.
     #[serde(default)]
     pub secrets: Option<Value>,
+    /// Job container (`container:`) — raw value, evaluated runner-side.
+    #[serde(default)]
+    pub container: Option<Value>,
+    /// Service containers (`services:`) — raw value, evaluated runner-side.
+    #[serde(default)]
+    pub services: Option<Value>,
 }
 
 /// `runs-on` syntax.
@@ -577,6 +583,14 @@ fn yaml_key_to_string(value: &serde_yaml::Value) -> String {
     }
 }
 
+/// Omit empty `services: {}` to match `EmitDefaultValue=false` behavior.
+fn non_empty_services(services: Option<serde_json::Value>) -> Option<serde_json::Value> {
+    match &services {
+        Some(serde_json::Value::Object(m)) if m.is_empty() => None,
+        _ => services,
+    }
+}
+
 /// Expand all jobs for a workflow.
 pub fn expand_jobs(workflow: &Workflow) -> Result<Vec<JobPlan>, ParserError> {
     let mut plans = Vec::new();
@@ -599,6 +613,8 @@ pub fn expand_jobs(workflow: &Workflow) -> Result<Vec<JobPlan>, ParserError> {
                 fail_fast: job.strategy.fail_fast.unwrap_or(true),
                 max_parallel: job.strategy.max_parallel,
                 secrets_inherit: false,
+                container: job.container.clone(),
+                services: non_empty_services(job.services.clone()),
             });
         }
     }
@@ -656,6 +672,8 @@ pub fn expand_jobs_with_reusables(
                 fail_fast: job.strategy.fail_fast.unwrap_or(true),
                 max_parallel: job.strategy.max_parallel,
                 secrets_inherit: false,
+                container: job.container.clone(),
+                services: non_empty_services(job.services.clone()),
             });
         }
     }

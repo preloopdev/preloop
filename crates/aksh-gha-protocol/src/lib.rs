@@ -219,6 +219,12 @@ pub struct JobPlan {
     /// Whether this job inherits all parent secrets (reusable workflow `secrets: inherit`).
     #[serde(default)]
     pub secrets_inherit: bool,
+    /// Raw `container:` value, string or mapping, un-evaluated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<serde_json::Value>,
+    /// Raw `services:` mapping, un-evaluated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub services: Option<serde_json::Value>,
 }
 
 fn default_fail_fast() -> bool {
