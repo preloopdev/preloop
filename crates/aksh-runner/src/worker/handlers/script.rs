@@ -102,7 +102,9 @@ pub async fn run_script_in_container(
     std::fs::create_dir_all(&temp_dir)?;
 
     let script_id = uuid::Uuid::new_v4();
-    let (script_path, program, args) = resolve_shell(shell, &temp_dir, &script_id)?;
+    // Default to sh inside containers (alpine/slim images may not have bash)
+    let container_shell = shell.or(Some("sh"));
+    let (script_path, program, args) = resolve_shell(container_shell, &temp_dir, &script_id)?;
 
     // Write the script content
     std::fs::write(&script_path, script)
