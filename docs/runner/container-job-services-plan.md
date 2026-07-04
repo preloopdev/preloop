@@ -4,9 +4,9 @@
 
 Add GitHub Actions `jobs.<id>.container:` and `jobs.<id>.services:` support end-to-end in aksh. The control plane (`aksh-runner-server` + `aksh-gha-parser`) must emit the same container fields GitHub's control plane sends, and the native Rust runner (`crates/aksh-runner`) must execute container jobs with behavior matching the official `actions/runner`.
 
-Updated architecture decision: **Docker engine compatibility is the primary implementation path.** The first supported backend is a real Docker-compatible engine, because the official runner itself uses Docker for job containers and service containers. The production isolation model is **fresh VM/microVM per job with the runner/worker and Docker stack inside the VM**. The local development model may use the host Docker daemon for convenience.
+Updated architecture decision: **Docker engine compatibility is the primary implementation path.** The first supported backend is a real Docker-compatible engine, because the official runner itself uses Docker for job containers and service containers. The production isolation model is **fresh VM/microVM per job with the runner/worker and Docker stack inside the VM**. 
 
-The earlier Docker-less libkrun/`crun` backend is no longer the main plan. `crun` is not Docker-compatible by itself; using it without `dockerd` would require aksh to reimplement Docker-engine behavior: image pull, registry auth, layer assembly, networks, ports, health checks, logs, option parsing, and exec. That is a later optimization path only after Docker parity is complete.
+The main plan for local macos ci is to use Smolvm. THey bundle a kernel that supports all thats needed to run nested docker i.e cgroups, overlayfs2
 
 Decisions locked:
 
@@ -104,23 +104,23 @@ The official runner's container path is Docker-centric. aksh should match it, no
 
 1. Validate container support. Official runner supports container operations on Linux only and refuses when the runner itself is already inside an unsupported containerized environment. For local Docker mode, match official messages. For hosted VM mode, the guest OS is Linux, so container support is available.
 2. Register post-job step **"Stop containers"** with `always()` semantics.
-3. Clean up stale containers/networks using the runner instance label.
-4. Create a per-job Docker network named `github_network_<uuid-no-dashes>`.
-5. Pull all container images. For ghcr.io / containers.pkg.github.com with no explicit credentials, use GitHub actor/token fallback credentials.
-6. Start the job container first, if present. Override entrypoint to keep it running, matching official behavior (`tail -f /dev/null`).
-7. Start service containers with `--network <job-net>` and `--network-alias <service-name>`.
+3. Clean up stale containers/networks using the runner instance label: `docker ps --all --quiet --no-trunc --filter "label=<6-hex>"` then `docker network prune --force --filter "label=<6-hex>"`.
+4. Create a per-job Docker network named `github_network_<uuid-no-dashes>` with `--label <6-hex>`.
+5. Pull all container images. For ghcr.io / containers.pkg.github.com with no explicit credentials, use GitHub actor/token fallback credentials. For `docker://` actions, pull appears as a separate timeline step named `"Pull <image>"`.
+6. Start the job container first, if present. Override entrypoint to keep it running (`--entrypoint "tail" <image> "-f" "/dev/null"`). Mount Docker socket (`/var/run/docker.sock`) automatically. Container name: `<32-hex-uuid>_<sanitized-image>_<6-hex>`.
+7. Start service containers with `--network <job-net>` and `--network-alias <service-name>`. Same naming and label conventions.
 8. Publish runtime context:
-  - `job.container.id`
-  - `job.container.network`
-  - `job.services.<name>.id`
+  - `job.container.id` — full 64-char container ID
+  - `job.container.network` — network name
+  - `job.services.<name>.id` — full 64-char container ID
   - `job.services.<name>.network`
-  - `job.services.<name>.ports`
-9. Wait for service health checks. Poll Docker health status while `starting`; fail the **"Initialize containers"** step if any service becomes unhealthy or never reaches healthy state.
+  - `job.services.<name>.ports` — **empty when job container present** (use DNS alias); mapped host port when no job container
+9. Wait for service health checks. Poll Docker health status while `starting` with backoff (2s, 3s, then interval); log `"<alias> service is starting, waiting N seconds before checking again."` / `"<alias> service is healthy."`. Fail the **"Initialize containers"** step if any service becomes unhealthy or never reaches healthy state.
 10. Run workflow steps:
   - without `container:`: execute steps directly on the runner machine/VM.
-    - with `container:`: execute steps with `docker exec` inside the long-running job container.
-11. Run Docker/container actions with the correct job network and mounts.
-12. Stop containers in post-job cleanup; dump service logs; remove containers; remove network.
+  - with `container:`: execute steps with `docker exec` inside the long-running job container.
+11. Run Docker/container actions: `docker run --rm` (NOT `docker exec`), attached to job network if present, with same instance label. Action container name uses shorter format: `<sanitized-image>_<6-hex>`.
+12. Stop containers in post-job cleanup. Order: stop+remove job container → per service (print logs with `docker logs --details`, then stop+remove) → remove network.
 
 ## Pre-Phase 0 — host-Docker smoke environment
 
@@ -213,10 +213,10 @@ macOS/Linux Host
     └── DOCKER_HOST=tcp://127.0.0.1:2375 (routed to host via TSI loopback)
 ```
 
-* **Mechanism:** The guest VM has no local Docker daemon. A `socat` TCP listener on the host forwards `127.0.0.1:2375` to the host's Docker Unix socket. Under libkrun's Transparent Socket Impersonation (TSI), connecting to `127.0.0.1` inside the guest VM transparently routes to the host's loopback interface. The guest sets `DOCKER_HOST=tcp://127.0.0.1:2375` and runs Docker CLI commands that execute containers on the host.
-* **Important:** Unix domain sockets (`/var/run/docker.sock`) **cannot** be bind-mounted across the VM boundary via `virtio-fs`. The socket file appears in the guest filesystem but connection attempts fail because the guest kernel cannot route IPC calls back to the host kernel's socket listener. TCP proxying via `socat` is the proven workaround.
-* **Pros:** Lower guest memory footprint. No nested virtualization or complex guest kernel netfilter requirements. Zero-config under TSI (loopback maps directly to host).
-* **Cons:** Weaker security boundary (guest VM can control host Docker daemon). Complex workspace path translations (host path vs guest path vs container path). Requires host-side `socat` process per runner.
+- **Mechanism:** The guest VM has no local Docker daemon. A `socat` TCP listener on the host forwards `127.0.0.1:2375` to the host's Docker Unix socket. Under libkrun's Transparent Socket Impersonation (TSI), connecting to `127.0.0.1` inside the guest VM transparently routes to the host's loopback interface. The guest sets `DOCKER_HOST=tcp://127.0.0.1:2375` and runs Docker CLI commands that execute containers on the host.
+- **Important:** Unix domain sockets (`/var/run/docker.sock`) **cannot** be bind-mounted across the VM boundary via `virtio-fs`. The socket file appears in the guest filesystem but connection attempts fail because the guest kernel cannot route IPC calls back to the host kernel's socket listener. TCP proxying via `socat` is the proven workaround.
+- **Pros:** Lower guest memory footprint. No nested virtualization or complex guest kernel netfilter requirements. Zero-config under TSI (loopback maps directly to host).
+- **Cons:** Weaker security boundary (guest VM can control host Docker daemon). Complex workspace path translations (host path vs guest path vs container path). Requires host-side `socat` process per runner.
 
 ### 2. Substrate evaluation criteria
 
@@ -266,6 +266,84 @@ Add or use fixtures:
 - `fixtures/workflows/17-service-container.yml`
 
 Run them against official `actions/runner` v2.335.1 on Linux with Docker and store recordings under `.runner-watch/golden/v2.335.1/`. These goldens are the authority for exact JSON encoding, timeline step numbering, log-group strings, health-check output, and service context shape.
+
+### Completed golden recordings
+
+Seven container/service workflows were run against the official GitHub Actions runner v2.335.1 on `ubuntu-latest` and recorded under `.runner-watch/golden/v2.335.1/`:
+
+| Scenario | What it tests |
+| :--- | :--- |
+| `30-container-job-basic` | Basic `container: node:20` job, Docker env verification |
+| `31-container-with-services` | Container + postgres/redis services, DNS alias resolution, health checks |
+| `32-services-no-container` | Service containers (nginx+redis) with port mapping, no job container |
+| `33-container-env-options` | Container env vars, `--cpus` option, `GITHUB_ENV`/`GITHUB_OUTPUT`/`GITHUB_PATH` file commands from inside container |
+| `34-container-with-checkout` | Container job + `actions/checkout@v4`, workspace mount verification |
+| `35-container-lifecycle` | `job.container` context fields, `continue-on-error`, conditional steps |
+| `36-docker-action` | `docker://` actions on host and inside container job (2 jobs) |
+
+Each golden directory contains: `run.json`, `jobs.json`, `timing.json`, full job logs, workflow YAML, and `summary.json`. Scenario definitions added to `experiments/mitm/scenarios/`.
+
+### Observed behavior from golden traces
+
+The following details were verified from golden trace logs and were not previously documented. They supplement the "Runtime sequence to match" and "Required behavior" sections below.
+
+#### Container naming convention
+
+Job containers: `<32-hex-job-uuid>_<sanitized-image>_<6-hex>` (e.g., `bc0b1a2164fe484f88c0d6da518dc2a0_node20bookworm_623c4d`). Image name is sanitized: colons, dots, and dashes are removed. Service containers follow the same pattern.
+
+Docker action containers (from `docker://` steps) use a shorter form: `<sanitized-image>_<6-hex>` (no UUID prefix).
+
+#### Instance label format
+
+A 6-character hex label (e.g., `607ed7`, `c5b131`) is assigned per job. All containers and the job network are tagged with `--label <hex>`. Cleanup uses `--filter "label=<hex>"`. The label appears to be derived from the runner session or job ID.
+
+#### Docker socket auto-mount
+
+The host Docker socket is automatically mounted into job containers: `-v "/var/run/docker.sock":"/var/run/docker.sock"`. This is NOT done for service containers or for service-only jobs (no job container). This enables Docker-in-Docker workflows from inside job containers.
+
+#### Stale container cleanup at job start
+
+Before creating the job network, the runner runs:
+1. `docker ps --all --quiet --no-trunc --filter "label=<hex>"` — find stale containers from a previous run with the same label.
+2. `docker network prune --force --filter "label=<hex>"` — remove stale networks.
+
+#### docker:// action execution model
+
+- **On host (no job container):** `docker run --rm` with `--workdir /github/workspace`. Environment variables are passed via `-e "VAR_NAME"` (key only, not `KEY=VALUE` — Docker resolves from host env). Image pull appears as a separate timeline step: `"Pull <image>"`.
+- **Inside a container job:** `docker://` actions use `docker run` (NOT `docker exec`), attached to the same job network with the same instance label.
+
+#### Step number reservation
+
+GitHub reserves step number slots between user steps and post-job steps. The gap pattern observed: 5 user steps → post-job at step 14; 8 user steps → post-job at step 16; 10 user steps → post-job at step 24. Post-job steps ("Stop containers", "Complete job") use the reserved high numbers.
+
+#### Health check backoff timing
+
+Health check polling uses sequential waits: 2s, then 3s, then continues at the configured `--health-interval`. Log messages follow the pattern:
+- `"<alias> service is starting, waiting N seconds before checking again."`
+- `"<alias> service is healthy."`
+
+#### Service port context behavior
+
+- **With job container** (services on same Docker network): `job.services.<name>.ports[<port>]` is **empty**. Services are accessed via DNS alias at their container port directly.
+- **Without job container** (host mode with `-p` port mapping): `job.services.<name>.ports['<container-port>']` resolves to the **mapped host port** (e.g., `job.services.nginx.ports['80']` = `8080`).
+
+#### Toolcache mount
+
+The golden logs show `/opt/hostedtoolcache` → `/__t` as an additional mount. This supplements the `_work/_tool` → `/__w/_tool` mount in the plan's table.
+
+#### Container environment variable ordering
+
+In `docker create`, user env vars from `container.env` appear BEFORE auto-injected vars (`HOME=/github/home`, `GITHUB_ACTIONS=true`, `CI=true`). User env vars use `-e "KEY=VALUE"` quoting; auto-injected vars for `GITHUB_ACTIONS` and `CI` omit the `=value` form.
+
+#### Post-job cleanup order
+
+1. Stop and remove job container: `docker rm --force <id>`.
+2. For each service container:
+   a. Print logs: `docker logs --details <id>`.
+   b. Stop and remove: `docker rm --force <id>`.
+3. Remove network: `docker network rm <network-name>`.
+
+Log group strings: `"Stop and remove container: <name>"`, `"Print service container logs: <name>"`, `"Remove container network: <network-name>"`.
 
 ## Phase 1 — control plane emits container fields
 
@@ -412,27 +490,33 @@ Required Docker commands/features:
 - `docker exec`
 - `docker rm --force`
 
-Required behavior:
+Required behavior (see also "Observed behavior from golden traces" in Phase 0):
 
-- instance labels for cleanup.
+- instance labels for cleanup: 6-hex label per job, applied via `--label <hex>` to all containers and networks.
+- stale container/network cleanup before network creation using label filter.
 - image pull retry behavior.
 - ghcr credential fallback.
-- log group strings matching official runner.
-- job network naming.
-- service network aliases.
-- job container keepalive entrypoint.
+- log group strings matching official runner (see Phase 0 cleanup order for exact strings).
+- job network naming: `github_network_<uuid-no-dashes>`.
+- container naming: `<32-hex-uuid>_<sanitized-image>_<6-hex>` (image name: colons/dots/dashes removed).
+- service network aliases via `--network-alias <service-name>`.
+- job container keepalive entrypoint: `--entrypoint "tail" <image> "-f" "/dev/null"`.
+- Docker socket auto-mount into job containers: `-v "/var/run/docker.sock":"/var/run/docker.sock"`.
 - official mount table:
   - `_work` → `/__w`
   - `externals` → `/__e` read-only
   - `_work/_temp` → `/__w/_temp`
   - `_work/_actions` → `/__w/_actions`
-  - `_work/_tool` → `/__w/_tool`
+  - `/opt/hostedtoolcache` → `/__t`
   - `_work/_temp/_github_home` → `/github/home`
   - `_work/_temp/_github_workflow` → `/github/workflow`
+- env var injection: user `container.env` vars first, then `HOME=/github/home`, `GITHUB_ACTIONS=true`, `CI=true`.
 - path translation for step scripts and file-command paths.
 - PATH extraction from image config and prepending on exec.
-- health check polling.
-- service log dumping in cleanup.
+- health check polling with 2s/3s/interval backoff (see Phase 0 golden observations).
+- service port context: empty when job container present (DNS alias access); mapped host port when no job container.
+- cleanup order: stop+remove job container → (per service: print logs → stop+remove) → remove network.
+- docker:// action execution: `docker run --rm` (not `docker exec`), on job network if present, shorter container name format.
 
 ### Job lifecycle integration
 
