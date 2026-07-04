@@ -22,7 +22,10 @@ pub fn evaluate_template(input: &str, ctx: &aksh_gha_expressions::Context) -> Re
         let expr_start = start + 3;
         let remaining = &rest[expr_start..];
 
-        if let Some(end) = remaining.find("}}") {
+        // Find the matching closing }} — must handle nested parens and quoted strings
+        // that may contain }} (e.g. format('...{0}...', arg) where the template has
+        // bash {{ }} brace groups).
+        if let Some(end) = find_expression_end(remaining) {
             let expr = remaining[..end].trim();
             debug!("Evaluating expression: {expr}");
 
@@ -46,6 +49,51 @@ pub fn evaluate_template(input: &str, ctx: &aksh_gha_expressions::Context) -> Re
 
     result.push_str(rest);
     Ok(result)
+}
+
+/// Find the closing `}}` of a `${{ ... }}` expression, respecting string literals.
+///
+/// GitHub's control plane wraps multi-line `run:` scripts containing expressions
+/// into `format('...{0}...', expr1, expr2)` calls. The format template string
+/// may contain `}}` as literal brace escapes (e.g. bash `${{ }}` or `{ }` blocks).
+/// We track single-quote depth so `}}` inside `'...'` literals is not treated
+/// as the expression closer.
+fn find_expression_end(s: &str) -> Option<usize> {
+    let mut in_single_quote = false;
+    let mut paren_depth: usize = 0;
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        match ch {
+            '\'' if !in_single_quote => {
+                in_single_quote = true;
+            }
+            '\'' if in_single_quote => {
+                // Check for escaped quote ('') inside string literal
+                if i + 1 < chars.len() && chars[i + 1] == '\'' {
+                    i += 1; // skip escaped quote
+                } else {
+                    in_single_quote = false;
+                }
+            }
+            '(' if !in_single_quote => {
+                paren_depth += 1;
+            }
+            ')' if !in_single_quote && paren_depth > 0 => {
+                paren_depth -= 1;
+            }
+            '}' if !in_single_quote && paren_depth == 0 => {
+                // Check for }}
+                if i + 1 < chars.len() && chars[i + 1] == '}' {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Convert a serde_json::Value to its display string (matching GitHub Actions semantics).
