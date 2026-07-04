@@ -1,0 +1,144 @@
+﻿2026-07-04T03:42:56.0615737Z Current runner version: '2.335.1'
+2026-07-04T03:42:56.0670879Z ##[group]Runner Image Provisioner
+2026-07-04T03:42:56.0672554Z Hosted Compute Agent
+2026-07-04T03:42:56.0673617Z Version: 20260624.560
+2026-07-04T03:42:56.0674601Z Commit: 925d229a51159bc391ae97e54a2dd1fe20af789d
+2026-07-04T03:42:56.0675748Z Build Date: 2026-06-24T18:26:47Z
+2026-07-04T03:42:56.0677042Z Worker ID: {34db300f-770c-4231-a1be-663f9b0acf98}
+2026-07-04T03:42:56.0678248Z Azure Region: eastus
+2026-07-04T03:42:56.0679094Z ##[endgroup]
+2026-07-04T03:42:56.0681495Z ##[group]Operating System
+2026-07-04T03:42:56.0703024Z Ubuntu
+2026-07-04T03:42:56.0703981Z 24.04.4
+2026-07-04T03:42:56.0704847Z LTS
+2026-07-04T03:42:56.0705788Z ##[endgroup]
+2026-07-04T03:42:56.0706677Z ##[group]Runner Image
+2026-07-04T03:42:56.0707586Z Image: ubuntu-24.04
+2026-07-04T03:42:56.0708571Z Version: 20260628.225.1
+2026-07-04T03:42:56.0710677Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260628.225/images/ubuntu/Ubuntu2404-Readme.md
+2026-07-04T03:42:56.0713680Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260628.225
+2026-07-04T03:42:56.0715371Z ##[endgroup]
+2026-07-04T03:42:56.0717374Z ##[group]GITHUB_TOKEN Permissions
+2026-07-04T03:42:56.0720639Z Contents: read
+2026-07-04T03:42:56.0721573Z Metadata: read
+2026-07-04T03:42:56.0732877Z Packages: read
+2026-07-04T03:42:56.0733875Z ##[endgroup]
+2026-07-04T03:42:56.0736876Z Secret source: Actions
+2026-07-04T03:42:56.0738498Z Prepare workflow directory
+2026-07-04T03:42:56.1591312Z Prepare all required actions
+2026-07-04T03:42:56.2615346Z Complete job name: container-basic
+2026-07-04T03:42:56.3502787Z ##[group]Checking docker version
+2026-07-04T03:42:56.3516355Z ##[command]/usr/bin/docker version --format '{{.Server.APIVersion}}'
+2026-07-04T03:42:56.4605565Z '1.48'
+2026-07-04T03:42:56.4624685Z Docker daemon API version: '1.48'
+2026-07-04T03:42:56.4625583Z ##[command]/usr/bin/docker version --format '{{.Client.APIVersion}}'
+2026-07-04T03:42:56.4832487Z '1.48'
+2026-07-04T03:42:56.4839022Z Docker client API version: '1.48'
+2026-07-04T03:42:56.4848296Z ##[endgroup]
+2026-07-04T03:42:56.4854766Z ##[group]Clean up resources from previous jobs
+2026-07-04T03:42:56.4864509Z ##[command]/usr/bin/docker ps --all --quiet --no-trunc --filter "label=607ed7"
+2026-07-04T03:42:56.5111487Z ##[command]/usr/bin/docker network prune --force --filter "label=607ed7"
+2026-07-04T03:42:56.5338729Z ##[endgroup]
+2026-07-04T03:42:56.5339872Z ##[group]Create local container network
+2026-07-04T03:42:56.5354956Z ##[command]/usr/bin/docker network create --label 607ed7 github_network_b4ce0deef92a42c3afc481b33205fb44
+2026-07-04T03:42:56.6456840Z aa6c18a531f9251b72fb8a09d951d354eda91ac66f2721d2a4997a29bb84362d
+2026-07-04T03:42:56.6466245Z ##[endgroup]
+2026-07-04T03:42:56.6490079Z ##[group]Starting job container
+2026-07-04T03:42:56.6511645Z ##[command]/usr/bin/docker pull node:20-bookworm
+2026-07-04T03:42:56.8992112Z 20-bookworm: Pulling from library/node
+2026-07-04T03:42:56.9717648Z db53381ee51f: Pulling fs layer
+2026-07-04T03:42:56.9721869Z e5203b2bfeff: Pulling fs layer
+2026-07-04T03:42:56.9749537Z 8fcda2b4d799: Pulling fs layer
+2026-07-04T03:42:56.9750857Z 2933ecab0f11: Pulling fs layer
+2026-07-04T03:42:56.9751815Z c83419f44309: Pulling fs layer
+2026-07-04T03:42:56.9753325Z 76e6b8204a89: Pulling fs layer
+2026-07-04T03:42:56.9754113Z 2f2ab6e4eb46: Pulling fs layer
+2026-07-04T03:42:56.9754877Z 0b22ec2d9b1a: Pulling fs layer
+2026-07-04T03:42:56.9755618Z c83419f44309: Waiting
+2026-07-04T03:42:56.9756282Z 76e6b8204a89: Waiting
+2026-07-04T03:42:56.9756948Z 2f2ab6e4eb46: Waiting
+2026-07-04T03:42:56.9757658Z 0b22ec2d9b1a: Waiting
+2026-07-04T03:42:56.9758372Z 2933ecab0f11: Waiting
+2026-07-04T03:42:57.2584682Z e5203b2bfeff: Verifying Checksum
+2026-07-04T03:42:57.2585435Z e5203b2bfeff: Download complete
+2026-07-04T03:42:57.4951421Z db53381ee51f: Verifying Checksum
+2026-07-04T03:42:57.4952878Z db53381ee51f: Download complete
+2026-07-04T03:42:57.4953627Z c83419f44309: Verifying Checksum
+2026-07-04T03:42:57.4954313Z c83419f44309: Download complete
+2026-07-04T03:42:57.5098560Z 8fcda2b4d799: Verifying Checksum
+2026-07-04T03:42:57.5099661Z 8fcda2b4d799: Download complete
+2026-07-04T03:42:57.6280457Z 2f2ab6e4eb46: Verifying Checksum
+2026-07-04T03:42:57.6282680Z 2f2ab6e4eb46: Download complete
+2026-07-04T03:42:57.6916537Z 0b22ec2d9b1a: Verifying Checksum
+2026-07-04T03:42:57.6918730Z 0b22ec2d9b1a: Download complete
+2026-07-04T03:42:57.8364404Z 76e6b8204a89: Verifying Checksum
+2026-07-04T03:42:57.8365762Z 76e6b8204a89: Download complete
+2026-07-04T03:42:58.5019682Z 2933ecab0f11: Verifying Checksum
+2026-07-04T03:42:58.5022200Z 2933ecab0f11: Download complete
+2026-07-04T03:43:00.6498035Z db53381ee51f: Pull complete
+2026-07-04T03:43:04.0756147Z e5203b2bfeff: Pull complete
+2026-07-04T03:43:07.2847316Z 8fcda2b4d799: Pull complete
+2026-07-04T03:43:16.0738151Z 2933ecab0f11: Pull complete
+2026-07-04T03:43:16.0945785Z c83419f44309: Pull complete
+2026-07-04T03:43:18.7733485Z 76e6b8204a89: Pull complete
+2026-07-04T03:43:18.8398403Z 2f2ab6e4eb46: Pull complete
+2026-07-04T03:43:18.8600678Z 0b22ec2d9b1a: Pull complete
+2026-07-04T03:43:18.8651241Z Digest: sha256:8f693eaa7e0a8e71560c9a82b55fd54c2ae920a2ba5d2cde28bac7d1c01c9ba5
+2026-07-04T03:43:18.8669514Z Status: Downloaded newer image for node:20-bookworm
+2026-07-04T03:43:18.8687655Z docker.io/library/node:20-bookworm
+2026-07-04T03:43:18.8782312Z ##[command]/usr/bin/docker create --name bc0b1a2164fe484f88c0d6da518dc2a0_node20bookworm_623c4d --label 607ed7 --workdir /__w/aksh-conformance-sample/aksh-conformance-sample --network github_network_b4ce0deef92a42c3afc481b33205fb44  -e "HOME=/github/home" -e GITHUB_ACTIONS=true -e CI=true -v "/var/run/docker.sock":"/var/run/docker.sock" -v "/home/runner/work":"/__w" -v "/home/runner/actions-runner/cached/2.335.1/externals":"/__e":ro -v "/home/runner/work/_temp":"/__w/_temp" -v "/home/runner/work/_actions":"/__w/_actions" -v "/opt/hostedtoolcache":"/__t" -v "/home/runner/work/_temp/_github_home":"/github/home" -v "/home/runner/work/_temp/_github_workflow":"/github/workflow" --entrypoint "tail" node:20-bookworm "-f" "/dev/null"
+2026-07-04T03:43:18.9152850Z 09462c2b559256a670a62135f7402c5fb54a4f3e635c262c48794d9cf323a2b5
+2026-07-04T03:43:18.9175035Z ##[command]/usr/bin/docker start 09462c2b559256a670a62135f7402c5fb54a4f3e635c262c48794d9cf323a2b5
+2026-07-04T03:43:19.1462278Z 09462c2b559256a670a62135f7402c5fb54a4f3e635c262c48794d9cf323a2b5
+2026-07-04T03:43:19.1504353Z ##[command]/usr/bin/docker ps --all --filter id=09462c2b559256a670a62135f7402c5fb54a4f3e635c262c48794d9cf323a2b5 --filter status=running --no-trunc --format "{{.ID}} {{.Status}}"
+2026-07-04T03:43:19.1632743Z 09462c2b559256a670a62135f7402c5fb54a4f3e635c262c48794d9cf323a2b5 Up Less than a second
+2026-07-04T03:43:19.1651085Z ##[command]/usr/bin/docker inspect --format "{{range .Config.Env}}{{println .}}{{end}}" 09462c2b559256a670a62135f7402c5fb54a4f3e635c262c48794d9cf323a2b5
+2026-07-04T03:43:19.1811083Z HOME=/github/home
+2026-07-04T03:43:19.1812143Z GITHUB_ACTIONS=true
+2026-07-04T03:43:19.1822718Z CI=true
+2026-07-04T03:43:19.1823476Z PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+2026-07-04T03:43:19.1825298Z NODE_VERSION=20.20.2
+2026-07-04T03:43:19.1825762Z YARN_VERSION=1.22.22
+2026-07-04T03:43:19.1836300Z ##[endgroup]
+2026-07-04T03:43:19.1845825Z ##[group]Waiting for all services to be ready
+2026-07-04T03:43:19.1847552Z ##[endgroup]
+2026-07-04T03:43:19.2070638Z ##[group]Run node --version
+2026-07-04T03:43:19.2070991Z [36;1mnode --version[0m
+2026-07-04T03:43:19.2074729Z shell: sh -e {0}
+2026-07-04T03:43:19.2075239Z ##[endgroup]
+2026-07-04T03:43:19.2767058Z v20.20.2
+2026-07-04T03:43:19.2883776Z ##[group]Run npm --version
+2026-07-04T03:43:19.2884093Z [36;1mnpm --version[0m
+2026-07-04T03:43:19.2884394Z shell: sh -e {0}
+2026-07-04T03:43:19.2884589Z ##[endgroup]
+2026-07-04T03:43:19.4359601Z 10.8.2
+2026-07-04T03:43:19.4464058Z ##[group]Run # The job container should have /.dockerenv
+2026-07-04T03:43:19.4464762Z [36;1m# The job container should have /.dockerenv[0m
+2026-07-04T03:43:19.4465281Z [36;1mtest -f /.dockerenv[0m
+2026-07-04T03:43:19.4465953Z [36;1mecho "Running inside Docker container"[0m
+2026-07-04T03:43:19.4466531Z shell: sh -e {0}
+2026-07-04T03:43:19.4466888Z ##[endgroup]
+2026-07-04T03:43:19.5072585Z Running inside Docker container
+2026-07-04T03:43:19.5176126Z ##[group]Run echo "HOME=$HOME"
+2026-07-04T03:43:19.5176454Z [36;1mecho "HOME=$HOME"[0m
+2026-07-04T03:43:19.5176737Z [36;1mecho "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"[0m
+2026-07-04T03:43:19.5177063Z [36;1mecho "RUNNER_TEMP=$RUNNER_TEMP"[0m
+2026-07-04T03:43:19.5177353Z [36;1mecho "GITHUB_ACTION=$GITHUB_ACTION"[0m
+2026-07-04T03:43:19.5177722Z shell: sh -e {0}
+2026-07-04T03:43:19.5177916Z ##[endgroup]
+2026-07-04T03:43:19.5750818Z HOME=/github/home
+2026-07-04T03:43:19.5755682Z GITHUB_WORKSPACE=/__w/aksh-conformance-sample/aksh-conformance-sample
+2026-07-04T03:43:19.5757643Z RUNNER_TEMP=/__w/_temp
+2026-07-04T03:43:19.5758423Z GITHUB_ACTION=__run_4
+2026-07-04T03:43:19.5819537Z ##[group]Run echo "hello from container" > /tmp/test-output.txt && cat /tmp/test-output.txt
+2026-07-04T03:43:19.5820276Z [36;1mecho "hello from container" > /tmp/test-output.txt && cat /tmp/test-output.txt[0m
+2026-07-04T03:43:19.5820784Z shell: sh -e {0}
+2026-07-04T03:43:19.5820985Z ##[endgroup]
+2026-07-04T03:43:19.6391236Z hello from container
+2026-07-04T03:43:19.6482713Z Stop and remove container: bc0b1a2164fe484f88c0d6da518dc2a0_node20bookworm_623c4d
+2026-07-04T03:43:19.6487549Z ##[command]/usr/bin/docker rm --force 09462c2b559256a670a62135f7402c5fb54a4f3e635c262c48794d9cf323a2b5
+2026-07-04T03:43:19.7494491Z 09462c2b559256a670a62135f7402c5fb54a4f3e635c262c48794d9cf323a2b5
+2026-07-04T03:43:19.7513543Z Remove container network: github_network_b4ce0deef92a42c3afc481b33205fb44
+2026-07-04T03:43:19.7517847Z ##[command]/usr/bin/docker network rm github_network_b4ce0deef92a42c3afc481b33205fb44
+2026-07-04T03:43:19.8240595Z github_network_b4ce0deef92a42c3afc481b33205fb44
+2026-07-04T03:43:19.8312978Z Cleaning up orphan processes

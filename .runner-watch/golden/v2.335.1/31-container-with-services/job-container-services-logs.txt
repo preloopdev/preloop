@@ -1,0 +1,448 @@
+﻿2026-07-04T03:42:58.5278028Z Current runner version: '2.335.1'
+2026-07-04T03:42:58.5347180Z ##[group]Runner Image Provisioner
+2026-07-04T03:42:58.5348456Z Hosted Compute Agent
+2026-07-04T03:42:58.5369759Z Version: 20260624.560
+2026-07-04T03:42:58.5370970Z Commit: 925d229a51159bc391ae97e54a2dd1fe20af789d
+2026-07-04T03:42:58.5372104Z Build Date: 2026-06-24T18:26:47Z
+2026-07-04T03:42:58.5373346Z Worker ID: {1ed96449-3206-4fb3-a2d0-573b438b1fc9}
+2026-07-04T03:42:58.5374468Z Azure Region: northcentralus
+2026-07-04T03:42:58.5375369Z ##[endgroup]
+2026-07-04T03:42:58.5377658Z ##[group]Operating System
+2026-07-04T03:42:58.5378658Z Ubuntu
+2026-07-04T03:42:58.5380061Z 24.04.4
+2026-07-04T03:42:58.5380941Z LTS
+2026-07-04T03:42:58.5381860Z ##[endgroup]
+2026-07-04T03:42:58.5382802Z ##[group]Runner Image
+2026-07-04T03:42:58.5383712Z Image: ubuntu-24.04
+2026-07-04T03:42:58.5384613Z Version: 20260628.225.1
+2026-07-04T03:42:58.5386731Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260628.225/images/ubuntu/Ubuntu2404-Readme.md
+2026-07-04T03:42:58.5389244Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260628.225
+2026-07-04T03:42:58.5400694Z ##[endgroup]
+2026-07-04T03:42:58.5402731Z ##[group]GITHUB_TOKEN Permissions
+2026-07-04T03:42:58.5405825Z Contents: read
+2026-07-04T03:42:58.5406698Z Metadata: read
+2026-07-04T03:42:58.5407651Z Packages: read
+2026-07-04T03:42:58.5408543Z ##[endgroup]
+2026-07-04T03:42:58.5411851Z Secret source: Actions
+2026-07-04T03:42:58.5413680Z Prepare workflow directory
+2026-07-04T03:42:58.6044645Z Prepare all required actions
+2026-07-04T03:42:58.6917934Z Complete job name: container-services
+2026-07-04T03:42:58.7742962Z ##[group]Checking docker version
+2026-07-04T03:42:58.7757488Z ##[command]/usr/bin/docker version --format '{{.Server.APIVersion}}'
+2026-07-04T03:42:58.8611916Z '1.48'
+2026-07-04T03:42:58.8631602Z Docker daemon API version: '1.48'
+2026-07-04T03:42:58.8632536Z ##[command]/usr/bin/docker version --format '{{.Client.APIVersion}}'
+2026-07-04T03:42:58.8830799Z '1.48'
+2026-07-04T03:42:58.8842381Z Docker client API version: '1.48'
+2026-07-04T03:42:58.8848544Z ##[endgroup]
+2026-07-04T03:42:58.8852477Z ##[group]Clean up resources from previous jobs
+2026-07-04T03:42:58.8858600Z ##[command]/usr/bin/docker ps --all --quiet --no-trunc --filter "label=c5b131"
+2026-07-04T03:42:58.9027972Z ##[command]/usr/bin/docker network prune --force --filter "label=c5b131"
+2026-07-04T03:42:58.9173111Z ##[endgroup]
+2026-07-04T03:42:58.9173770Z ##[group]Create local container network
+2026-07-04T03:42:58.9184517Z ##[command]/usr/bin/docker network create --label c5b131 github_network_5e69d607394146219dbab1c57057dde0
+2026-07-04T03:42:58.9910718Z b0cf5c8329385e0eb330a1bddcc943691536c246967cb1b6d59de34bbe91bbc2
+2026-07-04T03:42:58.9930086Z ##[endgroup]
+2026-07-04T03:42:58.9963115Z ##[group]Starting job container
+2026-07-04T03:42:58.9993712Z ##[command]/usr/bin/docker pull node:20-bookworm
+2026-07-04T03:42:59.4127627Z 20-bookworm: Pulling from library/node
+2026-07-04T03:42:59.5362581Z db53381ee51f: Pulling fs layer
+2026-07-04T03:42:59.5459940Z e5203b2bfeff: Pulling fs layer
+2026-07-04T03:42:59.5461213Z 8fcda2b4d799: Pulling fs layer
+2026-07-04T03:42:59.5462287Z 2933ecab0f11: Pulling fs layer
+2026-07-04T03:42:59.5463369Z c83419f44309: Pulling fs layer
+2026-07-04T03:42:59.5464410Z 76e6b8204a89: Pulling fs layer
+2026-07-04T03:42:59.5465434Z 2f2ab6e4eb46: Pulling fs layer
+2026-07-04T03:42:59.5466436Z 0b22ec2d9b1a: Pulling fs layer
+2026-07-04T03:42:59.5467713Z 2933ecab0f11: Waiting
+2026-07-04T03:42:59.5468640Z c83419f44309: Waiting
+2026-07-04T03:42:59.5469790Z 76e6b8204a89: Waiting
+2026-07-04T03:42:59.5470823Z 2f2ab6e4eb46: Waiting
+2026-07-04T03:42:59.5471777Z 0b22ec2d9b1a: Waiting
+2026-07-04T03:43:00.0435986Z e5203b2bfeff: Verifying Checksum
+2026-07-04T03:43:00.0458174Z e5203b2bfeff: Download complete
+2026-07-04T03:43:00.0623941Z db53381ee51f: Verifying Checksum
+2026-07-04T03:43:00.0626306Z db53381ee51f: Download complete
+2026-07-04T03:43:00.1789231Z 8fcda2b4d799: Verifying Checksum
+2026-07-04T03:43:00.1791451Z 8fcda2b4d799: Download complete
+2026-07-04T03:43:00.2300907Z c83419f44309: Verifying Checksum
+2026-07-04T03:43:00.2302730Z c83419f44309: Download complete
+2026-07-04T03:43:00.5276658Z 2f2ab6e4eb46: Verifying Checksum
+2026-07-04T03:43:00.5277649Z 2f2ab6e4eb46: Download complete
+2026-07-04T03:43:00.6813004Z 0b22ec2d9b1a: Verifying Checksum
+2026-07-04T03:43:00.6814864Z 0b22ec2d9b1a: Download complete
+2026-07-04T03:43:01.1167362Z 76e6b8204a89: Verifying Checksum
+2026-07-04T03:43:01.1173475Z 76e6b8204a89: Download complete
+2026-07-04T03:43:01.4349233Z 2933ecab0f11: Verifying Checksum
+2026-07-04T03:43:01.4351138Z 2933ecab0f11: Download complete
+2026-07-04T03:43:02.6880656Z db53381ee51f: Pull complete
+2026-07-04T03:43:05.6175530Z e5203b2bfeff: Pull complete
+2026-07-04T03:43:08.8755786Z 8fcda2b4d799: Pull complete
+2026-07-04T03:43:15.2189265Z 2933ecab0f11: Pull complete
+2026-07-04T03:43:18.0161794Z c83419f44309: Pull complete
+2026-07-04T03:43:20.7255715Z 76e6b8204a89: Pull complete
+2026-07-04T03:43:20.7752825Z 2f2ab6e4eb46: Pull complete
+2026-07-04T03:43:20.7895043Z 0b22ec2d9b1a: Pull complete
+2026-07-04T03:43:20.7957116Z Digest: sha256:8f693eaa7e0a8e71560c9a82b55fd54c2ae920a2ba5d2cde28bac7d1c01c9ba5
+2026-07-04T03:43:20.7969248Z Status: Downloaded newer image for node:20-bookworm
+2026-07-04T03:43:20.7982478Z docker.io/library/node:20-bookworm
+2026-07-04T03:43:20.8068153Z ##[command]/usr/bin/docker create --name 317ea51100c648ef966135e81560e99c_node20bookworm_7a2e28 --label c5b131 --workdir /__w/aksh-conformance-sample/aksh-conformance-sample --network github_network_5e69d607394146219dbab1c57057dde0  -e "HOME=/github/home" -e GITHUB_ACTIONS=true -e CI=true -v "/var/run/docker.sock":"/var/run/docker.sock" -v "/home/runner/work":"/__w" -v "/home/runner/actions-runner/cached/2.335.1/externals":"/__e":ro -v "/home/runner/work/_temp":"/__w/_temp" -v "/home/runner/work/_actions":"/__w/_actions" -v "/opt/hostedtoolcache":"/__t" -v "/home/runner/work/_temp/_github_home":"/github/home" -v "/home/runner/work/_temp/_github_workflow":"/github/workflow" --entrypoint "tail" node:20-bookworm "-f" "/dev/null"
+2026-07-04T03:43:20.8329781Z 65f4cb3df4d4cf4ece8f0e81c8408805645e09fafce8c2a9b5658db1e37d705f
+2026-07-04T03:43:20.8354812Z ##[command]/usr/bin/docker start 65f4cb3df4d4cf4ece8f0e81c8408805645e09fafce8c2a9b5658db1e37d705f
+2026-07-04T03:43:21.0398375Z 65f4cb3df4d4cf4ece8f0e81c8408805645e09fafce8c2a9b5658db1e37d705f
+2026-07-04T03:43:21.0444513Z ##[command]/usr/bin/docker ps --all --filter id=65f4cb3df4d4cf4ece8f0e81c8408805645e09fafce8c2a9b5658db1e37d705f --filter status=running --no-trunc --format "{{.ID}} {{.Status}}"
+2026-07-04T03:43:21.0575421Z 65f4cb3df4d4cf4ece8f0e81c8408805645e09fafce8c2a9b5658db1e37d705f Up Less than a second
+2026-07-04T03:43:21.0594609Z ##[command]/usr/bin/docker inspect --format "{{range .Config.Env}}{{println .}}{{end}}" 65f4cb3df4d4cf4ece8f0e81c8408805645e09fafce8c2a9b5658db1e37d705f
+2026-07-04T03:43:21.0728045Z HOME=/github/home
+2026-07-04T03:43:21.0728655Z GITHUB_ACTIONS=true
+2026-07-04T03:43:21.0729133Z CI=true
+2026-07-04T03:43:21.0729820Z PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+2026-07-04T03:43:21.0730433Z NODE_VERSION=20.20.2
+2026-07-04T03:43:21.0730675Z YARN_VERSION=1.22.22
+2026-07-04T03:43:21.0751603Z ##[endgroup]
+2026-07-04T03:43:21.0753025Z ##[group]Starting postgres service container
+2026-07-04T03:43:21.0754229Z ##[command]/usr/bin/docker pull postgres:16
+2026-07-04T03:43:21.4591633Z 16: Pulling from library/postgres
+2026-07-04T03:43:21.5850000Z e95a6c7ea7d4: Pulling fs layer
+2026-07-04T03:43:21.5852487Z da037c8341f5: Pulling fs layer
+2026-07-04T03:43:21.5853914Z 54771d3c89de: Pulling fs layer
+2026-07-04T03:43:21.5854318Z 926efa22a589: Pulling fs layer
+2026-07-04T03:43:21.5854898Z 7fc7d55cf27e: Pulling fs layer
+2026-07-04T03:43:21.5855281Z 61c89bffdf6a: Pulling fs layer
+2026-07-04T03:43:21.5855833Z 18b8094b0912: Pulling fs layer
+2026-07-04T03:43:21.5856393Z b45131cbfacd: Pulling fs layer
+2026-07-04T03:43:21.5856769Z b181572fe06f: Pulling fs layer
+2026-07-04T03:43:21.5859532Z 9388bc0a8098: Pulling fs layer
+2026-07-04T03:43:21.5859986Z 6c05417960f5: Pulling fs layer
+2026-07-04T03:43:21.5860257Z 6b52d0175b81: Pulling fs layer
+2026-07-04T03:43:21.5860552Z 71d757e66b8c: Pulling fs layer
+2026-07-04T03:43:21.5860972Z 1241050b0b0f: Pulling fs layer
+2026-07-04T03:43:21.5861319Z 926efa22a589: Waiting
+2026-07-04T03:43:21.5861663Z 7fc7d55cf27e: Waiting
+2026-07-04T03:43:21.5861979Z 61c89bffdf6a: Waiting
+2026-07-04T03:43:21.5862319Z 6c05417960f5: Waiting
+2026-07-04T03:43:21.5862568Z 6b52d0175b81: Waiting
+2026-07-04T03:43:21.5862771Z 18b8094b0912: Waiting
+2026-07-04T03:43:21.5862979Z 71d757e66b8c: Waiting
+2026-07-04T03:43:21.5863298Z 1241050b0b0f: Waiting
+2026-07-04T03:43:21.5863500Z b45131cbfacd: Waiting
+2026-07-04T03:43:21.5863701Z b181572fe06f: Waiting
+2026-07-04T03:43:21.5863953Z 9388bc0a8098: Waiting
+2026-07-04T03:43:21.6896775Z da037c8341f5: Verifying Checksum
+2026-07-04T03:43:21.6911836Z da037c8341f5: Download complete
+2026-07-04T03:43:21.7286734Z 54771d3c89de: Verifying Checksum
+2026-07-04T03:43:21.7288358Z 54771d3c89de: Download complete
+2026-07-04T03:43:21.7858975Z 926efa22a589: Download complete
+2026-07-04T03:43:21.8079797Z e95a6c7ea7d4: Download complete
+2026-07-04T03:43:21.8924037Z 7fc7d55cf27e: Verifying Checksum
+2026-07-04T03:43:21.8930566Z 7fc7d55cf27e: Download complete
+2026-07-04T03:43:21.8951704Z 18b8094b0912: Verifying Checksum
+2026-07-04T03:43:21.8971747Z 18b8094b0912: Download complete
+2026-07-04T03:43:21.9071050Z 61c89bffdf6a: Verifying Checksum
+2026-07-04T03:43:21.9082359Z 61c89bffdf6a: Download complete
+2026-07-04T03:43:21.9832100Z b45131cbfacd: Verifying Checksum
+2026-07-04T03:43:21.9839212Z b45131cbfacd: Download complete
+2026-07-04T03:43:21.9869286Z 9388bc0a8098: Verifying Checksum
+2026-07-04T03:43:21.9875851Z 9388bc0a8098: Download complete
+2026-07-04T03:43:22.0900854Z 6c05417960f5: Verifying Checksum
+2026-07-04T03:43:22.0902990Z 6c05417960f5: Download complete
+2026-07-04T03:43:22.0915911Z 6b52d0175b81: Verifying Checksum
+2026-07-04T03:43:22.0917540Z 6b52d0175b81: Download complete
+2026-07-04T03:43:22.1896153Z 71d757e66b8c: Verifying Checksum
+2026-07-04T03:43:22.1904607Z 71d757e66b8c: Download complete
+2026-07-04T03:43:22.1953259Z 1241050b0b0f: Verifying Checksum
+2026-07-04T03:43:22.1964019Z 1241050b0b0f: Download complete
+2026-07-04T03:43:22.4408566Z b181572fe06f: Verifying Checksum
+2026-07-04T03:43:22.4409063Z b181572fe06f: Download complete
+2026-07-04T03:43:23.1672603Z e95a6c7ea7d4: Pull complete
+2026-07-04T03:43:24.0170999Z da037c8341f5: Pull complete
+2026-07-04T03:43:24.2310747Z 54771d3c89de: Pull complete
+2026-07-04T03:43:24.2791775Z 926efa22a589: Pull complete
+2026-07-04T03:43:24.6314155Z 7fc7d55cf27e: Pull complete
+2026-07-04T03:43:24.7114254Z 61c89bffdf6a: Pull complete
+2026-07-04T03:43:24.7228697Z 18b8094b0912: Pull complete
+2026-07-04T03:43:24.7311928Z b45131cbfacd: Pull complete
+2026-07-04T03:43:29.0951714Z b181572fe06f: Pull complete
+2026-07-04T03:43:29.1188340Z 9388bc0a8098: Pull complete
+2026-07-04T03:43:29.1310132Z 6c05417960f5: Pull complete
+2026-07-04T03:43:29.1437666Z 6b52d0175b81: Pull complete
+2026-07-04T03:43:29.1558425Z 71d757e66b8c: Pull complete
+2026-07-04T03:43:29.1647058Z 1241050b0b0f: Pull complete
+2026-07-04T03:43:29.1685481Z Digest: sha256:fe03a7605299a34ddf5e4f285dff78c3d7190a576b3c6b46f2fcff69f4bffd54
+2026-07-04T03:43:29.1697198Z Status: Downloaded newer image for postgres:16
+2026-07-04T03:43:29.1708551Z docker.io/library/postgres:16
+2026-07-04T03:43:29.1726304Z ##[command]/usr/bin/docker create --name c85e6c3188d4428e9b8f91493b25f5de_postgres16_7cc24b --label c5b131 --network github_network_5e69d607394146219dbab1c57057dde0 --network-alias postgres --health-cmd "pg_isready -U testuser" --health-interval 5s --health-timeout 5s --health-retries 10 -e "POSTGRES_PASSWORD=postgres" -e "POSTGRES_USER=testuser" -e "POSTGRES_DB=testdb" -e GITHUB_ACTIONS=true -e CI=true postgres:16
+2026-07-04T03:43:29.1978155Z 717529cfbe4119a4e0567a0284669d760c8a2bed4358f3ebde5d41ab804ac66b
+2026-07-04T03:43:29.1992697Z ##[command]/usr/bin/docker start 717529cfbe4119a4e0567a0284669d760c8a2bed4358f3ebde5d41ab804ac66b
+2026-07-04T03:43:29.3893708Z 717529cfbe4119a4e0567a0284669d760c8a2bed4358f3ebde5d41ab804ac66b
+2026-07-04T03:43:29.3927106Z ##[command]/usr/bin/docker ps --all --filter id=717529cfbe4119a4e0567a0284669d760c8a2bed4358f3ebde5d41ab804ac66b --filter status=running --no-trunc --format "{{.ID}} {{.Status}}"
+2026-07-04T03:43:29.4126615Z 717529cfbe4119a4e0567a0284669d760c8a2bed4358f3ebde5d41ab804ac66b Up Less than a second (health: starting)
+2026-07-04T03:43:29.4152725Z ##[command]/usr/bin/docker port 717529cfbe4119a4e0567a0284669d760c8a2bed4358f3ebde5d41ab804ac66b
+2026-07-04T03:43:29.4377302Z ##[endgroup]
+2026-07-04T03:43:29.4379078Z ##[group]Starting redis service container
+2026-07-04T03:43:29.4381895Z ##[command]/usr/bin/docker pull redis:7-alpine
+2026-07-04T03:43:29.8122828Z 7-alpine: Pulling from library/redis
+2026-07-04T03:43:29.9455481Z 897d797d2723: Pulling fs layer
+2026-07-04T03:43:29.9456266Z c14c7509f545: Pulling fs layer
+2026-07-04T03:43:29.9456854Z f546396032e0: Pulling fs layer
+2026-07-04T03:43:29.9457445Z a300455a02bb: Pulling fs layer
+2026-07-04T03:43:29.9458012Z 941ebb020cf0: Pulling fs layer
+2026-07-04T03:43:29.9458479Z 4f4fb700ef54: Pulling fs layer
+2026-07-04T03:43:29.9458955Z 677c7c5aa821: Pulling fs layer
+2026-07-04T03:43:29.9459553Z a300455a02bb: Waiting
+2026-07-04T03:43:29.9460109Z 941ebb020cf0: Waiting
+2026-07-04T03:43:29.9460576Z 4f4fb700ef54: Waiting
+2026-07-04T03:43:29.9461015Z 677c7c5aa821: Waiting
+2026-07-04T03:43:30.0216437Z c14c7509f545: Verifying Checksum
+2026-07-04T03:43:30.0217587Z c14c7509f545: Download complete
+2026-07-04T03:43:30.0277361Z f546396032e0: Verifying Checksum
+2026-07-04T03:43:30.0288340Z f546396032e0: Download complete
+2026-07-04T03:43:30.0575754Z 897d797d2723: Verifying Checksum
+2026-07-04T03:43:30.0593999Z 897d797d2723: Download complete
+2026-07-04T03:43:30.1088163Z 941ebb020cf0: Verifying Checksum
+2026-07-04T03:43:30.1097699Z 941ebb020cf0: Download complete
+2026-07-04T03:43:30.1419191Z 4f4fb700ef54: Verifying Checksum
+2026-07-04T03:43:30.1421725Z 4f4fb700ef54: Download complete
+2026-07-04T03:43:30.2223068Z 677c7c5aa821: Verifying Checksum
+2026-07-04T03:43:30.2238300Z 677c7c5aa821: Download complete
+2026-07-04T03:43:30.2239197Z a300455a02bb: Verifying Checksum
+2026-07-04T03:43:30.2239888Z a300455a02bb: Download complete
+2026-07-04T03:43:30.2526578Z 897d797d2723: Pull complete
+2026-07-04T03:43:30.2926043Z c14c7509f545: Pull complete
+2026-07-04T03:43:30.4727201Z f546396032e0: Pull complete
+2026-07-04T03:43:30.7573107Z a300455a02bb: Pull complete
+2026-07-04T03:43:30.7656119Z 941ebb020cf0: Pull complete
+2026-07-04T03:43:30.7764668Z 4f4fb700ef54: Pull complete
+2026-07-04T03:43:30.7866068Z 677c7c5aa821: Pull complete
+2026-07-04T03:43:30.7905794Z Digest: sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+2026-07-04T03:43:30.7916016Z Status: Downloaded newer image for redis:7-alpine
+2026-07-04T03:43:30.7928110Z docker.io/library/redis:7-alpine
+2026-07-04T03:43:30.7948159Z ##[command]/usr/bin/docker create --name b4e21250604549a4bc811021eb46ca17_redis7alpine_0030ff --label c5b131 --network github_network_5e69d607394146219dbab1c57057dde0 --network-alias redis --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 5s --health-retries 10 -e GITHUB_ACTIONS=true -e CI=true redis:7-alpine
+2026-07-04T03:43:30.8227005Z 13b411d400dc614a06c900e8ea523c465af8e8921bcd5c741ec58bc25e0b8927
+2026-07-04T03:43:30.8230513Z ##[command]/usr/bin/docker start 13b411d400dc614a06c900e8ea523c465af8e8921bcd5c741ec58bc25e0b8927
+2026-07-04T03:43:30.9664766Z 13b411d400dc614a06c900e8ea523c465af8e8921bcd5c741ec58bc25e0b8927
+2026-07-04T03:43:30.9684451Z ##[command]/usr/bin/docker ps --all --filter id=13b411d400dc614a06c900e8ea523c465af8e8921bcd5c741ec58bc25e0b8927 --filter status=running --no-trunc --format "{{.ID}} {{.Status}}"
+2026-07-04T03:43:30.9881548Z 13b411d400dc614a06c900e8ea523c465af8e8921bcd5c741ec58bc25e0b8927 Up Less than a second (health: starting)
+2026-07-04T03:43:30.9897344Z ##[command]/usr/bin/docker port 13b411d400dc614a06c900e8ea523c465af8e8921bcd5c741ec58bc25e0b8927
+2026-07-04T03:43:31.0097946Z ##[endgroup]
+2026-07-04T03:43:31.0109917Z ##[group]Waiting for all services to be ready
+2026-07-04T03:43:31.0122082Z ##[command]/usr/bin/docker inspect --format="{{if .Config.Healthcheck}}{{print .State.Health.Status}}{{end}}" 717529cfbe4119a4e0567a0284669d760c8a2bed4358f3ebde5d41ab804ac66b
+2026-07-04T03:43:31.0261389Z starting
+2026-07-04T03:43:31.0281183Z postgres service is starting, waiting 2 seconds before checking again.
+2026-07-04T03:43:33.0292542Z ##[command]/usr/bin/docker inspect --format="{{if .Config.Healthcheck}}{{print .State.Health.Status}}{{end}}" 717529cfbe4119a4e0567a0284669d760c8a2bed4358f3ebde5d41ab804ac66b
+2026-07-04T03:43:33.0440119Z starting
+2026-07-04T03:43:33.0454833Z postgres service is starting, waiting 3 seconds before checking again.
+2026-07-04T03:43:36.7217432Z ##[command]/usr/bin/docker inspect --format="{{if .Config.Healthcheck}}{{print .State.Health.Status}}{{end}}" 717529cfbe4119a4e0567a0284669d760c8a2bed4358f3ebde5d41ab804ac66b
+2026-07-04T03:43:36.7362472Z healthy
+2026-07-04T03:43:36.7381488Z postgres service is healthy.
+2026-07-04T03:43:36.7382366Z ##[command]/usr/bin/docker inspect --format="{{if .Config.Healthcheck}}{{print .State.Health.Status}}{{end}}" 13b411d400dc614a06c900e8ea523c465af8e8921bcd5c741ec58bc25e0b8927
+2026-07-04T03:43:36.7516025Z healthy
+2026-07-04T03:43:36.7530628Z redis service is healthy.
+2026-07-04T03:43:36.7531525Z ##[endgroup]
+2026-07-04T03:43:36.7744573Z ##[group]Run apt-get update -qq
+2026-07-04T03:43:36.7744975Z [36;1mapt-get update -qq[0m
+2026-07-04T03:43:36.7745419Z [36;1mapt-get install -y --no-install-recommends postgresql-client redis-tools[0m
+2026-07-04T03:43:36.7748951Z shell: sh -e {0}
+2026-07-04T03:43:36.7749841Z ##[endgroup]
+2026-07-04T03:43:38.7741454Z Reading package lists...
+2026-07-04T03:43:38.8760282Z Building dependency tree...
+2026-07-04T03:43:38.8762414Z Reading state information...
+2026-07-04T03:43:38.9723308Z The following additional packages will be installed:
+2026-07-04T03:43:38.9726260Z   libjemalloc2 liblzf1 libpq-dev libpq5 postgresql-client-15
+2026-07-04T03:43:38.9727219Z   postgresql-client-common
+2026-07-04T03:43:38.9729867Z Suggested packages:
+2026-07-04T03:43:38.9730628Z   postgresql-doc-15 postgresql-15 ruby-redis
+2026-07-04T03:43:39.0186416Z The following NEW packages will be installed:
+2026-07-04T03:43:39.0188419Z   libjemalloc2 liblzf1 postgresql-client postgresql-client-15
+2026-07-04T03:43:39.0192703Z   postgresql-client-common redis-tools
+2026-07-04T03:43:39.0194790Z The following packages will be upgraded:
+2026-07-04T03:43:39.0199450Z   libpq-dev libpq5
+2026-07-04T03:43:39.0374903Z 2 upgraded, 6 newly installed, 0 to remove and 64 not upgraded.
+2026-07-04T03:43:39.0375518Z Need to get 3418 kB of archives.
+2026-07-04T03:43:39.0376322Z After this operation, 15.6 MB of additional disk space will be used.
+2026-07-04T03:43:39.0380660Z Get:1 http://deb.debian.org/debian bookworm/main amd64 libjemalloc2 amd64 5.3.0-1 [275 kB]
+2026-07-04T03:43:39.0475408Z Get:2 http://deb.debian.org/debian bookworm/main amd64 liblzf1 amd64 3.6-3 [10.2 kB]
+2026-07-04T03:43:39.0477742Z Get:3 http://deb.debian.org/debian-security bookworm-security/main amd64 libpq-dev amd64 15.18-0+deb12u1 [151 kB]
+2026-07-04T03:43:39.0495766Z Get:4 http://deb.debian.org/debian-security bookworm-security/main amd64 libpq5 amd64 15.18-0+deb12u1 [197 kB]
+2026-07-04T03:43:39.0519263Z Get:5 http://deb.debian.org/debian bookworm/main amd64 postgresql-client-common all 248+deb12u1 [35.2 kB]
+2026-07-04T03:43:39.0521989Z Get:6 http://deb.debian.org/debian-security bookworm-security/main amd64 postgresql-client-15 amd64 15.18-0+deb12u1 [1747 kB]
+2026-07-04T03:43:39.0635904Z Get:7 http://deb.debian.org/debian bookworm/main amd64 postgresql-client all 15+248+deb12u1 [10.2 kB]
+2026-07-04T03:43:39.0645352Z Get:8 http://deb.debian.org/debian-security bookworm-security/main amd64 redis-tools amd64 5:7.0.15-1~deb12u7 [992 kB]
+2026-07-04T03:43:39.1757225Z debconf: delaying package configuration, since apt-utils is not installed
+2026-07-04T03:43:39.1991721Z Fetched 3418 kB in 0s (77.8 MB/s)
+2026-07-04T03:43:39.2174091Z Selecting previously unselected package libjemalloc2:amd64.
+2026-07-04T03:43:39.2247890Z (Reading database ... 
+2026-07-04T03:43:39.2251161Z (Reading database ... 5%
+2026-07-04T03:43:39.2251758Z (Reading database ... 10%
+2026-07-04T03:43:39.2252135Z (Reading database ... 15%
+2026-07-04T03:43:39.2252524Z (Reading database ... 20%
+2026-07-04T03:43:39.2252891Z (Reading database ... 25%
+2026-07-04T03:43:39.2253256Z (Reading database ... 30%
+2026-07-04T03:43:39.2253598Z (Reading database ... 35%
+2026-07-04T03:43:39.2253926Z (Reading database ... 40%
+2026-07-04T03:43:39.2254261Z (Reading database ... 45%
+2026-07-04T03:43:39.2254636Z (Reading database ... 50%
+2026-07-04T03:43:39.2254989Z (Reading database ... 55%
+2026-07-04T03:43:39.2255332Z (Reading database ... 60%
+2026-07-04T03:43:39.2302094Z (Reading database ... 65%
+2026-07-04T03:43:39.2308727Z (Reading database ... 70%
+2026-07-04T03:43:39.2331384Z (Reading database ... 75%
+2026-07-04T03:43:39.2347706Z (Reading database ... 80%
+2026-07-04T03:43:39.2363879Z (Reading database ... 85%
+2026-07-04T03:43:39.2383731Z (Reading database ... 90%
+2026-07-04T03:43:39.2396529Z (Reading database ... 95%
+2026-07-04T03:43:39.2397134Z (Reading database ... 100%
+2026-07-04T03:43:39.2401254Z (Reading database ... 23258 files and directories currently installed.)
+2026-07-04T03:43:39.2408570Z Preparing to unpack .../0-libjemalloc2_5.3.0-1_amd64.deb ...
+2026-07-04T03:43:39.2424027Z Unpacking libjemalloc2:amd64 (5.3.0-1) ...
+2026-07-04T03:43:39.2783831Z Selecting previously unselected package liblzf1:amd64.
+2026-07-04T03:43:39.2810681Z Preparing to unpack .../1-liblzf1_3.6-3_amd64.deb ...
+2026-07-04T03:43:39.2817946Z Unpacking liblzf1:amd64 (3.6-3) ...
+2026-07-04T03:43:39.2994742Z Preparing to unpack .../2-libpq-dev_15.18-0+deb12u1_amd64.deb ...
+2026-07-04T03:43:39.3012212Z Unpacking libpq-dev (15.18-0+deb12u1) over (15.16-0+deb12u1) ...
+2026-07-04T03:43:39.3400336Z Preparing to unpack .../3-libpq5_15.18-0+deb12u1_amd64.deb ...
+2026-07-04T03:43:39.3421070Z Unpacking libpq5:amd64 (15.18-0+deb12u1) over (15.16-0+deb12u1) ...
+2026-07-04T03:43:39.3887007Z Selecting previously unselected package postgresql-client-common.
+2026-07-04T03:43:39.3915424Z Preparing to unpack .../4-postgresql-client-common_248+deb12u1_all.deb ...
+2026-07-04T03:43:39.3920657Z Unpacking postgresql-client-common (248+deb12u1) ...
+2026-07-04T03:43:39.4237382Z Selecting previously unselected package postgresql-client-15.
+2026-07-04T03:43:39.4244125Z Preparing to unpack .../5-postgresql-client-15_15.18-0+deb12u1_amd64.deb ...
+2026-07-04T03:43:39.4278629Z Unpacking postgresql-client-15 (15.18-0+deb12u1) ...
+2026-07-04T03:43:39.6336822Z Selecting previously unselected package postgresql-client.
+2026-07-04T03:43:39.6362448Z Preparing to unpack .../6-postgresql-client_15+248+deb12u1_all.deb ...
+2026-07-04T03:43:39.6371860Z Unpacking postgresql-client (15+248+deb12u1) ...
+2026-07-04T03:43:39.6534573Z Selecting previously unselected package redis-tools.
+2026-07-04T03:43:39.6555504Z Preparing to unpack .../7-redis-tools_5%3a7.0.15-1~deb12u7_amd64.deb ...
+2026-07-04T03:43:39.6566453Z Unpacking redis-tools (5:7.0.15-1~deb12u7) ...
+2026-07-04T03:43:39.7503371Z Setting up postgresql-client-common (248+deb12u1) ...
+2026-07-04T03:43:39.7563151Z Setting up libpq5:amd64 (15.18-0+deb12u1) ...
+2026-07-04T03:43:39.7582460Z Setting up postgresql-client-15 (15.18-0+deb12u1) ...
+2026-07-04T03:43:40.2145919Z update-alternatives: using /usr/share/postgresql/15/man/man1/psql.1.gz to provide /usr/share/man/man1/psql.1.gz (psql.1.gz) in auto mode
+2026-07-04T03:43:40.2613952Z Setting up libpq-dev (15.18-0+deb12u1) ...
+2026-07-04T03:43:40.2634802Z Setting up libjemalloc2:amd64 (5.3.0-1) ...
+2026-07-04T03:43:40.2655371Z Setting up liblzf1:amd64 (3.6-3) ...
+2026-07-04T03:43:40.2677509Z Setting up postgresql-client (15+248+deb12u1) ...
+2026-07-04T03:43:40.2699807Z Setting up redis-tools (5:7.0.15-1~deb12u7) ...
+2026-07-04T03:43:40.3303380Z Processing triggers for libc-bin (2.36-9+deb12u13) ...
+2026-07-04T03:43:40.3785504Z ##[group]Run PGPASSWORD=postgres psql -h postgres -U testuser -d testdb -c 'SELECT version();'
+2026-07-04T03:43:40.3786231Z [36;1mPGPASSWORD=postgres psql -h postgres -U testuser -d testdb -c 'SELECT version();'[0m
+2026-07-04T03:43:40.3786792Z shell: sh -e {0}
+2026-07-04T03:43:40.3787013Z ##[endgroup]
+2026-07-04T03:43:40.4815370Z                                                        version                                                        
+2026-07-04T03:43:40.4816744Z ----------------------------------------------------------------------------------------------------------------------
+2026-07-04T03:43:40.4818181Z  PostgreSQL 16.14 (Debian 16.14-1.pgdg13+1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit
+2026-07-04T03:43:40.4819132Z (1 row)
+2026-07-04T03:43:40.4819633Z 
+2026-07-04T03:43:40.4884714Z ##[group]Run PGPASSWORD=postgres psql -h postgres -U testuser -d testdb -c '
+2026-07-04T03:43:40.4885317Z [36;1mPGPASSWORD=postgres psql -h postgres -U testuser -d testdb -c '[0m
+2026-07-04T03:43:40.4885786Z [36;1m  CREATE TABLE test_table (id serial PRIMARY KEY, value text);[0m
+2026-07-04T03:43:40.4886227Z [36;1m  INSERT INTO test_table (value) VALUES ($$from-container$$);[0m
+2026-07-04T03:43:40.4886574Z [36;1m'[0m
+2026-07-04T03:43:40.4886881Z shell: sh -e {0}
+2026-07-04T03:43:40.4887089Z ##[endgroup]
+2026-07-04T03:43:40.6057521Z CREATE TABLE
+2026-07-04T03:43:40.6074705Z INSERT 0 1
+2026-07-04T03:43:40.6130700Z ##[group]Run PGPASSWORD=postgres psql -h postgres -U testuser -d testdb -t -c "SELECT value FROM test_table WHERE id=1;" | grep -q "from-container"
+2026-07-04T03:43:40.6131749Z [36;1mPGPASSWORD=postgres psql -h postgres -U testuser -d testdb -t -c "SELECT value FROM test_table WHERE id=1;" | grep -q "from-container"[0m
+2026-07-04T03:43:40.6132439Z shell: sh -e {0}
+2026-07-04T03:43:40.6132649Z ##[endgroup]
+2026-07-04T03:43:40.7261955Z ##[group]Run redis-cli -h redis SET mykey "hello"
+2026-07-04T03:43:40.7262625Z [36;1mredis-cli -h redis SET mykey "hello"[0m
+2026-07-04T03:43:40.7263202Z [36;1mredis-cli -h redis GET mykey | grep -q hello[0m
+2026-07-04T03:43:40.7263825Z shell: sh -e {0}
+2026-07-04T03:43:40.7264154Z ##[endgroup]
+2026-07-04T03:43:40.8031603Z OK
+2026-07-04T03:43:40.8204294Z ##[group]Run echo "job.services.postgres.id=717529cfbe4119a4e0567a0284669d760c8a2bed4358f3ebde5d41ab804ac66b"
+2026-07-04T03:43:40.8205090Z [36;1mecho "job.services.postgres.id=717529cfbe4119a4e0567a0284669d760c8a2bed4358f3ebde5d41ab804ac66b"[0m
+2026-07-04T03:43:40.8205663Z [36;1mecho "job.services.postgres.ports[5432]="[0m
+2026-07-04T03:43:40.8206199Z [36;1mecho "job.services.redis.id=13b411d400dc614a06c900e8ea523c465af8e8921bcd5c741ec58bc25e0b8927"[0m
+2026-07-04T03:43:40.8206697Z [36;1mecho "job.services.redis.ports[6379]="[0m
+2026-07-04T03:43:40.8207116Z shell: sh -e {0}
+2026-07-04T03:43:40.8207337Z ##[endgroup]
+2026-07-04T03:43:40.8800572Z job.services.postgres.id=717529cfbe4119a4e0567a0284669d760c8a2bed4358f3ebde5d41ab804ac66b
+2026-07-04T03:43:40.8801528Z job.services.postgres.ports[5432]=
+2026-07-04T03:43:40.8802253Z job.services.redis.id=13b411d400dc614a06c900e8ea523c465af8e8921bcd5c741ec58bc25e0b8927
+2026-07-04T03:43:40.8802844Z job.services.redis.ports[6379]=
+2026-07-04T03:43:40.8903455Z Stop and remove container: 317ea51100c648ef966135e81560e99c_node20bookworm_7a2e28
+2026-07-04T03:43:40.8907819Z ##[command]/usr/bin/docker rm --force 65f4cb3df4d4cf4ece8f0e81c8408805645e09fafce8c2a9b5658db1e37d705f
+2026-07-04T03:43:41.0908096Z 65f4cb3df4d4cf4ece8f0e81c8408805645e09fafce8c2a9b5658db1e37d705f
+2026-07-04T03:43:41.0938610Z Print service container logs: c85e6c3188d4428e9b8f91493b25f5de_postgres16_7cc24b
+2026-07-04T03:43:41.0944470Z ##[command]/usr/bin/docker logs --details 717529cfbe4119a4e0567a0284669d760c8a2bed4358f3ebde5d41ab804ac66b
+2026-07-04T03:43:41.1095695Z  initdb: warning: enabling "trust" authentication for local connections
+2026-07-04T03:43:41.1096546Z  The files belonging to this database system will be owned by user "postgres".
+2026-07-04T03:43:41.1100924Z  initdb: hint: You can change this by editing pg_hba.conf or using the option -A, or --auth-local and --auth-host, the next time you run initdb.
+2026-07-04T03:43:41.1101996Z  This user must also own the server process.
+2026-07-04T03:43:41.1103353Z  2026-07-04 03:43:30.502 UTC [1] LOG:  starting PostgreSQL 16.14 (Debian 16.14-1.pgdg13+1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit
+2026-07-04T03:43:41.1104319Z  
+2026-07-04T03:43:41.1105014Z  2026-07-04 03:43:30.502 UTC [1] LOG:  listening on IPv4 address "0.0.0.0", port 5432
+2026-07-04T03:43:41.1105738Z  The database cluster will be initialized with locale "en_US.utf8".
+2026-07-04T03:43:41.1106714Z  2026-07-04 03:43:30.502 UTC [1] LOG:  listening on IPv6 address "::", port 5432
+2026-07-04T03:43:41.1107445Z  The default database encoding has accordingly been set to "UTF8".
+2026-07-04T03:43:41.1108563Z  2026-07-04 03:43:30.503 UTC [1] LOG:  listening on Unix socket "/var/run/postgresql/.s.PGSQL.5432"
+2026-07-04T03:43:41.1109638Z  The default text search configuration will be set to "english".
+2026-07-04T03:43:41.1110602Z  2026-07-04 03:43:30.590 UTC [63] LOG:  database system was shut down at 2026-07-04 03:43:30 UTC
+2026-07-04T03:43:41.1111206Z  
+2026-07-04T03:43:41.1112364Z  2026-07-04 03:43:30.597 UTC [1] LOG:  database system is ready to accept connections
+2026-07-04T03:43:41.1112946Z  Data page checksums are disabled.
+2026-07-04T03:43:41.1113818Z  2026-07-04 03:43:34.454 UTC [75] FATAL:  database "testuser" does not exist
+2026-07-04T03:43:41.1114330Z  
+2026-07-04T03:43:41.1118025Z  2026-07-04 03:43:39.552 UTC [83] FATAL:  database "testuser" does not exist
+2026-07-04T03:43:41.1118763Z  fixing permissions on existing directory /var/lib/postgresql/data ... ok
+2026-07-04T03:43:41.1120370Z  creating subdirectories ... ok
+2026-07-04T03:43:41.1121061Z  selecting dynamic shared memory implementation ... posix
+2026-07-04T03:43:41.1121773Z  selecting default max_connections ... 100
+2026-07-04T03:43:41.1122428Z  selecting default shared_buffers ... 128MB
+2026-07-04T03:43:41.1123050Z  selecting default time zone ... Etc/UTC
+2026-07-04T03:43:41.1123661Z  creating configuration files ... ok
+2026-07-04T03:43:41.1124249Z  running bootstrap script ... ok
+2026-07-04T03:43:41.1124896Z  performing post-bootstrap initialization ... ok
+2026-07-04T03:43:41.1125550Z  syncing data to disk ... ok
+2026-07-04T03:43:41.1126050Z  
+2026-07-04T03:43:41.1126469Z  
+2026-07-04T03:43:41.1126981Z  Success. You can now start the database server using:
+2026-07-04T03:43:41.1127623Z  
+2026-07-04T03:43:41.1128150Z      pg_ctl -D /var/lib/postgresql/data -l logfile start
+2026-07-04T03:43:41.1128795Z  
+2026-07-04T03:43:41.1130608Z  waiting for server to start....2026-07-04 03:43:30.089 UTC [47] LOG:  starting PostgreSQL 16.14 (Debian 16.14-1.pgdg13+1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit
+2026-07-04T03:43:41.1132162Z  2026-07-04 03:43:30.090 UTC [47] LOG:  listening on Unix socket "/var/run/postgresql/.s.PGSQL.5432"
+2026-07-04T03:43:41.1133057Z  2026-07-04 03:43:30.095 UTC [50] LOG:  database system was shut down at 2026-07-04 03:43:29 UTC
+2026-07-04T03:43:41.1134212Z  2026-07-04 03:43:30.106 UTC [47] LOG:  database system is ready to accept connections
+2026-07-04T03:43:41.1134798Z   done
+2026-07-04T03:43:41.1135069Z  server started
+2026-07-04T03:43:41.1135370Z  CREATE DATABASE
+2026-07-04T03:43:41.1135657Z  
+2026-07-04T03:43:41.1135909Z  
+2026-07-04T03:43:41.1136402Z  /usr/local/bin/docker-entrypoint.sh: ignoring /docker-entrypoint-initdb.d/*
+2026-07-04T03:43:41.1137021Z  
+2026-07-04T03:43:41.1137405Z  2026-07-04 03:43:30.362 UTC [47] LOG:  received fast shutdown request
+2026-07-04T03:43:41.1138216Z  waiting for server to shut down....2026-07-04 03:43:30.363 UTC [47] LOG:  aborting any active transactions
+2026-07-04T03:43:41.1139280Z  2026-07-04 03:43:30.372 UTC [47] LOG:  background worker "logical replication launcher" (PID 53) exited with exit code 1
+2026-07-04T03:43:41.1140340Z  2026-07-04 03:43:30.372 UTC [48] LOG:  shutting down
+2026-07-04T03:43:41.1140988Z  2026-07-04 03:43:30.373 UTC [48] LOG:  checkpoint starting: shutdown immediate
+2026-07-04T03:43:41.1142080Z  2026-07-04 03:43:30.397 UTC [48] LOG:  checkpoint complete: wrote 926 buffers (5.7%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.021 s, sync=0.002 s, total=0.025 s; sync files=301, longest=0.001 s, average=0.001 s; distance=4273 kB, estimate=4273 kB; lsn=0/191F0E8, redo lsn=0/191F0E8
+2026-07-04T03:43:41.1143113Z  2026-07-04 03:43:30.406 UTC [47] LOG:  database system is shut down
+2026-07-04T03:43:41.1143439Z   done
+2026-07-04T03:43:41.1143629Z  server stopped
+2026-07-04T03:43:41.1143834Z  
+2026-07-04T03:43:41.1144091Z  PostgreSQL init process complete; ready for start up.
+2026-07-04T03:43:41.1144401Z  
+2026-07-04T03:43:41.1148300Z Stop and remove container: c85e6c3188d4428e9b8f91493b25f5de_postgres16_7cc24b
+2026-07-04T03:43:41.1149977Z ##[command]/usr/bin/docker rm --force 717529cfbe4119a4e0567a0284669d760c8a2bed4358f3ebde5d41ab804ac66b
+2026-07-04T03:43:41.2282435Z 717529cfbe4119a4e0567a0284669d760c8a2bed4358f3ebde5d41ab804ac66b
+2026-07-04T03:43:41.2285424Z Print service container logs: b4e21250604549a4bc811021eb46ca17_redis7alpine_0030ff
+2026-07-04T03:43:41.2286910Z ##[command]/usr/bin/docker logs --details 13b411d400dc614a06c900e8ea523c465af8e8921bcd5c741ec58bc25e0b8927
+2026-07-04T03:43:41.2463908Z  1:C 04 Jul 2026 03:43:30.975 # WARNING Memory overcommit must be enabled! Without it, a background save or replication may fail under low memory condition. Being disabled, it can also cause failures without low memory condition, see https://github.com/jemalloc/jemalloc/issues/1328. To fix this issue add 'vm.overcommit_memory = 1' to /etc/sysctl.conf and then reboot or run the command 'sysctl vm.overcommit_memory=1' for this to take effect.
+2026-07-04T03:43:41.2467130Z  1:C 04 Jul 2026 03:43:30.975 * oO0OoO0OoO0Oo Redis is starting oO0OoO0OoO0Oo
+2026-07-04T03:43:41.2469995Z  1:C 04 Jul 2026 03:43:30.975 * Redis version=7.4.9, bits=64, commit=00000000, modified=0, pid=1, just started
+2026-07-04T03:43:41.2471366Z  1:C 04 Jul 2026 03:43:30.975 # Warning: no config file specified, using the default config. In order to specify a config file use redis-server /path/to/redis.conf
+2026-07-04T03:43:41.2472510Z  1:M 04 Jul 2026 03:43:30.975 * monotonic clock: POSIX clock_gettime
+2026-07-04T03:43:41.2473105Z  1:M 04 Jul 2026 03:43:30.976 * Running mode=standalone, port=6379.
+2026-07-04T03:43:41.2473645Z  1:M 04 Jul 2026 03:43:30.977 * Server initialized
+2026-07-04T03:43:41.2474157Z  1:M 04 Jul 2026 03:43:30.977 * Ready to accept connections tcp
+2026-07-04T03:43:41.2479137Z Stop and remove container: b4e21250604549a4bc811021eb46ca17_redis7alpine_0030ff
+2026-07-04T03:43:41.2480109Z ##[command]/usr/bin/docker rm --force 13b411d400dc614a06c900e8ea523c465af8e8921bcd5c741ec58bc25e0b8927
+2026-07-04T03:43:41.3790997Z 13b411d400dc614a06c900e8ea523c465af8e8921bcd5c741ec58bc25e0b8927
+2026-07-04T03:43:41.3805012Z Remove container network: github_network_5e69d607394146219dbab1c57057dde0
+2026-07-04T03:43:41.3809863Z ##[command]/usr/bin/docker network rm github_network_5e69d607394146219dbab1c57057dde0
+2026-07-04T03:43:41.4685056Z github_network_5e69d607394146219dbab1c57057dde0
+2026-07-04T03:43:41.4746846Z Cleaning up orphan processes

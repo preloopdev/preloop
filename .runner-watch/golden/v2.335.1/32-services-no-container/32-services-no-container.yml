@@ -1,0 +1,40 @@
+name: "golden: services-no-container"
+on: workflow_dispatch
+
+jobs:
+  services-host:
+    runs-on: ubuntu-latest
+    services:
+      nginx:
+        image: nginx:1.27-alpine
+        ports:
+          - 8080:80
+        options: >-
+          --health-cmd "curl -sf http://localhost/ || exit 1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Verify nginx reachable on mapped port
+        run: |
+          curl -sf http://localhost:8080
+          echo "nginx OK"
+      - name: Verify redis reachable on mapped port
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends redis-tools
+          redis-cli -h 127.0.0.1 -p 6379 PING | grep -q PONG
+      - name: Dump service context (host mode)
+        run: |
+          echo "nginx.id=${{ job.services.nginx.id }}"
+          echo "nginx.ports[80]=${{ job.services.nginx.ports['80'] }}"
+          echo "redis.id=${{ job.services.redis.id }}"
+          echo "redis.ports[6379]=${{ job.services.redis.ports['6379'] }}"
