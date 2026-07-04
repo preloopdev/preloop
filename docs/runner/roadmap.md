@@ -123,9 +123,9 @@ These were the blockers identified by the 2026-07-02 full-code audit. They are n
 - `--replace` doesn't DELETE/replace the existing agent before re-creating.
 - `BrokerMigration` message handled as no-op instead of re-resolving the broker URL.
 - `AgentRsaKeypair` public-key XML export built by string-splitting (brittle; correctness verified but fragile).
-- Download path uses `api.github.com` tarball instead of golden's `codeload.github.com` CDN (subsumed by F022).
-- displayName evaluated eagerly rather than lazily at step start.
-- Composite nesting depth cap (10) missing (subsumed by F024).
+ - ~~Download path uses `api.github.com` tarball instead of golden's `codeload.github.com` CDN~~ — ✅ Fixed: resolved via official `runnerresolve/actions` endpoint (F022).
+ - displayName evaluated eagerly rather than lazily at step start.
+ - ~~Composite nesting depth cap (10) missing~~ — ✅ Fixed: nesting depth check implemented under composite handler (F024).
 
 ---
 
