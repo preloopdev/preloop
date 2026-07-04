@@ -167,6 +167,9 @@ pub async fn run_steps(
     for (idx, step) in steps.iter().enumerate() {
         let step_number = (idx as u32) + step_offset;
 
+        let expr_ctx = job.build_expression_context();
+        let resolved_display_name = crate::worker::template::evaluate_template(&step.display_name, &expr_ctx)
+            .unwrap_or_else(|_| step.display_name.clone());
         // Check for cancellation
         if *cancel_rx.borrow() && !cancelled {
             cancelled = true;
@@ -176,7 +179,7 @@ pub async fn run_steps(
 
         // Evaluate the step condition
         if !should_run_step(step, job) {
-            info!("Skipping step '{}' (condition not met)", step.display_name);
+            info!("Skipping step '{}' (condition not met)", resolved_display_name);
             job.steps.insert(
                 step.context_name.clone(),
                 StepResult {
@@ -192,7 +195,7 @@ pub async fn run_steps(
                 q.queue_update(StepUpdate {
                     external_id: step.id.clone(),
                     number: step_number,
-                    name: step.display_name.clone(),
+                    name: resolved_display_name.clone(),
                     status: step_status::COMPLETED,
                     started_at: Some(ts.clone()),
                     completed_at: Some(ts),
@@ -205,7 +208,7 @@ pub async fn run_steps(
             continue;
         }
 
-        info!("Running step: {}", step.display_name);
+        info!("Running step: {}", resolved_display_name);
         let step_start = crate::worker::job_runner::iso_now();
 
         // F019: Queue InProgress update
@@ -214,7 +217,7 @@ pub async fn run_steps(
             q.queue_update(StepUpdate {
                 external_id: step.id.clone(),
                 number: step_number,
-                name: step.display_name.clone(),
+                name: resolved_display_name.clone(),
                 status: step_status::IN_PROGRESS,
                 started_at: Some(step_start.clone()),
                 completed_at: None,
@@ -226,7 +229,7 @@ pub async fn run_steps(
         }
 
         let mut step_ctx =
-            StepContext::new(job, step.context_name.clone(), step.display_name.clone());
+            StepContext::new(job, step.context_name.clone(), resolved_display_name.clone());
         for (k, v) in &step.env {
             step_ctx.env.insert(k.clone(), v.clone());
         }
@@ -246,7 +249,7 @@ pub async fn run_steps(
 
         // P2.2: Emit debug logs for condition evaluation
         let condition = step.condition.as_deref().unwrap_or("success()");
-        step_ctx.debug(&format!("Evaluating condition for step: '{}'", step.display_name));
+        step_ctx.debug(&format!("Evaluating condition for step: '{}'", resolved_display_name));
         step_ctx.debug(&format!("Evaluating: {condition}"));
         step_ctx.debug("Result: true");
 
@@ -316,12 +319,12 @@ pub async fn run_steps(
         if timed_out.load(std::sync::atomic::Ordering::SeqCst) {
             warn!(
                 "Step '{}' timed out after {} minutes",
-                step.display_name,
+                resolved_display_name,
                 step.timeout_minutes.unwrap_or_default()
             );
             step_ctx.log(&format!(
                 "##[error]The step '{}' timed out",
-                step.display_name
+                resolved_display_name
             ));
             outcome = Err(anyhow::anyhow!("step timed out"));
         }
@@ -336,7 +339,7 @@ pub async fn run_steps(
                 } else if step.continue_on_error {
                     warn!(
                         "Step '{}' failed but continue-on-error is set: {e:#}",
-                        step.display_name
+                        resolved_display_name
                     );
                     ("Failure".to_string(), "Success".to_string())
                 } else {
@@ -378,7 +381,7 @@ pub async fn run_steps(
         ) {
             warn!(
                 "Applying file commands for step '{}' failed: {e:#}",
-                step.display_name
+                resolved_display_name
             );
         }
         // F035: Read step summary content before cleanup deletes the file
@@ -400,7 +403,7 @@ pub async fn run_steps(
             q.queue_update(StepUpdate {
                 external_id: step.id.clone(),
                 number: step_number,
-                name: step.display_name.clone(),
+                name: resolved_display_name.clone(),
                 status: step_status::COMPLETED,
                 started_at: Some(step_start.clone()),
                 completed_at: Some(step_end.clone()),
