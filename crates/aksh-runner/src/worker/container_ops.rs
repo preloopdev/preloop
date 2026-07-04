@@ -363,11 +363,7 @@ pub async fn start_job_container(
     args.push("-f".into());
     args.push("/dev/null".into());
 
-    let result = docker_cmd(
-        &args.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-        log,
-    )
-    .await?;
+    let result = docker_cmd(&args.iter().map(|s| s.as_str()).collect::<Vec<_>>(), log).await?;
 
     let container_id = result
         .first()
@@ -477,11 +473,7 @@ pub async fn start_service_container(
 
     args.push(service.image.clone());
 
-    let result = docker_cmd(
-        &args.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-        log,
-    )
-    .await?;
+    let result = docker_cmd(&args.iter().map(|s| s.as_str()).collect::<Vec<_>>(), log).await?;
 
     let container_id = result
         .first()
@@ -590,11 +582,7 @@ pub async fn docker_exec(
     env: &HashMap<String, String>,
     cancel_rx: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<process::ProcessOutput> {
-    let mut exec_args: Vec<String> = vec![
-        "exec".into(),
-        "-w".into(),
-        workdir.into(),
-    ];
+    let mut exec_args: Vec<String> = vec!["exec".into(), "-w".into(), workdir.into()];
 
     for (k, v) in env {
         exec_args.push("-e".into());
@@ -638,16 +626,8 @@ pub async fn get_port_mappings(container_id: &str) -> Vec<(String, String)> {
         for line in &output.lines {
             // Format: "5432/tcp -> 0.0.0.0:32768"
             if let Some((container_part, host_part)) = line.split_once(" -> ") {
-                let container_port = container_part
-                    .split('/')
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
-                let host_port = host_part
-                    .rsplit(':')
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
+                let container_port = container_part.split('/').next().unwrap_or("").to_string();
+                let host_port = host_part.rsplit(':').next().unwrap_or("").to_string();
                 if !container_port.is_empty() && !host_port.is_empty() {
                     mappings.push((container_port, host_port));
                 }
@@ -738,16 +718,9 @@ async fn docker_cmd(args: &[&str], log: &mut Vec<String>) -> Result<Vec<String>>
     log.push(format!("##[command]{cmd_line}"));
     debug!("docker {}", args.join(" "));
 
-    let result = process::invoke(
-        "docker",
-        args,
-        Path::new("."),
-        &HashMap::new(),
-        None,
-        None,
-    )
-    .await
-    .with_context(|| format!("docker {}", args.first().unwrap_or(&"")))?;
+    let result = process::invoke("docker", args, Path::new("."), &HashMap::new(), None, None)
+        .await
+        .with_context(|| format!("docker {}", args.first().unwrap_or(&"")))?;
 
     // Log output lines
     for line in &result.lines {
@@ -818,14 +791,8 @@ mod tests {
     fn sanitize_image() {
         assert_eq!(sanitize_image_name("node:20-bookworm"), "node20bookworm");
         assert_eq!(sanitize_image_name("postgres:16"), "postgres16");
-        assert_eq!(
-            sanitize_image_name("redis:7-alpine"),
-            "redis7alpine"
-        );
-        assert_eq!(
-            sanitize_image_name("nginx:1.27-alpine"),
-            "nginx127alpine"
-        );
+        assert_eq!(sanitize_image_name("redis:7-alpine"), "redis7alpine");
+        assert_eq!(sanitize_image_name("nginx:1.27-alpine"), "nginx127alpine");
     }
 
     #[test]
