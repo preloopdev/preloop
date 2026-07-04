@@ -279,6 +279,14 @@ pub struct AgentJobRequestMessage {
     /// Job timeout (seconds).
     #[serde(rename = "jobTimeout", skip_serializing_if = "Option::is_none")]
     pub job_timeout: Option<i64>,
+
+    /// Job container spec (`container:`) — TemplateToken-compatible JSON.
+    #[serde(rename = "jobContainer", default, skip_serializing_if = "Option::is_none")]
+    pub job_container: Option<serde_json::Value>,
+
+    /// Service container specs (`services:`) — alias → spec mapping.
+    #[serde(rename = "jobServiceContainers", default, skip_serializing_if = "Option::is_none")]
+    pub job_service_containers: Option<serde_json::Value>,
 }
 
 /// Plan reference — identifies the orchestration plan.
