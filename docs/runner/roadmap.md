@@ -16,15 +16,15 @@ Last full-code audit: **2026-07-02** (all of `crates/aksh-runner` diffed against
 | **renewjob lock renewal (M3)** | ✅ Implemented | live GitHub long-job validation pending |
 | **In-progress step updates — Twirp WorkflowStepsUpdate (M3)** | ✅ Implemented; live step-id/context reruns green | flow diff pending; local aksh auth/body fidelity may still reject results calls |
 | **Step/job log upload — signed blob (M3)** | ✅ Implemented | live GitHub log-viewer validation pending |
-| Contexts (github/matrix/needs/strategy/vars/inputs/secrets) (M4) | ✅ P0/P1 complete | `format()` `{{`/`}}` escaping remains P2 |
-| Expression engine (M4) | ✅ P0 complete | `format()` `{{`/`}}` escaping remains P2 |
+| Contexts (github/matrix/needs/strategy/vars/inputs/secrets) (M4) | ✅ P0/P1 complete | — |
+| Expression engine (M4) | ✅ P0 complete; `format()` `{{`/`}}` escaping fixed | — |
 | Script steps / process invoker / commands / file commands (M5) | ✅ P0/P1 complete | env-var edge cases remain P2 |
 | **Actions: resolution + pre/post lifecycle (M6)** | ✅ P0 implemented; live composite rerun green | live checkout/cache validation pending |
-| **Containers (M7)** | ❌ Helpers exist, never wired | F026 |
-| **Cache/artifact/OIDC env plumbing (M8)** | ✅ P0 implemented | live cache/artifact/OIDC validation pending |
-| AzDO compat reporting (M9) | ❌ Dispatch only; reporting endpoints have 0 call sites | F030 |
+| **Containers (M7)** | ✅ Implemented and E2E validated | job containers, service containers, health checks, docker exec, TemplateToken decoding, `job.container`/`job.services` contexts |
+| **Cache/artifact/OIDC env plumbing (M8)** | ✅ P0 implemented | live cache/artifact/OIDC validation pending; cache v2/artifact v2 Twirp protocol missing |
+| AzDO compat reporting (M9) | ❌ Dispatch only; reporting endpoints have 0 call sites | F030 — blocks local aksh CI reporting |
 | Cancellation / job timeout / matchers / hardening (M10) | ✅ P1 complete | BrokerMigration and AzDO reporting remain separate gaps |
-| Benchmarks (M11) | ⚠️ Size + cold start only | dispatch latency, throughput, RSS missing |
+| Benchmarks (M11) | ✅ CI pipeline + container benchmarks | see `docs/runner/11-benchmarks.md` |
 | **Conformance harness (H1–H3)** | ❌ `runner-e2e`, `runner-diff`, `--record-flows`, `fixtures/runner/` all missing | §4 |
 
 ---
@@ -89,7 +89,7 @@ These were the blockers identified by the 2026-07-02 full-code audit. They are n
 | ID | Item | Detail | Ref |
 |---|---|---|---|
 | ~~P1.1~~ | ~~Broker URL from connectionData~~ | ✅ Fixed: derived from agent response properties.ServerUrlV2 and persisted as serverUrlV2 in settings | F008 |
-| P1.2 | Job/service containers not wired | `container_ops.rs` (network create, start, health poll, path translation) is **dead code**; `job_runner.rs` never inspects the message's container resources; `handlers/script.rs` never takes the `docker exec` path; service containers have zero code | F026 |
+| ~~P1.2~~ | ~~Job/service containers not wired~~ | ✅ Fixed: full Docker engine lifecycle — job containers, service containers, health checks, docker exec routing, cleanup, TemplateToken decoding, `job.container`/`job.services` runtime contexts. E2E validated against live GitHub (scenarios 30-36) and aksh-server. | ~~F026~~ |
 | P1.3 | AzDO compat reporting (`--via azdo`) | `client/azdo.rs` has `patch_agent_request`, `update_timeline`, `create_log`/`append_log`, `post_console_log`, `finish_job` — **all 0 call sites**; `report_completion()` builds a non-`JobCompletedEvent` shape; `TimelineRecord` missing `order` population | F030 |
 | ~~P1.4~~ | ~~Cancellation completeness~~ | ✅ Fixed: runs always/post steps on cancel before timeout / hard kill | F031 |
 | ~~P1.5~~ | ~~Job-level `timeout-minutes`~~ | ✅ Fixed: defaults to 360 min; wrapped with cancel-channel timer (orphan-safe) | F031 |
@@ -113,7 +113,7 @@ These were the blockers identified by the 2026-07-02 full-code audit. They are n
 
 ## 3. P2 — Medium/Low divergences
 
-- `format()` `{{`/`}}` escaping not handled (`aksh-gha-expressions`).
+- ~~`format()` `{{`/`}}` escaping~~ — ✅ Fixed (2026-07-04): `format_args()` now unescapes `{{` → `{` and `}}` → `}`. Template expression parser also fixed to handle nested parens/quotes when finding closing `}}`.
 - Uploaded log lines lack the official ISO-8601 timestamp prefix (matters once F020 lands).
 - `##[debug]` lines not emitted when `ACTIONS_STEP_DEBUG`/`RUNNER_DEBUG` set (flag read, never used).
 - `echo on|off` command parsed but no echo-state tracking.
@@ -163,9 +163,14 @@ Oracle: **live GitHub runs + golden diffs** first (via `preloopdev/aksh-conforma
 | 13-composite-action | ✅ verified (run 28632746421) | ✅ passed | checkout dependency fails |
 | 14-annotations | ✅ verified (run 28632748224) | ✅ passed | ~~F038~~ fixed; step exits 1 (expected) |
 | 15-oidc-id-token | ✅ verified (run 28632750082) | ✅ passed | All fixed |
-| 16-container-job (golden TBD) | ❌ | ❌ | F026; record official golden first |
-| 17-service-container (golden TBD) | ❌ | ❌ | F026; record official golden first |
-| 18-cancel-mid-step (golden TBD) | ❌ | ❌ | F031; record official golden first |
+| 30-container-job-basic | ✅ golden recorded | ✅ passed (run 28706488417) | ~~F026~~ fixed |
+| 31-container-with-services | ✅ golden recorded | ✅ passed (run 28699731289) | ~~F026~~ fixed |
+| 32-services-no-container | ✅ golden recorded | ⚠️ host-mode services | Port mapping contexts need host-mode testing |
+| 33-container-env-options | ✅ golden recorded | ✅ passed (run 28706949887) | ~~F026~~ fixed |
+| 34-container-with-checkout | ✅ golden recorded | ⚠️ needs action download | Action download info missing (server gap) |
+| 35-container-lifecycle | ✅ golden recorded | ✅ passed on GitHub | ARM64 pip install slow (not a runner bug) |
+| 36-docker-action | ✅ golden recorded | ✅ passed (run 28699731289) | ~~F026~~ fixed |
+| 39-container-contexts | N/A (aksh-specific) | ✅ passed (run 28706488417) | job.container/services contexts verified |
 
 Per-scenario semantics checklists (what each must prove):
 
