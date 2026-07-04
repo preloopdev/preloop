@@ -31,6 +31,14 @@ pub async fn run_docker_action(
         "/github/workspace".to_string(),
     ];
 
+    // Phase 2: Attach to job network if container state exists
+    if let Some(state) = &ctx.job.container_state {
+        docker_args.push("--network".to_string());
+        docker_args.push(state.network.clone());
+        docker_args.push("--label".to_string());
+        docker_args.push(state.label.clone());
+    }
+
     // Add environment variables
     for (k, v) in &env {
         docker_args.push("-e".to_string());
