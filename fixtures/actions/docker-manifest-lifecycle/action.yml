@@ -1,0 +1,19 @@
+name: docker-manifest-lifecycle
+description: Validate Docker action lifecycle and manifest field evaluation.
+inputs:
+  arg-one:
+    description: Argument passed through runs.args
+    required: true
+  env-value:
+    description: Environment value passed through runs.env
+    required: true
+runs:
+  using: docker
+  image: Dockerfile
+  pre-entrypoint: /aksh/pre.sh
+  entrypoint: /aksh/main.sh
+  post-entrypoint: /aksh/post.sh
+  args:
+    - ${{ inputs.arg-one }}
+  env:
+    FROM_MANIFEST: ${{ inputs.env-value }}
