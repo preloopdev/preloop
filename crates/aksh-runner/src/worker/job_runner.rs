@@ -88,12 +88,15 @@ pub async fn run_job(
     let raw_services = job_message.get("jobServiceContainers");
     info!(
         "Container fields: jobContainer={}, jobServiceContainers={}",
-        raw_container.map(|v| v.to_string()).unwrap_or_else(|| "absent".to_string()),
-        raw_services.map(|v| v.to_string()).unwrap_or_else(|| "absent".to_string()),
+        raw_container
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "absent".to_string()),
+        raw_services
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "absent".to_string()),
     );
 
-    let job_container_spec = raw_container
-        .and_then(super::container_ops::parse_container_spec);
+    let job_container_spec = raw_container.and_then(super::container_ops::parse_container_spec);
     let service_specs = raw_services
         .map(super::container_ops::parse_service_specs)
         .unwrap_or_default();
