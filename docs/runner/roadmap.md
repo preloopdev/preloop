@@ -114,17 +114,17 @@ These were the blockers identified by the 2026-07-02 full-code audit. They are n
 ## 3. P2 — Medium/Low divergences
 
 - ~~`format()` `{{`/`}}` escaping~~ — ✅ Fixed (2026-07-04): `format_args()` now unescapes `{{` → `{` and `}}` → `}`. Template expression parser also fixed to handle nested parens/quotes when finding closing `}}`.
-- Uploaded log lines lack the official ISO-8601 timestamp prefix (matters once F020 lands).
-- `##[debug]` lines not emitted when `ACTIONS_STEP_DEBUG`/`RUNNER_DEBUG` set (flag read, never used).
-- `echo on|off` command parsed but no echo-state tracking.
-- Annotation caps not enforced (official caps ~10 errors/warnings surfaced per step).
-- Workflow command names not case-insensitive.
-- Script files: verify trailing-newline append parity with `ScriptHandler`.
-- `--replace` doesn't DELETE/replace the existing agent before re-creating.
-- `BrokerMigration` message handled as no-op instead of re-resolving the broker URL.
-- `AgentRsaKeypair` public-key XML export built by string-splitting (brittle; correctness verified but fragile).
+ - ~~Uploaded log lines lack the official ISO-8601 timestamp prefix~~ — ✅ Fixed (2026-07-04): ISO-8601 timestamps prepended to all logged lines.
+ - ~~`##[debug]` lines not emitted when `ACTIONS_STEP_DEBUG`/`RUNNER_DEBUG` set~~ — ✅ Fixed (2026-07-04): debug logging method added to StepContext, and condition/environment/shell/command execution debug logs emitted dynamically.
+ - ~~`echo on|off` command parsed but no echo-state tracking~~ — ✅ Fixed (2026-07-04): `echo` property added to `StepContext` to control echoing of consumed workflow commands.
+ - ~~Annotation caps not enforced~~ — ✅ Fixed (2026-07-04): enforced cap of max 10 annotations per step.
+ - ~~Workflow command names not case-insensitive~~ — ✅ Fixed (2026-07-04): command names converted to lowercase during parsing.
+ - ~~Script files: verify trailing-newline append parity with `ScriptHandler`~~ — ✅ Fixed (2026-07-04): inline script files written to disk are guaranteed to have a trailing newline.
+ - ~~`--replace` doesn't DELETE/replace the existing agent before re-creating~~ — ✅ Fixed (2026-07-04): DELETE request sent to remove existing agent registration when configure --replace is specified.
+ - ~~`BrokerMigration` message handled as no-op instead of re-resolving the broker URL~~ — ✅ Fixed (2026-07-04): BrokerMigration triggers URL re-resolution and session reconnect.
+ - ~~`AgentRsaKeypair` public-key XML export built by string-splitting (brittle; correctness verified but fragile)~~ — ✅ Fixed (2026-07-04): robust tag-based XML parsing implemented for `xml_tag` helper.
  - ~~Download path uses `api.github.com` tarball instead of golden's `codeload.github.com` CDN~~ — ✅ Fixed: resolved via official `runnerresolve/actions` endpoint (F022).
- - displayName evaluated eagerly rather than lazily at step start.
+ - ~~displayName evaluated eagerly rather than lazily at step start~~ — ✅ Fixed (2026-07-04): resolved dynamically at step execution time against runtime expression context.
  - ~~Composite nesting depth cap (10) missing~~ — ✅ Fixed: nesting depth check implemented under composite handler (F024).
 
 ---
