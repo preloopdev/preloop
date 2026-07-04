@@ -41,16 +41,25 @@ pub async fn run_node_action(
         _ => "node20", // node12/16 mapped to node20
     };
 
-    let runner_root = Path::new(workspace)
-        .parent()
-        .and_then(|p| p.parent())
-        .unwrap_or(Path::new("."));
+    let mut runner_root = Path::new(workspace).to_path_buf();
+    while !runner_root.join("externals").exists() {
+        if let Some(parent) = runner_root.parent() {
+            runner_root = parent.to_path_buf();
+        } else {
+            // Fallback if we hit root without finding it
+            runner_root = Path::new(workspace)
+                .parent()
+                .and_then(|p| p.parent())
+                .unwrap_or(Path::new("."))
+                .to_path_buf();
+            break;
+        }
+    }
     let node_bin = runner_root
         .join("externals")
         .join(node_version)
         .join("bin")
         .join("node");
-
     let node_path = if node_bin.exists() {
         node_bin.to_string_lossy().to_string()
     } else {
