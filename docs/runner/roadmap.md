@@ -2,7 +2,7 @@
 
 Tracks the remaining work required to achieve **100% compatibility** between the Rust runner (`aksh-runner`) and the official runner (`actions/runner` v2.335.1) as it speaks to **real GitHub**. Testing against local aksh is a secondary step, used only to mop up bugs found there after GitHub-truth conformance.
 
-Last full-code audit: **2026-07-02** (all of `crates/aksh-runner` diffed against `docs/runner/rust-runner-plan.md`, the golden captures at `.runner-watch/golden/v2.335.1/`, and upstream v2.335.1 semantics). Pending wire/behavior deviations are cross-referenced as **F0xx** entries in [`docs/runner/runner_fidelity_gap.md`](runner_fidelity_gap.md).
+Last full-code audit: **2026-07-04** (all of `crates/aksh-runner` diffed against the official `actions/runner` v2.335.1 C# source cloned at tag, the golden captures at `.runner-watch/golden/v2.335.1/`, and upstream semantics). Pending wire/behavior deviations are cross-referenced as **F0xx** entries in [`docs/runner/runner_fidelity_gap.md`](runner_fidelity_gap.md).
 
 ---
 
@@ -10,23 +10,23 @@ Last full-code audit: **2026-07-02** (all of `crates/aksh-runner` diffed against
 
 | Subsystem | Status | Blocking gaps |
 |---|---|---|
-| Configuration & registration (M1) | ✅ Verified vs golden 01 | `--replace` no agent DELETE (P2) |
-| OAuth PS256 / broker session / message poll (M2) | ✅ Verified vs golden 01 | BrokerMigration stub |
-| acquirejob / completejob (M3) | ✅ Shapes verified vs golden 06; local smoke green; live rerun green for multi-step/composite/summary/context/matcher | flow diff still pending |
+| Configuration & registration (M1) | ✅ Verified vs golden 01 | auth migration fields (F053), settings fields (F052) |
+| OAuth PS256 / broker session / message poll (M2) | ✅ Verified vs golden 01 | — |
+| acquirejob / completejob (M3) | ✅ Shapes verified vs golden 06; live rerun green | job-level annotations (F048) |
 | **renewjob lock renewal (M3)** | ✅ Implemented | live GitHub long-job validation pending |
-| **In-progress step updates — Twirp WorkflowStepsUpdate (M3)** | ✅ Implemented; live step-id/context reruns green | flow diff pending; local aksh auth/body fidelity may still reject results calls |
-| **Step/job log upload — signed blob (M3)** | ✅ Implemented | live GitHub log-viewer validation pending |
-| Contexts (github/matrix/needs/strategy/vars/inputs/secrets) (M4) | ✅ P0/P1 complete | — |
-| Expression engine (M4) | ✅ P0 complete; `format()` `{{`/`}}` escaping fixed | — |
-| Script steps / process invoker / commands / file commands (M5) | ✅ P0/P1 complete | env-var edge cases remain P2 |
-| **Actions: resolution + pre/post lifecycle (M6)** | ✅ P0 implemented; live composite rerun green | live checkout/cache validation pending |
-| **Containers (M7)** | ✅ Implemented and E2E validated | job containers, service containers, health checks, docker exec, TemplateToken decoding, `job.container`/`job.services` contexts |
+| **In-progress step updates — Twirp WorkflowStepsUpdate (M3)** | ✅ Implemented; live step-id/context reruns green | — |
+| **Step/job log upload — signed blob (M3)** | ✅ Implemented | — |
+| Contexts (github/matrix/needs/strategy/vars/inputs/secrets) (M4) | ✅ P0/P1 complete | action context (F050) |
+| Expression engine (M4) | ✅ P0 complete; `format()` `{{`/`}}` escaping fixed | hashFiles --follow-symbolic-links (F055) |
+| Script steps / process invoker / commands / file commands (M5) | ✅ P0/P1 complete | fromPath matchers (F051) |
+| **Actions: resolution + pre/post lifecycle (M6)** | ✅ P0/P1.5 implemented; live composite rerun green | — |
+| **Containers (M7)** | ✅ Implemented and E2E validated | proxy injection (F049) |
 | **Cache/artifact/OIDC env plumbing (M8)** | ✅ P0 implemented | live cache/artifact/OIDC validation pending; cache v2/artifact v2 Twirp protocol missing |
 | AzDO compat reporting (M9) | ⏸️ Deferred | Not needed — broker + Twirp covers all composability targets. GHES interop only. |
-| Cancellation / job timeout / matchers / hardening (M10) | ✅ P1 complete | BrokerMigration is a separate minor gap |
+| Cancellation / job timeout / matchers / hardening (M10) | ✅ P1 complete | — |
 | Benchmarks (M11) | ✅ CI pipeline + container benchmarks | see `docs/runner/11-benchmarks.md` |
 | **Conformance harness (H1–H3)** | ✅ Core tooling exists | `runner-e2e`, `runner-diff`, 24 scenarios, 18 goldens; flows.jsonl middleware and formal corpus are stretch goals |
-
+| **Diagnostics (M12)** | ❌ Not implemented | diagnostic log upload (F054) |
 ---
 
 ## 1. P0 — Blockers for live-GitHub correctness
@@ -111,6 +111,30 @@ These were the blockers identified by the 2026-07-02 full-code audit. They are n
 
 ---
 
+## 2.5. P0.5 — New blockers found via upstream source audit 2026-07-04
+
+Found by diffing every module of `crates/aksh-runner` against the official `actions/runner` v2.335.1 C# source (not just golden captures). These affect real workflow correctness.
+
+| ID | Item | Detail | Ref |
+|---|---|---|---|
+| ~~P0.5.1~~ | ~~Process cancel signal sequence~~ | ✅ Fixed: SIGINT (7.5s) → SIGTERM (2.5s) → kill with process-group reaping | F042 |
+| ~~P0.5.2~~ | ~~Docker env secret leakage~~ | ✅ Fixed: Docker create/exec/run use inherited `-e KEY` form where values should not appear in CLI args | F043 |
+| ~~P0.5.3~~ | ~~`github.action_repository` / `github.action_ref` contexts~~ | ✅ Fixed: set on remote action execution and restored afterwards | F044 |
+| ~~P0.5.4~~ | ~~`github.action_status` in composite nested steps~~ | ✅ Fixed: set before each nested composite step and updated across cancel/failure paths | F045 |
+
+---
+
+## 2.6. P1.5 — High gaps from upstream source audit 2026-07-04
+
+| ID | Item | Detail | Ref |
+|---|---|---|---|
+| ~~P1.5.1~~ | ~~Container action pre/post lifecycle~~ | ✅ Fixed: `build_step_list_with_lifecycle` recognizes `runs.using: docker`, parses official `pre-entrypoint`/`post-entrypoint`, and registers pre/main/post entries | F046 |
+| ~~P1.5.2~~ | ~~Container action manifest fields~~ | ✅ Fixed: `runs.entrypoint`/`runs.args`/`runs.env` are evaluated and applied to Docker actions | F047 |
+| P1.5.3 | Job-level annotations in completejob | Top-level `annotations` still `[]`; F025 only fixed per-step in `stepResults` | F048 |
+| P1.5.4 | Web proxy env injection for containers | `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` (both cases) from runner config not injected | F049 |
+
+---
+
 ## 3. P2 — Medium/Low divergences
 
 - ~~`format()` `{{`/`}}` escaping~~ — ✅ Fixed (2026-07-04): `format_args()` now unescapes `{{` → `{` and `}}` → `}`. Template expression parser also fixed to handle nested parens/quotes when finding closing `}}`.
@@ -127,6 +151,17 @@ These were the blockers identified by the 2026-07-02 full-code audit. They are n
  - ~~displayName evaluated eagerly rather than lazily at step start~~ — ✅ Fixed (2026-07-04): resolved dynamically at step execution time against runtime expression context.
  - ~~Composite nesting depth cap (10) missing~~ — ✅ Fixed: nesting depth check implemented under composite handler (F024).
 
+### P2 — New from upstream source audit 2026-07-04
+
+| ID | Item | Detail | Ref |
+|---|---|---|---|
+| P2.14 | `github.action` context | `SetGitHubContext("action", actionStep.Action.Name)` not called before action steps | F050 |
+| P2.15 | Problem matcher `fromPath` | Base directory for relative file paths in matcher output not parsed or used | F051 |
+| P2.16 | `.runner` settings fields | `DisableUpdate`, `UseRunnerAdminFlow`, `SkipSessionRecover`, `MonitorSocketAddress` missing | F052 |
+| P2.17 | Credential auth migration fields | `authorizationUrlV2`, `enableAuthMigrationByDefault`, `oauthEndpointUrl` not extracted | F053 |
+| P2.18 | Diagnostic log upload | `DiagnosticLogManager` equivalent missing; `_diag/` logs not collected/uploaded | F054 |
+| P2.19 | `hashFiles --follow-symbolic-links` | Flag not parsed in expression engine | F055 |
+| P2.20 | `requireFipsCryptography` hardcoded | Should read from agent response `properties.RequireFipsCryptography` | F056 |
 ---
 
 ## 4. Conformance harness
@@ -145,6 +180,25 @@ The core tooling exists and is functional. Remaining work is polish and coverage
 | `fixtures/runner/` corpus | ⚠️ Not a directory | 199 inline unit tests + 24 scenario workflows serve the purpose; formal corpus deferred |
 | Benchmarks (M11) | ✅ Complete | CI pipeline + container benchmarks in `docs/runner/11-benchmarks.md` |
 | Milestone docs | ⚠️ Partial | 00, 11, 12, 13, 14 exist; others deferred until gates are formalized |
+
+### 4.1 Validation run — 2026-07-04 F042–F047 audit fixes
+
+Commands/results from the post-fix validation pass:
+
+| Check | Result | Evidence |
+|---|---|---|
+| Rust formatting | ✅ Passed | `cargo fmt --all --check` |
+| F042 process cancellation | ✅ Passed | `cargo test -p aksh-runner process::tests::cancel_ --quiet`: 2 tests passed |
+| F043 Docker env secrecy | ✅ Passed | `docker_exec_env_args_do_not_include_secret_values`, `docker_create_env_uses_inherit_form_for_empty_values`, `inherited_env_args_do_not_include_secret_values` |
+| F044 action repo/ref context | ✅ Passed | `action_repository_context_*`, `set_github_context_value_updates_context_and_env` |
+| F045 composite action status | ✅ Passed | `composite_steps_receive_action_status_context`, `github_status_success_failure_cancelled` |
+| F046 Docker lifecycle | ✅ Passed | `load_docker_action_manifest`, `lifecycle_registers_docker_action_pre_and_post`; includes official `pre-entrypoint`/`post-entrypoint` metadata keys |
+| F047 Docker manifest fields | ✅ Passed | `manifest_env_entrypoint_and_args_evaluate_against_inputs`, `docker_run_args_apply_entrypoint_args_and_hide_env_values` |
+| Build/check | ✅ Passed | `cargo check -p aksh-runner` and release builds for host macOS arm64 + smolvm Linux arm64; existing missing-docs/dead-code warnings remain |
+| Live GitHub smolvm protocol smoke | ⚠️ Protocol path passed; workflow failed | smolvm ARM64 runner `aksh-smolvm-fidelity-0704` on run `28720263632` registered with GitHub, created broker session, acquired job, renewed lock, sent `WorkflowStepsUpdate`, uploaded logs, and completed `completejob`; job failed because existing `dogfood.yml` expands unset `vars.AKSH_REPO_ROOT` to `cd ""`, not because of runner protocol failure |
+| F042–F047 live workflow asset | ⚠️ Added but not dispatched | `.github/workflows/runner-fidelity-f042-f047.yml` plus `fixtures/actions/*` committed in `b531312`; GitHub refused `workflow_dispatch` from a branch because the workflow file is not on the default branch yet |
+| Local aksh secondary E2E | ✅ Passed with caveat | `aksh-conformance runner-e2e --workflow crates/aksh-conformance/fixtures/hello-world.yml --record-flows /tmp/smoke-flows.jsonl` returned `{"status":"success","success":true}`; a prior failed attempt left port 9191 occupied, so rerun reused an already-listening local server |
+| Golden replay | ⚠️ Known failures only | `runner-watch conform --runner v2.335.1 --aksh-url http://127.0.0.1:9090 --skip-cargo-test` generated reports and failed 2/11 scenarios: `11-cache-roundtrip` and `12-artifact` return 404 for unsupported CacheService/ArtifactService Twirp endpoints |
 
 ---
 
