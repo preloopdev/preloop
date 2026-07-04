@@ -85,6 +85,17 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
             );
         }
         info!("Replacing existing agent {existing_id}");
+        let delete_url = format!(
+            "{}/_apis/v1/pools/{}/agents/{}",
+            registration.service_url, pool_id, existing_id
+        );
+        match http
+            .delete_with_token(&delete_url, &registration.oauth_token)
+            .await
+        {
+            Ok(_) => info!("Deleted existing agent {existing_id}"),
+            Err(e) => warn!("Failed to delete existing agent {existing_id}: {e:#}"),
+        }
     }
 
     // Step 6: Register agent with the server (F003: correct endpoint)
