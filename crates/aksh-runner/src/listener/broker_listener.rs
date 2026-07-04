@@ -33,7 +33,7 @@ pub async fn run_broker_loop(
         .unwrap_or_else(|| config.settings.server_url.clone())
         .trim_end_matches('/')
         .to_string();
-    let client = BrokerClient::new(http.clone(), broker_url);
+    let mut client = BrokerClient::new(http.clone(), broker_url);
 
     let mut token = initial_token.to_string();
     let mut session_id = String::new();
@@ -263,7 +263,16 @@ pub async fn run_broker_loop(
                                 info!("Self-update requested; aksh-runner does not self-update");
                             }
                             "BrokerMigration" => {
-                                warn!("Broker migration requested — not yet implemented");
+                                info!("Broker migration requested — re-resolving broker URL...");
+                                if !session_id.is_empty() {
+                                    let _ = client.delete_session(&token, &session_id).await;
+                                    session_id = String::new();
+                                }
+                                need_session = true;
+                                if let Some(new_url) = re_resolve_broker_url(http, &config.settings.server_url).await {
+                                    info!("New broker URL after migration: {new_url}");
+                                    client = BrokerClient::new(http.clone(), new_url.trim_end_matches('/').to_string());
+                                }
                             }
                             other => {
                                 warn!("Unknown broker message type: {other}");
@@ -448,4 +457,19 @@ async fn acquire_job_from_ref(
         info!("Job message is full payload (no run-service URL)");
         Ok(Some(job_ref.clone()))
     }
+}
+async fn re_resolve_broker_url(http: &HttpClient, server_url: &str) -> Option<String> {
+    let url = format!("{}/_apis/connectionData?connectOptions=0", server_url);
+    if let Ok(resp) = http.get_json::<serde_json::Value>(&url).await {
+        if let Some(broker_url) = resp.get("brokerUrl").and_then(|v| v.as_str()) {
+            return Some(broker_url.to_string());
+        }
+        // Fall back to locationServiceData properties if brokerUrl not directly on root
+        if let Some(properties) = resp.get("locationServiceData").and_then(|l| l.get("properties")) {
+            if let Some(broker_url) = properties.get("ServerUrlV2").and_then(|v| v.as_str()) {
+                return Some(broker_url.to_string());
+            }
+        }
+    }
+    None
 }
