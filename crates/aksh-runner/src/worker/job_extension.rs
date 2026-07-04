@@ -555,6 +555,9 @@ pub fn build_step_list_with_lifecycle(
             Ok(m) => m,
             Err(_) => continue, // action not yet on disk — skip pre/post
         };
+        if !action_supports_lifecycle(&manifest) {
+            continue;
+        }
 
         // Pre step
         if let Some(pre_main) = &manifest.runs_pre {
@@ -624,6 +627,13 @@ fn with_internal_entry(with: &serde_json::Value, entry: &str) -> serde_json::Val
         serde_json::Value::String(entry.to_string()),
     );
     serde_json::Value::Object(obj)
+}
+
+fn action_supports_lifecycle(manifest: &super::handlers::factory::ActionManifest) -> bool {
+    matches!(
+        manifest.runs_using.as_str(),
+        "node12" | "node16" | "node20" | "node24" | "docker" | "composite"
+    )
 }
 
 fn extract_step_env(step: &serde_json::Value) -> HashMap<String, String> {
@@ -1036,6 +1046,68 @@ runs:
             &ordered[2].step_type,
             StepType::Action { with, .. }
                 if with.get("__aksh_entry").and_then(|v| v.as_str()) == Some("cleanup.js")
+        ));
+        assert_eq!(ordered[2].condition.as_deref(), Some("always()"));
+    }
+
+    #[test]
+    fn lifecycle_registers_docker_action_pre_and_post() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let workspace = temp.path().join("_work/repo/repo");
+        let action_dir = temp
+            .path()
+            .join("_work/_actions/actions/docker-action/0123456789abcdef");
+        std::fs::create_dir_all(&action_dir).unwrap();
+        std::fs::write(
+            action_dir.join("action.yml"),
+            r#"
+name: docker action
+runs:
+  using: docker
+  image: Dockerfile
+  pre: pre-entrypoint.sh
+  post: post-entrypoint.sh
+  post-if: always()
+"#,
+        )
+        .unwrap();
+
+        let main_steps = vec![Step {
+            id: "docker-action".into(),
+            context_name: "docker-action".into(),
+            display_name: "Docker Action".into(),
+            step_type: StepType::Action {
+                uses: "actions/docker-action@v1".into(),
+                with: serde_json::json!({}),
+            },
+            condition: Some("success()".into()),
+            continue_on_error: false,
+            timeout_minutes: None,
+            env: std::collections::HashMap::new(),
+            raw: serde_json::json!({}),
+        }];
+        let mut action_paths = std::collections::HashMap::new();
+        action_paths.insert(
+            "actions/docker-action@v1".to_string(),
+            action_dir.to_string_lossy().to_string(),
+        );
+
+        let ordered =
+            build_step_list_with_lifecycle(main_steps, workspace.to_str().unwrap(), &action_paths);
+
+        assert_eq!(ordered.len(), 3);
+        assert_eq!(ordered[0].id, "__pre_docker-action");
+        assert_eq!(ordered[1].id, "docker-action");
+        assert_eq!(ordered[2].id, "__post_docker-action");
+        assert!(matches!(
+            &ordered[0].step_type,
+            StepType::Action { with, .. }
+                if with.get("__aksh_entry").and_then(|v| v.as_str()) == Some("pre-entrypoint.sh")
+        ));
+        assert!(matches!(
+            &ordered[2].step_type,
+            StepType::Action { with, .. }
+                if with.get("__aksh_entry").and_then(|v| v.as_str()) == Some("post-entrypoint.sh")
         ));
         assert_eq!(ordered[2].condition.as_deref(), Some("always()"));
     }
