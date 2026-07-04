@@ -188,3 +188,10 @@ When changing runner-facing routes, payloads, or lease/session logic:
 - Many server tests are inline in `crates/aksh-runner-server/src/lib.rs`; targeted filtering is practical.
 - `runner-watch` and conformance docs under `docs/watcher/` record recent protocol investigations.
 - If a workflow passes locally but CI shape differs, compare `.github/workflows/ci.yml` vs `.github/workflows/dogfood.yml` before changing production behavior.
+
+## Agent Interaction Preferences
+
+- **Be critical.** Push back when a plan hides risk, a claim is wrong, or a prioritization doesn't make sense. Don't be a yes-man — question assumptions, challenge decisions, and propose alternatives with evidence. The user values direct, honest critique over agreement.
+- **Composability is the goal.** The aksh runner and server must be interchangeable with the official runner and GitHub's control plane. Any runner should work with any server. Never introduce protocol divergences that break this composability.
+- **Broker path only.** The AzDO legacy protocol path is deferred. All work targets the modern broker + Twirp results-service protocol (v2.329.0+). GitHub enforces this as the minimum runner version.
+- **ARM64 is the local target.** smolvm on Apple Silicon creates ARM64 VMs. ~90% of workflows work natively. x86 emulation via Rosetta is blocked on smolvm/libkrun limitations (see `docs/runner/13-x86-emulation-research.md`).
