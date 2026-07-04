@@ -70,7 +70,7 @@ fn parse_double_colon(line: &str) -> Option<WorkflowCommand> {
     }
 
     Some(WorkflowCommand {
-        name: name.to_string(),
+        name: name.to_lowercase(),
         properties,
         data: unescape_data(data),
     })
@@ -87,7 +87,7 @@ fn parse_legacy(line: &str) -> Option<WorkflowCommand> {
     let data = &line[close + 1..];
 
     Some(WorkflowCommand {
-        name: name.to_string(),
+        name: name.to_lowercase(),
         properties: HashMap::new(),
         data: data.to_string(),
     })
@@ -258,6 +258,13 @@ mod tests {
         let cmd = parse_command("##[error]Something failed").unwrap();
         assert_eq!(cmd.name, "error");
         assert_eq!(cmd.data, "Something failed");
+    }
+    #[test]
+    fn parse_case_insensitive() {
+        let cmd1 = parse_command("::SET-OUTPUT name=foo::bar").unwrap();
+        assert_eq!(cmd1.name, "set-output");
+        let cmd2 = parse_command("##[ERROR]failed").unwrap();
+        assert_eq!(cmd2.name, "error");
     }
 
     #[test]
