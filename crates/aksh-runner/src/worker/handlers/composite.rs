@@ -52,6 +52,8 @@ fn run_composite_action_inner<'a>(
             .as_ref()
             .context("composite action missing runs.steps")?;
 
+        let previous_action_status = ctx.job.github_context_value("action_status");
+
         // Set up INPUT_* env from `with` inputs
         let mut input_env = std::collections::HashMap::new();
         let expr_ctx_for_inputs = ctx.job.build_expression_context();
@@ -101,6 +103,13 @@ fn run_composite_action_inner<'a>(
 
         // Execute each composite step
         for (i, step) in steps.iter().enumerate() {
+            let action_status = if *cancel_rx.borrow() {
+                "cancelled"
+            } else {
+                "success"
+            };
+            ctx.job
+                .set_github_context_value("action_status", Some(serde_json::json!(action_status)));
             let step_run = step.get("run").and_then(|v| v.as_str());
             let step_uses = step.get("uses").and_then(|v| v.as_str());
             let step_shell = step.get("shell").and_then(|v| v.as_str());
@@ -301,7 +310,68 @@ fn run_composite_action_inner<'a>(
                 }
             }
         }
+        ctx.job
+            .set_github_context_value("action_status", previous_action_status);
 
         Ok(())
     }) // end Box::pin
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worker::contexts::JobContext;
+    use crate::worker::execution_context::StepContext;
+
+    fn composite_manifest(steps: Vec<serde_json::Value>) -> ActionManifest {
+        ActionManifest {
+            name: "composite".into(),
+            description: String::new(),
+            runs_using: "composite".into(),
+            runs_main: None,
+            runs_pre: None,
+            runs_pre_if: None,
+            runs_post: None,
+            runs_post_if: None,
+            runs_steps: Some(steps),
+            runs_image: None,
+            runs_entrypoint: None,
+            runs_args: None,
+            inputs: None,
+            outputs: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn composite_steps_receive_action_status_context() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let manifest = composite_manifest(vec![serde_json::json!({
+            "run": "echo status=${{ github.action_status }}",
+            "shell": "bash"
+        })]);
+        let mut job = JobContext::new(
+            "job".into(),
+            "job".into(),
+            serde_json::json!({}),
+            serde_json::json!({"github": {"workspace": workspace.path()}}),
+        );
+        job.workspace = Some(workspace.path().to_string_lossy().to_string());
+        let mut ctx = StepContext::new(&mut job, "composite".into(), "Composite".into());
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+        run_composite_action(
+            &manifest,
+            workspace.path(),
+            &serde_json::json!({}),
+            workspace.path().to_str().unwrap(),
+            &mut ctx,
+            cancel_rx,
+        )
+        .await
+        .unwrap();
+
+        assert!(ctx.log_content().contains("status=success"));
+        assert_eq!(ctx.job.github_context_value("action_status"), None);
+        assert!(!ctx.job.env.contains_key("GITHUB_ACTION_STATUS"));
+    }
 }
