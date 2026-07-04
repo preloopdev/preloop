@@ -325,7 +325,9 @@ impl JobContext {
 }
 
 fn sync_github_env(env: &mut HashMap<String, String>, key: &str, value: &serde_json::Value) {
-    let env_key = github_env_key(key);
+    let Some(env_key) = github_env_key(key) else {
+        return;
+    };
     match value {
         serde_json::Value::String(s) => {
             env.insert(env_key, s.clone());
@@ -340,11 +342,56 @@ fn sync_github_env(env: &mut HashMap<String, String>, key: &str, value: &serde_j
 }
 
 fn remove_github_env(env: &mut HashMap<String, String>, key: &str) {
-    env.remove(&github_env_key(key));
+    if let Some(env_key) = github_env_key(key) {
+        env.remove(&env_key);
+    }
 }
 
-fn github_env_key(key: &str) -> String {
-    format!("GITHUB_{}", key.to_ascii_uppercase())
+fn github_env_key(key: &str) -> Option<String> {
+    // Official GitHubContext.GetRuntimeEnvironmentVariables allowlist.
+    const ALLOWLIST: &[&str] = &[
+        "action_path",
+        "action_ref",
+        "action_repository",
+        "action",
+        "actor",
+        "actor_id",
+        "api_url",
+        "base_ref",
+        "env",
+        "event_name",
+        "event_path",
+        "graphql_url",
+        "head_ref",
+        "job",
+        "output",
+        "path",
+        "ref_name",
+        "ref_protected",
+        "ref_type",
+        "ref",
+        "repository",
+        "repository_id",
+        "repository_owner",
+        "repository_owner_id",
+        "retention_days",
+        "run_attempt",
+        "run_id",
+        "run_number",
+        "server_url",
+        "sha",
+        "state",
+        "step_summary",
+        "triggering_actor",
+        "workflow",
+        "workflow_ref",
+        "workflow_sha",
+        "workspace",
+    ];
+
+    ALLOWLIST
+        .contains(&key)
+        .then(|| format!("GITHUB_{}", key.to_ascii_uppercase()))
 }
 
 fn current_os() -> &'static str {
