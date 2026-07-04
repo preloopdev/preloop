@@ -21,7 +21,7 @@ pub async fn run_docker_action(
 
     info!("Running docker action: {image}");
 
-    let env = ctx.build_env();
+    let mut env = ctx.build_env();
     let mut docker_args = vec![
         "run".to_string(),
         "--rm".to_string(),
@@ -39,34 +39,24 @@ pub async fn run_docker_action(
         docker_args.push(state.label.clone());
     }
 
-    // Add environment variables
-    for (k, v) in &env {
-        docker_args.push("-e".to_string());
-        docker_args.push(format!("{k}={v}"));
-    }
-
-    // Add action inputs as INPUT_* env vars
+    // Add action inputs as INPUT_* env vars to the docker client process
+    // environment. Docker receives only `-e KEY`, matching the official runner
+    // and keeping secret values out of command-line args.
     if let Some(inputs) = with.as_object() {
         for (key, value) in inputs {
             let env_key = format!("INPUT_{}", key.to_uppercase().replace(' ', "_"));
             let val = value.as_str().unwrap_or(&value.to_string()).to_string();
-            docker_args.push("-e".to_string());
-            docker_args.push(format!("{env_key}={val}"));
+            env.insert(env_key, val);
         }
     }
+
+    push_inherited_env_args(&mut docker_args, &env);
 
     docker_args.push(image.to_string());
 
     let args_ref: Vec<&str> = docker_args.iter().map(|s| s.as_str()).collect();
-    let result = process::invoke(
-        "docker",
-        &args_ref,
-        Path::new(workspace),
-        &std::collections::HashMap::new(),
-        None,
-        None,
-    )
-    .await?;
+    let result =
+        process::invoke("docker", &args_ref, Path::new(workspace), &env, None, None).await?;
 
     for line in &result.lines {
         ctx.log(line);
@@ -127,5 +117,32 @@ pub async fn run_docker_action_from_manifest(
     } else {
         // Direct image reference
         run_docker_action(&format!("docker://{image}"), with, workspace, ctx).await
+    }
+}
+
+fn push_inherited_env_args(
+    docker_args: &mut Vec<String>,
+    env: &std::collections::HashMap<String, String>,
+) {
+    for key in env.keys() {
+        docker_args.push("-e".to_string());
+        docker_args.push(key.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn inherited_env_args_do_not_include_secret_values() {
+        let mut args = Vec::new();
+        let env = HashMap::from([("MY_SECRET".to_string(), "s3cr3t".to_string())]);
+
+        push_inherited_env_args(&mut args, &env);
+
+        assert_eq!(args, vec!["-e".to_string(), "MY_SECRET".to_string()]);
+        assert!(!args.iter().any(|arg| arg.contains("s3cr3t")));
     }
 }
