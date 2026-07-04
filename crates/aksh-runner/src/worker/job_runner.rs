@@ -84,11 +84,17 @@ pub async fn run_job(
     super::job_extension::inject_github_env(&mut job_ctx, &job_message);
 
     // Phase 2: Parse container/service specs from job message
-    let job_container_spec = job_message
-        .get("jobContainer")
+    let raw_container = job_message.get("jobContainer");
+    let raw_services = job_message.get("jobServiceContainers");
+    info!(
+        "Container fields: jobContainer={}, jobServiceContainers={}",
+        raw_container.map(|v| v.to_string()).unwrap_or_else(|| "absent".to_string()),
+        raw_services.map(|v| v.to_string()).unwrap_or_else(|| "absent".to_string()),
+    );
+
+    let job_container_spec = raw_container
         .and_then(super::container_ops::parse_container_spec);
-    let service_specs = job_message
-        .get("jobServiceContainers")
+    let service_specs = raw_services
         .map(super::container_ops::parse_service_specs)
         .unwrap_or_default();
 

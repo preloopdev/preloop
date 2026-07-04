@@ -22,3 +22,9 @@ __pycache__/
 .env
 *.pem
 *.key
+/_work/
+/_runner_work/
+/externals/
+/.runner
+/.credentials
+/.credentials_rsaparams
