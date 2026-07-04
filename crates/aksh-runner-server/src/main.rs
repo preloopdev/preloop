@@ -24,6 +24,9 @@ enum Command {
         /// State directory.
         #[arg(long, default_value = ".aksh")]
         state_dir: PathBuf,
+        /// File path to write recorded flows to (NDJSON format).
+        #[arg(long)]
+        record_flows: Option<PathBuf>,
     },
 }
 
@@ -35,8 +38,8 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve { listen, state_dir } => {
-            serve(ServerConfig { listen, state_dir }).await?;
+        Command::Serve { listen, state_dir, record_flows } => {
+            serve(ServerConfig { listen, state_dir, record_flows }).await?;
         }
     }
     Ok(())
