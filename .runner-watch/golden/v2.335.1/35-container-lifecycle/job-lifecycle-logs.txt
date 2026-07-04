@@ -1,0 +1,164 @@
+﻿2026-07-04T03:43:07.5435033Z Current runner version: '2.335.1'
+2026-07-04T03:43:07.5512075Z ##[group]Runner Image Provisioner
+2026-07-04T03:43:07.5513457Z Hosted Compute Agent
+2026-07-04T03:43:07.5514561Z Version: 20260624.560
+2026-07-04T03:43:07.5516043Z Commit: 925d229a51159bc391ae97e54a2dd1fe20af789d
+2026-07-04T03:43:07.5517340Z Build Date: 2026-06-24T18:26:47Z
+2026-07-04T03:43:07.5518683Z Worker ID: {0ab968c7-5cee-4edb-a185-66423f5731de}
+2026-07-04T03:43:07.5519976Z Azure Region: eastus
+2026-07-04T03:43:07.5520966Z ##[endgroup]
+2026-07-04T03:43:07.5547155Z ##[group]Operating System
+2026-07-04T03:43:07.5548245Z Ubuntu
+2026-07-04T03:43:07.5549298Z 24.04.4
+2026-07-04T03:43:07.5550200Z LTS
+2026-07-04T03:43:07.5551206Z ##[endgroup]
+2026-07-04T03:43:07.5552392Z ##[group]Runner Image
+2026-07-04T03:43:07.5553472Z Image: ubuntu-24.04
+2026-07-04T03:43:07.5554680Z Version: 20260628.225.1
+2026-07-04T03:43:07.5557180Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260628.225/images/ubuntu/Ubuntu2404-Readme.md
+2026-07-04T03:43:07.5559994Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260628.225
+2026-07-04T03:43:07.5561663Z ##[endgroup]
+2026-07-04T03:43:07.5563683Z ##[group]GITHUB_TOKEN Permissions
+2026-07-04T03:43:07.5587436Z Contents: read
+2026-07-04T03:43:07.5588439Z Metadata: read
+2026-07-04T03:43:07.5589358Z Packages: read
+2026-07-04T03:43:07.5591029Z ##[endgroup]
+2026-07-04T03:43:07.5594326Z Secret source: Actions
+2026-07-04T03:43:07.5596020Z Prepare workflow directory
+2026-07-04T03:43:07.6866137Z Prepare all required actions
+2026-07-04T03:43:07.7632782Z Complete job name: lifecycle
+2026-07-04T03:43:07.8369706Z ##[group]Checking docker version
+2026-07-04T03:43:07.8383331Z ##[command]/usr/bin/docker version --format '{{.Server.APIVersion}}'
+2026-07-04T03:43:07.9380207Z '1.48'
+2026-07-04T03:43:07.9415538Z Docker daemon API version: '1.48'
+2026-07-04T03:43:07.9416516Z ##[command]/usr/bin/docker version --format '{{.Client.APIVersion}}'
+2026-07-04T03:43:07.9713047Z '1.48'
+2026-07-04T03:43:07.9733664Z Docker client API version: '1.48'
+2026-07-04T03:43:07.9741252Z ##[endgroup]
+2026-07-04T03:43:07.9744494Z ##[group]Clean up resources from previous jobs
+2026-07-04T03:43:07.9751633Z ##[command]/usr/bin/docker ps --all --quiet --no-trunc --filter "label=c6e846"
+2026-07-04T03:43:08.0022419Z ##[command]/usr/bin/docker network prune --force --filter "label=c6e846"
+2026-07-04T03:43:08.0244519Z ##[endgroup]
+2026-07-04T03:43:08.0245818Z ##[group]Create local container network
+2026-07-04T03:43:08.0275782Z ##[command]/usr/bin/docker network create --label c6e846 github_network_ee6e52744f84491aaae655bbef84efcb
+2026-07-04T03:43:08.1121963Z 284baa7f3946111b6e6e6a96ef4ac941a1e516d0d90b39541ab58cc1df6304fe
+2026-07-04T03:43:08.1134731Z ##[endgroup]
+2026-07-04T03:43:08.1160105Z ##[group]Starting job container
+2026-07-04T03:43:08.1182284Z ##[command]/usr/bin/docker pull python:3.12-slim
+2026-07-04T03:43:08.3436864Z 3.12-slim: Pulling from library/python
+2026-07-04T03:43:08.4251591Z e95a6c7ea7d4: Pulling fs layer
+2026-07-04T03:43:08.4254048Z aff2d9f8dc87: Pulling fs layer
+2026-07-04T03:43:08.4256083Z df79d931cd67: Pulling fs layer
+2026-07-04T03:43:08.4257504Z b32430367bf0: Pulling fs layer
+2026-07-04T03:43:08.5157081Z aff2d9f8dc87: Download complete
+2026-07-04T03:43:08.6567678Z b32430367bf0: Verifying Checksum
+2026-07-04T03:43:08.6576973Z b32430367bf0: Download complete
+2026-07-04T03:43:08.6579644Z df79d931cd67: Verifying Checksum
+2026-07-04T03:43:08.6581248Z df79d931cd67: Download complete
+2026-07-04T03:43:08.6785866Z e95a6c7ea7d4: Verifying Checksum
+2026-07-04T03:43:08.6788253Z e95a6c7ea7d4: Download complete
+2026-07-04T03:43:10.5741615Z e95a6c7ea7d4: Pull complete
+2026-07-04T03:43:12.5353133Z aff2d9f8dc87: Pull complete
+2026-07-04T03:43:13.2420689Z df79d931cd67: Pull complete
+2026-07-04T03:43:13.2653880Z b32430367bf0: Pull complete
+2026-07-04T03:43:13.2707269Z Digest: sha256:423ed6ab25b1921a477529254bfeeabf5855151dc2c3141699a1bfc852199fbf
+2026-07-04T03:43:13.2725639Z Status: Downloaded newer image for python:3.12-slim
+2026-07-04T03:43:13.2735815Z docker.io/library/python:3.12-slim
+2026-07-04T03:43:13.2837094Z ##[command]/usr/bin/docker create --name 328d9a6d11df446d834dfb5d8f258110_python312slim_ff140a --label c6e846 --workdir /__w/aksh-conformance-sample/aksh-conformance-sample --network github_network_ee6e52744f84491aaae655bbef84efcb  -e "PYTHONDONTWRITEBYTECODE=1" -e "HOME=/github/home" -e GITHUB_ACTIONS=true -e CI=true -v "/var/run/docker.sock":"/var/run/docker.sock" -v "/home/runner/work":"/__w" -v "/home/runner/actions-runner/cached/2.335.1/externals":"/__e":ro -v "/home/runner/work/_temp":"/__w/_temp" -v "/home/runner/work/_actions":"/__w/_actions" -v "/opt/hostedtoolcache":"/__t" -v "/home/runner/work/_temp/_github_home":"/github/home" -v "/home/runner/work/_temp/_github_workflow":"/github/workflow" --entrypoint "tail" python:3.12-slim "-f" "/dev/null"
+2026-07-04T03:43:13.3167499Z d163f00a9a26344bf19cd41ba2965d2a0b8b7dd67121a369fd30d260a50e8735
+2026-07-04T03:43:13.3192192Z ##[command]/usr/bin/docker start d163f00a9a26344bf19cd41ba2965d2a0b8b7dd67121a369fd30d260a50e8735
+2026-07-04T03:43:13.5797015Z d163f00a9a26344bf19cd41ba2965d2a0b8b7dd67121a369fd30d260a50e8735
+2026-07-04T03:43:13.5826889Z ##[command]/usr/bin/docker ps --all --filter id=d163f00a9a26344bf19cd41ba2965d2a0b8b7dd67121a369fd30d260a50e8735 --filter status=running --no-trunc --format "{{.ID}} {{.Status}}"
+2026-07-04T03:43:13.5959034Z d163f00a9a26344bf19cd41ba2965d2a0b8b7dd67121a369fd30d260a50e8735 Up Less than a second
+2026-07-04T03:43:13.5980103Z ##[command]/usr/bin/docker inspect --format "{{range .Config.Env}}{{println .}}{{end}}" d163f00a9a26344bf19cd41ba2965d2a0b8b7dd67121a369fd30d260a50e8735
+2026-07-04T03:43:13.6115794Z PYTHONDONTWRITEBYTECODE=1
+2026-07-04T03:43:13.6116471Z HOME=/github/home
+2026-07-04T03:43:13.6117198Z GITHUB_ACTIONS=true
+2026-07-04T03:43:13.6117604Z CI=true
+2026-07-04T03:43:13.6118297Z PATH=/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+2026-07-04T03:43:13.6119025Z LANG=C.UTF-8
+2026-07-04T03:43:13.6119461Z GPG_KEY=7169605F62C751356D054A26A821E680E5FA6305
+2026-07-04T03:43:13.6119985Z PYTHON_VERSION=3.12.13
+2026-07-04T03:43:13.6120610Z PYTHON_SHA256=c08bc65a81971c1dd5783182826503369466c7e67374d1646519adf05207b684
+2026-07-04T03:43:13.6140118Z ##[endgroup]
+2026-07-04T03:43:13.6149592Z ##[group]Waiting for all services to be ready
+2026-07-04T03:43:13.6151366Z ##[endgroup]
+2026-07-04T03:43:13.6373262Z ##[group]Run python3 --version
+2026-07-04T03:43:13.6373687Z [36;1mpython3 --version[0m
+2026-07-04T03:43:13.6377790Z shell: sh -e {0}
+2026-07-04T03:43:13.6378349Z ##[endgroup]
+2026-07-04T03:43:13.7074666Z Python 3.12.13
+2026-07-04T03:43:13.7168183Z ##[group]Run pip install httpx
+2026-07-04T03:43:13.7168553Z [36;1mpip install httpx[0m
+2026-07-04T03:43:13.7168899Z shell: sh -e {0}
+2026-07-04T03:43:13.7169109Z ##[endgroup]
+2026-07-04T03:43:15.0168828Z WARNING: The directory '/github/home/.cache/pip' or its parent directory is not owned or is not writable by the current user. The cache has been disabled. Check the permissions and owner of that directory. If executing pip with sudo, you should use sudo's -H flag.
+2026-07-04T03:43:15.1866907Z Collecting httpx
+2026-07-04T03:43:15.2114054Z   Downloading httpx-0.28.1-py3-none-any.whl.metadata (7.1 kB)
+2026-07-04T03:43:15.2300746Z Collecting anyio (from httpx)
+2026-07-04T03:43:15.2352525Z   Downloading anyio-4.14.1-py3-none-any.whl.metadata (4.6 kB)
+2026-07-04T03:43:15.2554119Z Collecting certifi (from httpx)
+2026-07-04T03:43:15.2580536Z   Downloading certifi-2026.6.17-py3-none-any.whl.metadata (2.5 kB)
+2026-07-04T03:43:15.2755677Z Collecting httpcore==1.* (from httpx)
+2026-07-04T03:43:15.2790979Z   Downloading httpcore-1.0.9-py3-none-any.whl.metadata (21 kB)
+2026-07-04T03:43:15.2927288Z Collecting idna (from httpx)
+2026-07-04T03:43:15.2964138Z   Downloading idna-3.18-py3-none-any.whl.metadata (6.1 kB)
+2026-07-04T03:43:15.3064943Z Collecting h11>=0.16 (from httpcore==1.*->httpx)
+2026-07-04T03:43:15.3089965Z   Downloading h11-0.16.0-py3-none-any.whl.metadata (8.3 kB)
+2026-07-04T03:43:15.3286631Z Collecting typing_extensions>=4.5 (from anyio->httpx)
+2026-07-04T03:43:15.3325706Z   Downloading typing_extensions-4.16.0-py3-none-any.whl.metadata (3.3 kB)
+2026-07-04T03:43:15.3398479Z Downloading httpx-0.28.1-py3-none-any.whl (73 kB)
+2026-07-04T03:43:15.3454970Z Downloading httpcore-1.0.9-py3-none-any.whl (78 kB)
+2026-07-04T03:43:15.3495057Z Downloading anyio-4.14.1-py3-none-any.whl (124 kB)
+2026-07-04T03:43:15.3535682Z Downloading idna-3.18-py3-none-any.whl (65 kB)
+2026-07-04T03:43:15.3575296Z Downloading certifi-2026.6.17-py3-none-any.whl (133 kB)
+2026-07-04T03:43:15.3613130Z Downloading h11-0.16.0-py3-none-any.whl (37 kB)
+2026-07-04T03:43:15.3647560Z Downloading typing_extensions-4.16.0-py3-none-any.whl (45 kB)
+2026-07-04T03:43:15.3851967Z Installing collected packages: typing_extensions, idna, h11, certifi, httpcore, anyio, httpx
+2026-07-04T03:43:15.7128452Z Successfully installed anyio-4.14.1 certifi-2026.6.17 h11-0.16.0 httpcore-1.0.9 httpx-0.28.1 idna-3.18 typing_extensions-4.16.0
+2026-07-04T03:43:15.7140481Z WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+2026-07-04T03:43:15.7759603Z 
+2026-07-04T03:43:15.7760320Z [notice] A new release of pip is available: 25.0.1 -> 26.1.2
+2026-07-04T03:43:15.7761100Z [notice] To update, run: pip install --upgrade pip
+2026-07-04T03:43:15.8453280Z ##[group]Run python3 -c "
+2026-07-04T03:43:15.8453649Z [36;1mpython3 -c "[0m
+2026-07-04T03:43:15.8453879Z [36;1mimport httpx[0m
+2026-07-04T03:43:15.8454122Z [36;1mimport sys[0m
+2026-07-04T03:43:15.8454380Z [36;1mprint(f'Python {sys.version}')[0m
+2026-07-04T03:43:15.8454719Z [36;1mprint(f'httpx {httpx.__version__}')[0m
+2026-07-04T03:43:15.8455040Z [36;1mprint('Container lifecycle OK')[0m
+2026-07-04T03:43:15.8455630Z [36;1m"[0m
+2026-07-04T03:43:15.8455934Z shell: sh -e {0}
+2026-07-04T03:43:15.8456146Z ##[endgroup]
+2026-07-04T03:43:16.2980976Z Python 3.12.13 (main, Jun 24 2026, 02:08:01) [GCC 14.2.0]
+2026-07-04T03:43:16.2996037Z httpx 0.28.1
+2026-07-04T03:43:16.3003273Z Container lifecycle OK
+2026-07-04T03:43:16.3314410Z ##[group]Run echo "container.id=d163f00a9a26344bf19cd41ba2965d2a0b8b7dd67121a369fd30d260a50e8735"
+2026-07-04T03:43:16.3315556Z [36;1mecho "container.id=d163f00a9a26344bf19cd41ba2965d2a0b8b7dd67121a369fd30d260a50e8735"[0m
+2026-07-04T03:43:16.3316225Z [36;1mecho "container.network=github_network_ee6e52744f84491aaae655bbef84efcb"[0m
+2026-07-04T03:43:16.3316746Z shell: sh -e {0}
+2026-07-04T03:43:16.3316947Z ##[endgroup]
+2026-07-04T03:43:16.3876595Z container.id=d163f00a9a26344bf19cd41ba2965d2a0b8b7dd67121a369fd30d260a50e8735
+2026-07-04T03:43:16.3888316Z container.network=github_network_ee6e52744f84491aaae655bbef84efcb
+2026-07-04T03:43:16.3982664Z ##[group]Run exit 1
+2026-07-04T03:43:16.3983092Z [36;1mexit 1[0m
+2026-07-04T03:43:16.3983545Z shell: sh -e {0}
+2026-07-04T03:43:16.3983792Z ##[endgroup]
+2026-07-04T03:43:16.4789061Z ##[error]Process completed with exit code 1.
+2026-07-04T03:43:16.4858189Z ##[group]Run echo "This should still run"
+2026-07-04T03:43:16.4858743Z [36;1mecho "This should still run"[0m
+2026-07-04T03:43:16.4859304Z shell: sh -e {0}
+2026-07-04T03:43:16.4859650Z ##[endgroup]
+2026-07-04T03:43:16.5530792Z This should still run
+2026-07-04T03:43:16.5609911Z ##[group]Run echo "Previous step succeeded or was continue-on-error"
+2026-07-04T03:43:16.5610491Z [36;1mecho "Previous step succeeded or was continue-on-error"[0m
+2026-07-04T03:43:16.5610958Z shell: sh -e {0}
+2026-07-04T03:43:16.5611163Z ##[endgroup]
+2026-07-04T03:43:16.8831710Z Previous step succeeded or was continue-on-error
+2026-07-04T03:43:16.8924671Z Stop and remove container: 328d9a6d11df446d834dfb5d8f258110_python312slim_ff140a
+2026-07-04T03:43:16.8933153Z ##[command]/usr/bin/docker rm --force d163f00a9a26344bf19cd41ba2965d2a0b8b7dd67121a369fd30d260a50e8735
+2026-07-04T03:43:17.1027174Z d163f00a9a26344bf19cd41ba2965d2a0b8b7dd67121a369fd30d260a50e8735
+2026-07-04T03:43:17.1049359Z Remove container network: github_network_ee6e52744f84491aaae655bbef84efcb
+2026-07-04T03:43:17.1055924Z ##[command]/usr/bin/docker network rm github_network_ee6e52744f84491aaae655bbef84efcb
+2026-07-04T03:43:17.2153870Z github_network_ee6e52744f84491aaae655bbef84efcb
+2026-07-04T03:43:17.2260422Z Cleaning up orphan processes

@@ -1,0 +1,16 @@
+description = "Service containers without job container: nginx+redis on mapped ports, host step access."
+duration_seconds_max = 600
+
+[[steps]]
+kind = "submit_workflow"
+path = "32-services-no-container.yml"
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_assigned"
+timeout = 120
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_completed"
+timeout = 300

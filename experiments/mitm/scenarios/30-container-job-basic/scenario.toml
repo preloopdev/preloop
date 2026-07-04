@@ -1,0 +1,16 @@
+description = "Basic container job: node:20 image, verify Docker env, run commands inside container."
+duration_seconds_max = 600
+
+[[steps]]
+kind = "submit_workflow"
+path = "30-container-job-basic.yml"
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_assigned"
+timeout = 120
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_completed"
+timeout = 300

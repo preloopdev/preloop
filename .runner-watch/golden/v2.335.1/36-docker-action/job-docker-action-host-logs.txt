@@ -1,0 +1,98 @@
+﻿2026-07-04T03:43:11.7446433Z Current runner version: '2.335.1'
+2026-07-04T03:43:11.7483520Z ##[group]Runner Image Provisioner
+2026-07-04T03:43:11.7484950Z Hosted Compute Agent
+2026-07-04T03:43:11.7486558Z Version: 20260624.560
+2026-07-04T03:43:11.7487702Z Commit: 925d229a51159bc391ae97e54a2dd1fe20af789d
+2026-07-04T03:43:11.7488929Z Build Date: 2026-06-24T18:26:47Z
+2026-07-04T03:43:11.7490310Z Worker ID: {38e61dde-997e-4801-9dd8-79d96fb23310}
+2026-07-04T03:43:11.7491521Z Azure Region: westus
+2026-07-04T03:43:11.7492622Z ##[endgroup]
+2026-07-04T03:43:11.7495505Z ##[group]Operating System
+2026-07-04T03:43:11.7496699Z Ubuntu
+2026-07-04T03:43:11.7497746Z 24.04.4
+2026-07-04T03:43:11.7498666Z LTS
+2026-07-04T03:43:11.7499520Z ##[endgroup]
+2026-07-04T03:43:11.7500628Z ##[group]Runner Image
+2026-07-04T03:43:11.7501753Z Image: ubuntu-24.04
+2026-07-04T03:43:11.7503683Z Version: 20260628.225.1
+2026-07-04T03:43:11.7506234Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260628.225/images/ubuntu/Ubuntu2404-Readme.md
+2026-07-04T03:43:11.7509120Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260628.225
+2026-07-04T03:43:11.7510839Z ##[endgroup]
+2026-07-04T03:43:11.7512866Z ##[group]GITHUB_TOKEN Permissions
+2026-07-04T03:43:11.7516505Z Contents: read
+2026-07-04T03:43:11.7517615Z Metadata: read
+2026-07-04T03:43:11.7518720Z Packages: read
+2026-07-04T03:43:11.7519704Z ##[endgroup]
+2026-07-04T03:43:11.7523067Z Secret source: Actions
+2026-07-04T03:43:11.7524379Z Prepare workflow directory
+2026-07-04T03:43:11.8104314Z Prepare all required actions
+2026-07-04T03:43:11.8266555Z Complete job name: docker-action-host
+2026-07-04T03:43:11.9145447Z ##[group]Pull down action image 'alpine:3.20'
+2026-07-04T03:43:11.9775721Z ##[command]/usr/bin/docker pull alpine:3.20
+2026-07-04T03:43:12.9829480Z 3.20: Pulling from library/alpine
+2026-07-04T03:43:13.2546610Z 25f1d6b1951a: Pulling fs layer
+2026-07-04T03:43:13.5101598Z 25f1d6b1951a: Download complete
+2026-07-04T03:43:13.6150875Z 25f1d6b1951a: Pull complete
+2026-07-04T03:43:13.6170854Z Digest: sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+2026-07-04T03:43:13.6187786Z Status: Downloaded newer image for alpine:3.20
+2026-07-04T03:43:13.6197533Z docker.io/library/alpine:3.20
+2026-07-04T03:43:13.6227526Z ##[endgroup]
+2026-07-04T03:43:13.6265961Z ##[group]Pull down action image 'busybox:latest'
+2026-07-04T03:43:13.6266990Z ##[command]/usr/bin/docker pull busybox:latest
+2026-07-04T03:43:14.4956868Z latest: Pulling from library/busybox
+2026-07-04T03:43:14.7717221Z b05093807bb0: Pulling fs layer
+2026-07-04T03:43:14.9952543Z b05093807bb0: Verifying Checksum
+2026-07-04T03:43:14.9953966Z b05093807bb0: Download complete
+2026-07-04T03:43:15.0899056Z b05093807bb0: Pull complete
+2026-07-04T03:43:15.0933741Z Digest: sha256:fd8d9aa63ba2f0982b5304e1ee8d3b90a210bc1ffb5314d980eb6962f1a9715d
+2026-07-04T03:43:15.0954335Z Status: Downloaded newer image for busybox:latest
+2026-07-04T03:43:15.0962514Z docker.io/library/busybox:latest
+2026-07-04T03:43:15.0976494Z ##[endgroup]
+2026-07-04T03:43:15.1194721Z ##[group]Run docker://alpine:3.20
+2026-07-04T03:43:15.1196037Z with:
+2026-07-04T03:43:15.1196335Z   args: echo "hello from docker action"
+2026-07-04T03:43:15.1197058Z ##[endgroup]
+2026-07-04T03:43:15.1539113Z ##[command]/usr/bin/docker run --name alpine320_6255bf --label e8a10d --workdir /github/workspace --rm -e "INPUT_ARGS" -e "HOME" -e "GITHUB_JOB" -e "GITHUB_REF" -e "GITHUB_SHA" -e "GITHUB_REPOSITORY" -e "GITHUB_REPOSITORY_OWNER" -e "GITHUB_REPOSITORY_OWNER_ID" -e "GITHUB_RUN_ID" -e "GITHUB_RUN_NUMBER" -e "GITHUB_RETENTION_DAYS" -e "GITHUB_RUN_ATTEMPT" -e "GITHUB_ACTOR_ID" -e "GITHUB_ACTOR" -e "GITHUB_WORKFLOW" -e "GITHUB_HEAD_REF" -e "GITHUB_BASE_REF" -e "GITHUB_EVENT_NAME" -e "GITHUB_SERVER_URL" -e "GITHUB_API_URL" -e "GITHUB_GRAPHQL_URL" -e "GITHUB_REF_NAME" -e "GITHUB_REF_PROTECTED" -e "GITHUB_REF_TYPE" -e "GITHUB_WORKFLOW_REF" -e "GITHUB_WORKFLOW_SHA" -e "GITHUB_REPOSITORY_ID" -e "GITHUB_TRIGGERING_ACTOR" -e "GITHUB_WORKSPACE" -e "GITHUB_ACTION" -e "GITHUB_EVENT_PATH" -e "GITHUB_ACTION_REPOSITORY" -e "GITHUB_ACTION_REF" -e "GITHUB_PATH" -e "GITHUB_ENV" -e "GITHUB_STEP_SUMMARY" -e "GITHUB_STATE" -e "GITHUB_OUTPUT" -e "RUNNER_OS" -e "RUNNER_ARCH" -e "RUNNER_NAME" -e "RUNNER_ENVIRONMENT" -e "RUNNER_TOOL_CACHE" -e "RUNNER_TEMP" -e "RUNNER_WORKSPACE" -e "ACTIONS_RUNTIME_URL" -e "ACTIONS_RUNTIME_TOKEN" -e "ACTIONS_CACHE_URL" -e "ACTIONS_RESULTS_URL" -e "ACTIONS_ORCHESTRATION_ID" -e GITHUB_ACTIONS=true -e CI=true -v "/var/run/docker.sock":"/var/run/docker.sock" -v "/home/runner/work/_temp":"/github/runner_temp" -v "/home/runner/work/_temp/_github_home":"/github/home" -v "/home/runner/work/_temp/_github_workflow":"/github/workflow" -v "/home/runner/work/_temp/_runner_file_commands":"/github/file_commands" -v "/home/runner/work/aksh-conformance-sample/aksh-conformance-sample":"/github/workspace" alpine:3.20 echo "hello from docker action"
+2026-07-04T03:43:15.4941001Z hello from docker action
+2026-07-04T03:43:15.5808347Z ##[group]Run docker://busybox:latest
+2026-07-04T03:43:15.5808705Z with:
+2026-07-04T03:43:15.5808903Z   args: echo "busybox action ok"
+2026-07-04T03:43:15.5809152Z ##[endgroup]
+2026-07-04T03:43:15.5819478Z ##[command]/usr/bin/docker run --name busyboxlatest_cc2361 --label e8a10d --workdir /github/workspace --rm -e "INPUT_ARGS" -e "HOME" -e "GITHUB_JOB" -e "GITHUB_REF" -e "GITHUB_SHA" -e "GITHUB_REPOSITORY" -e "GITHUB_REPOSITORY_OWNER" -e "GITHUB_REPOSITORY_OWNER_ID" -e "GITHUB_RUN_ID" -e "GITHUB_RUN_NUMBER" -e "GITHUB_RETENTION_DAYS" -e "GITHUB_RUN_ATTEMPT" -e "GITHUB_ACTOR_ID" -e "GITHUB_ACTOR" -e "GITHUB_WORKFLOW" -e "GITHUB_HEAD_REF" -e "GITHUB_BASE_REF" -e "GITHUB_EVENT_NAME" -e "GITHUB_SERVER_URL" -e "GITHUB_API_URL" -e "GITHUB_GRAPHQL_URL" -e "GITHUB_REF_NAME" -e "GITHUB_REF_PROTECTED" -e "GITHUB_REF_TYPE" -e "GITHUB_WORKFLOW_REF" -e "GITHUB_WORKFLOW_SHA" -e "GITHUB_REPOSITORY_ID" -e "GITHUB_TRIGGERING_ACTOR" -e "GITHUB_WORKSPACE" -e "GITHUB_ACTION" -e "GITHUB_EVENT_PATH" -e "GITHUB_ACTION_REPOSITORY" -e "GITHUB_ACTION_REF" -e "GITHUB_PATH" -e "GITHUB_ENV" -e "GITHUB_STEP_SUMMARY" -e "GITHUB_STATE" -e "GITHUB_OUTPUT" -e "RUNNER_OS" -e "RUNNER_ARCH" -e "RUNNER_NAME" -e "RUNNER_ENVIRONMENT" -e "RUNNER_TOOL_CACHE" -e "RUNNER_TEMP" -e "RUNNER_WORKSPACE" -e "ACTIONS_RUNTIME_URL" -e "ACTIONS_RUNTIME_TOKEN" -e "ACTIONS_CACHE_URL" -e "ACTIONS_RESULTS_URL" -e "ACTIONS_ORCHESTRATION_ID" -e GITHUB_ACTIONS=true -e CI=true -v "/var/run/docker.sock":"/var/run/docker.sock" -v "/home/runner/work/_temp":"/github/runner_temp" -v "/home/runner/work/_temp/_github_home":"/github/home" -v "/home/runner/work/_temp/_github_workflow":"/github/workflow" -v "/home/runner/work/_temp/_runner_file_commands":"/github/file_commands" -v "/home/runner/work/aksh-conformance-sample/aksh-conformance-sample":"/github/workspace" busybox:latest echo "busybox action ok"
+2026-07-04T03:43:15.7773632Z busybox action ok
+2026-07-04T03:43:15.8442229Z ##[group]Run cat > /tmp/Dockerfile <<'EOF'
+2026-07-04T03:43:15.8442695Z [36;1mcat > /tmp/Dockerfile <<'EOF'[0m
+2026-07-04T03:43:15.8442994Z [36;1mFROM alpine:3.20[0m
+2026-07-04T03:43:15.8443283Z [36;1mRUN echo "built" > /built.txt[0m
+2026-07-04T03:43:15.8443555Z [36;1mCMD ["cat", "/built.txt"][0m
+2026-07-04T03:43:15.8443802Z [36;1mEOF[0m
+2026-07-04T03:43:15.8444036Z [36;1mdocker build -t golden-test /tmp/[0m
+2026-07-04T03:43:15.8444389Z [36;1mdocker run --rm golden-test | grep -q built[0m
+2026-07-04T03:43:15.8494313Z shell: /usr/bin/bash -e {0}
+2026-07-04T03:43:15.8494601Z ##[endgroup]
+2026-07-04T03:43:16.4110623Z #0 building with "default" instance using docker driver
+2026-07-04T03:43:16.4111054Z 
+2026-07-04T03:43:16.4111266Z #1 [internal] load build definition from Dockerfile
+2026-07-04T03:43:16.4111759Z #1 transferring dockerfile: 110B done
+2026-07-04T03:43:16.4112150Z #1 DONE 0.0s
+2026-07-04T03:43:16.4112315Z 
+2026-07-04T03:43:16.4112627Z #2 [internal] load metadata for docker.io/library/alpine:3.20
+2026-07-04T03:43:16.4113128Z #2 DONE 0.0s
+2026-07-04T03:43:16.4113289Z 
+2026-07-04T03:43:16.4113453Z #3 [internal] load .dockerignore
+2026-07-04T03:43:16.4114142Z #3 transferring context: 2B done
+2026-07-04T03:43:16.4114502Z #3 DONE 0.0s
+2026-07-04T03:43:16.4114661Z 
+2026-07-04T03:43:16.4114853Z #4 [1/2] FROM docker.io/library/alpine:3.20
+2026-07-04T03:43:16.4115620Z #4 DONE 0.0s
+2026-07-04T03:43:16.4115798Z 
+2026-07-04T03:43:16.4115963Z #5 [2/2] RUN echo "built" > /built.txt
+2026-07-04T03:43:16.4320076Z #5 DONE 0.2s
+2026-07-04T03:43:16.5836454Z 
+2026-07-04T03:43:16.5836888Z #6 exporting to image
+2026-07-04T03:43:16.5837729Z #6 exporting layers
+2026-07-04T03:43:17.0053011Z #6 exporting layers 0.6s done
+2026-07-04T03:43:17.0264465Z #6 writing image sha256:a4f427655a24e5109e7a2baf3c2f4f96e24a1507c6fc8168ad51d91f8bf9b7bc done
+2026-07-04T03:43:17.0267042Z #6 naming to docker.io/library/golden-test done
+2026-07-04T03:43:17.0268242Z #6 DONE 0.6s
+2026-07-04T03:43:17.3030656Z Cleaning up orphan processes
