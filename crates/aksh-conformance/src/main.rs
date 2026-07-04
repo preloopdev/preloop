@@ -410,7 +410,11 @@ fn generate_random_yaml(seed: u64) -> String {
     yaml
 }
 
-async fn run_runner_e2e(runner_bin: PathBuf, workflow: PathBuf, record_flows: Option<PathBuf>) -> anyhow::Result<()> {
+async fn run_runner_e2e(
+    runner_bin: PathBuf,
+    workflow: PathBuf,
+    record_flows: Option<PathBuf>,
+) -> anyhow::Result<()> {
     use std::time::Duration;
 
     // Check binaries
