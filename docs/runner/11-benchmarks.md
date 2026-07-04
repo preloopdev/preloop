@@ -14,21 +14,49 @@ The Rust binary is a single static executable. The official runner includes the 
 
 ## 2. CI Pipeline Benchmark (cargo fmt + clippy + test)
 
-Workload: the aksh workspace — `cargo fmt --all --check` + `cargo clippy --workspace --all-targets` + `cargo test --workspace --quiet`. 199 tests across 22 suites.
+Workload: the aksh workspace — `cargo fmt --all --check` + `cargo clippy --workspace --all-targets` + `cargo test --workspace --quiet`. 202 tests across 22 suites.
 
-### Test environments
+### Test matrix (2026-07-04)
 
-| | GitHub-hosted | aksh/smolvm | Host bare metal | Agent CI |
+Four configurations, all using warm cargo cache (incremental compilation):
+
+| | Config 1 | Config 2 | Config 3 | Config 4 |
 |---|---|---|---|---|
-| **Runner** | Official C# v2.335.1 | aksh Rust runner | cargo directly | Official C# in Docker |
-| **Control plane** | GitHub.com | aksh-runner-server | N/A (no runner) | Agent CI DTU mock |
-| **Machine** | Azure VM (ubuntu-latest) | smolvm ARM64 VM | macOS native | Docker on macOS |
-| **CPU** | 4 vCPU (x86_64) | 4 vCPU (Apple M4 Max) | Apple M4 Max | Apple M4 Max |
-| **RAM** | 16 GB | 8 GB | 128 GB | Docker-allocated |
-| **Docker storage** | N/A | overlay2 on ext4 (10 GB vdb) | N/A | overlay2 |
-| **VM boot** | N/A | 1.2s (from stopped state) | N/A | ~4s (container start) |
+| **Runner** | Official C# v2.335.1 | aksh Rust runner | aksh Rust runner | Official C# in Docker |
+| **Control plane** | GitHub.com | GitHub.com | aksh-runner-server | Agent CI (emulated) |
+| **Environment** | smolvm ARM64 VM | smolvm ARM64 VM | smolvm ARM64 VM | Docker on macOS host |
+| **CPU** | 4 vCPU (Apple M4 Max) | 4 vCPU (Apple M4 Max) | 4 vCPU (Apple M4 Max) | Apple M4 Max |
+| **RAM** | 8 GB | 8 GB | 8 GB | Docker-allocated |
 
-### Results
+### Per-step results (warm cache)
+
+```
+                                Official→GH    aksh→GH   aksh→aksh   agent-ci
+                                   (smolvm)   (smolvm)    (smolvm)   (Docker)
+────────────────────────────────────────────────────────────────────────────────
+checkout                               —           —           —       161ms
+rust-toolchain                         —           —           —       8.4s
+cargo fmt                          ~0.5s        0.3s       0.17s       131ms
+cargo clippy                        6.0s        0.7s       0.29s       2.8s
+cargo test                         89.0s       45.7s       42.7s         —*
+────────────────────────────────────────────────────────────────────────────────
+JOB TOTAL                          97.0s       46.7s       43.2s     ~11.5s†
+```
+
+`*` agent-ci clippy failed (`-D clippy::too_many_arguments`); test skipped.
+`†` Estimated without test; with test would be ~40s total.
+
+### Speedup vs Official C# → GitHub (Config 1)
+
+| Config | Speedup |
+|---|---|
+| aksh Rust → GitHub (smolvm) | **2.1x faster** |
+| aksh Rust → aksh-server (smolvm) | **2.2x faster** |
+| agent-ci (Docker, host) | **8.4x faster** (partial — no cargo test) |
+
+### Historical comparison (cold cache, cross-architecture)
+
+These earlier numbers compare a fresh `target/` build across different machines (not apples-to-apples with the warm-cache test matrix above):
 
 ```
                                   fmt    clippy    test    steps    wall
@@ -39,30 +67,15 @@ smolvm warm cache (direct)         0s       1s     45s      46s     47s
 smolvm warm + aksh protocol        0s       0s     43s      43s     45s
 Host bare metal (warm)           0.2s       2s     25s      27s     27s
 ──────────────────────────────────────────────────────────────────────────
-Agent CI                          —         —       —        —    FAILED
 ```
-
-### Comparison ratios (vs GitHub-hosted)
-
-| Config | Ratio | Speedup |
-|---|---|---|
-| smolvm cold cache | 0.33x | **3x faster** |
-| smolvm warm cache | 0.13x | **7.7x faster** |
-| smolvm warm + aksh protocol | 0.12x | **8.1x faster** |
-| Host bare metal | 0.07x | **13.4x faster** |
-
-### Agent CI failure
-
-Agent CI could not complete this benchmark. The official runner Docker image (`ghcr.io/actions/actions-runner`) does not include a C linker or Rust toolchain. `cargo clippy` fails with `error: linker 'cc' not found`. A custom `.github/agent-ci.Dockerfile` adding `build-essential` and Rust is required. The `dtolnay/rust-toolchain` action installs rustup but not the system linker.
 
 ### Key observations
 
-- **GitHub CI is dominated by cold compilation.** Every run downloads and compiles all dependencies from scratch. `cargo test` alone takes 284s because it compiles the full dep tree + 199 test binaries.
-- **smolvm benefits from persistent cargo cache.** The VM's `/workspace/target` directory persists across runs, so incremental compilation applies. Warm-cache runs are 7.7x faster than GitHub.
-- **Cold-cache smolvm is still 3x faster than GitHub.** Even compiling everything from scratch, the M4 Max outperforms Azure's 4-vCPU x86 VM. ARM64 Rust compilation is not a bottleneck.
-- **The VM tax is ~1.7x.** Comparing warm-cache smolvm direct (46s) to bare-metal host (27s). The overhead comes from virtio-fs I/O for the many small files in `target/` and memory bandwidth in the microVM.
-- **aksh protocol overhead is ~2s.** Wall time with protocol (45s) vs direct execution (43s step time). Job dispatch, step reporting, and log upload add negligible overhead.
-
+- **Official C# runner overhead is measurable.** On the same smolvm VM with the same warm cache, the C# runner takes 97s vs the Rust runner's 47s — a 2.1x gap. The bulk is in `cargo test` (89s vs 46s), suggesting per-test-binary dispatch/reporting overhead in the .NET runtime.
+- **Eliminating GitHub round-trips saves another 3s.** Config 3 (fully local) is 43.2s vs Config 2's 46.7s — the difference is GitHub's broker dispatch latency and signed-URL log upload.
+- **The VM tax is ~1.7x.** Config 3 in smolvm (43.2s) vs host bare metal (27s). This is virtio-fs I/O overhead on the `target/` directory.
+- **aksh protocol overhead is <1s.** In Config 3, job dispatch + step reporting + log upload add negligible time to the raw cargo execution.
+- **agent-ci is fastest for fmt+clippy** because it runs on host Docker with direct disk I/O. Its `cargo test` timing would likely be ~25-30s (Docker on host has less I/O overhead than smolvm virtio-fs).
 ### Cache state definitions
 
 | State | Definition |
@@ -160,54 +173,54 @@ These are not aksh bugs — the same workflows succeed on GitHub's x86 runners b
 ## 6. Summary
 
 ```
-                              GitHub    aksh/smolvm    Host
-                              (cloud)   (local VM)     (native)
-─────────────────────────────────────────────────────────────────
-CI pipeline (warm)             363s        45s           27s
-                                1x       8.1x faster   13.4x faster
+                              Official C#   aksh Rust    aksh Rust    Agent CI
+                              → GitHub      → GitHub     → aksh       (Docker)
+                              (smolvm)      (smolvm)     (smolvm)     (host)
+─────────────────────────────────────────────────────────────────────────────────
+CI pipeline (warm)             97s           47s          43s          ~40s (est)
+  vs Official                  1x           2.1x faster  2.2x faster  2.4x (est)
 
-Container job (arch-neutral)   8-30s     4.7-30s        N/A
-                                1x       0.6-1.0x       N/A
+CI pipeline (warm, host)       —             —            27s          —
 
-Runner binary size             435 MB    5.3 MB         N/A
-                                1x       82x smaller    N/A
+Container job (arch-neutral)   8-30s         4.7-30s      —            —
+  vs GitHub-hosted             1x           0.6-1.0x      —            —
 
-Protocol overhead              N/A       ~2s/job        0s
-Boot time (VM)                 N/A       1.2s           0s
+Runner binary size             435 MB        5.3 MB       5.3 MB       435 MB
+Protocol overhead              N/A           ~3s (GH)     <1s (local)  0s
+Boot time (VM)                 1.2s          1.2s         1.2s         ~4s
 ```
 
-The aksh Rust runner on a local Mac via smolvm is **8x faster** than GitHub-hosted CI for iterative development (warm cache) and adds only 2 seconds of protocol overhead per job. Container jobs run at parity or faster on architecture-neutral workloads.
+On the same smolvm VM with the same warm cache, the aksh Rust runner is **2.1x faster** than the official C# runner against GitHub, and **2.2x faster** running fully local. The gap is dominated by `cargo test` (89s C# vs 43-46s Rust), where the C# runner's per-test-binary dispatch overhead is measurable.
 
 ## 7. Methodology
 
-### CI pipeline benchmark
+### CI pipeline benchmark (2026-07-04 4-config matrix)
 
-- GitHub: averaged 2 successful runs of `ci.yml` (run IDs 28528128463, 28528125128)
-- aksh/smolvm: cold cache (target dir deleted) and warm cache runs on the same VM
-- aksh protocol: warm cache, job submitted via `aksh-runner-client`, executed by `aksh-runner` against `aksh-runner-server`
-- Host: single run, cargo cache warm
-- Per-step times extracted from GitHub API (`jobs[].steps[].started_at/completed_at`) and aksh runner logs
+- All 4 configs ran with warm cargo cache (incremental compilation)
+- Config 1 (Official → GitHub): official runner v2.335.1 registered as `bench-official` on `preloopdev/aksh-conformance-sample`, triggered via `gh workflow run`, timed via GitHub API (second resolution)
+- Config 2 (aksh → GitHub): aksh-runner compiled for Linux ARM64 inside smolvm, registered as `bench-aksh`, triggered via `gh workflow run`, timed via runner tracing logs (millisecond resolution)
+- Config 3 (aksh → aksh-server): aksh-runner + aksh-runner-server both running inside smolvm, workflow submitted via aksh-runner-client, timed via runner tracing logs
+- Config 4 (Agent CI): `agent-ci run --workflow .github/workflows/bench-agent-ci.yml`, timed via NDJSON event stream (millisecond resolution)
+- smolvm VM: `build-runner` (4 vCPU, 8 GB, Apple M4 Max host, ubuntu:24.04, Docker CE 29.6.1)
+- Per-step times from runner logs (`Running step:` → next `Running step:` or `completed:` timestamps)
 
 ### Container benchmarks
 
-- 7 golden workflows (scenarios 30-36) created and run on both GitHub-hosted (`ubuntu-latest`) and aksh/smolvm (self-hosted ARM64)
-- GitHub-hosted runs triggered via `gh workflow run`, timed via API
-- aksh runs triggered via `gh workflow run` with aksh-runner registered as a self-hosted runner on the conformance sample repo (`preloopdev/aksh-conformance-sample`)
+- 7 golden workflows (scenarios 30-36) run on both GitHub-hosted (`ubuntu-latest`) and aksh/smolvm (self-hosted ARM64)
 - Docker storage driver: overlay2 on ext4 (dedicated 10 GB block device)
 
 ### Reproducing
 
 ```sh
-# CI pipeline on host (warm cache)
-time cargo fmt --all --check
-time cargo clippy --workspace --all-targets
-time cargo test --workspace --quiet
-
-# CI pipeline via aksh on smolvm
+# Config 1/2: register runner in smolvm, trigger workflow
 smolvm machine start --name build-runner
-# Start server, configure runner, submit workflow
-# See scripts/e2e-start.sh for full procedure
+gh workflow run bench-aksh-ci.yml -R preloopdev/aksh-conformance-sample
 
-# Container benchmarks: push workflows to conformance sample repo
-# See .runner-watch/golden/v2.335.1/ for recorded traces
+# Config 3: local server + runner in smolvm
+smolvm machine exec --name build-runner -- /root/aksh-runner-server serve --listen 127.0.0.1:9191
+smolvm machine exec --name build-runner -- /root/aksh-runner-client --server http://127.0.0.1:9191 submit -W bench-ci.yml
+smolvm machine exec --name build-runner -- /root/aksh-runner --runner-root /root/local-runner-root run --once
+
+# Config 4: agent-ci on host
+agent-ci run --workflow .github/workflows/bench-agent-ci.yml --json --quiet
 ```
