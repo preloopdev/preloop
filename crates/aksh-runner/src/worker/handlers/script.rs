@@ -27,8 +27,12 @@ pub async fn run_script(
     let script_id = uuid::Uuid::new_v4();
     let (script_path, program, args) = resolve_shell(shell, &temp_dir, &script_id)?;
 
-    // Write the script content
-    std::fs::write(&script_path, script)
+    // Write the script content (ensuring trailing newline)
+    let mut script_content = script.to_string();
+    if !script_content.ends_with('\n') {
+        script_content.push('\n');
+    }
+    std::fs::write(&script_path, &script_content)
         .with_context(|| format!("writing script to {}", script_path.display()))?;
 
     // Make executable on Unix
@@ -105,8 +109,12 @@ pub async fn run_script_in_container(
     let container_shell = shell.or(Some("sh"));
     let (script_path, program, args) = resolve_shell(container_shell, &temp_dir, &script_id)?;
 
-    // Write the script content
-    std::fs::write(&script_path, script)
+    // Write the script content (ensuring trailing newline)
+    let mut script_content = script.to_string();
+    if !script_content.ends_with('\n') {
+        script_content.push('\n');
+    }
+    std::fs::write(&script_path, &script_content)
         .with_context(|| format!("writing script to {}", script_path.display()))?;
 
     #[cfg(unix)]
