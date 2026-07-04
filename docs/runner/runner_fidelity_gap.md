@@ -206,7 +206,8 @@ simple-echo smoke run. Tier-1 live GitHub validation and MITM flow diffs are sti
 
 - **Found**: `container_ops.rs` (docker check, network create, start, health, path translation) has zero call sites; `job_runner` never inspects the message container spec; service containers unimplemented; `script.rs` never takes a docker-exec path.
 - **File**: `crates/aksh-runner/src/worker/container_ops.rs`, `crates/aksh-runner/src/worker/job_runner.rs`, `crates/aksh-runner/src/worker/handlers/script.rs`
-- **Status**: ❌ Pending (roadmap P1.2)
+- **Fix**: Full Docker engine lifecycle implemented — TemplateToken decoding, container/service spec parsing, Docker CLI command sequences matching golden traces (create, start, health poll, exec, cleanup), `job.container`/`job.services` runtime contexts populated, synthetic Initialize/Stop containers steps with log upload, service volumes mounted, `format()` `{{`/`}}` brace escaping fixed.
+- **Status**: ✅ Fixed (2026-07-04) — E2E validated against live GitHub (scenarios 30-36, run 28706488417) and aksh-server on smolvm.
 
 ### F029 — HIGH: step ID / display-name auto-generation missing
 
