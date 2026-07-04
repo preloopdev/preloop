@@ -465,7 +465,10 @@ async fn re_resolve_broker_url(http: &HttpClient, server_url: &str) -> Option<St
             return Some(broker_url.to_string());
         }
         // Fall back to locationServiceData properties if brokerUrl not directly on root
-        if let Some(properties) = resp.get("locationServiceData").and_then(|l| l.get("properties")) {
+        if let Some(properties) = resp
+            .get("locationServiceData")
+            .and_then(|l| l.get("properties"))
+        {
             if let Some(broker_url) = properties.get("ServerUrlV2").and_then(|v| v.as_str()) {
                 return Some(broker_url.to_string());
             }
