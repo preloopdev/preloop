@@ -456,13 +456,19 @@ pub fn build_step_list(steps: &[serde_json::Value], _job_message: &serde_json::V
                             .unwrap_or("")
                             .to_string()
                     } else {
-                        // Remote action: combine name + @ref
+                        // Remote action: combine name + /path + @ref
                         let name = ref_val.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        let path = ref_val.get("path").and_then(|v| v.as_str()).unwrap_or("");
                         let action_ref = ref_val.get("ref").and_then(|v| v.as_str());
-                        if name.contains('@') || action_ref.is_none() {
+                        let full_name = if path.is_empty() {
                             name.to_string()
                         } else {
-                            format!("{name}@{}", action_ref.unwrap())
+                            format!("{name}/{path}")
+                        };
+                        if full_name.contains('@') || action_ref.is_none() {
+                            full_name
+                        } else {
+                            format!("{full_name}@{}", action_ref.unwrap())
                         }
                     };
                     let with =
