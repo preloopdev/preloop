@@ -165,6 +165,11 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
             is_hosted_server: false,
             use_v2_flow: true,
             server_url_v2: Some(server_url_v2),
+            // F052: settings fields (defaults matching official runner)
+            disable_update: false,
+            skip_session_recover: false,
+            monitor_socket_address: None,
+            use_runner_admin_flow: false,
         },
         credentials: CredentialData {
             scheme: "OAuth".to_string(),
