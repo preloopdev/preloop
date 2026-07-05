@@ -424,6 +424,9 @@ pub struct Step {
     /// Optional if condition.
     #[serde(default, rename = "if")]
     pub if_condition: Option<String>,
+    /// Whether to continue on error.
+    #[serde(default, rename = "continue-on-error")]
+    pub continue_on_error: Option<bool>,
 }
 
 /// Action metadata from `action.yml` or `action.yaml`.
@@ -710,6 +713,7 @@ fn step_plan(step: Step) -> StepPlan {
         env: step.env.into_strings(),
         with: step.with,
         if_condition: step.if_condition,
+        continue_on_error: step.continue_on_error,
     }
 }
 
