@@ -127,9 +127,9 @@ fn xml_tag<'a>(value: &'a str, tag: &str) -> Option<&'a str> {
             let base_tag = full_tag.split_whitespace().next().unwrap_or("");
             if base_tag == tag || base_tag.ends_with(&format!(":{tag}")) {
                 let content_start = tag_start + tag_end + 1;
-                let close_str = format!("</");
+                let close_str = "</";
                 let mut close_search_idx = content_start;
-                while let Some(close_pos) = value[close_search_idx..].find(&close_str) {
+                while let Some(close_pos) = value[close_search_idx..].find(close_str) {
                     let close_tag_start = close_search_idx + close_pos + 2;
                     if let Some(close_tag_end) = value[close_tag_start..].find('>') {
                         let full_close_tag =
@@ -214,6 +214,7 @@ pub trait RsaParamsLike {
 }
 
 /// Exported RSA parameters (C# RSAParameters format).
+#[allow(missing_docs)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RsaParametersExport {
     #[serde(rename = "D")]
