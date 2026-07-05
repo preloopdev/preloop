@@ -379,19 +379,21 @@ C# source (cloned at tag `v2.335.1`). These are behavioral differences NOT cover
 
 ### F051 — MEDIUM: Problem matcher `fromPath` field not supported
 
-- **Found**: official uses `fromPath` as a base directory for resolving relative file paths in matcher output. Our `matchers.rs` does not parse or use this field.
+- **Found**: official uses `fromPath` as a base directory for resolving relative file paths in matcher output. Our `matchers.rs` did not parse or use this field.
 - **Impact**: Relative file paths in annotations resolved incorrectly or dropped.
-- **Upstream**: `Runner.Worker/Handlers/OutputManager.cs:297-303` (resolves relative paths against `fromPath`), `Runner.Worker/IssueMatcher.cs:210` (`FromPath` property)
+- **Upstream**: `Runner.Worker/Handlers/OutputManager.cs:283-290` (resolves relative paths against `fromPath`), `Runner.Worker/IssueMatcher.cs:193,210,305-306` (`FromPath` at both pattern and matcher level)
 - **File**: `crates/aksh-runner/src/worker/matchers.rs`
-- **Status**: ❌ Open
+- **Fix**: Added `from_path` field to `ProblemMatcher` (matcher-level default) and `MatcherPattern` (capture group index). `match_line()` now resolves relative file paths against `fromPath` directory (pattern capture → matcher default → leave relative). Matches official `OutputManager.cs:283-290` behavior.
+- **Status**: ✅ Fixed (2026-07-05, commit `dab6e0c`). Verified: live GitHub run 28725932080 (aksh) and official runner comparison — both produced matching `##[error]`/`##[warning]` annotations from custom problem matcher with `fromPath`.
 
 ### F052 — MEDIUM: Missing `.runner` settings fields
 
-- **Found**: official persists `DisableUpdate`, `UseRunnerAdminFlow`, `SkipSessionRecover`, `MonitorSocketAddress` in `.runner`. Our `settings.rs` does not include these fields.
+- **Found**: official persists `DisableUpdate`, `UseRunnerAdminFlow`, `SkipSessionRecover`, `MonitorSocketAddress` in `.runner`. Our `settings.rs` did not include these fields.
 - **Impact**: `SkipSessionRecover` affects session recovery behavior; others are minor runtime flags.
 - **Upstream**: `Runner.Common/ConfigurationStore.cs` (`RunnerSettings` class — all four fields with `[DataMember]` attributes)
-- **File**: `crates/aksh-runner/src/settings.rs`
-- **Status**: ❌ Open
+- **File**: `crates/aksh-runner/src/settings.rs`, `crates/aksh-runner/src/listener/broker_listener.rs`
+- **Fix**: Added `disable_update`, `skip_session_recover`, `monitor_socket_address`, and `use_runner_admin_flow` to `RunnerSettings` with `skip_serializing_if` for clean output. Wired `skip_session_recover` into broker listener session recovery logic.
+- **Status**: ✅ Fixed (2026-07-05, commit `dab6e0c`). Verified: live GitHub run 28725932090 (runner registered, all 4 steps completed — settings loaded and parsed correctly).
 
 ### F053 — MEDIUM: Missing credential data fields for auth migration
 
