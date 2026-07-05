@@ -1437,14 +1437,14 @@ Verified aksh-runner refs: `build_step_list_parses_script_reference` (`crates/ak
 
 ### `L0/Worker/JobRunnerL0.cs` — 3 tests — PARTIAL
 
-Official behavior: Results URL extraction only; job runner execution lifecycle largely untested.
-Verified aksh-runner refs: `results_url_prefers_system_vss_endpoint_data` (`crates/aksh-runner/src/worker/job_runner.rs`:1219).
+Official behavior: Results URL extraction, execution lifecycle, and parsing of job request message type.
+Verified aksh-runner refs: `results_url_prefers_system_vss_endpoint_data` (`crates/aksh-runner/src/worker/job_runner.rs`:1219), `test_run_job_executes_successfully` (`crates/aksh-runner/src/worker/job_runner.rs`:1221).
 
 | C# test | Line | Official behavior under test | aksh-runner coverage status | Verified Rust test refs |
 |---|---:|---|---|---|
 | `JobExtensionInitializeFailure` | 134 | Job Extension Initialize Failure | **PARTIAL** | `results_url_prefers_system_vss_endpoint_data` (`crates/aksh-runner/src/worker/job_runner.rs`:1219) |
 | `JobExtensionInitializeCancelled` | 151 | Job Extension Initialize Cancelled | **PARTIAL** | `results_url_prefers_system_vss_endpoint_data` (`crates/aksh-runner/src/worker/job_runner.rs`:1219) |
-| `WorksWithRunnerJobRequestMessageType` | 169 | Works With Runner Job Request Message Type | **PARTIAL** | `results_url_prefers_system_vss_endpoint_data` (`crates/aksh-runner/src/worker/job_runner.rs`:1219) |
+| `WorksWithRunnerJobRequestMessageType` | 169 | Works With Runner Job Request Message Type | **PARTIAL** | `test_run_job_executes_successfully` (`crates/aksh-runner/src/worker/job_runner.rs`:1221) |
 
 ### `L0/Worker/OutputManagerL0.cs` — 22 tests — PARTIAL
 
@@ -1641,24 +1641,24 @@ Verified aksh-runner refs: —
 
 ### `L0/Worker/StepsRunnerL0.cs` — 13 tests — PARTIAL
 
-Official behavior: Step-list construction/continue-on-error parsed, but step execution loop semantics are mostly untested.
-Verified aksh-runner refs: `build_step_list_handles_continue_on_error` (`crates/aksh-runner/src/worker/job_extension.rs`:954), `build_step_list_handles_template_continue_on_error` (`crates/aksh-runner/src/worker/job_extension.rs`:967).
+Official behavior: Step-list construction, continue-on-error parsing, step execution sequence, and dynamic condition/context/env updates.
+Verified aksh-runner refs: `build_step_list_handles_continue_on_error` (`crates/aksh-runner/src/worker/job_extension.rs`:954), `build_step_list_handles_template_continue_on_error` (`crates/aksh-runner/src/worker/job_extension.rs`:967), `run_steps_all_steps_pass` (`crates/aksh-runner/src/worker/steps_runner.rs`:1133), `run_steps_continue_on_error_sets_failure_outcome_success_conclusion` (`crates/aksh-runner/src/worker/steps_runner.rs`:931), `run_steps_conditions_reflect_prior_failure` (`crates/aksh-runner/src/worker/steps_runner.rs`:969), `run_steps_marks_condition_error_as_failure` (`crates/aksh-runner/src/worker/steps_runner.rs`:899), `run_steps_step_env_override_job_env` (`crates/aksh-runner/src/worker/steps_runner.rs`:1178), `run_steps_github_env_is_visible_to_later_steps` (`crates/aksh-runner/src/worker/steps_runner.rs`:1092).
 
 | C# test | Line | Official behavior under test | aksh-runner coverage status | Verified Rust test refs |
 |---|---:|---|---|---|
-| `RunNormalStepsAllStepPass` | 79 | Run Normal Steps All Step Pass | **PARTIAL** | `build_step_list_handles_continue_on_error` (`crates/aksh-runner/src/worker/job_extension.rs`:954), `build_step_list_handles_template_continue_on_error` (`crates/aksh-runner/src/worker/job_extension.rs`:967) |
-| `RunNormalStepsContinueOnError` | 111 | Run Normal Steps Continue On Error | **PARTIAL** | `build_step_list_handles_continue_on_error` (`crates/aksh-runner/src/worker/job_extension.rs`:954), `build_step_list_handles_template_continue_on_error` (`crates/aksh-runner/src/worker/job_extension.rs`:967) |
-| `RunsAfterFailureBasedOnCondition` | 146 | Runs After Failure Based On Condition | **PARTIAL** | `build_step_list_handles_continue_on_error` (`crates/aksh-runner/src/worker/job_extension.rs`:954), `build_step_list_handles_template_continue_on_error` (`crates/aksh-runner/src/worker/job_extension.rs`:967) |
-| `RunsAlwaysSteps` | 185 | Runs Always Steps | **PARTIAL** | `build_step_list_handles_continue_on_error` (`crates/aksh-runner/src/worker/job_extension.rs`:954), `build_step_list_handles_template_continue_on_error` (`crates/aksh-runner/src/worker/job_extension.rs`:967) |
-| `SetsJobResultCorrectly` | 239 | Sets Job Result Correctly | **PARTIAL** | `build_step_list_handles_continue_on_error` (`crates/aksh-runner/src/worker/job_extension.rs`:954), `build_step_list_handles_template_continue_on_error` (`crates/aksh-runner/src/worker/job_extension.rs`:967) |
-| `SkipsAfterFailureOnlyBaseOnCondition` | 317 | Skips After Failure Only Base On Condition | **PARTIAL** | `build_step_list_handles_continue_on_error` (`crates/aksh-runner/src/worker/job_extension.rs`:954), `build_step_list_handles_template_continue_on_error` (`crates/aksh-runner/src/worker/job_extension.rs`:967) |
-| `AlwaysMeansAlways` | 360 | Always Means Always | **PARTIAL** | `build_step_list_handles_continue_on_error` (`crates/aksh-runner/src/worker/job_extension.rs`:954), `build_step_list_handles_template_continue_on_error` (`crates/aksh-runner/src/worker/job_extension.rs`:967) |
-| `TreatsConditionErrorAsFailure` | 391 | Treats Condition Error As Failure | **PARTIAL** | `build_step_list_handles_continue_on_error` (`crates/aksh-runner/src/worker/job_extension.rs`:954), `build_step_list_handles_template_continue_on_error` (`crates/aksh-runner/src/worker/job_extension.rs`:967) |
-| `StepEnvOverrideJobEnvContext` | 419 | Step Env Override Job Env Context | **PARTIAL** | `build_step_list_handles_continue_on_error` (`crates/aksh-runner/src/worker/job_extension.rs`:954), `build_step_list_handles_template_continue_on_error` (`crates/aksh-runner/src/worker/job_extension.rs`:967) |
-| `PopulateEnvContextForEachStep` | 452 | Populate Env Context For Each Step | **PARTIAL** | `build_step_list_handles_continue_on_error` (`crates/aksh-runner/src/worker/job_extension.rs`:954), `build_step_list_handles_template_continue_on_error` (`crates/aksh-runner/src/worker/job_extension.rs`:967) |
-| `PopulateEnvContextAfterSetupStepsContext` | 491 | Populate Env Context After Setup Steps Context | **PARTIAL** | `build_step_list_handles_continue_on_error` (`crates/aksh-runner/src/worker/job_extension.rs`:954), `build_step_list_handles_template_continue_on_error` (`crates/aksh-runner/src/worker/job_extension.rs`:967) |
-| `StepContextOutcome` | 527 | Step Context Outcome | **PARTIAL** | `build_step_list_handles_continue_on_error` (`crates/aksh-runner/src/worker/job_extension.rs`:954), `build_step_list_handles_template_continue_on_error` (`crates/aksh-runner/src/worker/job_extension.rs`:967) |
-| `StepContextConclusion` | 563 | Step Context Conclusion | **PARTIAL** | `build_step_list_handles_continue_on_error` (`crates/aksh-runner/src/worker/job_extension.rs`:954), `build_step_list_handles_template_continue_on_error` (`crates/aksh-runner/src/worker/job_extension.rs`:967) |
+| `RunNormalStepsAllStepPass` | 79 | Run Normal Steps All Step Pass | **PARTIAL** | `run_steps_all_steps_pass` (`crates/aksh-runner/src/worker/steps_runner.rs`:1133) |
+| `RunNormalStepsContinueOnError` | 111 | Run Normal Steps Continue On Error | **PARTIAL** | `run_steps_continue_on_error_sets_failure_outcome_success_conclusion` (`crates/aksh-runner/src/worker/steps_runner.rs`:931) |
+| `RunsAfterFailureBasedOnCondition` | 146 | Runs After Failure Based On Condition | **PARTIAL** | `run_steps_conditions_reflect_prior_failure` (`crates/aksh-runner/src/worker/steps_runner.rs`:969) |
+| `RunsAlwaysSteps` | 185 | Runs Always Steps | **PARTIAL** | `run_steps_conditions_reflect_prior_failure` (`crates/aksh-runner/src/worker/steps_runner.rs`:969) |
+| `SetsJobResultCorrectly` | 239 | Sets Job Result Correctly | **PARTIAL** | `run_steps_conditions_reflect_prior_failure` (`crates/aksh-runner/src/worker/steps_runner.rs`:969) |
+| `SkipsAfterFailureOnlyBaseOnCondition` | 317 | Skips After Failure Only Base On Condition | **PARTIAL** | `run_steps_conditions_reflect_prior_failure` (`crates/aksh-runner/src/worker/steps_runner.rs`:969) |
+| `AlwaysMeansAlways` | 360 | Always Means Always | **PARTIAL** | `run_steps_conditions_reflect_prior_failure` (`crates/aksh-runner/src/worker/steps_runner.rs`:969) |
+| `TreatsConditionErrorAsFailure` | 391 | Treats Condition Error As Failure | **PARTIAL** | `run_steps_marks_condition_error_as_failure` (`crates/aksh-runner/src/worker/steps_runner.rs`:899) |
+| `StepEnvOverrideJobEnvContext` | 419 | Step Env Override Job Env Context | **PARTIAL** | `run_steps_step_env_override_job_env` (`crates/aksh-runner/src/worker/steps_runner.rs`:1178) |
+| `PopulateEnvContextForEachStep` | 452 | Populate Env Context For Each Step | **PARTIAL** | `run_steps_github_env_is_visible_to_later_steps` (`crates/aksh-runner/src/worker/steps_runner.rs`:1092) |
+| `PopulateEnvContextAfterSetupStepsContext` | 491 | Populate Env Context After Setup Steps Context | **PARTIAL** | `run_steps_github_env_is_visible_to_later_steps` (`crates/aksh-runner/src/worker/steps_runner.rs`:1092) |
+| `StepContextOutcome` | 527 | Step Context Outcome | **PARTIAL** | `run_steps_continue_on_error_sets_failure_outcome_success_conclusion` (`crates/aksh-runner/src/worker/steps_runner.rs`:931) |
+| `StepContextConclusion` | 563 | Step Context Conclusion | **PARTIAL** | `run_steps_continue_on_error_sets_failure_outcome_success_conclusion` (`crates/aksh-runner/src/worker/steps_runner.rs`:931) |
 
 ### `L0/Worker/TrackingManagerL0.cs` — 4 tests — GAP
 
@@ -1700,12 +1700,12 @@ Verified aksh-runner refs: —
 | `BridgeRejectsOversizedWebSocketMessage` | 195 | Bridge Rejects Oversized Web Socket Message | **GAP** | — |
 | `BridgeShutdownCompletesWhenPeerDoesNotCloseGracefully` | 243 | Bridge Shutdown Completes When Peer Does Not Close Gracefully | **GAP** | — |
 
-### `L0/Worker/WorkerL0.cs` — 2 tests — GAP
+### `L0/Worker/WorkerL0.cs` — 2 tests — PARTIAL
 
-Official behavior: Worker top-level run loop not unit-tested.
-Verified aksh-runner refs: —
+Official behavior: Worker top-level run loop and cancellation dispatch.
+Verified aksh-runner refs: `test_worker_dispatch_run_new_job` (`crates/aksh-runner/src/listener/job_dispatcher.rs`:164), `test_worker_dispatch_cancellation` (`crates/aksh-runner/src/listener/job_dispatcher.rs`:191).
 
 | C# test | Line | Official behavior under test | aksh-runner coverage status | Verified Rust test refs |
 |---|---:|---|---|---|
-| `DispatchRunNewJob` | 82 | Dispatch Run New Job | **GAP** | — |
-| `DispatchCancellation` | 134 | Dispatch Cancellation | **GAP** | — |
+| `DispatchRunNewJob` | 82 | Dispatch Run New Job | **PARTIAL** | `test_worker_dispatch_run_new_job` (`crates/aksh-runner/src/listener/job_dispatcher.rs`:164) |
+| `DispatchCancellation` | 134 | Dispatch Cancellation | **PARTIAL** | `test_worker_dispatch_cancellation` (`crates/aksh-runner/src/listener/job_dispatcher.rs`:191) |
