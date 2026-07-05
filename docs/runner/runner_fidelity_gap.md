@@ -353,19 +353,21 @@ C# source (cloned at tag `v2.335.1`). These are behavioral differences NOT cover
 
 ### F048 — HIGH: Job-level annotations hardcoded to `[]` in completejob
 
-- **Found**: official collects infrastructure failure annotations at the job level in `GlobalContext.JobAnnotations` and passes them to `CompleteJobAsync`. Our implementation hardcodes the top-level `annotations` field to `[]` — F025 only fixed per-step annotations in `stepResults`.
+- **Found**: official collects infrastructure failure annotations at the job level in `GlobalContext.JobAnnotations` and passes them to `CompleteJobAsync`. Our implementation hardcoded the top-level `annotations` field to `[]` — F025 only fixed per-step annotations in `stepResults`.
 - **Impact**: Infrastructure failures and job-level issues not visible in GitHub UI.
-- **Upstream**: `Runner.Worker/JobRunner.cs` (`GlobalContext.JobAnnotations` collection and `CompleteJobAsync` call)
-- **File**: `crates/aksh-runner/src/worker/job_runner.rs`
-- **Status**: ❌ Open (partial regression of F025)
+- **Upstream**: `Runner.Worker/JobRunner.cs` (`GlobalContext.JobAnnotations` collection and `CompleteJobAsync` call), `Runner.Worker/ExecutionContext.cs:598-615` (feature-flag gated collection from job-level issues)
+- **File**: `crates/aksh-runner/src/worker/job_runner.rs`, `crates/aksh-runner/src/worker/contexts.rs`
+- **Fix**: Added `job_annotations: Vec<Annotation>` to `JobContext`. Job-level annotations are now collected on infrastructure failures (job timeout, step execution errors) and included in the completejob body's `annotations` array. Step annotations remain in `stepResults` (F025).
+- **Status**: ✅ Fixed (2026-07-05, commit `71ad99a`). Verified: live GitHub run 28725557539 (aksh) and 28725606404 (official v2.335.1) both succeeded with matching annotation behavior.
 
 ### F049 — HIGH: Web proxy env not injected into containers
 
-- **Found**: official injects `HTTP_PROXY`/`http_proxy`, `HTTPS_PROXY`/`https_proxy`, `NO_PROXY`/`no_proxy` (both cases) from runner web proxy config into container environment. Our `container_ops.rs` has no proxy handling.
+- **Found**: official injects `HTTP_PROXY`/`http_proxy`, `HTTPS_PROXY`/`https_proxy`, `NO_PROXY`/`no_proxy` (both cases) from runner web proxy config into container environment. Our `container_ops.rs` had no proxy handling.
 - **Impact**: Container workflows behind corporate proxies fail on Docker image pulls and network access.
 - **Upstream**: `Runner.Worker/Container/ContainerInfo.cs:253-271` (`UpdateWebProxyEnv` method — `TryAdd` for each proxy var in both upper/lower case)
-- **File**: `crates/aksh-runner/src/worker/container_ops.rs`
-- **Status**: ❌ Open
+- **File**: `crates/aksh-runner/src/worker/container_ops.rs`, `crates/aksh-runner/src/worker/handlers/container.rs`
+- **Fix**: Added `inject_proxy_env()` that reads `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` (both cases) from host environment and injects into container env with `TryAdd` semantics (user-specified env takes precedence). Applied to job containers, service containers, and Docker action containers.
+- **Status**: ✅ Fixed (2026-07-05, commit `71ad99a`). Verified: live GitHub runs 28725557542 (container-proxy + service-proxy both succeeded). No proxy configured on test host → no vars injected (correct behavior).
 
 ### F050 — MEDIUM: `github.action` context not set from step action name
 
