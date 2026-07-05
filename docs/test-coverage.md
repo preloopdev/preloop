@@ -19,6 +19,24 @@ Scope: official C# runner tests under `/tmp/actions-runner-src/src/Test/L0` comp
 - Official-vs-aksh replay comparison now runs for golden scenario `06-multi-step`: `runner-watch conform --runner v2.335.1 --aksh-url http://127.0.0.1:9090 --scenario 06-multi-step --skip-cargo-test` produced `.runner-watch/conformance/v2.335.1/06-multi-step.md` with **42 official filtered flows** and **42 aksh flows**; the aggregate gate reports all status-checked flows matched recorded baseline responses.
 - `aksh-conformance runner-diff --scenario 06-multi-step --target aksh` also produced `.runner-watch/runner-conformance/06-multi-step.md`. Remaining report diffs are protocol-shape caveats, not runner-step P0 failures: e.g. OAuth replay status differences are explicitly excluded because official GitHub rejects static job-scoped assertions while aksh accepts local credentials, and `connectionData` still has schema/value differences.
 
+## Live GitHub + local aksh verification addendum — 2026-07-05
+
+Live verification uses `aksh-runner` against **real GitHub Actions** as the primary gate, then runs the same workflow fixtures against local `aksh-runner-server` where the harness can model the scenario.
+
+| Fixture / behavior bucket | GitHub run | GitHub result | Local aksh `runner-e2e` result | Notes |
+|---|---:|---|---|---|
+| `p0-step-execution.yml` | [`28754418659`](https://github.com/preloopdev/aksh-conformance-sample/actions/runs/28754418659) | success | pass | Sequential steps, `$GITHUB_ENV`, `$GITHUB_OUTPUT`, step-env override, `continue-on-error`, `success()`, step summary. |
+| `p0-failure-conditions.yml` | [`28754419325`](https://github.com/preloopdev/aksh-conformance-sample/actions/runs/28754419325) | expected failure | pass | Intentional failure verifies `success()` skip, `failure()` run, `always()` run, and final failed job result. |
+| `p0-file-commands.yml` | [`28755293879`](https://github.com/preloopdev/aksh-conformance-sample/actions/runs/28755293879) | success | pass | `NODE_OPTIONS` block, heredoc env parsing, summary size cap, secret/matcher output behavior. |
+| P0 Docker/container workflow | [`28755911596`](https://github.com/preloopdev/aksh-conformance-sample/actions/runs/28755911596) | success | not run locally | Requires Linux Docker daemon; later smolvm reruns failed at `docker pull` because VM DNS/storage setup could not reach Docker Hub, not because runner command construction failed. |
+| `p0-cancel-semantics.yml` | [`28756327702`](https://github.com/preloopdev/aksh-conformance-sample/actions/runs/28756327702) | cancelled | not run locally | External GitHub cancellation was required; runner logs showed `cancelled()` and `always()` steps ran after cancellation while `success()` skipped. |
+| `p1-expressions.yml` | [`28756574650`](https://github.com/preloopdev/aksh-conformance-sample/actions/runs/28756574650) | success | pass | Template functions, expression env fields, true/false conditions, string comparisons. |
+| `p1-listener-config.yml` | [`28756828143`](https://github.com/preloopdev/aksh-conformance-sample/actions/runs/28756828143) | success | fail / divergence found | Live GitHub covers configure, OAuth, broker session, job acquire, worker dispatch, context env, completion. Local aksh completed the job as failed because submitted local payloads did not populate every asserted GitHub context env value. |
+| `p1-process-runtime.yml` | [`28756827413`](https://github.com/preloopdev/aksh-conformance-sample/actions/runs/28756827413) | success | pass | stdout/stderr, cwd, env, exit-code failure under `continue-on-error`, timeout field, long output. |
+| `p1-protocol.yml` | [`28756578118`](https://github.com/preloopdev/aksh-conformance-sample/actions/runs/28756578118) | success | pass | Warning/error/notice annotations, groups, debug command, multiline log upload, step/job completion. |
+
+P2/P3 classification is explicit: DAP/debugging and background/wait/snapshot execution are **not implemented** in `aksh-runner`; P3 Windows service, self-update, .NET bootstrapper, and official-runner infrastructure remain **NOT_APPLICABLE/DEFERRED** for the macOS/Linux Rust runner target.
+
 ## Status definitions
 
 - **PARTIAL** — aksh-runner has tests for the same behavior family, but not every official edge case.

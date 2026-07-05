@@ -1,5 +1,7 @@
 name: P0 Container Job Verification
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+  push:
 jobs:
   container-job:
     runs-on: [self-hosted, p0-linux]
