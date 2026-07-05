@@ -54,15 +54,20 @@ impl BrokerClient {
         busy: bool,
     ) -> Result<Option<serde_json::Value>> {
         let status = if busy { "Busy" } else { "Online" };
+        let wait_seconds = if busy { 1 } else { 50 };
         let url = format!(
-            "{}/message?sessionId={session_id}&status={status}&runnerVersion={}&os={}&architecture={}&disableUpdate=false",
+            "{}/message?sessionId={session_id}&status={status}&runnerVersion={}&os={}&architecture={}&disableUpdate=false&waitSeconds={wait_seconds}",
             self.base_url,
             crate::PROTOCOL_COMPAT_VERSION,
             os_label(),
             arch_label(),
         );
         self.http
-            .get_long_poll(&url, &format!("Bearer {token}"), Duration::from_secs(50))
+            .get_long_poll(
+                &url,
+                &format!("Bearer {token}"),
+                Duration::from_secs(wait_seconds + 1),
+            )
             .await
             .context("polling broker message")
     }

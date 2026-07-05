@@ -698,6 +698,7 @@ struct InnerState {
     agent_job_requests: BTreeMap<uuid::Uuid, i64>,
     timeline_requests: BTreeMap<uuid::Uuid, i64>,
     session_active_requests: BTreeMap<String, i64>,
+    deleted_sessions: std::collections::HashSet<String>,
     next_runner_id: i64,
     next_cache_id: i64,
     next_message_id: i64,
@@ -1213,6 +1214,13 @@ async fn create_session(
         inner
             .session_keys
             .insert(session_id.to_string(), session_enc);
+        inner.sessions.insert(
+            session_id.to_string(),
+            RunnerSession {
+                session_id: aksh_gha_protocol::SessionId(session_id),
+                runner_id: request.runner_id,
+            },
+        );
     }
 
     info!(%session_id, runner_id = request.runner_id, encrypted, "session created with AES key");
@@ -1273,6 +1281,8 @@ async fn delete_session(
 ) -> StatusCode {
     let mut inner = shared.state.inner.lock().await;
     inner.sessions.remove(&session_id);
+    inner.session_keys.remove(&session_id);
+    inner.deleted_sessions.insert(session_id);
     StatusCode::NO_CONTENT
 }
 
@@ -1378,8 +1388,15 @@ async fn next_message_broker_ref(
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(50);
 
+    let runner_is_busy = params
+        .get("status")
+        .is_some_and(|status| status.eq_ignore_ascii_case("busy"));
+
     loop {
         let mut inner = shared.state.inner.lock().await;
+        if inner.deleted_sessions.contains(&session_id) {
+            return Err(ApiError::not_found("Session not found"));
+        }
         if let Some(message) = inner
             .inflight_messages
             .get(&session_id)
@@ -1410,12 +1427,44 @@ async fn next_message_broker_ref(
                 }
 
                 if request.result.is_none() {
+                    if runner_is_busy {
+                        drop(inner);
+                        if wait_seconds == 0 {
+                            return Ok((StatusCode::ACCEPTED, Json(json!({}))).into_response());
+                        }
+                        if tokio::time::timeout(
+                            Duration::from_secs(wait_seconds),
+                            shared.state.message_notify.notified(),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return Ok((StatusCode::ACCEPTED, Json(json!({}))).into_response());
+                        }
+                        continue;
+                    }
                     return Ok(Json(broker_job_ref(request, pool_id)).into_response());
                 }
             }
             inner.session_active_requests.remove(&session_id);
         }
 
+        if runner_is_busy {
+            drop(inner);
+            if wait_seconds == 0 {
+                return Ok((StatusCode::ACCEPTED, Json(json!({}))).into_response());
+            }
+            if tokio::time::timeout(
+                Duration::from_secs(wait_seconds),
+                shared.state.message_notify.notified(),
+            )
+            .await
+            .is_err()
+            {
+                return Ok((StatusCode::ACCEPTED, Json(json!({}))).into_response());
+            }
+            continue;
+        }
         let Some(queued) = inner.queue.pop_front() else {
             drop(inner);
             if wait_seconds == 0 {
@@ -1532,15 +1581,25 @@ async fn next_message_broker_ref_root(
         .get("waitSeconds")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(50);
+    let runner_is_busy = params
+        .get("status")
+        .is_some_and(|status| status.eq_ignore_ascii_case("busy"));
     let deadline = std::time::Instant::now() + Duration::from_secs(wait);
 
     loop {
         let maybe = {
             let mut inner = shared.state.inner.lock().await;
+            if inner.deleted_sessions.contains(&session_id) {
+                return Err(ApiError::not_found("Session not found"));
+            }
             if let Some(request_id) = inner.session_active_requests.get(&session_id).copied() {
                 if let Some(request) = inner.job_requests.get(&request_id) {
                     if request.result.is_none() {
-                        Some(broker_job_ref_root(request, 1))
+                        if runner_is_busy {
+                            None
+                        } else {
+                            Some(broker_job_ref_root(request, 1))
+                        }
                     } else {
                         inner.session_active_requests.remove(&session_id);
                         None
@@ -1549,6 +1608,8 @@ async fn next_message_broker_ref_root(
                     inner.session_active_requests.remove(&session_id);
                     None
                 }
+            } else if runner_is_busy {
+                None
             } else if let Some(queued) = inner.queue.pop_front() {
                 if let Some(run) = inner.runs.get_mut(&queued.run_id) {
                     run.status = ExecutionStatus::InProgress;
@@ -1583,14 +1644,9 @@ async fn next_message_broker_ref_root(
 }
 
 async fn broker_acknowledge_root(
-    State(shared): State<Arc<SharedState>>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
+    State(_shared): State<Arc<SharedState>>,
+    Query(_params): Query<std::collections::HashMap<String, String>>,
 ) -> StatusCode {
-    let session_id = params.get("sessionId").map(String::as_str).unwrap_or("");
-    if !session_id.is_empty() {
-        let mut inner = shared.state.inner.lock().await;
-        inner.session_active_requests.remove(session_id);
-    }
     StatusCode::OK
 }
 
@@ -1842,6 +1898,9 @@ async fn next_message(
 
     loop {
         let mut inner = shared.state.inner.lock().await;
+        if inner.deleted_sessions.contains(&session_id) {
+            return Err(ApiError::not_found("Session not found"));
+        }
         if let Some(message) = inner
             .inflight_messages
             .get(&session_id)
@@ -5461,6 +5520,99 @@ jobs:
             .await
             .unwrap();
         assert_eq!(ack.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn busy_runner_poll_does_not_consume_another_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": "on: push\njobs:\n  first:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo first\n  second:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo second\n",
+                "event": "push",
+                "payload": {"ref": "refs/heads/main", "commits": []},
+                "repository": "preloopdev/aksh",
+                "git_ref": "refs/heads/main",
+                "secrets": {},
+                "vars": {},
+                "reusable_workflows": {}
+            }),
+        )
+        .await;
+        assert_eq!(accepted["queued_jobs"], 2);
+
+        let session_one = request_json(
+            &app,
+            Method::POST,
+            "/runner/server/_apis/distributedtask/pools/1/sessions",
+            json!({
+                "agent": {"id": 1, "name": "runner-1"},
+                "ownerName": "runner-1",
+                "sessionId": "00000000-0000-0000-0000-000000000001",
+                "useFipsEncryption": false
+            }),
+        )
+        .await;
+        let session_one_id = session_one["sessionId"].as_str().unwrap();
+
+        let first = request_json(
+            &app,
+            Method::GET,
+            &format!("/runner/server/_apis/distributedtask/pools/1/messages?sessionId={session_one_id}&status=Online&waitSeconds=0"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(first["messageType"], "RunnerJobRequest");
+
+        let busy_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/runner/server/_apis/distributedtask/pools/1/messages?sessionId={session_one_id}&status=Busy&waitSeconds=0"))
+                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(busy_response.status(), StatusCode::ACCEPTED);
+        let busy_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(busy_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(busy_body, json!({}));
+
+        let session_two = request_json(
+            &app,
+            Method::POST,
+            "/runner/server/_apis/distributedtask/pools/1/sessions",
+            json!({
+                "agent": {"id": 2, "name": "runner-2"},
+                "ownerName": "runner-2",
+                "sessionId": "00000000-0000-0000-0000-000000000002",
+                "useFipsEncryption": false
+            }),
+        )
+        .await;
+        let session_two_id = session_two["sessionId"].as_str().unwrap();
+
+        let second = request_json(
+            &app,
+            Method::GET,
+            &format!("/runner/server/_apis/distributedtask/pools/1/messages?sessionId={session_two_id}&status=Online&waitSeconds=0"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(second["messageType"], "RunnerJobRequest");
+        assert_ne!(first["messageId"], second["messageId"]);
     }
 
     #[tokio::test]

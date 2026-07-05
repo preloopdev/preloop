@@ -32,6 +32,10 @@ Agent CI's control plane is more pragmatic and product-coupled. aksh's control p
 - Artifact API: <https://github.com/redwoodjs/agent-ci/blob/main/crates/agent-ci-runtime/src/dtu/artifacts.rs>
 - Planner/job seeding: <https://github.com/redwoodjs/agent-ci/blob/main/crates/agent-ci-runtime/src/runner/plans.rs>
 - DTU client/bootstrap: <https://github.com/redwoodjs/agent-ci/blob/main/crates/agent-ci-runtime/src/dtu.rs>
+- Docker socket requirement: <https://github.com/redwoodjs/agent-ci/blob/main/packages/cli/docs/docker-socket.md>
+- Local runner container lifecycle: <https://github.com/redwoodjs/agent-ci/blob/main/packages/cli/src/runner/local-job.ts>
+- Service container orchestration: <https://github.com/redwoodjs/agent-ci/blob/main/packages/cli/src/docker/service-containers.ts>
+- Container option handling: <https://github.com/redwoodjs/agent-ci/blob/main/packages/cli/src/docker/container-config.ts>
 
 ### aksh
 
@@ -538,6 +542,108 @@ Keep aksh's service model:
 - external runner support.
 
 That is the right decomposition if Preloop is the local CI product and aksh is the control plane under it.
+
+---
+
+## 16. If both rely on the host Docker daemon locally
+
+Using the host Docker daemon does **not** make Agent CI and aksh the same design.
+
+### Agent CI host-Docker model
+
+Agent CI is a local execution product that uses Docker as the main runtime substrate:
+
+```mermaid
+flowchart TD
+    CLI[Agent CI CLI / local orchestrator] --> DTU[Ephemeral DTU/mock API]
+    CLI --> Docker[Host Docker daemon]
+    Docker --> Runner[Official runner container]
+    Docker --> Services[Service containers]
+    Runner --> DTU
+    Runner --> Sock[/Bind-mounted host Docker socket/]
+```
+
+Key runtime properties observed from the Agent CI code:
+
+- It launches GitHub Actions runners **inside Docker containers** and bind-mounts the host Docker socket so workflow steps can call `docker build` / `docker run`.
+- In `container:` mode, it pulls the user image, extracts the official runner binary from a seed runner image, bind-mounts that runner into the user container, and runs `./run.sh --once` inside the user image.
+- It starts service containers itself with dockerode, creates an `agent-ci-net-<runner>` bridge network, assigns service aliases, and waits for Docker health state.
+- It adds Python TCP port-forward snippets so `localhost:<port>` inside the runner container can reach service containers.
+- Its `container.options` support is intentionally partial: only `--env`/`-e` and `--label`/`-l` are parsed today; other flags are ignored.
+
+This is a pragmatic local-product design. It prioritizes local speed, cache mounts, pause/retry, and making the official runner execute under a controlled orchestrator.
+
+### aksh host-Docker local model
+
+aksh should treat host Docker as a **local backend for the native runner**, not as the core architecture:
+
+```mermaid
+flowchart TD
+    Submitter[Run submitter/API] --> Aksh[aksh control plane]
+    Worker[aksh native runner/worker] --> Aksh
+    Worker --> Docker[DockerEngine backend]
+    Docker --> JobContainer[Job container]
+    Docker --> ServiceContainers[Service containers]
+```
+
+The compatibility target remains the official runner's Docker path:
+
+- `ContainerOperationProvider`
+- `DockerCommandManager`
+- `ContainerStepHost`
+- `ContainerActionHandler`
+
+That means aksh should reproduce official semantics directly:
+
+- official `jobContainer` / `jobServiceContainers` wire fields,
+- official Docker network naming and cleanup behavior,
+- official job-container mount table (`/__w`, `/__e`, `/github/home`, etc.),
+- official `docker exec` step execution from the runner into the job container,
+- official service health polling and log-group strings,
+- official `job.container` / `job.services` context shape,
+- official container option handling, not Agent CI's reduced subset.
+
+### Strategic difference
+
+If both use host Docker locally:
+
+| Dimension | Agent CI | aksh |
+| --- | --- | --- |
+| Primary goal | Local CI product loop | Reusable runner protocol service + native runner |
+| Runner process | Official runner inside Docker container | Native Rust runner/worker |
+| `container:` implementation | Runner binary injected into the user container | Runner stays outside; steps execute via Docker exec into job container |
+| Service containers | Local dockerode orchestration with product-specific port forwarding | Official runner-compatible service container lifecycle |
+| Control plane | Ephemeral DTU/mock API owned by local orchestrator | Standalone runner-facing protocol service |
+| Docker socket | Bind-mounted into runner containers | Local backend may use host daemon; prod should avoid exposing host socket |
+| Hosted/prod path | Not the control-plane focus of this doc | Fresh job VM/microVM with worker + Docker stack inside |
+
+### Security implication
+
+Host Docker is acceptable for local/trusted CI. It is not the hosted multi-tenant isolation model.
+
+For aksh hosted/prod execution, the intended shape is:
+
+```mermaid
+flowchart TD
+    Host[Trusted host orchestrator] --> VM[Fresh job VM/microVM]
+    VM --> Worker[aksh worker/runner]
+    VM --> Dockerd[Docker daemon inside VM]
+    Dockerd --> Containers[Job/service containers]
+```
+
+The host schedules, boots, streams results, enforces timeouts, and destroys the VM. User code and Docker daemon state live inside the job VM.
+
+### Practical takeaway
+
+Borrow from Agent CI for local UX:
+
+- Docker socket discovery,
+- cache mount ergonomics,
+- service startup progress,
+- runner/container cleanup,
+- pause/retry workflow ideas.
+
+Do **not** copy Agent CI's container execution model as aksh's compatibility model. aksh should implement the official runner's Docker behavior first, then choose whether that worker runs on the host for local mode or inside a fresh VM for hosted/prod mode.
 
 ---
 
