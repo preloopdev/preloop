@@ -255,6 +255,9 @@ pub struct StepPlan {
     /// Optional `if` expression.
     #[serde(default)]
     pub if_condition: Option<String>,
+    /// Whether to continue on error.
+    #[serde(default)]
+    pub continue_on_error: Option<bool>,
 }
 
 /// Context material sent to a runner.
