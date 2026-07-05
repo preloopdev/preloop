@@ -351,14 +351,18 @@ pub async fn run_steps(
                 let msg = e.to_string();
                 if msg.contains("cancelled") {
                     ("Cancelled".to_string(), "Cancelled".to_string())
-                } else if step.continue_on_error {
-                    warn!(
-                        "Step '{}' failed but continue-on-error is set: {e:#}",
-                        resolved_display_name
-                    );
-                    ("Failure".to_string(), "Success".to_string())
                 } else {
-                    ("Failure".to_string(), "Failure".to_string())
+                    step_ctx.log(&format!("##[error]{e:#}"));
+                    if step.continue_on_error {
+                        warn!(
+                            "Step '{}' failed but continue-on-error is set: {e:#}",
+                            resolved_display_name
+                        );
+                        ("Failure".to_string(), "Success".to_string())
+                    } else {
+                        warn!("Step '{}' failed: {e:#}", resolved_display_name);
+                        ("Failure".to_string(), "Failure".to_string())
+                    }
                 }
             }
         };
