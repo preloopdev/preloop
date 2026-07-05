@@ -61,7 +61,8 @@ pub fn load_action_manifest(action_dir: &Path) -> Result<ActionManifest> {
     let runs_using = runs
         .get("using")
         .and_then(|v| v.as_str())
-        .unwrap_or("")
+        .filter(|s| !s.trim().is_empty())
+        .context("action manifest missing 'runs.using'")?
         .to_string();
     let runs_main = runs.get("main").and_then(|v| v.as_str()).map(String::from);
     let runs_pre = runs
@@ -69,19 +70,31 @@ pub fn load_action_manifest(action_dir: &Path) -> Result<ActionManifest> {
         .or_else(|| runs.get("pre-entrypoint"))
         .and_then(|v| v.as_str())
         .map(String::from);
-    let runs_pre_if = runs
-        .get("pre-if")
-        .and_then(|v| v.as_str())
-        .map(String::from);
+    let runs_pre_if = if runs_pre.is_some() {
+        Some(
+            runs.get("pre-if")
+                .and_then(|v| v.as_str())
+                .unwrap_or("always()")
+                .to_string(),
+        )
+    } else {
+        None
+    };
     let runs_post = runs
         .get("post")
         .or_else(|| runs.get("post-entrypoint"))
         .and_then(|v| v.as_str())
         .map(String::from);
-    let runs_post_if = runs
-        .get("post-if")
-        .and_then(|v| v.as_str())
-        .map(String::from);
+    let runs_post_if = if runs_post.is_some() {
+        Some(
+            runs.get("post-if")
+                .and_then(|v| v.as_str())
+                .unwrap_or("always()")
+                .to_string(),
+        )
+    } else {
+        None
+    };
     let runs_steps = runs.get("steps").and_then(|v| v.as_array()).cloned();
     let runs_image = runs.get("image").and_then(|v| v.as_str()).map(String::from);
     let runs_entrypoint = runs
@@ -222,6 +235,118 @@ runs:
         assert_eq!(manifest.runs_pre_if.as_deref(), Some("success()"));
         assert_eq!(manifest.runs_post.as_deref(), Some("/post.sh"));
         assert_eq!(manifest.runs_post_if.as_deref(), Some("always()"));
+    }
+
+    #[test]
+    fn lifecycle_conditions_default_to_always_when_entrypoints_exist() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("action.yml"),
+            r#"
+name: Docker Action
+runs:
+  using: docker
+  image: Dockerfile
+  entrypoint: /entrypoint.sh
+  pre-entrypoint: /pre.sh
+  post-entrypoint: /post.sh
+"#,
+        )
+        .unwrap();
+
+        let manifest = load_action_manifest(dir.path()).unwrap();
+        assert_eq!(manifest.runs_pre_if.as_deref(), Some("always()"));
+        assert_eq!(manifest.runs_post_if.as_deref(), Some("always()"));
+    }
+
+    #[test]
+    fn lifecycle_conditions_absent_without_entrypoints() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("action.yml"),
+            r#"
+name: Docker Action
+runs:
+  using: docker
+  image: Dockerfile
+  entrypoint: /entrypoint.sh
+"#,
+        )
+        .unwrap();
+
+        let manifest = load_action_manifest(dir.path()).unwrap();
+        assert_eq!(manifest.runs_pre_if, None);
+        assert_eq!(manifest.runs_post_if, None);
+    }
+
+    #[test]
+    fn load_docker_action_manifest_with_dockerhub_image_and_optional_fields_absent() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("action.yml"),
+            r#"
+name: DockerHub Action
+runs:
+  using: docker
+  image: docker://alpine:3.20
+"#,
+        )
+        .unwrap();
+
+        let manifest = load_action_manifest(dir.path()).unwrap();
+        assert_eq!(manifest.runs_using, "docker");
+        assert_eq!(manifest.runs_image.as_deref(), Some("docker://alpine:3.20"));
+        assert_eq!(manifest.runs_entrypoint, None);
+        assert_eq!(manifest.runs_args, None);
+        assert_eq!(manifest.runs_env, None);
+        assert_eq!(manifest.runs_pre, None);
+        assert_eq!(manifest.runs_post, None);
+    }
+
+    #[test]
+    fn action_yml_takes_precedence_over_action_yaml() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("action.yml"),
+            r#"
+name: Primary
+runs:
+  using: node20
+  main: primary.js
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("action.yaml"),
+            r#"
+name: Secondary
+runs:
+  using: node20
+  main: secondary.js
+"#,
+        )
+        .unwrap();
+
+        let manifest = load_action_manifest(dir.path()).unwrap();
+        assert_eq!(manifest.name, "Primary");
+        assert_eq!(manifest.runs_main.as_deref(), Some("primary.js"));
+    }
+
+    #[test]
+    fn missing_runs_using_returns_error() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("action.yml"),
+            r#"
+name: Broken
+runs:
+  main: index.js
+"#,
+        )
+        .unwrap();
+
+        let err = load_action_manifest(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("runs.using"));
     }
 
     #[test]

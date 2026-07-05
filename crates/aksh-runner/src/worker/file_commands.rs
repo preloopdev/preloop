@@ -87,21 +87,36 @@ pub fn parse_kv_file(path: &Path) -> Result<HashMap<String, String>> {
         if let Some(pos) = line.find("<<") {
             let key = line[..pos].to_string();
             let delimiter = &line[pos + 2..];
+            if key.is_empty() || delimiter.is_empty() {
+                anyhow::bail!("Invalid file command heredoc header: {line}");
+            }
 
-            // Read until we find the delimiter on its own line
+            // Read until we find the delimiter on its own line.
             let mut value_parts = Vec::new();
+            let mut found_delimiter = false;
             for inner_line in lines.by_ref() {
                 if inner_line.trim_end() == delimiter {
+                    found_delimiter = true;
                     break;
                 }
                 value_parts.push(inner_line);
+            }
+            if !found_delimiter {
+                anyhow::bail!(
+                    "Invalid file command value for '{key}': missing heredoc delimiter '{delimiter}'"
+                );
             }
             result.insert(key, value_parts.join("\n"));
         } else if let Some(eq_pos) = line.find('=') {
             // Simple KEY=VALUE
             let key = line[..eq_pos].to_string();
             let value = line[eq_pos + 1..].to_string();
+            if key.is_empty() {
+                anyhow::bail!("Invalid file command line with empty key: {line}");
+            }
             result.insert(key, value);
+        } else {
+            anyhow::bail!("Invalid file command line: {line}");
         }
     }
 
@@ -127,9 +142,17 @@ pub fn apply_file_commands(
     step_id: &str,
     job: &mut super::contexts::JobContext,
 ) -> Result<()> {
-    // Apply GITHUB_ENV
+    // Apply GITHUB_ENV. Match the official runner security block: NODE_OPTIONS
+    // must not be set through GITHUB_ENV because it can alter runner-hosted
+    // Node action execution.
     let env_vars = parse_kv_file(&paths.env_file)?;
     for (k, v) in env_vars {
+        if k.eq_ignore_ascii_case("NODE_OPTIONS") {
+            tracing::warn!(
+                "Can't store NODE_OPTIONS output parameter using '$GITHUB_ENV' command."
+            );
+            continue;
+        }
         debug!("GITHUB_ENV: {k}={v}");
         job.env.insert(k, v);
     }
@@ -213,6 +236,42 @@ mod tests {
     }
 
     #[test]
+    fn parse_empty_values_and_multiple_values() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("env");
+        std::fs::write(&path, "EMPTY=\nFOO=bar\nFOO=baz\n").unwrap();
+        let result = parse_kv_file(&path).unwrap();
+        assert_eq!(result.get("EMPTY").map(String::as_str), Some(""));
+        assert_eq!(result.get("FOO").map(String::as_str), Some("baz"));
+    }
+
+    #[test]
+    fn parse_heredoc_empty_value() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("env");
+        std::fs::write(&path, "EMPTY<<EOF\nEOF\n").unwrap();
+        let result = parse_kv_file(&path).unwrap();
+        assert_eq!(result.get("EMPTY").map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn parse_heredoc_requires_closing_delimiter() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("env");
+        std::fs::write(&path, "BROKEN<<EOF\nunterminated\n").unwrap();
+        let err = parse_kv_file(&path).unwrap_err();
+        assert!(err.to_string().contains("missing heredoc delimiter"));
+    }
+
+    #[test]
+    fn parse_rejects_invalid_lines() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("env");
+        std::fs::write(&path, "not a command\n").unwrap();
+        let err = parse_kv_file(&path).unwrap_err();
+        assert!(err.to_string().contains("Invalid file command line"));
+    }
+    #[test]
     fn parse_path_file_lines() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("path");
@@ -254,5 +313,24 @@ mod tests {
             Some("alpha")
         );
         assert!(!job.state.contains_key("__pre_main-action"));
+    }
+
+    #[test]
+    fn github_env_blocks_node_options() {
+        let dir = TempDir::new().unwrap();
+        let paths = create_file_commands(dir.path()).unwrap();
+        std::fs::write(&paths.env_file, "NODE_OPTIONS=--require bad.js\nOK=value\n").unwrap();
+
+        let mut job = crate::worker::contexts::JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+
+        apply_file_commands(&paths, "step", &mut job).unwrap();
+
+        assert_eq!(job.env.get("OK").map(String::as_str), Some("value"));
+        assert!(!job.env.contains_key("NODE_OPTIONS"));
     }
 }
