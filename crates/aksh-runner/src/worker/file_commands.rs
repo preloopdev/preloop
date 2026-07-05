@@ -149,10 +149,16 @@ pub fn apply_file_commands(
         }
     }
 
-    // Apply GITHUB_STATE
+    // Apply GITHUB_STATE. Lifecycle synthetic steps are named __pre_<id> /
+    // __post_<id>, but their state belongs to the original action step id so
+    // post actions receive STATE_* values written by pre/main.
     let state = parse_kv_file(&paths.state_file)?;
     if !state.is_empty() {
-        let step_state = job.state.entry(step_id.to_string()).or_default();
+        let state_step_id = step_id
+            .strip_prefix("__pre_")
+            .or_else(|| step_id.strip_prefix("__post_"))
+            .unwrap_or(step_id);
+        let step_state = job.state.entry(state_step_id.to_string()).or_default();
         for (k, v) in state {
             step_state.insert(k, v);
         }
@@ -223,5 +229,30 @@ mod tests {
         assert!(paths.output_file.exists());
         cleanup_file_commands(&paths);
         assert!(!paths.env_file.exists());
+    }
+
+    #[test]
+    fn lifecycle_state_is_stored_under_original_step_id() {
+        let dir = TempDir::new().unwrap();
+        let paths = create_file_commands(dir.path()).unwrap();
+        std::fs::write(&paths.state_file, "node_pre_case=alpha\n").unwrap();
+
+        let mut job = crate::worker::contexts::JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+
+        apply_file_commands(&paths, "__pre_main-action", &mut job).unwrap();
+
+        assert_eq!(
+            job.state
+                .get("main-action")
+                .and_then(|state| state.get("node_pre_case"))
+                .map(String::as_str),
+            Some("alpha")
+        );
+        assert!(!job.state.contains_key("__pre_main-action"));
     }
 }
