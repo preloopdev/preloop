@@ -2,7 +2,7 @@ name: runner-fidelity-f042-f047
 
 on:
   push:
-    branches: [cachingv4]
+    branches: [cachingv4, main]
     paths:
       - '.github/workflows/runner-fidelity-f042-f047.yml'
   workflow_dispatch:
@@ -17,6 +17,7 @@ jobs:
       - name: Verify graceful signal handling
         shell: bash
         run: |
+          set -m
           # Start a process that traps SIGINT/SIGTERM and writes markers
           trap_script=$(mktemp)
           marker=$(mktemp)
