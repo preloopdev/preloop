@@ -125,6 +125,52 @@ fn run_composite_action_inner<'a>(
 
             info!("  Composite step: {step_name}");
 
+            // Evaluate `if` condition — skip step if condition is false
+            let step_if = step.get("if").and_then(|v| v.as_str());
+            if let Some(condition) = step_if {
+                let mut if_ctx = ctx.job.build_expression_context();
+                // Include composite inputs and nested step results in if-condition context
+                let mut inputs_map = serde_json::Map::new();
+                for (k, v) in &input_env {
+                    if let Some(name) = k.strip_prefix("INPUT_") {
+                        inputs_map.insert(name.to_lowercase(), serde_json::json!(v));
+                    }
+                }
+                if_ctx.insert("inputs", serde_json::Value::Object(inputs_map));
+                let mut nested_steps_map = serde_json::Map::new();
+                for (sid, sresult) in &nested_step_results {
+                    let mut step_val = serde_json::Map::new();
+                    step_val.insert("outcome".into(), serde_json::json!(sresult.outcome));
+                    step_val.insert("conclusion".into(), serde_json::json!(sresult.conclusion));
+                    let mut out_map = serde_json::Map::new();
+                    for (ok, ov) in &sresult.outputs {
+                        out_map.insert(ok.clone(), serde_json::json!(ov));
+                    }
+                    step_val.insert("outputs".into(), serde_json::Value::Object(out_map));
+                    nested_steps_map.insert(sid.clone(), serde_json::Value::Object(step_val));
+                }
+                if_ctx.insert("steps", serde_json::Value::Object(nested_steps_map));
+
+                match crate::worker::template::evaluate_condition(condition, &if_ctx) {
+                    Ok(true) => {} // condition met, continue
+                    Ok(false) => {
+                        info!("  Skipping composite step '{step_name}' (if: {condition} → false)");
+                        nested_step_results.insert(
+                            step_id.clone(),
+                            crate::worker::contexts::StepResult {
+                                outcome: "Skipped".to_string(),
+                                conclusion: "Skipped".to_string(),
+                                outputs: Default::default(),
+                            },
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!("  Failed to evaluate if condition for '{step_name}': {e:#}. Running step.");
+                    }
+                }
+            }
+
             let temp_dir = Path::new(workspace)
                 .parent()
                 .unwrap_or(Path::new("."))
@@ -140,9 +186,7 @@ fn run_composite_action_inner<'a>(
             }
 
             let outcome = if let Some(script) = step_run {
-                // Evaluate ${{ }} expressions in composite step scripts.
-                // Build an expression context that includes `inputs.*` from the
-                // INPUT_* env vars set above (stripping the INPUT_ prefix and lowercasing).
+                // Build expression context with inputs + nested step results
                 let mut expr_ctx = ctx.job.build_expression_context();
                 let mut inputs_map = serde_json::Map::new();
                 for (k, v) in &input_env {
@@ -151,17 +195,55 @@ fn run_composite_action_inner<'a>(
                     }
                 }
                 expr_ctx.insert("inputs", serde_json::Value::Object(inputs_map));
+
+                let mut nested_steps_map = serde_json::Map::new();
+                for (sid, sresult) in &nested_step_results {
+                    let mut step_val = serde_json::Map::new();
+                    step_val.insert("outcome".into(), serde_json::json!(sresult.outcome));
+                    step_val.insert("conclusion".into(), serde_json::json!(sresult.conclusion));
+                    let mut out_map = serde_json::Map::new();
+                    for (k, v) in &sresult.outputs {
+                        out_map.insert(k.clone(), serde_json::json!(v));
+                    }
+                    step_val.insert("outputs".into(), serde_json::Value::Object(out_map));
+                    nested_steps_map.insert(sid.clone(), serde_json::Value::Object(step_val));
+                }
+                expr_ctx.insert("steps", serde_json::Value::Object(nested_steps_map));
+
+                // Evaluate ${{ }} in step-level env: block and inject into ctx.env
+                let mut step_env_overrides = Vec::new();
+                if let Some(env_obj) = step.get("env").and_then(|v| v.as_object()) {
+                    for (ek, ev) in env_obj {
+                        let raw_val = ev.as_str().unwrap_or(&ev.to_string()).to_string();
+                        let evaluated_val =
+                            crate::worker::template::evaluate_template(&raw_val, &expr_ctx)
+                                .unwrap_or(raw_val);
+                        let prev = ctx.env.insert(ek.clone(), evaluated_val);
+                        step_env_overrides.push((ek.clone(), prev));
+                    }
+                }
+
                 let evaluated = crate::worker::template::evaluate_template(script, &expr_ctx)
                     .unwrap_or_else(|_| script.to_string());
-                super::script::run_script(
+                let result = super::script::run_script(
                     &evaluated,
                     step_shell,
                     workspace,
                     ctx,
                     Some(cancel_rx.clone()),
                 )
-                .await
-                .map(|_| "Success".to_string())
+                .await;
+
+                // Restore env overrides (step-level env is scoped to the step)
+                for (ek, prev) in step_env_overrides {
+                    if let Some(prev_val) = prev {
+                        ctx.env.insert(ek, prev_val);
+                    } else {
+                        ctx.env.remove(&ek);
+                    }
+                }
+
+                result.map(|_| "Success".to_string())
             } else if let Some(uses) = step_uses {
                 let inner_with = step
                     .get("with")
@@ -204,6 +286,11 @@ fn run_composite_action_inner<'a>(
                 Ok("Skipped".to_string())
             };
 
+            // Apply GITHUB_ENV and GITHUB_PATH from this composite step
+            // so subsequent steps see the env changes (e.g. dtolnay/rust-toolchain
+            // sets CARGO_HOME via GITHUB_ENV and adds to PATH via GITHUB_PATH)
+            crate::worker::file_commands::apply_file_commands_to_job(&file_commands, &mut ctx.job);
+
             let step_outputs =
                 crate::worker::file_commands::parse_kv_file(&file_commands.output_file)
                     .unwrap_or_default();
@@ -216,11 +303,21 @@ fn run_composite_action_inner<'a>(
                 }
             }
 
+            let continue_on_error = step
+                .get("continue-on-error")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
             let conclusion = match &outcome {
                 Ok(s) => s.clone(),
                 Err(e) => {
-                    warn!("Composite step '{step_name}' failed: {e:#}");
-                    "Failure".to_string()
+                    if continue_on_error {
+                        info!("Composite step '{step_name}' failed but continue-on-error is set: {e:#}");
+                        "Success".to_string()
+                    } else {
+                        warn!("Composite step '{step_name}' failed: {e:#}");
+                        "Failure".to_string()
+                    }
                 }
             };
 
@@ -228,13 +325,12 @@ fn run_composite_action_inner<'a>(
                 step_id.clone(),
                 crate::worker::contexts::StepResult {
                     outcome: conclusion.clone(),
-                    conclusion,
+                    conclusion: conclusion.clone(),
                     outputs: step_outputs,
                 },
             );
 
-            if outcome.is_err() {
-                // Non-continue-on-error composite step failure stops the composite
+            if outcome.is_err() && !continue_on_error {
                 break;
             }
         }
