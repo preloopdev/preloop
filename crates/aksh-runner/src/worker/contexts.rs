@@ -31,6 +31,10 @@ pub struct JobContext {
     pub state: HashMap<String, HashMap<String, String>>,
     /// Annotations collected per step_id (F025).
     pub step_annotations: HashMap<String, Vec<Annotation>>,
+    /// Job-level annotations for completejob (F048).
+    /// These are infrastructure-level issues (container failures, action download errors)
+    /// that are not tied to a specific step.
+    pub job_annotations: Vec<Annotation>,
     /// Resolved action directories keyed by the original `uses:` reference.
     pub action_paths: HashMap<String, String>,
     /// P1.6: Active problem matchers (cross-step, registered by actions like setup-node).
@@ -104,8 +108,9 @@ impl JobContext {
             masks,
             outputs: HashMap::new(),
             job_status: JobStatus::Success,
-            state: HashMap::new(),
             step_annotations: HashMap::new(),
+            job_annotations: Vec::new(),
+            state: HashMap::new(),
             action_paths: HashMap::new(),
             matchers: MatcherRegistry::new(),
             container_state: None,
@@ -182,6 +187,11 @@ impl JobContext {
         if let Some(obj) = self.context_data.as_object_mut() {
             obj.insert("github".to_string(), github);
         }
+    }
+
+    /// F048: Add a job-level annotation (infrastructure issue).
+    pub fn add_job_annotation(&mut self, annotation: Annotation) {
+        self.job_annotations.push(annotation);
     }
 
     /// Build the expression evaluation context for condition evaluation.
