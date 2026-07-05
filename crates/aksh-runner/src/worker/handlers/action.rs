@@ -19,11 +19,9 @@ pub fn run_action<'a>(
     Box::pin(async move {
         info!("Running action: {uses}");
 
-        let previous_repository = ctx.job.github_context_value("action_repository");
-        let previous_ref = ctx.job.github_context_value("action_ref");
         set_action_repository_context(ctx, uses);
 
-        let result = if uses.starts_with("docker://") {
+        if uses.starts_with("docker://") {
             super::container::run_docker_action(uses, with, workspace, ctx).await
         } else if uses.starts_with("./") || uses.starts_with("../") {
             let action_dir = std::path::Path::new(workspace).join(uses);
@@ -31,13 +29,7 @@ pub fn run_action<'a>(
         } else {
             let action_dir = resolve_remote_action(uses, workspace, ctx)?;
             run_action_from_dir(&action_dir, with, workspace, ctx, cancel_rx).await
-        };
-
-        ctx.job
-            .set_github_context_value("action_repository", previous_repository);
-        ctx.job.set_github_context_value("action_ref", previous_ref);
-
-        result
+        }
     })
 }
 
@@ -117,6 +109,12 @@ fn resolve_remote_action(
 }
 
 fn set_action_repository_context(ctx: &mut StepContext<'_>, uses: &str) {
+    // Set github.action to the step's context name (matches official runner behavior)
+    ctx.job.set_github_context_value(
+        "action",
+        Some(serde_json::Value::String(ctx.step_id.clone())),
+    );
+
     if let Some((repository, git_ref)) = action_repository_context(uses) {
         ctx.job.set_github_context_value(
             "action_repository",

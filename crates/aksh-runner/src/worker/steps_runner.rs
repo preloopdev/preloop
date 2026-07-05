@@ -237,8 +237,13 @@ pub async fn run_steps(
             step.context_name.clone(),
             resolved_display_name.clone(),
         );
-        for (k, v) in &step.env {
-            step_ctx.env.insert(k.clone(), v.clone());
+        {
+            let expr_ctx = step_ctx.job.build_expression_context();
+            for (k, v) in &step.env {
+                let evaluated = crate::worker::template::evaluate_template(v, &expr_ctx)
+                    .unwrap_or_else(|_| v.clone());
+                step_ctx.env.insert(k.clone(), evaluated);
+            }
         }
 
         let file_command_paths = {
