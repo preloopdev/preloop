@@ -137,6 +137,31 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
         "requireFipsCryptography".to_string(),
         serde_json::json!("True"),
     );
+
+    // F053: Extract auth migration fields from agent response properties
+    let props = agent_response.get("properties");
+    let enable_auth_migration = props
+        .and_then(|p| p.get("EnableAuthMigrationByDefault"))
+        .and_then(|v| v.get("$value").or(Some(v)))
+        .and_then(|v| {
+            v.as_bool()
+                .or_else(|| v.as_str().map(|s| s == "true" || s == "True"))
+        })
+        .unwrap_or(false);
+    let auth_url_v2 = props
+        .and_then(|p| p.get("AuthorizationUrlV2"))
+        .and_then(|v| v.get("$value").or(Some(v)))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    if enable_auth_migration {
+        cred_data.insert(
+            "enableAuthMigrationByDefault".to_string(),
+            serde_json::json!("true"),
+        );
+    }
+    if let Some(url_v2) = auth_url_v2 {
+        cred_data.insert("authorizationUrlV2".to_string(), serde_json::json!(url_v2));
+    }
     // P1.1: Extract broker URL from agent response properties.ServerUrlV2
     // GitHub returns `properties.ServerUrlV2.$value` = "https://broker.actions.githubusercontent.com/"
     // aksh returns it set to its own server URL. Fall back to registration service URL.
