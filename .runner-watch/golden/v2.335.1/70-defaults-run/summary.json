@@ -1,0 +1,46 @@
+{
+  "scenario": "70-defaults-run",
+  "run_id": 28754864349,
+  "name": "golden: defaults-run-working-dir",
+  "status": "completed",
+  "conclusion": "success",
+  "started_at": "2026-07-05T21:04:49Z",
+  "jobs": [
+    {
+      "name": "test-defaults",
+      "conclusion": "success",
+      "steps": [
+        {
+          "name": "Set up job",
+          "conclusion": "success",
+          "number": 1
+        },
+        {
+          "name": "Create subdir with marker",
+          "conclusion": "success",
+          "number": 2
+        },
+        {
+          "name": "Verify defaults.run.working-directory works",
+          "conclusion": "success",
+          "number": 3
+        },
+        {
+          "name": "Read file from default working dir",
+          "conclusion": "success",
+          "number": 4
+        },
+        {
+          "name": "Step override takes precedence",
+          "conclusion": "success",
+          "number": 5
+        },
+        {
+          "name": "Complete job",
+          "conclusion": "success",
+          "number": 6
+        }
+      ]
+    }
+  ]
+}
