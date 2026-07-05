@@ -19,6 +19,13 @@ pub struct ProblemMatcher {
     pub from_path: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum SeveritySpec {
+    Capture(usize),
+    Literal(String),
+}
+
 /// A single matcher pattern.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MatcherPattern {
@@ -29,8 +36,7 @@ pub struct MatcherPattern {
     pub line: Option<usize>,
     #[serde(default)]
     pub column: Option<usize>,
-    #[serde(default)]
-    pub severity: Option<usize>,
+    pub severity: Option<SeveritySpec>,
     #[serde(default)]
     pub message: Option<usize>,
     #[serde(default)]
@@ -151,12 +157,15 @@ impl MatcherRegistry {
                             .and_then(|g| captures.get(g))
                             .and_then(|m| m.as_str().parse().ok());
 
-                        let severity = pattern
-                            .severity
-                            .and_then(|g| captures.get(g))
-                            .map(|m| m.as_str());
+                        let severity = match &pattern.severity {
+                            Some(SeveritySpec::Capture(g)) => {
+                                captures.get(*g).map(|m| m.as_str().to_string())
+                            }
+                            Some(SeveritySpec::Literal(value)) => Some(value.to_string()),
+                            None => None,
+                        };
 
-                        let level = match severity {
+                        let level = match severity.as_deref() {
                             Some("warning") => {
                                 crate::worker::execution_context::AnnotationLevel::Warning
                             }
@@ -182,5 +191,45 @@ impl MatcherRegistry {
         }
 
         annotations
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worker::execution_context::AnnotationLevel;
+
+    #[test]
+    fn matcher_accepts_literal_severity() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("matcher.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "problemMatcher": [{
+                "owner": "mega",
+                "pattern": [{
+                  "regexp": "^MEGA_ERROR ([^:]+):(\\d+):(\\d+): (.*)$",
+                  "file": 1,
+                  "line": 2,
+                  "column": 3,
+                  "message": 4,
+                  "severity": "error"
+                }]
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        let mut registry = MatcherRegistry::new();
+        registry.add_from_file(&path).unwrap();
+
+        let annotations = registry.match_line("MEGA_ERROR sample.rs:12:34: boom");
+        assert_eq!(annotations.len(), 1);
+        assert_eq!(annotations[0].level, AnnotationLevel::Error);
+        assert_eq!(annotations[0].file.as_deref(), Some("sample.rs"));
+        assert_eq!(annotations[0].line, Some(12));
+        assert_eq!(annotations[0].col, Some(34));
+        assert_eq!(annotations[0].message, "boom");
     }
 }
