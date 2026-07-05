@@ -97,7 +97,11 @@ pub async fn spawn_job(
     let raw_exe = std::env::current_exe().context("finding current executable")?;
     let current_exe = if let Ok(bin) = std::env::var("CARGO_BIN_EXE_aksh-runner") {
         let p = std::path::PathBuf::from(bin);
-        if p.exists() && p.file_name().unwrap() == "aksh-runner" { p } else { raw_exe }
+        if p.exists() && p.file_name().unwrap() == "aksh-runner" {
+            p
+        } else {
+            raw_exe
+        }
     } else if let Ok(bin) = std::env::var("AKSH_RUNNER_BIN") {
         std::path::PathBuf::from(bin)
     } else {
@@ -170,8 +174,8 @@ pub async fn dispatch_job(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
     use std::time::Instant;
+    use tempfile::TempDir;
 
     #[tokio::test]
     async fn test_worker_dispatch_run_new_job() {
@@ -240,6 +244,10 @@ mod tests {
         // The job should succeed/exit (with Ok status since cancellation is handled gracefully)
         assert!(success);
         // The elapsed time should be way below 10 seconds
-        assert!(elapsed.as_secs() < 5, "Expected cancellation to exit quickly, took {:?}", elapsed);
+        assert!(
+            elapsed.as_secs() < 5,
+            "Expected cancellation to exit quickly, took {:?}",
+            elapsed
+        );
     }
 }
