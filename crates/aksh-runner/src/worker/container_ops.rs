@@ -325,6 +325,9 @@ pub async fn start_job_container(
     args.push("-e".into());
     args.push("CI=true".into());
 
+    // F049: Inject proxy env vars from host into container
+    inject_proxy_env(&mut args, &spec.env);
+
     // Docker socket auto-mount (enables DinD)
     args.push("-v".into());
     args.push("/var/run/docker.sock:/var/run/docker.sock".into());
@@ -458,6 +461,9 @@ pub async fn start_service_container(
     args.push("GITHUB_ACTIONS=true".into());
     args.push("-e".into());
     args.push("CI=true".into());
+
+    // F049: Inject proxy env vars from host into container
+    inject_proxy_env(&mut args, &service.env);
 
     // Port mappings
     for port in &service.ports {
@@ -731,6 +737,45 @@ fn push_docker_create_env(args: &mut Vec<String>, key: &str, value: &str) {
 fn push_docker_inherited_env(args: &mut Vec<String>, key: &str) {
     args.push("-e".into());
     args.push(key.to_string());
+}
+
+/// F049: Inject web proxy env vars into container if configured on the host.
+///
+/// Matches official runner `ContainerInfo.UpdateWebProxyEnv()`:
+/// - `HTTP_PROXY`/`http_proxy` from `$HTTP_PROXY` or `$http_proxy`
+/// - `HTTPS_PROXY`/`https_proxy` from `$HTTPS_PROXY` or `$https_proxy`
+/// - `NO_PROXY`/`no_proxy` from `$NO_PROXY` or `$no_proxy`
+///
+/// Uses TryAdd semantics: only injects if not already set by the container's own env.
+fn inject_proxy_env(args: &mut Vec<String>, user_env: &HashMap<String, String>) {
+    let proxy_vars = [
+        ("HTTP_PROXY", "http_proxy"),
+        ("HTTPS_PROXY", "https_proxy"),
+        ("NO_PROXY", "no_proxy"),
+    ];
+
+    for (upper, lower) in &proxy_vars {
+        // Read from host environment (check both cases)
+        let value = std::env::var(upper)
+            .or_else(|_| std::env::var(lower))
+            .unwrap_or_default();
+        if value.is_empty() {
+            continue;
+        }
+        // TryAdd: only inject if user hasn't already set this key
+        if !user_env.contains_key(*upper) {
+            push_docker_create_env(args, upper, &value);
+        }
+        if !user_env.contains_key(*lower) {
+            push_docker_create_env(args, lower, &value);
+        }
+    }
+}
+
+/// F049: Public wrapper for docker action containers.
+/// Same as `inject_proxy_env` but callable from handler modules.
+pub fn inject_proxy_env_for_docker(args: &mut Vec<String>, env: &HashMap<String, String>) {
+    inject_proxy_env(args, env);
 }
 
 fn build_docker_exec_args(
