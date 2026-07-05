@@ -1,0 +1,41 @@
+{
+  "scenario": "72-label-matching",
+  "run_id": 28754865425,
+  "name": "golden: label-matching",
+  "status": "completed",
+  "conclusion": "cancelled",
+  "started_at": "2026-07-05T21:04:52Z",
+  "jobs": [
+    {
+      "name": "labeled-job",
+      "conclusion": "cancelled",
+      "steps": []
+    },
+    {
+      "name": "ubuntu-latest-job",
+      "conclusion": "success",
+      "steps": [
+        {
+          "name": "Set up job",
+          "conclusion": "success",
+          "number": 1
+        },
+        {
+          "name": "Verify ubuntu runner",
+          "conclusion": "success",
+          "number": 2
+        },
+        {
+          "name": "Complete job",
+          "conclusion": "success",
+          "number": 3
+        }
+      ]
+    },
+    {
+      "name": "self-hosted-job",
+      "conclusion": "cancelled",
+      "steps": []
+    }
+  ]
+}

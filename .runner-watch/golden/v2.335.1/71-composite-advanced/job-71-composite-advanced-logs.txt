@@ -1,0 +1,545 @@
+test-composite-fail	Set up job	﻿2026-07-05T21:04:54.6319768Z Current runner version: '2.335.1'
+test-composite-fail	Set up job	2026-07-05T21:04:54.6355722Z ##[group]Runner Image Provisioner
+test-composite-fail	Set up job	2026-07-05T21:04:54.6357084Z Hosted Compute Agent
+test-composite-fail	Set up job	2026-07-05T21:04:54.6357984Z Version: 20260624.560
+test-composite-fail	Set up job	2026-07-05T21:04:54.6359165Z Commit: 925d229a51159bc391ae97e54a2dd1fe20af789d
+test-composite-fail	Set up job	2026-07-05T21:04:54.6360397Z Build Date: 2026-06-24T18:26:47Z
+test-composite-fail	Set up job	2026-07-05T21:04:54.6361474Z Worker ID: {afcf9e07-1101-4e59-92e1-7e1d2ea254d9}
+test-composite-fail	Set up job	2026-07-05T21:04:54.6363082Z Azure Region: eastus
+test-composite-fail	Set up job	2026-07-05T21:04:54.6364065Z ##[endgroup]
+test-composite-fail	Set up job	2026-07-05T21:04:54.6366220Z ##[group]Operating System
+test-composite-fail	Set up job	2026-07-05T21:04:54.6367279Z Ubuntu
+test-composite-fail	Set up job	2026-07-05T21:04:54.6368075Z 24.04.4
+test-composite-fail	Set up job	2026-07-05T21:04:54.6368944Z LTS
+test-composite-fail	Set up job	2026-07-05T21:04:54.6369778Z ##[endgroup]
+test-composite-fail	Set up job	2026-07-05T21:04:54.6370727Z ##[group]Runner Image
+test-composite-fail	Set up job	2026-07-05T21:04:54.6371736Z Image: ubuntu-24.04
+test-composite-fail	Set up job	2026-07-05T21:04:54.6372612Z Version: 20260628.225.1
+test-composite-fail	Set up job	2026-07-05T21:04:54.6374771Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260628.225/images/ubuntu/Ubuntu2404-Readme.md
+test-composite-fail	Set up job	2026-07-05T21:04:54.6377709Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260628.225
+test-composite-fail	Set up job	2026-07-05T21:04:54.6379478Z ##[endgroup]
+test-composite-fail	Set up job	2026-07-05T21:04:54.6381410Z ##[group]GITHUB_TOKEN Permissions
+test-composite-fail	Set up job	2026-07-05T21:04:54.6384243Z Contents: read
+test-composite-fail	Set up job	2026-07-05T21:04:54.6385157Z Metadata: read
+test-composite-fail	Set up job	2026-07-05T21:04:54.6386228Z Packages: read
+test-composite-fail	Set up job	2026-07-05T21:04:54.6387149Z ##[endgroup]
+test-composite-fail	Set up job	2026-07-05T21:04:54.6390150Z Secret source: Actions
+test-composite-fail	Set up job	2026-07-05T21:04:54.6391353Z Prepare workflow directory
+test-composite-fail	Set up job	2026-07-05T21:04:54.6726412Z Prepare all required actions
+test-composite-fail	Set up job	2026-07-05T21:04:54.6763863Z Getting action download info
+test-composite-fail	Set up job	2026-07-05T21:04:54.8513888Z Download action repository 'actions/checkout@v4' (SHA:34e114876b0b11c390a56381ad16ebd13914f8d5)
+test-composite-fail	Set up job	2026-07-05T21:04:55.0086035Z Complete job name: test-composite-fail
+test-composite-fail	Run actions/checkout@v4	﻿2026-07-05T21:04:55.0918946Z Node 20 is being deprecated. This workflow is running with Node 24 by default. If you need to temporarily use Node 20, you can set the ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true environment variable. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.0927836Z ##[group]Run actions/checkout@v4
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.0928593Z with:
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.0929101Z   repository: preloopdev/aksh-conformance-sample
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.0933150Z   token: ***
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.0933587Z   ssh-strict: true
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.0934018Z   ssh-user: git
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.0934453Z   persist-credentials: true
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.0934927Z   clean: true
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.0935363Z   sparse-checkout-cone-mode: true
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.0935881Z   fetch-depth: 1
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.0936308Z   fetch-tags: false
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.0936743Z   show-progress: true
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.0937185Z   lfs: false
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.0937592Z   submodules: false
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.0938074Z   set-safe-directory: true
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.0938812Z ##[endgroup]
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.1947197Z Syncing repository: preloopdev/aksh-conformance-sample
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.1949996Z ##[group]Getting Git version info
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.1951419Z Working directory is '/home/runner/work/aksh-conformance-sample/aksh-conformance-sample'
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.1953761Z [command]/usr/bin/git version
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.2019212Z git version 2.54.0
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.2041658Z ##[endgroup]
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.2056694Z Temporarily overriding HOME='/home/runner/work/_temp/3fb32aed-22a8-4b07-b458-63b10188a43f' before making global git config changes
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.2059383Z Adding repository directory to the temporary git global config as a safe directory
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.2064720Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/aksh-conformance-sample/aksh-conformance-sample
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.2116277Z Deleting the contents of '/home/runner/work/aksh-conformance-sample/aksh-conformance-sample'
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.2120949Z ##[group]Initializing the repository
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.2127218Z [command]/usr/bin/git init /home/runner/work/aksh-conformance-sample/aksh-conformance-sample
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.2242229Z hint: Using 'master' as the name for the initial branch. This default branch name
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.2244079Z hint: will change to "main" in Git 3.0. To configure the initial branch name
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.2245116Z hint: to use in all of your new repositories, which will suppress this warning,
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.2246386Z hint: call:
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.2247105Z hint:
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.2247981Z hint: 	git config --global init.defaultBranch <name>
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.2248998Z hint:
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.2250029Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.2251775Z hint: 'development'. The just-created branch can be renamed via this command:
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.2253407Z hint:
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.2254232Z hint: 	git branch -m <name>
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.2255167Z hint:
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.2256336Z hint: Disable this message with "git config set advice.defaultBranchName false"
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.2258537Z Initialized empty Git repository in /home/runner/work/aksh-conformance-sample/aksh-conformance-sample/.git/
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.2274816Z [command]/usr/bin/git remote add origin https://github.com/preloopdev/aksh-conformance-sample
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.2309354Z ##[endgroup]
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.2310660Z ##[group]Disabling automatic garbage collection
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.2314662Z [command]/usr/bin/git config --local gc.auto 0
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.2350755Z ##[endgroup]
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.2352074Z ##[group]Setting up auth
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.2357543Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.2393397Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.2792124Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.2831442Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.3055358Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.3089963Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.3308684Z [command]/usr/bin/git config --local http.https://github.com/.extraheader AUTHORIZATION: basic ***
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.3347319Z ##[endgroup]
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.3348223Z ##[group]Fetching the repository
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.3357572Z [command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +c3dee6bd8f424dc37e95c90f55d9e414c7c8e2b6:refs/remotes/origin/main
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.5240750Z From https://github.com/preloopdev/aksh-conformance-sample
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.5243081Z  * [new ref]         c3dee6bd8f424dc37e95c90f55d9e414c7c8e2b6 -> origin/main
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.5265683Z ##[endgroup]
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.5267215Z ##[group]Determining the checkout info
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.5268932Z ##[endgroup]
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.5274918Z [command]/usr/bin/git sparse-checkout disable
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.5326482Z [command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.5359417Z ##[group]Checking out the ref
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.5365190Z [command]/usr/bin/git checkout --progress --force -B main refs/remotes/origin/main
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.5505059Z Switched to a new branch 'main'
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.5508366Z branch 'main' set up to track 'origin/main'.
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.5516370Z ##[endgroup]
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.5565280Z [command]/usr/bin/git log -1 --format=%H
+test-composite-fail	Run actions/checkout@v4	2026-07-05T21:04:55.5591862Z c3dee6bd8f424dc37e95c90f55d9e414c7c8e2b6
+test-composite-fail	Run composite in fail mode (continue-on-error)	﻿2026-07-05T21:04:55.6041012Z Prepare all required actions
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6238723Z ##[group]Run ./.github/actions/composite-advanced
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6240174Z with:
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6240919Z   mode: fail
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6241683Z ##[endgroup]
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6380477Z ##[group]Run echo "MODE=fail" >> "$GITHUB_ENV"
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6381749Z ^[[36;1mecho "MODE=fail" >> "$GITHUB_ENV"^[[0m
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6383465Z ^[[36;1mecho "COMPOSITE_PATH_ENTRY=/tmp/composite-bin" >> "$GITHUB_PATH"^[[0m
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6385001Z ^[[36;1mecho "Setup complete, mode=fail"^[[0m
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6559368Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6560984Z ##[endgroup]
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6649674Z Setup complete, mode=fail
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6753435Z ##[group]Run echo "MODE from GITHUB_ENV: $MODE"
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6754743Z ^[[36;1mecho "MODE from GITHUB_ENV: $MODE"^[[0m
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6755866Z ^[[36;1mif [[ -z "$MODE" ]]; then^[[0m
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6757239Z ^[[36;1m  echo "FAIL: GITHUB_ENV not propagated between composite steps"^[[0m
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6758716Z ^[[36;1m  exit 1^[[0m
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6759483Z ^[[36;1mfi^[[0m
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6760326Z ^[[36;1mecho "PASS: GITHUB_ENV propagated"^[[0m
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6761465Z ^[[36;1mecho "PATH check: $PATH"^[[0m
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6762590Z ^[[36;1mif [[ "$PATH" != */tmp/composite-bin* ]]; then^[[0m
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6764406Z ^[[36;1m  echo "FAIL: GITHUB_PATH not propagated between composite steps"^[[0m
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6765833Z ^[[36;1m  exit 1^[[0m
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6766594Z ^[[36;1mfi^[[0m
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6767435Z ^[[36;1mecho "PASS: GITHUB_PATH propagated"^[[0m
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6803060Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6804342Z env:
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6805044Z   MODE: fail
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6805772Z ##[endgroup]
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6875644Z MODE from GITHUB_ENV: fail
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6877106Z PASS: GITHUB_ENV propagated
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6883249Z PATH check: COMPOSITE_PATH_ENTRY=/tmp/composite-bin:/snap/bin:/home/runner/.local/bin:/opt/pipx_bin:/home/runner/.cargo/bin:/home/runner/.config/composer/vendor/bin:/usr/local/.ghcup/bin:/home/runner/.dotnet/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6888665Z PASS: GITHUB_PATH propagated
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6949325Z ##[group]Run echo "This step intentionally fails"
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6950578Z ^[[36;1mecho "This step intentionally fails"^[[0m
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6951621Z ^[[36;1mexit 1^[[0m
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6981725Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6983079Z env:
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6983738Z   MODE: fail
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.6984429Z ##[endgroup]
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.7054750Z This step intentionally fails
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.7067216Z ##[error]Process completed with exit code 1.
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.7200577Z ##[group]Run echo "PASS: detected intentional-fail outcome=failure"
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.7202189Z ^[[36;1mecho "PASS: detected intentional-fail outcome=failure"^[[0m
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.7203778Z ^[[36;1mecho "PASS: conclusion=success"^[[0m
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.7236609Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.7237811Z env:
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.7238470Z   MODE: fail
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.7239166Z ##[endgroup]
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.7303815Z PASS: detected intentional-fail outcome=failure
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.7305744Z PASS: conclusion=success
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.7347981Z ##[group]Run echo "result=all-checks-passed" >> "$GITHUB_OUTPUT"
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.7349474Z ^[[36;1mecho "result=all-checks-passed" >> "$GITHUB_OUTPUT"^[[0m
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.7350772Z ^[[36;1mecho "All composite checks passed"^[[0m
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.7380966Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.7382168Z env:
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.7383020Z   MODE: fail
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.7383735Z ##[endgroup]
+test-composite-fail	Run composite in fail mode (continue-on-error)	2026-07-05T21:04:55.7446863Z All composite checks passed
+test-composite-fail	Verify fail mode still succeeds (continue-on-error)	﻿2026-07-05T21:04:55.7582187Z ##[group]Run echo "Output: all-checks-passed"
+test-composite-fail	Verify fail mode still succeeds (continue-on-error)	2026-07-05T21:04:55.7583626Z ^[[36;1mecho "Output: all-checks-passed"^[[0m
+test-composite-fail	Verify fail mode still succeeds (continue-on-error)	2026-07-05T21:04:55.7585104Z ^[[36;1mif [[ "all-checks-passed" != "all-checks-passed" ]]; then^[[0m
+test-composite-fail	Verify fail mode still succeeds (continue-on-error)	2026-07-05T21:04:55.7586829Z ^[[36;1m  echo "FAIL: composite with continue-on-error should still produce output"^[[0m
+test-composite-fail	Verify fail mode still succeeds (continue-on-error)	2026-07-05T21:04:55.7588265Z ^[[36;1m  exit 1^[[0m
+test-composite-fail	Verify fail mode still succeeds (continue-on-error)	2026-07-05T21:04:55.7588971Z ^[[36;1mfi^[[0m
+test-composite-fail	Verify fail mode still succeeds (continue-on-error)	2026-07-05T21:04:55.7589892Z ^[[36;1mecho "PASS: composite continue-on-error works"^[[0m
+test-composite-fail	Verify fail mode still succeeds (continue-on-error)	2026-07-05T21:04:55.7620771Z shell: /usr/bin/bash -e {0}
+test-composite-fail	Verify fail mode still succeeds (continue-on-error)	2026-07-05T21:04:55.7621635Z env:
+test-composite-fail	Verify fail mode still succeeds (continue-on-error)	2026-07-05T21:04:55.7622292Z   MODE: fail
+test-composite-fail	Verify fail mode still succeeds (continue-on-error)	2026-07-05T21:04:55.7623236Z ##[endgroup]
+test-composite-fail	Verify fail mode still succeeds (continue-on-error)	2026-07-05T21:04:55.7685536Z Output: all-checks-passed
+test-composite-fail	Verify fail mode still succeeds (continue-on-error)	2026-07-05T21:04:55.7687638Z PASS: composite continue-on-error works
+test-composite-fail	Post Run actions/checkout@v4	﻿2026-07-05T21:04:55.7898718Z Node 20 is being deprecated. This workflow is running with Node 24 by default. If you need to temporarily use Node 20, you can set the ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true environment variable. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+test-composite-fail	Post Run actions/checkout@v4	2026-07-05T21:04:55.7903409Z Post job cleanup.
+test-composite-fail	Post Run actions/checkout@v4	2026-07-05T21:04:55.8739899Z [command]/usr/bin/git version
+test-composite-fail	Post Run actions/checkout@v4	2026-07-05T21:04:55.8789699Z git version 2.54.0
+test-composite-fail	Post Run actions/checkout@v4	2026-07-05T21:04:55.8826693Z Temporarily overriding HOME='/home/runner/work/_temp/8c9c0dd4-b057-4faa-9caa-33022643fb13' before making global git config changes
+test-composite-fail	Post Run actions/checkout@v4	2026-07-05T21:04:55.8830299Z Adding repository directory to the temporary git global config as a safe directory
+test-composite-fail	Post Run actions/checkout@v4	2026-07-05T21:04:55.8834300Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/aksh-conformance-sample/aksh-conformance-sample
+test-composite-fail	Post Run actions/checkout@v4	2026-07-05T21:04:55.8871802Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+test-composite-fail	Post Run actions/checkout@v4	2026-07-05T21:04:55.8909549Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+test-composite-fail	Post Run actions/checkout@v4	2026-07-05T21:04:55.9148961Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+test-composite-fail	Post Run actions/checkout@v4	2026-07-05T21:04:55.9176568Z http.https://github.com/.extraheader
+test-composite-fail	Post Run actions/checkout@v4	2026-07-05T21:04:55.9188342Z [command]/usr/bin/git config --local --unset-all http.https://github.com/.extraheader
+test-composite-fail	Post Run actions/checkout@v4	2026-07-05T21:04:55.9236062Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+test-composite-fail	Post Run actions/checkout@v4	2026-07-05T21:04:55.9495799Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+test-composite-fail	Post Run actions/checkout@v4	2026-07-05T21:04:55.9543172Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+test-composite-fail	Complete job	﻿2026-07-05T21:04:55.9957819Z Cleaning up orphan processes
+test-composite-fail	Complete job	2026-07-05T21:04:56.0373968Z ##[warning]Node.js 20 is deprecated. The following actions target Node.js 20 but are being forced to run on Node.js 24: actions/checkout@v4. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+test-composite-pass	Set up job	﻿2026-07-05T21:04:54.7965387Z Current runner version: '2.335.1'
+test-composite-pass	Set up job	2026-07-05T21:04:54.7991846Z ##[group]Runner Image Provisioner
+test-composite-pass	Set up job	2026-07-05T21:04:54.7992729Z Hosted Compute Agent
+test-composite-pass	Set up job	2026-07-05T21:04:54.7993328Z Version: 20260624.560
+test-composite-pass	Set up job	2026-07-05T21:04:54.7994094Z Commit: 925d229a51159bc391ae97e54a2dd1fe20af789d
+test-composite-pass	Set up job	2026-07-05T21:04:54.7994815Z Build Date: 2026-06-24T18:26:47Z
+test-composite-pass	Set up job	2026-07-05T21:04:54.7995565Z Worker ID: {874efdf0-1159-447d-bba1-c7ce5b7d4557}
+test-composite-pass	Set up job	2026-07-05T21:04:54.7996290Z Azure Region: eastus
+test-composite-pass	Set up job	2026-07-05T21:04:54.7996883Z ##[endgroup]
+test-composite-pass	Set up job	2026-07-05T21:04:54.7998642Z ##[group]Operating System
+test-composite-pass	Set up job	2026-07-05T21:04:54.7999312Z Ubuntu
+test-composite-pass	Set up job	2026-07-05T21:04:54.7999853Z 24.04.4
+test-composite-pass	Set up job	2026-07-05T21:04:54.8000427Z LTS
+test-composite-pass	Set up job	2026-07-05T21:04:54.8000908Z ##[endgroup]
+test-composite-pass	Set up job	2026-07-05T21:04:54.8001434Z ##[group]Runner Image
+test-composite-pass	Set up job	2026-07-05T21:04:54.8002126Z Image: ubuntu-24.04
+test-composite-pass	Set up job	2026-07-05T21:04:54.8002716Z Version: 20260628.225.1
+test-composite-pass	Set up job	2026-07-05T21:04:54.8003877Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260628.225/images/ubuntu/Ubuntu2404-Readme.md
+test-composite-pass	Set up job	2026-07-05T21:04:54.8005554Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260628.225
+test-composite-pass	Set up job	2026-07-05T21:04:54.8006597Z ##[endgroup]
+test-composite-pass	Set up job	2026-07-05T21:04:54.8008206Z ##[group]GITHUB_TOKEN Permissions
+test-composite-pass	Set up job	2026-07-05T21:04:54.8010477Z Contents: read
+test-composite-pass	Set up job	2026-07-05T21:04:54.8011098Z Metadata: read
+test-composite-pass	Set up job	2026-07-05T21:04:54.8011721Z Packages: read
+test-composite-pass	Set up job	2026-07-05T21:04:54.8012310Z ##[endgroup]
+test-composite-pass	Set up job	2026-07-05T21:04:54.8014475Z Secret source: Actions
+test-composite-pass	Set up job	2026-07-05T21:04:54.8015550Z Prepare workflow directory
+test-composite-pass	Set up job	2026-07-05T21:04:54.8343470Z Prepare all required actions
+test-composite-pass	Set up job	2026-07-05T21:04:54.8381673Z Getting action download info
+test-composite-pass	Set up job	2026-07-05T21:04:55.0599129Z Download action repository 'actions/checkout@v4' (SHA:34e114876b0b11c390a56381ad16ebd13914f8d5)
+test-composite-pass	Set up job	2026-07-05T21:04:55.2190913Z Complete job name: test-composite-pass
+test-composite-pass	Run actions/checkout@v4	﻿2026-07-05T21:04:55.3070290Z Node 20 is being deprecated. This workflow is running with Node 24 by default. If you need to temporarily use Node 20, you can set the ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true environment variable. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.3079250Z ##[group]Run actions/checkout@v4
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.3080023Z with:
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.3080529Z   repository: preloopdev/aksh-conformance-sample
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.3084625Z   token: ***
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.3085050Z   ssh-strict: true
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.3085485Z   ssh-user: git
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.3085925Z   persist-credentials: true
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.3086409Z   clean: true
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.3086850Z   sparse-checkout-cone-mode: true
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.3087822Z   fetch-depth: 1
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.3088280Z   fetch-tags: false
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.3088718Z   show-progress: true
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.3089170Z   lfs: false
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.3089576Z   submodules: false
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.3090069Z   set-safe-directory: true
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.3090971Z ##[endgroup]
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.4078772Z Syncing repository: preloopdev/aksh-conformance-sample
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.4080775Z ##[group]Getting Git version info
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.4081784Z Working directory is '/home/runner/work/aksh-conformance-sample/aksh-conformance-sample'
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.4083560Z [command]/usr/bin/git version
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.4154295Z git version 2.54.0
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.4178907Z ##[endgroup]
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.4203587Z Temporarily overriding HOME='/home/runner/work/_temp/66bb88a9-4ae7-41fe-a30e-549922a93cc0' before making global git config changes
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.4208615Z Adding repository directory to the temporary git global config as a safe directory
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.4211106Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/aksh-conformance-sample/aksh-conformance-sample
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.4258741Z Deleting the contents of '/home/runner/work/aksh-conformance-sample/aksh-conformance-sample'
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.4262241Z ##[group]Initializing the repository
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.4267881Z [command]/usr/bin/git init /home/runner/work/aksh-conformance-sample/aksh-conformance-sample
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.4416742Z hint: Using 'master' as the name for the initial branch. This default branch name
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.4418832Z hint: will change to "main" in Git 3.0. To configure the initial branch name
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.4420619Z hint: to use in all of your new repositories, which will suppress this warning,
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.4421838Z hint: call:
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.4422760Z hint:
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.4423537Z hint: 	git config --global init.defaultBranch <name>
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.4424631Z hint:
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.4425627Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.4427349Z hint: 'development'. The just-created branch can be renamed via this command:
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.4428543Z hint:
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.4429177Z hint: 	git branch -m <name>
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.4429938Z hint:
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.4431079Z hint: Disable this message with "git config set advice.defaultBranchName false"
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.4433289Z Initialized empty Git repository in /home/runner/work/aksh-conformance-sample/aksh-conformance-sample/.git/
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.4440519Z [command]/usr/bin/git remote add origin https://github.com/preloopdev/aksh-conformance-sample
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.4524982Z ##[endgroup]
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.4526444Z ##[group]Disabling automatic garbage collection
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.4528672Z [command]/usr/bin/git config --local gc.auto 0
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.4583677Z ##[endgroup]
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.4585527Z ##[group]Setting up auth
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.4586915Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.4619617Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.5003321Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.5040330Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.5270834Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.5308208Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.5529456Z [command]/usr/bin/git config --local http.https://github.com/.extraheader AUTHORIZATION: basic ***
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.5567570Z ##[endgroup]
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.5568403Z ##[group]Fetching the repository
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.5576879Z [command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +c3dee6bd8f424dc37e95c90f55d9e414c7c8e2b6:refs/remotes/origin/main
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.7416301Z From https://github.com/preloopdev/aksh-conformance-sample
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.7418900Z  * [new ref]         c3dee6bd8f424dc37e95c90f55d9e414c7c8e2b6 -> origin/main
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.7461144Z ##[endgroup]
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.7462385Z ##[group]Determining the checkout info
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.7463939Z ##[endgroup]
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.7473190Z [command]/usr/bin/git sparse-checkout disable
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.7530130Z [command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.7566904Z ##[group]Checking out the ref
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.7574143Z [command]/usr/bin/git checkout --progress --force -B main refs/remotes/origin/main
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.7683428Z Switched to a new branch 'main'
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.7685749Z branch 'main' set up to track 'origin/main'.
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.7701614Z ##[endgroup]
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.7753936Z [command]/usr/bin/git log -1 --format=%H
+test-composite-pass	Run actions/checkout@v4	2026-07-05T21:04:55.7782359Z c3dee6bd8f424dc37e95c90f55d9e414c7c8e2b6
+test-composite-pass	Run composite in pass mode	﻿2026-07-05T21:04:55.8185457Z Prepare all required actions
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.8366088Z ##[group]Run ./.github/actions/composite-advanced
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.8368036Z with:
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.8368513Z   mode: pass
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.8369149Z ##[endgroup]
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.8509061Z ##[group]Run echo "MODE=pass" >> "$GITHUB_ENV"
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.8510153Z ^[[36;1mecho "MODE=pass" >> "$GITHUB_ENV"^[[0m
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.8511516Z ^[[36;1mecho "COMPOSITE_PATH_ENTRY=/tmp/composite-bin" >> "$GITHUB_PATH"^[[0m
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.8512919Z ^[[36;1mecho "Setup complete, mode=pass"^[[0m
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.8727428Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.8728524Z ##[endgroup]
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.8812042Z Setup complete, mode=pass
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.8877752Z ##[group]Run echo "MODE from GITHUB_ENV: $MODE"
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.8878729Z ^[[36;1mecho "MODE from GITHUB_ENV: $MODE"^[[0m
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.8879556Z ^[[36;1mif [[ -z "$MODE" ]]; then^[[0m
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.8880594Z ^[[36;1m  echo "FAIL: GITHUB_ENV not propagated between composite steps"^[[0m
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.8881716Z ^[[36;1m  exit 1^[[0m
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.8882211Z ^[[36;1mfi^[[0m
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.8882757Z ^[[36;1mecho "PASS: GITHUB_ENV propagated"^[[0m
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.8883569Z ^[[36;1mecho "PATH check: $PATH"^[[0m
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.8884396Z ^[[36;1mif [[ "$PATH" != */tmp/composite-bin* ]]; then^[[0m
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.8885594Z ^[[36;1m  echo "FAIL: GITHUB_PATH not propagated between composite steps"^[[0m
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.8886642Z ^[[36;1m  exit 1^[[0m
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.8887433Z ^[[36;1mfi^[[0m
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.8888042Z ^[[36;1mecho "PASS: GITHUB_PATH propagated"^[[0m
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.8922382Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.8923354Z env:
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.8923787Z   MODE: pass
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.8924258Z ##[endgroup]
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.8988261Z MODE from GITHUB_ENV: pass
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.8989429Z PASS: GITHUB_ENV propagated
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.8993965Z PATH check: COMPOSITE_PATH_ENTRY=/tmp/composite-bin:/snap/bin:/home/runner/.local/bin:/opt/pipx_bin:/home/runner/.cargo/bin:/home/runner/.config/composer/vendor/bin:/usr/local/.ghcup/bin:/home/runner/.dotnet/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.8998118Z PASS: GITHUB_PATH propagated
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.9071966Z ##[group]Run echo "result=all-checks-passed" >> "$GITHUB_OUTPUT"
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.9073184Z ^[[36;1mecho "result=all-checks-passed" >> "$GITHUB_OUTPUT"^[[0m
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.9074188Z ^[[36;1mecho "All composite checks passed"^[[0m
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.9105221Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.9106159Z env:
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.9106585Z   MODE: pass
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.9107302Z ##[endgroup]
+test-composite-pass	Run composite in pass mode	2026-07-05T21:04:55.9236957Z All composite checks passed
+test-composite-pass	Verify pass output	﻿2026-07-05T21:04:55.9333607Z ##[group]Run echo "Output: all-checks-passed"
+test-composite-pass	Verify pass output	2026-07-05T21:04:55.9334532Z ^[[36;1mecho "Output: all-checks-passed"^[[0m
+test-composite-pass	Verify pass output	2026-07-05T21:04:55.9335513Z ^[[36;1mif [[ "all-checks-passed" != "all-checks-passed" ]]; then^[[0m
+test-composite-pass	Verify pass output	2026-07-05T21:04:55.9336622Z ^[[36;1m  echo "FAIL: expected all-checks-passed"^[[0m
+test-composite-pass	Verify pass output	2026-07-05T21:04:55.9337837Z ^[[36;1m  exit 1^[[0m
+test-composite-pass	Verify pass output	2026-07-05T21:04:55.9338335Z ^[[36;1mfi^[[0m
+test-composite-pass	Verify pass output	2026-07-05T21:04:55.9338901Z ^[[36;1mecho "PASS: composite pass mode works"^[[0m
+test-composite-pass	Verify pass output	2026-07-05T21:04:55.9370518Z shell: /usr/bin/bash -e {0}
+test-composite-pass	Verify pass output	2026-07-05T21:04:55.9371131Z env:
+test-composite-pass	Verify pass output	2026-07-05T21:04:55.9371557Z   MODE: pass
+test-composite-pass	Verify pass output	2026-07-05T21:04:55.9372019Z ##[endgroup]
+test-composite-pass	Verify pass output	2026-07-05T21:04:55.9429061Z Output: all-checks-passed
+test-composite-pass	Verify pass output	2026-07-05T21:04:55.9429814Z PASS: composite pass mode works
+test-composite-pass	Post Run actions/checkout@v4	﻿2026-07-05T21:04:55.9614348Z Node 20 is being deprecated. This workflow is running with Node 24 by default. If you need to temporarily use Node 20, you can set the ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true environment variable. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+test-composite-pass	Post Run actions/checkout@v4	2026-07-05T21:04:55.9618733Z Post job cleanup.
+test-composite-pass	Post Run actions/checkout@v4	2026-07-05T21:04:56.0450654Z [command]/usr/bin/git version
+test-composite-pass	Post Run actions/checkout@v4	2026-07-05T21:04:56.0494064Z git version 2.54.0
+test-composite-pass	Post Run actions/checkout@v4	2026-07-05T21:04:56.0539970Z Temporarily overriding HOME='/home/runner/work/_temp/c5f5037f-5c6b-4495-b7bd-8c7b4c36a6df' before making global git config changes
+test-composite-pass	Post Run actions/checkout@v4	2026-07-05T21:04:56.0542389Z Adding repository directory to the temporary git global config as a safe directory
+test-composite-pass	Post Run actions/checkout@v4	2026-07-05T21:04:56.0548401Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/aksh-conformance-sample/aksh-conformance-sample
+test-composite-pass	Post Run actions/checkout@v4	2026-07-05T21:04:56.0589344Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+test-composite-pass	Post Run actions/checkout@v4	2026-07-05T21:04:56.0651784Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+test-composite-pass	Post Run actions/checkout@v4	2026-07-05T21:04:56.0892572Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+test-composite-pass	Post Run actions/checkout@v4	2026-07-05T21:04:56.0919422Z http.https://github.com/.extraheader
+test-composite-pass	Post Run actions/checkout@v4	2026-07-05T21:04:56.0935297Z [command]/usr/bin/git config --local --unset-all http.https://github.com/.extraheader
+test-composite-pass	Post Run actions/checkout@v4	2026-07-05T21:04:56.0972395Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+test-composite-pass	Post Run actions/checkout@v4	2026-07-05T21:04:56.1230545Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+test-composite-pass	Post Run actions/checkout@v4	2026-07-05T21:04:56.1256047Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+test-composite-pass	Complete job	﻿2026-07-05T21:04:56.1649287Z Cleaning up orphan processes
+test-composite-pass	Complete job	2026-07-05T21:04:56.2034543Z ##[warning]Node.js 20 is deprecated. The following actions target Node.js 20 but are being forced to run on Node.js 24: actions/checkout@v4. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+test-env-propagation	Set up job	﻿2026-07-05T21:04:56.6257466Z Current runner version: '2.335.1'
+test-env-propagation	Set up job	2026-07-05T21:04:56.6282728Z ##[group]Runner Image Provisioner
+test-env-propagation	Set up job	2026-07-05T21:04:56.6283606Z Hosted Compute Agent
+test-env-propagation	Set up job	2026-07-05T21:04:56.6284267Z Version: 20260624.560
+test-env-propagation	Set up job	2026-07-05T21:04:56.6284916Z Commit: 925d229a51159bc391ae97e54a2dd1fe20af789d
+test-env-propagation	Set up job	2026-07-05T21:04:56.6285636Z Build Date: 2026-06-24T18:26:47Z
+test-env-propagation	Set up job	2026-07-05T21:04:56.6286414Z Worker ID: {3b22c96e-d6a1-4a23-8b6a-3ec7032dd4a6}
+test-env-propagation	Set up job	2026-07-05T21:04:56.6287417Z Azure Region: westus
+test-env-propagation	Set up job	2026-07-05T21:04:56.6287993Z ##[endgroup]
+test-env-propagation	Set up job	2026-07-05T21:04:56.6289528Z ##[group]Operating System
+test-env-propagation	Set up job	2026-07-05T21:04:56.6290175Z Ubuntu
+test-env-propagation	Set up job	2026-07-05T21:04:56.6290831Z 24.04.4
+test-env-propagation	Set up job	2026-07-05T21:04:56.6291362Z LTS
+test-env-propagation	Set up job	2026-07-05T21:04:56.6291893Z ##[endgroup]
+test-env-propagation	Set up job	2026-07-05T21:04:56.6292488Z ##[group]Runner Image
+test-env-propagation	Set up job	2026-07-05T21:04:56.6293085Z Image: ubuntu-24.04
+test-env-propagation	Set up job	2026-07-05T21:04:56.6293626Z Version: 20260628.225.1
+test-env-propagation	Set up job	2026-07-05T21:04:56.6294775Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260628.225/images/ubuntu/Ubuntu2404-Readme.md
+test-env-propagation	Set up job	2026-07-05T21:04:56.6296526Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260628.225
+test-env-propagation	Set up job	2026-07-05T21:04:56.6297755Z ##[endgroup]
+test-env-propagation	Set up job	2026-07-05T21:04:56.6298991Z ##[group]GITHUB_TOKEN Permissions
+test-env-propagation	Set up job	2026-07-05T21:04:56.6300895Z Contents: read
+test-env-propagation	Set up job	2026-07-05T21:04:56.6301504Z Metadata: read
+test-env-propagation	Set up job	2026-07-05T21:04:56.6302165Z Packages: read
+test-env-propagation	Set up job	2026-07-05T21:04:56.6302766Z ##[endgroup]
+test-env-propagation	Set up job	2026-07-05T21:04:56.6304864Z Secret source: Actions
+test-env-propagation	Set up job	2026-07-05T21:04:56.6305996Z Prepare workflow directory
+test-env-propagation	Set up job	2026-07-05T21:04:56.6643921Z Prepare all required actions
+test-env-propagation	Set up job	2026-07-05T21:04:56.6683990Z Getting action download info
+test-env-propagation	Set up job	2026-07-05T21:04:57.0407691Z Download action repository 'actions/checkout@v4' (SHA:34e114876b0b11c390a56381ad16ebd13914f8d5)
+test-env-propagation	Set up job	2026-07-05T21:04:57.2109538Z Complete job name: test-env-propagation
+test-env-propagation	Run actions/checkout@v4	﻿2026-07-05T21:04:57.2923041Z Node 20 is being deprecated. This workflow is running with Node 24 by default. If you need to temporarily use Node 20, you can set the ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true environment variable. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.2932233Z ##[group]Run actions/checkout@v4
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.2933046Z with:
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.2933616Z   repository: preloopdev/aksh-conformance-sample
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.2937986Z   token: ***
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.2938586Z   ssh-strict: true
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.2939089Z   ssh-user: git
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.2939585Z   persist-credentials: true
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.2940127Z   clean: true
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.2940627Z   sparse-checkout-cone-mode: true
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.2941172Z   fetch-depth: 1
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.2941606Z   fetch-tags: false
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.2942053Z   show-progress: true
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.2942502Z   lfs: false
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.2942919Z   submodules: false
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.2943413Z   set-safe-directory: true
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.2944264Z ##[endgroup]
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.3964461Z Syncing repository: preloopdev/aksh-conformance-sample
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.3967914Z ##[group]Getting Git version info
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.3968936Z Working directory is '/home/runner/work/aksh-conformance-sample/aksh-conformance-sample'
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.3970288Z [command]/usr/bin/git version
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.4061932Z git version 2.54.0
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.4113291Z ##[endgroup]
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.4131722Z Temporarily overriding HOME='/home/runner/work/_temp/0027c950-d05d-45f3-8893-c6b1ab178dbb' before making global git config changes
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.4134632Z Adding repository directory to the temporary git global config as a safe directory
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.4138456Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/aksh-conformance-sample/aksh-conformance-sample
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.4193933Z Deleting the contents of '/home/runner/work/aksh-conformance-sample/aksh-conformance-sample'
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.4198064Z ##[group]Initializing the repository
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.4204308Z [command]/usr/bin/git init /home/runner/work/aksh-conformance-sample/aksh-conformance-sample
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.4318505Z hint: Using 'master' as the name for the initial branch. This default branch name
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.4320531Z hint: will change to "main" in Git 3.0. To configure the initial branch name
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.4322565Z hint: to use in all of your new repositories, which will suppress this warning,
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.4325443Z hint: call:
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.4326641Z hint:
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.4328197Z hint: 	git config --global init.defaultBranch <name>
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.4329485Z hint:
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.4330940Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.4333047Z hint: 'development'. The just-created branch can be renamed via this command:
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.4334811Z hint:
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.4335901Z hint: 	git branch -m <name>
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.4337265Z hint:
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.4338737Z hint: Disable this message with "git config set advice.defaultBranchName false"
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.4341317Z Initialized empty Git repository in /home/runner/work/aksh-conformance-sample/aksh-conformance-sample/.git/
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.4345501Z [command]/usr/bin/git remote add origin https://github.com/preloopdev/aksh-conformance-sample
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.4394597Z ##[endgroup]
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.4395784Z ##[group]Disabling automatic garbage collection
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.4399880Z [command]/usr/bin/git config --local gc.auto 0
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.4434214Z ##[endgroup]
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.4436430Z ##[group]Setting up auth
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.4442034Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.4495315Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.4871318Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.4906578Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.5133705Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.5170877Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.5395702Z [command]/usr/bin/git config --local http.https://github.com/.extraheader AUTHORIZATION: basic ***
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.5434290Z ##[endgroup]
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.5435115Z ##[group]Fetching the repository
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:57.5444216Z [command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +c3dee6bd8f424dc37e95c90f55d9e414c7c8e2b6:refs/remotes/origin/main
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:58.1005808Z From https://github.com/preloopdev/aksh-conformance-sample
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:58.1007770Z  * [new ref]         c3dee6bd8f424dc37e95c90f55d9e414c7c8e2b6 -> origin/main
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:58.1043398Z ##[endgroup]
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:58.1044190Z ##[group]Determining the checkout info
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:58.1047281Z ##[endgroup]
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:58.1054897Z [command]/usr/bin/git sparse-checkout disable
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:58.1106103Z [command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:58.1203235Z ##[group]Checking out the ref
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:58.1204769Z [command]/usr/bin/git checkout --progress --force -B main refs/remotes/origin/main
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:58.1247595Z Switched to a new branch 'main'
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:58.1250315Z branch 'main' set up to track 'origin/main'.
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:58.1257689Z ##[endgroup]
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:58.1306826Z [command]/usr/bin/git log -1 --format=%H
+test-env-propagation	Run actions/checkout@v4	2026-07-05T21:04:58.1336611Z c3dee6bd8f424dc37e95c90f55d9e414c7c8e2b6
+test-env-propagation	Run composite (env propagation test)	﻿2026-07-05T21:04:58.1705562Z Prepare all required actions
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.1850755Z ##[group]Run ./.github/actions/composite-advanced
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.1852044Z with:
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.1852759Z   mode: pass
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.1853492Z ##[endgroup]
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.1983148Z ##[group]Run echo "MODE=pass" >> "$GITHUB_ENV"
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.1984532Z ^[[36;1mecho "MODE=pass" >> "$GITHUB_ENV"^[[0m
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.1985907Z ^[[36;1mecho "COMPOSITE_PATH_ENTRY=/tmp/composite-bin" >> "$GITHUB_PATH"^[[0m
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.1987555Z ^[[36;1mecho "Setup complete, mode=pass"^[[0m
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.2161106Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.2162245Z ##[endgroup]
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.2244190Z Setup complete, mode=pass
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.2313603Z ##[group]Run echo "MODE from GITHUB_ENV: $MODE"
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.2314677Z ^[[36;1mecho "MODE from GITHUB_ENV: $MODE"^[[0m
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.2315646Z ^[[36;1mif [[ -z "$MODE" ]]; then^[[0m
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.2316768Z ^[[36;1m  echo "FAIL: GITHUB_ENV not propagated between composite steps"^[[0m
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.2318304Z ^[[36;1m  exit 1^[[0m
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.2319034Z ^[[36;1mfi^[[0m
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.2319780Z ^[[36;1mecho "PASS: GITHUB_ENV propagated"^[[0m
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.2320787Z ^[[36;1mecho "PATH check: $PATH"^[[0m
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.2321760Z ^[[36;1mif [[ "$PATH" != */tmp/composite-bin* ]]; then^[[0m
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.2323044Z ^[[36;1m  echo "FAIL: GITHUB_PATH not propagated between composite steps"^[[0m
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.2324225Z ^[[36;1m  exit 1^[[0m
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.2324949Z ^[[36;1mfi^[[0m
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.2325705Z ^[[36;1mecho "PASS: GITHUB_PATH propagated"^[[0m
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.2360463Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.2361558Z env:
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.2362210Z   MODE: pass
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.2362890Z ##[endgroup]
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.2428405Z MODE from GITHUB_ENV: pass
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.2430138Z PASS: GITHUB_ENV propagated
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.2436282Z PATH check: COMPOSITE_PATH_ENTRY=/tmp/composite-bin:/snap/bin:/home/runner/.local/bin:/opt/pipx_bin:/home/runner/.cargo/bin:/home/runner/.config/composer/vendor/bin:/usr/local/.ghcup/bin:/home/runner/.dotnet/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.2442188Z PASS: GITHUB_PATH propagated
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.2532896Z ##[group]Run echo "result=all-checks-passed" >> "$GITHUB_OUTPUT"
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.2534164Z ^[[36;1mecho "result=all-checks-passed" >> "$GITHUB_OUTPUT"^[[0m
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.2535257Z ^[[36;1mecho "All composite checks passed"^[[0m
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.2566332Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.2567660Z env:
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.2568319Z   MODE: pass
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.2568995Z ##[endgroup]
+test-env-propagation	Run composite (env propagation test)	2026-07-05T21:04:58.2697432Z All composite checks passed
+test-env-propagation	Verify env leaked from composite	﻿2026-07-05T21:04:58.2794277Z ##[group]Run echo "MODE after composite: ${MODE:-unset}"
+test-env-propagation	Verify env leaked from composite	2026-07-05T21:04:58.2795421Z ^[[36;1mecho "MODE after composite: ${MODE:-unset}"^[[0m
+test-env-propagation	Verify env leaked from composite	2026-07-05T21:04:58.2796428Z ^[[36;1mecho "PATH after composite: $PATH"^[[0m
+test-env-propagation	Verify env leaked from composite	2026-07-05T21:04:58.2797612Z ^[[36;1mif [[ "$PATH" == */tmp/composite-bin* ]]; then^[[0m
+test-env-propagation	Verify env leaked from composite	2026-07-05T21:04:58.2798771Z ^[[36;1m  echo "PASS: GITHUB_PATH from composite visible in caller"^[[0m
+test-env-propagation	Verify env leaked from composite	2026-07-05T21:04:58.2799820Z ^[[36;1melse^[[0m
+test-env-propagation	Verify env leaked from composite	2026-07-05T21:04:58.2800890Z ^[[36;1m  echo "INFO: GITHUB_PATH from composite not visible in caller (expected per spec)"^[[0m
+test-env-propagation	Verify env leaked from composite	2026-07-05T21:04:58.2802133Z ^[[36;1mfi^[[0m
+test-env-propagation	Verify env leaked from composite	2026-07-05T21:04:58.2834258Z shell: /usr/bin/bash -e {0}
+test-env-propagation	Verify env leaked from composite	2026-07-05T21:04:58.2835053Z env:
+test-env-propagation	Verify env leaked from composite	2026-07-05T21:04:58.2835678Z   MODE: pass
+test-env-propagation	Verify env leaked from composite	2026-07-05T21:04:58.2836325Z ##[endgroup]
+test-env-propagation	Verify env leaked from composite	2026-07-05T21:04:58.2895566Z MODE after composite: pass
+test-env-propagation	Verify env leaked from composite	2026-07-05T21:04:58.2900806Z PATH after composite: COMPOSITE_PATH_ENTRY=/tmp/composite-bin:/snap/bin:/home/runner/.local/bin:/opt/pipx_bin:/home/runner/.cargo/bin:/home/runner/.config/composer/vendor/bin:/usr/local/.ghcup/bin:/home/runner/.dotnet/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
+test-env-propagation	Verify env leaked from composite	2026-07-05T21:04:58.2904146Z PASS: GITHUB_PATH from composite visible in caller
+test-env-propagation	Post Run actions/checkout@v4	﻿2026-07-05T21:04:58.3080761Z Node 20 is being deprecated. This workflow is running with Node 24 by default. If you need to temporarily use Node 20, you can set the ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true environment variable. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+test-env-propagation	Post Run actions/checkout@v4	2026-07-05T21:04:58.3084212Z Post job cleanup.
+test-env-propagation	Post Run actions/checkout@v4	2026-07-05T21:04:58.3941954Z [command]/usr/bin/git version
+test-env-propagation	Post Run actions/checkout@v4	2026-07-05T21:04:58.3983272Z git version 2.54.0
+test-env-propagation	Post Run actions/checkout@v4	2026-07-05T21:04:58.4055044Z Temporarily overriding HOME='/home/runner/work/_temp/a150c7fa-db83-47ec-80ea-00ea0773ca33' before making global git config changes
+test-env-propagation	Post Run actions/checkout@v4	2026-07-05T21:04:58.4058810Z Adding repository directory to the temporary git global config as a safe directory
+test-env-propagation	Post Run actions/checkout@v4	2026-07-05T21:04:58.4062054Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/aksh-conformance-sample/aksh-conformance-sample
+test-env-propagation	Post Run actions/checkout@v4	2026-07-05T21:04:58.4105596Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+test-env-propagation	Post Run actions/checkout@v4	2026-07-05T21:04:58.4199346Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+test-env-propagation	Post Run actions/checkout@v4	2026-07-05T21:04:58.4684771Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+test-env-propagation	Post Run actions/checkout@v4	2026-07-05T21:04:58.4732734Z http.https://github.com/.extraheader
+test-env-propagation	Post Run actions/checkout@v4	2026-07-05T21:04:58.4760048Z [command]/usr/bin/git config --local --unset-all http.https://github.com/.extraheader
+test-env-propagation	Post Run actions/checkout@v4	2026-07-05T21:04:58.4802964Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+test-env-propagation	Post Run actions/checkout@v4	2026-07-05T21:04:58.5114689Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+test-env-propagation	Post Run actions/checkout@v4	2026-07-05T21:04:58.5169920Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+test-env-propagation	Complete job	﻿2026-07-05T21:04:58.5582730Z Cleaning up orphan processes
+test-env-propagation	Complete job	2026-07-05T21:04:58.6010636Z ##[warning]Node.js 20 is deprecated. The following actions target Node.js 20 but are being forced to run on Node.js 24: actions/checkout@v4. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
