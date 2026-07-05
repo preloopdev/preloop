@@ -229,10 +229,22 @@ pub async fn run_job(
 
     // If the job timed out, override status to Failure with timeout message
     if was_timeout {
-        error!(
+        let msg = format!(
             "Job {job_name} exceeded the maximum execution time of {job_timeout_minutes} minutes"
         );
+        error!("{msg}");
         job_ctx.job_status = super::contexts::JobStatus::Failure;
+        // F048: Add job-level annotation for timeout
+        job_ctx.add_job_annotation(super::execution_context::Annotation {
+            level: super::execution_context::AnnotationLevel::Error,
+            message: msg,
+            title: None,
+            file: None,
+            line: None,
+            end_line: None,
+            col: None,
+            end_column: None,
+        });
     }
 
     // F018: Stop renew loop
@@ -249,7 +261,19 @@ pub async fn run_job(
                 (conclusion.clone(), conclusion.clone())
             }
             Err(e) => {
-                error!("Job {job_name} failed: {e:#}");
+                let msg = format!("Job {job_name} failed: {e:#}");
+                error!("{msg}");
+                // F048: Add job-level annotation for infrastructure failure
+                job_ctx.add_job_annotation(super::execution_context::Annotation {
+                    level: super::execution_context::AnnotationLevel::Error,
+                    message: msg,
+                    title: None,
+                    file: None,
+                    line: None,
+                    end_line: None,
+                    col: None,
+                    end_column: None,
+                });
                 ("Failed".to_string(), "Failed".to_string())
             }
         }
@@ -939,13 +963,22 @@ async fn report_completion(
         }
     }
 
+    // F048: Collect job-level annotations for completejob body.
+    // These are infrastructure-level issues (container failures, action download errors)
+    // not tied to a specific step. Step annotations are already in stepResults (F025).
+    let job_annotations: Vec<serde_json::Value> = job_ctx
+        .job_annotations
+        .iter()
+        .map(|a| annotation_to_json(a, 0))
+        .collect();
+
     let completion_body = serde_json::json!({
         "planId": plan_id,
         "jobId": job_id,
         "conclusion": result.to_lowercase(),
         "outputs": outputs,
         "stepResults": step_results,
-        "annotations": [],
+        "annotations": job_annotations,
         "telemetry": [],
         "billingOwnerId": billing_owner_id,
     });
