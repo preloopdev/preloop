@@ -10,20 +10,20 @@ Last full-code audit: **2026-07-04** (all of `crates/aksh-runner` diffed against
 
 | Subsystem | Status | Blocking gaps |
 |---|---|---|
-| Configuration & registration (M1) | ✅ Verified vs golden 01 | — |
-| OAuth PS256 / broker session / message poll (M2) | ✅ Verified vs golden 01 | — |
+| Configuration & registration (M1) | ✅ Verified vs golden 01 | `--replace` DELETEs existing agent (P2.7) |
+| OAuth PS256 / broker session / message poll (M2) | ✅ Verified vs golden 01 | BrokerMigration re-resolves URL (P2.8) |
 | acquirejob / completejob (M3) | ✅ Shapes verified vs golden 06; live rerun green | — |
 | **renewjob lock renewal (M3)** | ✅ Implemented | live GitHub long-job validation pending |
 | **In-progress step updates — Twirp WorkflowStepsUpdate (M3)** | ✅ Implemented; live step-id/context reruns green | — |
 | **Step/job log upload — signed blob (M3)** | ✅ Implemented | — |
 | Contexts (github/matrix/needs/strategy/vars/inputs/secrets) (M4) | ✅ P0/P1 complete | — |
 | Expression engine (M4) | ✅ P0 complete; `format()` `{{`/`}}` escaping fixed; `--follow-symbolic-links` (F055) | — |
-| Script steps / process invoker / commands / file commands (M5) | ✅ P0/P1 complete | — |
-| **Actions: resolution + pre/post lifecycle (M6)** | ✅ P0/P1.5 implemented; live composite rerun green | — |
+| Script steps / process invoker / commands / file commands (M5) | ✅ P0/P1/P2 complete | `defaults.run.working-directory` + `shell` support |
+| **Actions: resolution + pre/post lifecycle (M6)** | ✅ P0/P1.5 implemented; composite `if`/`continue-on-error`/env propagation | — |
 | **Containers (M7)** | ✅ Implemented and E2E validated | — |
 | **Cache/artifact/OIDC env plumbing (M8)** | ✅ Validated end-to-end | Live GitHub runs 28726954812 (cache) + 28726954825 (artifact) — `actions/cache@v4`, `actions/upload-artifact@v4`, `actions/download-artifact@v4` all pass. Cache v2 Twirp + Artifact v2 Twirp confirmed working. |
 | AzDO compat reporting (M9) | ⏸️ Deferred | Not needed — broker + Twirp covers all composability targets. GHES interop only. |
-| Cancellation / job timeout / matchers / hardening (M10) | ✅ P1 complete | — |
+| Cancellation / job timeout / matchers / hardening (M10) | ✅ P1/P2 complete | annotation caps, case-insensitive commands, echo state, debug logging |
 | Benchmarks (M11) | ✅ CI pipeline + container benchmarks | see `docs/runner/11-benchmarks.md` |
 | **Conformance harness (H1–H3)** | ✅ Core tooling exists | `runner-e2e`, `runner-diff`, 24 scenarios, 18 goldens; flows.jsonl middleware and formal corpus are stretch goals |
 | **Diagnostics (M12)** | ✅ Implemented | diagnostic log upload (F054) — best-effort upload from `_diag/` directory |
@@ -176,8 +176,8 @@ The core tooling exists and is functional. Remaining work is polish and coverage
 | MITM scenarios | ✅ 24 scenarios | 01-17 (host workflows) + 30-36 (container workflows) with `scenario.toml` |
 | Golden recordings | ✅ 18 goldens | `.runner-watch/golden/v2.335.1/` — recorded from official runner v2.335.1 on GitHub |
 | Justfile targets | ✅ Working | `conform-local`, `conform-runner` wire to `runner-diff` |
-| `--record-flows` on server | ⚠️ Partial | `replay_results_put` stores logs; full flows.jsonl middleware not yet implemented |
-| `fixtures/runner/` corpus | ⚠️ Not a directory | 199 inline unit tests + 24 scenario workflows serve the purpose; formal corpus deferred |
+| `--record-flows` on server | ✅ Implemented | Full NDJSON flows.jsonl middleware; wired to `runner-e2e` and `just conform-smoke` |
+| `fixtures/runner/` corpus | ⚠️ Not a directory | 229 inline unit tests + 24 scenario workflows serve the purpose; formal corpus deferred |
 | Benchmarks (M11) | ✅ Complete | CI pipeline + container benchmarks in `docs/runner/11-benchmarks.md` |
 | Milestone docs | ⚠️ Partial | 00, 11, 12, 13, 14 exist; others deferred until gates are formalized |
 
