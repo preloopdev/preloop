@@ -1,0 +1,82 @@
+{
+  "scenario": "73-path-env",
+  "run_id": 28754865917,
+  "name": "golden: path-env-interaction",
+  "status": "completed",
+  "conclusion": "success",
+  "started_at": "2026-07-05T21:04:53Z",
+  "jobs": [
+    {
+      "name": "test-env-path-base",
+      "conclusion": "success",
+      "steps": [
+        {
+          "name": "Set up job",
+          "conclusion": "success",
+          "number": 1
+        },
+        {
+          "name": "Verify job-level env PATH is base",
+          "conclusion": "success",
+          "number": 2
+        },
+        {
+          "name": "Add GITHUB_PATH on top of env.PATH",
+          "conclusion": "success",
+          "number": 3
+        },
+        {
+          "name": "Verify GITHUB_PATH prepended to env.PATH base",
+          "conclusion": "success",
+          "number": 4
+        },
+        {
+          "name": "Complete job",
+          "conclusion": "success",
+          "number": 5
+        }
+      ]
+    },
+    {
+      "name": "test-github-path",
+      "conclusion": "success",
+      "steps": [
+        {
+          "name": "Set up job",
+          "conclusion": "success",
+          "number": 1
+        },
+        {
+          "name": "Record initial PATH",
+          "conclusion": "success",
+          "number": 2
+        },
+        {
+          "name": "Add to GITHUB_PATH",
+          "conclusion": "success",
+          "number": 3
+        },
+        {
+          "name": "Verify GITHUB_PATH prepended",
+          "conclusion": "success",
+          "number": 4
+        },
+        {
+          "name": "Add second GITHUB_PATH entry",
+          "conclusion": "success",
+          "number": 5
+        },
+        {
+          "name": "Verify both PATH entries present in correct order",
+          "conclusion": "success",
+          "number": 6
+        },
+        {
+          "name": "Complete job",
+          "conclusion": "success",
+          "number": 7
+        }
+      ]
+    }
+  ]
+}
