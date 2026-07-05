@@ -374,6 +374,29 @@ pub(crate) fn decode_typed_value(val: &serde_json::Value) -> serde_json::Value {
     }
 }
 
+fn bool_from_template_token(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Bool(b) => *b,
+        serde_json::Value::String(s) => s.eq_ignore_ascii_case("true"),
+        serde_json::Value::Object(map) => {
+            if let Some(b) = map.get("bool").and_then(|v| v.as_bool()) {
+                return b;
+            }
+            if let Some(b) = map.get("boolean").and_then(|v| v.as_bool()) {
+                return b;
+            }
+            if let Some(lit) = map.get("lit").and_then(|v| v.as_str()) {
+                return lit.eq_ignore_ascii_case("true");
+            }
+            if let Some(expr) = map.get("expr").and_then(|v| v.as_str()) {
+                return expr.trim().eq_ignore_ascii_case("true");
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
 /// Build the ordered step list from the job message steps.
 pub fn build_step_list(steps: &[serde_json::Value], _job_message: &serde_json::Value) -> Vec<Step> {
     let mut result = Vec::new();
@@ -432,7 +455,7 @@ pub fn build_step_list(steps: &[serde_json::Value], _job_message: &serde_json::V
 
         let continue_on_error = step
             .get("continueOnError")
-            .and_then(|v| v.as_bool())
+            .map(bool_from_template_token)
             .unwrap_or(false);
 
         let timeout_minutes = step.get("timeoutInMinutes").and_then(|v| v.as_u64());
@@ -938,6 +961,33 @@ mod tests {
 
         let result = build_step_list(&steps, &serde_json::json!({}));
         assert!(result[0].continue_on_error);
+    }
+
+    #[test]
+    fn build_step_list_handles_template_continue_on_error() {
+        let steps = vec![
+            serde_json::json!({
+                "id": "lit",
+                "displayName": "Template literal",
+                "continueOnError": {
+                    "type": 0,
+                    "lit": "true"
+                },
+                "run": "exit 1"
+            }),
+            serde_json::json!({
+                "id": "expr",
+                "displayName": "Template expression",
+                "continueOnError": {
+                    "expr": "true"
+                },
+                "run": "exit 1"
+            }),
+        ];
+
+        let result = build_step_list(&steps, &serde_json::json!({}));
+        assert!(result[0].continue_on_error);
+        assert!(result[1].continue_on_error);
     }
 
     #[test]
