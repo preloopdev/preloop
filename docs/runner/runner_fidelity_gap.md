@@ -397,19 +397,21 @@ C# source (cloned at tag `v2.335.1`). These are behavioral differences NOT cover
 
 ### F053 — MEDIUM: Missing credential data fields for auth migration
 
-- **Found**: official reads `authorizationUrlV2`, `enableAuthMigrationByDefault`, `oauthEndpointUrl` from `.credentials` data block. Our `configure.rs` does not extract these from the agent response and our OAuth exchange ignores them.
+- **Found**: official reads `authorizationUrlV2`, `enableAuthMigrationByDefault`, `oauthEndpointUrl` from `.credentials` data block. Our `configure.rs` did not extract these from the agent response and our OAuth exchange ignored them.
 - **Impact**: Auth migration to V2 URLs not supported; `oauthEndpointUrl` fallback missing.
-- **Upstream**: `Runner.Listener/Configuration/OAuthCredential.cs` (reads all three fields from `CredentialData.Data` dictionary and selects auth URL accordingly)
+- **Upstream**: `Runner.Listener/Configuration/OAuthCredential.cs:28-49` (reads all three fields, selects auth URL), `Runner.Listener/Configuration/ConfigurationManager.cs:410-416` (extracts from agent properties at configure time)
 - **File**: `crates/aksh-runner/src/configure.rs`, `crates/aksh-runner/src/listener/oauth.rs`
-- **Status**: ❌ Open
+- **Fix**: At configure time, extract `EnableAuthMigrationByDefault` and `AuthorizationUrlV2` from agent response properties and persist to `.credentials` data. At OAuth time, prefer `authorizationUrlV2` when `enableAuthMigrationByDefault` is set, and use `oauthEndpointUrl` as the token exchange endpoint (falling back to `authorizationUrl`).
+- **Status**: ✅ Fixed (2026-07-05, commit `1f08416`). Verified: live GitHub run 28726251502 (aksh registered, acquired job, OAuth token acquired successfully) and official runner comparison (both Succeeded).
 
 ### F054 — MEDIUM: Diagnostic log upload missing
 
 - **Found**: official collects runner/worker diagnostic logs from `_diag/`, zips with metadata, and uploads via the results service `CreateResultsDiagnosticLogsAsync`. No equivalent in our codebase.
 - **Impact**: No runner diagnostic telemetry collected. Not a workflow blocker but affects debugging.
 - **Upstream**: `Runner.Worker/DiagnosticLogManager.cs` (full class — collects `_diag/*.log`, filters by job start time, creates zip with metadata JSON, uploads via results service signed URL)
-- **File**: N/A (not implemented)
-- **Status**: ❌ Open
+- **File**: `crates/aksh-runner/src/worker/job_runner.rs`, `crates/aksh-runner/src/client/results.rs`
+- **Fix**: Added `upload_diagnostic_logs()` that collects `_diag/*.log` files from the runner root, creates a zip archive with metadata JSON, and uploads via `CreateResultsDiagnosticLogsSignedBlobURL` Twirp endpoint. Called after job log upload, before completion report. Non-fatal if `_diag/` doesn't exist or server doesn't support the endpoint.
+- **Status**: ✅ Fixed (2026-07-05, commit `1f08416`). Verified: live GitHub run 28726251502 (aksh) and official runner comparison — both succeeded. Diagnostic upload is best-effort (no `_diag/` logs present in test environment, so upload was skipped gracefully).
 
 ### F055 — MEDIUM: `hashFiles()` doesn't support `--follow-symbolic-links` flag
 
