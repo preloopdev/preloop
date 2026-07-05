@@ -21,7 +21,7 @@ pub async fn run_docker_action(
 
     info!("Running docker action: {image}");
 
-    let inputs = evaluated_inputs(None, with, ctx);
+    let inputs = evaluated_inputs(None, with, ctx)?;
     let env = container_action_env(ctx, &inputs, None, None)?;
     run_docker_image(image, workspace, ctx, env, None, Vec::new()).await
 }
@@ -75,7 +75,7 @@ pub async fn run_docker_action_from_manifest(
         image.to_string()
     };
 
-    let inputs = evaluated_inputs(Some(manifest), with, ctx);
+    let inputs = evaluated_inputs(Some(manifest), with, ctx)?;
     let mut expr_ctx = ctx.job.build_expression_context();
     expr_ctx.insert("inputs", inputs_to_json(&inputs));
     let manifest_env = evaluate_manifest_env(manifest.runs_env.as_ref(), &expr_ctx)?;
@@ -139,6 +139,8 @@ fn build_docker_run_args(
         docker_args.push(state.label.clone());
     }
 
+    mount_file_command_dirs(&mut docker_args, env);
+
     if let Some(entrypoint) = entrypoint {
         docker_args.push("--entrypoint".to_string());
         docker_args.push(entrypoint.to_string());
@@ -158,14 +160,18 @@ fn evaluated_inputs(
     manifest: Option<&ActionManifest>,
     with: &serde_json::Value,
     ctx: &StepContext<'_>,
-) -> std::collections::HashMap<String, String> {
+) -> Result<std::collections::HashMap<String, String>> {
     let mut inputs = std::collections::HashMap::new();
+    let expr_ctx = ctx.job.build_expression_context();
     if let Some(obj) = with.as_object() {
         for (key, value) in obj {
             if key.starts_with("__aksh_") {
                 continue;
             }
-            inputs.insert(key.clone(), value_to_string(value));
+            inputs.insert(
+                key.clone(),
+                evaluate_template_value(&value_to_string(value), &expr_ctx)?,
+            );
         }
     }
 
@@ -185,7 +191,7 @@ fn evaluated_inputs(
         }
     }
 
-    inputs
+    Ok(inputs)
 }
 
 fn container_action_env(
@@ -266,6 +272,33 @@ fn value_to_string(value: &serde_json::Value) -> String {
         .unwrap_or_else(|| value.to_string())
 }
 
+fn mount_file_command_dirs(
+    docker_args: &mut Vec<String>,
+    env: &std::collections::HashMap<String, String>,
+) {
+    let mut dirs = std::collections::BTreeSet::new();
+    for key in [
+        "GITHUB_ENV",
+        "GITHUB_PATH",
+        "GITHUB_OUTPUT",
+        "GITHUB_STATE",
+        "GITHUB_STEP_SUMMARY",
+    ] {
+        let Some(path) = env.get(key) else {
+            continue;
+        };
+        let Some(parent) = Path::new(path).parent() else {
+            continue;
+        };
+        dirs.insert(parent.to_string_lossy().to_string());
+    }
+
+    for dir in dirs {
+        docker_args.push("-v".to_string());
+        docker_args.push(format!("{dir}:{dir}"));
+    }
+}
+
 fn push_inherited_env_args(
     docker_args: &mut Vec<String>,
     env: &std::collections::HashMap<String, String>,
@@ -290,6 +323,36 @@ mod tests {
 
         assert_eq!(args, vec!["-e".to_string(), "MY_SECRET".to_string()]);
         assert!(!args.iter().any(|arg| arg.contains("s3cr3t")));
+    }
+
+    #[test]
+    fn docker_run_args_mount_file_command_directories() {
+        let mut job = crate::worker::contexts::JobContext::new(
+            "job".into(),
+            "job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let ctx = test_step_context(&mut job);
+        let env = HashMap::from([
+            (
+                "GITHUB_OUTPUT".to_string(),
+                "/tmp/runner/_work/repo/_temp/_runner_file_commands/out".to_string(),
+            ),
+            (
+                "GITHUB_STATE".to_string(),
+                "/tmp/runner/_work/repo/_temp/_runner_file_commands/state".to_string(),
+            ),
+        ]);
+
+        let args = build_docker_run_args("/tmp/work", &ctx, &env, "alpine:3.20", None, &[]);
+
+        assert_eq!(
+            args.iter()
+                .filter(|arg| *arg == "/tmp/runner/_work/repo/_temp/_runner_file_commands:/tmp/runner/_work/repo/_temp/_runner_file_commands")
+                .count(),
+            1
+        );
     }
 
     fn test_manifest() -> ActionManifest {
@@ -342,7 +405,8 @@ mod tests {
             Some(&manifest),
             &serde_json::json!({"message": "from-input", "entrypoint": "run.sh"}),
             &ctx,
-        );
+        )
+        .unwrap();
         let mut expr_ctx = ctx.job.build_expression_context();
         expr_ctx.insert("inputs", inputs_to_json(&inputs));
 
