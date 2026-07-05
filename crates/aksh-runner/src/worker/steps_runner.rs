@@ -1130,6 +1130,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_steps_all_steps_pass() {
+        let dir = TempDir::new().unwrap();
+        let mut job = JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+        let (_tx, cancel_rx) = watch::channel(false);
+
+        let mut step1 = test_step("step1", None);
+        step1.step_type = StepType::Script {
+            script: "echo step1-ran".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+        let mut step2 = test_step("step2", None);
+        step2.step_type = StepType::Script {
+            script: "echo step2-ran".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+
+        let result = run_steps(
+            &[step1, step2],
+            &mut job,
+            dir.path().to_str().unwrap(),
+            cancel_rx,
+            queue,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "Succeeded");
+        assert_eq!(job.job_status, JobStatus::Success);
+        assert_eq!(job.steps.get("step1").unwrap().conclusion, "Success");
+        assert_eq!(job.steps.get("step2").unwrap().conclusion, "Success");
+    }
+
+    #[tokio::test]
+    async fn run_steps_step_env_override_job_env() {
+        let dir = TempDir::new().unwrap();
+        let mut job = JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        // Set a job-level environment variable
+        job.env.insert("JOB_VAR".to_string(), "job-val".to_string());
+        job.env.insert("OVERRIDE_VAR".to_string(), "job-val".to_string());
+
+        let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+        let (_tx, cancel_rx) = watch::channel(false);
+
+        let mut step = test_step("test_env", None);
+        step.env.insert("OVERRIDE_VAR".to_string(), "step-val".to_string());
+        step.env.insert("STEP_VAR".to_string(), "step-val".to_string());
+        step.step_type = StepType::Script {
+            // Write variables to output so we can verify the actual process env
+            script: "echo job_var=$JOB_VAR >> \"$GITHUB_OUTPUT\"\necho override_var=$OVERRIDE_VAR >> \"$GITHUB_OUTPUT\"\necho step_var=$STEP_VAR >> \"$GITHUB_OUTPUT\"".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+
+        let result = run_steps(
+            &[step],
+            &mut job,
+            dir.path().to_str().unwrap(),
+            cancel_rx,
+            queue,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "Succeeded");
+        let step_res = job.steps.get("test_env").unwrap();
+        assert_eq!(step_res.outputs.get("job_var").map(String::as_str), Some("job-val"));
+        assert_eq!(step_res.outputs.get("override_var").map(String::as_str), Some("step-val"));
+        assert_eq!(step_res.outputs.get("step_var").map(String::as_str), Some("step-val"));
+    }
+
+    #[tokio::test]
     async fn run_steps_honors_script_working_directory() {
         let dir = TempDir::new().unwrap();
         let workspace = dir.path().join("workspace");
