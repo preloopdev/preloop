@@ -223,6 +223,17 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
         }
     }
 
+    // Official runner evaluates job/workflow-level env from
+    // AgentJobRequestMessage.EnvironmentVariables into the global environment
+    // before any step starts. GitHub sends this as a list of typed template maps.
+    if let Some(env_tokens) = msg.get("environmentVariables").and_then(|v| v.as_array()) {
+        for token in env_tokens {
+            for (key, value) in extract_template_map(token) {
+                job.env.insert(key, value);
+            }
+        }
+    }
+
     // F021: ACTIONS_* runtime env plumbing.
     // SystemVssConnection carries both the run-service URL/token and data URLs
     // used by cache, artifact, results, and OIDC actions.
@@ -995,6 +1006,33 @@ mod tests {
         assert!(job.mask_secrets("runtime-token").contains("***"));
     }
 
+    #[test]
+    fn injects_job_environment_variables_from_acquire_payload() {
+        let mut job = JobContext::new(
+            "j1".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        job.workspace = Some("_work/repo/repo".into());
+
+        let msg = serde_json::json!({
+            "environmentVariables": [{
+                "type": 2,
+                "map": [{
+                    "Key": { "type": 0, "lit": "MEGA_GLOBAL_ENV" },
+                    "Value": { "type": 0, "lit": "global-env-ok" }
+                }]
+            }]
+        });
+
+        inject_github_env(&mut job, &msg);
+
+        assert_eq!(
+            job.env.get("MEGA_GLOBAL_ENV").map(String::as_str),
+            Some("global-env-ok")
+        );
+    }
     #[test]
     fn lifecycle_uses_resolved_action_path_and_entry_overrides() {
         let temp = tempfile::TempDir::new().unwrap();
