@@ -316,7 +316,7 @@ C# source (cloned at tag `v2.335.1`). These are behavioral differences NOT cover
 - **Impact**: `${{ github.action_repository }}` and `${{ github.action_ref }}` returned empty in action steps.
 - **Upstream**: `Runner.Worker/ActionRunner.cs:147-153` (sets `action_repository` and `action_ref` from `repoPathReferenceAction.Name`/`.Ref`)
 - **File**: `crates/aksh-runner/src/worker/handlers/action.rs`, `crates/aksh-runner/src/worker/contexts.rs`
-- **Status**: ✅ Fixed (2026-07-04, commit `45ac510`) — action handlers set action-scoped `github.action_repository`/`github.action_ref` while executing remote actions and restore previous values afterwards. Verified by focused context/env-sync tests and `cargo check -p aksh-runner`.
+- **Status**: ✅ Fixed (2026-07-04, commit `a82a1aa`) — action handlers set `github.action_repository`/`github.action_ref` without save/restore (matching official runner behavior). Also set `github.action` to step name. Verified: live GitHub run 28724871604 (`action_repository=actions/checkout`, `action_ref=v4` assertions passed).
 
 ### F045 — HIGH: `github.action_status` context not set on composite nested steps
 
@@ -373,7 +373,7 @@ C# source (cloned at tag `v2.335.1`). These are behavioral differences NOT cover
 - **Impact**: `${{ github.action }}` returns empty for action steps.
 - **Upstream**: `Runner.Worker/StepsRunner.cs:118` (`SetGitHubContext("action", actionStep.Action.Name)`)
 - **File**: `crates/aksh-runner/src/worker/steps_runner.rs`
-- **Status**: ❌ Open
+- **Status**: ✅ Fixed (2026-07-04, commit `a82a1aa`) — `github.action` set to step name on each action step in `action.rs`. Matches official `StepsRunner.cs:118`. Verified: live GitHub run 28724871604.
 
 ### F051 — MEDIUM: Problem matcher `fromPath` field not supported
 
@@ -425,6 +425,39 @@ C# source (cloned at tag `v2.335.1`). These are behavioral differences NOT cover
 
 ---
 
+## Live E2E bugs found 2026-07-04 (not in upstream audit)
+
+Found by running aksh-runner against real GitHub via `preloopdev/aksh-conformance-sample`.
+
+### Step env expressions not evaluated
+
+- **Found**: Step-level `env:` values containing `${{ }}` expressions were inserted raw without template evaluation. `${{ matrix['os'] }}` passed through as literal text.
+- **Upstream**: `Runner.Worker/StepsRunner.cs:122-128` (`EvaluateStepEnvironment` evaluates step env through template evaluator)
+- **Fix**: Added `evaluate_template()` call for step env values in `steps_runner.rs:243`.
+- **Status**: ✅ Fixed (2026-07-04, commit `a82a1aa`). Verified: live GitHub run 28725011207.
+
+### Expression parser: no member access after function calls
+
+- **Found**: `fromJSON('[...]').*.name` failed with "unexpected token Dot" — the parser didn't support `.`/`[`/`.*` chaining after function call results.
+- **Upstream**: Official expression parser (DTExpressions2) uses operator-precedence parsing where `Dereference` (`.`) and `Wildcard` (`*`) are operators that naturally chain after `EndParameters`.
+- **Fix**: Added `MemberAccess` expr variant, `parse_member_suffix()`, and `Context::resolve_value()` in `aksh-gha-expressions`.
+- **Status**: ✅ Fixed (2026-07-04, commit `a82a1aa`). Verified: live GitHub run 28725011207 (bracket, wildcard, contains, nested, format all passed).
+
+### Subdirectory action paths dropped from step reference
+
+- **Found**: `uses: owner/repo/subdir@ref` — GitHub sends `reference.path` separately from `reference.name`. Our step parser ignored `reference.path`, so subdirectory actions resolved to the repo root. Manifest not found → lifecycle steps not created.
+- **Upstream**: Official runner resolves `reference.path` as the action subdirectory within the downloaded repository.
+- **Fix**: Step parser now reads `reference.path` and appends it to construct the full `uses` string in `job_extension.rs`.
+- **Status**: ✅ Fixed (2026-07-04, commit `db0325d`). Verified: live GitHub run (F046 Docker lifecycle with subdirectory action).
+
+### vars context not decoded from typed-dict format
+
+- **Found**: `${{ vars.AKSH_REPO_ROOT }}` resolved to empty. GitHub sends `contextData.vars` in Azure DevOps typed-dictionary format (`{type: 4, map: [{Key: ..., Value: ...}]}`). Our code only decoded the flat JSON format.
+- **Fix**: Added typed-dict decoding for `vars` context in `worker/contexts.rs` and inserted `vars` into `contextData` in `job_builder.rs`.
+- **Status**: ✅ Fixed (2026-07-04, commit `307afe2` + `d986f77`). Verified: dogfood green run.
+
+---
+
 ## Remaining Known Gaps (deferred)
 
 
@@ -438,4 +471,31 @@ C# source (cloned at tag `v2.335.1`). These are behavioral differences NOT cover
 | Job hooks           | `ACTIONS_RUNNER_HOOK_JOB_STARTED` etc.                    | Post-M12  |
 | Background steps    | Coordinator for parallel composite steps                  | Post-M12  |
 
+---
 
+## Upstream fixture corpus (TODO)
+
+`fixtures/upstream-workflows/` contains 98 workflow fixtures from
+[ChristopherHX/runner.server](https://github.com/ChristopherHX/runner.server) —
+the other major GitHub Actions local server implementation that speaks the real
+runner protocol. These are regression tests from a production control plane, not
+toy examples.
+
+### Why they matter
+
+These cover edge cases we don't currently test:
+
+- **Matrix case-insensitivity** — `case-insensitive-keys-matrix/`: `Hello` vs `hello` in exclude/include must match case-insensitively. `case_insensitive_needs/`: `needs` context keys are case-insensitive.
+- **Matrix partial object matching** — `matrix-partial-test/`: exclude with nested arrays and partial property matching.
+- **Reusable workflows** — `called.yml`, `inherit_secrets/`, `inherit_vars/`, `node16_complex_reusable_workflows/`: full `workflow_call` with input/secret/vars inheritance (reference for when we implement this).
+- **YAML anchors** — `verify-yaml-anchors.yml`: `&label`/`*label` and `&steps`/`*steps`.
+- **Error handling** — `workflowerrors/` (16 files): intentionally malformed workflows for graceful parser error testing.
+- **Expression edge cases** — `db-disposed-issue/` (6 files): recursive needs context, expressions in environment names, concurrency with inputs.
+- **Container edge cases** — `linux-container-i386/`, `linux-container-problem-matcher-test1/`: i386 containers, problem matchers inside containers.
+- **Context completeness** — `dumpcontexts.yml`, `workflow_ref_and_job_workflow_ref/`: full context dumping and `github.workflow_ref`/`github.job_workflow_ref`.
+
+### Planned usage
+
+1. **Parser fuzz/regression** (immediate): feed every `.yml` through `aksh-gha-parser` and assert no panics. The `workflowerrors/` directory is particularly valuable.
+2. **Server conformance** (next): run non-reusable, non-Windows workflows against `aksh-runner-server` + official runner. Matrix case-insensitivity and `needs` case-insensitivity are high-priority.
+3. **Roadmap reference** (future): reusable workflow fixtures provide the test corpus for `workflow_call` support.
