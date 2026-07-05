@@ -101,6 +101,22 @@ impl ResultsClient {
             .context("creating step summary metadata")
     }
 
+    /// F054: Get a signed blob URL for diagnostic log upload.
+    pub async fn get_diagnostic_logs_signed_url(
+        &self,
+        token: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let url = format!(
+            "{}/twirp/results.services.receiver.Receiver/CreateResultsDiagnosticLogsSignedBlobURL",
+            self.base_url
+        );
+        self.http
+            .post_json_bearer(&url, body, token)
+            .await
+            .context("getting diagnostic logs signed URL")
+    }
+
     /// Upload log content to a signed blob URL.
     pub async fn upload_log_blob(&self, signed_url: &str, content: Vec<u8>) -> Result<()> {
         self.http
