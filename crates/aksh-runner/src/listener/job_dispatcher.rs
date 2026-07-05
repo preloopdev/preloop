@@ -94,7 +94,25 @@ pub async fn spawn_job(
 
     info!("Dispatching job {request_id} to worker");
 
-    let current_exe = std::env::current_exe().context("finding current executable")?;
+    let raw_exe = std::env::current_exe().context("finding current executable")?;
+    let current_exe = if let Ok(bin) = std::env::var("CARGO_BIN_EXE_aksh-runner") {
+        let p = std::path::PathBuf::from(bin);
+        if p.exists() && p.file_name().unwrap() == "aksh-runner" { p } else { raw_exe }
+    } else if let Ok(bin) = std::env::var("AKSH_RUNNER_BIN") {
+        std::path::PathBuf::from(bin)
+    } else {
+        let target_dir = raw_exe.parent().unwrap();
+        let aksh_bin = if target_dir.file_name().unwrap() == "deps" {
+            target_dir.parent().unwrap().join("aksh-runner")
+        } else {
+            target_dir.join("aksh-runner")
+        };
+        if aksh_bin.exists() {
+            aksh_bin
+        } else {
+            raw_exe
+        }
+    };
     let via_str = match via {
         ProtocolPath::Broker => "broker",
         ProtocolPath::Azdo => "azdo",
@@ -147,4 +165,81 @@ pub async fn dispatch_job(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+    use std::time::Instant;
+
+    #[tokio::test]
+    async fn test_worker_dispatch_run_new_job() {
+        let dir = TempDir::new().unwrap();
+        let workspace_dir = dir.path().join("work");
+        let payload = serde_json::json!({
+            "jobId": "job-worker-1",
+            "jobDisplayName": "Worker Job",
+            "steps": [
+                {
+                    "id": "step-1",
+                    "contextName": "step1",
+                    "displayName": "Step One",
+                    "run": "echo step-one-executed",
+                    "shell": "bash"
+                }
+            ],
+            "fileTable": {
+                "workDirectory": workspace_dir.to_str().unwrap()
+            }
+        });
+
+        let mut running = spawn_job(payload, dir.path(), ProtocolPath::Broker)
+            .await
+            .unwrap();
+
+        let success = running.wait().await.unwrap();
+        assert!(success);
+    }
+
+    #[tokio::test]
+    async fn test_worker_dispatch_cancellation() {
+        let dir = TempDir::new().unwrap();
+        let workspace_dir = dir.path().join("work");
+        let payload = serde_json::json!({
+            "jobId": "job-worker-cancel",
+            "jobDisplayName": "Cancel Job",
+            "steps": [
+                {
+                    "id": "step-1",
+                    "contextName": "step1",
+                    "displayName": "Step One",
+                    "run": "sleep 10",
+                    "shell": "bash"
+                }
+            ],
+            "fileTable": {
+                "workDirectory": workspace_dir.to_str().unwrap()
+            }
+        });
+
+        let start = Instant::now();
+        let mut running = spawn_job(payload, dir.path(), ProtocolPath::Broker)
+            .await
+            .unwrap();
+
+        // Let it start up
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Cancel the job
+        running.cancel(5).await;
+
+        let success = running.wait().await.unwrap();
+        let elapsed = start.elapsed();
+
+        // The job should succeed/exit (with Ok status since cancellation is handled gracefully)
+        assert!(success);
+        // The elapsed time should be way below 10 seconds
+        assert!(elapsed.as_secs() < 5, "Expected cancellation to exit quickly, took {:?}", elapsed);
+    }
 }
