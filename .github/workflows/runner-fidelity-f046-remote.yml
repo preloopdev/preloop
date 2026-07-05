@@ -2,7 +2,7 @@ name: runner-fidelity-f046-remote
 
 on:
   push:
-    branches: [cachingv4]
+    branches: [cachingv4, main]
     paths:
       - '.github/workflows/runner-fidelity-f046-remote.yml'
   workflow_dispatch:

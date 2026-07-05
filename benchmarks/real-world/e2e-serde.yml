@@ -1,0 +1,52 @@
+name: E2E serde
+on: workflow_dispatch
+
+env:
+  RUSTUP_HOME: /workspace/.rustup
+  CARGO_HOME: /workspace/.cargo
+  RUSTUP_TOOLCHAIN: stable
+  PATH: /workspace/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+jobs:
+  fmt:
+    name: Rustfmt
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: serde-rs/serde
+      - run: cargo fmt --all --check
+
+  build:
+    name: Build
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: serde-rs/serde
+      - run: cd serde && cargo build --features rc
+      - run: cd serde && cargo build --no-default-features
+
+  clippy:
+    name: Clippy
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: serde-rs/serde
+      - run: cd serde && cargo clippy --features rc
+      - run: cd serde_derive && cargo clippy
+
+  test:
+    name: Test
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: serde-rs/serde
+      - run: cd serde_core && cargo test --features rc
+      - run: cd serde_derive && cargo test
