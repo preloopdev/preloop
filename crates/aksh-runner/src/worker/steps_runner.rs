@@ -1355,4 +1355,71 @@ mod tests {
             .message
             .contains("upload aborted, supports content up to a size of 1024k"));
     }
+
+    #[tokio::test]
+    async fn run_steps_cancelled_condition_runs_only_when_cancelled() {
+        let dir = TempDir::new().unwrap();
+        let mut job = JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+
+        // Step 1: a slow step that will be interrupted by cancellation
+        let mut slow = test_step("slow", None);
+        slow.step_type = StepType::Script {
+            script: "sleep 30".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+        // Step 2: default condition (success()) — should be SKIPPED after cancel
+        let normal = test_step("normal_after", None);
+        // Step 3: cancelled() — should RUN after cancel
+        let mut on_cancel = test_step("on_cancel", Some("cancelled()"));
+        on_cancel.step_type = StepType::Script {
+            script: "echo cleanup-ran".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+        // Step 4: always() — should RUN after cancel
+        let mut on_always = test_step("on_always", Some("always()"));
+        on_always.step_type = StepType::Script {
+            script: "echo always-ran".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+
+        // Fire cancellation after 500ms
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let _ = cancel_tx.send(true);
+        });
+
+        let result = run_steps(
+            &[slow, normal, on_cancel, on_always],
+            &mut job,
+            dir.path().to_str().unwrap(),
+            cancel_rx,
+            queue,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "Cancelled");
+        assert_eq!(job.job_status, JobStatus::Cancelled);
+        // slow step was cancelled
+        assert_eq!(job.steps.get("slow").unwrap().conclusion, "Cancelled");
+        // normal step was skipped (success() is false under cancel)
+        assert_eq!(job.steps.get("normal_after").unwrap().conclusion, "Skipped");
+        // cancelled() step ran
+        assert_eq!(job.steps.get("on_cancel").unwrap().conclusion, "Success");
+        // always() step ran
+        assert_eq!(job.steps.get("on_always").unwrap().conclusion, "Success");
+    }
 }
