@@ -398,12 +398,14 @@ fn bool_from_template_token(value: &serde_json::Value) -> bool {
 }
 
 /// Build the ordered step list from the job message steps.
-pub fn build_step_list(steps: &[serde_json::Value], _job_message: &serde_json::Value) -> Vec<Step> {
+pub fn build_step_list(steps: &[serde_json::Value], job_message: &serde_json::Value) -> Vec<Step> {
     let mut result = Vec::new();
     let mut run_counter: usize = 0; // F029: counts id-less script steps for __run / __run_N
 
+    // Parse defaults.run from job message (working-directory, shell)
+    let (default_working_dir, default_shell) = parse_job_defaults(job_message);
+
     for (i, step) in steps.iter().enumerate() {
-        // Determine step type first so we know if it's a script step (needed for auto-ID)
         let reference = step.get("reference");
         let inputs = extract_template_map(step.get("inputs").unwrap_or(&serde_json::Value::Null));
         let is_script = match reference {
@@ -468,8 +470,14 @@ pub fn build_step_list(steps: &[serde_json::Value], _job_message: &serde_json::V
             match ref_type {
                 "script" | "Script" => {
                     let script = inputs.get("script").cloned().unwrap_or_default();
-                    let shell = inputs.get("shell").cloned();
-                    let working_dir = inputs.get("workingDirectory").cloned();
+                    let shell = inputs
+                        .get("shell")
+                        .cloned()
+                        .or_else(|| default_shell.clone());
+                    let working_dir = inputs
+                        .get("workingDirectory")
+                        .cloned()
+                        .or_else(|| default_working_dir.clone());
                     StepType::Script {
                         script,
                         shell,
@@ -674,6 +682,58 @@ fn action_supports_lifecycle(manifest: &super::handlers::factory::ActionManifest
         manifest.runs_using.as_str(),
         "node12" | "node16" | "node20" | "node24" | "docker" | "composite"
     )
+}
+
+/// Parse `defaults.run` from the job message.
+///
+/// GitHub sends `defaults` as an array of AzDO typed-dict entries:
+/// ```json
+/// [{"type":2,"map":[{"Key":{"lit":"run"},"Value":{"type":2,"map":[
+///   {"Key":{"lit":"working-directory"},"Value":{"lit":"subdir"}},
+///   {"Key":{"lit":"shell"},"Value":{"lit":"bash"}}
+/// ]}}]}]
+/// ```
+///
+/// Returns `(working_directory, shell)` as optional strings.
+fn parse_job_defaults(job_message: &serde_json::Value) -> (Option<String>, Option<String>) {
+    let defaults = match job_message.get("defaults") {
+        Some(v) => v,
+        None => return (None, None),
+    };
+
+    // defaults can be an array of typed-dict entries or a plain object
+    let run_value = if let Some(arr) = defaults.as_array() {
+        // Walk the array looking for a "run" key in each typed-dict map
+        arr.iter().find_map(|entry| {
+            let map = entry.get("map").and_then(|v| v.as_array())?;
+            map.iter().find_map(|kv| {
+                let key = kv
+                    .get("Key")
+                    .or_else(|| kv.get("key"))
+                    .and_then(template_scalar)?;
+                if key == "run" {
+                    kv.get("Value").or_else(|| kv.get("value")).cloned()
+                } else {
+                    None
+                }
+            })
+        })
+    } else if let Some(obj) = defaults.as_object() {
+        obj.get("run").cloned()
+    } else {
+        None
+    };
+
+    let run_value = match run_value {
+        Some(v) => v,
+        None => return (None, None),
+    };
+
+    // Extract working-directory and shell from the run value
+    let run_map = extract_template_map(&run_value);
+    let working_dir = run_map.get("working-directory").cloned();
+    let shell = run_map.get("shell").cloned();
+    (working_dir, shell)
 }
 
 fn extract_step_env(step: &serde_json::Value) -> HashMap<String, String> {
