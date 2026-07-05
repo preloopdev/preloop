@@ -1,0 +1,233 @@
+{
+  "jobs": [
+    {
+      "check_run_url": "https://api.github.com/repos/preloopdev/aksh-conformance-sample/check-runs/85260109719",
+      "completed_at": "2026-07-05T21:04:57Z",
+      "conclusion": "success",
+      "created_at": "2026-07-05T21:04:52Z",
+      "head_branch": "main",
+      "head_sha": "c3dee6bd8f424dc37e95c90f55d9e414c7c8e2b6",
+      "html_url": "https://github.com/preloopdev/aksh-conformance-sample/actions/runs/28754864922/job/85260109719",
+      "id": 85260109719,
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "test-composite-fail",
+      "node_id": "CR_kwDOTJqUK88AAAAT2eYHlw",
+      "run_attempt": 1,
+      "run_id": 28754864922,
+      "run_url": "https://api.github.com/repos/preloopdev/aksh-conformance-sample/actions/runs/28754864922",
+      "runner_group_id": 0,
+      "runner_group_name": "GitHub Actions",
+      "runner_id": 1000000171,
+      "runner_name": "GitHub Actions 1000000171",
+      "started_at": "2026-07-05T21:04:54Z",
+      "status": "completed",
+      "steps": [
+        {
+          "completed_at": "2026-07-05T21:04:55Z",
+          "conclusion": "success",
+          "name": "Set up job",
+          "number": 1,
+          "started_at": "2026-07-05T21:04:54Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-07-05T21:04:55Z",
+          "conclusion": "success",
+          "name": "Run actions/checkout@v4",
+          "number": 2,
+          "started_at": "2026-07-05T21:04:55Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-07-05T21:04:55Z",
+          "conclusion": "success",
+          "name": "Run composite in fail mode (continue-on-error)",
+          "number": 3,
+          "started_at": "2026-07-05T21:04:55Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-07-05T21:04:55Z",
+          "conclusion": "success",
+          "name": "Verify fail mode still succeeds (continue-on-error)",
+          "number": 4,
+          "started_at": "2026-07-05T21:04:55Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-07-05T21:04:55Z",
+          "conclusion": "success",
+          "name": "Post Run actions/checkout@v4",
+          "number": 8,
+          "started_at": "2026-07-05T21:04:55Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-07-05T21:04:56Z",
+          "conclusion": "success",
+          "name": "Complete job",
+          "number": 9,
+          "started_at": "2026-07-05T21:04:55Z",
+          "status": "completed"
+        }
+      ],
+      "url": "https://api.github.com/repos/preloopdev/aksh-conformance-sample/actions/jobs/85260109719",
+      "workflow_name": "golden: composite-advanced"
+    },
+    {
+      "check_run_url": "https://api.github.com/repos/preloopdev/aksh-conformance-sample/check-runs/85260109720",
+      "completed_at": "2026-07-05T21:04:57Z",
+      "conclusion": "success",
+      "created_at": "2026-07-05T21:04:52Z",
+      "head_branch": "main",
+      "head_sha": "c3dee6bd8f424dc37e95c90f55d9e414c7c8e2b6",
+      "html_url": "https://github.com/preloopdev/aksh-conformance-sample/actions/runs/28754864922/job/85260109720",
+      "id": 85260109720,
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "test-composite-pass",
+      "node_id": "CR_kwDOTJqUK88AAAAT2eYHmA",
+      "run_attempt": 1,
+      "run_id": 28754864922,
+      "run_url": "https://api.github.com/repos/preloopdev/aksh-conformance-sample/actions/runs/28754864922",
+      "runner_group_id": 0,
+      "runner_group_name": "GitHub Actions",
+      "runner_id": 1000000172,
+      "runner_name": "GitHub Actions 1000000172",
+      "started_at": "2026-07-05T21:04:54Z",
+      "status": "completed",
+      "steps": [
+        {
+          "completed_at": "2026-07-05T21:04:55Z",
+          "conclusion": "success",
+          "name": "Set up job",
+          "number": 1,
+          "started_at": "2026-07-05T21:04:54Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-07-05T21:04:55Z",
+          "conclusion": "success",
+          "name": "Run actions/checkout@v4",
+          "number": 2,
+          "started_at": "2026-07-05T21:04:55Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-07-05T21:04:55Z",
+          "conclusion": "success",
+          "name": "Run composite in pass mode",
+          "number": 3,
+          "started_at": "2026-07-05T21:04:55Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-07-05T21:04:55Z",
+          "conclusion": "success",
+          "name": "Verify pass output",
+          "number": 4,
+          "started_at": "2026-07-05T21:04:55Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-07-05T21:04:56Z",
+          "conclusion": "success",
+          "name": "Post Run actions/checkout@v4",
+          "number": 8,
+          "started_at": "2026-07-05T21:04:55Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-07-05T21:04:56Z",
+          "conclusion": "success",
+          "name": "Complete job",
+          "number": 9,
+          "started_at": "2026-07-05T21:04:56Z",
+          "status": "completed"
+        }
+      ],
+      "url": "https://api.github.com/repos/preloopdev/aksh-conformance-sample/actions/jobs/85260109720",
+      "workflow_name": "golden: composite-advanced"
+    },
+    {
+      "check_run_url": "https://api.github.com/repos/preloopdev/aksh-conformance-sample/check-runs/85260109763",
+      "completed_at": "2026-07-05T21:05:02Z",
+      "conclusion": "success",
+      "created_at": "2026-07-05T21:04:52Z",
+      "head_branch": "main",
+      "head_sha": "c3dee6bd8f424dc37e95c90f55d9e414c7c8e2b6",
+      "html_url": "https://github.com/preloopdev/aksh-conformance-sample/actions/runs/28754864922/job/85260109763",
+      "id": 85260109763,
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "test-env-propagation",
+      "node_id": "CR_kwDOTJqUK88AAAAT2eYHww",
+      "run_attempt": 1,
+      "run_id": 28754864922,
+      "run_url": "https://api.github.com/repos/preloopdev/aksh-conformance-sample/actions/runs/28754864922",
+      "runner_group_id": 0,
+      "runner_group_name": "GitHub Actions",
+      "runner_id": 1000000173,
+      "runner_name": "GitHub Actions 1000000173",
+      "started_at": "2026-07-05T21:04:55Z",
+      "status": "completed",
+      "steps": [
+        {
+          "completed_at": "2026-07-05T21:04:57Z",
+          "conclusion": "success",
+          "name": "Set up job",
+          "number": 1,
+          "started_at": "2026-07-05T21:04:56Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-07-05T21:04:58Z",
+          "conclusion": "success",
+          "name": "Run actions/checkout@v4",
+          "number": 2,
+          "started_at": "2026-07-05T21:04:57Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-07-05T21:04:58Z",
+          "conclusion": "success",
+          "name": "Run composite (env propagation test)",
+          "number": 3,
+          "started_at": "2026-07-05T21:04:58Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-07-05T21:04:58Z",
+          "conclusion": "success",
+          "name": "Verify env leaked from composite",
+          "number": 4,
+          "started_at": "2026-07-05T21:04:58Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-07-05T21:04:58Z",
+          "conclusion": "success",
+          "name": "Post Run actions/checkout@v4",
+          "number": 8,
+          "started_at": "2026-07-05T21:04:58Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-07-05T21:04:58Z",
+          "conclusion": "success",
+          "name": "Complete job",
+          "number": 9,
+          "started_at": "2026-07-05T21:04:58Z",
+          "status": "completed"
+        }
+      ],
+      "url": "https://api.github.com/repos/preloopdev/aksh-conformance-sample/actions/jobs/85260109763",
+      "workflow_name": "golden: composite-advanced"
+    }
+  ],
+  "total_count": 3
+}
