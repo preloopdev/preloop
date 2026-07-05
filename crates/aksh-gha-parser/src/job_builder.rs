@@ -314,7 +314,10 @@ fn build_task_step(step: &crate::StepPlan, context: &Context) -> TaskStep {
         inputs: with,
         env,
         continue_on_error: None,
-        working_directory: None,
+        working_directory: step
+            .working_directory
+            .as_ref()
+            .map(|wd| resolve_string(wd, context).unwrap_or_else(|_| wd.clone())),
         timeout_in_minutes: None,
     }
 }
