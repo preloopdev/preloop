@@ -51,6 +51,28 @@ pub fn evaluate_template(input: &str, ctx: &aksh_gha_expressions::Context) -> Re
     Ok(result)
 }
 
+/// Evaluate an `if:` condition expression as a boolean.
+///
+/// GitHub Actions `if:` conditions are implicitly wrapped in `${{ }}` if they
+/// don't already contain it. The result is coerced to a boolean per GitHub's
+/// truthy rules: empty string, "0", "false", null → false; everything else → true.
+pub fn evaluate_condition(condition: &str, ctx: &aksh_gha_expressions::Context) -> Result<bool> {
+    // If the condition already contains ${{ }}, evaluate as template
+    let evaluated = if condition.contains("${{") {
+        evaluate_template(condition, ctx)?
+    } else {
+        // Wrap in ${{ }} for implicit expression evaluation
+        evaluate_template(&format!("${{{{ {condition} }}}}"), ctx)?
+    };
+    // Coerce to boolean per GitHub truthy rules
+    let trimmed = evaluated.trim();
+    Ok(!trimmed.is_empty()
+        && trimmed != "0"
+        && trimmed.to_lowercase() != "false"
+        && trimmed != "null"
+        && trimmed != "")
+}
+
 /// Find the closing `}}` of a `${{ ... }}` expression, respecting string literals.
 ///
 /// GitHub's control plane wraps multi-line `run:` scripts containing expressions
