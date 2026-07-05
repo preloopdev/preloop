@@ -1,0 +1,44 @@
+name: P0 Container Job Verification
+on: workflow_dispatch
+jobs:
+  container-job:
+    runs-on: [self-hosted, p0-linux]
+    container:
+      image: alpine:3.20
+      options: --cpus 1
+    steps:
+      # 1. Verify we're inside the container
+      - name: Check container env
+        run: |
+          echo "Running inside container"
+          cat /etc/os-release | grep -q "Alpine"
+          echo "Container OS verified: Alpine"
+
+      # 2. GITHUB_ENV works inside container
+      - name: Set env in container
+        run: echo "CONTAINER_VAR=from-container" >> "$GITHUB_ENV"
+
+      - name: Use env in container
+        run: |
+          test "$CONTAINER_VAR" = "from-container"
+          echo "GITHUB_ENV works inside container"
+
+      # 3. GITHUB_OUTPUT works inside container
+      - name: Produce output in container
+        id: ctr_output
+        run: echo "cval=container-output" >> "$GITHUB_OUTPUT"
+
+      # 4. File operations work inside container
+      - name: Write and read file
+        run: |
+          echo "test-content" > /tmp/test-file.txt
+          test "$(cat /tmp/test-file.txt)" = "test-content"
+          echo "File I/O works inside container"
+
+      # 5. Step summary inside container
+      - name: Write summary in container
+        run: echo "### Container Job Verified" >> "$GITHUB_STEP_SUMMARY"
+
+      # 6. Final marker
+      - name: All container checks passed
+        run: echo "ALL_P0_CONTAINER_JOB_CHECKS_PASSED"

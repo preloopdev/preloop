@@ -1,0 +1,28 @@
+name: P0 Cancel Semantics Verification
+on: workflow_dispatch
+jobs:
+  cancel-test:
+    runs-on: [self-hosted, p0-cancel]
+    steps:
+      # 1. Long-running step that will be cancelled
+      - name: Long running step
+        run: |
+          echo "Starting long sleep — waiting for cancellation"
+          sleep 120
+
+      # 2. success() — should be SKIPPED after cancel
+      - name: Should be skipped (success)
+        if: success()
+        run: |
+          echo "BUG: this should not run after cancellation"
+          exit 1
+
+      # 3. cancelled() — should RUN after cancel
+      - name: Runs on cancel
+        if: cancelled()
+        run: echo "CANCELLED_CONDITION_RAN"
+
+      # 4. always() — should RUN after cancel
+      - name: Runs always after cancel
+        if: always()
+        run: echo "ALWAYS_CONDITION_RAN_AFTER_CANCEL"
