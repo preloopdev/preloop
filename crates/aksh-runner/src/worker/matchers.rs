@@ -84,6 +84,7 @@ impl MatcherRegistry {
             .with_context(|| format!("parsing matcher file {}", path.display()))?;
 
         for def in file.problem_matcher {
+            validate_matcher_definition(&def)?;
             debug!("Registered problem matcher: {}", def.owner);
             self.matchers.insert(
                 def.owner.clone(),
@@ -106,17 +107,19 @@ impl MatcherRegistry {
     /// Match a log line against all registered matchers.
     pub fn match_line(&self, line: &str) -> Vec<crate::worker::execution_context::Annotation> {
         let mut annotations = Vec::new();
+        let stripped_line = strip_ansi_codes(line);
+        let match_line = stripped_line.as_deref().unwrap_or(line);
 
         for matcher in self.matchers.values() {
             // Only handle single-pattern matchers for now
             if let Some(pattern) = matcher.patterns.first() {
                 if let Ok(re) = regex::Regex::new(&pattern.regexp) {
-                    if let Some(captures) = re.captures(line) {
+                    if let Some(captures) = re.captures(match_line) {
                         let message = pattern
                             .message
                             .and_then(|g| captures.get(g))
                             .map(|m| m.as_str().to_string())
-                            .unwrap_or_else(|| line.to_string());
+                            .unwrap_or_else(|| match_line.to_string());
 
                         // F051: Extract file path and fromPath from captures
                         let raw_file = pattern
@@ -194,6 +197,54 @@ impl MatcherRegistry {
     }
 }
 
+fn strip_ansi_codes(line: &str) -> Option<String> {
+    if !line.as_bytes().contains(&0x1b) {
+        return None;
+    }
+
+    let mut output = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            output.push(ch);
+            continue;
+        }
+
+        if chars.peek() == Some(&'[') {
+            chars.next();
+            for next in chars.by_ref() {
+                if ('@'..='~').contains(&next) {
+                    break;
+                }
+            }
+        }
+    }
+    Some(output)
+}
+
+fn validate_matcher_definition(def: &MatcherDefinition) -> Result<()> {
+    if def.owner.trim().is_empty() {
+        anyhow::bail!("Problem matcher owner is required");
+    }
+    if def.pattern.is_empty() {
+        anyhow::bail!("Problem matcher pattern is required");
+    }
+    for (idx, pattern) in def.pattern.iter().enumerate() {
+        if pattern.message.is_none() {
+            anyhow::bail!("Problem matcher pattern message is required");
+        }
+        if pattern.is_loop {
+            if def.pattern.len() == 1 {
+                anyhow::bail!("Problem matcher loop may not be set on a single pattern");
+            }
+            if idx + 1 != def.pattern.len() {
+                anyhow::bail!("Problem matcher loop is only allowed on the last pattern");
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,5 +282,141 @@ mod tests {
         assert_eq!(annotations[0].line, Some(12));
         assert_eq!(annotations[0].col, Some(34));
         assert_eq!(annotations[0].message, "boom");
+    }
+
+    #[test]
+    fn matcher_strips_ansi_color_codes_before_matching() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("matcher.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "problemMatcher": [{
+                "owner": "ansi",
+                "pattern": [{
+                  "regexp": "^ERR ([^:]+):(\\d+): (.*)$",
+                  "file": 1,
+                  "line": 2,
+                  "message": 3,
+                  "severity": "warning"
+                }]
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        let mut registry = MatcherRegistry::new();
+        registry.add_from_file(&path).unwrap();
+
+        let annotations = registry.match_line("\u{1b}[31mERR src/lib.rs:7: red boom\u{1b}[0m");
+
+        assert_eq!(annotations.len(), 1);
+        assert_eq!(annotations[0].level, AnnotationLevel::Warning);
+        assert_eq!(annotations[0].file.as_deref(), Some("src/lib.rs"));
+        assert_eq!(annotations[0].line, Some(7));
+        assert_eq!(annotations[0].message, "red boom");
+    }
+
+    #[test]
+    fn matcher_owner_can_be_removed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("matcher.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "problemMatcher": [{
+                "owner": "removable",
+                "pattern": [{
+                  "regexp": "^ERR (.*)$",
+                  "message": 1
+                }]
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        let mut registry = MatcherRegistry::new();
+        registry.add_from_file(&path).unwrap();
+        assert_eq!(registry.match_line("ERR boom").len(), 1);
+
+        registry.remove("removable");
+
+        assert!(registry.match_line("ERR boom").is_empty());
+    }
+
+    #[test]
+    fn matcher_validation_requires_message() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("matcher.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "problemMatcher": [{
+                "owner": "bad",
+                "pattern": [{
+                  "regexp": "^ERR (.*)$"
+                }]
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        let mut registry = MatcherRegistry::new();
+        let err = registry.add_from_file(&path).unwrap_err();
+        assert!(err.to_string().contains("message is required"));
+    }
+
+    #[test]
+    fn matcher_validation_rejects_loop_on_single_pattern() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("matcher.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "problemMatcher": [{
+                "owner": "bad",
+                "pattern": [{
+                  "regexp": "^ERR (.*)$",
+                  "message": 1,
+                  "loop": true
+                }]
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        let mut registry = MatcherRegistry::new();
+        let err = registry.add_from_file(&path).unwrap_err();
+        assert!(err.to_string().contains("loop may not be set"));
+    }
+
+    #[test]
+    fn matcher_validation_rejects_loop_before_last_pattern() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("matcher.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "problemMatcher": [{
+                "owner": "bad",
+                "pattern": [
+                  {
+                    "regexp": "^ERR (.*)$",
+                    "message": 1,
+                    "loop": true
+                  },
+                  {
+                    "regexp": "^(.*)$",
+                    "message": 1
+                  }
+                ]
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        let mut registry = MatcherRegistry::new();
+        let err = registry.add_from_file(&path).unwrap_err();
+        assert!(err.to_string().contains("only allowed on the last"));
     }
 }
