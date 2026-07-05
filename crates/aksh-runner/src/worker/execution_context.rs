@@ -189,11 +189,16 @@ impl<'a> StepContext<'a> {
                 env.insert(format!("STATE_{k}"), v.clone());
             }
         }
-        // Add PATH extensions
+        // Prepend GITHUB_PATH additions to the step environment PATH.
+        // Match official runner: use the job/step env PATH as base (which
+        // includes workflow-level env.PATH), falling back to system PATH.
         if !self.job.extra_path.is_empty() {
-            let current_path = std::env::var("PATH").unwrap_or_default();
+            let base_path = env
+                .get("PATH")
+                .cloned()
+                .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
             let mut parts: Vec<&str> = self.job.extra_path.iter().map(|s| s.as_str()).collect();
-            parts.push(&current_path);
+            parts.push(&base_path);
             env.insert("PATH".to_string(), parts.join(":"));
         }
         env
@@ -243,6 +248,30 @@ mod tests {
         let env = ctx.build_env();
         let path = env.get("PATH").unwrap();
         assert!(path.starts_with("/custom/bin:"));
+    }
+
+    #[test]
+    fn build_env_extra_path_prepends_to_env_path_not_system() {
+        let mut job = make_job();
+        // Simulate workflow-level env.PATH override
+        job.env
+            .insert("PATH".into(), "/workflow/bin:/usr/bin".into());
+        // Simulate GITHUB_PATH addition
+        job.extra_path.push("/github/path/bin".into());
+        let ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+
+        let env = ctx.build_env();
+        let path = env.get("PATH").unwrap();
+        // GITHUB_PATH should prepend to the workflow env.PATH, not system PATH
+        assert!(
+            path.starts_with("/github/path/bin:"),
+            "expected prepend, got: {path}"
+        );
+        assert!(
+            path.contains("/workflow/bin"),
+            "expected workflow PATH base, got: {path}"
+        );
+        // Should NOT contain the test runner's system path as the base
     }
 
     #[test]

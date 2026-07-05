@@ -391,7 +391,7 @@ mod tests {
         }
     }
 
-    fn test_step_context<'a>(job: &'a mut crate::worker::contexts::JobContext) -> StepContext<'a> {
+    fn test_step_context(job: &mut crate::worker::contexts::JobContext) -> StepContext<'_> {
         StepContext::new(job, "container".into(), "Container".into())
     }
 
