@@ -415,19 +415,21 @@ C# source (cloned at tag `v2.335.1`). These are behavioral differences NOT cover
 
 ### F055 — MEDIUM: `hashFiles()` doesn't support `--follow-symbolic-links` flag
 
-- **Found**: official parses `--follow-symbolic-links` as a flag argument. Our expression engine does not handle this flag.
+- **Found**: official parses `--follow-symbolic-links` as a flag argument. Our expression engine did not handle this flag, treating it as a glob pattern.
 - **Impact**: Symbolic links silently ignored in cache keys when flag is used.
-- **Upstream**: `Runner.Worker/Expressions/HashFilesFunction.cs:44-51` (parses `--follow-symbolic-links` from first argument, passes to `Globber` options)
+- **Upstream**: `Runner.Worker/Expressions/HashFilesFunction.cs:44-51` (parses `--follow-symbolic-links` from first argument, case-insensitive, passes to `Globber` options; throws on unknown `--` flags)
 - **File**: `crates/aksh-gha-expressions/src/lib.rs`
-- **Status**: ❌ Open
+- **Fix**: Added flag parsing in `hash_files()` — first argument starting with `--` is checked for `--follow-symbolic-links` (case-insensitive). Unknown `--` flags are silently skipped. When set, `follow_symlinks` mode follows symlinks during file enumeration.
+- **Status**: ✅ Fixed (2026-07-05, commit `6a7a97b`). Verified: live GitHub run 28726677018 (aksh) — both `hashFiles('hashtest/*.txt')` and `hashFiles('--follow-symbolic-links', 'hashtest/*.txt')` produced valid matching hashes. Official runner comparison also succeeded.
 
 ### F056 — LOW: `requireFipsCryptography` hardcoded to `"True"`
 
-- **Found**: official reads `properties.RequireFipsCryptography` from agent response. Our `configure.rs` hardcodes `"True"`.
+- **Found**: official reads `properties.RequireFipsCryptography` from agent response. Our `configure.rs` hardcoded `"True"`.
 - **Impact**: Minor; always enables FIPS regardless of server preference.
 - **Upstream**: `Runner.Listener/Configuration/ConfigurationManager.cs` (reads `RequireFipsCryptography` from agent creation response `properties` block)
 - **File**: `crates/aksh-runner/src/configure.rs`
-- **Status**: ❌ Open
+- **Fix**: Read `RequireFipsCryptography` from agent response `properties` at configure time, falling back to `"True"` if not present (preserving prior behavior).
+- **Status**: ✅ Fixed (2026-07-05, commit `6a7a97b`). Verified: live GitHub run 28726677018 — runner registered and acquired job successfully with FIPS settings read from agent response.
 
 ---
 
