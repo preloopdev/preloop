@@ -688,6 +688,17 @@ impl AppState {
     }
 }
 
+impl InnerState {
+    /// Look up the labels for the runner that owns a given session.
+    fn runner_labels_for_session(&self, session_id: &str) -> Vec<String> {
+        self.sessions
+            .get(session_id)
+            .and_then(|s| self.runners.get(&s.runner_id))
+            .map(|r| r.labels.clone())
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Default)]
 #[allow(dead_code)]
 struct InnerState {
@@ -760,6 +771,8 @@ struct QueuedJob {
     needs: Vec<JobId>,
     fail_fast: bool,
     max_parallel: Option<u64>,
+    /// Required runner labels from `runs-on`.
+    runs_on: Vec<String>,
     message: azdo::AgentJobRequestMessage,
 }
 
@@ -958,6 +971,7 @@ pub(crate) async fn submit_run_inner(
                 needs: job.needs.clone(),
                 fail_fast: job.fail_fast,
                 max_parallel: job.max_parallel,
+                runs_on: job.runs_on.clone(),
                 message: agent_msg,
             };
             job_base_ids.insert(job.id.clone(), job.base_id.clone());
@@ -1433,7 +1447,8 @@ async fn next_message_broker_ref(
             inner.session_active_requests.remove(&session_id);
         }
 
-        let Some(queued) = inner.queue.pop_front() else {
+        let runner_labels = inner.runner_labels_for_session(&session_id);
+        let Some(queued) = take_matching_job(&mut inner.queue, &runner_labels) else {
             drop(inner);
             if wait_seconds == 0 {
                 return Ok((StatusCode::ACCEPTED, Json(json!({}))).into_response());
@@ -1566,26 +1581,29 @@ async fn next_message_broker_ref_root(
                     inner.session_active_requests.remove(&session_id);
                     None
                 }
-            } else if let Some(queued) = inner.queue.pop_front() {
-                if let Some(run) = inner.runs.get_mut(&queued.run_id) {
-                    run.status = ExecutionStatus::InProgress;
-                    run.jobs
-                        .insert(queued.job_id.clone(), ExecutionStatus::InProgress);
-                }
-                let request_id = queued.message.request_id;
-                inner
-                    .session_active_requests
-                    .insert(session_id.clone(), request_id);
-                inner
-                    .broker_messages
-                    .insert(request_id, queued.message.clone());
-                let request = inner
-                    .job_requests
-                    .get(&request_id)
-                    .expect("queued request must exist");
-                Some(broker_job_ref_root(request, 1))
             } else {
-                None
+                let labels = inner.runner_labels_for_session(&session_id);
+                if let Some(queued) = take_matching_job(&mut inner.queue, &labels) {
+                    if let Some(run) = inner.runs.get_mut(&queued.run_id) {
+                        run.status = ExecutionStatus::InProgress;
+                        run.jobs
+                            .insert(queued.job_id.clone(), ExecutionStatus::InProgress);
+                    }
+                    let request_id = queued.message.request_id;
+                    inner
+                        .session_active_requests
+                        .insert(session_id.clone(), request_id);
+                    inner
+                        .broker_messages
+                        .insert(request_id, queued.message.clone());
+                    let request = inner
+                        .job_requests
+                        .get(&request_id)
+                        .expect("queued request must exist");
+                    Some(broker_job_ref_root(request, 1))
+                } else {
+                    None
+                }
             }
         };
 
@@ -1907,7 +1925,8 @@ async fn next_message(
             }
         }
 
-        let Some(queued) = inner.queue.pop_front() else {
+        let runner_labels = inner.runner_labels_for_session(&session_id);
+        let Some(queued) = take_matching_job(&mut inner.queue, &runner_labels) else {
             drop(inner);
             if wait_seconds == 0 {
                 return Ok(Json(None));
@@ -2362,6 +2381,65 @@ fn promote_ready_jobs(inner: &mut InnerState) -> usize {
         inner.queue.push_back(job);
     }
     promoted_count
+}
+
+/// Check if a job's `runs-on` labels match a runner's registered labels.
+///
+/// A job matches when every label in the job's `runs-on` is present in the
+/// runner's label set (case-insensitive). GitHub-hosted runner labels like
+/// `ubuntu-latest` are treated as aliases for common self-hosted labels.
+fn job_matches_runner(job_labels: &[String], runner_labels: &[String]) -> bool {
+    // Empty runs-on matches any runner (shouldn't happen, but be safe)
+    if job_labels.is_empty() {
+        return true;
+    }
+    // Unknown runner (no session→runner mapping) matches any job.
+    // This preserves backward compat for tests and legacy session paths.
+    if runner_labels.is_empty() {
+        return true;
+    }
+    let runner_set: std::collections::HashSet<String> =
+        runner_labels.iter().map(|l| l.to_lowercase()).collect();
+    job_labels.iter().all(|required| {
+        let req = required.to_lowercase();
+        // Direct match
+        if runner_set.contains(&req) {
+            return true;
+        }
+        // GitHub-hosted aliases: treat `ubuntu-latest`, `ubuntu-24.04`, etc.
+        // as matching a runner with "linux" label; `macos-latest` matches "macos";
+        // `windows-latest` matches "windows".
+        if req.starts_with("ubuntu") && runner_set.contains("linux") {
+            return true;
+        }
+        if req.starts_with("macos") && runner_set.contains("macos") {
+            return true;
+        }
+        if req.starts_with("windows") && runner_set.contains("windows") {
+            return true;
+        }
+        // Broad fallback: if the runner has "self-hosted" and the job only
+        // specifies a GitHub-hosted label (e.g. "ubuntu-latest"), match it.
+        // This lets single-runner local setups work without label gymnastics.
+        if runner_set.contains("self-hosted")
+            && (req.starts_with("ubuntu") || req.starts_with("macos") || req.starts_with("windows"))
+        {
+            return true;
+        }
+        false
+    })
+}
+
+/// Find and remove the first job in the queue that matches the given runner's labels.
+/// Returns `None` if no matching job is found.
+fn take_matching_job(
+    queue: &mut VecDeque<QueuedJob>,
+    runner_labels: &[String],
+) -> Option<QueuedJob> {
+    let pos = queue
+        .iter()
+        .position(|job| job_matches_runner(&job.runs_on, runner_labels))?;
+    queue.remove(pos)
 }
 
 fn under_max_parallel(inner: &InnerState, job: &QueuedJob) -> bool {
@@ -6696,5 +6774,58 @@ jobs:
 
         // Clean up
         std::env::remove_var("AKSH_GITHUB_API_URL");
+    }
+
+    #[test]
+    fn label_matching_exact() {
+        assert!(job_matches_runner(
+            &["self-hosted".into(), "Linux".into()],
+            &["self-hosted".into(), "Linux".into(), "X64".into()]
+        ));
+    }
+
+    #[test]
+    fn label_matching_case_insensitive() {
+        assert!(job_matches_runner(
+            &["Self-Hosted".into(), "linux".into()],
+            &["self-hosted".into(), "Linux".into()]
+        ));
+    }
+
+    #[test]
+    fn label_matching_ubuntu_alias() {
+        // ubuntu-latest should match a runner with "self-hosted"
+        assert!(job_matches_runner(
+            &["ubuntu-latest".into()],
+            &["self-hosted".into(), "Linux".into()]
+        ));
+        // Also matches via the "linux" label
+        assert!(job_matches_runner(
+            &["ubuntu-24.04".into()],
+            &["linux".into()]
+        ));
+    }
+
+    #[test]
+    fn label_matching_rejects_missing_labels() {
+        // Runner missing "gpu" label
+        assert!(!job_matches_runner(
+            &["self-hosted".into(), "gpu".into()],
+            &["self-hosted".into(), "Linux".into()]
+        ));
+    }
+
+    #[test]
+    fn label_matching_empty_runner_matches_all() {
+        // Unknown runner (empty labels) matches everything
+        assert!(job_matches_runner(
+            &["self-hosted".into(), "Linux".into()],
+            &[]
+        ));
+    }
+
+    #[test]
+    fn label_matching_empty_job_matches_all() {
+        assert!(job_matches_runner(&[], &["self-hosted".into()]));
     }
 }
