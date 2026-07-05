@@ -1,0 +1,117 @@
+name: P0 File Commands Verification
+on: workflow_dispatch
+jobs:
+  file-commands:
+    runs-on: [self-hosted, p0-test]
+    steps:
+      # 1. NODE_OPTIONS blocking — GITHUB_ENV must not allow NODE_OPTIONS
+      - name: Attempt to set NODE_OPTIONS via GITHUB_ENV
+        id: node_opts
+        run: |
+          echo "NODE_OPTIONS=--max-old-space-size=4096" >> "$GITHUB_ENV"
+          echo "Wrote NODE_OPTIONS to GITHUB_ENV"
+
+      - name: Verify NODE_OPTIONS was blocked
+        run: |
+          if [ -n "$NODE_OPTIONS" ]; then
+            echo "BUG: NODE_OPTIONS should have been blocked but is set to: $NODE_OPTIONS"
+            exit 1
+          fi
+          echo "NODE_OPTIONS correctly blocked"
+
+      # 2. Heredoc file commands — multi-line values
+      - name: Set multi-line env via heredoc
+        run: |
+          {
+            echo "MULTI_LINE<<HEREDOC_DELIM"
+            echo "line one"
+            echo "line two"
+            echo "HEREDOC_DELIM"
+          } >> "$GITHUB_ENV"
+
+      - name: Verify multi-line env
+        run: |
+          echo "MULTI_LINE=$MULTI_LINE"
+          echo "$MULTI_LINE" | grep -q "line one"
+          echo "$MULTI_LINE" | grep -q "line two"
+          echo "Multi-line heredoc env verified"
+
+      # 3. Step summary size limit — >1MiB should be rejected
+      - name: Write oversized step summary
+        run: |
+          dd if=/dev/zero bs=1024 count=1100 2>/dev/null | tr '\0' 'X' >> "$GITHUB_STEP_SUMMARY"
+          echo "Wrote 1.1MiB to GITHUB_STEP_SUMMARY (should be rejected)"
+
+      # 4. Normal step summary works
+      - name: Write normal step summary
+        run: echo "### P0 File Commands Verified" >> "$GITHUB_STEP_SUMMARY"
+
+      # 5. Problem matcher — add, match, remove
+      - name: Create problem matcher
+        run: |
+          cat > /tmp/p0-matcher.json << 'EOF'
+          {
+            "problemMatcher": [
+              {
+                "owner": "p0-test-matcher",
+                "pattern": [
+                  {
+                    "regexp": "^(.+):(\\d+):(\\d+):\\s+(error|warning):\\s+(.+)$",
+                    "file": 1,
+                    "line": 2,
+                    "column": 3,
+                    "severity": 4,
+                    "message": 5
+                  }
+                ]
+              }
+            ]
+          }
+          EOF
+          echo "::add-matcher::/tmp/p0-matcher.json"
+
+      - name: Emit lines that match the pattern
+        run: |
+          echo "src/main.rs:42:5: error: unused variable"
+          echo "src/lib.rs:10:1: warning: missing docs"
+          echo "This line should not produce an annotation"
+
+      - name: Remove matcher
+        run: echo "::remove-matcher owner=p0-test-matcher::"
+
+      - name: Lines after removal should not match
+        run: |
+          echo "src/main.rs:99:1: error: this should NOT produce annotation"
+          echo "Matcher removed — no annotation expected"
+
+      # 6. ANSI color stripping in matcher context
+      - name: Create ANSI matcher
+        run: |
+          cat > /tmp/ansi-matcher.json << 'EOF'
+          {
+            "problemMatcher": [
+              {
+                "owner": "ansi-test",
+                "pattern": [
+                  {
+                    "regexp": "^ERROR:\\s+(.+)$",
+                    "message": 1
+                  }
+                ]
+              }
+            ]
+          }
+          EOF
+          echo "::add-matcher::/tmp/ansi-matcher.json"
+
+      - name: Emit ANSI-colored error
+        run: |
+          printf '\033[31mERROR: something went wrong\033[0m\n'
+          echo "ANSI codes should be stripped before matching"
+
+      - name: Remove ANSI matcher
+        run: echo "::remove-matcher owner=ansi-test::"
+
+      # 7. Final marker
+      - name: All file command checks passed
+        run: echo "ALL_P0_FILE_COMMAND_CHECKS_PASSED"
