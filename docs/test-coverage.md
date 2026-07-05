@@ -81,7 +81,7 @@ Scope: official C# runner tests under `/tmp/actions-runner-src/src/Test/L0` comp
 | `L0/Worker/ActionRunnerL0.cs` | 13 | **PARTIAL** | Display-name and action reference parsing only partially covered by job-extension tests | `build_step_list_parses_action_reference` (`crates/aksh-runner/src/worker/job_extension.rs`:859), `lifecycle_uses_resolved_action_path_and_entry_overrides` (`crates/aksh-runner/src/worker/job_extension.rs`:1087), `lifecycle_registers_docker_action_pre_and_post` (`crates/aksh-runner/src/worker/job_extension.rs`:1148) |
 | `L0/Worker/BackgroundStepsL0.cs` | 10 | **GAP** | Background/wait/cancel concurrent step semantics not implemented/tested | — |
 | `L0/Worker/ContainerOperationProviderL0.cs` | 5 | **PARTIAL** | Docker/container command construction and naming covered; provider orchestration edge cases gaps | `parse_container_string` (`crates/aksh-runner/src/worker/container_ops.rs`:878), `parse_container_mapping` (`crates/aksh-runner/src/worker/container_ops.rs`:886), `parse_services` (`crates/aksh-runner/src/worker/container_ops.rs`:903), `docker_create_env_uses_inherit_form_for_empty_values` (`crates/aksh-runner/src/worker/container_ops.rs`:941), `docker_exec_env_args_do_not_include_secret_values` (`crates/aksh-runner/src/worker/container_ops.rs`:959) |
-| `L0/Worker/CreateStepSummaryCommandL0.cs` | 7 | **GAP** | GITHUB_STEP_SUMMARY upload/scrub/size-limit behavior not tested in aksh-runner | — |
+| `L0/Worker/CreateStepSummaryCommandL0.cs` | 7 | **PARTIAL** | GITHUB_STEP_SUMMARY upload/scrub/size-limit behavior | `test_step_summary_size_limit_and_scrubbing` (`crates/aksh-runner/src/worker/steps_runner.rs`:1177) |
 | `L0/Worker/DapDebuggerL0.cs` | 37 | **GAP** | DAP debugger not implemented/tested | — |
 | `L0/Worker/DapMessagesL0.cs` | 13 | **GAP** | DAP protocol messages not implemented/tested | — |
 | `L0/Worker/DapReplExecutorL0.cs` | 15 | **GAP** | DAP REPL executor not implemented/tested | — |
@@ -1050,20 +1050,20 @@ Verified aksh-runner refs: `parse_container_string` (`crates/aksh-runner/src/wor
 | `RunServiceContainersHealthcheck_healthyServiceContainerWithoutHealthcheck_AssertSucceededTask` | 88 | Run Service Containers Healthcheck healthy Service Container Without Healthcheck Assert Succeeded Task | **PARTIAL** | `parse_container_string` (`crates/aksh-runner/src/worker/container_ops.rs`:878), `parse_container_mapping` (`crates/aksh-runner/src/worker/container_ops.rs`:886), `parse_services` (`crates/aksh-runner/src/worker/container_ops.rs`:903), `docker_create_env_uses_inherit_form_for_empty_values` (`crates/aksh-runner/src/worker/container_ops.rs`:941), `docker_exec_env_args_do_not_include_secret_values` (`crates/aksh-runner/src/worker/container_ops.rs`:959) |
 | `InitializeWithCorrectManager` | 105 | Initialize With Correct Manager | **PARTIAL** | `parse_container_string` (`crates/aksh-runner/src/worker/container_ops.rs`:878), `parse_container_mapping` (`crates/aksh-runner/src/worker/container_ops.rs`:886), `parse_services` (`crates/aksh-runner/src/worker/container_ops.rs`:903), `docker_create_env_uses_inherit_form_for_empty_values` (`crates/aksh-runner/src/worker/container_ops.rs`:941), `docker_exec_env_args_do_not_include_secret_values` (`crates/aksh-runner/src/worker/container_ops.rs`:959) |
 
-### `L0/Worker/CreateStepSummaryCommandL0.cs` — 7 tests — GAP
+### `L0/Worker/CreateStepSummaryCommandL0.cs` — 7 tests — PARTIAL
 
-Official behavior: GITHUB_STEP_SUMMARY upload/scrub/size-limit behavior not tested in aksh-runner.
-Verified aksh-runner refs: —
+Official behavior: GITHUB_STEP_SUMMARY upload/scrub/size-limit behavior.
+Verified aksh-runner refs: `test_step_summary_size_limit_and_scrubbing` (`crates/aksh-runner/src/worker/steps_runner.rs`:1177).
 
 | C# test | Line | Official behavior under test | aksh-runner coverage status | Verified Rust test refs |
 |---|---:|---|---|---|
-| `CreateStepSummaryCommand_FileNull` | 31 | Create Step Summary Command File Null | **GAP** | — |
-| `CreateStepSummaryCommand_DirectoryNotFound` | 46 | Create Step Summary Command Directory Not Found | **GAP** | — |
-| `CreateStepSummaryCommand_FileNotFound` | 63 | Create Step Summary Command File Not Found | **GAP** | — |
-| `CreateStepSummaryCommand_EmptyFile` | 80 | Create Step Summary Command Empty File | **GAP** | — |
-| `CreateStepSummaryCommand_LargeFile` | 98 | Create Step Summary Command Large File | **GAP** | — |
-| `CreateStepSummaryCommand_Simple` | 116 | Create Step Summary Command Simple | **GAP** | — |
-| `CreateStepSummaryCommand_ScrubSecrets` | 140 | Create Step Summary Command Scrub Secrets | **GAP** | — |
+| `CreateStepSummaryCommand_FileNull` | 31 | Create Step Summary Command File Null | **PARTIAL** | `test_step_summary_size_limit_and_scrubbing` (`crates/aksh-runner/src/worker/steps_runner.rs`:1177) |
+| `CreateStepSummaryCommand_DirectoryNotFound` | 46 | Create Step Summary Command Directory Not Found | **PARTIAL** | `test_step_summary_size_limit_and_scrubbing` (`crates/aksh-runner/src/worker/steps_runner.rs`:1177) |
+| `CreateStepSummaryCommand_FileNotFound` | 63 | Create Step Summary Command File Not Found | **PARTIAL** | `test_step_summary_size_limit_and_scrubbing` (`crates/aksh-runner/src/worker/steps_runner.rs`:1177) |
+| `CreateStepSummaryCommand_EmptyFile` | 80 | Create Step Summary Command Empty File | **PARTIAL** | `test_step_summary_size_limit_and_scrubbing` (`crates/aksh-runner/src/worker/steps_runner.rs`:1177) |
+| `CreateStepSummaryCommand_LargeFile` | 98 | Create Step Summary Command Large File | **PARTIAL** | `test_step_summary_size_limit_and_scrubbing` (`crates/aksh-runner/src/worker/steps_runner.rs`:1177) |
+| `CreateStepSummaryCommand_Simple` | 116 | Create Step Summary Command Simple | **PARTIAL** | `test_step_summary_size_limit_and_scrubbing` (`crates/aksh-runner/src/worker/steps_runner.rs`:1177) |
+| `CreateStepSummaryCommand_ScrubSecrets` | 140 | Create Step Summary Command Scrub Secrets | **PARTIAL** | `test_step_summary_size_limit_and_scrubbing` (`crates/aksh-runner/src/worker/steps_runner.rs`:1177) |
 
 ### `L0/Worker/DapDebuggerL0.cs` — 37 tests — GAP
 
