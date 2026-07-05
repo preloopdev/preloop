@@ -419,6 +419,14 @@ fn validate_matcher_definition(def: &MatcherDefinition) -> Result<()> {
         anyhow::bail!("Problem matcher pattern is required");
     }
 
+    let mut file_count = 0;
+    let mut line_count = 0;
+    let mut col_count = 0;
+    let mut sev_count = 0;
+    let mut code_count = 0;
+    let mut msg_count = 0;
+    let mut from_count = 0;
+
     let mut has_message = false;
     for (idx, pattern) in def.pattern.iter().enumerate() {
         let is_first = idx == 0;
@@ -438,7 +446,81 @@ fn validate_matcher_definition(def: &MatcherDefinition) -> Result<()> {
         if pattern.message.is_some() {
             has_message = true;
         }
+
+        if pattern.file.is_some() {
+            file_count += 1;
+        }
+        if pattern.line.is_some() {
+            line_count += 1;
+        }
+        if pattern.column.is_some() {
+            col_count += 1;
+        }
+        if pattern.severity.is_some() {
+            sev_count += 1;
+        }
+        if pattern.code.is_some() {
+            code_count += 1;
+        }
+        if pattern.message.is_some() {
+            msg_count += 1;
+        }
+        if pattern.from_path.is_some() {
+            from_count += 1;
+        }
+
+        // Regex group count check
+        let re = regex::Regex::new(&pattern.regexp).map_err(|e| {
+            anyhow::anyhow!("Invalid regular expression '{}': {}", pattern.regexp, e)
+        })?;
+        let groups = re.captures_len();
+
+        let check_range = |name: &str, val: Option<usize>| -> Result<()> {
+            if let Some(idx) = val {
+                if idx >= groups {
+                    anyhow::bail!(
+                        "The property '{}' is set to {} which is out of range",
+                        name,
+                        idx
+                    );
+                }
+            }
+            Ok(())
+        };
+
+        check_range("file", pattern.file)?;
+        check_range("line", pattern.line)?;
+        check_range("column", pattern.column)?;
+        check_range("code", pattern.code)?;
+        check_range("message", pattern.message)?;
+        check_range("fromPath", pattern.from_path)?;
+        if let Some(SeveritySpec::Capture(idx)) = pattern.severity {
+            check_range("severity", Some(idx))?;
+        }
     }
+
+    if file_count > 1 {
+        anyhow::bail!("The property 'file' is set twice");
+    }
+    if line_count > 1 {
+        anyhow::bail!("The property 'line' is set twice");
+    }
+    if col_count > 1 {
+        anyhow::bail!("The property 'column' is set twice");
+    }
+    if sev_count > 1 {
+        anyhow::bail!("The property 'severity' is set twice");
+    }
+    if code_count > 1 {
+        anyhow::bail!("The property 'code' is set twice");
+    }
+    if msg_count > 1 {
+        anyhow::bail!("The property 'message' is set twice");
+    }
+    if from_count > 1 {
+        anyhow::bail!("The property 'fromPath' is set twice");
+    }
+
     if !has_message {
         anyhow::bail!("Problem matcher pattern message is required");
     }
@@ -907,5 +989,102 @@ mod tests {
         let mut registry = MatcherRegistry::new();
         let err = registry.add_from_file(&path).unwrap_err();
         assert!(err.to_string().contains("only allowed on the last"));
+    }
+    #[test]
+    fn matcher_validation_rejects_property_set_twice() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("matcher.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "problemMatcher": [{
+                "owner": "bad",
+                "pattern": [
+                  {
+                    "regexp": "^(file1): (.*)$",
+                    "file": 1
+                  },
+                  {
+                    "regexp": "^(file2): (.*)$",
+                    "file": 1,
+                    "message": 2
+                  }
+                ]
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        let mut registry = MatcherRegistry::new();
+        let err = registry.add_from_file(&path).unwrap_err();
+        assert!(err.to_string().contains("property 'file' is set twice"));
+    }
+
+    #[test]
+    fn matcher_validation_rejects_property_out_of_range() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("matcher.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "problemMatcher": [{
+                "owner": "bad",
+                "pattern": [{
+                  "regexp": "^(.+)$",
+                  "message": 2
+                }]
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        let mut registry = MatcherRegistry::new();
+        let err = registry.add_from_file(&path).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("property 'message' is set to 2 which is out of range"));
+    }
+
+    #[test]
+    fn matcher_validation_requires_owner() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("matcher.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "problemMatcher": [{
+                "owner": "  ",
+                "pattern": [{
+                  "regexp": "^ERR (.*)$",
+                  "message": 1
+                }]
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        let mut registry = MatcherRegistry::new();
+        let err = registry.add_from_file(&path).unwrap_err();
+        assert!(err.to_string().contains("owner is required"));
+    }
+
+    #[test]
+    fn matcher_validation_requires_pattern() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("matcher.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "problemMatcher": [{
+                "owner": "bad",
+                "pattern": []
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        let mut registry = MatcherRegistry::new();
+        let err = registry.add_from_file(&path).unwrap_err();
+        assert!(err.to_string().contains("pattern is required"));
     }
 }
