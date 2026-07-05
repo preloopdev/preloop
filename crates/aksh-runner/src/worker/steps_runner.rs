@@ -966,6 +966,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_steps_job_status_remains_success_after_continue_on_error() {
+        let dir = TempDir::new().unwrap();
+        let mut job = JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+        let (_tx, cancel_rx) = watch::channel(false);
+
+        // Step 1: fails but continue-on-error is true
+        let mut soft_fail = test_step("soft_fail", None);
+        soft_fail.step_type = StepType::Script {
+            script: "exit 1".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+        soft_fail.continue_on_error = true;
+
+        // Step 2: normal step that should still run and succeed
+        let mut after = test_step("after", None);
+        after.step_type = StepType::Script {
+            script: "echo still-running".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+
+        let result = run_steps(
+            &[soft_fail, after],
+            &mut job,
+            dir.path().to_str().unwrap(),
+            cancel_rx,
+            queue,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        // Job overall succeeds
+        assert_eq!(result, "Succeeded");
+        assert_eq!(job.job_status, JobStatus::Success);
+
+        // soft_fail: outcome=Failure, conclusion=Success (continue-on-error)
+        let sf = job.steps.get("soft_fail").unwrap();
+        assert_eq!(sf.outcome, "Failure");
+        assert_eq!(sf.conclusion, "Success");
+
+        // after: ran normally
+        let a = job.steps.get("after").unwrap();
+        assert_eq!(a.outcome, "Success");
+        assert_eq!(a.conclusion, "Success");
+    }
+
+    #[tokio::test]
     async fn run_steps_conditions_reflect_prior_failure() {
         let dir = TempDir::new().unwrap();
         let mut job = JobContext::new(
