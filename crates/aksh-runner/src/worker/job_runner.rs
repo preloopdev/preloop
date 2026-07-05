@@ -1214,6 +1214,34 @@ async fn report_completion(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+    use tokio::sync::watch;
+
+    #[tokio::test]
+    async fn test_run_job_executes_successfully() {
+        let dir = TempDir::new().unwrap();
+        let workspace_dir = dir.path().join("work");
+        let payload = serde_json::json!({
+            "jobId": "job-1",
+            "jobDisplayName": "Mock Job",
+            "steps": [
+                {
+                    "id": "step-1",
+                    "contextName": "step1",
+                    "displayName": "Step One",
+                    "run": "echo step-one-executed",
+                    "shell": "bash"
+                }
+            ],
+            "fileTable": {
+                "workDirectory": workspace_dir.to_str().unwrap()
+            }
+        });
+
+        let (_tx, cancel_rx) = watch::channel(false);
+        let res = run_job(payload, ProtocolPath::Broker, cancel_rx).await;
+        assert!(res.is_ok(), "Expected run_job to succeed, got: {:?}", res);
+    }
 
     #[test]
     fn results_url_prefers_system_vss_endpoint_data() {
