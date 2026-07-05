@@ -15,6 +15,8 @@ use tracing::debug;
 pub struct ProblemMatcher {
     pub owner: String,
     pub patterns: Vec<MatcherPattern>,
+    /// F051: Default base directory for resolving relative file paths in annotations.
+    pub from_path: String,
 }
 
 /// A single matcher pattern.
@@ -33,6 +35,9 @@ pub struct MatcherPattern {
     pub message: Option<usize>,
     #[serde(default)]
     pub code: Option<usize>,
+    /// F051: Capture group index for the fromPath (base directory for relative file resolution).
+    #[serde(default, rename = "fromPath")]
+    pub from_path: Option<usize>,
     #[serde(rename = "loop", default)]
     pub is_loop: bool,
 }
@@ -48,6 +53,9 @@ struct MatcherFile {
 struct MatcherDefinition {
     owner: String,
     pattern: Vec<MatcherPattern>,
+    /// F051: Default fromPath for the matcher (base directory for relative file paths).
+    #[serde(default, rename = "fromPath")]
+    from_path: Option<String>,
 }
 
 /// Registry of active problem matchers.
@@ -76,6 +84,7 @@ impl MatcherRegistry {
                 ProblemMatcher {
                     owner: def.owner,
                     patterns: def.pattern,
+                    from_path: def.from_path.unwrap_or_default(),
                 },
             );
         }
@@ -103,10 +112,34 @@ impl MatcherRegistry {
                             .map(|m| m.as_str().to_string())
                             .unwrap_or_else(|| line.to_string());
 
-                        let file = pattern
+                        // F051: Extract file path and fromPath from captures
+                        let raw_file = pattern
                             .file
                             .and_then(|g| captures.get(g))
                             .map(|m| m.as_str().to_string());
+
+                        // F051: Resolve relative file paths using fromPath
+                        let file = raw_file.map(|f| {
+                            // If file is already absolute, use as-is
+                            if Path::new(&f).is_absolute() {
+                                return f;
+                            }
+                            // Try pattern-level fromPath capture group first
+                            let from_path = pattern
+                                .from_path
+                                .and_then(|g| captures.get(g))
+                                .map(|m| m.as_str().to_string())
+                                .unwrap_or_else(|| matcher.from_path.clone());
+                            // Resolve relative file against fromPath directory
+                            if !from_path.is_empty() {
+                                if let Some(dir) = Path::new(&from_path).parent() {
+                                    if !dir.as_os_str().is_empty() {
+                                        return dir.join(&f).to_string_lossy().to_string();
+                                    }
+                                }
+                            }
+                            f
+                        });
 
                         let line_num = pattern
                             .line
