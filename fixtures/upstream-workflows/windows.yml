@@ -1,7 +1,0 @@
-on: push
-name: windows
-jobs:
-  windows-latest:
-    runs-on: windows-latest
-    steps:
-    - run: echo "Hello from windows"
