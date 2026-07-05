@@ -1,0 +1,71 @@
+test-defaults	Set up job	﻿2026-07-05T21:04:53.2353637Z Current runner version: '2.335.1'
+test-defaults	Set up job	2026-07-05T21:04:53.2381581Z ##[group]Runner Image Provisioner
+test-defaults	Set up job	2026-07-05T21:04:53.2382504Z Hosted Compute Agent
+test-defaults	Set up job	2026-07-05T21:04:53.2383305Z Version: 20260624.560
+test-defaults	Set up job	2026-07-05T21:04:53.2383947Z Commit: 925d229a51159bc391ae97e54a2dd1fe20af789d
+test-defaults	Set up job	2026-07-05T21:04:53.2384750Z Build Date: 2026-06-24T18:26:47Z
+test-defaults	Set up job	2026-07-05T21:04:53.2385471Z Worker ID: {9796dd2b-e55a-4038-a0b8-48c3990c7718}
+test-defaults	Set up job	2026-07-05T21:04:53.2386164Z Azure Region: eastus2
+test-defaults	Set up job	2026-07-05T21:04:53.2386832Z ##[endgroup]
+test-defaults	Set up job	2026-07-05T21:04:53.2388199Z ##[group]Operating System
+test-defaults	Set up job	2026-07-05T21:04:53.2388910Z Ubuntu
+test-defaults	Set up job	2026-07-05T21:04:53.2389497Z 24.04.4
+test-defaults	Set up job	2026-07-05T21:04:53.2390021Z LTS
+test-defaults	Set up job	2026-07-05T21:04:53.2390603Z ##[endgroup]
+test-defaults	Set up job	2026-07-05T21:04:53.2391174Z ##[group]Runner Image
+test-defaults	Set up job	2026-07-05T21:04:53.2391790Z Image: ubuntu-24.04
+test-defaults	Set up job	2026-07-05T21:04:53.2392432Z Version: 20260628.225.1
+test-defaults	Set up job	2026-07-05T21:04:53.2393865Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260628.225/images/ubuntu/Ubuntu2404-Readme.md
+test-defaults	Set up job	2026-07-05T21:04:53.2395714Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260628.225
+test-defaults	Set up job	2026-07-05T21:04:53.2396686Z ##[endgroup]
+test-defaults	Set up job	2026-07-05T21:04:53.2398016Z ##[group]GITHUB_TOKEN Permissions
+test-defaults	Set up job	2026-07-05T21:04:53.2399963Z Contents: read
+test-defaults	Set up job	2026-07-05T21:04:53.2400688Z Metadata: read
+test-defaults	Set up job	2026-07-05T21:04:53.2401278Z Packages: read
+test-defaults	Set up job	2026-07-05T21:04:53.2401837Z ##[endgroup]
+test-defaults	Set up job	2026-07-05T21:04:53.2404495Z Secret source: Actions
+test-defaults	Set up job	2026-07-05T21:04:53.2405557Z Prepare workflow directory
+test-defaults	Set up job	2026-07-05T21:04:53.2816663Z Prepare all required actions
+test-defaults	Set up job	2026-07-05T21:04:53.2877094Z Complete job name: test-defaults
+test-defaults	Create subdir with marker	﻿2026-07-05T21:04:53.3617416Z ##[group]Run mkdir -p subdir
+test-defaults	Create subdir with marker	2026-07-05T21:04:53.3618218Z ^[[36;1mmkdir -p subdir^[[0m
+test-defaults	Create subdir with marker	2026-07-05T21:04:53.3619098Z ^[[36;1mecho "MARKER_VALUE=from-subdir" > subdir/marker.txt^[[0m
+test-defaults	Create subdir with marker	2026-07-05T21:04:53.3619930Z ^[[36;1mecho "Created marker in subdir"^[[0m
+test-defaults	Create subdir with marker	2026-07-05T21:04:53.4201132Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+test-defaults	Create subdir with marker	2026-07-05T21:04:53.4202377Z ##[endgroup]
+test-defaults	Create subdir with marker	2026-07-05T21:04:53.4411653Z Created marker in subdir
+test-defaults	Verify defaults.run.working-directory works	﻿2026-07-05T21:04:53.4517684Z ##[group]Run echo "PWD is: $PWD"
+test-defaults	Verify defaults.run.working-directory works	2026-07-05T21:04:53.4518442Z ^[[36;1mecho "PWD is: $PWD"^[[0m
+test-defaults	Verify defaults.run.working-directory works	2026-07-05T21:04:53.4519077Z ^[[36;1mif [[ "$PWD" != *"/subdir" ]]; then^[[0m
+test-defaults	Verify defaults.run.working-directory works	2026-07-05T21:04:53.4519965Z ^[[36;1m  echo "FAIL: expected PWD to end with /subdir, got $PWD"^[[0m
+test-defaults	Verify defaults.run.working-directory works	2026-07-05T21:04:53.4520732Z ^[[36;1m  exit 1^[[0m
+test-defaults	Verify defaults.run.working-directory works	2026-07-05T21:04:53.4521428Z ^[[36;1mfi^[[0m
+test-defaults	Verify defaults.run.working-directory works	2026-07-05T21:04:53.4522039Z ^[[36;1mecho "PASS: working directory is subdir"^[[0m
+test-defaults	Verify defaults.run.working-directory works	2026-07-05T21:04:53.4559152Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+test-defaults	Verify defaults.run.working-directory works	2026-07-05T21:04:53.4560034Z ##[endgroup]
+test-defaults	Verify defaults.run.working-directory works	2026-07-05T21:04:53.4710389Z PWD is: /home/runner/work/aksh-conformance-sample/aksh-conformance-sample/subdir
+test-defaults	Verify defaults.run.working-directory works	2026-07-05T21:04:53.4711813Z PASS: working directory is subdir
+test-defaults	Read file from default working dir	﻿2026-07-05T21:04:53.4754091Z ##[group]Run cat marker.txt
+test-defaults	Read file from default working dir	2026-07-05T21:04:53.4754661Z ^[[36;1mcat marker.txt^[[0m
+test-defaults	Read file from default working dir	2026-07-05T21:04:53.4755143Z ^[[36;1msource marker.txt^[[0m
+test-defaults	Read file from default working dir	2026-07-05T21:04:53.4755720Z ^[[36;1mif [[ "$MARKER_VALUE" != "from-subdir" ]]; then^[[0m
+test-defaults	Read file from default working dir	2026-07-05T21:04:53.4756363Z ^[[36;1m  echo "FAIL: marker not found"^[[0m
+test-defaults	Read file from default working dir	2026-07-05T21:04:53.4756897Z ^[[36;1m  exit 1^[[0m
+test-defaults	Read file from default working dir	2026-07-05T21:04:53.4757312Z ^[[36;1mfi^[[0m
+test-defaults	Read file from default working dir	2026-07-05T21:04:53.4757762Z ^[[36;1mecho "PASS: marker read from subdir"^[[0m
+test-defaults	Read file from default working dir	2026-07-05T21:04:53.4793507Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+test-defaults	Read file from default working dir	2026-07-05T21:04:53.4794175Z ##[endgroup]
+test-defaults	Read file from default working dir	2026-07-05T21:04:53.4864207Z MARKER_VALUE=from-subdir
+test-defaults	Read file from default working dir	2026-07-05T21:04:53.4867352Z PASS: marker read from subdir
+test-defaults	Step override takes precedence	﻿2026-07-05T21:04:53.4905126Z ##[group]Run echo "PWD is: $PWD"
+test-defaults	Step override takes precedence	2026-07-05T21:04:53.4905704Z ^[[36;1mecho "PWD is: $PWD"^[[0m
+test-defaults	Step override takes precedence	2026-07-05T21:04:53.4906233Z ^[[36;1mif [[ "$PWD" == *"/subdir" ]]; then^[[0m
+test-defaults	Step override takes precedence	2026-07-05T21:04:53.4906932Z ^[[36;1m  echo "FAIL: step override should have overridden defaults"^[[0m
+test-defaults	Step override takes precedence	2026-07-05T21:04:53.4907596Z ^[[36;1m  exit 1^[[0m
+test-defaults	Step override takes precedence	2026-07-05T21:04:53.4908016Z ^[[36;1mfi^[[0m
+test-defaults	Step override takes precedence	2026-07-05T21:04:53.4908577Z ^[[36;1mecho "PASS: step-level working-directory overrides defaults"^[[0m
+test-defaults	Step override takes precedence	2026-07-05T21:04:53.4943909Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+test-defaults	Step override takes precedence	2026-07-05T21:04:53.4944574Z ##[endgroup]
+test-defaults	Step override takes precedence	2026-07-05T21:04:53.5000684Z PWD is: /home/runner/work/aksh-conformance-sample/aksh-conformance-sample
+test-defaults	Step override takes precedence	2026-07-05T21:04:53.5001907Z PASS: step-level working-directory overrides defaults
+test-defaults	Complete job	﻿2026-07-05T21:04:53.5088488Z Cleaning up orphan processes

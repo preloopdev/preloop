@@ -1,0 +1,118 @@
+{
+  "scenario": "71-composite-advanced",
+  "run_id": 28754864922,
+  "name": "golden: composite-advanced",
+  "status": "completed",
+  "conclusion": "success",
+  "started_at": "2026-07-05T21:04:51Z",
+  "jobs": [
+    {
+      "name": "test-composite-fail",
+      "conclusion": "success",
+      "steps": [
+        {
+          "name": "Set up job",
+          "conclusion": "success",
+          "number": 1
+        },
+        {
+          "name": "Run actions/checkout@v4",
+          "conclusion": "success",
+          "number": 2
+        },
+        {
+          "name": "Run composite in fail mode (continue-on-error)",
+          "conclusion": "success",
+          "number": 3
+        },
+        {
+          "name": "Verify fail mode still succeeds (continue-on-error)",
+          "conclusion": "success",
+          "number": 4
+        },
+        {
+          "name": "Post Run actions/checkout@v4",
+          "conclusion": "success",
+          "number": 8
+        },
+        {
+          "name": "Complete job",
+          "conclusion": "success",
+          "number": 9
+        }
+      ]
+    },
+    {
+      "name": "test-composite-pass",
+      "conclusion": "success",
+      "steps": [
+        {
+          "name": "Set up job",
+          "conclusion": "success",
+          "number": 1
+        },
+        {
+          "name": "Run actions/checkout@v4",
+          "conclusion": "success",
+          "number": 2
+        },
+        {
+          "name": "Run composite in pass mode",
+          "conclusion": "success",
+          "number": 3
+        },
+        {
+          "name": "Verify pass output",
+          "conclusion": "success",
+          "number": 4
+        },
+        {
+          "name": "Post Run actions/checkout@v4",
+          "conclusion": "success",
+          "number": 8
+        },
+        {
+          "name": "Complete job",
+          "conclusion": "success",
+          "number": 9
+        }
+      ]
+    },
+    {
+      "name": "test-env-propagation",
+      "conclusion": "success",
+      "steps": [
+        {
+          "name": "Set up job",
+          "conclusion": "success",
+          "number": 1
+        },
+        {
+          "name": "Run actions/checkout@v4",
+          "conclusion": "success",
+          "number": 2
+        },
+        {
+          "name": "Run composite (env propagation test)",
+          "conclusion": "success",
+          "number": 3
+        },
+        {
+          "name": "Verify env leaked from composite",
+          "conclusion": "success",
+          "number": 4
+        },
+        {
+          "name": "Post Run actions/checkout@v4",
+          "conclusion": "success",
+          "number": 8
+        },
+        {
+          "name": "Complete job",
+          "conclusion": "success",
+          "number": 9
+        }
+      ]
+    }
+  ]
+}

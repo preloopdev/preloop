@@ -1,0 +1,142 @@
+test-env-path-base	Set up job	﻿2026-07-05T21:04:57.6761155Z Current runner version: '2.335.1'
+test-env-path-base	Set up job	2026-07-05T21:04:57.6795248Z ##[group]Runner Image Provisioner
+test-env-path-base	Set up job	2026-07-05T21:04:57.6796651Z Hosted Compute Agent
+test-env-path-base	Set up job	2026-07-05T21:04:57.6797544Z Version: 20260624.560
+test-env-path-base	Set up job	2026-07-05T21:04:57.6798450Z Commit: 925d229a51159bc391ae97e54a2dd1fe20af789d
+test-env-path-base	Set up job	2026-07-05T21:04:57.6799886Z Build Date: 2026-06-24T18:26:47Z
+test-env-path-base	Set up job	2026-07-05T21:04:57.6800978Z Worker ID: {376e8323-ee5e-4a78-b7ba-0ff58a311d06}
+test-env-path-base	Set up job	2026-07-05T21:04:57.6802041Z Azure Region: centralus
+test-env-path-base	Set up job	2026-07-05T21:04:57.6802899Z ##[endgroup]
+test-env-path-base	Set up job	2026-07-05T21:04:57.6804858Z ##[group]Operating System
+test-env-path-base	Set up job	2026-07-05T21:04:57.6805857Z Ubuntu
+test-env-path-base	Set up job	2026-07-05T21:04:57.6806696Z 24.04.4
+test-env-path-base	Set up job	2026-07-05T21:04:57.6807442Z LTS
+test-env-path-base	Set up job	2026-07-05T21:04:57.6808251Z ##[endgroup]
+test-env-path-base	Set up job	2026-07-05T21:04:57.6809054Z ##[group]Runner Image
+test-env-path-base	Set up job	2026-07-05T21:04:57.6810131Z Image: ubuntu-24.04
+test-env-path-base	Set up job	2026-07-05T21:04:57.6811000Z Version: 20260628.225.1
+test-env-path-base	Set up job	2026-07-05T21:04:57.6812602Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260628.225/images/ubuntu/Ubuntu2404-Readme.md
+test-env-path-base	Set up job	2026-07-05T21:04:57.6815391Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260628.225
+test-env-path-base	Set up job	2026-07-05T21:04:57.6817003Z ##[endgroup]
+test-env-path-base	Set up job	2026-07-05T21:04:57.6818873Z ##[group]GITHUB_TOKEN Permissions
+test-env-path-base	Set up job	2026-07-05T21:04:57.6821975Z Contents: read
+test-env-path-base	Set up job	2026-07-05T21:04:57.6822905Z Metadata: read
+test-env-path-base	Set up job	2026-07-05T21:04:57.6823718Z Packages: read
+test-env-path-base	Set up job	2026-07-05T21:04:57.6824623Z ##[endgroup]
+test-env-path-base	Set up job	2026-07-05T21:04:57.6827306Z Secret source: Actions
+test-env-path-base	Set up job	2026-07-05T21:04:57.6828508Z Prepare workflow directory
+test-env-path-base	Set up job	2026-07-05T21:04:57.7228720Z Prepare all required actions
+test-env-path-base	Set up job	2026-07-05T21:04:57.7311252Z Complete job name: test-env-path-base
+test-env-path-base	Verify job-level env PATH is base	﻿2026-07-05T21:04:57.8100283Z ##[group]Run echo "PATH: $PATH"
+test-env-path-base	Verify job-level env PATH is base	2026-07-05T21:04:57.8101044Z ^[[36;1mecho "PATH: $PATH"^[[0m
+test-env-path-base	Verify job-level env PATH is base	2026-07-05T21:04:57.8101767Z ^[[36;1mif [[ "$PATH" != *"/usr/local/custom"* ]]; then^[[0m
+test-env-path-base	Verify job-level env PATH is base	2026-07-05T21:04:57.8102531Z ^[[36;1m  echo "FAIL: job-level env.PATH should be in PATH"^[[0m
+test-env-path-base	Verify job-level env PATH is base	2026-07-05T21:04:57.8103428Z ^[[36;1m  exit 1^[[0m
+test-env-path-base	Verify job-level env PATH is base	2026-07-05T21:04:57.8103908Z ^[[36;1mfi^[[0m
+test-env-path-base	Verify job-level env PATH is base	2026-07-05T21:04:57.8104502Z ^[[36;1mecho "PASS: job-level env.PATH used as base"^[[0m
+test-env-path-base	Verify job-level env PATH is base	2026-07-05T21:04:57.8413176Z shell: /usr/bin/bash -e {0}
+test-env-path-base	Verify job-level env PATH is base	2026-07-05T21:04:57.8414956Z env:
+test-env-path-base	Verify job-level env PATH is base	2026-07-05T21:04:57.8415678Z   PATH: /usr/local/custom:/usr/bin:/bin
+test-env-path-base	Verify job-level env PATH is base	2026-07-05T21:04:57.8416461Z ##[endgroup]
+test-env-path-base	Verify job-level env PATH is base	2026-07-05T21:04:57.8745746Z PATH: /usr/local/custom:/usr/bin:/bin
+test-env-path-base	Verify job-level env PATH is base	2026-07-05T21:04:57.8746487Z PASS: job-level env.PATH used as base
+test-env-path-base	Add GITHUB_PATH on top of env.PATH	﻿2026-07-05T21:04:57.8837221Z ##[group]Run echo "/tmp/over-env-path" >> "$GITHUB_PATH"
+test-env-path-base	Add GITHUB_PATH on top of env.PATH	2026-07-05T21:04:57.8838057Z ^[[36;1mecho "/tmp/over-env-path" >> "$GITHUB_PATH"^[[0m
+test-env-path-base	Add GITHUB_PATH on top of env.PATH	2026-07-05T21:04:57.8857264Z shell: /usr/bin/bash -e {0}
+test-env-path-base	Add GITHUB_PATH on top of env.PATH	2026-07-05T21:04:57.8857880Z env:
+test-env-path-base	Add GITHUB_PATH on top of env.PATH	2026-07-05T21:04:57.8858376Z   PATH: /usr/local/custom:/usr/bin:/bin
+test-env-path-base	Add GITHUB_PATH on top of env.PATH	2026-07-05T21:04:57.8859000Z ##[endgroup]
+test-env-path-base	Verify GITHUB_PATH prepended to env.PATH base	﻿2026-07-05T21:04:57.8939403Z ##[group]Run echo "PATH: $PATH"
+test-env-path-base	Verify GITHUB_PATH prepended to env.PATH base	2026-07-05T21:04:57.8940325Z ^[[36;1mecho "PATH: $PATH"^[[0m
+test-env-path-base	Verify GITHUB_PATH prepended to env.PATH base	2026-07-05T21:04:57.8940957Z ^[[36;1mif [[ "$PATH" != /tmp/over-env-path:* ]]; then^[[0m
+test-env-path-base	Verify GITHUB_PATH prepended to env.PATH base	2026-07-05T21:04:57.8941686Z ^[[36;1m  echo "FAIL: GITHUB_PATH should be prepended"^[[0m
+test-env-path-base	Verify GITHUB_PATH prepended to env.PATH base	2026-07-05T21:04:57.8942330Z ^[[36;1m  exit 1^[[0m
+test-env-path-base	Verify GITHUB_PATH prepended to env.PATH base	2026-07-05T21:04:57.8942785Z ^[[36;1mfi^[[0m
+test-env-path-base	Verify GITHUB_PATH prepended to env.PATH base	2026-07-05T21:04:57.8943320Z ^[[36;1mif [[ "$PATH" != *"/usr/local/custom"* ]]; then^[[0m
+test-env-path-base	Verify GITHUB_PATH prepended to env.PATH base	2026-07-05T21:04:57.8944092Z ^[[36;1m  echo "FAIL: env.PATH base should still be present"^[[0m
+test-env-path-base	Verify GITHUB_PATH prepended to env.PATH base	2026-07-05T21:04:57.8944759Z ^[[36;1m  exit 1^[[0m
+test-env-path-base	Verify GITHUB_PATH prepended to env.PATH base	2026-07-05T21:04:57.8945232Z ^[[36;1mfi^[[0m
+test-env-path-base	Verify GITHUB_PATH prepended to env.PATH base	2026-07-05T21:04:57.8945809Z ^[[36;1mecho "PASS: GITHUB_PATH prepended to env.PATH base"^[[0m
+test-env-path-base	Verify GITHUB_PATH prepended to env.PATH base	2026-07-05T21:04:57.8965976Z shell: /usr/bin/bash -e {0}
+test-env-path-base	Verify GITHUB_PATH prepended to env.PATH base	2026-07-05T21:04:57.8966553Z env:
+test-env-path-base	Verify GITHUB_PATH prepended to env.PATH base	2026-07-05T21:04:57.8967048Z   PATH: /usr/local/custom:/usr/bin:/bin
+test-env-path-base	Verify GITHUB_PATH prepended to env.PATH base	2026-07-05T21:04:57.8967628Z ##[endgroup]
+test-env-path-base	Verify GITHUB_PATH prepended to env.PATH base	2026-07-05T21:04:57.9012065Z PATH: /tmp/over-env-path:/usr/local/custom:/usr/bin:/bin
+test-env-path-base	Verify GITHUB_PATH prepended to env.PATH base	2026-07-05T21:04:57.9013655Z PASS: GITHUB_PATH prepended to env.PATH base
+test-env-path-base	Complete job	﻿2026-07-05T21:04:57.9117558Z Cleaning up orphan processes
+test-github-path	Set up job	﻿2026-07-05T21:04:58.5667174Z Current runner version: '2.335.1'
+test-github-path	Set up job	2026-07-05T21:04:58.5690492Z ##[group]Runner Image Provisioner
+test-github-path	Set up job	2026-07-05T21:04:58.5691333Z Hosted Compute Agent
+test-github-path	Set up job	2026-07-05T21:04:58.5691872Z Version: 20260624.560
+test-github-path	Set up job	2026-07-05T21:04:58.5692499Z Commit: 925d229a51159bc391ae97e54a2dd1fe20af789d
+test-github-path	Set up job	2026-07-05T21:04:58.5693160Z Build Date: 2026-06-24T18:26:47Z
+test-github-path	Set up job	2026-07-05T21:04:58.5693754Z Worker ID: {1ea3eb4a-7b6e-4e35-96be-084d6347f8f0}
+test-github-path	Set up job	2026-07-05T21:04:58.5694501Z Azure Region: northcentralus
+test-github-path	Set up job	2026-07-05T21:04:58.5695053Z ##[endgroup]
+test-github-path	Set up job	2026-07-05T21:04:58.5696741Z ##[group]Operating System
+test-github-path	Set up job	2026-07-05T21:04:58.5697363Z Ubuntu
+test-github-path	Set up job	2026-07-05T21:04:58.5697835Z 24.04.4
+test-github-path	Set up job	2026-07-05T21:04:58.5698376Z LTS
+test-github-path	Set up job	2026-07-05T21:04:58.5698836Z ##[endgroup]
+test-github-path	Set up job	2026-07-05T21:04:58.5699603Z ##[group]Runner Image
+test-github-path	Set up job	2026-07-05T21:04:58.5700290Z Image: ubuntu-24.04
+test-github-path	Set up job	2026-07-05T21:04:58.5700805Z Version: 20260628.225.1
+test-github-path	Set up job	2026-07-05T21:04:58.5701796Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260628.225/images/ubuntu/Ubuntu2404-Readme.md
+test-github-path	Set up job	2026-07-05T21:04:58.5703401Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260628.225
+test-github-path	Set up job	2026-07-05T21:04:58.5704334Z ##[endgroup]
+test-github-path	Set up job	2026-07-05T21:04:58.5705402Z ##[group]GITHUB_TOKEN Permissions
+test-github-path	Set up job	2026-07-05T21:04:58.5707205Z Contents: read
+test-github-path	Set up job	2026-07-05T21:04:58.5707772Z Metadata: read
+test-github-path	Set up job	2026-07-05T21:04:58.5708344Z Packages: read
+test-github-path	Set up job	2026-07-05T21:04:58.5708857Z ##[endgroup]
+test-github-path	Set up job	2026-07-05T21:04:58.5711072Z Secret source: Actions
+test-github-path	Set up job	2026-07-05T21:04:58.5711906Z Prepare workflow directory
+test-github-path	Set up job	2026-07-05T21:04:58.6121169Z Prepare all required actions
+test-github-path	Set up job	2026-07-05T21:04:58.6260665Z Complete job name: test-github-path
+test-github-path	Record initial PATH	﻿2026-07-05T21:04:58.7287457Z ##[group]Run echo "Initial PATH: $PATH"
+test-github-path	Record initial PATH	2026-07-05T21:04:58.7288654Z ^[[36;1mecho "Initial PATH: $PATH"^[[0m
+test-github-path	Record initial PATH	2026-07-05T21:04:58.7290235Z ^[[36;1mecho "INITIAL_PATH=$PATH" >> "$GITHUB_ENV"^[[0m
+test-github-path	Record initial PATH	2026-07-05T21:04:58.7716928Z shell: /usr/bin/bash -e {0}
+test-github-path	Record initial PATH	2026-07-05T21:04:58.7717978Z ##[endgroup]
+test-github-path	Record initial PATH	2026-07-05T21:04:58.7897169Z Initial PATH: /snap/bin:/home/runner/.local/bin:/opt/pipx_bin:/home/runner/.cargo/bin:/home/runner/.config/composer/vendor/bin:/usr/local/.ghcup/bin:/home/runner/.dotnet/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
+test-github-path	Add to GITHUB_PATH	﻿2026-07-05T21:04:58.8080074Z ##[group]Run echo "/tmp/custom-bin-1" >> "$GITHUB_PATH"
+test-github-path	Add to GITHUB_PATH	2026-07-05T21:04:58.8080818Z ^[[36;1mecho "/tmp/custom-bin-1" >> "$GITHUB_PATH"^[[0m
+test-github-path	Add to GITHUB_PATH	2026-07-05T21:04:58.8081457Z ^[[36;1mecho "Added /tmp/custom-bin-1 to GITHUB_PATH"^[[0m
+test-github-path	Add to GITHUB_PATH	2026-07-05T21:04:58.8111102Z shell: /usr/bin/bash -e {0}
+test-github-path	Add to GITHUB_PATH	2026-07-05T21:04:58.8111606Z env:
+test-github-path	Add to GITHUB_PATH	2026-07-05T21:04:58.8113234Z   INITIAL_PATH: /snap/bin:/home/runner/.local/bin:/opt/pipx_bin:/home/runner/.cargo/bin:/home/runner/.config/composer/vendor/bin:/usr/local/.ghcup/bin:/home/runner/.dotnet/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
+test-github-path	Add to GITHUB_PATH	2026-07-05T21:04:58.8114949Z ##[endgroup]
+test-github-path	Add to GITHUB_PATH	2026-07-05T21:04:58.8165766Z Added /tmp/custom-bin-1 to GITHUB_PATH
+test-github-path	Verify GITHUB_PATH prepended	﻿2026-07-05T21:04:58.8201407Z ##[group]Run echo "PATH now: $PATH"
+test-github-path	Verify GITHUB_PATH prepended	2026-07-05T21:04:58.8201982Z ^[[36;1mecho "PATH now: $PATH"^[[0m
+test-github-path	Verify GITHUB_PATH prepended	2026-07-05T21:04:58.8202527Z ^[[36;1mif [[ "$PATH" != /tmp/custom-bin-1:* ]]; then^[[0m
+test-github-path	Verify GITHUB_PATH prepended	2026-07-05T21:04:58.8203224Z ^[[36;1m  echo "FAIL: /tmp/custom-bin-1 should be at start of PATH"^[[0m
+test-github-path	Verify GITHUB_PATH prepended	2026-07-05T21:04:58.8203838Z ^[[36;1m  exit 1^[[0m
+test-github-path	Verify GITHUB_PATH prepended	2026-07-05T21:04:58.8204218Z ^[[36;1mfi^[[0m
+test-github-path	Verify GITHUB_PATH prepended	2026-07-05T21:04:58.8204657Z ^[[36;1mecho "PASS: GITHUB_PATH entry prepended"^[[0m
+test-github-path	Verify GITHUB_PATH prepended	2026-07-05T21:04:58.8234089Z shell: /usr/bin/bash -e {0}
+test-github-path	Verify GITHUB_PATH prepended	2026-07-05T21:04:58.8234558Z env:
+test-github-path	Verify GITHUB_PATH prepended	2026-07-05T21:04:58.8236076Z   INITIAL_PATH: /snap/bin:/home/runner/.local/bin:/opt/pipx_bin:/home/runner/.cargo/bin:/home/runner/.config/composer/vendor/bin:/usr/local/.ghcup/bin:/home/runner/.dotnet/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
+test-github-path	Verify GITHUB_PATH prepended	2026-07-05T21:04:58.8237696Z ##[endgroup]
+test-github-path	Verify GITHUB_PATH prepended	2026-07-05T21:04:58.8293322Z PATH now: /tmp/custom-bin-1:/snap/bin:/home/runner/.local/bin:/opt/pipx_bin:/home/runner/.cargo/bin:/home/runner/.config/composer/vendor/bin:/usr/local/.ghcup/bin:/home/runner/.dotnet/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
+test-github-path	Verify GITHUB_PATH prepended	2026-07-05T21:04:58.8296738Z PASS: GITHUB_PATH entry prepended
+test-github-path	Add second GITHUB_PATH entry	﻿2026-07-05T21:04:58.8328454Z ##[group]Run echo "/tmp/custom-bin-2" >> "$GITHUB_PATH"
+test-github-path	Add second GITHUB_PATH entry	2026-07-05T21:04:58.8329183Z ^[[36;1mecho "/tmp/custom-bin-2" >> "$GITHUB_PATH"^[[0m
+test-github-path	Add second GITHUB_PATH entry	2026-07-05T21:04:58.8357029Z shell: /usr/bin/bash -e {0}
+test-github-path	Add second GITHUB_PATH entry	2026-07-05T21:04:58.8357487Z env:
+test-github-path	Add second GITHUB_PATH entry	2026-07-05T21:04:58.8359011Z   INITIAL_PATH: /snap/bin:/home/runner/.local/bin:/opt/pipx_bin:/home/runner/.cargo/bin:/home/runner/.config/composer/vendor/bin:/usr/local/.ghcup/bin:/home/runner/.dotnet/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
+test-github-path	Add second GITHUB_PATH entry	2026-07-05T21:04:58.8360886Z ##[endgroup]
+test-github-path	Verify both PATH entries present in correct order	﻿2026-07-05T21:04:58.8443679Z ##[group]Run echo "PATH: $PATH"
+test-github-path	Verify both PATH entries present in correct order	2026-07-05T21:04:58.8444205Z ^[[36;1mecho "PATH: $PATH"^[[0m
+test-github-path	Verify both PATH entries present in correct order	2026-07-05T21:04:58.8444779Z ^[[36;1mif [[ "$PATH" != /tmp/custom-bin-2:*/tmp/custom-bin-1:* ]]; then^[[0m
+test-github-path	Verify both PATH entries present in correct order	2026-07-05T21:04:58.8445570Z ^[[36;1m  echo "FAIL: expected /tmp/custom-bin-2 before /tmp/custom-bin-1"^[[0m
+test-github-path	Verify both PATH entries present in correct order	2026-07-05T21:04:58.8446280Z ^[[36;1m  exit 1^[[0m
+test-github-path	Verify both PATH entries present in correct order	2026-07-05T21:04:58.8446657Z ^[[36;1mfi^[[0m
+test-github-path	Verify both PATH entries present in correct order	2026-07-05T21:04:58.8447339Z ^[[36;1mecho "PASS: multiple GITHUB_PATH entries in correct order"^[[0m
+test-github-path	Verify both PATH entries present in correct order	2026-07-05T21:04:58.8475214Z shell: /usr/bin/bash -e {0}
+test-github-path	Verify both PATH entries present in correct order	2026-07-05T21:04:58.8475674Z env:
+test-github-path	Verify both PATH entries present in correct order	2026-07-05T21:04:58.8477183Z   INITIAL_PATH: /snap/bin:/home/runner/.local/bin:/opt/pipx_bin:/home/runner/.cargo/bin:/home/runner/.config/composer/vendor/bin:/usr/local/.ghcup/bin:/home/runner/.dotnet/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
+test-github-path	Verify both PATH entries present in correct order	2026-07-05T21:04:58.8478806Z ##[endgroup]
+test-github-path	Verify both PATH entries present in correct order	2026-07-05T21:04:58.8530272Z PATH: /tmp/custom-bin-2:/tmp/custom-bin-1:/snap/bin:/home/runner/.local/bin:/opt/pipx_bin:/home/runner/.cargo/bin:/home/runner/.config/composer/vendor/bin:/usr/local/.ghcup/bin:/home/runner/.dotnet/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
+test-github-path	Verify both PATH entries present in correct order	2026-07-05T21:04:58.8532875Z PASS: multiple GITHUB_PATH entries in correct order
+test-github-path	Complete job	﻿2026-07-05T21:04:58.8605028Z Cleaning up orphan processes

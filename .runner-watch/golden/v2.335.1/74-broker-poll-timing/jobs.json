@@ -1,0 +1,65 @@
+{
+  "jobs": [
+    {
+      "check_run_url": "https://api.github.com/repos/preloopdev/aksh-conformance-sample/check-runs/85260114292",
+      "completed_at": "2026-07-05T21:05:00Z",
+      "conclusion": "success",
+      "created_at": "2026-07-05T21:04:56Z",
+      "head_branch": "main",
+      "head_sha": "c3dee6bd8f424dc37e95c90f55d9e414c7c8e2b6",
+      "html_url": "https://github.com/preloopdev/aksh-conformance-sample/actions/runs/28754866476/job/85260114292",
+      "id": 85260114292,
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "fast-job",
+      "node_id": "CR_kwDOTJqUK88AAAAT2eYZdA",
+      "run_attempt": 1,
+      "run_id": 28754866476,
+      "run_url": "https://api.github.com/repos/preloopdev/aksh-conformance-sample/actions/runs/28754866476",
+      "runner_group_id": 0,
+      "runner_group_name": "GitHub Actions",
+      "runner_id": 1000000177,
+      "runner_name": "GitHub Actions 1000000177",
+      "started_at": "2026-07-05T21:04:58Z",
+      "status": "completed",
+      "steps": [
+        {
+          "completed_at": "2026-07-05T21:04:59Z",
+          "conclusion": "success",
+          "name": "Set up job",
+          "number": 1,
+          "started_at": "2026-07-05T21:04:59Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-07-05T21:04:59Z",
+          "conclusion": "success",
+          "name": "Quick step",
+          "number": 2,
+          "started_at": "2026-07-05T21:04:59Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-07-05T21:04:59Z",
+          "conclusion": "success",
+          "name": "Verify fast completion",
+          "number": 3,
+          "started_at": "2026-07-05T21:04:59Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-07-05T21:04:59Z",
+          "conclusion": "success",
+          "name": "Complete job",
+          "number": 4,
+          "started_at": "2026-07-05T21:04:59Z",
+          "status": "completed"
+        }
+      ],
+      "url": "https://api.github.com/repos/preloopdev/aksh-conformance-sample/actions/jobs/85260114292",
+      "workflow_name": "golden: broker-poll-timing"
+    }
+  ],
+  "total_count": 1
+}
