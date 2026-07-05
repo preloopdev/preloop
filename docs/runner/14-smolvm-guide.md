@@ -88,6 +88,45 @@ smolvm machine exec --name myvm -- sh -c '
 
 Docker defaults to **overlay2** on ext4. The VM's root filesystem is an overlayfs itself (from the container image layers), so Docker needs a real block device (`/dev/vdb` from the `--storage` option) formatted as ext4. Without this, Docker falls back to `vfs` which is extremely slow (copies entire image on every container create).
 
+## Docker Service Containers & DNS Limitations
+
+When running workflows with Docker service containers (e.g., `services:` blocks mapping a DB or Web container), standard Docker container-to-container DNS resolution (`http://web/`) fails under the default `smolvm` user-space network mode (`tsi`). This is because the statically compiled `libkrun` guest kernel lacks the Netfilter NAT modules that Docker's embedded DNS server (`127.0.0.11`) relies on to intercept queries.
+
+Here are the three workarounds for local CI:
+
+### Workaround 1: Localhost Port Mapping (No Host VM changes)
+Configure the service container to bind its ports to the runner VM, and have the job access the service via `localhost` instead of the service name:
+```yaml
+services:
+  web:
+    image: nginx:1.27-alpine
+    ports:
+      +- 80:80 # Maps container port 80 to VM port 80
+steps:
+  +- name: Access Service
+    run: curl -fsS http://localhost:80/
+```
+* **Pros:** 100% compatible with production GitHub Actions (where mapping ports to `localhost` is the standard way to connect to services).
+* **Cons:** Requires adding `ports:` to workflow YAML files.
+
+### Workaround 2: Use virtio-net Backend (Root VM start)
+Configure `smolvm` to use the host-native networking backend instead of `tsi` when creating the VM:
+```sh
+smolvm machine create --name my-runner --net --net-backend virtio-net ...
+```
+* **Pros:** Standard container-to-container DNS works out of the box. No YAML changes required.
+* **Cons:** Requires running the host `smolvm start` command with `sudo` on macOS to allow the VM to attach to the host `vmnet.framework` interface.
+
+### Workaround 3: Use Lima/Colima on macOS (Zero-YAML, Zero-Sudo Local CI)
+Instead of running nested microVMs via `smolvm` for every test run, developers can run `aksh-runner` directly inside a persistent lightweight Linux VM managed by **Lima** or **Colima** on their Macs:
+```sh
+# Start standard docker VM
+limactl start template://docker
+# Shell in and run the local runner
+lima aksh-runner --runner-root /tmp/runner run
+```
+* **Pros:** Standard Docker bridge networks, DNS, and `overlay2` storage work natively inside the VM with 100% local-production parity. No YAML changes and no `sudo` required.
+* **Cons:** Pays a one-time 10-15s boot time cost to start the Lima/Colima VM in the morning (subsequent workflow jobs run instantly in milliseconds inside the persistent VM).
 ## Packing VMs
 
 ### Image-based pack (recommended)
