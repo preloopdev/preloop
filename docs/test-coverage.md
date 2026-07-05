@@ -111,7 +111,7 @@ Scope: official C# runner tests under `/tmp/actions-runner-src/src/Test/L0` comp
 | `L0/Worker/TrackingManagerL0.cs` | 4 | **GAP** | Workspace tracking config persistence not tested | — |
 | `L0/Worker/VariablesL0.cs` | 8 | **PARTIAL** | Secret masking and variable lookup covered in JobContext, but official Variables class edge cases not mirrored | `new_extracts_masks_from_secret_variables` (`crates/aksh-runner/src/worker/contexts.rs`:445), `mask_secrets_replaces_with_stars` (`crates/aksh-runner/src/worker/contexts.rs`:459), `get_variable_returns_value` (`crates/aksh-runner/src/worker/contexts.rs`:497) |
 | `L0/Worker/WebSocketDapBridgeL0.cs` | 4 | **GAP** | DAP WebSocket bridge not implemented/tested | — |
-| `L0/Worker/WorkerL0.cs` | 2 | **GAP** | Worker top-level run loop not unit-tested | — |
+| `L0/Worker/WorkerL0.cs` | 2 | **PARTIAL** | Worker top-level run loop and cancellation dispatch | `test_worker_dispatch_run_new_job` (`crates/aksh-runner/src/listener/job_dispatcher.rs`:164), `test_worker_dispatch_cancellation` (`crates/aksh-runner/src/listener/job_dispatcher.rs`:191) |
 
 ## aksh-runner test inventory
 
