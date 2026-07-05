@@ -1,0 +1,81 @@
+{
+  "jobs": [
+    {
+      "check_run_url": "https://api.github.com/repos/preloopdev/aksh-conformance-sample/check-runs/85260108022",
+      "completed_at": "2026-07-05T21:04:55Z",
+      "conclusion": "success",
+      "created_at": "2026-07-05T21:04:51Z",
+      "head_branch": "main",
+      "head_sha": "c3dee6bd8f424dc37e95c90f55d9e414c7c8e2b6",
+      "html_url": "https://github.com/preloopdev/aksh-conformance-sample/actions/runs/28754864349/job/85260108022",
+      "id": 85260108022,
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "test-defaults",
+      "node_id": "CR_kwDOTJqUK88AAAAT2eYA9g",
+      "run_attempt": 1,
+      "run_id": 28754864349,
+      "run_url": "https://api.github.com/repos/preloopdev/aksh-conformance-sample/actions/runs/28754864349",
+      "runner_group_id": 0,
+      "runner_group_name": "GitHub Actions",
+      "runner_id": 1000000170,
+      "runner_name": "GitHub Actions 1000000170",
+      "started_at": "2026-07-05T21:04:52Z",
+      "status": "completed",
+      "steps": [
+        {
+          "completed_at": "2026-07-05T21:04:53Z",
+          "conclusion": "success",
+          "name": "Set up job",
+          "number": 1,
+          "started_at": "2026-07-05T21:04:53Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-07-05T21:04:53Z",
+          "conclusion": "success",
+          "name": "Create subdir with marker",
+          "number": 2,
+          "started_at": "2026-07-05T21:04:53Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-07-05T21:04:53Z",
+          "conclusion": "success",
+          "name": "Verify defaults.run.working-directory works",
+          "number": 3,
+          "started_at": "2026-07-05T21:04:53Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-07-05T21:04:53Z",
+          "conclusion": "success",
+          "name": "Read file from default working dir",
+          "number": 4,
+          "started_at": "2026-07-05T21:04:53Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-07-05T21:04:53Z",
+          "conclusion": "success",
+          "name": "Step override takes precedence",
+          "number": 5,
+          "started_at": "2026-07-05T21:04:53Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-07-05T21:04:53Z",
+          "conclusion": "success",
+          "name": "Complete job",
+          "number": 6,
+          "started_at": "2026-07-05T21:04:53Z",
+          "status": "completed"
+        }
+      ],
+      "url": "https://api.github.com/repos/preloopdev/aksh-conformance-sample/actions/jobs/85260108022",
+      "workflow_name": "golden: defaults-run-working-dir"
+    }
+  ],
+  "total_count": 1
+}
