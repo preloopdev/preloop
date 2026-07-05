@@ -145,6 +145,10 @@ fn build_docker_run_args(
     }
 
     push_inherited_env_args(&mut docker_args, env);
+
+    // F049: Inject proxy env vars from host into container
+    super::super::container_ops::inject_proxy_env_for_docker(&mut docker_args, env);
+
     docker_args.push(image.to_string());
     docker_args.extend(entrypoint_args.iter().cloned());
     docker_args
