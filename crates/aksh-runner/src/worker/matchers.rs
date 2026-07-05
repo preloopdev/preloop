@@ -17,6 +17,95 @@ pub struct ProblemMatcher {
     pub patterns: Vec<MatcherPattern>,
     /// F051: Default base directory for resolving relative file paths in annotations.
     pub from_path: String,
+    pub state: Vec<Option<PatternMatch>>,
+}
+
+impl ProblemMatcher {
+    pub fn reset(&mut self) {
+        if self.patterns.len() > 1 {
+            self.state = vec![None; self.patterns.len() - 1];
+        } else {
+            self.state = Vec::new();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PatternMatch {
+    pub file: Option<String>,
+    pub line: Option<String>,
+    pub column: Option<String>,
+    pub severity: Option<String>,
+    pub code: Option<String>,
+    pub message: Option<String>,
+    pub from_path: Option<String>,
+}
+
+fn get_group_value(captures: &regex::Captures, index: Option<usize>) -> Option<String> {
+    let idx = index?;
+    captures.get(idx).map(|m| m.as_str().to_string())
+}
+
+impl PatternMatch {
+    pub fn new(
+        running_match: Option<&PatternMatch>,
+        pattern: &MatcherPattern,
+        captures: &regex::Captures,
+        default_severity: &str,
+        default_from_path: &str,
+    ) -> Self {
+        let file = running_match
+            .and_then(|r| r.file.clone())
+            .or_else(|| get_group_value(captures, pattern.file));
+        let line = running_match
+            .and_then(|r| r.line.clone())
+            .or_else(|| get_group_value(captures, pattern.line));
+        let column = running_match
+            .and_then(|r| r.column.clone())
+            .or_else(|| get_group_value(captures, pattern.column));
+
+        let mut severity =
+            running_match
+                .and_then(|r| r.severity.clone())
+                .or_else(|| match &pattern.severity {
+                    Some(SeveritySpec::Capture(g)) => {
+                        captures.get(*g).map(|m| m.as_str().to_string())
+                    }
+                    Some(SeveritySpec::Literal(value)) => Some(value.to_string()),
+                    None => None,
+                });
+        if (severity.is_none() || severity.as_deref().is_some_and(|s| s.is_empty()))
+            && !default_severity.is_empty()
+        {
+            severity = Some(default_severity.to_string());
+        }
+
+        let code = running_match
+            .and_then(|r| r.code.clone())
+            .or_else(|| get_group_value(captures, pattern.code));
+        let message = running_match
+            .and_then(|r| r.message.clone())
+            .or_else(|| get_group_value(captures, pattern.message));
+
+        let mut from_path = running_match
+            .and_then(|r| r.from_path.clone())
+            .or_else(|| get_group_value(captures, pattern.from_path));
+        if (from_path.is_none() || from_path.as_deref().is_some_and(|s| s.is_empty()))
+            && !default_from_path.is_empty()
+        {
+            from_path = Some(default_from_path.to_string());
+        }
+
+        Self {
+            file,
+            line,
+            column,
+            severity,
+            code,
+            message,
+            from_path,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -86,12 +175,19 @@ impl MatcherRegistry {
         for def in file.problem_matcher {
             validate_matcher_definition(&def)?;
             debug!("Registered problem matcher: {}", def.owner);
+            let pattern_len = def.pattern.len();
+            let state = if pattern_len > 1 {
+                vec![None; pattern_len - 1]
+            } else {
+                Vec::new()
+            };
             self.matchers.insert(
                 def.owner.clone(),
                 ProblemMatcher {
                     owner: def.owner,
                     patterns: def.pattern,
                     from_path: def.from_path.unwrap_or_default(),
+                    state,
                 },
             );
         }
@@ -105,91 +201,184 @@ impl MatcherRegistry {
     }
 
     /// Match a log line against all registered matchers.
-    pub fn match_line(&self, line: &str) -> Vec<crate::worker::execution_context::Annotation> {
+    pub fn match_line(
+        &mut self,
+        line: &str,
+        workspace: &str,
+        repository: &str,
+        server_url: &str,
+        translate_container_path: bool,
+    ) -> Vec<crate::worker::execution_context::Annotation> {
         let mut annotations = Vec::new();
         let stripped_line = strip_ansi_codes(line);
         let match_line = stripped_line.as_deref().unwrap_or(line);
 
-        for matcher in self.matchers.values() {
-            // Only handle single-pattern matchers for now
-            if let Some(pattern) = matcher.patterns.first() {
+        let failsafe = std::env::var("RUNNER_TEST_GET_REPOSITORY_PATH_FAILSAFE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(50);
+
+        let host_work = if !workspace.is_empty() {
+            Path::new(workspace)
+                .parent()
+                .and_then(|p| p.parent())
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default()
+        } else {
+            "".to_string()
+        };
+
+        let mut matched_owner: Option<String> = None;
+        let mut matched_match: Option<PatternMatch> = None;
+
+        for matcher in self.matchers.values_mut() {
+            if matcher.patterns.is_empty() {
+                continue;
+            }
+
+            if matcher.patterns.len() == 1 {
+                let pattern = &matcher.patterns[0];
                 if let Ok(re) = regex::Regex::new(&pattern.regexp) {
                     if let Some(captures) = re.captures(match_line) {
-                        let message = pattern
-                            .message
-                            .and_then(|g| captures.get(g))
-                            .map(|m| m.as_str().to_string())
-                            .unwrap_or_else(|| match_line.to_string());
+                        let pm = PatternMatch::new(
+                            None,
+                            pattern,
+                            &captures,
+                            "error", // default severity
+                            &matcher.from_path,
+                        );
+                        matched_owner = Some(matcher.owner.clone());
+                        matched_match = Some(pm);
+                        break;
+                    }
+                }
+            } else {
+                let num_patterns = matcher.patterns.len();
+                for i in (0..num_patterns).rev() {
+                    let running_match = if i > 0 {
+                        matcher.state[i - 1].as_ref()
+                    } else {
+                        None
+                    };
 
-                        // F051: Extract file path and fromPath from captures
-                        let raw_file = pattern
-                            .file
-                            .and_then(|g| captures.get(g))
-                            .map(|m| m.as_str().to_string());
-
-                        // F051: Resolve relative file paths using fromPath
-                        let file = raw_file.map(|f| {
-                            // If file is already absolute, use as-is
-                            if Path::new(&f).is_absolute() {
-                                return f;
+                    if i == 0 || running_match.is_some() {
+                        let pattern = &matcher.patterns[i];
+                        let is_last = i == num_patterns - 1;
+                        if let Ok(re) = regex::Regex::new(&pattern.regexp) {
+                            if let Some(captures) = re.captures(match_line) {
+                                if is_last {
+                                    let pm = PatternMatch::new(
+                                        running_match,
+                                        pattern,
+                                        &captures,
+                                        "error", // default severity
+                                        &matcher.from_path,
+                                    );
+                                    if pattern.is_loop {
+                                        let saved_run = running_match.cloned();
+                                        matcher.reset();
+                                        matcher.state[i - 1] = saved_run;
+                                    } else {
+                                        matcher.reset();
+                                    }
+                                    matched_owner = Some(matcher.owner.clone());
+                                    matched_match = Some(pm);
+                                    break;
+                                } else {
+                                    let pm = PatternMatch::new(
+                                        running_match,
+                                        pattern,
+                                        &captures,
+                                        "", // default severity
+                                        "", // default fromPath
+                                    );
+                                    matcher.state[i] = Some(pm);
+                                }
+                            } else {
+                                if is_last {
+                                    matcher.state[i - 1] = None;
+                                } else {
+                                    matcher.state[i] = None;
+                                }
                             }
-                            // Try pattern-level fromPath capture group first
-                            let from_path = pattern
-                                .from_path
-                                .and_then(|g| captures.get(g))
-                                .map(|m| m.as_str().to_string())
-                                .unwrap_or_else(|| matcher.from_path.clone());
-                            // Resolve relative file against fromPath directory
+                        }
+                    }
+                }
+                if matched_match.is_some() {
+                    break;
+                }
+            }
+        }
+
+        if let Some(pm) = matched_match {
+            let owner = matched_owner.unwrap();
+            for m in self.matchers.values_mut() {
+                if m.owner != owner {
+                    m.reset();
+                }
+            }
+
+            if let Some(mut ann) = convert_to_annotation(&pm) {
+                let file = pm.file.clone().and_then(|f| {
+                    let mut resolved = f.clone();
+
+                    if !Path::new(&resolved).is_absolute() {
+                        if let Some(from_path) = &pm.from_path {
                             if !from_path.is_empty() {
-                                if let Some(dir) = Path::new(&from_path).parent() {
+                                if let Some(dir) = Path::new(from_path).parent() {
                                     if !dir.as_os_str().is_empty() {
-                                        return dir.join(&f).to_string_lossy().to_string();
+                                        resolved =
+                                            dir.join(&resolved).to_string_lossy().to_string();
                                     }
                                 }
                             }
-                            f
-                        });
-
-                        let line_num = pattern
-                            .line
-                            .and_then(|g| captures.get(g))
-                            .and_then(|m| m.as_str().parse().ok());
-
-                        let col = pattern
-                            .column
-                            .and_then(|g| captures.get(g))
-                            .and_then(|m| m.as_str().parse().ok());
-
-                        let severity = match &pattern.severity {
-                            Some(SeveritySpec::Capture(g)) => {
-                                captures.get(*g).map(|m| m.as_str().to_string())
-                            }
-                            Some(SeveritySpec::Literal(value)) => Some(value.to_string()),
-                            None => None,
-                        };
-
-                        let level = match severity.as_deref() {
-                            Some("warning") => {
-                                crate::worker::execution_context::AnnotationLevel::Warning
-                            }
-                            Some("notice") => {
-                                crate::worker::execution_context::AnnotationLevel::Notice
-                            }
-                            _ => crate::worker::execution_context::AnnotationLevel::Error,
-                        };
-
-                        annotations.push(crate::worker::execution_context::Annotation {
-                            level,
-                            message,
-                            title: None,
-                            file,
-                            line: line_num,
-                            end_line: None,
-                            col,
-                            end_column: None,
-                        });
+                        }
                     }
-                }
+
+                    if !Path::new(&resolved).is_absolute() {
+                        if !workspace.is_empty() {
+                            resolved = Path::new(workspace)
+                                .join(&resolved)
+                                .to_string_lossy()
+                                .to_string();
+                        }
+                    }
+
+                    let mut resolved = normalize_path(Path::new(&resolved))
+                        .to_string_lossy()
+                        .to_string();
+
+                    if translate_container_path && !host_work.is_empty() {
+                        resolved = translate_to_host_path(&resolved, &host_work);
+                        resolved = normalize_path(Path::new(&resolved))
+                            .to_string_lossy()
+                            .to_string();
+                    }
+
+                    if workspace.is_empty() {
+                        return Some(resolved);
+                    }
+
+                    let resolved_path = Path::new(&resolved);
+                    if resolved_path.exists() && resolved_path.is_file() {
+                        if let Some(repo_path) = get_repository_path(
+                            resolved_path,
+                            workspace,
+                            repository,
+                            server_url,
+                            failsafe,
+                        ) {
+                            if let Ok(rel) = resolved_path.strip_prefix(&repo_path) {
+                                let rel_str = rel.to_string_lossy().to_string();
+                                return Some(rel_str.replace('\\', "/"));
+                            }
+                        }
+                    }
+                    None
+                });
+
+                ann.file = file;
+                annotations.push(ann);
             }
         }
 
@@ -229,20 +418,159 @@ fn validate_matcher_definition(def: &MatcherDefinition) -> Result<()> {
     if def.pattern.is_empty() {
         anyhow::bail!("Problem matcher pattern is required");
     }
+
+    let mut has_message = false;
     for (idx, pattern) in def.pattern.iter().enumerate() {
-        if pattern.message.is_none() {
-            anyhow::bail!("Problem matcher pattern message is required");
-        }
+        let is_first = idx == 0;
+        let is_last = idx == def.pattern.len() - 1;
+
         if pattern.is_loop {
             if def.pattern.len() == 1 {
                 anyhow::bail!("Problem matcher loop may not be set on a single pattern");
             }
-            if idx + 1 != def.pattern.len() {
+            if is_first || !is_last {
                 anyhow::bail!("Problem matcher loop is only allowed on the last pattern");
+            }
+            if pattern.message.is_none() {
+                anyhow::bail!("The loop pattern must set 'message'");
+            }
+        }
+        if pattern.message.is_some() {
+            has_message = true;
+        }
+    }
+    if !has_message {
+        anyhow::bail!("Problem matcher pattern message is required");
+    }
+    Ok(())
+}
+
+fn convert_to_annotation(
+    pm: &PatternMatch,
+) -> Option<crate::worker::execution_context::Annotation> {
+    let message = pm.message.clone()?;
+    if message.trim().is_empty() {
+        return None;
+    }
+
+    let level = match pm.severity.as_deref().map(|s| s.to_lowercase()) {
+        Some(ref s) if s == "warning" => crate::worker::execution_context::AnnotationLevel::Warning,
+        Some(ref s) if s == "notice" => crate::worker::execution_context::AnnotationLevel::Notice,
+        _ => crate::worker::execution_context::AnnotationLevel::Error,
+    };
+
+    let line = pm.line.as_deref().and_then(|s| s.parse().ok());
+    let col = pm.column.as_deref().and_then(|s| s.parse().ok());
+
+    Some(crate::worker::execution_context::Annotation {
+        level,
+        message,
+        title: None,
+        file: None,
+        line,
+        end_line: None,
+        col,
+        end_column: None,
+    })
+}
+
+fn normalize_path(path: &Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut components = path.components().peekable();
+    let mut ret = std::path::PathBuf::new();
+    if let Some(c @ Component::Prefix(..)) = components.peek() {
+        ret.push(c.as_os_str());
+        components.next();
+    }
+    if let Some(c @ Component::RootDir) = components.peek() {
+        ret.push(c.as_os_str());
+        components.next();
+    }
+    for component in components {
+        match component {
+            Component::Prefix(..) => {}
+            Component::RootDir => {}
+            Component::CurDir => {}
+            Component::ParentDir => {
+                ret.pop();
+            }
+            Component::Normal(c) => {
+                ret.push(c);
             }
         }
     }
-    Ok(())
+    ret
+}
+
+pub fn translate_to_host_path(container_path: &str, host_work: &str) -> String {
+    if let Some(relative) = container_path.strip_prefix("/__w") {
+        let mut path = std::path::PathBuf::from(host_work);
+        path.push(relative.trim_start_matches('/'));
+        path.to_string_lossy().to_string()
+    } else {
+        container_path.to_string()
+    }
+}
+
+fn get_url_host(server_url: &str) -> String {
+    let mut s = server_url;
+    if let Some(rest) = s.strip_prefix("https://") {
+        s = rest;
+    } else if let Some(rest) = s.strip_prefix("http://") {
+        s = rest;
+    }
+    s.split('/')
+        .next()
+        .unwrap_or(s)
+        .split(':')
+        .next()
+        .unwrap_or(s)
+        .to_string()
+}
+
+fn get_repository_path(
+    file_path: &Path,
+    _workspace: &str,
+    repository: &str,
+    server_url: &str,
+    failsafe: usize,
+) -> Option<std::path::PathBuf> {
+    let mut current = file_path.parent()?;
+    let mut recursion = 0;
+
+    let host = get_url_host(server_url);
+    let patterns = vec![
+        format!("url = {}/{}", server_url.trim_end_matches('/'), repository),
+        format!("url = git@{}:{}.git", host, repository),
+    ];
+
+    while recursion <= failsafe {
+        if current.as_os_str().is_empty() {
+            break;
+        }
+
+        let git_config_path = current.join(".git").join("config");
+        if git_config_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&git_config_path) {
+                for line in content.lines() {
+                    let trimmed = line.trim();
+                    for pattern in &patterns {
+                        if trimmed.eq_ignore_ascii_case(pattern) {
+                            return Some(current.to_path_buf());
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(parent) = current.parent() {
+            current = parent;
+            recursion += 1;
+        } else {
+            break;
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -275,7 +603,8 @@ mod tests {
         let mut registry = MatcherRegistry::new();
         registry.add_from_file(&path).unwrap();
 
-        let annotations = registry.match_line("MEGA_ERROR sample.rs:12:34: boom");
+        let annotations =
+            registry.match_line("MEGA_ERROR sample.rs:12:34: boom", "", "", "", false);
         assert_eq!(annotations.len(), 1);
         assert_eq!(annotations[0].level, AnnotationLevel::Error);
         assert_eq!(annotations[0].file.as_deref(), Some("sample.rs"));
@@ -308,7 +637,13 @@ mod tests {
         let mut registry = MatcherRegistry::new();
         registry.add_from_file(&path).unwrap();
 
-        let annotations = registry.match_line("\u{1b}[31mERR src/lib.rs:7: red boom\u{1b}[0m");
+        let annotations = registry.match_line(
+            "\u{1b}[31mERR src/lib.rs:7: red boom\u{1b}[0m",
+            "",
+            "",
+            "",
+            false,
+        );
 
         assert_eq!(annotations.len(), 1);
         assert_eq!(annotations[0].level, AnnotationLevel::Warning);
@@ -337,13 +672,167 @@ mod tests {
 
         let mut registry = MatcherRegistry::new();
         registry.add_from_file(&path).unwrap();
-        assert_eq!(registry.match_line("ERR boom").len(), 1);
+        assert_eq!(registry.match_line("ERR boom", "", "", "", false).len(), 1);
 
         registry.remove("removable");
 
-        assert!(registry.match_line("ERR boom").is_empty());
+        assert!(registry
+            .match_line("ERR boom", "", "", "", false)
+            .is_empty());
     }
 
+    #[test]
+    fn test_multi_pattern_matching_lifecycle() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("matcher.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "problemMatcher": [{
+                "owner": "multiline",
+                "pattern": [
+                  {
+                    "regexp": "^Start: (.*)$"
+                  },
+                  {
+                    "regexp": "^Middle: (.*)$"
+                  },
+                  {
+                    "regexp": "^End: (.*)$",
+                    "message": 1
+                  }
+                ]
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        let mut registry = MatcherRegistry::new();
+        registry.add_from_file(&path).unwrap();
+
+        assert!(registry
+            .match_line("Start: hello", "", "", "", false)
+            .is_empty());
+        assert!(registry
+            .match_line("Middle: world", "", "", "", false)
+            .is_empty());
+        let anns = registry.match_line("End: final", "", "", "", false);
+        assert_eq!(anns.len(), 1);
+        assert_eq!(anns[0].message, "final");
+
+        assert!(registry
+            .match_line("Start: hello", "", "", "", false)
+            .is_empty());
+        assert!(registry
+            .match_line("Other line", "", "", "", false)
+            .is_empty());
+        assert!(registry
+            .match_line("Middle: world", "", "", "", false)
+            .is_empty());
+        assert!(registry
+            .match_line("End: final", "", "", "", false)
+            .is_empty());
+    }
+
+    #[test]
+    fn test_multi_pattern_matching_with_loop() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("matcher.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "problemMatcher": [{
+                "owner": "looping",
+                "pattern": [
+                  {
+                    "regexp": "^Start: (.*)$"
+                  },
+                  {
+                    "regexp": "^End: (.*)$",
+                    "message": 1,
+                    "loop": true
+                  }
+                ]
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        let mut registry = MatcherRegistry::new();
+        registry.add_from_file(&path).unwrap();
+
+        assert!(registry
+            .match_line("Start: hello", "", "", "", false)
+            .is_empty());
+        let anns1 = registry.match_line("End: first", "", "", "", false);
+        assert_eq!(anns1.len(), 1);
+        assert_eq!(anns1[0].message, "first");
+
+        let anns2 = registry.match_line("End: second", "", "", "", false);
+        assert_eq!(anns2.len(), 1);
+        assert_eq!(anns2[0].message, "second");
+
+        assert!(registry
+            .match_line("Other line", "", "", "", false)
+            .is_empty());
+        assert!(registry
+            .match_line("End: third", "", "", "", false)
+            .is_empty());
+    }
+
+    #[test]
+    fn test_repository_path_resolution() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let workspace = dir.path().join("workspace");
+        let repo_dir = workspace.join("my-repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+
+        let status = std::process::Command::new("git")
+            .arg("init")
+            .current_dir(&repo_dir)
+            .status();
+        if status.is_ok() {
+            let config_content = "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n\tlogallrefupdates = true\n[remote \"origin\"]\n\turl = https://github.com/my-org/my-repo\n";
+            std::fs::write(repo_dir.join(".git").join("config"), config_content).unwrap();
+        }
+
+        let file_path = repo_dir.join("subdir").join("test-file.txt");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, "boom").unwrap();
+
+        let matcher_path = dir.path().join("matcher.json");
+        std::fs::write(
+            &matcher_path,
+            r#"{
+              "problemMatcher": [{
+                "owner": "path-test",
+                "pattern": [{
+                  "regexp": "^ERROR: (.*)$",
+                  "file": 1,
+                  "message": 1
+                }]
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        let mut registry = MatcherRegistry::new();
+        registry.add_from_file(&matcher_path).unwrap();
+
+        let line = format!("ERROR: {}", file_path.to_string_lossy());
+        let anns = registry.match_line(
+            &line,
+            &workspace.to_string_lossy(),
+            "my-org/my-repo",
+            "https://github.com",
+            false,
+        );
+
+        assert_eq!(anns.len(), 1);
+        if status.is_ok() {
+            assert_eq!(anns[0].file.as_deref(), Some("subdir/test-file.txt"));
+        }
+    }
     #[test]
     fn matcher_validation_requires_message() {
         let dir = tempfile::TempDir::new().unwrap();

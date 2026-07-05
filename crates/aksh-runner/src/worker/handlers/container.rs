@@ -15,6 +15,7 @@ pub async fn run_docker_action(
     workspace: &str,
     ctx: &mut StepContext<'_>,
 ) -> Result<()> {
+    ctx.translate_container_path = true;
     let image = uses
         .strip_prefix("docker://")
         .context("invalid docker action reference")?;
@@ -34,6 +35,7 @@ pub async fn run_docker_action_from_manifest(
     workspace: &str,
     ctx: &mut StepContext<'_>,
 ) -> Result<()> {
+    ctx.translate_container_path = true;
     let image = manifest
         .runs_image
         .as_deref()

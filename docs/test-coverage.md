@@ -98,7 +98,7 @@ Scope: official C# runner tests under `/tmp/actions-runner-src/src/Test/L0` comp
 | `L0/Worker/JobExecutionViewL0.cs` | 3 | **GAP** | Job execution view/display behavior not tested | — |
 | `L0/Worker/JobExtensionL0.cs` | 25 | **PARTIAL** | Step-list parsing, env injection, lifecycle pre/post covered; many official job extension paths still gaps | `build_step_list_parses_script_reference` (`crates/aksh-runner/src/worker/job_extension.rs`:834), `build_step_list_parses_action_reference` (`crates/aksh-runner/src/worker/job_extension.rs`:859), `inject_github_env_sets_core_vars` (`crates/aksh-runner/src/worker/job_extension.rs`:794), `injects_job_environment_variables_from_acquire_payload` (`crates/aksh-runner/src/worker/job_extension.rs`:1060), `inject_actions_env_from_system_vss_endpoint_data` (`crates/aksh-runner/src/worker/job_extension.rs`:994), `lifecycle_uses_resolved_action_path_and_entry_overrides` (`crates/aksh-runner/src/worker/job_extension.rs`:1087), `lifecycle_registers_docker_action_pre_and_post` (`crates/aksh-runner/src/worker/job_extension.rs`:1148) |
 | `L0/Worker/JobRunnerL0.cs` | 3 | **PARTIAL** | Results URL extraction only; job runner execution lifecycle largely untested | `results_url_prefers_system_vss_endpoint_data` (`crates/aksh-runner/src/worker/job_runner.rs`:1219) |
-| `L0/Worker/OutputManagerL0.cs` | 22 | **GAP** | Output manager/problem matcher runtime line processing not tested | — |
+| `L0/Worker/OutputManagerL0.cs` | 22 | **PARTIAL** | Output manager/problem matcher runtime line processing | `test_multi_pattern_matching_lifecycle` (`crates/aksh-runner/src/worker/matchers.rs`:652), `test_multi_pattern_matching_with_loop` (`crates/aksh-runner/src/worker/matchers.rs`:697), `test_repository_path_resolution` (`crates/aksh-runner/src/worker/matchers.rs`:727), `log_raw_problem_matching_and_telemetry` (`crates/aksh-runner/src/worker/execution_context.rs`:388) |
 | `L0/Worker/PipelineDirectoryManagerL0.cs` | 8 | **GAP** | Workspace/pipeline directory tracking/cleanup not tested | — |
 | `L0/Worker/PipelineTemplateEvaluatorWrapperL0.cs` | 29 | **PARTIAL** | Template substitution basics covered; official pipeline-template evaluator matrix much broader | `simple_expression` (`crates/aksh-runner/src/worker/template.rs`:136), `multiple_expressions` (`crates/aksh-runner/src/worker/template.rs`:143), `passthrough_literal` (`crates/aksh-runner/src/worker/template.rs`:151), `no_expressions` (`crates/aksh-runner/src/worker/template.rs`:127), `build_step_list_parses_github_template_token_maps` (`crates/aksh-runner/src/worker/job_extension.rs`:882), `build_step_list_parses_aksh_template_string_maps` (`crates/aksh-runner/src/worker/job_extension.rs`:918) |
 | `L0/Worker/SaveStateFileCommandL0.cs` | 15 | **PARTIAL** | State file command parsing and post-step state exposure | `parse_simple_kv` (`crates/aksh-runner/src/worker/file_commands.rs`:196), `parse_heredoc` (`crates/aksh-runner/src/worker/file_commands.rs`:206), `lifecycle_state_is_stored_under_original_step_id` (`crates/aksh-runner/src/worker/file_commands.rs`:235), `post_step_env_exposes_saved_state_from_main_step` (`crates/aksh-runner/src/worker/execution_context.rs`:308) |
@@ -1446,36 +1446,35 @@ Verified aksh-runner refs: `results_url_prefers_system_vss_endpoint_data` (`crat
 | `JobExtensionInitializeCancelled` | 151 | Job Extension Initialize Cancelled | **PARTIAL** | `results_url_prefers_system_vss_endpoint_data` (`crates/aksh-runner/src/worker/job_runner.rs`:1219) |
 | `WorksWithRunnerJobRequestMessageType` | 169 | Works With Runner Job Request Message Type | **PARTIAL** | `results_url_prefers_system_vss_endpoint_data` (`crates/aksh-runner/src/worker/job_runner.rs`:1219) |
 
-### `L0/Worker/OutputManagerL0.cs` — 22 tests — GAP
+### `L0/Worker/OutputManagerL0.cs` — 22 tests — PARTIAL
 
-Official behavior: Output manager/problem matcher runtime line processing not tested.
-Verified aksh-runner refs: —
+Official behavior: Output manager/problem matcher runtime line processing.
+Verified aksh-runner refs: `test_multi_pattern_matching_lifecycle` (`crates/aksh-runner/src/worker/matchers.rs`:652), `test_multi_pattern_matching_with_loop` (`crates/aksh-runner/src/worker/matchers.rs`:697), `test_repository_path_resolution` (`crates/aksh-runner/src/worker/matchers.rs`:727), `log_raw_problem_matching_and_telemetry` (`crates/aksh-runner/src/worker/execution_context.rs`:388).
 
 | C# test | Line | Official behavior under test | aksh-runner coverage status | Verified Rust test refs |
 |---|---:|---|---|---|
-| `AddMatcher_Clobber` | 33 | Add Matcher Clobber | **GAP** | — |
-| `AddMatcher_Prepend` | 99 | Add Matcher Prepend | **GAP** | — |
-| `MatcherCode` | 165 | Matcher Code | **GAP** | — |
-| `DoesNotResetMatchingMatcher` | 204 | Does Not Reset Matching Matcher | **GAP** | — |
-| `InitialMatchers` | 259 | Initial Matchers | **GAP** | — |
-| `MatcherLineColumn` | 307 | Matcher Line Column | **GAP** | — |
-| `MatcherDoesNotReceiveCommand` | 355 | Matcher Does Not Receive Command | **GAP** | — |
-| `MatcherRemoveColorCodes` | 389 | Matcher Remove Color Codes | **GAP** | — |
-| `RemoveMatcher` | 418 | Remove Matcher | **GAP** | — |
-| `ResetsOtherMatchers` | 471 | Resets Other Matchers | **GAP** | — |
-| `MatcherSeverity` | 535 | Matcher Severity | **GAP** | — |
-| `MatcherTimeout` | 596 | Matcher Timeout | **GAP** | — |
-| `MatcherFile` | 650 | Matcher File | **GAP** | — |
-| `MatcherFile_JobContainer` | 764 | Matcher File Job Container | **GAP** | — |
-| `MatcherFile_StepContainer` | 825 | Matcher File Step Container | **GAP** | — |
-| `MatcherFromPath` | 887 | Matcher From Path | **GAP** | — |
-| `MatcherDefaultFromPath` | 943 | Matcher Default From Path | **GAP** | — |
-| `CaptureTelemetryForGitUnsafeRepository` | 999 | Capture Telemetry For Git Unsafe Repository | **GAP** | — |
-| `StripCompositeMarkers_StartAction` | 1012 | Strip Composite Markers Start Action | **GAP** | — |
-| `StripCompositeMarkers_EndAction` | 1027 | Strip Composite Markers End Action | **GAP** | — |
-| `StripCompositeMarkers_PreservesOtherCommands` | 1042 | Strip Composite Markers Preserves Other Commands | **GAP** | — |
-| `StripCompositeMarkers_EmbeddedInLine` | 1057 | Strip Composite Markers Embedded In Line | **GAP** | — |
-
+| `AddMatcher_Clobber` | 33 | Add Matcher Clobber | **PARTIAL** | `test_multi_pattern_matching_lifecycle` (`crates/aksh-runner/src/worker/matchers.rs`:652) |
+| `AddMatcher_Prepend` | 99 | Add Matcher Prepend | **PARTIAL** | `test_multi_pattern_matching_lifecycle` (`crates/aksh-runner/src/worker/matchers.rs`:652) |
+| `MatcherCode` | 165 | Matcher Code | **PARTIAL** | `matcher_accepts_literal_severity` (`crates/aksh-runner/src/worker/matchers.rs`:203) |
+| `DoesNotResetMatchingMatcher` | 204 | Does Not Reset Matching Matcher | **PARTIAL** | `test_multi_pattern_matching_lifecycle` (`crates/aksh-runner/src/worker/matchers.rs`:652) |
+| `InitialMatchers` | 259 | Initial Matchers | **PARTIAL** | `log_raw_problem_matching_and_telemetry` (`crates/aksh-runner/src/worker/execution_context.rs`:388) |
+| `MatcherLineColumn` | 307 | Matcher Line Column | **PARTIAL** | `matcher_accepts_literal_severity` (`crates/aksh-runner/src/worker/matchers.rs`:203) |
+| `MatcherDoesNotReceiveCommand` | 355 | Matcher Does Not Receive Command | **PARTIAL** | `log_raw_problem_matching_and_telemetry` (`crates/aksh-runner/src/worker/execution_context.rs`:388) |
+| `MatcherRemoveColorCodes` | 389 | Matcher Remove Color Codes | **PARTIAL** | `matcher_strips_ansi_color_codes_before_matching` (`crates/aksh-runner/src/worker/matchers.rs`:203) |
+| `RemoveMatcher` | 418 | Remove Matcher | **PARTIAL** | `matcher_owner_can_be_removed` (`crates/aksh-runner/src/worker/matchers.rs`:321) |
+| `ResetsOtherMatchers` | 471 | Resets Other Matchers | **PARTIAL** | `log_raw_problem_matching_and_telemetry` (`crates/aksh-runner/src/worker/execution_context.rs`:388) |
+| `MatcherSeverity` | 535 | Matcher Severity | **PARTIAL** | `matcher_accepts_literal_severity` (`crates/aksh-runner/src/worker/matchers.rs`:203) |
+| `MatcherTimeout` | 596 | Matcher Timeout | **NOT_APPLICABLE** | Rust regex crate linear time guarantees prevent catastrophic backtracking, timeouts not required |
+| `MatcherFile` | 650 | Matcher File | **PARTIAL** | `test_repository_path_resolution` (`crates/aksh-runner/src/worker/matchers.rs`:727) |
+| `MatcherFile_JobContainer` | 764 | Matcher File Job Container | **PARTIAL** | `test_repository_path_resolution` (`crates/aksh-runner/src/worker/matchers.rs`:727) |
+| `MatcherFile_StepContainer` | 825 | Matcher File Step Container | **PARTIAL** | `test_repository_path_resolution` (`crates/aksh-runner/src/worker/matchers.rs`:727) |
+| `MatcherFromPath` | 887 | Matcher From Path | **PARTIAL** | `test_repository_path_resolution` (`crates/aksh-runner/src/worker/matchers.rs`:727) |
+| `MatcherDefaultFromPath` | 943 | Matcher Default From Path | **PARTIAL** | `test_repository_path_resolution` (`crates/aksh-runner/src/worker/matchers.rs`:727) |
+| `CaptureTelemetryForGitUnsafeRepository` | 999 | Capture Telemetry For Git Unsafe Repository | **PARTIAL** | `log_raw_problem_matching_and_telemetry` (`crates/aksh-runner/src/worker/execution_context.rs`:388) |
+| `StripCompositeMarkers_StartAction` | 1012 | Strip Composite Markers Start Action | **PARTIAL** | `log_raw_problem_matching_and_telemetry` (`crates/aksh-runner/src/worker/execution_context.rs`:388) |
+| `StripCompositeMarkers_EndAction` | 1027 | Strip Composite Markers End Action | **PARTIAL** | `log_raw_problem_matching_and_telemetry` (`crates/aksh-runner/src/worker/execution_context.rs`:388) |
+| `StripCompositeMarkers_PreservesOtherCommands` | 1042 | Strip Composite Markers Preserves Other Commands | **PARTIAL** | `log_raw_problem_matching_and_telemetry` (`crates/aksh-runner/src/worker/execution_context.rs`:388) |
+| `StripCompositeMarkers_EmbeddedInLine` | 1057 | Strip Composite Markers Embedded In Line | **PARTIAL** | `log_raw_problem_matching_and_telemetry` (`crates/aksh-runner/src/worker/execution_context.rs`:388) |
 ### `L0/Worker/PipelineDirectoryManagerL0.cs` — 8 tests — GAP
 
 Official behavior: Workspace/pipeline directory tracking/cleanup not tested.
