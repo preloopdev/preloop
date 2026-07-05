@@ -51,7 +51,8 @@ pub async fn run_broker_loop(
     let mut need_session = true;
 
     loop {
-        // Check if active job has finished (non-blocking)
+        // Check if active job has finished (non-blocking) — covers the case
+        // where the job completed between loop iterations without going through select!.
         if let Some(job) = &mut active_job {
             match job.try_wait() {
                 Ok(Some(success)) => {
@@ -142,6 +143,15 @@ pub async fn run_broker_loop(
 
         let busy = active_job.is_some();
 
+        // When a job is running, use a short poll interval so we detect
+        // completion promptly (within 200ms) instead of waiting up to 50s
+        // for the broker long-poll to time out.
+        let poll_timeout = if busy {
+            std::time::Duration::from_millis(200)
+        } else {
+            std::time::Duration::from_secs(50)
+        };
+
         tokio::select! {
             _ = &mut shutdown => {
                 info!("Shutdown signal received");
@@ -156,6 +166,11 @@ pub async fn run_broker_loop(
                     let _ = client.delete_session(&token, &session_id).await;
                 }
                 return Ok(());
+            }
+            // When a job is active, short-circuit the long-poll to re-check
+            // try_wait() at the top of the loop every 200ms.
+            _ = tokio::time::sleep(poll_timeout), if busy => {
+                continue;
             }
             result = client.get_message(&token, &session_id, busy) => {
                 match result {
