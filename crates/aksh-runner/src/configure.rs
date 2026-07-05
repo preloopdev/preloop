@@ -133,13 +133,23 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
     let mut cred_data = serde_json::Map::new();
     cred_data.insert("clientId".to_string(), serde_json::json!(client_id));
     cred_data.insert("authorizationUrl".to_string(), serde_json::json!(auth_url));
+    // Extract agent response properties (used for FIPS, auth migration, broker URL)
+    let props = agent_response.get("properties");
+
+    // F056: Read requireFipsCryptography from agent response properties
+    // instead of hardcoding "True". Official reads properties.RequireFipsCryptography.
+    // Default to "True" if not present (matches prior behavior).
+    let require_fips = props
+        .and_then(|p| p.get("RequireFipsCryptography"))
+        .and_then(|v| v.get("$value").or(Some(v)))
+        .and_then(|v| v.as_str())
+        .unwrap_or("True");
     cred_data.insert(
         "requireFipsCryptography".to_string(),
-        serde_json::json!("True"),
+        serde_json::json!(require_fips),
     );
 
     // F053: Extract auth migration fields from agent response properties
-    let props = agent_response.get("properties");
     let enable_auth_migration = props
         .and_then(|p| p.get("EnableAuthMigrationByDefault"))
         .and_then(|v| v.get("$value").or(Some(v)))
