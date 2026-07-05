@@ -16,7 +16,7 @@
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::{watch, Mutex};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::execution_context::Annotation;
 use super::server_queue::ServerQueue;
@@ -294,6 +294,17 @@ pub async fn run_job(
         }
     }
 
+    // F054: Upload diagnostic logs from _diag/ directory
+    if let Some(ref rpt) = reporting {
+        // Derive runner root from workspace: workspace is <root>/_work/<repo>/<dir>
+        // so runner root is workspace/../../..
+        let runner_root = std::path::Path::new(&workspace)
+            .ancestors()
+            .nth(3)
+            .unwrap_or(std::path::Path::new("."));
+        upload_diagnostic_logs(rpt, runner_root, job_name, &plan_id, job_id).await;
+    }
+
     // Report job completion — actually POST to the server
     if let Err(e) = report_completion(
         &job_message,
@@ -544,6 +555,135 @@ async fn upload_job_log(rpt: &ReportingContext, content: &str) {
     {
         Ok(()) => info!("Uploaded job log ({} bytes)", content.len()),
         Err(e) => warn!("Job log upload failed: {e:#}"),
+    }
+}
+
+/// F054: Upload diagnostic logs from the _diag/ directory (if present).
+///
+/// Matches official `DiagnosticLogManager.UploadDiagnosticLogs()`:
+/// - Collects log files from the runner's _diag/ directory
+/// - Creates a zip archive with metadata
+/// - Uploads via the results service
+async fn upload_diagnostic_logs(
+    rpt: &ReportingContext,
+    runner_root: &std::path::Path,
+    job_name: &str,
+    plan_id: &str,
+    job_id: &str,
+) {
+    let diag_dir = runner_root.join("_diag");
+    if !diag_dir.is_dir() {
+        debug!(
+            "No _diag/ directory found at {} — skipping diagnostic log upload",
+            diag_dir.display()
+        );
+        return;
+    }
+
+    // Collect log files
+    let log_files: Vec<_> = match std::fs::read_dir(&diag_dir) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .is_some_and(|ext| ext == "log" || ext == "txt")
+            })
+            .collect(),
+        Err(e) => {
+            debug!("Failed to read _diag/ directory: {e}");
+            return;
+        }
+    };
+
+    if log_files.is_empty() {
+        debug!("No log files in _diag/ — skipping diagnostic upload");
+        return;
+    }
+
+    // Create a simple zip of all log files
+    let zip_path = runner_root
+        .join("_work")
+        .join("_temp")
+        .join(format!("{job_name}-diagnostics.zip"));
+    if let Some(parent) = zip_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+
+    let zip_result = (|| -> Result<Vec<u8>> {
+        use std::io::Write;
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+
+            for entry in &log_files {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if let Ok(content) = std::fs::read(&entry.path()) {
+                    zip.start_file(&name, options)?;
+                    zip.write_all(&content)?;
+                }
+            }
+
+            // Add metadata JSON
+            let metadata = serde_json::json!({
+                "jobName": job_name,
+                "planId": plan_id,
+                "jobId": job_id,
+                "fileCount": log_files.len(),
+            });
+            zip.start_file("diagnostics-metadata.json", options)?;
+            zip.write_all(serde_json::to_string_pretty(&metadata)?.as_bytes())?;
+            zip.finish()?;
+        }
+        Ok(buf)
+    })();
+
+    let zip_content = match zip_result {
+        Ok(content) => content,
+        Err(e) => {
+            warn!("Failed to create diagnostic zip: {e:#}");
+            return;
+        }
+    };
+
+    // Upload via results service
+    let body = serde_json::json!({
+        "workflow_run_backend_id": plan_id,
+        "workflow_job_run_backend_id": job_id,
+    });
+
+    let signed_url = match rpt
+        .results
+        .get_diagnostic_logs_signed_url(&rpt.access_token, &body)
+        .await
+    {
+        Ok(resp) => resp
+            .get("blob_url")
+            .or_else(|| resp.get("url"))
+            .or_else(|| resp.get("logs_url"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        Err(e) => {
+            debug!("Diagnostic log signed URL request failed (non-fatal): {e:#}");
+            return;
+        }
+    };
+
+    if signed_url.is_empty() {
+        debug!("Empty signed URL for diagnostic logs — server may not support this feature");
+        return;
+    }
+
+    match rpt.results.upload_log_blob(&signed_url, zip_content).await {
+        Ok(()) => info!(
+            "Uploaded diagnostic logs ({} files, {} bytes)",
+            log_files.len(),
+            zip_path.display()
+        ),
+        Err(e) => warn!("Diagnostic log upload failed: {e:#}"),
     }
 }
 

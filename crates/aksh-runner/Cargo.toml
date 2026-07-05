@@ -42,6 +42,7 @@ hostname.workspace = true
 bytes.workspace = true
 serde_yaml.workspace = true
 regex.workspace = true
+zip.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
