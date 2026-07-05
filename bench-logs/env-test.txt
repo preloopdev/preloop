@@ -1,0 +1,5 @@
+FOO_VAR=bar123
+GITHUB_EVENT_PATH=/tmp/rr/_work/_temp/event.json
+GITHUB_PATH=/tmp/rr/_work/default/_temp/github_path_005c1959-76a2-496a-930d-69ef3e646cde
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+RUSTUP_TOOLCHAIN=stable

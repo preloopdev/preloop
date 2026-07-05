@@ -29,3 +29,8 @@ __pycache__/
 /.credentials
 /.credentials_rsaparams
 /.aksh/
+
+# Local toolchains & runner binaries
+.cargo/
+.rustup/
+actions-runner/
