@@ -40,6 +40,18 @@ pub struct RunnerSettings {
     /// F007: matches official .runner `serverUrlV2` field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_url_v2: Option<String>,
+    /// F052: Disable auto-update check.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disable_update: bool,
+    /// F052: Skip session recovery on broker reconnect.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skip_session_recover: bool,
+    /// F052: Monitor socket address for diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor_socket_address: Option<String>,
+    /// F052: Use runner admin flow for registration.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub use_runner_admin_flow: bool,
 }
 
 fn default_true() -> bool {
@@ -207,6 +219,10 @@ mod tests {
             server_url_v2: Some(
                 "https://pipelines.actions.githubusercontent.com/abc123".to_string(),
             ),
+            disable_update: false,
+            skip_session_recover: false,
+            monitor_socket_address: None,
+            use_runner_admin_flow: false,
         };
         let dir = TempDir::new().unwrap();
         let path = dir.path().join(".runner");
@@ -264,6 +280,10 @@ mod tests {
                 is_hosted_server: false,
                 use_v2_flow: true,
                 server_url_v2: None,
+                disable_update: false,
+                skip_session_recover: false,
+                monitor_socket_address: None,
+                use_runner_admin_flow: false,
             },
             credentials: CredentialData {
                 scheme: "OAuth".to_string(),
