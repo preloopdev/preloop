@@ -341,6 +341,7 @@ fn statuses_sorted(flows: &[Value]) -> Vec<String> {
 // ── public entry point ───────────────────────────────────────────────────────
 
 /// Arguments mirroring the Python CLI of `_compare.py`.
+#[allow(missing_docs)]
 pub struct Args<'a> {
     pub scenario: &'a str,
     pub left_dir: &'a Path,
