@@ -1,0 +1,46 @@
+fast-job	Set up job	﻿2026-07-05T21:04:59.0430902Z Current runner version: '2.335.1'
+fast-job	Set up job	2026-07-05T21:04:59.0460529Z ##[group]Runner Image Provisioner
+fast-job	Set up job	2026-07-05T21:04:59.0461332Z Hosted Compute Agent
+fast-job	Set up job	2026-07-05T21:04:59.0461903Z Version: 20260624.560
+fast-job	Set up job	2026-07-05T21:04:59.0462481Z Commit: 925d229a51159bc391ae97e54a2dd1fe20af789d
+fast-job	Set up job	2026-07-05T21:04:59.0463153Z Build Date: 2026-06-24T18:26:47Z
+fast-job	Set up job	2026-07-05T21:04:59.0463927Z Worker ID: {a0ea22cd-1cc0-4521-bd49-502fa8ec4035}
+fast-job	Set up job	2026-07-05T21:04:59.0464585Z Azure Region: northcentralus
+fast-job	Set up job	2026-07-05T21:04:59.0465114Z ##[endgroup]
+fast-job	Set up job	2026-07-05T21:04:59.0466540Z ##[group]Operating System
+fast-job	Set up job	2026-07-05T21:04:59.0467106Z Ubuntu
+fast-job	Set up job	2026-07-05T21:04:59.0467606Z 24.04.4
+fast-job	Set up job	2026-07-05T21:04:59.0468091Z LTS
+fast-job	Set up job	2026-07-05T21:04:59.0468552Z ##[endgroup]
+fast-job	Set up job	2026-07-05T21:04:59.0469049Z ##[group]Runner Image
+fast-job	Set up job	2026-07-05T21:04:59.0469581Z Image: ubuntu-24.04
+fast-job	Set up job	2026-07-05T21:04:59.0470220Z Version: 20260628.225.1
+fast-job	Set up job	2026-07-05T21:04:59.0471223Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260628.225/images/ubuntu/Ubuntu2404-Readme.md
+fast-job	Set up job	2026-07-05T21:04:59.0472765Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260628.225
+fast-job	Set up job	2026-07-05T21:04:59.0473613Z ##[endgroup]
+fast-job	Set up job	2026-07-05T21:04:59.0474675Z ##[group]GITHUB_TOKEN Permissions
+fast-job	Set up job	2026-07-05T21:04:59.0476883Z Contents: read
+fast-job	Set up job	2026-07-05T21:04:59.0477408Z Metadata: read
+fast-job	Set up job	2026-07-05T21:04:59.0477945Z Packages: read
+fast-job	Set up job	2026-07-05T21:04:59.0478439Z ##[endgroup]
+fast-job	Set up job	2026-07-05T21:04:59.0480674Z Secret source: Actions
+fast-job	Set up job	2026-07-05T21:04:59.0481382Z Prepare workflow directory
+fast-job	Set up job	2026-07-05T21:04:59.0794436Z Prepare all required actions
+fast-job	Set up job	2026-07-05T21:04:59.0891803Z Complete job name: fast-job
+fast-job	Quick step	﻿2026-07-05T21:04:59.1513644Z ##[group]Run echo "Start: $(date +%s%N)"
+fast-job	Quick step	2026-07-05T21:04:59.1514476Z ^[[36;1mecho "Start: $(date +%s%N)"^[[0m
+fast-job	Quick step	2026-07-05T21:04:59.1515235Z ^[[36;1mecho "This job should complete and the runner should exit promptly"^[[0m
+fast-job	Quick step	2026-07-05T21:04:59.1516039Z ^[[36;1mecho "End: $(date +%s%N)"^[[0m
+fast-job	Quick step	2026-07-05T21:04:59.1822025Z shell: /usr/bin/bash -e {0}
+fast-job	Quick step	2026-07-05T21:04:59.1823133Z ##[endgroup]
+fast-job	Quick step	2026-07-05T21:04:59.2025466Z Start: 1783285499197595916
+fast-job	Quick step	2026-07-05T21:04:59.2032233Z This job should complete and the runner should exit promptly
+fast-job	Quick step	2026-07-05T21:04:59.2046019Z End: 1783285499198912277
+fast-job	Verify fast completion	﻿2026-07-05T21:04:59.2137730Z ##[group]Run echo "If the broker poll is 200ms (not 50s), this job completes fast"
+fast-job	Verify fast completion	2026-07-05T21:04:59.2138799Z ^[[36;1mecho "If the broker poll is 200ms (not 50s), this job completes fast"^[[0m
+fast-job	Verify fast completion	2026-07-05T21:04:59.2139561Z ^[[36;1mecho "PASS: job completed"^[[0m
+fast-job	Verify fast completion	2026-07-05T21:04:59.2158972Z shell: /usr/bin/bash -e {0}
+fast-job	Verify fast completion	2026-07-05T21:04:59.2159558Z ##[endgroup]
+fast-job	Verify fast completion	2026-07-05T21:04:59.2203837Z If the broker poll is 200ms (not 50s), this job completes fast
+fast-job	Verify fast completion	2026-07-05T21:04:59.2205950Z PASS: job completed
+fast-job	Complete job	﻿2026-07-05T21:04:59.2286507Z Cleaning up orphan processes

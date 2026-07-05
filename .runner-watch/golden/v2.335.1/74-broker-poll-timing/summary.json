@@ -1,0 +1,36 @@
+{
+  "scenario": "74-broker-poll-timing",
+  "run_id": 28754866476,
+  "name": "golden: broker-poll-timing",
+  "status": "completed",
+  "conclusion": "success",
+  "started_at": "2026-07-05T21:04:55Z",
+  "jobs": [
+    {
+      "name": "fast-job",
+      "conclusion": "success",
+      "steps": [
+        {
+          "name": "Set up job",
+          "conclusion": "success",
+          "number": 1
+        },
+        {
+          "name": "Quick step",
+          "conclusion": "success",
+          "number": 2
+        },
+        {
+          "name": "Verify fast completion",
+          "conclusion": "success",
+          "number": 3
+        },
+        {
+          "name": "Complete job",
+          "conclusion": "success",
+          "number": 4
+        }
+      ]
+    }
+  ]
+}
