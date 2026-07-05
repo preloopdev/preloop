@@ -82,6 +82,38 @@ impl Context {
         }
         current
     }
+
+    /// Resolve a path against an existing value (used for member access on expression results).
+    pub fn resolve_value(mut current: Value, path: &[String]) -> Value {
+        for segment in path {
+            if segment == "*" {
+                current = match current {
+                    Value::Object(map) => Value::Array(map.into_values().collect()),
+                    Value::Array(arr) => Value::Array(arr),
+                    _ => Value::Null,
+                };
+                continue;
+            }
+            current = match current {
+                Value::Object(map) => map.get(segment).cloned().unwrap_or(Value::Null),
+                Value::Array(arr) => Value::Array(
+                    arr.into_iter()
+                        .filter_map(|v| match v {
+                            Value::Object(ref m) => m.get(segment).cloned(),
+                            Value::Array(ref a) => segment
+                                .parse::<usize>()
+                                .ok()
+                                .and_then(|i| a.get(i))
+                                .cloned(),
+                            _ => None,
+                        })
+                        .collect(),
+                ),
+                _ => Value::Null,
+            };
+        }
+        current
+    }
 }
 
 impl Default for Context {
@@ -161,6 +193,11 @@ enum Expr {
         name: String,
         args: Vec<Expr>,
     },
+    /// Member access on an expression result, e.g. `fromJSON('...').*.name`
+    MemberAccess {
+        expr: Box<Expr>,
+        path: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,6 +264,10 @@ fn eval(expr: &Expr, context: &Context) -> Result<Value, ExpressionError> {
             ))),
         },
         Expr::Call { name, args } => eval_call(name, args, context),
+        Expr::MemberAccess { expr, path } => {
+            let base = eval(expr, context)?;
+            Ok(Context::resolve_value(base, path))
+        }
     }
 }
 
@@ -727,7 +768,17 @@ impl Parser {
                 }
             }
             self.expect(Token::RParen)?;
-            Ok(Expr::Call { name, args })
+            let call = Expr::Call { name, args };
+            // Check for trailing member access: fromJSON('...').*.name or fn()[0]
+            let suffix = self.parse_member_suffix();
+            if suffix.is_empty() {
+                Ok(call)
+            } else {
+                Ok(Expr::MemberAccess {
+                    expr: Box::new(call),
+                    path: suffix,
+                })
+            }
         } else {
             let mut path = vec![name];
             loop {
@@ -777,6 +828,53 @@ impl Parser {
             }
             Ok(Expr::Path(path))
         }
+    }
+
+    /// Parse trailing `.ident`, `.*`, or `['key']` segments after an expression.
+    fn parse_member_suffix(&mut self) -> Vec<String> {
+        let mut path = Vec::new();
+        loop {
+            match self.current() {
+                Token::Dot => {
+                    self.advance();
+                    match self.current().clone() {
+                        Token::Ident(segment) => {
+                            self.advance();
+                            path.push(segment);
+                        }
+                        Token::Star => {
+                            self.advance();
+                            path.push("*".to_string());
+                        }
+                        _ => break,
+                    }
+                }
+                Token::LBracket => {
+                    self.advance();
+                    let segment = match self.current().clone() {
+                        Token::String(s) => {
+                            self.advance();
+                            s
+                        }
+                        Token::Number(n) => {
+                            self.advance();
+                            n
+                        }
+                        Token::Ident(s) => {
+                            self.advance();
+                            s
+                        }
+                        _ => break,
+                    };
+                    if self.expect(Token::RBracket).is_err() {
+                        break;
+                    }
+                    path.push(segment);
+                }
+                _ => break,
+            }
+        }
+        path
     }
 
     fn expect(&mut self, expected: Token) -> Result<(), ExpressionError> {
@@ -883,6 +981,30 @@ mod tests {
         assert_eq!(
             eval_expression("'a''b''c'", &context).unwrap(),
             Value::String("a'b'c".to_owned())
+        );
+    }
+
+    #[test]
+    fn fromjson_wildcard_member_access() {
+        let context = Context::default();
+        // fromJSON('...').*.name — member access on function call result
+        assert_eq!(
+            eval_expression(
+                r#"join(fromJSON('[{"name":"alpha"},{"name":"beta"},{"name":"gamma"}]').*.name, ',')"#,
+                &context
+            )
+            .unwrap(),
+            Value::String("alpha,beta,gamma".to_owned())
+        );
+        // Simple member access on fromJSON
+        assert_eq!(
+            eval_expression(r#"fromJSON('{"a":{"b":"deep"}}').a.b"#, &context).unwrap(),
+            Value::String("deep".to_owned())
+        );
+        // Bracket access on fromJSON
+        assert_eq!(
+            eval_expression(r#"fromJSON('{"x":"val"}')['x']"#, &context).unwrap(),
+            Value::String("val".to_owned())
         );
     }
 

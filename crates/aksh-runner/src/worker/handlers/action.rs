@@ -19,7 +19,14 @@ pub fn run_action<'a>(
     Box::pin(async move {
         info!("Running action: {uses}");
 
+        // Set github.action_repository, github.action_ref, and github.action
+        // The official runner leaves these set after the action completes so
+        // subsequent script steps can read them.
         set_action_repository_context(ctx, uses);
+        ctx.job.set_github_context_value(
+            "action",
+            Some(serde_json::Value::String(ctx.step_name.clone())),
+        );
 
         if uses.starts_with("docker://") {
             super::container::run_docker_action(uses, with, workspace, ctx).await
