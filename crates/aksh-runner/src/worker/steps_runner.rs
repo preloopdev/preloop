@@ -1184,14 +1184,17 @@ mod tests {
         );
         // Set a job-level environment variable
         job.env.insert("JOB_VAR".to_string(), "job-val".to_string());
-        job.env.insert("OVERRIDE_VAR".to_string(), "job-val".to_string());
+        job.env
+            .insert("OVERRIDE_VAR".to_string(), "job-val".to_string());
 
         let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
         let (_tx, cancel_rx) = watch::channel(false);
 
         let mut step = test_step("test_env", None);
-        step.env.insert("OVERRIDE_VAR".to_string(), "step-val".to_string());
-        step.env.insert("STEP_VAR".to_string(), "step-val".to_string());
+        step.env
+            .insert("OVERRIDE_VAR".to_string(), "step-val".to_string());
+        step.env
+            .insert("STEP_VAR".to_string(), "step-val".to_string());
         step.step_type = StepType::Script {
             // Write variables to output so we can verify the actual process env
             script: "echo job_var=$JOB_VAR >> \"$GITHUB_OUTPUT\"\necho override_var=$OVERRIDE_VAR >> \"$GITHUB_OUTPUT\"\necho step_var=$STEP_VAR >> \"$GITHUB_OUTPUT\"".to_string(),
@@ -1214,9 +1217,18 @@ mod tests {
 
         assert_eq!(result, "Succeeded");
         let step_res = job.steps.get("test_env").unwrap();
-        assert_eq!(step_res.outputs.get("job_var").map(String::as_str), Some("job-val"));
-        assert_eq!(step_res.outputs.get("override_var").map(String::as_str), Some("step-val"));
-        assert_eq!(step_res.outputs.get("step_var").map(String::as_str), Some("step-val"));
+        assert_eq!(
+            step_res.outputs.get("job_var").map(String::as_str),
+            Some("job-val")
+        );
+        assert_eq!(
+            step_res.outputs.get("override_var").map(String::as_str),
+            Some("step-val")
+        );
+        assert_eq!(
+            step_res.outputs.get("step_var").map(String::as_str),
+            Some("step-val")
+        );
     }
 
     #[tokio::test]
