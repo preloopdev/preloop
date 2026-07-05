@@ -70,7 +70,10 @@ impl JobContext {
         // Extract mask hints from variables
         let mut masks = HashSet::new();
         if let Some(vars) = variables.as_object() {
-            for (_, v) in vars {
+            for (k, v) in vars {
+                if k.is_empty() {
+                    continue;
+                }
                 let is_secret = v.get("isSecret").and_then(|s| s.as_bool()).unwrap_or(false);
                 if is_secret {
                     if let Some(val) = v.get("value").and_then(|s| s.as_str()) {
@@ -117,12 +120,34 @@ impl JobContext {
         }
     }
 
-    /// Get the value of a variable by key.
+    /// Get the value of a variable by key. Supports case-insensitive lookup.
+    /// If key is found but value is null, returns empty string `""` (C# parity).
     pub fn get_variable(&self, key: &str) -> Option<&str> {
-        self.variables
-            .get(key)
-            .and_then(|v| v.get("value"))
-            .and_then(|v| v.as_str())
+        let key_lower = key.to_lowercase();
+        if let Some(obj) = self.variables.as_object() {
+            for (k, v) in obj {
+                if k.is_empty() {
+                    continue;
+                }
+                if k.to_lowercase() == key_lower {
+                    if let Some(val_node) = v.get("value") {
+                        if val_node.is_null() {
+                            return Some("");
+                        }
+                        return Some(val_node.as_str().unwrap_or(""));
+                    }
+                    return Some("");
+                }
+            }
+        }
+        None
+    }
+
+    /// Get a variable parsed as boolean. Does not throw if not found or null.
+    pub fn get_variable_bool(&self, key: &str) -> bool {
+        self.get_variable(key)
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false)
     }
 
     /// Add a mask value (secrets, add-mask command).
@@ -626,5 +651,59 @@ mod tests {
         assert_eq!(val.unwrap().as_str(), Some("/workspace"));
         let val2 = aksh_gha_expressions::eval_expression("vars.OTHER_VAR", &expr);
         assert_eq!(val2.unwrap().as_str(), Some("hello"));
+    }
+
+    #[test]
+    fn variables_case_insensitive_and_edge_cases() {
+        let variables = serde_json::json!({
+            "MY_VAR": {"value": "hello", "isSecret": false},
+            "secret_var": {"value": "secret123", "isSecret": true},
+            "NULL_VAR": {"value": null, "isSecret": false},
+            "": {"value": "skipped", "isSecret": false}
+        });
+
+        let ctx = JobContext::new(
+            "job1".into(),
+            "Test Job".into(),
+            variables,
+            serde_json::json!({}),
+        );
+
+        // Case-insensitive lookup
+        assert_eq!(ctx.get_variable("MY_VAR"), Some("hello"));
+        assert_eq!(ctx.get_variable("my_var"), Some("hello"));
+        assert_eq!(ctx.get_variable("My_Var"), Some("hello"));
+
+        // Null variable sets null/empty as empty string ""
+        assert_eq!(ctx.get_variable("NULL_VAR"), Some(""));
+        assert_eq!(ctx.get_variable("null_var"), Some(""));
+
+        // Empty name is ignored/skipped (or at least cannot be looked up)
+        assert_eq!(ctx.get_variable(""), None);
+
+        // Missing returns None
+        assert_eq!(ctx.get_variable("MISSING_VAR"), None);
+    }
+
+    #[test]
+    fn variables_get_boolean_does_not_throw_when_null() {
+        let variables = serde_json::json!({
+            "TRUE_VAR": {"value": "true", "isSecret": false},
+            "FALSE_VAR": {"value": "false", "isSecret": false},
+            "NULL_VAR": {"value": null, "isSecret": false}
+        });
+
+        let ctx = JobContext::new(
+            "job1".into(),
+            "Test Job".into(),
+            variables,
+            serde_json::json!({}),
+        );
+
+        assert!(ctx.get_variable_bool("TRUE_VAR"));
+        assert!(ctx.get_variable_bool("true_var"));
+        assert!(!ctx.get_variable_bool("FALSE_VAR"));
+        assert!(!ctx.get_variable_bool("NULL_VAR"));
+        assert!(!ctx.get_variable_bool("MISSING_VAR"));
     }
 }
