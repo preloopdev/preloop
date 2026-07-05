@@ -1,5 +1,7 @@
 name: P0 Cancel Semantics Verification
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+  push:
 jobs:
   cancel-test:
     runs-on: [self-hosted, p0-cancel]

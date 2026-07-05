@@ -1,5 +1,7 @@
 name: P1 Listener and Config Verification
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+  push:
 jobs:
   listener-test:
     runs-on: [self-hosted, p1-test]

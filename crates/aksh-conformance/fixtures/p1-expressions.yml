@@ -1,5 +1,7 @@
 name: P1 Expressions Verification
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+  push:
 jobs:
   expressions:
     runs-on: [self-hosted, p1-test]

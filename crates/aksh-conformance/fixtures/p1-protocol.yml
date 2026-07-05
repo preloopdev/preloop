@@ -1,5 +1,7 @@
 name: P1 Protocol Verification
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+  push:
 jobs:
   protocol-test:
     runs-on: [self-hosted, p1-test]
