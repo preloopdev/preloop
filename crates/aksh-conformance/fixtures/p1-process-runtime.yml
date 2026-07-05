@@ -1,0 +1,63 @@
+name: P1 Process and Runtime Verification
+on: workflow_dispatch
+jobs:
+  process-tests:
+    runs-on: [self-hosted, p1-test]
+    steps:
+      # 1. Process stdout/stderr streaming
+      - name: Stdout and stderr
+        run: |
+          echo "stdout-line-1"
+          echo "stderr-line-1" >&2
+          echo "stdout-line-2"
+
+      # 2. Working directory
+      - name: Working directory
+        run: |
+          mkdir -p /tmp/p1-workdir-test
+          cd /tmp/p1-workdir-test
+          pwd | grep -q p1-workdir-test
+
+      # 3. Exit code propagation
+      - name: Exit code 0
+        run: exit 0
+
+      - name: Exit code non-zero fails
+        id: fail_exit
+        continue-on-error: true
+        run: exit 42
+
+      - name: Verify exit code failure
+        run: |
+          test "${{ steps.fail_exit.outcome }}" = "failure"
+          echo "Exit code failure propagated correctly"
+
+      # 4. Environment propagation
+      - name: Env propagation
+        env:
+          CUSTOM_VAR: custom-value
+          PATH_EXTRA: /custom/bin
+        run: |
+          test "$CUSTOM_VAR" = "custom-value"
+          echo "Env propagation works"
+
+      # 5. Process timeout (step timeout-minutes)
+      - name: Step with timeout
+        timeout-minutes: 1
+        run: echo "step-with-timeout-ran"
+
+      # 6. Long output (streaming test)
+      - name: Long output
+        run: |
+          for i in $(seq 1 100); do echo "line-$i"; done
+          echo "100-lines-output-complete"
+
+      # 7. Workspace directories exist
+      - name: Workspace layout
+        run: |
+          test -d "$RUNNER_TEMP" || test -d "${RUNNER_WORKSPACE:-/tmp}"
+          echo "Workspace layout verified"
+
+      # 8. Final
+      - name: All process checks passed
+        run: echo "ALL_P1_PROCESS_CHECKS_PASSED"

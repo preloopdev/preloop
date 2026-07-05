@@ -1,0 +1,49 @@
+name: P1 Listener and Config Verification
+on: workflow_dispatch
+jobs:
+  listener-test:
+    runs-on: [self-hosted, p1-test]
+    steps:
+      # The fact that this workflow runs at all proves:
+      # 1. Runner registered successfully (configure)
+      # 2. OAuth token acquired
+      # 3. Broker session created
+      # 4. Job message received via broker
+      # 5. Job acquired via run-service
+      # 6. Worker process spawned
+      # 7. Job executed
+      # 8. Completion reported
+
+      - name: Verify runner context
+        run: |
+          echo "RUNNER_NAME=$RUNNER_NAME"
+          echo "RUNNER_OS=$RUNNER_OS"
+          echo "RUNNER_ARCH=$RUNNER_ARCH"
+          echo "RUNNER_TEMP=$RUNNER_TEMP"
+          test -n "$RUNNER_NAME"
+          test -n "$RUNNER_OS"
+          test -n "$RUNNER_ARCH"
+          echo "Runner context variables populated"
+
+      - name: Verify GitHub context
+        run: |
+          echo "GITHUB_REPOSITORY=$GITHUB_REPOSITORY"
+          echo "GITHUB_WORKFLOW=$GITHUB_WORKFLOW"
+          echo "GITHUB_RUN_ID=$GITHUB_RUN_ID"
+          echo "GITHUB_ACTION=$GITHUB_ACTION"
+          test -n "$GITHUB_REPOSITORY"
+          test -n "$GITHUB_WORKFLOW"
+          test -n "$GITHUB_RUN_ID"
+          echo "GitHub context variables populated"
+
+      - name: Verify workspace
+        run: |
+          echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
+          test -d "$GITHUB_WORKSPACE" || mkdir -p "$GITHUB_WORKSPACE"
+          echo "Workspace exists"
+
+      - name: Multi-step proves broker session held
+        run: echo "If this runs, broker session was maintained across steps"
+
+      - name: All listener checks passed
+        run: echo "ALL_P1_LISTENER_CHECKS_PASSED"

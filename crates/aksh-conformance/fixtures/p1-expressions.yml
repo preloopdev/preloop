@@ -1,0 +1,66 @@
+name: P1 Expressions Verification
+on: workflow_dispatch
+jobs:
+  expressions:
+    runs-on: [self-hosted, p1-test]
+    env:
+      JOB_LEVEL_VAR: from-job
+    steps:
+      # 1. Expression in step env
+      - name: Expression in env
+        env:
+          COMPUTED: ${{ format('hello-{0}', 'world') }}
+        run: test "$COMPUTED" = "hello-world"
+
+      # 2. Ternary / contains
+      - name: Contains function
+        env:
+          HAS_IT: ${{ contains('hello world', 'world') }}
+        run: test "$HAS_IT" = "true"
+
+      # 3. startsWith / endsWith
+      - name: StartsWith and endsWith
+        env:
+          STARTS: ${{ startsWith('hello-world', 'hello') }}
+          ENDS: ${{ endsWith('hello-world', 'world') }}
+        run: |
+          test "$STARTS" = "true"
+          test "$ENDS" = "true"
+
+      # 4. Job env visible in expressions
+      - name: Job env in expression
+        env:
+          GOT_IT: ${{ env.JOB_LEVEL_VAR }}
+        run: test "$GOT_IT" = "from-job"
+
+      # 5. toJSON / fromJSON
+      - name: JSON functions
+        env:
+          JSON_VAL: ${{ toJSON('hello') }}
+        run: |
+          echo "JSON_VAL=$JSON_VAL"
+          test "$JSON_VAL" = '"hello"'
+
+      # 6. success() in default condition
+      - name: Success by default
+        run: echo "default-success-condition-works"
+
+      # 7. Condition with expression
+      - name: True condition runs
+        if: ${{ 1 == 1 }}
+        run: echo "expression-condition-true"
+
+      - name: False condition skips
+        if: ${{ 1 == 2 }}
+        run: |
+          echo "BUG: should not run"
+          exit 1
+
+      # 8. String comparison in condition
+      - name: String condition
+        if: ${{ 'abc' == 'abc' }}
+        run: echo "string-comparison-works"
+
+      # 9. Final
+      - name: All expression checks passed
+        run: echo "ALL_P1_EXPRESSION_CHECKS_PASSED"
