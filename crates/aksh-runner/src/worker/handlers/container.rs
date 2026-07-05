@@ -63,6 +63,10 @@ pub async fn run_docker_action_from_manifest(
         )
         .await?;
 
+        for line in &build_result.lines {
+            ctx.log(line);
+        }
+
         if build_result.exit_code != 0 {
             anyhow::bail!(
                 "docker build failed with exit code {}",
