@@ -4,6 +4,22 @@ Bucketed implementation plan for closing aksh-runner test gaps against the offic
 
 This plan is based on the verified comparison in `docs/test-coverage.md`.
 
+## High-level status summary
+
+| Priority | Bucket / Area | C# Tests | Status (2026-07-05) | Description of Coverage / Gaps |
+|---|---|---:|---|---|
+| **P0** | **Step execution semantics** | 90 | **PARTIAL** | Condition errors, continue-on-error, env/context mutation covered; worker top-level cancel/cleanup has gaps. |
+| **P0** | **File commands, outputs, matchers** | 117 | **PARTIAL** | Heredocs, ANSI stripping, NODE_OPTIONS, and GITHUB_STEP_SUMMARY size validation/scrubbing covered. |
+| **P0** | **Actions, manifests, composite execution** | 168 | **PARTIAL** | Manifest evaluation, basic composite, and Docker action args/env covered; nested outputs and resolver gaps. |
+| **P0** | **Containers and step host** | 24 | **PARTIAL** | Docker naming/network, path translation, env inherit covered; Alpine detection and service health gaps. |
+| **P1** | **Expressions and templates** | 37 | **PARTIAL** | String maps/tokens covered; condition functions and evaluator cancellation remain. |
+| **P1** | **Listener / configuration lifecycle** | 115 | **PARTIAL** | CLI flags, config lifecycle, and RSA field names covered; broker poll loop and interactive config gaps. |
+| **P1** | **Process / runtime environment** | 93 | **PARTIAL** | Signal sequence/SIGINT cancellation covered; process tree kill, proxy, and workspace cleanup gaps. |
+| **P1** | **Protocol / client DTO behavior** | 35 | **PARTIAL** | Annotations and server-side APIs covered; client-side HTTP error handling gaps. |
+| **P2** | **DAP / debugging** | 117 | **GAP** | WebSocket bridge, REPL, breakpoints, variables, and step pausing are completely unimplemented. |
+| **P2** | **Background / snapshot / aux features** | 14 | **GAP** | Background/wait steps and snapshot provider are completely unimplemented. |
+| **P3** | **Official runner infrastructure** | 32 | **NOT_APPLICABLE** | Windows service control, self-update, and .NET bootstrapper are intentionally deprioritized or out-of-scope. |
+
 ## Current implementation status — 2026-07-05
 
 The P0 runner slice from this plan has been implemented and verified in the Rust runner:
