@@ -253,8 +253,13 @@ pub struct StepPlan {
     #[serde(default)]
     pub with: BTreeMap<String, serde_json::Value>,
     /// Optional `if` expression.
-    #[serde(default)]
     pub if_condition: Option<String>,
+    /// Working directory for `run` steps.
+    #[serde(default)]
+    pub working_directory: Option<String>,
+    /// Shell override for `run` steps.
+    #[serde(default)]
+    pub shell: Option<String>,
 }
 
 /// Context material sent to a runner.
