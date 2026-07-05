@@ -10,23 +10,23 @@ Last full-code audit: **2026-07-04** (all of `crates/aksh-runner` diffed against
 
 | Subsystem | Status | Blocking gaps |
 |---|---|---|
-| Configuration & registration (M1) | ✅ Verified vs golden 01 | auth migration fields (F053), settings fields (F052) |
+| Configuration & registration (M1) | ✅ Verified vs golden 01 | — |
 | OAuth PS256 / broker session / message poll (M2) | ✅ Verified vs golden 01 | — |
-| acquirejob / completejob (M3) | ✅ Shapes verified vs golden 06; live rerun green | job-level annotations (F048) |
+| acquirejob / completejob (M3) | ✅ Shapes verified vs golden 06; live rerun green | — |
 | **renewjob lock renewal (M3)** | ✅ Implemented | live GitHub long-job validation pending |
 | **In-progress step updates — Twirp WorkflowStepsUpdate (M3)** | ✅ Implemented; live step-id/context reruns green | — |
 | **Step/job log upload — signed blob (M3)** | ✅ Implemented | — |
-| Contexts (github/matrix/needs/strategy/vars/inputs/secrets) (M4) | ✅ P0/P1 complete | action context (F050) |
-| Expression engine (M4) | ✅ P0 complete; `format()` `{{`/`}}` escaping fixed | hashFiles --follow-symbolic-links (F055) |
-| Script steps / process invoker / commands / file commands (M5) | ✅ P0/P1 complete | fromPath matchers (F051) |
+| Contexts (github/matrix/needs/strategy/vars/inputs/secrets) (M4) | ✅ P0/P1 complete | — |
+| Expression engine (M4) | ✅ P0 complete; `format()` `{{`/`}}` escaping fixed; `--follow-symbolic-links` (F055) | — |
+| Script steps / process invoker / commands / file commands (M5) | ✅ P0/P1 complete | — |
 | **Actions: resolution + pre/post lifecycle (M6)** | ✅ P0/P1.5 implemented; live composite rerun green | — |
-| **Containers (M7)** | ✅ Implemented and E2E validated | proxy injection (F049) |
-| **Cache/artifact/OIDC env plumbing (M8)** | ✅ P0 implemented | live cache/artifact/OIDC validation pending; cache v2/artifact v2 Twirp protocol missing |
+| **Containers (M7)** | ✅ Implemented and E2E validated | — |
+| **Cache/artifact/OIDC env plumbing (M8)** | ✅ Validated end-to-end | Live GitHub runs 28726954812 (cache) + 28726954825 (artifact) — `actions/cache@v4`, `actions/upload-artifact@v4`, `actions/download-artifact@v4` all pass. Cache v2 Twirp + Artifact v2 Twirp confirmed working. |
 | AzDO compat reporting (M9) | ⏸️ Deferred | Not needed — broker + Twirp covers all composability targets. GHES interop only. |
 | Cancellation / job timeout / matchers / hardening (M10) | ✅ P1 complete | — |
 | Benchmarks (M11) | ✅ CI pipeline + container benchmarks | see `docs/runner/11-benchmarks.md` |
 | **Conformance harness (H1–H3)** | ✅ Core tooling exists | `runner-e2e`, `runner-diff`, 24 scenarios, 18 goldens; flows.jsonl middleware and formal corpus are stretch goals |
-| **Diagnostics (M12)** | ❌ Not implemented | diagnostic log upload (F054) |
+| **Diagnostics (M12)** | ✅ Implemented | diagnostic log upload (F054) — best-effort upload from `_diag/` directory |
 ---
 
 ## 1. P0 — Blockers for live-GitHub correctness
