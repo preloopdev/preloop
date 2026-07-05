@@ -466,6 +466,33 @@ Found by running aksh-runner against real GitHub via `preloopdev/aksh-conformanc
 
 ---
 
+## Disparities found in real-world benchmarks (2026-07-05)
+
+Tested serde, axum, bat against aksh-runner-server with both aksh-runner and official C# runner v2.335.1.
+See `docs/runner/15-real-world-benchmarks.md` for full results.
+
+### `defaults.run.working-directory` not implemented
+- **Severity**: LOW — parser feature gap, not runner
+- **Impact**: Workflows must use `cd` in each step instead of `defaults.run.working-directory`
+- **Status**: ✅ Fixed (2026-07-05). Implemented in `aksh-gha-parser` (`Job.defaults` → `StepPlan.working_directory`) and wired through `steps_runner.rs` script execution. Relative paths resolved against job workspace.
+
+### `env.PATH` + `GITHUB_PATH` interaction
+- **Severity**: MEDIUM — PATH construction didn't match official runner
+- **Impact**: aksh-runner was prepending `GITHUB_PATH` entries to the **system** PATH, ignoring workflow-level `env.PATH`. Official runner uses the step/job environment PATH (which includes `env.PATH`) as the base for prepending. Workflows setting `env.PATH` and then using `GITHUB_PATH` would get the wrong PATH order.
+- **Status**: ✅ Fixed (2026-07-05). `build_env()` in `execution_context.rs` now uses the already-built step env PATH as the base for `GITHUB_PATH` prepending, matching the official runner's `AddPrependPathToEnvironment()` at `Handler.cs:205-233`. Test added.
+
+### Broker long-poll 50s idle timeout on `--once`
+- **Severity**: LOW — performance issue, not behavioral
+- **Impact**: After `--once` job completes, runner waited up to 50s for broker poll to expire before exiting.
+- **Status**: ✅ Fixed (2026-07-05). Broker loop now polls every 200ms while a job is active, exiting within 200ms of completion. Changed in `broker_listener.rs` — short-circuit `select!` branch races sleep against long-poll when busy.
+
+### Server `runs-on` label matching not implemented
+- **Severity**: HIGH — blocks multi-runner deployments
+- **Impact**: Server dispatched jobs from a FIFO queue with no label filtering. Any runner got any job regardless of `runs-on` labels, breaking multi-runner setups (e.g. Linux + macOS runners).
+- **Status**: ✅ Fixed (2026-07-05). Server now matches job `runs-on` labels against runner registration labels (case-insensitive). GitHub-hosted aliases (`ubuntu-latest` → `self-hosted`/`linux`, `macos-*` → `macos`, `windows-*` → `windows`) are supported. 6 unit tests added. Jobs skip non-matching runners in the queue (FIFO with filtering, not strict FIFO).
+
+---
+
 ## Remaining Known Gaps (deferred)
 
 
@@ -481,29 +508,33 @@ Found by running aksh-runner against real GitHub via `preloopdev/aksh-conformanc
 
 ---
 
-## Upstream fixture corpus (TODO)
+## Upstream fixture corpus
 
-`fixtures/upstream-workflows/` contains 98 workflow fixtures from
+`fixtures/upstream-workflows/` contains 74 files from
 [ChristopherHX/runner.server](https://github.com/ChristopherHX/runner.server) —
-the other major GitHub Actions local server implementation that speaks the real
-runner protocol. These are regression tests from a production control plane, not
-toy examples.
+curated to runner-relevant fixtures only (Windows, control-plane cache/artifact/OIDC,
+and redundant fixtures were removed).
 
-### Why they matter
+### Runner-relevant (test now)
 
-These cover edge cases we don't currently test:
+- **Env propagation** — `stepenv.yml`, `localenv.yml`, `globalenv.yml`, `multiline_env.yml`
+- **Matrix edge cases** — `matrixtest.yml`, `case-insensitive-keys-matrix/`, `case_insensitive_needs/`, `matrix-partial-test/`, `matrix-eq-test/`, `matrix-selector/`
+- **Status/control flow** — `job-continue-on-error.yml`, `continue-on-error-bug-3.6.0-4-test.yml`, `skippedjob.yml`, `skipped.yml`
+- **Expression edge cases** — `db-disposed-issue/` (6 files: recursive needs, expressions in env names, advanced status functions), `issue70/` (4 variants), `testhashfiles.yml`
+- **Parser robustness** — `verify-yaml-anchors.yml` (YAML anchors), `workflowerrors/` (16 malformed YAMLs)
+- **Context dump** — `dumpcontexts.yml` (full context regression)
+- **Containers** — `linux-container-i386/` (i386 arch), `linux-container-problem-matcher-test1/` (matcher in container)
+- **Inputs** — `workflow_dispatch/` (boolean, choice, defaults)
 
-- **Matrix case-insensitivity** — `case-insensitive-keys-matrix/`: `Hello` vs `hello` in exclude/include must match case-insensitively. `case_insensitive_needs/`: `needs` context keys are case-insensitive.
-- **Matrix partial object matching** — `matrix-partial-test/`: exclude with nested arrays and partial property matching.
-- **Reusable workflows** — `called.yml`, `inherit_secrets/`, `inherit_vars/`, `node16_complex_reusable_workflows/`: full `workflow_call` with input/secret/vars inheritance (reference for when we implement this).
-- **YAML anchors** — `verify-yaml-anchors.yml`: `&label`/`*label` and `&steps`/`*steps`.
-- **Error handling** — `workflowerrors/` (16 files): intentionally malformed workflows for graceful parser error testing.
-- **Expression edge cases** — `db-disposed-issue/` (6 files): recursive needs context, expressions in environment names, concurrency with inputs.
-- **Container edge cases** — `linux-container-i386/`, `linux-container-problem-matcher-test1/`: i386 containers, problem matchers inside containers.
-- **Context completeness** — `dumpcontexts.yml`, `workflow_ref_and_job_workflow_ref/`: full context dumping and `github.workflow_ref`/`github.job_workflow_ref`.
+### Future reference (reusable workflows — not yet implemented)
+
+- `called.yml`, `called_template_runs_on.yml`, `called_with_required_secret.yml`
+- `inherit_secrets/`, `inherit_vars/`, `reusablesCaseInsensitive/`, `reusablesConsistentWorkflowName/`
+- `node16_complex_reusable_workflows/`, `workflow_ref_and_job_workflow_ref/`
+- `test_template_runs_on.yml` (4 variants), `test_with_required_secret.yml`
 
 ### Planned usage
 
-1. **Parser fuzz/regression** (immediate): feed every `.yml` through `aksh-gha-parser` and assert no panics. The `workflowerrors/` directory is particularly valuable.
-2. **Server conformance** (next): run non-reusable, non-Windows workflows against `aksh-runner-server` + official runner. Matrix case-insensitivity and `needs` case-insensitivity are high-priority.
-3. **Roadmap reference** (future): reusable workflow fixtures provide the test corpus for `workflow_call` support.
+1. **Parser fuzz/regression** (immediate): feed every `.yml` through `aksh-gha-parser` and assert no panics. `workflowerrors/` is the primary fuzz corpus.
+2. **Runner conformance** (next): run env, matrix, status, and expression fixtures against `aksh-runner-server` + `aksh-runner`. Matrix case-insensitivity and `needs` case-insensitivity are high-priority.
+3. **Reusable workflow reference** (future): `called.yml` and inheritance fixtures provide the test corpus for `workflow_call` support.
