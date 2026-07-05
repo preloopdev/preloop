@@ -1479,4 +1479,80 @@ mod tests {
         // always() step ran
         assert_eq!(job.steps.get("on_always").unwrap().conclusion, "Success");
     }
+
+    #[tokio::test]
+    async fn run_steps_outcome_visible_in_later_step_condition() {
+        let dir = TempDir::new().unwrap();
+        let mut job = JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+        let (_tx, cancel_rx) = watch::channel(false);
+
+        // Step 1: fails with continue-on-error so job stays alive
+        let mut fail_step = test_step("fail_step", None);
+        fail_step.step_type = StepType::Script {
+            script: "exit 1".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+        fail_step.continue_on_error = true;
+
+        // Step 2: condition references steps.fail_step.outcome == 'failure'
+        // This should run because the outcome IS 'failure' (even though conclusion is success)
+        let mut check_outcome = test_step(
+            "check_outcome",
+            Some("steps.fail_step.outcome == 'failure'"),
+        );
+        check_outcome.step_type = StepType::Script {
+            script: "echo outcome-matched".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+
+        // Step 3: condition references steps.fail_step.conclusion == 'success'
+        // This should run because continue-on-error maps conclusion to success
+        let mut check_conclusion = test_step(
+            "check_conclusion",
+            Some("steps.fail_step.conclusion == 'success'"),
+        );
+        check_conclusion.step_type = StepType::Script {
+            script: "echo conclusion-matched".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+
+        // Step 4: condition that should NOT match
+        let skip_step = test_step("should_skip", Some("steps.fail_step.outcome == 'success'"));
+
+        let result = run_steps(
+            &[fail_step, check_outcome, check_conclusion, skip_step],
+            &mut job,
+            dir.path().to_str().unwrap(),
+            cancel_rx,
+            queue,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "Succeeded");
+        // check_outcome ran: steps.fail_step.outcome == 'failure' was true
+        assert_eq!(
+            job.steps.get("check_outcome").unwrap().conclusion,
+            "Success"
+        );
+        // check_conclusion ran: steps.fail_step.conclusion == 'success' was true
+        assert_eq!(
+            job.steps.get("check_conclusion").unwrap().conclusion,
+            "Success"
+        );
+        // should_skip was skipped: steps.fail_step.outcome != 'success'
+        assert_eq!(job.steps.get("should_skip").unwrap().conclusion, "Skipped");
+    }
 }
