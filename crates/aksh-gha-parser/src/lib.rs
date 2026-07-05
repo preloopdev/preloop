@@ -316,8 +316,29 @@ pub struct Job {
     #[serde(default)]
     pub container: Option<Value>,
     /// Service containers (`services:`) — raw value, evaluated runner-side.
-    #[serde(default)]
     pub services: Option<Value>,
+    /// Job-level defaults for run steps (`defaults.run`).
+    #[serde(default)]
+    pub defaults: Option<JobDefaults>,
+}
+
+/// `defaults:` block in a job definition.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct JobDefaults {
+    /// Defaults for `run` steps.
+    #[serde(default)]
+    pub run: Option<DefaultsRun>,
+}
+
+/// `defaults.run` — default shell and working-directory for script steps.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DefaultsRun {
+    /// Default shell for `run` steps.
+    #[serde(default)]
+    pub shell: Option<String>,
+    /// Default working directory for `run` steps.
+    #[serde(default, rename = "working-directory")]
+    pub working_directory: Option<String>,
 }
 
 /// `runs-on` syntax.
@@ -422,8 +443,13 @@ pub struct Step {
     #[serde(default)]
     pub with: BTreeMap<String, Value>,
     /// Optional if condition.
-    #[serde(default, rename = "if")]
     pub if_condition: Option<String>,
+    /// Working directory override.
+    #[serde(default, rename = "working-directory")]
+    pub working_directory: Option<String>,
+    /// Shell override.
+    #[serde(default)]
+    pub shell: Option<String>,
 }
 
 /// Action metadata from `action.yml` or `action.yaml`.
@@ -608,7 +634,12 @@ pub fn expand_jobs(workflow: &Workflow) -> Result<Vec<JobPlan>, ParserError> {
                 needs: job.needs.ids(),
                 matrix,
                 env,
-                steps: job.steps.iter().cloned().map(step_plan).collect(),
+                steps: job
+                    .steps
+                    .iter()
+                    .cloned()
+                    .map(|s| step_plan(s, &job.defaults))
+                    .collect(),
                 if_condition: job.if_condition.clone(),
                 fail_fast: job.strategy.fail_fast.unwrap_or(true),
                 max_parallel: job.strategy.max_parallel,
@@ -667,7 +698,12 @@ pub fn expand_jobs_with_reusables(
                 needs: job.needs.ids(),
                 matrix,
                 env,
-                steps: job.steps.iter().cloned().map(step_plan).collect(),
+                steps: job
+                    .steps
+                    .iter()
+                    .cloned()
+                    .map(|s| step_plan(s, &job.defaults))
+                    .collect(),
                 if_condition: job.if_condition.clone(),
                 fail_fast: job.strategy.fail_fast.unwrap_or(true),
                 max_parallel: job.strategy.max_parallel,
@@ -701,7 +737,20 @@ fn normalize_reusable_path(uses: &str) -> String {
         .into_owned()
 }
 
-fn step_plan(step: Step) -> StepPlan {
+fn step_plan(step: Step, defaults: &Option<JobDefaults>) -> StepPlan {
+    // Merge job-level defaults into step — step values take precedence.
+    let working_directory = step.working_directory.or_else(|| {
+        defaults
+            .as_ref()
+            .and_then(|d| d.run.as_ref())
+            .and_then(|r| r.working_directory.clone())
+    });
+    let shell = step.shell.or_else(|| {
+        defaults
+            .as_ref()
+            .and_then(|d| d.run.as_ref())
+            .and_then(|r| r.shell.clone())
+    });
     StepPlan {
         id: step.id,
         name: step.name,
@@ -710,6 +759,8 @@ fn step_plan(step: Step) -> StepPlan {
         env: step.env.into_strings(),
         with: step.with,
         if_condition: step.if_condition,
+        working_directory,
+        shell,
     }
 }
 

@@ -578,12 +578,29 @@ async fn execute_step(
         StepType::Script {
             script,
             shell,
-            working_directory: _,
+            working_directory,
         } => {
             // Evaluate ${{ }} expressions in the script body
             let expr_ctx = ctx.job.build_expression_context();
             let evaluated_script = crate::worker::template::evaluate_template(script, &expr_ctx)
                 .unwrap_or_else(|_| script.clone());
+
+            // Use step-level working-directory if set, otherwise job workspace
+            let effective_dir = working_directory
+                .as_ref()
+                .map(|wd| {
+                    // Resolve relative paths against the workspace
+                    let p = std::path::Path::new(wd);
+                    if p.is_absolute() {
+                        wd.clone()
+                    } else {
+                        std::path::Path::new(workspace)
+                            .join(wd)
+                            .to_string_lossy()
+                            .into_owned()
+                    }
+                })
+                .unwrap_or_else(|| workspace.to_owned());
 
             // Phase 2: Route through docker exec when job container is active
             let container_id = ctx
@@ -595,7 +612,7 @@ async fn execute_step(
                 return super::handlers::script::run_script_in_container(
                     &evaluated_script,
                     shell.as_deref(),
-                    workspace,
+                    &effective_dir,
                     &cid,
                     ctx,
                     Some(cancel_rx),
@@ -606,7 +623,7 @@ async fn execute_step(
             super::handlers::script::run_script(
                 &evaluated_script,
                 shell.as_deref(),
-                workspace,
+                &effective_dir,
                 ctx,
                 Some(cancel_rx),
             )
