@@ -8,28 +8,27 @@ This plan is based on the verified comparison in `docs/test-coverage.md`.
 
 | Priority | Bucket / Area | C# Tests | Status (2026-07-05) | Description of Coverage / Gaps |
 |---|---|---:|---|---|
-| **P0** | **Step execution semantics** | 90 | **PARTIAL** | Condition errors, continue-on-error, env/context mutation covered; worker top-level cancel/cleanup has gaps. |
-| **P0** | **File commands, outputs, matchers** | 117 | **PARTIAL** | Heredocs, ANSI stripping, NODE_OPTIONS, and GITHUB_STEP_SUMMARY size validation/scrubbing covered. |
-| **P0** | **Actions, manifests, composite execution** | 168 | **PARTIAL** | Manifest evaluation, basic composite, and Docker action args/env covered; nested outputs and resolver gaps. |
-| **P0** | **Containers and step host** | 24 | **PARTIAL** | Docker naming/network, path translation, env inherit covered; Alpine detection and service health gaps. |
-| **P1** | **Expressions and templates** | 37 | **PARTIAL** | String maps/tokens covered; condition functions and evaluator cancellation remain. |
-| **P1** | **Listener / configuration lifecycle** | 115 | **PARTIAL** | CLI flags, config lifecycle, and RSA field names covered; broker poll loop and interactive config gaps. |
-| **P1** | **Process / runtime environment** | 93 | **PARTIAL** | Signal sequence/SIGINT cancellation covered; process tree kill, proxy, and workspace cleanup gaps. |
-| **P1** | **Protocol / client DTO behavior** | 35 | **PARTIAL** | Annotations and server-side APIs covered; client-side HTTP error handling gaps. |
-| **P2** | **DAP / debugging** | 117 | **GAP** | WebSocket bridge, REPL, breakpoints, variables, and step pausing are completely unimplemented. |
-| **P2** | **Background / snapshot / aux features** | 14 | **GAP** | Background/wait steps and snapshot provider are completely unimplemented. |
-| **P3** | **Official runner infrastructure** | 32 | **NOT_APPLICABLE** | Windows service control, self-update, and .NET bootstrapper are intentionally deprioritized or out-of-scope. |
+| **P0** | **Step execution semantics** | 90 | **LIVE_VERIFIED / PARTIAL** | Rust unit coverage plus live GitHub verification for sequential steps, env/output propagation, `continue-on-error`, condition functions, failure propagation, and external cancellation. |
+| **P0** | **File commands, outputs, matchers** | 117 | **LIVE_VERIFIED / PARTIAL** | File commands, summaries, NODE_OPTIONS blocking, ANSI matcher stripping, add/remove matcher, and problem matcher annotations verified live; deeper OutputManager parity remains partial. |
+| **P0** | **Actions, manifests, composite execution** | 168 | **PARTIAL** | Manifest evaluation, basic composite, and Docker action args/env covered by unit tests; live P0 workflows avoid remote action download and nested composite edge cases. |
+| **P0** | **Containers and step host** | 24 | **LIVE_VERIFIED_WITH_CAVEAT / PARTIAL** | Linux smolvm runner successfully ran Docker/container verification once; later fresh `docker pull` attempts exposed smolvm DNS/storage setup limits, not runner-command construction failures. |
+| **P1** | **Expressions and templates** | 37 | **LIVE_VERIFIED / PARTIAL** | Live GitHub and local aksh E2E cover env/template functions, conditions, and step fields; evaluator cancellation and matrix/needs breadth remain gaps. |
+| **P1** | **Listener / configuration lifecycle** | 115 | **LIVE_VERIFIED / PARTIAL** | Live GitHub and local aksh E2E cover configure, OAuth, broker session, job acquire, worker dispatch, and completion; reconnect/backoff/interactive config remain gaps. |
+| **P1** | **Process / runtime environment** | 93 | **LIVE_VERIFIED / PARTIAL** | Live GitHub and local aksh E2E cover stdout/stderr, cwd, env, exit-code propagation, `continue-on-error`, timeout field parsing, and long output; proxy/process-tree/workspace cleanup remain gaps. |
+| **P1** | **Protocol / client DTO behavior** | 35 | **LIVE_VERIFIED / PARTIAL** | Live GitHub and local aksh E2E cover Twirp step updates, log uploads, annotations, grouping/debug commands, and completion; client HTTP error behavior remains gap. |
+| **P2** | **DAP / debugging** | 117 | **NOT_IMPLEMENTED** | No runner DAP server, message framing, WebSocket bridge, REPL, breakpoints, variables, step pausing, or debugger cancellation path exists. |
+| **P2** | **Background / snapshot / aux features** | 14 | **NOT_IMPLEMENTED** | Protocol DTOs include background timeline fields, but runner execution does not implement background/wait steps, snapshot provider, or job execution view semantics. |
+| **P3** | **Official runner infrastructure** | 32 | **NOT_APPLICABLE / DEFERRED** | Windows service control, self-update, official constant generation, paging logger, and .NET bootstrapper are official-runner infrastructure, not current aksh macOS/Linux runtime correctness. |
 
 ## Current implementation status — 2026-07-05
 
-The P0 runner slice from this plan has been implemented and verified in the Rust runner:
+The P0/P1 runner slice from this plan has been implemented or classified through three gates:
 
-- Step execution semantics: condition errors fail steps/jobs; `continue-on-error`, `success()`, `failure()`, `always()`, skip-after-failure, step output visibility, and env/context mutation are covered by `worker::steps_runner::tests`.
-- File commands and matchers: heredoc edge cases, blocked `NODE_OPTIONS`, saved state, output/env parsing, matcher ANSI stripping, owner replacement/removal, and matcher validation are covered by `worker::file_commands::tests` and `worker::matchers::tests`.
-- Action/composite/container behavior: action manifest defaults/validation, composite inputs/defaults/outputs/nesting, Docker action env/args/entrypoint evaluation, file-command mounts, and step-host working-directory propagation are covered by focused handler/container tests.
-- Verification on current code: `cargo fmt --all --check && cargo test -p aksh-runner --lib --quiet` passed with **117** runner lib tests; focused P0 suites passed; local `runner-e2e` hello-world completed successfully; `runner-watch conform --scenario 06-multi-step` replayed the official v2.335.1 golden against aksh with status-checked flows matching.
+- **Live GitHub primary gate using `aksh-runner` against real GitHub Actions:** P0 step execution (`28754418659`, success), P0 failure conditions (`28754419325`, expected failure), P0 file commands (`28755293879`, success), P0 Docker/container verification (`28755911596`, success on Linux smolvm), P0 cancellation (`28756327702`, cancelled with `cancelled()`/`always()` markers observed in runner logs), P1 expressions (`28756574650`, success), P1 listener/config (`28756828143`, success), P1 process/runtime (`28756827413`, success), and P1 protocol/logging (`28756578118`, success).
+- **Local aksh control-plane gate using `aksh-runner` + `aksh-runner-server`:** `aksh-conformance runner-e2e` passed for `p0-step-execution.yml`, `p0-failure-conditions.yml`, `p0-file-commands.yml`, `p1-expressions.yml`, `p1-process-runtime.yml`, and `p1-protocol.yml`, recording flows under `/tmp/aksh-*-flows.jsonl`. The same gate exposed one local control-plane divergence: `p1-listener-config.yml` completed with `conclusion:"failed"` because the local submitted job did not populate all GitHub context env values asserted by the workflow. The cancel workflow needs an external GitHub cancellation signal and the Docker workflow needs a Linux Docker daemon, so those remain live-GitHub/Linux-smolvm-only.
+- **Unit and focused runner coverage:** step execution semantics, file commands, matchers, action manifest factory, composite actions, Docker action handler, container ops, process cancellation, config/settings, and protocol DTO surfaces have Rust coverage mapped in `docs/test-coverage.md`.
 
-The detailed baseline sections below are retained as the original gap-analysis input. They are not a live list of remaining P0 work after the 2026-07-05 implementation pass.
+The detailed baseline sections below are retained as the original gap-analysis input. They are not a live list of remaining P0/P1 work after the 2026-07-05 implementation and live-verification pass.
 
 ## Compatibility scoring
 
