@@ -407,18 +407,6 @@ pub async fn run_steps(
         let step_end = crate::worker::job_runner::iso_now();
         let conclusion_proto = ServerQueue::conclusion_to_proto(&conclusion_str);
 
-        // Collect annotations before consuming step_ctx
-        let annotations = step_ctx.annotations.clone();
-        let log_lines = step_ctx.log_lines.clone();
-
-        // F025: Store annotations in job context
-        if !annotations.is_empty() {
-            step_ctx
-                .job
-                .step_annotations
-                .insert(step.context_name.clone(), annotations);
-        }
-
         // Record a step result before applying file commands so GITHUB_OUTPUT can
         // attach outputs to this step.
         step_ctx.job.steps.insert(
@@ -441,10 +429,51 @@ pub async fn run_steps(
             );
         }
         // F035: Read and scrub step summary content before cleanup deletes the file.
-        let summary_content = std::fs::read_to_string(&file_command_paths.summary_file)
-            .map(|content| step_ctx.job.mask_secrets(&content))
-            .unwrap_or_default();
+        let summary_content = if let Ok(metadata) =
+            std::fs::metadata(&file_command_paths.summary_file)
+        {
+            let file_size = metadata.len();
+            if file_size == 0 {
+                "".to_string()
+            } else if file_size > 1_048_576 {
+                let limit_k = 1024;
+                let size_k = file_size / 1024;
+                let msg = format!(
+                    "$GITHUB_STEP_SUMMARY upload aborted, supports content up to a size of {}k, got {}k. For more information see: https://docs.github.com/actions/using-workflows/workflow-commands-for-github-actions#adding-a-markdown-summary",
+                    limit_k, size_k
+                );
+                step_ctx.annotate(crate::worker::execution_context::Annotation {
+                    level: crate::worker::execution_context::AnnotationLevel::Error,
+                    message: msg.clone(),
+                    title: None,
+                    file: None,
+                    line: None,
+                    end_line: None,
+                    col: None,
+                    end_column: None,
+                });
+                warn!("{msg}");
+                "".to_string()
+            } else {
+                std::fs::read_to_string(&file_command_paths.summary_file)
+                    .map(|content| step_ctx.job.mask_secrets(&content))
+                    .unwrap_or_default()
+            }
+        } else {
+            "".to_string()
+        };
         super::file_commands::cleanup_file_commands(&file_command_paths);
+        // Collect annotations after all processing (including step summary validation)
+        let annotations = step_ctx.annotations.clone();
+        let log_lines = step_ctx.log_lines.clone();
+
+        // F025: Store annotations in job context
+        if !annotations.is_empty() {
+            step_ctx
+                .job
+                .step_annotations
+                .insert(step.context_name.clone(), annotations);
+        }
 
         if conclusion_str == "Failure" {
             any_failed = true;
@@ -1145,5 +1174,83 @@ mod tests {
             actual.as_deref(),
             Some(subdir.canonicalize().unwrap().as_path())
         );
+    }
+    #[tokio::test]
+    async fn test_step_summary_size_limit_and_scrubbing() {
+        let workspace = TempDir::new().unwrap();
+        let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+        let (_tx, cancel_rx) = watch::channel(false);
+
+        // Scenario 1: Simple summary and secret scrubbing
+        let mut job = JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        job.add_mask("secret-value");
+
+        let mut step = test_step("summary-scrub", None);
+        step.step_type = StepType::Script {
+            script: "echo '# hello secret-value' >> \"$GITHUB_STEP_SUMMARY\"".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+
+        let result = run_steps(
+            &[step.clone()],
+            &mut job,
+            workspace.path().to_str().unwrap(),
+            cancel_rx.clone(),
+            queue.clone(),
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "Succeeded");
+        // Verify annotations has no errors
+        assert!(!job.step_annotations.contains_key("summary-scrub"));
+
+        // Scenario 2: Summary size limit exceeded
+        let mut job = JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let mut step = test_step("summary-large", None);
+        step.step_type = StepType::Script {
+            script: "dd if=/dev/zero bs=1024 count=1100 >> \"$GITHUB_STEP_SUMMARY\"".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+
+        let result = run_steps(
+            &[step],
+            &mut job,
+            workspace.path().to_str().unwrap(),
+            cancel_rx,
+            queue,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "Succeeded");
+        // Verify that an Error annotation was added under "summary-large"
+        let annotations = job.step_annotations.get("summary-large").unwrap();
+        assert_eq!(annotations.len(), 1);
+        assert_eq!(
+            annotations[0].level,
+            crate::worker::execution_context::AnnotationLevel::Error
+        );
+        assert!(annotations[0]
+            .message
+            .contains("upload aborted, supports content up to a size of 1024k"));
     }
 }
