@@ -174,6 +174,26 @@ pub fn apply_file_commands(
     Ok(())
 }
 
+/// Apply GITHUB_ENV and GITHUB_PATH from file commands to the job context.
+/// Used between composite steps so env changes propagate to subsequent steps.
+/// Does NOT apply outputs or state — those are handled by the composite handler.
+pub fn apply_file_commands_to_job(paths: &FileCommandPaths, job: &mut super::contexts::JobContext) {
+    // Apply GITHUB_ENV
+    if let Ok(env_vars) = parse_kv_file(&paths.env_file) {
+        for (k, v) in env_vars {
+            debug!("GITHUB_ENV (composite): {k}={v}");
+            job.env.insert(k, v);
+        }
+    }
+    // Apply GITHUB_PATH
+    if let Ok(extra_paths) = parse_path_file(&paths.path_file) {
+        for p in extra_paths {
+            debug!("GITHUB_PATH (composite): {p}");
+            job.extra_path.insert(0, p);
+        }
+    }
+}
+
 /// Clean up file command temp files.
 pub fn cleanup_file_commands(paths: &FileCommandPaths) {
     for path in [
