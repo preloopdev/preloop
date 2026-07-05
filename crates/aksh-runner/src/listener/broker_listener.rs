@@ -301,6 +301,11 @@ pub async fn run_broker_loop(
                                 }
                             }
                         } else if is_session_expired(&e) {
+                            // F052: Respect skip_session_recover setting
+                            if config.settings.skip_session_recover {
+                                warn!("Broker session expired. SkipSessionRecover is set — exiting.");
+                                return Err(e);
+                            }
                             warn!("Broker session expired or invalid. Re-creating session...");
                             need_session = true;
                         } else {
