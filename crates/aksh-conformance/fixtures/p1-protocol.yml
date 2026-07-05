@@ -1,0 +1,41 @@
+name: P1 Protocol Verification
+on: workflow_dispatch
+jobs:
+  protocol-test:
+    runs-on: [self-hosted, p1-test]
+    steps:
+      # Protocol verification — the fact that these steps execute and
+      # report correctly to GitHub proves the wire protocol works:
+      # - WorkflowStepsUpdate Twirp calls (step status)
+      # - Step log upload (GetStepLogsSignedBlobURL + PUT)
+      # - Job completion (completejob)
+      # - Job log upload
+      # - Annotations via workflow commands
+
+      - name: Create annotation via warning
+        run: echo "::warning file=test.rs,line=42,col=5::This is a test warning"
+
+      - name: Create annotation via error
+        run: echo "::error file=test.rs,line=10::This is a test error"
+
+      - name: Create notice
+        run: echo "::notice::This is a test notice"
+
+      - name: Group output
+        run: |
+          echo "::group::Test Group"
+          echo "Inside the group"
+          echo "::endgroup::"
+
+      - name: Debug output
+        run: echo "::debug::This is debug output"
+
+      - name: Multi-line step with logging
+        run: |
+          for i in $(seq 1 50); do
+            echo "Log line $i"
+          done
+          echo "50 lines logged and uploaded"
+
+      - name: All protocol checks passed
+        run: echo "ALL_P1_PROTOCOL_CHECKS_PASSED"
