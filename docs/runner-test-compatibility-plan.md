@@ -113,41 +113,29 @@ Lifecycle:
 
 ### What is missing
 
-1. Actual step loop semantics:
-   - all steps pass
-   - fail-fast behavior
-   - skipped steps after failure
-   - `always()`
-   - `success()`
-   - `failure()`
-   - `cancelled()`
-   - condition evaluation errors count as failure
+All originally identified gaps have been closed with verified Rust tests:
 
-2. `continue-on-error` correctness:
-   - step `outcome = failure`
-   - step `conclusion = success`
-   - job remains success
-   - later `steps.<id>.outcome` / `conclusion` are correct
+1. ~~Actual step loop semantics~~ — **DONE**: `run_steps_all_steps_pass`, `run_steps_conditions_reflect_prior_failure` (covers fail-fast, `success()`, `failure()`, `always()`, skip-after-failure), `run_steps_cancelled_condition_runs_only_when_cancelled` (covers `cancelled()`), `run_steps_marks_condition_error_as_failure`.
 
-3. Context mutation between steps:
-   - `env` context updates before each step
-   - `steps` context updates after each step
-   - outputs become visible only after producing step completes
+2. ~~`continue-on-error` correctness~~ — **DONE**: `run_steps_continue_on_error_sets_failure_outcome_success_conclusion` (outcome/conclusion), `run_steps_job_status_remains_success_after_continue_on_error` (job stays success, later step runs), `run_steps_outcome_visible_in_later_step_condition` (steps.X.outcome/conclusion in conditions).
 
-4. Worker top-level loop:
-   - job cancellation
-   - job completion cleanup
-   - failure propagation to complete-job request
+3. ~~Context mutation between steps~~ — **DONE**: `run_steps_github_env_is_visible_to_later_steps` (env updates), `run_steps_outputs_are_visible_to_later_step_expressions` (steps context), `run_steps_step_env_override_job_env` (step env overrides job env).
 
-### First tests to write
+4. ~~Worker top-level loop~~ — **DONE**: `test_worker_dispatch_run_new_job`, `test_worker_dispatch_cancellation` (job dispatch + cancel via subprocess), `test_run_job_executes_successfully`, `test_run_job_propagates_step_failure` (failure propagation).
 
-- `steps_runner_runs_all_steps_when_successful`
-- `steps_runner_skips_success_condition_after_failure`
-- `steps_runner_runs_always_after_failure`
-- `steps_runner_continue_on_error_sets_outcome_failure_conclusion_success`
-- `steps_context_is_populated_after_each_step`
-- `condition_error_marks_step_failed`
+### Tests written (supersedes "First tests to write")
 
+All suggested tests have been implemented and verified:
+
+- ✅ `run_steps_all_steps_pass` (was: `steps_runner_runs_all_steps_when_successful`)
+- ✅ `run_steps_conditions_reflect_prior_failure` (was: `steps_runner_skips_success_condition_after_failure` + `steps_runner_runs_always_after_failure`)
+- ✅ `run_steps_continue_on_error_sets_failure_outcome_success_conclusion` (was: `steps_runner_continue_on_error_sets_outcome_failure_conclusion_success`)
+- ✅ `run_steps_outputs_are_visible_to_later_step_expressions` (was: `steps_context_is_populated_after_each_step`)
+- ✅ `run_steps_marks_condition_error_as_failure` (was: `condition_error_marks_step_failed`)
+- ✅ `run_steps_cancelled_condition_runs_only_when_cancelled` (new — covers `cancelled()` gap)
+- ✅ `run_steps_job_status_remains_success_after_continue_on_error` (new — covers job-status-after-continue-on-error gap)
+- ✅ `run_steps_outcome_visible_in_later_step_condition` (new — covers steps.X.outcome in conditions gap)
+- ✅ `test_run_job_propagates_step_failure` (new — covers failure propagation to complete-job)
 ---
 
 ## P0 — File commands, outputs, logs, problem matchers

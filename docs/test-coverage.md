@@ -1641,24 +1641,25 @@ Verified aksh-runner refs: —
 
 ### `L0/Worker/StepsRunnerL0.cs` — 13 tests — PARTIAL
 
-Official behavior: Step-list construction, continue-on-error parsing, step execution sequence, and dynamic condition/context/env updates.
-Verified aksh-runner refs: `build_step_list_handles_continue_on_error` (`crates/aksh-runner/src/worker/job_extension.rs`:954), `build_step_list_handles_template_continue_on_error` (`crates/aksh-runner/src/worker/job_extension.rs`:967), `run_steps_all_steps_pass` (`crates/aksh-runner/src/worker/steps_runner.rs`:1133), `run_steps_continue_on_error_sets_failure_outcome_success_conclusion` (`crates/aksh-runner/src/worker/steps_runner.rs`:931), `run_steps_conditions_reflect_prior_failure` (`crates/aksh-runner/src/worker/steps_runner.rs`:969), `run_steps_marks_condition_error_as_failure` (`crates/aksh-runner/src/worker/steps_runner.rs`:899), `run_steps_step_env_override_job_env` (`crates/aksh-runner/src/worker/steps_runner.rs`:1178), `run_steps_github_env_is_visible_to_later_steps` (`crates/aksh-runner/src/worker/steps_runner.rs`:1092).
+Official behavior: Step execution loop semantics — sequential execution, condition evaluation (`success()`, `failure()`, `always()`, `cancelled()`), `continue-on-error` correctness, env/context mutation between steps, and step outcome/conclusion visibility in later conditions.
+Verified aksh-runner refs: `run_steps_all_steps_pass`, `run_steps_continue_on_error_sets_failure_outcome_success_conclusion`, `run_steps_job_status_remains_success_after_continue_on_error`, `run_steps_conditions_reflect_prior_failure`, `run_steps_cancelled_condition_runs_only_when_cancelled`, `run_steps_outcome_visible_in_later_step_condition`, `run_steps_marks_condition_error_as_failure`, `run_steps_step_env_override_job_env`, `run_steps_github_env_is_visible_to_later_steps`, `run_steps_outputs_are_visible_to_later_step_expressions`.
 
 | C# test | Line | Official behavior under test | aksh-runner coverage status | Verified Rust test refs |
 |---|---:|---|---|---|
-| `RunNormalStepsAllStepPass` | 79 | Run Normal Steps All Step Pass | **PARTIAL** | `run_steps_all_steps_pass` (`crates/aksh-runner/src/worker/steps_runner.rs`:1133) |
-| `RunNormalStepsContinueOnError` | 111 | Run Normal Steps Continue On Error | **PARTIAL** | `run_steps_continue_on_error_sets_failure_outcome_success_conclusion` (`crates/aksh-runner/src/worker/steps_runner.rs`:931) |
-| `RunsAfterFailureBasedOnCondition` | 146 | Runs After Failure Based On Condition | **PARTIAL** | `run_steps_conditions_reflect_prior_failure` (`crates/aksh-runner/src/worker/steps_runner.rs`:969) |
-| `RunsAlwaysSteps` | 185 | Runs Always Steps | **PARTIAL** | `run_steps_conditions_reflect_prior_failure` (`crates/aksh-runner/src/worker/steps_runner.rs`:969) |
-| `SetsJobResultCorrectly` | 239 | Sets Job Result Correctly | **PARTIAL** | `run_steps_conditions_reflect_prior_failure` (`crates/aksh-runner/src/worker/steps_runner.rs`:969) |
-| `SkipsAfterFailureOnlyBaseOnCondition` | 317 | Skips After Failure Only Base On Condition | **PARTIAL** | `run_steps_conditions_reflect_prior_failure` (`crates/aksh-runner/src/worker/steps_runner.rs`:969) |
-| `AlwaysMeansAlways` | 360 | Always Means Always | **PARTIAL** | `run_steps_conditions_reflect_prior_failure` (`crates/aksh-runner/src/worker/steps_runner.rs`:969) |
-| `TreatsConditionErrorAsFailure` | 391 | Treats Condition Error As Failure | **PARTIAL** | `run_steps_marks_condition_error_as_failure` (`crates/aksh-runner/src/worker/steps_runner.rs`:899) |
-| `StepEnvOverrideJobEnvContext` | 419 | Step Env Override Job Env Context | **PARTIAL** | `run_steps_step_env_override_job_env` (`crates/aksh-runner/src/worker/steps_runner.rs`:1178) |
-| `PopulateEnvContextForEachStep` | 452 | Populate Env Context For Each Step | **PARTIAL** | `run_steps_github_env_is_visible_to_later_steps` (`crates/aksh-runner/src/worker/steps_runner.rs`:1092) |
-| `PopulateEnvContextAfterSetupStepsContext` | 491 | Populate Env Context After Setup Steps Context | **PARTIAL** | `run_steps_github_env_is_visible_to_later_steps` (`crates/aksh-runner/src/worker/steps_runner.rs`:1092) |
-| `StepContextOutcome` | 527 | Step Context Outcome | **PARTIAL** | `run_steps_continue_on_error_sets_failure_outcome_success_conclusion` (`crates/aksh-runner/src/worker/steps_runner.rs`:931) |
-| `StepContextConclusion` | 563 | Step Context Conclusion | **PARTIAL** | `run_steps_continue_on_error_sets_failure_outcome_success_conclusion` (`crates/aksh-runner/src/worker/steps_runner.rs`:931) |
+| `RunNormalStepsAllStepPass` | 79 | All steps pass sequentially | **PARTIAL** | `run_steps_all_steps_pass` |
+| `RunNormalStepsContinueOnError` | 111 | continue-on-error: outcome=Failure, conclusion=Success, job stays Success | **PARTIAL** | `run_steps_continue_on_error_sets_failure_outcome_success_conclusion`, `run_steps_job_status_remains_success_after_continue_on_error` |
+| `RunsAfterFailureBasedOnCondition` | 146 | failure() condition runs after step failure | **PARTIAL** | `run_steps_conditions_reflect_prior_failure` |
+| `RunsAlwaysSteps` | 185 | always() runs after failure and cancellation | **PARTIAL** | `run_steps_conditions_reflect_prior_failure`, `run_steps_cancelled_condition_runs_only_when_cancelled` |
+| `SetsJobResultCorrectly` | 239 | Job result reflects step outcomes | **PARTIAL** | `run_steps_conditions_reflect_prior_failure`, `run_steps_job_status_remains_success_after_continue_on_error` |
+| `SkipsAfterFailureOnlyBaseOnCondition` | 317 | success() skipped after failure | **PARTIAL** | `run_steps_conditions_reflect_prior_failure` |
+| `AlwaysMeansAlways` | 360 | always() runs regardless of cancel or failure | **PARTIAL** | `run_steps_conditions_reflect_prior_failure`, `run_steps_cancelled_condition_runs_only_when_cancelled` |
+| `TreatsConditionErrorAsFailure` | 391 | Condition parse error marks step failed | **PARTIAL** | `run_steps_marks_condition_error_as_failure` |
+| `StepEnvOverrideJobEnvContext` | 419 | Step env overrides job env | **PARTIAL** | `run_steps_step_env_override_job_env` |
+| `PopulateEnvContextForEachStep` | 452 | GITHUB_ENV visible to later steps | **PARTIAL** | `run_steps_github_env_is_visible_to_later_steps` |
+| `PopulateEnvContextAfterSetupStepsContext` | 491 | Steps context populated before env context | **PARTIAL** | `run_steps_github_env_is_visible_to_later_steps`, `run_steps_outputs_are_visible_to_later_step_expressions` |
+| `StepContextOutcome` | 527 | steps.X.outcome visible in later conditions | **PARTIAL** | `run_steps_outcome_visible_in_later_step_condition` |
+| `StepContextConclusion` | 563 | steps.X.conclusion visible in later conditions | **PARTIAL** | `run_steps_outcome_visible_in_later_step_condition` |
+
 
 ### `L0/Worker/TrackingManagerL0.cs` — 4 tests — GAP
 
