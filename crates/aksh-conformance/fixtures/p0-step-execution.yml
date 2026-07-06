@@ -1,0 +1,50 @@
+name: p0-step-execution
+on: push
+jobs:
+  step-semantics:
+    runs-on: self-hosted
+    steps:
+      # 1. Normal sequential execution — both must pass
+      - name: Step 1 passes
+        run: echo "step-1-ok"
+
+      - name: Step 2 passes
+        run: echo "step-2-ok"
+
+      # 2. GITHUB_ENV cross-step visibility
+      - name: Set env var
+        run: echo "P0_TEST_VAR=from-github-env" >> "$GITHUB_ENV"
+
+      - name: Use env var
+        run: |
+          echo "P0_TEST_VAR=$P0_TEST_VAR"
+          test "$P0_TEST_VAR" = "from-github-env"
+
+      # 3. GITHUB_OUTPUT — produce a value
+      - name: Produce output
+        id: producer
+        run: echo "val=hello-from-producer" >> "$GITHUB_OUTPUT"
+
+      # 4. Step env overrides
+      - name: Step env override
+        env:
+          OVERRIDE_TEST: step-level
+        run: test "$OVERRIDE_TEST" = "step-level"
+
+      # 5. continue-on-error — step fails but job continues
+      - name: Soft failure
+        id: soft_fail
+        continue-on-error: true
+        run: exit 1
+
+      # 6. Step after continue-on-error still runs
+      - name: After soft failure
+        run: echo "job-still-running-after-continue-on-error"
+
+      # 7. Step summary upload
+      - name: Write step summary
+        run: echo "### P0 Step Execution Verified" >> "$GITHUB_STEP_SUMMARY"
+
+      # 8. Final marker
+      - name: All checks passed
+        run: echo "ALL_P0_STEP_EXECUTION_CHECKS_PASSED"
