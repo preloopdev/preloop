@@ -25,6 +25,7 @@ const DRAIN_LIMIT: usize = 500;
 const LINES_PER_BATCH: usize = 100;
 const SHUTDOWN_LINES_PER_STEP: usize = 200;
 const AGGRESSIVE_INTERVAL: Duration = Duration::from_millis(250);
+const NORMAL_INTERVAL: Duration = Duration::from_millis(500);
 const AGGRESSIVE_DURATION: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -354,20 +355,27 @@ pub fn extract_feed_stream_url(job_message: &serde_json::Value) -> Option<String
 /// Build a process-line callback that masks secrets and enqueues live lines for
 /// one step. The callback is best-effort and intentionally independent of the
 /// durable `StepContext` log collection.
+///
+/// Uses the shared `live_masks` so that `::add-mask::` commands issued mid-step
+/// take effect immediately on the live feed (not just the durable log).
 pub fn process_line_callback(
     step_id: &str,
-    masks: &std::collections::HashSet<String>,
+    live_masks: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
     live_logs: Option<&Arc<LiveLogQueue>>,
 ) -> Option<crate::process::LineCallback> {
     let live_logs = live_logs.cloned()?;
     let step_id = step_id.to_string();
-    let masks: Vec<String> = masks.iter().cloned().collect();
+    let live_masks = live_masks.clone();
     let next_line = Arc::new(std::sync::atomic::AtomicU64::new(1));
     Some(Box::new(move |line: &str| {
         let mut masked = line.to_string();
-        for secret in &masks {
-            if !secret.is_empty() {
-                masked = masked.replace(secret, "***");
+        if let Ok(masks) = live_masks.read() {
+            // Sort by length descending so longer secrets are replaced first,
+            // matching the durable-log masking order in JobContext::mask_secrets.
+            let mut secrets: Vec<&String> = masks.iter().filter(|s| !s.is_empty()).collect();
+            secrets.sort_by_key(|b| std::cmp::Reverse(b.len()));
+            for secret in secrets {
+                masked = masked.replace(secret.as_str(), "***");
             }
         }
         let line_number = next_line.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

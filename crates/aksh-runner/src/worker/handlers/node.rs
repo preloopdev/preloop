@@ -16,6 +16,7 @@ pub async fn run_node_action(
     workspace: &str,
     ctx: &mut StepContext<'_>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
+    live_logs: Option<&std::sync::Arc<crate::worker::live_logs::LiveLogQueue>>,
 ) -> Result<()> {
     let main = with
         .get("__aksh_entry")
@@ -131,7 +132,7 @@ pub async fn run_node_action(
         &[entry_point.to_str().unwrap_or("")],
         Path::new(workspace),
         &env,
-        None,
+        crate::worker::live_logs::process_line_callback(&ctx.step_id, &ctx.job.live_masks, live_logs),
         Some(cancel_rx),
     )
     .await?;
@@ -192,6 +193,7 @@ mod tests {
             dir.path().to_str().unwrap(),
             &mut ctx,
             cancel_rx,
+            None,
         )
         .await
         .unwrap_err();
@@ -220,6 +222,7 @@ mod tests {
             dir.path().to_str().unwrap(),
             &mut ctx,
             cancel_rx,
+            None,
         )
         .await
         .unwrap_err();
