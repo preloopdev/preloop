@@ -25,10 +25,6 @@ pub fn run_action<'a>(
         // The official runner leaves these set after the action completes so
         // subsequent script steps can read them.
         set_action_repository_context(ctx, uses);
-        ctx.job.set_github_context_value(
-            "action",
-            Some(serde_json::Value::String(ctx.step_name.clone())),
-        );
 
         if uses.starts_with("docker://") {
             super::container::run_docker_action(uses, with, workspace, ctx).await
@@ -359,4 +355,43 @@ mod tests {
         let val = ctx.job.github_context_value("action_repository");
         assert!(val.is_none() || val == Some(serde_json::Value::Null));
     }
+    #[test]
+    fn set_action_repository_context_sets_action_to_step_id_not_display_name() {
+        // RHAND-01 regression: github.action must equal the step ID, not the display name.
+        // Pre-fix: run_action() overrode set_action_repository_context() with step_name.
+        // Post-fix: only set_action_repository_context() runs, which correctly uses step_id.
+        let mut job = crate::worker::contexts::JobContext::new(
+            "j1".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let mut ctx = crate::worker::execution_context::StepContext::new(
+            &mut job,
+            "my_step_id".into(),          // step ID (context_name)
+            "My Display Name".into(),     // step display name — must NOT appear in github.action
+        );
+
+        // Call set_action_repository_context as run_action does
+        set_action_repository_context(&mut ctx, "actions/checkout@v4");
+
+        // github.action must be the step ID, not the display name
+        let action_val = ctx
+            .job
+            .github_context_value("action")
+            .and_then(|v| v.as_str().map(String::from));
+        assert_eq!(
+            action_val,
+            Some("my_step_id".to_string()),
+            "github.action should be the step id, not the display name"
+        );
+        assert_ne!(
+            ctx.job
+                .github_context_value("action")
+                .and_then(|v| v.as_str().map(String::from)),
+            Some("My Display Name".to_string()),
+            "github.action must not be the display name"
+        );
+    }
+
 }
