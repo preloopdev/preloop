@@ -576,17 +576,21 @@ pub async fn start_service_container(
 
 /// Wait for all service containers to be healthy.
 ///
-/// Golden trace shows 2s/3s backoff, then continues at health-interval.
+/// Polls each container until its health status is `healthy`, `none` (no
+/// health-check configured), or definitively `unhealthy`.  Backoff follows
+/// the official runner's `GetExponentialBackoff(attempt, min=2s, max=32s,
+/// delta=2s)`: delay = min(2 + (2^attempt - 1) * 2, 32) seconds.
+/// There is no hard retry cap — the outer job-level timeout or cancel channel
+/// terminates a stuck wait.
 pub async fn wait_for_services_healthy(
     services: &[(String, String, String)],
     log: &mut Vec<String>,
 ) -> Result<()> {
     log.push("##[group]Waiting for all services to be ready".to_string());
 
-    let delays = [2u64, 3, 5, 5, 5, 10, 10, 10, 10, 10];
     for (alias, container_id, _) in services {
-        let mut healthy = false;
-        for (attempt, &delay) in delays.iter().enumerate() {
+        let mut attempt: u32 = 0;
+        loop {
             let result = docker_cmd(
                 &[
                     "inspect",
@@ -601,31 +605,29 @@ pub async fn wait_for_services_healthy(
             let status = status.trim();
 
             if status.is_empty() || status == "none" {
-                // No health check configured — consider healthy immediately
+                // No HEALTHCHECK directive — container is considered ready
                 info!("{alias} service has no health check — ready");
-                healthy = true;
                 break;
             } else if status == "healthy" {
                 log.push(format!("{alias} service is healthy."));
                 info!("{alias} service is healthy");
-                healthy = true;
                 break;
             } else if status == "unhealthy" {
                 anyhow::bail!("{alias} service is unhealthy");
-            } else {
-                // starting
+            } else if status == "starting" {
+                // Exponential backoff: min=2s, max=32s, delta=2s
+                // delay = min(2 + (2^attempt - 1) * 2, 32)
+                let additional = (1u64 << attempt).saturating_sub(1).saturating_mul(2);
+                let delay = std::cmp::min(2u64 + additional, 32);
                 log.push(format!(
                     "{alias} service is starting, waiting {delay} seconds before checking again."
                 ));
                 info!("{alias} service is starting (attempt {attempt}), waiting {delay}s");
                 tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                attempt = attempt.saturating_add(1);
+            } else {
+                anyhow::bail!("{alias} service has unexpected health status: {status}");
             }
-        }
-        if !healthy {
-            anyhow::bail!(
-                "{alias} service did not become healthy after {} attempts",
-                delays.len()
-            );
         }
     }
 
