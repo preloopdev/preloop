@@ -41,6 +41,10 @@ use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
 use tracing::{debug, info, warn};
 
+/// Shared local-only token used for runner ↔ server auth in development.
+/// Not a credential — just a magic value that both sides agree on.
+const AKSH_SYSTEM_TOKEN: &str = "aksh-system-token";
+
 /// Server configuration.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -616,7 +620,7 @@ async fn require_bearer(request: Request, next: Next) -> Result<Response, ApiErr
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .is_some_and(|token| {
-            token == "aksh-system-token" || token.starts_with("aksh-") || verify_local_jwt(token)
+            token == AKSH_SYSTEM_TOKEN || token.starts_with("aksh-") || verify_local_jwt(token)
         });
     if authorized {
         Ok(next.run(request).await)
@@ -1831,7 +1835,7 @@ async fn broker_acquire_job(
             endpoint
                 .authorization
                 .parameters
-                .insert("AccessToken".to_owned(), "aksh-system-token".to_owned());
+                .insert("AccessToken".to_owned(), AKSH_SYSTEM_TOKEN.to_owned());
             endpoint
                 .data
                 .insert("ResultsServiceUrl".to_owned(), public_base_url());
