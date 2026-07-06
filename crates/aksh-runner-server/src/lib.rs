@@ -341,6 +341,10 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             "/runner/server/_apis/v1/ActionDownloadInfo/:scope/:hub/:plan_id",
             post(action_download_info),
         )
+        .route(
+            "/api/v1/runs/:run_id/jobs/:job_id/logs/live",
+            get(live_logs_sse),
+        )
         .route_layer(middleware::from_fn(require_bearer));
 
     Router::new()
@@ -475,10 +479,6 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         .route("/api/v1/runs/:run_id/cancel", post(cancel_run))
         .route("/api/v1/runs/:run_id/rerun", post(rerun_run))
         .route("/api/v1/runs/:run_id/events.ndjson", get(run_events))
-        .route(
-            "/api/v1/runs/:run_id/jobs/:job_id/logs/live",
-            get(live_logs_sse),
-        )
         .route("/api/v1/runners", post(register_runner))
         .route("/api/v1/runners/sessions", post(create_session))
         .route(
