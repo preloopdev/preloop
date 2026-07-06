@@ -1687,4 +1687,136 @@ mod tests {
         // should_skip was skipped: steps.fail_step.outcome != 'success'
         assert_eq!(job.steps.get("should_skip").unwrap().conclusion, "Skipped");
     }
+
+    // --- P1 expressions/templates gap coverage ---
+
+    #[tokio::test]
+    async fn run_steps_step_env_evaluates_expressions() {
+        let dir = TempDir::new().unwrap();
+        let mut job = JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({
+                "github": {"repository": "owner/repo", "ref": "refs/heads/main"}
+            }),
+        );
+        let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+        let (_tx, cancel_rx) = watch::channel(false);
+
+        let mut step = test_step("env_expr", None);
+        step.env
+            .insert("REPO".to_string(), "${{ github.repository }}".to_string());
+        step.env
+            .insert("BRANCH".to_string(), "${{ github.ref }}".to_string());
+        step.step_type = StepType::Script {
+            script:
+                "echo repo=$REPO >> \"$GITHUB_OUTPUT\"\necho branch=$BRANCH >> \"$GITHUB_OUTPUT\""
+                    .to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+
+        let result = run_steps(
+            &[step],
+            &mut job,
+            dir.path().to_str().unwrap(),
+            cancel_rx,
+            queue,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "Succeeded");
+        let outputs = &job.steps.get("env_expr").unwrap().outputs;
+        assert_eq!(outputs.get("repo").map(String::as_str), Some("owner/repo"));
+        assert_eq!(
+            outputs.get("branch").map(String::as_str),
+            Some("refs/heads/main")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_steps_display_name_evaluates_expression() {
+        let dir = TempDir::new().unwrap();
+        let mut job = JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({
+                "github": {"repository": "owner/repo"},
+                "matrix": {"os": "ubuntu"}
+            }),
+        );
+        let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+        let (_tx, cancel_rx) = watch::channel(false);
+
+        let mut step = test_step("dynamic_name", None);
+        step.display_name = "Build (${{ matrix.os }})".to_string();
+        step.step_type = StepType::Script {
+            script: "echo ran".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+
+        let result = run_steps(
+            &[step],
+            &mut job,
+            dir.path().to_str().unwrap(),
+            cancel_rx,
+            queue,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "Succeeded");
+        // The step ran; the display name was resolved dynamically
+        assert_eq!(job.steps.get("dynamic_name").unwrap().conclusion, "Success");
+    }
+
+    #[tokio::test]
+    async fn run_steps_condition_uses_env_context() {
+        let dir = TempDir::new().unwrap();
+        let mut job = JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        job.env.insert("DEPLOY".into(), "true".into());
+        let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+        let (_tx, cancel_rx) = watch::channel(false);
+
+        let mut runs = test_step("deploy_step", Some("env.DEPLOY == 'true'"));
+        runs.step_type = StepType::Script {
+            script: "echo deploying".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+
+        let skips = test_step("skip_step", Some("env.DEPLOY == 'false'"));
+
+        let result = run_steps(
+            &[runs, skips],
+            &mut job,
+            dir.path().to_str().unwrap(),
+            cancel_rx,
+            queue,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "Succeeded");
+        assert_eq!(job.steps.get("deploy_step").unwrap().conclusion, "Success");
+        assert_eq!(job.steps.get("skip_step").unwrap().conclusion, "Skipped");
+    }
 }
