@@ -809,14 +809,8 @@ struct ArtifactRecord {
     size: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct LiveLogFeedLinesWrapper {
-    step_id: String,
-    start_line: u64,
-    count: usize,
-    value: Vec<String>,
-}
+// Re-export from protocol crate — shared wire type with the runner.
+use aksh_gha_protocol::LiveLogFeedLinesWrapper;
 
 #[derive(Debug, Deserialize)]
 struct CachePutRequest {
