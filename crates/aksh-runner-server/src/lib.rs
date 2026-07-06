@@ -725,6 +725,7 @@ struct InnerState {
     runner_rsa_public_keys: BTreeMap<i64, AgentRsaPublicKey>,
     inflight_messages: BTreeMap<String, BTreeMap<i64, azdo::TaskAgentMessage>>,
     broker_messages: BTreeMap<i64, azdo::AgentJobRequestMessage>,
+    runner_client_ids: BTreeMap<String, i64>,
     cancellation_queue: VecDeque<QueuedCancellation>,
     pending_caches: BTreeMap<i64, PendingCache>,
     artifacts: BTreeMap<String, ArtifactRecord>,
@@ -1209,11 +1210,7 @@ async fn live_logs_sse(
         let mut inner = shared.state.inner.lock().await;
         let key = live_log_key_for_job(&inner, run_id, &job_id)
             .ok_or_else(|| ApiError::not_found("job not found"))?;
-        let lines_arc = inner
-            .live_log_lines
-            .entry(key.clone())
-            .or_default()
-            .clone();
+        let lines_arc = inner.live_log_lines.entry(key.clone()).or_default().clone();
         let tx = live_log_sender(&mut inner, &key);
         (lines_arc, tx.subscribe())
     };
@@ -3320,7 +3317,14 @@ async fn register_runner_compat(
         ephemeral,
         public_key: public_key_xml,
     };
-    let result = register_runner(State(shared), Json(reg_request)).await?;
+    let result = register_runner(State(shared.clone()), Json(reg_request)).await?;
+    let client_id = uuid::Uuid::new_v4().to_string();
+    {
+        let mut inner = shared.state.inner.lock().await;
+        inner
+            .runner_client_ids
+            .insert(client_id.clone(), result.0.id);
+    }
     Ok(Json(json!({
         "id": result.0.id,
         "name": result.0.name,
@@ -3341,7 +3345,7 @@ async fn register_runner_compat(
         "labels": result.0.labels.iter().map(|l| json!({"name": l, "type": "user"})).collect::<Vec<_>>(),
         "authorization": {
             "authorizationUrl": format!("{}/_apis/v1/oauth2/token", runner_server_url()),
-            "clientId": uuid::Uuid::new_v4().to_string(),
+            "clientId": client_id,
             "publicKey": public_key_object
         },
         "properties": {
@@ -3622,16 +3626,113 @@ struct TokenResponse {
     expires_in: u64,
 }
 
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct FormOAuth2Request {
+    client_assertion_type: Option<String>,
+    client_assertion: Option<String>,
+    grant_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct JsonOAuth2Request {
+    grant_type: String,
+    client_id: String,
+    client_secret: String,
+}
+
+fn decode_jwt_segment(segment: &str) -> Option<serde_json::Value> {
+    let bytes = BASE64_STANDARD
+        .decode(segment.as_bytes())
+        .or_else(|_| URL_SAFE_NO_PAD.decode(segment.as_bytes()))
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
 async fn oauth2_token(
+    State(shared): State<Arc<SharedState>>,
     _headers: axum::http::HeaderMap,
     body: bytes::Bytes,
 ) -> Result<Json<TokenResponse>, ApiError> {
-    let _ = body;
+    // Try JSON first (mock flow from existing tests)
+    if let Ok(req) = serde_json::from_slice::<JsonOAuth2Request>(&body) {
+        let token = local_jwt(json!({
+            "sub": format!("aksh-runner-listen-mock-{}", req.client_id),
+            "scp": "ActionsRuntime.RunnerListen Framework.GenericRead Identity.ReadRefs LocationService.Connect",
+            "jti": uuid::Uuid::new_v4().to_string()
+        }))?;
+        return Ok(Json(TokenResponse {
+            access_token: token,
+            token_type: "JWT".to_owned(),
+            expires_in: 2999,
+        }));
+    }
+
+    // Try urlencoded form (production runner flow with client assertion)
+    let form: FormOAuth2Request = serde_urlencoded::from_bytes(&body)
+        .map_err(|e| ApiError::bad_request(format!("invalid urlencoded OAuth body: {e}")))?;
+
+    let assertion = form
+        .client_assertion
+        .ok_or_else(|| ApiError::bad_request("missing client_assertion in OAuth request"))?;
+
+    // Parse the client_assertion JWT (header.payload.signature)
+    let parts: Vec<&str> = assertion.split('.').collect();
+    if parts.len() != 3 {
+        return Err(ApiError::bad_request(
+            "invalid JWT format in client_assertion",
+        ));
+    }
+
+    let _header_val = decode_jwt_segment(parts[0])
+        .ok_or_else(|| ApiError::bad_request("failed to decode JWT header"))?;
+    let _claims_val = decode_jwt_segment(parts[1])
+        .ok_or_else(|| ApiError::bad_request("failed to decode JWT claims"))?;
+
+    let client_id = _claims_val
+        .get("sub")
+        .or_else(|| _claims_val.get("iss"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::bad_request("client_assertion claims missing sub/iss"))?;
+
+    let signature = URL_SAFE_NO_PAD
+        .decode(parts[2].as_bytes())
+        .map_err(|e| ApiError::bad_request(format!("invalid JWT signature encoding: {e}")))?;
+
+    let signing_input = format!("{}.{}", parts[0], parts[1]);
+
+    // Look up the runner and its public key
+    let (runner_id, pubkey) = {
+        let inner = shared.state.inner.lock().await;
+        let id = inner
+            .runner_client_ids
+            .get(client_id)
+            .copied()
+            .ok_or_else(|| {
+                ApiError::unauthorized(format!("client ID not registered: {client_id}"))
+            })?;
+        let pubkey = inner
+            .runner_rsa_public_keys
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| {
+                ApiError::unauthorized(format!("runner {id} missing registered public key"))
+            })?;
+        (id, pubkey)
+    };
+
+    // Verify signature
+    pubkey
+        .verify_signature_ps256(signing_input.as_bytes(), &signature)
+        .map_err(|e| ApiError::unauthorized(format!("JWT signature verification failed: {e}")))?;
+
     let token = local_jwt(json!({
-        "sub": "aksh-runner-listen",
+        "sub": format!("aksh-runner-listen-{runner_id}"),
         "scp": "ActionsRuntime.RunnerListen Framework.GenericRead Identity.ReadRefs LocationService.Connect",
         "jti": uuid::Uuid::new_v4().to_string()
     }))?;
+
     Ok(Json(TokenResponse {
         access_token: token,
         token_type: "JWT".to_owned(),
@@ -7121,6 +7222,131 @@ jobs:
 
         // Clean up
         std::env::remove_var("AKSH_GITHUB_API_URL");
+    }
+
+    #[tokio::test]
+    async fn runner_oauth2_token_client_assertion_verification() {
+        use aksh_gha_protocol::crypto::sign_jwt_ps256;
+        use serde_json::Value;
+
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        // 1. Generate RSA keypair for the runner using the protocol's library
+        let keypair = aksh_gha_protocol::crypto::AgentRsaKeypair::generate().unwrap();
+        let rsa_params = keypair.to_rsaparams();
+
+        let keypair_xml = format!(
+            "<RSAKeyValue><Modulus>{}</Modulus><Exponent>{}</Exponent></RSAKeyValue>",
+            rsa_params.modulus, rsa_params.exponent
+        );
+
+        // 2. Register the runner
+        let reg_response = request_json(
+            &app,
+            Method::POST,
+            "/runner/server/_apis/distributedtask/pools/1/agents",
+            json!({
+                "name": "runner-cryptographic",
+                "version": "2.335.1",
+                "osDescription": "Linux",
+                "enabled": true,
+                "status": "offline",
+                "publicKey": keypair_xml,
+                "authorization": {
+                    "publicKey": keypair_xml,
+                }
+            }),
+        )
+        .await;
+
+        let client_id = reg_response["authorization"]["clientId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // 3. Build a valid client assertion JWT signed with the runner's private RSA key
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let header = json!({
+            "typ": "JWT",
+            "alg": "PS256"
+        });
+        let claims = json!({
+            "sub": client_id,
+            "iss": client_id,
+            "aud": "https://aksh.local/oauth",
+            "jti": uuid::Uuid::new_v4().to_string(),
+            "nbf": now,
+            "exp": now + 300,
+        });
+
+        let client_assertion = sign_jwt_ps256(&header, &claims, &rsa_params).unwrap();
+
+        // 4. Request OAuth token using urlencoded body
+        let form_body = serde_urlencoded::to_string(&[
+            (
+                "client_assertion_type",
+                "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+            ),
+            ("client_assertion", &client_assertion),
+            ("grant_type", "client_credentials"),
+        ])
+        .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/runner/server/_apis/v1/oauth2/token")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(form_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let token_resp: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(token_resp["access_token"].is_string());
+
+        // 5. Test negative case: Invalid signature (wrong key)
+        let wrong_keypair = aksh_gha_protocol::crypto::AgentRsaKeypair::generate().unwrap();
+        let wrong_rsa_params = wrong_keypair.to_rsaparams();
+        let bad_assertion = sign_jwt_ps256(&header, &claims, &wrong_rsa_params).unwrap();
+
+        let bad_form_body = serde_urlencoded::to_string(&[
+            (
+                "client_assertion_type",
+                "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+            ),
+            ("client_assertion", &bad_assertion),
+            ("grant_type", "client_credentials"),
+        ])
+        .unwrap();
+
+        let bad_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/runner/server/_apis/v1/oauth2/token")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(bad_form_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(bad_response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]

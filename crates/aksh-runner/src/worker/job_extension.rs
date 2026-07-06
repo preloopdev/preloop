@@ -445,9 +445,7 @@ pub fn build_step_list(steps: &[serde_json::Value], job_message: &serde_json::Va
         // Wire ID: prefer id (GUID on live GitHub), fall back to context_name
         let id = raw_id.unwrap_or(&context_name).to_string();
 
-        let display_name_override = step
-            .get("displayName")
-            .and_then(template_scalar);
+        let display_name_override = step.get("displayName").and_then(template_scalar);
 
         let condition = step
             .get("condition")

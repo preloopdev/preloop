@@ -182,7 +182,6 @@ impl ServerQueue {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
