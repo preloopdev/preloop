@@ -18,6 +18,7 @@ pub async fn run_broker_loop(
     http: &HttpClient,
     config: &RunnerConfig,
     initial_token: &str,
+    initial_expires_at: Option<std::time::Instant>,
     once: bool,
     runner_root: &std::path::Path,
 ) -> Result<()> {
@@ -36,7 +37,7 @@ pub async fn run_broker_loop(
     let mut client = BrokerClient::new(http.clone(), broker_url);
 
     let mut token = initial_token.to_string();
-    let mut token_expires_at: Option<std::time::Instant> = None;
+    let mut token_expires_at: Option<std::time::Instant> = initial_expires_at;
     let mut session_id = String::new();
     let mut session_key: Option<Vec<u8>> = None;
 

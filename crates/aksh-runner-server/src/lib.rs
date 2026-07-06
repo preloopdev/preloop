@@ -1731,6 +1731,7 @@ async fn next_message_broker_ref_root(
     let deadline = std::time::Instant::now() + Duration::from_secs(wait);
 
     loop {
+
         let maybe = {
             let mut inner = shared.state.inner.lock().await;
             if let Some(request_id) = inner.session_active_requests.get(&session_id).copied() {
@@ -3650,6 +3651,15 @@ fn decode_jwt_segment(segment: &str) -> Option<serde_json::Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// Token TTL in seconds. Override with AKSH_TOKEN_TTL_SECS for testing
+/// short-lived tokens (e.g. =1 triggers RLIS-02 proactive refresh immediately).
+fn token_ttl_secs() -> u64 {
+    std::env::var("AKSH_TOKEN_TTL_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2999)
+}
+
 async fn oauth2_token(
     State(shared): State<Arc<SharedState>>,
     _headers: axum::http::HeaderMap,
@@ -3665,7 +3675,7 @@ async fn oauth2_token(
         return Ok(Json(TokenResponse {
             access_token: token,
             token_type: "JWT".to_owned(),
-            expires_in: 2999,
+            expires_in: token_ttl_secs(),
         }));
     }
 
@@ -3736,7 +3746,7 @@ async fn oauth2_token(
     Ok(Json(TokenResponse {
         access_token: token,
         token_type: "JWT".to_owned(),
-        expires_in: 2999,
+        expires_in: token_ttl_secs(),
     }))
 }
 
