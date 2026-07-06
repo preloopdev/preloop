@@ -14,7 +14,6 @@ pub async fn run_docker_action(
     with: &serde_json::Value,
     workspace: &str,
     ctx: &mut StepContext<'_>,
-    live_logs: Option<&std::sync::Arc<crate::worker::live_logs::LiveLogQueue>>,
 ) -> Result<()> {
     ctx.translate_container_path = true;
     let image = uses
@@ -25,7 +24,7 @@ pub async fn run_docker_action(
 
     let inputs = evaluated_inputs(None, with, ctx)?;
     let env = container_action_env(ctx, &inputs, None, None)?;
-    run_docker_image(image, workspace, ctx, env, None, Vec::new(), live_logs).await
+    run_docker_image(image, workspace, ctx, env, None, Vec::new()).await
 }
 
 /// Run a docker action from a manifest (Dockerfile or image).
@@ -35,7 +34,6 @@ pub async fn run_docker_action_from_manifest(
     with: &serde_json::Value,
     workspace: &str,
     ctx: &mut StepContext<'_>,
-    live_logs: Option<&std::sync::Arc<crate::worker::live_logs::LiveLogQueue>>,
 ) -> Result<()> {
     ctx.translate_container_path = true;
     let image = manifest
@@ -65,7 +63,7 @@ pub async fn run_docker_action_from_manifest(
             crate::worker::live_logs::process_line_callback(
                 &ctx.step_id,
                 &ctx.job.live_masks,
-                live_logs,
+                ctx.job.live_logs.as_ref(),
             ),
             None,
         )
@@ -98,7 +96,7 @@ pub async fn run_docker_action_from_manifest(
         .transpose()?;
     let args = evaluate_manifest_args(manifest.runs_args.as_ref(), &expr_ctx)?;
 
-    run_docker_image(&image, workspace, ctx, env, entrypoint, args, live_logs).await
+    run_docker_image(&image, workspace, ctx, env, entrypoint, args).await
 }
 
 async fn run_docker_image(
@@ -108,7 +106,6 @@ async fn run_docker_image(
     env: std::collections::HashMap<String, String>,
     entrypoint: Option<String>,
     args: Vec<String>,
-    live_logs: Option<&std::sync::Arc<crate::worker::live_logs::LiveLogQueue>>,
 ) -> Result<()> {
     let docker_args =
         build_docker_run_args(workspace, ctx, &env, image, entrypoint.as_deref(), &args);
@@ -118,7 +115,11 @@ async fn run_docker_image(
         &args_ref,
         Path::new(workspace),
         &env,
-        crate::worker::live_logs::process_line_callback(&ctx.step_id, &ctx.job.live_masks, live_logs),
+        crate::worker::live_logs::process_line_callback(
+            &ctx.step_id,
+            &ctx.job.live_masks,
+            ctx.job.live_logs.as_ref(),
+        ),
         None,
     )
     .await?;
