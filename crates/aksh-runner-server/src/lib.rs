@@ -5297,6 +5297,88 @@ jobs:
     }
 
     #[tokio::test]
+    async fn live_log_websocket_rejects_unauthenticated() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state, CancellationToken::new());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // Connect without Authorization header — should fail.
+        let url = format!("ws://{addr}/ws/live-logs/job-no-auth");
+        let result = tokio_tungstenite::connect_async(url).await;
+        assert!(result.is_err(), "WS connect without auth should fail");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn live_log_websocket_survives_malformed_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let url = format!("ws://{addr}/ws/live-logs/job-malformed");
+        let mut request =
+            tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url)
+                .unwrap();
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            "Bearer aksh-system-token".parse().unwrap(),
+        );
+        let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+
+        // Send invalid JSON — should not close the connection.
+        futures::SinkExt::send(
+            &mut ws,
+            tokio_tungstenite::tungstenite::Message::Text("not json".to_string()),
+        )
+        .await
+        .unwrap();
+
+        // Send valid payload after the malformed one — should still work.
+        let valid = json!({
+            "stepId": "s1",
+            "startLine": 1,
+            "count": 1,
+            "value": ["survived"]
+        });
+        futures::SinkExt::send(
+            &mut ws,
+            tokio_tungstenite::tungstenite::Message::Text(valid.to_string()),
+        )
+        .await
+        .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let inner = state.inner.lock().await;
+                if let Some(job_lines) = inner.live_log_lines.get("job-malformed") {
+                    let wrappers = job_lines.lock().await;
+                    if wrappers.len() == 1 {
+                        assert_eq!(wrappers[0].value, vec!["survived"]);
+                        break;
+                    }
+                }
+                drop(inner);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn log_append_persists_payload_bytes() {
         let temp = tempfile::tempdir().unwrap();
         let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
