@@ -418,4 +418,111 @@ mod tests {
         let err = parse_kv_file(&path).unwrap_err();
         assert!(err.to_string().contains("EOF marker missing new line"));
     }
+
+    // --- P0 file command gap coverage ---
+
+    #[test]
+    fn parse_kv_equals_in_value() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("env");
+        std::fs::write(&path, "CONN=host=localhost;port=5432\n").unwrap();
+        let result = parse_kv_file(&path).unwrap();
+        assert_eq!(
+            result.get("CONN").map(String::as_str),
+            Some("host=localhost;port=5432")
+        );
+    }
+
+    #[test]
+    fn parse_kv_unicode_value() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("env");
+        std::fs::write(&path, "GREETING=こんにちは\nEMOJI=🎉\n").unwrap();
+        let result = parse_kv_file(&path).unwrap();
+        assert_eq!(
+            result.get("GREETING").map(String::as_str),
+            Some("こんにちは")
+        );
+        assert_eq!(result.get("EMOJI").map(String::as_str), Some("🎉"));
+    }
+
+    #[test]
+    fn parse_kv_crlf_line_endings() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("env");
+        std::fs::write(&path, "FOO=bar\r\nBAZ=qux\r\n").unwrap();
+        let result = parse_kv_file(&path).unwrap();
+        assert_eq!(result.get("FOO").map(String::as_str), Some("bar"));
+        assert_eq!(result.get("BAZ").map(String::as_str), Some("qux"));
+    }
+
+    #[test]
+    fn parse_heredoc_crlf_line_endings() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("env");
+        std::fs::write(&path, "CERT<<EOF\r\nline1\r\nline2\r\nEOF\r\n").unwrap();
+        let result = parse_kv_file(&path).unwrap();
+        assert_eq!(
+            result.get("CERT").map(String::as_str),
+            Some("line1\r\nline2")
+        );
+    }
+
+    #[test]
+    fn parse_kv_empty_key_rejected() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("env");
+        std::fs::write(&path, "=value\n").unwrap();
+        let err = parse_kv_file(&path).unwrap_err();
+        assert!(err.to_string().contains("Name must not be empty"));
+    }
+
+    #[test]
+    fn parse_path_file_ignores_blank_lines() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("path");
+        std::fs::write(&path, "/usr/bin\n\n  \n/opt/bin\n").unwrap();
+        let result = parse_path_file(&path).unwrap();
+        assert_eq!(result, vec!["/usr/bin", "/opt/bin"]);
+    }
+
+    #[test]
+    fn apply_file_commands_attaches_outputs_and_prepends_path() {
+        let dir = TempDir::new().unwrap();
+        let paths = create_file_commands(dir.path()).unwrap();
+        std::fs::write(&paths.output_file, "result=42\nstatus=ok\n").unwrap();
+        std::fs::write(&paths.path_file, "/custom/bin\n").unwrap();
+        std::fs::write(&paths.env_file, "MY_VAR=hello\n").unwrap();
+
+        let mut job = crate::worker::contexts::JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        job.steps.insert(
+            "step1".to_string(),
+            crate::worker::contexts::StepResult {
+                outcome: "Success".into(),
+                conclusion: "Success".into(),
+                outputs: std::collections::HashMap::new(),
+            },
+        );
+
+        apply_file_commands(&paths, "step1", &mut job).unwrap();
+
+        // Outputs attached to step
+        let step = job.steps.get("step1").unwrap();
+        assert_eq!(step.outputs.get("result").map(String::as_str), Some("42"));
+        assert_eq!(step.outputs.get("status").map(String::as_str), Some("ok"));
+
+        // Path prepended
+        assert_eq!(
+            job.extra_path.first().map(String::as_str),
+            Some("/custom/bin")
+        );
+
+        // Env applied
+        assert_eq!(job.env.get("MY_VAR").map(String::as_str), Some("hello"));
+    }
 }
