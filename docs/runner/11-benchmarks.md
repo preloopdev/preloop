@@ -186,6 +186,25 @@ Boot time (VM)                 1.2s          1.2s         1.2s         ~4s
 
 On the same smolvm VM with the same warm cache, the aksh Rust runner is **2.1x faster** than the official C# runner against GitHub, and **2.2x faster** running fully local. The gap is dominated by `cargo test` (89s C# vs 43-46s Rust), where the C# runner's per-test-binary dispatch overhead is measurable.
 
+## 6. Real-World E2E Project Benchmarks (2026-07-06)
+
+We evaluated the `aksh-runner` natively inside `smolvm` (ARM64 Ubuntu 24.04, 4 vCPU, 8 GB RAM, Apple Silicon host) on **7 real-world open-source projects** running against the live GitHub Actions control plane.
+
+| Project | Workflow | Status | GHA Job Duration | Step/Compilation Details |
+|---------|----------|--------|------------------|--------------------------|
+| **ripgrep** | `e2e-ripgrep.yml` | Succeeded | **26s** | Checkout (1s), Toolchain (1s), Build (11s), Test (6s) |
+| **clap** | `e2e-clap.yml` | Succeeded | **1m 5s** | Checkout (2s), Toolchain (1s), Build (35s), Test (23s) |
+| **sqlx** | `e2e-sqlx.yml` | Succeeded | **2m 33s** | Clones launchbadge/sqlx, runs check & test on core |
+| **ruff** | `e2e-ruff.yml` | Succeeded | **1m 8s** | Clones astral-sh/ruff, compiles & tests ruff_linter |
+| **serde** | `e2e-serde.yml` | Succeeded | **35s** | Chained sequentially: fmt (11s), build (7s), clippy (7s), test (10s) |
+| **axum** | `e2e-axum.yml` | Succeeded | **7m 32s** | Concurrent fmt, clippy, test, doc |
+| **bat** | `e2e-bat.yml` | Succeeded | **2m 53s** | Chained sequentially: fmt/submodules (1m 34s), build (24s), clippy (17s), test (38s) |
+
+### Key Findings
+- **Performance is highly optimal:** Compiling and testing complex Rust codebases like `clap` (65s) and `serde` (35s) inside the microVM runs with minimal overhead.
+- **Submodule Concurrency Clashing:** Parallel checkout steps on the same self-hosted runner instance sharing the same workspace directory (like `bat`'s submodules) cause Git lock collisions. Chaining jobs sequentially with `needs:` resolved the issue.
+- **DNS and Docker Configuration:** Docker CE was run with `--storage-driver vfs` inside the microVM's overlay guest file system.
+
 ## 7. Methodology
 
 ### CI pipeline benchmark (2026-07-04 4-config matrix)
