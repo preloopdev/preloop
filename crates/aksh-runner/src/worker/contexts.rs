@@ -1,6 +1,7 @@
 //! Job execution contexts (github, runner, job, steps, env, secrets).
 
 use indexmap::IndexMap;
+use std::sync::{Arc, RwLock};
 use std::collections::{HashMap, HashSet};
 
 use crate::worker::execution_context::Annotation;
@@ -23,6 +24,9 @@ pub struct JobContext {
     pub steps: IndexMap<String, StepResult>,
     /// Secret values to mask in logs.
     pub masks: HashSet<String>,
+    /// Shared read-view of masks for live-log callbacks that need to see
+    /// `::add-mask::` additions mid-step without rebuilding the callback.
+    pub live_masks: Arc<RwLock<HashSet<String>>>,
     /// Job-level outputs collected from steps.
     pub outputs: HashMap<String, String>,
     /// Job status for status functions (success/failure/cancelled).
@@ -108,7 +112,8 @@ impl JobContext {
             env: HashMap::new(),
             extra_path: Vec::new(),
             steps: IndexMap::new(),
-            masks,
+            masks: masks.clone(),
+            live_masks: Arc::new(RwLock::new(masks)),
             outputs: HashMap::new(),
             job_status: JobStatus::Success,
             step_annotations: HashMap::new(),
@@ -154,6 +159,9 @@ impl JobContext {
     pub fn add_mask(&mut self, value: &str) {
         if !value.is_empty() {
             self.masks.insert(value.to_string());
+            if let Ok(mut live) = self.live_masks.write() {
+                live.insert(value.to_string());
+            }
         }
     }
 
