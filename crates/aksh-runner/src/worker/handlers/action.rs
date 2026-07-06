@@ -1,5 +1,7 @@
 //! Action step handler — dispatches `uses:` steps to the appropriate handler.
 
+use std::future::Future;
+
 use anyhow::{Context, Result};
 use tracing::info;
 
@@ -15,7 +17,6 @@ pub fn run_action<'a>(
     workspace: &'a str,
     ctx: &'a mut StepContext<'_>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
-    live_logs: Option<&'a std::sync::Arc<crate::worker::live_logs::LiveLogQueue>>,
 ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
         info!("Running action: {uses}");
@@ -30,18 +31,16 @@ pub fn run_action<'a>(
         );
 
         if uses.starts_with("docker://") {
-            super::container::run_docker_action(uses, with, workspace, ctx, live_logs).await
+            super::container::run_docker_action(uses, with, workspace, ctx).await
         } else if uses.starts_with("./") || uses.starts_with("../") {
             let action_dir = std::path::Path::new(workspace).join(uses);
-            run_action_from_dir(&action_dir, with, workspace, ctx, cancel_rx, live_logs).await
+            run_action_from_dir(&action_dir, with, workspace, ctx, cancel_rx).await
         } else {
             let action_dir = resolve_remote_action(uses, workspace, ctx)?;
-            run_action_from_dir(&action_dir, with, workspace, ctx, cancel_rx, live_logs).await
+            run_action_from_dir(&action_dir, with, workspace, ctx, cancel_rx).await
         }
     })
 }
-
-use std::future::Future;
 
 /// Run an action from a resolved directory.
 async fn run_action_from_dir(
@@ -50,7 +49,6 @@ async fn run_action_from_dir(
     workspace: &str,
     ctx: &mut StepContext<'_>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
-    live_logs: Option<&std::sync::Arc<crate::worker::live_logs::LiveLogQueue>>,
 ) -> Result<()> {
     let manifest = super::factory::load_action_manifest(action_dir)?;
 
@@ -62,20 +60,18 @@ async fn run_action_from_dir(
                     manifest.runs_using
                 ));
             }
-            super::node::run_node_action(
-                &manifest, action_dir, with, workspace, ctx, cancel_rx, live_logs,
-            )
-            .await
+            super::node::run_node_action(&manifest, action_dir, with, workspace, ctx, cancel_rx)
+                .await
         }
         "composite" => {
             super::composite::run_composite_action(
-                &manifest, action_dir, with, workspace, ctx, cancel_rx, live_logs,
+                &manifest, action_dir, with, workspace, ctx, cancel_rx,
             )
             .await
         }
         "docker" => {
             super::container::run_docker_action_from_manifest(
-                &manifest, action_dir, with, workspace, ctx, live_logs,
+                &manifest, action_dir, with, workspace, ctx,
             )
             .await
         }
