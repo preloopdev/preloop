@@ -164,6 +164,7 @@ pub async fn run_job(
         None
     };
     let live_log_handle = live_logs.as_ref().map(|queue| queue.spawn_drain());
+    job_ctx.live_logs = live_logs.clone();
 
     // Create the server queue for step status tracking
     let queue = Arc::new(Mutex::new(ServerQueue::new(
@@ -229,7 +230,6 @@ pub async fn run_job(
         reporting.as_deref(),
         job_container_spec.as_ref(),
         &service_specs,
-        live_logs.clone(),
     )
     .await;
 
