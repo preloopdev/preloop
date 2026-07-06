@@ -125,24 +125,21 @@ pub async fn run_node_action(
     );
 
     info!("Running node action: {node_path} {}", entry_point.display());
+    let ctx_ref = &*ctx;
+    let on_chunk = Box::new(move |chunk: &[u8]| {
+        ctx_ref.write_chunk(chunk);
+    });
 
     let result = process::invoke(
         &node_path,
         &[entry_point.to_str().unwrap_or("")],
         Path::new(workspace),
         &env,
-        crate::worker::live_logs::process_line_callback(
-            &ctx.step_id,
-            &ctx.job.live_masks,
-            ctx.job.live_logs.as_ref(),
-        ),
+        Some(on_chunk),
         Some(cancel_rx),
+        false,
     )
     .await?;
-
-    for line in &result.lines {
-        ctx.log(line);
-    }
 
     if result.exit_code != 0 {
         anyhow::bail!("node action exited with code {}", result.exit_code);

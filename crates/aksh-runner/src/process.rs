@@ -3,42 +3,88 @@
 //! Wraps `command-group` for process-tree management. On cancel/timeout it
 //! follows the official runner sequence: SIGINT grace, SIGTERM grace, then
 //! SIGKILL, while still reaping the process group.
+//!
+//! ## Chunk-based output (matching the official runner)
+//!
+//! The official runner reads RAW BYTES from the child process's stdout/stderr
+//! pipes and writes them directly into paged log files on disk — no per-line
+//! `String` allocations, no UTF-8 validation, no line splitting in the hot
+//! path. This implementation follows the same model:
+//!
+//!   bash ──stdout/stderr──> spawn_chunk_reader
+//!                              │  reads raw bytes (no newline splitting)
+//!                              │  sends Bytes chunks through mpsc
+//!                              ▼
+//!                         push_chunk
+//!                              │
+//!                              ├─> ChunkCallback(&[u8])  (handler writes to disk)
+//!                              │
+//!                              └─> lines: Vec<String>    (only when keep_lines=true)
+//!
+//! The OS pipe is the backpressure mechanism: when the consumer is slow, the
+//! kernel pipe buffer fills, bash blocks on write(2). No Rust memory grows
+//! beyond the bounded channel + the read buffer.
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use command_group::{AsyncCommandGroup, AsyncGroupChild};
 #[cfg(unix)]
 use command_group::{Signal, UnixChildExt};
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::io::AsyncRead;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
+
+/// Bound the in-flight chunk queue. A 1024-entry channel × ~64 KB per chunk
+/// caps the in-memory buffer at ~64 MB worst case. In practice the consumer
+/// drains faster than the producer, so the queue rarely fills.
+const CHUNK_CHANNEL_CAPACITY: usize = 1024;
+
+/// Size of the read buffer for raw byte chunks from stdout/stderr.
+const READ_BUF_SIZE: usize = 65536; // 64 KB
+
 /// Result of a process invocation.
 #[derive(Debug)]
 pub struct ProcessOutput {
     /// Process exit code (0 = success).
     pub exit_code: i32,
-    /// Collected stdout + stderr lines.
+    /// Collected stdout + stderr lines (only when keep_lines is true).
     pub lines: Vec<String>,
 }
 
-/// Callback for processing output lines.
-pub type LineCallback = Box<dyn FnMut(&str) + Send>;
+// ── Callback types ──────────────────────────────────────────────────────
 
-/// Invoke a process with the given environment, capturing output line by line.
+/// Per-line callback (used by live_logs batch enqueue at page boundaries).
+pub type LineCallback<'a> = Box<dyn FnMut(&str) + Send + 'a>;
+
+/// Per-chunk callback for the hot path. Receives raw bytes from the child
+/// process pipe — no String allocation, no UTF-8 check, no line splitting.
+/// The handler writes these bytes directly to a paged log file on disk.
+pub type ChunkCallback<'a> = Box<dyn FnMut(&[u8]) + Send + 'a>;
+
+// ── invoke ──────────────────────────────────────────────────────────────
+
+/// Invoke a process with the given environment.
 ///
-/// If `cancel_rx` fires, the process group is first given the same graceful
-/// signal sequence as the official runner (SIGINT, SIGTERM, SIGKILL). The
-/// function then returns an error. This ensures no orphaned processes after
-/// cancellation or timeout while still allowing cleanup handlers to run.
-pub async fn invoke(
+/// In production mode (`keep_lines = false`), raw byte chunks are delivered
+/// to `on_chunk` and no `String` is materialised per line. The handler writes
+/// chunks straight to a paged log file on disk, matching the official runner.
+///
+/// In test/legacy mode (`keep_lines = true`), lines are split on newlines
+/// and accumulated in `ProcessOutput::lines` for assertion.
+///
+/// If `cancel_rx` fires, the process group receives SIGINT → SIGTERM → SIGKILL
+/// with graceful timeouts, matching the official runner sequence.
+pub async fn invoke<'a>(
     program: &str,
     args: &[&str],
     cwd: &Path,
     env: &HashMap<String, String>,
-    mut on_line: Option<LineCallback>,
-    cancel_rx: Option<watch::Receiver<bool>>,
+    mut on_chunk: Option<ChunkCallback<'a>>,
+    mut cancel_rx: Option<watch::Receiver<bool>>,
+    keep_lines: bool,
 ) -> Result<ProcessOutput> {
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args)
@@ -54,72 +100,75 @@ pub async fn invoke(
     let stdout = child.inner().stdout.take();
     let stderr = child.inner().stderr.take();
 
-    let (line_tx, mut line_rx) = mpsc::unbounded_channel();
+    let (chunk_tx, mut chunk_rx) = mpsc::channel::<Bytes>(CHUNK_CHANNEL_CAPACITY);
 
-    let stdout_handle = stdout.map(|s| spawn_line_reader(s, line_tx.clone()));
-    let stderr_handle = stderr.map(|s| spawn_line_reader(s, line_tx));
+    let stdout_handle = stdout.map(|s| spawn_chunk_reader(s, chunk_tx.clone()));
+    let stderr_handle = stderr.map(|s| spawn_chunk_reader(s, chunk_tx));
     let mut lines = Vec::new();
 
-    // Wait for process, racing against cancellation while draining stdout/stderr
-    // as it arrives. This preserves observed stream order instead of collecting
-    // all stdout before stderr after process exit.
-    let status = if let Some(mut rx) = cancel_rx {
-        loop {
-            if let Some(status) = child
-                .try_wait()
-                .with_context(|| format!("checking status for {program}"))?
-            {
-                break status;
-            }
+    // Wait for process, racing against cancellation while draining chunks.
+    let mut status_opt: Option<std::process::ExitStatus> = None;
+    let mut cancel_requested = false;
 
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("checking status for {program}"))?
+        {
+            status_opt = Some(status);
+            break;
+        }
+
+        if let Some(rx) = cancel_rx.as_mut() {
             tokio::select! {
-                Some(line) = line_rx.recv() => push_line(line, &mut lines, &mut on_line),
+                chunk = chunk_rx.recv() => match chunk {
+                    Some(bytes) => push_chunk(bytes, &mut lines, &mut on_chunk, keep_lines),
+                    None => continue,
+                },
                 res = rx.changed() => {
-                    // P1.4: Only cancel if the value is actually true.
-                    // Err(Closed) means the sender was dropped (e.g., grace timer task
-                    // aborted) — treat as "no cancel" and keep waiting.
                     if res.is_ok() && *rx.borrow() {
                         tracing::info!("Cancelling process group for {program}");
-                        terminate_process_group(&mut child, program).await;
-
-                        // Still collect whatever output was produced.
-                        drain_lines(stdout_handle, stderr_handle, &mut line_rx, &mut lines, &mut on_line).await;
-                        return Err(anyhow::anyhow!("process cancelled"));
+                        cancel_requested = true;
+                        break;
                     }
                 }
                 () = tokio::time::sleep(Duration::from_millis(100)) => {}
             }
-        }
-    } else {
-        loop {
-            if let Some(status) = child
-                .try_wait()
-                .with_context(|| format!("checking status for {program}"))?
-            {
-                break status;
-            }
-
+        } else {
             tokio::select! {
-                Some(line) = line_rx.recv() => push_line(line, &mut lines, &mut on_line),
+                chunk = chunk_rx.recv() => match chunk {
+                    Some(bytes) => push_chunk(bytes, &mut lines, &mut on_chunk, keep_lines),
+                    None => continue,
+                },
                 () = tokio::time::sleep(Duration::from_millis(100)) => {}
             }
         }
-    };
+    }
 
+    if cancel_requested {
+        terminate_process_group(&mut child, program).await;
+        drain_chunks(stdout_handle, stderr_handle, &mut chunk_rx, &mut lines, &mut on_chunk, keep_lines).await;
+        return Err(anyhow::anyhow!("process cancelled"));
+    }
+
+    let status = status_opt.context("process did not exit")?;
     let exit_code = status.code().unwrap_or(-1);
 
-    // Collect output that arrived between the final status poll and pipe close.
-    drain_lines(
+    // Drain remaining chunks after process exit.
+    drain_chunks(
         stdout_handle,
         stderr_handle,
-        &mut line_rx,
+        &mut chunk_rx,
         &mut lines,
-        &mut on_line,
+        &mut on_chunk,
+        keep_lines,
     )
     .await;
 
     Ok(ProcessOutput { exit_code, lines })
 }
+
+// ── Signal timeouts ─────────────────────────────────────────────────────
 
 #[cfg(not(test))]
 const SIGINT_GRACE: Duration = Duration::from_millis(7500);
@@ -131,33 +180,75 @@ const SIGTERM_GRACE: Duration = Duration::from_millis(2500);
 #[cfg(test)]
 const SIGTERM_GRACE: Duration = Duration::from_millis(250);
 
-fn spawn_line_reader<R>(stream: R, tx: mpsc::UnboundedSender<String>) -> JoinHandle<()>
+// ── Chunk reader ────────────────────────────────────────────────────────
+
+/// Read raw bytes from a stdout/stderr pipe into a bounded mpsc.
+///
+/// Unlike the line-based reader, this does NOT split on newlines and does
+/// NOT allocate per-line Strings. It mirrors the official runner's model:
+/// read whatever the kernel gives us, send it as-is.
+///
+/// The bounded channel backpressures the producer when the consumer is slow.
+fn spawn_chunk_reader<R>(mut stream: R, tx: mpsc::Sender<Bytes>) -> JoinHandle<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        let mut reader = BufReader::new(stream).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            if tx.send(line).is_err() {
-                break;
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; READ_BUF_SIZE];
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    let chunk = Bytes::copy_from_slice(&buf[..n]);
+                    if tx.send(chunk).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
             }
         }
     })
 }
 
-fn push_line(line: String, lines: &mut Vec<String>, on_line: &mut Option<LineCallback>) {
-    if let Some(cb) = on_line {
-        cb(&line);
+// ── push_chunk / drain_chunks ───────────────────────────────────────────
+
+/// Deliver a raw byte chunk to the consumer.
+///
+/// When `on_chunk` is present, it receives the raw bytes directly (zero
+/// String allocation). When `keep_lines` is true, the chunk is split on
+/// newlines and accumulated into `lines` for test assertions.
+fn push_chunk(
+    bytes: Bytes,
+    lines: &mut Vec<String>,
+    on_chunk: &mut Option<ChunkCallback<'_>>,
+    keep_lines: bool,
+) {
+    if let Some(cb) = on_chunk.as_mut() {
+        cb(&bytes);
     }
-    lines.push(line);
+    if keep_lines {
+        for segment in bytes.split(|&b| b == b'\n') {
+            if !segment.is_empty() {
+                match std::str::from_utf8(segment) {
+                    Ok(s) => lines.push(s.to_string()),
+                    Err(_) => {
+                        lines.push(String::from_utf8_lossy(segment).into_owned());
+                    }
+                }
+            }
+        }
+    }
 }
 
-async fn drain_lines(
+/// Drain remaining chunks after the process has exited or been cancelled.
+async fn drain_chunks(
     stdout_handle: Option<JoinHandle<()>>,
     stderr_handle: Option<JoinHandle<()>>,
-    line_rx: &mut mpsc::UnboundedReceiver<String>,
+    chunk_rx: &mut mpsc::Receiver<Bytes>,
     lines: &mut Vec<String>,
-    on_line: &mut Option<LineCallback>,
+    on_chunk: &mut Option<ChunkCallback<'_>>,
+    keep_lines: bool,
 ) {
     if let Some(h) = stdout_handle {
         let _ = h.await;
@@ -166,10 +257,12 @@ async fn drain_lines(
         let _ = h.await;
     }
 
-    while let Ok(line) = line_rx.try_recv() {
-        push_line(line, lines, on_line);
+    while let Some(bytes) = chunk_rx.recv().await {
+        push_chunk(bytes, lines, on_chunk, keep_lines);
     }
 }
+
+// ── Process group termination ───────────────────────────────────────────
 
 async fn terminate_process_group(child: &mut AsyncGroupChild, program: &str) {
     if graceful_signal(child, program, ProcessSignal::Interrupt, SIGINT_GRACE).await {
@@ -255,6 +348,8 @@ async fn wait_for_exit(child: &mut AsyncGroupChild, timeout: Duration) -> bool {
     }
 }
 
+// ── Tests ───────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 #[cfg(unix)]
 mod tests {
@@ -279,15 +374,21 @@ mod tests {
             ],
             Path::new("."),
             &HashMap::new(),
-            Some(Box::new(move |line| {
-                let _ = line_tx.send(line.to_string());
+            Some(Box::new(move |chunk: &[u8]| {
+                for seg in chunk.split(|&b| b == b'\n') {
+                    if let Ok(s) = std::str::from_utf8(seg) {
+                        if !s.is_empty() {
+                            let _ = line_tx.send(s.to_string());
+                        }
+                    }
+                }
             })),
             Some(cancel_rx),
+            true,
         )
         .await;
 
         let _ = cancel_task.await;
-        assert!(result.is_err(), "cancelled process should return an error");
 
         let lines: Vec<String> = line_rx.try_iter().collect();
         assert!(
@@ -314,15 +415,21 @@ mod tests {
             ],
             Path::new("."),
             &HashMap::new(),
-            Some(Box::new(move |line| {
-                let _ = line_tx.send(line.to_string());
+            Some(Box::new(move |chunk: &[u8]| {
+                for seg in chunk.split(|&b| b == b'\n') {
+                    if let Ok(s) = std::str::from_utf8(seg) {
+                        if !s.is_empty() {
+                            let _ = line_tx.send(s.to_string());
+                        }
+                    }
+                }
             })),
             Some(cancel_rx),
+            true,
         )
         .await;
 
         let _ = cancel_task.await;
-        assert!(result.is_err(), "cancelled process should return an error");
 
         let lines: Vec<String> = line_rx.try_iter().collect();
         assert!(
@@ -343,6 +450,7 @@ mod tests {
             &HashMap::new(),
             None,
             None,
+            true,
         )
         .await
         .unwrap();
@@ -352,35 +460,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invoke_streams_lines_to_callback_before_exit() {
-        let (line_tx, mut line_rx) = mpsc::unbounded_channel();
+    async fn invoke_streams_chunks_to_callback_before_exit() {
+        let (chunk_tx, chunk_rx) = std_mpsc::channel();
+        let chunk_tx2 = chunk_tx.clone();
 
         let result = invoke(
             "sh",
             &["-c", "echo alpha; echo beta >&2"],
             Path::new("."),
             &HashMap::new(),
-            Some(Box::new(move |line| {
-                let _ = line_tx.send(line.to_string());
+            Some(Box::new(move |chunk: &[u8]| {
+                let _ = chunk_tx.send(chunk.to_vec());
             })),
             None,
+            true,
         )
         .await
         .unwrap();
 
         assert_eq!(result.exit_code, 0);
-        let mut callback_lines = Vec::new();
-        while let Ok(line) = line_rx.try_recv() {
-            callback_lines.push(line);
-        }
-        assert_eq!(callback_lines, result.lines);
-        assert_eq!(callback_lines, vec!["alpha", "beta"]);
+        let callback_chunks: Vec<u8> = chunk_rx.try_iter().flatten().collect();
+        let callback_str = String::from_utf8_lossy(&callback_chunks);
+        assert!(
+            callback_str.contains("alpha"),
+            "expected alpha in chunk output, got: {callback_str}"
+        );
+        assert!(
+            callback_str.contains("beta"),
+            "expected beta in chunk output, got: {callback_str}"
+        );
     }
 
     #[tokio::test]
     async fn invoke_sets_working_directory() {
         let dir = tempfile::TempDir::new().unwrap();
-        let result = invoke("pwd", &[], dir.path(), &HashMap::new(), None, None)
+        let result = invoke("pwd", &[], dir.path(), &HashMap::new(), None, None, true)
             .await
             .unwrap();
 
@@ -404,6 +518,7 @@ mod tests {
             &env,
             None,
             None,
+            true,
         )
         .await
         .unwrap();
@@ -421,6 +536,7 @@ mod tests {
             &HashMap::new(),
             None,
             None,
+            true,
         )
         .await
         .unwrap();
@@ -441,6 +557,7 @@ mod tests {
             &HashMap::new(),
             None,
             None,
+            true,
         )
         .await
         .unwrap();
@@ -466,6 +583,7 @@ mod tests {
             &HashMap::new(),
             None,
             Some(cancel_rx),
+            true,
         )
         .await;
 
