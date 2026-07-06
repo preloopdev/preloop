@@ -26,6 +26,10 @@ pub struct StepContext<'a> {
     pub cancelled: bool,
     /// stop-commands token: when set, all commands are suspended until `::{token}::` is seen.
     pub stop_commands_token: Option<String>,
+    /// Whether to translate container path to host path.
+    pub translate_container_path: bool,
+    /// Telemetry error messages collected during step execution.
+    pub telemetry_errors: Vec<String>,
 }
 
 /// A workflow annotation (error/warning/notice).
@@ -60,6 +64,7 @@ impl<'a> StepContext<'a> {
                 .get("ACTIONS_STEP_DEBUG")
                 .is_some_and(|v| is_debug(v))
             || job.env.get("RUNNER_DEBUG").is_some_and(|v| is_debug(v));
+        let translate_container_path = job.container_state.is_some();
         Self {
             job,
             step_id,
@@ -71,6 +76,8 @@ impl<'a> StepContext<'a> {
             log_lines: Vec::new(),
             cancelled: false,
             stop_commands_token: None,
+            translate_container_path,
+            telemetry_errors: Vec::new(),
         }
     }
 
@@ -124,19 +131,83 @@ impl<'a> StepContext<'a> {
 
     /// Log a line directly (no command parsing). Applies masking and problem matchers.
     pub fn log_raw(&mut self, line: &str) {
-        let masked = self.job.mask_secrets(line);
-        // P1.6: Feed through job-level problem matchers to produce annotations
-        let matched_annotations = self.job.matchers.match_line(&masked);
-        for ann in matched_annotations {
-            self.annotate(ann);
+        // Strip runner-controlled markers from user output to prevent injection
+        let line = if line.contains("##[start-action") || line.contains("##[end-action") {
+            line.replace("##[start-action", r##"##[\start-action"##)
+                .replace("##[end-action", r##"##[\end-action"##)
+        } else {
+            line.to_string()
+        };
+
+        // Capture git unsafe repository error messages to telemetry
+        if line.contains("fatal: unsafe repository") {
+            self.telemetry_errors.push(line.clone());
         }
-        let ts = crate::worker::job_runner::iso_now();
-        self.log_lines.push(format!("{ts} {masked}"));
+
+        let masked = self.job.mask_secrets(&line);
+
+        let workspace = self.job.workspace.clone().unwrap_or_default();
+        let repository = self
+            .job
+            .github_context_value("repository")
+            .and_then(|v| v.as_str().map(String::from))
+            .unwrap_or_default();
+        let server_url = self
+            .job
+            .github_context_value("server_url")
+            .and_then(|v| v.as_str().map(String::from))
+            .unwrap_or_default();
+
+        // P1.6: Feed through job-level problem matchers to produce annotations
+        let matched_annotations = self.job.matchers.match_line(
+            &masked,
+            &workspace,
+            &repository,
+            &server_url,
+            self.translate_container_path,
+        );
+
+        if !matched_annotations.is_empty() {
+            // Find the highest severity level to prefix the log line
+            let mut prefix = "##[error]";
+            for ann in &matched_annotations {
+                match ann.level {
+                    AnnotationLevel::Error => {
+                        prefix = "##[error]";
+                        break;
+                    }
+                    AnnotationLevel::Warning => {
+                        prefix = "##[warning]";
+                    }
+                    AnnotationLevel::Notice => {
+                        if prefix != "##[error]" && prefix != "##[warning]" {
+                            prefix = "##[notice]";
+                        }
+                    }
+                }
+            }
+
+            for ann in matched_annotations {
+                self.annotate(ann);
+            }
+
+            let ts = crate::worker::job_runner::iso_now();
+            self.log_lines.push(format!("{ts} {prefix}{masked}"));
+        } else {
+            let ts = crate::worker::job_runner::iso_now();
+            self.log_lines.push(format!("{ts} {masked}"));
+        }
     }
 
     /// Add an annotation.
-    pub fn annotate(&mut self, annotation: Annotation) {
+    ///
+    /// Official runner caps annotation messages at 4096 characters and limits
+    /// to 10 annotations per step.
+    pub fn annotate(&mut self, mut annotation: Annotation) {
         if self.annotations.len() < 10 {
+            if annotation.message.len() > 4096 {
+                annotation.message.truncate(4096);
+            }
             self.annotations.push(annotation);
         }
     }
@@ -165,9 +236,14 @@ impl<'a> StepContext<'a> {
     }
 
     /// Log a debug line if debug mode is active.
+    ///
+    /// Official runner splits multiline debug messages into separate log
+    /// entries, one per line.
     pub fn debug(&mut self, message: &str) {
         if self.debug {
-            self.log_raw(&format!("##[debug]{}", message));
+            for line in message.split('\n') {
+                self.log_raw(&format!("##[debug]{}", line));
+            }
         }
     }
 
@@ -348,5 +424,107 @@ mod tests {
             env.get("STATE_repository").map(String::as_str),
             Some("owner/repo")
         );
+    }
+    #[test]
+    fn log_raw_problem_matching_and_telemetry() {
+        let mut job = make_job();
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("matcher.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "problemMatcher": [{
+                "owner": "test-owner",
+                "pattern": [{
+                  "regexp": "^ERROR: (.*)$",
+                  "message": 1
+                }]
+              }]
+            }"#,
+        )
+        .unwrap();
+        job.matchers.add_from_file(&path).unwrap();
+
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+
+        // 1. Unsafe repository telemetry check
+        ctx.log("fatal: unsafe repository ('/github/workspace' is owned by someone else)");
+        assert_eq!(ctx.telemetry_errors.len(), 1);
+        assert!(ctx.telemetry_errors[0].contains("fatal: unsafe repository"));
+
+        // 2. Composite action marker stripping check
+        ctx.log("Some text ##[start-action display=fake;id=fake] more text");
+        let last_log = ctx.log_lines.last().unwrap();
+        assert!(last_log.contains("##[\\start-action"));
+
+        // 3. Problem matcher check
+        ctx.log("ERROR: compilation failed");
+        assert_eq!(ctx.annotations.len(), 1);
+        assert_eq!(ctx.annotations[0].message, "compilation failed");
+        let last_log = ctx.log_lines.last().unwrap();
+        assert!(last_log.contains("##[error]ERROR: compilation failed"));
+    }
+
+    // --- ExecutionContextL0 gap coverage ---
+
+    #[test]
+    fn annotation_message_trimmed_to_max_length() {
+        let mut job = make_job();
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        let long_msg = "x".repeat(5000);
+        ctx.annotate(Annotation {
+            level: AnnotationLevel::Error,
+            message: long_msg,
+            title: None,
+            file: None,
+            line: None,
+            end_line: None,
+            col: None,
+            end_column: None,
+        });
+        assert_eq!(ctx.annotations.len(), 1);
+        assert_eq!(ctx.annotations[0].message.len(), 4096);
+    }
+
+    #[test]
+    fn debug_splits_multiline_messages() {
+        let mut job = make_job();
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        ctx.debug = true;
+        ctx.debug("line1\nline2\nline3");
+        // Should produce 3 separate log entries
+        let debug_lines: Vec<_> = ctx
+            .log_lines
+            .iter()
+            .filter(|l| l.contains("##[debug]"))
+            .collect();
+        assert_eq!(debug_lines.len(), 3);
+        assert!(debug_lines[0].contains("##[debug]line1"));
+        assert!(debug_lines[1].contains("##[debug]line2"));
+        assert!(debug_lines[2].contains("##[debug]line3"));
+    }
+
+    #[test]
+    fn debug_single_line_unchanged() {
+        let mut job = make_job();
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        ctx.debug = true;
+        ctx.debug("single line");
+        let debug_lines: Vec<_> = ctx
+            .log_lines
+            .iter()
+            .filter(|l| l.contains("##[debug]"))
+            .collect();
+        assert_eq!(debug_lines.len(), 1);
+        assert!(debug_lines[0].contains("##[debug]single line"));
+    }
+
+    #[test]
+    fn debug_noop_when_disabled() {
+        let mut job = make_job();
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        ctx.debug = false;
+        ctx.debug("should not appear");
+        assert!(ctx.log_lines.is_empty());
     }
 }
