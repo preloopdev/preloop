@@ -481,3 +481,175 @@ async fn re_resolve_broker_url(http: &HttpClient, server_url: &str) -> Option<St
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- P1 broker listener gap coverage ---
+
+    #[test]
+    fn is_unauthorized_detects_401() {
+        let err = anyhow::Error::new(crate::client::http::HttpError::Status {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            body: "Unauthorized".to_string(),
+        });
+        assert!(is_unauthorized(&err));
+    }
+
+    #[test]
+    fn is_unauthorized_rejects_other_status() {
+        let err = anyhow::Error::new(crate::client::http::HttpError::Status {
+            status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            body: "error".to_string(),
+        });
+        assert!(!is_unauthorized(&err));
+    }
+
+    #[test]
+    fn is_unauthorized_rejects_non_http_error() {
+        let err = anyhow::anyhow!("network timeout");
+        assert!(!is_unauthorized(&err));
+    }
+
+    #[test]
+    fn is_session_expired_detects_404() {
+        let err = anyhow::Error::new(crate::client::http::HttpError::Status {
+            status: reqwest::StatusCode::NOT_FOUND,
+            body: "session not found".to_string(),
+        });
+        assert!(is_session_expired(&err));
+    }
+
+    #[test]
+    fn is_session_expired_detects_400() {
+        let err = anyhow::Error::new(crate::client::http::HttpError::Status {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            body: "bad session".to_string(),
+        });
+        assert!(is_session_expired(&err));
+    }
+
+    #[test]
+    fn is_session_expired_rejects_200() {
+        let err = anyhow::Error::new(crate::client::http::HttpError::Status {
+            status: reqwest::StatusCode::OK,
+            body: "ok".to_string(),
+        });
+        assert!(!is_session_expired(&err));
+    }
+
+    #[test]
+    fn parse_message_body_plaintext_object() {
+        let msg = serde_json::json!({
+            "body": {"runner_request_id": "abc-123", "run_service_url": "https://example.com"}
+        });
+        let body = parse_message_body(&msg, None).unwrap();
+        assert_eq!(
+            body.get("runner_request_id").unwrap().as_str().unwrap(),
+            "abc-123"
+        );
+    }
+
+    #[test]
+    fn parse_message_body_plaintext_string() {
+        let msg = serde_json::json!({
+            "body": "{\"key\": \"value\"}"
+        });
+        let body = parse_message_body(&msg, None).unwrap();
+        assert_eq!(body.get("key").unwrap().as_str().unwrap(), "value");
+    }
+
+    #[test]
+    fn parse_message_body_empty_is_error() {
+        let msg = serde_json::json!({"body": ""});
+        // Empty string is not valid JSON — parse_message_body should fail
+        assert!(parse_message_body(&msg, None).is_err());
+    }
+
+    #[test]
+    fn parse_message_body_no_body_field() {
+        let msg = serde_json::json!({"messageType": "unknown"});
+        let body = parse_message_body(&msg, None).unwrap();
+        assert!(body.is_object() || body.is_null());
+    }
+
+    #[test]
+    fn extract_session_key_no_encryption_key() {
+        let session = serde_json::json!({"sessionId": "abc"});
+        let config = test_config();
+        assert!(extract_session_key_if_present(&session, &config).is_none());
+    }
+
+    #[test]
+    fn extract_session_key_empty_value() {
+        let session = serde_json::json!({
+            "sessionId": "abc",
+            "encryptionKey": {"value": "", "encrypted": false}
+        });
+        let config = test_config();
+        assert!(extract_session_key_if_present(&session, &config).is_none());
+    }
+
+    #[test]
+    fn extract_session_key_unencrypted_returns_raw() {
+        use base64::Engine;
+        let raw_key = vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&raw_key);
+        let session = serde_json::json!({
+            "sessionId": "abc",
+            "encryptionKey": {"value": b64, "encrypted": false}
+        });
+        let config = test_config();
+        let key = extract_session_key_if_present(&session, &config).unwrap();
+        assert_eq!(key, raw_key);
+    }
+
+    /// Helper: build a minimal RunnerConfig for tests
+    fn test_config() -> RunnerConfig {
+        RunnerConfig {
+            settings: crate::settings::RunnerSettings {
+                agent_id: 1,
+                agent_name: "test".to_string(),
+                pool_id: 1,
+                pool_name: "Default".to_string(),
+                server_url: "https://example.com".to_string(),
+                git_hub_url: "https://github.com/test/repo".to_string(),
+                work_folder: "_work".to_string(),
+                is_hosted: false,
+                runner_group_id: None,
+                runner_group_name: None,
+                ephemeral: false,
+                is_hosted_server: false,
+                use_v2_flow: true,
+                server_url_v2: None,
+                disable_update: false,
+                skip_session_recover: false,
+                monitor_socket_address: None,
+                use_runner_admin_flow: false,
+            },
+            credentials: crate::settings::CredentialData {
+                scheme: "OAuth".to_string(),
+                data: {
+                    let mut m = serde_json::Map::new();
+                    m.insert("clientId".into(), serde_json::json!("test-id"));
+                    m.insert(
+                        "authorizationUrl".into(),
+                        serde_json::json!("https://vstoken.example.com"),
+                    );
+                    m
+                },
+            },
+            rsa_params: crate::settings::RsaParameters {
+                d: "d".to_string(),
+                dp: "dp".to_string(),
+                dq: "dq".to_string(),
+                exponent: "AQAB".to_string(),
+                inverse_q: "iq".to_string(),
+                modulus: "mod".to_string(),
+                p: "p".to_string(),
+                q: "q".to_string(),
+            },
+        }
+    }
+}
