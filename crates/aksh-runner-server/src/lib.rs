@@ -890,6 +890,7 @@ pub(crate) async fn submit_run_inner(
         "repository": submission.repository,
         "ref": submission.git_ref,
         "run_id": run_id.to_string(),
+        "workflow": workflow.name.clone().unwrap_or_default(),
         "server_url": "http://localhost"
     });
 
@@ -5386,7 +5387,7 @@ jobs:
             Method::POST,
             "/api/v1/runs",
             json!({
-                "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo current\n",
+                "workflow_yaml": "name: Current Runner Verification\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo current\n",
                 "event": "push",
                 "payload": {"ref": "refs/heads/main", "commits": []},
                 "repository": "preloopdev/aksh",
@@ -5428,6 +5429,16 @@ jobs:
             format!("http://127.0.0.1:9090/broker/{runner_id}/")
         );
         assert!(acquired["contextData"]["github"].is_object());
+        let github_context_json = serde_json::to_string(&acquired["contextData"]["github"])
+            .expect("github context should serialize");
+        assert!(
+            github_context_json.contains("\"workflow\""),
+            "github context missing workflow key: {github_context_json}"
+        );
+        assert!(
+            github_context_json.contains("Current Runner Verification"),
+            "github context missing workflow name: {github_context_json}"
+        );
         assert!(
             acquired["steps"].as_array().unwrap().iter().any(|step| {
                 step["inputs"]["script"].as_str() == Some("echo current")
