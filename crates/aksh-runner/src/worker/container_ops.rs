@@ -1111,39 +1111,24 @@ mod tests {
     }
 
     #[test]
-    fn proxy_env_injection() {
-        let user_env = HashMap::new();
+    fn push_docker_create_env_non_empty_value() {
         let mut args = Vec::new();
-
-        // Set a proxy env var for the test
-        std::env::set_var("HTTP_PROXY", "http://proxy.test:8080");
-        inject_proxy_env(&mut args, &user_env);
-        std::env::remove_var("HTTP_PROXY");
-
-        // Should have injected HTTP_PROXY and http_proxy
-        assert!(args
-            .windows(2)
-            .any(|w| w[0] == "-e" && w[1].starts_with("HTTP_PROXY=")));
-        assert!(args
-            .windows(2)
-            .any(|w| w[0] == "-e" && w[1].starts_with("http_proxy=")));
+        push_docker_create_env(&mut args, "HTTP_PROXY", "http://proxy.test:8080");
+        assert_eq!(args, vec!["-e", "HTTP_PROXY=http://proxy.test:8080"]);
     }
 
     #[test]
-    fn proxy_env_not_injected_when_user_sets() {
-        let user_env = HashMap::from([
-            ("HTTP_PROXY".to_string(), "user-proxy".to_string()),
-            ("http_proxy".to_string(), "user-proxy".to_string()),
-        ]);
+    fn push_docker_create_env_empty_value_inherits() {
         let mut args = Vec::new();
+        push_docker_create_env(&mut args, "HTTP_PROXY", "");
+        // Empty value → just key (inherit from host)
+        assert_eq!(args, vec!["-e", "HTTP_PROXY"]);
+    }
 
-        std::env::set_var("HTTP_PROXY", "http://proxy.test:8080");
-        inject_proxy_env(&mut args, &user_env);
-        std::env::remove_var("HTTP_PROXY");
-
-        // Should NOT have injected because user already set it
-        assert!(!args
-            .windows(2)
-            .any(|w| w[0] == "-e" && w[1].contains("proxy.test")));
+    #[test]
+    fn push_docker_inherited_env_key_only() {
+        let mut args = Vec::new();
+        push_docker_inherited_env(&mut args, "SOME_VAR");
+        assert_eq!(args, vec!["-e", "SOME_VAR"]);
     }
 }
