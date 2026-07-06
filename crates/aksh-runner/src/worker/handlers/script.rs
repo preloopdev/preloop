@@ -16,7 +16,6 @@ pub async fn run_script(
     working_directory: &str,
     ctx: &mut StepContext<'_>,
     cancel_rx: Option<tokio::sync::watch::Receiver<bool>>,
-    live_logs: Option<&std::sync::Arc<crate::worker::live_logs::LiveLogQueue>>,
 ) -> Result<()> {
     // Write script to temp file
     let temp_dir = Path::new(working_directory)
@@ -53,7 +52,11 @@ pub async fn run_script(
         &args.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
         Path::new(working_directory),
         &env,
-        crate::worker::live_logs::process_line_callback(&ctx.step_id, &ctx.job.live_masks, live_logs),
+        crate::worker::live_logs::process_line_callback(
+            &ctx.step_id,
+            &ctx.job.live_masks,
+            ctx.job.live_logs.as_ref(),
+        ),
         cancel_rx,
     )
     .await?;
@@ -87,7 +90,6 @@ pub async fn run_script_in_container(
     container_id: &str,
     ctx: &mut StepContext<'_>,
     cancel_rx: Option<tokio::sync::watch::Receiver<bool>>,
-    live_logs: Option<&std::sync::Arc<crate::worker::live_logs::LiveLogQueue>>,
 ) -> Result<()> {
     // Write script to host temp dir (mounted as /__w/_temp in container)
     let temp_dir = Path::new(working_directory)
@@ -166,7 +168,11 @@ pub async fn run_script_in_container(
         &container_workdir,
         &env,
         cancel_rx,
-        crate::worker::live_logs::process_line_callback(&ctx.step_id, &ctx.job.live_masks, live_logs),
+        crate::worker::live_logs::process_line_callback(
+            &ctx.step_id,
+            &ctx.job.live_masks,
+            ctx.job.live_logs.as_ref(),
+        ),
     )
     .await?;
 
