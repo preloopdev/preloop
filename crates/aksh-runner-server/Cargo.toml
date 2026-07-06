@@ -20,6 +20,7 @@ aksh-cache = { path = "../aksh-cache" }
 aksh-gha-parser = { path = "../aksh-gha-parser" }
 aksh-gha-expressions = { path = "../aksh-gha-expressions" }
 aksh-gha-protocol = { path = "../aksh-gha-protocol" }
+serde_urlencoded = "0.7"
 serde.workspace = true
 serde_json.workspace = true
 futures.workspace = true
