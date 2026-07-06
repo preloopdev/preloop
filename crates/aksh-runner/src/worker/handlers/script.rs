@@ -292,4 +292,46 @@ mod tests {
         assert_eq!(prog, "perl");
         assert!(args[0].ends_with(".sh"));
     }
+
+    // --- P0 container step host gap coverage ---
+
+    #[test]
+    fn resolve_sh_shell_default() {
+        let dir = std::path::PathBuf::from("/tmp");
+        let id = uuid::Uuid::nil();
+        let (path, prog, _args) = resolve_shell(Some("sh"), &dir, &id).unwrap();
+        assert_eq!(prog, "sh");
+        assert!(path.to_string_lossy().ends_with(".sh"));
+    }
+
+    #[test]
+    fn resolve_python_shell() {
+        let dir = std::path::PathBuf::from("/tmp");
+        let id = uuid::Uuid::nil();
+        let (path, prog, args) = resolve_shell(Some("python3 {0}"), &dir, &id).unwrap();
+        assert_eq!(prog, "python3");
+        assert!(args[0].ends_with(".sh"));
+        assert!(path.to_string_lossy().ends_with(".sh"));
+    }
+
+    #[test]
+    fn resolve_default_shell_is_bash() {
+        let dir = std::path::PathBuf::from("/tmp");
+        let id = uuid::Uuid::nil();
+        let (_, prog, args) = resolve_shell(None, &dir, &id).unwrap();
+        assert_eq!(prog, "bash");
+        assert!(args.contains(&"--noprofile".to_string()));
+        assert!(args.contains(&"--norc".to_string()));
+        assert!(args.contains(&"-e".to_string()));
+    }
+
+    #[test]
+    fn resolve_pwsh_shell() {
+        let dir = std::path::PathBuf::from("/tmp");
+        let id = uuid::Uuid::nil();
+        let (path, prog, args) = resolve_shell(Some("pwsh"), &dir, &id).unwrap();
+        assert_eq!(prog, "pwsh");
+        assert!(path.to_string_lossy().ends_with(".ps1"));
+        assert!(args.contains(&"-command".to_string()));
+    }
 }
