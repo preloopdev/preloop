@@ -13,6 +13,7 @@ pub mod file_commands;
 pub mod handlers;
 pub mod job_extension;
 pub mod job_runner;
+pub mod live_logs;
 pub mod matchers;
 pub mod server_queue;
 pub mod steps_runner;
