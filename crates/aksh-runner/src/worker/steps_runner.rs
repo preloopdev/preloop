@@ -619,20 +619,79 @@ fn should_run_step(step: &Step, job: &JobContext) -> Result<bool> {
         Some(c) if !c.is_empty() => c.as_str(),
         _ => "success()",
     };
+    let stripped = aksh_gha_expressions::trim_expression_markers(condition);
+    let effective_condition = if contains_status_check_function(stripped) {
+        stripped.to_string()
+    } else {
+        format!("success() && ({stripped})")
+    };
 
     let ctx = job.build_expression_context();
-    match aksh_gha_expressions::eval_bool(condition, &ctx) {
+    match aksh_gha_expressions::eval_bool(&effective_condition, &ctx) {
         Ok(result) => Ok(result),
-        Err(original) => {
-            // Try stripping ${{ }} markers (conditions sometimes come pre-wrapped)
-            let stripped = aksh_gha_expressions::trim_expression_markers(condition);
+        Err(effective_error) => {
             if stripped == condition {
-                Err(original.into())
+                Err(effective_error.into())
             } else {
-                aksh_gha_expressions::eval_bool(stripped, &ctx).map_err(Into::into)
+                aksh_gha_expressions::eval_bool(
+                    &if contains_status_check_function(condition) {
+                        condition.to_string()
+                    } else {
+                        format!("success() && ({condition})")
+                    },
+                    &ctx,
+                )
+                .map_err(Into::into)
             }
         }
     }
+}
+
+fn contains_status_check_function(condition: &str) -> bool {
+    let mut chars = condition.char_indices().peekable();
+    while let Some((_, ch)) = chars.next() {
+        if ch == '\'' || ch == '"' {
+            let quote = ch;
+            while let Some((_, quoted)) = chars.next() {
+                if quoted == '\\' {
+                    let _ = chars.next();
+                } else if quoted == quote {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if ch == '_' || ch.is_ascii_alphabetic() {
+            let mut ident = String::from(ch);
+            while let Some((_, next)) = chars.peek().copied() {
+                if next == '_' || next.is_ascii_alphanumeric() {
+                    ident.push(next);
+                    let _ = chars.next();
+                } else {
+                    break;
+                }
+            }
+
+            while let Some((_, whitespace)) = chars.peek().copied() {
+                if whitespace.is_whitespace() {
+                    let _ = chars.next();
+                } else {
+                    break;
+                }
+            }
+
+            if matches!(
+                ident.to_ascii_lowercase().as_str(),
+                "success" | "failure" | "cancelled" | "always"
+            ) && chars.peek().is_some_and(|(_, next)| *next == '(')
+            {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 /// Execute a single step, threading cancel_rx to the process invoker.
@@ -895,6 +954,20 @@ mod tests {
         assert!(!err.to_string().is_empty());
     }
 
+    #[test]
+    fn status_check_function_detection_ignores_string_literals() {
+        assert!(contains_status_check_function(
+            "failure() && steps.build.outcome == 'failure'"
+        ));
+        assert!(contains_status_check_function("${{ always() }}"));
+        assert!(!contains_status_check_function(
+            "steps.build.outcome == 'failure'"
+        ));
+        assert!(!contains_status_check_function(
+            "contains('failure()', steps.build.outcome)"
+        ));
+    }
+
     #[tokio::test]
     async fn run_steps_marks_condition_error_as_failure() {
         let dir = TempDir::new().unwrap();
@@ -1086,6 +1159,65 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn run_steps_implicitly_gates_conditions_with_success() {
+        let dir = TempDir::new().unwrap();
+        let mut job = JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+        let (_tx, cancel_rx) = watch::channel(false);
+
+        let mut fail = test_step("fail", None);
+        fail.step_type = StepType::Script {
+            script: "exit 1".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+
+        let implicit_success = test_step(
+            "implicit_success",
+            Some("steps.fail.outcome == 'Failure' || steps.fail.outcome == 'failure'"),
+        );
+
+        let mut explicit_failure = test_step(
+            "explicit_failure",
+            Some(
+                "failure() && (steps.fail.outcome == 'Failure' || steps.fail.outcome == 'failure')",
+            ),
+        );
+        explicit_failure.step_type = StepType::Script {
+            script: "echo explicit-failure-ran".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+
+        let result = run_steps(
+            &[fail, implicit_success, explicit_failure],
+            &mut job,
+            dir.path().to_str().unwrap(),
+            cancel_rx,
+            queue,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "Failed");
+        assert_eq!(
+            job.steps.get("implicit_success").unwrap().conclusion,
+            "Skipped"
+        );
+        assert_eq!(
+            job.steps.get("explicit_failure").unwrap().conclusion,
+            "Success"
+        );
+    }
     #[test]
     fn step_summary_content_uses_job_secret_masking() {
         let job = JobContext::new(
