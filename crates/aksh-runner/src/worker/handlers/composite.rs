@@ -24,8 +24,12 @@ pub async fn run_composite_action(
     workspace: &str,
     ctx: &mut StepContext<'_>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
+    live_logs: Option<&std::sync::Arc<crate::worker::live_logs::LiveLogQueue>>,
 ) -> Result<()> {
-    run_composite_action_inner(manifest, action_dir, with, workspace, ctx, 0, cancel_rx).await
+    run_composite_action_inner(
+        manifest, action_dir, with, workspace, ctx, 0, cancel_rx, live_logs,
+    )
+    .await
 }
 
 fn run_composite_action_inner<'a>(
@@ -36,6 +40,7 @@ fn run_composite_action_inner<'a>(
     ctx: &'a mut StepContext<'_>,
     depth: u32,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
+    live_logs: Option<&'a std::sync::Arc<crate::worker::live_logs::LiveLogQueue>>,
 ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
         if depth >= MAX_COMPOSITE_DEPTH {
@@ -231,6 +236,7 @@ fn run_composite_action_inner<'a>(
                     workspace,
                     ctx,
                     Some(cancel_rx.clone()),
+                    live_logs,
                 )
                 .await;
 
@@ -263,6 +269,7 @@ fn run_composite_action_inner<'a>(
                                 ctx,
                                 depth + 1,
                                 cancel_rx.clone(),
+                                live_logs,
                             )
                             .await
                             .map(|_| "Success".to_string())
@@ -273,14 +280,22 @@ fn run_composite_action_inner<'a>(
                             workspace,
                             ctx,
                             cancel_rx.clone(),
+                            live_logs,
                         )
                         .await
                         .map(|_| "Success".to_string()),
                     }
                 } else {
-                    super::action::run_action(uses, &inner_with, workspace, ctx, cancel_rx.clone())
-                        .await
-                        .map(|_| "Success".to_string())
+                    super::action::run_action(
+                        uses,
+                        &inner_with,
+                        workspace,
+                        ctx,
+                        cancel_rx.clone(),
+                        live_logs,
+                    )
+                    .await
+                    .map(|_| "Success".to_string())
                 }
             } else {
                 Ok("Skipped".to_string())
@@ -463,6 +478,7 @@ mod tests {
             workspace.path().to_str().unwrap(),
             &mut ctx,
             cancel_rx,
+            None,
         )
         .await
         .unwrap();
@@ -506,6 +522,7 @@ mod tests {
             workspace.path().to_str().unwrap(),
             &mut ctx,
             cancel_rx,
+            None,
         )
         .await
         .unwrap();
@@ -549,6 +566,7 @@ mod tests {
             workspace.path().to_str().unwrap(),
             &mut ctx,
             cancel_rx,
+            None,
         )
         .await
         .unwrap();
@@ -589,6 +607,7 @@ mod tests {
             workspace.path().to_str().unwrap(),
             &mut ctx,
             cancel_rx,
+            None,
         )
         .await
         .unwrap();
@@ -617,6 +636,7 @@ mod tests {
             &mut ctx,
             MAX_COMPOSITE_DEPTH,
             cancel_rx,
+            None,
         )
         .await
         .unwrap_err();
@@ -666,6 +686,7 @@ runs:
             workspace.path().to_str().unwrap(),
             &mut ctx,
             cancel_rx,
+            None,
         )
         .await
         .unwrap();
@@ -713,6 +734,7 @@ runs:
             workspace.path().to_str().unwrap(),
             &mut ctx,
             cancel_rx,
+            None,
         )
         .await
         .unwrap();
