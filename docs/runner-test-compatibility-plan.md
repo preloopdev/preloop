@@ -26,20 +26,19 @@ The P0/P1 runner slice from this plan has been implemented or classified through
 
 - **Live GitHub primary gate using `aksh-runner` against real GitHub Actions:** P0 step execution (`28754418659`, success), P0 failure conditions (`28754419325`, expected failure), P0 file commands (`28755293879`, success), P0 Docker/container verification (`28755911596`, success on Linux smolvm), P0 cancellation (`28756327702`, cancelled with `cancelled()`/`always()` markers observed in runner logs), P1 expressions (`28756574650`, success), P1 listener/config (`28756828143`, success), P1 process/runtime (`28756827413`, success), and P1 protocol/logging (`28756578118`, success).
 - **Local aksh control-plane gate using `aksh-runner` + `aksh-runner-server`:** `aksh-conformance runner-e2e` passed for `p0-step-execution.yml`, `p0-failure-conditions.yml`, `p0-file-commands.yml`, `p1-expressions.yml`, `p1-listener-config.yml`, `p1-process-runtime.yml`, and `p1-protocol.yml`, recording flows under `/tmp/aksh-*-flows.jsonl`. A previously found local control-plane gap where submitted jobs omitted `github.workflow`/`GITHUB_WORKFLOW` was fixed by propagating the workflow name into the job message context; the fixed listener run recorded `/tmp/aksh-p1-listener-config-fixed-flows.jsonl`. The cancel workflow needs an external GitHub cancellation signal and the Docker workflow needs a Linux Docker daemon, so those remain live-GitHub/Linux-smolvm-only.
-- **Unit and focused runner coverage:** step execution semantics, file commands, matchers, action manifest factory, composite actions, Docker action handler, container ops, process cancellation, config/settings, and protocol DTO surfaces have Rust coverage mapped in `docs/test-coverage.md`. Current runner library verification is `cargo test -p aksh-runner --lib --quiet` → 140 passed.
+- **Unit and focused runner coverage:** step execution semantics, file commands, matchers, action manifest factory, composite actions, Docker action handler, container ops, process cancellation, config/settings, and protocol DTO surfaces have Rust coverage mapped in `docs/test-coverage.md`. Current runner library verification is `cargo test -p aksh-runner --lib --quiet` → 280 passed.
 
-## Current P0/P1 work left
+## Current work left
 
-The detailed baseline sections below are retained as the original gap-analysis input. They are useful for traceability to the official C# test inventory, but they are not a live remaining-work checklist after the 2026-07-05 implementation and live-verification pass. The current remaining work is:
+The P0/P1 runner slice in this plan is closed. The detailed baseline sections below are retained only for traceability to the official C# test inventory; they are not a live remaining-work checklist.
 
-1. **Remote action ecosystem:** implement and live-test remote action download/cache/resolution, auth headers, package layout, cache reuse, and `actions/checkout@v4`.
-2. **Composite action parity:** implement nested `uses:`, composite outputs, input/default breadth, recursion/depth limits, failure/continue-on-error behavior, and official marker/display-name parity.
-3. **Service containers and full container lifecycle:** implement service DNS/name resolution, health waits, network attach/detach, cancellation cleanup, port mapping parity, and container Node runtime selection.
-4. **OutputManager and matcher deep parity:** complete multi-pattern/loop matchers, matcher timeout/reset/clobber/prepend ordering, exact command passthrough, masking order, and step-summary upload/scrubbing edge cases.
-5. **Matrix/needs/fanout breadth:** cover `strategy.matrix`, `needs.<job>.outputs`, fail-fast/max-parallel, and local aksh server payload parity for those contexts.
-6. **Listener lifecycle hardening:** cover reconnect/backoff, broker migration URL, duplicate/stale jobs, remove/replace/ephemeral runner lifecycle, invalid URL/token handling, and error throttling.
-7. **Process/runtime long tail:** cover process-tree kill, cancellation races, proxy env/credential masking/bypass behavior, workspace tracking/cleanup, path search, and filesystem retry/delete utilities.
-8. **Run-service/client error-path parity:** cover empty success responses, preserved error bodies, launch-client behavior, DTO conversion edge cases, and annotation edge cases.
+Actually remaining from this document:
+
+1. **P2 — DAP / debugging:** not implemented and out of scope for the P0/P1 runner-compatibility pass.
+2. **P2 — Background / snapshot / aux features:** not implemented and out of scope for the P0/P1 runner-compatibility pass.
+3. **P3 — Official runner infrastructure:** deferred or not applicable for current macOS/Linux runner correctness work, including Windows service control, self-update, official constant generation, paging logger, and .NET bootstrapper behavior.
+
+If any previously classified `NOT_APPLICABLE` item becomes a product requirement, promote it into a new plan with a concrete runner-facing acceptance test instead of treating the archived gap-analysis bullets below as open work.
 
 ## Compatibility scoring
 
