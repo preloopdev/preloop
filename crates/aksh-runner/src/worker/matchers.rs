@@ -35,6 +35,8 @@ pub struct PatternMatch {
     pub file: Option<String>,
     pub line: Option<String>,
     pub column: Option<String>,
+    pub end_line: Option<String>,
+    pub end_column: Option<String>,
     pub severity: Option<String>,
     pub code: Option<String>,
     pub message: Option<String>,
@@ -63,6 +65,12 @@ impl PatternMatch {
         let column = running_match
             .and_then(|r| r.column.clone())
             .or_else(|| get_group_value(captures, pattern.column));
+        let end_line = running_match
+            .and_then(|r| r.end_line.clone())
+            .or_else(|| get_group_value(captures, pattern.end_line));
+        let end_column = running_match
+            .and_then(|r| r.end_column.clone())
+            .or_else(|| get_group_value(captures, pattern.end_column));
 
         let mut severity =
             running_match
@@ -100,6 +108,8 @@ impl PatternMatch {
             file,
             line,
             column,
+            end_line,
+            end_column,
             severity,
             code,
             message,
@@ -125,6 +135,10 @@ pub struct MatcherPattern {
     pub line: Option<usize>,
     #[serde(default)]
     pub column: Option<usize>,
+    #[serde(default, rename = "endLine")]
+    pub end_line: Option<usize>,
+    #[serde(default, rename = "endColumn")]
+    pub end_column: Option<usize>,
     pub severity: Option<SeveritySpec>,
     #[serde(default)]
     pub message: Option<usize>,
@@ -491,6 +505,8 @@ fn validate_matcher_definition(def: &MatcherDefinition) -> Result<()> {
         check_range("file", pattern.file)?;
         check_range("line", pattern.line)?;
         check_range("column", pattern.column)?;
+        check_range("endLine", pattern.end_line)?;
+        check_range("endColumn", pattern.end_column)?;
         check_range("code", pattern.code)?;
         check_range("message", pattern.message)?;
         check_range("fromPath", pattern.from_path)?;
@@ -543,6 +559,8 @@ fn convert_to_annotation(
 
     let line = pm.line.as_deref().and_then(|s| s.parse().ok());
     let col = pm.column.as_deref().and_then(|s| s.parse().ok());
+    let end_line = pm.end_line.as_deref().and_then(|s| s.parse().ok());
+    let end_column = pm.end_column.as_deref().and_then(|s| s.parse().ok());
 
     Some(crate::worker::execution_context::Annotation {
         level,
@@ -550,9 +568,9 @@ fn convert_to_annotation(
         title: None,
         file: None,
         line,
-        end_line: None,
+        end_line,
         col,
-        end_column: None,
+        end_column,
     })
 }
 
@@ -1086,5 +1104,129 @@ mod tests {
         let mut registry = MatcherRegistry::new();
         let err = registry.add_from_file(&path).unwrap_err();
         assert!(err.to_string().contains("pattern is required"));
+    }
+
+    // --- P0 matcher gap coverage ---
+
+    #[test]
+    fn matcher_owner_clobber_replaces_old() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path1 = dir.path().join("matcher1.json");
+        std::fs::write(
+            &path1,
+            r#"{
+              "problemMatcher": [{
+                "owner": "same-owner",
+                "pattern": [{
+                  "regexp": "^OLD (.*)$",
+                  "message": 1
+                }]
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        let path2 = dir.path().join("matcher2.json");
+        std::fs::write(
+            &path2,
+            r#"{
+              "problemMatcher": [{
+                "owner": "same-owner",
+                "pattern": [{
+                  "regexp": "^NEW (.*)$",
+                  "message": 1
+                }]
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        let mut registry = MatcherRegistry::new();
+        registry.add_from_file(&path1).unwrap();
+        assert_eq!(registry.match_line("OLD first", "", "", "", false).len(), 1);
+
+        // Adding same owner replaces
+        registry.add_from_file(&path2).unwrap();
+        assert!(registry
+            .match_line("OLD first", "", "", "", false)
+            .is_empty());
+        assert_eq!(
+            registry.match_line("NEW second", "", "", "", false).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn matcher_dynamic_severity_from_regex_group() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("matcher.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "problemMatcher": [{
+                "owner": "dyn-sev",
+                "pattern": [{
+                  "regexp": "^(error|warning|notice): (.*)$",
+                  "severity": 1,
+                  "message": 2
+                }]
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        let mut registry = MatcherRegistry::new();
+        registry.add_from_file(&path).unwrap();
+
+        let warns = registry.match_line("warning: deprecated API", "", "", "", false);
+        assert_eq!(warns.len(), 1);
+        assert_eq!(warns[0].level, AnnotationLevel::Warning);
+        assert_eq!(warns[0].message, "deprecated API");
+
+        let errors = registry.match_line("error: compilation failed", "", "", "", false);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].level, AnnotationLevel::Error);
+
+        let notices = registry.match_line("notice: FYI", "", "", "", false);
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].level, AnnotationLevel::Notice);
+    }
+
+    #[test]
+    fn matcher_captures_end_line_and_end_column() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("matcher.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "problemMatcher": [{
+                "owner": "range",
+                "pattern": [{
+                  "regexp": "^(.+):(\\d+):(\\d+)-(\\d+):(\\d+): (.*)$",
+                  "file": 1,
+                  "line": 2,
+                  "column": 3,
+                  "endLine": 4,
+                  "endColumn": 5,
+                  "message": 6,
+                  "severity": "warning"
+                }]
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        let mut registry = MatcherRegistry::new();
+        registry.add_from_file(&path).unwrap();
+
+        let anns = registry.match_line("src/lib.rs:10:5-12:20: unused variable", "", "", "", false);
+        assert_eq!(anns.len(), 1);
+        assert_eq!(anns[0].file.as_deref(), Some("src/lib.rs"));
+        assert_eq!(anns[0].line, Some(10));
+        assert_eq!(anns[0].col, Some(5));
+        assert_eq!(anns[0].end_line, Some(12));
+        assert_eq!(anns[0].end_column, Some(20));
+        assert_eq!(anns[0].message, "unused variable");
+        assert_eq!(anns[0].level, AnnotationLevel::Warning);
     }
 }
