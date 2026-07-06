@@ -200,8 +200,14 @@ impl<'a> StepContext<'a> {
     }
 
     /// Add an annotation.
-    pub fn annotate(&mut self, annotation: Annotation) {
+    ///
+    /// Official runner caps annotation messages at 4096 characters and limits
+    /// to 10 annotations per step.
+    pub fn annotate(&mut self, mut annotation: Annotation) {
         if self.annotations.len() < 10 {
+            if annotation.message.len() > 4096 {
+                annotation.message.truncate(4096);
+            }
             self.annotations.push(annotation);
         }
     }
@@ -230,9 +236,14 @@ impl<'a> StepContext<'a> {
     }
 
     /// Log a debug line if debug mode is active.
+    ///
+    /// Official runner splits multiline debug messages into separate log
+    /// entries, one per line.
     pub fn debug(&mut self, message: &str) {
         if self.debug {
-            self.log_raw(&format!("##[debug]{}", message));
+            for line in message.split('\n') {
+                self.log_raw(&format!("##[debug]{}", line));
+            }
         }
     }
 
@@ -423,5 +434,68 @@ mod tests {
         assert_eq!(ctx.annotations[0].message, "compilation failed");
         let last_log = ctx.log_lines.last().unwrap();
         assert!(last_log.contains("##[error]ERROR: compilation failed"));
+    }
+
+    // --- ExecutionContextL0 gap coverage ---
+
+    #[test]
+    fn annotation_message_trimmed_to_max_length() {
+        let mut job = make_job();
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        let long_msg = "x".repeat(5000);
+        ctx.annotate(Annotation {
+            level: AnnotationLevel::Error,
+            message: long_msg,
+            title: None,
+            file: None,
+            line: None,
+            end_line: None,
+            col: None,
+            end_column: None,
+        });
+        assert_eq!(ctx.annotations.len(), 1);
+        assert_eq!(ctx.annotations[0].message.len(), 4096);
+    }
+
+    #[test]
+    fn debug_splits_multiline_messages() {
+        let mut job = make_job();
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        ctx.debug = true;
+        ctx.debug("line1\nline2\nline3");
+        // Should produce 3 separate log entries
+        let debug_lines: Vec<_> = ctx
+            .log_lines
+            .iter()
+            .filter(|l| l.contains("##[debug]"))
+            .collect();
+        assert_eq!(debug_lines.len(), 3);
+        assert!(debug_lines[0].contains("##[debug]line1"));
+        assert!(debug_lines[1].contains("##[debug]line2"));
+        assert!(debug_lines[2].contains("##[debug]line3"));
+    }
+
+    #[test]
+    fn debug_single_line_unchanged() {
+        let mut job = make_job();
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        ctx.debug = true;
+        ctx.debug("single line");
+        let debug_lines: Vec<_> = ctx
+            .log_lines
+            .iter()
+            .filter(|l| l.contains("##[debug]"))
+            .collect();
+        assert_eq!(debug_lines.len(), 1);
+        assert!(debug_lines[0].contains("##[debug]single line"));
+    }
+
+    #[test]
+    fn debug_noop_when_disabled() {
+        let mut job = make_job();
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        ctx.debug = false;
+        ctx.debug("should not appear");
+        assert!(ctx.log_lines.is_empty());
     }
 }
