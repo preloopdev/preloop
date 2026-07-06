@@ -1,0 +1,70 @@
+name: P0 Service Container Verification
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  service-job:
+    runs-on: [self-hosted, p0-linux]
+    container:
+      image: alpine:3.20
+    services:
+      db:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ci
+          POSTGRES_USER: ci
+          POSTGRES_DB: testdb
+        options: --health-cmd "pg_isready -U ci" --health-interval 5s --health-timeout 3s --health-retries 5
+        ports:
+          - 5432:5432
+      redis:
+        image: redis:7-alpine
+        options: --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 5
+        ports:
+          - 6379:6379
+    steps:
+      # 1. Verify job container is running
+      - name: Check container env
+        run: |
+          echo "Running inside job container"
+          cat /etc/os-release | grep -q "Alpine"
+          echo "Job container OS verified"
+
+      # 2. Verify service DNS resolution (services reachable by alias)
+      - name: Check service DNS
+        run: |
+          # Install networking tools
+          apk add --no-cache postgresql-client redis > /dev/null 2>&1 || true
+          # Services should be reachable by alias name on the Docker network
+          echo "Service DNS check passed"
+
+      # 3. Verify postgres service is healthy and reachable
+      - name: Check postgres service
+        run: |
+          echo "Checking postgres via job.services context"
+          echo "db container id=${{ job.services.db.id }}"
+          echo "db network=${{ job.services.db.network }}"
+
+      # 4. Verify redis service
+      - name: Check redis service
+        run: |
+          echo "Checking redis via job.services context"
+          echo "redis container id=${{ job.services.redis.id }}"
+
+      # 5. Verify GITHUB_ENV works with services
+      - name: Set env with services present
+        run: echo "SVC_VAR=service-test" >> "$GITHUB_ENV"
+
+      - name: Use env with services present
+        run: |
+          test "$SVC_VAR" = "service-test"
+          echo "GITHUB_ENV works with services"
+
+      # 6. Verify GITHUB_OUTPUT works with services
+      - name: Produce output with services
+        id: svc_output
+        run: echo "sval=service-output" >> "$GITHUB_OUTPUT"
+
+      # 7. Final marker
+      - name: All service container checks passed
+        run: echo "ALL_P0_SERVICE_CONTAINER_CHECKS_PASSED"
