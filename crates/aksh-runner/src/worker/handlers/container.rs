@@ -47,6 +47,10 @@ pub async fn run_docker_action_from_manifest(
         let tag = format!("action-{}", uuid::Uuid::new_v4());
 
         info!("Building docker action from {}", dockerfile.display());
+        let ctx_ref = &*ctx;
+        let on_chunk = Box::new(move |chunk: &[u8]| {
+            ctx_ref.write_chunk(chunk);
+        });
 
         let build_result = process::invoke(
             "docker",
@@ -60,19 +64,11 @@ pub async fn run_docker_action_from_manifest(
             ],
             Path::new(workspace),
             &std::collections::HashMap::new(),
-            crate::worker::live_logs::process_line_callback(
-                &ctx.step_id,
-                &ctx.job.live_masks,
-                ctx.job.live_logs.as_ref(),
-            ),
+            Some(on_chunk),
             None,
+            false,
         )
         .await?;
-
-        for line in &build_result.lines {
-            ctx.log(line);
-        }
-
         if build_result.exit_code != 0 {
             anyhow::bail!(
                 "docker build failed with exit code {}",
@@ -110,23 +106,21 @@ async fn run_docker_image(
     let docker_args =
         build_docker_run_args(workspace, ctx, &env, image, entrypoint.as_deref(), &args);
     let args_ref: Vec<&str> = docker_args.iter().map(|s| s.as_str()).collect();
+    let ctx_ref = &*ctx;
+    let on_chunk = Box::new(move |chunk: &[u8]| {
+        ctx_ref.write_chunk(chunk);
+    });
+
     let result = process::invoke(
         "docker",
         &args_ref,
         Path::new(workspace),
         &env,
-        crate::worker::live_logs::process_line_callback(
-            &ctx.step_id,
-            &ctx.job.live_masks,
-            ctx.job.live_logs.as_ref(),
-        ),
+        Some(on_chunk),
         None,
+        false,
     )
     .await?;
-
-    for line in &result.lines {
-        ctx.log(line);
-    }
 
     if result.exit_code != 0 {
         anyhow::bail!("docker action exited with code {}", result.exit_code);
