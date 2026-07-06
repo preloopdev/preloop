@@ -84,6 +84,9 @@ pub struct ServerQueue {
     change_order: u64,
     job_id: String,
     plan_id: String,
+    /// All updates ever queued — populated only in test builds.
+    #[cfg(test)]
+    all_updates_log: Vec<StepUpdate>,
 }
 
 impl ServerQueue {
@@ -96,6 +99,8 @@ impl ServerQueue {
             change_order: 0,
             job_id,
             plan_id,
+            #[cfg(test)]
+            all_updates_log: Vec::new(),
         }
     }
 
@@ -105,6 +110,8 @@ impl ServerQueue {
             "Queued update for step {}: status={} conclusion={}",
             update.external_id, update.status, update.conclusion
         );
+        #[cfg(test)]
+        self.all_updates_log.push(update.clone());
         self.pending_updates.push(update);
     }
 
@@ -166,6 +173,15 @@ impl ServerQueue {
         out
     }
 }
+
+#[cfg(test)]
+impl ServerQueue {
+    /// Return every StepUpdate that was ever passed to queue_update (test-only).
+    pub fn all_queued_updates(&self) -> &[StepUpdate] {
+        &self.all_updates_log
+    }
+}
+
 
 #[cfg(test)]
 mod tests {

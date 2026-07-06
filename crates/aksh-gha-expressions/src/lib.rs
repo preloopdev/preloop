@@ -1200,4 +1200,53 @@ mod tests {
         assert!(eval_bool("failure() || cancelled()", &ctx).unwrap());
         assert!(!eval_bool("success() && !failure()", &ctx).unwrap());
     }
+    #[test]
+    fn format_with_non_ascii_in_template() {
+        let ctx = Context::default();
+        // em dash U+2014 inside the format template literal
+        let r = eval_expression(
+            "format('only runs for ubuntu-latest \u{2014} os={0}', 'ubuntu-latest')",
+            &ctx,
+        );
+        assert_eq!(
+            r.unwrap(),
+            serde_json::Value::String(
+                "only runs for ubuntu-latest \u{2014} os=ubuntu-latest".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn format_with_matrix_context() {
+        let mut ctx = Context::default();
+        ctx.insert("matrix", serde_json::json!({"os": "ubuntu-latest"}));
+        let r = eval_expression(
+            "format('echo \"only runs for ubuntu-latest \u{2014} os={0}\"', matrix.os)",
+            &ctx,
+        );
+        assert_eq!(
+            r.unwrap(),
+            serde_json::Value::String(
+                "echo \"only runs for ubuntu-latest \u{2014} os=ubuntu-latest\"".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn format_with_multiline_template() {
+        let mut ctx = Context::default();
+        ctx.insert("matrix", serde_json::json!({"platform": {"name": "Linux ARM64", "target": "aarch64"}}));
+        // Matches what GHA sends: format string with real newlines
+        let r = eval_expression(
+            "format('echo \"name={0}\"\necho \"target={1}\"\n', matrix.platform.name, matrix.platform.target)",
+            &ctx,
+        );
+        assert_eq!(
+            r.unwrap(),
+            serde_json::Value::String(
+                "echo \"name=Linux ARM64\"\necho \"target=aarch64\"\n".to_string()
+            )
+        );
+    }
+
 }
