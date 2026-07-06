@@ -1,8 +1,8 @@
 //! Job execution contexts (github, runner, job, steps, env, secrets).
 
 use indexmap::IndexMap;
-use std::sync::{Arc, RwLock};
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, RwLock};
 
 use crate::worker::execution_context::Annotation;
 use crate::worker::matchers::MatcherRegistry;
@@ -45,6 +45,8 @@ pub struct JobContext {
     pub matchers: MatcherRegistry,
     /// Container state for job/service containers (Phase 2).
     pub container_state: Option<super::container_ops::ContainerState>,
+    /// Live log queue for WebSocket streaming (None when not connected).
+    pub live_logs: Option<std::sync::Arc<crate::worker::live_logs::LiveLogQueue>>,
 }
 
 /// Result of a completed step.
@@ -122,6 +124,7 @@ impl JobContext {
             action_paths: HashMap::new(),
             matchers: MatcherRegistry::new(),
             container_state: None,
+            live_logs: None,
         }
     }
 
