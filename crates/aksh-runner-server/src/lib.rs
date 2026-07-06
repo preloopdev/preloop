@@ -2471,6 +2471,17 @@ async fn complete_job_inner(
         .get(&completion.run_id)
         .cloned()
         .ok_or_else(|| ApiError::not_found("run not found"))?;
+    // Evict live-log state for this job to prevent unbounded memory growth.
+    // The durable step-log blob has already been uploaded by the runner.
+    if let Some(agent_key) = inner
+        .job_requests
+        .values()
+        .find(|r| r.run_id == completion.run_id && r.job_id == completion.job_id)
+        .map(|r| r.agent_job_id.to_string())
+    {
+        inner.live_log_lines.remove(&agent_key);
+        inner.live_log_tx.remove(&agent_key);
+    }
     drop(inner);
 
     github::report_check_run_completed(
