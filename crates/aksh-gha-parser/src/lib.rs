@@ -450,6 +450,9 @@ pub struct Step {
     /// Shell override.
     #[serde(default)]
     pub shell: Option<String>,
+    /// Whether to continue on error.
+    #[serde(default, rename = "continue-on-error")]
+    pub continue_on_error: Option<bool>,
 }
 
 /// Action metadata from `action.yml` or `action.yaml`.
@@ -761,6 +764,7 @@ fn step_plan(step: Step, defaults: &Option<JobDefaults>) -> StepPlan {
         if_condition: step.if_condition,
         working_directory,
         shell,
+        continue_on_error: step.continue_on_error,
     }
 }
 

@@ -63,3 +63,24 @@ impl RunServiceClient {
             .context("completing job")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_trims_trailing_slashes_from_base_url() {
+        let http = HttpClient::new(None).unwrap();
+        let client = RunServiceClient::new(http, "https://run.example.com/".to_string());
+
+        assert_eq!(client.base_url(), "https://run.example.com");
+    }
+
+    #[test]
+    fn new_preserves_base_url_without_trailing_slash() {
+        let http = HttpClient::new(None).unwrap();
+        let client = RunServiceClient::new(http, "https://run.example.com/path".to_string());
+
+        assert_eq!(client.base_url(), "https://run.example.com/path");
+    }
+}

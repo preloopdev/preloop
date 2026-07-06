@@ -13,7 +13,10 @@ pub struct ResultsClient {
 impl ResultsClient {
     /// Create a new results client.
     pub fn new(http: HttpClient, base_url: String) -> Self {
-        Self { http, base_url }
+        Self {
+            http,
+            base_url: base_url.trim_end_matches('/').to_string(),
+        }
     }
 
     /// Expose the underlying HTTP client for direct requests.
@@ -123,5 +126,63 @@ impl ResultsClient {
             .put_bytes(signed_url, content, "application/octet-stream")
             .await
             .context("uploading log blob")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_trims_trailing_slashes_from_base_url() {
+        let http = HttpClient::new(None).unwrap();
+        let client = ResultsClient::new(http, "https://results.example.com/".to_string());
+
+        assert_eq!(client.base_url, "https://results.example.com");
+    }
+
+    #[test]
+    fn update_workflow_steps_endpoint_path_matches_twirp_shape() {
+        let http = HttpClient::new(None).unwrap();
+        let client = ResultsClient::new(http, "https://results.example.com".to_string());
+
+        let url = format!(
+            "{}/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate",
+            client.base_url
+        );
+        assert_eq!(
+            url,
+            "https://results.example.com/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate"
+        );
+    }
+
+    #[test]
+    fn signed_blob_endpoint_paths_match_receiver_service() {
+        let http = HttpClient::new(None).unwrap();
+        let client = ResultsClient::new(http, "https://results.example.com".to_string());
+
+        let step = format!(
+            "{}/twirp/results.services.receiver.Receiver/GetStepLogsSignedBlobURL",
+            client.base_url
+        );
+        let job = format!(
+            "{}/twirp/results.services.receiver.Receiver/GetJobLogsSignedBlobURL",
+            client.base_url
+        );
+        let summary = format!(
+            "{}/twirp/results.services.receiver.Receiver/GetStepSummarySignedBlobURL",
+            client.base_url
+        );
+        let diagnostics = format!(
+            "{}/twirp/results.services.receiver.Receiver/CreateResultsDiagnosticLogsSignedBlobURL",
+            client.base_url
+        );
+
+        assert!(step.ends_with("results.services.receiver.Receiver/GetStepLogsSignedBlobURL"));
+        assert!(job.ends_with("results.services.receiver.Receiver/GetJobLogsSignedBlobURL"));
+        assert!(summary.ends_with("results.services.receiver.Receiver/GetStepSummarySignedBlobURL"));
+        assert!(diagnostics.ends_with(
+            "results.services.receiver.Receiver/CreateResultsDiagnosticLogsSignedBlobURL"
+        ));
     }
 }
