@@ -173,6 +173,12 @@ impl LiveLogQueue {
             let mut ws = self.ws.lock().await;
             if let Some(sender) = ws.as_mut() {
                 if !sender.send(&wrapper).await && sender.should_disable() {
+                    warn!(
+                        url = %sender.url,
+                        failed = sender.failed_batches,
+                        total = sender.total_batches,
+                        "disabling live log websocket — failure rate exceeded 50%"
+                    );
                     *ws = None;
                 }
             }
