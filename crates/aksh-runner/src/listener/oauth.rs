@@ -20,7 +20,14 @@ struct TokenResponse {
 }
 
 /// Obtain an OAuth access token using the runner's credentials.
-pub async fn get_oauth_token(http: &HttpClient, config: &RunnerConfig) -> Result<String> {
+///
+/// Returns the token string and an optional `Instant` at which the token
+/// should be proactively refreshed (5 minutes before the server-reported
+/// expiry).  Callers that only need the token can discard the second element.
+pub async fn get_oauth_token(
+    http: &HttpClient,
+    config: &RunnerConfig,
+) -> anyhow::Result<(String, Option<std::time::Instant>)> {
     // F053: Prefer authorizationUrlV2 when available (auth migration)
     let auth_url_v2 = config
         .credentials
@@ -79,8 +86,17 @@ pub async fn get_oauth_token(http: &HttpClient, config: &RunnerConfig) -> Result
         .await
         .context("OAuth token exchange")?;
 
-    info!("OAuth token acquired (type: {})", resp.token_type);
-    Ok(resp.access_token)
+    // Schedule proactive refresh 5 minutes before the token expires.
+    let expires_at = resp.expires_in.map(|secs| {
+        std::time::Instant::now()
+            + std::time::Duration::from_secs(secs.saturating_sub(300))
+    });
+    info!(
+        "OAuth token acquired (type: {}, expires_in: {:?}s)",
+        resp.token_type,
+        resp.expires_in
+    );
+    Ok((resp.access_token, expires_at))
 }
 
 /// Build a PS256-signed JWT for client-credentials authentication.
