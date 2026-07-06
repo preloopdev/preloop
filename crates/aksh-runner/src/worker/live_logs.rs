@@ -31,19 +31,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const RETRIES: usize = 3;
 
-/// JSON payload sent by the runner to the live console feed WebSocket.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TimelineRecordFeedLinesWrapper {
-    /// Step/timeline record GUID.
-    pub step_id: String,
-    /// First line number in this batch, 1-indexed within the step.
-    pub start_line: u64,
-    /// Number of lines in `value`.
-    pub count: usize,
-    /// Console lines for this step.
-    pub value: Vec<String>,
-}
+/// Re-export from protocol crate for backward compatibility.
+pub use aksh_gha_protocol::LiveLogFeedLinesWrapper as TimelineRecordFeedLinesWrapper;
 
 #[derive(Debug, Clone)]
 struct ConsoleLineInfo {
