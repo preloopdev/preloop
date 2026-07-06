@@ -245,52 +245,35 @@ docker run --platform linux/amd64 alpine uname -m  # x86_64
 
 ## Performance Notes
 
-### virtio-fs vs tmpfs for build workloads
+### Disk I/O: virtio-fs vs virtio-blk
 
-Host-mounted volumes (`-v HOST:GUEST`) use **virtio-fs** (FUSE over vsock). Each
-filesystem syscall crosses the hypervisor boundary, which adds overhead that is
-negligible for sequential reads but severe for write-heavy workloads like `cargo build`,
-which issues tens of thousands of small `.rlib`/`.rmeta`/`.d` writes.
+**For normal workflow execution** (runner checks out code inside the VM, cargo
+writes `./target` inside the VM), disk I/O goes through the **guest's own
+virtio-blk overlay disk** — not a host mount. virtio-fs is not involved and is
+not a bottleneck.
 
-**Measured on axum (`cargo build --workspace --all-targets`, Apple M4 Max, 128 GiB RAM):**
-
-| Build target dir | Transport | Duration |
-|---|---|---|
-| Host mount via virtio-fs | FUSE over vsock | ~7m 32s |
-| Guest tmpfs (RAM-backed) | none (in-guest) | **~17s** (~27× faster) |
-
-#### Fix: redirect `CARGO_TARGET_DIR` to a guest tmpfs
-
-Mount a tmpfs inside the VM before the runner starts and point cargo at it.
-The build artifacts live in RAM; the source tree can stay on a host volume.
-
-**Option 1 — VM `--init` hook (persists across forks):**
-```bash
-smolvm machine create --name p0-linux \
-  --init "mkdir -p /tmp/cargo-target && mount -t tmpfs -o size=6g none /tmp/cargo-target" \
-  ...
-```
-
-**Option 2 — inject via runner environment:**
-Add to the runner's env before it starts:
-```bash
-export CARGO_TARGET_DIR=/tmp/cargo-target
-```
-
-The tmpfs is discarded when the VM stops, which is fine — each job runs in a
-fresh VM clone anyway.
-
-**Sizing:** A full `cargo build --all-targets` on a large workspace peaks around
-2–3 GiB. A 6 GiB tmpfs cap is comfortable. At 128 GiB host RAM, 6 concurrent
-VMs with 6 GiB caps each cost at most 36 GiB total.
-
-### virtio-blk vs virtio-fs
+**virtio-fs** (FUSE over vsock) is only in play when you explicitly mount a host
+directory into the VM with `-v HOST:GUEST` and then do write-heavy work on that
+path from inside the VM. Each filesystem syscall crosses the hypervisor boundary,
+which is cheap for reads but expensive for write storms (thousands of small
+`.rlib`/`.rmeta`/`.d` files). If you find yourself in that situation, the fix is
+to use a guest tmpfs as a staging area and copy results out with
+`smolvm machine cp` rather than writing back through the mount.
 
 smolvm exposes host volumes exclusively via virtio-fs. The internal `--storage`
-and `--overlay` disks are already virtio-blk (ext4 images handed as block
-devices to libkrun), but there is no CLI flag to expose a host directory as a
-block device. If you need native block I/O for a host path, use tmpfs inside
-the guest as a staging area and copy results out with `smolvm machine cp`.
+and `--overlay` disks are virtio-blk (ext4 images handed directly to libkrun),
+but there is no CLI flag to present a host directory as a block device.
+
+### Workflow build performance: vCPU count is the bottleneck
+
+For CI workflows, the dominant factor is **vCPU count**, not I/O. `cargo build`
+on a large workspace (e.g. axum) is CPU-bound once the source is checked out
+inside the VM. The default VM has 4 vCPUs; the host has 16.
+
+Increase vCPUs at VM create time for compile-heavy workloads:
+```bash
+smolvm machine create --name p0-linux --cpus 8 ...
+```
 
 ### General table
 
@@ -299,13 +282,11 @@ the guest as a staging area and copy results out with `smolvm machine cp`.
 | VM boot (from stopped) | 1.2s |
 | VM boot (packed, first run) | ~9s (asset extraction) |
 | VM boot (packed, cached) | ~3s |
-| virtio-fs overhead (write-heavy) | ~27× slower than guest tmpfs |
 | virtio-fs overhead vs native (read-heavy) | ~1.7× |
-| Docker overlay2 on ext4 | Same perf as native Linux |
-| Rust compilation, CARGO_TARGET_DIR on tmpfs | ~17s (axum workspace) |
-| Rust compilation, CARGO_TARGET_DIR on virtio-fs | ~7m 32s (axum workspace) |
-| Rust compilation (warm cache, virtio-fs) | ~1.7× slower than host bare metal |
-| Rust compilation (cold cache, virtio-fs) | 118s vs 27s host (4.4×) |
+| virtio-fs overhead (write storm on host mount) | significant; use guest tmpfs instead |
+| Docker overlay2 on ext4 (guest disk) | Same perf as native Linux |
+| Rust compilation (warm cache, 4 vCPUs) | ~1.7× slower than 16-vCPU host |
+| Rust compilation (cold cache, 4 vCPUs) | 118s vs 27s on host (4.4×) |
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
