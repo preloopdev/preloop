@@ -2173,7 +2173,6 @@ async fn next_message_broker_ref_root(
     let deadline = std::time::Instant::now() + Duration::from_secs(wait);
 
     loop {
-
         let maybe = {
             let mut inner = shared.state.inner.lock().await;
             if let Some(request_id) = inner.session_active_requests.get(&session_id).copied() {

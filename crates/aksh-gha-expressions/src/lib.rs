@@ -1101,7 +1101,11 @@ mod tests {
             combined.extend_from_slice(&inner);
             format!("{:x}", Sha256::digest(&combined))
         };
-        assert_eq!(ha, Value::String(expected_a.clone()), "single-file hash mismatch");
+        assert_eq!(
+            ha,
+            Value::String(expected_a.clone()),
+            "single-file hash mismatch"
+        );
 
         // Must be 64 lowercase hex chars
         assert_eq!(expected_a.len(), 64);
@@ -1113,7 +1117,11 @@ mod tests {
 
         // hashFiles with no-match pattern returns ""
         let empty = eval_expression("hashFiles('nonexistent.txt')", &ctx).unwrap();
-        assert_eq!(empty, Value::String(String::new()), "no-match must return empty string");
+        assert_eq!(
+            empty,
+            Value::String(String::new()),
+            "no-match must return empty string"
+        );
 
         // Cleanup
         let _ = std::fs::remove_dir_all(dir);
