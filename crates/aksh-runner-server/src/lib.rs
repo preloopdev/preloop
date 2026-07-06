@@ -18,15 +18,18 @@ use aksh_gha_protocol::{
     RunnerSessionRequest, WorkflowSubmission, PROTOCOL_VERSION,
 };
 use axum::body::{to_bytes, Body};
+use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use bytes::Bytes;
+use futures::{stream, StreamExt};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -282,6 +285,7 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             "/runner/server/_apis/distributedtask/hubs/actions/plans/:run_id/jobs/:job_id",
             patch(complete_job_compat),
         )
+        .route("/ws/live-logs/:job_id", get(ws_live_logs))
         .route("/broker/:runner_id/acquirejob", post(broker_acquire_job))
         .route("/broker/:runner_id/renewjob", post(broker_renew_job))
         .route("/broker/:runner_id/completejob", post(broker_complete_job))
@@ -471,6 +475,10 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         .route("/api/v1/runs/:run_id/cancel", post(cancel_run))
         .route("/api/v1/runs/:run_id/rerun", post(rerun_run))
         .route("/api/v1/runs/:run_id/events.ndjson", get(run_events))
+        .route(
+            "/api/v1/runs/:run_id/jobs/:job_id/logs/live",
+            get(live_logs_sse),
+        )
         .route("/api/v1/runners", post(register_runner))
         .route("/api/v1/runners/sessions", post(create_session))
         .route(
@@ -718,6 +726,8 @@ struct InnerState {
     artifacts: BTreeMap<String, ArtifactRecord>,
     logs: BTreeMap<String, Vec<u8>>,
     timeline_events: BTreeMap<RunId, Vec<NdjsonEvent>>,
+    live_log_lines: BTreeMap<String, Vec<LiveLogFeedLinesWrapper>>,
+    live_log_tx: BTreeMap<String, broadcast::Sender<LiveLogFeedLinesWrapper>>,
     inflight_requests: BTreeMap<i64, (RunId, JobId)>,
     job_requests: BTreeMap<i64, TaskAgentJobRequestRecord>,
     plan_requests: BTreeMap<String, i64>,
@@ -797,6 +807,15 @@ struct ArtifactRecord {
     file_name: String,
     path: String,
     size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LiveLogFeedLinesWrapper {
+    step_id: String,
+    start_line: u64,
+    count: usize,
+    value: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1183,6 +1202,117 @@ async fn run_events(
         .expect("static response builder"))
 }
 
+async fn live_logs_sse(
+    State(shared): State<Arc<SharedState>>,
+    Path((run_id, job_id)): Path<(RunId, String)>,
+) -> Result<Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
+    let (snapshot, rx) = {
+        let mut inner = shared.state.inner.lock().await;
+        let key = live_log_key_for_job(&inner, run_id, &job_id)
+            .ok_or_else(|| ApiError::not_found("job not found"))?;
+        let snapshot = inner.live_log_lines.get(&key).cloned().unwrap_or_default();
+        let tx = live_log_sender(&mut inner, &key);
+        (snapshot, tx.subscribe())
+    };
+
+    let snapshot_stream = stream::iter(
+        snapshot
+            .into_iter()
+            .map(|wrapper| Ok(live_log_sse_event(&wrapper))),
+    );
+    let live_stream = stream::unfold(rx, |mut rx| async move {
+        loop {
+            match rx.recv().await {
+                Ok(wrapper) => {
+                    let event = live_log_sse_event(&wrapper);
+                    return Some((Ok(event), rx));
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    });
+
+    Ok(Sse::new(snapshot_stream.chain(live_stream)).keep_alive(KeepAlive::default()))
+}
+
+fn live_log_sse_event(wrapper: &LiveLogFeedLinesWrapper) -> Event {
+    let data = serde_json::to_string(wrapper).unwrap_or_else(|_| "{}".to_string());
+    Event::default().event("live-log").data(data)
+}
+
+fn live_log_key_for_job(inner: &InnerState, run_id: RunId, job_id: &str) -> Option<String> {
+    inner.runs.get(&run_id)?;
+    inner
+        .job_requests
+        .values()
+        .find(|record| {
+            record.run_id == run_id
+                && (record.job_id.0 == job_id || record.agent_job_id.to_string() == job_id)
+        })
+        .map(|record| record.agent_job_id.to_string())
+        .or_else(|| Some(job_id.to_string()).filter(|key| inner.live_log_lines.contains_key(key)))
+}
+
+fn live_log_sender(
+    inner: &mut InnerState,
+    key: &str,
+) -> broadcast::Sender<LiveLogFeedLinesWrapper> {
+    inner
+        .live_log_tx
+        .entry(key.to_string())
+        .or_insert_with(|| {
+            let (tx, _) = broadcast::channel(1024);
+            tx
+        })
+        .clone()
+}
+
+async fn ws_live_logs(
+    State(shared): State<Arc<SharedState>>,
+    Path(job_id): Path<String>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_live_log_socket(socket, job_id, shared))
+}
+
+async fn handle_live_log_socket(mut socket: WebSocket, job_id: String, shared: Arc<SharedState>) {
+    while let Some(message) = socket.next().await {
+        match message {
+            Ok(WsMessage::Text(text)) => {
+                match serde_json::from_str::<LiveLogFeedLinesWrapper>(&text) {
+                    Ok(mut wrapper) => {
+                        wrapper.count = wrapper.value.len();
+                        record_live_log_wrapper(&shared, &job_id, wrapper).await;
+                    }
+                    Err(error) => warn!(%error, %job_id, "invalid live log websocket payload"),
+                }
+            }
+            Ok(WsMessage::Binary(_)) | Ok(WsMessage::Ping(_)) | Ok(WsMessage::Pong(_)) => {}
+            Ok(WsMessage::Close(_)) => break,
+            Err(error) => {
+                warn!(%error, %job_id, "live log websocket receive failed");
+                break;
+            }
+        }
+    }
+}
+
+async fn record_live_log_wrapper(
+    shared: &Arc<SharedState>,
+    job_id: &str,
+    wrapper: LiveLogFeedLinesWrapper,
+) {
+    let mut inner = shared.state.inner.lock().await;
+    inner
+        .live_log_lines
+        .entry(job_id.to_string())
+        .or_default()
+        .push(wrapper.clone());
+    let tx = live_log_sender(&mut inner, job_id);
+    let _ = tx.send(wrapper);
+}
+
 async fn register_runner(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<RunnerRegistrationRequest>,
@@ -1364,6 +1494,17 @@ fn public_base_url() -> String {
         .unwrap_or_else(|_| "http://127.0.0.1:9090".to_owned())
         .trim_end_matches('/')
         .to_owned()
+}
+
+fn websocket_base_url() -> String {
+    let base = public_base_url();
+    if let Some(rest) = base.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = base.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else {
+        base
+    }
 }
 
 fn runner_server_url() -> String {
@@ -1667,6 +1808,10 @@ async fn broker_acquire_job(
         if endpoint.name.eq_ignore_ascii_case("SystemVssConnection") {
             endpoint.url = Some(run_service_url.clone());
             endpoint
+                .authorization
+                .parameters
+                .insert("AccessToken".to_owned(), "aksh-system-token".to_owned());
+            endpoint
                 .data
                 .insert("ResultsServiceUrl".to_owned(), public_base_url());
             endpoint
@@ -1675,6 +1820,10 @@ async fn broker_acquire_job(
             endpoint
                 .data
                 .insert("CacheServerUrl".to_owned(), public_base_url());
+            endpoint.data.insert(
+                "FeedStreamUrl".to_owned(),
+                format!("{}/ws/live-logs/{}", websocket_base_url(), message.job_id),
+            );
         }
     }
     Ok(Json(message))
@@ -5055,6 +5204,62 @@ jobs:
     }
 
     #[tokio::test]
+    async fn live_log_websocket_accepts_bearer_and_stores_lines() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let url = format!("ws://{addr}/ws/live-logs/job-live");
+        let mut request =
+            tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url)
+                .unwrap();
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            "Bearer aksh-system-token".parse().unwrap(),
+        );
+        let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        let payload = json!({
+            "stepId": "step-1",
+            "startLine": 1,
+            "count": 2,
+            "value": ["hello", "world"]
+        });
+        futures::SinkExt::send(
+            &mut ws,
+            tokio_tungstenite::tungstenite::Message::Text(payload.to_string()),
+        )
+        .await
+        .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                {
+                    let inner = state.inner.lock().await;
+                    if let Some(wrappers) = inner.live_log_lines.get("job-live") {
+                        if wrappers.len() == 1 {
+                            assert_eq!(wrappers[0].step_id, "step-1");
+                            assert_eq!(wrappers[0].start_line, 1);
+                            assert_eq!(wrappers[0].count, 2);
+                            assert_eq!(wrappers[0].value, vec!["hello", "world"]);
+                            break;
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn log_append_persists_payload_bytes() {
         let temp = tempfile::tempdir().unwrap();
         let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
@@ -5505,6 +5710,13 @@ jobs:
         assert_eq!(
             acquired["resources"]["endpoints"][0]["url"],
             format!("http://127.0.0.1:9090/broker/{runner_id}/")
+        );
+        assert_eq!(
+            acquired["resources"]["endpoints"][0]["data"]["FeedStreamUrl"],
+            format!(
+                "ws://127.0.0.1:9090/ws/live-logs/{}",
+                acquired["jobId"].as_str().unwrap()
+            )
         );
         assert!(acquired["contextData"]["github"].is_object());
         let github_context_json = serde_json::to_string(&acquired["contextData"]["github"])
