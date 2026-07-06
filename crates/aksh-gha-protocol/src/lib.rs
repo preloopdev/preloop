@@ -457,6 +457,21 @@ pub fn event_to_ndjson(event: &NdjsonEvent) -> Result<String, ProtocolError> {
     Ok(line)
 }
 
+/// JSON payload exchanged between the runner and server over the live console
+/// feed WebSocket. Matches the official runner's `TimelineRecordFeedLinesWrapper`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveLogFeedLinesWrapper {
+    /// Step/timeline record GUID.
+    pub step_id: String,
+    /// First line number in this batch, 1-indexed within the step.
+    pub start_line: u64,
+    /// Number of lines in `value`.
+    pub count: usize,
+    /// Console lines for this step.
+    pub value: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
