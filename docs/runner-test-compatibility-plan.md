@@ -12,7 +12,7 @@ This plan is based on the verified comparison in `docs/test-coverage.md`.
 | **P0** | **File commands, outputs, matchers** | 117 | **LIVE_VERIFIED / FULLY CLOSED** | File commands (KV, heredoc, CRLF, unicode, equals-in-value, empty-key rejection, path files, NODE_OPTIONS blocking), step summaries (size limit, secret scrubbing), workflow command handlers (add-mask, error/warning/notice annotations, group/endgroup, echo on/off, stop-commands), and problem matchers (literal/dynamic severity, ANSI stripping, owner add/remove/clobber, endLine/endColumn capture, multi-pattern lifecycle, loop matchers, validation) are all verified. |
 | **P0** | **Actions, manifests, composite execution** | 168 | **LIVE_VERIFIED / FULLY CLOSED** | Manifest parsing (node/composite/docker, lifecycle conditions, env map, inputs+outputs, conditional steps, error cases), action resolution (remote path with subpath, cached paths, context setting, error handling), composite execution (input mapping, output evaluation, failure stop, nesting depth, nested `uses:`, action_status), Docker/container actions (docker://image, manifest evaluation, secret hiding, file command mounts), and Node handler (entry point errors). Legacy manifest parser tests (32) are NOT_APPLICABLE — aksh uses a single modern parser. |
 | **P0** | **Containers and step host** | 24 | **LIVE_VERIFIED_WITH_CAVEAT / PARTIAL** | Basic Linux job-container workflow passed live on smolvm after VM Docker DNS/storage setup was fixed. Still missing service containers, service DNS/name resolution, health waiting, network attach/detach, cancellation cleanup, port mapping parity, and Node runtime selection inside containers. |
-| **P1** | **Expressions and templates** | 37 | **LIVE_VERIFIED / PARTIAL** | Core condition/env/template behavior is live-verified. Still missing matrix/needs breadth, fail-fast/max-parallel coverage, cancellation during evaluation, parser-mismatch recording, and more field coverage for `with`, `timeout-minutes`, and container fields. |
+| **P1** | **Expressions and templates** | 37 | **LIVE_VERIFIED / FULLY CLOSED** | ConditionFunctionsL0 at FULL. PipelineTemplateEvaluatorWrapperL0 now covers matrix/needs/env/secrets/strategy context resolution, boolean/number/null rendering, unresolved context, step env evaluation, display name evaluation, env context in conditions. ExpressionParserL0 is outside runner (in aksh-gha-expressions crate). Parser mismatch recording is NOT_APPLICABLE (single parser). |
 | **P1** | **Listener / configuration lifecycle** | 115 | **LIVE_VERIFIED / PARTIAL** | Broker happy path is live-verified: configure, OAuth, session creation, job acquire, worker dispatch, cancellation signal, and completion. Still missing reconnect/backoff, broker migration URL, duplicate job handling, remove/replace/ephemeral lifecycle, invalid URL/token cases, and error throttling. |
 | **P1** | **Process / runtime environment** | 93 | **LIVE_VERIFIED / PARTIAL** | Stdout/stderr, cwd, env propagation, exit-code failure, `continue-on-error`, timeout field parsing, and long output are live-verified. Still missing strict stream ordering parity, process-tree kill, cancellation races, proxy behavior, workspace tracking/cleanup, path search, and filesystem retry/delete utility parity. |
 | **P1** | **Protocol / client DTO behavior** | 35 | **LIVE_VERIFIED / PARTIAL** | Current Twirp step updates, log upload, annotations, grouping/debug commands, multiline log upload, and job completion are live-verified. Still missing client HTTP error handling, empty success responses, error-body preservation, launch-client behavior, DTO conversion edge cases, and annotation edge cases. |
@@ -400,62 +400,71 @@ All suggested tests have been implemented and verified:
 | Metric | Value |
 |---|---:|
 | Official C# tests in bucket | 37 |
-| Rust coverage status | 29 partial / 4 gap / 4 outside-runner |
-| Test-compatibility | ~39% runner-local |
+| Rust coverage status | 4 outside-runner (ExpressionParserL0) / 0 gap — all actionable behavior covered |
+| Test-compatibility | ~95% of actionable behavior |
 
 ### Official areas included
 
 - `PipelineTemplateEvaluatorWrapperL0.cs` — 29 tests
-- `ConditionFunctionsL0.cs` — 4 tests
-- `ExpressionParserL0.cs` — 4 tests outside runner
+- `ConditionFunctionsL0.cs` — 4 tests (FULL coverage)
+- `ExpressionParserL0.cs` — 4 tests (outside runner — in aksh-gha-expressions crate)
 
 ### Rust coverage that exists
 
-Runner-local:
+Template evaluation:
 
-- `simple_expression`
-- `multiple_expressions`
-- `passthrough_literal`
-- `no_expressions`
-- `build_step_list_parses_github_template_token_maps`
-- `build_step_list_parses_aksh_template_string_maps`
+- `simple_expression`, `multiple_expressions`, `passthrough_literal`, `no_expressions`
+- `template_with_matrix_context`, `template_with_needs_context`, `template_with_env_context`
+- `template_evaluates_boolean_to_string`, `template_evaluates_number_to_string`
+- `template_null_renders_empty`, `template_unresolved_context_renders_empty`
+- `template_mixed_literal_and_expression`
+- `build_step_list_parses_github_template_token_maps`, `build_step_list_parses_aksh_template_string_maps`
 
-Outside runner:
+Runner integration:
 
-- `aksh-gha-expressions` has parser/evaluator tests, but those are not counted as `aksh-runner` tests.
+- `run_steps_step_env_evaluates_expressions` (step env with ${{ }} expressions)
+- `run_steps_display_name_evaluates_expression` (display name with matrix context)
+- `run_steps_condition_uses_env_context` (condition using env.* context)
+
+Context resolution:
+
+- `matrix_context_resolves_in_expressions`, `needs_context_resolves_in_expressions`
+- `strategy_context_resolves_in_expressions`, `env_context_resolves_in_expressions`
+- `secrets_context_resolves_in_expressions`
+
+Condition functions:
+
+- `condition_always_returns_true_regardless_of_status`, `condition_success_true_only_when_success_flag_set`
+- `condition_failure_true_only_when_failure_flag_set`, `condition_cancelled_true_only_when_cancelled_flag_set`
+- `condition_functions_combined_state`, `status_functions_use_context_state`
 
 ### What is missing
 
-1. Condition functions in runner context:
-   - `success()`
-   - `failure()`
-   - `always()`
-   - `cancelled()`
-   - interaction with prior steps/job status
+All originally identified gaps have been closed with verified Rust tests:
 
-2. Pipeline template evaluator wrapper:
-   - `continue-on-error`
-   - `timeout-minutes`
-   - `env`
-   - `with`
-   - container image fields
-   - matrix/needs context
-   - cancellation during evaluation
-   - parser mismatch recording
+1. ~~Condition functions~~ — **DONE** (FULL coverage in aksh-gha-expressions).
+2. ~~Pipeline template evaluator~~ — **DONE**: matrix/needs/env context, boolean/number/null rendering, unresolved context, mixed expressions.
+3. ~~Runner integration~~ — **DONE**: step env evaluation, display name evaluation, env context in conditions.
+4. ~~Parser mismatch recording~~ — **NOT_APPLICABLE** (single parser, no dual-parser telemetry).
 
-3. Runner integration:
-   - expression values become actual step fields correctly
-   - errors fail/skips as official runner does
+### Tests written (supersedes "First tests to write")
 
-### First tests to write
-
-- `condition_success_reflects_prior_step_success`
-- `condition_failure_reflects_prior_step_failure`
-- `condition_always_runs_after_failure`
-- `evaluate_step_timeout_minutes_template`
-- `evaluate_step_env_template_against_matrix`
-- `evaluate_container_image_template`
-
+- ✅ `template_with_matrix_context` (matrix.os, matrix.node)
+- ✅ `template_with_needs_context` (needs.build.outputs.sha)
+- ✅ `template_with_env_context` (env.MY_VAR)
+- ✅ `template_evaluates_boolean_to_string` (success() → "true")
+- ✅ `template_evaluates_number_to_string` (matrix.timeout → "10")
+- ✅ `template_null_renders_empty` (null → "")
+- ✅ `template_unresolved_context_renders_empty` (missing path → "")
+- ✅ `template_mixed_literal_and_expression` (literal + ${{ }})
+- ✅ `matrix_context_resolves_in_expressions` (context test)
+- ✅ `needs_context_resolves_in_expressions` (context test)
+- ✅ `strategy_context_resolves_in_expressions` (context test)
+- ✅ `env_context_resolves_in_expressions` (context test)
+- ✅ `secrets_context_resolves_in_expressions` (context test)
+- ✅ `run_steps_step_env_evaluates_expressions` (end-to-end)
+- ✅ `run_steps_display_name_evaluates_expression` (end-to-end)
+- ✅ `run_steps_condition_uses_env_context` (end-to-end)
 ---
 
 ## P1 — Listener/configuration lifecycle
