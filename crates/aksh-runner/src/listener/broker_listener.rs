@@ -53,6 +53,24 @@ pub async fn run_broker_loop(
     let mut need_session = true;
 
     loop {
+        // Proactive OAuth token refresh — renew 5 minutes before expiry so the
+        // next poll cycle always uses a live token (RLIS-02).
+        if let Some(exp) = token_expires_at {
+            if std::time::Instant::now() >= exp {
+                info!("OAuth token expiring soon, proactively refreshing...");
+                match crate::listener::oauth::get_oauth_token(http, config).await {
+                    Ok((t, ea)) => {
+                        token = t;
+                        token_expires_at = ea;
+                        consecutive_errors = 0;
+                    }
+                    Err(e) => {
+                        warn!("Proactive OAuth token refresh failed: {e:#}");
+                    }
+                }
+            }
+        }
+
         // Check if active job has finished (non-blocking) — covers the case
         // where the job completed between loop iterations without going through select!.
         if let Some(job) = &mut active_job {
@@ -111,6 +129,10 @@ pub async fn run_broker_loop(
                         info!("Broker session created: {session_id}");
                         need_session = false;
                         consecutive_errors = 0;
+                        // Scope dedup set to this session — old IDs from a previous
+                        // session must not block re-delivered messages on the new one.
+                        processed_message_ids.clear();
+                        debug!("Cleared message dedup set for new session {session_id}");
                     } else {
                         warn!("Session response missing sessionId");
                         consecutive_errors += 1;
