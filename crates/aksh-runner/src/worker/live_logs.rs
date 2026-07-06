@@ -363,7 +363,7 @@ pub fn process_line_callback(
     step_id: &str,
     live_masks: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
     live_logs: Option<&Arc<LiveLogQueue>>,
-) -> Option<crate::process::LineCallback> {
+) -> Option<crate::process::LineCallback<'static>> {
     let live_logs = live_logs.cloned()?;
     let step_id = step_id.to_string();
     let live_masks = live_masks.clone();
