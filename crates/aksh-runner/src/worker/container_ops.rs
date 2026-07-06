@@ -587,11 +587,12 @@ pub async fn docker_exec(
     workdir: &str,
     env: &HashMap<String, String>,
     cancel_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    on_line: Option<crate::process::LineCallback>,
 ) -> Result<process::ProcessOutput> {
     let exec_args = build_docker_exec_args(container_id, program, args, workdir, env);
     let args_ref: Vec<&str> = exec_args.iter().map(|s| s.as_str()).collect();
 
-    process::invoke("docker", &args_ref, Path::new("."), env, None, cancel_rx).await
+    process::invoke("docker", &args_ref, Path::new("."), env, on_line, cancel_rx).await
 }
 
 /// Get port mappings for a service container.
