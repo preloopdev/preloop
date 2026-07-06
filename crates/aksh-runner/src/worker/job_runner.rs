@@ -153,6 +153,18 @@ pub async fn run_job(
         .as_ref()
         .map(|rpt| spawn_renew_loop(rpt.clone(), cancel_rx.clone()));
 
+    let live_logs = if let Some(feed_url) = super::live_logs::extract_feed_stream_url(&job_message)
+    {
+        let token = reporting
+            .as_ref()
+            .map(|rpt| rpt.access_token.clone())
+            .unwrap_or_default();
+        Some(super::live_logs::LiveLogQueue::connect(feed_url, token).await)
+    } else {
+        None
+    };
+    let live_log_handle = live_logs.as_ref().map(|queue| queue.spawn_drain());
+
     // Create the server queue for step status tracking
     let queue = Arc::new(Mutex::new(ServerQueue::new(
         job_id.to_string(),
@@ -217,8 +229,13 @@ pub async fn run_job(
         reporting.as_deref(),
         job_container_spec.as_ref(),
         &service_specs,
+        live_logs.clone(),
     )
     .await;
+
+    if let (Some(queue), Some(handle)) = (live_logs.as_ref(), live_log_handle) {
+        queue.shutdown_and_wait(handle).await;
+    }
 
     // Check if we timed out (must check before aborting the timer)
     let was_timeout = timed_out.load(std::sync::atomic::Ordering::SeqCst);

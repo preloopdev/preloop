@@ -16,6 +16,7 @@ pub async fn run_script(
     working_directory: &str,
     ctx: &mut StepContext<'_>,
     cancel_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    live_logs: Option<&std::sync::Arc<crate::worker::live_logs::LiveLogQueue>>,
 ) -> Result<()> {
     // Write script to temp file
     let temp_dir = Path::new(working_directory)
@@ -52,17 +53,7 @@ pub async fn run_script(
         &args.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
         Path::new(working_directory),
         &env,
-        Some(Box::new({
-            let masks = ctx.job.masks.clone();
-            move |line: &str| {
-                let mut masked = line.to_string();
-                for secret in &masks {
-                    if !secret.is_empty() {
-                        masked = masked.replace(secret, "***");
-                    }
-                }
-            }
-        })),
+        crate::worker::live_logs::process_line_callback(&ctx.step_id, &ctx.job.live_masks, live_logs),
         cancel_rx,
     )
     .await?;
@@ -96,6 +87,7 @@ pub async fn run_script_in_container(
     container_id: &str,
     ctx: &mut StepContext<'_>,
     cancel_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    live_logs: Option<&std::sync::Arc<crate::worker::live_logs::LiveLogQueue>>,
 ) -> Result<()> {
     // Write script to host temp dir (mounted as /__w/_temp in container)
     let temp_dir = Path::new(working_directory)
@@ -174,6 +166,7 @@ pub async fn run_script_in_container(
         &container_workdir,
         &env,
         cancel_rx,
+        crate::worker::live_logs::process_line_callback(&ctx.step_id, &ctx.job.live_masks, live_logs),
     )
     .await?;
 
