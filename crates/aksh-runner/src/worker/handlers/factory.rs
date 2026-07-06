@@ -355,4 +355,114 @@ runs:
         let result = load_action_manifest(dir.path());
         assert!(result.is_err());
     }
+
+    // --- P0 factory gap coverage ---
+
+    #[test]
+    fn empty_runs_using_returns_error() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("action.yml"),
+            r#"
+name: Broken
+runs:
+  using: "  "
+  main: index.js
+"#,
+        )
+        .unwrap();
+
+        let err = load_action_manifest(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("runs.using"));
+    }
+
+    #[test]
+    fn manifest_with_env_map() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("action.yml"),
+            r#"
+name: Docker with env
+runs:
+  using: docker
+  image: Dockerfile
+  env:
+    FOO: bar
+    BAZ: ${{ inputs.val }}
+"#,
+        )
+        .unwrap();
+
+        let manifest = load_action_manifest(dir.path()).unwrap();
+        let env = manifest.runs_env.unwrap();
+        assert_eq!(env.get("FOO").and_then(|v| v.as_str()), Some("bar"));
+        assert_eq!(
+            env.get("BAZ").and_then(|v| v.as_str()),
+            Some("${{ inputs.val }}")
+        );
+    }
+
+    #[test]
+    fn composite_manifest_with_inputs_and_outputs() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("action.yml"),
+            r#"
+name: Full Composite
+inputs:
+  greeting:
+    description: A greeting
+    default: hello
+outputs:
+  result:
+    description: The result
+    value: ${{ steps.run.outputs.out }}
+runs:
+  using: composite
+  steps:
+    - id: run
+      run: echo "out=done" >> "$GITHUB_OUTPUT"
+      shell: bash
+"#,
+        )
+        .unwrap();
+
+        let manifest = load_action_manifest(dir.path()).unwrap();
+        assert_eq!(manifest.runs_using, "composite");
+        assert!(manifest.inputs.is_some());
+        assert!(manifest.inputs.as_ref().unwrap().contains_key("greeting"));
+        assert!(manifest.outputs.is_some());
+        assert!(manifest.outputs.as_ref().unwrap().contains_key("result"));
+        assert!(manifest.runs_steps.is_some());
+        assert_eq!(manifest.runs_steps.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn composite_manifest_with_conditional_steps() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("action.yml"),
+            r#"
+name: Conditional Composite
+runs:
+  using: composite
+  steps:
+    - run: echo always
+      shell: bash
+    - if: runner.os == 'Linux'
+      run: echo linux-only
+      shell: bash
+"#,
+        )
+        .unwrap();
+
+        let manifest = load_action_manifest(dir.path()).unwrap();
+        let steps = manifest.runs_steps.unwrap();
+        assert_eq!(steps.len(), 2);
+        // Second step has an `if` condition
+        assert_eq!(
+            steps[1].get("if").and_then(|v| v.as_str()),
+            Some("runner.os == 'Linux'")
+        );
+    }
 }
