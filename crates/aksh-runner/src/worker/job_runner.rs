@@ -303,7 +303,7 @@ pub async fn run_job(
 
     // F020: Upload job log (concatenation of all step logs)
     if let Some(ref rpt) = reporting {
-        let q = queue.lock().await;
+        let mut q = queue.lock().await;
         let all_logs = q.all_step_log_content();
         drop(q);
         if !all_logs.is_empty() {
