@@ -5988,6 +5988,11 @@ jobs:
                 Method::POST,
                 "/runner/server/_apis/v1/ActionDownloadInfo/s/h/p",
             ),
+            (Method::GET, "/ws/live-logs/test-job"),
+            (
+                Method::GET,
+                "/api/v1/runs/00000000-0000-0000-0000-000000000000/jobs/test/logs/live",
+            ),
         ];
         for (method, uri) in cases {
             let response = app
