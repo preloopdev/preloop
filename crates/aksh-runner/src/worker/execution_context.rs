@@ -90,6 +90,32 @@ impl<'a> StepContext<'a> {
             keep_in_memory,
         }
     }
+
+
+    /// Write a raw byte chunk from process output. In production mode this
+    /// writes directly to the disk-backed log file. No String allocation,
+    /// no UTF-8 check, no per-line processing. Secret masking and timestamp
+    pub fn write_chunk(&self, chunk: &[u8]) {
+        let mut lock = self.log_file.lock();
+        let _ = lock.write_all(chunk);
+    }
+
+    /// Add a log line: parse workflow commands, apply masking, feed problem matchers.
+    pub fn log(&mut self, line: &str) {
+        // stop-commands: if a token is set, only look for the resume command
+        if let Some(token) = &self.stop_commands_token.clone() {
+            if line.trim() == format!("::{token}::") {
+                self.stop_commands_token = None;
+                return;
+            }
+            // All commands suspended — just log the line
+            let masked = self.job.mask_secrets(line);
+            let ts = crate::worker::job_runner::iso_now();
+            let fmt = format!("{ts} {masked}");
+            {
+                let mut lock = self.log_file.lock();
+                let _ = writeln!(lock, "{}", fmt);
+            }
             if self.keep_in_memory {
                 self.log_lines.push(fmt);
             }
