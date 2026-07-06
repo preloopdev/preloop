@@ -250,4 +250,93 @@ mod tests {
             elapsed
         );
     }
+
+    // --- P1 job dispatcher gap coverage ---
+
+    #[test]
+    fn worker_message_job_serialization() {
+        let msg = WorkerMessage::Job {
+            body: serde_json::json!({"jobId": "test-1", "steps": []}),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"t\":\"job\""));
+        assert!(json.contains("\"body\""));
+        assert!(json.contains("test-1"));
+    }
+
+    #[test]
+    fn worker_message_cancel_serialization() {
+        let msg = WorkerMessage::Cancel { timeout_secs: 300 };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"t\":\"cancel\""));
+        assert!(json.contains("300"));
+    }
+
+    #[test]
+    fn worker_message_shutdown_serialization() {
+        let msg = WorkerMessage::Shutdown;
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"t\":\"shutdown\""));
+    }
+
+    #[test]
+    fn worker_message_roundtrip_all_types() {
+        // Job
+        let job = WorkerMessage::Job {
+            body: serde_json::json!({"k": "v"}),
+        };
+        let j: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&job).unwrap()).unwrap();
+        assert_eq!(j["t"], "job");
+        assert_eq!(j["body"]["k"], "v");
+
+        // Cancel
+        let cancel = WorkerMessage::Cancel { timeout_secs: 60 };
+        let c: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&cancel).unwrap()).unwrap();
+        assert_eq!(c["t"], "cancel");
+        assert_eq!(c["timeout_secs"], 60);
+
+        // Shutdown
+        let shutdown = WorkerMessage::Shutdown;
+        let s: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&shutdown).unwrap()).unwrap();
+        assert_eq!(s["t"], "shutdown");
+    }
+
+    #[tokio::test]
+    async fn spawn_job_extracts_request_id_from_job_id() {
+        let dir = TempDir::new().unwrap();
+        let payload = serde_json::json!({
+            "jobId": "my-unique-job-42",
+            "jobDisplayName": "Test",
+            "steps": [],
+            "fileTable": {
+                "workDirectory": dir.path().join("work").to_str().unwrap()
+            }
+        });
+        let mut running = spawn_job(payload, dir.path(), ProtocolPath::Broker)
+            .await
+            .unwrap();
+        assert_eq!(running.request_id, "my-unique-job-42");
+        running.kill().await;
+    }
+
+    #[tokio::test]
+    async fn spawn_job_extracts_request_id_from_fallback() {
+        let dir = TempDir::new().unwrap();
+        let payload = serde_json::json!({
+            "requestId": "fallback-id",
+            "jobDisplayName": "Test",
+            "steps": [],
+            "fileTable": {
+                "workDirectory": dir.path().join("work").to_str().unwrap()
+            }
+        });
+        let mut running = spawn_job(payload, dir.path(), ProtocolPath::Broker)
+            .await
+            .unwrap();
+        assert_eq!(running.request_id, "fallback-id");
+        running.kill().await;
+    }
 }
