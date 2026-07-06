@@ -964,4 +964,171 @@ mod tests {
         assert!(args.windows(2).any(|pair| pair == ["-e", "MY_SECRET"]));
         assert!(!args.iter().any(|arg| arg.contains("s3cr3t")));
     }
+
+    // --- P0 container/step host gap coverage ---
+
+    #[test]
+    fn split_options_handles_quotes() {
+        assert_eq!(
+            split_options("--cpus 1 --health-cmd 'pg_isready -U postgres'"),
+            vec!["--cpus", "1", "--health-cmd", "pg_isready -U postgres"]
+        );
+        assert_eq!(
+            split_options("--health-cmd \"pg_isready -U ci\" --memory 512m"),
+            vec!["--health-cmd", "pg_isready -U ci", "--memory", "512m"]
+        );
+        assert_eq!(split_options(""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn translate_to_container_path_various() {
+        // Nested path
+        assert_eq!(
+            translate_to_container_path(
+                "/home/runner/_work/repo/repo/subdir",
+                "/home/runner/_work"
+            ),
+            "/__w/repo/repo/subdir"
+        );
+        // Exact match of work dir
+        assert_eq!(
+            translate_to_container_path("/home/runner/_work", "/home/runner/_work"),
+            "/__w"
+        );
+        // Non-matching path stays unchanged
+        assert_eq!(
+            translate_to_container_path("/tmp/something", "/home/runner/_work"),
+            "/tmp/something"
+        );
+    }
+
+    #[test]
+    fn parse_container_spec_with_template_token() {
+        // GitHub sends container specs as TemplateTokens
+        let v = serde_json::json!({
+            "type": 2,
+            "map": [
+                {
+                    "Key": {"type": 0, "lit": "image"},
+                    "Value": {"type": 0, "lit": "node:20"}
+                },
+                {
+                    "Key": {"type": 0, "lit": "options"},
+                    "Value": {"type": 0, "lit": "--cpus 1"}
+                }
+            ]
+        });
+        let spec = parse_container_spec(&v).unwrap();
+        assert_eq!(spec.image, "node:20");
+        assert_eq!(spec.options, "--cpus 1");
+    }
+
+    #[test]
+    fn parse_service_specs_with_template_tokens() {
+        let v = serde_json::json!({
+            "type": 2,
+            "map": [
+                {
+                    "Key": {"type": 0, "lit": "db"},
+                    "Value": {
+                        "type": 2,
+                        "map": [
+                            {
+                                "Key": {"type": 0, "lit": "image"},
+                                "Value": {"type": 0, "lit": "postgres:16"}
+                            }
+                        ]
+                    }
+                }
+            ]
+        });
+        let specs = parse_service_specs(&v);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].alias, "db");
+        assert_eq!(specs[0].image, "postgres:16");
+    }
+
+    #[test]
+    fn docker_exec_args_include_workdir_and_env() {
+        let env = HashMap::from([
+            ("FOO".to_string(), "bar".to_string()),
+            ("BAZ".to_string(), "qux".to_string()),
+        ]);
+        let args = build_docker_exec_args("cid123", "sh", &["-c", "echo hi"], "/__w/repo", &env);
+
+        // Must start with exec -w <workdir>
+        assert_eq!(args[0], "exec");
+        assert_eq!(args[1], "-w");
+        assert_eq!(args[2], "/__w/repo");
+
+        // Must contain -e for each env key (not values!)
+        let env_keys: Vec<_> = args
+            .windows(2)
+            .filter(|w| w[0] == "-e")
+            .map(|w| w[1].clone())
+            .collect();
+        assert!(env_keys.contains(&"FOO".to_string()));
+        assert!(env_keys.contains(&"BAZ".to_string()));
+        // Values must NOT appear
+        assert!(!args
+            .iter()
+            .any(|a| a == "bar" || a == "qux" || a.contains("FOO=bar")));
+
+        // Must end with container_id, program, args
+        assert!(args.contains(&"cid123".to_string()));
+        assert!(args.contains(&"sh".to_string()));
+        assert!(args.contains(&"-c".to_string()));
+        assert!(args.contains(&"echo hi".to_string()));
+    }
+
+    #[test]
+    fn parse_container_spec_string_with_tag() {
+        let v = serde_json::json!("ubuntu:22.04");
+        let spec = parse_container_spec(&v).unwrap();
+        assert_eq!(spec.image, "ubuntu:22.04");
+        assert!(spec.env.is_empty());
+        assert!(spec.options.is_empty());
+        assert!(spec.ports.is_empty());
+        assert!(spec.volumes.is_empty());
+    }
+
+    #[test]
+    fn parse_container_spec_full_mapping() {
+        let v = serde_json::json!({
+            "image": "node:20",
+            "env": {"NODE_ENV": "test", "CI": "true"},
+            "options": "--memory 1g --cpus 2",
+            "ports": ["3000:3000", "5432:5432"],
+            "volumes": ["/data:/data", "cache:/cache"]
+        });
+        let spec = parse_container_spec(&v).unwrap();
+        assert_eq!(spec.image, "node:20");
+        assert_eq!(spec.env.len(), 2);
+        assert_eq!(spec.env.get("NODE_ENV").unwrap(), "test");
+        assert_eq!(spec.options, "--memory 1g --cpus 2");
+        assert_eq!(spec.ports, vec!["3000:3000", "5432:5432"]);
+        assert_eq!(spec.volumes, vec!["/data:/data", "cache:/cache"]);
+    }
+
+    #[test]
+    fn push_docker_create_env_non_empty_value() {
+        let mut args = Vec::new();
+        push_docker_create_env(&mut args, "HTTP_PROXY", "http://proxy.test:8080");
+        assert_eq!(args, vec!["-e", "HTTP_PROXY=http://proxy.test:8080"]);
+    }
+
+    #[test]
+    fn push_docker_create_env_empty_value_inherits() {
+        let mut args = Vec::new();
+        push_docker_create_env(&mut args, "HTTP_PROXY", "");
+        // Empty value → just key (inherit from host)
+        assert_eq!(args, vec!["-e", "HTTP_PROXY"]);
+    }
+
+    #[test]
+    fn push_docker_inherited_env_key_only() {
+        let mut args = Vec::new();
+        push_docker_inherited_env(&mut args, "SOME_VAR");
+        assert_eq!(args, vec!["-e", "SOME_VAR"]);
+    }
 }

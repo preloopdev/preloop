@@ -317,4 +317,255 @@ mod tests {
         RunnerConfig::remove_files(dir.path()).unwrap();
         assert!(!RunnerConfig::is_configured(dir.path()));
     }
+
+    // --- P1 settings/credential gap coverage ---
+
+    #[test]
+    fn credential_data_accessors() {
+        let mut data = serde_json::Map::new();
+        data.insert("clientId".into(), serde_json::json!("abc-client-id"));
+        data.insert(
+            "authorizationUrl".into(),
+            serde_json::json!("https://vstoken.actions.githubusercontent.com"),
+        );
+        let cred = CredentialData {
+            scheme: "OAuth".to_string(),
+            data,
+        };
+        assert_eq!(cred.client_id(), Some("abc-client-id"));
+        assert_eq!(
+            cred.authorization_url(),
+            Some("https://vstoken.actions.githubusercontent.com")
+        );
+    }
+
+    #[test]
+    fn credential_data_missing_fields() {
+        let cred = CredentialData {
+            scheme: "OAuth".to_string(),
+            data: serde_json::Map::new(),
+        };
+        assert!(cred.client_id().is_none());
+        assert!(cred.authorization_url().is_none());
+    }
+
+    #[test]
+    fn runner_settings_ephemeral_fields_roundtrip() {
+        let settings = RunnerSettings {
+            agent_id: 99,
+            agent_name: "ephemeral-runner".to_string(),
+            pool_id: 2,
+            pool_name: "Hosted".to_string(),
+            server_url: "https://pipelines.actions.githubusercontent.com/xyz".to_string(),
+            git_hub_url: "https://github.com/org/repo".to_string(),
+            work_folder: "_work".to_string(),
+            is_hosted: true,
+            runner_group_id: Some(5),
+            runner_group_name: Some("Custom".to_string()),
+            ephemeral: true,
+            is_hosted_server: true,
+            use_v2_flow: true,
+            server_url_v2: Some("https://broker.actions.githubusercontent.com/".to_string()),
+            disable_update: true,
+            skip_session_recover: true,
+            monitor_socket_address: Some("/tmp/runner-monitor.sock".to_string()),
+            use_runner_admin_flow: true,
+        };
+        let json = serde_json::to_string_pretty(&settings).unwrap();
+        let loaded: RunnerSettings = serde_json::from_str(&json).unwrap();
+        assert!(loaded.ephemeral);
+        assert!(loaded.is_hosted);
+        assert!(loaded.is_hosted_server);
+        assert!(loaded.use_v2_flow);
+        assert!(loaded.disable_update);
+        assert!(loaded.skip_session_recover);
+        assert!(loaded.use_runner_admin_flow);
+        assert_eq!(
+            loaded.server_url_v2.as_deref(),
+            Some("https://broker.actions.githubusercontent.com/")
+        );
+        assert_eq!(
+            loaded.monitor_socket_address.as_deref(),
+            Some("/tmp/runner-monitor.sock")
+        );
+        assert_eq!(loaded.runner_group_id, Some(5));
+    }
+
+    #[test]
+    fn runner_settings_camel_case_json_keys() {
+        let settings = RunnerSettings {
+            agent_id: 1,
+            agent_name: "test".to_string(),
+            pool_id: 1,
+            pool_name: "Default".to_string(),
+            server_url: "https://example.com".to_string(),
+            git_hub_url: "https://github.com/t/r".to_string(),
+            work_folder: "_work".to_string(),
+            is_hosted: false,
+            runner_group_id: None,
+            runner_group_name: None,
+            ephemeral: false,
+            is_hosted_server: false,
+            use_v2_flow: true,
+            server_url_v2: None,
+            disable_update: false,
+            skip_session_recover: false,
+            monitor_socket_address: None,
+            use_runner_admin_flow: false,
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        // Official .runner uses camelCase
+        assert!(json.contains("\"agentId\""));
+        assert!(json.contains("\"agentName\""));
+        assert!(json.contains("\"poolId\""));
+        assert!(json.contains("\"serverUrl\""));
+        assert!(json.contains("\"gitHubUrl\""));
+        assert!(json.contains("\"workFolder\""));
+        assert!(json.contains("\"isHosted\""));
+        assert!(json.contains("\"useV2Flow\""));
+    }
+
+    #[test]
+    fn runner_settings_default_use_v2_flow_is_true() {
+        // When loading a .runner file that doesn't have useV2Flow,
+        // it should default to true (matching official runner behavior)
+        let json = r#"{
+            "agentId": 1,
+            "agentName": "test",
+            "poolId": 1,
+            "serverUrl": "https://example.com",
+            "gitHubUrl": "https://github.com/t/r",
+            "workFolder": "_work"
+        }"#;
+        let settings: RunnerSettings = serde_json::from_str(json).unwrap();
+        assert!(settings.use_v2_flow);
+        assert!(!settings.ephemeral);
+        assert!(!settings.disable_update);
+        assert!(!settings.skip_session_recover);
+    }
+
+    #[test]
+    fn credential_data_auth_migration_fields() {
+        let mut data = serde_json::Map::new();
+        data.insert("clientId".into(), serde_json::json!("cid"));
+        data.insert(
+            "authorizationUrl".into(),
+            serde_json::json!("https://vstoken.old.com"),
+        );
+        data.insert(
+            "enableAuthMigrationByDefault".into(),
+            serde_json::json!("true"),
+        );
+        data.insert(
+            "authorizationUrlV2".into(),
+            serde_json::json!("https://vstoken.new.com"),
+        );
+        data.insert(
+            "oauthEndpointUrl".into(),
+            serde_json::json!("https://oauth.example.com/token"),
+        );
+        let cred = CredentialData {
+            scheme: "OAuth".to_string(),
+            data,
+        };
+        // These are the fields the OAuth flow reads
+        assert_eq!(cred.client_id(), Some("cid"));
+        assert_eq!(cred.authorization_url(), Some("https://vstoken.old.com"));
+        assert_eq!(
+            cred.data
+                .get("enableAuthMigrationByDefault")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "true"
+        );
+        assert_eq!(
+            cred.data
+                .get("authorizationUrlV2")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "https://vstoken.new.com"
+        );
+        assert_eq!(
+            cred.data.get("oauthEndpointUrl").unwrap().as_str().unwrap(),
+            "https://oauth.example.com/token"
+        );
+    }
+
+    #[test]
+    fn config_save_load_with_all_credential_fields() {
+        let dir = TempDir::new().unwrap();
+        let mut data = serde_json::Map::new();
+        data.insert("clientId".into(), serde_json::json!("client-1"));
+        data.insert(
+            "authorizationUrl".into(),
+            serde_json::json!("https://auth.example.com"),
+        );
+        data.insert("requireFipsCryptography".into(), serde_json::json!("True"));
+        data.insert(
+            "enableAuthMigrationByDefault".into(),
+            serde_json::json!("true"),
+        );
+        data.insert(
+            "authorizationUrlV2".into(),
+            serde_json::json!("https://auth-v2.example.com"),
+        );
+
+        let config = RunnerConfig {
+            settings: RunnerSettings {
+                agent_id: 42,
+                agent_name: "full-config".to_string(),
+                pool_id: 3,
+                pool_name: "CI".to_string(),
+                server_url: "https://pipelines.example.com".to_string(),
+                git_hub_url: "https://github.com/org/repo".to_string(),
+                work_folder: "_work".to_string(),
+                is_hosted: false,
+                runner_group_id: Some(2),
+                runner_group_name: Some("GPU".to_string()),
+                ephemeral: true,
+                is_hosted_server: false,
+                use_v2_flow: true,
+                server_url_v2: Some("https://broker.example.com/".to_string()),
+                disable_update: false,
+                skip_session_recover: false,
+                monitor_socket_address: None,
+                use_runner_admin_flow: false,
+            },
+            credentials: CredentialData {
+                scheme: "OAuth".to_string(),
+                data,
+            },
+            rsa_params: RsaParameters {
+                d: "test-d".to_string(),
+                dp: "test-dp".to_string(),
+                dq: "test-dq".to_string(),
+                exponent: "AQAB".to_string(),
+                inverse_q: "test-iq".to_string(),
+                modulus: "test-mod".to_string(),
+                p: "test-p".to_string(),
+                q: "test-q".to_string(),
+            },
+        };
+        config.save(dir.path()).unwrap();
+        let loaded = RunnerConfig::load(dir.path()).unwrap();
+        assert!(loaded.settings.ephemeral);
+        assert_eq!(loaded.settings.agent_name, "full-config");
+        assert_eq!(loaded.credentials.client_id(), Some("client-1"));
+        assert_eq!(
+            loaded
+                .credentials
+                .data
+                .get("requireFipsCryptography")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "True"
+        );
+        assert_eq!(
+            loaded.settings.server_url_v2.as_deref(),
+            Some("https://broker.example.com/")
+        );
+    }
 }

@@ -175,4 +175,81 @@ mod tests {
         let result = evaluate_template("plain text no expressions", &ctx).unwrap();
         assert_eq!(result, "plain text no expressions");
     }
+
+    // --- P1 expressions/templates gap coverage ---
+
+    #[test]
+    fn template_with_matrix_context() {
+        let mut ctx = make_ctx();
+        ctx.insert(
+            "matrix",
+            serde_json::json!({"os": "ubuntu-latest", "node": "20"}),
+        );
+        let result =
+            evaluate_template("OS=${{ matrix.os }}, Node=${{ matrix.node }}", &ctx).unwrap();
+        assert_eq!(result, "OS=ubuntu-latest, Node=20");
+    }
+
+    #[test]
+    fn template_with_needs_context() {
+        let mut ctx = make_ctx();
+        ctx.insert(
+            "needs",
+            serde_json::json!({
+                "build": {"outputs": {"sha": "abc123"}}
+            }),
+        );
+        let result = evaluate_template("SHA=${{ needs.build.outputs.sha }}", &ctx).unwrap();
+        assert_eq!(result, "SHA=abc123");
+    }
+
+    #[test]
+    fn template_with_env_context() {
+        let mut ctx = make_ctx();
+        ctx.insert("env", serde_json::json!({"MY_VAR": "hello"}));
+        let result = evaluate_template("val=${{ env.MY_VAR }}", &ctx).unwrap();
+        assert_eq!(result, "val=hello");
+    }
+
+    #[test]
+    fn template_evaluates_boolean_to_string() {
+        let ctx = make_ctx();
+        // success() returns true, which should render as "true"
+        let result = evaluate_template("status=${{ success() }}", &ctx).unwrap();
+        assert_eq!(result, "status=true");
+    }
+
+    #[test]
+    fn template_evaluates_number_to_string() {
+        let mut ctx = make_ctx();
+        ctx.insert("matrix", serde_json::json!({"timeout": 10}));
+        let result = evaluate_template("timeout=${{ matrix.timeout }}", &ctx).unwrap();
+        assert_eq!(result, "timeout=10");
+    }
+
+    #[test]
+    fn template_null_renders_empty() {
+        let mut ctx = make_ctx();
+        ctx.insert("matrix", serde_json::json!({"missing": null}));
+        let result = evaluate_template("val=${{ matrix.missing }}", &ctx).unwrap();
+        assert_eq!(result, "val=");
+    }
+
+    #[test]
+    fn template_unresolved_context_renders_empty() {
+        let ctx = make_ctx();
+        let result = evaluate_template("val=${{ matrix.nonexistent }}", &ctx).unwrap();
+        assert_eq!(result, "val=");
+    }
+
+    #[test]
+    fn template_mixed_literal_and_expression() {
+        let ctx = make_ctx();
+        let result = evaluate_template(
+            "echo Running on ${{ github.repository }} ref ${{ github.ref }} done",
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(result, "echo Running on test/repo ref refs/heads/main done");
+    }
 }

@@ -233,4 +233,162 @@ mod tests {
             "/tmp/ca.pem"
         );
     }
+
+    // --- P1 CLI configuration gap coverage ---
+
+    #[test]
+    fn parse_configure_replace_flag() {
+        let cli = Cli::try_parse_from([
+            "aksh-runner",
+            "configure",
+            "--url",
+            "https://github.com/org/repo",
+            "--token",
+            "TOKEN",
+            "--replace",
+        ])
+        .unwrap();
+        match &cli.command {
+            Commands::Configure(args) => {
+                assert!(args.replace);
+                assert!(!args.ephemeral);
+            }
+            _ => panic!("expected Configure"),
+        }
+    }
+
+    #[test]
+    fn parse_configure_ephemeral_replace() {
+        let cli = Cli::try_parse_from([
+            "aksh-runner",
+            "configure",
+            "--url",
+            "https://github.com/org/repo",
+            "--token",
+            "TOKEN",
+            "--ephemeral",
+            "--replace",
+            "--unattended",
+        ])
+        .unwrap();
+        match &cli.command {
+            Commands::Configure(args) => {
+                assert!(args.ephemeral);
+                assert!(args.replace);
+                assert!(args.unattended);
+            }
+            _ => panic!("expected Configure"),
+        }
+    }
+
+    #[test]
+    fn parse_configure_no_externals() {
+        let cli = Cli::try_parse_from([
+            "aksh-runner",
+            "configure",
+            "--url",
+            "https://github.com/org/repo",
+            "--token",
+            "TOKEN",
+            "--no-externals",
+        ])
+        .unwrap();
+        match &cli.command {
+            Commands::Configure(args) => {
+                assert!(args.no_externals);
+            }
+            _ => panic!("expected Configure"),
+        }
+    }
+
+    #[test]
+    fn parse_configure_custom_work_dir() {
+        let cli = Cli::try_parse_from([
+            "aksh-runner",
+            "configure",
+            "--url",
+            "https://github.com/org/repo",
+            "--token",
+            "TOKEN",
+            "--work",
+            "custom_work",
+        ])
+        .unwrap();
+        match &cli.command {
+            Commands::Configure(args) => {
+                assert_eq!(args.work, "custom_work");
+            }
+            _ => panic!("expected Configure"),
+        }
+    }
+
+    #[test]
+    fn parse_configure_runner_group() {
+        let cli = Cli::try_parse_from([
+            "aksh-runner",
+            "configure",
+            "--url",
+            "https://github.com/org/repo",
+            "--token",
+            "TOKEN",
+            "--runner-group",
+            "gpu-runners",
+        ])
+        .unwrap();
+        match &cli.command {
+            Commands::Configure(args) => {
+                assert_eq!(args.runner_group, "gpu-runners");
+            }
+            _ => panic!("expected Configure"),
+        }
+    }
+
+    #[test]
+    fn parse_configure_defaults() {
+        let cli = Cli::try_parse_from([
+            "aksh-runner",
+            "configure",
+            "--url",
+            "https://github.com/test/repo",
+            "--token",
+            "TOKEN",
+        ])
+        .unwrap();
+        match &cli.command {
+            Commands::Configure(args) => {
+                assert_eq!(args.work, "_work");
+                assert_eq!(args.runner_group, "default");
+                assert!(!args.replace);
+                assert!(!args.ephemeral);
+                assert!(!args.unattended);
+                assert!(!args.no_externals);
+                assert!(args.name.is_none());
+                assert!(args.labels.is_none());
+            }
+            _ => panic!("expected Configure"),
+        }
+    }
+
+    #[test]
+    fn parse_run_once_broker() {
+        let cli = Cli::try_parse_from(["aksh-runner", "run", "--once"]).unwrap();
+        match &cli.command {
+            Commands::Run(args) => {
+                assert!(args.once);
+                assert_eq!(args.via, ProtocolPath::Broker);
+            }
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn parse_worker_azdo() {
+        let cli = Cli::try_parse_from(["aksh-runner", "worker", "--via", "azdo"]).unwrap();
+        match &cli.command {
+            Commands::Worker(args) => {
+                assert_eq!(args.via, ProtocolPath::Azdo);
+            }
+            _ => panic!("expected Worker"),
+        }
+    }
 }
