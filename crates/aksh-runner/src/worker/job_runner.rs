@@ -381,6 +381,12 @@ pub async fn run_job(
         queue.shutdown_and_wait(handle).await;
     }
 
+    // Kill any orphan child processes left over from the job steps.
+    // This mirrors the official runner's FinalizeJob orphan-process cleanup.
+    if let Some(tracking_id) = job_ctx.env.get("RUNNER_TRACKING_ID").cloned() {
+        super::job_extension::kill_orphan_processes(&tracking_id);
+    }
+
     // Check if we timed out (must check before aborting the timer)
     let was_timeout = timed_out.load(std::sync::atomic::Ordering::SeqCst);
 
