@@ -168,9 +168,35 @@ pub async fn run_steps(
         let step_number = (idx as u32) + step_offset;
 
         let expr_ctx = job.build_expression_context();
-        let resolved_display_name =
-            crate::worker::template::evaluate_template(&step.display_name, &expr_ctx)
-                .unwrap_or_else(|_| step.display_name.clone());
+        let resolved_display_name = {
+            let evaluated =
+                crate::worker::template::evaluate_template(&step.display_name, &expr_ctx)
+                    .unwrap_or_else(|_| step.display_name.clone());
+            // The auto-generated display name for a script step is "Run <first-line-of-script>".
+            // When the script contains ${{ }} expressions GHA encodes the entire script as a
+            // single format() token, so the first line is a truncated format() expression that
+            // evaluate_template cannot resolve. Detect that case and regenerate from the
+            // fully-evaluated script content instead.
+            if evaluated.contains("${{") {
+                if let StepType::Script { script, .. } = &step.step_type {
+                    let evaluated_script =
+                        crate::worker::template::evaluate_template(script, &expr_ctx)
+                            .unwrap_or_else(|_| script.clone());
+                    crate::worker::job_extension::display_name_for_step(
+                        &step.id,
+                        &StepType::Script {
+                            script: evaluated_script,
+                            shell: None,
+                            working_directory: None,
+                        },
+                    )
+                } else {
+                    evaluated
+                }
+            } else {
+                evaluated
+            }
+        };
         // Check for cancellation
         if *cancel_rx.borrow() && !cancelled {
             cancelled = true;
@@ -1834,4 +1860,66 @@ mod tests {
         assert_eq!(job.steps.get("deploy_step").unwrap().conclusion, "Success");
         assert_eq!(job.steps.get("skip_step").unwrap().conclusion, "Skipped");
     }
+    /// Regression: when GHA encodes a multi-expression run: script as a single format() token,
+    /// display_name_for_step takes only the first line, producing a truncated ${{ format(...)
+    /// expression. evaluate_template fails to close it; the fallback regenerates from the
+    /// evaluated full script so the timeline shows the resolved first line.
+    #[tokio::test]
+    async fn run_steps_display_name_from_format_token_script() {
+        let dir = TempDir::new().unwrap();
+        let mut job = JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({"matrix": {"platform": {"name": "Linux ARM64", "target": "aarch64-unknown-linux-gnu"}}}),
+        );
+        let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+        let (_tx, cancel_rx) = watch::channel(false);
+
+        // Simulate what build_step_list produces when GHA sends the script as a
+        // format() token: the display name is "Run <first-line>" where the first
+        // line is the start of the multi-line format() expression.
+        let format_script = "${{ format('echo \"name={0}\"\necho \"target={1}\"', matrix.platform.name, matrix.platform.target) }}".to_string();
+        let mut step = test_step("print_ctx", None);
+        step.display_name = format!("Run {}", format_script.lines().next().unwrap_or(""));
+        step.step_type = StepType::Script {
+            script: format_script,
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+
+        let result = run_steps(
+            &[step],
+            &mut job,
+            dir.path().to_str().unwrap(),
+            cancel_rx,
+            queue.clone(),
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "Succeeded");
+        // The step name sent in queue updates should be the resolved first line,
+        // not the raw format() expression.
+        let updates = queue.lock().await;
+        let step_update = updates
+            .all_queued_updates()
+            .iter()
+            .find(|u| u.number > 1)
+            .expect("expected at least one user step update");
+        assert!(
+            !step_update.name.contains("${{"),
+            "display name should be resolved, got: {}",
+            step_update.name
+        );
+        assert!(
+            step_update.name.starts_with("Run "),
+            "display name should start with 'Run', got: {}",
+            step_update.name
+        );
+    }
+
 }

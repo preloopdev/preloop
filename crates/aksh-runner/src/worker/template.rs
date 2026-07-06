@@ -83,18 +83,19 @@ pub fn evaluate_condition(condition: &str, ctx: &aksh_gha_expressions::Context) 
 fn find_expression_end(s: &str) -> Option<usize> {
     let mut in_single_quote = false;
     let mut paren_depth: usize = 0;
-    let chars: Vec<char> = s.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        let ch = chars[i];
+    // char_indices() yields (byte_offset, char) — we return byte offsets so
+    // that the caller can safely slice `s[..end]` even when `s` contains
+    // multi-byte characters (e.g. em dash U+2014 inside a format() literal).
+    let mut iter = s.char_indices().peekable();
+    while let Some((byte_pos, ch)) = iter.next() {
         match ch {
             '\'' if !in_single_quote => {
                 in_single_quote = true;
             }
             '\'' if in_single_quote => {
                 // Check for escaped quote ('') inside string literal
-                if i + 1 < chars.len() && chars[i + 1] == '\'' {
-                    i += 1; // skip escaped quote
+                if iter.peek().map(|&(_, c)| c) == Some('\'') {
+                    iter.next(); // skip escaped quote
                 } else {
                     in_single_quote = false;
                 }
@@ -107,13 +108,12 @@ fn find_expression_end(s: &str) -> Option<usize> {
             }
             '}' if !in_single_quote && paren_depth == 0 => {
                 // Check for }}
-                if i + 1 < chars.len() && chars[i + 1] == '}' {
-                    return Some(i);
+                if iter.peek().map(|&(_, c)| c) == Some('}') {
+                    return Some(byte_pos);
                 }
             }
             _ => {}
         }
-        i += 1;
     }
     None
 }
@@ -252,4 +252,24 @@ mod tests {
         .unwrap();
         assert_eq!(result, "echo Running on test/repo ref refs/heads/main done");
     }
+    /// Regression: format() expressions whose template literal contains multi-byte
+    /// Unicode characters (e.g. em dash U+2014) previously caused find_expression_end
+    /// to return a char index instead of a byte offset, silently truncating the
+    /// expression and leaving the raw ${{ format(...) }} literal in the script.
+    #[test]
+    fn format_expression_with_multibyte_char_in_template() {
+        let mut ctx = make_ctx();
+        ctx.insert("matrix", serde_json::json!({"os": "ubuntu-latest"}));
+        // Mirrors what GHA sends for: run: echo "only runs for ubuntu-latest — os=${{ matrix.os }}"
+        let result = evaluate_template(
+            "${{ format('echo \"only runs for ubuntu-latest \u{2014} os={0}\"', matrix.os) }}",
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            "echo \"only runs for ubuntu-latest \u{2014} os=ubuntu-latest\""
+        );
+    }
+
 }
