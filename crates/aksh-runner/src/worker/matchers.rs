@@ -18,6 +18,9 @@ pub struct ProblemMatcher {
     /// F051: Default base directory for resolving relative file paths in annotations.
     pub from_path: String,
     pub state: Vec<Option<PatternMatch>>,
+    /// Regexes compiled from `patterns` at registration time; index-parallel to `patterns`.
+    /// Avoids re-compiling on every log line (hot path).
+    pub compiled_regexes: Vec<regex::Regex>,
 }
 
 impl ProblemMatcher {
@@ -185,9 +188,14 @@ impl MatcherRegistry {
             .with_context(|| format!("reading matcher file {}", path.display()))?;
         let file: MatcherFile = serde_json::from_str(&content)
             .with_context(|| format!("parsing matcher file {}", path.display()))?;
-
         for def in file.problem_matcher {
             validate_matcher_definition(&def)?;
+            // Compile once at registration — validated above so unwrap is safe.
+            let compiled_regexes: Vec<regex::Regex> = def
+                .pattern
+                .iter()
+                .map(|p| regex::Regex::new(&p.regexp).expect("regex validated above"))
+                .collect();
             debug!("Registered problem matcher: {}", def.owner);
             let pattern_len = def.pattern.len();
             let state = if pattern_len > 1 {
@@ -202,6 +210,7 @@ impl MatcherRegistry {
                     patterns: def.pattern,
                     from_path: def.from_path.unwrap_or_default(),
                     state,
+                    compiled_regexes,
                 },
             );
         }
@@ -252,19 +261,18 @@ impl MatcherRegistry {
 
             if matcher.patterns.len() == 1 {
                 let pattern = &matcher.patterns[0];
-                if let Ok(re) = regex::Regex::new(&pattern.regexp) {
-                    if let Some(captures) = re.captures(match_line) {
-                        let pm = PatternMatch::new(
-                            None,
-                            pattern,
-                            &captures,
-                            "error", // default severity
-                            &matcher.from_path,
-                        );
-                        matched_owner = Some(matcher.owner.clone());
-                        matched_match = Some(pm);
-                        break;
-                    }
+                let re = &matcher.compiled_regexes[0];
+                if let Some(captures) = re.captures(match_line) {
+                    let pm = PatternMatch::new(
+                        None,
+                        pattern,
+                        &captures,
+                        "error", // default severity
+                        &matcher.from_path,
+                    );
+                    matched_owner = Some(matcher.owner.clone());
+                    matched_match = Some(pm);
+                    break;
                 }
             } else {
                 let num_patterns = matcher.patterns.len();
@@ -278,42 +286,41 @@ impl MatcherRegistry {
                     if i == 0 || running_match.is_some() {
                         let pattern = &matcher.patterns[i];
                         let is_last = i == num_patterns - 1;
-                        if let Ok(re) = regex::Regex::new(&pattern.regexp) {
-                            if let Some(captures) = re.captures(match_line) {
-                                if is_last {
-                                    let pm = PatternMatch::new(
-                                        running_match,
-                                        pattern,
-                                        &captures,
-                                        "error", // default severity
-                                        &matcher.from_path,
-                                    );
-                                    if pattern.is_loop {
-                                        let saved_run = running_match.cloned();
-                                        matcher.reset();
-                                        matcher.state[i - 1] = saved_run;
-                                    } else {
-                                        matcher.reset();
-                                    }
-                                    matched_owner = Some(matcher.owner.clone());
-                                    matched_match = Some(pm);
-                                    break;
+                        let re = &matcher.compiled_regexes[i];
+                        if let Some(captures) = re.captures(match_line) {
+                            if is_last {
+                                let pm = PatternMatch::new(
+                                    running_match,
+                                    pattern,
+                                    &captures,
+                                    "error", // default severity
+                                    &matcher.from_path,
+                                );
+                                if pattern.is_loop {
+                                    let saved_run = running_match.cloned();
+                                    matcher.reset();
+                                    matcher.state[i - 1] = saved_run;
                                 } else {
-                                    let pm = PatternMatch::new(
-                                        running_match,
-                                        pattern,
-                                        &captures,
-                                        "", // default severity
-                                        "", // default fromPath
-                                    );
-                                    matcher.state[i] = Some(pm);
+                                    matcher.reset();
                                 }
+                                matched_owner = Some(matcher.owner.clone());
+                                matched_match = Some(pm);
+                                break;
                             } else {
-                                if is_last {
-                                    matcher.state[i - 1] = None;
-                                } else {
-                                    matcher.state[i] = None;
-                                }
+                                let pm = PatternMatch::new(
+                                    running_match,
+                                    pattern,
+                                    &captures,
+                                    "", // default severity
+                                    "", // default fromPath
+                                );
+                                matcher.state[i] = Some(pm);
+                            }
+                        } else {
+                            if is_last {
+                                matcher.state[i - 1] = None;
+                            } else {
+                                matcher.state[i] = None;
                             }
                         }
                     }
