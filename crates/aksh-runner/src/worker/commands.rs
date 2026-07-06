@@ -292,4 +292,133 @@ mod tests {
         assert_eq!(cmd.properties.get("name").unwrap(), "result");
         assert_eq!(cmd.data, "hello world");
     }
+
+    // --- P0 command handler integration tests ---
+
+    fn make_ctx<'a>(
+        job: &'a mut crate::worker::contexts::JobContext,
+    ) -> crate::worker::execution_context::StepContext<'a> {
+        crate::worker::execution_context::StepContext::new(job, "s1".into(), "Step".into())
+    }
+
+    fn make_job() -> crate::worker::contexts::JobContext {
+        crate::worker::contexts::JobContext::new(
+            "j1".into(),
+            "Test".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        )
+    }
+
+    #[test]
+    fn handle_add_mask_adds_to_masks() {
+        let mut job = make_job();
+        let mut ctx = make_ctx(&mut job);
+        let cmd = parse_command("::add-mask::my-secret-token").unwrap();
+        handle_command(&cmd, &mut ctx);
+        assert_eq!(
+            ctx.job.mask_secrets("my-secret-token is here"),
+            "*** is here"
+        );
+    }
+
+    #[test]
+    fn handle_error_creates_annotation() {
+        let mut job = make_job();
+        let mut ctx = make_ctx(&mut job);
+        let cmd = parse_command("::error file=src/main.rs,line=42,endLine=44,col=5,endColumn=10,title=Build Error::compilation failed").unwrap();
+        handle_command(&cmd, &mut ctx);
+        assert_eq!(ctx.annotations.len(), 1);
+        assert_eq!(
+            ctx.annotations[0].level,
+            crate::worker::execution_context::AnnotationLevel::Error
+        );
+        assert_eq!(ctx.annotations[0].message, "compilation failed");
+        assert_eq!(ctx.annotations[0].file.as_deref(), Some("src/main.rs"));
+        assert_eq!(ctx.annotations[0].line, Some(42));
+        assert_eq!(ctx.annotations[0].end_line, Some(44));
+        assert_eq!(ctx.annotations[0].col, Some(5));
+        assert_eq!(ctx.annotations[0].end_column, Some(10));
+        assert_eq!(ctx.annotations[0].title.as_deref(), Some("Build Error"));
+    }
+
+    #[test]
+    fn handle_warning_creates_annotation() {
+        let mut job = make_job();
+        let mut ctx = make_ctx(&mut job);
+        let cmd = parse_command("::warning::this is a warning").unwrap();
+        handle_command(&cmd, &mut ctx);
+        assert_eq!(ctx.annotations.len(), 1);
+        assert_eq!(
+            ctx.annotations[0].level,
+            crate::worker::execution_context::AnnotationLevel::Warning
+        );
+        assert_eq!(ctx.annotations[0].message, "this is a warning");
+    }
+
+    #[test]
+    fn handle_notice_creates_annotation() {
+        let mut job = make_job();
+        let mut ctx = make_ctx(&mut job);
+        let cmd = parse_command("::notice::just an FYI").unwrap();
+        handle_command(&cmd, &mut ctx);
+        assert_eq!(ctx.annotations.len(), 1);
+        assert_eq!(
+            ctx.annotations[0].level,
+            crate::worker::execution_context::AnnotationLevel::Notice
+        );
+    }
+
+    #[test]
+    fn handle_group_endgroup_logging() {
+        let mut job = make_job();
+        let mut ctx = make_ctx(&mut job);
+        let group = parse_command("::group::Build step").unwrap();
+        handle_command(&group, &mut ctx);
+        assert!(ctx
+            .log_lines
+            .iter()
+            .any(|l| l.contains("##[group]Build step")));
+
+        let endgroup = parse_command("::endgroup::").unwrap();
+        handle_command(&endgroup, &mut ctx);
+        assert!(ctx.log_lines.iter().any(|l| l.contains("##[endgroup]")));
+    }
+
+    #[test]
+    fn handle_echo_on_off() {
+        let mut job = make_job();
+        let mut ctx = make_ctx(&mut job);
+        assert!(!ctx.echo);
+
+        let on = parse_command("::echo::on").unwrap();
+        handle_command(&on, &mut ctx);
+        assert!(ctx.echo);
+
+        let off = parse_command("::echo::off").unwrap();
+        handle_command(&off, &mut ctx);
+        assert!(!ctx.echo);
+    }
+
+    #[test]
+    fn handle_stop_commands_via_log() {
+        let mut job = make_job();
+        let mut ctx = make_ctx(&mut job);
+
+        // stop-commands sets a token
+        ctx.log("::stop-commands::my_token");
+        assert_eq!(ctx.stop_commands_token, Some("my_token".to_string()));
+
+        // Commands are suspended while token is active
+        ctx.log("::error::this should not create an annotation");
+        assert!(ctx.annotations.is_empty());
+
+        // Resume with the token
+        ctx.log("::my_token::");
+        assert!(ctx.stop_commands_token.is_none());
+
+        // Commands work again
+        ctx.log("::error::this should create an annotation");
+        assert_eq!(ctx.annotations.len(), 1);
+    }
 }

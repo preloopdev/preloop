@@ -11,8 +11,8 @@ use command_group::{Signal, UnixChildExt};
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::watch;
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 /// Result of a process invocation.
 #[derive(Debug)]
@@ -54,30 +54,15 @@ pub async fn invoke(
     let stdout = child.inner().stdout.take();
     let stderr = child.inner().stderr.take();
 
-    // Spawn tasks to read stdout/stderr concurrently
-    let stdout_handle = stdout.map(|s| {
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(s).lines();
-            let mut out = Vec::new();
-            while let Ok(Some(line)) = reader.next_line().await {
-                out.push(line);
-            }
-            out
-        })
-    });
+    let (line_tx, mut line_rx) = mpsc::unbounded_channel();
 
-    let stderr_handle = stderr.map(|s| {
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(s).lines();
-            let mut out = Vec::new();
-            while let Ok(Some(line)) = reader.next_line().await {
-                out.push(line);
-            }
-            out
-        })
-    });
+    let stdout_handle = stdout.map(|s| spawn_line_reader(s, line_tx.clone()));
+    let stderr_handle = stderr.map(|s| spawn_line_reader(s, line_tx));
+    let mut lines = Vec::new();
 
-    // Wait for process, racing against cancellation.
+    // Wait for process, racing against cancellation while draining stdout/stderr
+    // as it arrives. This preserves observed stream order instead of collecting
+    // all stdout before stderr after process exit.
     let status = if let Some(mut rx) = cancel_rx {
         loop {
             if let Some(status) = child
@@ -88,6 +73,7 @@ pub async fn invoke(
             }
 
             tokio::select! {
+                Some(line) = line_rx.recv() => push_line(line, &mut lines, &mut on_line),
                 res = rx.changed() => {
                     // P1.4: Only cancel if the value is actually true.
                     // Err(Closed) means the sender was dropped (e.g., grace timer task
@@ -97,7 +83,7 @@ pub async fn invoke(
                         terminate_process_group(&mut child, program).await;
 
                         // Still collect whatever output was produced.
-                        let _ = collect_lines(stdout_handle, stderr_handle, &mut on_line).await;
+                        drain_lines(stdout_handle, stderr_handle, &mut line_rx, &mut lines, &mut on_line).await;
                         return Err(anyhow::anyhow!("process cancelled"));
                     }
                 }
@@ -105,16 +91,32 @@ pub async fn invoke(
             }
         }
     } else {
-        child
-            .wait()
-            .await
-            .with_context(|| format!("waiting for {program}"))?
+        loop {
+            if let Some(status) = child
+                .try_wait()
+                .with_context(|| format!("checking status for {program}"))?
+            {
+                break status;
+            }
+
+            tokio::select! {
+                Some(line) = line_rx.recv() => push_line(line, &mut lines, &mut on_line),
+                () = tokio::time::sleep(Duration::from_millis(100)) => {}
+            }
+        }
     };
 
     let exit_code = status.code().unwrap_or(-1);
 
-    // Collect output
-    let lines = collect_lines(stdout_handle, stderr_handle, &mut on_line).await;
+    // Collect output that arrived between the final status poll and pipe close.
+    drain_lines(
+        stdout_handle,
+        stderr_handle,
+        &mut line_rx,
+        &mut lines,
+        &mut on_line,
+    )
+    .await;
 
     Ok(ProcessOutput { exit_code, lines })
 }
@@ -129,26 +131,44 @@ const SIGTERM_GRACE: Duration = Duration::from_millis(2500);
 #[cfg(test)]
 const SIGTERM_GRACE: Duration = Duration::from_millis(250);
 
-async fn collect_lines(
-    stdout_handle: Option<JoinHandle<Vec<String>>>,
-    stderr_handle: Option<JoinHandle<Vec<String>>>,
+fn spawn_line_reader<R>(stream: R, tx: mpsc::UnboundedSender<String>) -> JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(stream).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    })
+}
+
+fn push_line(line: String, lines: &mut Vec<String>, on_line: &mut Option<LineCallback>) {
+    if let Some(cb) = on_line {
+        cb(&line);
+    }
+    lines.push(line);
+}
+
+async fn drain_lines(
+    stdout_handle: Option<JoinHandle<()>>,
+    stderr_handle: Option<JoinHandle<()>>,
+    line_rx: &mut mpsc::UnboundedReceiver<String>,
+    lines: &mut Vec<String>,
     on_line: &mut Option<LineCallback>,
-) -> Vec<String> {
-    let mut lines = Vec::new();
+) {
     if let Some(h) = stdout_handle {
-        lines.extend(h.await.unwrap_or_default());
+        let _ = h.await;
     }
     if let Some(h) = stderr_handle {
-        lines.extend(h.await.unwrap_or_default());
+        let _ = h.await;
     }
 
-    for line in &lines {
-        if let Some(cb) = on_line {
-            cb(line);
-        }
+    while let Ok(line) = line_rx.try_recv() {
+        push_line(line, lines, on_line);
     }
-
-    lines
 }
 
 async fn terminate_process_group(child: &mut AsyncGroupChild, program: &str) {
@@ -239,12 +259,12 @@ async fn wait_for_exit(child: &mut AsyncGroupChild, timeout: Duration) -> bool {
 #[cfg(unix)]
 mod tests {
     use super::*;
-    use std::sync::mpsc;
+    use std::sync::mpsc as std_mpsc;
 
     #[tokio::test]
     async fn cancel_sends_sigint_before_hard_kill() {
         let (cancel_tx, cancel_rx) = watch::channel(false);
-        let (line_tx, line_rx) = mpsc::channel();
+        let (line_tx, line_rx) = std_mpsc::channel();
 
         let cancel_task = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -279,7 +299,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_falls_back_to_sigterm_when_sigint_is_ignored() {
         let (cancel_tx, cancel_rx) = watch::channel(false);
-        let (line_tx, line_rx) = mpsc::channel();
+        let (line_tx, line_rx) = std_mpsc::channel();
 
         let cancel_task = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -309,5 +329,148 @@ mod tests {
             lines.iter().any(|line| line == "got-term"),
             "expected SIGTERM trap output after ignored SIGINT, got {lines:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn invoke_captures_stdout_and_stderr_in_observed_order() {
+        let result = invoke(
+            "sh",
+            &[
+                "-c",
+                "echo out-1; sleep 0.05; echo err-1 >&2; sleep 0.05; echo out-2; sleep 0.05; echo err-2 >&2",
+            ],
+            Path::new("."),
+            &HashMap::new(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.lines, vec!["out-1", "err-1", "out-2", "err-2"]);
+    }
+
+    #[tokio::test]
+    async fn invoke_streams_lines_to_callback_before_exit() {
+        let (line_tx, mut line_rx) = mpsc::unbounded_channel();
+
+        let result = invoke(
+            "sh",
+            &["-c", "echo alpha; echo beta >&2"],
+            Path::new("."),
+            &HashMap::new(),
+            Some(Box::new(move |line| {
+                let _ = line_tx.send(line.to_string());
+            })),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        let mut callback_lines = Vec::new();
+        while let Ok(line) = line_rx.try_recv() {
+            callback_lines.push(line);
+        }
+        assert_eq!(callback_lines, result.lines);
+        assert_eq!(callback_lines, vec!["alpha", "beta"]);
+    }
+
+    #[tokio::test]
+    async fn invoke_sets_working_directory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let result = invoke("pwd", &[], dir.path(), &HashMap::new(), None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(
+            result.lines,
+            vec![std::fs::canonicalize(dir.path())
+                .unwrap()
+                .to_string_lossy()
+                .to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_propagates_environment() {
+        let env = HashMap::from([("AKSH_PROCESS_TEST".to_string(), "visible".to_string())]);
+        let result = invoke(
+            "sh",
+            &["-c", "printf '%s\n' \"$AKSH_PROCESS_TEST\""],
+            Path::new("."),
+            &env,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.lines, vec!["visible"]);
+    }
+
+    #[tokio::test]
+    async fn invoke_returns_nonzero_exit_code() {
+        let result = invoke(
+            "sh",
+            &["-c", "echo before-exit; exit 42"],
+            Path::new("."),
+            &HashMap::new(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.exit_code, 42);
+        assert_eq!(result.lines, vec!["before-exit"]);
+    }
+
+    #[tokio::test]
+    async fn invoke_handles_long_output_without_loss() {
+        let result = invoke(
+            "sh",
+            &[
+                "-c",
+                "i=0; while [ $i -lt 200 ]; do echo line-$i; i=$((i+1)); done",
+            ],
+            Path::new("."),
+            &HashMap::new(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.lines.len(), 200);
+        assert_eq!(result.lines.first().map(String::as_str), Some("line-0"));
+        assert_eq!(result.lines.last().map(String::as_str), Some("line-199"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_process_returns_error() {
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let cancel_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let _ = cancel_tx.send(true);
+        });
+
+        let result = invoke(
+            "sh",
+            &["-c", "echo started; while true; do sleep 1; done"],
+            Path::new("."),
+            &HashMap::new(),
+            None,
+            Some(cancel_rx),
+        )
+        .await;
+
+        let _ = cancel_task.await;
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("process cancelled"));
     }
 }

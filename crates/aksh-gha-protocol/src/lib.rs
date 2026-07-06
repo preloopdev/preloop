@@ -260,6 +260,9 @@ pub struct StepPlan {
     /// Shell override for `run` steps.
     #[serde(default)]
     pub shell: Option<String>,
+    /// Whether to continue on error.
+    #[serde(default)]
+    pub continue_on_error: Option<bool>,
 }
 
 /// Context material sent to a runner.
