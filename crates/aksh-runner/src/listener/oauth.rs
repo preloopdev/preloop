@@ -88,13 +88,11 @@ pub async fn get_oauth_token(
 
     // Schedule proactive refresh 5 minutes before the token expires.
     let expires_at = resp.expires_in.map(|secs| {
-        std::time::Instant::now()
-            + std::time::Duration::from_secs(secs.saturating_sub(300))
+        std::time::Instant::now() + std::time::Duration::from_secs(secs.saturating_sub(300))
     });
     info!(
         "OAuth token acquired (type: {}, expires_in: {:?}s)",
-        resp.token_type,
-        resp.expires_in
+        resp.token_type, resp.expires_in
     );
     Ok((resp.access_token, expires_at))
 }

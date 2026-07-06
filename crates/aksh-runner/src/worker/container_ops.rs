@@ -154,26 +154,26 @@ fn parse_container_spec_plain(value: &serde_json::Value) -> Option<ContainerSpec
             if image.is_empty() {
                 return None;
             }
-            let credentials = map
-                .get("credentials")
-                .and_then(|v| v.as_object())
-                .and_then(|creds| {
-                    let username = creds
-                        .get("username")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let password = creds
-                        .get("password")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if username.is_empty() && password.is_empty() {
-                        None
-                    } else {
-                        Some(RegistryCredentials { username, password })
-                    }
-                });
+            let credentials =
+                map.get("credentials")
+                    .and_then(|v| v.as_object())
+                    .and_then(|creds| {
+                        let username = creds
+                            .get("username")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let password = creds
+                            .get("password")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if username.is_empty() && password.is_empty() {
+                            None
+                        } else {
+                            Some(RegistryCredentials { username, password })
+                        }
+                    });
             Some(ContainerSpec {
                 image,
                 env: parse_env_map(map.get("env")),
@@ -763,9 +763,7 @@ pub fn translate_to_container_path(host_path: &str, host_work: &str) -> String {
 /// - `ubuntu` → `""` (DockerHub image)
 fn parse_registry_from_image(image: &str) -> &str {
     let parts: Vec<&str> = image.splitn(3, '/').collect();
-    if parts.len() >= 2
-        && (parts[0].contains('.') || parts[0].contains(':'))
-    {
+    if parts.len() >= 2 && (parts[0].contains('.') || parts[0].contains(':')) {
         parts[0]
     } else {
         ""
@@ -786,8 +784,8 @@ async fn docker_registry_login(
     use tokio::io::AsyncWriteExt;
 
     let registry = parse_registry_from_image(image);
-    let config_dir = tempfile::TempDir::new()
-        .context("creating docker config directory for registry auth")?;
+    let config_dir =
+        tempfile::TempDir::new().context("creating docker config directory for registry auth")?;
 
     let registry_display = if registry.is_empty() {
         "docker.io".to_string()

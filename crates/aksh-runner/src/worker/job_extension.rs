@@ -883,9 +883,7 @@ fn orphan_pids_with_tracking_id(needle: &str) -> Vec<u32> {
                 if let Ok(pid) = pid_str.parse::<u32>() {
                     let env_path = format!("/proc/{pid}/environ");
                     if let Ok(data) = std::fs::read(&env_path) {
-                        let has = data
-                            .split(|&b| b == 0)
-                            .any(|kv| kv == needle.as_bytes());
+                        let has = data.split(|&b| b == 0).any(|kv| kv == needle.as_bytes());
                         if has {
                             pids.push(pid);
                         }
@@ -904,7 +902,12 @@ fn orphan_pids_with_tracking_id(needle: &str) -> Vec<u32> {
             let stdout = String::from_utf8_lossy(&out.stdout);
             for line in stdout.lines() {
                 if line.contains(needle) {
-                    if let Some(pid) = line.trim().split_whitespace().next().and_then(|s| s.parse().ok()) {
+                    if let Some(pid) = line
+                        .trim()
+                        .split_whitespace()
+                        .next()
+                        .and_then(|s| s.parse().ok())
+                    {
                         pids.push(pid);
                     }
                 }

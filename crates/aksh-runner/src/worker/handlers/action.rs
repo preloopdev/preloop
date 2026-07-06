@@ -368,8 +368,8 @@ mod tests {
         );
         let mut ctx = crate::worker::execution_context::StepContext::new(
             &mut job,
-            "my_step_id".into(),          // step ID (context_name)
-            "My Display Name".into(),     // step display name — must NOT appear in github.action
+            "my_step_id".into(),      // step ID (context_name)
+            "My Display Name".into(), // step display name — must NOT appear in github.action
         );
 
         // Call set_action_repository_context as run_action does
@@ -393,5 +393,4 @@ mod tests {
             "github.action must not be the display name"
         );
     }
-
 }
