@@ -706,4 +706,118 @@ mod tests {
         assert!(!ctx.get_variable_bool("NULL_VAR"));
         assert!(!ctx.get_variable_bool("MISSING_VAR"));
     }
+
+    // --- JobContextL0 gap coverage ---
+
+    #[test]
+    fn set_github_context_value_clears_on_none() {
+        let mut job = JobContext::new(
+            "j1".into(),
+            "Test".into(),
+            serde_json::json!({}),
+            serde_json::json!({"github": {"repository": "owner/repo"}}),
+        );
+
+        // Set workflow_ref
+        job.set_github_context_value(
+            "workflow_ref",
+            Some(serde_json::json!(
+                "owner/repo/.github/workflows/ci.yml@refs/heads/main"
+            )),
+        );
+        assert_eq!(
+            job.github_context_value("workflow_ref")
+                .and_then(|v| v.as_str().map(String::from)),
+            Some("owner/repo/.github/workflows/ci.yml@refs/heads/main".to_string())
+        );
+        assert_eq!(
+            job.env.get("GITHUB_WORKFLOW_REF").map(String::as_str),
+            Some("owner/repo/.github/workflows/ci.yml@refs/heads/main")
+        );
+
+        // Clear it
+        job.set_github_context_value("workflow_ref", None);
+        assert!(job.github_context_value("workflow_ref").is_none());
+        assert!(!job.env.contains_key("GITHUB_WORKFLOW_REF"));
+    }
+
+    #[test]
+    fn set_github_context_value_workflow_identity_fields() {
+        let mut job = JobContext::new(
+            "j1".into(),
+            "Test".into(),
+            serde_json::json!({}),
+            serde_json::json!({"github": {"repository": "owner/repo"}}),
+        );
+
+        // Set all workflow identity fields
+        job.set_github_context_value(
+            "workflow_ref",
+            Some(serde_json::json!(
+                "owner/repo/.github/workflows/ci.yml@refs/heads/main"
+            )),
+        );
+        job.set_github_context_value("workflow_sha", Some(serde_json::json!("abc123def456")));
+        job.set_github_context_value("workflow", Some(serde_json::json!("CI")));
+
+        // Verify all set
+        assert_eq!(
+            job.github_context_value("workflow_ref")
+                .and_then(|v| v.as_str().map(String::from)),
+            Some("owner/repo/.github/workflows/ci.yml@refs/heads/main".to_string())
+        );
+        assert_eq!(
+            job.github_context_value("workflow_sha")
+                .and_then(|v| v.as_str().map(String::from)),
+            Some("abc123def456".to_string())
+        );
+        assert_eq!(
+            job.github_context_value("workflow")
+                .and_then(|v| v.as_str().map(String::from)),
+            Some("CI".to_string())
+        );
+
+        // Verify env synced
+        assert_eq!(
+            job.env.get("GITHUB_WORKFLOW_REF").map(String::as_str),
+            Some("owner/repo/.github/workflows/ci.yml@refs/heads/main")
+        );
+        assert_eq!(
+            job.env.get("GITHUB_WORKFLOW_SHA").map(String::as_str),
+            Some("abc123def456")
+        );
+        assert_eq!(
+            job.env.get("GITHUB_WORKFLOW").map(String::as_str),
+            Some("CI")
+        );
+
+        // Clear all
+        job.set_github_context_value("workflow_ref", None);
+        job.set_github_context_value("workflow_sha", None);
+        job.set_github_context_value("workflow", None);
+
+        assert!(job.github_context_value("workflow_ref").is_none());
+        assert!(job.github_context_value("workflow_sha").is_none());
+        assert!(job.github_context_value("workflow").is_none());
+        assert!(!job.env.contains_key("GITHUB_WORKFLOW_REF"));
+        assert!(!job.env.contains_key("GITHUB_WORKFLOW_SHA"));
+        assert!(!job.env.contains_key("GITHUB_WORKFLOW"));
+    }
+
+    #[test]
+    fn cancelled_status_reflects_in_context() {
+        let mut ctx = JobContext::new(
+            "job1".into(),
+            "Test".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        ctx.job_status = JobStatus::Cancelled;
+
+        let expr_ctx = ctx.build_expression_context();
+        assert!(!aksh_gha_expressions::eval_bool("success()", &expr_ctx).unwrap());
+        assert!(!aksh_gha_expressions::eval_bool("failure()", &expr_ctx).unwrap());
+        assert!(aksh_gha_expressions::eval_bool("cancelled()", &expr_ctx).unwrap());
+        assert!(aksh_gha_expressions::eval_bool("always()", &expr_ctx).unwrap());
+    }
 }
