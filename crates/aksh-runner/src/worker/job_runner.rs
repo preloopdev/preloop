@@ -1300,4 +1300,76 @@ mod tests {
             res
         );
     }
+
+    // --- JobRunnerL0 gap coverage ---
+
+    #[tokio::test]
+    async fn test_run_job_handles_cancelled() {
+        let dir = TempDir::new().unwrap();
+        let workspace_dir = dir.path().join("work");
+        let payload = serde_json::json!({
+            "jobId": "job-cancel",
+            "jobDisplayName": "Cancel Job",
+            "steps": [
+                {
+                    "id": "step-1",
+                    "contextName": "step1",
+                    "displayName": "Long Step",
+                    "run": "sleep 30",
+                    "shell": "bash"
+                }
+            ],
+            "fileTable": {
+                "workDirectory": workspace_dir.to_str().unwrap()
+            }
+        });
+
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let _ = cancel_tx.send(true);
+        });
+
+        let res = run_job(payload, ProtocolPath::Broker, cancel_rx).await;
+        // run_job returns Ok — cancellation is reported via completion, not
+        // the function return value.
+        assert!(
+            res.is_ok(),
+            "Expected run_job to handle cancel gracefully, got: {:?}",
+            res
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_job_with_timeout() {
+        let dir = TempDir::new().unwrap();
+        let workspace_dir = dir.path().join("work");
+        // jobTimeout of 0 means the timeout fires immediately (0 * 60 = 0s),
+        // triggering the cancel channel before the step can finish.
+        let payload = serde_json::json!({
+            "jobId": "job-timeout",
+            "jobDisplayName": "Timeout Job",
+            "plan": {"jobTimeoutInMinutes": 0},
+            "steps": [
+                {
+                    "id": "step-1",
+                    "contextName": "step1",
+                    "displayName": "Long Step",
+                    "run": "sleep 30",
+                    "shell": "bash"
+                }
+            ],
+            "fileTable": {
+                "workDirectory": workspace_dir.to_str().unwrap()
+            }
+        });
+
+        let (_tx, cancel_rx) = watch::channel(false);
+        let res = run_job(payload, ProtocolPath::Broker, cancel_rx).await;
+        assert!(
+            res.is_ok(),
+            "Expected run_job to handle timeout gracefully, got: {:?}",
+            res
+        );
+    }
 }
