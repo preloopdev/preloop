@@ -178,38 +178,75 @@ pub async fn run_steps(
             info!("Job cancelled — evaluating remaining steps under cancelled() semantics");
         }
 
-        // Evaluate the step condition
-        if !should_run_step(step, job) {
-            info!(
-                "Skipping step '{}' (condition not met)",
-                resolved_display_name
-            );
-            job.steps.insert(
-                step.context_name.clone(),
-                StepResult {
-                    outcome: "Skipped".to_string(),
-                    conclusion: "Skipped".to_string(),
-                    outputs: std::collections::HashMap::new(),
-                },
-            );
-            // F019: Queue skipped step
-            let ts = crate::worker::job_runner::iso_now();
-            {
-                let mut q = queue.lock().await;
-                q.queue_update(StepUpdate {
-                    external_id: step.id.clone(),
-                    number: step_number,
-                    name: resolved_display_name.clone(),
-                    status: step_status::COMPLETED,
-                    started_at: Some(ts.clone()),
-                    completed_at: Some(ts),
-                    conclusion: step_conclusion::SKIPPED,
-                });
+        // Evaluate the step condition. Official runner treats expression
+        // evaluation errors as step failures, not skips.
+        match should_run_step(step, job) {
+            Ok(true) => {}
+            Ok(false) => {
+                info!(
+                    "Skipping step '{}' (condition not met)",
+                    resolved_display_name
+                );
+                job.steps.insert(
+                    step.context_name.clone(),
+                    StepResult {
+                        outcome: "Skipped".to_string(),
+                        conclusion: "Skipped".to_string(),
+                        outputs: std::collections::HashMap::new(),
+                    },
+                );
+                // F019: Queue skipped step
+                let ts = crate::worker::job_runner::iso_now();
+                {
+                    let mut q = queue.lock().await;
+                    q.queue_update(StepUpdate {
+                        external_id: step.id.clone(),
+                        number: step_number,
+                        name: resolved_display_name.clone(),
+                        status: step_status::COMPLETED,
+                        started_at: Some(ts.clone()),
+                        completed_at: Some(ts),
+                        conclusion: step_conclusion::SKIPPED,
+                    });
+                }
+                if let Some(rpt) = reporting {
+                    crate::worker::job_runner::flush_step_updates(rpt, &queue).await;
+                }
+                continue;
             }
-            if let Some(rpt) = reporting {
-                crate::worker::job_runner::flush_step_updates(rpt, &queue).await;
+            Err(e) => {
+                warn!(
+                    "Condition evaluation failed for step '{}': {e:#}",
+                    resolved_display_name
+                );
+                any_failed = true;
+                job.job_status = JobStatus::Failure;
+                job.steps.insert(
+                    step.context_name.clone(),
+                    StepResult {
+                        outcome: "Failure".to_string(),
+                        conclusion: "Failure".to_string(),
+                        outputs: std::collections::HashMap::new(),
+                    },
+                );
+                let ts = crate::worker::job_runner::iso_now();
+                {
+                    let mut q = queue.lock().await;
+                    q.queue_update(StepUpdate {
+                        external_id: step.id.clone(),
+                        number: step_number,
+                        name: resolved_display_name.clone(),
+                        status: step_status::COMPLETED,
+                        started_at: Some(ts.clone()),
+                        completed_at: Some(ts),
+                        conclusion: step_conclusion::FAILED,
+                    });
+                }
+                if let Some(rpt) = reporting {
+                    crate::worker::job_runner::flush_step_updates(rpt, &queue).await;
+                }
+                continue;
             }
-            continue;
         }
 
         info!("Running step: {}", resolved_display_name);
@@ -370,18 +407,6 @@ pub async fn run_steps(
         let step_end = crate::worker::job_runner::iso_now();
         let conclusion_proto = ServerQueue::conclusion_to_proto(&conclusion_str);
 
-        // Collect annotations before consuming step_ctx
-        let annotations = step_ctx.annotations.clone();
-        let log_lines = step_ctx.log_lines.clone();
-
-        // F025: Store annotations in job context
-        if !annotations.is_empty() {
-            step_ctx
-                .job
-                .step_annotations
-                .insert(step.context_name.clone(), annotations);
-        }
-
         // Record a step result before applying file commands so GITHUB_OUTPUT can
         // attach outputs to this step.
         step_ctx.job.steps.insert(
@@ -403,10 +428,52 @@ pub async fn run_steps(
                 resolved_display_name
             );
         }
-        // F035: Read step summary content before cleanup deletes the file
-        let summary_content =
-            std::fs::read_to_string(&file_command_paths.summary_file).unwrap_or_default();
+        // F035: Read and scrub step summary content before cleanup deletes the file.
+        let summary_content = if let Ok(metadata) =
+            std::fs::metadata(&file_command_paths.summary_file)
+        {
+            let file_size = metadata.len();
+            if file_size == 0 {
+                "".to_string()
+            } else if file_size > 1_048_576 {
+                let limit_k = 1024;
+                let size_k = file_size / 1024;
+                let msg = format!(
+                    "$GITHUB_STEP_SUMMARY upload aborted, supports content up to a size of {}k, got {}k. For more information see: https://docs.github.com/actions/using-workflows/workflow-commands-for-github-actions#adding-a-markdown-summary",
+                    limit_k, size_k
+                );
+                step_ctx.annotate(crate::worker::execution_context::Annotation {
+                    level: crate::worker::execution_context::AnnotationLevel::Error,
+                    message: msg.clone(),
+                    title: None,
+                    file: None,
+                    line: None,
+                    end_line: None,
+                    col: None,
+                    end_column: None,
+                });
+                warn!("{msg}");
+                "".to_string()
+            } else {
+                std::fs::read_to_string(&file_command_paths.summary_file)
+                    .map(|content| step_ctx.job.mask_secrets(&content))
+                    .unwrap_or_default()
+            }
+        } else {
+            "".to_string()
+        };
         super::file_commands::cleanup_file_commands(&file_command_paths);
+        // Collect annotations after all processing (including step summary validation)
+        let annotations = step_ctx.annotations.clone();
+        let log_lines = step_ctx.log_lines.clone();
+
+        // F025: Store annotations in job context
+        if !annotations.is_empty() {
+            step_ctx
+                .job
+                .step_annotations
+                .insert(step.context_name.clone(), annotations);
+        }
 
         if conclusion_str == "Failure" {
             any_failed = true;
@@ -547,22 +614,84 @@ pub async fn run_steps(
     })
 }
 
-/// Evaluate whether a step should run based on its condition.
-fn should_run_step(step: &Step, job: &JobContext) -> bool {
+fn should_run_step(step: &Step, job: &JobContext) -> Result<bool> {
     let condition = match &step.condition {
         Some(c) if !c.is_empty() => c.as_str(),
         _ => "success()",
     };
+    let stripped = aksh_gha_expressions::trim_expression_markers(condition);
+    let effective_condition = if contains_status_check_function(stripped) {
+        stripped.to_string()
+    } else {
+        format!("success() && ({stripped})")
+    };
 
     let ctx = job.build_expression_context();
-    match aksh_gha_expressions::eval_bool(condition, &ctx) {
-        Ok(result) => result,
-        Err(_) => {
-            // Try stripping ${{ }} markers (conditions sometimes come pre-wrapped)
-            let stripped = aksh_gha_expressions::trim_expression_markers(condition);
-            aksh_gha_expressions::eval_bool(stripped, &ctx).unwrap_or(false)
+    match aksh_gha_expressions::eval_bool(&effective_condition, &ctx) {
+        Ok(result) => Ok(result),
+        Err(effective_error) => {
+            if stripped == condition {
+                Err(effective_error.into())
+            } else {
+                aksh_gha_expressions::eval_bool(
+                    &if contains_status_check_function(condition) {
+                        condition.to_string()
+                    } else {
+                        format!("success() && ({condition})")
+                    },
+                    &ctx,
+                )
+                .map_err(Into::into)
+            }
         }
     }
+}
+
+fn contains_status_check_function(condition: &str) -> bool {
+    let mut chars = condition.char_indices().peekable();
+    while let Some((_, ch)) = chars.next() {
+        if ch == '\'' || ch == '"' {
+            let quote = ch;
+            while let Some((_, quoted)) = chars.next() {
+                if quoted == '\\' {
+                    let _ = chars.next();
+                } else if quoted == quote {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if ch == '_' || ch.is_ascii_alphabetic() {
+            let mut ident = String::from(ch);
+            while let Some((_, next)) = chars.peek().copied() {
+                if next == '_' || next.is_ascii_alphanumeric() {
+                    ident.push(next);
+                    let _ = chars.next();
+                } else {
+                    break;
+                }
+            }
+
+            while let Some((_, whitespace)) = chars.peek().copied() {
+                if whitespace.is_whitespace() {
+                    let _ = chars.next();
+                } else {
+                    break;
+                }
+            }
+
+            if matches!(
+                ident.to_ascii_lowercase().as_str(),
+                "success" | "failure" | "cancelled" | "always"
+            ) && chars.peek().is_some_and(|(_, next)| *next == '(')
+            {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 /// Execute a single step, threading cancel_rx to the process invoker.
@@ -584,7 +713,6 @@ async fn execute_step(
             let expr_ctx = ctx.job.build_expression_context();
             let evaluated_script = crate::worker::template::evaluate_template(script, &expr_ctx)
                 .unwrap_or_else(|_| script.clone());
-
             // Use step-level working-directory if set, otherwise job workspace
             let effective_dir = working_directory
                 .as_ref()
@@ -797,4 +925,913 @@ async fn initialize_containers(
     }
 
     Ok(log)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worker::contexts::JobContext;
+    use crate::worker::server_queue::ServerQueue;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use tokio::sync::{watch, Mutex};
+
+    fn test_step(name: &str, condition: Option<&str>) -> Step {
+        Step {
+            id: uuid::Uuid::new_v4().to_string(),
+            context_name: name.to_string(),
+            display_name: name.to_string(),
+            step_type: StepType::Script {
+                script: "echo should-not-run".to_string(),
+                shell: Some("bash".to_string()),
+                working_directory: None,
+            },
+            condition: condition.map(str::to_string),
+            continue_on_error: false,
+            timeout_minutes: None,
+            env: std::collections::HashMap::new(),
+            raw: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn condition_error_is_not_treated_as_skip() {
+        let job = JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let step = test_step("broken", Some("${{"));
+
+        let err = should_run_step(&step, &job).unwrap_err();
+
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn status_check_function_detection_ignores_string_literals() {
+        assert!(contains_status_check_function(
+            "failure() && steps.build.outcome == 'failure'"
+        ));
+        assert!(contains_status_check_function("${{ always() }}"));
+        assert!(!contains_status_check_function(
+            "steps.build.outcome == 'failure'"
+        ));
+        assert!(!contains_status_check_function(
+            "contains('failure()', steps.build.outcome)"
+        ));
+    }
+
+    #[tokio::test]
+    async fn run_steps_marks_condition_error_as_failure() {
+        let dir = TempDir::new().unwrap();
+        let mut job = JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+        let (_tx, cancel_rx) = watch::channel(false);
+        let step = test_step("broken", Some("${{"));
+
+        let result = run_steps(
+            &[step],
+            &mut job,
+            dir.path().to_str().unwrap(),
+            cancel_rx,
+            queue,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "Failed");
+        let step_result = job.steps.get("broken").unwrap();
+        assert_eq!(step_result.outcome, "Failure");
+        assert_eq!(step_result.conclusion, "Failure");
+    }
+
+    #[tokio::test]
+    async fn run_steps_continue_on_error_sets_failure_outcome_success_conclusion() {
+        let dir = TempDir::new().unwrap();
+        let mut job = JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+        let (_tx, cancel_rx) = watch::channel(false);
+        let mut step = test_step("soft_fail", None);
+        step.step_type = StepType::Script {
+            script: "exit 1".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+        step.continue_on_error = true;
+
+        let result = run_steps(
+            &[step],
+            &mut job,
+            dir.path().to_str().unwrap(),
+            cancel_rx,
+            queue,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "Succeeded");
+        let step_result = job.steps.get("soft_fail").unwrap();
+        assert_eq!(step_result.outcome, "Failure");
+        assert_eq!(step_result.conclusion, "Success");
+    }
+
+    #[tokio::test]
+    async fn run_steps_job_status_remains_success_after_continue_on_error() {
+        let dir = TempDir::new().unwrap();
+        let mut job = JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+        let (_tx, cancel_rx) = watch::channel(false);
+
+        // Step 1: fails but continue-on-error is true
+        let mut soft_fail = test_step("soft_fail", None);
+        soft_fail.step_type = StepType::Script {
+            script: "exit 1".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+        soft_fail.continue_on_error = true;
+
+        // Step 2: normal step that should still run and succeed
+        let mut after = test_step("after", None);
+        after.step_type = StepType::Script {
+            script: "echo still-running".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+
+        let result = run_steps(
+            &[soft_fail, after],
+            &mut job,
+            dir.path().to_str().unwrap(),
+            cancel_rx,
+            queue,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        // Job overall succeeds
+        assert_eq!(result, "Succeeded");
+        assert_eq!(job.job_status, JobStatus::Success);
+
+        // soft_fail: outcome=Failure, conclusion=Success (continue-on-error)
+        let sf = job.steps.get("soft_fail").unwrap();
+        assert_eq!(sf.outcome, "Failure");
+        assert_eq!(sf.conclusion, "Success");
+
+        // after: ran normally
+        let a = job.steps.get("after").unwrap();
+        assert_eq!(a.outcome, "Success");
+        assert_eq!(a.conclusion, "Success");
+    }
+
+    #[tokio::test]
+    async fn run_steps_conditions_reflect_prior_failure() {
+        let dir = TempDir::new().unwrap();
+        let mut job = JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+        let (_tx, cancel_rx) = watch::channel(false);
+        let mut fail = test_step("fail", None);
+        fail.step_type = StepType::Script {
+            script: "exit 1".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+        let success_after_failure = test_step("success_after_failure", Some("success()"));
+        let mut failure_after_failure = test_step("failure_after_failure", Some("failure()"));
+        failure_after_failure.step_type = StepType::Script {
+            script: "echo failure-ran".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+        let mut always_after_failure = test_step("always_after_failure", Some("always()"));
+        always_after_failure.step_type = StepType::Script {
+            script: "echo always-ran".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+
+        let result = run_steps(
+            &[
+                fail,
+                success_after_failure,
+                failure_after_failure,
+                always_after_failure,
+            ],
+            &mut job,
+            dir.path().to_str().unwrap(),
+            cancel_rx,
+            queue,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "Failed");
+        assert_eq!(
+            job.steps.get("success_after_failure").unwrap().conclusion,
+            "Skipped"
+        );
+        assert_eq!(
+            job.steps.get("failure_after_failure").unwrap().conclusion,
+            "Success"
+        );
+        assert_eq!(
+            job.steps.get("always_after_failure").unwrap().conclusion,
+            "Success"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_steps_implicitly_gates_conditions_with_success() {
+        let dir = TempDir::new().unwrap();
+        let mut job = JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+        let (_tx, cancel_rx) = watch::channel(false);
+
+        let mut fail = test_step("fail", None);
+        fail.step_type = StepType::Script {
+            script: "exit 1".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+
+        let implicit_success = test_step(
+            "implicit_success",
+            Some("steps.fail.outcome == 'Failure' || steps.fail.outcome == 'failure'"),
+        );
+
+        let mut explicit_failure = test_step(
+            "explicit_failure",
+            Some(
+                "failure() && (steps.fail.outcome == 'Failure' || steps.fail.outcome == 'failure')",
+            ),
+        );
+        explicit_failure.step_type = StepType::Script {
+            script: "echo explicit-failure-ran".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+
+        let result = run_steps(
+            &[fail, implicit_success, explicit_failure],
+            &mut job,
+            dir.path().to_str().unwrap(),
+            cancel_rx,
+            queue,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "Failed");
+        assert_eq!(
+            job.steps.get("implicit_success").unwrap().conclusion,
+            "Skipped"
+        );
+        assert_eq!(
+            job.steps.get("explicit_failure").unwrap().conclusion,
+            "Success"
+        );
+    }
+    #[test]
+    fn step_summary_content_uses_job_secret_masking() {
+        let job = JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({"SECRET_TOKEN": {"value": "top-secret", "isSecret": true}}),
+            serde_json::json!({}),
+        );
+
+        assert_eq!(job.mask_secrets("summary top-secret"), "summary ***");
+    }
+
+    #[tokio::test]
+    async fn run_steps_outputs_are_visible_to_later_step_expressions() {
+        let dir = TempDir::new().unwrap();
+        let mut job = JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+        let (_tx, cancel_rx) = watch::channel(false);
+        let mut produce = test_step("produce", None);
+        produce.step_type = StepType::Script {
+            script: "echo value=from-output >> \"$GITHUB_OUTPUT\"".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+        let mut consume = test_step("consume", None);
+        consume.step_type = StepType::Script {
+            script: "echo seen=${{ steps.produce.outputs.value }}".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+
+        let result = run_steps(
+            &[produce, consume],
+            &mut job,
+            dir.path().to_str().unwrap(),
+            cancel_rx,
+            queue,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "Succeeded");
+        assert_eq!(
+            job.steps
+                .get("produce")
+                .and_then(|step| step.outputs.get("value"))
+                .map(String::as_str),
+            Some("from-output")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_steps_github_env_is_visible_to_later_steps() {
+        let dir = TempDir::new().unwrap();
+        let mut job = JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+        let (_tx, cancel_rx) = watch::channel(false);
+        let mut set_env = test_step("set_env", None);
+        set_env.step_type = StepType::Script {
+            script: "echo FOO=bar >> \"$GITHUB_ENV\"".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+        let mut use_env = test_step("use_env", None);
+        use_env.step_type = StepType::Script {
+            script: "echo FOO=$FOO".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+
+        let result = run_steps(
+            &[set_env, use_env],
+            &mut job,
+            dir.path().to_str().unwrap(),
+            cancel_rx,
+            queue,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "Succeeded");
+        assert_eq!(job.env.get("FOO").map(String::as_str), Some("bar"));
+    }
+
+    #[tokio::test]
+    async fn run_steps_all_steps_pass() {
+        let dir = TempDir::new().unwrap();
+        let mut job = JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+        let (_tx, cancel_rx) = watch::channel(false);
+
+        let mut step1 = test_step("step1", None);
+        step1.step_type = StepType::Script {
+            script: "echo step1-ran".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+        let mut step2 = test_step("step2", None);
+        step2.step_type = StepType::Script {
+            script: "echo step2-ran".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+
+        let result = run_steps(
+            &[step1, step2],
+            &mut job,
+            dir.path().to_str().unwrap(),
+            cancel_rx,
+            queue,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "Succeeded");
+        assert_eq!(job.job_status, JobStatus::Success);
+        assert_eq!(job.steps.get("step1").unwrap().conclusion, "Success");
+        assert_eq!(job.steps.get("step2").unwrap().conclusion, "Success");
+    }
+
+    #[tokio::test]
+    async fn run_steps_step_env_override_job_env() {
+        let dir = TempDir::new().unwrap();
+        let mut job = JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        // Set a job-level environment variable
+        job.env.insert("JOB_VAR".to_string(), "job-val".to_string());
+        job.env
+            .insert("OVERRIDE_VAR".to_string(), "job-val".to_string());
+
+        let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+        let (_tx, cancel_rx) = watch::channel(false);
+
+        let mut step = test_step("test_env", None);
+        step.env
+            .insert("OVERRIDE_VAR".to_string(), "step-val".to_string());
+        step.env
+            .insert("STEP_VAR".to_string(), "step-val".to_string());
+        step.step_type = StepType::Script {
+            // Write variables to output so we can verify the actual process env
+            script: "echo job_var=$JOB_VAR >> \"$GITHUB_OUTPUT\"\necho override_var=$OVERRIDE_VAR >> \"$GITHUB_OUTPUT\"\necho step_var=$STEP_VAR >> \"$GITHUB_OUTPUT\"".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+
+        let result = run_steps(
+            &[step],
+            &mut job,
+            dir.path().to_str().unwrap(),
+            cancel_rx,
+            queue,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "Succeeded");
+        let step_res = job.steps.get("test_env").unwrap();
+        assert_eq!(
+            step_res.outputs.get("job_var").map(String::as_str),
+            Some("job-val")
+        );
+        assert_eq!(
+            step_res.outputs.get("override_var").map(String::as_str),
+            Some("step-val")
+        );
+        assert_eq!(
+            step_res.outputs.get("step_var").map(String::as_str),
+            Some("step-val")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_steps_honors_script_working_directory() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("workspace");
+        let subdir = workspace.join("subdir");
+        std::fs::create_dir_all(&subdir).unwrap();
+        let mut job = JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+        let (_tx, cancel_rx) = watch::channel(false);
+        let mut step = test_step("pwd", None);
+        step.step_type = StepType::Script {
+            script: "echo pwd=$(pwd) >> \"$GITHUB_OUTPUT\"".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: Some(subdir.to_string_lossy().to_string()),
+        };
+
+        let result = run_steps(
+            &[step],
+            &mut job,
+            workspace.to_str().unwrap(),
+            cancel_rx,
+            queue,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "Succeeded");
+        let actual = job
+            .steps
+            .get("pwd")
+            .and_then(|step| step.outputs.get("pwd"))
+            .map(std::path::PathBuf::from)
+            .and_then(|path| path.canonicalize().ok());
+        assert_eq!(
+            actual.as_deref(),
+            Some(subdir.canonicalize().unwrap().as_path())
+        );
+    }
+    #[tokio::test]
+    async fn test_step_summary_size_limit_and_scrubbing() {
+        let workspace = TempDir::new().unwrap();
+        let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+        let (_tx, cancel_rx) = watch::channel(false);
+
+        // Scenario 1: Simple summary and secret scrubbing
+        let mut job = JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        job.add_mask("secret-value");
+
+        let mut step = test_step("summary-scrub", None);
+        step.step_type = StepType::Script {
+            script: "echo '# hello secret-value' >> \"$GITHUB_STEP_SUMMARY\"".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+
+        let result = run_steps(
+            &[step.clone()],
+            &mut job,
+            workspace.path().to_str().unwrap(),
+            cancel_rx.clone(),
+            queue.clone(),
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "Succeeded");
+        // Verify annotations has no errors
+        assert!(!job.step_annotations.contains_key("summary-scrub"));
+
+        // Scenario 2: Summary size limit exceeded
+        let mut job = JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let mut step = test_step("summary-large", None);
+        step.step_type = StepType::Script {
+            script: "dd if=/dev/zero bs=1024 count=1100 >> \"$GITHUB_STEP_SUMMARY\"".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+
+        let result = run_steps(
+            &[step],
+            &mut job,
+            workspace.path().to_str().unwrap(),
+            cancel_rx,
+            queue,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "Succeeded");
+        // Verify that an Error annotation was added under "summary-large"
+        let annotations = job.step_annotations.get("summary-large").unwrap();
+        assert_eq!(annotations.len(), 1);
+        assert_eq!(
+            annotations[0].level,
+            crate::worker::execution_context::AnnotationLevel::Error
+        );
+        assert!(annotations[0]
+            .message
+            .contains("upload aborted, supports content up to a size of 1024k"));
+    }
+
+    #[tokio::test]
+    async fn run_steps_cancelled_condition_runs_only_when_cancelled() {
+        let dir = TempDir::new().unwrap();
+        let mut job = JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+
+        // Step 1: a slow step that will be interrupted by cancellation
+        let mut slow = test_step("slow", None);
+        slow.step_type = StepType::Script {
+            script: "sleep 30".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+        // Step 2: default condition (success()) — should be SKIPPED after cancel
+        let normal = test_step("normal_after", None);
+        // Step 3: cancelled() — should RUN after cancel
+        let mut on_cancel = test_step("on_cancel", Some("cancelled()"));
+        on_cancel.step_type = StepType::Script {
+            script: "echo cleanup-ran".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+        // Step 4: always() — should RUN after cancel
+        let mut on_always = test_step("on_always", Some("always()"));
+        on_always.step_type = StepType::Script {
+            script: "echo always-ran".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+
+        // Fire cancellation after 500ms
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let _ = cancel_tx.send(true);
+        });
+
+        let result = run_steps(
+            &[slow, normal, on_cancel, on_always],
+            &mut job,
+            dir.path().to_str().unwrap(),
+            cancel_rx,
+            queue,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "Cancelled");
+        assert_eq!(job.job_status, JobStatus::Cancelled);
+        // slow step was cancelled
+        assert_eq!(job.steps.get("slow").unwrap().conclusion, "Cancelled");
+        // normal step was skipped (success() is false under cancel)
+        assert_eq!(job.steps.get("normal_after").unwrap().conclusion, "Skipped");
+        // cancelled() step ran
+        assert_eq!(job.steps.get("on_cancel").unwrap().conclusion, "Success");
+        // always() step ran
+        assert_eq!(job.steps.get("on_always").unwrap().conclusion, "Success");
+    }
+
+    #[tokio::test]
+    async fn run_steps_outcome_visible_in_later_step_condition() {
+        let dir = TempDir::new().unwrap();
+        let mut job = JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+        let (_tx, cancel_rx) = watch::channel(false);
+
+        // Step 1: fails with continue-on-error so job stays alive
+        let mut fail_step = test_step("fail_step", None);
+        fail_step.step_type = StepType::Script {
+            script: "exit 1".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+        fail_step.continue_on_error = true;
+
+        // Step 2: condition references steps.fail_step.outcome == 'failure'
+        // This should run because the outcome IS 'failure' (even though conclusion is success)
+        let mut check_outcome = test_step(
+            "check_outcome",
+            Some("steps.fail_step.outcome == 'failure'"),
+        );
+        check_outcome.step_type = StepType::Script {
+            script: "echo outcome-matched".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+
+        // Step 3: condition references steps.fail_step.conclusion == 'success'
+        // This should run because continue-on-error maps conclusion to success
+        let mut check_conclusion = test_step(
+            "check_conclusion",
+            Some("steps.fail_step.conclusion == 'success'"),
+        );
+        check_conclusion.step_type = StepType::Script {
+            script: "echo conclusion-matched".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+
+        // Step 4: condition that should NOT match
+        let skip_step = test_step("should_skip", Some("steps.fail_step.outcome == 'success'"));
+
+        let result = run_steps(
+            &[fail_step, check_outcome, check_conclusion, skip_step],
+            &mut job,
+            dir.path().to_str().unwrap(),
+            cancel_rx,
+            queue,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "Succeeded");
+        // check_outcome ran: steps.fail_step.outcome == 'failure' was true
+        assert_eq!(
+            job.steps.get("check_outcome").unwrap().conclusion,
+            "Success"
+        );
+        // check_conclusion ran: steps.fail_step.conclusion == 'success' was true
+        assert_eq!(
+            job.steps.get("check_conclusion").unwrap().conclusion,
+            "Success"
+        );
+        // should_skip was skipped: steps.fail_step.outcome != 'success'
+        assert_eq!(job.steps.get("should_skip").unwrap().conclusion, "Skipped");
+    }
+
+    // --- P1 expressions/templates gap coverage ---
+
+    #[tokio::test]
+    async fn run_steps_step_env_evaluates_expressions() {
+        let dir = TempDir::new().unwrap();
+        let mut job = JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({
+                "github": {"repository": "owner/repo", "ref": "refs/heads/main"}
+            }),
+        );
+        let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+        let (_tx, cancel_rx) = watch::channel(false);
+
+        let mut step = test_step("env_expr", None);
+        step.env
+            .insert("REPO".to_string(), "${{ github.repository }}".to_string());
+        step.env
+            .insert("BRANCH".to_string(), "${{ github.ref }}".to_string());
+        step.step_type = StepType::Script {
+            script:
+                "echo repo=$REPO >> \"$GITHUB_OUTPUT\"\necho branch=$BRANCH >> \"$GITHUB_OUTPUT\""
+                    .to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+
+        let result = run_steps(
+            &[step],
+            &mut job,
+            dir.path().to_str().unwrap(),
+            cancel_rx,
+            queue,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "Succeeded");
+        let outputs = &job.steps.get("env_expr").unwrap().outputs;
+        assert_eq!(outputs.get("repo").map(String::as_str), Some("owner/repo"));
+        assert_eq!(
+            outputs.get("branch").map(String::as_str),
+            Some("refs/heads/main")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_steps_display_name_evaluates_expression() {
+        let dir = TempDir::new().unwrap();
+        let mut job = JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({
+                "github": {"repository": "owner/repo"},
+                "matrix": {"os": "ubuntu"}
+            }),
+        );
+        let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+        let (_tx, cancel_rx) = watch::channel(false);
+
+        let mut step = test_step("dynamic_name", None);
+        step.display_name = "Build (${{ matrix.os }})".to_string();
+        step.step_type = StepType::Script {
+            script: "echo ran".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+
+        let result = run_steps(
+            &[step],
+            &mut job,
+            dir.path().to_str().unwrap(),
+            cancel_rx,
+            queue,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "Succeeded");
+        // The step ran; the display name was resolved dynamically
+        assert_eq!(job.steps.get("dynamic_name").unwrap().conclusion, "Success");
+    }
+
+    #[tokio::test]
+    async fn run_steps_condition_uses_env_context() {
+        let dir = TempDir::new().unwrap();
+        let mut job = JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        job.env.insert("DEPLOY".into(), "true".into());
+        let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+        let (_tx, cancel_rx) = watch::channel(false);
+
+        let mut runs = test_step("deploy_step", Some("env.DEPLOY == 'true'"));
+        runs.step_type = StepType::Script {
+            script: "echo deploying".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+
+        let skips = test_step("skip_step", Some("env.DEPLOY == 'false'"));
+
+        let result = run_steps(
+            &[runs, skips],
+            &mut job,
+            dir.path().to_str().unwrap(),
+            cancel_rx,
+            queue,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "Succeeded");
+        assert_eq!(job.steps.get("deploy_step").unwrap().conclusion, "Success");
+        assert_eq!(job.steps.get("skip_step").unwrap().conclusion, "Skipped");
+    }
 }

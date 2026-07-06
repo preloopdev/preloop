@@ -1,0 +1,110 @@
+name: P0 Docker and Container Verification
+on: workflow_dispatch
+jobs:
+  docker-tests:
+    runs-on: [self-hosted, p0-linux]
+    steps:
+      # 1. Docker is available
+      - name: Docker available
+        run: docker version
+
+      # 2. Docker container action — run a docker:// action
+      - name: Run docker action
+        uses: docker://alpine:3.20
+        with:
+          args: echo "hello-from-docker-action"
+
+      # 3. Build and run a custom Docker image
+      - name: Build custom image
+        run: |
+          cat > /tmp/Dockerfile << 'EOF'
+          FROM alpine:3.20
+          RUN echo "built" > /output.txt
+          CMD ["cat", "/output.txt"]
+          EOF
+          docker build -t p0-custom-img -f /tmp/Dockerfile /tmp
+
+      - name: Run custom image
+        run: |
+          RESULT=$(docker run --rm p0-custom-img)
+          test "$RESULT" = "built"
+          echo "Custom Docker image verified"
+
+      # 4. Container env hiding — secrets should not appear in docker env args
+      - name: Docker env test
+        run: |
+          # Verify docker run doesn't echo secret values in env form
+          docker run --rm -e SAFE_VAR=visible alpine:3.20 env | grep SAFE_VAR
+          echo "Docker env verified"
+
+      # 5. Problem matcher with compiler-like output
+      - name: Create GCC-style matcher
+        run: |
+          cat > /tmp/gcc-matcher.json << 'EOF'
+          {
+            "problemMatcher": [
+              {
+                "owner": "gcc",
+                "pattern": [
+                  {
+                    "regexp": "^(.+):(\\d+):(\\d+):\\s+(error|warning|note):\\s+(.+)$",
+                    "file": 1,
+                    "line": 2,
+                    "column": 3,
+                    "severity": 4,
+                    "message": 5
+                  }
+                ]
+              }
+            ]
+          }
+          EOF
+          echo "::add-matcher::/tmp/gcc-matcher.json"
+
+      - name: Emit GCC-style errors
+        run: |
+          echo "src/main.c:10:5: error: implicit declaration of function"
+          echo "src/util.c:42:1: warning: unused variable"
+          echo "src/lib.c:99:10: note: expanded from macro"
+
+      - name: Remove GCC matcher
+        run: echo "::remove-matcher owner=gcc::"
+
+      # 6. ANSI color stripping with matcher
+      - name: Create ANSI-aware matcher
+        run: |
+          cat > /tmp/ansi2-matcher.json << 'EOF'
+          {
+            "problemMatcher": [
+              {
+                "owner": "ansi-strip-test",
+                "pattern": [
+                  {
+                    "regexp": "^CRITICAL:\\s+(.+)$",
+                    "message": 1
+                  }
+                ]
+              }
+            ]
+          }
+          EOF
+          echo "::add-matcher::/tmp/ansi2-matcher.json"
+
+      - name: Emit ANSI-colored critical error
+        run: |
+          printf '\033[1;31mCRITICAL: database connection lost\033[0m\n'
+
+      - name: Remove ANSI matcher
+        run: echo "::remove-matcher owner=ansi-strip-test::"
+
+      # 7. Composite action markers (##[start-action] / ##[end-action])
+      - name: Emit and verify marker stripping
+        run: |
+          echo "##[start-action]setup"
+          echo "This is inside a marker block"
+          echo "##[end-action]"
+          echo "Markers should be stripped from runner output processing"
+
+      # 8. Final marker
+      - name: All Docker P0 checks passed
+        run: echo "ALL_P0_DOCKER_CONTAINER_CHECKS_PASSED"

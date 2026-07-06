@@ -70,7 +70,10 @@ impl JobContext {
         // Extract mask hints from variables
         let mut masks = HashSet::new();
         if let Some(vars) = variables.as_object() {
-            for (_, v) in vars {
+            for (k, v) in vars {
+                if k.is_empty() {
+                    continue;
+                }
                 let is_secret = v.get("isSecret").and_then(|s| s.as_bool()).unwrap_or(false);
                 if is_secret {
                     if let Some(val) = v.get("value").and_then(|s| s.as_str()) {
@@ -117,12 +120,34 @@ impl JobContext {
         }
     }
 
-    /// Get the value of a variable by key.
+    /// Get the value of a variable by key. Supports case-insensitive lookup.
+    /// If key is found but value is null, returns empty string `""` (C# parity).
     pub fn get_variable(&self, key: &str) -> Option<&str> {
-        self.variables
-            .get(key)
-            .and_then(|v| v.get("value"))
-            .and_then(|v| v.as_str())
+        let key_lower = key.to_lowercase();
+        if let Some(obj) = self.variables.as_object() {
+            for (k, v) in obj {
+                if k.is_empty() {
+                    continue;
+                }
+                if k.to_lowercase() == key_lower {
+                    if let Some(val_node) = v.get("value") {
+                        if val_node.is_null() {
+                            return Some("");
+                        }
+                        return Some(val_node.as_str().unwrap_or(""));
+                    }
+                    return Some("");
+                }
+            }
+        }
+        None
+    }
+
+    /// Get a variable parsed as boolean. Does not throw if not found or null.
+    pub fn get_variable_bool(&self, key: &str) -> bool {
+        self.get_variable(key)
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false)
     }
 
     /// Add a mask value (secrets, add-mask command).
@@ -626,5 +651,297 @@ mod tests {
         assert_eq!(val.unwrap().as_str(), Some("/workspace"));
         let val2 = aksh_gha_expressions::eval_expression("vars.OTHER_VAR", &expr);
         assert_eq!(val2.unwrap().as_str(), Some("hello"));
+    }
+
+    #[test]
+    fn variables_case_insensitive_and_edge_cases() {
+        let variables = serde_json::json!({
+            "MY_VAR": {"value": "hello", "isSecret": false},
+            "secret_var": {"value": "secret123", "isSecret": true},
+            "NULL_VAR": {"value": null, "isSecret": false},
+            "": {"value": "skipped", "isSecret": false}
+        });
+
+        let ctx = JobContext::new(
+            "job1".into(),
+            "Test Job".into(),
+            variables,
+            serde_json::json!({}),
+        );
+
+        // Case-insensitive lookup
+        assert_eq!(ctx.get_variable("MY_VAR"), Some("hello"));
+        assert_eq!(ctx.get_variable("my_var"), Some("hello"));
+        assert_eq!(ctx.get_variable("My_Var"), Some("hello"));
+
+        // Null variable sets null/empty as empty string ""
+        assert_eq!(ctx.get_variable("NULL_VAR"), Some(""));
+        assert_eq!(ctx.get_variable("null_var"), Some(""));
+
+        // Empty name is ignored/skipped (or at least cannot be looked up)
+        assert_eq!(ctx.get_variable(""), None);
+
+        // Missing returns None
+        assert_eq!(ctx.get_variable("MISSING_VAR"), None);
+    }
+
+    #[test]
+    fn variables_get_boolean_does_not_throw_when_null() {
+        let variables = serde_json::json!({
+            "TRUE_VAR": {"value": "true", "isSecret": false},
+            "FALSE_VAR": {"value": "false", "isSecret": false},
+            "NULL_VAR": {"value": null, "isSecret": false}
+        });
+
+        let ctx = JobContext::new(
+            "job1".into(),
+            "Test Job".into(),
+            variables,
+            serde_json::json!({}),
+        );
+
+        assert!(ctx.get_variable_bool("TRUE_VAR"));
+        assert!(ctx.get_variable_bool("true_var"));
+        assert!(!ctx.get_variable_bool("FALSE_VAR"));
+        assert!(!ctx.get_variable_bool("NULL_VAR"));
+        assert!(!ctx.get_variable_bool("MISSING_VAR"));
+    }
+
+    // --- JobContextL0 gap coverage ---
+
+    #[test]
+    fn set_github_context_value_clears_on_none() {
+        let mut job = JobContext::new(
+            "j1".into(),
+            "Test".into(),
+            serde_json::json!({}),
+            serde_json::json!({"github": {"repository": "owner/repo"}}),
+        );
+
+        // Set workflow_ref
+        job.set_github_context_value(
+            "workflow_ref",
+            Some(serde_json::json!(
+                "owner/repo/.github/workflows/ci.yml@refs/heads/main"
+            )),
+        );
+        assert_eq!(
+            job.github_context_value("workflow_ref")
+                .and_then(|v| v.as_str().map(String::from)),
+            Some("owner/repo/.github/workflows/ci.yml@refs/heads/main".to_string())
+        );
+        assert_eq!(
+            job.env.get("GITHUB_WORKFLOW_REF").map(String::as_str),
+            Some("owner/repo/.github/workflows/ci.yml@refs/heads/main")
+        );
+
+        // Clear it
+        job.set_github_context_value("workflow_ref", None);
+        assert!(job.github_context_value("workflow_ref").is_none());
+        assert!(!job.env.contains_key("GITHUB_WORKFLOW_REF"));
+    }
+
+    #[test]
+    fn set_github_context_value_workflow_identity_fields() {
+        let mut job = JobContext::new(
+            "j1".into(),
+            "Test".into(),
+            serde_json::json!({}),
+            serde_json::json!({"github": {"repository": "owner/repo"}}),
+        );
+
+        // Set all workflow identity fields
+        job.set_github_context_value(
+            "workflow_ref",
+            Some(serde_json::json!(
+                "owner/repo/.github/workflows/ci.yml@refs/heads/main"
+            )),
+        );
+        job.set_github_context_value("workflow_sha", Some(serde_json::json!("abc123def456")));
+        job.set_github_context_value("workflow", Some(serde_json::json!("CI")));
+
+        // Verify all set
+        assert_eq!(
+            job.github_context_value("workflow_ref")
+                .and_then(|v| v.as_str().map(String::from)),
+            Some("owner/repo/.github/workflows/ci.yml@refs/heads/main".to_string())
+        );
+        assert_eq!(
+            job.github_context_value("workflow_sha")
+                .and_then(|v| v.as_str().map(String::from)),
+            Some("abc123def456".to_string())
+        );
+        assert_eq!(
+            job.github_context_value("workflow")
+                .and_then(|v| v.as_str().map(String::from)),
+            Some("CI".to_string())
+        );
+
+        // Verify env synced
+        assert_eq!(
+            job.env.get("GITHUB_WORKFLOW_REF").map(String::as_str),
+            Some("owner/repo/.github/workflows/ci.yml@refs/heads/main")
+        );
+        assert_eq!(
+            job.env.get("GITHUB_WORKFLOW_SHA").map(String::as_str),
+            Some("abc123def456")
+        );
+        assert_eq!(
+            job.env.get("GITHUB_WORKFLOW").map(String::as_str),
+            Some("CI")
+        );
+
+        // Clear all
+        job.set_github_context_value("workflow_ref", None);
+        job.set_github_context_value("workflow_sha", None);
+        job.set_github_context_value("workflow", None);
+
+        assert!(job.github_context_value("workflow_ref").is_none());
+        assert!(job.github_context_value("workflow_sha").is_none());
+        assert!(job.github_context_value("workflow").is_none());
+        assert!(!job.env.contains_key("GITHUB_WORKFLOW_REF"));
+        assert!(!job.env.contains_key("GITHUB_WORKFLOW_SHA"));
+        assert!(!job.env.contains_key("GITHUB_WORKFLOW"));
+    }
+
+    #[test]
+    fn cancelled_status_reflects_in_context() {
+        let mut ctx = JobContext::new(
+            "job1".into(),
+            "Test".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        ctx.job_status = JobStatus::Cancelled;
+
+        let expr_ctx = ctx.build_expression_context();
+        assert!(!aksh_gha_expressions::eval_bool("success()", &expr_ctx).unwrap());
+        assert!(!aksh_gha_expressions::eval_bool("failure()", &expr_ctx).unwrap());
+        assert!(aksh_gha_expressions::eval_bool("cancelled()", &expr_ctx).unwrap());
+        assert!(aksh_gha_expressions::eval_bool("always()", &expr_ctx).unwrap());
+    }
+
+    // --- P1 expressions/templates gap coverage ---
+
+    #[test]
+    fn matrix_context_resolves_in_expressions() {
+        let ctx = JobContext::new(
+            "job1".into(),
+            "Test".into(),
+            serde_json::json!({}),
+            serde_json::json!({
+                "github": {"repository": "owner/repo"},
+                "matrix": {"os": "ubuntu-latest", "node": "20"}
+            }),
+        );
+
+        let expr_ctx = ctx.build_expression_context();
+        assert_eq!(
+            aksh_gha_expressions::eval_expression("matrix.os", &expr_ctx)
+                .unwrap()
+                .as_str(),
+            Some("ubuntu-latest")
+        );
+        assert_eq!(
+            aksh_gha_expressions::eval_expression("matrix.node", &expr_ctx)
+                .unwrap()
+                .as_str(),
+            Some("20")
+        );
+    }
+
+    #[test]
+    fn needs_context_resolves_in_expressions() {
+        let ctx = JobContext::new(
+            "job1".into(),
+            "Test".into(),
+            serde_json::json!({}),
+            serde_json::json!({
+                "github": {"repository": "owner/repo"},
+                "needs": {
+                    "build": {
+                        "result": "success",
+                        "outputs": {"sha": "abc123", "version": "1.2.3"}
+                    }
+                }
+            }),
+        );
+
+        let expr_ctx = ctx.build_expression_context();
+        assert_eq!(
+            aksh_gha_expressions::eval_expression("needs.build.result", &expr_ctx)
+                .unwrap()
+                .as_str(),
+            Some("success")
+        );
+        assert_eq!(
+            aksh_gha_expressions::eval_expression("needs.build.outputs.sha", &expr_ctx)
+                .unwrap()
+                .as_str(),
+            Some("abc123")
+        );
+    }
+
+    #[test]
+    fn strategy_context_resolves_in_expressions() {
+        let ctx = JobContext::new(
+            "job1".into(),
+            "Test".into(),
+            serde_json::json!({}),
+            serde_json::json!({
+                "github": {"repository": "owner/repo"},
+                "strategy": {"fail-fast": true, "max-parallel": 2}
+            }),
+        );
+
+        let expr_ctx = ctx.build_expression_context();
+        assert!(aksh_gha_expressions::eval_bool("strategy.fail-fast", &expr_ctx).unwrap());
+    }
+
+    #[test]
+    fn env_context_resolves_in_expressions() {
+        let mut ctx = JobContext::new(
+            "job1".into(),
+            "Test".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        ctx.env.insert("MY_VAR".into(), "hello".into());
+        ctx.env.insert("OTHER".into(), "world".into());
+
+        let expr_ctx = ctx.build_expression_context();
+        assert_eq!(
+            aksh_gha_expressions::eval_expression("env.MY_VAR", &expr_ctx)
+                .unwrap()
+                .as_str(),
+            Some("hello")
+        );
+        assert_eq!(
+            aksh_gha_expressions::eval_expression("env.OTHER", &expr_ctx)
+                .unwrap()
+                .as_str(),
+            Some("world")
+        );
+    }
+
+    #[test]
+    fn secrets_context_resolves_in_expressions() {
+        let ctx = JobContext::new(
+            "job1".into(),
+            "Test".into(),
+            serde_json::json!({
+                "system.github.token": {"value": "ghp_tok", "isSecret": true},
+                "MY_SECRET": {"value": "s3cr3t", "isSecret": true}
+            }),
+            serde_json::json!({}),
+        );
+
+        let expr_ctx = ctx.build_expression_context();
+        assert_eq!(
+            aksh_gha_expressions::eval_expression("secrets.MY_SECRET", &expr_ctx)
+                .unwrap()
+                .as_str(),
+            Some("s3cr3t")
+        );
     }
 }

@@ -313,7 +313,7 @@ fn build_task_step(step: &crate::StepPlan, context: &Context) -> TaskStep {
             }),
         inputs: with,
         env,
-        continue_on_error: None,
+        continue_on_error: step.continue_on_error,
         working_directory: step
             .working_directory
             .as_ref()
