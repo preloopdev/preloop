@@ -382,3 +382,163 @@ async fn json_or_null<T: serde::de::DeserializeOwned>(
         serde_json::from_str(&text).with_context(|| context.to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    async fn serve_once(status: &str, body: &str) -> (String, oneshot::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = oneshot::channel();
+        let status = status.to_string();
+        let body = body.to_string();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = socket.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let _ = request_tx.send(request);
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        (format!("http://{addr}"), request_rx)
+    }
+
+    #[tokio::test]
+    async fn post_json_with_auth_handles_empty_success_response() {
+        let (url, request_rx) = serve_once("200 OK", "").await;
+        let client = HttpClient::new(None).unwrap();
+
+        let value: serde_json::Value = client
+            .post_json_with_auth(&url, &serde_json::json!({"hello": "world"}), "Bearer token")
+            .await
+            .unwrap();
+
+        assert!(value.is_null());
+        let request = request_rx.await.unwrap();
+        assert!(request.starts_with("POST / HTTP/1.1"));
+        assert!(request.contains("authorization: Bearer token"));
+        assert!(request.contains(r#""hello":"world""#));
+    }
+
+    #[tokio::test]
+    async fn post_json_with_auth_preserves_client_error_body() {
+        let (url, _request_rx) = serve_once("400 Bad Request", r#"{"message":"bad token"}"#).await;
+        let client = HttpClient::new(None).unwrap();
+
+        let err = client
+            .post_json_with_auth::<serde_json::Value>(&url, &serde_json::json!({}), "Bearer token")
+            .await
+            .unwrap_err();
+
+        let http_err = err
+            .downcast_ref::<HttpError>()
+            .expect("expected typed HttpError");
+        match http_err {
+            HttpError::Status { status, body } => {
+                assert_eq!(*status, reqwest::StatusCode::BAD_REQUEST);
+                assert_eq!(body, r#"{"message":"bad token"}"#);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn post_json_with_auth_headers_handles_empty_success_response() {
+        let (url, _request_rx) = serve_once("204 No Content", "").await;
+        let client = HttpClient::new(None).unwrap();
+
+        let value: serde_json::Value = client
+            .post_json_with_auth_headers(
+                &url,
+                &serde_json::json!({}),
+                "Bearer token",
+                "application/json",
+                "application/json",
+            )
+            .await
+            .unwrap();
+
+        assert!(value.is_null());
+    }
+
+    #[tokio::test]
+    async fn get_long_poll_treats_accepted_as_no_message() {
+        let (url, _request_rx) = serve_once("202 Accepted", "").await;
+        let client = HttpClient::new(None).unwrap();
+
+        let value: Option<serde_json::Value> = client
+            .get_long_poll(&url, "Bearer token", Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        assert!(value.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_long_poll_treats_no_content_as_no_message() {
+        let (url, _request_rx) = serve_once("204 No Content", "").await;
+        let client = HttpClient::new(None).unwrap();
+
+        let value: Option<serde_json::Value> = client
+            .get_long_poll(&url, "Bearer token", Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        assert!(value.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_long_poll_preserves_error_body() {
+        let (url, _request_rx) = serve_once("409 Conflict", "session expired").await;
+        let client = HttpClient::new(None).unwrap();
+
+        let err = client
+            .get_long_poll::<serde_json::Value>(&url, "Bearer token", Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        let http_err = err
+            .downcast_ref::<HttpError>()
+            .expect("expected typed HttpError");
+        match http_err {
+            HttpError::Status { status, body } => {
+                assert_eq!(*status, reqwest::StatusCode::CONFLICT);
+                assert_eq!(body, "session expired");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn put_bytes_preserves_client_error_body() {
+        let (url, request_rx) = serve_once("403 Forbidden", "signed url expired").await;
+        let client = HttpClient::new(None).unwrap();
+
+        let err = client
+            .put_bytes(&url, b"log-data".to_vec(), "text/plain")
+            .await
+            .unwrap_err();
+
+        let request = request_rx.await.unwrap();
+        assert!(request.starts_with("PUT / HTTP/1.1"));
+        assert!(request.contains("x-ms-blob-type: BlockBlob"));
+
+        let http_err = err
+            .downcast_ref::<HttpError>()
+            .expect("expected typed HttpError");
+        match http_err {
+            HttpError::Status { status, body } => {
+                assert_eq!(*status, reqwest::StatusCode::FORBIDDEN);
+                assert_eq!(body, "signed url expired");
+            }
+        }
+    }
+}
