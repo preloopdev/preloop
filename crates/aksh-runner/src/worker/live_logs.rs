@@ -186,7 +186,6 @@ struct WebSocketSender {
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
     failed_batches: u32,
     total_batches: u32,
-    last_failure: Option<Instant>,
 }
 
 impl WebSocketSender {
@@ -198,7 +197,6 @@ impl WebSocketSender {
             ws,
             failed_batches: 0,
             total_batches: 0,
-            last_failure: None,
         })
     }
 
@@ -219,7 +217,6 @@ impl WebSocketSender {
             Err(error) => {
                 warn!(%error, "serializing live log wrapper failed");
                 self.failed_batches += 1;
-                self.last_failure = Some(Instant::now());
                 return false;
             }
         };
@@ -229,7 +226,6 @@ impl WebSocketSender {
                 return true;
             }
 
-            self.last_failure = Some(Instant::now());
             random_backoff().await;
 
             if attempt + 1 < RETRIES {
