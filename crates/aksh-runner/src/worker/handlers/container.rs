@@ -15,6 +15,7 @@ pub async fn run_docker_action(
     workspace: &str,
     ctx: &mut StepContext<'_>,
 ) -> Result<()> {
+    ctx.translate_container_path = true;
     let image = uses
         .strip_prefix("docker://")
         .context("invalid docker action reference")?;
@@ -34,6 +35,7 @@ pub async fn run_docker_action_from_manifest(
     workspace: &str,
     ctx: &mut StepContext<'_>,
 ) -> Result<()> {
+    ctx.translate_container_path = true;
     let image = manifest
         .runs_image
         .as_deref()
@@ -460,5 +462,87 @@ mod tests {
         assert!(!args.iter().any(|arg| arg.contains("s3cr3t")));
         let image_index = args.iter().position(|arg| arg == "alpine:3.20").unwrap();
         assert_eq!(&args[image_index + 1..], ["arg1", "arg2"]);
+    }
+
+    // --- P0 container action gap coverage ---
+
+    #[test]
+    fn docker_image_reference_builds_run_args() {
+        // Simulates `docker://alpine:3.20` action — verifies the run args
+        // include the image, workspace mount, and workdir.
+        let mut job = crate::worker::contexts::JobContext::new(
+            "job".into(),
+            "job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let ctx = test_step_context(&mut job);
+        let env = HashMap::new();
+        let args = build_docker_run_args("/tmp/work", &ctx, &env, "alpine:3.20", None, &[]);
+
+        assert!(args.contains(&"alpine:3.20".to_string()));
+        assert!(args.contains(&"--rm".to_string()));
+        assert!(args.contains(&"/tmp/work:/github/workspace".to_string()));
+        assert!(args.contains(&"/github/workspace".to_string()));
+    }
+
+    #[test]
+    fn manifest_without_entrypoint_or_args() {
+        // DockerHub image with no entrypoint/args — uses image's default CMD
+        let mut job = crate::worker::contexts::JobContext::new(
+            "job".into(),
+            "job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let ctx = test_step_context(&mut job);
+        let env = HashMap::new();
+        let args = build_docker_run_args("/tmp/work", &ctx, &env, "python:3.12", None, &[]);
+
+        // No --entrypoint flag
+        assert!(!args.windows(2).any(|pair| pair[0] == "--entrypoint"));
+        // Image is last arg (no entrypoint args after it)
+        assert_eq!(args.last().map(String::as_str), Some("python:3.12"));
+    }
+
+    #[test]
+    fn evaluated_inputs_applies_defaults_from_manifest() {
+        let manifest = test_manifest();
+        let mut job = crate::worker::contexts::JobContext::new(
+            "job".into(),
+            "job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let ctx = test_step_context(&mut job);
+
+        // Only provide message, entrypoint should get default
+        let inputs =
+            evaluated_inputs(Some(&manifest), &serde_json::json!({"message": "hi"}), &ctx).unwrap();
+        assert_eq!(inputs.get("message").map(String::as_str), Some("hi"));
+        assert_eq!(
+            inputs.get("entrypoint").map(String::as_str),
+            Some("default-entry")
+        );
+    }
+
+    #[test]
+    fn evaluated_inputs_skips_aksh_internal_keys() {
+        let mut job = crate::worker::contexts::JobContext::new(
+            "job".into(),
+            "job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let ctx = test_step_context(&mut job);
+
+        let inputs = evaluated_inputs(
+            None,
+            &serde_json::json!({"__aksh_entry": "pre.js", "real": "val"}),
+            &ctx,
+        )
+        .unwrap();
+        assert!(!inputs.contains_key("__aksh_entry"));
+        assert_eq!(inputs.get("real").map(String::as_str), Some("val"));
     }
 }

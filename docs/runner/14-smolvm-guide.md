@@ -88,6 +88,64 @@ smolvm machine exec --name myvm -- sh -c '
 
 Docker defaults to **overlay2** on ext4. The VM's root filesystem is an overlayfs itself (from the container image layers), so Docker needs a real block device (`/dev/vdb` from the `--storage` option) formatted as ext4. Without this, Docker falls back to `vfs` which is extremely slow (copies entire image on every container create).
 
+## Host / Registry DNS for Docker Pulls
+
+Docker image pulls need normal guest DNS before container networking matters. If `docker pull alpine:3.20` fails with Docker trying to query loopback IPv6 DNS:
+
+```text
+lookup registry-1.docker.io on [::1]:53: read: connection refused
+```
+
+the VM was started with a broken resolver. Do **not** debug this as a Docker bridge or `127.0.0.11` service-container problem; Docker has not reached container networking yet.
+
+Create the runner VM with an explicit DNS resolver:
+
+```sh
+smolvm machine create --name p0-linux \
+  --image ubuntu:24.04 \
+  --cpus 4 --mem 8192 --storage 40 --net \
+  --dns 1.1.1.1 \
+  -v /tmp/smolvm-share:/share
+```
+
+Use the resolver that works on your network. Public examples:
+
+- `--dns 1.1.1.1`
+- `--dns 8.8.8.8`
+- corporate/VPN resolver IP if public DNS is blocked
+
+Validate before installing/running Docker:
+
+```sh
+smolvm machine exec --name p0-linux -- sh -c '
+  cat /etc/resolv.conf
+  nslookup registry-1.docker.io
+'
+```
+
+Expected:
+
+```text
+nameserver 1.1.1.1
+Name: registry-1.docker.io
+Address: ...
+```
+
+`smolvm machine update` currently cannot change DNS on an existing machine, so recreate the VM if it was created with the wrong resolver. Editing `/etc/resolv.conf` inside an image-based VM is not a reliable fix: depending on the image/rootfs layout it may be absent, generated at boot, or not writable in the layer you expect.
+
+After DNS works, start Docker and confirm a fresh pull:
+
+```sh
+smolvm machine exec --name p0-linux --stream -- sh -c '
+  dockerd --storage-driver vfs >/tmp/dockerd.log 2>&1 &
+  sleep 3
+  docker pull alpine:3.20
+  docker run --rm alpine:3.20 echo docker-pull-and-run-ok
+'
+```
+
+This fixes host/registry resolution only. Docker service-container name resolution (`http://web/`) is a separate limitation covered below.
+
 ## Docker Service Containers & DNS Limitations
 
 When running workflows with Docker service containers (e.g., `services:` blocks mapping a DB or Web container), standard Docker container-to-container DNS resolution (`http://web/`) fails under the default `smolvm` user-space network mode (`tsi`). This is because the statically compiled `libkrun` guest kernel lacks the Netfilter NAT modules that Docker's embedded DNS server (`127.0.0.11`) relies on to intercept queries.
@@ -204,6 +262,7 @@ docker run --platform linux/amd64 alpine uname -m  # x86_64
 | Exit code 137 on exec | 30s socket timeout | Use `--stream` or `--timeout` |
 | Zombie processes after crash | Exec killed mid-command | `stop` + `start` the VM |
 | Packed VM won't boot | Dirty state in overlay | Clean VM before packing |
+| `docker pull` uses `[::1]:53` and fails | Broken guest resolver | Recreate VM with `--net --dns <resolver-ip>` |
 | Docker uses vfs (slow) | No ext4 block device | Mount `/dev/vdb` as ext4 |
 | Host mount not visible | Path collision with internal disk | Use different mount point |
 | `cargo: command not found` | Non-login shell, PATH not set | `export PATH="$HOME/.cargo/bin:$PATH"` |
