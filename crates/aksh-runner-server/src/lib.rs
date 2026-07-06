@@ -1295,7 +1295,12 @@ async fn handle_live_log_socket(mut socket: WebSocket, job_id: String, shared: A
                     Err(error) => warn!(%error, %job_id, "invalid live log websocket payload"),
                 }
             }
-            Ok(WsMessage::Binary(_)) | Ok(WsMessage::Ping(_)) | Ok(WsMessage::Pong(_)) => {}
+            Ok(WsMessage::Ping(data)) => {
+                if socket.send(WsMessage::Pong(data)).await.is_err() {
+                    break;
+                }
+            }
+            Ok(WsMessage::Binary(_)) | Ok(WsMessage::Pong(_)) => {}
             Ok(WsMessage::Close(_)) => break,
             Err(error) => {
                 warn!(%error, %job_id, "live log websocket receive failed");
