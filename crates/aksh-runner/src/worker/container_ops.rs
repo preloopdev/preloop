@@ -15,6 +15,16 @@ use tracing::{debug, info};
 
 use crate::process;
 
+/// Registry credentials for pulling images from private registries.
+///
+/// Parsed from the `credentials` field in the container spec.
+/// Matches `ContainerRegistryCredentials` in the official runner (JobContainer.cs:89-108).
+#[derive(Debug, Clone)]
+pub struct RegistryCredentials {
+    pub username: String,
+    pub password: String,
+}
+
 /// Parsed container spec from the job message.
 #[derive(Debug, Clone)]
 pub struct ContainerSpec {
@@ -23,6 +33,8 @@ pub struct ContainerSpec {
     pub ports: Vec<String>,
     pub volumes: Vec<String>,
     pub options: String,
+    /// Optional registry credentials for pulling from private registries.
+    pub credentials: Option<RegistryCredentials>,
 }
 
 /// Parsed service container spec.
@@ -34,6 +46,8 @@ pub struct ServiceSpec {
     pub ports: Vec<String>,
     pub volumes: Vec<String>,
     pub options: String,
+    /// Optional registry credentials for pulling from private registries.
+    pub credentials: Option<RegistryCredentials>,
 }
 
 /// Runtime state for a running container job.
@@ -129,6 +143,7 @@ fn parse_container_spec_plain(value: &serde_json::Value) -> Option<ContainerSpec
             ports: Vec::new(),
             volumes: Vec::new(),
             options: String::new(),
+            credentials: None,
         }),
         serde_json::Value::Object(map) => {
             let image = map
@@ -139,6 +154,26 @@ fn parse_container_spec_plain(value: &serde_json::Value) -> Option<ContainerSpec
             if image.is_empty() {
                 return None;
             }
+            let credentials = map
+                .get("credentials")
+                .and_then(|v| v.as_object())
+                .and_then(|creds| {
+                    let username = creds
+                        .get("username")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let password = creds
+                        .get("password")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if username.is_empty() && password.is_empty() {
+                        None
+                    } else {
+                        Some(RegistryCredentials { username, password })
+                    }
+                });
             Some(ContainerSpec {
                 image,
                 env: parse_env_map(map.get("env")),
@@ -149,6 +184,7 @@ fn parse_container_spec_plain(value: &serde_json::Value) -> Option<ContainerSpec
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string(),
+                credentials,
             })
         }
         _ => None,
@@ -173,6 +209,7 @@ pub fn parse_service_specs(value: &serde_json::Value) -> Vec<ServiceSpec> {
                     ports: container.ports,
                     volumes: container.volumes,
                     options: container.options,
+                    credentials: container.credentials,
                 });
             }
         }
@@ -262,9 +299,26 @@ pub async fn create_network(network: &str, label: &str, log: &mut Vec<String>) -
     Ok(())
 }
 
-/// Pull a Docker image.
-pub async fn pull_image(image: &str, log: &mut Vec<String>) -> Result<()> {
-    docker_cmd(&["pull", image], log).await?;
+/// Pull a Docker image, optionally authenticating to a private registry first.
+///
+/// When `credentials` is `Some`, logs into the registry using a temporary
+/// Docker config directory (so the user's global `~/.docker/config.json` is
+/// never touched), pulls with that config, then removes the credentials on
+/// drop.  Matches official runner `ContainerOperationProvider.cs:193-221`.
+pub async fn pull_image(
+    image: &str,
+    credentials: Option<&RegistryCredentials>,
+    log: &mut Vec<String>,
+) -> Result<()> {
+    if let Some(creds) = credentials {
+        let config_dir = docker_registry_login(image, creds, log).await?;
+        let config_path = config_dir.path().to_string_lossy().to_string();
+        let result = docker_cmd(&["--config", &config_path, "pull", image], log).await;
+        drop(config_dir); // deletes temp credentials dir
+        result?;
+    } else {
+        docker_cmd(&["pull", image], log).await?;
+    }
     Ok(())
 }
 
@@ -287,7 +341,7 @@ pub async fn start_job_container(
     log.push("##[group]Starting job container".to_string());
 
     // Pull image
-    pull_image(&spec.image, log).await?;
+    pull_image(&spec.image, spec.credentials.as_ref(), log).await?;
 
     let container_workdir = translate_to_container_path(work_dir, runner_work);
 
@@ -430,7 +484,7 @@ pub async fn start_service_container(
     ));
 
     // Pull image
-    pull_image(&service.image, log).await?;
+    pull_image(&service.image, service.credentials.as_ref(), log).await?;
 
     let mut args: Vec<String> = vec![
         "create".into(),
@@ -698,6 +752,106 @@ pub fn translate_to_container_path(host_path: &str, host_work: &str) -> String {
     }
 }
 
+/// Extract the registry hostname from a Docker image reference.
+///
+/// Matches `DockerUtil.ParseRegistryHostnameFromImageName` (DockerUtil.cs:53-67):
+/// - `ghcr.io/owner/image` → `"ghcr.io"` (first component has `.`)
+/// - `registry:5000/image` → `"registry:5000"` (first component has `:`)
+/// - `owner/image` → `""` (DockerHub shorthand)
+/// - `ubuntu` → `""` (DockerHub image)
+fn parse_registry_from_image(image: &str) -> &str {
+    let parts: Vec<&str> = image.splitn(3, '/').collect();
+    if parts.len() >= 2
+        && (parts[0].contains('.') || parts[0].contains(':'))
+    {
+        parts[0]
+    } else {
+        ""
+    }
+}
+
+/// Authenticate to the registry that hosts `image`, placing credentials in a
+/// fresh temporary directory so the user's global `~/.docker/config.json` is
+/// never touched.  Returns the `TempDir`; dropping it deletes the config.
+///
+/// Retries up to 3 times with 5 s / 10 s exponential backoff, matching
+/// official runner `ContainerOperationProvider.cs:470-499`.
+async fn docker_registry_login(
+    image: &str,
+    creds: &RegistryCredentials,
+    log: &mut Vec<String>,
+) -> Result<tempfile::TempDir> {
+    use tokio::io::AsyncWriteExt;
+
+    let registry = parse_registry_from_image(image);
+    let config_dir = tempfile::TempDir::new()
+        .context("creating docker config directory for registry auth")?;
+
+    let registry_display = if registry.is_empty() {
+        "docker.io".to_string()
+    } else {
+        registry.to_string()
+    };
+    log.push(format!(
+        "##[command]docker --config <tmpdir> login{} -u {} --password-stdin",
+        if registry.is_empty() {
+            String::new()
+        } else {
+            format!(" {registry}")
+        },
+        creds.username
+    ));
+
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 0u32..3 {
+        if attempt > 0 {
+            let secs = 5u64 * (1 << (attempt - 1));
+            log.push(format!(
+                "##[warning]docker login for '{registry_display}' failed (attempt {attempt}), \
+                 retrying in {secs}s"
+            ));
+            tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+        }
+
+        let mut cmd = tokio::process::Command::new("docker");
+        cmd.arg("--config").arg(config_dir.path());
+        cmd.arg("login");
+        if !registry.is_empty() {
+            cmd.arg(registry);
+        }
+        cmd.arg("-u")
+            .arg(&creds.username)
+            .arg("--password-stdin")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        let mut child = cmd.spawn().context("spawning docker login")?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(creds.password.as_bytes()).await;
+        }
+        let output = child.wait_with_output().await.context("docker login")?;
+
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            log.push(line.to_string());
+        }
+        for line in String::from_utf8_lossy(&output.stderr).lines() {
+            log.push(line.to_string());
+        }
+
+        if output.status.success() {
+            return Ok(config_dir);
+        }
+        last_err = Some(anyhow::anyhow!(
+            "docker login for '{}' failed with exit code {}",
+            registry_display,
+            output.status.code().unwrap_or(-1)
+        ));
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("docker login failed")))
+}
+
 // ── Internal helpers ─────────────────────────────────────────────────
 
 /// Run a docker command, logging the command line, and return stdout lines.
@@ -786,7 +940,7 @@ fn build_docker_exec_args(
     workdir: &str,
     env: &HashMap<String, String>,
 ) -> Vec<String> {
-    let mut exec_args: Vec<String> = vec!["exec".into(), "-w".into(), workdir.into()];
+    let mut exec_args: Vec<String> = vec!["exec".into(), "-i".into(), "-w".into(), workdir.into()];
 
     for key in env.keys() {
         // Match official StepHost: pass only the key on the Docker CLI and put
@@ -1057,10 +1211,11 @@ mod tests {
         ]);
         let args = build_docker_exec_args("cid123", "sh", &["-c", "echo hi"], "/__w/repo", &env);
 
-        // Must start with exec -w <workdir>
+        // Must start with exec -i -w <workdir>
         assert_eq!(args[0], "exec");
-        assert_eq!(args[1], "-w");
-        assert_eq!(args[2], "/__w/repo");
+        assert_eq!(args[1], "-i");
+        assert_eq!(args[2], "-w");
+        assert_eq!(args[3], "/__w/repo");
 
         // Must contain -e for each env key (not values!)
         let env_keys: Vec<_> = args
