@@ -127,8 +127,32 @@ pub async fn run_job(
     job_ctx.action_paths = action_paths.clone();
 
     // Build step list (F023: includes pre/post from downloaded manifests)
-    let ordered_steps =
+    let mut ordered_steps =
         super::job_extension::build_step_list_with_lifecycle(main_steps, &workspace, &action_paths);
+
+    // ACTIONS_RUNNER_HOOK_JOB_STARTED / ACTIONS_RUNNER_HOOK_JOB_COMPLETED:
+    // The official runner reads these from the host OS environment and injects
+    // them as synthetic script steps before and after user steps respectively.
+    // Providers use them for workspace pre-warming, VM snapshotting, metrics, etc.
+    if let Ok(hook) = std::env::var("ACTIONS_RUNNER_HOOK_JOB_STARTED") {
+        if !hook.is_empty() {
+            info!("Injecting ACTIONS_RUNNER_HOOK_JOB_STARTED: {hook}");
+            ordered_steps.insert(
+                0,
+                make_hook_step("__hook_job_started", "__hook_job_started", &hook),
+            );
+        }
+    }
+    if let Ok(hook) = std::env::var("ACTIONS_RUNNER_HOOK_JOB_COMPLETED") {
+        if !hook.is_empty() {
+            info!("Injecting ACTIONS_RUNNER_HOOK_JOB_COMPLETED: {hook}");
+            ordered_steps.push(make_hook_step(
+                "__hook_job_completed",
+                "__hook_job_completed",
+                &hook,
+            ));
+        }
+    }
 
     // ── DAP debugger (parity with GlobalContext.Debugger) ────────
     // Mirrors `ExecutionContext.cs` populating `Global.Debugger` from
@@ -214,7 +238,6 @@ pub async fn run_job(
         }];
         dbg.on_job_steps_initialized(&entries, &post, &predicted).await;
     }
-
     // Set up reporting context (F018/F019/F020)
     let reporting = if let Some((service_url, access_token)) =
         extract_service_endpoint(&job_message)
@@ -1544,7 +1567,26 @@ async fn report_completion(
     Ok(())
 }
 
-#[cfg(test)]
+/// Build a synthetic script Step for a job hook (ACTIONS_RUNNER_HOOK_JOB_STARTED
+/// / ACTIONS_RUNNER_HOOK_JOB_COMPLETED). The hook path is a shell script on the
+/// runner host, executed with the default shell exactly like a `run:` step.
+fn make_hook_step(id: &str, context_name: &str, script_path: &str) -> super::steps_runner::Step {
+    super::steps_runner::Step {
+        id: id.to_string(),
+        context_name: context_name.to_string(),
+        display_name: context_name.replace('_', " ").trim().to_string(),
+        step_type: super::steps_runner::StepType::Script {
+            script: script_path.to_string(),
+            shell: None,
+            working_directory: None,
+        },
+        condition: Some("always()".to_string()),
+        continue_on_error: true,
+        timeout_minutes: Some(10),
+        env: std::collections::HashMap::new(),
+        raw: serde_json::json!({}),
+    }
+}
 mod tests {
     use super::*;
     use tempfile::TempDir;
