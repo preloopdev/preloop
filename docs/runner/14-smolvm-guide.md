@@ -245,16 +245,48 @@ docker run --platform linux/amd64 alpine uname -m  # x86_64
 
 ## Performance Notes
 
+### Disk I/O: virtio-fs vs virtio-blk
+
+**For normal workflow execution** (runner checks out code inside the VM, cargo
+writes `./target` inside the VM), disk I/O goes through the **guest's own
+virtio-blk overlay disk** — not a host mount. virtio-fs is not involved and is
+not a bottleneck.
+
+**virtio-fs** (FUSE over vsock) is only in play when you explicitly mount a host
+directory into the VM with `-v HOST:GUEST` and then do write-heavy work on that
+path from inside the VM. Each filesystem syscall crosses the hypervisor boundary,
+which is cheap for reads but expensive for write storms (thousands of small
+`.rlib`/`.rmeta`/`.d` files). If you find yourself in that situation, the fix is
+to use a guest tmpfs as a staging area and copy results out with
+`smolvm machine cp` rather than writing back through the mount.
+
+smolvm exposes host volumes exclusively via virtio-fs. The internal `--storage`
+and `--overlay` disks are virtio-blk (ext4 images handed directly to libkrun),
+but there is no CLI flag to present a host directory as a block device.
+
+### Workflow build performance: vCPU count is the bottleneck
+
+For CI workflows, the dominant factor is **vCPU count**, not I/O. `cargo build`
+on a large workspace (e.g. axum) is CPU-bound once the source is checked out
+inside the VM. The default VM has 4 vCPUs; the host has 16.
+
+Increase vCPUs at VM create time for compile-heavy workloads:
+```bash
+smolvm machine create --name p0-linux --cpus 8 ...
+```
+
+### General table
+
 | Metric | Value |
 |---|---|
 | VM boot (from stopped) | 1.2s |
 | VM boot (packed, first run) | ~9s (asset extraction) |
 | VM boot (packed, cached) | ~3s |
-| virtio-fs overhead vs native | ~1.7x for I/O-heavy workloads |
-| Docker overlay2 on ext4 | Same perf as native Linux |
-| Rust compilation (warm cache) | ~1.7x slower than host bare metal |
-| Rust compilation (cold cache) | 118s vs 27s host (4.4x, includes I/O overhead) |
-
+| virtio-fs overhead vs native (read-heavy) | ~1.7× |
+| virtio-fs overhead (write storm on host mount) | significant; use guest tmpfs instead |
+| Docker overlay2 on ext4 (guest disk) | Same perf as native Linux |
+| Rust compilation (warm cache, 4 vCPUs) | ~1.7× slower than 16-vCPU host |
+| Rust compilation (cold cache, 4 vCPUs) | 118s vs 27s on host (4.4×) |
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
