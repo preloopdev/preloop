@@ -726,7 +726,7 @@ struct InnerState {
     artifacts: BTreeMap<String, ArtifactRecord>,
     logs: BTreeMap<String, Vec<u8>>,
     timeline_events: BTreeMap<RunId, Vec<NdjsonEvent>>,
-    live_log_lines: BTreeMap<String, Vec<LiveLogFeedLinesWrapper>>,
+    live_log_lines: BTreeMap<String, Arc<tokio::sync::Mutex<Vec<LiveLogFeedLinesWrapper>>>>,
     live_log_tx: BTreeMap<String, broadcast::Sender<LiveLogFeedLinesWrapper>>,
     inflight_requests: BTreeMap<i64, (RunId, JobId)>,
     job_requests: BTreeMap<i64, TaskAgentJobRequestRecord>,
@@ -1206,14 +1206,21 @@ async fn live_logs_sse(
     State(shared): State<Arc<SharedState>>,
     Path((run_id, job_id)): Path<(RunId, String)>,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
-    let (snapshot, rx) = {
+    // Grab per-job handles under the global lock, then drop it immediately.
+    let (job_lines, rx) = {
         let mut inner = shared.state.inner.lock().await;
         let key = live_log_key_for_job(&inner, run_id, &job_id)
             .ok_or_else(|| ApiError::not_found("job not found"))?;
-        let snapshot = inner.live_log_lines.get(&key).cloned().unwrap_or_default();
+        let lines_arc = inner
+            .live_log_lines
+            .entry(key.clone())
+            .or_default()
+            .clone();
         let tx = live_log_sender(&mut inner, &key);
-        (snapshot, tx.subscribe())
+        (lines_arc, tx.subscribe())
     };
+    // Snapshot under per-job lock only — does not block global state.
+    let snapshot = job_lines.lock().await.clone();
 
     let snapshot_stream = stream::iter(
         snapshot
@@ -1303,13 +1310,19 @@ async fn record_live_log_wrapper(
     job_id: &str,
     wrapper: LiveLogFeedLinesWrapper,
 ) {
-    let mut inner = shared.state.inner.lock().await;
-    inner
-        .live_log_lines
-        .entry(job_id.to_string())
-        .or_default()
-        .push(wrapper.clone());
-    let tx = live_log_sender(&mut inner, job_id);
+    // Grab per-job Arc and broadcast sender under the global lock, then release it.
+    let (job_lines, tx) = {
+        let mut inner = shared.state.inner.lock().await;
+        let lines_arc = inner
+            .live_log_lines
+            .entry(job_id.to_string())
+            .or_default()
+            .clone();
+        let tx = live_log_sender(&mut inner, job_id);
+        (lines_arc, tx)
+    };
+    // Push and broadcast under per-job lock only.
+    job_lines.lock().await.push(wrapper.clone());
     let _ = tx.send(wrapper);
 }
 
@@ -5251,7 +5264,8 @@ jobs:
             loop {
                 {
                     let inner = state.inner.lock().await;
-                    if let Some(wrappers) = inner.live_log_lines.get("job-live") {
+                    if let Some(job_lines) = inner.live_log_lines.get("job-live") {
+                        let wrappers = job_lines.lock().await;
                         if wrappers.len() == 1 {
                             assert_eq!(wrappers[0].step_id, "step-1");
                             assert_eq!(wrappers[0].start_line, 1);
