@@ -168,7 +168,14 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
         ),
         ("RUNNER_ENVIRONMENT", "self-hosted".to_string()),
         ("RUNNER_PERFLOG", String::new()),
-        ("RUNNER_TRACKING_ID", str_from_json(&github, "tracking_id")),
+        // Generate a unique tracking ID per job, matching the official runner's
+        // `github_{Guid.NewGuid()}` pattern. Used to identify orphan child
+        // processes after the job finishes (any process still carrying this env
+        // var was spawned by this job and not cleaned up).
+        (
+            "RUNNER_TRACKING_ID",
+            format!("github_{}", uuid::Uuid::new_v4()),
+        ),
     ];
 
     for (key, value) in vars {
@@ -858,10 +865,15 @@ fn runner_arch() -> &'static str {
 /// Kill any child processes still carrying a `RUNNER_TRACKING_ID` env var
 /// matching `tracking_id`. This mirrors the official runner's orphan-process
 /// cleanup in `JobExtension.cs` (`FinalizeJob`).
+///
+/// Best-effort: errors reading individual process environments are silently
+/// skipped — we never want cleanup failures to fail the job.
 pub fn kill_orphan_processes(tracking_id: &str) {
     let needle = format!("RUNNER_TRACKING_ID={tracking_id}");
     for pid in orphan_pids_with_tracking_id(&needle) {
         tracing::warn!(pid, %tracking_id, "killing orphan process");
+        // Use the shell `kill -9` — avoids unsafe libc calls while still
+        // matching the official runner's SIGKILL semantics.
         let _ = std::process::Command::new("kill")
             .args(["-9", &pid.to_string()])
             .status();
@@ -869,6 +881,9 @@ pub fn kill_orphan_processes(tracking_id: &str) {
 }
 
 /// Enumerate PIDs whose environment contains `needle`.
+///
+/// On Linux reads `/proc/<pid>/environ` (NUL-delimited).
+/// On macOS uses `ps -Ewwx -o pid=,command=` which prints the env inline.
 fn orphan_pids_with_tracking_id(needle: &str) -> Vec<u32> {
     let mut pids = Vec::new();
     #[cfg(target_os = "linux")]
@@ -891,6 +906,7 @@ fn orphan_pids_with_tracking_id(needle: &str) -> Vec<u32> {
     }
     #[cfg(target_os = "macos")]
     {
+        // `ps -Ewwx` prints each process's env vars inline after its command.
         if let Ok(out) = std::process::Command::new("ps")
             .args(["-Ewwx", "-o", "pid=,command="])
             .output()
