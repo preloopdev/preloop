@@ -192,3 +192,107 @@ fn process_message(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- P1 message listener gap coverage ---
+
+    #[test]
+    fn process_message_job_request() {
+        let msg = serde_json::json!({
+            "messageType": "PipelineAgentJobRequest",
+            "body": "{\"jobId\": \"test-job-1\", \"steps\": []}"
+        });
+        let result = process_message(&msg, None).unwrap();
+        let job = result.expect("should return job");
+        assert_eq!(job.get("jobId").unwrap().as_str().unwrap(), "test-job-1");
+    }
+
+    #[test]
+    fn process_message_runner_job_request() {
+        let msg = serde_json::json!({
+            "messageType": "RunnerJobRequest",
+            "body": "{\"jobId\": \"broker-job-1\"}"
+        });
+        let result = process_message(&msg, None).unwrap();
+        let job = result.expect("should return job");
+        assert_eq!(job.get("jobId").unwrap().as_str().unwrap(), "broker-job-1");
+    }
+
+    #[test]
+    fn process_message_cancellation_returns_none() {
+        let msg = serde_json::json!({
+            "messageType": "JobCancellation",
+            "body": "{}"
+        });
+        let result = process_message(&msg, None).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn process_message_agent_refresh_returns_none() {
+        let msg = serde_json::json!({
+            "messageType": "AgentRefresh",
+            "body": ""
+        });
+        let result = process_message(&msg, None).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn process_message_unknown_type_returns_none() {
+        let msg = serde_json::json!({
+            "messageType": "SomeFutureMessageType",
+            "body": ""
+        });
+        let result = process_message(&msg, None).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn process_message_missing_type_returns_none() {
+        let msg = serde_json::json!({"body": ""});
+        let result = process_message(&msg, None).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn extract_session_key_optional_no_key() {
+        let session = serde_json::json!({"sessionId": "test"});
+        assert!(extract_session_key_optional(&session, None).is_none());
+    }
+
+    #[test]
+    fn extract_session_key_optional_empty_value() {
+        let session = serde_json::json!({
+            "encryptionKey": {"value": "", "encrypted": false}
+        });
+        assert!(extract_session_key_optional(&session, None).is_none());
+    }
+
+    #[test]
+    fn extract_session_key_optional_unencrypted() {
+        use base64::Engine;
+        let key_bytes = vec![10u8, 20, 30, 40, 50, 60, 70, 80];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&key_bytes);
+        let session = serde_json::json!({
+            "encryptionKey": {"value": b64, "encrypted": false}
+        });
+        let result = extract_session_key_optional(&session, None).unwrap();
+        assert_eq!(result, key_bytes);
+    }
+
+    #[test]
+    fn extract_session_key_optional_encrypted_without_keypair() {
+        use base64::Engine;
+        let key_bytes = vec![1u8, 2, 3, 4];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&key_bytes);
+        let session = serde_json::json!({
+            "encryptionKey": {"value": b64, "encrypted": true}
+        });
+        // No keypair → cannot decrypt → None
+        assert!(extract_session_key_optional(&session, None).is_none());
+    }
+}
