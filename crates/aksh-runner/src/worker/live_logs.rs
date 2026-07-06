@@ -226,9 +226,10 @@ impl WebSocketSender {
                 return true;
             }
 
-            random_backoff().await;
-
+            // Only backoff and reconnect if we have more attempts left;
+            // don't waste time on the final failed attempt.
             if attempt + 1 < RETRIES {
+                random_backoff().await;
                 let _ = self.reconnect().await;
             }
         }
