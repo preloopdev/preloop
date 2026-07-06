@@ -5133,7 +5133,6 @@ fn token_ttl_secs() -> u64 {
         .and_then(|s| s.parse().ok())
         .unwrap_or(2999)
 }
-
 async fn oauth2_token(
     State(shared): State<Arc<SharedState>>,
     _headers: axum::http::HeaderMap,
