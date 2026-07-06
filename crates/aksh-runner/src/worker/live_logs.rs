@@ -53,6 +53,12 @@ struct ConsoleLineInfo {
 }
 
 /// Best-effort live log queue with official-runner-style batching/backpressure.
+impl std::fmt::Debug for LiveLogQueue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveLogQueue").finish_non_exhaustive()
+    }
+}
+
 pub struct LiveLogQueue {
     lines: Mutex<VecDeque<ConsoleLineInfo>>,
     ws: tokio::sync::Mutex<Option<WebSocketSender>>,
@@ -136,7 +142,10 @@ impl LiveLogQueue {
         match tokio::time::timeout(SHUTDOWN_TIMEOUT, handle).await {
             Ok(_) => {}
             Err(_) => {
-                warn!("live log drain did not finish within {}s, aborting", SHUTDOWN_TIMEOUT.as_secs());
+                warn!(
+                    "live log drain did not finish within {}s, aborting",
+                    SHUTDOWN_TIMEOUT.as_secs()
+                );
             }
         }
     }
