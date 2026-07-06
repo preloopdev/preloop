@@ -47,25 +47,21 @@ pub async fn run_script(
 
     // Build environment
     let env = ctx.build_env();
+    let ctx_ref = &*ctx;
+    let on_chunk = Box::new(move |chunk: &[u8]| {
+        ctx_ref.write_chunk(chunk);
+    });
+
     let result = process::invoke(
         &program,
         &args.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
         Path::new(working_directory),
         &env,
-        crate::worker::live_logs::process_line_callback(
-            &ctx.step_id,
-            &ctx.job.live_masks,
-            ctx.job.live_logs.as_ref(),
-        ),
+        Some(on_chunk),
         cancel_rx,
+        false,
     )
     .await?;
-
-    // Collect log lines
-    for line in &result.lines {
-        ctx.log(line);
-    }
-
     // Check exit code
     if result.exit_code != 0 {
         ctx.log(&format!(
@@ -161,6 +157,11 @@ pub async fn run_script_in_container(
     ctx.debug(&format!(
         "Command line: docker exec -i {container_id} {container_program} {container_args_ref:?}"
     ));
+    let ctx_ref = &*ctx;
+    let on_chunk = Box::new(move |chunk: &[u8]| {
+        ctx_ref.write_chunk(chunk);
+    });
+
     let result = crate::worker::container_ops::docker_exec(
         container_id,
         &container_program,
@@ -168,19 +169,9 @@ pub async fn run_script_in_container(
         &container_workdir,
         &env,
         cancel_rx,
-        crate::worker::live_logs::process_line_callback(
-            &ctx.step_id,
-            &ctx.job.live_masks,
-            ctx.job.live_logs.as_ref(),
-        ),
+        Some(on_chunk),
     )
     .await?;
-
-    // Collect log lines
-    for line in &result.lines {
-        ctx.log(line);
-    }
-
     // Check exit code
     if result.exit_code != 0 {
         ctx.log(&format!(
