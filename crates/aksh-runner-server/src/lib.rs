@@ -39,7 +39,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{broadcast, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Server configuration.
 #[derive(Debug, Clone)]
@@ -1284,7 +1284,16 @@ async fn ws_live_logs(
 }
 
 async fn handle_live_log_socket(mut socket: WebSocket, job_id: String, shared: Arc<SharedState>) {
-    while let Some(message) = socket.next().await {
+    const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+    loop {
+        let message = match tokio::time::timeout(IDLE_TIMEOUT, socket.next()).await {
+            Ok(Some(msg)) => msg,
+            Ok(None) => break, // stream ended
+            Err(_) => {
+                debug!(%job_id, "live log websocket idle for 5m, closing");
+                break;
+            }
+        };
         match message {
             Ok(WsMessage::Text(text)) => {
                 match serde_json::from_str::<LiveLogFeedLinesWrapper>(&text) {
