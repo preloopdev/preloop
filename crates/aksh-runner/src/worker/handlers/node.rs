@@ -146,3 +146,84 @@ pub async fn run_node_action(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worker::handlers::factory::ActionManifest;
+
+    fn node_manifest(main: &str) -> ActionManifest {
+        ActionManifest {
+            name: "node".into(),
+            description: String::new(),
+            runs_using: "node20".into(),
+            runs_main: Some(main.into()),
+            runs_pre: None,
+            runs_pre_if: None,
+            runs_post: None,
+            runs_post_if: None,
+            runs_steps: None,
+            runs_image: None,
+            runs_entrypoint: None,
+            runs_args: None,
+            runs_env: None,
+            inputs: None,
+            outputs: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_entry_point_errors() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manifest = node_manifest("does_not_exist.js");
+        let mut job = crate::worker::contexts::JobContext::new(
+            "job".into(),
+            "job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let mut ctx = StepContext::new(&mut job, "step1".into(), "Step".into());
+        let (_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+        let err = run_node_action(
+            &manifest,
+            dir.path(),
+            &serde_json::json!({}),
+            dir.path().to_str().unwrap(),
+            &mut ctx,
+            cancel_rx,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("entry point not found"));
+    }
+
+    #[tokio::test]
+    async fn missing_runs_main_errors() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut manifest = node_manifest("index.js");
+        manifest.runs_main = None;
+        let mut job = crate::worker::contexts::JobContext::new(
+            "job".into(),
+            "job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let mut ctx = StepContext::new(&mut job, "step1".into(), "Step".into());
+        let (_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+        let err = run_node_action(
+            &manifest,
+            dir.path(),
+            &serde_json::json!({}),
+            dir.path().to_str().unwrap(),
+            &mut ctx,
+            cancel_rx,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("missing runs.main"));
+    }
+}

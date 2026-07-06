@@ -170,4 +170,193 @@ mod tests {
         assert_eq!(action_repository_context("./.github/actions/local"), None);
         assert_eq!(action_repository_context("docker://alpine:3.20"), None);
     }
+
+    // --- P0 action resolution gap coverage ---
+
+    #[test]
+    fn resolve_remote_action_constructs_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let workspace = dir.path().join("work").join("repo");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut job = crate::worker::contexts::JobContext::new(
+            "j1".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let ctx = crate::worker::execution_context::StepContext::new(
+            &mut job,
+            "step1".into(),
+            "Step".into(),
+        );
+
+        let result =
+            resolve_remote_action("actions/checkout@v4", workspace.to_str().unwrap(), &ctx)
+                .unwrap();
+        let expected = dir
+            .path()
+            .join("work")
+            .join("_actions")
+            .join("actions")
+            .join("checkout")
+            .join("v4");
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn resolve_remote_action_with_subpath() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let workspace = dir.path().join("work").join("repo");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut job = crate::worker::contexts::JobContext::new(
+            "j1".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let ctx = crate::worker::execution_context::StepContext::new(
+            &mut job,
+            "step1".into(),
+            "Step".into(),
+        );
+
+        let result = resolve_remote_action(
+            "actions/checkout/subdir@v4",
+            workspace.to_str().unwrap(),
+            &ctx,
+        )
+        .unwrap();
+        let expected = dir
+            .path()
+            .join("work")
+            .join("_actions")
+            .join("actions")
+            .join("checkout")
+            .join("v4")
+            .join("subdir");
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn resolve_remote_action_missing_ref_errors() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let workspace = dir.path().join("work").join("repo");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut job = crate::worker::contexts::JobContext::new(
+            "j1".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let ctx = crate::worker::execution_context::StepContext::new(
+            &mut job,
+            "step1".into(),
+            "Step".into(),
+        );
+
+        let err = resolve_remote_action("actions/checkout", workspace.to_str().unwrap(), &ctx)
+            .unwrap_err();
+        assert!(err.to_string().contains("@ref"));
+    }
+
+    #[test]
+    fn resolve_remote_action_invalid_format_errors() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let workspace = dir.path().join("work").join("repo");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut job = crate::worker::contexts::JobContext::new(
+            "j1".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let ctx = crate::worker::execution_context::StepContext::new(
+            &mut job,
+            "step1".into(),
+            "Step".into(),
+        );
+
+        let err =
+            resolve_remote_action("checkout@v4", workspace.to_str().unwrap(), &ctx).unwrap_err();
+        assert!(err.to_string().contains("invalid action reference"));
+    }
+
+    #[test]
+    fn resolve_remote_action_uses_cached_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let workspace = dir.path().join("work").join("repo");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut job = crate::worker::contexts::JobContext::new(
+            "j1".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        job.action_paths.insert(
+            "actions/checkout@v4".to_string(),
+            "/cached/actions/checkout/v4".to_string(),
+        );
+        let ctx = crate::worker::execution_context::StepContext::new(
+            &mut job,
+            "step1".into(),
+            "Step".into(),
+        );
+
+        let result =
+            resolve_remote_action("actions/checkout@v4", workspace.to_str().unwrap(), &ctx)
+                .unwrap();
+        assert_eq!(
+            result,
+            std::path::PathBuf::from("/cached/actions/checkout/v4")
+        );
+    }
+
+    #[test]
+    fn set_action_repository_context_sets_fields() {
+        let mut job = crate::worker::contexts::JobContext::new(
+            "j1".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({"github": {"repository": "owner/repo"}}),
+        );
+        let mut ctx = crate::worker::execution_context::StepContext::new(
+            &mut job,
+            "step1".into(),
+            "Step".into(),
+        );
+
+        set_action_repository_context(&mut ctx, "actions/checkout@v4");
+        assert_eq!(
+            ctx.job
+                .github_context_value("action_repository")
+                .and_then(|v| v.as_str().map(String::from)),
+            Some("actions/checkout".to_string())
+        );
+        assert_eq!(
+            ctx.job
+                .github_context_value("action_ref")
+                .and_then(|v| v.as_str().map(String::from)),
+            Some("v4".to_string())
+        );
+    }
+
+    #[test]
+    fn set_action_repository_context_clears_for_local() {
+        let mut job = crate::worker::contexts::JobContext::new(
+            "j1".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({"github": {"repository": "owner/repo"}}),
+        );
+        let mut ctx = crate::worker::execution_context::StepContext::new(
+            &mut job,
+            "step1".into(),
+            "Step".into(),
+        );
+
+        set_action_repository_context(&mut ctx, "./.github/actions/local");
+        // For local actions, action_repository is set to null
+        let val = ctx.job.github_context_value("action_repository");
+        assert!(val.is_none() || val == Some(serde_json::Value::Null));
+    }
 }
