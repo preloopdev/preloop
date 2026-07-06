@@ -445,8 +445,7 @@ pub fn build_step_list(steps: &[serde_json::Value], _job_message: &serde_json::V
 
         let display_name_override = step
             .get("displayName")
-            .and_then(|v| v.as_str())
-            .map(String::from);
+            .and_then(template_scalar);
 
         let condition = step
             .get("condition")
@@ -737,7 +736,7 @@ fn template_scalar(value: &serde_json::Value) -> Option<String> {
 /// F029: Generate display names matching official runner conventions.
 /// Script steps: "Run {first_line}" truncated to 80 chars.
 /// Action steps: the full `uses` ref (e.g. "actions/checkout@v4").
-fn display_name_for_step(id: &str, step_type: &StepType) -> String {
+pub(crate) fn display_name_for_step(id: &str, step_type: &StepType) -> String {
     match step_type {
         StepType::Script { script, .. } if !script.trim().is_empty() => {
             let first_line = script.lines().next().unwrap_or("").trim();
