@@ -820,4 +820,128 @@ mod tests {
         assert!(aksh_gha_expressions::eval_bool("cancelled()", &expr_ctx).unwrap());
         assert!(aksh_gha_expressions::eval_bool("always()", &expr_ctx).unwrap());
     }
+
+    // --- P1 expressions/templates gap coverage ---
+
+    #[test]
+    fn matrix_context_resolves_in_expressions() {
+        let ctx = JobContext::new(
+            "job1".into(),
+            "Test".into(),
+            serde_json::json!({}),
+            serde_json::json!({
+                "github": {"repository": "owner/repo"},
+                "matrix": {"os": "ubuntu-latest", "node": "20"}
+            }),
+        );
+
+        let expr_ctx = ctx.build_expression_context();
+        assert_eq!(
+            aksh_gha_expressions::eval_expression("matrix.os", &expr_ctx)
+                .unwrap()
+                .as_str(),
+            Some("ubuntu-latest")
+        );
+        assert_eq!(
+            aksh_gha_expressions::eval_expression("matrix.node", &expr_ctx)
+                .unwrap()
+                .as_str(),
+            Some("20")
+        );
+    }
+
+    #[test]
+    fn needs_context_resolves_in_expressions() {
+        let ctx = JobContext::new(
+            "job1".into(),
+            "Test".into(),
+            serde_json::json!({}),
+            serde_json::json!({
+                "github": {"repository": "owner/repo"},
+                "needs": {
+                    "build": {
+                        "result": "success",
+                        "outputs": {"sha": "abc123", "version": "1.2.3"}
+                    }
+                }
+            }),
+        );
+
+        let expr_ctx = ctx.build_expression_context();
+        assert_eq!(
+            aksh_gha_expressions::eval_expression("needs.build.result", &expr_ctx)
+                .unwrap()
+                .as_str(),
+            Some("success")
+        );
+        assert_eq!(
+            aksh_gha_expressions::eval_expression("needs.build.outputs.sha", &expr_ctx)
+                .unwrap()
+                .as_str(),
+            Some("abc123")
+        );
+    }
+
+    #[test]
+    fn strategy_context_resolves_in_expressions() {
+        let ctx = JobContext::new(
+            "job1".into(),
+            "Test".into(),
+            serde_json::json!({}),
+            serde_json::json!({
+                "github": {"repository": "owner/repo"},
+                "strategy": {"fail-fast": true, "max-parallel": 2}
+            }),
+        );
+
+        let expr_ctx = ctx.build_expression_context();
+        assert!(aksh_gha_expressions::eval_bool("strategy.fail-fast", &expr_ctx).unwrap());
+    }
+
+    #[test]
+    fn env_context_resolves_in_expressions() {
+        let mut ctx = JobContext::new(
+            "job1".into(),
+            "Test".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        ctx.env.insert("MY_VAR".into(), "hello".into());
+        ctx.env.insert("OTHER".into(), "world".into());
+
+        let expr_ctx = ctx.build_expression_context();
+        assert_eq!(
+            aksh_gha_expressions::eval_expression("env.MY_VAR", &expr_ctx)
+                .unwrap()
+                .as_str(),
+            Some("hello")
+        );
+        assert_eq!(
+            aksh_gha_expressions::eval_expression("env.OTHER", &expr_ctx)
+                .unwrap()
+                .as_str(),
+            Some("world")
+        );
+    }
+
+    #[test]
+    fn secrets_context_resolves_in_expressions() {
+        let ctx = JobContext::new(
+            "job1".into(),
+            "Test".into(),
+            serde_json::json!({
+                "system.github.token": {"value": "ghp_tok", "isSecret": true},
+                "MY_SECRET": {"value": "s3cr3t", "isSecret": true}
+            }),
+            serde_json::json!({}),
+        );
+
+        let expr_ctx = ctx.build_expression_context();
+        assert_eq!(
+            aksh_gha_expressions::eval_expression("secrets.MY_SECRET", &expr_ctx)
+                .unwrap()
+                .as_str(),
+            Some("s3cr3t")
+        );
+    }
 }
