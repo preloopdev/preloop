@@ -443,6 +443,7 @@ pub struct Step {
     #[serde(default)]
     pub with: BTreeMap<String, Value>,
     /// Optional if condition.
+    #[serde(default, rename = "if")]
     pub if_condition: Option<String>,
     /// Working directory override.
     #[serde(default, rename = "working-directory")]
