@@ -580,19 +580,20 @@ pub async fn wait_for_services_healthy(
 }
 
 /// Execute a command inside the job container via `docker exec`.
-pub async fn docker_exec(
+pub async fn docker_exec<'a>(
     container_id: &str,
     program: &str,
     args: &[&str],
     workdir: &str,
     env: &HashMap<String, String>,
     cancel_rx: Option<tokio::sync::watch::Receiver<bool>>,
-    on_line: Option<crate::process::LineCallback>,
+    on_chunk: Option<crate::process::ChunkCallback<'a>>,
 ) -> Result<process::ProcessOutput> {
     let exec_args = build_docker_exec_args(container_id, program, args, workdir, env);
     let args_ref: Vec<&str> = exec_args.iter().map(|s| s.as_str()).collect();
 
-    process::invoke("docker", &args_ref, Path::new("."), env, on_line, cancel_rx).await
+    let keep_lines = on_chunk.is_none();
+    process::invoke("docker", &args_ref, Path::new("."), env, on_chunk, cancel_rx, keep_lines).await
 }
 
 /// Get port mappings for a service container.
@@ -606,6 +607,7 @@ pub async fn get_port_mappings(container_id: &str) -> Vec<(String, String)> {
         &HashMap::new(),
         None,
         None,
+        true,
     )
     .await;
 
@@ -706,7 +708,7 @@ async fn docker_cmd(args: &[&str], log: &mut Vec<String>) -> Result<Vec<String>>
     log.push(format!("##[command]{cmd_line}"));
     debug!("docker {}", args.join(" "));
 
-    let result = process::invoke("docker", args, Path::new("."), &HashMap::new(), None, None)
+    let result = process::invoke("docker", args, Path::new("."), &HashMap::new(), None, None, true)
         .await
         .with_context(|| format!("docker {}", args.first().unwrap_or(&"")))?;
 
