@@ -68,7 +68,6 @@ pub async fn run_steps(
     reporting: Option<&crate::worker::job_runner::ReportingContext>,
     container_spec: Option<&super::container_ops::ContainerSpec>,
     service_specs: &[super::container_ops::ServiceSpec],
-    live_logs: Option<std::sync::Arc<super::live_logs::LiveLogQueue>>,
 ) -> Result<String> {
     let has_containers = container_spec.is_some() || !service_specs.is_empty();
     let mut any_failed = false;
@@ -364,14 +363,8 @@ pub async fn run_steps(
             step_cancel_rx
         };
 
-        let mut outcome = execute_step(
-            &step.step_type,
-            &mut step_ctx,
-            workspace,
-            exec_cancel_rx,
-            live_logs.as_ref(),
-        )
-        .await;
+        let mut outcome =
+            execute_step(&step.step_type, &mut step_ctx, workspace, exec_cancel_rx).await;
         if let Some(handle) = timeout_handle {
             handle.abort();
         }
@@ -709,7 +702,6 @@ async fn execute_step(
     ctx: &mut StepContext<'_>,
     workspace: &str,
     cancel_rx: watch::Receiver<bool>,
-    live_logs: Option<&std::sync::Arc<super::live_logs::LiveLogQueue>>,
 ) -> Result<()> {
     match step_type {
         StepType::Script {
@@ -752,7 +744,6 @@ async fn execute_step(
                     &cid,
                     ctx,
                     Some(cancel_rx),
-                    live_logs,
                 )
                 .await;
             }
@@ -763,13 +754,11 @@ async fn execute_step(
                 &effective_dir,
                 ctx,
                 Some(cancel_rx),
-                live_logs,
             )
             .await
         }
         StepType::Action { uses, with } => {
-            super::handlers::action::run_action(uses, with, workspace, ctx, cancel_rx, live_logs)
-                .await
+            super::handlers::action::run_action(uses, with, workspace, ctx, cancel_rx).await
         }
     }
 }
@@ -1016,7 +1005,6 @@ mod tests {
             None,
             None,
             &[],
-            None,
         )
         .await
         .unwrap();
@@ -1055,7 +1043,6 @@ mod tests {
             None,
             None,
             &[],
-            None,
         )
         .await
         .unwrap();
@@ -1104,7 +1091,6 @@ mod tests {
             None,
             None,
             &[],
-            None,
         )
         .await
         .unwrap();
@@ -1169,7 +1155,6 @@ mod tests {
             None,
             None,
             &[],
-            None,
         )
         .await
         .unwrap();
@@ -1234,7 +1219,6 @@ mod tests {
             None,
             None,
             &[],
-            None,
         )
         .await
         .unwrap();
@@ -1294,7 +1278,6 @@ mod tests {
             None,
             None,
             &[],
-            None,
         )
         .await
         .unwrap();
@@ -1342,7 +1325,6 @@ mod tests {
             None,
             None,
             &[],
-            None,
         )
         .await
         .unwrap();
@@ -1385,7 +1367,6 @@ mod tests {
             None,
             None,
             &[],
-            None,
         )
         .await
         .unwrap();
@@ -1434,7 +1415,6 @@ mod tests {
             None,
             None,
             &[],
-            None,
         )
         .await
         .unwrap();
@@ -1485,7 +1465,6 @@ mod tests {
             None,
             None,
             &[],
-            None,
         )
         .await
         .unwrap();
@@ -1533,7 +1512,6 @@ mod tests {
             None,
             None,
             &[],
-            None,
         )
         .await
         .unwrap();
@@ -1565,7 +1543,6 @@ mod tests {
             None,
             None,
             &[],
-            None,
         )
         .await
         .unwrap();
@@ -1634,7 +1611,6 @@ mod tests {
             None,
             None,
             &[],
-            None,
         )
         .await
         .unwrap();
@@ -1708,7 +1684,6 @@ mod tests {
             None,
             None,
             &[],
-            None,
         )
         .await
         .unwrap();
@@ -1766,7 +1741,6 @@ mod tests {
             None,
             None,
             &[],
-            None,
         )
         .await
         .unwrap();
@@ -1812,7 +1786,6 @@ mod tests {
             None,
             None,
             &[],
-            None,
         )
         .await
         .unwrap();
@@ -1853,7 +1826,6 @@ mod tests {
             None,
             None,
             &[],
-            None,
         )
         .await
         .unwrap();
