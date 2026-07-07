@@ -279,7 +279,7 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         )
         .route(
             "/runner/server/_apis/distributedtask/pools/:pool_id/messages",
-            get(next_message_broker_ref),
+            get(next_message_disttask),
         )
         .route(
             "/runner/server/_apis/distributedtask/pools/:pool_id/messages/:message_id",
@@ -348,6 +348,42 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         .route(
             "/api/v1/runs/:run_id/jobs/:job_id/logs/live",
             get(live_logs_sse),
+        )
+        // F030: standard AzDO API URL pattern used by the aksh-runner AzDO client.
+        // These alias the scope/hub-prefixed handlers above so both URL forms work.
+        .route(
+            "/_apis/v1/plans/:plan_id/timelines/:timeline_id/records",
+            patch(patch_timeline_records_plan),
+        )
+        .route(
+            "/_apis/v1/plans/:plan_id/logs",
+            post(create_log_plan),
+        )
+        .route(
+            "/_apis/v1/plans/:plan_id/logs/:log_id",
+            put(append_log_plan),
+        )
+        .route(
+            "/_apis/v1/plans/:plan_id/events",
+            post(finish_job_plan),
+        )
+        // F030: /runner/server/ aliases — runner uses the SystemVssConnection URL
+        // which is http://…/runner/server so all plan-level AzDO calls land here.
+        .route(
+            "/runner/server/_apis/v1/plans/:plan_id/timelines/:timeline_id/records",
+            patch(patch_timeline_records_plan),
+        )
+        .route(
+            "/runner/server/_apis/v1/plans/:plan_id/logs",
+            post(create_log_plan),
+        )
+        .route(
+            "/runner/server/_apis/v1/plans/:plan_id/logs/:log_id",
+            put(append_log_plan),
+        )
+        .route(
+            "/runner/server/_apis/v1/plans/:plan_id/events",
+            post(finish_job_plan),
         )
         .route_layer(middleware::from_fn(require_bearer));
 
@@ -746,6 +782,9 @@ struct InnerState {
     next_request_id: i64,
     flows_file: Option<std::fs::File>,
     next_flow_index: usize,
+    /// Sessions created via the AzDO distributedtask path (full encrypted message format).
+    /// Sessions NOT in this set use the broker-ref (RunnerJobRequest) format.
+    azdo_sessions: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1415,38 +1454,46 @@ async fn create_session_disttask(
     Path(_pool_id): Path<i64>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    let runner_id = body
-        .get("agent")
-        .and_then(|a| a.get("id"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(1);
-    let name = body
-        .get("agent")
-        .and_then(|a| a.get("name"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("runner")
-        .to_owned();
-    let response = create_session(
-        State(shared),
-        Json(RunnerSessionRequest { runner_id, name }),
-    )
-    .await?;
-    let session_id = response["sessionId"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
+    // For the AzDO message path, generate an unencrypted session key directly.
+    // RSA-wrapped keys are only needed for real internet-facing GHES; for local
+    // use the runner's from_rsaparams may not reconstruct the keypair correctly.
+    let session_id = uuid::Uuid::new_v4();
+    let session_enc = SessionEncryption::generate();
+    let key_b64 = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        session_enc.key.clone(),
+    );
+
+    {
+        let mut inner = shared.state.inner.lock().await;
+        inner.session_keys.insert(session_id.to_string(), session_enc);
+        // Only mark as AzDO if the client explicitly opts in.
+        // This preserves backward compat: test and broker-hybrid sessions do NOT
+        // include `akshAzdo: true` and continue to receive broker-ref messages.
+        if body.get("akshAzdo").and_then(|v| v.as_bool()).unwrap_or(false) {
+            inner.azdo_sessions.insert(session_id.to_string());
+        }
+    }
+
     let owner_name = body
         .get("ownerName")
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
+
+    info!(%session_id, "AzDO session created (unencrypted key)");
+
     Ok((
         StatusCode::CREATED,
         Json(json!({
-            "sessionId": session_id,
+            "sessionId": session_id.to_string(),
             "ownerName": owner_name,
             "assignmentQueued": false,
-            "orchestrationId": ""
+            "orchestrationId": "",
+            "encryptionKey": {
+                "value": key_b64,
+                "encrypted": false,
+            },
         })),
     ))
 }
@@ -1668,6 +1715,34 @@ async fn next_message_broker_ref(
             .await;
 
         return Ok(Json(broker_job_ref(&request, pool_id)).into_response());
+    }
+}
+
+/// GET `/_apis/distributedtask/pools/:pool_id/messages` dispatcher.
+///
+/// Sessions created via the AzDO path (`create_session_disttask`) are marked
+/// in `azdo_sessions` and receive the full encrypted `PipelineAgentJobRequest`
+/// message via `next_message_compat`.  All other sessions (broker-hybrid tests,
+/// legacy broker flow) get the lightweight `RunnerJobRequest` broker ref.
+async fn next_message_disttask(
+    State(shared): State<Arc<SharedState>>,
+    Path(pool_id): Path<i64>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    let session_id = params
+        .get("sessionId")
+        .cloned()
+        .unwrap_or_else(|| "default".to_owned());
+    let is_azdo = {
+        let inner = shared.state.inner.lock().await;
+        inner.azdo_sessions.contains(&session_id)
+    };
+    if is_azdo {
+        next_message_compat(State(shared), Path(pool_id), Query(params))
+            .await
+            .map(|r| r.into_response())
+    } else {
+        next_message_broker_ref(State(shared), Path(pool_id), Query(params)).await
     }
 }
 
@@ -2122,7 +2197,29 @@ async fn next_message(
                 .insert(queued.job_id.clone(), ExecutionStatus::InProgress);
         }
 
-        let body_json = serde_json::to_string(&queued.message)
+        // F030: inject SystemVssConnection so the worker's AzDO reporting context
+        // has a server URL, access token, and ResultsServiceUrl — same as broker_acquire_job.
+        let mut msg = queued.message.clone();
+        for endpoint in &mut msg.resources.endpoints {
+            if endpoint.name.eq_ignore_ascii_case("SystemVssConnection") {
+                endpoint.url = Some(runner_server_url());
+                endpoint
+                    .authorization
+                    .parameters
+                    .insert("AccessToken".to_owned(), AKSH_SYSTEM_TOKEN.to_owned());
+                endpoint
+                    .data
+                    .insert("ResultsServiceUrl".to_owned(), public_base_url());
+                endpoint
+                    .data
+                    .insert("PipelinesServiceUrl".to_owned(), runner_server_url());
+                endpoint
+                    .data
+                    .insert("CacheServerUrl".to_owned(), public_base_url());
+            }
+        }
+        debug!(endpoint_count = msg.resources.endpoints.len(), "F030: injected SystemVssConnection into AzDO job message");
+        let body_json = serde_json::to_string(&msg)
             .map_err(|e| ApiError::bad_request(format!("failed to serialize job message: {e}")))?;
         let request_id = queued.message.request_id;
         inner
@@ -2189,7 +2286,7 @@ fn build_task_agent_message(
         message_id,
         message_type: message_type.to_owned(),
         body: BASE64_STANDARD.encode(&encrypted_body),
-        iv: Some(iv),
+        iv: Some(BASE64_STANDARD.encode(&iv)),
     };
     inner
         .inflight_messages
@@ -3012,6 +3109,111 @@ async fn finish_job(
         );
     }
 
+    Json(json!({ "ok": true }))
+}
+
+// ── F030: standard AzDO `/_apis/v1/plans/` route handlers ────────────────────
+// These use the URL pattern our AzDO client sends (`plans/{planId}/...`) rather
+// than the scoped pattern (`Timeline/{scope}/{hub}/{planId}/{timelineId}`).
+// The logic is identical to the existing handlers above.
+
+/// PATCH `/_apis/v1/plans/:plan_id/timelines/:timeline_id/records`
+async fn patch_timeline_records_plan(
+    State(shared): State<Arc<SharedState>>,
+    Path((plan_id, timeline_id)): Path<(String, String)>,
+    Json(wrapper): Json<azdo::VssJsonCollectionWrapper<azdo::TimelineRecord>>,
+) -> Json<serde_json::Value> {
+    patch_timeline_records(
+        State(shared),
+        Path((String::new(), String::new(), plan_id, timeline_id)),
+        Json(wrapper),
+    )
+    .await
+}
+
+/// POST `/_apis/v1/plans/:plan_id/logs`
+async fn create_log_plan(
+    State(shared): State<Arc<SharedState>>,
+    Path(plan_id): Path<String>,
+    Json(log): Json<azdo::TaskLog>,
+) -> Json<serde_json::Value> {
+    create_log(
+        State(shared),
+        Path((String::new(), String::new(), plan_id)),
+        Json(log),
+    )
+    .await
+}
+
+/// PUT `/_apis/v1/plans/:plan_id/logs/:log_id`
+async fn append_log_plan(
+    State(shared): State<Arc<SharedState>>,
+    Path((plan_id, log_id)): Path<(String, String)>,
+    body: Bytes,
+) -> StatusCode {
+    append_log(
+        State(shared),
+        Path((String::new(), String::new(), plan_id, log_id)),
+        body,
+    )
+    .await
+}
+
+/// POST `/_apis/v1/plans/:plan_id/events`
+///
+/// Handles the `JobCompleted` event sent by the runner's AzDO reporting path.
+/// The body shape is `{name, jobId, requestId, result, outputs}` — slightly
+/// different from the scoped `finish_job` path which uses `JobCompletedEvent`.
+async fn finish_job_plan(
+    State(shared): State<Arc<SharedState>>,
+    Path(plan_id): Path<String>,
+    Json(event): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let result_str = event
+        .get("result")
+        .and_then(|v| v.as_str())
+        .unwrap_or("failed");
+    let status = execution_status_from_runner_result(result_str)
+        .unwrap_or(ExecutionStatus::Failure);
+    let job_id_str = event
+        .get("jobId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let outputs = event
+        .get("outputs")
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned())))
+                .collect::<std::collections::HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let outputs: aksh_gha_protocol::OutputMap = outputs
+        .into_iter()
+        .map(|(k, v)| (k, serde_json::Value::String(v)))
+        .collect();
+
+    info!(plan_id, job_id = job_id_str, result = result_str, "finish_job_plan");
+
+    let completion = {
+        let mut inner = shared.state.inner.lock().await;
+        let resolved = resolve_callback_job(&inner, &plan_id, None, None)
+            .or_else(|| sole_active_unfinished_request(&inner)
+                .and_then(|id| job_request_tuple(&inner, id)));
+        if let Some((request_id, run_id, job_id)) = resolved {
+            if let Some(request) = inner.job_requests.get_mut(&request_id) {
+                request.result = Some(status);
+                request.locked_until = agent_request_locked_until();
+            }
+            Some(JobCompletion { run_id, job_id, status, outputs })
+        } else {
+            warn!(plan_id, "finish_job_plan: could not resolve run/job");
+            None
+        }
+    };
+    if let Some(c) = completion {
+        let _ = complete_job_inner(shared, c).await;
+    }
     Json(json!({ "ok": true }))
 }
 
@@ -6496,12 +6698,9 @@ jobs:
         let body = BASE64_STANDARD
             .decode(message["body"].as_str().unwrap())
             .unwrap();
-        let iv: Vec<u8> = message["iv"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|value| value.as_u64().unwrap() as u8)
-            .collect();
+        let iv: Vec<u8> = BASE64_STANDARD
+            .decode(message["iv"].as_str().unwrap())
+            .unwrap();
         let plaintext = SessionEncryption::from_key(aes_key)
             .decrypt(&body, &iv)
             .unwrap();

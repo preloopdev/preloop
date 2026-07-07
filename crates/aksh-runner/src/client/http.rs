@@ -334,6 +334,54 @@ impl HttpClient {
         Err(last_err.unwrap_or_else(|| anyhow::anyhow!("PUT {url} failed after 3 retries")))
     }
 
+    /// PUT bytes with Bearer token authentication (for AzDO log append).
+    pub async fn put_bytes_bearer(
+        &self,
+        url: &str,
+        data: Vec<u8>,
+        content_type: &str,
+        token: &str,
+    ) -> Result<()> {
+        let mut last_err = None;
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                let delay = Duration::from_secs(1 << attempt);
+                tracing::warn!(
+                    "Retrying PUT {url} (attempt {}, backoff {delay:?})",
+                    attempt + 1
+                );
+                tokio::time::sleep(delay).await;
+            }
+            let resp = match self
+                .inner
+                .put(url)
+                .header(CONTENT_TYPE, content_type)
+                .header(AUTHORIZATION, format!("Bearer {token}"))
+                .body(data.clone())
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    last_err = Some(anyhow::anyhow!("PUT {url}: {e}"));
+                    continue;
+                }
+            };
+            let status = resp.status();
+            if status.is_server_error() {
+                let body = resp.text().await.unwrap_or_default();
+                last_err = Some(anyhow::anyhow!("PUT {url} returned {status}: {body}"));
+                continue;
+            }
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(anyhow::Error::new(HttpError::Status { status, body }));
+            }
+            return Ok(());
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("PUT {url} failed after 3 retries")))
+    }
+
     /// Build a long-poll GET request with timeout.
     pub async fn get_long_poll<T: serde::de::DeserializeOwned>(
         &self,
