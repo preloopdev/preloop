@@ -2329,7 +2329,7 @@ struct ArtifactV2FinalizeRequest {
     #[serde(default)]
     size: serde_json::Value, // proto3 JSON: int64 as string
     #[serde(default)]
-    hash: Option<String>, // StringValue unwrapped to plain string by proto3 JSON
+    hash: Option<serde_json::Value>, // StringValue: plain string or wrapped object
 }
 
 #[derive(Debug, Deserialize)]
@@ -2445,6 +2445,11 @@ async fn twirp_artifact_v2_finalize(
         inner.artifact_v2_pending.remove(&token);
         inner.next_artifact_v2_id += 1;
         artifact_id = inner.next_artifact_v2_id;
+        let digest = request.hash.and_then(|v| match v {
+            serde_json::Value::String(s) => Some(s),
+            serde_json::Value::Object(ref obj) => obj.get("value").and_then(|val| val.as_str().map(|s| s.to_owned())),
+            _ => None,
+        });
         inner.artifact_v2_registry.insert(
             registry_key,
             ArtifactV2Entry {
@@ -2454,7 +2459,7 @@ async fn twirp_artifact_v2_finalize(
                 name: request.name.clone(),
                 size,
                 created_at: server_iso_now(),
-                digest: request.hash,
+                digest,
                 blob_token: token,
             },
         );
@@ -2472,11 +2477,17 @@ async fn twirp_artifact_v2_list(
 
     let name_filter: Option<String> = request.name_filter.and_then(|v| match v {
         serde_json::Value::String(s) => Some(s),
+        serde_json::Value::Object(ref obj) => obj.get("value").and_then(|val| val.as_str().map(|s| s.to_owned())),
         _ => None,
     });
     let id_filter: Option<u64> = request.id_filter.and_then(|v| match v {
         serde_json::Value::String(s) => s.parse::<u64>().ok(),
         serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::Object(ref obj) => obj.get("value").and_then(|val| match val {
+            serde_json::Value::String(s) => s.parse::<u64>().ok(),
+            serde_json::Value::Number(n) => n.as_u64(),
+            _ => None,
+        }),
         _ => None,
     });
 
