@@ -307,7 +307,11 @@ pub async fn run_job(
                     "percentComplete": 0_u32,
                 }]
             });
-            match azdo.client.update_timeline(&rpt.access_token, &plan_id, &azdo.timeline_id, &job_record).await {
+            match azdo
+                .client
+                .update_timeline(&rpt.access_token, &plan_id, &azdo.timeline_id, &job_record)
+                .await
+            {
                 Ok(_) => info!("AzDO: job timeline record set to InProgress"),
                 Err(e) => warn!("AzDO: job timeline InProgress failed (non-fatal): {e:#}"),
             }
@@ -729,13 +733,15 @@ pub async fn flush_step_updates(rpt: &ReportingContext, queue: &Arc<Mutex<Server
 /// AzDO `TimelineRecordState`: 0=Pending, 1=InProgress, 2=Completed.
 /// AzDO `TaskResult`:          0=Succeeded, 1=SucceededWithIssues, 2=Failed,
 ///                             3=Canceled, 4=Skipped, 5=Abandoned.
-fn azdo_timeline_record_from_step_update(
-    s: &super::server_queue::StepUpdate,
-) -> serde_json::Value {
+fn azdo_timeline_record_from_step_update(s: &super::server_queue::StepUpdate) -> serde_json::Value {
     use super::server_queue::{step_conclusion, step_status};
 
     // AzDO TimelineRecordState strings (TimelineRecordState.cs): "pending", "inProgress", "completed"
-    let state_str = if s.status == step_status::COMPLETED { "completed" } else { "inProgress" };
+    let state_str = if s.status == step_status::COMPLETED {
+        "completed"
+    } else {
+        "inProgress"
+    };
 
     let mut record = serde_json::json!({
         "id":    s.external_id,
@@ -755,9 +761,9 @@ fn azdo_timeline_record_from_step_update(
         // "failed", "canceled", "skipped", "abandoned".
         let result_str = match s.conclusion {
             c if c == step_conclusion::SUCCEEDED => "succeeded",
-            c if c == step_conclusion::FAILED    => "failed",
-            c if c == step_conclusion::SKIPPED   => "skipped",
-            _                                    => "failed",
+            c if c == step_conclusion::FAILED => "failed",
+            c if c == step_conclusion::SKIPPED => "skipped",
+            _ => "failed",
         };
         record["result"] = serde_json::json!(result_str);
         if let Some(ts) = &s.completed_at {
@@ -806,7 +812,12 @@ pub async fn upload_step_log(rpt: &ReportingContext, step_id: &str, content: &st
 
         match azdo
             .client
-            .append_log(&rpt.access_token, &rpt.plan_id, log_id, content.as_bytes().to_vec())
+            .append_log(
+                &rpt.access_token,
+                &rpt.plan_id,
+                log_id,
+                content.as_bytes().to_vec(),
+            )
             .await
         {
             Ok(()) => info!(
@@ -823,7 +834,12 @@ pub async fn upload_step_log(rpt: &ReportingContext, step_id: &str, content: &st
         });
         match azdo
             .client
-            .update_timeline(&rpt.access_token, &rpt.plan_id, &azdo.timeline_id, &log_ref_patch)
+            .update_timeline(
+                &rpt.access_token,
+                &rpt.plan_id,
+                &azdo.timeline_id,
+                &log_ref_patch,
+            )
             .await
         {
             Ok(_) => {}
