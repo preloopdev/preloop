@@ -751,8 +751,25 @@ impl AppState {
         let (events, _) = broadcast::channel(1024);
         let keypair = AgentRsaKeypair::generate()
             .map_err(|e| anyhow::anyhow!("Failed to generate RSA keypair: {}", e))?;
+        let registry_path = state_dir.join("artifact_v2_registry.json");
+        let (registry, next_id) = if registry_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&registry_path) {
+                if let Ok(map) = serde_json::from_str::<BTreeMap<String, ArtifactV2Entry>>(&content) {
+                    let max_id = map.values().map(|e| e.id).max().unwrap_or(0);
+                    (map, max_id)
+                } else {
+                    (BTreeMap::new(), 0)
+                }
+            } else {
+                (BTreeMap::new(), 0)
+            }
+        } else {
+            (BTreeMap::new(), 0)
+        };
         let inner = InnerState {
             agent_keypair: Some(keypair),
+            artifact_v2_registry: registry,
+            next_artifact_v2_id: next_id,
             ..Default::default()
         };
         let webhook_secret = std::env::var("AKSH_WEBHOOK_SECRET").ok();
@@ -918,7 +935,7 @@ struct ArtifactV2Pending {
 }
 
 /// Finalized artifact v2 entry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ArtifactV2Entry {
     id: u64,
     workflow_run_backend_id: String,
@@ -2343,6 +2360,16 @@ fn artifact_v2_registry_key(run_id: &str, job_id: &str, name: &str) -> String {
     format!("{run_id}/{job_id}/{name}")
 }
 
+async fn save_artifact_v2_registry(shared: &Arc<SharedState>) -> Result<(), std::io::Error> {
+    let registry_path = shared.state.state_dir.join("artifact_v2_registry.json");
+    let serialized = {
+        let inner = shared.state.inner.lock().await;
+        serde_json::to_string(&inner.artifact_v2_registry)?
+    };
+    tokio::fs::write(&registry_path, serialized.as_bytes()).await?;
+    Ok(())
+}
+
 async fn twirp_artifact_v2_create(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<ArtifactV2CreateRequest>,
@@ -2432,6 +2459,7 @@ async fn twirp_artifact_v2_finalize(
             },
         );
     }
+    let _ = save_artifact_v2_registry(&shared).await;
     info!(artifact_id, name = request.name, size, "artifact v2 finalized");
     Ok(Json(json!({ "ok": true, "artifact_id": artifact_id.to_string() })))
 }
@@ -2513,6 +2541,7 @@ async fn twirp_artifact_v2_delete(
         inner.artifact_v2_registry.remove(&registry_key)
     };
     if let Some(e) = removed {
+        let _ = save_artifact_v2_registry(&shared).await;
         let blob_dir = shared
             .state
             .state_dir
