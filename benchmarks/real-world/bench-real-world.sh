@@ -11,13 +11,18 @@ PORT=9191
 REPO_DIR="/tmp/bench-repos/$REPO"
 BENCH_DIR="$(dirname "$(readlink -f "$0")")"
 RESULTS="/tmp/bench-results"
-AKSH="$HOME/aksh-runner"
+AKSH="${AKSH:-/usr/local/bin}"
 OFFICIAL="$HOME/actions-runner"
 
 mkdir -p "$RESULTS"
 
 WFNAME="${REPO}-bench.yml"
 [ -f "$BENCH_DIR/$WFNAME" ] || { echo "Missing $BENCH_DIR/$WFNAME"; exit 1; }
+if [ ! -d "$REPO_DIR" ] && [ -d "/workspace/repos/$REPO" ]; then
+  mkdir -p "$(dirname "$REPO_DIR")"
+  cp -r "/workspace/repos/$REPO" "$REPO_DIR"
+fi
+
 mkdir -p "$REPO_DIR/.github/workflows"
 cp "$BENCH_DIR/$WFNAME" "$REPO_DIR/.github/workflows/$WFNAME"
 
