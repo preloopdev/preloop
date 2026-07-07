@@ -22,9 +22,18 @@ use super::execution_context::Annotation;
 use super::server_queue::ServerQueue;
 use super::steps_runner::{Step, StepType};
 use crate::cli::ProtocolPath;
+use crate::client::azdo::AzdoClient;
 use crate::client::http::HttpClient;
 use crate::client::results::ResultsClient;
 use crate::client::run_service::RunServiceClient;
+
+/// AzDO-specific reporting state threaded into [`ReportingContext`] when
+/// `--via azdo` is active.  Contains only what the timeline and log endpoints
+/// need; `pool_id` is intentionally absent (not required for those URLs).
+pub struct AzdoReportingContext {
+    pub client: AzdoClient,
+    pub timeline_id: String,
+}
 
 /// Shared reporting context for step updates and log uploads.
 pub struct ReportingContext {
@@ -33,6 +42,9 @@ pub struct ReportingContext {
     pub access_token: String,
     pub plan_id: String,
     pub job_id: String,
+    /// Populated when running via the AzDO (legacy) protocol path.
+    /// `None` on the broker path.
+    pub azdo: Option<AzdoReportingContext>,
 }
 
 /// Execute a job from the deserialized message.
@@ -238,23 +250,69 @@ pub async fn run_job(
         }];
         dbg.on_job_steps_initialized(&entries, &post, &predicted).await;
     }
-    // Set up reporting context (F018/F019/F020)
+    // Set up reporting context (F018/F019/F020/F030)
     let reporting = if let Some((service_url, access_token)) =
         extract_service_endpoint(&job_message)
     {
         let http = HttpClient::new(None)?;
         let results_url = extract_results_url(&job_message).unwrap_or_else(|| service_url.clone());
+
+        // F030: build AzDO-specific context when running via the legacy protocol path.
+        let azdo = if via == ProtocolPath::Azdo {
+            let timeline_id = job_message
+                .get("timeline")
+                .and_then(|t| t.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if timeline_id.is_empty() {
+                warn!("No timeline.id in AzDO job message — timeline reporting disabled");
+                None
+            } else {
+                Some(AzdoReportingContext {
+                    client: AzdoClient::new(http.clone(), service_url.clone(), 0),
+                    timeline_id,
+                })
+            }
+        } else {
+            None
+        };
+
         Some(Arc::new(ReportingContext {
             results: ResultsClient::new(http.clone(), results_url),
             run_service: RunServiceClient::new(http, service_url),
             access_token,
             plan_id: plan_id.clone(),
             job_id: job_id.to_string(),
+            azdo,
         }))
     } else {
         warn!("No SystemVssConnection endpoint — reporting disabled");
         None
     };
+
+    // F030: mark the job record InProgress on the AzDO timeline so GitHub shows
+    // the job as running (mirrors JobRunner.cs InitializeJob → QueueTimelineRecordUpdate).
+    if let Some(rpt) = &reporting {
+        if let Some(azdo) = &rpt.azdo {
+            let job_record = serde_json::json!({
+                "count": 1,
+                "value": [{
+                    "id": job_id,
+                    "type": "job",
+                    "name": job_name,
+                    "order": 1,
+                    "state": "inProgress",
+                    "startTime": iso_now(),
+                    "percentComplete": 0_u32,
+                }]
+            });
+            match azdo.client.update_timeline(&rpt.access_token, &plan_id, &azdo.timeline_id, &job_record).await {
+                Ok(_) => info!("AzDO: job timeline record set to InProgress"),
+                Err(e) => warn!("AzDO: job timeline InProgress failed (non-fatal): {e:#}"),
+            }
+        }
+    }
 
     // F018: Spawn renew loop
     let renew_handle = reporting
@@ -616,14 +674,40 @@ fn spawn_renew_loop(
     })
 }
 
-/// Flush queued WorkflowStepsUpdate entries without holding the queue lock across I/O.
+/// Flush queued step-status updates to the server.
+///
+/// Broker path: WorkflowStepsUpdate Twirp call.
+/// AzDO path (F030): PATCH timeline records via `update_timeline`.
 pub async fn flush_step_updates(rpt: &ReportingContext, queue: &Arc<Mutex<ServerQueue>>) {
     let body = {
         let mut q = queue.lock().await;
         q.take_steps_update_body()
     };
 
-    if let Some(body) = body {
+    let Some(body) = body else { return };
+
+    if let Some(azdo) = &rpt.azdo {
+        // F030: translate StepUpdate → AzDO TimelineRecord and PATCH.
+        let records: Vec<serde_json::Value> = body
+            .steps
+            .iter()
+            .map(azdo_timeline_record_from_step_update)
+            .collect();
+        let count = records.len();
+        let payload = serde_json::json!({ "count": count, "value": records });
+        match azdo
+            .client
+            .update_timeline(&rpt.access_token, &rpt.plan_id, &azdo.timeline_id, &payload)
+            .await
+        {
+            Ok(_) => info!(
+                "AzDO timeline updated ({} steps, change_order={})",
+                body.steps.len(),
+                body.change_order
+            ),
+            Err(e) => warn!("AzDO timeline update failed (non-fatal): {e:#}"),
+        }
+    } else {
         let body_json = serde_json::to_value(&body).unwrap_or_default();
         match rpt
             .results
@@ -640,16 +724,115 @@ pub async fn flush_step_updates(rpt: &ReportingContext, queue: &Arc<Mutex<Server
     }
 }
 
+/// Convert a [`StepUpdate`] (Twirp-oriented) to an AzDO timeline record JSON value.
+///
+/// AzDO `TimelineRecordState`: 0=Pending, 1=InProgress, 2=Completed.
+/// AzDO `TaskResult`:          0=Succeeded, 1=SucceededWithIssues, 2=Failed,
+///                             3=Canceled, 4=Skipped, 5=Abandoned.
+fn azdo_timeline_record_from_step_update(
+    s: &super::server_queue::StepUpdate,
+) -> serde_json::Value {
+    use super::server_queue::{step_conclusion, step_status};
+
+    // AzDO TimelineRecordState strings (TimelineRecordState.cs): "pending", "inProgress", "completed"
+    let state_str = if s.status == step_status::COMPLETED { "completed" } else { "inProgress" };
+
+    let mut record = serde_json::json!({
+        "id":    s.external_id,
+        "name":  s.name,
+        "type":  "step",
+        "order": s.number,
+        "state": state_str,
+        "percentComplete": if s.status == step_status::COMPLETED { 100_u32 } else { 0_u32 },
+    });
+
+    if let Some(ts) = &s.started_at {
+        record["startTime"] = serde_json::json!(ts);
+    }
+
+    if s.status == step_status::COMPLETED {
+        // AzDO TaskResult strings (TaskResult.cs): "succeeded", "succeededWithIssues",
+        // "failed", "canceled", "skipped", "abandoned".
+        let result_str = match s.conclusion {
+            c if c == step_conclusion::SUCCEEDED => "succeeded",
+            c if c == step_conclusion::FAILED    => "failed",
+            c if c == step_conclusion::SKIPPED   => "skipped",
+            _                                    => "failed",
+        };
+        record["result"] = serde_json::json!(result_str);
+        if let Some(ts) = &s.completed_at {
+            record["finishTime"] = serde_json::json!(ts);
+        }
+    }
+
+    record
+}
+
 // ── Log upload (F020) ────────────────────────────────────────────────
 
-/// Upload a single step's log content via signed blob URL.
+/// Upload a single step's log content.
 ///
-/// Golden 06 flow 28-36: POST GetStepLogsSignedBlobURL → PUT blob.
+/// Broker path (F020): POST GetStepLogsSignedBlobURL → PUT blob.
+/// AzDO path  (F030): POST create_log → PUT append_log → PATCH timeline log ref.
 pub async fn upload_step_log(rpt: &ReportingContext, step_id: &str, content: &str) {
     if content.is_empty() {
         return;
     }
 
+    if let Some(azdo) = &rpt.azdo {
+        // AzDO: create a log entry, append content, then set the log ref on the
+        // timeline record so GitHub can link the step record to its log.
+        let log_body = serde_json::json!({
+            "path": format!("logs/{step_id}"),
+            "lineCount": content.lines().count(),
+        });
+        let log_id = match azdo
+            .client
+            .create_log(&rpt.access_token, &rpt.plan_id, &log_body)
+            .await
+        {
+            Ok(resp) => match resp.get("id").and_then(|v| v.as_i64()) {
+                Some(id) => id,
+                None => {
+                    warn!("AzDO create_log response missing id for step {step_id}");
+                    return;
+                }
+            },
+            Err(e) => {
+                warn!("AzDO create_log failed for step {step_id}: {e:#}");
+                return;
+            }
+        };
+
+        match azdo
+            .client
+            .append_log(&rpt.access_token, &rpt.plan_id, log_id, content.as_bytes().to_vec())
+            .await
+        {
+            Ok(()) => info!(
+                "AzDO: uploaded log for step {step_id} (log_id={log_id}, {} bytes)",
+                content.len()
+            ),
+            Err(e) => warn!("AzDO append_log failed for step {step_id}: {e:#}"),
+        }
+
+        // Patch the timeline record to attach the log reference.
+        let log_ref_patch = serde_json::json!({
+            "count": 1,
+            "value": [{ "id": step_id, "log": { "id": log_id } }]
+        });
+        match azdo
+            .client
+            .update_timeline(&rpt.access_token, &rpt.plan_id, &azdo.timeline_id, &log_ref_patch)
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => warn!("AzDO timeline log-ref patch failed for step {step_id}: {e:#}"),
+        }
+        return;
+    }
+
+    // Broker path: signed-URL blob upload.
     let body = serde_json::json!({
         "workflow_job_run_backend_id": rpt.job_id,
         "workflow_run_backend_id": rpt.plan_id,
@@ -707,11 +890,15 @@ pub async fn upload_step_log(rpt: &ReportingContext, step_id: &str, content: &st
 
 /// F035: Upload step summary content to the results service.
 ///
-/// GetStepSummarySignedBlobURL → PUT blob → CreateStepSummaryMetadata.
-/// Official runner rejects oversized summaries rather than truncating; we warn
-/// and skip if content exceeds 1 MiB.
+/// AzDO path: no-op — the AzDO protocol has no step summary equivalent.
+/// Broker path: GetStepSummarySignedBlobURL → PUT blob → CreateStepSummaryMetadata.
 pub async fn upload_step_summary(rpt: &ReportingContext, step_id: &str, content: &str) {
     if content.is_empty() {
+        return;
+    }
+
+    if rpt.azdo.is_some() {
+        debug!("AzDO path: step summaries not supported, skipping for step {step_id}");
         return;
     }
 
@@ -760,7 +947,6 @@ pub async fn upload_step_summary(rpt: &ReportingContext, step_id: &str, content:
         }
     }
 
-    // Finalize: CreateStepSummaryMetadata
     let metadata = serde_json::json!({
         "workflow_job_run_backend_id": rpt.job_id,
         "workflow_run_backend_id": rpt.plan_id,
@@ -780,8 +966,15 @@ pub async fn upload_step_summary(rpt: &ReportingContext, step_id: &str, content:
 
 /// Upload the full job log (concatenation of all step logs).
 ///
-/// Golden 06 flow 37: POST GetJobLogsSignedBlobURL → PUT blob.
+/// AzDO path: no-op — individual step logs are already uploaded via
+/// `upload_step_log`; there is no separate job-log endpoint in the AzDO path.
+/// Broker path (F020): POST GetJobLogsSignedBlobURL → PUT blob.
 async fn upload_job_log(rpt: &ReportingContext, content: &str) {
+    if rpt.azdo.is_some() {
+        debug!("AzDO path: skipping job log upload (step logs already uploaded individually)");
+        return;
+    }
+
     let body = serde_json::json!({
         "workflow_job_run_backend_id": rpt.job_id,
         "workflow_run_backend_id": rpt.plan_id,
@@ -1500,6 +1693,34 @@ async fn report_completion(
                 }
             }
             ProtocolPath::Azdo => {
+                // F030: mark the job timeline record as Completed before posting the event.
+                if let Some(azdo) = &rpt.azdo {
+                    let azdo_result_str = match result.to_ascii_lowercase().as_str() {
+                        "success" | "succeeded" => "succeeded",
+                        "cancelled" | "canceled" => "canceled",
+                        _ => "failed",
+                    };
+                    let job_record = serde_json::json!({
+                        "count": 1,
+                        "value": [{
+                            "id": job_id,
+                            "type": "job",
+                            "state": "completed",
+                            "result": azdo_result_str,
+                            "finishTime": iso_now(),
+                            "percentComplete": 100_u32,
+                        }]
+                    });
+                    match azdo
+                        .client
+                        .update_timeline(&rpt.access_token, plan_id, &azdo.timeline_id, &job_record)
+                        .await
+                    {
+                        Ok(_) => info!("AzDO: job timeline record set to Completed"),
+                        Err(e) => warn!("AzDO: job timeline Completed failed (non-fatal): {e:#}"),
+                    }
+                }
+
                 let url = format!(
                     "{}/_apis/v1/plans/{plan_id}/events",
                     rpt.run_service.base_url()
