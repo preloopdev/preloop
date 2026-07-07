@@ -34,3 +34,5 @@ __pycache__/
 .cargo/
 .rustup/
 actions-runner/
+bin-linux/
+libs/

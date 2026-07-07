@@ -144,8 +144,9 @@ service-location richness, and lower-priority/currently unexercised surfaces.
 | Timeline / logs / web-console feed | AzDO timeline/log routes exist; current service path now includes Twirp results surfaces, but the response payloads are not yet faithful | ⚠️ partial |
 | Job/step completion events + annotations | AgentRequest PATCH and broker complete paths exist; annotation/body fidelity remains partial | ⚠️ partial |
 | Action download info | stub endpoint; batch/bearer modes not implemented | ⚠️ stub |
-| Cache v1 / Artifact v1 shapes | in-memory stubs | ⚠️ partial |
-| Cache v2 / Artifact v2 / blob/Twirp | absent | ❌ missing |
+| Cache v1 (`/_apis/artifactcache/...`) | file-backed `CacheStore`; runner injects `ACTIONS_CACHE_URL` from `SystemVssConnection.CacheServerUrl`; full reserve→upload→commit→lookup; integration tested | ✅ good |
+| Artifact v1 (`/_apis/pipelines/workflows/...`) | file-backed `ArtifactStore`; runner injects `ACTIONS_RESULTS_URL`; create/upload/list/download wired; integration tested | ✅ good |
+| Cache v2 / Artifact v2 / blob/Twirp | server-side gap only — runner correctly sets `ACTIONS_CACHE_SERVICE_V2=true` signalling v4 actions to use Twirp blob path, but server has no Twirp blob handler; `actions/cache@v3` and `actions/upload-artifact@v3` work fine | ❌ server missing |
 | Background steps | `TimelineRecord` DTO now accepts background-step fields; control-flow behavior remains unexercised by the idle replay | ⚠️ partial |
 | DAP debugger integration | absent; non-blocking unless debugging requested | ❌ missing |
 | Runner config refresh | not exercised in this replay; support remains incomplete/untested | ⚠️ unknown/partial |

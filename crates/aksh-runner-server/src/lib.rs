@@ -634,6 +634,46 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             "/twirp/results.services.receiver.Receiver/CreateStepSummaryMetadata",
             post(twirp_create_step_summary_metadata),
         )
+        // Cache v2 Twirp (CacheService) — used by actions/cache@v4 when ACTIONS_CACHE_SERVICE_V2=true.
+        // Auth: bearer from job runtime token (verified by having correct scp in the JWT).
+        // These routes are outside require_bearer because the job JWT uses its own signing context.
+        .route(
+            "/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry",
+            post(twirp_cache_v2_create),
+        )
+        .route(
+            "/twirp/github.actions.results.api.v1.CacheService/FinalizeCacheEntryUpload",
+            post(twirp_cache_v2_finalize),
+        )
+        .route(
+            "/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL",
+            post(twirp_cache_v2_get_dl_url),
+        )
+        // Artifact v2 Twirp (ArtifactService) — used by actions/upload-artifact@v4 and download-artifact@v4.
+        .route(
+            "/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact",
+            post(twirp_artifact_v2_create),
+        )
+        .route(
+            "/twirp/github.actions.results.api.v1.ArtifactService/FinalizeArtifact",
+            post(twirp_artifact_v2_finalize),
+        )
+        .route(
+            "/twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts",
+            post(twirp_artifact_v2_list),
+        )
+        .route(
+            "/twirp/github.actions.results.api.v1.ArtifactService/GetSignedArtifactURL",
+            post(twirp_artifact_v2_get_signed_url),
+        )
+        .route(
+            "/twirp/github.actions.results.api.v1.ArtifactService/DeleteArtifact",
+            post(twirp_artifact_v2_delete),
+        )
+        // Azure Block Blob compat blob store — upload (PUT) and download (GET).
+        // Cache: /twirp-blob/cache/{token}
+        // Artifact: /twirp-blob/artifact/{token}  (download URL appends .zip for content-type detection)
+        .route("/twirp-blob/:kind/:token", put(blob_put).get(blob_get))
         .merge(protected_apis)
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
@@ -785,6 +825,16 @@ struct InnerState {
     /// Sessions created via the AzDO distributedtask path (full encrypted message format).
     /// Sessions NOT in this set use the broker-ref (RunnerJobRequest) format.
     azdo_sessions: std::collections::HashSet<String>,
+    /// Cache v2 Twirp pending uploads: upload_token → (key, version).
+    cache_v2_pending: BTreeMap<String, CacheV2Pending>,
+    /// Cache v2 download tokens: dl_token → (key, version).
+    cache_v2_dl_tokens: BTreeMap<String, (String, String)>,
+    /// Artifact v2 Twirp pending uploads: upload_token → registry_key.
+    artifact_v2_pending: BTreeMap<String, ArtifactV2Pending>,
+    /// Artifact v2 finalized registry: registry_key → metadata.
+    artifact_v2_registry: BTreeMap<String, ArtifactV2Entry>,
+    /// Monotonic artifact v2 ID counter.
+    next_artifact_v2_id: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -851,6 +901,34 @@ struct ArtifactRecord {
     file_name: String,
     path: String,
     size: u64,
+}
+
+/// Pending cache v2 upload (Twirp CacheService).
+#[derive(Debug)]
+struct CacheV2Pending {
+    key: String,
+    version: String,
+}
+
+/// Pending artifact v2 upload (Twirp ArtifactService).
+#[derive(Debug)]
+struct ArtifactV2Pending {
+    /// Registry key = "{run_backend_id}/{job_backend_id}/{name}".
+    registry_key: String,
+}
+
+/// Finalized artifact v2 entry.
+#[derive(Debug, Clone)]
+struct ArtifactV2Entry {
+    id: u64,
+    workflow_run_backend_id: String,
+    workflow_job_run_backend_id: String,
+    name: String,
+    size: u64,
+    created_at: String,
+    digest: Option<String>,
+    /// Upload token used to find the assembled blob on disk.
+    blob_token: String,
 }
 
 // Re-export from protocol crate — shared wire type with the runner.
@@ -1907,7 +1985,7 @@ async fn broker_acquire_job(
             endpoint
                 .authorization
                 .parameters
-                .insert("AccessToken".to_owned(), AKSH_SYSTEM_TOKEN.to_owned());
+                .insert("AccessToken".to_owned(), mint_runtime_token(&message.plan.plan_id, &message.job_id));
             endpoint
                 .data
                 .insert("ResultsServiceUrl".to_owned(), public_base_url());
@@ -2070,6 +2148,566 @@ async fn twirp_create_step_summary_metadata(
     Json(json!({"ok": true}))
 }
 
+// ─── Cache v2 Twirp (github.actions.results.api.v1.CacheService) ─────────────
+
+#[derive(Debug, Deserialize)]
+struct CacheV2CreateRequest {
+    key: String,
+    version: String,
+    // metadata ignored — scope/repo_id not needed for local store
+}
+
+#[derive(Debug, Deserialize)]
+struct CacheV2FinalizeRequest {
+    key: String,
+    version: String,
+    // size_bytes is informational; we measure the actual blob
+}
+
+#[derive(Debug, Deserialize)]
+struct CacheV2GetDlUrlRequest {
+    key: String,
+    version: String,
+    #[serde(default)]
+    restore_keys: Vec<String>,
+}
+
+async fn twirp_cache_v2_create(
+    State(shared): State<Arc<SharedState>>,
+    Json(request): Json<CacheV2CreateRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let token = uuid::Uuid::new_v4().to_string();
+    let stage_dir = shared
+        .state
+        .state_dir
+        .join("blobs")
+        .join("cache")
+        .join(&token);
+    tokio::fs::create_dir_all(&stage_dir).await.map_err(|e| {
+        ApiError::internal(format!("failed to create cache stage dir: {e}"))
+    })?;
+    {
+        let mut inner = shared.state.inner.lock().await;
+        inner.cache_v2_pending.insert(
+            token.clone(),
+            CacheV2Pending {
+                key: request.key,
+                version: request.version,
+            },
+        );
+    }
+    let upload_url = format!("{}/twirp-blob/cache/{token}", public_base_url());
+    info!(token, "cache v2 create entry");
+    Ok(Json(json!({ "ok": true, "signed_upload_url": upload_url, "message": "" })))
+}
+
+async fn twirp_cache_v2_finalize(
+    State(shared): State<Arc<SharedState>>,
+    Json(request): Json<CacheV2FinalizeRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // Find the pending upload token matching key+version.
+    let token = {
+        let inner = shared.state.inner.lock().await;
+        inner
+            .cache_v2_pending
+            .iter()
+            .find(|(_, p)| p.key == request.key && p.version == request.version)
+            .map(|(k, _)| k.clone())
+    }
+    .ok_or_else(|| ApiError::not_found("no pending cache upload for key+version"))?;
+
+    let blob_path = shared
+        .state
+        .state_dir
+        .join("blobs")
+        .join("cache")
+        .join(&token)
+        .join("data");
+    let bytes = tokio::fs::read(&blob_path)
+        .await
+        .map_err(|e| ApiError::not_found(format!("cache blob not found (not yet uploaded?): {e}")))?;
+
+    let (key, version) = {
+        let mut inner = shared.state.inner.lock().await;
+        let pending = inner
+            .cache_v2_pending
+            .remove(&token)
+            .ok_or_else(|| ApiError::internal("pending entry vanished"))?;
+        (pending.key, pending.version)
+    };
+
+    shared
+        .state
+        .cache
+        .put(&key, &version, &bytes)
+        .await
+        .map_err(|e| ApiError::internal(format!("cache store error: {e}")))?;
+
+    // Clean up staging directory.
+    let _ = tokio::fs::remove_dir_all(
+        shared
+            .state
+            .state_dir
+            .join("blobs")
+            .join("cache")
+            .join(&token),
+    )
+    .await;
+
+    info!(key, version, size = bytes.len(), "cache v2 finalized");
+    Ok(Json(json!({ "ok": true, "entry_id": "1", "message": "" })))
+}
+
+async fn twirp_cache_v2_get_dl_url(
+    State(shared): State<Arc<SharedState>>,
+    Json(request): Json<CacheV2GetDlUrlRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let result = shared
+        .state
+        .cache
+        .get(&request.key, &request.version, &request.restore_keys)
+        .await
+        .map_err(|e| ApiError::internal(format!("cache lookup error: {e}")))?;
+
+    let (entry, _bytes) = match result {
+        Some(r) => r,
+        None => {
+            return Ok(Json(
+                json!({ "ok": false, "signed_download_url": "", "matched_key": "" }),
+            ))
+        }
+    };
+
+    let dl_token = uuid::Uuid::new_v4().to_string();
+    {
+        let mut inner = shared.state.inner.lock().await;
+        inner
+            .cache_v2_dl_tokens
+            .insert(dl_token.clone(), (entry.key.clone(), entry.version.clone()));
+    }
+
+    let download_url = format!("{}/twirp-blob/cache/{dl_token}", public_base_url());
+    info!(key = entry.key, "cache v2 download URL issued");
+    Ok(Json(json!({
+        "ok": true,
+        "signed_download_url": download_url,
+        "matched_key": entry.key
+    })))
+}
+
+// ─── Artifact v2 Twirp (github.actions.results.api.v1.ArtifactService) ────────
+
+#[derive(Debug, Deserialize)]
+struct ArtifactV2CreateRequest {
+    workflow_run_backend_id: String,
+    workflow_job_run_backend_id: String,
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactV2FinalizeRequest {
+    workflow_run_backend_id: String,
+    workflow_job_run_backend_id: String,
+    name: String,
+    #[serde(default)]
+    size: serde_json::Value, // proto3 JSON: int64 as string
+    #[serde(default)]
+    hash: Option<String>, // StringValue unwrapped to plain string by proto3 JSON
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactV2ListRequest {
+    workflow_run_backend_id: String,
+    workflow_job_run_backend_id: String,
+    #[serde(default)]
+    name_filter: Option<serde_json::Value>, // StringValue: plain string in proto3 JSON
+    #[serde(default)]
+    id_filter: Option<serde_json::Value>, // Int64Value: string in proto3 JSON
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactV2GetSignedUrlRequest {
+    workflow_run_backend_id: String,
+    workflow_job_run_backend_id: String,
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactV2DeleteRequest {
+    workflow_run_backend_id: String,
+    workflow_job_run_backend_id: String,
+    name: String,
+}
+
+fn artifact_v2_registry_key(run_id: &str, job_id: &str, name: &str) -> String {
+    format!("{run_id}/{job_id}/{name}")
+}
+
+async fn twirp_artifact_v2_create(
+    State(shared): State<Arc<SharedState>>,
+    Json(request): Json<ArtifactV2CreateRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let token = uuid::Uuid::new_v4().to_string();
+    let registry_key = artifact_v2_registry_key(
+        &request.workflow_run_backend_id,
+        &request.workflow_job_run_backend_id,
+        &request.name,
+    );
+    let stage_dir = shared
+        .state
+        .state_dir
+        .join("blobs")
+        .join("artifact")
+        .join(&token);
+    tokio::fs::create_dir_all(&stage_dir).await.map_err(|e| {
+        ApiError::internal(format!("failed to create artifact stage dir: {e}"))
+    })?;
+    {
+        let mut inner = shared.state.inner.lock().await;
+        inner.artifact_v2_pending.insert(
+            token.clone(),
+            ArtifactV2Pending {
+                registry_key,
+            },
+        );
+    }
+    let upload_url = format!("{}/twirp-blob/artifact/{token}", public_base_url());
+    info!(token, name = request.name, "artifact v2 create");
+    Ok(Json(json!({ "ok": true, "signed_upload_url": upload_url })))
+}
+
+async fn twirp_artifact_v2_finalize(
+    State(shared): State<Arc<SharedState>>,
+    Json(request): Json<ArtifactV2FinalizeRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let registry_key = artifact_v2_registry_key(
+        &request.workflow_run_backend_id,
+        &request.workflow_job_run_backend_id,
+        &request.name,
+    );
+    let token = {
+        let inner = shared.state.inner.lock().await;
+        inner
+            .artifact_v2_pending
+            .iter()
+            .find(|(_, p)| p.registry_key == registry_key)
+            .map(|(k, _)| k.clone())
+    }
+    .ok_or_else(|| ApiError::not_found("no pending artifact upload for this name/run/job"))?;
+
+    // Measure actual blob size.
+    let blob_path = shared
+        .state
+        .state_dir
+        .join("blobs")
+        .join("artifact")
+        .join(&token)
+        .join("data");
+    let size = tokio::fs::metadata(&blob_path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or_else(|_| match &request.size {
+            serde_json::Value::String(s) => s.parse::<u64>().unwrap_or(0),
+            serde_json::Value::Number(n) => n.as_u64().unwrap_or(0),
+            _ => 0,
+        });
+
+    let artifact_id;
+    {
+        let mut inner = shared.state.inner.lock().await;
+        inner.artifact_v2_pending.remove(&token);
+        inner.next_artifact_v2_id += 1;
+        artifact_id = inner.next_artifact_v2_id;
+        inner.artifact_v2_registry.insert(
+            registry_key,
+            ArtifactV2Entry {
+                id: artifact_id,
+                workflow_run_backend_id: request.workflow_run_backend_id,
+                workflow_job_run_backend_id: request.workflow_job_run_backend_id,
+                name: request.name.clone(),
+                size,
+                created_at: server_iso_now(),
+                digest: request.hash,
+                blob_token: token,
+            },
+        );
+    }
+    info!(artifact_id, name = request.name, size, "artifact v2 finalized");
+    Ok(Json(json!({ "ok": true, "artifact_id": artifact_id.to_string() })))
+}
+
+async fn twirp_artifact_v2_list(
+    State(shared): State<Arc<SharedState>>,
+    Json(request): Json<ArtifactV2ListRequest>,
+) -> Json<serde_json::Value> {
+    let inner = shared.state.inner.lock().await;
+
+    let name_filter: Option<String> = request.name_filter.and_then(|v| match v {
+        serde_json::Value::String(s) => Some(s),
+        _ => None,
+    });
+    let id_filter: Option<u64> = request.id_filter.and_then(|v| match v {
+        serde_json::Value::String(s) => s.parse::<u64>().ok(),
+        serde_json::Value::Number(n) => n.as_u64(),
+        _ => None,
+    });
+
+    let artifacts: Vec<serde_json::Value> = inner
+        .artifact_v2_registry
+        .values()
+        .filter(|e| {
+            e.workflow_run_backend_id == request.workflow_run_backend_id
+                && e.workflow_job_run_backend_id == request.workflow_job_run_backend_id
+        })
+        .filter(|e| name_filter.as_deref().map(|f| e.name == f).unwrap_or(true))
+        .filter(|e| id_filter.map(|id| e.id == id).unwrap_or(true))
+        .map(|e| {
+            json!({
+                "workflow_run_backend_id": e.workflow_run_backend_id,
+                "workflow_job_run_backend_id": e.workflow_job_run_backend_id,
+                "database_id": e.id.to_string(),
+                "name": e.name,
+                "size": e.size.to_string(),
+                "created_at": e.created_at,
+                "digest": e.digest.as_deref().unwrap_or("")
+            })
+        })
+        .collect();
+    Json(json!({ "artifacts": artifacts }))
+}
+
+async fn twirp_artifact_v2_get_signed_url(
+    State(shared): State<Arc<SharedState>>,
+    Json(request): Json<ArtifactV2GetSignedUrlRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let registry_key = artifact_v2_registry_key(
+        &request.workflow_run_backend_id,
+        &request.workflow_job_run_backend_id,
+        &request.name,
+    );
+    let blob_token = {
+        let inner = shared.state.inner.lock().await;
+        inner
+            .artifact_v2_registry
+            .get(&registry_key)
+            .map(|e| e.blob_token.clone())
+    }
+    .ok_or_else(|| ApiError::not_found("artifact not found"))?;
+
+    // URL must end in .zip so the toolkit's streamExtract detects it as a zip.
+    let signed_url = format!("{}/twirp-blob/artifact/{blob_token}.zip", public_base_url());
+    Ok(Json(json!({ "signed_url": signed_url })))
+}
+
+async fn twirp_artifact_v2_delete(
+    State(shared): State<Arc<SharedState>>,
+    Json(request): Json<ArtifactV2DeleteRequest>,
+) -> Json<serde_json::Value> {
+    let registry_key = artifact_v2_registry_key(
+        &request.workflow_run_backend_id,
+        &request.workflow_job_run_backend_id,
+        &request.name,
+    );
+    let removed = {
+        let mut inner = shared.state.inner.lock().await;
+        inner.artifact_v2_registry.remove(&registry_key)
+    };
+    if let Some(e) = removed {
+        let blob_dir = shared
+            .state
+            .state_dir
+            .join("blobs")
+            .join("artifact")
+            .join(&e.blob_token);
+        let _ = tokio::fs::remove_dir_all(blob_dir).await;
+        Json(json!({ "ok": true, "artifact_id": e.id.to_string() }))
+    } else {
+        Json(json!({ "ok": false, "artifact_id": "0" }))
+    }
+}
+
+// ─── Azure Block Blob compat blob store ───────────────────────────────────────
+//
+// Both actions/cache@v4 and actions/upload-artifact@v4 upload via the Azure SDK
+// (BlockBlobClient).  The protocol is:
+//   • Single-shot: PUT /twirp-blob/{kind}/{token}                  → 201
+//   • Stage block: PUT /twirp-blob/{kind}/{token}?comp=block&blockid={b64} → 201
+//   • Commit list: PUT /twirp-blob/{kind}/{token}?comp=blocklist   → 201
+// Downloads (cache + artifact) use a plain GET.
+
+#[derive(Debug, Deserialize)]
+struct BlobPutQuery {
+    comp: Option<String>,
+    blockid: Option<String>,
+}
+
+/// Convert a base64 block ID to a filesystem-safe name.
+fn blockid_to_filename(blockid: &str) -> String {
+    blockid.replace('+', "-").replace('/', "_").replace('=', "")
+}
+
+/// Parse an Azure Block Blob blocklist XML body and return block IDs in order.
+fn parse_blocklist_xml(body: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut pos = 0;
+    while let Some(start_off) = body[pos..].find("<Latest>") {
+        let content_start = pos + start_off + 8; // len("<Latest>") == 8
+        if let Some(end_off) = body[content_start..].find("</Latest>") {
+            let id = body[content_start..content_start + end_off].trim().to_owned();
+            if !id.is_empty() {
+                ids.push(id);
+            }
+            pos = content_start + end_off + 9; // len("</Latest>") == 9
+        } else {
+            break;
+        }
+    }
+    ids
+}
+
+async fn blob_put(
+    State(shared): State<Arc<SharedState>>,
+    Path((kind, token)): Path<(String, String)>,
+    Query(query): Query<BlobPutQuery>,
+    body: axum::body::Bytes,
+) -> StatusCode {
+    let blob_root = shared
+        .state
+        .state_dir
+        .join("blobs")
+        .join(&kind)
+        .join(&token);
+
+    match query.comp.as_deref() {
+        Some("block") => {
+            let block_id = query.blockid.unwrap_or_default();
+            let safe_id = blockid_to_filename(&block_id);
+            let blocks_dir = blob_root.join("blocks");
+            if let Err(e) = tokio::fs::create_dir_all(&blocks_dir).await {
+                warn!(kind, token, "failed to create blocks dir: {e}");
+                return StatusCode::INTERNAL_SERVER_ERROR;
+            }
+            match tokio::fs::write(blocks_dir.join(&safe_id), &body).await {
+                Ok(()) => {
+                    debug!(kind, token, block = safe_id, bytes = body.len(), "blob block staged");
+                    StatusCode::CREATED
+                }
+                Err(e) => {
+                    warn!(kind, token, "failed to write block {safe_id}: {e}");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            }
+        }
+        Some("blocklist") => {
+            let body_str = String::from_utf8_lossy(&body);
+            let block_ids = parse_blocklist_xml(&body_str);
+            let blocks_dir = blob_root.join("blocks");
+            let data_path = blob_root.join("data");
+
+            let mut assembled: Vec<u8> = Vec::new();
+            for bid in &block_ids {
+                let safe_id = blockid_to_filename(bid);
+                match tokio::fs::read(blocks_dir.join(&safe_id)).await {
+                    Ok(bytes) => assembled.extend_from_slice(&bytes),
+                    Err(e) => {
+                        warn!(kind, token, "failed to read block {safe_id}: {e}");
+                        return StatusCode::INTERNAL_SERVER_ERROR;
+                    }
+                }
+            }
+            match tokio::fs::write(&data_path, &assembled).await {
+                Ok(()) => {
+                    let _ = tokio::fs::remove_dir_all(&blocks_dir).await;
+                    info!(
+                        kind, token,
+                        size = assembled.len(),
+                        blocks = block_ids.len(),
+                        "blob assembled from blocks"
+                    );
+                    StatusCode::CREATED
+                }
+                Err(e) => {
+                    warn!(kind, token, "failed to write assembled blob: {e}");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            }
+        }
+        _ => {
+            // Single-shot upload.
+            let data_path = blob_root.join("data");
+            match tokio::fs::write(&data_path, &body).await {
+                Ok(()) => {
+                    info!(kind, token, size = body.len(), "blob single-shot upload");
+                    StatusCode::CREATED
+                }
+                Err(e) => {
+                    warn!(kind, token, "failed to write single-shot blob: {e}");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            }
+        }
+    }
+}
+
+async fn blob_get(
+    State(shared): State<Arc<SharedState>>,
+    Path((kind, mut token)): Path<(String, String)>,
+) -> Response {
+    // Artifact download URLs end in .zip for toolkit zip-detection.
+    if kind == "artifact" && token.ends_with(".zip") {
+        token.truncate(token.len() - 4);
+    }
+
+    if kind == "cache" {
+        // Token is a download token → look up (key, version) in state.
+        let kv = {
+            let inner = shared.state.inner.lock().await;
+            inner.cache_v2_dl_tokens.get(&token).cloned()
+        };
+        if let Some((key, version)) = kv {
+            let empty: Vec<String> = Vec::new();
+            return match shared.state.cache.get(&key, &version, &empty).await {
+                Ok(Some((_entry, bytes))) => (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/octet-stream")],
+                    bytes,
+                )
+                    .into_response(),
+                Ok(None) => StatusCode::NOT_FOUND.into_response(),
+                Err(e) => {
+                    warn!(key, version, "cache read error: {e}");
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+            };
+        }
+    }
+
+    // Artifact (or cache fallback): serve from blob staging dir.
+    let data_path = shared
+        .state
+        .state_dir
+        .join("blobs")
+        .join(&kind)
+        .join(&token)
+        .join("data");
+    match tokio::fs::read(&data_path).await {
+        Ok(bytes) => {
+            let content_type = if kind == "artifact" {
+                "application/zip"
+            } else {
+                "application/octet-stream"
+            };
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, content_type)],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 /// Accept blob uploads (logs, summaries) at signed-URL paths.
 /// Stores them in a local replay directory for conformance inspection.
 async fn replay_results_put(
@@ -2206,7 +2844,7 @@ async fn next_message(
                 endpoint
                     .authorization
                     .parameters
-                    .insert("AccessToken".to_owned(), AKSH_SYSTEM_TOKEN.to_owned());
+                    .insert("AccessToken".to_owned(), mint_runtime_token(&msg.plan.plan_id, &msg.job_id));
                 endpoint
                     .data
                     .insert("ResultsServiceUrl".to_owned(), public_base_url());
@@ -3980,6 +4618,20 @@ fn local_jwt(mut claims: serde_json::Value) -> Result<String, ApiError> {
     Ok(format!("{signing_input}.{signature}"))
 }
 
+/// Mint a per-job `ACTIONS_RUNTIME_TOKEN` JWT.
+///
+/// The artifact toolkit (`@actions/artifact`, `@actions/cache` v2) decodes this token
+/// (without signature verification) and extracts `workflowRunBackendId` and
+/// `workflowJobRunBackendId` from the `scp` claim before making any Twirp requests.
+/// Format: `Actions.Results:{plan_id}:{job_id}`.
+fn mint_runtime_token(plan_id: &str, job_id: &uuid::Uuid) -> String {
+    local_jwt(json!({
+        "sub": format!("aksh-job-{job_id}"),
+        "scp": format!("Actions.Results:{plan_id}:{job_id}"),
+    }))
+    .unwrap_or_else(|_| AKSH_SYSTEM_TOKEN.to_owned())
+}
+
 #[derive(Debug, Deserialize)]
 struct OidcTokenQuery {
     audience: Option<String>,
@@ -4309,6 +4961,13 @@ impl ApiError {
     fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
+            message: message.into(),
+        }
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
             message: message.into(),
         }
     }
