@@ -322,6 +322,10 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             post(action_download_info),
         )
         .route(
+            "/actions/build/:orchestration_id/jobs/:job_id/runnerresolve/actions",
+            post(runnerresolve_actions),
+        )
+        .route(
             "/runner/server/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id",
             patch(patch_timeline_records),
         )
@@ -519,6 +523,10 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         .route("/api/v1/runs/:run_id/cancel", post(cancel_run))
         .route("/api/v1/runs/:run_id/rerun", post(rerun_run))
         .route("/api/v1/runs/:run_id/events.ndjson", get(run_events))
+        .route(
+            "/api/v1/actions/download/:owner/:repo/*git_ref",
+            get(download_action_tarball),
+        )
         .route("/api/v1/runners", post(register_runner))
         .route("/api/v1/runners/sessions", post(create_session))
         .route(
@@ -754,7 +762,8 @@ impl AppState {
         let registry_path = state_dir.join("artifact_v2_registry.json");
         let (registry, next_id) = if registry_path.exists() {
             if let Ok(content) = std::fs::read_to_string(&registry_path) {
-                if let Ok(map) = serde_json::from_str::<BTreeMap<String, ArtifactV2Entry>>(&content) {
+                if let Ok(map) = serde_json::from_str::<BTreeMap<String, ArtifactV2Entry>>(&content)
+                {
                     let max_id = map.values().map(|e| e.id).max().unwrap_or(0);
                     (map, max_id)
                 } else {
@@ -1056,7 +1065,7 @@ pub(crate) async fn submit_run_inner(
         "ref": submission.git_ref,
         "run_id": run_id.to_string(),
         "workflow": workflow.name.clone().unwrap_or_default(),
-        "server_url": "http://localhost"
+        "server_url": "https://github.com"
     });
 
     {
@@ -1079,6 +1088,25 @@ pub(crate) async fn submit_run_inner(
                 &submission.vars,
             )
             .map_err(|e| ApiError::bad_request(format!("failed to build job message: {e}")))?;
+
+            // Mint a dynamic JWT for the job and inject it as GITHUB_TOKEN
+            let token = mint_runtime_token(&agent_msg.plan.plan_id, &agent_msg.job_id);
+            agent_msg.variables.insert(
+                "system.github.token".to_owned(),
+                aksh_gha_protocol::azdo::VariableValue::secret(token.clone()),
+            );
+            agent_msg.variables.insert(
+                "system.github.launch_endpoint".to_owned(),
+                aksh_gha_protocol::azdo::VariableValue::new(public_base_url()),
+            );
+            if let Some(aksh_gha_protocol::azdo::PipelineContextData::Dict(github_dict)) =
+                &mut agent_msg.context_data.get_mut("github")
+            {
+                github_dict.insert(
+                    "token".to_owned(),
+                    aksh_gha_protocol::azdo::PipelineContextData::String(token),
+                );
+            }
 
             // Give every dispatched job a unique requestId so PATCH
             // /AgentRequest/:request_id can target exactly one job.
@@ -1561,11 +1589,17 @@ async fn create_session_disttask(
 
     {
         let mut inner = shared.state.inner.lock().await;
-        inner.session_keys.insert(session_id.to_string(), session_enc);
+        inner
+            .session_keys
+            .insert(session_id.to_string(), session_enc);
         // Only mark as AzDO if the client explicitly opts in.
         // This preserves backward compat: test and broker-hybrid sessions do NOT
         // include `akshAzdo: true` and continue to receive broker-ref messages.
-        if body.get("akshAzdo").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if body
+            .get("akshAzdo")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
             inner.azdo_sessions.insert(session_id.to_string());
         }
     }
@@ -1999,10 +2033,10 @@ async fn broker_acquire_job(
     for endpoint in &mut message.resources.endpoints {
         if endpoint.name.eq_ignore_ascii_case("SystemVssConnection") {
             endpoint.url = Some(run_service_url.clone());
-            endpoint
-                .authorization
-                .parameters
-                .insert("AccessToken".to_owned(), mint_runtime_token(&message.plan.plan_id, &message.job_id));
+            endpoint.authorization.parameters.insert(
+                "AccessToken".to_owned(),
+                mint_runtime_token(&message.plan.plan_id, &message.job_id),
+            );
             endpoint
                 .data
                 .insert("ResultsServiceUrl".to_owned(), public_base_url());
@@ -2200,9 +2234,9 @@ async fn twirp_cache_v2_create(
         .join("blobs")
         .join("cache")
         .join(&token);
-    tokio::fs::create_dir_all(&stage_dir).await.map_err(|e| {
-        ApiError::internal(format!("failed to create cache stage dir: {e}"))
-    })?;
+    tokio::fs::create_dir_all(&stage_dir)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to create cache stage dir: {e}")))?;
     {
         let mut inner = shared.state.inner.lock().await;
         inner.cache_v2_pending.insert(
@@ -2215,7 +2249,9 @@ async fn twirp_cache_v2_create(
     }
     let upload_url = format!("{}/twirp-blob/cache/{token}", public_base_url());
     info!(token, "cache v2 create entry");
-    Ok(Json(json!({ "ok": true, "signed_upload_url": upload_url, "message": "" })))
+    Ok(Json(
+        json!({ "ok": true, "signed_upload_url": upload_url, "message": "" }),
+    ))
 }
 
 async fn twirp_cache_v2_finalize(
@@ -2240,9 +2276,9 @@ async fn twirp_cache_v2_finalize(
         .join("cache")
         .join(&token)
         .join("data");
-    let bytes = tokio::fs::read(&blob_path)
-        .await
-        .map_err(|e| ApiError::not_found(format!("cache blob not found (not yet uploaded?): {e}")))?;
+    let bytes = tokio::fs::read(&blob_path).await.map_err(|e| {
+        ApiError::not_found(format!("cache blob not found (not yet uploaded?): {e}"))
+    })?;
 
     let (key, version) = {
         let mut inner = shared.state.inner.lock().await;
@@ -2386,17 +2422,14 @@ async fn twirp_artifact_v2_create(
         .join("blobs")
         .join("artifact")
         .join(&token);
-    tokio::fs::create_dir_all(&stage_dir).await.map_err(|e| {
-        ApiError::internal(format!("failed to create artifact stage dir: {e}"))
-    })?;
+    tokio::fs::create_dir_all(&stage_dir)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to create artifact stage dir: {e}")))?;
     {
         let mut inner = shared.state.inner.lock().await;
-        inner.artifact_v2_pending.insert(
-            token.clone(),
-            ArtifactV2Pending {
-                registry_key,
-            },
-        );
+        inner
+            .artifact_v2_pending
+            .insert(token.clone(), ArtifactV2Pending { registry_key });
     }
     let upload_url = format!("{}/twirp-blob/artifact/{token}", public_base_url());
     info!(token, name = request.name, "artifact v2 create");
@@ -2447,7 +2480,9 @@ async fn twirp_artifact_v2_finalize(
         artifact_id = inner.next_artifact_v2_id;
         let digest = request.hash.and_then(|v| match v {
             serde_json::Value::String(s) => Some(s),
-            serde_json::Value::Object(ref obj) => obj.get("value").and_then(|val| val.as_str().map(|s| s.to_owned())),
+            serde_json::Value::Object(ref obj) => obj
+                .get("value")
+                .and_then(|val| val.as_str().map(|s| s.to_owned())),
             _ => None,
         });
         inner.artifact_v2_registry.insert(
@@ -2465,8 +2500,15 @@ async fn twirp_artifact_v2_finalize(
         );
     }
     let _ = save_artifact_v2_registry(&shared).await;
-    info!(artifact_id, name = request.name, size, "artifact v2 finalized");
-    Ok(Json(json!({ "ok": true, "artifact_id": artifact_id.to_string() })))
+    info!(
+        artifact_id,
+        name = request.name,
+        size,
+        "artifact v2 finalized"
+    );
+    Ok(Json(
+        json!({ "ok": true, "artifact_id": artifact_id.to_string() }),
+    ))
 }
 
 async fn twirp_artifact_v2_list(
@@ -2477,7 +2519,9 @@ async fn twirp_artifact_v2_list(
 
     let name_filter: Option<String> = request.name_filter.and_then(|v| match v {
         serde_json::Value::String(s) => Some(s),
-        serde_json::Value::Object(ref obj) => obj.get("value").and_then(|val| val.as_str().map(|s| s.to_owned())),
+        serde_json::Value::Object(ref obj) => obj
+            .get("value")
+            .and_then(|val| val.as_str().map(|s| s.to_owned())),
         _ => None,
     });
     let id_filter: Option<u64> = request.id_filter.and_then(|v| match v {
@@ -2593,7 +2637,9 @@ fn parse_blocklist_xml(body: &str) -> Vec<String> {
     while let Some(start_off) = body[pos..].find("<Latest>") {
         let content_start = pos + start_off + 8; // len("<Latest>") == 8
         if let Some(end_off) = body[content_start..].find("</Latest>") {
-            let id = body[content_start..content_start + end_off].trim().to_owned();
+            let id = body[content_start..content_start + end_off]
+                .trim()
+                .to_owned();
             if !id.is_empty() {
                 ids.push(id);
             }
@@ -2629,7 +2675,13 @@ async fn blob_put(
             }
             match tokio::fs::write(blocks_dir.join(&safe_id), &body).await {
                 Ok(()) => {
-                    debug!(kind, token, block = safe_id, bytes = body.len(), "blob block staged");
+                    debug!(
+                        kind,
+                        token,
+                        block = safe_id,
+                        bytes = body.len(),
+                        "blob block staged"
+                    );
                     StatusCode::CREATED
                 }
                 Err(e) => {
@@ -2659,7 +2711,8 @@ async fn blob_put(
                 Ok(()) => {
                     let _ = tokio::fs::remove_dir_all(&blocks_dir).await;
                     info!(
-                        kind, token,
+                        kind,
+                        token,
                         size = assembled.len(),
                         blocks = block_ids.len(),
                         "blob assembled from blocks"
@@ -2898,10 +2951,10 @@ async fn next_message(
         for endpoint in &mut msg.resources.endpoints {
             if endpoint.name.eq_ignore_ascii_case("SystemVssConnection") {
                 endpoint.url = Some(runner_server_url());
-                endpoint
-                    .authorization
-                    .parameters
-                    .insert("AccessToken".to_owned(), mint_runtime_token(&msg.plan.plan_id, &msg.job_id));
+                endpoint.authorization.parameters.insert(
+                    "AccessToken".to_owned(),
+                    mint_runtime_token(&msg.plan.plan_id, &msg.job_id),
+                );
                 endpoint
                     .data
                     .insert("ResultsServiceUrl".to_owned(), public_base_url());
@@ -2913,7 +2966,10 @@ async fn next_message(
                     .insert("CacheServerUrl".to_owned(), public_base_url());
             }
         }
-        debug!(endpoint_count = msg.resources.endpoints.len(), "F030: injected SystemVssConnection into AzDO job message");
+        debug!(
+            endpoint_count = msg.resources.endpoints.len(),
+            "F030: injected SystemVssConnection into AzDO job message"
+        );
         let body_json = serde_json::to_string(&msg)
             .map_err(|e| ApiError::bad_request(format!("failed to serialize job message: {e}")))?;
         let request_id = queued.message.request_id;
@@ -3868,12 +3924,9 @@ async fn finish_job_plan(
         .get("result")
         .and_then(|v| v.as_str())
         .unwrap_or("failed");
-    let status = execution_status_from_runner_result(result_str)
-        .unwrap_or(ExecutionStatus::Failure);
-    let job_id_str = event
-        .get("jobId")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let status =
+        execution_status_from_runner_result(result_str).unwrap_or(ExecutionStatus::Failure);
+    let job_id_str = event.get("jobId").and_then(|v| v.as_str()).unwrap_or("");
     let outputs = event
         .get("outputs")
         .and_then(|v| v.as_object())
@@ -3888,19 +3941,29 @@ async fn finish_job_plan(
         .map(|(k, v)| (k, serde_json::Value::String(v)))
         .collect();
 
-    info!(plan_id, job_id = job_id_str, result = result_str, "finish_job_plan");
+    info!(
+        plan_id,
+        job_id = job_id_str,
+        result = result_str,
+        "finish_job_plan"
+    );
 
     let completion = {
         let mut inner = shared.state.inner.lock().await;
-        let resolved = resolve_callback_job(&inner, &plan_id, None, None)
-            .or_else(|| sole_active_unfinished_request(&inner)
-                .and_then(|id| job_request_tuple(&inner, id)));
+        let resolved = resolve_callback_job(&inner, &plan_id, None, None).or_else(|| {
+            sole_active_unfinished_request(&inner).and_then(|id| job_request_tuple(&inner, id))
+        });
         if let Some((request_id, run_id, job_id)) = resolved {
             if let Some(request) = inner.job_requests.get_mut(&request_id) {
                 request.result = Some(status);
                 request.locked_until = agent_request_locked_until();
             }
-            Some(JobCompletion { run_id, job_id, status, outputs })
+            Some(JobCompletion {
+                run_id,
+                job_id,
+                status,
+                outputs,
+            })
         } else {
             warn!(plan_id, "finish_job_plan: could not resolve run/job");
             None
@@ -3915,10 +3978,285 @@ async fn finish_job_plan(
 /// POST action download info — resolve action references to download URLs.
 async fn action_download_info(
     State(_shared): State<Arc<SharedState>>,
-    Json(_request): Json<serde_json::Value>,
+    Json(request): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-    // For now, return empty info — actions will be downloaded from GitHub
-    Json(json!({ "archiveDownloadTickets": {} }))
+    let mut tickets = serde_json::Map::new();
+    collect_action_download_refs(&request, &mut tickets);
+
+    Json(json!({
+        "archiveDownloadTickets": tickets.clone(),
+        // Some runner/protocol paths call the same payload an actionsDownloadInfo
+        // map. Return both names so legacy and batch clients can consume the same
+        // local fallback without a second resolution path.
+        "actionsDownloadInfo": tickets,
+    }))
+}
+
+async fn runnerresolve_actions(
+    State(_shared): State<Arc<SharedState>>,
+    Json(request): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let mut actions = serde_json::Map::new();
+    collect_runnerresolve_refs(&request, &mut actions);
+
+    Json(json!({ "actions": actions }))
+}
+
+async fn download_action_tarball(
+    State(shared): State<Arc<SharedState>>,
+    Path((owner, repo, git_ref)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    // 1. Sanitize parameters to avoid directory traversal
+    if owner.contains('.')
+        || owner.contains('/')
+        || owner.contains('\\')
+        || repo.contains('.')
+        || repo.contains('/')
+        || repo.contains('\\')
+        || git_ref.contains("..")
+        || git_ref.contains('\\')
+    {
+        return Err(ApiError::bad_request("invalid owner, repo, or git_ref"));
+    }
+
+    let cache_dir = shared
+        .state
+        .state_dir
+        .join("actions")
+        .join(&owner)
+        .join(&repo)
+        .join(&git_ref);
+    let cached_path = cache_dir.join("action.tar.gz");
+
+    if cached_path.exists() {
+        let file = tokio::fs::File::open(&cached_path)
+            .await
+            .map_err(|e| ApiError::internal(format!("failed to open cached action: {e}")))?;
+        let stream = tokio_util::io::ReaderStream::new(file);
+        let body = Body::from_stream(stream);
+
+        let res = Response::builder()
+            .header(header::CONTENT_TYPE, "application/gzip")
+            .header(
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{repo}-{git_ref}.tar.gz\""),
+            )
+            .body(body)
+            .map_err(|e| ApiError::internal(format!("failed to build response: {e}")))?;
+        return Ok(res);
+    }
+
+    // Cache Miss: Download from GitHub
+    tokio::fs::create_dir_all(&cache_dir)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to create action cache dir: {e}")))?;
+
+    let temp_path = cache_dir.join("action.tar.gz.tmp");
+    let github_url = format!("https://api.github.com/repos/{owner}/{repo}/tarball/{git_ref}");
+
+    info!(
+        owner,
+        repo, git_ref, github_url, "Downloading action to server cache"
+    );
+
+    let client = reqwest::Client::builder()
+        .user_agent("aksh-runner-server")
+        .build()
+        .map_err(|e| ApiError::internal(format!("failed to build reqwest client: {e}")))?;
+
+    let response = client.get(&github_url).send().await.map_err(|e| {
+        ApiError::internal(format!("failed to send download request to GitHub: {e}"))
+    })?;
+
+    if !response.status().is_success() {
+        return Err(ApiError::not_found(format!(
+            "GitHub returned status {} for {}",
+            response.status(),
+            github_url
+        )));
+    }
+
+    let mut temp_file = tokio::fs::File::create(&temp_path)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to create temporary action file: {e}")))?;
+
+    let mut stream = response.bytes_stream();
+    while let Some(chunk_result) = stream.next().await {
+        let chunk = chunk_result.map_err(|e| {
+            ApiError::internal(format!("failed to read chunk from GitHub response: {e}"))
+        })?;
+        tokio::io::copy(&mut &chunk[..], &mut temp_file)
+            .await
+            .map_err(|e| {
+                ApiError::internal(format!("failed to write chunk to temporary file: {e}"))
+            })?;
+    }
+
+    // Atomically rename to final target path
+    tokio::fs::rename(&temp_path, &cached_path)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to rename cached action file: {e}")))?;
+
+    info!(cached_path = ?cached_path, "Action cached successfully on server");
+
+    let file = tokio::fs::File::open(&cached_path)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to open newly cached action: {e}")))?;
+    let stream = tokio_util::io::ReaderStream::new(file);
+    let body = Body::from_stream(stream);
+
+    let res = Response::builder()
+        .header(header::CONTENT_TYPE, "application/gzip")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{repo}-{git_ref}.tar.gz\""),
+        )
+        .body(body)
+        .map_err(|e| ApiError::internal(format!("failed to build response: {e}")))?;
+    Ok(res)
+}
+
+fn collect_action_download_refs(
+    value: &serde_json::Value,
+    tickets: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    match value {
+        serde_json::Value::String(raw) => {
+            if let Some((key, ticket)) = action_download_ticket(raw, None) {
+                tickets.entry(key).or_insert(ticket);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_action_download_refs(item, tickets);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            let action = map
+                .get("action")
+                .or_else(|| map.get("name"))
+                .or_else(|| map.get("nameWithOwner"))
+                .or_else(|| map.get("repository"))
+                .and_then(|v| v.as_str());
+            let version = map
+                .get("version")
+                .or_else(|| map.get("ref"))
+                .or_else(|| map.get("reference"))
+                .and_then(|v| v.as_str());
+            if let Some(action) = action {
+                if let Some((key, ticket)) = action_download_ticket(action, version) {
+                    tickets.entry(key).or_insert(ticket);
+                }
+            }
+
+            for nested in map.values() {
+                collect_action_download_refs(nested, tickets);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn action_download_ticket(
+    action: &str,
+    version_override: Option<&str>,
+) -> Option<(String, serde_json::Value)> {
+    if action.starts_with("./") || action.starts_with("../") || action.starts_with("docker://") {
+        return None;
+    }
+
+    let (repo_part, git_ref) = if let Some(version) = version_override {
+        (action, version)
+    } else {
+        action.split_once('@')?
+    };
+    if git_ref.is_empty() {
+        return None;
+    }
+
+    let mut parts = repo_part.split('/');
+    let owner = parts.next()?;
+    let repo = parts.next()?;
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+
+    let key = format!("{repo_part}@{git_ref}");
+    let public_url = public_base_url();
+    let url = format!("{public_url}/api/v1/actions/download/{owner}/{repo}/{git_ref}");
+    Some((
+        key,
+        json!({
+            "type": "Archive",
+            "url": url,
+            "authentication": null,
+            "auth": null,
+        }),
+    ))
+}
+
+fn collect_runnerresolve_refs(
+    value: &serde_json::Value,
+    actions: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    match value {
+        serde_json::Value::String(raw) => {
+            if let Some((key, action)) = runnerresolve_action(raw, None) {
+                actions.entry(key).or_insert(action);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_runnerresolve_refs(item, actions);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            let action = map
+                .get("action")
+                .or_else(|| map.get("name"))
+                .or_else(|| map.get("nameWithOwner"))
+                .or_else(|| map.get("repository"))
+                .and_then(|v| v.as_str());
+            let version = map
+                .get("version")
+                .or_else(|| map.get("ref"))
+                .or_else(|| map.get("reference"))
+                .and_then(|v| v.as_str());
+            if let Some(action) = action {
+                if let Some((key, value)) = runnerresolve_action(action, version) {
+                    actions.entry(key).or_insert(value);
+                }
+            }
+
+            for nested in map.values() {
+                collect_runnerresolve_refs(nested, actions);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn runnerresolve_action(
+    action: &str,
+    version_override: Option<&str>,
+) -> Option<(String, serde_json::Value)> {
+    let (key, ticket) = action_download_ticket(action, version_override)?;
+    let (name, version) = key.split_once('@')?;
+    let name = name.to_string();
+    let version = version.to_string();
+    let tar_url = ticket.get("url")?.as_str()?.to_string();
+    Some((
+        key,
+        json!({
+            "name": name,
+            "version": version,
+            // Local aksh does not pin refs yet; use the requested ref as the
+            // extraction directory until a GitHub API lookup is added.
+            "resolved_sha": version,
+            "tar_url": tar_url,
+            "authentication": null,
+        }),
+    ))
 }
 
 fn summarize_run(statuses: impl Iterator<Item = ExecutionStatus>) -> ExecutionStatus {
@@ -6994,6 +7332,16 @@ jobs:
             azdo::message_type::RUNNER_JOB_REQUEST
         );
         assert_eq!(
+            acquired["variables"]["system.github.launch_endpoint"]["value"],
+            public_base_url()
+        );
+        assert!(acquired["variables"]["system.github.token"]["value"].is_string());
+        assert!(acquired["contextData"]["github"]["d"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|pair| pair["k"] == "token" && pair["v"].as_str().is_some()));
+        assert_eq!(
             acquired["resources"]["endpoints"][0]["url"],
             "http://127.0.0.1:9090/broker/1/"
         );
@@ -7050,6 +7398,148 @@ jobs:
             .await
             .unwrap();
         assert_eq!(ack.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn action_download_info_returns_remote_action_tickets() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+
+        let response = request_json(
+            &app,
+            Method::POST,
+            "/runner/server/_apis/v1/ActionDownloadInfo/scope/actions/plan",
+            json!({
+                "actions": [
+                    {"action": "actions/checkout", "version": "v4"},
+                    "dtolnay/rust-toolchain@stable",
+                    "./.github/actions/local",
+                    "docker://alpine:3.20"
+                ]
+            }),
+        )
+        .await;
+
+        let tickets = response["archiveDownloadTickets"].as_object().unwrap();
+        assert_eq!(
+            tickets["actions/checkout@v4"]["url"],
+            "http://127.0.0.1:9090/api/v1/actions/download/actions/checkout/v4"
+        );
+        assert_eq!(
+            tickets["dtolnay/rust-toolchain@stable"]["url"],
+            "http://127.0.0.1:9090/api/v1/actions/download/dtolnay/rust-toolchain/stable"
+        );
+        assert!(!tickets.contains_key("./.github/actions/local"));
+        assert!(!tickets.contains_key("docker://alpine:3.20"));
+        assert_eq!(
+            response["actionsDownloadInfo"],
+            response["archiveDownloadTickets"]
+        );
+    }
+
+    #[tokio::test]
+    async fn runnerresolve_actions_returns_runner_parseable_tar_urls() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+
+        let response = request_json(
+            &app,
+            Method::POST,
+            "/actions/build/plan/jobs/job/runnerresolve/actions",
+            json!({
+                "actions": [
+                    {"action": "actions/checkout", "version": "v4"},
+                    {"action": "owner/repo/path", "version": "main"}
+                ]
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            response["actions"]["actions/checkout@v4"]["tar_url"],
+            "http://127.0.0.1:9090/api/v1/actions/download/actions/checkout/v4"
+        );
+        assert_eq!(
+            response["actions"]["actions/checkout@v4"]["resolved_sha"],
+            "v4"
+        );
+        assert_eq!(
+            response["actions"]["owner/repo/path@main"]["tar_url"],
+            "http://127.0.0.1:9090/api/v1/actions/download/owner/repo/main"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_action_tarball_serves_from_cache_and_rejects_traversal() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        // Pre-populate cache for testing
+        let cache_dir = temp
+            .path()
+            .join("actions")
+            .join("test-owner")
+            .join("test-repo")
+            .join("v1");
+        tokio::fs::create_dir_all(&cache_dir).await.unwrap();
+        let cached_path = cache_dir.join("action.tar.gz");
+        tokio::fs::write(&cached_path, b"dummy-tar-content")
+            .await
+            .unwrap();
+
+        // 1. Successful cache hit
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/v1/actions/download/test-owner/test-repo/v1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/gzip"
+        );
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(bytes.as_ref(), b"dummy-tar-content");
+
+        // 2. Reject path traversal
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/v1/actions/download/test-owner/test-repo/../invalid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/v1/actions/download/test-owner/../../invalid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -7726,6 +8216,7 @@ jobs:
         if uri.starts_with("/_apis/")
             || uri.starts_with("/runner/server/_apis/")
             || uri.starts_with("/broker/")
+            || uri.starts_with("/actions/build/")
             || uri.starts_with("/twirp/")
         {
             builder = builder.header(header::AUTHORIZATION, "Bearer aksh-system-token");

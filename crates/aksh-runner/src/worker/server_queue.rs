@@ -95,7 +95,9 @@ impl ServerQueue {
         Self {
             pending_updates: Vec::new(),
             pending_logs: HashMap::new(),
-            job_log_file: std::io::BufWriter::new(tempfile::tempfile().expect("failed to create job log temp file")),
+            job_log_file: std::io::BufWriter::new(
+                tempfile::tempfile().expect("failed to create job log temp file"),
+            ),
             change_order: 0,
             job_id,
             plan_id,

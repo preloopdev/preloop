@@ -16,7 +16,6 @@ use super::http::HttpClient;
 /// and plan-level (timeline, log, event) endpoints on GitHub's Actions service.
 const DISTTASK_API_VERSION: &str = "5.1-preview.1";
 
-
 /// Client for the AzDO distributedtask endpoints.
 pub struct AzdoClient {
     http: HttpClient,
@@ -141,7 +140,10 @@ impl AzdoClient {
         plan_id: &str,
         log: &serde_json::Value,
     ) -> Result<serde_json::Value> {
-        let url = format!("{}/_apis/v1/plans/{plan_id}/logs?api-version={DISTTASK_API_VERSION}", self.base_url);
+        let url = format!(
+            "{}/_apis/v1/plans/{plan_id}/logs?api-version={DISTTASK_API_VERSION}",
+            self.base_url
+        );
         self.http
             .post_json_bearer(&url, log, token)
             .await
@@ -156,7 +158,10 @@ impl AzdoClient {
         log_id: i64,
         lines: Vec<u8>,
     ) -> Result<()> {
-        let url = format!("{}/_apis/v1/plans/{plan_id}/logs/{log_id}?api-version={DISTTASK_API_VERSION}", self.base_url);
+        let url = format!(
+            "{}/_apis/v1/plans/{plan_id}/logs/{log_id}?api-version={DISTTASK_API_VERSION}",
+            self.base_url
+        );
         self.http
             .put_bytes_bearer(&url, lines, "application/octet-stream", token)
             .await
@@ -191,7 +196,10 @@ impl AzdoClient {
         plan_id: &str,
         event: &serde_json::Value,
     ) -> Result<()> {
-        let url = format!("{}/_apis/v1/plans/{plan_id}/events?api-version={DISTTASK_API_VERSION}", self.base_url);
+        let url = format!(
+            "{}/_apis/v1/plans/{plan_id}/events?api-version={DISTTASK_API_VERSION}",
+            self.base_url
+        );
         let _: serde_json::Value = self
             .http
             .post_json_bearer(&url, event, token)
