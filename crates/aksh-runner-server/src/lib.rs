@@ -2692,17 +2692,34 @@ async fn blob_get(
         .join("data");
     match tokio::fs::read(&data_path).await {
         Ok(bytes) => {
-            let content_type = if kind == "artifact" {
-                "application/zip"
+            if kind == "artifact" {
+                let name = {
+                    let inner = shared.state.inner.lock().await;
+                    inner
+                        .artifact_v2_registry
+                        .values()
+                        .find(|e| e.blob_token == token)
+                        .map(|e| e.name.clone())
+                };
+                let filename = name.unwrap_or_else(|| "artifact".to_owned());
+                let content_disposition = format!("attachment; filename=\"{filename}.zip\"");
+                (
+                    StatusCode::OK,
+                    [
+                        (header::CONTENT_TYPE, "application/zip"),
+                        (header::CONTENT_DISPOSITION, &content_disposition),
+                    ],
+                    bytes,
+                )
+                    .into_response()
             } else {
-                "application/octet-stream"
-            };
-            (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, content_type)],
-                bytes,
-            )
-                .into_response()
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/octet-stream")],
+                    bytes,
+                )
+                    .into_response()
+            }
         }
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
