@@ -33,10 +33,8 @@ business model.
 | `ACTIONS_RUNNER_HOOK_JOB_STARTED` | OS environment on runner host | Pre-warm workspace, snapshot VM |
 | `ACTIONS_RUNNER_HOOK_JOB_COMPLETED` | OS environment on runner host | Cleanup, metrics, snapshot |
 
-aksh currently sets all of these correctly **except**
-`ACTIONS_RUNNER_HOOK_JOB_STARTED` and `ACTIONS_RUNNER_HOOK_JOB_COMPLETED`,
-which the official runner reads from the OS environment but aksh does not
-implement.
+aksh implements all of these, including the job start/completed hooks, which
+are injected as synthetic script steps before and after the user steps respectively.
 
 ---
 
@@ -117,44 +115,24 @@ transparent to the workflow.
 
 ---
 
-## Job Hooks: The Missing aksh Feature
+## Job Hooks: Supported natively in aksh
 
-The official runner reads two paths from the OS environment of the runner host
-before starting any job:
+The official runner reads two paths from the OS environment of the runner host:
 
 ```
 ACTIONS_RUNNER_HOOK_JOB_STARTED=/path/to/script.sh
 ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/path/to/script.sh
 ```
 
-It executes these scripts before and after every job, at the runner level.
-The workflow YAML never sees them. Providers use them for:
+aksh implements this natively during step ordering (`crates/aksh-runner/src/worker/job_runner.rs`).
+If these variables are present in the runner host OS environment, aksh generates
+synthetic script steps and inserts them at the start and end of the step execution queue.
 
-- **Pre-job:** Clone the repo into the workspace so `actions/checkout` becomes
-  a local `git pull` instead of a full network clone.
-- **Pre-job:** Take a VM snapshot so failed jobs can roll back without
-  re-provisioning.
-- **Pre-job:** Pre-pull Docker images the job will need.
-- **Post-job:** Clean up orphaned containers, export metrics, write billing
-  records.
-
-aksh does not implement these hooks. The official runner reads them in
-`JobExtension.cs`:
-
-```csharp
-var startedHookPath = Environment.GetEnvironmentVariable("ACTIONS_RUNNER_HOOK_JOB_STARTED");
-if (!string.IsNullOrEmpty(startedHookPath))
-{
-    var hookProvider = HostContext.GetService<IJobHookProvider>();
-    var jobHookData = new JobHookData(ActionRunStage.Pre, startedHookPath);
-    preJobSteps.Add(new JobExtensionRunner(...));
-}
-```
-
-This is a concrete compatibility gap. Any workflow that depends on these hooks
-(e.g. a repo that has set these env vars on its self-hosted runner host to
-pre-warm the workspace) will silently skip the hooks when running on aksh.
-
+Providers utilize these hooks for:
+- **Pre-job:** Cloning the repository into the workspace so `actions/checkout` can just do a local `git pull`.
+- **Pre-job:** Instantly snapshotting the VM to enable time-travel rollbacks on failure.
+- **Pre-job:** Pre-pulling heavy Docker images specified by steps.
+- **Post-job:** Cleaning up orphaned containers, writing telemetry, and calculating billing metrics.
 ---
 
 ## What aksh Already Does
@@ -172,3 +150,54 @@ endpoint.data.insert("FeedStreamUrl".to_owned(),
 So from day one, aksh redirects cache, artifact, and live-log traffic to itself
 rather than GitHub's Azure backend. This is the same mechanism every commercial
 CI provider uses.
+
+---
+
+## Advanced Control-Plane Value-Add Techniques
+
+By controlling the backend scheduler and emulating the Twirp protocols, a managed CI provider can layer advanced features directly on top of the unmodified official runner:
+
+### 1. Network & Dependency Sandboxing (The "Token Firewall")
+- **Mechanism:** `aksh` intercepts the `GITHUB_API_URL` environment variable, routing all API calls from the runner through a local proxy. 
+- **Feature:** Enforce granular policies (least-privilege tokens). If the runner is compromised by a malicious pull request dependency, `aksh` blocks any calls attempting to write to the repository or delete tags, while still permitting standard check-run status posts.
+
+### 2. Zero-Wait Cache Pre-fetching
+- **Mechanism:** Since the control plane knows which job is queued, it knows the expected cache keys before the runner even boots.
+- **Feature:** Begin streaming the `.tar.zst` cache archive to the runner host's staging area in the background during VM bootstrap. When the runner evaluates the restore step, the files are already sitting on the local SSD, reducing restore wait times from seconds to milliseconds.
+
+### 3. OIDC Cloud Federation Brokerage
+- **Mechanism:** `aksh` serves the OIDC token endpoints (`/.../oidctoken`) and acts as the JWT signing authority.
+- **Feature:** Negotiate credentials dynamically with cloud providers (AWS IAM Roles Anywhere, GCP, HashiCorp Vault) based on job metadata, injecting AWS credentials directly into the job context without requiring the developer to configure cloud trust policies with GitHub.
+
+### 4. Interactive Debugging & Time-Travel VM snapshots
+- **Mechanism:** Control plane coordinates with the VM/container host during job execution.
+- **Feature:** On step failure, `aksh` suspends the run, holds the VM alive, and launches an interactive shell session in the web browser. If running on isolated microVMs, `aksh` can take snapshots at the end of each step, allowing developers to restart execution from any prior step's exact state.
+
+---
+
+## Strategic Trade-offs & Napkin Math
+
+If you are building a managed CI service, you face a major architectural fork:
+
+### Option A: Reimplement the GHA Control Plane (`aksh` approach)
+*You host the scheduler, broker, and Twirp services. Unmodified runners talk only to you.*
+* **Initial CapEx:** High ($800k+ engineering over 1 year).
+* **OpEx Maintenance:** High ($400k+/year). You are chasing GitHub's undocumented internal runner API. If GitHub releases a runner version with new required location fields or padding requirements, your customers' builds will fail until you reverse-engineer the change.
+* **SLA Risk:** 100% on you. If your database/scheduler crashes, your customers cannot run builds.
+* **The Payoff:** **Enterprise/Air-Gapped Market Access.** You can package your control plane and sell it to banks, defense contractors, and healthcare companies that are legally barred from sending code, secrets, or logs to `github.com`. These contracts routinely sell for $100k-$250k/year ARR.
+
+### Option B: Compute-Only Hosting + Caching Proxy (Warp/Depot approach)
+*Runners talk directly to github.com. You manage the VM hosting and optimize disk/caching at the VM boundary.*
+* **Initial CapEx:** Low ($150k over 3 months).
+* **OpEx Maintenance:** Low ($100k/year). GitHub maintains the API contract; your VM agent only listens to standard signals.
+* **SLA Risk:** Low. If GitHub Actions has an outage, it is GitHub's fault, not yours.
+* **The Payoff:** **Developer SaaS Scale.** High-speed, high-performance compute that is easy to adopt for public-cloud developers.
+
+### Napkin Math: The Egress Bottleneck
+Assume a provider running **1,000 active concurrent runner VMs** with a **5GB average cache size** and **50 builds per day per VM**.
+Total cache data transferred per month: 
+$$1,000 \text{ VMs} \times 50 \text{ builds/day} \times 5\text{ GB} \times 30 \text{ days} = 7.5\text{ PB/month}$$
+
+* **Without Local Caching (Egress to Azure/S3):** If your compute runs in AWS and your cache is in GitHub's Azure storage, at standard egress rates ($0.05/GB), the network transfer cost would be:
+  $$7.5\text{ PB} \times 1,000,000\text{ GB/PB} \times \$0.05/\text{GB} = \$375,000/\text{month}$$
+* **With Local Caching:** By routing cache traffic locally (Option A or Option B with a proxy), egress fees are eliminated ($\$0$), saving hundreds of thousands of dollars monthly at scale.
