@@ -4,10 +4,11 @@
 //! secret masking, issue/annotation collection, debug flag.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use parking_lot::Mutex;
+use std::io::{BufWriter, Write};
 
 use super::contexts::JobContext;
-
-/// Per-step execution context.
 pub struct StepContext<'a> {
     pub job: &'a mut JobContext,
     pub step_id: String,
@@ -30,6 +31,10 @@ pub struct StepContext<'a> {
     pub translate_container_path: bool,
     /// Telemetry error messages collected during step execution.
     pub telemetry_errors: Vec<String>,
+    /// Log temp file for durable storage.
+    pub log_file: Arc<Mutex<BufWriter<std::fs::File>>>,
+    /// Whether to also accumulate log lines in memory (for tests).
+    pub keep_in_memory: bool,
 }
 
 /// A workflow annotation (error/warning/notice).
@@ -65,6 +70,9 @@ impl<'a> StepContext<'a> {
                 .is_some_and(|v| is_debug(v))
             || job.env.get("RUNNER_DEBUG").is_some_and(|v| is_debug(v));
         let translate_container_path = job.container_state.is_some();
+        let temp_file = tempfile::tempfile().expect("failed to create log temp file");
+        let log_file = Arc::new(Mutex::new(BufWriter::new(temp_file)));
+        let keep_in_memory = cfg!(test);
         Self {
             job,
             step_id,
@@ -78,13 +86,24 @@ impl<'a> StepContext<'a> {
             stop_commands_token: None,
             translate_container_path,
             telemetry_errors: Vec::new(),
+            log_file,
+            keep_in_memory,
         }
+    }
+
+
+    /// Write a raw byte chunk from process output. In production mode this
+    /// writes directly to the disk-backed log file. No String allocation,
+    /// no UTF-8 check, no per-line processing. Secret masking and timestamp
+    pub fn write_chunk(&self, chunk: &[u8]) {
+        let mut lock = self.log_file.lock();
+        let _ = lock.write_all(chunk);
     }
 
     /// Add a log line: parse workflow commands, apply masking, feed problem matchers.
     pub fn log(&mut self, line: &str) {
         // stop-commands: if a token is set, only look for the resume command
-        if let Some(ref token) = self.stop_commands_token.clone() {
+        if let Some(token) = &self.stop_commands_token.clone() {
             if line.trim() == format!("::{token}::") {
                 self.stop_commands_token = None;
                 return;
@@ -92,10 +111,16 @@ impl<'a> StepContext<'a> {
             // All commands suspended — just log the line
             let masked = self.job.mask_secrets(line);
             let ts = crate::worker::job_runner::iso_now();
-            self.log_lines.push(format!("{ts} {masked}"));
+            let fmt = format!("{ts} {masked}");
+            {
+                let mut lock = self.log_file.lock();
+                let _ = writeln!(lock, "{}", fmt);
+            }
+            if self.keep_in_memory {
+                self.log_lines.push(fmt);
+            }
             return;
         }
-
         // Parse and handle workflow commands (::add-matcher::, ::error::, etc.)
         if let Some(cmd) = super::commands::parse_command(line) {
             // stop-commands: record the token and consume the line
@@ -167,7 +192,7 @@ impl<'a> StepContext<'a> {
             self.translate_container_path,
         );
 
-        if !matched_annotations.is_empty() {
+        let fmt = if !matched_annotations.is_empty() {
             // Find the highest severity level to prefix the log line
             let mut prefix = "##[error]";
             for ann in &matched_annotations {
@@ -192,10 +217,18 @@ impl<'a> StepContext<'a> {
             }
 
             let ts = crate::worker::job_runner::iso_now();
-            self.log_lines.push(format!("{ts} {prefix}{masked}"));
+            format!("{ts} {prefix}{masked}")
         } else {
             let ts = crate::worker::job_runner::iso_now();
-            self.log_lines.push(format!("{ts} {masked}"));
+            format!("{ts} {masked}")
+        };
+
+        {
+            let mut lock = self.log_file.lock();
+            let _ = writeln!(lock, "{}", fmt);
+        }
+        if self.keep_in_memory {
+            self.log_lines.push(fmt);
         }
     }
 
@@ -282,7 +315,18 @@ impl<'a> StepContext<'a> {
 
     /// Get all collected log content as a single string.
     pub fn log_content(&self) -> String {
-        self.log_lines.join("\n")
+        let mut lock = self.log_file.lock();
+        let _ = lock.flush();
+        let file = lock.get_ref();
+        if let Ok(mut cloned) = file.try_clone() {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut content = String::new();
+            let _ = cloned.seek(SeekFrom::Start(0));
+            let _ = cloned.read_to_string(&mut content);
+            content
+        } else {
+            String::new()
+        }
     }
 }
 

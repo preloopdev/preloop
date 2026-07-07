@@ -141,7 +141,7 @@ pub async fn run_steps(
             });
             // Attach init logs to synthetic step
             if !init_logs.is_empty() {
-                q.record_step_logs(&init_step_id, init_logs.clone());
+                q.record_step_logs(&init_step_id, &init_logs.join("\n"));
             }
         }
         if let Some(rpt) = reporting {
@@ -491,7 +491,7 @@ pub async fn run_steps(
         super::file_commands::cleanup_file_commands(&file_command_paths);
         // Collect annotations after all processing (including step summary validation)
         let annotations = step_ctx.annotations.clone();
-        let log_lines = step_ctx.log_lines.clone();
+        let log_content = step_ctx.log_content();
 
         // F025: Store annotations in job context
         if !annotations.is_empty() {
@@ -522,8 +522,8 @@ pub async fn run_steps(
                 conclusion: conclusion_proto,
             });
             // Record logs for job log assembly
-            if !log_lines.is_empty() {
-                q.record_step_logs(&step.id, log_lines.clone());
+            if !log_content.is_empty() {
+                q.record_step_logs(&step.id, &log_content);
             }
         }
         if let Some(rpt) = reporting {
@@ -532,9 +532,8 @@ pub async fn run_steps(
 
         // F020: Upload step log immediately after completion
         if let Some(rpt) = reporting {
-            if !log_lines.is_empty() {
-                let content = log_lines.join("\n");
-                crate::worker::job_runner::upload_step_log(rpt, &step.id, &content).await;
+            if !log_content.is_empty() {
+                crate::worker::job_runner::upload_step_log(rpt, &step.id, &log_content).await;
             }
             // F035: Upload step summary if non-empty
             if !summary_content.is_empty() {
@@ -593,7 +592,7 @@ pub async fn run_steps(
             });
             // Attach cleanup logs to synthetic step
             if !cleanup_log.is_empty() {
-                q.record_step_logs(&stop_step_id, cleanup_log.clone());
+                q.record_step_logs(&stop_step_id, &cleanup_log.join("\n"));
             }
         }
         if let Some(rpt) = reporting {

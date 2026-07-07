@@ -79,8 +79,8 @@ pub struct StepLog {
 pub struct ServerQueue {
     pending_updates: Vec<StepUpdate>,
     pending_logs: HashMap<String, Vec<String>>,
-    /// Accumulated log content per step (never drained — used for job log).
-    accumulated_logs: Vec<(String, Vec<String>)>,
+    /// Accumulated log content temp file (used for job log).
+    job_log_file: std::io::BufWriter<std::fs::File>,
     change_order: u64,
     job_id: String,
     plan_id: String,
@@ -95,7 +95,7 @@ impl ServerQueue {
         Self {
             pending_updates: Vec::new(),
             pending_logs: HashMap::new(),
-            accumulated_logs: Vec::new(),
+            job_log_file: std::io::BufWriter::new(tempfile::tempfile().expect("failed to create job log temp file")),
             change_order: 0,
             job_id,
             plan_id,
@@ -157,20 +157,27 @@ impl ServerQueue {
     }
 
     /// Record completed step logs into the accumulated store (for job log assembly).
-    pub fn record_step_logs(&mut self, step_id: &str, lines: Vec<String>) {
-        self.accumulated_logs.push((step_id.to_string(), lines));
+    pub fn record_step_logs(&mut self, _step_id: &str, content: &str) {
+        use std::io::Write;
+        let _ = write!(self.job_log_file, "{}", content);
+        if !content.ends_with('\n') && !content.is_empty() {
+            let _ = writeln!(self.job_log_file);
+        }
     }
 
     /// Return concatenated content of all accumulated step logs (for job log upload).
-    pub fn all_step_log_content(&self) -> String {
-        let mut out = String::new();
-        for (_, lines) in &self.accumulated_logs {
-            for line in lines {
-                out.push_str(line);
-                out.push('\n');
-            }
+    pub fn all_step_log_content(&mut self) -> String {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let _ = self.job_log_file.flush();
+        let file = self.job_log_file.get_ref();
+        if let Ok(mut cloned) = file.try_clone() {
+            let mut content = String::new();
+            let _ = cloned.seek(SeekFrom::Start(0));
+            let _ = cloned.read_to_string(&mut content);
+            content
+        } else {
+            String::new()
         }
-        out
     }
 }
 
@@ -230,6 +237,15 @@ mod tests {
         let logs = q.take_logs();
         assert_eq!(logs.get("s1").unwrap().len(), 3);
         assert_eq!(logs.get("s2").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn record_and_assemble_logs() {
+        let mut q = ServerQueue::new("j".into(), "p".into());
+        q.record_step_logs("s1", "line1\nline2\n");
+        q.record_step_logs("s2", "line3");
+        let content = q.all_step_log_content();
+        assert_eq!(content, "line1\nline2\nline3\n");
     }
 
     #[test]
