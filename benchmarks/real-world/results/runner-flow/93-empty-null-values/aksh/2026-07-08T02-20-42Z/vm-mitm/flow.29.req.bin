@@ -1,0 +1,6 @@
+2026-07-08T02:21:05.659Z ##[group]Run echo 'empty_var=' >> $GITHUB_OUTPUT
+2026-07-08T02:21:05.659Z echo 'empty_var=' >> $GITHUB_OUTPUT
+2026-07-08T02:21:05.659Z echo "Empty output set"
+2026-07-08T02:21:05.659Z shell: bash --noprofile --norc -e -o pipefail {0}
+2026-07-08T02:21:05.659Z ##[endgroup]
+2026-07-08T02:21:05.660Z Empty output set

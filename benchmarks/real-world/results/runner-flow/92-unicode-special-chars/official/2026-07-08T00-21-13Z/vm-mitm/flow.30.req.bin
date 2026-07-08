@@ -1,0 +1,14 @@
+﻿2026-07-08T00:21:36.3647162Z ##[group]Run echo 'emoji_output<<EOF' >> $GITHUB_OUTPUT
+2026-07-08T00:21:36.3647571Z [36;1mecho 'emoji_output<<EOF' >> $GITHUB_OUTPUT[0m
+2026-07-08T00:21:36.3647926Z [36;1mecho '🌟 Success! ✅ All tests passed 🎯' >> $GITHUB_OUTPUT[0m
+2026-07-08T00:21:36.3648258Z [36;1mecho 'EOF' >> $GITHUB_OUTPUT[0m
+2026-07-08T00:21:36.3648512Z [36;1m[0m
+2026-07-08T00:21:36.3648740Z [36;1mecho 'cjk_output<<EOF' >> $GITHUB_OUTPUT[0m
+2026-07-08T00:21:36.3649048Z [36;1mecho '日本語のテスト: これは有効なテストです' >> $GITHUB_OUTPUT[0m
+2026-07-08T00:21:36.3661328Z [36;1mecho 'EOF' >> $GITHUB_OUTPUT[0m
+2026-07-08T00:21:36.3661629Z [36;1m[0m
+2026-07-08T00:21:36.3661898Z [36;1mecho 'special_output<<EOF' >> $GITHUB_OUTPUT[0m
+2026-07-08T00:21:36.3662360Z [36;1mecho 'Quotes: "double" and '"'"'single'"'"' and \backslash and \n and \t' >> $GITHUB_OUTPUT[0m
+2026-07-08T00:21:36.3662795Z [36;1mecho 'EOF' >> $GITHUB_OUTPUT[0m
+2026-07-08T00:21:36.3666158Z shell: /usr/bin/bash -e {0}
+2026-07-08T00:21:36.3666482Z ##[endgroup]
