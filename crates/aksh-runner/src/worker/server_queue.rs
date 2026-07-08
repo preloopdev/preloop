@@ -28,6 +28,8 @@ pub mod step_conclusion {
     pub const SUCCEEDED: u32 = 2;
     /// Step failed.
     pub const FAILED: u32 = 3;
+    /// Step was cancelled.
+    pub const CANCELLED: u32 = 4;
     /// Step was skipped.
     pub const SKIPPED: u32 = 7;
 }
@@ -162,7 +164,7 @@ impl ServerQueue {
             "success" | "succeeded" => step_conclusion::SUCCEEDED,
             "failure" | "failed" => step_conclusion::FAILED,
             "skipped" => step_conclusion::SKIPPED,
-            "cancelled" | "canceled" => step_conclusion::FAILED, // Twirp has no cancel value
+            "cancelled" | "canceled" => step_conclusion::CANCELLED,
             _ => step_conclusion::SUCCEEDED,
         }
     }
