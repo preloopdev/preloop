@@ -182,6 +182,10 @@ impl JobContext {
         // Sort by length descending so longer secrets are replaced before
         // shorter ones that might be a subset (e.g. trimmed variant).
         let mut secrets: Vec<&String> = self.masks.iter().filter(|s| !s.is_empty()).collect();
+        // If the DAP debugger is active, we preserve the standard protocol keywords.
+        if self.dap_debugger.is_some() {
+            secrets.retain(|s| !aksh_dap::DAP_PROTOCOL_KEYWORDS.contains(&s.as_str()));
+        }
         secrets.sort_by_key(|b| std::cmp::Reverse(b.len()));
         for secret in secrets {
             result = result.replace(secret.as_str(), "***");
