@@ -211,9 +211,7 @@ async fn handle_connection(mut inbound: TcpStream, target_port: u16) -> Result<(
         IncomingStreamPrefixKind::Unknown => raw_dap_pump(inbound, target_port).await,
         IncomingStreamPrefixKind::Http2Preface
         | IncomingStreamPrefixKind::TlsClientHello
-        | IncomingStreamPrefixKind::WebSocketReservedBits => {
-            Err(BridgeError::RejectedPrefix(kind))
-        }
+        | IncomingStreamPrefixKind::WebSocketReservedBits => Err(BridgeError::RejectedPrefix(kind)),
     }
 }
 
@@ -539,9 +537,7 @@ mod tests {
     #[test]
     fn try_drain_message_rejects_oversize() {
         let mut buf = BytesMut::new();
-        buf.extend_from_slice(
-            format!("Content-Length: {}\r\n\r\nx", 11 * 1024 * 1024).as_bytes(),
-        );
+        buf.extend_from_slice(format!("Content-Length: {}\r\n\r\nx", 11 * 1024 * 1024).as_bytes());
         let r = try_drain_message(&mut buf);
         assert!(matches!(r, Some(Err(_))));
     }

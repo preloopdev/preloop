@@ -45,7 +45,7 @@ use crate::messages::{
     Capabilities, Event, Request, Response, EVENT_CONTINUED, EVENT_EXITED, EVENT_INITIALIZED,
     EVENT_OUTPUT, EVENT_STOPPED, EVENT_TERMINATED, EVENT_THREAD,
 };
-use crate::repl::{DapReplCommand, DapReplExecutor, DapReplParser, ParseError};
+use crate::repl::{DapReplExecutor, DapReplParser, ParseError};
 use crate::variables::DapVariableProvider;
 use crate::view::{JobExecutionView, PredictedPostStep, SourceEntry};
 
@@ -390,7 +390,12 @@ impl DapDebugger {
         let welcome = if self.core.override_welcome {
             self.core.welcome_message.clone()
         } else {
-            Some(self.core.welcome_message.clone().unwrap_or_else(default_welcome_message))
+            Some(
+                self.core
+                    .welcome_message
+                    .clone()
+                    .unwrap_or_else(default_welcome_message),
+            )
         };
         if let Some(msg) = welcome {
             if !msg.is_empty() {
@@ -399,12 +404,12 @@ impl DapDebugger {
                     msg.push('\n');
                 }
                 let seq = self.next_seq_internal().await;
-                let _ = out_tx.send(Outbound::Event(
-                    Event::new(seq, EVENT_OUTPUT).with_body(json!({
+                let _ = out_tx.send(Outbound::Event(Event::new(seq, EVENT_OUTPUT).with_body(
+                    json!({
                         "category": "console",
                         "output": msg,
-                    })),
-                ));
+                    }),
+                )));
             }
         }
 
@@ -540,8 +545,8 @@ async fn read_headers<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> Result<usiz
             return Err(DapError::Protocol("header too long".into()));
         }
     }
-    let text = std::str::from_utf8(&header)
-        .map_err(|_| DapError::Protocol("non-utf8 header".into()))?;
+    let text =
+        std::str::from_utf8(&header).map_err(|_| DapError::Protocol("non-utf8 header".into()))?;
     for line in text.split("\r\n") {
         if let Some(rest) = line
             .strip_prefix("Content-Length:")
@@ -561,9 +566,13 @@ async fn dispatch_one(core: &Arc<DebuggerCore>, req: &Request, seq: i64) -> Resp
     match cmd {
         "initialize" => {
             let event_seq = next_seq(core).await;
-            let _ = core.out_tx.lock().send(Outbound::Event(Event::new(event_seq, EVENT_INITIALIZED)));
-            Response::success(seq, req.header.seq, "initialize")
-                .with_body(serde_json::to_value(Capabilities::runner_default()).unwrap_or(Value::Null))
+            let _ = core
+                .out_tx
+                .lock()
+                .send(Outbound::Event(Event::new(event_seq, EVENT_INITIALIZED)));
+            Response::success(seq, req.header.seq, "initialize").with_body(
+                serde_json::to_value(Capabilities::runner_default()).unwrap_or(Value::Null),
+            )
         }
         "configurationDone" => {
             *core.state.lock() = DapSessionState::Ready;
@@ -601,7 +610,8 @@ async fn dispatch_one(core: &Arc<DebuggerCore>, req: &Request, seq: i64) -> Resp
             let masks = core.masks.lock().clone();
             let mask_secret = Box::new(move |input: &str| {
                 let mut result = input.to_string();
-                let mut sorted_masks: Vec<&String> = masks.iter().filter(|s| !s.is_empty()).collect();
+                let mut sorted_masks: Vec<&String> =
+                    masks.iter().filter(|s| !s.is_empty()).collect();
                 sorted_masks.sort_by_key(|b| std::cmp::Reverse(b.len()));
                 for secret in sorted_masks {
                     result = result.replace(secret.as_str(), "***");
@@ -622,7 +632,8 @@ async fn dispatch_one(core: &Arc<DebuggerCore>, req: &Request, seq: i64) -> Resp
             let masks = core.masks.lock().clone();
             let mask_secret = Box::new(move |input: &str| {
                 let mut result = input.to_string();
-                let mut sorted_masks: Vec<&String> = masks.iter().filter(|s| !s.is_empty()).collect();
+                let mut sorted_masks: Vec<&String> =
+                    masks.iter().filter(|s| !s.is_empty()).collect();
                 sorted_masks.sort_by_key(|b| std::cmp::Reverse(b.len()));
                 for secret in sorted_masks {
                     result = result.replace(secret.as_str(), "***");
@@ -644,10 +655,12 @@ async fn dispatch_one(core: &Arc<DebuggerCore>, req: &Request, seq: i64) -> Resp
         "continue" => {
             *core.state.lock() = DapSessionState::Running;
             let _ = core.resume_tx.send(());
-            let _ = core.out_tx.lock().send(Outbound::Event(
-                Event::new(seq, EVENT_CONTINUED)
-                    .with_body(json!({"threadId": 1, "allThreadsContinued": true})),
-            ));
+            let _ = core
+                .out_tx
+                .lock()
+                .send(Outbound::Event(Event::new(seq, EVENT_CONTINUED).with_body(
+                    json!({"threadId": 1, "allThreadsContinued": true}),
+                )));
             Response::success(seq, req.header.seq, "continue")
                 .with_body(json!({"allThreadsContinued": true}))
         }
@@ -659,8 +672,9 @@ async fn dispatch_one(core: &Arc<DebuggerCore>, req: &Request, seq: i64) -> Resp
             Response::success(seq, req.header.seq, cmd)
                 .with_body(json!({"allThreadsContinued": true}))
         }
-        "pause" => Response::success(seq, req.header.seq, "pause")
-            .with_body(json!({"reason": "pause"})),
+        "pause" => {
+            Response::success(seq, req.header.seq, "pause").with_body(json!({"reason": "pause"}))
+        }
         "evaluate" => {
             let expr = req
                 .arguments
@@ -677,7 +691,8 @@ async fn dispatch_one(core: &Arc<DebuggerCore>, req: &Request, seq: i64) -> Resp
                 let masks = core.masks.lock().clone();
                 let mask_secret = Box::new(move |input: &str| {
                     let mut result = input.to_string();
-                    let mut sorted_masks: Vec<&String> = masks.iter().filter(|s| !s.is_empty()).collect();
+                    let mut sorted_masks: Vec<&String> =
+                        masks.iter().filter(|s| !s.is_empty()).collect();
                     sorted_masks.sort_by_key(|b| std::cmp::Reverse(b.len()));
                     for secret in sorted_masks {
                         result = result.replace(secret.as_str(), "***");
@@ -706,7 +721,8 @@ async fn dispatch_one(core: &Arc<DebuggerCore>, req: &Request, seq: i64) -> Resp
                         };
                         let masks = core.masks.lock().clone();
                         let mut result_masked = result_raw;
-                        let mut sorted_masks: Vec<&String> = masks.iter().filter(|s| !s.is_empty()).collect();
+                        let mut sorted_masks: Vec<&String> =
+                            masks.iter().filter(|s| !s.is_empty()).collect();
                         sorted_masks.sort_by_key(|b| std::cmp::Reverse(b.len()));
                         for secret in sorted_masks {
                             result_masked = result_masked.replace(secret.as_str(), "***");
@@ -905,13 +921,15 @@ impl IDapDebugger for DapDebugger {
 
     async fn on_job_completed(&self) -> Result<(), DapError> {
         let seq = self.next_seq_internal().await;
-        let _ = self.core.out_tx.lock().send(Outbound::Event(Event::new(seq, EVENT_TERMINATED)));
-        let seq = self.next_seq_internal().await;
         let _ = self
             .core
             .out_tx
             .lock()
-            .send(Outbound::Event(Event::new(seq, EVENT_EXITED).with_body(json!({"exitCode": 0}))));
+            .send(Outbound::Event(Event::new(seq, EVENT_TERMINATED)));
+        let seq = self.next_seq_internal().await;
+        let _ = self.core.out_tx.lock().send(Outbound::Event(
+            Event::new(seq, EVENT_EXITED).with_body(json!({"exitCode": 0})),
+        ));
         *self.core.state.lock() = DapSessionState::Terminated;
         if let Some(mut child) = self.core.devtunnel_child.lock().await.take() {
             let _ = child.start_kill();
@@ -1057,7 +1075,8 @@ mod tests {
     #[tokio::test]
     async fn source_returns_synthetic_yaml() {
         let dbg = DapDebugger::new(sample_config());
-        dbg.on_job_steps_initialized(&[step("Build")], &[], &[]).await;
+        dbg.on_job_steps_initialized(&[step("Build")], &[], &[])
+            .await;
         let resp = dbg.dispatch(Request::new("source")).await;
         let body = resp.body.unwrap();
         let content = body["content"].as_str().unwrap();

@@ -117,9 +117,7 @@ where
 {
     let body = serde_json::to_vec(value)?;
     if body.len() > MAX_MESSAGE_SIZE {
-        return Err(FrameError::BodyTooLarge {
-            actual: body.len(),
-        });
+        return Err(FrameError::BodyTooLarge { actual: body.len() });
     }
     let header = format!("Content-Length: {}\r\n\r\n", body.len());
     writer.write_all(header.as_bytes()).await?;
@@ -317,10 +315,7 @@ mod tests {
             payload: "b".into(),
         })
         .unwrap();
-        let chunk = format!(
-            "Content-Length: {}\r\n\r\n",
-            body1.len()
-        );
+        let chunk = format!("Content-Length: {}\r\n\r\n", body1.len());
         let mut all = Vec::new();
         all.extend_from_slice(chunk.as_bytes());
         all.extend_from_slice(&body1);

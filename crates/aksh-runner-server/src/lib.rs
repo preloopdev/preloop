@@ -1224,11 +1224,7 @@ async fn live_logs_sse(
         let mut inner = shared.state.inner.lock().await;
         let key = live_log_key_for_job(&inner, run_id, &job_id)
             .ok_or_else(|| ApiError::not_found("job not found"))?;
-        let lines_arc = inner
-            .live_log_lines
-            .entry(key.clone())
-            .or_default()
-            .clone();
+        let lines_arc = inner.live_log_lines.entry(key.clone()).or_default().clone();
         let tx = live_log_sender(&mut inner, &key);
         (lines_arc, tx.subscribe())
     };
@@ -1395,7 +1391,9 @@ async fn pump_axum_ws_to_dap(ws: WebSocket, target_port: u16) -> Result<(), anyh
                     target_write.flush().await?;
                 }
                 Ok(WsMessage::Binary(_)) => {
-                    return Err(anyhow::anyhow!("binary WebSocket frames are not allowed on the DAP bridge"));
+                    return Err(anyhow::anyhow!(
+                        "binary WebSocket frames are not allowed on the DAP bridge"
+                    ));
                 }
                 Ok(WsMessage::Close(_)) | Err(_) => break,
                 Ok(WsMessage::Ping(_)) | Ok(WsMessage::Pong(_)) => continue,
@@ -1466,7 +1464,7 @@ fn try_drain_message_from_buf(buf: &mut bytes::BytesMut) -> Option<Result<String
 
 fn find_crlf_crlf_bytes(buf: &bytes::BytesMut) -> Option<usize> {
     for i in 0..buf.len().saturating_sub(3) {
-        if buf[i] == b'\r' && buf[i+1] == b'\n' && buf[i+2] == b'\r' && buf[i+3] == b'\n' {
+        if buf[i] == b'\r' && buf[i + 1] == b'\n' && buf[i + 2] == b'\r' && buf[i + 3] == b'\n' {
             return Some(i);
         }
     }

@@ -201,7 +201,11 @@ impl JobExecutionView {
     ///
     /// Caller MUST hold the `line_by_step` lock (this avoids a
     /// reentrant deadlock on the non-reentrant `std::sync::Mutex`).
-    fn claim_predicted_frame_id_locked(&self, display_name: &str, lines: &[StepLine]) -> Option<i64> {
+    fn claim_predicted_frame_id_locked(
+        &self,
+        display_name: &str,
+        lines: &[StepLine],
+    ) -> Option<i64> {
         for line in lines.iter() {
             if line.is_post && line.display_name == display_name {
                 return Some(line.frame_id);

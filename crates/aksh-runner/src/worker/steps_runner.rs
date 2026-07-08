@@ -104,7 +104,10 @@ pub async fn run_steps(
         let ts = crate::worker::job_runner::iso_now();
 
         let mut setup_lines = Vec::new();
-        setup_lines.push(format!("{ts} Current runner version: '{}'", crate::PROTOCOL_COMPAT_VERSION));
+        setup_lines.push(format!(
+            "{ts} Current runner version: '{}'",
+            crate::PROTOCOL_COMPAT_VERSION
+        ));
         setup_lines.push(format!("{ts} Runner name: '{runner_name}'"));
         setup_lines.push(format!("{ts} Runner group name: 'Default'"));
         setup_lines.push(format!("{ts} Machine name: '{machine_name}'"));
@@ -433,11 +436,22 @@ pub async fn run_steps(
         // If no editor is attached, the trait returns immediately.
         if let Some(dbg) = dap_debugger.as_ref() {
             let expr_ctx = step_ctx.job.build_expression_context();
-            let context_val = serde_json::to_value(expr_ctx.roots()).unwrap_or_else(|_| serde_json::json!({}));
+            let context_val =
+                serde_json::to_value(expr_ctx.roots()).unwrap_or_else(|_| serde_json::json!({}));
             dbg.update_context(context_val, step_ctx.job.masks.clone());
 
-            let is_pre = step.id.starts_with("__pre_") || step.raw.get("__pre").and_then(|v| v.as_bool()).unwrap_or(false);
-            let is_post = step.id.starts_with("__post_") || step.raw.get("__post").and_then(|v| v.as_bool()).unwrap_or(false);
+            let is_pre = step.id.starts_with("__pre_")
+                || step
+                    .raw
+                    .get("__pre")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+            let is_post = step.id.starts_with("__post_")
+                || step
+                    .raw
+                    .get("__post")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
             let source_entry = aksh_dap::SourceEntry {
                 display_name: resolved_display_name.clone(),
                 is_pre,
@@ -455,8 +469,18 @@ pub async fn run_steps(
         }
         // DAP: OnStepCompleted — emit `continued` if we paused.
         if let Some(dbg) = dap_debugger.as_ref() {
-            let is_pre = step.id.starts_with("__pre_") || step.raw.get("__pre").and_then(|v| v.as_bool()).unwrap_or(false);
-            let is_post = step.id.starts_with("__post_") || step.raw.get("__post").and_then(|v| v.as_bool()).unwrap_or(false);
+            let is_pre = step.id.starts_with("__pre_")
+                || step
+                    .raw
+                    .get("__pre")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+            let is_post = step.id.starts_with("__post_")
+                || step
+                    .raw
+                    .get("__post")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
             let source_entry = aksh_dap::SourceEntry {
                 display_name: resolved_display_name.clone(),
                 is_pre,

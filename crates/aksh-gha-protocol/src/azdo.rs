@@ -300,11 +300,7 @@ pub struct AgentJobRequestMessage {
     /// starts the DAP subsystem inside "Set up job" when this is
     /// `true`. Mirrors `AgentJobRequestMessage.EnableDebugger` in
     /// `actions/runner` v2.335.0+.
-    #[serde(
-        rename = "enableDebugger",
-        default,
-        skip_serializing_if = "is_false"
-    )]
+    #[serde(rename = "enableDebugger", default, skip_serializing_if = "is_false")]
     pub enable_debugger: bool,
 
     /// Dev Tunnel info for remote debugging. Required when

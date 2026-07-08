@@ -374,7 +374,6 @@ fn is_session_expired(err: &anyhow::Error) -> bool {
     }
 }
 
-
 /// F011: Extract session key only if present.
 fn extract_session_key_if_present(
     session: &serde_json::Value,

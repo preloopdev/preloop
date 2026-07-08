@@ -110,7 +110,9 @@ impl DapReplParser {
             return parse_run(args).map(DapReplCommand::Run);
         }
 
-        Err(ParseError::UnknownCommand(trimmed.split_whitespace().next().unwrap_or("").to_string()))
+        Err(ParseError::UnknownCommand(
+            trimmed.split_whitespace().next().unwrap_or("").to_string(),
+        ))
     }
 }
 
@@ -145,9 +147,9 @@ fn parse_run(args: &str) -> Result<RunCommand, ParseError> {
     };
 
     for pair in iter {
-        let (key, value) = pair
-            .split_once(':')
-            .ok_or_else(|| ParseError::MalformedArguments(format!("expected key: value, got {pair}")))?;
+        let (key, value) = pair.split_once(':').ok_or_else(|| {
+            ParseError::MalformedArguments(format!("expected key: value, got {pair}"))
+        })?;
         let key = key.trim();
         let value = value.trim();
         match key {
@@ -161,7 +163,9 @@ fn parse_run(args: &str) -> Result<RunCommand, ParseError> {
                 command.env = parse_env_map(value)?;
             }
             other => {
-                return Err(ParseError::MalformedArguments(format!("unknown key: {other}")));
+                return Err(ParseError::MalformedArguments(format!(
+                    "unknown key: {other}"
+                )));
             }
         }
     }
@@ -178,12 +182,13 @@ fn parse_env_map(s: &str) -> Result<BTreeMap<String, String>, ParseError> {
         .ok_or_else(|| ParseError::MalformedArguments("env must be a brace-enclosed map".into()))?;
     let mut map = BTreeMap::new();
     for entry in split_args(inner) {
-        let (k, v) = entry
-            .split_once(':')
-            .ok_or_else(|| ParseError::MalformedArguments(format!("env entry must be key: value, got {entry}")))?;
+        let (k, v) = entry.split_once(':').ok_or_else(|| {
+            ParseError::MalformedArguments(format!("env entry must be key: value, got {entry}"))
+        })?;
         let key = k.trim().to_string();
-        let value = parse_string_literal(v.trim())
-            .ok_or_else(|| ParseError::MalformedArguments(format!("env value for {key} must be a string")))?;
+        let value = parse_string_literal(v.trim()).ok_or_else(|| {
+            ParseError::MalformedArguments(format!("env value for {key} must be a string"))
+        })?;
         map.insert(key, value);
     }
     Ok(map)
@@ -308,7 +313,12 @@ mod tests {
     #[test]
     fn parses_help_with_topic() {
         let cmd = DapReplParser::parse("help(\"run\")").unwrap();
-        assert_eq!(cmd, DapReplCommand::Help { topic: Some("run".into()) });
+        assert_eq!(
+            cmd,
+            DapReplCommand::Help {
+                topic: Some("run".into())
+            }
+        );
     }
 
     #[test]
@@ -372,9 +382,8 @@ mod tests {
 
     #[test]
     fn executor_run_uses_launcher() {
-        let exec = DapReplExecutor::default().with_launcher(Box::new(|cmd| {
-            Ok(format!("ran: {}", cmd.script))
-        }));
+        let exec = DapReplExecutor::default()
+            .with_launcher(Box::new(|cmd| Ok(format!("ran: {}", cmd.script))));
         let out = exec.execute(&DapReplCommand::Run(RunCommand {
             script: "echo hi".into(),
             shell: None,
@@ -400,6 +409,13 @@ mod tests {
     #[test]
     fn split_args_respects_quotes_and_braces() {
         let parts = split_args(r#""a, b", c, { d: e }"#);
-        assert_eq!(parts, vec![r#""a, b""#.to_string(), "c".to_string(), "{ d: e }".to_string()]);
+        assert_eq!(
+            parts,
+            vec![
+                r#""a, b""#.to_string(),
+                "c".to_string(),
+                "{ d: e }".to_string()
+            ]
+        );
     }
 }

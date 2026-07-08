@@ -325,7 +325,10 @@ pub struct Capabilities {
     pub supports_evaluate_for_hovers: bool,
 
     /// `ExceptionBreakpointsFilters` advertised by the adapter.
-    #[serde(rename = "exceptionBreakpointFilters", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "exceptionBreakpointFilters",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub exception_breakpoint_filters: Option<Value>,
 
     /// The debug adapter supports the `terminate` request.
@@ -444,7 +447,10 @@ mod tests {
         assert_eq!(DapCommand::from_str("next"), Some(DapCommand::Next));
         assert_eq!(DapCommand::from_str("stepIn"), Some(DapCommand::StepIn));
         assert_eq!(DapCommand::from_str("stepOut"), Some(DapCommand::StepOut));
-        assert_eq!(DapCommand::from_str("disconnect"), Some(DapCommand::Disconnect));
+        assert_eq!(
+            DapCommand::from_str("disconnect"),
+            Some(DapCommand::Disconnect)
+        );
         assert_eq!(DapCommand::from_str("nope"), None);
     }
 

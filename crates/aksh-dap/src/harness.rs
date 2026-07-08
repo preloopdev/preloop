@@ -295,7 +295,8 @@ pub async fn replay_trace(
                     }
                 };
                 let resp = debugger.dispatch(req).await;
-                let actual_frame = DapFrame::a2c(serde_json::to_value(&resp).unwrap_or(Value::Null));
+                let actual_frame =
+                    DapFrame::a2c(serde_json::to_value(&resp).unwrap_or(Value::Null));
                 // Compare to the next a2c frame in the expected queue.
                 let mut consumed_expected: Option<DapFrame> = None;
                 let next = q.front();
@@ -352,7 +353,10 @@ pub async fn replay_trace(
             }
         }
     }
-    ReplayResult { actual, divergences }
+    ReplayResult {
+        actual,
+        divergences,
+    }
 }
 
 /// Compare two traces. Returns the set of frame indices where they
@@ -510,7 +514,8 @@ mod tests {
     #[tokio::test]
     async fn replay_initialize_trace() {
         let dbg = Arc::new(DapDebugger::new(sample_config()));
-        let trace = TraceBuilder::new("init").job_id("job-1")
+        let trace = TraceBuilder::new("init")
+            .job_id("job-1")
             .initial_steps(vec![step("Build")])
             .request(Request::new("initialize").with_arguments(json!({"clientID": "vscode"})))
             .expected(json!({
@@ -544,7 +549,8 @@ mod tests {
 
     #[test]
     fn trace_round_trips_json() {
-        let trace = TraceBuilder::new("rt").job_id("j")
+        let trace = TraceBuilder::new("rt")
+            .job_id("j")
             .request(Request::new("threads"))
             .build();
         let s = serde_json::to_string(&trace).unwrap();
@@ -564,12 +570,18 @@ mod tests {
 
     #[test]
     fn compare_traces_detects_length_difference() {
-        let mut t1 = TraceBuilder::new("a").job_id("j").request(Request::new("threads")).build();
+        let mut t1 = TraceBuilder::new("a")
+            .job_id("j")
+            .request(Request::new("threads"))
+            .build();
         t1.frames.push(DapFrame {
             direction: "a2c".into(),
             message: json!({"seq": 1, "type": "response", "command": "threads"}),
         });
-        let t2 = TraceBuilder::new("a").job_id("j").request(Request::new("threads")).build();
+        let t2 = TraceBuilder::new("a")
+            .job_id("j")
+            .request(Request::new("threads"))
+            .build();
         let diffs = compare_traces(&t1, &t2);
         assert_eq!(diffs.len(), 1);
         assert_eq!(diffs[0].kind, "missing");
@@ -578,7 +590,10 @@ mod tests {
     #[tokio::test]
     async fn recorder_records_both_directions() {
         let mut rec = DapRecorder::new("rec", "job-1", true, vec![], vec![], vec![]);
-        rec.record("c2a", json!({"seq": 1, "type": "request", "command": "threads"}));
+        rec.record(
+            "c2a",
+            json!({"seq": 1, "type": "request", "command": "threads"}),
+        );
         rec.record("a2c", json!({"seq": 1, "type": "response", "command": "threads", "request_seq": 1, "success": true}));
         let trace = rec.finish();
         assert_eq!(trace.frames.len(), 2);

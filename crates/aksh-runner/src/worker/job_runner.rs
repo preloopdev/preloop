@@ -18,7 +18,7 @@ use std::sync::Arc;
 use tokio::sync::{watch, Mutex};
 use tracing::{debug, error, info, warn};
 
-use aksh_dap::{DapDebugger, DebuggerTunnelInfo, IDapDebugger};
+use aksh_dap::IDapDebugger;
 
 use super::execution_context::Annotation;
 use super::server_queue::ServerQueue;
@@ -104,14 +104,18 @@ pub async fn run_job(
         let override_welcome = job_ctx
             .variables
             .get("ACTIONS_RUNNER_DEBUGGER_OVERRIDE_WELCOME_MESSAGE")
-            .or_else(|| job_ctx.variables.get("actions_runner_override_debugger_welcome_message"))
+            .or_else(|| {
+                job_ctx
+                    .variables
+                    .get("actions_runner_override_debugger_welcome_message")
+            })
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         if enable_debugger {
             if let Some(tunnel_json) = debugger_tunnel_json {
-                if let Ok(tunnel) = serde_json::from_value::<aksh_gha_protocol::DebuggerTunnelInfo>(
-                    tunnel_json,
-                ) {
+                if let Ok(tunnel) =
+                    serde_json::from_value::<aksh_gha_protocol::DebuggerTunnelInfo>(tunnel_json)
+                {
                     let cfg = aksh_dap::DebuggerConfig::new(
                         true,
                         Some(aksh_dap::DebuggerTunnelInfo {
@@ -125,7 +129,8 @@ pub async fn run_job(
                     );
                     if cfg.is_runnable() {
                         let dbg = std::sync::Arc::new(aksh_dap::DapDebugger::new(cfg));
-                        job_ctx.dap_debugger = Some(dbg.clone() as std::sync::Arc<dyn aksh_dap::IDapDebugger>);
+                        job_ctx.dap_debugger =
+                            Some(dbg.clone() as std::sync::Arc<dyn aksh_dap::IDapDebugger>);
                     } else {
                         warn!(
                             "Debugger enabled but tunnel config is invalid \
@@ -196,8 +201,16 @@ pub async fn run_job(
         let entries: Vec<aksh_dap::SourceEntry> = ordered_steps
             .iter()
             .map(|s| {
-                let is_pre = s.id.starts_with("__pre_") || s.raw.get("__pre").and_then(|v| v.as_bool()).unwrap_or(false);
-                let is_post = s.id.starts_with("__post_") || s.raw.get("__post").and_then(|v| v.as_bool()).unwrap_or(false);
+                let is_pre = s.id.starts_with("__pre_")
+                    || s.raw
+                        .get("__pre")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                let is_post = s.id.starts_with("__post_")
+                    || s.raw
+                        .get("__post")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                 aksh_dap::SourceEntry {
                     display_name: s.display_name.clone(),
                     is_pre,
@@ -220,7 +233,8 @@ pub async fn run_job(
             display_name: "Complete job".into(),
             frame_id: 1, // overwritten by view allocation
         }];
-        dbg.on_job_steps_initialized(&entries, &post, &predicted).await;
+        dbg.on_job_steps_initialized(&entries, &post, &predicted)
+            .await;
     }
 
     // Set up reporting context (F018/F019/F020)
@@ -319,7 +333,9 @@ pub async fn run_job(
         info!("Starting debugger…");
         if let Err(e) = dbg.start(&job_id, &[]).await {
             error!("DAP debugger failed to start: {e}");
-            debugger_result = Err(anyhow::anyhow!("The debugger failed to start or no debugger client connected in time."));
+            debugger_result = Err(anyhow::anyhow!(
+                "The debugger failed to start or no debugger client connected in time."
+            ));
         } else {
             // Register the bound local port with the server
             if let Some(port) = dbg.local_port() {
@@ -329,8 +345,14 @@ pub async fn run_job(
                     let register_url = format!("{}/api/v1/runs/{}/debug", base, plan_id);
                     let client = HttpClient::new(None)?;
                     let body = serde_json::json!({ "port": port });
-                    info!("Registering DAP port {} with server at {}", port, register_url);
-                    if let Err(e) = client.post_json_bearer::<serde_json::Value>(&register_url, &body, &token).await {
+                    info!(
+                        "Registering DAP port {} with server at {}",
+                        port, register_url
+                    );
+                    if let Err(e) = client
+                        .post_json_bearer::<serde_json::Value>(&register_url, &body, &token)
+                        .await
+                    {
                         warn!("Failed to register DAP port with server: {}", e);
                     }
                 }
@@ -538,26 +560,25 @@ fn spawn_renew_loop(
                 first_renew = false;
                 let http = rpt.results.http();
                 // Fire-and-forget health probes — matching official runner lifecycle
-                let broker_health = format!(
-                    "https://broker.actions.githubusercontent.com/health"
-                );
-                let run_health = format!(
-                    "https://run.actions.githubusercontent.com/health"
-                );
+                let broker_health = format!("https://broker.actions.githubusercontent.com/health");
+                let run_health = format!("https://run.actions.githubusercontent.com/health");
                 let results_ws = format!(
                     "https://results-receiver.actions.githubusercontent.com/_ws/ingest.sock"
                 );
-                let token_ready = format!(
-                    "https://token.actions.githubusercontent.com/ready"
-                );
+                let token_ready = format!("https://token.actions.githubusercontent.com/ready");
                 // Probe in parallel, non-blocking
                 let inner = http.inner_client();
                 let _ = tokio::join!(
-                    async { let _ = http.get_json::<serde_json::Value>(&broker_health).await; },
-                    async { let _ = http.get_json::<serde_json::Value>(&run_health).await; },
+                    async {
+                        let _ = http.get_json::<serde_json::Value>(&broker_health).await;
+                    },
+                    async {
+                        let _ = http.get_json::<serde_json::Value>(&run_health).await;
+                    },
                     async {
                         // WebSocket upgrade probe — official gets 101 Switching Protocols
-                        let _ = inner.get(&results_ws)
+                        let _ = inner
+                            .get(&results_ws)
                             .header("Upgrade", "websocket")
                             .header("Connection", "Upgrade")
                             .header("Sec-WebSocket-Version", "13")
@@ -565,7 +586,9 @@ fn spawn_renew_loop(
                             .send()
                             .await;
                     },
-                    async { let _ = http.get_json::<serde_json::Value>(&token_ready).await; },
+                    async {
+                        let _ = http.get_json::<serde_json::Value>(&token_ready).await;
+                    },
                 );
                 info!("Service health probes completed");
             }

@@ -56,13 +56,19 @@ pub async fn run_script(
     let shell_display = if args.is_empty() {
         program.clone()
     } else {
-        let shell_args: Vec<String> = args.iter().map(|a| {
-            if a.contains('/') && a.ends_with(".sh") || a.ends_with(".py") || a.ends_with(".ps1") {
-                "{0}".to_string()
-            } else {
-                a.clone()
-            }
-        }).collect();
+        let shell_args: Vec<String> = args
+            .iter()
+            .map(|a| {
+                if a.contains('/') && a.ends_with(".sh")
+                    || a.ends_with(".py")
+                    || a.ends_with(".ps1")
+                {
+                    "{0}".to_string()
+                } else {
+                    a.clone()
+                }
+            })
+            .collect();
         format!("{program} {}", shell_args.join(" "))
     };
     ctx.log(&format!("shell: {shell_display}"));
