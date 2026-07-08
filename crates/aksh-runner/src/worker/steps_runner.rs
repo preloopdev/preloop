@@ -75,10 +75,11 @@ pub async fn run_steps(
     let now = crate::worker::job_runner::iso_now();
 
     // F019: Queue initial "Set up job" step as completed (number 1, official convention)
+    let setup_step_id = uuid::Uuid::new_v4().to_string();
     {
         let mut q = queue.lock().await;
         q.queue_update(StepUpdate {
-            external_id: uuid::Uuid::new_v4().to_string(),
+            external_id: setup_step_id.clone(),
             number: 1,
             name: "Set up job".to_string(),
             status: step_status::COMPLETED,
@@ -86,6 +87,54 @@ pub async fn run_steps(
             completed_at: Some(now.clone()),
             conclusion: step_conclusion::SUCCEEDED,
         });
+    }
+
+    // Build "Set up job" log content matching official runner
+    {
+        let runner_name = job.env.get("RUNNER_NAME").cloned().unwrap_or_else(|| {
+            crate::settings::RunnerConfig::load(std::path::Path::new("."))
+                .ok()
+                .map(|c| c.settings.agent_name)
+                .unwrap_or_else(|| "aksh-runner".to_string())
+        });
+        let machine_name = hostname::get()
+            .ok()
+            .and_then(|h| h.into_string().ok())
+            .unwrap_or_else(|| "unknown".to_string());
+        let ts = crate::worker::job_runner::iso_now();
+
+        let mut setup_lines = Vec::new();
+        setup_lines.push(format!("{ts} Current runner version: '{}'", crate::PROTOCOL_COMPAT_VERSION));
+        setup_lines.push(format!("{ts} Runner name: '{runner_name}'"));
+        setup_lines.push(format!("{ts} Runner group name: 'Default'"));
+        setup_lines.push(format!("{ts} Machine name: '{machine_name}'"));
+
+        // GITHUB_TOKEN permissions from the job message (available in job context)
+        if let Some(token_perms) = job.github_context_value("token") {
+            if let Some(perms) = token_perms.as_object() {
+                setup_lines.push(format!("{ts} ##[group]GITHUB_TOKEN Permissions"));
+                for (perm, level) in perms {
+                    if let Some(level_str) = level.as_str() {
+                        setup_lines.push(format!("{ts} {perm}: {level_str}"));
+                    }
+                }
+                setup_lines.push(format!("{ts} ##[endgroup]"));
+            }
+        }
+
+        setup_lines.push(format!("{ts} Secret source: Actions"));
+        setup_lines.push(format!("{ts} Prepare workflow directory"));
+        setup_lines.push(format!("{ts} Prepare all required actions"));
+        setup_lines.push(format!("{ts} Complete job name: {}", job.job_name));
+
+        let setup_content = setup_lines.join("\n");
+        {
+            let mut q = queue.lock().await;
+            q.record_step_logs(&setup_step_id, &setup_content);
+        }
+        if let Some(rpt) = reporting {
+            crate::worker::job_runner::upload_step_log(rpt, &setup_step_id, &setup_content).await;
+        }
     }
 
     // Phase 2: Initialize containers step (step 2 when containers present)
@@ -609,17 +658,31 @@ pub async fn run_steps(
     } else {
         step_conclusion::SUCCEEDED
     };
+    let complete_step_id = uuid::Uuid::new_v4().to_string();
     {
         let mut q = queue.lock().await;
         q.queue_update(StepUpdate {
-            external_id: uuid::Uuid::new_v4().to_string(),
+            external_id: complete_step_id.clone(),
             number: complete_step_number,
             name: "Complete job".to_string(),
             status: step_status::COMPLETED,
             started_at: Some(ts.clone()),
-            completed_at: Some(ts),
+            completed_at: Some(ts.clone()),
             conclusion: final_conclusion,
         });
+    }
+
+    // Upload "Complete job" log matching official runner
+    {
+        let complete_content = format!("{ts} Cleaning up orphan processes");
+        {
+            let mut q = queue.lock().await;
+            q.record_step_logs(&complete_step_id, &complete_content);
+        }
+        if let Some(rpt) = reporting {
+            crate::worker::job_runner::upload_step_log(rpt, &complete_step_id, &complete_content)
+                .await;
+        }
     }
 
     Ok(if cancelled {
