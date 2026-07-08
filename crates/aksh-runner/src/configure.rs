@@ -40,14 +40,27 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
         registration.service_url
     );
 
-    // Step 2: Fetch connection data
-    let _conn_data = http
-        .get_json::<serde_json::Value>(&format!(
-            "{}/_apis/connectionData?connectOptions=0&lastChangeId=-1&lastChangeId64=-1",
-            registration.service_url
-        ))
-        .await
-        .context("fetching connectionData")?;
+    // Step 2: Fetch connection data (official calls 3x before pool discovery)
+    // Each call threads lastChangeId from the previous response.
+    let mut last_change_id: i64 = -1;
+    let mut last_change_id64: i64 = -1;
+    for _ in 0..3 {
+        let conn_data = http
+            .get_json::<serde_json::Value>(&format!(
+                "{}/_apis/connectionData?connectOptions=0&lastChangeId={}&lastChangeId64={}",
+                registration.service_url, last_change_id, last_change_id64
+            ))
+            .await
+            .context("fetching connectionData")?;
+        if let Some(loc) = conn_data.get("locationServiceData") {
+            if let Some(id) = loc.get("lastChangeId").and_then(|v| v.as_i64()) {
+                last_change_id = id;
+            }
+            if let Some(id) = loc.get("lastChangeId64").and_then(|v| v.as_i64()) {
+                last_change_id64 = id;
+            }
+        }
+    }
 
     // Step 3: Generate RSA keypair
     let keypair = aksh_gha_protocol::crypto::AgentRsaKeypair::generate()
@@ -113,6 +126,26 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
         .get("id")
         .and_then(|v| v.as_i64())
         .unwrap_or(1);
+
+    // Step 6b: Refresh connection data (official calls 3x after agent creation
+    // to pick up lastChangeId updates from the registration)
+    for _ in 0..3 {
+        let conn_data = http
+            .get_json::<serde_json::Value>(&format!(
+                "{}/_apis/connectionData?connectOptions=0&lastChangeId={}&lastChangeId64={}",
+                registration.service_url, last_change_id, last_change_id64
+            ))
+            .await
+            .context("fetching connectionData after agent creation")?;
+        if let Some(loc) = conn_data.get("locationServiceData") {
+            if let Some(id) = loc.get("lastChangeId").and_then(|v| v.as_i64()) {
+                last_change_id = id;
+            }
+            if let Some(id) = loc.get("lastChangeId64").and_then(|v| v.as_i64()) {
+                last_change_id64 = id;
+            }
+        }
+    }
 
     // Step 7: Persist configuration (F006: .credentials format, F007: .runner fields)
     // Extract OAuth URL and clientId from the agent creation RESPONSE (golden flow 6)
