@@ -49,6 +49,9 @@ pub struct JobContext {
     /// External IDs for synthetic steps created by steps_runner
     /// that MUST be reused in completejob to avoid duplicates.
     pub setup_step_id: Option<String>,
+    /// Cumulative size of output values across all steps in this job (UTF-16 bytes).
+    /// GitHub limit: 1 MB per job. Exceeding this fails the step.
+    pub output_size_utf16: usize,
     pub complete_step_id: Option<String>,
 }
 
@@ -126,9 +129,10 @@ impl JobContext {
             state: HashMap::new(),
             action_paths: HashMap::new(),
             matchers: MatcherRegistry::new(),
+            setup_step_id: None,
+            output_size_utf16: 0,
             container_state: None,
             live_logs: None,
-            setup_step_id: None,
             complete_step_id: None,
         }
     }
