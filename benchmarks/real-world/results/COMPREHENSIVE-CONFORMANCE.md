@@ -66,22 +66,25 @@ python3 benchmarks/real-world/log-content-diff.py --batch
 
 ## Scenario Matrix
 
+9 of 21 scenarios have completion data from both sides. The remaining 12 are incomplete — official runner timed out, aksh was cancelled, or neither side completed.
+
 | # | Scenario | Official | Aksh | Match | Issues |
 |---|---|---|---|---|---|
-| 80 | Custom Shells | (incomplete) | failure | — | Official timed out |
+| 90 | Shell Exit Behavior | failure | failure | ✅ | Step display names differ |
 | 93 | Empty/Null Values | success | success | ✅ | Step display names differ |
 | 94 | Action Pinning | success | success | ✅ | Step display names differ |
-| 100 | Tool Cache | success | success | ✅ | Step display names differ |
-| 90 | Shell Exit Behavior | failure | failure | ✅ | Step display names differ |
 | 98 | Outcome vs Conclusion | failure | failure | ✅ | Step display names differ |
-| 81 | Step Timeout | (incomplete) | failure | — | |
-| 82 | Reusable Workflow | failure | (incomplete) | — | |
+| 100 | Tool Cache | success | success | ✅ | Step display names differ |
+| 80 | Custom Shells | (incomplete) | failure | — | Official timed out; aksh fails python shell |
+| 81 | Step Timeout | (incomplete) | failure | — | Both have issues |
+| 82 | Reusable Workflow | failure | cancelled | — | Aksh cancelled (single runner can't do reusable) |
 | 83 | Local Node Action | (incomplete) | success | — | Official timed out |
-| 91 | Large Output | failure | success | ❌ | Conclusion mismatch |
-| 92 | Unicode Special Chars | failure | success | ❌ | Conclusion mismatch |
-| 85-89, 95-97, 99 | Various | — | — | — | Incomplete both sides |
+| 91 | Large Output | failure | success | ❌ | Output variable size limits differ |
+| 92 | Unicode Special Chars | failure | success | ❌ | Hex escape handling differs |
+| 96 | Env Inheritance | success | cancelled | ❌ | Infrastructure: single runner for multi-job workflow |
+| 84-89, 95, 97, 99 | Various | — | — | — | Incomplete both sides |
 
-**Totals: 8 matching, 4 mismatches, 8 incomplete**
+**5 real matches, 2 real mismatches (91, 92), 2 infrastructure failures (82, 96)**
 
 ## Conformance Report: Detailed Mismatches
 
