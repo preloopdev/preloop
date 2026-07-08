@@ -34,6 +34,8 @@ pub struct Step {
     pub timeout_minutes: Option<u64>,
     pub env: std::collections::HashMap<String, String>,
     pub raw: serde_json::Value,
+    /// Background steps run without DAP step-pauses, matching the official runner.
+    pub is_background: bool,
 }
 
 /// What kind of step this is.
@@ -434,31 +436,33 @@ pub async fn run_steps(
         // The official runner awaits this before every step:
         //     await dapDebugger?.OnStepStartingAsync(step);
         // If no editor is attached, the trait returns immediately.
-        if let Some(dbg) = dap_debugger.as_ref() {
-            let expr_ctx = step_ctx.job.build_expression_context();
-            let context_val =
-                serde_json::to_value(expr_ctx.roots()).unwrap_or_else(|_| serde_json::json!({}));
-            dbg.update_context(context_val, step_ctx.job.masks.clone());
+        if !step.is_background {
+            if let Some(dbg) = dap_debugger.as_ref() {
+                let expr_ctx = step_ctx.job.build_expression_context();
+                let context_val = serde_json::to_value(expr_ctx.roots())
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                dbg.update_context(context_val, step_ctx.job.masks.clone());
 
-            let is_pre = step.id.starts_with("__pre_")
-                || step
-                    .raw
-                    .get("__pre")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-            let is_post = step.id.starts_with("__post_")
-                || step
-                    .raw
-                    .get("__post")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-            let source_entry = aksh_dap::SourceEntry {
-                display_name: resolved_display_name.clone(),
-                is_pre,
-                is_post,
-            };
-            if let Err(e) = dbg.on_step_starting(&source_entry).await {
-                warn!("DAP OnStepStarting failed: {e}");
+                let is_pre = step.id.starts_with("__pre_")
+                    || step
+                        .raw
+                        .get("__pre")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                let is_post = step.id.starts_with("__post_")
+                    || step
+                        .raw
+                        .get("__post")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                let source_entry = aksh_dap::SourceEntry {
+                    display_name: resolved_display_name.clone(),
+                    is_pre,
+                    is_post,
+                };
+                if let Err(e) = dbg.on_step_starting(&source_entry).await {
+                    warn!("DAP OnStepStarting failed: {e}");
+                }
             }
         }
 
@@ -468,25 +472,27 @@ pub async fn run_steps(
             handle.abort();
         }
         // DAP: OnStepCompleted — emit `continued` if we paused.
-        if let Some(dbg) = dap_debugger.as_ref() {
-            let is_pre = step.id.starts_with("__pre_")
-                || step
-                    .raw
-                    .get("__pre")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-            let is_post = step.id.starts_with("__post_")
-                || step
-                    .raw
-                    .get("__post")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-            let source_entry = aksh_dap::SourceEntry {
-                display_name: resolved_display_name.clone(),
-                is_pre,
-                is_post,
-            };
-            dbg.on_step_completed(&source_entry);
+        if !step.is_background {
+            if let Some(dbg) = dap_debugger.as_ref() {
+                let is_pre = step.id.starts_with("__pre_")
+                    || step
+                        .raw
+                        .get("__pre")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                let is_post = step.id.starts_with("__post_")
+                    || step
+                        .raw
+                        .get("__post")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                let source_entry = aksh_dap::SourceEntry {
+                    display_name: resolved_display_name.clone(),
+                    is_pre,
+                    is_post,
+                };
+                dbg.on_step_completed(&source_entry);
+            }
         }
         if timed_out.load(std::sync::atomic::Ordering::SeqCst) {
             warn!(
@@ -1100,6 +1106,7 @@ mod tests {
             timeout_minutes: None,
             env: std::collections::HashMap::new(),
             raw: serde_json::json!({}),
+            is_background: false,
         }
     }
 
