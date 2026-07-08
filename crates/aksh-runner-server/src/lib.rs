@@ -1153,6 +1153,7 @@ async fn cancel_run(
     }
     inner.queue.retain(|job| job.run_id != run_id);
     inner.pending_jobs.retain(|job| job.run_id != run_id);
+    inner.dap_ports.remove(&run_id);
     let cancellation_count = cancellations.len();
     inner.cancellation_queue.extend(cancellations);
     let record = inner
@@ -2658,6 +2659,15 @@ async fn complete_job_inner(
                 .collect(),
         );
         run.status = summarize_run(run.jobs.values().copied());
+        if matches!(
+            run.status,
+            ExecutionStatus::Success
+                | ExecutionStatus::Failure
+                | ExecutionStatus::Skipped
+                | ExecutionStatus::Cancelled
+        ) {
+            inner.dap_ports.remove(&completion.run_id);
+        }
     }
     let cancelled_siblings = if completion.status == ExecutionStatus::Failure {
         apply_matrix_fail_fast(&mut inner, completion.run_id, &completion.job_id)
