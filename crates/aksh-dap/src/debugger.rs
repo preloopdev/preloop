@@ -896,21 +896,19 @@ impl IDapDebugger for DapDebugger {
 
         let mut rx = self.core.resume_tx.subscribe();
         let _ = rx.borrow_and_update();
-        let timeout_d = self.core.timeouts.connection;
-        tokio::select! {
-            _ = rx.changed() => {
-                *self.core.state.lock() = DapSessionState::Running;
-                let seq = self.next_seq_internal().await;
-                let _ = self.core.out_tx.lock().send(Outbound::Event(
-                    Event::new(seq, EVENT_CONTINUED)
-                        .with_body(json!({"threadId": 1, "allThreadsContinued": true})),
-                ));
-                Ok(())
-            }
-            _ = tokio::time::sleep(timeout_d) => {
-                Err(DapError::Protocol("step pause timeout".into()))
-            }
-        }
+        rx.changed()
+            .await
+            .map_err(|_| DapError::Protocol("debugger resume channel closed".into()))?;
+        *self.core.state.lock() = DapSessionState::Running;
+        let seq = self.next_seq_internal().await;
+        let _ = self
+            .core
+            .out_tx
+            .lock()
+            .send(Outbound::Event(Event::new(seq, EVENT_CONTINUED).with_body(
+                json!({"threadId": 1, "allThreadsContinued": true}),
+            )));
+        Ok(())
     }
 
     fn on_step_completed(&self, _step: &SourceEntry) {
