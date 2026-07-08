@@ -295,6 +295,73 @@ pub struct AgentJobRequestMessage {
         skip_serializing_if = "Option::is_none"
     )]
     pub job_service_containers: Option<serde_json::Value>,
+
+    /// Whether the debugger is enabled for this job. The runner
+    /// starts the DAP subsystem inside "Set up job" when this is
+    /// `true`. Mirrors `AgentJobRequestMessage.EnableDebugger` in
+    /// `actions/runner` v2.335.0+.
+    #[serde(
+        rename = "enableDebugger",
+        default,
+        skip_serializing_if = "is_false"
+    )]
+    pub enable_debugger: bool,
+
+    /// Dev Tunnel info for remote debugging. Required when
+    /// [`Self::enable_debugger`] is `true`. Mirrors
+    /// `AgentJobRequestMessage.DebuggerTunnel` and the
+    /// `DebuggerTunnelInfo` contract type from
+    /// `src/Sdk/DTPipelines/Pipelines/DebuggerTunnelInfo.cs`.
+    #[serde(
+        rename = "debuggerTunnel",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub debugger_tunnel: Option<DebuggerTunnelInfo>,
+
+    /// Optional welcome message. The runner emits it as a DAP
+    /// `output` event after the editor sends `initialize`. When
+    /// the `actions_runner_override_debugger_welcome_message`
+    /// feature flag is also set, this message replaces the
+    /// default. Mirrors `AgentJobRequestMessage.DebuggerWelcomeMessage`.
+    #[serde(
+        rename = "debuggerWelcomeMessage",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub debugger_welcome_message: Option<String>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// Dev Tunnel info for remote debugging. Required when
+/// [`AgentJobRequestMessage::enable_debugger`] is `true`.
+///
+/// 1:1 port of `src/Sdk/DTPipelines/Pipelines/DebuggerTunnelInfo.cs`
+/// in `actions/runner` v2.335.1. The runner binds its inner DAP
+/// server to `127.0.0.1:port` and presents `host_token` when
+/// opening the WebSocket to the Microsoft Dev Tunnels relay.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct DebuggerTunnelInfo {
+    /// Opaque tunnel identifier. The host and clients use this to
+    /// find each other in the multi-tenant relay.
+    #[serde(rename = "tunnelId", default)]
+    pub tunnel_id: String,
+    /// Azure region for the relay (e.g. `"use2"`). The runner
+    /// connects to `<cluster>-data.rel.tunnels.api.visualstudio.com`.
+    #[serde(rename = "clusterId", default)]
+    pub cluster_id: String,
+    /// Bearer credential presented by the runner when opening the
+    /// outbound WebSocket to the relay.
+    #[serde(rename = "hostToken", default)]
+    pub host_token: String,
+    /// Local TCP port the DAP server must bind to. Upstream
+    /// hard-codes this to `4711` and the runner rejects anything
+    /// else.
+    #[serde(rename = "port", default)]
+    pub port: u16,
 }
 
 /// Plan reference — identifies the orchestration plan.

@@ -18,6 +18,8 @@ use std::sync::Arc;
 use tokio::sync::{watch, Mutex};
 use tracing::{debug, error, info, warn};
 
+use aksh_dap::{DapDebugger, DebuggerTunnelInfo, IDapDebugger};
+
 use super::execution_context::Annotation;
 use super::server_queue::ServerQueue;
 use super::steps_runner::{Step, StepType};
@@ -51,6 +53,12 @@ pub async fn run_job(
         .unwrap_or("unknown");
 
     info!("Starting job: {job_name} ({job_id})");
+    let plan_id = job_message
+        .get("plan")
+        .and_then(|p| p.get("planId"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
     let steps = job_message
         .get("steps")
@@ -75,6 +83,59 @@ pub async fn run_job(
         variables,
         context_data,
     );
+
+    // ── DAP debugger (parity with GlobalContext.Debugger) ────────
+    // Mirrors `ExecutionContext.cs` populating `Global.Debugger` from
+    // `message.EnableDebugger` + `message.DebuggerTunnel` +
+    // `actions_runner_override_debugger_welcome_message` feature
+    // flag. If runnable, start the DAP server before "Set up job"
+    // emits, and block on `WaitUntilReady` so the first step
+    // pauses for an editor attach.
+    {
+        let enable_debugger = job_message
+            .get("enableDebugger")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let debugger_tunnel_json = job_message.get("debuggerTunnel").cloned();
+        let debugger_welcome = job_message
+            .get("debuggerWelcomeMessage")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let override_welcome = job_ctx
+            .variables
+            .get("ACTIONS_RUNNER_DEBUGGER_OVERRIDE_WELCOME_MESSAGE")
+            .or_else(|| job_ctx.variables.get("actions_runner_override_debugger_welcome_message"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if enable_debugger {
+            if let Some(tunnel_json) = debugger_tunnel_json {
+                if let Ok(tunnel) = serde_json::from_value::<aksh_gha_protocol::DebuggerTunnelInfo>(
+                    tunnel_json,
+                ) {
+                    let cfg = aksh_dap::DebuggerConfig::new(
+                        true,
+                        Some(aksh_dap::DebuggerTunnelInfo {
+                            tunnel_id: tunnel.tunnel_id,
+                            cluster_id: tunnel.cluster_id,
+                            host_token: tunnel.host_token,
+                            port: tunnel.port,
+                        }),
+                        override_welcome,
+                        debugger_welcome,
+                    );
+                    if cfg.is_runnable() {
+                        let dbg = std::sync::Arc::new(aksh_dap::DapDebugger::new(cfg));
+                        job_ctx.dap_debugger = Some(dbg.clone() as std::sync::Arc<dyn aksh_dap::IDapDebugger>);
+                    } else {
+                        warn!(
+                            "Debugger enabled but tunnel config is invalid \
+                             (tunnelId/clusterId/hostToken/port required)"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     // Initialize workspace
     let workspace = super::job_extension::setup_workspace(&job_message)?;
@@ -111,13 +172,7 @@ pub async fn run_job(
     }
 
     // Extract plan ID
-    let plan_id = job_message
-        .get("plan")
-        .and_then(|p| p.get("planId"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-
+    // plan_id is already defined and extracted at the top of the function.
     let main_steps = super::job_extension::build_step_list(&steps, &job_message);
 
     // F022/F023: download remote actions before lifecycle discovery so pre/post
@@ -129,6 +184,40 @@ pub async fn run_job(
     // Build step list (F023: includes pre/post from downloaded manifests)
     let ordered_steps =
         super::job_extension::build_step_list_with_lifecycle(main_steps, &workspace, &action_paths);
+
+    // ── DAP: build synthetic source view (OnJobStepsInitialized) ──
+    // Mirrors `JobRunner.cs`:
+    //     if (jobContext.Global.Debugger?.Enabled == true) {
+    //         var dapDebugger = HostContext.GetService<IDapDebugger>();
+    //         await dapDebugger.OnJobStepsInitializedAsync(
+    //             jobContext.JobSteps, jobContext.PostJobSteps);
+    //     }
+    if let Some(dbg) = job_ctx.dap_debugger.as_ref() {
+        let entries: Vec<aksh_dap::SourceEntry> = ordered_steps
+            .iter()
+            .map(|s| aksh_dap::SourceEntry {
+                display_name: s.display_name.clone(),
+                is_pre: false,
+                is_post: false,
+            })
+            .collect();
+        // Initial post steps are passed via the lifecycle
+        // mechanism; the Rust runner does not model them as
+        // separate `StepType::Post` entries. The first batch
+        // of post steps is what the C# code would pass to
+        // `OnJobStepsInitializedAsync`; the synthetic "Complete
+        // job" group is the conventional name.
+        let post = vec![aksh_dap::SourceEntry {
+            display_name: "Complete job".into(),
+            is_pre: false,
+            is_post: true,
+        }];
+        let predicted = vec![aksh_dap::PredictedPostStep {
+            display_name: "Complete job".into(),
+            frame_id: 1, // overwritten by view allocation
+        }];
+        dbg.on_job_steps_initialized(&entries, &post, &predicted).await;
+    }
 
     // Set up reporting context (F018/F019/F020)
     let reporting = if let Some((service_url, access_token)) =
@@ -221,18 +310,67 @@ pub async fn run_job(
     });
 
     // Execute steps with the derived cancel channel
-    let job_result = super::steps_runner::run_steps(
-        &ordered_steps,
-        &mut job_ctx,
-        &workspace,
-        job_cancel_rx,
-        queue.clone(),
-        reporting.as_deref(),
-        job_container_spec.as_ref(),
-        &service_specs,
-    )
-    .await;
+    let mut debugger_result = Ok(());
+    if let Some(dbg) = job_ctx.dap_debugger.as_ref() {
+        info!("Starting debugger…");
+        if let Err(e) = dbg.start(&job_id, &[]).await {
+            error!("DAP debugger failed to start: {e}");
+            debugger_result = Err(anyhow::anyhow!("The debugger failed to start or no debugger client connected in time."));
+        } else {
+            // Register the bound local port with the server
+            if let Some(port) = dbg.local_port() {
+                let base_url = extract_results_url(&job_message);
+                let auth = extract_service_endpoint(&job_message).map(|(_, token)| token);
+                if let (Some(base), Some(token)) = (base_url, auth) {
+                    let register_url = format!("{}/api/v1/runs/{}/debug", base, plan_id);
+                    let client = HttpClient::new(None)?;
+                    let body = serde_json::json!({ "port": port });
+                    info!("Registering DAP port {} with server at {}", port, register_url);
+                    if let Err(e) = client.post_json_bearer::<serde_json::Value>(&register_url, &body, &token).await {
+                        warn!("Failed to register DAP port with server: {}", e);
+                    }
+                }
+            }
 
+            // Wait for client connection
+            info!("Waiting for debugger client to connect…");
+            let mut job_cancel = cancel_rx.clone();
+            let wait_ready = dbg.wait_until_ready();
+            tokio::select! {
+                r = wait_ready => {
+                    if let Err(e) = r {
+                        error!("DAP debugger failed to connect: {e}");
+                        debugger_result = Err(anyhow::anyhow!("The debugger failed to start or no debugger client connected in time."));
+                    } else {
+                        info!("Debugger connected.");
+                    }
+                }
+                _ = job_cancel.changed() => {
+                    if *job_cancel.borrow() {
+                        error!("Job was cancelled before debugger client connected.");
+                        let _ = dbg.stop().await;
+                        debugger_result = Err(anyhow::anyhow!("Job was cancelled before debugger client connected."));
+                    }
+                }
+            }
+        }
+    }
+
+    let job_result = if let Err(e) = debugger_result {
+        Err(e)
+    } else {
+        super::steps_runner::run_steps(
+            &ordered_steps,
+            &mut job_ctx,
+            &workspace,
+            job_cancel_rx,
+            queue.clone(),
+            reporting.as_deref(),
+            job_container_spec.as_ref(),
+            &service_specs,
+        )
+        .await
+    };
     if let (Some(queue), Some(handle)) = (live_logs.as_ref(), live_log_handle) {
         queue.shutdown_and_wait(handle).await;
     }
@@ -243,6 +381,18 @@ pub async fn run_job(
     // Clean up timer/forward tasks
     timeout_handle.abort();
     forward_handle.abort();
+
+    // ── DAP: OnJobCompleted (emit terminated/exited, then teardown) ──
+    // Mirrors `JobExtension.cs` FinalizeJob block:
+    //     if (_dapDebugger != null) {
+    //         context.Output("Job completed — pausing for debugger inspection...");
+    //         await _dapDebugger.OnJobCompletedAsync();
+    //     }
+    if let Some(dbg) = job_ctx.dap_debugger.as_ref() {
+        if let Err(e) = dbg.on_job_completed().await {
+            warn!("DAP OnJobCompleted failed: {e}");
+        }
+    }
 
     // If the job timed out, override status to Failure with timeout message
     if was_timeout {

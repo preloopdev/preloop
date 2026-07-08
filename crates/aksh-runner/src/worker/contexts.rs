@@ -4,11 +4,13 @@ use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
+use aksh_dap::IDapDebugger;
+
 use crate::worker::execution_context::Annotation;
 use crate::worker::matchers::MatcherRegistry;
 
 /// The top-level job context holding all sub-contexts and accumulated state.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct JobContext {
     pub job_id: String,
     pub job_name: String,
@@ -47,6 +49,11 @@ pub struct JobContext {
     pub container_state: Option<super::container_ops::ContainerState>,
     /// Live log queue for WebSocket streaming (None when not connected).
     pub live_logs: Option<std::sync::Arc<crate::worker::live_logs::LiveLogQueue>>,
+    /// DAP debugger for this job. `None` unless the acquire
+    /// response set `enableDebugger=true` and provided a valid
+    /// `DebuggerTunnelInfo`. Mirrors `GlobalContext.Debugger` in
+    /// `actions/runner` v2.335.0+.
+    pub dap_debugger: Option<Arc<dyn IDapDebugger>>,
 }
 
 /// Result of a completed step.
@@ -125,6 +132,7 @@ impl JobContext {
             matchers: MatcherRegistry::new(),
             container_state: None,
             live_logs: None,
+            dap_debugger: None,
         }
     }
 

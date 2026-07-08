@@ -67,6 +67,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "aksh-dap"
+version = "0.1.0"
+dependencies = [
+ "aksh-gha-expressions",
+ "aksh-gha-protocol",
+ "anyhow",
+ "async-trait",
+ "base64",
+ "bytes",
+ "futures",
+ "indexmap",
+ "parking_lot",
+ "proptest",
+ "rand 0.8.6",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-tungstenite 0.23.1",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "aksh-gha-expressions"
 version = "0.1.0"
 dependencies = [
@@ -117,6 +145,7 @@ dependencies = [
 name = "aksh-runner"
 version = "0.1.0"
 dependencies = [
+ "aksh-dap",
  "aksh-gha-expressions",
  "aksh-gha-parser",
  "aksh-gha-protocol",

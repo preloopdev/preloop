@@ -11,6 +11,12 @@ use uuid::Uuid;
 /// Azure DevOps wire-format DTOs for the official runner protocol.
 pub mod azdo;
 
+// Re-exports for the DAP debugger integration. The runner
+// receives a job message and needs `DebuggerTunnelInfo` without
+// going through the `azdo` module path. Mirrors
+// `Sdk.DTPipelines.Pipelines.DebuggerTunnelInfo` in upstream.
+pub use azdo::DebuggerTunnelInfo;
+
 /// RSA/AES session encryption for the runner protocol.
 pub mod crypto;
 

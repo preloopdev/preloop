@@ -254,6 +254,9 @@ pub fn build_agent_job_message(
         job_timeout: None,
         job_container: plan.container.clone(),
         job_service_containers: non_empty_services(plan.services.clone()),
+        enable_debugger: false,
+        debugger_tunnel: None,
+        debugger_welcome_message: None,
     })
 }
 

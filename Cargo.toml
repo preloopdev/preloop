@@ -3,6 +3,7 @@ members = [
     "crates/aksh-artifacts",
     "crates/aksh-cache",
     "crates/aksh-conformance",
+    "crates/aksh-dap",
     "crates/aksh-gha-expressions",
     "crates/aksh-gha-parser",
     "crates/aksh-gha-protocol",

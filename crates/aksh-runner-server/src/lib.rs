@@ -290,6 +290,10 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             patch(complete_job_compat),
         )
         .route("/ws/live-logs/:job_id", get(ws_live_logs))
+        // DAP debugger routes (parity with `actions/runner`'s
+        // WebSocketDapBridge + devtunnel relay).
+        .route("/api/v1/runs/:run_id/debug", get(ws_dap_debug))
+        .route("/api/v1/runs/:run_id/debug", post(register_dap_port))
         .route("/broker/:runner_id/acquirejob", post(broker_acquire_job))
         .route("/broker/:runner_id/renewjob", post(broker_renew_job))
         .route("/broker/:runner_id/completejob", post(broker_complete_job))
@@ -738,6 +742,7 @@ struct InnerState {
     agent_job_requests: BTreeMap<uuid::Uuid, i64>,
     timeline_requests: BTreeMap<uuid::Uuid, i64>,
     session_active_requests: BTreeMap<String, i64>,
+    dap_ports: BTreeMap<RunId, u16>,
     next_runner_id: i64,
     next_cache_id: i64,
     next_message_id: i64,
@@ -1315,6 +1320,162 @@ async fn handle_live_log_socket(mut socket: WebSocket, job_id: String, shared: A
             }
         }
     }
+}
+
+#[derive(serde::Deserialize)]
+struct RegisterDapPortRequest {
+    port: u16,
+}
+
+async fn register_dap_port(
+    State(shared): State<Arc<SharedState>>,
+    Path(run_id): Path<RunId>,
+    Json(payload): Json<RegisterDapPortRequest>,
+) -> StatusCode {
+    let mut inner = shared.state.inner.lock().await;
+    inner.dap_ports.insert(run_id, payload.port);
+    info!(%run_id, port = payload.port, "Registered DAP port");
+    StatusCode::OK
+}
+
+async fn ws_dap_debug(
+    State(shared): State<Arc<SharedState>>,
+    Path(run_id): Path<RunId>,
+    ws: WebSocketUpgrade,
+) -> impl axum::response::IntoResponse {
+    ws.on_upgrade(move |socket| handle_dap_debug_socket(socket, run_id, shared))
+}
+
+async fn handle_dap_debug_socket(socket: WebSocket, run_id: RunId, shared: Arc<SharedState>) {
+    let port = {
+        let inner = shared.state.inner.lock().await;
+        inner.dap_ports.get(&run_id).copied()
+    };
+    let port = match port {
+        Some(p) => p,
+        None => {
+            warn!(%run_id, "DAP port not registered for run");
+            return;
+        }
+    };
+
+    info!(%run_id, port, "Starting DAP websocket proxy to runner");
+    if let Err(e) = pump_axum_ws_to_dap(socket, port).await {
+        warn!(%run_id, port, "DAP websocket proxy ended with error: {e}");
+    }
+}
+
+async fn pump_axum_ws_to_dap(ws: WebSocket, target_port: u16) -> Result<(), anyhow::Error> {
+    use futures::{SinkExt, StreamExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let mut target = TcpStream::connect(("127.0.0.1", target_port)).await?;
+    let (mut target_read, mut target_write) = target.split();
+    let (mut ws_sink, mut ws_stream) = ws.split();
+
+    let to_target = async {
+        while let Some(msg) = ws_stream.next().await {
+            match msg {
+                Ok(WsMessage::Text(text)) => {
+                    let bytes = text.as_bytes();
+                    let header = format!("Content-Length: {}\r\n\r\n", bytes.len());
+                    target_write.write_all(header.as_bytes()).await?;
+                    target_write.write_all(bytes).await?;
+                    target_write.flush().await?;
+                }
+                Ok(WsMessage::Binary(_)) => {
+                    return Err(anyhow::anyhow!("binary WebSocket frames are not allowed on the DAP bridge"));
+                }
+                Ok(WsMessage::Close(_)) | Err(_) => break,
+                Ok(WsMessage::Ping(_)) | Ok(WsMessage::Pong(_)) => continue,
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    };
+
+    let from_target = async {
+        let mut buf = bytes::BytesMut::with_capacity(32 * 1024);
+        loop {
+            let mut tmp = [0u8; 32 * 1024];
+            let n = match target_read.read(&mut tmp).await {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => return Err(e.into()),
+            };
+            buf.extend_from_slice(&tmp[..n]);
+            loop {
+                match try_drain_message_from_buf(&mut buf) {
+                    Some(Ok(text)) => {
+                        ws_sink
+                            .send(WsMessage::Text(text))
+                            .await
+                            .map_err(|e| anyhow::anyhow!("ws send: {e}"))?;
+                    }
+                    Some(Err(e)) => return Err(e),
+                    None => break,
+                }
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    };
+
+    tokio::select! {
+        a = to_target => a?,
+        b = from_target => b?,
+    }
+    Ok(())
+}
+
+fn try_drain_message_from_buf(buf: &mut bytes::BytesMut) -> Option<Result<String, anyhow::Error>> {
+    use bytes::Buf;
+    // Find CRLF CRLF
+    let terminator = find_crlf_crlf_bytes(buf)?;
+    let header_part = match std::str::from_utf8(&buf[..terminator]) {
+        Ok(s) => s,
+        Err(e) => return Some(Err(anyhow::anyhow!("non-utf8 header: {e}"))),
+    };
+    let content_len = match parse_content_length_str(header_part) {
+        Ok(len) => len,
+        Err(e) => return Some(Err(e)),
+    };
+    let total_len = terminator + 4 + content_len;
+    if buf.len() < total_len {
+        return None;
+    }
+    // Extract body
+    let start = terminator + 4;
+    let body_bytes = &buf[start..total_len];
+    let body_str = match std::str::from_utf8(body_bytes) {
+        Ok(s) => s.to_owned(),
+        Err(e) => return Some(Err(anyhow::anyhow!("non-utf8 body: {e}"))),
+    };
+    buf.advance(total_len);
+    Some(Ok(body_str))
+}
+
+fn find_crlf_crlf_bytes(buf: &bytes::BytesMut) -> Option<usize> {
+    for i in 0..buf.len().saturating_sub(3) {
+        if buf[i] == b'\r' && buf[i+1] == b'\n' && buf[i+2] == b'\r' && buf[i+3] == b'\n' {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn parse_content_length_str(headers: &str) -> Result<usize, anyhow::Error> {
+    for line in headers.split("\r\n") {
+        if let Some(rest) = line
+            .strip_prefix("Content-Length:")
+            .or_else(|| line.strip_prefix("content-length:"))
+        {
+            return rest
+                .trim()
+                .parse::<usize>()
+                .map_err(|e| anyhow::anyhow!("invalid Content-Length: {e}"));
+        }
+    }
+    Err(anyhow::anyhow!("missing Content-Length"))
 }
 
 async fn record_live_log_wrapper(

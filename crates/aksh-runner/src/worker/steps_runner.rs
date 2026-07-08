@@ -328,6 +328,11 @@ pub async fn run_steps(
             });
         }
 
+        // Capture the DAP debugger reference before `StepContext::new`
+        // takes a `&mut JobContext` borrow — the trait object can be
+        // invoked without holding a borrow on `job`.
+        let dap_debugger = job.dap_debugger.clone();
+
         let mut step_ctx = StepContext::new(
             job,
             step.context_name.clone(),
@@ -422,10 +427,24 @@ pub async fn run_steps(
             step_cancel_rx
         };
 
+        // ── DAP pause hook (parity with StepsRunner.cs) ───────────
+        // The official runner awaits this before every step:
+        //     await dapDebugger?.OnStepStartingAsync(step);
+        // If no editor is attached, the trait returns immediately.
+        if let Some(dbg) = dap_debugger.as_ref() {
+            if let Err(e) = dbg.on_step_starting(&resolved_display_name).await {
+                warn!("DAP OnStepStarting failed: {e}");
+            }
+        }
+
         let mut outcome =
             execute_step(&step.step_type, &mut step_ctx, workspace, exec_cancel_rx).await;
         if let Some(handle) = timeout_handle {
             handle.abort();
+        }
+        // DAP: OnStepCompleted — emit `continued` if we paused.
+        if let Some(dbg) = dap_debugger.as_ref() {
+            dbg.on_step_completed(&resolved_display_name);
         }
         if timed_out.load(std::sync::atomic::Ordering::SeqCst) {
             warn!(

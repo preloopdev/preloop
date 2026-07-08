@@ -15,6 +15,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+aksh-dap = { path = "../aksh-dap" }
 aksh-gha-protocol = { path = "../aksh-gha-protocol" }
 aksh-gha-expressions = { path = "../aksh-gha-expressions" }
 aksh-gha-parser = { path = "../aksh-gha-parser" }
