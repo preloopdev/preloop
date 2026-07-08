@@ -71,7 +71,7 @@ pub async fn run_broker_loop(
                     }
                     active_job = None;
                 }
-                Ok(None) => {} // still running
+                Ok(None) => {} // still running — wait() branch in select! will catch it
                 Err(e) => {
                     warn!("Error checking worker status: {e:#}");
                     active_job = None;
@@ -145,15 +145,6 @@ pub async fn run_broker_loop(
 
         let busy = active_job.is_some();
 
-        // When a job is running, use a short poll interval so we detect
-        // completion promptly (within 200ms) instead of waiting up to 50s
-        // for the broker long-poll to time out.
-        let poll_timeout = if busy {
-            std::time::Duration::from_millis(200)
-        } else {
-            std::time::Duration::from_secs(50)
-        };
-
         tokio::select! {
             _ = &mut shutdown => {
                 info!("Shutdown signal received");
@@ -166,9 +157,30 @@ pub async fn run_broker_loop(
                 }
                 return Ok(());
             }
-            // When a job is active, short-circuit the long-poll to re-check
-            // try_wait() at the top of the loop every 200ms.
-            _ = tokio::time::sleep(poll_timeout), if busy => {
+            // When a job is active, await its exit directly instead of
+            // polling try_wait() every 200ms.  This avoids generating a
+            // new GET /message?status=Busy every 200ms — the official
+            // runner issues only ONE busy poll per job.
+            result = async { active_job.as_mut().unwrap().wait().await }, if busy => {
+                match result {
+                    Ok(success) => {
+                        let id = &active_job.as_ref().unwrap().request_id;
+                        if success {
+                            info!("Worker completed job {id} successfully");
+                        } else {
+                            warn!("Worker failed for job {id}");
+                        }
+                    }
+                    Err(e) => warn!("Worker wait error: {e:#}"),
+                }
+                if once || config.settings.ephemeral {
+                    info!("exiting after first job");
+                    if !session_id.is_empty() {
+                        let _ = client.delete_session(&token, &session_id).await;
+                    }
+                    return Ok(());
+                }
+                active_job = None;
                 continue;
             }
             result = client.get_message(&token, &session_id, busy) => {
