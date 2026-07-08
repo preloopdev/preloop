@@ -258,16 +258,9 @@ impl DapDebugger {
         self.core.config.is_runnable()
     }
 
-    /// Internal: bind a TCP listener on the configured port.
+    /// Internal: bind a TCP listener on a random local port.
     async fn bind_tcp_server(&self) -> Result<TcpListener, DapError> {
-        let port = self
-            .core
-            .config
-            .tunnel
-            .as_ref()
-            .map(|t| t.port)
-            .unwrap_or(crate::DAP_TUNNEL_PORT);
-        let listener = TcpListener::bind(("127.0.0.1", port)).await?;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
         let bound_port = listener.local_addr()?.port();
         *self.core.local_port.lock() = Some(bound_port);
         Ok(listener)
@@ -781,6 +774,14 @@ impl IDapDebugger for DapDebugger {
         *self.core.job_id.lock().await = Some(job_id.to_string());
 
         let listener = self.bind_tcp_server().await?;
+        let local_port = listener.local_addr()?.port();
+
+        let bridge = crate::bridge::WebSocketDapBridge::new(tunnel.port, local_port);
+        tokio::spawn(async move {
+            if let Err(e) = bridge.run().await {
+                warn!("DAP WebSocket bridge failed: {e}");
+            }
+        });
 
         match self.launch_devtunnel(&tunnel).await {
             Ok(child) => *self.core.devtunnel_child.lock().await = Some(child),
