@@ -64,9 +64,6 @@ pub async fn run_broker_loop(
                     }
                     if once || config.settings.ephemeral {
                         info!("exiting after first job");
-                        if config.settings.ephemeral {
-                            ephemeral_unregister(http, config, &token).await;
-                        }
                         if !session_id.is_empty() {
                             let _ = client.delete_session(&token, &session_id).await;
                         }
@@ -158,9 +155,6 @@ pub async fn run_broker_loop(
                 if let Some(mut job) = active_job.take() {
                     info!("Killing active worker");
                     job.kill().await;
-                }
-                if once && config.settings.ephemeral {
-                    ephemeral_unregister(http, config, &token).await;
                 }
                 if !session_id.is_empty() {
                     let _ = client.delete_session(&token, &session_id).await;
@@ -263,9 +257,6 @@ pub async fn run_broker_loop(
                                     }
                                     if once || config.settings.ephemeral {
                                         info!("exiting after cancelled job");
-                                        if config.settings.ephemeral {
-                                            ephemeral_unregister(http, config, &token).await;
-                                        }
                                         let _ = client.delete_session(&token, &session_id).await;
                                         return Ok(());
                                     }
@@ -361,18 +352,6 @@ fn is_session_expired(err: &anyhow::Error) -> bool {
     }
 }
 
-/// P1.8: Unregister the agent on ephemeral (--once) exit.
-async fn ephemeral_unregister(http: &HttpClient, config: &RunnerConfig, token: &str) {
-    let delete_url = format!(
-        "{}/_apis/distributedtask/pools/{}/agents/{}?api-version=6.0-preview",
-        config.settings.server_url, config.settings.pool_id, config.settings.agent_id
-    );
-    if let Err(e) = http.delete_with_token(&delete_url, token).await {
-        warn!("Failed to unregister agent: {e:#}");
-    } else {
-        info!("Agent unregistered (ephemeral --once cleanup)");
-    }
-}
 
 /// F011: Extract session key only if present.
 fn extract_session_key_if_present(
