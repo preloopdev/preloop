@@ -447,7 +447,14 @@ pub fn build_step_list(steps: &[serde_json::Value], job_message: &serde_json::Va
 
         let display_name_override = step
             .get("displayName")
-            .and_then(template_scalar);
+            .and_then(template_scalar)
+            .or_else(|| {
+                // Live GitHub payloads use displayNameToken.lit instead of displayName
+                step.get("displayNameToken")
+                    .and_then(|t| t.get("lit"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            });
 
         let condition = step
             .get("condition")
