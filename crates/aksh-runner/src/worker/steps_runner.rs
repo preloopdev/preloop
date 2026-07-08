@@ -578,6 +578,14 @@ pub async fn run_steps(
             }
         }
 
+        // Official runner flushes step updates immediately when a step fails,
+        // so GitHub's UI shows the failure before post/always steps run.
+        if (conclusion_str == "Failure" || conclusion_str == "Cancelled") && reporting.is_some() {
+            if let Some(rpt) = reporting {
+                crate::worker::job_runner::flush_step_updates(rpt, &queue).await;
+            }
+        }
+
         // F020: Upload step log immediately after completion
         if let Some(rpt) = reporting {
             if !log_content.is_empty() {
