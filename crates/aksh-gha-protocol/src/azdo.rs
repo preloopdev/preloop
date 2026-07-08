@@ -326,6 +326,19 @@ pub struct AgentJobRequestMessage {
         skip_serializing_if = "Option::is_none"
     )]
     pub debugger_welcome_message: Option<String>,
+
+    /// aksh local-control-plane extension: the workflow run id to use when
+    /// registering local DAP proxy ports with `aksh-runner-server`.
+    ///
+    /// GitHub's hosted control plane does not need this because DAP traffic
+    /// reaches the runner through DevTunnels. aksh local mode needs a stable
+    /// run-scoped key for `/api/v1/runs/:run_id/debug`.
+    #[serde(
+        rename = "akshDebugRunId",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub aksh_debug_run_id: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {

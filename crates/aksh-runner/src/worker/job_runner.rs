@@ -342,18 +342,25 @@ pub async fn run_job(
                 let base_url = extract_results_url(&job_message);
                 let auth = extract_service_endpoint(&job_message).map(|(_, token)| token);
                 if let (Some(base), Some(token)) = (base_url, auth) {
-                    let register_url = format!("{}/api/v1/runs/{}/debug", base, plan_id);
-                    let client = HttpClient::new(None)?;
-                    let body = serde_json::json!({ "port": port });
-                    info!(
-                        "Registering DAP port {} with server at {}",
-                        port, register_url
-                    );
-                    if let Err(e) = client
-                        .post_json_bearer::<serde_json::Value>(&register_url, &body, &token)
-                        .await
+                    if let Some(run_id) = job_message.get("akshDebugRunId").and_then(|v| v.as_str())
                     {
-                        warn!("Failed to register DAP port with server: {}", e);
+                        let register_url = format!("{}/api/v1/runs/{}/debug", base, run_id);
+                        let client = HttpClient::new(None)?;
+                        let body = serde_json::json!({ "port": port, "job_id": job_id });
+                        info!(
+                            "Registering DAP port {} with server at {}",
+                            port, register_url
+                        );
+                        if let Err(e) = client
+                            .post_json_bearer::<serde_json::Value>(&register_url, &body, &token)
+                            .await
+                        {
+                            warn!("Failed to register DAP port with server: {}", e);
+                        }
+                    } else {
+                        warn!(
+                            "Debugger enabled but acquire payload did not include akshDebugRunId"
+                        );
                     }
                 }
             }

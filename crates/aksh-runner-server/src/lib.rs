@@ -951,6 +951,7 @@ pub(crate) async fn submit_run_inner(
             .map_err(|e| ApiError::bad_request(format!("failed to build job message: {e}")))?;
 
             agent_msg.enable_debugger = submission.enable_debugger;
+            agent_msg.aksh_debug_run_id = Some(run_id.to_string());
             if submission.enable_debugger {
                 agent_msg.debugger_tunnel = Some(azdo::DebuggerTunnelInfo {
                     tunnel_id: "local".to_string(),

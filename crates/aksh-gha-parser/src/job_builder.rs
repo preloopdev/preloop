@@ -257,6 +257,7 @@ pub fn build_agent_job_message(
         enable_debugger: false,
         debugger_tunnel: None,
         debugger_welcome_message: None,
+        aksh_debug_run_id: None,
     })
 }
 
