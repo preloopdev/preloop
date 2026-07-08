@@ -92,6 +92,11 @@ pub async fn run_broker_loop(
                 "agent": {
                     "id": config.settings.agent_id,
                     "name": config.settings.agent_name,
+                    "version": crate::PROTOCOL_COMPAT_VERSION,
+                    "osDescription": format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+                    "ephemeral": serde_json::Value::Null,
+                    "status": 0,
+                    "provisioningState": serde_json::Value::Null,
                 },
                 "useFipsEncryption": false,
             });
