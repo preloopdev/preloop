@@ -56,7 +56,7 @@ mkdir -p '$RUNNER_ROOT'
   --token '$REG_TOKEN' \
   --name '$RUNNER_NAME' \
   --unattended --replace --ephemeral \
-  --labels 'self-hosted,linux,x64' 2>&1 | tail -3
+  --labels 'self-hosted,linux,x64,mitm' 2>&1 | tail -3
 
 # Run once
 RUST_LOG=info \$AKSH_RUNNER --runner-root '$RUNNER_ROOT' run --once 2>&1

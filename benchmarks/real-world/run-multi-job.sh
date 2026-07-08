@@ -56,7 +56,7 @@ mkdir -p '$root'
   --token '$REG_TOKEN' \
   --name '$name' \
   --unattended --replace --ephemeral \
-  --labels 'self-hosted,linux,x64' >&2
+  --labels 'self-hosted,linux,x64,mitm' >&2
 RUST_LOG=info /workspace/target/aarch64-unknown-linux-musl/release/aksh-runner \
   --runner-root '$root' run --once 2>&1
 echo 'EXIT='\$?
