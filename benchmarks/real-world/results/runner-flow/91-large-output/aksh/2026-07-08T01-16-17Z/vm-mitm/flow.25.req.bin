@@ -1,0 +1,4 @@
+Creating 50KB output variable...
+Large output variable created
+2026-07-08T01:16:40.885Z ##[error]Unable to process file command successfully.
+2026-07-08T01:16:40.885Z ##[error]Invalid value. Matching delimiter not found 'EOF' (missing heredoc delimiter)

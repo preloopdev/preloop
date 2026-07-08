@@ -1,0 +1,27 @@
+EMOJI_VAR=🚀 Rocket 🎉 Party 🔥
+CJK_VAR=中文字符 日本語 한국어
+SPECIAL_VAR=quote"test' backslash\ newline
+test
+MATH_VAR=∑∏∫ mathematical symbols
+Retrieved emoji output: 🌟 Success! ✅ All tests passed 🎯
+Retrieved CJK output: 日本語のテスト: これは有効なテストです
+Retrieved special output: Quotes: "double" and single and \backslash and \n and \t
+✓ Emoji preserved in output
+✓ CJK characters preserved
+✓ Created directories and files with spaces and unicode
+total 0
+drwxr-xr-x 2 root root 60 Jul  8 01:17 .
+drwxr-xr-x 4 root root 80 Jul  8 01:17 ..
+-rw-r--r-- 1 root root  0 Jul  8 01:17 file with spaces.txt
+total 0
+drwxr-xr-x 2 root root 60 Jul  8 01:17 .
+drwxr-xr-x 4 root root 80 Jul  8 01:17 ..
+-rw-r--r-- 1 root root  0 Jul  8 01:17 文件.txt
+Multiline env var:
+Line 1 with emoji 🎨
+Line 2 with special chars: @#$%
+Line 3 with unicode: Ñoño Schöne
+
+✓ Multiline env var with unicode preserved
+2026-07-08T01:17:19.836Z ##[error]Unable to process file command successfully.
+2026-07-08T01:17:19.836Z ##[error]Invalid value. Matching delimiter not found 'EOF' (missing heredoc delimiter)

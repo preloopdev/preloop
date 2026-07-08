@@ -32,6 +32,10 @@ impl HttpClient {
                 crate::PROTOCOL_COMPAT_VERSION
             ));
 
+        let env_ca_bundle = std::env::var_os("SSL_CERT_FILE")
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from);
+        let ca_bundle = ca_bundle.or(env_ca_bundle.as_deref());
         if let Some(ca_path) = ca_bundle {
             let pem = std::fs::read(ca_path)
                 .with_context(|| format!("reading CA bundle {}", ca_path.display()))?;

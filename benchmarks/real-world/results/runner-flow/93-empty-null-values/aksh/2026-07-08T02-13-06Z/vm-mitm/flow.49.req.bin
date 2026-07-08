@@ -1,0 +1,19 @@
+2026-07-08T02:13:32.724Z ##[group]Run EMPTY=""
+2026-07-08T02:13:32.724Z EMPTY=""
+2026-07-08T02:13:32.725Z 
+2026-07-08T02:13:32.725Z if [[ -n "$EMPTY" ]]; then
+2026-07-08T02:13:32.725Z   echo "✗ Non-empty test failed on empty string"
+2026-07-08T02:13:32.725Z   exit 1
+2026-07-08T02:13:32.726Z else
+2026-07-08T02:13:32.726Z   echo "✓ Non-empty test correctly fails on empty string"
+2026-07-08T02:13:32.726Z fi
+2026-07-08T02:13:32.727Z 
+2026-07-08T02:13:32.727Z if [[ -z "$EMPTY" ]]; then
+2026-07-08T02:13:32.727Z   echo "✓ Empty test correctly passes on empty string"
+2026-07-08T02:13:32.727Z else
+2026-07-08T02:13:32.727Z   echo "✗ Empty test failed"
+2026-07-08T02:13:32.727Z   exit 1
+2026-07-08T02:13:32.728Z fi
+2026-07-08T02:13:32.728Z ##[endgroup]
+2026-07-08T02:13:32.730Z ✓ Non-empty test correctly fails on empty string
+2026-07-08T02:13:32.730Z ✓ Empty test correctly passes on empty string

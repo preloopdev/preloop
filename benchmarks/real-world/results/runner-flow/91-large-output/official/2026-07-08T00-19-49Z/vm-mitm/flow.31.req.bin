@@ -1,0 +1,19 @@
+﻿2026-07-08T00:20:12.1400759Z ##[group]Run echo "Creating 50KB output variable..."
+2026-07-08T00:20:12.1400916Z [36;1mecho "Creating 50KB output variable..."[0m
+2026-07-08T00:20:12.1401015Z [36;1mLARGE_OUTPUT=""[0m
+2026-07-08T00:20:12.1401111Z [36;1mfor i in {1..1000}; do[0m
+2026-07-08T00:20:12.1401689Z [36;1m  LARGE_OUTPUT="${LARGE_OUTPUT}This is line $i with some padding. Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation. Line $i end.\n"[0m
+2026-07-08T00:20:12.1401779Z [36;1mdone[0m
+2026-07-08T00:20:12.1401867Z [36;1m[0m
+2026-07-08T00:20:12.1402013Z [36;1m# Write to GITHUB_OUTPUT using heredoc for large content[0m
+2026-07-08T00:20:12.1402155Z [36;1mecho 'large_value<<EOF' >> $GITHUB_OUTPUT[0m
+2026-07-08T00:20:12.1402279Z [36;1mprintf "%s" "$LARGE_OUTPUT" >> $GITHUB_OUTPUT[0m
+2026-07-08T00:20:12.1402380Z [36;1mecho 'EOF' >> $GITHUB_OUTPUT[0m
+2026-07-08T00:20:12.1402472Z [36;1m[0m
+2026-07-08T00:20:12.1402624Z [36;1mecho "Large output variable created"[0m
+2026-07-08T00:20:12.1405988Z shell: /usr/bin/bash -e {0}
+2026-07-08T00:20:12.1406087Z ##[endgroup]
+2026-07-08T00:20:12.1418514Z Creating 50KB output variable...
+2026-07-08T00:20:13.2840072Z Large output variable created
+2026-07-08T00:20:13.2858010Z ##[error]Unable to process file command 'output' successfully.
+2026-07-08T00:20:13.2861195Z ##[error]Invalid value. Matching delimiter not found 'EOF'

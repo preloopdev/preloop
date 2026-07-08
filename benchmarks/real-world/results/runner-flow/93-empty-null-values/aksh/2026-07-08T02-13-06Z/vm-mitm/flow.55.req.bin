@@ -1,0 +1,17 @@
+2026-07-08T02:13:33.454Z ##[group]Run DEFINED='has_value'
+2026-07-08T02:13:33.455Z DEFINED='has_value'
+2026-07-08T02:13:33.455Z UNDEFINED=''
+2026-07-08T02:13:33.455Z 
+2026-07-08T02:13:33.455Z if [[ "$DEFINED" == "has_value" ]]; then
+2026-07-08T02:13:33.455Z   echo "✓ Defined output correctly retrieved"
+2026-07-08T02:13:33.456Z fi
+2026-07-08T02:13:33.456Z 
+2026-07-08T02:13:33.456Z if [[ "$UNDEFINED" == "" ]]; then
+2026-07-08T02:13:33.456Z   echo "✓ Undefined output field is empty string"
+2026-07-08T02:13:33.456Z else
+2026-07-08T02:13:33.456Z   echo "✗ Undefined output field not empty: '$UNDEFINED'"
+2026-07-08T02:13:33.457Z   exit 1
+2026-07-08T02:13:33.457Z fi
+2026-07-08T02:13:33.457Z ##[endgroup]
+2026-07-08T02:13:33.458Z ✓ Defined output correctly retrieved
+2026-07-08T02:13:33.459Z ✓ Undefined output field is empty string
