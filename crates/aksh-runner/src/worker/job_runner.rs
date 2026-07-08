@@ -354,6 +354,7 @@ fn spawn_renew_loop(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut cancel_rx = cancel_rx;
+        let mut first_renew = true;
         loop {
             if *cancel_rx.borrow() {
                 info!("Renew loop: job cancelled, stopping");
@@ -376,6 +377,33 @@ fn spawn_renew_loop(
                 Err(e) => {
                     warn!("renewjob failed: {e:#}");
                 }
+            }
+
+            // Official runner probes service health after the first renewjob
+            if first_renew {
+                first_renew = false;
+                let http = rpt.results.http();
+                // Fire-and-forget health probes — matching official runner lifecycle
+                let broker_health = format!(
+                    "https://broker.actions.githubusercontent.com/health"
+                );
+                let run_health = format!(
+                    "https://run.actions.githubusercontent.com/health"
+                );
+                let results_ws = format!(
+                    "https://results-receiver.actions.githubusercontent.com/_ws/ingest.sock"
+                );
+                let token_ready = format!(
+                    "https://token.actions.githubusercontent.com/ready"
+                );
+                // Probe in parallel, non-blocking
+                let _ = tokio::join!(
+                    async { let _ = http.get_json::<serde_json::Value>(&broker_health).await; },
+                    async { let _ = http.get_json::<serde_json::Value>(&run_health).await; },
+                    async { let _ = http.get_json::<serde_json::Value>(&results_ws).await; },
+                    async { let _ = http.get_json::<serde_json::Value>(&token_ready).await; },
+                );
+                info!("Service health probes completed");
             }
 
             tokio::select! {
