@@ -1,5 +1,5 @@
 # Capture Inventory & Conformance Status
-Generated: 2026-07-08 15:05 UTC
+Generated: 2026-07-08 18:26 UTC
 
 Two separate data sources:
 - **MITM flows** — raw HTTP traffic captures (flows.jsonl) from mitmproxy, recording every request/response
