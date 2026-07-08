@@ -1,0 +1,205 @@
+[
+  {
+    "direction": "c2a",
+    "message": {
+      "seq": 1,
+      "type": "request",
+      "command": "initialize",
+      "arguments": {
+        "clientID": "mitm-tester",
+        "adapterID": "aksh"
+      }
+    }
+  },
+  {
+    "direction": "a2c",
+    "message": {
+      "body": {
+        "supportsConfigurationDoneRequest": true,
+        "supportsEvaluateForHovers": true,
+        "supportsTerminateRequest": true
+      },
+      "command": "initialize",
+      "request_seq": 1,
+      "seq": 1,
+      "success": true,
+      "type": "response"
+    }
+  },
+  {
+    "direction": "a2c",
+    "message": {
+      "event": "initialized",
+      "seq": 2,
+      "type": "event"
+    }
+  },
+  {
+    "direction": "c2a",
+    "message": {
+      "seq": 2,
+      "type": "request",
+      "command": "configurationDone"
+    }
+  },
+  {
+    "direction": "a2c",
+    "message": {
+      "body": null,
+      "command": "configurationDone",
+      "request_seq": 2,
+      "seq": 3,
+      "success": true,
+      "type": "response"
+    }
+  },
+  {
+    "direction": "a2c",
+    "message": {
+      "body": {
+        "category": "console",
+        "output": "DAP Debugger Session Started for aksh\n"
+      },
+      "event": "output",
+      "seq": 4,
+      "type": "event"
+    }
+  },
+  {
+    "direction": "a2c",
+    "message": {
+      "body": {
+        "reason": "started",
+        "threadId": 1
+      },
+      "event": "thread",
+      "seq": 5,
+      "type": "event"
+    }
+  },
+  {
+    "direction": "a2c",
+    "message": {
+      "body": {
+        "allThreadsStopped": true,
+        "description": "Stopped at job entry: Step 1",
+        "reason": "entry",
+        "threadId": 1
+      },
+      "event": "stopped",
+      "seq": 6,
+      "type": "event"
+    }
+  },
+  {
+    "direction": "c2a",
+    "message": {
+      "seq": 3,
+      "type": "request",
+      "command": "scopes",
+      "arguments": {
+        "frameId": 0
+      }
+    }
+  },
+  {
+    "direction": "a2c",
+    "message": {
+      "body": {
+        "scopes": [
+          {
+            "name": "github",
+            "variables_count": 0,
+            "variables_reference": 1
+          },
+          {
+            "name": "env",
+            "variables_count": 0,
+            "variables_reference": 2
+          },
+          {
+            "name": "runner",
+            "variables_count": 0,
+            "variables_reference": 3
+          },
+          {
+            "name": "job",
+            "variables_count": 0,
+            "variables_reference": 4
+          },
+          {
+            "name": "steps",
+            "variables_count": 0,
+            "variables_reference": 5
+          },
+          {
+            "name": "secrets",
+            "variables_count": 0,
+            "variables_reference": 6
+          }
+        ]
+      },
+      "command": "scopes",
+      "request_seq": 3,
+      "seq": 7,
+      "success": true,
+      "type": "response"
+    }
+  },
+  {
+    "direction": "c2a",
+    "message": {
+      "seq": 4,
+      "type": "request",
+      "command": "continue",
+      "arguments": {
+        "threadId": 1
+      }
+    }
+  },
+  {
+    "direction": "a2c",
+    "message": {
+      "body": {
+        "allThreadsContinued": true,
+        "threadId": 1
+      },
+      "event": "continued",
+      "seq": 8,
+      "type": "event"
+    }
+  },
+  {
+    "direction": "a2c",
+    "message": {
+      "body": {
+        "allThreadsContinued": true
+      },
+      "command": "continue",
+      "request_seq": 4,
+      "seq": 8,
+      "success": true,
+      "type": "response"
+    }
+  },
+  {
+    "direction": "a2c",
+    "message": {
+      "body": {
+        "allThreadsContinued": true,
+        "threadId": 1
+      },
+      "event": "continued",
+      "seq": 9,
+      "type": "event"
+    }
+  },
+  {
+    "direction": "a2c",
+    "message": {
+      "event": "terminated",
+      "seq": 10,
+      "type": "event"
+    }
+  }
+]

@@ -41,7 +41,18 @@ async function runScenario(backend) {
     const serverProc = spawn(
         path.join(AKSH_RUNNER_DIR, "aksh-runner-server"),
         ["serve", "--listen", "0.0.0.0:9090", "--state-dir", tempStateDir],
-        { stdio: "pipe", env: { ...process.env, RUST_LOG: "info", AKSH_PUBLIC_URL: "http://192.168.1.221:9090" } }
+        {
+            stdio: "pipe",
+            env: {
+                ...process.env,
+                RUST_LOG: "info",
+                // Official runner needs LAN IP (port 80 redirect via mitm).
+                // Aksh runner connects directly to localhost.
+                AKSH_PUBLIC_URL: backend === "official"
+                    ? "http://192.168.1.221:9090"
+                    : "http://127.0.0.1:9090",
+            }
+        }
     );
     
     let serverOutput = "";
@@ -100,17 +111,23 @@ async function runScenario(backend) {
     const token = tokenData.token;
     console.log(`Registration token: ${token}`);
 
-    // Set proxy environment variables for the runner
-    const runnerEnv = {
+    // Set proxy environment variables for the runner.
+    // Official runner needs the proxy for port 80 → 9090 redirect.
+    // Aksh runner connects directly — proxy breaks its WebSocket live-log connection.
+    const baseEnv = {
         ...process.env,
+        GITHUB_ACTIONS_RUNNER_TLS_NO_VERIFY: "1",
+        RUST_LOG: "info"
+    };
+    const proxyEnv = {
+        ...baseEnv,
         http_proxy: "http://127.0.0.1:18080",
         https_proxy: "http://127.0.0.1:18080",
         HTTP_PROXY: "http://127.0.0.1:18080",
         HTTPS_PROXY: "http://127.0.0.1:18080",
-        GITHUB_ACTIONS_RUNNER_TLS_NO_VERIFY: "1",
         SSL_CERT_FILE: path.join(MITM_DIR, ".cache/mitmproxy/mitmproxy-ca-cert.pem"),
-        RUST_LOG: "info"
     };
+    const runnerEnv = backend === "official" ? proxyEnv : baseEnv;
 
     let runnerProc;
     if (backend === "official") {
@@ -166,7 +183,7 @@ async function runScenario(backend) {
             [
                 "configure",
                 "--unattended",
-                "--url", "http://192.168.1.221:9090/runner/server",
+                "--url", "http://127.0.0.1:9090",
                 "--token", token,
                 "--name", `mitm-aksh-${backend}`,
                 "--labels", "self-hosted,mitm,ubuntu-latest",
