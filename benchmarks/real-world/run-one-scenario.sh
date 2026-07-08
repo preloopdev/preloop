@@ -11,20 +11,27 @@ WORKSPACE="/Users/bnjoroge/macos-runners"
 
 log() { echo "[$(date +%T.%3N)] $*"; }
 
-# ── Cancel any queued runs for this workflow ────────────────────────
-WFBASE=$(basename "$WF" .yml)
-log "Cancelling stale runs for $WFBASE..."
-gh run list -R "$GH_REPO" -w "$WF" --json databaseId,status \
-  -q '.[] | select(.status == "queued" or .status == "in_progress") | .databaseId' 2>/dev/null | \
+# ── Cancel ALL stale runs and wait for effect ──────────────────────
+log "Cancelling ALL queued/in-progress runs..."
+for rid in $(gh run list -R "$GH_REPO" -L 30 --json databaseId,status \
+  -q '.[] | select(.status == "queued" or .status == "in_progress") | .databaseId' 2>/dev/null); do
+  gh run cancel "$rid" -R "$GH_REPO" 2>/dev/null || true
+done
+log "Waiting for cancellations to take effect..."
+for i in $(seq 1 12); do
+  PENDING=$(gh run list -R "$GH_REPO" -L 10 --json status -q '[.[] | select(.status == "queued" or .status == "in_progress")] | length' 2>/dev/null || echo 0)
+  [ "$PENDING" -eq 0 ] && { log "Queue clear"; break; }
+  sleep 5
+done
+# Delete stale offline runners
+gh api "repos/$GH_REPO/actions/runners" --jq '.runners[] | select(.status == "offline") | .id' 2>/dev/null | \
   while read -r rid; do
-    gh run cancel "$rid" -R "$GH_REPO" 2>/dev/null || true
+    gh api -X DELETE "repos/$GH_REPO/actions/runners/$rid" 2>/dev/null || true
   done
-
-# ── Kill any running runners in VM ──────────────────────────────────
+# ── Kill stale runner processes in VM ───────────────────────────────
 log "Killing stale runners in $VM..."
-smolvm machine exec --name "$VM" -- bash -c 'pkill -f aksh-runner 2>/dev/null || true' 2>/dev/null || true
+smolvm machine exec --name "$VM" -- bash -c 'pkill -f aksh-runner 2>/dev/null; true' 2>/dev/null || true
 sleep 2
-
 # ── Get registration token ──────────────────────────────────────────
 log "Getting registration token..."
 REG_TOKEN=$(gh api "repos/$GH_REPO/actions/runners/registration-token" --method POST --jq .token)
