@@ -477,6 +477,15 @@ impl DapDebugger {
                         }
                     }
                 }
+                if matches!(req.raw.command.as_str(), "continue" | "next" | "stepIn" | "stepOut") {
+                    let event_seq = next_seq(&core).await;
+                    let _ = out_tx_dispatch.send(Outbound::Event(
+                        Event::new(event_seq, EVENT_CONTINUED).with_body(json!({
+                            "threadId": 1,
+                            "allThreadsContinued": true,
+                        })),
+                    ));
+                }
                 if matches!(req.raw.command.as_str(), "disconnect" | "terminate") {
                     break;
                 }
@@ -659,12 +668,8 @@ async fn dispatch_one(core: &Arc<DebuggerCore>, req: &Request, seq: i64) -> Resp
         "continue" => {
             *core.state.lock() = DapSessionState::Running;
             let _ = core.resume_tx.send(());
-            let _ = core
-                .out_tx
-                .lock()
-                .send(Outbound::Event(Event::new(seq, EVENT_CONTINUED).with_body(
-                    json!({"threadId": 1, "allThreadsContinued": true}),
-                )));
+            // continued event is sent by the dispatcher loop after
+            // the response, matching official runner ordering.
             Response::success(seq, req.header.seq, "continue")
                 .with_body(json!({"allThreadsContinued": true}))
         }
@@ -917,14 +922,8 @@ impl IDapDebugger for DapDebugger {
             .await
             .map_err(|_| DapError::Protocol("debugger resume channel closed".into()))?;
         *self.core.state.lock() = DapSessionState::Running;
-        let seq = self.next_seq_internal().await;
-        let _ = self
-            .core
-            .out_tx
-            .lock()
-            .send(Outbound::Event(Event::new(seq, EVENT_CONTINUED).with_body(
-                json!({"threadId": 1, "allThreadsContinued": true}),
-            )));
+        // continued event is sent by the dispatcher loop after the
+        // continue response, matching official runner ordering.
         Ok(())
     }
 
