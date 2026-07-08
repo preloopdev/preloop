@@ -45,6 +45,15 @@ pub async fn run_script(
     ctx.debug(&format!("Shell resolved: {}", program));
     ctx.debug(&format!("Command line: {} {:?}", program, args));
 
+    // Official runner wraps script execution in a group showing the command
+    let first_line = script.lines().next().unwrap_or("");
+    ctx.log(&format!("##[group]Run {first_line}"));
+    // Echo the full script content inside the group (one line per script line)
+    for line in script.lines() {
+        ctx.log(line);
+    }
+    ctx.log("##[endgroup]");
+
     // Build environment
     let env = ctx.build_env();
     let ctx_ref = &*ctx;
@@ -62,6 +71,9 @@ pub async fn run_script(
         false,
     )
     .await?;
+
+    // Flush any partial line remaining in the buffer
+    ctx.flush_line_buffer();
     // Check exit code
     if result.exit_code != 0 {
         ctx.log(&format!(
@@ -157,6 +169,15 @@ pub async fn run_script_in_container(
     ctx.debug(&format!(
         "Command line: docker exec -i {container_id} {container_program} {container_args_ref:?}"
     ));
+
+    // Official runner wraps script execution in a group
+    let first_line = script.lines().next().unwrap_or("");
+    ctx.log(&format!("##[group]Run {first_line}"));
+    for line in script.lines() {
+        ctx.log(line);
+    }
+    ctx.log("##[endgroup]");
+
     let ctx_ref = &*ctx;
     let on_chunk = Box::new(move |chunk: &[u8]| {
         ctx_ref.write_chunk(chunk);
@@ -172,6 +193,9 @@ pub async fn run_script_in_container(
         Some(on_chunk),
     )
     .await?;
+
+    // Flush any partial line remaining in the buffer
+    ctx.flush_line_buffer();
     // Check exit code
     if result.exit_code != 0 {
         ctx.log(&format!(
