@@ -1,0 +1,20 @@
+2026-07-08T02:21:06.352Z ##[group]Run EMPTY=''
+2026-07-08T02:21:06.352Z EMPTY=''
+2026-07-08T02:21:06.352Z 
+2026-07-08T02:21:06.352Z if [[ -z "$EMPTY" ]]; then
+2026-07-08T02:21:06.353Z   echo "✓ Empty string identified with -z test"
+2026-07-08T02:21:06.353Z else
+2026-07-08T02:21:06.353Z   echo "✗ Empty string not recognized"
+2026-07-08T02:21:06.353Z   exit 1
+2026-07-08T02:21:06.353Z fi
+2026-07-08T02:21:06.353Z 
+2026-07-08T02:21:06.353Z if [[ "$EMPTY" == '' ]]; then
+2026-07-08T02:21:06.353Z   echo "✓ Comparison with empty string works"
+2026-07-08T02:21:06.353Z else
+2026-07-08T02:21:06.353Z   echo "✗ Empty string comparison failed"
+2026-07-08T02:21:06.353Z   exit 1
+2026-07-08T02:21:06.354Z fi
+2026-07-08T02:21:06.354Z shell: bash --noprofile --norc -e -o pipefail {0}
+2026-07-08T02:21:06.354Z ##[endgroup]
+2026-07-08T02:21:06.355Z ✓ Empty string identified with -z test
+2026-07-08T02:21:06.355Z ✓ Comparison with empty string works

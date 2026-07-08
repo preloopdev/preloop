@@ -1,0 +1,12 @@
+2026-07-08T02:21:07.412Z ##[group]Run UNDEFINED=''
+2026-07-08T02:21:07.412Z UNDEFINED=''
+2026-07-08T02:21:07.412Z 
+2026-07-08T02:21:07.412Z if [[ -z "$UNDEFINED" ]]; then
+2026-07-08T02:21:07.412Z   echo "✓ Undefined step output is empty string"
+2026-07-08T02:21:07.412Z else
+2026-07-08T02:21:07.413Z   echo "✗ Undefined step output is not empty: '$UNDEFINED'"
+2026-07-08T02:21:07.413Z   exit 1
+2026-07-08T02:21:07.413Z fi
+2026-07-08T02:21:07.413Z shell: bash --noprofile --norc -e -o pipefail {0}
+2026-07-08T02:21:07.413Z ##[endgroup]
+2026-07-08T02:21:07.416Z ✓ Undefined step output is empty string

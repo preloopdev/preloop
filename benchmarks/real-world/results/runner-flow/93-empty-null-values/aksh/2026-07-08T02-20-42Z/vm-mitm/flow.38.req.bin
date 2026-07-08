@@ -1,0 +1,21 @@
+2026-07-08T02:21:06.748Z ##[group]Run # Unset env var should be empty/null
+2026-07-08T02:21:06.748Z # Unset env var should be empty/null
+2026-07-08T02:21:06.749Z UNSET_VAR="${NONEXISTENT_VAR}"
+2026-07-08T02:21:06.749Z 
+2026-07-08T02:21:06.749Z if [[ -z "$UNSET_VAR" ]]; then
+2026-07-08T02:21:06.749Z   echo "✓ Unset env var reference is empty"
+2026-07-08T02:21:06.749Z else
+2026-07-08T02:21:06.749Z   echo "✗ Unset env var is not empty: '$UNSET_VAR'"
+2026-07-08T02:21:06.750Z   exit 1
+2026-07-08T02:21:06.750Z fi
+2026-07-08T02:21:06.750Z 
+2026-07-08T02:21:06.750Z # Test in conditional
+2026-07-08T02:21:06.750Z if [[ "$NONEXISTENT_VAR" == "" ]]; then
+2026-07-08T02:21:06.750Z   echo "✓ Unset var comparison works"
+2026-07-08T02:21:06.750Z else
+2026-07-08T02:21:06.750Z   echo "✗ Unset var comparison failed"
+2026-07-08T02:21:06.751Z fi
+2026-07-08T02:21:06.751Z shell: bash --noprofile --norc -e -o pipefail {0}
+2026-07-08T02:21:06.751Z ##[endgroup]
+2026-07-08T02:21:06.753Z ✓ Unset env var reference is empty
+2026-07-08T02:21:06.753Z ✓ Unset var comparison works

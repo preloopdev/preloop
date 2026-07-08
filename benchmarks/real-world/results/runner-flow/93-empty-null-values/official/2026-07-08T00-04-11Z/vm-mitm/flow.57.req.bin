@@ -1,0 +1,5 @@
+﻿2026-07-08T00:04:34.5384429Z ##[group]Run # Set one output but not another
+2026-07-08T00:04:34.5384736Z [36;1m# Set one output but not another[0m
+2026-07-08T00:04:34.5385042Z [36;1mecho 'defined_field=has_value' >> $GITHUB_OUTPUT[0m
+2026-07-08T00:04:34.5387568Z shell: /usr/bin/bash -e {0}
+2026-07-08T00:04:34.5387815Z ##[endgroup]

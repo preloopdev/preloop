@@ -1,0 +1,23 @@
+﻿2026-07-08T00:20:13.2920285Z ##[group]Run OUTPUT=''
+2026-07-08T00:20:13.2920455Z [36;1mOUTPUT=''[0m
+2026-07-08T00:20:13.2920574Z [36;1mOUTPUT_SIZE=${#OUTPUT}[0m
+2026-07-08T00:20:13.2920700Z [36;1m[0m
+2026-07-08T00:20:13.2920847Z [36;1mecho "Retrieved output variable size: $OUTPUT_SIZE bytes"[0m
+2026-07-08T00:20:13.2921035Z [36;1m[0m
+2026-07-08T00:20:13.2921154Z [36;1mif [[ $OUTPUT_SIZE -gt 40000 ]]; then[0m
+2026-07-08T00:20:13.2921358Z [36;1m  echo "✓ Large output variable (50KB+) retrieved successfully"[0m
+2026-07-08T00:20:13.2921543Z [36;1melse[0m
+2026-07-08T00:20:13.2921706Z [36;1m  echo "⚠ Output variable size smaller than expected: $OUTPUT_SIZE bytes"[0m
+2026-07-08T00:20:13.2921905Z [36;1mfi[0m
+2026-07-08T00:20:13.2922005Z [36;1m[0m
+2026-07-08T00:20:13.2922120Z [36;1m# Verify content integrity[0m
+2026-07-08T00:20:13.2922302Z [36;1mif [[ "$OUTPUT" == *"Line 1"* ]] && [[ "$OUTPUT" == *"Line 1000"* ]]; then[0m
+2026-07-08T00:20:13.2922510Z [36;1m  echo "✓ Large output variable content verified"[0m
+2026-07-08T00:20:13.2922688Z [36;1melse[0m
+2026-07-08T00:20:13.2922820Z [36;1m  echo "✗ Large output variable content corrupted"[0m
+2026-07-08T00:20:13.2922975Z [36;1mfi[0m
+2026-07-08T00:20:13.2926311Z shell: /usr/bin/bash -e {0}
+2026-07-08T00:20:13.2926446Z ##[endgroup]
+2026-07-08T00:20:13.2935967Z Retrieved output variable size: 0 bytes
+2026-07-08T00:20:13.2982075Z ⚠ Output variable size smaller than expected: 0 bytes
+2026-07-08T00:20:13.2982287Z ✗ Large output variable content corrupted
