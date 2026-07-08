@@ -397,10 +397,20 @@ fn spawn_renew_loop(
                     "https://token.actions.githubusercontent.com/ready"
                 );
                 // Probe in parallel, non-blocking
+                let inner = http.inner_client();
                 let _ = tokio::join!(
                     async { let _ = http.get_json::<serde_json::Value>(&broker_health).await; },
                     async { let _ = http.get_json::<serde_json::Value>(&run_health).await; },
-                    async { let _ = http.get_json::<serde_json::Value>(&results_ws).await; },
+                    async {
+                        // WebSocket upgrade probe — official gets 101 Switching Protocols
+                        let _ = inner.get(&results_ws)
+                            .header("Upgrade", "websocket")
+                            .header("Connection", "Upgrade")
+                            .header("Sec-WebSocket-Version", "13")
+                            .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+                            .send()
+                            .await;
+                    },
                     async { let _ = http.get_json::<serde_json::Value>(&token_ready).await; },
                 );
                 info!("Service health probes completed");
