@@ -48,6 +48,12 @@ enum Command {
         /// Secret in KEY=VALUE form. Values are redacted in JSON output.
         #[arg(long = "secret")]
         secrets: Vec<String>,
+        /// Enable the DAP debugger for this run.
+        #[arg(long)]
+        debug: bool,
+        /// Welcome message displayed by the debugger after attach.
+        #[arg(long)]
+        debugger_welcome_message: Option<String>,
     },
     /// Show a run.
     Run {
@@ -87,6 +93,8 @@ async fn main() -> anyhow::Result<()> {
             git_ref,
             vars,
             secrets,
+            debug,
+            debugger_welcome_message,
         } => {
             let workflow_yaml = tokio::fs::read_to_string(&workflow)
                 .await
@@ -114,6 +122,8 @@ async fn main() -> anyhow::Result<()> {
                     &workflow,
                 )
                 .await?,
+                enable_debugger: debug,
+                debugger_welcome_message,
             };
             let response = http
                 .post(cli.server.join("/api/v1/runs")?)
@@ -187,6 +197,8 @@ struct SubmitWire {
     vars: BTreeMap<String, String>,
     secrets: BTreeMap<String, String>,
     reusable_workflows: BTreeMap<String, String>,
+    enable_debugger: bool,
+    debugger_welcome_message: Option<String>,
 }
 
 async fn collect_reusable_workflows(
