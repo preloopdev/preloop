@@ -1,5 +1,5 @@
 # Capture Inventory & Conformance Status
-Generated: 2026-07-08 15:04 UTC
+Generated: 2026-07-08 15:05 UTC
 
 Two separate data sources:
 - **MITM flows** — raw HTTP traffic captures (flows.jsonl) from mitmproxy, recording every request/response
@@ -58,6 +58,12 @@ Two separate data sources:
 **Official only (9):** 07 step-failure, 08 job-outputs-needs, 09 matrix-fan-out, 10 uses-checkout, 11 cache-roundtrip, 12 artifact, 13 composite-action, 14 annotations, 15 oidc-id-token
 **Aksh only (2):** 20 reusable-workflow, 75 workflow-call-stress
 **Neither (30):** 19, 21, 22, 23, 24, 30, 31, 32, 33, 34, 35, 36, 50, 51, 52, 53, 54, 55, 56, 57, 58, 60, 61, 62, 63, 70, 71, 72, 73, 74
+
+## Conformance Outcomes
+Scenarios 80–100 dispatched against GitHub. 7 match, 3 mismatch, 9 incomplete.
+
+| # | Scenario | Official | Aksh | Match |
+|---|---|---|---|---|
 
 | 80 | custom-shells | (empty) | failure | ⏳ (empty) / failure |
 | 81 | step-timeout | (empty) | failure | ⏳ (empty) / failure |
