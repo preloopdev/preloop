@@ -567,10 +567,8 @@ async fn dispatch_one(core: &Arc<DebuggerCore>, req: &Request, seq: i64) -> Resp
     let cmd = req.command.as_str();
     match cmd {
         "initialize" => {
-            // The transport's writer picks this up and forwards to
-            // the editor. We also emit `initialized` here, but the
-            // outer caller (handle_client) already routes that
-            // through the same out_tx.
+            let event_seq = next_seq(core).await;
+            let _ = core.out_tx.lock().send(Outbound::Event(Event::new(event_seq, EVENT_INITIALIZED)));
             Response::success(seq, req.header.seq, "initialize")
                 .with_body(serde_json::to_value(Capabilities::runner_default()).unwrap_or(Value::Null))
         }
