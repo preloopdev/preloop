@@ -1095,7 +1095,7 @@ fn runner_conclusion(conclusion: &str) -> &'static str {
     match conclusion.to_ascii_lowercase().as_str() {
         "success" | "succeeded" => "succeeded",
         "failure" | "failed" => "failed",
-        "cancelled" | "canceled" => "cancelled",
+        "cancelled" | "canceled" => "canceled",
         "skipped" => "skipped",
         _ => "failed",
     }
@@ -1105,7 +1105,7 @@ fn job_status_conclusion(status: super::contexts::JobStatus) -> &'static str {
     match status {
         super::contexts::JobStatus::Success => "succeeded",
         super::contexts::JobStatus::Failure => "failed",
-        super::contexts::JobStatus::Cancelled => "cancelled",
+        super::contexts::JobStatus::Cancelled => "canceled",
     }
 }
 
