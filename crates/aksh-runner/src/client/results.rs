@@ -127,6 +127,38 @@ impl ResultsClient {
             .await
             .context("uploading log blob")
     }
+
+    /// Finalize step log metadata after blob upload.
+    pub async fn create_step_logs_metadata(
+        &self,
+        token: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let url = format!(
+            "{}/twirp/results.services.receiver.Receiver/CreateStepLogsMetadata",
+            self.base_url
+        );
+        self.http
+            .post_json_bearer(&url, body, token)
+            .await
+            .context("creating step logs metadata")
+    }
+
+    /// Finalize job log metadata after blob upload.
+    pub async fn create_job_logs_metadata(
+        &self,
+        token: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let url = format!(
+            "{}/twirp/results.services.receiver.Receiver/CreateJobLogsMetadata",
+            self.base_url
+        );
+        self.http
+            .post_json_bearer(&url, body, token)
+            .await
+            .context("creating job logs metadata")
+    }
 }
 
 #[cfg(test)]
