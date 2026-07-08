@@ -918,6 +918,40 @@ impl IDapDebugger for DapDebugger {
     }
 
     async fn on_job_completed(&self) -> Result<(), DapError> {
+        if *self.core.state.lock() != DapSessionState::Terminated {
+            let seq = self.next_seq_internal().await;
+            let _ = self.core.out_tx.lock().send(Outbound::Event(
+                Event::new(seq, EVENT_THREAD).with_body(json!({"reason": "exited", "threadId": 1})),
+            ));
+            let seq = self.next_seq_internal().await;
+            let _ = self.core.out_tx.lock().send(Outbound::Event(
+                Event::new(seq, EVENT_STOPPED).with_body(json!({
+                    "reason": "pause",
+                    "threadId": 1,
+                    "allThreadsContinued": false,
+                    "description": "Job completed — pausing for debugger inspection. Press continue to finish.",
+                })),
+            ));
+            *self.core.state.lock() = DapSessionState::Paused;
+
+            let mut resume_rx = self.core.resume_tx.subscribe();
+            let _ = resume_rx.borrow_and_update();
+            let cancel_rx = {
+                let g = self.core.cancel.lock().await;
+                g.as_ref().map(|tx| tx.subscribe())
+            };
+            if let Some(mut cancel_rx) = cancel_rx {
+                tokio::select! {
+                    _ = resume_rx.changed() => {}
+                    _ = cancel_rx.changed() => {}
+                }
+            } else {
+                resume_rx
+                    .changed()
+                    .await
+                    .map_err(|_| DapError::Protocol("debugger resume channel closed".into()))?;
+            }
+        }
         let seq = self.next_seq_internal().await;
         let _ = self
             .core

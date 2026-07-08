@@ -423,6 +423,7 @@ pub async fn run_job(
     //         await _dapDebugger.OnJobCompletedAsync();
     //     }
     if let Some(dbg) = job_ctx.dap_debugger.as_ref() {
+        info!("Job completed — pausing for debugger inspection. Press continue to finish.");
         if let Err(e) = dbg.on_job_completed().await {
             warn!("DAP OnJobCompleted failed: {e}");
         }
