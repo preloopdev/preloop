@@ -1,0 +1,11 @@
+2026-07-08T02:13:29.936Z ##[group]Run EMPTY=''
+2026-07-08T02:13:29.937Z EMPTY=''
+2026-07-08T02:13:29.937Z 
+2026-07-08T02:13:29.937Z if [[ "$EMPTY" == "" ]]; then
+2026-07-08T02:13:29.937Z   echo "✓ Empty string output correctly retrieved"
+2026-07-08T02:13:29.937Z else
+2026-07-08T02:13:29.937Z   echo "✗ Empty string output is not empty: '$EMPTY'"
+2026-07-08T02:13:29.938Z   exit 1
+2026-07-08T02:13:29.938Z fi
+2026-07-08T02:13:29.938Z ##[endgroup]
+2026-07-08T02:13:29.941Z ✓ Empty string output correctly retrieved

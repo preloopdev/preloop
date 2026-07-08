@@ -1,0 +1,11 @@
+{
+  "runner": "aksh",
+  "scenario": "92-unicode-special-chars.yml",
+  "github_repo": "preloopdev/aksh-conformance-sample",
+  "run_id": "28908170117",
+  "status": "ok",
+  "conclusion": "failure",
+  "job_count": 1,
+  "total_ms": 28791,
+  "flows_count":       54
+}

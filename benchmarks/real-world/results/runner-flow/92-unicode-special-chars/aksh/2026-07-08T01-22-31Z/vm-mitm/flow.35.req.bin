@@ -1,0 +1,2 @@
+2026-07-08T01:22:53.954Z ##[error]Unable to process file command successfully.
+2026-07-08T01:22:53.954Z ##[error]Invalid value. Matching delimiter not found 'EOF' (missing heredoc delimiter)

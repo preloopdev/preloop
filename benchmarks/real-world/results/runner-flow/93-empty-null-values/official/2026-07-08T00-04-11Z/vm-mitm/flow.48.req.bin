@@ -1,0 +1,14 @@
+﻿2026-07-08T00:04:34.5286329Z ##[group]Run if [[ "$EXPLICIT_EMPTY" == "" ]]; then
+2026-07-08T00:04:34.5286655Z [36;1mif [[ "$EXPLICIT_EMPTY" == "" ]]; then[0m
+2026-07-08T00:04:34.5286971Z [36;1m  echo "✓ Explicit empty string handled correctly"[0m
+2026-07-08T00:04:34.5287260Z [36;1mfi[0m
+2026-07-08T00:04:34.5287450Z [36;1m[0m
+2026-07-08T00:04:34.5287655Z [36;1mif [[ -z "$UNSET_VAR_REF" ]]; then[0m
+2026-07-08T00:04:34.5287943Z [36;1m  echo "✓ Unset variable reference is empty"[0m
+2026-07-08T00:04:34.5288213Z [36;1mfi[0m
+2026-07-08T00:04:34.5291264Z shell: /usr/bin/bash -e {0}
+2026-07-08T00:04:34.5291497Z env:
+2026-07-08T00:04:34.5291755Z   EXPLICIT_EMPTY: 
+2026-07-08T00:04:34.5291982Z   UNSET_VAR_REF: $NONEXISTENT
+2026-07-08T00:04:34.5292212Z ##[endgroup]
+2026-07-08T00:04:34.5302725Z ✓ Explicit empty string handled correctly

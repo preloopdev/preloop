@@ -1,0 +1,13 @@
+2026-07-08T02:21:08.470Z ##[group]Run EMPTY_VAR=""
+2026-07-08T02:21:08.470Z EMPTY_VAR=""
+2026-07-08T02:21:08.470Z DEFAULT_VALUE="${EMPTY_VAR:-default}"
+2026-07-08T02:21:08.471Z 
+2026-07-08T02:21:08.471Z if [[ "$DEFAULT_VALUE" == "default" ]]; then
+2026-07-08T02:21:08.471Z   echo "✓ Default value expansion works with empty var"
+2026-07-08T02:21:08.471Z else
+2026-07-08T02:21:08.471Z   echo "✗ Default value not applied: '$DEFAULT_VALUE'"
+2026-07-08T02:21:08.471Z   exit 1
+2026-07-08T02:21:08.471Z fi
+2026-07-08T02:21:08.472Z shell: bash --noprofile --norc -e -o pipefail {0}
+2026-07-08T02:21:08.472Z ##[endgroup]
+2026-07-08T02:21:08.474Z ✓ Default value expansion works with empty var

@@ -1,0 +1,8 @@
+{
+  "mode": "github-official",
+  "workflow": "e2e-serde.yml",
+  "run_id": "28885644587",
+  "total_ms": 62292,
+  "vm_failures": 0,
+  "timestamp": "2026-07-07T17:26:56.3NZ"
+}

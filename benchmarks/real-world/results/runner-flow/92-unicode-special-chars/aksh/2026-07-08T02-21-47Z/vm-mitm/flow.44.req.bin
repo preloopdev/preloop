@@ -1,0 +1,9 @@
+2026-07-08T02:22:11.585Z ##[group]Run echo 'hex_output<<EOF' >> $GITHUB_OUTPUT
+2026-07-08T02:22:11.585Z echo 'hex_output<<EOF' >> $GITHUB_OUTPUT
+2026-07-08T02:22:11.585Z printf '%b' 'Line 1: \\x41\\x42\\x43\\n' >> $GITHUB_OUTPUT
+2026-07-08T02:22:11.585Z printf '%b' 'Unicode: \\u00E9\\u00E8\\u00EA\\n' >> $GITHUB_OUTPUT
+2026-07-08T02:22:11.585Z echo 'EOF' >> $GITHUB_OUTPUT
+2026-07-08T02:22:11.586Z shell: bash --noprofile --norc -e -o pipefail {0}
+2026-07-08T02:22:11.586Z ##[endgroup]
+2026-07-08T02:22:11.592Z ##[error]Unable to process file command successfully.
+2026-07-08T02:22:11.592Z ##[error]Invalid value. Matching delimiter not found 'EOF' (missing heredoc delimiter)

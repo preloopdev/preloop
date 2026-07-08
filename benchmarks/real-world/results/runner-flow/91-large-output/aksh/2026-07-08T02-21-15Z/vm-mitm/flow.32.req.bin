@@ -1,0 +1,19 @@
+2026-07-08T02:21:37.773Z ##[group]Run echo "Creating 50KB output variable..."
+2026-07-08T02:21:37.773Z echo "Creating 50KB output variable..."
+2026-07-08T02:21:37.773Z LARGE_OUTPUT=""
+2026-07-08T02:21:37.773Z for i in {1..1000}; do
+2026-07-08T02:21:37.773Z   LARGE_OUTPUT="${LARGE_OUTPUT}This is line $i with some padding. Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation. Line $i end.\n"
+2026-07-08T02:21:37.773Z done
+2026-07-08T02:21:37.773Z 
+2026-07-08T02:21:37.774Z # Write to GITHUB_OUTPUT using heredoc for large content
+2026-07-08T02:21:37.774Z echo 'large_value<<EOF' >> $GITHUB_OUTPUT
+2026-07-08T02:21:37.774Z printf "%s" "$LARGE_OUTPUT" >> $GITHUB_OUTPUT
+2026-07-08T02:21:37.774Z echo 'EOF' >> $GITHUB_OUTPUT
+2026-07-08T02:21:37.774Z 
+2026-07-08T02:21:37.774Z echo "Large output variable created"
+2026-07-08T02:21:37.774Z shell: bash --noprofile --norc -e -o pipefail {0}
+2026-07-08T02:21:37.774Z ##[endgroup]
+2026-07-08T02:21:37.776Z Creating 50KB output variable...
+2026-07-08T02:21:38.105Z Large output variable created
+2026-07-08T02:21:38.105Z ##[error]Unable to process file command successfully.
+2026-07-08T02:21:38.106Z ##[error]Invalid value. Matching delimiter not found 'EOF' (missing heredoc delimiter)
