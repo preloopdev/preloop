@@ -11,14 +11,23 @@ WFBASE=$(basename "$WF" .yml)
 
 log() { echo "[$(date +%T.%3N)] $*"; }
 
-# ── Cancel stale ────────────────────────────────────────────────────
-log "Cancelling stale runs for $WFBASE..."
-for rid in $(gh run list -R "$GH_REPO" -w "$WF" -L 10 --json databaseId,status \
+# ── Cancel ALL stale runs (not just this workflow) ──────────────────
+log "Cancelling ALL queued/in-progress runs..."
+for rid in $(gh run list -R "$GH_REPO" -L 30 --json databaseId,status \
   -q '.[] | select(.status == "queued" or .status == "in_progress") | .databaseId' 2>/dev/null); do
   gh run cancel "$rid" -R "$GH_REPO" 2>/dev/null || true
 done
+sleep 3
 
-# ── Kill stale runners in VMs ───────────────────────────────────────
+# ── Delete stale offline runners on GitHub ──────────────────────────
+log "Deleting stale offline runners..."
+gh api "repos/$GH_REPO/actions/runners" --jq '.runners[] | select(.status == "offline") | .id' 2>/dev/null | \
+  while read -r rid; do
+    gh api -X DELETE "repos/$GH_REPO/actions/runners/$rid" 2>/dev/null || true
+  done
+sleep 2
+
+# ── Kill stale runner processes inside VMs ─────────────────────────
 for i in $(seq 1 "$NUM_RUNNERS"); do
   vm="bench-aksh-$i"
   smolvm machine exec --name "$vm" -- bash -c 'pkill -f aksh-runner 2>/dev/null; true' 2>/dev/null || true
@@ -54,10 +63,14 @@ echo 'EXIT='\$?
 " > "/tmp/runner-${WFBASE}-${i}.log" 2>&1 &
 done
 
-# ── Wait for all runners to register ────────────────────────────────
-log "Waiting for $NUM_RUNNERS runners to register..."
-sleep 12
-
+# ── Poll until all runners are online on GitHub ────────────────────
+log "Waiting for $NUM_RUNNERS runners to appear online..."
+for attempt in $(seq 1 30); do
+  ONLINE=$(gh api "repos/$GH_REPO/actions/runners" --jq '[.runners[] | select(.status == "online")] | length' 2>/dev/null || echo 0)
+  [ "$ONLINE" -ge "$NUM_RUNNERS" ] && { log "All $NUM_RUNNERS runners online"; break; }
+  [ "$attempt" -eq 30 ] && { log "TIMEOUT: only $ONLINE/$NUM_RUNNERS runners online"; exit 1; }
+  sleep 10
+done
 # ── Dispatch ────────────────────────────────────────────────────────
 log "Dispatching $WF..."
 gh workflow run "$WF" -R "$GH_REPO" --ref main 2>&1
@@ -85,4 +98,15 @@ echo "{\"runner\":\"aksh\",\"workflow\":\"$WF\",\"run_id\":\"$RUN_ID\",\"conclus
   >> "$RESULTS_DIR/conformance/conformance-aksh.jsonl"
 
 log "Done: $WF => $CONCLUSION"
-wait
+
+# Wait for background runner processes with 30s timeout
+timeout 30 wait 2>/dev/null || true
+# Delete our ephemeral runners from GitHub
+log "Cleaning up runners..."
+for i in $(seq 1 "$NUM_RUNNERS"); do
+  gh api "repos/$GH_REPO/actions/runners" --jq ".runners[] | select(.name | startswith(\"aksh-${WFBASE}-\")) | .id" 2>/dev/null | \
+    while read -r rid; do
+      gh api -X DELETE "repos/$GH_REPO/actions/runners/$rid" 2>/dev/null || true
+    done
+done
+
