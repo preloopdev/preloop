@@ -1168,7 +1168,10 @@ async fn report_completion(
         "outputs": outputs,
         "stepResults": step_results,
         "annotations": job_annotations,
-        "telemetry": [],
+        "telemetry": [{
+            "type": "task",
+            "message": format!("{{\"ClassType\":\"StepsRunner\",\"FinishResult\":\"{}\"}}", result.to_lowercase()),
+        }],
         "billingOwnerId": billing_owner_id,
     });
 
