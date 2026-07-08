@@ -902,10 +902,6 @@ impl IDapDebugger for DapDebugger {
         }
         let seq = self.next_seq_internal().await;
         let _ = self.core.out_tx.lock().send(Outbound::Event(
-            Event::new(seq, EVENT_THREAD).with_body(json!({"reason": "started", "threadId": 1})),
-        ));
-        let seq = self.next_seq_internal().await;
-        let _ = self.core.out_tx.lock().send(Outbound::Event(
             Event::new(seq, EVENT_STOPPED).with_body(json!({
                 "reason": "entry",
                 "description": format!("Stopped at job entry: {}", step.display_name),
