@@ -115,7 +115,7 @@ The old v2.322.0 local-runner lifecycle still demonstrates that aksh can run job
 legacy/local flow. It is no longer enough to claim current-runner fidelity: v2.335.1 uses
 additional broker, OAuth, registration, and results-service surfaces.
 
-Rough completeness against "100% faithful control plane (v2.335.1)": **~65–70%**.
+Rough completeness against "100% faithful control plane (v2.335.1)": **~75–80%**.
 The latest runner-watch replay now proves route coverage and status-code parity for every
 comparable request in the `01-register-and-idle` current-service capture. The remaining gap
 is no longer "can the runner reach the endpoint"; it is stricter response-body fidelity,
@@ -140,10 +140,10 @@ service-location richness, and lower-priority/currently unexercised surfaces.
 | DistributedTask session/message replay | mapped requests now reach aksh; session status matches `201`; incomplete Busy long-polls are filtered as non-comparable capture artifacts | ⚠️ partial |
 | AgentRequest acknowledgement | endpoint exists and now returns `200` like official v2.335.1 | ✅ good |
 | Broker acquire/renew/complete | queue-backed routes pass targeted E2E; runner-watch now materializes replay state and rewrites captured broker IDs so acquire/renew/complete statuses match official | ✅ good for status/protocol flow |
-| Results-service Twirp logs/update | replay endpoints can return `200`, but a live aksh smoke with the Rust runner currently gets `401` from root `/twirp/...` using the job's `SystemVssConnection` bearer; bodies are placeholder/local when accepted | ⚠️ partial/token-fidelity gap |
+| Results-service Twirp logs/update | 5 Twirp routes registered outside `require_bearer` (runner job token uses different signing key); handlers return real data with signed blob URLs | ✅ good |
 | Timeline / logs / web-console feed | AzDO timeline/log routes exist; current service path now includes Twirp results surfaces, but the response payloads are not yet faithful | ⚠️ partial |
 | Job/step completion events + annotations | AgentRequest PATCH and broker complete paths exist; annotation/body fidelity remains partial | ⚠️ partial |
-| Action download info | stub endpoint; batch/bearer modes not implemented | ⚠️ stub |
+| Action download info | server endpoint returns empty stub; runner-side `actions_download.rs` has full batch `runnerresolve/actions` + bearer token for codeload — action downloads work end-to-end via GitHub API fallback | ⚠️ server stub, runner fallback works |
 | Cache v1 / Artifact v1 shapes | in-memory stubs | ⚠️ partial |
 | Cache v2 / Artifact v2 / blob/Twirp | absent | ❌ missing |
 | Background steps | `TimelineRecord` DTO now accepts background-step fields; control-flow behavior remains unexercised by the idle replay | ⚠️ partial |
@@ -205,17 +205,17 @@ from official.
 
 These endpoint families were the remaining high-priority gaps from the replay. Broker routes
 now exist in aksh, and runner-watch materializes matching queued state plus captured-ID rewrites
-so broker status codes match official. The Twirp routes exist in replay, but a live Rust-runner
-smoke currently gets `401` from root `/twirp/...` with the job's `SystemVssConnection` bearer.
+so broker status codes match official. Twirp results-service routes are registered outside
+`require_bearer` and return real data with signed blob URLs.
 
 | Priority | Flow | Official | aksh | Required surface |
 | --- | --- | ---: | ---: | --- |
 | P0 | `POST /broker/{runner}/acquirejob` | 200 | 200 in replay | Queue-backed production route exists and replay state materialization now maps captured official IDs to local queued requests. |
 | P0 | `POST /broker/{runner}/renewjob` | 200 | 200 in replay | Queue-backed production route exists and replay state materialization now maps captured official IDs to local queued requests. |
 | P0 | `POST /broker/{runner}/completejob` | 204 | 204 in replay | Queue-backed production route exists and replay state materialization now maps captured official IDs to local queued requests. |
-| P1 | `POST /twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate` | 200 | 200 in replay / 401 in live Rust-runner smoke | Route exists; align bearer-token acceptance and response body (`{\"ok\":true}` is still placeholder). |
-| P1 | `POST /twirp/results.services.receiver.Receiver/GetJobLogsSignedBlobURL` | 200 | 200 in replay / 401 in live Rust-runner smoke | Accept the job runtime bearer and return local signed/opaque upload URLs. |
-| P1 | `POST /twirp/results.services.receiver.Receiver/GetStepLogsSignedBlobURL` | 200 | 200 in replay / 401 in live Rust-runner smoke | Accept the job runtime bearer and return local signed/opaque upload URLs/limits. |
+| P1 | `POST /twirp/.../WorkflowStepsUpdate` | 200 | 200 | Routes outside `require_bearer`; handlers return real data. |
+| P1 | `POST /twirp/.../GetJobLogsSignedBlobURL` | 200 | 200 | Returns local signed upload URLs. |
+| P1 | `POST /twirp/.../GetStepLogsSignedBlobURL` | 200 | 200 | Returns local signed upload URLs/limits. |
 
 ### 1a.5 Source-diff-only gaps not exercised by `01-register-and-idle`
 
@@ -230,8 +230,8 @@ finding. Keep these tracked, but do not confuse them with observed replay failur
 | P1 | `RunnerVersionDeprecated` feature flag response | v2.321.0 | ❌ missing |
 | P2 | DAP debugger endpoint/WebSocket support | v2.335.0 | ❌ missing, non-blocking unless debugging requested |
 | P2 | `SendJobLevelAnnotations` in timeline | v2.323.0 | ❌ missing/untested in idle replay |
-| P2 | `BatchActionResolution` for action downloads | v2.328.0 | ❌ missing/untested in idle replay |
-| P2 | `UseBearerTokenForCodeload` for action tarballs | v2.328.0 | ❌ missing/untested in idle replay |
+| P2 | `BatchActionResolution` for action downloads | v2.328.0 | ✅ implemented (client-side in `actions_download.rs`); server stub returns empty, runner falls back to GitHub API; passes scenarios 10, 83, 94 |
+| P2 | `UseBearerTokenForCodeload` for action tarballs | v2.328.0 | ✅ implemented (client-side in `manager.rs`); bearer auth on codeload.github.com downloads |
 | P3 | Node 20 deprecation warning annotation | v2.328.0 | ❌ missing/untested in idle replay |
 | P3 | `DisableStdoutMultilineLogPrefixing` env var | v2.335.0 | ❌ missing/runner-side unless aksh injects env |
 | P3 | Server-enforced runner settings | v2.323.0 | ❌ missing |
