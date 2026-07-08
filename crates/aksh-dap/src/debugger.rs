@@ -40,7 +40,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tracing::{debug, error, warn};
 
-use crate::config::{DebuggerConfig, DebuggerTunnelInfo};
+use crate::config::{DebuggerConfig, DebuggerTransportMode, DebuggerTunnelInfo};
 use crate::messages::{
     Capabilities, Event, Request, Response, EVENT_CONTINUED, EVENT_EXITED, EVENT_INITIALIZED,
     EVENT_OUTPUT, EVENT_STOPPED, EVENT_TERMINATED, EVENT_THREAD,
@@ -789,18 +789,28 @@ impl IDapDebugger for DapDebugger {
         let listener = self.bind_tcp_server().await?;
         let local_port = listener.local_addr()?.port();
 
-        let bridge = crate::bridge::WebSocketDapBridge::new(tunnel.port, local_port);
-        tokio::spawn(async move {
-            if let Err(e) = bridge.run().await {
-                warn!("DAP WebSocket bridge failed: {e}");
+        match self.core.config.transport {
+            DebuggerTransportMode::LocalServerProxy => {
+                debug!(
+                    local_port,
+                    "DAP local server-proxy transport selected; skipping DevTunnel bridge"
+                );
             }
-        });
+            DebuggerTransportMode::DevTunnel => {
+                let bridge = crate::bridge::WebSocketDapBridge::new(tunnel.port, local_port);
+                tokio::spawn(async move {
+                    if let Err(e) = bridge.run().await {
+                        warn!("DAP WebSocket bridge failed: {e}");
+                    }
+                });
 
-        match self.launch_devtunnel(&tunnel).await {
-            Ok(child) => *self.core.devtunnel_child.lock().await = Some(child),
-            Err(e) => {
-                warn!("devtunnel host failed to start: {e}");
-                // Local debug still works.
+                match self.launch_devtunnel(&tunnel).await {
+                    Ok(child) => *self.core.devtunnel_child.lock().await = Some(child),
+                    Err(e) => {
+                        warn!("devtunnel host failed to start: {e}");
+                        // Local TCP debug still works if a caller can reach the port.
+                    }
+                }
             }
         }
 
