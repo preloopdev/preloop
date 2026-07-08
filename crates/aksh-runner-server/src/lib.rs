@@ -742,7 +742,7 @@ struct InnerState {
     agent_job_requests: BTreeMap<uuid::Uuid, i64>,
     timeline_requests: BTreeMap<uuid::Uuid, i64>,
     session_active_requests: BTreeMap<String, i64>,
-    dap_ports: BTreeMap<RunId, u16>,
+    dap_ports: BTreeMap<RunId, DapPortRegistration>,
     next_runner_id: i64,
     next_cache_id: i64,
     next_message_id: i64,
@@ -750,6 +750,12 @@ struct InnerState {
     next_request_id: i64,
     flows_file: Option<std::fs::File>,
     next_flow_index: usize,
+}
+
+#[derive(Debug, Clone)]
+struct DapPortRegistration {
+    port: u16,
+    job_id: JobId,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1337,17 +1343,43 @@ async fn handle_live_log_socket(mut socket: WebSocket, job_id: String, shared: A
 #[derive(serde::Deserialize)]
 struct RegisterDapPortRequest {
     port: u16,
+    job_id: JobId,
 }
 
 async fn register_dap_port(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
     Json(payload): Json<RegisterDapPortRequest>,
-) -> StatusCode {
+) -> Result<StatusCode, ApiError> {
+    if payload.port < 1024 {
+        return Err(ApiError::bad_request(
+            "DAP port must be an unprivileged local port",
+        ));
+    }
     let mut inner = shared.state.inner.lock().await;
-    inner.dap_ports.insert(run_id, payload.port);
-    info!(%run_id, port = payload.port, "Registered DAP port");
-    StatusCode::OK
+    let run = inner
+        .runs
+        .get(&run_id)
+        .ok_or_else(|| ApiError::not_found("run not found"))?;
+    let status = run
+        .jobs
+        .get(&payload.job_id)
+        .copied()
+        .ok_or_else(|| ApiError::bad_request("job does not belong to run"))?;
+    if !matches!(status, ExecutionStatus::InProgress) {
+        return Err(ApiError::bad_request(
+            "DAP port can only be registered for an in-progress job",
+        ));
+    }
+    inner.dap_ports.insert(
+        run_id,
+        DapPortRegistration {
+            port: payload.port,
+            job_id: payload.job_id.clone(),
+        },
+    );
+    info!(%run_id, job_id = %payload.job_id, port = payload.port, "Registered DAP port");
+    Ok(StatusCode::OK)
 }
 
 async fn ws_dap_debug(
@@ -1359,21 +1391,22 @@ async fn ws_dap_debug(
 }
 
 async fn handle_dap_debug_socket(socket: WebSocket, run_id: RunId, shared: Arc<SharedState>) {
-    let port = {
+    let registration = {
         let inner = shared.state.inner.lock().await;
-        inner.dap_ports.get(&run_id).copied()
+        inner.dap_ports.get(&run_id).cloned()
     };
-    let port = match port {
-        Some(p) => p,
+    let registration = match registration {
+        Some(registration) => registration,
         None => {
             warn!(%run_id, "DAP port not registered for run");
             return;
         }
     };
+    let port = registration.port;
 
-    info!(%run_id, port, "Starting DAP websocket proxy to runner");
+    info!(%run_id, job_id = %registration.job_id, port, "Starting DAP websocket proxy to runner");
     if let Err(e) = pump_axum_ws_to_dap(socket, port).await {
-        warn!(%run_id, port, "DAP websocket proxy ended with error: {e}");
+        warn!(%run_id, job_id = %registration.job_id, port, "DAP websocket proxy ended with error: {e}");
     }
 }
 
