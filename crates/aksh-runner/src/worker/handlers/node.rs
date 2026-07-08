@@ -141,6 +141,9 @@ pub async fn run_node_action(
     )
     .await?;
 
+    // Flush any partial line remaining in the buffer
+    ctx.flush_line_buffer();
+
     if result.exit_code != 0 {
         anyhow::bail!("node action exited with code {}", result.exit_code);
     }
