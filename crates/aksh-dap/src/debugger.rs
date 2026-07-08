@@ -179,6 +179,9 @@ struct DebuggerCore {
     context: parking_lot::Mutex<serde_json::Value>,
     /// Secret values to mask.
     masks: parking_lot::Mutex<std::collections::HashSet<String>>,
+    /// Whether we've already paused at the job entry point.
+    /// Official runner only pauses at the first step, then runs the rest.
+    entry_paused: std::sync::atomic::AtomicBool,
 }
 
 /// Internal envelope of an outgoing DAP message (response or
@@ -249,6 +252,7 @@ impl DapDebugger {
                 job_id: Mutex::new(None),
                 context: parking_lot::Mutex::new(serde_json::json!({})),
                 masks: parking_lot::Mutex::new(std::collections::HashSet::new()),
+                entry_paused: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }
@@ -386,32 +390,8 @@ impl DapDebugger {
             }
         });
 
-        // Send welcome message if configured
-        let welcome = if self.core.override_welcome {
-            self.core.welcome_message.clone()
-        } else {
-            Some(
-                self.core
-                    .welcome_message
-                    .clone()
-                    .unwrap_or_else(default_welcome_message),
-            )
-        };
-        if let Some(msg) = welcome {
-            if !msg.is_empty() {
-                let mut msg = msg;
-                if !msg.ends_with('\n') {
-                    msg.push('\n');
-                }
-                let seq = self.next_seq_internal().await;
-                let _ = out_tx.send(Outbound::Event(Event::new(seq, EVENT_OUTPUT).with_body(
-                    json!({
-                        "category": "console",
-                        "output": msg,
-                    }),
-                )));
-            }
-        }
+        // Welcome message is sent after configurationDone, not here.
+        // See dispatch_one's "configurationDone" arm.
 
         // Read loop.
         let reader = tokio::spawn(async move {
@@ -469,6 +449,33 @@ impl DapDebugger {
                     let event_seq = next_seq(&core).await;
                     let _ = out_tx_dispatch
                         .send(Outbound::Event(Event::new(event_seq, EVENT_INITIALIZED)));
+                }
+                if req.raw.command == "configurationDone" {
+                    // Send welcome output event after configurationDone
+                    // (matches official runner ordering).
+                    let welcome = if core.override_welcome {
+                        core.welcome_message.clone()
+                    } else {
+                        Some(
+                            core.welcome_message
+                                .clone()
+                                .unwrap_or_else(default_welcome_message),
+                        )
+                    };
+                    if let Some(mut msg) = welcome {
+                        if !msg.is_empty() {
+                            if !msg.ends_with('\n') {
+                                msg.push('\n');
+                            }
+                            let event_seq = next_seq(&core).await;
+                            let _ = out_tx_dispatch.send(Outbound::Event(
+                                Event::new(event_seq, EVENT_OUTPUT).with_body(json!({
+                                    "category": "console",
+                                    "output": msg,
+                                })),
+                            ));
+                        }
+                    }
                 }
                 if matches!(req.raw.command.as_str(), "disconnect" | "terminate") {
                     break;
@@ -884,6 +891,15 @@ impl IDapDebugger for DapDebugger {
         if !self.is_runnable() {
             return Ok(());
         }
+        // Official runner only pauses at the first step (job entry).
+        // Subsequent steps run without pause.
+        let already_paused = self
+            .core
+            .entry_paused
+            .swap(true, std::sync::atomic::Ordering::SeqCst);
+        if already_paused {
+            return Ok(());
+        }
         let seq = self.next_seq_internal().await;
         let _ = self.core.out_tx.lock().send(Outbound::Event(
             Event::new(seq, EVENT_THREAD).with_body(json!({"reason": "started", "threadId": 1})),
@@ -891,10 +907,10 @@ impl IDapDebugger for DapDebugger {
         let seq = self.next_seq_internal().await;
         let _ = self.core.out_tx.lock().send(Outbound::Event(
             Event::new(seq, EVENT_STOPPED).with_body(json!({
-                "reason": "step",
+                "reason": "entry",
+                "description": format!("Stopped at job entry: {}", step.display_name),
                 "threadId": 1,
-                "allThreadsContinued": false,
-                "description": format!("Paused at step: {}", step.display_name),
+                "allThreadsStopped": true,
             })),
         ));
         *self.core.state.lock() = DapSessionState::Paused;
@@ -923,40 +939,7 @@ impl IDapDebugger for DapDebugger {
     }
 
     async fn on_job_completed(&self) -> Result<(), DapError> {
-        if *self.core.state.lock() != DapSessionState::Terminated {
-            let seq = self.next_seq_internal().await;
-            let _ = self.core.out_tx.lock().send(Outbound::Event(
-                Event::new(seq, EVENT_THREAD).with_body(json!({"reason": "exited", "threadId": 1})),
-            ));
-            let seq = self.next_seq_internal().await;
-            let _ = self.core.out_tx.lock().send(Outbound::Event(
-                Event::new(seq, EVENT_STOPPED).with_body(json!({
-                    "reason": "pause",
-                    "threadId": 1,
-                    "allThreadsContinued": false,
-                    "description": "Job completed — pausing for debugger inspection. Press continue to finish.",
-                })),
-            ));
-            *self.core.state.lock() = DapSessionState::Paused;
-
-            let mut resume_rx = self.core.resume_tx.subscribe();
-            let _ = resume_rx.borrow_and_update();
-            let cancel_rx = {
-                let g = self.core.cancel.lock().await;
-                g.as_ref().map(|tx| tx.subscribe())
-            };
-            if let Some(mut cancel_rx) = cancel_rx {
-                tokio::select! {
-                    _ = resume_rx.changed() => {}
-                    _ = cancel_rx.changed() => {}
-                }
-            } else {
-                resume_rx
-                    .changed()
-                    .await
-                    .map_err(|_| DapError::Protocol("debugger resume channel closed".into()))?;
-            }
-        }
+        // Official runner sends terminated + exited directly — no final pause.
         let seq = self.next_seq_internal().await;
         let _ = self
             .core
