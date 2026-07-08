@@ -393,6 +393,28 @@ impl DapDebugger {
             }
         });
 
+        // Send welcome message if configured
+        let welcome = if self.core.override_welcome {
+            self.core.welcome_message.clone()
+        } else {
+            Some(self.core.welcome_message.clone().unwrap_or_else(default_welcome_message))
+        };
+        if let Some(msg) = welcome {
+            if !msg.is_empty() {
+                let mut msg = msg;
+                if !msg.ends_with('\n') {
+                    msg.push('\n');
+                }
+                let seq = self.next_seq_internal().await;
+                let _ = out_tx.send(Outbound::Event(
+                    Event::new(seq, EVENT_OUTPUT).with_body(json!({
+                        "category": "console",
+                        "output": msg,
+                    })),
+                ));
+            }
+        }
+
         // Read loop.
         let reader = tokio::spawn(async move {
             loop {
