@@ -977,7 +977,7 @@ fn build_completejob_step_results(
 
     // "Set up job" wrapper step
     results.push(serde_json::json!({
-        "external_id": uuid::Uuid::new_v4().to_string(),
+        "external_id": job_ctx.setup_step_id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
         "number": 1,
         "name": "Set up job",
         "action_name": "setup_job",
@@ -1025,7 +1025,7 @@ fn build_completejob_step_results(
 
     // "Complete job" wrapper step
     results.push(serde_json::json!({
-        "external_id": uuid::Uuid::new_v4().to_string(),
+        "external_id": job_ctx.complete_step_id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
         "number": ordered_steps.len() + 2,
         "name": "Complete job",
         "action_name": "complete_job",

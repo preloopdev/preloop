@@ -269,6 +269,14 @@ fn resolve_shell(
                 vec![path.to_string_lossy().to_string()],
             ))
         }
+        "python3" => {
+            let path = temp_dir.join(format!("{script_id}.py"));
+            Ok((
+                path.clone(),
+                "python3".to_string(),
+                vec![path.to_string_lossy().to_string()],
+            ))
+        }
         "pwsh" => {
             let path = temp_dir.join(format!("{script_id}.ps1"));
             Ok((

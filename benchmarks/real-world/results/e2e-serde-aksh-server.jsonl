@@ -1,0 +1,7 @@
+{
+  "mode": "aksh-server",
+  "workflow": "e2e-serde.yml",
+  "total_ms": 326959,
+  "vm_failures": 4,
+  "timestamp": "2026-07-07T15:34:08.3NZ"
+}
