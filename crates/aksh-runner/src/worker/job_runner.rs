@@ -457,7 +457,25 @@ pub async fn upload_step_log(rpt: &ReportingContext, step_id: &str, content: &st
         .upload_log_blob(&signed_url, content.as_bytes().to_vec())
         .await
     {
-        Ok(()) => info!("Uploaded log for step {step_id} ({} bytes)", content.len()),
+        Ok(()) => {
+            info!("Uploaded log for step {step_id} ({} bytes)", content.len());
+            // Official runner calls CreateStepLogsMetadata after each step log upload
+            let metadata = serde_json::json!({
+                "workflow_run_backend_id": rpt.plan_id,
+                "workflow_job_run_backend_id": rpt.job_id,
+                "step_backend_id": step_id,
+                "uploaded_at": iso_now(),
+                "line_count": content.lines().count(),
+            });
+            match rpt
+                .results
+                .create_step_logs_metadata(&rpt.access_token, &metadata)
+                .await
+            {
+                Ok(_) => info!("CreateStepLogsMetadata succeeded for step {step_id}"),
+                Err(e) => warn!("CreateStepLogsMetadata failed for step {step_id}: {e:#}"),
+            }
+        }
         Err(e) => warn!("Log upload failed for step {step_id}: {e:#}"),
     }
 }
@@ -570,7 +588,24 @@ async fn upload_job_log(rpt: &ReportingContext, content: &str) {
         .upload_log_blob(&signed_url, content.as_bytes().to_vec())
         .await
     {
-        Ok(()) => info!("Uploaded job log ({} bytes)", content.len()),
+        Ok(()) => {
+            info!("Uploaded job log ({} bytes)", content.len());
+            // Official runner calls CreateJobLogsMetadata after job log upload
+            let metadata = serde_json::json!({
+                "workflow_run_backend_id": rpt.plan_id,
+                "workflow_job_run_backend_id": rpt.job_id,
+                "uploaded_at": iso_now(),
+                "line_count": content.lines().count(),
+            });
+            match rpt
+                .results
+                .create_job_logs_metadata(&rpt.access_token, &metadata)
+                .await
+            {
+                Ok(_) => info!("CreateJobLogsMetadata succeeded"),
+                Err(e) => warn!("CreateJobLogsMetadata failed: {e:#}"),
+            }
+        }
         Err(e) => warn!("Job log upload failed: {e:#}"),
     }
 }
