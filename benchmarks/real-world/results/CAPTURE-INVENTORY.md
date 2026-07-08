@@ -1,26 +1,26 @@
 # Capture Inventory & Conformance Status
-Generated: 2026-07-08 18:26 UTC
+Generated: 2026-07-08 20:19 UTC
 
 Two separate data sources:
 - **MITM flows** — raw HTTP traffic captures (flows.jsonl) from mitmproxy, recording every request/response
 - **Conformance outcomes** — job conclusion + step data from GitHub's API after live workflow dispatch
 
 ## MITM Flow Captures
-43 scenarios — 11 official — 4 aksh — 2 both — [diffs](runner-flow/) linked where available
+43 scenarios — 11 official — 13 aksh — 11 both — [diffs](runner-flow/) linked where available
 
 | # | Scenario | Official | Aksh | Diff |
 |---|---:|---:|---|
 | 01 | ⚠️ register-and-idle | 68 | 3 | [1 diffs](runner-flow/01/diff.md) |
 | 06 | ⚠️ multi-step | 47 | 240474 | [1 diffs](runner-flow/06/diff.md) |
-| 07 | 🔵 step-failure | 50 | — | — |
-| 08 | 🔵 job-outputs-needs | 59 | — | — |
-| 09 | 🔵 matrix-fan-out | 73 | — | — |
-| 10 | 🔵 uses-checkout | 36 | — | — |
-| 11 | 🔵 cache-roundtrip | 40 | — | — |
-| 12 | 🔵 artifact | 45 | — | — |
-| 13 | 🔵 composite-action | 36 | — | — |
-| 14 | 🔵 annotations | 33 | — | — |
-| 15 | 🔵 oidc-id-token | 30 | — | — |
+| 07 | ⚠️ step-failure | 50 | 43 | — |
+| 08 | ⚠️ job-outputs-needs | 59 | 39 | — |
+| 09 | ⚠️ matrix-fan-out | 73 | 39 | — |
+| 10 | ⚠️ uses-checkout | 36 | 45 | — |
+| 11 | ⚠️ cache-roundtrip | 40 | 52 | — |
+| 12 | ⚠️ artifact | 45 | 46 | — |
+| 13 | ⚠️ composite-action | 36 | 42 | — |
+| 14 | ⚠️ annotations | 33 | 15 | — |
+| 15 | ⚠️ oidc-id-token | 30 | 40 | — |
 | 19 | ⬜ step-summary | — | — | — |
 | 20 | 🟡 reusable-workflow | — | 30 | — |
 | 21 | ⬜ job-timeout | — | — | — |
@@ -55,7 +55,7 @@ Two separate data sources:
 | 75 | 🟡 workflow-call-stress | — | 12 | — |
 
 ### Gaps
-**Official only (9):** 07 step-failure, 08 job-outputs-needs, 09 matrix-fan-out, 10 uses-checkout, 11 cache-roundtrip, 12 artifact, 13 composite-action, 14 annotations, 15 oidc-id-token
+**Official only:** _none_
 **Aksh only (2):** 20 reusable-workflow, 75 workflow-call-stress
 **Neither (30):** 19, 21, 22, 23, 24, 30, 31, 32, 33, 34, 35, 36, 50, 51, 52, 53, 54, 55, 56, 57, 58, 60, 61, 62, 63, 70, 71, 72, 73, 74
 
