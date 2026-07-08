@@ -11,6 +11,7 @@ WORKSPACE="/Users/bnjoroge/macos-runners"
 
 log() { echo "[$(date +%T.%3N)] $*"; }
 
+WFBASE=$(basename "$WF" .yml)
 # ── Cancel ALL stale runs and wait for effect ──────────────────────
 log "Cancelling ALL queued/in-progress runs..."
 for rid in $(gh run list -R "$GH_REPO" -L 30 --json databaseId,status \
