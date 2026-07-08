@@ -1395,39 +1395,53 @@ async fn handle_dap_debug_socket(socket: WebSocket, run_id: RunId, shared: Arc<S
         let inner = shared.state.inner.lock().await;
         inner.dap_ports.get(&run_id).cloned()
     };
-    let registration = match registration {
-        Some(registration) => registration,
+    let (port, job_id_str) = match registration {
+        Some(reg) => (reg.port, reg.job_id.to_string()),
         None => {
-            warn!(%run_id, "DAP port not registered for run");
-            return;
+            info!(%run_id, "No DAP port registered; falling back to default port 4711 for official runner");
+            (4711, "official".to_string())
         }
     };
-    let port = registration.port;
 
-    info!(%run_id, job_id = %registration.job_id, port, "Starting DAP websocket proxy to runner");
+    info!(%run_id, job_id = %job_id_str, port, "Starting DAP websocket proxy to runner");
     if let Err(e) = pump_axum_ws_to_dap(socket, port).await {
-        warn!(%run_id, job_id = %registration.job_id, port, "DAP websocket proxy ended with error: {e}");
+        warn!(%run_id, job_id = %job_id_str, port, "DAP websocket proxy ended with error: {e}");
     }
 }
 
 async fn pump_axum_ws_to_dap(ws: WebSocket, target_port: u16) -> Result<(), anyhow::Error> {
     use futures::{SinkExt, StreamExt};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpStream;
 
-    let mut target = TcpStream::connect(("127.0.0.1", target_port)).await?;
-    let (mut target_read, mut target_write) = target.split();
+    // Connect to the runner's WebSocket DAP bridge with retries.
+    // The bridge may not be listening yet when the server opens this proxy.
+    let url = format!("ws://127.0.0.1:{target_port}");
+    let mut target_ws = None;
+    for _ in 0..50 {
+        match tokio_tungstenite::connect_async(&url).await {
+            Ok((stream, _)) => {
+                target_ws = Some(stream);
+                break;
+            }
+            Err(_) => {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+    }
+    let target_ws = target_ws
+        .ok_or_else(|| anyhow::anyhow!("failed to connect to runner DAP bridge after retries"))?;
+
+    let (mut target_sink, mut target_stream) = target_ws.split();
     let (mut ws_sink, mut ws_stream) = ws.split();
 
+    // Client WS → Runner bridge WS (forward text frames directly).
     let to_target = async {
         while let Some(msg) = ws_stream.next().await {
             match msg {
                 Ok(WsMessage::Text(text)) => {
-                    let bytes = text.as_bytes();
-                    let header = format!("Content-Length: {}\r\n\r\n", bytes.len());
-                    target_write.write_all(header.as_bytes()).await?;
-                    target_write.write_all(bytes).await?;
-                    target_write.flush().await?;
+                    target_sink
+                        .send(tokio_tungstenite::tungstenite::Message::Text(text))
+                        .await
+                        .map_err(|e| anyhow::anyhow!("target ws send: {e}"))?;
                 }
                 Ok(WsMessage::Binary(_)) => {
                     return Err(anyhow::anyhow!(
@@ -1441,27 +1455,18 @@ async fn pump_axum_ws_to_dap(ws: WebSocket, target_port: u16) -> Result<(), anyh
         Ok::<_, anyhow::Error>(())
     };
 
+    // Runner bridge WS → Client WS (forward text frames directly).
     let from_target = async {
-        let mut buf = bytes::BytesMut::with_capacity(32 * 1024);
-        loop {
-            let mut tmp = [0u8; 32 * 1024];
-            let n = match target_read.read(&mut tmp).await {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(e) => return Err(e.into()),
-            };
-            buf.extend_from_slice(&tmp[..n]);
-            loop {
-                match try_drain_message_from_buf(&mut buf) {
-                    Some(Ok(text)) => {
-                        ws_sink
-                            .send(WsMessage::Text(text))
-                            .await
-                            .map_err(|e| anyhow::anyhow!("ws send: {e}"))?;
-                    }
-                    Some(Err(e)) => return Err(e),
-                    None => break,
+        while let Some(msg) = target_stream.next().await {
+            match msg {
+                Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
+                    ws_sink
+                        .send(WsMessage::Text(text))
+                        .await
+                        .map_err(|e| anyhow::anyhow!("ws send: {e}"))?;
                 }
+                Ok(tokio_tungstenite::tungstenite::Message::Close(_)) | Err(_) => break,
+                Ok(_) => continue,
             }
         }
         Ok::<_, anyhow::Error>(())
@@ -1472,57 +1477,6 @@ async fn pump_axum_ws_to_dap(ws: WebSocket, target_port: u16) -> Result<(), anyh
         b = from_target => b?,
     }
     Ok(())
-}
-
-fn try_drain_message_from_buf(buf: &mut bytes::BytesMut) -> Option<Result<String, anyhow::Error>> {
-    use bytes::Buf;
-    // Find CRLF CRLF
-    let terminator = find_crlf_crlf_bytes(buf)?;
-    let header_part = match std::str::from_utf8(&buf[..terminator]) {
-        Ok(s) => s,
-        Err(e) => return Some(Err(anyhow::anyhow!("non-utf8 header: {e}"))),
-    };
-    let content_len = match parse_content_length_str(header_part) {
-        Ok(len) => len,
-        Err(e) => return Some(Err(e)),
-    };
-    let total_len = terminator + 4 + content_len;
-    if buf.len() < total_len {
-        return None;
-    }
-    // Extract body
-    let start = terminator + 4;
-    let body_bytes = &buf[start..total_len];
-    let body_str = match std::str::from_utf8(body_bytes) {
-        Ok(s) => s.to_owned(),
-        Err(e) => return Some(Err(anyhow::anyhow!("non-utf8 body: {e}"))),
-    };
-    buf.advance(total_len);
-    Some(Ok(body_str))
-}
-
-fn find_crlf_crlf_bytes(buf: &bytes::BytesMut) -> Option<usize> {
-    for i in 0..buf.len().saturating_sub(3) {
-        if buf[i] == b'\r' && buf[i + 1] == b'\n' && buf[i + 2] == b'\r' && buf[i + 3] == b'\n' {
-            return Some(i);
-        }
-    }
-    None
-}
-
-fn parse_content_length_str(headers: &str) -> Result<usize, anyhow::Error> {
-    for line in headers.split("\r\n") {
-        if let Some(rest) = line
-            .strip_prefix("Content-Length:")
-            .or_else(|| line.strip_prefix("content-length:"))
-        {
-            return rest
-                .trim()
-                .parse::<usize>()
-                .map_err(|e| anyhow::anyhow!("invalid Content-Length: {e}"));
-        }
-    }
-    Err(anyhow::anyhow!("missing Content-Length"))
 }
 
 async fn record_live_log_wrapper(
@@ -2040,10 +1994,13 @@ async fn broker_acquire_job(
     for endpoint in &mut message.resources.endpoints {
         if endpoint.name.eq_ignore_ascii_case("SystemVssConnection") {
             endpoint.url = Some(run_service_url.clone());
+            let system_jwt = local_jwt(serde_json::json!({
+                "sub": "aksh-system-token"
+            }))?;
             endpoint
                 .authorization
                 .parameters
-                .insert("AccessToken".to_owned(), AKSH_SYSTEM_TOKEN.to_owned());
+                .insert("AccessToken".to_owned(), system_jwt);
             endpoint
                 .data
                 .insert("ResultsServiceUrl".to_owned(), public_base_url());
