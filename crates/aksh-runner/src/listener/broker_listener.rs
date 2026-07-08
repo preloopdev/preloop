@@ -220,6 +220,11 @@ pub async fn run_broker_loop(
                                     warn!("Received job while another is running — ignoring");
                                     continue;
                                 }
+                                // Renew OAuth token before job acquisition (official runner refreshes here)
+                                match crate::listener::oauth::get_oauth_token(http, config).await {
+                                    Ok(new_token) => token = new_token,
+                                    Err(e) => warn!("OAuth token renewal before job failed: {e:#}"),
+                                }
                                 let job = acquire_job_from_ref(&body, http, &token).await?;
                                 if let Some(job_msg) = job {
                                     let running = job_dispatcher::spawn_job(
