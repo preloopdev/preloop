@@ -82,14 +82,15 @@ def _dump_flow(flow: http.HTTPFlow, index: int, cd: Path):
     if response is not None and response.timestamp_end and request.timestamp_start:
         duration = (response.timestamp_end - request.timestamp_start) * 1000
 
-    # Large/non-JSON bodies: save as bin files, omit base64 from JSONL
-    req_large = len(req_body) > 256 * 1024 or (_safe_json(req_body) is None and req_body)
-    resp_large = response and (len(resp_body) > 256 * 1024 or (_safe_json(resp_body) is None and resp_body))
-    if req_large:
+    # Large bodies (>256KB): save as bin files, omit base64 from JSONL.
+    # Small bodies (including non-JSON text like log uploads): keep base64 inline.
+    req_large = len(req_body) > 256 * 1024
+    resp_large = response and len(resp_body) > 256 * 1024
+    # Also save any non-JSON/non-empty body as a bin file for convenience
+    if _safe_json(req_body) is None and req_body:
         (cd / f"flow.{index}.req.bin").write_bytes(req_body)
-    if resp_large:
+    if response and _safe_json(resp_body) is None and resp_body:
         (cd / f"flow.{index}.resp.bin").write_bytes(resp_body)
-
     record = {
         "flow_index": index,
         "ts_request": request.timestamp_start,
