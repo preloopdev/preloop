@@ -101,6 +101,11 @@ pub async fn run_job(
             .get("debuggerWelcomeMessage")
             .and_then(|v| v.as_str())
             .map(str::to_string);
+        let debugger_transport = aksh_dap::DebuggerTransportMode::from_wire(
+            job_message
+                .get("akshDebugTransport")
+                .and_then(|v| v.as_str()),
+        );
         let override_welcome = job_ctx
             .variables
             .get("ACTIONS_RUNNER_DEBUGGER_OVERRIDE_WELCOME_MESSAGE")
@@ -116,7 +121,7 @@ pub async fn run_job(
                 if let Ok(tunnel) =
                     serde_json::from_value::<aksh_gha_protocol::DebuggerTunnelInfo>(tunnel_json)
                 {
-                    let cfg = aksh_dap::DebuggerConfig::new(
+                    let cfg = aksh_dap::DebuggerConfig::new_with_transport(
                         true,
                         Some(aksh_dap::DebuggerTunnelInfo {
                             tunnel_id: tunnel.tunnel_id,
@@ -126,6 +131,7 @@ pub async fn run_job(
                         }),
                         override_welcome,
                         debugger_welcome,
+                        debugger_transport,
                     );
                     if cfg.is_runnable() {
                         let dbg = std::sync::Arc::new(aksh_dap::DapDebugger::new(cfg));

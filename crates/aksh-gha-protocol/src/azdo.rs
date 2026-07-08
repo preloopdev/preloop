@@ -339,6 +339,15 @@ pub struct AgentJobRequestMessage {
         skip_serializing_if = "Option::is_none"
     )]
     pub aksh_debug_run_id: Option<String>,
+
+    /// aksh local-control-plane extension: transport mode for DAP traffic.
+    /// Absent on official GitHub payloads, which default to DevTunnel mode.
+    #[serde(
+        rename = "akshDebugTransport",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub aksh_debug_transport: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {

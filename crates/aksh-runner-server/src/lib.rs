@@ -952,6 +952,10 @@ pub(crate) async fn submit_run_inner(
 
             agent_msg.enable_debugger = submission.enable_debugger;
             agent_msg.aksh_debug_run_id = Some(run_id.to_string());
+            agent_msg.aksh_debug_transport = Some(
+                std::env::var("AKSH_DAP_TRANSPORT")
+                    .unwrap_or_else(|_| "localServerProxy".to_string()),
+            );
             if submission.enable_debugger {
                 agent_msg.debugger_tunnel = Some(azdo::DebuggerTunnelInfo {
                     tunnel_id: "local".to_string(),

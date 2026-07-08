@@ -13,6 +13,41 @@
 
 use serde::{Deserialize, Serialize};
 
+/// DAP transport mode selected by the control plane.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum DebuggerTransportMode {
+    /// aksh local mode: the runner exposes only the inner TCP DAP server and
+    /// registers that port with `aksh-runner-server`, which proxies WebSocket
+    /// clients locally.
+    LocalServerProxy,
+    /// Official/GitHub mode: the runner hosts a DevTunnel and starts
+    /// WebSocketDapBridge on the tunnel port.
+    #[default]
+    DevTunnel,
+}
+
+impl DebuggerTransportMode {
+    /// Parse the aksh local extension value from an acquire payload.
+    pub fn from_wire(value: Option<&str>) -> Self {
+        match value {
+            Some("local" | "localServerProxy" | "server-proxy" | "serverProxy") => {
+                Self::LocalServerProxy
+            }
+            Some("devtunnel" | "devTunnel" | "prod") | None => Self::DevTunnel,
+            Some(_) => Self::DevTunnel,
+        }
+    }
+
+    /// Wire value for aksh control-plane payloads.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::LocalServerProxy => "localServerProxy",
+            Self::DevTunnel => "devTunnel",
+        }
+    }
+}
+
 /// Dev Tunnel details for remote debugging.
 ///
 /// Mirrors `src/Sdk/DTPipelines/Pipelines/DebuggerTunnelInfo.cs` in
@@ -69,7 +104,8 @@ impl DebuggerTunnelInfo {
 ///
 /// Populated once from the acquire response and owned by
 /// `GlobalContext.Debugger`. Mirrors `DebuggerConfig.cs` in
-/// `actions/runner`.
+/// `actions/runner`, with one aksh-local extension for transport
+/// selection.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct DebuggerConfig {
     /// Whether the debugger is enabled for this job.
@@ -99,23 +135,44 @@ pub struct DebuggerConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub welcome_message: Option<String>,
+
+    /// How debugger traffic reaches this runner.
+    #[serde(rename = "transport", default)]
+    pub transport: DebuggerTransportMode,
 }
 
 impl DebuggerConfig {
-    /// Build a config from the wire-level acquire-response fields.
-    /// Mirrors `ExecutionContext.cs`'s construction of
-    /// `new Dap.DebuggerConfig(message.EnableDebugger, message.DebuggerTunnel, ...)`.
+    /// Build a config from official wire-level acquire-response fields.
+    /// Defaults to DevTunnel transport for GitHub compatibility.
     pub fn new(
         enabled: bool,
         tunnel: Option<DebuggerTunnelInfo>,
         override_welcome_message: bool,
         welcome_message: Option<String>,
     ) -> Self {
+        Self::new_with_transport(
+            enabled,
+            tunnel,
+            override_welcome_message,
+            welcome_message,
+            DebuggerTransportMode::DevTunnel,
+        )
+    }
+
+    /// Build a config with an explicit aksh transport mode.
+    pub fn new_with_transport(
+        enabled: bool,
+        tunnel: Option<DebuggerTunnelInfo>,
+        override_welcome_message: bool,
+        welcome_message: Option<String>,
+        transport: DebuggerTransportMode,
+    ) -> Self {
         Self {
             enabled,
             tunnel,
             override_welcome_message,
             welcome_message,
+            transport,
         }
     }
 

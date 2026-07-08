@@ -49,7 +49,7 @@ pub mod view;
 /// Re-export of the most commonly used types so callers can
 /// `use aksh_dap::*;` without listing every module.
 pub use bridge::{IncomingStreamPrefixKind, WebSocketDapBridge};
-pub use config::{DebuggerConfig, DebuggerTunnelInfo};
+pub use config::{DebuggerConfig, DebuggerTransportMode, DebuggerTunnelInfo};
 pub use debugger::{DapDebugger, DapSessionState, IDapDebugger};
 // Re-export at the top level for downstream consumers that want
 // `aksg_dap::IDapDebugger` without reaching into the `debugger` module.
