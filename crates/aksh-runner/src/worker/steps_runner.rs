@@ -432,6 +432,10 @@ pub async fn run_steps(
         //     await dapDebugger?.OnStepStartingAsync(step);
         // If no editor is attached, the trait returns immediately.
         if let Some(dbg) = dap_debugger.as_ref() {
+            let expr_ctx = step_ctx.job.build_expression_context();
+            let context_val = serde_json::to_value(expr_ctx.roots()).unwrap_or_else(|_| serde_json::json!({}));
+            dbg.update_context(context_val, step_ctx.job.masks.clone());
+
             if let Err(e) = dbg.on_step_starting(&resolved_display_name).await {
                 warn!("DAP OnStepStarting failed: {e}");
             }

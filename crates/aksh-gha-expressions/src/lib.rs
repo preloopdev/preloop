@@ -40,6 +40,11 @@ impl Context {
         self.roots.insert(key.into(), value);
     }
 
+    /// Get the raw roots map.
+    pub fn roots(&self) -> &BTreeMap<String, Value> {
+        &self.roots
+    }
+
     /// Resolve a dotted path such as `github.event_name`.
     /// Resolve a path such as `github.event_name`, with bracket access and wildcard support.
     ///
