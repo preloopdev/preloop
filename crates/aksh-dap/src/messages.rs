@@ -297,100 +297,69 @@ impl Event {
 /// hand-rolled so that only the `true` flags appear in the wire
 /// body — matching the C# `JsonProperty(EmitDefaultValue = false)`
 /// behavior.
-#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
 pub struct Capabilities {
-    /// The debug adapter supports the `configurationDone` request.
     #[serde(rename = "supportsConfigurationDoneRequest", default)]
     pub supports_configuration_done_request: bool,
-
-    /// The debug adapter supports `conditionalBreakpoints`.
-    #[serde(rename = "supportsConditionalBreakpoints", default)]
-    pub supports_conditional_breakpoints: bool,
-
-    /// The debug adapter supports `hitConditionalBreakpoints`.
-    #[serde(rename = "supportsHitConditionalBreakpoints", default)]
-    pub supports_hit_conditional_breakpoints: bool,
-
-    /// The debug adapter supports function breakpoints.
     #[serde(rename = "supportsFunctionBreakpoints", default)]
     pub supports_function_breakpoints: bool,
-
-    /// The debug adapter supports breakpoints in exceptions.
-    #[serde(rename = "supportsExceptionFilterOptions", default)]
-    pub supports_exception_filter_options: bool,
-
-    /// The debug adapter supports `evaluate` requests for the
-    /// REPL DSL (`help`, `run(...)`).
+    #[serde(rename = "supportsConditionalBreakpoints", default)]
+    pub supports_conditional_breakpoints: bool,
     #[serde(rename = "supportsEvaluateForHovers", default)]
     pub supports_evaluate_for_hovers: bool,
-
-    /// `ExceptionBreakpointsFilters` advertised by the adapter.
+    #[serde(rename = "supportsStepBack", default)]
+    pub supports_step_back: bool,
+    #[serde(rename = "supportsSetVariable", default)]
+    pub supports_set_variable: bool,
+    #[serde(rename = "supportsRestartFrame", default)]
+    pub supports_restart_frame: bool,
+    #[serde(rename = "supportsGotoTargetsRequest", default)]
+    pub supports_goto_targets_request: bool,
+    #[serde(rename = "supportsStepInTargetsRequest", default)]
+    pub supports_step_in_targets_request: bool,
+    #[serde(rename = "supportsCompletionsRequest", default)]
+    pub supports_completions_request: bool,
+    #[serde(rename = "supportsModulesRequest", default)]
+    pub supports_modules_request: bool,
+    #[serde(rename = "supportsTerminateRequest", default)]
+    pub supports_terminate_request: bool,
+    // Note: official runner uses "supportTerminateDebuggee" (no 's' prefix).
+    #[serde(rename = "supportTerminateDebuggee", default)]
+    pub support_terminate_debuggee: bool,
+    #[serde(rename = "supportsDelayedStackTraceLoading", default)]
+    pub supports_delayed_stack_trace_loading: bool,
+    #[serde(rename = "supportsLoadedSourcesRequest", default)]
+    pub supports_loaded_sources_request: bool,
+    #[serde(rename = "supportsProgressReporting", default)]
+    pub supports_progress_reporting: bool,
+    #[serde(rename = "supportsRunInTerminalRequest", default)]
+    pub supports_run_in_terminal_request: bool,
+    #[serde(rename = "supportsCancelRequest", default)]
+    pub supports_cancel_request: bool,
+    #[serde(rename = "supportsExceptionOptions", default)]
+    pub supports_exception_options: bool,
+    #[serde(rename = "supportsValueFormattingOptions", default)]
+    pub supports_value_formatting_options: bool,
+    #[serde(rename = "supportsExceptionInfoRequest", default)]
+    pub supports_exception_info_request: bool,
     #[serde(
         rename = "exceptionBreakpointFilters",
         skip_serializing_if = "Option::is_none"
     )]
     pub exception_breakpoint_filters: Option<Value>,
-
-    /// The debug adapter supports the `terminate` request.
-    #[serde(rename = "supportsTerminateRequest", default)]
-    pub supports_terminate_request: bool,
-
-    /// The debug adapter supports `stepBack`.
-    #[serde(rename = "supportsStepBack", default)]
-    pub supports_step_back: bool,
 }
 
 impl Capabilities {
-    /// Build the default capabilities the runner advertises. Mirrors
-    /// the C# `HandleInitialize` response body. Only the `true` flags
-    /// are non-default; the rest are left at the C# default of
-    /// `EmitDefaultValue = false`, so they don't appear in the
-    /// serialized body.
+    /// Build the default capabilities the runner advertises.
+    /// Matches official runner v2.335.1 `HandleInitialize` response body
+    /// exactly — all fields present, true values matching upstream.
     pub fn runner_default() -> Self {
         Self {
             supports_configuration_done_request: true,
             supports_evaluate_for_hovers: true,
-            supports_terminate_request: true,
+            supports_completions_request: true,
             ..Default::default()
         }
-    }
-}
-
-impl Serialize for Capabilities {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeMap;
-        let mut map = serializer.serialize_map(None)?;
-        if self.supports_configuration_done_request {
-            map.serialize_entry("supportsConfigurationDoneRequest", &true)?;
-        }
-        if self.supports_conditional_breakpoints {
-            map.serialize_entry("supportsConditionalBreakpoints", &true)?;
-        }
-        if self.supports_hit_conditional_breakpoints {
-            map.serialize_entry("supportsHitConditionalBreakpoints", &true)?;
-        }
-        if self.supports_function_breakpoints {
-            map.serialize_entry("supportsFunctionBreakpoints", &true)?;
-        }
-        if self.supports_exception_filter_options {
-            map.serialize_entry("supportsExceptionFilterOptions", &true)?;
-        }
-        if self.supports_evaluate_for_hovers {
-            map.serialize_entry("supportsEvaluateForHovers", &true)?;
-        }
-        if self.supports_terminate_request {
-            map.serialize_entry("supportsTerminateRequest", &true)?;
-        }
-        if self.supports_step_back {
-            map.serialize_entry("supportsStepBack", &true)?;
-        }
-        if let Some(ebpf) = &self.exception_breakpoint_filters {
-            map.serialize_entry("exceptionBreakpointFilters", ebpf)?;
-        }
-        map.end()
     }
 }
 
@@ -455,14 +424,17 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_default_serializes_only_runner_set_flags() {
+    fn capabilities_default_matches_official_runner() {
         let caps = Capabilities::runner_default();
         let v: Value = serde_json::to_value(&caps).unwrap();
-        // Only the `true` flags should be present.
+        // True in official runner:
         assert_eq!(v["supportsConfigurationDoneRequest"], true);
         assert_eq!(v["supportsEvaluateForHovers"], true);
-        assert_eq!(v["supportsTerminateRequest"], true);
-        // Unsupported ones should not appear at all.
-        assert!(v.get("supportsStepBack").is_none());
+        assert_eq!(v["supportsCompletionsRequest"], true);
+        // False in official runner (all present, not omitted):
+        assert_eq!(v["supportsTerminateRequest"], false);
+        assert_eq!(v["supportsStepBack"], false);
+        assert_eq!(v["supportsFunctionBreakpoints"], false);
+        assert_eq!(v["supportTerminateDebuggee"], false);
     }
 }

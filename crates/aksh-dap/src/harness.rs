@@ -526,8 +526,26 @@ mod tests {
                 "success": true,
                 "body": {
                     "supportsConfigurationDoneRequest": true,
+                    "supportsFunctionBreakpoints": false,
+                    "supportsConditionalBreakpoints": false,
                     "supportsEvaluateForHovers": true,
-                    "supportsTerminateRequest": true
+                    "supportsStepBack": false,
+                    "supportsSetVariable": false,
+                    "supportsRestartFrame": false,
+                    "supportsGotoTargetsRequest": false,
+                    "supportsStepInTargetsRequest": false,
+                    "supportsCompletionsRequest": true,
+                    "supportsModulesRequest": false,
+                    "supportsTerminateRequest": false,
+                    "supportTerminateDebuggee": false,
+                    "supportsDelayedStackTraceLoading": false,
+                    "supportsLoadedSourcesRequest": false,
+                    "supportsProgressReporting": false,
+                    "supportsRunInTerminalRequest": false,
+                    "supportsCancelRequest": false,
+                    "supportsExceptionOptions": false,
+                    "supportsValueFormattingOptions": false,
+                    "supportsExceptionInfoRequest": false
                 }
             }))
             .build();

@@ -1035,7 +1035,8 @@ mod tests {
         let body = resp.body.unwrap();
         assert_eq!(body["supportsConfigurationDoneRequest"], true);
         assert_eq!(body["supportsEvaluateForHovers"], true);
-        assert_eq!(body["supportsTerminateRequest"], true);
+        assert_eq!(body["supportsTerminateRequest"], false);
+        assert_eq!(body["supportsCompletionsRequest"], true);
     }
 
     #[tokio::test]
