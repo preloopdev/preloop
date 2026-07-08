@@ -122,13 +122,24 @@ impl ServerQueue {
     }
 
     /// Build the WorkflowStepsUpdate request body and drain pending updates.
+    ///
+    /// Deduplicates by `external_id`, keeping only the latest update per step.
+    /// This matches official runner behavior: the final batch contains each step
+    /// in its terminal state only (no InProgress → Completed pairs).
     pub fn take_steps_update_body(&mut self) -> Option<WorkflowStepsUpdateBody> {
         if self.pending_updates.is_empty() {
             return None;
         }
+        // Dedup: keep last update per external_id (Completed overwrites InProgress)
+        let mut seen = HashMap::new();
+        for update in std::mem::take(&mut self.pending_updates) {
+            seen.insert(update.external_id.clone(), update);
+        }
+        let mut steps: Vec<StepUpdate> = seen.into_values().collect();
+        steps.sort_by_key(|s| s.number);
         self.change_order += 1;
         Some(WorkflowStepsUpdateBody {
-            steps: std::mem::take(&mut self.pending_updates),
+            steps,
             change_order: self.change_order,
             workflow_job_run_backend_id: self.job_id.clone(),
             workflow_run_backend_id: self.plan_id.clone(),
