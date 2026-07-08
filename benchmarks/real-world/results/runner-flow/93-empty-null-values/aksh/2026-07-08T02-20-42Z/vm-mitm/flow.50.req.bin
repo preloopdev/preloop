@@ -1,0 +1,11 @@
+2026-07-08T02:21:08.136Z ##[group]Run if [[ "$EXPLICIT_EMPTY" == "" ]]; then
+2026-07-08T02:21:08.137Z if [[ "$EXPLICIT_EMPTY" == "" ]]; then
+2026-07-08T02:21:08.137Z   echo "✓ Explicit empty string handled correctly"
+2026-07-08T02:21:08.137Z fi
+2026-07-08T02:21:08.137Z 
+2026-07-08T02:21:08.137Z if [[ -z "$UNSET_VAR_REF" ]]; then
+2026-07-08T02:21:08.137Z   echo "✓ Unset variable reference is empty"
+2026-07-08T02:21:08.137Z fi
+2026-07-08T02:21:08.138Z shell: bash --noprofile --norc -e -o pipefail {0}
+2026-07-08T02:21:08.138Z ##[endgroup]
+2026-07-08T02:21:08.140Z ✓ Explicit empty string handled correctly

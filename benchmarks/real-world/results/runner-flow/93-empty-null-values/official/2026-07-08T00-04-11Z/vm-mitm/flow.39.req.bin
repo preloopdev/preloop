@@ -1,0 +1,6 @@
+﻿2026-07-08T00:04:34.5146841Z ##[group]Run # Intentionally don't set never_set_var
+2026-07-08T00:04:34.5147304Z [36;1m# Intentionally don't set never_set_var[0m
+2026-07-08T00:04:34.5147711Z [36;1mecho "Step executed but output variable never defined"[0m
+2026-07-08T00:04:34.5150422Z shell: /usr/bin/bash -e {0}
+2026-07-08T00:04:34.5150688Z ##[endgroup]
+2026-07-08T00:04:34.5169026Z Step executed but output variable never defined

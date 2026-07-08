@@ -1,0 +1,5 @@
+2026-07-08T02:21:09.188Z ##[group]Run # Set one output but not another
+2026-07-08T02:21:09.188Z # Set one output but not another
+2026-07-08T02:21:09.188Z echo 'defined_field=has_value' >> $GITHUB_OUTPUT
+2026-07-08T02:21:09.188Z shell: bash --noprofile --norc -e -o pipefail {0}
+2026-07-08T02:21:09.188Z ##[endgroup]
