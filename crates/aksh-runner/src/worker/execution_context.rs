@@ -33,10 +33,11 @@ pub struct StepContext<'a> {
     pub telemetry_errors: Vec<String>,
     /// Log temp file for durable storage.
     pub log_file: Arc<Mutex<BufWriter<std::fs::File>>>,
+    /// Line buffer for accumulating partial lines from process output chunks.
+    line_buffer: Arc<Mutex<Vec<u8>>>,
     /// Whether to also accumulate log lines in memory (for tests).
     pub keep_in_memory: bool,
 }
-
 /// A workflow annotation (error/warning/notice).
 #[derive(Debug, Clone)]
 pub struct Annotation {
@@ -87,17 +88,56 @@ impl<'a> StepContext<'a> {
             translate_container_path,
             telemetry_errors: Vec::new(),
             log_file,
+            line_buffer: Arc::new(Mutex::new(Vec::new())),
             keep_in_memory,
         }
     }
 
 
-    /// Write a raw byte chunk from process output. In production mode this
-    /// writes directly to the disk-backed log file. No String allocation,
-    /// no UTF-8 check, no per-line processing. Secret masking and timestamp
+    /// Write a raw byte chunk from process output.
+    ///
+    /// Buffers partial lines and processes each complete line with a UTC
+    /// timestamp prefix and secret masking, matching the official runner's
+    /// per-line log formatting.
     pub fn write_chunk(&self, chunk: &[u8]) {
-        let mut lock = self.log_file.lock();
-        let _ = lock.write_all(chunk);
+        let mut buf = self.line_buffer.lock();
+        buf.extend_from_slice(chunk);
+
+        // Process all complete lines (ending with \n)
+        loop {
+            let newline_pos = match buf.iter().position(|&b| b == b'\n') {
+                Some(pos) => pos,
+                None => break,
+            };
+            // Extract the line (without the newline)
+            let line_bytes: Vec<u8> = buf.drain(..=newline_pos).collect();
+            let line = String::from_utf8_lossy(&line_bytes[..line_bytes.len() - 1]);
+
+            let masked = self.job.mask_secrets(&line);
+            let ts = crate::worker::job_runner::iso_now();
+            let fmt = format!("{ts} {masked}");
+            {
+                let mut lock = self.log_file.lock();
+                let _ = writeln!(lock, "{}", fmt);
+            }
+        }
+    }
+
+    /// Flush any remaining partial line in the buffer (call at step end).
+    pub fn flush_line_buffer(&self) {
+        let mut buf = self.line_buffer.lock();
+        if buf.is_empty() {
+            return;
+        }
+        let line = String::from_utf8_lossy(&buf);
+        let masked = self.job.mask_secrets(&line);
+        let ts = crate::worker::job_runner::iso_now();
+        let fmt = format!("{ts} {masked}");
+        {
+            let mut lock = self.log_file.lock();
+            let _ = writeln!(lock, "{}", fmt);
+        }
+        buf.clear();
     }
 
     /// Add a log line: parse workflow commands, apply masking, feed problem matchers.
