@@ -156,6 +156,12 @@ match_n = sum(1 for n in CONFORMANCE_NUMS if n in off_out and n in aksh_out and 
 fail_n = sum(1 for n in CONFORMANCE_NUMS if n in off_out and n in aksh_out and off_out[n]!=aksh_out[n] and off_out[n] not in ("(empty)","") and aksh_out[n] not in ("(empty)",""))
 inc_n  = sum(1 for n in CONFORMANCE_NUMS if n in off_out and n in aksh_out and (off_out[n]=="(empty)" or aksh_out[n]=="(empty)"))
 
+L.append("## Conformance Outcomes")
+L.append(f"Scenarios 80–100 dispatched against GitHub. {match_n} match, {fail_n} mismatch, {inc_n} incomplete.")
+L.append("")
+L.append("| # | Scenario | Official | Aksh | Match |")
+L.append("|---|---|---|---|---|")
+L.append("")
 for num in CONFORMANCE_NUMS:
     name = CONFORMANCE_NAMES.get(num, num)
     oo = off_out.get(num, "—"); ao = aksh_out.get(num, "—")
