@@ -87,9 +87,6 @@ pub async fn run_steps(
             conclusion: step_conclusion::SUCCEEDED,
         });
     }
-    if let Some(rpt) = reporting {
-        crate::worker::job_runner::flush_step_updates(rpt, &queue).await;
-    }
 
     // Phase 2: Initialize containers step (step 2 when containers present)
     let step_offset: u32 = if has_containers {
@@ -106,9 +103,6 @@ pub async fn run_steps(
                 completed_at: None,
                 conclusion: 0,
             });
-        }
-        if let Some(rpt) = reporting {
-            crate::worker::job_runner::flush_step_updates(rpt, &queue).await;
         }
 
         let init_result =
@@ -145,7 +139,6 @@ pub async fn run_steps(
             }
         }
         if let Some(rpt) = reporting {
-            crate::worker::job_runner::flush_step_updates(rpt, &queue).await;
             // Upload init container logs
             if !init_logs.is_empty() {
                 let content = init_logs.join("\n");
@@ -235,9 +228,6 @@ pub async fn run_steps(
                         conclusion: step_conclusion::SKIPPED,
                     });
                 }
-                if let Some(rpt) = reporting {
-                    crate::worker::job_runner::flush_step_updates(rpt, &queue).await;
-                }
                 continue;
             }
             Err(e) => {
@@ -268,9 +258,6 @@ pub async fn run_steps(
                         conclusion: step_conclusion::FAILED,
                     });
                 }
-                if let Some(rpt) = reporting {
-                    crate::worker::job_runner::flush_step_updates(rpt, &queue).await;
-                }
                 continue;
             }
         }
@@ -290,9 +277,6 @@ pub async fn run_steps(
                 completed_at: None,
                 conclusion: 0,
             });
-        }
-        if let Some(rpt) = reporting {
-            crate::worker::job_runner::flush_step_updates(rpt, &queue).await;
         }
 
         let mut step_ctx = StepContext::new(
@@ -407,8 +391,8 @@ pub async fn run_steps(
             outcome = Err(anyhow::anyhow!("step timed out"));
         }
 
-        // Determine outcome and conclusion
-        let (outcome_str, conclusion_str) = match &outcome {
+        // Determine initial outcome and conclusion from step execution.
+        let (mut outcome_str, mut conclusion_str) = match &outcome {
             Ok(()) => ("Success".to_string(), "Success".to_string()),
             Err(e) => {
                 let msg = e.to_string();
@@ -430,11 +414,9 @@ pub async fn run_steps(
             }
         };
 
-        let step_end = crate::worker::job_runner::iso_now();
-        let conclusion_proto = ServerQueue::conclusion_to_proto(&conclusion_str);
-
         // Record a step result before applying file commands so GITHUB_OUTPUT can
-        // attach outputs to this step.
+        // attach outputs to this step.  If file-command parsing fails, official
+        // runner behavior is to mark the step failed after process execution.
         step_ctx.job.steps.insert(
             step.context_name.clone(),
             StepResult {
@@ -449,11 +431,31 @@ pub async fn run_steps(
             &step.context_name,
             step_ctx.job,
         ) {
-            warn!(
-                "Applying file commands for step '{}' failed: {e:#}",
-                resolved_display_name
-            );
+            step_ctx.log("##[error]Unable to process file command successfully.");
+            step_ctx.log(&format!("##[error]{e:#}"));
+            if step.continue_on_error {
+                warn!(
+                    "File commands for step '{}' failed but continue-on-error is set: {e:#}",
+                    resolved_display_name
+                );
+                outcome_str = "Failure".to_string();
+                conclusion_str = "Success".to_string();
+            } else {
+                warn!(
+                    "Applying file commands for step '{}' failed: {e:#}",
+                    resolved_display_name
+                );
+                outcome_str = "Failure".to_string();
+                conclusion_str = "Failure".to_string();
+            }
+            if let Some(step_result) = step_ctx.job.steps.get_mut(&step.context_name) {
+                step_result.outcome = outcome_str.clone();
+                step_result.conclusion = conclusion_str.clone();
+            }
         }
+
+        let step_end = crate::worker::job_runner::iso_now();
+        let conclusion_proto = ServerQueue::conclusion_to_proto(&conclusion_str);
         // F035: Read and scrub step summary content before cleanup deletes the file.
         let summary_content = if let Ok(metadata) =
             std::fs::metadata(&file_command_paths.summary_file)
@@ -526,9 +528,6 @@ pub async fn run_steps(
                 q.record_step_logs(&step.id, &log_content);
             }
         }
-        if let Some(rpt) = reporting {
-            crate::worker::job_runner::flush_step_updates(rpt, &queue).await;
-        }
 
         // F020: Upload step log immediately after completion
         if let Some(rpt) = reporting {
@@ -562,9 +561,6 @@ pub async fn run_steps(
                 conclusion: 0,
             });
         }
-        if let Some(rpt) = reporting {
-            crate::worker::job_runner::flush_step_updates(rpt, &queue).await;
-        }
 
         // Run cleanup
         let mut cleanup_log = Vec::new();
@@ -596,7 +592,6 @@ pub async fn run_steps(
             }
         }
         if let Some(rpt) = reporting {
-            crate::worker::job_runner::flush_step_updates(rpt, &queue).await;
             // Upload cleanup logs
             if !cleanup_log.is_empty() {
                 let content = cleanup_log.join("\n");
@@ -625,9 +620,6 @@ pub async fn run_steps(
             completed_at: Some(ts),
             conclusion: final_conclusion,
         });
-    }
-    if let Some(rpt) = reporting {
-        crate::worker::job_runner::flush_step_updates(rpt, &queue).await;
     }
 
     Ok(if cancelled {
@@ -1318,6 +1310,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_steps_file_command_parse_error_fails_successful_step() {
+        let dir = TempDir::new().unwrap();
+        let mut job = JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+        let (_tx, cancel_rx) = watch::channel(false);
+        let mut broken = test_step("broken_output", None);
+        broken.step_type = StepType::Script {
+            script: "echo 'value<<EOF' >> \"$GITHUB_OUTPUT\"\nprintf 'missing delimiter' >> \"$GITHUB_OUTPUT\"".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+
+        let result = run_steps(
+            &[broken],
+            &mut job,
+            dir.path().to_str().unwrap(),
+            cancel_rx,
+            queue,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "Failed");
+        let step = job.steps.get("broken_output").unwrap();
+        assert_eq!(step.outcome, "Failure");
+        assert_eq!(step.conclusion, "Failure");
+        assert!(step.outputs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_steps_file_command_parse_error_respects_continue_on_error() {
+        let dir = TempDir::new().unwrap();
+        let mut job = JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+        let (_tx, cancel_rx) = watch::channel(false);
+        let mut broken = test_step("broken_output", None);
+        broken.continue_on_error = true;
+        broken.step_type = StepType::Script {
+            script: "echo 'value<<EOF' >> \"$GITHUB_OUTPUT\"\nprintf 'missing delimiter' >> \"$GITHUB_OUTPUT\"".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+
+        let result = run_steps(
+            &[broken],
+            &mut job,
+            dir.path().to_str().unwrap(),
+            cancel_rx,
+            queue,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "Succeeded");
+        let step = job.steps.get("broken_output").unwrap();
+        assert_eq!(step.outcome, "Failure");
+        assert_eq!(step.conclusion, "Success");
+        assert!(step.outputs.is_empty());
+    }
+
+    #[tokio::test]
     async fn run_steps_github_env_is_visible_to_later_steps() {
         let dir = TempDir::new().unwrap();
         let mut job = JobContext::new(
@@ -1920,5 +1989,4 @@ mod tests {
             step_update.name
         );
     }
-
 }
