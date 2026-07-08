@@ -15,9 +15,27 @@
     "direction": "a2c",
     "message": {
       "body": {
+        "supportTerminateDebuggee": false,
+        "supportsCancelRequest": false,
+        "supportsCompletionsRequest": true,
+        "supportsConditionalBreakpoints": false,
         "supportsConfigurationDoneRequest": true,
+        "supportsDelayedStackTraceLoading": false,
         "supportsEvaluateForHovers": true,
-        "supportsTerminateRequest": true
+        "supportsExceptionInfoRequest": false,
+        "supportsExceptionOptions": false,
+        "supportsFunctionBreakpoints": false,
+        "supportsGotoTargetsRequest": false,
+        "supportsLoadedSourcesRequest": false,
+        "supportsModulesRequest": false,
+        "supportsProgressReporting": false,
+        "supportsRestartFrame": false,
+        "supportsRunInTerminalRequest": false,
+        "supportsSetVariable": false,
+        "supportsStepBack": false,
+        "supportsStepInTargetsRequest": false,
+        "supportsTerminateRequest": false,
+        "supportsValueFormattingOptions": false
       },
       "command": "initialize",
       "request_seq": 1,
@@ -69,25 +87,13 @@
     "direction": "a2c",
     "message": {
       "body": {
-        "reason": "started",
-        "threadId": 1
-      },
-      "event": "thread",
-      "seq": 5,
-      "type": "event"
-    }
-  },
-  {
-    "direction": "a2c",
-    "message": {
-      "body": {
         "allThreadsStopped": true,
         "description": "Stopped at job entry: Step 1",
         "reason": "entry",
         "threadId": 1
       },
       "event": "stopped",
-      "seq": 6,
+      "seq": 5,
       "type": "event"
     }
   },
@@ -100,6 +106,18 @@
       "arguments": {
         "frameId": 0
       }
+    }
+  },
+  {
+    "direction": "a2c",
+    "message": {
+      "body": {
+        "category": "console",
+        "output": "\nCommands will run on runner host\n"
+      },
+      "event": "output",
+      "seq": 6,
+      "type": "event"
     }
   },
   {
@@ -155,18 +173,6 @@
       "arguments": {
         "threadId": 1
       }
-    }
-  },
-  {
-    "direction": "a2c",
-    "message": {
-      "body": {
-        "allThreadsContinued": true,
-        "threadId": 1
-      },
-      "event": "continued",
-      "seq": 8,
-      "type": "event"
     }
   },
   {
