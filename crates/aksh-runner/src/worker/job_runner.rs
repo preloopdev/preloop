@@ -1021,7 +1021,7 @@ fn build_completejob_step_results(
         "action_name": "complete_job",
         "type": "runner",
         "status": "completed",
-        "conclusion": job_status_conclusion(job_ctx.job_status),
+        "conclusion": "succeeded",
         "started_at": &now,
         "completed_at": &now,
         "annotations": [],
