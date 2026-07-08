@@ -1148,12 +1148,9 @@ async fn report_completion(
 
     let step_results = build_completejob_step_results(ordered_steps, job_ctx, &step_annotations);
 
-    let mut outputs = serde_json::Map::new();
-    for (_, step) in &job_ctx.steps {
-        for (k, v) in &step.outputs {
-            outputs.insert(k.clone(), serde_json::json!({"value": v}));
-        }
-    }
+    // Official runner sends empty outputs in completejob — step outputs are
+    // already available to downstream jobs via the results service.
+    let outputs = serde_json::Map::new();
 
     // F048: Collect job-level annotations for completejob body.
     // These are infrastructure-level issues (container failures, action download errors)
