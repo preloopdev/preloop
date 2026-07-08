@@ -131,9 +131,9 @@ pub trait IDapDebugger: Send + Sync {
     fn on_post_step_registered(&self, step: &SourceEntry);
     /// Pause for inspection. Returns when the editor sends
     /// `continue` (or the job is cancelled).
-    async fn on_step_starting(&self, step_name: &str) -> Result<(), DapError>;
+    async fn on_step_starting(&self, step: &SourceEntry) -> Result<(), DapError>;
     /// Mark a step as completed; emits `continued` if we paused.
-    fn on_step_completed(&self, step_name: &str);
+    fn on_step_completed(&self, step: &SourceEntry);
     /// Job has completed: emit `terminated`/`exited`, pause for
     /// final inspection, then tear down.
     async fn on_job_completed(&self) -> Result<(), DapError>;
@@ -858,7 +858,7 @@ impl IDapDebugger for DapDebugger {
         }
     }
 
-    async fn on_step_starting(&self, step_name: &str) -> Result<(), DapError> {
+    async fn on_step_starting(&self, step: &SourceEntry) -> Result<(), DapError> {
         if !self.is_runnable() {
             return Ok(());
         }
@@ -872,7 +872,7 @@ impl IDapDebugger for DapDebugger {
                 "reason": "step",
                 "threadId": 1,
                 "allThreadsContinued": false,
-                "description": format!("Paused at step: {step_name}"),
+                "description": format!("Paused at step: {}", step.display_name),
             })),
         ));
         *self.core.state.lock() = DapSessionState::Paused;
@@ -896,7 +896,7 @@ impl IDapDebugger for DapDebugger {
         }
     }
 
-    fn on_step_completed(&self, _step_name: &str) {
+    fn on_step_completed(&self, _step: &SourceEntry) {
         // No-op for now: the resume signal was already sent in
         // handle_continue. Hook left here for parity with the C#
         // `OnStepCompleted` method.

@@ -195,10 +195,14 @@ pub async fn run_job(
     if let Some(dbg) = job_ctx.dap_debugger.as_ref() {
         let entries: Vec<aksh_dap::SourceEntry> = ordered_steps
             .iter()
-            .map(|s| aksh_dap::SourceEntry {
-                display_name: s.display_name.clone(),
-                is_pre: false,
-                is_post: false,
+            .map(|s| {
+                let is_pre = s.id.starts_with("__pre_") || s.raw.get("__pre").and_then(|v| v.as_bool()).unwrap_or(false);
+                let is_post = s.id.starts_with("__post_") || s.raw.get("__post").and_then(|v| v.as_bool()).unwrap_or(false);
+                aksh_dap::SourceEntry {
+                    display_name: s.display_name.clone(),
+                    is_pre,
+                    is_post,
+                }
             })
             .collect();
         // Initial post steps are passed via the lifecycle

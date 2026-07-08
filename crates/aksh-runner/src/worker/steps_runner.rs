@@ -436,7 +436,14 @@ pub async fn run_steps(
             let context_val = serde_json::to_value(expr_ctx.roots()).unwrap_or_else(|_| serde_json::json!({}));
             dbg.update_context(context_val, step_ctx.job.masks.clone());
 
-            if let Err(e) = dbg.on_step_starting(&resolved_display_name).await {
+            let is_pre = step.id.starts_with("__pre_") || step.raw.get("__pre").and_then(|v| v.as_bool()).unwrap_or(false);
+            let is_post = step.id.starts_with("__post_") || step.raw.get("__post").and_then(|v| v.as_bool()).unwrap_or(false);
+            let source_entry = aksh_dap::SourceEntry {
+                display_name: resolved_display_name.clone(),
+                is_pre,
+                is_post,
+            };
+            if let Err(e) = dbg.on_step_starting(&source_entry).await {
                 warn!("DAP OnStepStarting failed: {e}");
             }
         }
@@ -448,7 +455,14 @@ pub async fn run_steps(
         }
         // DAP: OnStepCompleted — emit `continued` if we paused.
         if let Some(dbg) = dap_debugger.as_ref() {
-            dbg.on_step_completed(&resolved_display_name);
+            let is_pre = step.id.starts_with("__pre_") || step.raw.get("__pre").and_then(|v| v.as_bool()).unwrap_or(false);
+            let is_post = step.id.starts_with("__post_") || step.raw.get("__post").and_then(|v| v.as_bool()).unwrap_or(false);
+            let source_entry = aksh_dap::SourceEntry {
+                display_name: resolved_display_name.clone(),
+                is_pre,
+                is_post,
+            };
+            dbg.on_step_completed(&source_entry);
         }
         if timed_out.load(std::sync::atomic::Ordering::SeqCst) {
             warn!(
