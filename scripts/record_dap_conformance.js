@@ -259,10 +259,20 @@ jobs:
     console.log("Debugger client WebSocket connected successfully!");
 
     // 5. DAP Handshake and Step Continue flow
+    // Standard DAP: client sends initialize immediately after connecting.
     let dapSeq = 1;
     let currentStep = 0;
     
     const dapFrames = [];
+
+    // Send initialize request immediately (standard DAP client behavior).
+    console.log("[DAP Client] Sending initialize...");
+    const initReq = {
+        seq: dapSeq++,
+        type: "request",
+        command: "initialize",
+        arguments: { clientID: "mitm-tester", adapterID: "aksh" }
+    };
 
     await new Promise((resolve, reject) => {
         ws.onmessage = async (event) => {
@@ -271,16 +281,8 @@ jobs:
             dapFrames.push({ direction: "a2c", message: msg });
 
             if (msg.type === "event" && msg.event === "output") {
-                // Initialize
-                console.log("[DAP Client] Sending initialize...");
-                const initReq = {
-                    seq: dapSeq++,
-                    type: "request",
-                    command: "initialize",
-                    arguments: { clientID: "mitm-tester", adapterID: "aksh" }
-                };
-                dapFrames.push({ direction: "c2a", message: initReq });
-                ws.send(JSON.stringify(initReq));
+                // Welcome message received — already sent initialize
+                console.log("[DAP Client] Got welcome output event");
             } else if (msg.type === "response" && msg.command === "initialize") {
                 // Wait for initialized event to send configurationDone
             } else if (msg.type === "event" && msg.event === "initialized") {
@@ -329,6 +331,10 @@ jobs:
             }
         };
 
+        // Now send the initialize request.
+        dapFrames.push({ direction: "c2a", message: initReq });
+        ws.send(JSON.stringify(initReq));
+
         ws.onclose = () => {
             console.log("Debugger client WebSocket closed");
             resolve();
@@ -340,10 +346,15 @@ jobs:
         };
     });
 
-    // 6. Wait for runner process to exit
+    // 6. Wait for runner process to exit (with timeout)
     console.log("Waiting for runner process to complete...");
     await new Promise((resolve) => {
+        const timer = setTimeout(() => {
+            console.log("Runner exit timeout — proceeding with cleanup");
+            resolve();
+        }, 30000);
         runnerProc.on("exit", (code) => {
+            clearTimeout(timer);
             console.log(`Runner process exited with code ${code}`);
             resolve();
         });
