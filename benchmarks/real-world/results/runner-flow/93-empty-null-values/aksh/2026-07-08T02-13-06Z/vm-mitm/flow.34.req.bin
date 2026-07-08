@@ -1,0 +1,5 @@
+2026-07-08T02:13:31.032Z ##[group]Run # Intentionally don't set never_set_var
+2026-07-08T02:13:31.033Z # Intentionally don't set never_set_var
+2026-07-08T02:13:31.033Z echo "Step executed but output variable never defined"
+2026-07-08T02:13:31.033Z ##[endgroup]
+2026-07-08T02:13:31.035Z Step executed but output variable never defined

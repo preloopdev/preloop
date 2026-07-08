@@ -1,0 +1,13 @@
+﻿2026-07-08T00:04:34.5246530Z ##[group]Run # Simulate matrix with empty value
+2026-07-08T00:04:34.5246861Z [36;1m# Simulate matrix with empty value[0m
+2026-07-08T00:04:34.5247152Z [36;1mMATRIX_VALUES=("value1" "" "value3")[0m
+2026-07-08T00:04:34.5247417Z [36;1m[0m
+2026-07-08T00:04:34.5247633Z [36;1mfor i in "${!MATRIX_VALUES[@]}"; do[0m
+2026-07-08T00:04:34.5247943Z [36;1m  VAL="${MATRIX_VALUES[$i]}"[0m
+2026-07-08T00:04:34.5248207Z [36;1m  if [[ -z "$VAL" ]]; then[0m
+2026-07-08T00:04:34.5248522Z [36;1m    echo "✓ Empty value in array index $i correctly identified"[0m
+2026-07-08T00:04:34.5248850Z [36;1m  fi[0m
+2026-07-08T00:04:34.5249062Z [36;1mdone[0m
+2026-07-08T00:04:34.5252022Z shell: /usr/bin/bash -e {0}
+2026-07-08T00:04:34.5252255Z ##[endgroup]
+2026-07-08T00:04:34.5264005Z ✓ Empty value in array index 1 correctly identified

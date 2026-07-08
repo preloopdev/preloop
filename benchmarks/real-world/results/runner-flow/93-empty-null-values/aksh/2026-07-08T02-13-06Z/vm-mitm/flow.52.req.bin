@@ -1,0 +1,4 @@
+2026-07-08T02:13:33.143Z ##[group]Run # Set one output but not another
+2026-07-08T02:13:33.144Z # Set one output but not another
+2026-07-08T02:13:33.144Z echo 'defined_field=has_value' >> $GITHUB_OUTPUT
+2026-07-08T02:13:33.144Z ##[endgroup]

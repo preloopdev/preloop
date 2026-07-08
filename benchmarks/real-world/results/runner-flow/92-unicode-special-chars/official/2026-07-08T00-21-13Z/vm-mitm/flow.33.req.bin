@@ -1,0 +1,29 @@
+﻿2026-07-08T00:21:36.3715511Z ##[group]Run EMOJI='🌟 Success! ✅ All tests passed 🎯'
+2026-07-08T00:21:36.3715868Z [36;1mEMOJI='🌟 Success! ✅ All tests passed 🎯'[0m
+2026-07-08T00:21:36.3716159Z [36;1mCJK='日本語のテスト: これは有効なテストです'[0m
+2026-07-08T00:21:36.3716496Z [36;1mSPECIAL='Quotes: "double" and 'single' and \backslash and \n and \t'[0m
+2026-07-08T00:21:36.3716841Z [36;1m[0m
+2026-07-08T00:21:36.3717067Z [36;1mecho "Retrieved emoji output: $EMOJI"[0m
+2026-07-08T00:21:36.3717360Z [36;1mecho "Retrieved CJK output: $CJK"[0m
+2026-07-08T00:21:36.3717655Z [36;1mecho "Retrieved special output: $SPECIAL"[0m
+2026-07-08T00:21:36.3717936Z [36;1m[0m
+2026-07-08T00:21:36.3718183Z [36;1mif [[ "$EMOJI" == *"🌟"* ]] && [[ "$EMOJI" == *"✅"* ]]; then[0m
+2026-07-08T00:21:36.3718510Z [36;1m  echo "✓ Emoji preserved in output"[0m
+2026-07-08T00:21:36.3718781Z [36;1melse[0m
+2026-07-08T00:21:36.3719001Z [36;1m  echo "✗ Emoji not preserved"[0m
+2026-07-08T00:21:36.3719260Z [36;1m  exit 1[0m
+2026-07-08T00:21:36.3719469Z [36;1mfi[0m
+2026-07-08T00:21:36.3719682Z [36;1m[0m
+2026-07-08T00:21:36.3719912Z [36;1mif [[ "$CJK" == *"日本語"* ]]; then[0m
+2026-07-08T00:21:36.3720189Z [36;1m  echo "✓ CJK characters preserved"[0m
+2026-07-08T00:21:36.3720455Z [36;1melse[0m
+2026-07-08T00:21:36.3720685Z [36;1m  echo "✗ CJK characters not preserved"[0m
+2026-07-08T00:21:36.3720962Z [36;1m  exit 1[0m
+2026-07-08T00:21:36.3721167Z [36;1mfi[0m
+2026-07-08T00:21:36.3723637Z shell: /usr/bin/bash -e {0}
+2026-07-08T00:21:36.3723879Z ##[endgroup]
+2026-07-08T00:21:36.3745623Z Retrieved emoji output: 🌟 Success! ✅ All tests passed 🎯
+2026-07-08T00:21:36.3819897Z Retrieved CJK output: 日本語のテスト: これは有効なテストです
+2026-07-08T00:21:36.3820405Z Retrieved special output: Quotes: "double" and single and \backslash and \n and \t
+2026-07-08T00:21:36.3820844Z ✓ Emoji preserved in output
+2026-07-08T00:21:36.3821133Z ✓ CJK characters preserved

@@ -1,0 +1,20 @@
+﻿2026-07-08T00:21:36.3834495Z ##[group]Run mkdir -p "test dir with spaces"
+2026-07-08T00:21:36.3834890Z [36;1mmkdir -p "test dir with spaces"[0m
+2026-07-08T00:21:36.3835173Z [36;1mmkdir -p "测试目录"[0m
+2026-07-08T00:21:36.3835470Z [36;1mtouch "test dir with spaces/file with spaces.txt"[0m
+2026-07-08T00:21:36.3835788Z [36;1mtouch "测试目录/文件.txt"[0m
+2026-07-08T00:21:36.3836035Z [36;1m[0m
+2026-07-08T00:21:36.3836321Z [36;1mecho "✓ Created directories and files with spaces and unicode"[0m
+2026-07-08T00:21:36.3836683Z [36;1mls -la "test dir with spaces/"[0m
+2026-07-08T00:21:36.3836957Z [36;1mls -la "测试目录/"[0m
+2026-07-08T00:21:36.3839598Z shell: /usr/bin/bash -e {0}
+2026-07-08T00:21:36.3839851Z ##[endgroup]
+2026-07-08T00:21:36.3861633Z ✓ Created directories and files with spaces and unicode
+2026-07-08T00:21:36.3865790Z total 0
+2026-07-08T00:21:36.3866088Z drwxr-xr-x 2 root root 60 Jul  8 00:21 .
+2026-07-08T00:21:36.3866400Z drwxr-xr-x 4 root root 80 Jul  8 00:21 ..
+2026-07-08T00:21:36.3866738Z -rw-r--r-- 1 root root  0 Jul  8 00:21 file with spaces.txt
+2026-07-08T00:21:36.3870388Z total 0
+2026-07-08T00:21:36.3870748Z drwxr-xr-x 2 root root 60 Jul  8 00:21 .
+2026-07-08T00:21:36.3871420Z drwxr-xr-x 4 root root 80 Jul  8 00:21 ..
+2026-07-08T00:21:36.3871829Z -rw-r--r-- 1 root root  0 Jul  8 00:21 文件.txt

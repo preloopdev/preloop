@@ -1,0 +1,29 @@
+2026-07-08T02:22:10.857Z ##[group]Run EMOJI='🌟 Success! ✅ All tests passed 🎯'
+2026-07-08T02:22:10.857Z EMOJI='🌟 Success! ✅ All tests passed 🎯'
+2026-07-08T02:22:10.857Z CJK='日本語のテスト: これは有効なテストです'
+2026-07-08T02:22:10.858Z SPECIAL='Quotes: "double" and 'single' and \backslash and \n and \t'
+2026-07-08T02:22:10.858Z 
+2026-07-08T02:22:10.858Z echo "Retrieved emoji output: $EMOJI"
+2026-07-08T02:22:10.858Z echo "Retrieved CJK output: $CJK"
+2026-07-08T02:22:10.858Z echo "Retrieved special output: $SPECIAL"
+2026-07-08T02:22:10.858Z 
+2026-07-08T02:22:10.859Z if [[ "$EMOJI" == *"🌟"* ]] && [[ "$EMOJI" == *"✅"* ]]; then
+2026-07-08T02:22:10.859Z   echo "✓ Emoji preserved in output"
+2026-07-08T02:22:10.859Z else
+2026-07-08T02:22:10.859Z   echo "✗ Emoji not preserved"
+2026-07-08T02:22:10.859Z   exit 1
+2026-07-08T02:22:10.859Z fi
+2026-07-08T02:22:10.860Z 
+2026-07-08T02:22:10.860Z if [[ "$CJK" == *"日本語"* ]]; then
+2026-07-08T02:22:10.860Z   echo "✓ CJK characters preserved"
+2026-07-08T02:22:10.860Z else
+2026-07-08T02:22:10.860Z   echo "✗ CJK characters not preserved"
+2026-07-08T02:22:10.860Z   exit 1
+2026-07-08T02:22:10.860Z fi
+2026-07-08T02:22:10.861Z shell: bash --noprofile --norc -e -o pipefail {0}
+2026-07-08T02:22:10.861Z ##[endgroup]
+2026-07-08T02:22:10.863Z Retrieved emoji output: 🌟 Success! ✅ All tests passed 🎯
+2026-07-08T02:22:10.863Z Retrieved CJK output: 日本語のテスト: これは有効なテストです
+2026-07-08T02:22:10.863Z Retrieved special output: Quotes: "double" and single and \backslash and \n and \t
+2026-07-08T02:22:10.863Z ✓ Emoji preserved in output
+2026-07-08T02:22:10.863Z ✓ CJK characters preserved
