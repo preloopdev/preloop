@@ -335,10 +335,11 @@ pub async fn run_job(
 
     // Execute steps with the derived cancel channel
     let mut debugger_result = Ok(());
-    if let Some(dbg) = job_ctx.dap_debugger.as_ref() {
+    if let Some(dbg) = job_ctx.dap_debugger.clone() {
         info!("Starting debugger…");
         if let Err(e) = dbg.start(&job_id, &[]).await {
             error!("DAP debugger failed to start: {e}");
+            job_ctx.debugger_telemetry.push("Failed".to_string());
             debugger_result = Err(anyhow::anyhow!(
                 "The debugger failed to start or no debugger client connected in time."
             ));
@@ -379,15 +380,18 @@ pub async fn run_job(
                 r = wait_ready => {
                     if let Err(e) = r {
                         error!("DAP debugger failed to connect: {e}");
+                        job_ctx.debugger_telemetry.push("Failed".to_string());
                         let _ = dbg.stop().await;
                         debugger_result = Err(anyhow::anyhow!("The debugger failed to start or no debugger client connected in time."));
                     } else {
                         info!("Debugger connected.");
+                        job_ctx.debugger_telemetry.push("Connected".to_string());
                     }
                 }
                 _ = job_cancel.changed() => {
                     if *job_cancel.borrow() {
                         error!("Job was cancelled before debugger client connected.");
+                        job_ctx.debugger_telemetry.push("Canceled".to_string());
                         let _ = dbg.stop().await;
                         debugger_result = Err(anyhow::anyhow!("Job was cancelled before debugger client connected."));
                     }
@@ -1391,6 +1395,17 @@ async fn report_completion(
         .map(|a| annotation_to_json(a, 0))
         .collect();
 
+    let mut telemetry = vec![serde_json::json!({
+        "type": "task",
+        "message": format!("{{\"ClassType\":\"StepsRunner\",\"FinishResult\":\"{}\"}}", result.to_lowercase()),
+    })];
+    telemetry.extend(job_ctx.debugger_telemetry.iter().map(|result| {
+        serde_json::json!({
+            "type": "task",
+            "message": format!("{{\"ClassType\":\"DapDebugger\",\"DebuggerConnectionResult\":\"{}\"}}", result),
+        })
+    }));
+
     let completion_body = serde_json::json!({
         "planId": plan_id,
         "jobId": job_id,
@@ -1398,10 +1413,7 @@ async fn report_completion(
         "outputs": outputs,
         "stepResults": step_results,
         "annotations": job_annotations,
-        "telemetry": [{
-            "type": "task",
-            "message": format!("{{\"ClassType\":\"StepsRunner\",\"FinishResult\":\"{}\"}}", result.to_lowercase()),
-        }],
+        "telemetry": telemetry,
         "billingOwnerId": billing_owner_id,
     });
 

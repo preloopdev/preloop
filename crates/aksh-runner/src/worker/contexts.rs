@@ -54,6 +54,8 @@ pub struct JobContext {
     /// `DebuggerTunnelInfo`. Mirrors `GlobalContext.Debugger` in
     /// `actions/runner` v2.335.0+.
     pub dap_debugger: Option<Arc<dyn IDapDebugger>>,
+    /// Debugger connection telemetry entries for completejob.
+    pub debugger_telemetry: Vec<String>,
 }
 
 /// Result of a completed step.
@@ -133,6 +135,7 @@ impl JobContext {
             container_state: None,
             live_logs: None,
             dap_debugger: None,
+            debugger_telemetry: Vec::new(),
         }
     }
 
