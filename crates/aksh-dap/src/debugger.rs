@@ -465,6 +465,11 @@ impl DapDebugger {
                 let response = dispatch_one(&core, &req.raw, seq).await;
                 let _ = req.respond.send(response.clone());
                 let _ = out_tx_dispatch.send(Outbound::Response(response));
+                if req.raw.command == "initialize" {
+                    let event_seq = next_seq(&core).await;
+                    let _ = out_tx_dispatch
+                        .send(Outbound::Event(Event::new(event_seq, EVENT_INITIALIZED)));
+                }
                 if matches!(req.raw.command.as_str(), "disconnect" | "terminate") {
                     break;
                 }
@@ -564,16 +569,8 @@ async fn read_headers<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> Result<usiz
 async fn dispatch_one(core: &Arc<DebuggerCore>, req: &Request, seq: i64) -> Response {
     let cmd = req.command.as_str();
     match cmd {
-        "initialize" => {
-            let event_seq = next_seq(core).await;
-            let _ = core
-                .out_tx
-                .lock()
-                .send(Outbound::Event(Event::new(event_seq, EVENT_INITIALIZED)));
-            Response::success(seq, req.header.seq, "initialize").with_body(
-                serde_json::to_value(Capabilities::runner_default()).unwrap_or(Value::Null),
-            )
-        }
+        "initialize" => Response::success(seq, req.header.seq, "initialize")
+            .with_body(serde_json::to_value(Capabilities::runner_default()).unwrap_or(Value::Null)),
         "configurationDone" => {
             *core.state.lock() = DapSessionState::Ready;
             Response::success(seq, req.header.seq, "configurationDone")
