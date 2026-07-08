@@ -1,0 +1,8 @@
+{
+  "mode": "github-official",
+  "workflow": "e2e-bat.yml",
+  "run_id": "28887091521",
+  "total_ms": 178355,
+  "vm_failures": 0,
+  "timestamp": "2026-07-07T17:53:02.3NZ"
+}

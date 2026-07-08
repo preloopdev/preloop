@@ -1,0 +1,32 @@
+{
+  "mode": "github-aksh",
+  "workflow": "e2e-serde.yml",
+  "run_id": "28883598700",
+  "total_ms": 61090,
+  "vm_failures": 0,
+  "timestamp": "2026-07-07T16:53:16.3NZ"
+}
+{
+  "mode": "github-aksh",
+  "workflow": "e2e-serde.yml",
+  "run_id": "28888694029",
+  "total_ms": 28060,
+  "vm_failures": 0,
+  "timestamp": "2026-07-07T18:18:31.3NZ"
+}
+{
+  "mode": "github-aksh",
+  "workflow": "e2e-serde.yml",
+  "run_id": "28888808287",
+  "total_ms": 24127,
+  "vm_failures": 0,
+  "timestamp": "2026-07-07T18:20:21.3NZ"
+}
+{
+  "mode": "github-aksh",
+  "workflow": "e2e-serde.yml",
+  "run_id": "28888883034",
+  "total_ms": 43887,
+  "vm_failures": 0,
+  "timestamp": "2026-07-07T18:21:54.3NZ"
+}

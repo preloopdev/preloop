@@ -1,0 +1,6 @@
+Multiline env var:
+Line 1 with emoji 🎨
+Line 2 with special chars: @#$%
+Line 3 with unicode: Ñoño Schöne
+
+✓ Multiline env var with unicode preserved

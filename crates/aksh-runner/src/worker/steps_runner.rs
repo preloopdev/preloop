@@ -88,6 +88,7 @@ pub async fn run_steps(
             conclusion: step_conclusion::SUCCEEDED,
         });
     }
+    job.setup_step_id = Some(setup_step_id.clone());
 
     // Build "Set up job" log content matching official runner
     {
@@ -679,6 +680,7 @@ pub async fn run_steps(
             conclusion: final_conclusion,
         });
     }
+    job.complete_step_id = Some(complete_step_id.clone());
 
     // Upload "Complete job" log matching official runner
     {

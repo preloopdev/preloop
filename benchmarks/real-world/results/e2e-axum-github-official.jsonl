@@ -1,0 +1,8 @@
+{
+  "mode": "github-official",
+  "workflow": "e2e-axum.yml",
+  "run_id": "28886808757",
+  "total_ms": 76348,
+  "vm_failures": 0,
+  "timestamp": "2026-07-07T17:46:32.3NZ"
+}
