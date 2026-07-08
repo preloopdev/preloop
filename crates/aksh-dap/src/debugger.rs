@@ -914,6 +914,14 @@ impl IDapDebugger for DapDebugger {
                 "allThreadsStopped": true,
             })),
         ));
+        // Official runner sends a host info message after the stopped event.
+        let seq = self.next_seq_internal().await;
+        let _ = self.core.out_tx.lock().send(Outbound::Event(
+            Event::new(seq, EVENT_OUTPUT).with_body(json!({
+                "category": "console",
+                "output": "\nCommands will run on runner host\n",
+            })),
+        ));
         *self.core.state.lock() = DapSessionState::Paused;
 
         let mut rx = self.core.resume_tx.subscribe();
