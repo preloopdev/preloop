@@ -373,6 +373,7 @@ pub async fn run_job(
                 r = wait_ready => {
                     if let Err(e) = r {
                         error!("DAP debugger failed to connect: {e}");
+                        let _ = dbg.stop().await;
                         debugger_result = Err(anyhow::anyhow!("The debugger failed to start or no debugger client connected in time."));
                     } else {
                         info!("Debugger connected.");
