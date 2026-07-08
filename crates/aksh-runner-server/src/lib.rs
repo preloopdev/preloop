@@ -950,6 +950,16 @@ pub(crate) async fn submit_run_inner(
             )
             .map_err(|e| ApiError::bad_request(format!("failed to build job message: {e}")))?;
 
+            agent_msg.enable_debugger = submission.enable_debugger;
+            if submission.enable_debugger {
+                agent_msg.debugger_tunnel = Some(azdo::DebuggerTunnelInfo {
+                    tunnel_id: "local".to_string(),
+                    cluster_id: "local".to_string(),
+                    host_token: "local".to_string(),
+                    port: 4711,
+                });
+                agent_msg.debugger_welcome_message = submission.debugger_welcome_message.clone();
+            }
             // Give every dispatched job a unique requestId so PATCH
             // /AgentRequest/:request_id can target exactly one job.
             inner.next_request_id += 1;

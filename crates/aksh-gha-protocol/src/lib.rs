@@ -157,6 +157,12 @@ pub struct WorkflowSubmission {
     /// Local reusable workflow YAML keyed by repository-relative path.
     #[serde(default)]
     pub reusable_workflows: BTreeMap<String, String>,
+    /// Enable DAP debugger for the run's jobs.
+    #[serde(default)]
+    pub enable_debugger: bool,
+    /// Welcome message to show when debugger attaches.
+    #[serde(default)]
+    pub debugger_welcome_message: Option<String>,
 }
 
 fn default_ref() -> String {
