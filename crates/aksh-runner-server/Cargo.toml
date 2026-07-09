@@ -35,6 +35,10 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
 tokio-tungstenite.workspace = true
+axum-server.workspace = true
+rcgen.workspace = true
+rustls = { version = "0.23", features = ["ring"] }
+serde_urlencoded = "0.7"
 
 [dev-dependencies]
 tempfile.workspace = true
