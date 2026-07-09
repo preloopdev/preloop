@@ -126,9 +126,13 @@ class Capture:
     counter: int = 0
 
     def request(self, flow: http.HTTPFlow):
+        if flow.request.host in ("127.0.0.1", "localhost", "aksh.local") or flow.request.host.endswith(".local"):
+            backend_port = int(os.environ.get("BACKEND_PORT", "5000"))
+            flow.request.host = "127.0.0.1"
+            flow.request.port = backend_port
+
         Capture.counter += 1
         flow.metadata["_capture_order"] = Capture.counter  # 1-based
-
     def response(self, flow: http.HTTPFlow):
         self._do_dump(flow)
 

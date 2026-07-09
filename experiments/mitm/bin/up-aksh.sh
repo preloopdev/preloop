@@ -63,7 +63,7 @@ if [ "$ready" -eq 0 ]; then
 fi
 
 # Write artefacts. The runner connects via the runner.server-compat URL prefix.
-echo "$AKSH_URL/runner/server" > "$CACHE/aksh.url"
+echo "http://aksh.local:9090/runner/server" > "$CACHE/aksh.url"
 echo "ThisIsIgnored" > "$CACHE/aksh.token"
 
 echo "aksh running on $AKSH_URL (pid $PID)"
