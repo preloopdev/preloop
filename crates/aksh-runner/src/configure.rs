@@ -43,7 +43,7 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
     // Step 2: Fetch connection data
     let _conn_data = http
         .get_json::<serde_json::Value>(&format!(
-            "{}/_apis/connectionData",
+            "{}/_apis/connectionData?connectOptions=1",
             registration.service_url
         ))
         .await
