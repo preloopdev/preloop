@@ -469,13 +469,15 @@ fn hash_files(values: &[Value], context: &Context) -> String {
 
     all_paths.sort();
 
-    // Hash each file, collect hex digests
-    let mut combined = String::new();
+    // Hash each file's bytes; concatenate raw 32-byte binary digests (NOT hex strings).
+    // Official hashFiles.ts:29-35 feeds binary digest bytes directly into the outer SHA-256.
+    // Concatenating hex-string representations produces a completely different key.
+    let mut combined: Vec<u8> = Vec::new();
     for path in &all_paths {
         match std::fs::read(path) {
             Ok(bytes) => {
                 let digest = Sha256::digest(&bytes);
-                combined.push_str(&format!("{digest:x}"));
+                combined.extend_from_slice(&digest);
             }
             Err(_) => continue,
         }
@@ -485,8 +487,8 @@ fn hash_files(values: &[Value], context: &Context) -> String {
         return String::new();
     }
 
-    // Hash the concatenated hex digests
-    let final_hash = Sha256::digest(combined.as_bytes());
+    // Hash the concatenated binary digests
+    let final_hash = Sha256::digest(&combined);
     format!("{final_hash:x}")
 }
 
@@ -1070,6 +1072,59 @@ mod tests {
             eval_expression("hashFiles('Cargo.toml')", &context).unwrap(),
             Value::String(String::new())
         );
+    }
+
+    #[test]
+    fn hashfiles_binary_digest_matches_official_algorithm() {
+        // PEXP-01 regression test: verify binary digest concatenation.
+        // Official hashFiles.ts concatenates raw 32-byte SHA-256 digests before hashing.
+        // Pre-fix aksh concatenated hex strings — wrong algorithm, different cache keys.
+        use sha2::{Digest, Sha256};
+
+        // Use a unique temp dir under /tmp
+        let dir = std::path::Path::new("/tmp/aksh-hashfiles-test");
+        std::fs::create_dir_all(dir).unwrap();
+
+        // Write two known files
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        std::fs::write(&a, b"hello aksh").unwrap();
+        std::fs::write(&b, b"hello world").unwrap();
+
+        let ctx = Context::default().with_workspace(dir.to_string_lossy().to_string());
+
+        // Single file: hashFiles('a.txt') should equal SHA256(binary concat of SHA256(content))
+        let ha = eval_expression("hashFiles('a.txt')", &ctx).unwrap();
+        let expected_a: String = {
+            let inner = Sha256::digest(b"hello aksh");
+            let mut combined: Vec<u8> = Vec::new();
+            combined.extend_from_slice(&inner);
+            format!("{:x}", Sha256::digest(&combined))
+        };
+        assert_eq!(
+            ha,
+            Value::String(expected_a.clone()),
+            "single-file hash mismatch"
+        );
+
+        // Must be 64 lowercase hex chars
+        assert_eq!(expected_a.len(), 64);
+        assert!(expected_a.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Different files must produce different hashes
+        let hb = eval_expression("hashFiles('b.txt')", &ctx).unwrap();
+        assert_ne!(ha, hb, "distinct files must produce distinct hashes");
+
+        // hashFiles with no-match pattern returns ""
+        let empty = eval_expression("hashFiles('nonexistent.txt')", &ctx).unwrap();
+        assert_eq!(
+            empty,
+            Value::String(String::new()),
+            "no-match must return empty string"
+        );
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     proptest! {
