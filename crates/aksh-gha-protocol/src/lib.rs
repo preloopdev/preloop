@@ -225,6 +225,28 @@ pub struct JobPlan {
     /// Raw `services:` mapping, un-evaluated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub services: Option<serde_json::Value>,
+    /// Inputs passed to a reusable workflow.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub inputs: BTreeMap<String, serde_json::Value>,
+    /// Path of the called workflow file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_file: Option<String>,
+    /// Resolved workflow ref.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_ref: Option<String>,
+    /// Resolved workflow commit SHA.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_sha: Option<String>,
+    /// Resolved workflow repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_repository: Option<String>,
+    /// Map of called secret name to the expression/value passed by the caller.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secrets_map: BTreeMap<String, String>,
+    /// Job-level output declarations: output name → value expression.
+    /// The runner evaluates these after step execution and includes results in completejob.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub job_outputs: BTreeMap<String, String>,
 }
 
 fn default_fail_fast() -> bool {
