@@ -271,5 +271,4 @@ mod tests {
             "echo \"only runs for ubuntu-latest \u{2014} os=ubuntu-latest\""
         );
     }
-
 }

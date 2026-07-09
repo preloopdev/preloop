@@ -28,8 +28,6 @@ pub mod step_conclusion {
     pub const SUCCEEDED: u32 = 2;
     /// Step failed.
     pub const FAILED: u32 = 3;
-    /// Step was cancelled.
-    pub const CANCELLED: u32 = 4;
     /// Step was skipped.
     pub const SKIPPED: u32 = 7;
 }
@@ -97,7 +95,9 @@ impl ServerQueue {
         Self {
             pending_updates: Vec::new(),
             pending_logs: HashMap::new(),
-            job_log_file: std::io::BufWriter::new(tempfile::tempfile().expect("failed to create job log temp file")),
+            job_log_file: std::io::BufWriter::new(
+                tempfile::tempfile().expect("failed to create job log temp file"),
+            ),
             change_order: 0,
             job_id,
             plan_id,
@@ -124,24 +124,13 @@ impl ServerQueue {
     }
 
     /// Build the WorkflowStepsUpdate request body and drain pending updates.
-    ///
-    /// Deduplicates by `external_id`, keeping only the latest update per step.
-    /// This matches official runner behavior: the final batch contains each step
-    /// in its terminal state only (no InProgress → Completed pairs).
     pub fn take_steps_update_body(&mut self) -> Option<WorkflowStepsUpdateBody> {
         if self.pending_updates.is_empty() {
             return None;
         }
-        // Dedup: keep last update per external_id (Completed overwrites InProgress)
-        let mut seen = HashMap::new();
-        for update in std::mem::take(&mut self.pending_updates) {
-            seen.insert(update.external_id.clone(), update);
-        }
-        let mut steps: Vec<StepUpdate> = seen.into_values().collect();
-        steps.sort_by_key(|s| s.number);
         self.change_order += 1;
         Some(WorkflowStepsUpdateBody {
-            steps,
+            steps: std::mem::take(&mut self.pending_updates),
             change_order: self.change_order,
             workflow_job_run_backend_id: self.job_id.clone(),
             workflow_run_backend_id: self.plan_id.clone(),
@@ -164,7 +153,7 @@ impl ServerQueue {
             "success" | "succeeded" => step_conclusion::SUCCEEDED,
             "failure" | "failed" => step_conclusion::FAILED,
             "skipped" => step_conclusion::SKIPPED,
-            "cancelled" | "canceled" => step_conclusion::CANCELLED,
+            "cancelled" | "canceled" => step_conclusion::FAILED, // Twirp has no cancel value
             _ => step_conclusion::SUCCEEDED,
         }
     }
@@ -201,7 +190,6 @@ impl ServerQueue {
         &self.all_updates_log
     }
 }
-
 
 #[cfg(test)]
 mod tests {
