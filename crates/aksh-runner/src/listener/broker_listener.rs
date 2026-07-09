@@ -93,7 +93,7 @@ pub async fn run_broker_loop(
                     "id": config.settings.agent_id,
                     "name": config.settings.agent_name,
                     "version": crate::PROTOCOL_COMPAT_VERSION,
-                    "osDescription": format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+                    "osDescription": crate::os_description(),
                     "ephemeral": serde_json::Value::Null,
                     "status": 0,
                     "provisioningState": serde_json::Value::Null,
@@ -373,7 +373,6 @@ fn is_session_expired(err: &anyhow::Error) -> bool {
         false
     }
 }
-
 
 /// F011: Extract session key only if present.
 fn extract_session_key_if_present(
