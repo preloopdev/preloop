@@ -9,7 +9,7 @@ Two separate data sources:
 43 scenarios — 11 official — 13 aksh — 11 both — [diffs](runner-flow/) linked where available
 
 | # | Scenario | Official | Aksh | Diff |
-|---|---:|---:|---|
+|---|---|---:|---:|---|
 | 01 | ⚠️ register-and-idle | 68 | 3 | [1 diffs](runner-flow/01/diff.md) |
 | 06 | ⚠️ multi-step | 47 | 240474 | [1 diffs](runner-flow/06/diff.md) |
 | 07 | ⚠️ step-failure | 50 | 43 | — |
@@ -60,11 +60,10 @@ Two separate data sources:
 **Neither (30):** 19, 21, 22, 23, 24, 30, 31, 32, 33, 34, 35, 36, 50, 51, 52, 53, 54, 55, 56, 57, 58, 60, 61, 62, 63, 70, 71, 72, 73, 74
 
 ## Conformance Outcomes
-Scenarios 80–100 dispatched against GitHub. 7 match, 3 mismatch, 9 incomplete.
+Scenarios 80–100 dispatched against GitHub. 8 match, 2 mismatch, 9 incomplete.
 
 | # | Scenario | Official | Aksh | Match |
 |---|---|---|---|---|
-
 | 80 | custom-shells | (empty) | failure | ⏳ (empty) / failure |
 | 81 | step-timeout | (empty) | failure | ⏳ (empty) / failure |
 | 82 | reusable-workflow | failure | cancelled | 🔴 failure / cancelled |
@@ -76,8 +75,8 @@ Scenarios 80–100 dispatched against GitHub. 7 match, 3 mismatch, 9 incomplete.
 | 88 | state-and-post | success | (empty) | ⏳ success / (empty) |
 | 89 | workflow-inputs | failure | (empty) | ⏳ failure / (empty) |
 | 90 | shell-exit-behavior | failure | failure | 🟢 failure |
-| 91 | large-output | failure | success | 🔴 failure / success |
-| 92 | unicode-special-chars | failure | success | 🔴 failure / success |
+| 91 | large-output | failure | failure | 🟢 failure |
+| 92 | unicode-special-chars | failure | failure | 🟢 failure |
 | 93 | empty-null-values | success | success | 🟢 success |
 | 94 | action-pinning | success | success | 🟢 success |
 | 95 | nested-composite-outputs | success | success | 🟢 success |
@@ -85,4 +84,4 @@ Scenarios 80–100 dispatched against GitHub. 7 match, 3 mismatch, 9 incomplete.
 | 97 | artifact-cross-job | — | (empty) | — (empty) |
 | 98 | outcome-vs-conclusion | failure | failure | 🟢 failure |
 | 99 | workspace-defaults | (empty) | failure | ⏳ (empty) / failure |
-| 100 | tool-cache | success | success | 🟢 success |
+| 100 | tool-cache | success | success | 🔴 mismatch |
