@@ -130,6 +130,91 @@ pub async fn run_job(
     let ordered_steps =
         super::job_extension::build_step_list_with_lifecycle(main_steps, &workspace, &action_paths);
 
+    // ── DAP debugger (parity with GlobalContext.Debugger) ────────
+    // Mirrors `ExecutionContext.cs` populating `Global.Debugger` from
+    // `message.EnableDebugger` + `message.DebuggerTunnel`.
+    {
+        let enable_debugger = job_message
+            .get("enableDebugger")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if enable_debugger {
+            let debugger_tunnel_json = job_message.get("debuggerTunnel").cloned();
+            let debugger_welcome = job_message
+                .get("debuggerWelcomeMessage")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let debugger_transport = aksh_dap::DebuggerTransportMode::from_wire(
+                job_message
+                    .get("akshDebugTransport")
+                    .and_then(|v| v.as_str()),
+            );
+            let override_welcome = job_message
+                .get("variables")
+                .and_then(|v| {
+                    v.get("actions_runner_override_debugger_welcome_message")
+                })
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if let Some(tunnel_json) = debugger_tunnel_json {
+                if let Ok(tunnel) =
+                    serde_json::from_value::<aksh_gha_protocol::DebuggerTunnelInfo>(tunnel_json)
+                {
+                    let cfg = aksh_dap::DebuggerConfig::new_with_transport(
+                        true,
+                        Some(aksh_dap::DebuggerTunnelInfo {
+                            tunnel_id: tunnel.tunnel_id,
+                            cluster_id: tunnel.cluster_id,
+                            host_token: tunnel.host_token,
+                            port: tunnel.port,
+                        }),
+                        override_welcome,
+                        debugger_welcome,
+                        debugger_transport,
+                    );
+                    if cfg.is_runnable() {
+                        let dbg = std::sync::Arc::new(aksh_dap::DapDebugger::new(cfg));
+                        job_ctx.dap_debugger =
+                            Some(dbg.clone() as std::sync::Arc<dyn aksh_dap::IDapDebugger>);
+                    } else {
+                        warn!(
+                            "Debugger enabled but tunnel config is invalid \
+                             — skipping DAP startup"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // DAP: OnJobStepsInitialized — send step list to debugger view.
+    if let Some(dbg) = job_ctx.dap_debugger.as_ref() {
+        let entries: Vec<aksh_dap::SourceEntry> = ordered_steps
+            .iter()
+            .map(|s| {
+                let is_pre = s.id.starts_with("__pre_")
+                    || s.raw.get("isPre").and_then(|v| v.as_bool()).unwrap_or(false);
+                let is_post = s.id.starts_with("__post_")
+                    || s.raw.get("isPost").and_then(|v| v.as_bool()).unwrap_or(false);
+                aksh_dap::SourceEntry {
+                    display_name: s.display_name.clone(),
+                    is_pre,
+                    is_post,
+                }
+            })
+            .collect();
+        let post = vec![aksh_dap::SourceEntry {
+            display_name: "Complete job".into(),
+            is_pre: false,
+            is_post: true,
+        }];
+        let predicted = vec![aksh_dap::PredictedPostStep {
+            display_name: "Complete job".into(),
+            frame_id: 1,
+        }];
+        dbg.on_job_steps_initialized(&entries, &post, &predicted).await;
+    }
+
     // Set up reporting context (F018/F019/F020)
     let reporting = if let Some((service_url, access_token)) =
         extract_service_endpoint(&job_message)
@@ -221,17 +306,76 @@ pub async fn run_job(
     });
 
     // Execute steps with the derived cancel channel
-    let job_result = super::steps_runner::run_steps(
-        &ordered_steps,
-        &mut job_ctx,
-        &workspace,
-        job_cancel_rx,
-        queue.clone(),
-        reporting.as_deref(),
-        job_container_spec.as_ref(),
-        &service_specs,
-    )
-    .await;
+    let mut debugger_result = Ok(());
+    if let Some(dbg) = job_ctx.dap_debugger.clone() {
+        info!("Starting debugger…");
+        if let Err(e) = dbg.start(&job_id, &[]).await {
+            error!("DAP debugger failed to start: {e}");
+            job_ctx.debugger_telemetry.push("Failed".to_string());
+            debugger_result = Err(anyhow::anyhow!(
+                "The debugger failed to start or no debugger client connected in time."
+            ));
+        } else {
+            // Register the bound local port with the server
+            if let Some(run_id_str) = job_message
+                .get("akshDebugRunId")
+                .and_then(|v| v.as_str())
+            {
+                if let Some((svc_url, token)) = extract_service_endpoint(&job_message) {
+                    let port = dbg.local_port().unwrap_or(aksh_dap::DAP_TUNNEL_PORT);
+                    let url = format!("{svc_url}/api/v1/runs/{run_id_str}/debug");
+                    if let Ok(http) = HttpClient::new(None) {
+                        let body = serde_json::json!({ "port": port, "job_id": job_id });
+                        if let Err(e) = http.post_json_bearer::<serde_json::Value>(&url, &body, &token).await {
+                            warn!("Failed to register DAP port with server: {e}");
+                        }
+                    }
+                }
+            }
+            // Wait for client connection
+            info!("Waiting for debugger client to connect…");
+            let mut job_cancel = cancel_rx.clone();
+            let wait_ready = dbg.wait_until_ready();
+            tokio::select! {
+                r = wait_ready => {
+                    if let Err(e) = r {
+                        error!("DAP debugger failed to connect: {e}");
+                        job_ctx.debugger_telemetry.push("Failed".to_string());
+                        let _ = dbg.stop().await;
+                        debugger_result = Err(anyhow::anyhow!("The debugger failed to start or no debugger client connected in time."));
+                    } else {
+                        info!("Debugger connected.");
+                        job_ctx.debugger_telemetry.push("Connected".to_string());
+                    }
+                }
+                _ = job_cancel.changed() => {
+                    if *job_cancel.borrow() {
+                        error!("Job was cancelled before debugger client connected.");
+                        job_ctx.debugger_telemetry.push("Canceled".to_string());
+                        let _ = dbg.stop().await;
+                        debugger_result = Err(anyhow::anyhow!("Job was cancelled before debugger client connected."));
+                    }
+                }
+            }
+        }
+    }
+
+    let job_result = if let Err(e) = debugger_result {
+        Err(e)
+    } else {
+        super::steps_runner::run_steps(
+            &ordered_steps,
+            &mut job_ctx,
+            &workspace,
+            job_cancel_rx,
+            queue.clone(),
+            reporting.as_deref(),
+            job_container_spec.as_ref(),
+            &service_specs,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+    };
 
     if let (Some(queue), Some(handle)) = (live_logs.as_ref(), live_log_handle) {
         queue.shutdown_and_wait(handle).await;
@@ -320,6 +464,18 @@ pub async fn run_job(
             .nth(3)
             .unwrap_or(std::path::Path::new("."));
         upload_diagnostic_logs(rpt, runner_root, job_name, &plan_id, job_id).await;
+    }
+
+    // DAP: OnJobCompleted — pause for debugger inspection.
+    // Mirrors `JobExtension.cs` FinalizeJob block.
+    if let Some(dbg) = job_ctx.dap_debugger.as_ref() {
+        info!("Job completed — pausing for debugger inspection. Press continue to finish.");
+        if let Err(e) = dbg.on_job_completed().await {
+            warn!("DAP OnJobCompleted failed: {e}");
+        }
+        if let Err(e) = dbg.stop().await {
+            warn!("DAP debugger stop failed: {e}");
+        }
     }
 
     // Report job completion — actually POST to the server
@@ -1272,6 +1428,17 @@ async fn report_completion(
         .map(|a| annotation_to_json(a, 0))
         .collect();
 
+    let mut telemetry = vec![serde_json::json!({
+        "type": "task",
+        "message": format!("{{\"ClassType\":\"StepsRunner\",\"FinishResult\":\"{}\"}}", result.to_lowercase()),
+    })];
+    telemetry.extend(job_ctx.debugger_telemetry.iter().map(|dbg_result| {
+        serde_json::json!({
+            "type": "task",
+            "message": format!("{{\"ClassType\":\"DapDebugger\",\"DebuggerConnectionResult\":\"{}\"}}", dbg_result),
+        })
+    }));
+
     let completion_body = serde_json::json!({
         "planId": plan_id,
         "jobId": job_id,
@@ -1279,10 +1446,7 @@ async fn report_completion(
         "outputs": outputs,
         "stepResults": step_results,
         "annotations": job_annotations,
-        "telemetry": [{
-            "type": "task",
-            "message": format!("{{\"ClassType\":\"StepsRunner\",\"FinishResult\":\"{}\"}}", result.to_lowercase()),
-        }],
+        "telemetry": telemetry,
         "billingOwnerId": billing_owner_id,
     });
 
