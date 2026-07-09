@@ -442,7 +442,7 @@ async fn create_agent(
     }
 
     // F005: Full field set matching official runner (golden flow 6)
-    let os_description = format!("{} {}", std::env::consts::OS, std::env::consts::ARCH);
+    let os_description = crate::os_description();
     let agent = serde_json::json!({
         "labels": labels,
         "maxParallelism": 1,

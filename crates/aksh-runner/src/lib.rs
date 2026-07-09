@@ -30,3 +30,21 @@ pub const PROTOCOL_COMPAT_VERSION: &str = "2.335.1";
 
 /// Crate version for display.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// OS description string for runner registration, matching official runner.
+///
+/// Reads `PRETTY_NAME` from `/etc/os-release` on Linux.
+/// Falls back to `os arch` (e.g. `linux aarch64`).
+pub fn os_description() -> String {
+    if let Ok(contents) = std::fs::read_to_string("/etc/os-release") {
+        for line in contents.lines() {
+            if let Some(val) = line.strip_prefix("PRETTY_NAME=") {
+                let pretty = val.trim_matches('"');
+                if !pretty.is_empty() {
+                    return pretty.to_string();
+                }
+            }
+        }
+    }
+    format!("{} {}", std::env::consts::OS, std::env::consts::ARCH)
+}
