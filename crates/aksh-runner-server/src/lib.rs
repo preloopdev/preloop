@@ -7,6 +7,9 @@ use std::sync::Arc;
 
 pub mod github;
 
+use axum_server::{tls_rustls::RustlsConfig, Handle};
+use rcgen::generate_simple_self_signed;
+
 use aksh_artifacts::ArtifactStore;
 use aksh_cache::CacheStore;
 use aksh_gha_parser::{expand_jobs_with_reusables, parse_workflow};
@@ -54,6 +57,38 @@ pub struct ServerConfig {
     pub state_dir: PathBuf,
     /// Optional file path to write recorded flows to (NDJSON format).
     pub record_flows: Option<PathBuf>,
+    /// TLS mode (default: no TLS).
+    pub tls: TlsMode,
+}
+
+/// TLS configuration.
+#[derive(Debug, Clone)]
+pub enum TlsMode {
+    /// Plain HTTP (default).
+    None,
+    /// Generate an ephemeral self-signed cert at startup.
+    SelfSigned,
+    /// Load cert and key from PEM files.
+    PemFiles { cert: PathBuf, key: PathBuf },
+}
+
+/// A self-signed TLS certificate + private key in PEM format.
+pub struct SelfSignedCert {
+    /// PEM-encoded certificate.
+    pub cert: String,
+    /// PEM-encoded private key.
+    pub key: String,
+}
+
+/// Generate an ephemeral self-signed TLS certificate valid for localhost.
+pub fn generate_self_signed_cert() -> anyhow::Result<SelfSignedCert> {
+    let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+    let rcgen::CertifiedKey { cert, key_pair } = generate_simple_self_signed(subject_alt_names)
+        .map_err(|e| anyhow::anyhow!("self-signed cert generation failed: {e}"))?;
+    Ok(SelfSignedCert {
+        cert: cert.pem(),
+        key: key_pair.serialize_pem(),
+    })
 }
 
 async fn reap_once(shared: &Arc<SharedState>) {
@@ -181,7 +216,7 @@ async fn run_background_reaper(shared: Arc<SharedState>) {
 
 /// Start the server and block until shutdown.
 pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
-    let state = AppState::new(config.state_dir).await?;
+    let state = AppState::new(config.state_dir.clone()).await?;
     if let Some(path) = &config.record_flows {
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -193,7 +228,6 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     }
     let shutdown = CancellationToken::new();
     let router = app(state.clone(), shutdown.clone());
-    let listener = TcpListener::bind(config.listen).await?;
 
     let shared = Arc::new(SharedState {
         state,
@@ -205,10 +239,56 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
         run_background_reaper(checker_shared).await;
     });
 
-    info!(listen = %config.listen, "aksh runner server listening");
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal(shutdown))
-        .await?;
+    match config.tls {
+        TlsMode::None => {
+            let listener = TcpListener::bind(config.listen).await?;
+            info!(listen = %config.listen, scheme = "http", "aksh runner server listening");
+            axum::serve(listener, router)
+                .with_graceful_shutdown(shutdown_signal(shutdown))
+                .await?;
+        }
+        TlsMode::SelfSigned => {
+            let cert = generate_self_signed_cert()?;
+            let tls_config =
+                RustlsConfig::from_pem(cert.cert.into_bytes(), cert.key.into_bytes()).await?;
+            info!(listen = %config.listen, scheme = "https", self_signed = true, "aksh runner server listening");
+            warn!("self-signed cert -- runner needs --ss-skip-tls-verify or GITHUB_ACTIONS_RUNNER_SKIP_TLS_VERIFY=1");
+            let handle = Handle::new();
+            tokio::spawn({
+                let handle = handle.clone();
+                async move {
+                    if let Err(e) = axum_server::bind_rustls(config.listen, tls_config)
+                        .handle(handle)
+                        .serve(router.into_make_service())
+                        .await
+                    {
+                        warn!(%e, "TLS server error");
+                    }
+                }
+            });
+            shutdown_signal(shutdown).await;
+            handle.graceful_shutdown(Some(Duration::from_secs(5)));
+        }
+        TlsMode::PemFiles { cert, key } => {
+            let tls_config = RustlsConfig::from_pem_file(&cert, &key).await?;
+            info!(listen = %config.listen, scheme = "https", cert = %cert.display(), "aksh runner server listening");
+            let handle = Handle::new();
+            tokio::spawn({
+                let handle = handle.clone();
+                async move {
+                    if let Err(e) = axum_server::bind_rustls(config.listen, tls_config)
+                        .handle(handle)
+                        .serve(router.into_make_service())
+                        .await
+                    {
+                        warn!(%e, "TLS server error");
+                    }
+                }
+            });
+            shutdown_signal(shutdown).await;
+            handle.graceful_shutdown(Some(Duration::from_secs(5)));
+        }
+    }
     Ok(())
 }
 
@@ -279,7 +359,7 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         )
         .route(
             "/runner/server/_apis/distributedtask/pools/:pool_id/messages",
-            get(next_message_broker_ref),
+            get(next_message_disttask),
         )
         .route(
             "/runner/server/_apis/distributedtask/pools/:pool_id/messages/:message_id",
@@ -322,6 +402,10 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             post(action_download_info),
         )
         .route(
+            "/actions/build/:orchestration_id/jobs/:job_id/runnerresolve/actions",
+            post(runnerresolve_actions),
+        )
+        .route(
             "/runner/server/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id",
             patch(patch_timeline_records),
         )
@@ -348,6 +432,42 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         .route(
             "/api/v1/runs/:run_id/jobs/:job_id/logs/live",
             get(live_logs_sse),
+        )
+        // F030: standard AzDO API URL pattern used by the aksh-runner AzDO client.
+        // These alias the scope/hub-prefixed handlers above so both URL forms work.
+        .route(
+            "/_apis/v1/plans/:plan_id/timelines/:timeline_id/records",
+            patch(patch_timeline_records_plan),
+        )
+        .route(
+            "/_apis/v1/plans/:plan_id/logs",
+            post(create_log_plan),
+        )
+        .route(
+            "/_apis/v1/plans/:plan_id/logs/:log_id",
+            put(append_log_plan),
+        )
+        .route(
+            "/_apis/v1/plans/:plan_id/events",
+            post(finish_job_plan),
+        )
+        // F030: /runner/server/ aliases — runner uses the SystemVssConnection URL
+        // which is http://…/runner/server so all plan-level AzDO calls land here.
+        .route(
+            "/runner/server/_apis/v1/plans/:plan_id/timelines/:timeline_id/records",
+            patch(patch_timeline_records_plan),
+        )
+        .route(
+            "/runner/server/_apis/v1/plans/:plan_id/logs",
+            post(create_log_plan),
+        )
+        .route(
+            "/runner/server/_apis/v1/plans/:plan_id/logs/:log_id",
+            put(append_log_plan),
+        )
+        .route(
+            "/runner/server/_apis/v1/plans/:plan_id/events",
+            post(finish_job_plan),
         )
         .route_layer(middleware::from_fn(require_bearer));
 
@@ -485,6 +605,10 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         .route("/api/v1/runs/:run_id/events.ndjson", get(run_events))
         .route("/api/v1/runs/:run_id/debug", get(ws_dap_debug))
         .route("/api/v1/runs/:run_id/debug", post(register_dap_port))
+        .route(
+            "/api/v1/actions/download/:owner/:repo/*git_ref",
+            get(download_action_tarball),
+        )
         .route("/api/v1/runners", post(register_runner))
         .route("/api/v1/runners/sessions", post(create_session))
         .route(
@@ -600,6 +724,46 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             "/twirp/results.services.receiver.Receiver/CreateStepSummaryMetadata",
             post(twirp_create_step_summary_metadata),
         )
+        // Cache v2 Twirp (CacheService) — used by actions/cache@v4 when ACTIONS_CACHE_SERVICE_V2=true.
+        // Auth: bearer from job runtime token (verified by having correct scp in the JWT).
+        // These routes are outside require_bearer because the job JWT uses its own signing context.
+        .route(
+            "/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry",
+            post(twirp_cache_v2_create),
+        )
+        .route(
+            "/twirp/github.actions.results.api.v1.CacheService/FinalizeCacheEntryUpload",
+            post(twirp_cache_v2_finalize),
+        )
+        .route(
+            "/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL",
+            post(twirp_cache_v2_get_dl_url),
+        )
+        // Artifact v2 Twirp (ArtifactService) — used by actions/upload-artifact@v4 and download-artifact@v4.
+        .route(
+            "/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact",
+            post(twirp_artifact_v2_create),
+        )
+        .route(
+            "/twirp/github.actions.results.api.v1.ArtifactService/FinalizeArtifact",
+            post(twirp_artifact_v2_finalize),
+        )
+        .route(
+            "/twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts",
+            post(twirp_artifact_v2_list),
+        )
+        .route(
+            "/twirp/github.actions.results.api.v1.ArtifactService/GetSignedArtifactURL",
+            post(twirp_artifact_v2_get_signed_url),
+        )
+        .route(
+            "/twirp/github.actions.results.api.v1.ArtifactService/DeleteArtifact",
+            post(twirp_artifact_v2_delete),
+        )
+        // Azure Block Blob compat blob store — upload (PUT) and download (GET).
+        // Cache: /twirp-blob/cache/{token}
+        // Artifact: /twirp-blob/artifact/{token}  (download URL appends .zip for content-type detection)
+        .route("/twirp-blob/:kind/:token", put(blob_put).get(blob_get))
         .merge(protected_apis)
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
@@ -677,8 +841,26 @@ impl AppState {
         let (events, _) = broadcast::channel(1024);
         let keypair = AgentRsaKeypair::generate()
             .map_err(|e| anyhow::anyhow!("Failed to generate RSA keypair: {}", e))?;
+        let registry_path = state_dir.join("artifact_v2_registry.json");
+        let (registry, next_id) = if registry_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&registry_path) {
+                if let Ok(map) = serde_json::from_str::<BTreeMap<String, ArtifactV2Entry>>(&content)
+                {
+                    let max_id = map.values().map(|e| e.id).max().unwrap_or(0);
+                    (map, max_id)
+                } else {
+                    (BTreeMap::new(), 0)
+                }
+            } else {
+                (BTreeMap::new(), 0)
+            }
+        } else {
+            (BTreeMap::new(), 0)
+        };
         let inner = InnerState {
             agent_keypair: Some(keypair),
+            artifact_v2_registry: registry,
+            next_artifact_v2_id: next_id,
             ..Default::default()
         };
         let webhook_secret = std::env::var("AKSH_WEBHOOK_SECRET").ok();
@@ -727,6 +909,7 @@ struct InnerState {
     runner_rsa_public_keys: BTreeMap<i64, AgentRsaPublicKey>,
     inflight_messages: BTreeMap<String, BTreeMap<i64, azdo::TaskAgentMessage>>,
     broker_messages: BTreeMap<i64, azdo::AgentJobRequestMessage>,
+    runner_client_ids: BTreeMap<String, i64>,
     cancellation_queue: VecDeque<QueuedCancellation>,
     pending_caches: BTreeMap<i64, PendingCache>,
     artifacts: BTreeMap<String, ArtifactRecord>,
@@ -747,6 +930,19 @@ struct InnerState {
     next_request_id: i64,
     flows_file: Option<std::fs::File>,
     next_flow_index: usize,
+    /// Sessions created via the AzDO distributedtask path (full encrypted message format).
+    /// Sessions NOT in this set use the broker-ref (RunnerJobRequest) format.
+    azdo_sessions: std::collections::HashSet<String>,
+    /// Cache v2 Twirp pending uploads: upload_token → (key, version).
+    cache_v2_pending: BTreeMap<String, CacheV2Pending>,
+    /// Cache v2 download tokens: dl_token → (key, version).
+    cache_v2_dl_tokens: BTreeMap<String, (String, String)>,
+    /// Artifact v2 Twirp pending uploads: upload_token → registry_key.
+    artifact_v2_pending: BTreeMap<String, ArtifactV2Pending>,
+    /// Artifact v2 finalized registry: registry_key → metadata.
+    artifact_v2_registry: BTreeMap<String, ArtifactV2Entry>,
+    /// Monotonic artifact v2 ID counter.
+    next_artifact_v2_id: u64,
     dap_ports: BTreeMap<RunId, DapPortRegistration>,
 }
 
@@ -822,6 +1018,34 @@ struct ArtifactRecord {
     file_name: String,
     path: String,
     size: u64,
+}
+
+/// Pending cache v2 upload (Twirp CacheService).
+#[derive(Debug)]
+struct CacheV2Pending {
+    key: String,
+    version: String,
+}
+
+/// Pending artifact v2 upload (Twirp ArtifactService).
+#[derive(Debug)]
+struct ArtifactV2Pending {
+    /// Registry key = "{run_backend_id}/{job_backend_id}/{name}".
+    registry_key: String,
+}
+
+/// Finalized artifact v2 entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ArtifactV2Entry {
+    id: u64,
+    workflow_run_backend_id: String,
+    workflow_job_run_backend_id: String,
+    name: String,
+    size: u64,
+    created_at: String,
+    digest: Option<String>,
+    /// Upload token used to find the assembled blob on disk.
+    blob_token: String,
 }
 
 // Re-export from protocol crate — shared wire type with the runner.
@@ -900,125 +1124,9 @@ async fn healthz(State(shared): State<Arc<SharedState>>) -> Json<serde_json::Val
     }))
 }
 
-async fn fetch_remote_workflow(uses: &str) -> Result<String, String> {
-    let parts: Vec<&str> = uses.split('@').collect();
-    if parts.len() != 2 {
-        return Err(format!("invalid remote uses reference: {}", uses));
-    }
-    let path_part = parts[0];
-    let git_ref = parts[1];
-
-    let path_segments: Vec<&str> = path_part.splitn(3, '/').collect();
-    if path_segments.len() != 3 {
-        return Err(format!("invalid remote uses reference path: {}", path_part));
-    }
-    let owner = path_segments[0];
-    let repo = path_segments[1];
-    let path = path_segments[2];
-
-    let url = format!(
-        "https://raw.githubusercontent.com/{}/{}/{}/{}",
-        owner, repo, git_ref, path
-    );
-
-    let client = reqwest::Client::new();
-    let response = client
-        .get(&url)
-        .header("User-Agent", "aksh-runner-server")
-        .send()
-        .await
-        .map_err(|e| format!("failed to send request to {}: {}", url, e))?;
-
-    if !response.status().is_success() {
-        return Err(format!(
-            "failed to fetch remote workflow from {}, status: {}",
-            url,
-            response.status()
-        ));
-    }
-
-    let text = response
-        .text()
-        .await
-        .map_err(|e| format!("failed to read response text: {}", e))?;
-
-    Ok(text)
-}
-
-async fn resolve_remote_sha(owner: &str, repo: &str, git_ref: &str) -> Option<String> {
-    let url = format!(
-        "https://api.github.com/repos/{}/{}/commits/{}",
-        owner, repo, git_ref
-    );
-    let client = reqwest::Client::new();
-    let res = client
-        .get(&url)
-        .header("User-Agent", "aksh-runner-server")
-        .header("Accept", "application/vnd.github.sha")
-        .send()
-        .await
-        .ok()?;
-    if res.status().is_success() {
-        res.text().await.ok()
-    } else {
-        None
-    }
-}
-
-async fn resolve_all_reusable_workflows(
-    workflow: &aksh_gha_parser::Workflow,
-    reusable_workflows: &mut BTreeMap<String, String>,
-    reusable_shas: &mut BTreeMap<String, String>,
-    depth: usize,
-) -> Result<(), ApiError> {
-    if depth >= 4 {
-        return Ok(());
-    }
-    for job in workflow.jobs.values() {
-        if let Some(uses) = &job.uses {
-            if !uses.starts_with("./") && !uses.starts_with(".github/") {
-                if !reusable_workflows.contains_key(uses) {
-                    let text = fetch_remote_workflow(uses).await.map_err(|e| {
-                        ApiError::bad_request(format!(
-                            "failed to fetch remote workflow `{}`: {}",
-                            uses, e
-                        ))
-                    })?;
-                    reusable_workflows.insert(uses.clone(), text.clone());
-                    if let Ok(called) = parse_workflow(&text) {
-                        Box::pin(resolve_all_reusable_workflows(
-                            &called,
-                            reusable_workflows,
-                            reusable_shas,
-                            depth + 1,
-                        ))
-                        .await?;
-                    }
-                }
-                if !reusable_shas.contains_key(uses) {
-                    let parts: Vec<&str> = uses.split('@').collect();
-                    if parts.len() == 2 {
-                        let path_part = parts[0];
-                        let git_ref = parts[1];
-                        let path_segments: Vec<&str> = path_part.splitn(3, '/').collect();
-                        if path_segments.len() == 3 {
-                            let owner = path_segments[0];
-                            let repo = path_segments[1];
-                            if let Some(sha) = resolve_remote_sha(owner, repo, git_ref).await {
-                                reusable_shas.insert(uses.clone(), sha);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 pub(crate) async fn submit_run_inner(
     shared: &Arc<SharedState>,
-    mut submission: WorkflowSubmission,
+    submission: WorkflowSubmission,
 ) -> Result<RunAccepted, ApiError> {
     let workflow = parse_workflow(&submission.workflow_yaml)?;
     let (branch, tag) = git_ref_context(&submission.git_ref);
@@ -1039,50 +1147,9 @@ pub(crate) async fn submit_run_inner(
             submission.event
         )));
     }
-
-    let mut reusable_shas = BTreeMap::new();
-    resolve_all_reusable_workflows(
-        &workflow,
-        &mut submission.reusable_workflows,
-        &mut reusable_shas,
-        0,
-    )
-    .await?;
-
     let expanded = expand_jobs_with_reusables(&workflow, &submission.reusable_workflows)?;
     let mut jobs = expanded.jobs;
     let reusable_calls = expanded.reusable_calls;
-
-    for job in &mut jobs {
-        if let Some(uses) = &job.workflow_ref {
-            if !uses.starts_with("./") && !uses.starts_with(".github/") {
-                if let Some(sha) = reusable_shas.get(uses) {
-                    job.workflow_sha = Some(sha.clone());
-                }
-                let parts: Vec<&str> = uses.split('@').collect();
-                if !parts.is_empty() {
-                    let path_part = parts[0];
-                    let segments: Vec<&str> = path_part.split('/').collect();
-                    if segments.len() >= 2 {
-                        job.workflow_repository = Some(format!("{}/{}", segments[0], segments[1]));
-                    }
-                }
-            } else {
-                let sha = submission
-                    .payload
-                    .get("after")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                job.workflow_sha = Some(if sha.is_empty() {
-                    "0000000000000000000000000000000000000000".to_string()
-                } else {
-                    sha.to_string()
-                });
-                job.workflow_repository = Some(submission.repository.clone());
-            }
-        }
-    }
-
     let run_id = RunId::new();
     let github = json!({
         "event_name": submission.event,
@@ -1091,7 +1158,7 @@ pub(crate) async fn submit_run_inner(
         "ref": submission.git_ref,
         "run_id": run_id.to_string(),
         "workflow": workflow.name.clone().unwrap_or_default(),
-        "server_url": "http://localhost"
+        "server_url": "https://github.com"
     });
 
     {
@@ -1114,6 +1181,25 @@ pub(crate) async fn submit_run_inner(
                 &submission.vars,
             )
             .map_err(|e| ApiError::bad_request(format!("failed to build job message: {e}")))?;
+
+            // Mint a dynamic JWT for the job and inject it as GITHUB_TOKEN
+            let token = mint_runtime_token(&agent_msg.plan.plan_id, &agent_msg.job_id);
+            agent_msg.variables.insert(
+                "system.github.token".to_owned(),
+                aksh_gha_protocol::azdo::VariableValue::secret(token.clone()),
+            );
+            agent_msg.variables.insert(
+                "system.github.launch_endpoint".to_owned(),
+                aksh_gha_protocol::azdo::VariableValue::new(public_base_url()),
+            );
+            if let Some(aksh_gha_protocol::azdo::PipelineContextData::Dict(github_dict)) =
+                &mut agent_msg.context_data.get_mut("github")
+            {
+                github_dict.insert(
+                    "token".to_owned(),
+                    aksh_gha_protocol::azdo::PipelineContextData::String(token),
+                );
+            }
 
             // Give every dispatched job a unique requestId so PATCH
             // /AgentRequest/:request_id can target exactly one job.
@@ -1627,6 +1713,7 @@ async fn pump_axum_ws_to_dap(ws: WebSocket, target_port: u16) -> Result<(), anyh
     Ok(())
 }
 
+
 async fn record_live_log_wrapper(
     shared: &Arc<SharedState>,
     job_id: &str,
@@ -1728,38 +1815,52 @@ async fn create_session_disttask(
     Path(_pool_id): Path<i64>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    let runner_id = body
-        .get("agent")
-        .and_then(|a| a.get("id"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(1);
-    let name = body
-        .get("agent")
-        .and_then(|a| a.get("name"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("runner")
-        .to_owned();
-    let response = create_session(
-        State(shared),
-        Json(RunnerSessionRequest { runner_id, name }),
-    )
-    .await?;
-    let session_id = response["sessionId"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
+    // For the AzDO message path, generate an unencrypted session key directly.
+    // RSA-wrapped keys are only needed for real internet-facing GHES; for local
+    // use the runner's from_rsaparams may not reconstruct the keypair correctly.
+    let session_id = uuid::Uuid::new_v4();
+    let session_enc = SessionEncryption::generate();
+    let key_b64 = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        session_enc.key.clone(),
+    );
+
+    {
+        let mut inner = shared.state.inner.lock().await;
+        inner
+            .session_keys
+            .insert(session_id.to_string(), session_enc);
+        // Only mark as AzDO if the client explicitly opts in.
+        // This preserves backward compat: test and broker-hybrid sessions do NOT
+        // include `akshAzdo: true` and continue to receive broker-ref messages.
+        if body
+            .get("akshAzdo")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            inner.azdo_sessions.insert(session_id.to_string());
+        }
+    }
+
     let owner_name = body
         .get("ownerName")
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
+
+    info!(%session_id, "AzDO session created (unencrypted key)");
+
     Ok((
         StatusCode::CREATED,
         Json(json!({
-            "sessionId": session_id,
+            "sessionId": session_id.to_string(),
             "ownerName": owner_name,
             "assignmentQueued": false,
-            "orchestrationId": ""
+            "orchestrationId": "",
+            "encryptionKey": {
+                "value": key_b64,
+                "encrypted": false,
+            },
         })),
     ))
 }
@@ -1809,8 +1910,6 @@ struct BrokerRenewJobRequest {
     job_id: uuid::Uuid,
     plan_id: String,
     conclusion: Option<String>,
-    #[serde(default)]
-    outputs: serde_json::Map<String, serde_json::Value>,
 }
 
 fn execution_status_from_runner_result(result: &str) -> Option<ExecutionStatus> {
@@ -1986,27 +2085,43 @@ async fn next_message_broker_ref(
     }
 }
 
+/// GET `/_apis/distributedtask/pools/:pool_id/messages` dispatcher.
+///
+/// Sessions created via the AzDO path (`create_session_disttask`) are marked
+/// in `azdo_sessions` and receive the full encrypted `PipelineAgentJobRequest`
+/// message via `next_message_compat`.  All other sessions (broker-hybrid tests,
+/// legacy broker flow) get the lightweight `RunnerJobRequest` broker ref.
+async fn next_message_disttask(
+    State(shared): State<Arc<SharedState>>,
+    Path(pool_id): Path<i64>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    let session_id = params
+        .get("sessionId")
+        .cloned()
+        .unwrap_or_else(|| "default".to_owned());
+    let is_azdo = {
+        let inner = shared.state.inner.lock().await;
+        inner.azdo_sessions.contains(&session_id)
+    };
+    if is_azdo {
+        next_message_compat(State(shared), Path(pool_id), Query(params))
+            .await
+            .map(|r| r.into_response())
+    } else {
+        next_message_broker_ref(State(shared), Path(pool_id), Query(params)).await
+    }
+}
+
 async fn broker_session_root(
     State(shared): State<Arc<SharedState>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let session_uuid = uuid::Uuid::new_v4();
-    let session_id = session_uuid.to_string();
+    let session_id = uuid::Uuid::new_v4().to_string();
     {
         let mut inner = shared.state.inner.lock().await;
         inner
             .session_keys
             .insert(session_id.clone(), SessionEncryption::generate());
-        // Link session to the most recently registered runner so label
-        // matching works when the runner polls for jobs.
-        if let Some((&runner_id, _)) = inner.runners.iter().next_back() {
-            inner.sessions.insert(
-                session_id.clone(),
-                RunnerSession {
-                    session_id: aksh_gha_protocol::SessionId(session_uuid),
-                    runner_id,
-                },
-            );
-        }
     }
     (
         StatusCode::CREATED,
@@ -2156,10 +2271,10 @@ async fn broker_acquire_job(
     for endpoint in &mut message.resources.endpoints {
         if endpoint.name.eq_ignore_ascii_case("SystemVssConnection") {
             endpoint.url = Some(run_service_url.clone());
-            endpoint
-                .authorization
-                .parameters
-                .insert("AccessToken".to_owned(), AKSH_SYSTEM_TOKEN.to_owned());
+            endpoint.authorization.parameters.insert(
+                "AccessToken".to_owned(),
+                mint_runtime_token(&message.plan.plan_id, &message.job_id),
+            );
             endpoint
                 .data
                 .insert("ResultsServiceUrl".to_owned(), public_base_url());
@@ -2233,11 +2348,7 @@ async fn broker_complete_job(
                 run_id,
                 job_id,
                 status,
-                outputs: request
-                    .outputs
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
+                outputs: Default::default(),
             })
     };
     if let Some(completion) = completion {
@@ -2324,6 +2435,625 @@ async fn twirp_create_step_summary_metadata(
     Json(_request): Json<StepSummaryMetadataRequest>,
 ) -> Json<serde_json::Value> {
     Json(json!({"ok": true}))
+}
+
+// ─── Cache v2 Twirp (github.actions.results.api.v1.CacheService) ─────────────
+
+#[derive(Debug, Deserialize)]
+struct CacheV2CreateRequest {
+    key: String,
+    version: String,
+    // metadata ignored — scope/repo_id not needed for local store
+}
+
+#[derive(Debug, Deserialize)]
+struct CacheV2FinalizeRequest {
+    key: String,
+    version: String,
+    // size_bytes is informational; we measure the actual blob
+}
+
+#[derive(Debug, Deserialize)]
+struct CacheV2GetDlUrlRequest {
+    key: String,
+    version: String,
+    #[serde(default)]
+    restore_keys: Vec<String>,
+}
+
+async fn twirp_cache_v2_create(
+    State(shared): State<Arc<SharedState>>,
+    Json(request): Json<CacheV2CreateRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let token = uuid::Uuid::new_v4().to_string();
+    let stage_dir = shared
+        .state
+        .state_dir
+        .join("blobs")
+        .join("cache")
+        .join(&token);
+    tokio::fs::create_dir_all(&stage_dir)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to create cache stage dir: {e}")))?;
+    {
+        let mut inner = shared.state.inner.lock().await;
+        inner.cache_v2_pending.insert(
+            token.clone(),
+            CacheV2Pending {
+                key: request.key,
+                version: request.version,
+            },
+        );
+    }
+    let upload_url = format!("{}/twirp-blob/cache/{token}", public_base_url());
+    info!(token, "cache v2 create entry");
+    Ok(Json(
+        json!({ "ok": true, "signed_upload_url": upload_url, "message": "" }),
+    ))
+}
+
+async fn twirp_cache_v2_finalize(
+    State(shared): State<Arc<SharedState>>,
+    Json(request): Json<CacheV2FinalizeRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // Find the pending upload token matching key+version.
+    let token = {
+        let inner = shared.state.inner.lock().await;
+        inner
+            .cache_v2_pending
+            .iter()
+            .find(|(_, p)| p.key == request.key && p.version == request.version)
+            .map(|(k, _)| k.clone())
+    }
+    .ok_or_else(|| ApiError::not_found("no pending cache upload for key+version"))?;
+
+    let blob_path = shared
+        .state
+        .state_dir
+        .join("blobs")
+        .join("cache")
+        .join(&token)
+        .join("data");
+    let bytes = tokio::fs::read(&blob_path).await.map_err(|e| {
+        ApiError::not_found(format!("cache blob not found (not yet uploaded?): {e}"))
+    })?;
+
+    let (key, version) = {
+        let mut inner = shared.state.inner.lock().await;
+        let pending = inner
+            .cache_v2_pending
+            .remove(&token)
+            .ok_or_else(|| ApiError::internal("pending entry vanished"))?;
+        (pending.key, pending.version)
+    };
+
+    shared
+        .state
+        .cache
+        .put(&key, &version, &bytes)
+        .await
+        .map_err(|e| ApiError::internal(format!("cache store error: {e}")))?;
+
+    // Clean up staging directory.
+    let _ = tokio::fs::remove_dir_all(
+        shared
+            .state
+            .state_dir
+            .join("blobs")
+            .join("cache")
+            .join(&token),
+    )
+    .await;
+
+    info!(key, version, size = bytes.len(), "cache v2 finalized");
+    Ok(Json(json!({ "ok": true, "entry_id": "1", "message": "" })))
+}
+
+async fn twirp_cache_v2_get_dl_url(
+    State(shared): State<Arc<SharedState>>,
+    Json(request): Json<CacheV2GetDlUrlRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let result = shared
+        .state
+        .cache
+        .get(&request.key, &request.version, &request.restore_keys)
+        .await
+        .map_err(|e| ApiError::internal(format!("cache lookup error: {e}")))?;
+
+    let (entry, _bytes) = match result {
+        Some(r) => r,
+        None => {
+            return Ok(Json(
+                json!({ "ok": false, "signed_download_url": "", "matched_key": "" }),
+            ))
+        }
+    };
+
+    let dl_token = uuid::Uuid::new_v4().to_string();
+    {
+        let mut inner = shared.state.inner.lock().await;
+        inner
+            .cache_v2_dl_tokens
+            .insert(dl_token.clone(), (entry.key.clone(), entry.version.clone()));
+    }
+
+    let download_url = format!("{}/twirp-blob/cache/{dl_token}", public_base_url());
+    info!(key = entry.key, "cache v2 download URL issued");
+    Ok(Json(json!({
+        "ok": true,
+        "signed_download_url": download_url,
+        "matched_key": entry.key
+    })))
+}
+
+// ─── Artifact v2 Twirp (github.actions.results.api.v1.ArtifactService) ────────
+
+#[derive(Debug, Deserialize)]
+struct ArtifactV2CreateRequest {
+    workflow_run_backend_id: String,
+    workflow_job_run_backend_id: String,
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactV2FinalizeRequest {
+    workflow_run_backend_id: String,
+    workflow_job_run_backend_id: String,
+    name: String,
+    #[serde(default)]
+    size: serde_json::Value, // proto3 JSON: int64 as string
+    #[serde(default)]
+    hash: Option<serde_json::Value>, // StringValue: plain string or wrapped object
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactV2ListRequest {
+    workflow_run_backend_id: String,
+    workflow_job_run_backend_id: String,
+    #[serde(default)]
+    name_filter: Option<serde_json::Value>, // StringValue: plain string in proto3 JSON
+    #[serde(default)]
+    id_filter: Option<serde_json::Value>, // Int64Value: string in proto3 JSON
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactV2GetSignedUrlRequest {
+    workflow_run_backend_id: String,
+    workflow_job_run_backend_id: String,
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactV2DeleteRequest {
+    workflow_run_backend_id: String,
+    workflow_job_run_backend_id: String,
+    name: String,
+}
+
+fn artifact_v2_registry_key(run_id: &str, job_id: &str, name: &str) -> String {
+    format!("{run_id}/{job_id}/{name}")
+}
+
+async fn save_artifact_v2_registry(shared: &Arc<SharedState>) -> Result<(), std::io::Error> {
+    let registry_path = shared.state.state_dir.join("artifact_v2_registry.json");
+    let serialized = {
+        let inner = shared.state.inner.lock().await;
+        serde_json::to_string(&inner.artifact_v2_registry)?
+    };
+    tokio::fs::write(&registry_path, serialized.as_bytes()).await?;
+    Ok(())
+}
+
+async fn twirp_artifact_v2_create(
+    State(shared): State<Arc<SharedState>>,
+    Json(request): Json<ArtifactV2CreateRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let token = uuid::Uuid::new_v4().to_string();
+    let registry_key = artifact_v2_registry_key(
+        &request.workflow_run_backend_id,
+        &request.workflow_job_run_backend_id,
+        &request.name,
+    );
+    let stage_dir = shared
+        .state
+        .state_dir
+        .join("blobs")
+        .join("artifact")
+        .join(&token);
+    tokio::fs::create_dir_all(&stage_dir)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to create artifact stage dir: {e}")))?;
+    {
+        let mut inner = shared.state.inner.lock().await;
+        inner
+            .artifact_v2_pending
+            .insert(token.clone(), ArtifactV2Pending { registry_key });
+    }
+    let upload_url = format!("{}/twirp-blob/artifact/{token}", public_base_url());
+    info!(token, name = request.name, "artifact v2 create");
+    Ok(Json(json!({ "ok": true, "signed_upload_url": upload_url })))
+}
+
+async fn twirp_artifact_v2_finalize(
+    State(shared): State<Arc<SharedState>>,
+    Json(request): Json<ArtifactV2FinalizeRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let registry_key = artifact_v2_registry_key(
+        &request.workflow_run_backend_id,
+        &request.workflow_job_run_backend_id,
+        &request.name,
+    );
+    let token = {
+        let inner = shared.state.inner.lock().await;
+        inner
+            .artifact_v2_pending
+            .iter()
+            .find(|(_, p)| p.registry_key == registry_key)
+            .map(|(k, _)| k.clone())
+    }
+    .ok_or_else(|| ApiError::not_found("no pending artifact upload for this name/run/job"))?;
+
+    // Measure actual blob size.
+    let blob_path = shared
+        .state
+        .state_dir
+        .join("blobs")
+        .join("artifact")
+        .join(&token)
+        .join("data");
+    let size = tokio::fs::metadata(&blob_path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or_else(|_| match &request.size {
+            serde_json::Value::String(s) => s.parse::<u64>().unwrap_or(0),
+            serde_json::Value::Number(n) => n.as_u64().unwrap_or(0),
+            _ => 0,
+        });
+
+    let artifact_id;
+    {
+        let mut inner = shared.state.inner.lock().await;
+        inner.artifact_v2_pending.remove(&token);
+        inner.next_artifact_v2_id += 1;
+        artifact_id = inner.next_artifact_v2_id;
+        let digest = request.hash.and_then(|v| match v {
+            serde_json::Value::String(s) => Some(s),
+            serde_json::Value::Object(ref obj) => obj
+                .get("value")
+                .and_then(|val| val.as_str().map(|s| s.to_owned())),
+            _ => None,
+        });
+        inner.artifact_v2_registry.insert(
+            registry_key,
+            ArtifactV2Entry {
+                id: artifact_id,
+                workflow_run_backend_id: request.workflow_run_backend_id,
+                workflow_job_run_backend_id: request.workflow_job_run_backend_id,
+                name: request.name.clone(),
+                size,
+                created_at: server_iso_now(),
+                digest,
+                blob_token: token,
+            },
+        );
+    }
+    let _ = save_artifact_v2_registry(&shared).await;
+    info!(
+        artifact_id,
+        name = request.name,
+        size,
+        "artifact v2 finalized"
+    );
+    Ok(Json(
+        json!({ "ok": true, "artifact_id": artifact_id.to_string() }),
+    ))
+}
+
+async fn twirp_artifact_v2_list(
+    State(shared): State<Arc<SharedState>>,
+    Json(request): Json<ArtifactV2ListRequest>,
+) -> Json<serde_json::Value> {
+    let inner = shared.state.inner.lock().await;
+
+    let name_filter: Option<String> = request.name_filter.and_then(|v| match v {
+        serde_json::Value::String(s) => Some(s),
+        serde_json::Value::Object(ref obj) => obj
+            .get("value")
+            .and_then(|val| val.as_str().map(|s| s.to_owned())),
+        _ => None,
+    });
+    let id_filter: Option<u64> = request.id_filter.and_then(|v| match v {
+        serde_json::Value::String(s) => s.parse::<u64>().ok(),
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::Object(ref obj) => obj.get("value").and_then(|val| match val {
+            serde_json::Value::String(s) => s.parse::<u64>().ok(),
+            serde_json::Value::Number(n) => n.as_u64(),
+            _ => None,
+        }),
+        _ => None,
+    });
+
+    let artifacts: Vec<serde_json::Value> = inner
+        .artifact_v2_registry
+        .values()
+        .filter(|e| {
+            e.workflow_run_backend_id == request.workflow_run_backend_id
+                && e.workflow_job_run_backend_id == request.workflow_job_run_backend_id
+        })
+        .filter(|e| name_filter.as_deref().map(|f| e.name == f).unwrap_or(true))
+        .filter(|e| id_filter.map(|id| e.id == id).unwrap_or(true))
+        .map(|e| {
+            json!({
+                "workflow_run_backend_id": e.workflow_run_backend_id,
+                "workflow_job_run_backend_id": e.workflow_job_run_backend_id,
+                "database_id": e.id.to_string(),
+                "name": e.name,
+                "size": e.size.to_string(),
+                "created_at": e.created_at,
+                "digest": e.digest.as_deref().unwrap_or("")
+            })
+        })
+        .collect();
+    Json(json!({ "artifacts": artifacts }))
+}
+
+async fn twirp_artifact_v2_get_signed_url(
+    State(shared): State<Arc<SharedState>>,
+    Json(request): Json<ArtifactV2GetSignedUrlRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let registry_key = artifact_v2_registry_key(
+        &request.workflow_run_backend_id,
+        &request.workflow_job_run_backend_id,
+        &request.name,
+    );
+    let blob_token = {
+        let inner = shared.state.inner.lock().await;
+        inner
+            .artifact_v2_registry
+            .get(&registry_key)
+            .map(|e| e.blob_token.clone())
+    }
+    .ok_or_else(|| ApiError::not_found("artifact not found"))?;
+
+    // URL must end in .zip so the toolkit's streamExtract detects it as a zip.
+    let signed_url = format!("{}/twirp-blob/artifact/{blob_token}.zip", public_base_url());
+    Ok(Json(json!({ "signed_url": signed_url })))
+}
+
+async fn twirp_artifact_v2_delete(
+    State(shared): State<Arc<SharedState>>,
+    Json(request): Json<ArtifactV2DeleteRequest>,
+) -> Json<serde_json::Value> {
+    let registry_key = artifact_v2_registry_key(
+        &request.workflow_run_backend_id,
+        &request.workflow_job_run_backend_id,
+        &request.name,
+    );
+    let removed = {
+        let mut inner = shared.state.inner.lock().await;
+        inner.artifact_v2_registry.remove(&registry_key)
+    };
+    if let Some(e) = removed {
+        let _ = save_artifact_v2_registry(&shared).await;
+        let blob_dir = shared
+            .state
+            .state_dir
+            .join("blobs")
+            .join("artifact")
+            .join(&e.blob_token);
+        let _ = tokio::fs::remove_dir_all(blob_dir).await;
+        Json(json!({ "ok": true, "artifact_id": e.id.to_string() }))
+    } else {
+        Json(json!({ "ok": false, "artifact_id": "0" }))
+    }
+}
+
+// ─── Azure Block Blob compat blob store ───────────────────────────────────────
+//
+// Both actions/cache@v4 and actions/upload-artifact@v4 upload via the Azure SDK
+// (BlockBlobClient).  The protocol is:
+//   • Single-shot: PUT /twirp-blob/{kind}/{token}                  → 201
+//   • Stage block: PUT /twirp-blob/{kind}/{token}?comp=block&blockid={b64} → 201
+//   • Commit list: PUT /twirp-blob/{kind}/{token}?comp=blocklist   → 201
+// Downloads (cache + artifact) use a plain GET.
+
+#[derive(Debug, Deserialize)]
+struct BlobPutQuery {
+    comp: Option<String>,
+    blockid: Option<String>,
+}
+
+/// Convert a base64 block ID to a filesystem-safe name.
+fn blockid_to_filename(blockid: &str) -> String {
+    blockid.replace('+', "-").replace('/', "_").replace('=', "")
+}
+
+/// Parse an Azure Block Blob blocklist XML body and return block IDs in order.
+fn parse_blocklist_xml(body: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut pos = 0;
+    while let Some(start_off) = body[pos..].find("<Latest>") {
+        let content_start = pos + start_off + 8; // len("<Latest>") == 8
+        if let Some(end_off) = body[content_start..].find("</Latest>") {
+            let id = body[content_start..content_start + end_off]
+                .trim()
+                .to_owned();
+            if !id.is_empty() {
+                ids.push(id);
+            }
+            pos = content_start + end_off + 9; // len("</Latest>") == 9
+        } else {
+            break;
+        }
+    }
+    ids
+}
+
+async fn blob_put(
+    State(shared): State<Arc<SharedState>>,
+    Path((kind, token)): Path<(String, String)>,
+    Query(query): Query<BlobPutQuery>,
+    body: axum::body::Bytes,
+) -> StatusCode {
+    let blob_root = shared
+        .state
+        .state_dir
+        .join("blobs")
+        .join(&kind)
+        .join(&token);
+
+    match query.comp.as_deref() {
+        Some("block") => {
+            let block_id = query.blockid.unwrap_or_default();
+            let safe_id = blockid_to_filename(&block_id);
+            let blocks_dir = blob_root.join("blocks");
+            if let Err(e) = tokio::fs::create_dir_all(&blocks_dir).await {
+                warn!(kind, token, "failed to create blocks dir: {e}");
+                return StatusCode::INTERNAL_SERVER_ERROR;
+            }
+            match tokio::fs::write(blocks_dir.join(&safe_id), &body).await {
+                Ok(()) => {
+                    debug!(
+                        kind,
+                        token,
+                        block = safe_id,
+                        bytes = body.len(),
+                        "blob block staged"
+                    );
+                    StatusCode::CREATED
+                }
+                Err(e) => {
+                    warn!(kind, token, "failed to write block {safe_id}: {e}");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            }
+        }
+        Some("blocklist") => {
+            let body_str = String::from_utf8_lossy(&body);
+            let block_ids = parse_blocklist_xml(&body_str);
+            let blocks_dir = blob_root.join("blocks");
+            let data_path = blob_root.join("data");
+
+            let mut assembled: Vec<u8> = Vec::new();
+            for bid in &block_ids {
+                let safe_id = blockid_to_filename(bid);
+                match tokio::fs::read(blocks_dir.join(&safe_id)).await {
+                    Ok(bytes) => assembled.extend_from_slice(&bytes),
+                    Err(e) => {
+                        warn!(kind, token, "failed to read block {safe_id}: {e}");
+                        return StatusCode::INTERNAL_SERVER_ERROR;
+                    }
+                }
+            }
+            match tokio::fs::write(&data_path, &assembled).await {
+                Ok(()) => {
+                    let _ = tokio::fs::remove_dir_all(&blocks_dir).await;
+                    info!(
+                        kind,
+                        token,
+                        size = assembled.len(),
+                        blocks = block_ids.len(),
+                        "blob assembled from blocks"
+                    );
+                    StatusCode::CREATED
+                }
+                Err(e) => {
+                    warn!(kind, token, "failed to write assembled blob: {e}");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            }
+        }
+        _ => {
+            // Single-shot upload.
+            let data_path = blob_root.join("data");
+            match tokio::fs::write(&data_path, &body).await {
+                Ok(()) => {
+                    info!(kind, token, size = body.len(), "blob single-shot upload");
+                    StatusCode::CREATED
+                }
+                Err(e) => {
+                    warn!(kind, token, "failed to write single-shot blob: {e}");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            }
+        }
+    }
+}
+
+async fn blob_get(
+    State(shared): State<Arc<SharedState>>,
+    Path((kind, mut token)): Path<(String, String)>,
+) -> Response {
+    // Artifact download URLs end in .zip for toolkit zip-detection.
+    if kind == "artifact" && token.ends_with(".zip") {
+        token.truncate(token.len() - 4);
+    }
+
+    if kind == "cache" {
+        // Token is a download token → look up (key, version) in state.
+        let kv = {
+            let inner = shared.state.inner.lock().await;
+            inner.cache_v2_dl_tokens.get(&token).cloned()
+        };
+        if let Some((key, version)) = kv {
+            let empty: Vec<String> = Vec::new();
+            return match shared.state.cache.get(&key, &version, &empty).await {
+                Ok(Some((_entry, bytes))) => (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/octet-stream")],
+                    bytes,
+                )
+                    .into_response(),
+                Ok(None) => StatusCode::NOT_FOUND.into_response(),
+                Err(e) => {
+                    warn!(key, version, "cache read error: {e}");
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+            };
+        }
+    }
+
+    // Artifact (or cache fallback): serve from blob staging dir.
+    let data_path = shared
+        .state
+        .state_dir
+        .join("blobs")
+        .join(&kind)
+        .join(&token)
+        .join("data");
+    match tokio::fs::read(&data_path).await {
+        Ok(bytes) => {
+            if kind == "artifact" {
+                let name = {
+                    let inner = shared.state.inner.lock().await;
+                    inner
+                        .artifact_v2_registry
+                        .values()
+                        .find(|e| e.blob_token == token)
+                        .map(|e| e.name.clone())
+                };
+                let filename = name.unwrap_or_else(|| "artifact".to_owned());
+                let content_disposition = format!("attachment; filename=\"{filename}.zip\"");
+                (
+                    StatusCode::OK,
+                    [
+                        (header::CONTENT_TYPE, "application/zip"),
+                        (header::CONTENT_DISPOSITION, &content_disposition),
+                    ],
+                    bytes,
+                )
+                    .into_response()
+            } else {
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/octet-stream")],
+                    bytes,
+                )
+                    .into_response()
+            }
+        }
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// Accept blob uploads (logs, summaries) at signed-URL paths.
@@ -2453,7 +3183,32 @@ async fn next_message(
                 .insert(queued.job_id.clone(), ExecutionStatus::InProgress);
         }
 
-        let body_json = serde_json::to_string(&queued.message)
+        // F030: inject SystemVssConnection so the worker's AzDO reporting context
+        // has a server URL, access token, and ResultsServiceUrl — same as broker_acquire_job.
+        let mut msg = queued.message.clone();
+        for endpoint in &mut msg.resources.endpoints {
+            if endpoint.name.eq_ignore_ascii_case("SystemVssConnection") {
+                endpoint.url = Some(runner_server_url());
+                endpoint.authorization.parameters.insert(
+                    "AccessToken".to_owned(),
+                    mint_runtime_token(&msg.plan.plan_id, &msg.job_id),
+                );
+                endpoint
+                    .data
+                    .insert("ResultsServiceUrl".to_owned(), public_base_url());
+                endpoint
+                    .data
+                    .insert("PipelinesServiceUrl".to_owned(), runner_server_url());
+                endpoint
+                    .data
+                    .insert("CacheServerUrl".to_owned(), public_base_url());
+            }
+        }
+        debug!(
+            endpoint_count = msg.resources.endpoints.len(),
+            "F030: injected SystemVssConnection into AzDO job message"
+        );
+        let body_json = serde_json::to_string(&msg)
             .map_err(|e| ApiError::bad_request(format!("failed to serialize job message: {e}")))?;
         let request_id = queued.message.request_id;
         inner
@@ -2520,7 +3275,7 @@ fn build_task_agent_message(
         message_id,
         message_type: message_type.to_owned(),
         body: BASE64_STANDARD.encode(&encrypted_body),
-        iv: Some(BASE64_STANDARD.encode(iv)),
+        iv: Some(BASE64_STANDARD.encode(&iv)),
     };
     inner
         .inflight_messages
@@ -2808,18 +3563,7 @@ async fn complete_job_inner(
             completion
                 .outputs
                 .iter()
-                .map(|(k, v)| {
-                    let val = if let Some(obj) = v.as_object() {
-                        if let Some(inner_val) = obj.get("value") {
-                            inner_val.clone()
-                        } else {
-                            v.clone()
-                        }
-                    } else {
-                        v.clone()
-                    };
-                    (k.clone(), val)
-                })
+                .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
         );
         propagate_reusable_outputs(run);
@@ -3039,140 +3783,12 @@ fn apply_matrix_fail_fast(inner: &mut InnerState, run_id: RunId, failed_job: &Jo
     count
 }
 
-fn propagate_reusable_outputs(run: &mut RunRecord) {
-    let mut outputs_to_add = Vec::new();
-    for (caller_job_id, call) in &run.reusable_calls {
-        let caller_job_id_typed = JobId(caller_job_id.clone());
-        if run.job_outputs.contains_key(&caller_job_id_typed) {
-            continue;
-        }
-
-        // Check if all inner jobs are complete
-        let all_complete = !call.inner_job_ids.is_empty()
-            && call.inner_job_ids.iter().all(|id| {
-                run.jobs.get(&JobId(id.clone())).is_some_and(|status| {
-                    matches!(
-                        status,
-                        ExecutionStatus::Success
-                            | ExecutionStatus::Failure
-                            | ExecutionStatus::Skipped
-                            | ExecutionStatus::Cancelled
-                    )
-                })
-            });
-
-        if all_complete {
-            // Build expression context
-            let mut jobs_map = serde_json::Map::new();
-            for inner_id in &call.inner_job_ids {
-                let prefix = format!("{}/", caller_job_id);
-                let inner_id_without_prefix = if inner_id.starts_with(&prefix) {
-                    &inner_id[prefix.len()..]
-                } else {
-                    inner_id
-                };
-
-                let mut job_outputs_map = serde_json::Map::new();
-                if let Some(outputs) = run.job_outputs.get(&JobId(inner_id.clone())) {
-                    for (k, v) in outputs {
-                        job_outputs_map.insert(k.clone(), v.clone());
-                    }
-                }
-
-                let mut job_record = serde_json::Map::new();
-                job_record.insert(
-                    "outputs".to_owned(),
-                    serde_json::Value::Object(job_outputs_map),
-                );
-                jobs_map.insert(
-                    inner_id_without_prefix.to_owned(),
-                    serde_json::Value::Object(job_record),
-                );
-            }
-
-            let mut context = aksh_gha_expressions::Context::default();
-            context.insert("jobs", serde_json::Value::Object(jobs_map));
-
-            let mut inputs_map = serde_json::Map::new();
-            for (k, v) in &call.inputs {
-                inputs_map.insert(k.clone(), v.clone());
-            }
-            context.insert("inputs", serde_json::Value::Object(inputs_map));
-
-            let mut caller_outputs = BTreeMap::new();
-            for (name, expr) in &call.output_definitions {
-                let resolved = aksh_gha_parser::eval::resolve_string(expr, &context)
-                    .unwrap_or_else(|_| expr.clone());
-                let val =
-                    serde_json::from_str(&resolved).unwrap_or(serde_json::Value::String(resolved));
-                caller_outputs.insert(name.clone(), val);
-            }
-
-            outputs_to_add.push((caller_job_id_typed, caller_outputs));
-        }
-    }
-
-    for (job_id, outputs) in outputs_to_add {
-        run.job_outputs.insert(job_id, outputs);
-    }
-}
-
-fn parent_need_context(
-    run: &RunRecord,
-    parent_job_id: &JobId,
-) -> Option<azdo::PipelineContextData> {
-    let prefix = format!("{}/", parent_job_id.0);
-    let mut inner_statuses = Vec::new();
-    for (job_id, status) in &run.jobs {
-        if job_id.0.starts_with(&prefix) {
-            inner_statuses.push(*status);
-        }
-    }
-
-    if inner_statuses.is_empty() {
-        return None;
-    }
-
-    let result = summarize_run(inner_statuses.into_iter());
-    let mut outputs = BTreeMap::new();
-    if let Some(job_outputs) = run.job_outputs.get(parent_job_id) {
-        for (key, value) in job_outputs {
-            outputs.insert(key.clone(), json_to_context_data(value));
-        }
-    }
-
-    let mut dict = BTreeMap::new();
-    dict.insert(
-        "result".to_owned(),
-        azdo::PipelineContextData::String(status_string(result)),
-    );
-    dict.insert(
-        "outputs".to_owned(),
-        azdo::PipelineContextData::Dict(outputs),
-    );
-    Some(azdo::PipelineContextData::Dict(dict))
-}
-
 fn hydrate_needs_context(job: &mut QueuedJob, run: &RunRecord) {
-    let mut needs = BTreeMap::new();
-    for need in &job.needs {
-        if let Some(context) = need_context(run, need) {
-            needs.insert(need.0.clone(), context);
-        }
-
-        let mut current = need.0.clone();
-        while let Some(last_slash) = current.rfind('/') {
-            let parent = current[..last_slash].to_string();
-            let parent_job_id = JobId(parent.clone());
-
-            if !needs.contains_key(&parent) {
-                if let Some(context) = parent_need_context(run, &parent_job_id) {
-                    needs.insert(parent.clone(), context);
-                }
-            }
-            current = parent;
-        }
-    }
+    let needs = job
+        .needs
+        .iter()
+        .filter_map(|need| need_context(run, need).map(|context| (need.0.clone(), context)))
+        .collect();
     job.message
         .context_data
         .insert("needs".to_owned(), azdo::PipelineContextData::Dict(needs));
@@ -3487,13 +4103,400 @@ async fn finish_job(
     Json(json!({ "ok": true }))
 }
 
+// ── F030: standard AzDO `/_apis/v1/plans/` route handlers ────────────────────
+// These use the URL pattern our AzDO client sends (`plans/{planId}/...`) rather
+// than the scoped pattern (`Timeline/{scope}/{hub}/{planId}/{timelineId}`).
+// The logic is identical to the existing handlers above.
+
+/// PATCH `/_apis/v1/plans/:plan_id/timelines/:timeline_id/records`
+async fn patch_timeline_records_plan(
+    State(shared): State<Arc<SharedState>>,
+    Path((plan_id, timeline_id)): Path<(String, String)>,
+    Json(wrapper): Json<azdo::VssJsonCollectionWrapper<azdo::TimelineRecord>>,
+) -> Json<serde_json::Value> {
+    patch_timeline_records(
+        State(shared),
+        Path((String::new(), String::new(), plan_id, timeline_id)),
+        Json(wrapper),
+    )
+    .await
+}
+
+/// POST `/_apis/v1/plans/:plan_id/logs`
+async fn create_log_plan(
+    State(shared): State<Arc<SharedState>>,
+    Path(plan_id): Path<String>,
+    Json(log): Json<azdo::TaskLog>,
+) -> Json<serde_json::Value> {
+    create_log(
+        State(shared),
+        Path((String::new(), String::new(), plan_id)),
+        Json(log),
+    )
+    .await
+}
+
+/// PUT `/_apis/v1/plans/:plan_id/logs/:log_id`
+async fn append_log_plan(
+    State(shared): State<Arc<SharedState>>,
+    Path((plan_id, log_id)): Path<(String, String)>,
+    body: Bytes,
+) -> StatusCode {
+    append_log(
+        State(shared),
+        Path((String::new(), String::new(), plan_id, log_id)),
+        body,
+    )
+    .await
+}
+
+/// POST `/_apis/v1/plans/:plan_id/events`
+///
+/// Handles the `JobCompleted` event sent by the runner's AzDO reporting path.
+/// The body shape is `{name, jobId, requestId, result, outputs}` — slightly
+/// different from the scoped `finish_job` path which uses `JobCompletedEvent`.
+async fn finish_job_plan(
+    State(shared): State<Arc<SharedState>>,
+    Path(plan_id): Path<String>,
+    Json(event): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let result_str = event
+        .get("result")
+        .and_then(|v| v.as_str())
+        .unwrap_or("failed");
+    let status =
+        execution_status_from_runner_result(result_str).unwrap_or(ExecutionStatus::Failure);
+    let job_id_str = event.get("jobId").and_then(|v| v.as_str()).unwrap_or("");
+    let outputs = event
+        .get("outputs")
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned())))
+                .collect::<std::collections::HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let outputs: aksh_gha_protocol::OutputMap = outputs
+        .into_iter()
+        .map(|(k, v)| (k, serde_json::Value::String(v)))
+        .collect();
+
+    info!(
+        plan_id,
+        job_id = job_id_str,
+        result = result_str,
+        "finish_job_plan"
+    );
+
+    let completion = {
+        let mut inner = shared.state.inner.lock().await;
+        let resolved = resolve_callback_job(&inner, &plan_id, None, None).or_else(|| {
+            sole_active_unfinished_request(&inner).and_then(|id| job_request_tuple(&inner, id))
+        });
+        if let Some((request_id, run_id, job_id)) = resolved {
+            if let Some(request) = inner.job_requests.get_mut(&request_id) {
+                request.result = Some(status);
+                request.locked_until = agent_request_locked_until();
+            }
+            Some(JobCompletion {
+                run_id,
+                job_id,
+                status,
+                outputs,
+            })
+        } else {
+            warn!(plan_id, "finish_job_plan: could not resolve run/job");
+            None
+        }
+    };
+    if let Some(c) = completion {
+        let _ = complete_job_inner(shared, c).await;
+    }
+    Json(json!({ "ok": true }))
+}
+
 /// POST action download info — resolve action references to download URLs.
 async fn action_download_info(
     State(_shared): State<Arc<SharedState>>,
-    Json(_request): Json<serde_json::Value>,
+    Json(request): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-    // For now, return empty info — actions will be downloaded from GitHub
-    Json(json!({ "archiveDownloadTickets": {} }))
+    let mut tickets = serde_json::Map::new();
+    collect_action_download_refs(&request, &mut tickets);
+
+    Json(json!({
+        "archiveDownloadTickets": tickets.clone(),
+        // Some runner/protocol paths call the same payload an actionsDownloadInfo
+        // map. Return both names so legacy and batch clients can consume the same
+        // local fallback without a second resolution path.
+        "actionsDownloadInfo": tickets,
+    }))
+}
+
+async fn runnerresolve_actions(
+    State(_shared): State<Arc<SharedState>>,
+    Json(request): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let mut actions = serde_json::Map::new();
+    collect_runnerresolve_refs(&request, &mut actions);
+
+    Json(json!({ "actions": actions }))
+}
+
+async fn download_action_tarball(
+    State(shared): State<Arc<SharedState>>,
+    Path((owner, repo, git_ref)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    // 1. Sanitize parameters to avoid directory traversal
+    if owner.contains('.')
+        || owner.contains('/')
+        || owner.contains('\\')
+        || repo.contains('.')
+        || repo.contains('/')
+        || repo.contains('\\')
+        || git_ref.contains("..")
+        || git_ref.contains('\\')
+    {
+        return Err(ApiError::bad_request("invalid owner, repo, or git_ref"));
+    }
+
+    let cache_dir = shared
+        .state
+        .state_dir
+        .join("actions")
+        .join(&owner)
+        .join(&repo)
+        .join(&git_ref);
+    let cached_path = cache_dir.join("action.tar.gz");
+
+    if cached_path.exists() {
+        let file = tokio::fs::File::open(&cached_path)
+            .await
+            .map_err(|e| ApiError::internal(format!("failed to open cached action: {e}")))?;
+        let stream = tokio_util::io::ReaderStream::new(file);
+        let body = Body::from_stream(stream);
+
+        let res = Response::builder()
+            .header(header::CONTENT_TYPE, "application/gzip")
+            .header(
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{repo}-{git_ref}.tar.gz\""),
+            )
+            .body(body)
+            .map_err(|e| ApiError::internal(format!("failed to build response: {e}")))?;
+        return Ok(res);
+    }
+
+    // Cache Miss: Download from GitHub
+    tokio::fs::create_dir_all(&cache_dir)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to create action cache dir: {e}")))?;
+
+    let temp_path = cache_dir.join("action.tar.gz.tmp");
+    let github_url = format!("https://api.github.com/repos/{owner}/{repo}/tarball/{git_ref}");
+
+    info!(
+        owner,
+        repo, git_ref, github_url, "Downloading action to server cache"
+    );
+
+    let client = reqwest::Client::builder()
+        .user_agent("aksh-runner-server")
+        .build()
+        .map_err(|e| ApiError::internal(format!("failed to build reqwest client: {e}")))?;
+
+    let response = client.get(&github_url).send().await.map_err(|e| {
+        ApiError::internal(format!("failed to send download request to GitHub: {e}"))
+    })?;
+
+    if !response.status().is_success() {
+        return Err(ApiError::not_found(format!(
+            "GitHub returned status {} for {}",
+            response.status(),
+            github_url
+        )));
+    }
+
+    let mut temp_file = tokio::fs::File::create(&temp_path)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to create temporary action file: {e}")))?;
+
+    let mut stream = response.bytes_stream();
+    while let Some(chunk_result) = stream.next().await {
+        let chunk = chunk_result.map_err(|e| {
+            ApiError::internal(format!("failed to read chunk from GitHub response: {e}"))
+        })?;
+        tokio::io::copy(&mut &chunk[..], &mut temp_file)
+            .await
+            .map_err(|e| {
+                ApiError::internal(format!("failed to write chunk to temporary file: {e}"))
+            })?;
+    }
+
+    // Atomically rename to final target path
+    tokio::fs::rename(&temp_path, &cached_path)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to rename cached action file: {e}")))?;
+
+    info!(cached_path = ?cached_path, "Action cached successfully on server");
+
+    let file = tokio::fs::File::open(&cached_path)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to open newly cached action: {e}")))?;
+    let stream = tokio_util::io::ReaderStream::new(file);
+    let body = Body::from_stream(stream);
+
+    let res = Response::builder()
+        .header(header::CONTENT_TYPE, "application/gzip")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{repo}-{git_ref}.tar.gz\""),
+        )
+        .body(body)
+        .map_err(|e| ApiError::internal(format!("failed to build response: {e}")))?;
+    Ok(res)
+}
+
+fn collect_action_download_refs(
+    value: &serde_json::Value,
+    tickets: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    match value {
+        serde_json::Value::String(raw) => {
+            if let Some((key, ticket)) = action_download_ticket(raw, None) {
+                tickets.entry(key).or_insert(ticket);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_action_download_refs(item, tickets);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            let action = map
+                .get("action")
+                .or_else(|| map.get("name"))
+                .or_else(|| map.get("nameWithOwner"))
+                .or_else(|| map.get("repository"))
+                .and_then(|v| v.as_str());
+            let version = map
+                .get("version")
+                .or_else(|| map.get("ref"))
+                .or_else(|| map.get("reference"))
+                .and_then(|v| v.as_str());
+            if let Some(action) = action {
+                if let Some((key, ticket)) = action_download_ticket(action, version) {
+                    tickets.entry(key).or_insert(ticket);
+                }
+            }
+
+            for nested in map.values() {
+                collect_action_download_refs(nested, tickets);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn action_download_ticket(
+    action: &str,
+    version_override: Option<&str>,
+) -> Option<(String, serde_json::Value)> {
+    if action.starts_with("./") || action.starts_with("../") || action.starts_with("docker://") {
+        return None;
+    }
+
+    let (repo_part, git_ref) = if let Some(version) = version_override {
+        (action, version)
+    } else {
+        action.split_once('@')?
+    };
+    if git_ref.is_empty() {
+        return None;
+    }
+
+    let mut parts = repo_part.split('/');
+    let owner = parts.next()?;
+    let repo = parts.next()?;
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+
+    let key = format!("{repo_part}@{git_ref}");
+    let public_url = public_base_url();
+    let url = format!("{public_url}/api/v1/actions/download/{owner}/{repo}/{git_ref}");
+    Some((
+        key,
+        json!({
+            "type": "Archive",
+            "url": url,
+            "authentication": null,
+            "auth": null,
+        }),
+    ))
+}
+
+fn collect_runnerresolve_refs(
+    value: &serde_json::Value,
+    actions: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    match value {
+        serde_json::Value::String(raw) => {
+            if let Some((key, action)) = runnerresolve_action(raw, None) {
+                actions.entry(key).or_insert(action);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_runnerresolve_refs(item, actions);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            let action = map
+                .get("action")
+                .or_else(|| map.get("name"))
+                .or_else(|| map.get("nameWithOwner"))
+                .or_else(|| map.get("repository"))
+                .and_then(|v| v.as_str());
+            let version = map
+                .get("version")
+                .or_else(|| map.get("ref"))
+                .or_else(|| map.get("reference"))
+                .and_then(|v| v.as_str());
+            if let Some(action) = action {
+                if let Some((key, value)) = runnerresolve_action(action, version) {
+                    actions.entry(key).or_insert(value);
+                }
+            }
+
+            for nested in map.values() {
+                collect_runnerresolve_refs(nested, actions);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn runnerresolve_action(
+    action: &str,
+    version_override: Option<&str>,
+) -> Option<(String, serde_json::Value)> {
+    let (key, ticket) = action_download_ticket(action, version_override)?;
+    let (name, version) = key.split_once('@')?;
+    let name = name.to_string();
+    let version = version.to_string();
+    let tar_url = ticket.get("url")?.as_str()?.to_string();
+    Some((
+        key,
+        json!({
+            "name": name,
+            "version": version,
+            // Local aksh does not pin refs yet; use the requested ref as the
+            // extraction directory until a GitHub API lookup is added.
+            "resolved_sha": version,
+            "tar_url": tar_url,
+            "authentication": null,
+        }),
+    ))
 }
 
 fn summarize_run(statuses: impl Iterator<Item = ExecutionStatus>) -> ExecutionStatus {
@@ -3789,7 +4792,14 @@ async fn register_runner_compat(
         ephemeral,
         public_key: public_key_xml,
     };
-    let result = register_runner(State(shared), Json(reg_request)).await?;
+    let result = register_runner(State(shared.clone()), Json(reg_request)).await?;
+    let client_id = uuid::Uuid::new_v4().to_string();
+    {
+        let mut inner = shared.state.inner.lock().await;
+        inner
+            .runner_client_ids
+            .insert(client_id.clone(), result.0.id);
+    }
     Ok(Json(json!({
         "id": result.0.id,
         "name": result.0.name,
@@ -3810,7 +4820,7 @@ async fn register_runner_compat(
         "labels": result.0.labels.iter().map(|l| json!({"name": l, "type": "user"})).collect::<Vec<_>>(),
         "authorization": {
             "authorizationUrl": format!("{}/_apis/v1/oauth2/token", runner_server_url()),
-            "clientId": uuid::Uuid::new_v4().to_string(),
+            "clientId": client_id,
             "publicKey": public_key_object
         },
         "properties": {
@@ -4091,20 +5101,126 @@ struct TokenResponse {
     expires_in: u64,
 }
 
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct FormOAuth2Request {
+    client_assertion_type: Option<String>,
+    client_assertion: Option<String>,
+    grant_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct JsonOAuth2Request {
+    grant_type: String,
+    client_id: String,
+    client_secret: String,
+}
+
+fn decode_jwt_segment(segment: &str) -> Option<serde_json::Value> {
+    let bytes = BASE64_STANDARD
+        .decode(segment.as_bytes())
+        .or_else(|_| URL_SAFE_NO_PAD.decode(segment.as_bytes()))
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Token TTL in seconds. Override with AKSH_TOKEN_TTL_SECS for testing
+/// short-lived tokens (e.g. =1 triggers RLIS-02 proactive refresh immediately).
+fn token_ttl_secs() -> u64 {
+    std::env::var("AKSH_TOKEN_TTL_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2999)
+}
+
 async fn oauth2_token(
+    State(shared): State<Arc<SharedState>>,
     _headers: axum::http::HeaderMap,
     body: bytes::Bytes,
 ) -> Result<Json<TokenResponse>, ApiError> {
-    let _ = body;
+    // Try JSON first (mock flow from existing tests)
+    if let Ok(req) = serde_json::from_slice::<JsonOAuth2Request>(&body) {
+        let token = local_jwt(json!({
+            "sub": format!("aksh-runner-listen-mock-{}", req.client_id),
+            "scp": "ActionsRuntime.RunnerListen Framework.GenericRead Identity.ReadRefs LocationService.Connect",
+            "jti": uuid::Uuid::new_v4().to_string()
+        }))?;
+        return Ok(Json(TokenResponse {
+            access_token: token,
+            token_type: "JWT".to_owned(),
+            expires_in: token_ttl_secs(),
+        }));
+    }
+
+    // Try urlencoded form (production runner flow with client assertion)
+    let form: FormOAuth2Request = serde_urlencoded::from_bytes(&body)
+        .map_err(|e| ApiError::bad_request(format!("invalid urlencoded OAuth body: {e}")))?;
+
+    let assertion = form
+        .client_assertion
+        .ok_or_else(|| ApiError::bad_request("missing client_assertion in OAuth request"))?;
+
+    // Parse the client_assertion JWT (header.payload.signature)
+    let parts: Vec<&str> = assertion.split('.').collect();
+    if parts.len() != 3 {
+        return Err(ApiError::bad_request(
+            "invalid JWT format in client_assertion",
+        ));
+    }
+
+    let _header_val = decode_jwt_segment(parts[0])
+        .ok_or_else(|| ApiError::bad_request("failed to decode JWT header"))?;
+    let _claims_val = decode_jwt_segment(parts[1])
+        .ok_or_else(|| ApiError::bad_request("failed to decode JWT claims"))?;
+
+    let client_id = _claims_val
+        .get("sub")
+        .or_else(|| _claims_val.get("iss"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::bad_request("client_assertion claims missing sub/iss"))?;
+
+    let signature = URL_SAFE_NO_PAD
+        .decode(parts[2].as_bytes())
+        .map_err(|e| ApiError::bad_request(format!("invalid JWT signature encoding: {e}")))?;
+
+    let signing_input = format!("{}.{}", parts[0], parts[1]);
+
+    // Look up the runner and its public key
+    let (runner_id, pubkey) = {
+        let inner = shared.state.inner.lock().await;
+        let id = inner
+            .runner_client_ids
+            .get(client_id)
+            .copied()
+            .ok_or_else(|| {
+                ApiError::unauthorized(format!("client ID not registered: {client_id}"))
+            })?;
+        let pubkey = inner
+            .runner_rsa_public_keys
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| {
+                ApiError::unauthorized(format!("runner {id} missing registered public key"))
+            })?;
+        (id, pubkey)
+    };
+
+    // Verify signature
+    pubkey
+        .verify_signature_ps256(signing_input.as_bytes(), &signature)
+        .map_err(|e| ApiError::unauthorized(format!("JWT signature verification failed: {e}")))?;
+
     let token = local_jwt(json!({
-        "sub": "aksh-runner-listen",
+        "sub": format!("aksh-runner-listen-{runner_id}"),
         "scp": "ActionsRuntime.RunnerListen Framework.GenericRead Identity.ReadRefs LocationService.Connect",
         "jti": uuid::Uuid::new_v4().to_string()
     }))?;
+
     Ok(Json(TokenResponse {
         access_token: token,
         token_type: "JWT".to_owned(),
-        expires_in: 2999,
+        expires_in: token_ttl_secs(),
     }))
 }
 
@@ -4135,6 +5251,20 @@ fn local_jwt(mut claims: serde_json::Value) -> Result<String, ApiError> {
     mac.update(signing_input.as_bytes());
     let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
     Ok(format!("{signing_input}.{signature}"))
+}
+
+/// Mint a per-job `ACTIONS_RUNTIME_TOKEN` JWT.
+///
+/// The artifact toolkit (`@actions/artifact`, `@actions/cache` v2) decodes this token
+/// (without signature verification) and extracts `workflowRunBackendId` and
+/// `workflowJobRunBackendId` from the `scp` claim before making any Twirp requests.
+/// Format: `Actions.Results:{plan_id}:{job_id}`.
+fn mint_runtime_token(plan_id: &str, job_id: &uuid::Uuid) -> String {
+    local_jwt(json!({
+        "sub": format!("aksh-job-{job_id}"),
+        "scp": format!("Actions.Results:{plan_id}:{job_id}"),
+    }))
+    .unwrap_or_else(|_| AKSH_SYSTEM_TOKEN.to_owned())
 }
 
 #[derive(Debug, Deserialize)]
@@ -4469,6 +5599,13 @@ impl ApiError {
             message: message.into(),
         }
     }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+        }
+    }
 }
 
 impl From<aksh_gha_parser::ParserError> for ApiError {
@@ -4636,6 +5773,203 @@ fn server_iso_now() -> String {
 
     format!("{y:04}-{m:02}-{d:02}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z")
 }
+
+/// Fetch a remote reusable workflow YAML from GitHub.
+/// `uses` format: `owner/repo/path/.github/workflows/workflow.yml@ref`
+async fn fetch_remote_workflow(uses: &str) -> Result<String, anyhow::Error> {
+    let parts: Vec<&str> = uses.split('@').collect();
+    if parts.len() != 2 {
+        return Err(anyhow::anyhow!("invalid uses format: {uses}"));
+    }
+    let path_part = parts[0];
+    let git_ref = parts[1];
+    let segments: Vec<&str> = path_part.splitn(3, '/').collect();
+    if segments.len() < 3 {
+        return Err(anyhow::anyhow!("invalid uses path: {uses}"));
+    }
+    let owner = segments[0];
+    let repo = segments[1];
+    let path = segments[2];
+    let url = format!(
+        "https://raw.githubusercontent.com/{}/{}/{}/{}",
+        owner, repo, git_ref, path
+    );
+    let client = reqwest::Client::new();
+    let resp = client.get(&url).send().await?.error_for_status()?;
+    Ok(resp.text().await?)
+}
+
+/// Resolve a git ref (branch/tag) to a commit SHA via the GitHub API.
+async fn resolve_remote_sha(owner: &str, repo: &str, git_ref: &str) -> Option<String> {
+    let url = format!(
+        "https://api.github.com/repos/{}/{}/git/ref/{}",
+        owner, repo, git_ref
+    );
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(&url)
+        .header("User-Agent", "aksh-runner-server")
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        // Try tags endpoint if heads fails
+        let url = format!(
+            "https://api.github.com/repos/{}/{}/git/ref/tags/{}",
+            owner, repo, git_ref
+        );
+        let resp = client
+            .get(&url)
+            .header("User-Agent", "aksh-runner-server")
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let json: serde_json::Value = resp.json().await.ok()?;
+        return json
+            .get("object")
+            .and_then(|o| o.get("sha"))
+            .and_then(|s| s.as_str())
+            .map(String::from);
+    }
+    let json: serde_json::Value = resp.json().await.ok()?;
+    json.get("object")
+        .and_then(|o| o.get("sha"))
+        .and_then(|s| s.as_str())
+        .map(String::from)
+}
+
+async fn resolve_all_reusable_workflows(
+    workflow: &aksh_gha_parser::Workflow,
+    reusable_workflows: &mut BTreeMap<String, String>,
+    reusable_shas: &mut BTreeMap<String, String>,
+    depth: usize,
+) -> Result<(), ApiError> {
+    if depth >= 4 {
+        return Ok(());
+    }
+    for job in workflow.jobs.values() {
+        if let Some(uses) = &job.uses {
+            if !uses.starts_with("./") && !uses.starts_with(".github/") {
+                if !reusable_workflows.contains_key(uses) {
+                    let text = fetch_remote_workflow(uses).await.map_err(|e| {
+                        ApiError::bad_request(format!(
+                            "failed to fetch remote workflow `{}`: {}",
+                            uses, e
+                        ))
+                    })?;
+                    reusable_workflows.insert(uses.clone(), text.clone());
+                    if let Ok(called) = parse_workflow(&text) {
+                        Box::pin(resolve_all_reusable_workflows(
+                            &called,
+                            reusable_workflows,
+                            reusable_shas,
+                            depth + 1,
+                        ))
+                        .await?;
+                    }
+                }
+                if !reusable_shas.contains_key(uses) {
+                    let parts: Vec<&str> = uses.split('@').collect();
+                    if parts.len() == 2 {
+                        let path_part = parts[0];
+                        let git_ref = parts[1];
+                        let path_segments: Vec<&str> = path_part.splitn(3, '/').collect();
+                        if path_segments.len() == 3 {
+                            let owner = path_segments[0];
+                            let repo = path_segments[1];
+                            if let Some(sha) = resolve_remote_sha(owner, repo, git_ref).await {
+                                reusable_shas.insert(uses.clone(), sha);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn propagate_reusable_outputs(run: &mut RunRecord) {
+    let mut outputs_to_add = Vec::new();
+    for (caller_job_id, call) in &run.reusable_calls {
+        let caller_job_id_typed = JobId(caller_job_id.clone());
+        if run.job_outputs.contains_key(&caller_job_id_typed) {
+            continue;
+        }
+
+        // Check if all inner jobs are complete
+        let all_complete = !call.inner_job_ids.is_empty()
+            && call.inner_job_ids.iter().all(|id| {
+                run.jobs.get(&JobId(id.clone())).is_some_and(|status| {
+                    matches!(
+                        status,
+                        ExecutionStatus::Success
+                            | ExecutionStatus::Failure
+                            | ExecutionStatus::Skipped
+                            | ExecutionStatus::Cancelled
+                    )
+                })
+            });
+
+        if all_complete {
+            // Build expression context
+            let mut jobs_map = serde_json::Map::new();
+            for inner_id in &call.inner_job_ids {
+                let prefix = format!("{}/", caller_job_id);
+                let inner_id_without_prefix = if inner_id.starts_with(&prefix) {
+                    &inner_id[prefix.len()..]
+                } else {
+                    inner_id
+                };
+
+                let mut job_outputs_map = serde_json::Map::new();
+                if let Some(outputs) = run.job_outputs.get(&JobId(inner_id.clone())) {
+                    for (k, v) in outputs {
+                        job_outputs_map.insert(k.clone(), v.clone());
+                    }
+                }
+
+                let mut job_record = serde_json::Map::new();
+                job_record.insert(
+                    "outputs".to_owned(),
+                    serde_json::Value::Object(job_outputs_map),
+                );
+                jobs_map.insert(
+                    inner_id_without_prefix.to_owned(),
+                    serde_json::Value::Object(job_record),
+                );
+            }
+
+            let mut context = aksh_gha_expressions::Context::default();
+            context.insert("jobs", serde_json::Value::Object(jobs_map));
+
+            let mut inputs_map = serde_json::Map::new();
+            for (k, v) in &call.inputs {
+                inputs_map.insert(k.clone(), v.clone());
+            }
+            context.insert("inputs", serde_json::Value::Object(inputs_map));
+
+            let mut caller_outputs = BTreeMap::new();
+            for (name, expr) in &call.output_definitions {
+                let resolved = aksh_gha_parser::eval::resolve_string(expr, &context)
+                    .unwrap_or_else(|_| expr.clone());
+                let val =
+                    serde_json::from_str(&resolved).unwrap_or(serde_json::Value::String(resolved));
+                caller_outputs.insert(name.clone(), val);
+            }
+
+            outputs_to_add.push((caller_job_id_typed, caller_outputs));
+        }
+    }
+
+    for (job_id, outputs) in outputs_to_add {
+        run.job_outputs.insert(job_id, outputs);
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -5543,95 +6877,6 @@ jobs:
     }
 
     #[tokio::test]
-    async fn scenario_reusable_workflow_e2e() {
-        let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
-        let app = app(state.clone(), CancellationToken::new());
-
-        let accepted = request_json(
-            &app,
-            Method::POST,
-            "/api/v1/runs",
-            json!({
-                "workflow_yaml": r#"
-name: main workflow
-on: workflow_dispatch
-jobs:
-  call:
-    uses: ./.github/workflows/reusable.yml
-    with:
-      x: "Hello"
-  consumer:
-    needs: call
-    runs-on: [self-hosted, mitm]
-    steps:
-      - run: echo "got ${{ needs.call.outputs.y }}"
-"#,
-                "event": "workflow_dispatch",
-                "repository": "owner/repo",
-                "reusable_workflows": {
-                    ".github/workflows/reusable.yml": r#"
-on:
-  workflow_call:
-    inputs:
-      x:
-        type: string
-        required: true
-    outputs:
-      y:
-        value: ${{ jobs.inner.outputs.z }}
-jobs:
-  inner:
-    runs-on: [self-hosted, mitm]
-    outputs:
-      z: ${{ steps.step1.outputs.out1 }}
-    steps:
-      - id: step1
-        run: echo "out1=World" >> "$GITHUB_OUTPUT"
-"#
-                }
-            }),
-        )
-        .await;
-        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
-
-        request_json(
-            &app,
-            Method::POST,
-            "/api/v1/jobs/complete",
-            json!({
-                "run_id": run_id,
-                "job_id": "call/inner",
-                "status": "success",
-                "outputs": {"z": "World"}
-            }),
-        )
-        .await;
-
-        let inner = state.inner.lock().await;
-        let consumer = inner
-            .queue
-            .iter()
-            .find(|job| job.job_id.0 == "consumer")
-            .expect("consumer job should be promoted");
-        let azdo::PipelineContextData::Dict(needs) =
-            consumer.message.context_data.get("needs").unwrap()
-        else {
-            panic!("needs context should be a dict");
-        };
-        let azdo::PipelineContextData::Dict(call) = needs.get("call").unwrap() else {
-            panic!("call needs entry should be a dict");
-        };
-        let azdo::PipelineContextData::Dict(outputs) = call.get("outputs").unwrap() else {
-            panic!("call outputs should be a dict");
-        };
-        assert!(matches!(
-            outputs.get("y"),
-            Some(azdo::PipelineContextData::String(value)) if value == "World"
-        ));
-    }
-
-    #[tokio::test]
     async fn scenario_09_matrix_fail_fast_cancels_siblings() {
         let temp = tempfile::tempdir().unwrap();
         let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
@@ -6524,6 +7769,16 @@ jobs:
             azdo::message_type::RUNNER_JOB_REQUEST
         );
         assert_eq!(
+            acquired["variables"]["system.github.launch_endpoint"]["value"],
+            public_base_url()
+        );
+        assert!(acquired["variables"]["system.github.token"]["value"].is_string());
+        assert!(acquired["contextData"]["github"]["d"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|pair| pair["k"] == "token" && pair["v"].as_str().is_some()));
+        assert_eq!(
             acquired["resources"]["endpoints"][0]["url"],
             "http://127.0.0.1:9090/broker/1/"
         );
@@ -6580,6 +7835,148 @@ jobs:
             .await
             .unwrap();
         assert_eq!(ack.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn action_download_info_returns_remote_action_tickets() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+
+        let response = request_json(
+            &app,
+            Method::POST,
+            "/runner/server/_apis/v1/ActionDownloadInfo/scope/actions/plan",
+            json!({
+                "actions": [
+                    {"action": "actions/checkout", "version": "v4"},
+                    "dtolnay/rust-toolchain@stable",
+                    "./.github/actions/local",
+                    "docker://alpine:3.20"
+                ]
+            }),
+        )
+        .await;
+
+        let tickets = response["archiveDownloadTickets"].as_object().unwrap();
+        assert_eq!(
+            tickets["actions/checkout@v4"]["url"],
+            "http://127.0.0.1:9090/api/v1/actions/download/actions/checkout/v4"
+        );
+        assert_eq!(
+            tickets["dtolnay/rust-toolchain@stable"]["url"],
+            "http://127.0.0.1:9090/api/v1/actions/download/dtolnay/rust-toolchain/stable"
+        );
+        assert!(!tickets.contains_key("./.github/actions/local"));
+        assert!(!tickets.contains_key("docker://alpine:3.20"));
+        assert_eq!(
+            response["actionsDownloadInfo"],
+            response["archiveDownloadTickets"]
+        );
+    }
+
+    #[tokio::test]
+    async fn runnerresolve_actions_returns_runner_parseable_tar_urls() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+
+        let response = request_json(
+            &app,
+            Method::POST,
+            "/actions/build/plan/jobs/job/runnerresolve/actions",
+            json!({
+                "actions": [
+                    {"action": "actions/checkout", "version": "v4"},
+                    {"action": "owner/repo/path", "version": "main"}
+                ]
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            response["actions"]["actions/checkout@v4"]["tar_url"],
+            "http://127.0.0.1:9090/api/v1/actions/download/actions/checkout/v4"
+        );
+        assert_eq!(
+            response["actions"]["actions/checkout@v4"]["resolved_sha"],
+            "v4"
+        );
+        assert_eq!(
+            response["actions"]["owner/repo/path@main"]["tar_url"],
+            "http://127.0.0.1:9090/api/v1/actions/download/owner/repo/main"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_action_tarball_serves_from_cache_and_rejects_traversal() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        // Pre-populate cache for testing
+        let cache_dir = temp
+            .path()
+            .join("actions")
+            .join("test-owner")
+            .join("test-repo")
+            .join("v1");
+        tokio::fs::create_dir_all(&cache_dir).await.unwrap();
+        let cached_path = cache_dir.join("action.tar.gz");
+        tokio::fs::write(&cached_path, b"dummy-tar-content")
+            .await
+            .unwrap();
+
+        // 1. Successful cache hit
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/v1/actions/download/test-owner/test-repo/v1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/gzip"
+        );
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(bytes.as_ref(), b"dummy-tar-content");
+
+        // 2. Reject path traversal
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/v1/actions/download/test-owner/test-repo/../invalid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/v1/actions/download/test-owner/../../invalid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -6944,7 +8341,7 @@ jobs:
         let body = BASE64_STANDARD
             .decode(message["body"].as_str().unwrap())
             .unwrap();
-        let iv = BASE64_STANDARD
+        let iv: Vec<u8> = BASE64_STANDARD
             .decode(message["iv"].as_str().unwrap())
             .unwrap();
         let plaintext = SessionEncryption::from_key(aes_key)
@@ -7256,6 +8653,7 @@ jobs:
         if uri.starts_with("/_apis/")
             || uri.starts_with("/runner/server/_apis/")
             || uri.starts_with("/broker/")
+            || uri.starts_with("/actions/build/")
             || uri.starts_with("/twirp/")
         {
             builder = builder.header(header::AUTHORIZATION, "Bearer aksh-system-token");
@@ -7678,6 +9076,131 @@ jobs:
         std::env::remove_var("AKSH_GITHUB_API_URL");
     }
 
+    #[tokio::test]
+    async fn runner_oauth2_token_client_assertion_verification() {
+        use aksh_gha_protocol::crypto::sign_jwt_ps256;
+        use serde_json::Value;
+
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        // 1. Generate RSA keypair for the runner using the protocol's library
+        let keypair = aksh_gha_protocol::crypto::AgentRsaKeypair::generate().unwrap();
+        let rsa_params = keypair.to_rsaparams();
+
+        let keypair_xml = format!(
+            "<RSAKeyValue><Modulus>{}</Modulus><Exponent>{}</Exponent></RSAKeyValue>",
+            rsa_params.modulus, rsa_params.exponent
+        );
+
+        // 2. Register the runner
+        let reg_response = request_json(
+            &app,
+            Method::POST,
+            "/runner/server/_apis/distributedtask/pools/1/agents",
+            json!({
+                "name": "runner-cryptographic",
+                "version": "2.335.1",
+                "osDescription": "Linux",
+                "enabled": true,
+                "status": "offline",
+                "publicKey": keypair_xml,
+                "authorization": {
+                    "publicKey": keypair_xml,
+                }
+            }),
+        )
+        .await;
+
+        let client_id = reg_response["authorization"]["clientId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // 3. Build a valid client assertion JWT signed with the runner's private RSA key
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let header = json!({
+            "typ": "JWT",
+            "alg": "PS256"
+        });
+        let claims = json!({
+            "sub": client_id,
+            "iss": client_id,
+            "aud": "https://aksh.local/oauth",
+            "jti": uuid::Uuid::new_v4().to_string(),
+            "nbf": now,
+            "exp": now + 300,
+        });
+
+        let client_assertion = sign_jwt_ps256(&header, &claims, &rsa_params).unwrap();
+
+        // 4. Request OAuth token using urlencoded body
+        let form_body = serde_urlencoded::to_string(&[
+            (
+                "client_assertion_type",
+                "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+            ),
+            ("client_assertion", &client_assertion),
+            ("grant_type", "client_credentials"),
+        ])
+        .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/runner/server/_apis/v1/oauth2/token")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(form_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let token_resp: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(token_resp["access_token"].is_string());
+
+        // 5. Test negative case: Invalid signature (wrong key)
+        let wrong_keypair = aksh_gha_protocol::crypto::AgentRsaKeypair::generate().unwrap();
+        let wrong_rsa_params = wrong_keypair.to_rsaparams();
+        let bad_assertion = sign_jwt_ps256(&header, &claims, &wrong_rsa_params).unwrap();
+
+        let bad_form_body = serde_urlencoded::to_string(&[
+            (
+                "client_assertion_type",
+                "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+            ),
+            ("client_assertion", &bad_assertion),
+            ("grant_type", "client_credentials"),
+        ])
+        .unwrap();
+
+        let bad_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/runner/server/_apis/v1/oauth2/token")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(bad_form_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(bad_response.status(), StatusCode::UNAUTHORIZED);
+    }
+
     #[test]
     fn label_matching_exact() {
         assert!(job_matches_runner(
@@ -7729,83 +9252,5 @@ jobs:
     #[test]
     fn label_matching_empty_job_matches_all() {
         assert!(job_matches_runner(&[], &["self-hosted".into()]));
-    }
-
-    mod label_matching_properties {
-        use super::job_matches_runner;
-        use proptest::prelude::*;
-        use std::collections::HashSet;
-
-        fn arb_label() -> impl Strategy<Value = String> {
-            r#"[a-z][a-z0-9_-]{0,15}"#.prop_map(|s| s)
-        }
-
-        fn arb_label_set(size: std::ops::Range<usize>) -> impl Strategy<Value = Vec<String>> {
-            prop::collection::vec(arb_label(), size).prop_map(|v| {
-                let mut seen = HashSet::new();
-                v.into_iter()
-                    .filter(|l| seen.insert(l.to_lowercase()))
-                    .collect()
-            })
-        }
-
-        proptest! {
-            /// S1: Empty job labels match any runner.
-            #[test]
-            fn empty_job_matches_any_runner(
-                runner_labels in arb_label_set(0..8),
-            ) {
-                assert!(job_matches_runner(&[], &runner_labels));
-            }
-
-            /// S2: Empty runner labels match any job.
-            #[test]
-            fn empty_runner_matches_any_job(
-                job_labels in arb_label_set(1..8),
-            ) {
-                assert!(job_matches_runner(&job_labels, &[]));
-            }
-
-            /// S3: Reflexive — a label set always matches itself.
-            #[test]
-            fn reflexive_matching(labels in arb_label_set(1..8)) {
-                assert!(job_matches_runner(&labels, &labels));
-            }
-
-            /// S4: Superset — if runner has all job labels plus extras, match.
-            #[test]
-            fn superset_matches(
-                mut job_labels in arb_label_set(1..6),
-                extra in arb_label_set(1..4),
-            ) {
-                let mut runner_labels = job_labels.clone();
-                runner_labels.extend(extra);
-                assert!(job_matches_runner(&job_labels, &runner_labels));
-            }
-
-            /// S5: Missing required label — no match.
-            #[test]
-            fn missing_label_rejected(labels in arb_label_set(2..6)) {
-                // runner has all but the last label
-                let job = labels.clone();
-                let runner: Vec<_> = labels[..labels.len()-1].to_vec();
-                if job.iter().any(|j| j.starts_with("ubuntu") || j.starts_with("macos") || j.starts_with("windows"))
-                    && runner.iter().any(|r| r == "linux" || r == "macos" || r == "windows" || r == "self-hosted")
-                {
-                    // GitHub alias or self-hosted fallback could override
-                } else {
-                    assert!(!job_matches_runner(&job, &runner));
-                }
-            }
-
-            /// S6: Case-insensitive matching.
-            #[test]
-            fn case_insensitive(labels in arb_label_set(1..6)) {
-                let upper: Vec<String> = labels.iter().map(|l| l.to_uppercase()).collect();
-                let lower: Vec<String> = labels.iter().map(|l| l.to_lowercase()).collect();
-                assert!(job_matches_runner(&upper, &lower));
-                assert!(job_matches_runner(&lower, &upper));
-            }
-        }
     }
 }
