@@ -147,7 +147,15 @@ pub async fn invoke<'a>(
 
     if cancel_requested {
         terminate_process_group(&mut child, program).await;
-        drain_chunks(stdout_handle, stderr_handle, &mut chunk_rx, &mut lines, &mut on_chunk, keep_lines).await;
+        drain_chunks(
+            stdout_handle,
+            stderr_handle,
+            &mut chunk_rx,
+            &mut lines,
+            &mut on_chunk,
+            keep_lines,
+        )
+        .await;
         return Err(anyhow::anyhow!("process cancelled"));
     }
 

@@ -31,14 +31,14 @@ impl HttpClient {
                 crate::VERSION,
                 crate::PROTOCOL_COMPAT_VERSION
             ));
-
-        let env_ca_bundle = std::env::var_os("SSL_CERT_FILE")
-            .filter(|value| !value.is_empty())
+        let env_ca = std::env::var("SSL_CERT_FILE")
+            .ok()
             .map(std::path::PathBuf::from);
-        let ca_bundle = ca_bundle.or(env_ca_bundle.as_deref());
-        if let Some(ca_path) = ca_bundle {
-            let pem = std::fs::read(ca_path)
-                .with_context(|| format!("reading CA bundle {}", ca_path.display()))?;
+        let ca_path = ca_bundle.or(env_ca.as_deref());
+
+        if let Some(path) = ca_path {
+            let pem = std::fs::read(path)
+                .with_context(|| format!("reading CA bundle {}", path.display()))?;
             let cert = reqwest::Certificate::from_pem(&pem)?;
             builder = builder.add_root_certificate(cert);
         }
@@ -336,6 +336,31 @@ impl HttpClient {
             return Ok(());
         }
         Err(last_err.unwrap_or_else(|| anyhow::anyhow!("PUT {url} failed after 3 retries")))
+    }
+    /// PUT bytes with Bearer token authentication (for AzDO log append).
+    pub async fn put_bytes_bearer(
+        &self,
+        url: &str,
+        data: Vec<u8>,
+        content_type: &str,
+        token: &str,
+    ) -> Result<()> {
+        let resp = self
+            .inner
+            .put(url)
+            .header(CONTENT_TYPE, content_type)
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .header("x-ms-blob-type", "BlockBlob")
+            .body(data)
+            .send()
+            .await
+            .with_context(|| format!("PUT {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow::Error::new(HttpError::Status { status, body }));
+        }
+        Ok(())
     }
 
     /// Build a long-poll GET request with timeout.
