@@ -1,5 +1,0 @@
-﻿2026-07-08T00:20:13.2993143Z ##[group]Run echo "✓ Runner survived large output operations"
-2026-07-08T00:20:13.2993374Z [36;1mecho "✓ Runner survived large output operations"[0m
-2026-07-08T00:20:13.2995763Z shell: /usr/bin/bash -e {0}
-2026-07-08T00:20:13.2995897Z ##[endgroup]
-2026-07-08T00:20:13.3005036Z ✓ Runner survived large output operations
