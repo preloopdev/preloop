@@ -151,6 +151,24 @@ fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))
 }
 
+/// Restrict a file to owner-read/write only (0600) on Unix.
+///
+/// Matches the official runner which chmods `.runner`, `.credentials`, and
+/// `.credentials_rsaparams` to 0600 on Linux/macOS so the private RSA key
+/// is not readable by other users on a shared host.
+/// No-op on non-Unix platforms.
+fn restrict_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("setting permissions on {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 /// A loaded runner configuration (all three files).
 #[derive(Debug, Clone)]
 pub struct RunnerConfig {
@@ -170,10 +188,19 @@ impl RunnerConfig {
     }
 
     /// Persist runner configuration to the given root directory.
+    ///
+    /// Files are written with 0600 permissions on Unix so the private RSA key
+    /// and credentials are not readable by other users on a shared host.
     pub fn save(&self, root: &Path) -> Result<()> {
-        save_json(&root.join(RUNNER_FILE), &self.settings)?;
-        save_json(&root.join(CREDENTIALS_FILE), &self.credentials)?;
-        save_json(&root.join(RSA_PARAMS_FILE), &self.rsa_params)?;
+        let runner_path = root.join(RUNNER_FILE);
+        save_json(&runner_path, &self.settings)?;
+        restrict_permissions(&runner_path)?;
+        let cred_path = root.join(CREDENTIALS_FILE);
+        save_json(&cred_path, &self.credentials)?;
+        restrict_permissions(&cred_path)?;
+        let rsa_path = root.join(RSA_PARAMS_FILE);
+        save_json(&rsa_path, &self.rsa_params)?;
+        restrict_permissions(&rsa_path)?;
         Ok(())
     }
 
