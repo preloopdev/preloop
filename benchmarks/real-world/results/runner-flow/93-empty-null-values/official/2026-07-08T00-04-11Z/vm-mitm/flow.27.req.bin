@@ -1,6 +1,0 @@
-﻿2026-07-08T00:04:34.4856195Z ##[group]Run echo 'empty_var=' >> $GITHUB_OUTPUT
-2026-07-08T00:04:34.4856615Z [36;1mecho 'empty_var=' >> $GITHUB_OUTPUT[0m
-2026-07-08T00:04:34.4856900Z [36;1mecho "Empty output set"[0m
-2026-07-08T00:04:34.4864485Z shell: /usr/bin/bash -e {0}
-2026-07-08T00:04:34.4864795Z ##[endgroup]
-2026-07-08T00:04:34.4923426Z Empty output set
