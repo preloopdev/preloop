@@ -1235,7 +1235,10 @@ mod tests {
     #[test]
     fn format_with_multiline_template() {
         let mut ctx = Context::default();
-        ctx.insert("matrix", serde_json::json!({"platform": {"name": "Linux ARM64", "target": "aarch64"}}));
+        ctx.insert(
+            "matrix",
+            serde_json::json!({"platform": {"name": "Linux ARM64", "target": "aarch64"}}),
+        );
         // Matches what GHA sends: format string with real newlines
         let r = eval_expression(
             "format('echo \"name={0}\"\necho \"target={1}\"\n', matrix.platform.name, matrix.platform.target)",
@@ -1248,5 +1251,4 @@ mod tests {
             )
         );
     }
-
 }
