@@ -34,6 +34,8 @@ pub struct Step {
     pub timeout_minutes: Option<u64>,
     pub env: std::collections::HashMap<String, String>,
     pub raw: serde_json::Value,
+    /// Background steps run without DAP step-pauses, matching the official runner.
+    pub is_background: bool,
 }
 
 /// What kind of step this is.
@@ -332,6 +334,10 @@ pub async fn run_steps(
             });
         }
 
+        // Capture the DAP debugger reference before `StepContext::new`
+        // takes a `&mut JobContext` borrow.
+        let dap_debugger = job.dap_debugger.clone();
+
         let mut step_ctx = StepContext::new(
             job,
             step.context_name.clone(),
@@ -378,6 +384,28 @@ pub async fn run_steps(
                 let v = env.get(k).unwrap();
                 let masked_v = step_ctx.job.mask_secrets(v);
                 step_ctx.debug(&format!("  {}: {}", k, masked_v));
+            }
+        }
+
+        // DAP: OnStepStarting — pause for debugger before step execution.
+        // Mirrors StepsRunner.cs: `await dapDebugger?.OnStepStartingAsync(step);`
+        if !step.is_background {
+            if let Some(dbg) = dap_debugger.as_ref() {
+                let context_val = step_ctx.job.context_data.clone();
+                let masks: std::collections::HashSet<String> = step_ctx.job.masks.clone();
+                dbg.update_context(context_val, masks);
+                let is_pre = step.id.starts_with("__pre_")
+                    || step.raw.get("isPre").and_then(|v| v.as_bool()).unwrap_or(false);
+                let is_post = step.id.starts_with("__post_")
+                    || step.raw.get("isPost").and_then(|v| v.as_bool()).unwrap_or(false);
+                let source_entry = aksh_dap::SourceEntry {
+                    display_name: resolved_display_name.clone(),
+                    is_pre,
+                    is_post,
+                };
+                if let Err(e) = dbg.on_step_starting(&source_entry).await {
+                    warn!("DAP OnStepStarting failed: {e}");
+                }
             }
         }
 
@@ -504,6 +532,23 @@ pub async fn run_steps(
             if let Some(step_result) = step_ctx.job.steps.get_mut(&step.context_name) {
                 step_result.outcome = outcome_str.clone();
                 step_result.conclusion = conclusion_str.clone();
+            }
+        }
+
+        // DAP: OnStepCompleted — emit `continued` if we paused.
+        // Mirrors StepsRunner.cs: `dapDebugger?.OnStepCompleted(step);`
+        if !step.is_background {
+            if let Some(dbg) = dap_debugger.as_ref() {
+                let is_pre = step.id.starts_with("__pre_")
+                    || step.raw.get("isPre").and_then(|v| v.as_bool()).unwrap_or(false);
+                let is_post = step.id.starts_with("__post_")
+                    || step.raw.get("isPost").and_then(|v| v.as_bool()).unwrap_or(false);
+                let source_entry = aksh_dap::SourceEntry {
+                    display_name: resolved_display_name.clone(),
+                    is_pre,
+                    is_post,
+                };
+                dbg.on_step_completed(&source_entry);
             }
         }
 
@@ -1044,6 +1089,7 @@ mod tests {
             timeout_minutes: None,
             env: std::collections::HashMap::new(),
             raw: serde_json::json!({}),
+            is_background: false,
         }
     }
 

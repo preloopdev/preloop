@@ -8,7 +8,7 @@ use crate::worker::execution_context::Annotation;
 use crate::worker::matchers::MatcherRegistry;
 
 /// The top-level job context holding all sub-contexts and accumulated state.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct JobContext {
     pub job_id: String,
     pub job_name: String,
@@ -50,6 +50,23 @@ pub struct JobContext {
     /// Synthetic step IDs for "Set up job" and "Complete job" (generated in steps_runner, read in job_runner).
     pub setup_step_id: Option<String>,
     pub complete_step_id: Option<String>,
+    /// DAP debugger for this job. `None` unless the acquire response set
+    /// `enableDebugger=true` and provided a valid `DebuggerTunnelInfo`.
+    /// Mirrors `GlobalContext.Debugger` in `actions/runner` v2.335.0+.
+    pub dap_debugger: Option<Arc<dyn aksh_dap::IDapDebugger>>,
+    /// Debugger connection telemetry entries for completejob.
+    pub debugger_telemetry: Vec<String>,
+}
+
+impl std::fmt::Debug for JobContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JobContext")
+            .field("job_id", &self.job_id)
+            .field("job_name", &self.job_name)
+            .field("job_status", &self.job_status)
+            .field("dap_debugger", &self.dap_debugger.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Result of a completed step.
@@ -130,6 +147,8 @@ impl JobContext {
             live_logs: None,
             setup_step_id: None,
             complete_step_id: None,
+            dap_debugger: None,
+            debugger_telemetry: Vec::new(),
         }
     }
 
@@ -179,6 +198,10 @@ impl JobContext {
         // Sort by length descending so longer secrets are replaced before
         // shorter ones that might be a subset (e.g. trimmed variant).
         let mut secrets: Vec<&String> = self.masks.iter().filter(|s| !s.is_empty()).collect();
+        // If the DAP debugger is active, preserve standard protocol keywords.
+        if self.dap_debugger.is_some() {
+            secrets.retain(|s| !aksh_dap::DAP_PROTOCOL_KEYWORDS.contains(&s.as_str()));
+        }
         secrets.sort_by_key(|b| std::cmp::Reverse(b.len()));
         for secret in secrets {
             result = result.replace(secret.as_str(), "***");
