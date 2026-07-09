@@ -45,29 +45,6 @@ pub async fn run_script(
     ctx.debug(&format!("Shell resolved: {}", program));
     ctx.debug(&format!("Command line: {} {:?}", program, args));
 
-    // Official runner wraps script execution in a group showing the command
-    let first_line = script.lines().next().unwrap_or("");
-    ctx.log(&format!("##[group]Run {first_line}"));
-    // Echo the full script content inside the group (one line per script line)
-    for line in script.lines() {
-        ctx.log(line);
-    }
-    // Show the resolved shell command (official uses {0} placeholder for script path)
-    let shell_display = if args.is_empty() {
-        program.clone()
-    } else {
-        let shell_args: Vec<String> = args.iter().map(|a| {
-            if a.contains('/') && a.ends_with(".sh") || a.ends_with(".py") || a.ends_with(".ps1") {
-                "{0}".to_string()
-            } else {
-                a.clone()
-            }
-        }).collect();
-        format!("{program} {}", shell_args.join(" "))
-    };
-    ctx.log(&format!("shell: {shell_display}"));
-    ctx.log("##[endgroup]");
-
     // Build environment
     let env = ctx.build_env();
     let ctx_ref = &*ctx;
@@ -85,9 +62,6 @@ pub async fn run_script(
         false,
     )
     .await?;
-
-    // Flush any partial line remaining in the buffer
-    ctx.flush_line_buffer();
     // Check exit code
     if result.exit_code != 0 {
         ctx.log(&format!(
@@ -183,15 +157,6 @@ pub async fn run_script_in_container(
     ctx.debug(&format!(
         "Command line: docker exec -i {container_id} {container_program} {container_args_ref:?}"
     ));
-
-    // Official runner wraps script execution in a group
-    let first_line = script.lines().next().unwrap_or("");
-    ctx.log(&format!("##[group]Run {first_line}"));
-    for line in script.lines() {
-        ctx.log(line);
-    }
-    ctx.log("##[endgroup]");
-
     let ctx_ref = &*ctx;
     let on_chunk = Box::new(move |chunk: &[u8]| {
         ctx_ref.write_chunk(chunk);
@@ -207,9 +172,6 @@ pub async fn run_script_in_container(
         Some(on_chunk),
     )
     .await?;
-
-    // Flush any partial line remaining in the buffer
-    ctx.flush_line_buffer();
     // Check exit code
     if result.exit_code != 0 {
         ctx.log(&format!(
@@ -266,14 +228,6 @@ fn resolve_shell(
             Ok((
                 path.clone(),
                 "python".to_string(),
-                vec![path.to_string_lossy().to_string()],
-            ))
-        }
-        "python3" => {
-            let path = temp_dir.join(format!("{script_id}.py"));
-            Ok((
-                path.clone(),
-                "python3".to_string(),
                 vec![path.to_string_lossy().to_string()],
             ))
         }
