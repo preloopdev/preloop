@@ -18,6 +18,7 @@ workspace = true
 aksh-gha-protocol = { path = "../aksh-gha-protocol" }
 aksh-gha-expressions = { path = "../aksh-gha-expressions" }
 aksh-gha-parser = { path = "../aksh-gha-parser" }
+aksh-dap = { path = "../aksh-dap" }
 
 anyhow.workspace = true
 base64.workspace = true

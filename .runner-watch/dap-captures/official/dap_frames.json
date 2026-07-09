@@ -1,0 +1,180 @@
+[
+  {
+    "direction": "c2a",
+    "message": {
+      "seq": 1,
+      "type": "request",
+      "command": "initialize",
+      "arguments": {
+        "clientID": "mitm-tester",
+        "adapterID": "aksh"
+      }
+    }
+  },
+  {
+    "direction": "a2c",
+    "message": {
+      "request_seq": 1,
+      "success": true,
+      "command": "initialize",
+      "body": {
+        "supportsConfigurationDoneRequest": true,
+        "supportsFunctionBreakpoints": false,
+        "supportsConditionalBreakpoints": false,
+        "supportsEvaluateForHovers": true,
+        "supportsStepBack": false,
+        "supportsSetVariable": false,
+        "supportsRestartFrame": false,
+        "supportsGotoTargetsRequest": false,
+        "supportsStepInTargetsRequest": false,
+        "supportsCompletionsRequest": true,
+        "supportsModulesRequest": false,
+        "supportsTerminateRequest": false,
+        "supportTerminateDebuggee": false,
+        "supportsDelayedStackTraceLoading": false,
+        "supportsLoadedSourcesRequest": false,
+        "supportsProgressReporting": false,
+        "supportsRunInTerminalRequest": false,
+        "supportsCancelRequest": false,
+        "supportsExceptionOptions": false,
+        "supportsValueFormattingOptions": false,
+        "supportsExceptionInfoRequest": false
+      },
+      "seq": 1,
+      "type": "response"
+    }
+  },
+  {
+    "direction": "a2c",
+    "message": {
+      "event": "initialized",
+      "seq": 2,
+      "type": "event"
+    }
+  },
+  {
+    "direction": "c2a",
+    "message": {
+      "seq": 2,
+      "type": "request",
+      "command": "configurationDone"
+    }
+  },
+  {
+    "direction": "a2c",
+    "message": {
+      "request_seq": 2,
+      "success": true,
+      "command": "configurationDone",
+      "seq": 3,
+      "type": "response"
+    }
+  },
+  {
+    "direction": "a2c",
+    "message": {
+      "event": "output",
+      "body": {
+        "category": "console",
+        "output": "Actions Debug Console\n\nCommands:\n  help                  Show this help\n  help(\"run\")           Show help for the run command\n  run(\"script\")         Execute a script (like a workflow run step)\n\nAnything else is evaluated as a GitHub Actions expression.\n  Example: github.repository\n  Example: ${{ github.event_name }}\n"
+      },
+      "seq": 4,
+      "type": "event"
+    }
+  },
+  {
+    "direction": "a2c",
+    "message": {
+      "event": "stopped",
+      "body": {
+        "reason": "entry",
+        "description": "Stopped at job entry: Step 1",
+        "threadId": 1,
+        "allThreadsStopped": true
+      },
+      "seq": 5,
+      "type": "event"
+    }
+  },
+  {
+    "direction": "c2a",
+    "message": {
+      "seq": 3,
+      "type": "request",
+      "command": "scopes",
+      "arguments": {
+        "frameId": 0
+      }
+    }
+  },
+  {
+    "direction": "a2c",
+    "message": {
+      "event": "output",
+      "body": {
+        "category": "console",
+        "output": "\nCommands will run on runner host\n"
+      },
+      "seq": 6,
+      "type": "event"
+    }
+  },
+  {
+    "direction": "a2c",
+    "message": {
+      "request_seq": 3,
+      "success": true,
+      "command": "scopes",
+      "body": {
+        "scopes": []
+      },
+      "seq": 7,
+      "type": "response"
+    }
+  },
+  {
+    "direction": "c2a",
+    "message": {
+      "seq": 4,
+      "type": "request",
+      "command": "continue",
+      "arguments": {
+        "threadId": 1
+      }
+    }
+  },
+  {
+    "direction": "a2c",
+    "message": {
+      "request_seq": 4,
+      "success": true,
+      "command": "continue",
+      "body": {
+        "allThreadsContinued": true
+      },
+      "seq": 8,
+      "type": "response"
+    }
+  },
+  {
+    "direction": "a2c",
+    "message": {
+      "event": "continued",
+      "body": {
+        "threadId": 1,
+        "allThreadsContinued": true
+      },
+      "seq": 9,
+      "type": "event"
+    }
+  },
+  {
+    "direction": "a2c",
+    "message": {
+      "event": "terminated",
+      "body": {},
+      "seq": 10,
+      "type": "event"
+    }
+  }
+]
