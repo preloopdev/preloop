@@ -1,5 +1,0 @@
-2026-07-08T02:21:38.554Z ##[group]Run echo "✓ Runner survived large output operations"
-2026-07-08T02:21:38.554Z echo "✓ Runner survived large output operations"
-2026-07-08T02:21:38.554Z shell: bash --noprofile --norc -e -o pipefail {0}
-2026-07-08T02:21:38.555Z ##[endgroup]
-2026-07-08T02:21:38.558Z ✓ Runner survived large output operations
