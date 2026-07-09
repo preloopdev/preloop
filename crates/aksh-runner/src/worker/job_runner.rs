@@ -1822,6 +1822,7 @@ fn make_hook_step(id: &str, context_name: &str, script_path: &str) -> super::ste
         timeout_minutes: Some(10),
         env: std::collections::HashMap::new(),
         raw: serde_json::json!({}),
+        is_background: false,
     }
 }
 mod tests {
