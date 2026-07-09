@@ -37,6 +37,49 @@ pub enum ParserError {
         /// Referenced workflow path.
         path: String,
     },
+    /// Invalid workflow_call trigger definition.
+    #[error("invalid workflow_call trigger: {0}")]
+    InvalidWorkflowCallTrigger(String),
+    /// Maximum nesting depth for reusable workflows exceeded.
+    #[error("maximum nested reusable workflows depth (4) exceeded")]
+    MaxNestingDepthExceeded,
+    /// Called workflow does not declare `on: workflow_call` trigger.
+    #[error("called workflow does not declare `on: workflow_call` trigger")]
+    MissingWorkflowCallTrigger,
+    /// Missing required input.
+    #[error("missing required input `{name}` for reusable workflow")]
+    MissingRequiredInput {
+        /// Name of the missing input.
+        name: String,
+    },
+    /// Undeclared input.
+    #[error("caller provided input `{name}` which is not declared by the callee workflow")]
+    UndeclaredInput {
+        /// Name of the undeclared input.
+        name: String,
+    },
+    /// Undeclared secret.
+    #[error("caller provided secret `{name}` which is not declared by the callee workflow")]
+    UndeclaredSecret {
+        /// Name of the undeclared secret.
+        name: String,
+    },
+    /// Missing required secret.
+    #[error("missing required secret `{name}` for reusable workflow")]
+    MissingRequiredSecret {
+        /// Name of the missing secret.
+        name: String,
+    },
+    /// Input value cannot be coerced to the declared type.
+    #[error("unexpected value `{value}` for input `{name}` of type {expected_type}")]
+    InvalidInputValue {
+        /// Input name.
+        name: String,
+        /// The value that failed coercion.
+        value: String,
+        /// The expected type.
+        expected_type: String,
+    },
 }
 
 /// GitHub Actions workflow.
@@ -53,6 +96,144 @@ pub struct Workflow {
     pub env: Env,
     /// Job definitions.
     pub jobs: IndexMap<String, Job>,
+}
+
+impl Workflow {
+    /// Returns the workflow_call trigger definition if the workflow is callable.
+    pub fn workflow_call_trigger(&self) -> Result<Option<WorkflowCallTrigger>, ParserError> {
+        match &self.on {
+            Trigger::Single(s) => {
+                if s == "workflow_call" {
+                    Ok(Some(WorkflowCallTrigger {
+                        inputs: BTreeMap::new(),
+                        secrets: BTreeMap::new(),
+                        outputs: BTreeMap::new(),
+                    }))
+                } else {
+                    Ok(None)
+                }
+            }
+            Trigger::Many(v) => {
+                if v.iter().any(|s| s == "workflow_call") {
+                    Ok(Some(WorkflowCallTrigger {
+                        inputs: BTreeMap::new(),
+                        secrets: BTreeMap::new(),
+                        outputs: BTreeMap::new(),
+                    }))
+                } else {
+                    Ok(None)
+                }
+            }
+            Trigger::Map(map) => {
+                if let Some(val) = map.get("workflow_call") {
+                    if val.is_null() {
+                        Ok(Some(WorkflowCallTrigger {
+                            inputs: BTreeMap::new(),
+                            secrets: BTreeMap::new(),
+                            outputs: BTreeMap::new(),
+                        }))
+                    } else {
+                        let trigger: WorkflowCallTrigger = serde_json::from_value(val.clone())
+                            .map_err(|e| ParserError::InvalidWorkflowCallTrigger(e.to_string()))?;
+                        Ok(Some(trigger))
+                    }
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    }
+}
+
+/// Trigger definitions for `on: workflow_call`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkflowCallTrigger {
+    /// Inputs required or accepted by the workflow.
+    #[serde(default)]
+    pub inputs: BTreeMap<String, InputDefinition>,
+    /// Secrets required or accepted by the workflow.
+    #[serde(default)]
+    pub secrets: BTreeMap<String, SecretDefinition>,
+    /// Outputs produced by the workflow.
+    #[serde(default)]
+    pub outputs: BTreeMap<String, OutputDefinition>,
+}
+
+/// Input definition in `workflow_call`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InputDefinition {
+    /// Type of the input.
+    #[serde(default = "default_input_type", rename = "type")]
+    pub input_type: InputType,
+    /// Whether the input is required.
+    #[serde(default)]
+    pub required: bool,
+    /// Default value for the input.
+    #[serde(default)]
+    pub default: Option<Value>,
+    /// Description.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+fn default_input_type() -> InputType {
+    InputType::String
+}
+
+/// Allowed input types.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum InputType {
+    /// String type.
+    String,
+    /// Number type.
+    Number,
+    /// Boolean type.
+    Boolean,
+}
+
+/// Secret definition in `workflow_call`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SecretDefinition {
+    /// Whether the secret is required.
+    #[serde(default)]
+    pub required: bool,
+    /// Description.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// Output definition in `workflow_call`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OutputDefinition {
+    /// Value expression of the output (e.g. `${{ jobs.job1.outputs.out1 }}`).
+    pub value: String,
+    /// Description.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// Expanded workflows and metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpandedWorkflows {
+    /// Expanded job plans.
+    pub jobs: Vec<JobPlan>,
+    /// Metadata for reusable calls.
+    pub reusable_calls: BTreeMap<String, ReusableCallMetadata>,
+}
+
+/// Metadata for a reusable workflow call.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReusableCallMetadata {
+    /// Expanded caller job ID.
+    pub caller_job_id: String,
+    /// Output definitions (name -> value expression).
+    pub output_definitions: BTreeMap<String, String>,
+    /// List of expanded inner job IDs that must complete.
+    pub inner_job_ids: Vec<String>,
+    /// Evaluated inputs.
+    #[serde(default)]
+    pub inputs: BTreeMap<String, Value>,
 }
 
 /// Trigger syntax.
@@ -320,6 +501,10 @@ pub struct Job {
     /// Job-level defaults for run steps (`defaults.run`).
     #[serde(default)]
     pub defaults: Option<JobDefaults>,
+    /// Job-level outputs (`outputs:` block in workflow YAML).
+    /// Maps output name to value expression, e.g. `z: ${{ steps.step1.outputs.out1 }}`.
+    #[serde(default)]
+    pub outputs: BTreeMap<String, Value>,
 }
 
 /// `defaults:` block in a job definition.
@@ -649,44 +834,263 @@ pub fn expand_jobs(workflow: &Workflow) -> Result<Vec<JobPlan>, ParserError> {
                 secrets_inherit: false,
                 container: job.container.clone(),
                 services: non_empty_services(job.services.clone()),
+                inputs: BTreeMap::new(),
+                workflow_file: None,
+                workflow_ref: None,
+                workflow_sha: None,
+                workflow_repository: None,
+                secrets_map: BTreeMap::new(),
+                job_outputs: job
+                    .outputs
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.as_str().unwrap_or(&v.to_string()).to_string()))
+                    .collect(),
             });
         }
     }
     Ok(plans)
 }
 
-/// Expand jobs and inline local reusable workflows when their YAML is supplied.
-pub fn expand_jobs_with_reusables(
+/// Coerce value to the declared input type, matching GitHub's validation.
+///
+/// GitHub rejects values that cannot be cleanly coerced (e.g. `"0"` for boolean,
+/// `"abc"` for number). Only literal bools, `"true"`/`"false"` strings, and
+/// expression placeholders are accepted for boolean inputs. Only literal numbers,
+/// numeric strings, and expressions are accepted for number inputs.
+fn coerce_value(
+    val: &Value,
+    input_type: InputType,
+    input_name: &str,
+) -> Result<Value, ParserError> {
+    match input_type {
+        InputType::Boolean => match val {
+            Value::Bool(b) => Ok(Value::Bool(*b)),
+            Value::String(s) => {
+                let s_trimmed = s.trim();
+                if s_trimmed.starts_with("${{") && s_trimmed.ends_with("}}") {
+                    Ok(val.clone())
+                } else if s_trimmed.eq_ignore_ascii_case("true") {
+                    Ok(Value::Bool(true))
+                } else if s_trimmed.eq_ignore_ascii_case("false") {
+                    Ok(Value::Bool(false))
+                } else {
+                    Err(ParserError::InvalidInputValue {
+                        name: input_name.to_string(),
+                        value: s.clone(),
+                        expected_type: "boolean".to_string(),
+                    })
+                }
+            }
+            _ => Err(ParserError::InvalidInputValue {
+                name: input_name.to_string(),
+                value: val.to_string(),
+                expected_type: "boolean".to_string(),
+            }),
+        },
+        InputType::Number => match val {
+            Value::Number(_) => Ok(val.clone()),
+            Value::String(s) => {
+                let s_trimmed = s.trim();
+                if s_trimmed.starts_with("${{") && s_trimmed.ends_with("}}") {
+                    Ok(val.clone())
+                } else if let Ok(n) = s_trimmed.parse::<i64>() {
+                    Ok(Value::Number(n.into()))
+                } else if let Ok(f) = s_trimmed.parse::<f64>() {
+                    if let Some(n) = serde_json::Number::from_f64(f) {
+                        Ok(Value::Number(n))
+                    } else {
+                        Err(ParserError::InvalidInputValue {
+                            name: input_name.to_string(),
+                            value: s.clone(),
+                            expected_type: "number".to_string(),
+                        })
+                    }
+                } else {
+                    Err(ParserError::InvalidInputValue {
+                        name: input_name.to_string(),
+                        value: s.clone(),
+                        expected_type: "number".to_string(),
+                    })
+                }
+            }
+            _ => Err(ParserError::InvalidInputValue {
+                name: input_name.to_string(),
+                value: val.to_string(),
+                expected_type: "number".to_string(),
+            }),
+        },
+        InputType::String => match val {
+            Value::String(_) => Ok(val.clone()),
+            other => Ok(Value::String(other.to_string())),
+        },
+    }
+}
+
+fn expand_jobs_with_reusables_internal(
     workflow: &Workflow,
     reusable_workflows: &BTreeMap<String, String>,
+    depth: usize,
+    reusable_calls: &mut BTreeMap<String, ReusableCallMetadata>,
 ) -> Result<Vec<JobPlan>, ParserError> {
     let mut plans = Vec::new();
     let global_env = workflow.env.clone().into_strings();
     for (job_id, job) in &workflow.jobs {
         if let Some(uses) = &job.uses {
-            if is_local_reusable_workflow(uses) {
-                let path = normalize_reusable_path(uses);
-                let yaml = reusable_workflows
-                    .get(&path)
-                    .ok_or_else(|| ParserError::MissingReusableWorkflow { path: path.clone() })?;
-                let called = parse_workflow(yaml)?;
-                let mut called_plans = expand_jobs(&called)?;
+            if depth >= 4 {
+                return Err(ParserError::MaxNestingDepthExceeded);
+            }
+            let path = normalize_reusable_path(uses);
+            let yaml = reusable_workflows
+                .get(uses)
+                .or_else(|| reusable_workflows.get(&path))
+                .ok_or_else(|| ParserError::MissingReusableWorkflow { path: uses.clone() })?;
+            let called = parse_workflow(yaml)?;
+            let trigger = called
+                .workflow_call_trigger()?
+                .ok_or(ParserError::MissingWorkflowCallTrigger)?;
+
+            // Validate inputs
+            for caller_input_name in job.with.keys() {
+                let declared = trigger
+                    .inputs
+                    .keys()
+                    .any(|k| k.eq_ignore_ascii_case(caller_input_name));
+                if !declared {
+                    return Err(ParserError::UndeclaredInput {
+                        name: caller_input_name.clone(),
+                    });
+                }
+            }
+
+            let mut resolved_inputs = BTreeMap::new();
+            for (name, def) in &trigger.inputs {
+                let caller_val = job
+                    .with
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                    .map(|(_, v)| v.clone());
+                let coerced_val = match caller_val {
+                    Some(val) => coerce_value(&val, def.input_type, name)?,
+                    None => {
+                        if let Some(default_val) = &def.default {
+                            default_val.clone()
+                        } else if def.required {
+                            return Err(ParserError::MissingRequiredInput { name: name.clone() });
+                        } else {
+                            match def.input_type {
+                                InputType::String => Value::String(String::new()),
+                                InputType::Number => Value::Number(0.into()),
+                                InputType::Boolean => Value::Bool(false),
+                            }
+                        }
+                    }
+                };
+                resolved_inputs.insert(name.clone(), coerced_val);
+            }
+
+            // Validate secrets
+            let secrets_inherit = is_secrets_inherit(&job.secrets);
+            let mut secrets_map = BTreeMap::new();
+            if !secrets_inherit {
+                let caller_secrets = match &job.secrets {
+                    Some(Value::Object(map)) => Some(map),
+                    _ => None,
+                };
+                if !trigger.secrets.is_empty() {
+                    if let Some(c_secrets) = caller_secrets {
+                        for caller_sec_name in c_secrets.keys() {
+                            let declared = trigger
+                                .secrets
+                                .keys()
+                                .any(|k| k.eq_ignore_ascii_case(caller_sec_name));
+                            if !declared {
+                                return Err(ParserError::UndeclaredSecret {
+                                    name: caller_sec_name.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+                for (sec_name, sec_def) in &trigger.secrets {
+                    if sec_def.required {
+                        let provided = caller_secrets
+                            .map(|cs| cs.keys().any(|k| k.eq_ignore_ascii_case(sec_name)))
+                            .unwrap_or(false);
+                        if !provided {
+                            return Err(ParserError::MissingRequiredSecret {
+                                name: sec_name.clone(),
+                            });
+                        }
+                    }
+                }
+                if let Some(c_secrets) = caller_secrets {
+                    for (k, v) in c_secrets {
+                        if let Some(s) = v.as_str() {
+                            secrets_map.insert(k.clone(), s.to_string());
+                        } else {
+                            secrets_map.insert(k.clone(), v.to_string());
+                        }
+                    }
+                }
+            }
+
+            let output_definitions: BTreeMap<String, String> = trigger
+                .outputs
+                .iter()
+                .map(|(k, v)| (k.clone(), v.value.clone()))
+                .collect();
+
+            let matrices = expand_matrix(job_id, job.strategy.matrix.as_ref())?;
+            for matrix in matrices {
+                let expanded_job_id = expanded_job_id(job_id, &matrix);
+                let mut called_plans = expand_jobs_with_reusables_internal(
+                    &called,
+                    reusable_workflows,
+                    depth + 1,
+                    reusable_calls,
+                )?;
+
+                let mut inner_job_ids = Vec::new();
                 for called_plan in &mut called_plans {
                     let old_id = called_plan.id.0.clone();
-                    called_plan.id = JobId(format!("{job_id}/{old_id}"));
-                    called_plan.base_id = format!("{job_id}/{}", called_plan.base_id);
+                    let new_id = format!("{expanded_job_id}/{old_id}");
+                    called_plan.id = JobId(new_id.clone());
+                    inner_job_ids.push(new_id);
+                    called_plan.base_id = format!("{expanded_job_id}/{}", called_plan.base_id);
                     called_plan.needs = called_plan
                         .needs
                         .iter()
-                        .map(|need| JobId(format!("{job_id}/{}", need.0)))
+                        .map(|need| JobId(format!("{expanded_job_id}/{}", need.0)))
                         .collect();
+                    for outer_need in &job.needs.ids() {
+                        if !called_plan.needs.contains(outer_need) {
+                            called_plan.needs.push(outer_need.clone());
+                        }
+                    }
                     called_plan.env.extend(global_env.clone());
                     called_plan.env.extend(job.env.clone().into_strings());
-                    called_plan.secrets_inherit = is_secrets_inherit(&job.secrets);
+
+                    called_plan.inputs.extend(resolved_inputs.clone());
+                    called_plan.secrets_inherit = secrets_inherit;
+                    called_plan.secrets_map.extend(secrets_map.clone());
+                    called_plan.workflow_file = Some(path.clone());
+                    called_plan.workflow_ref = Some(uses.clone());
+                    called_plan.matrix.extend(matrix.clone());
                 }
+
+                reusable_calls.insert(
+                    expanded_job_id.clone(),
+                    ReusableCallMetadata {
+                        caller_job_id: expanded_job_id,
+                        output_definitions: output_definitions.clone(),
+                        inner_job_ids,
+                        inputs: resolved_inputs.clone(),
+                    },
+                );
+
                 plans.extend(called_plans);
-                continue;
             }
+            continue;
         }
 
         for matrix in expand_matrix(job_id, job.strategy.matrix.as_ref())? {
@@ -713,14 +1117,61 @@ pub fn expand_jobs_with_reusables(
                 secrets_inherit: false,
                 container: job.container.clone(),
                 services: non_empty_services(job.services.clone()),
+                inputs: BTreeMap::new(),
+                workflow_file: None,
+                workflow_ref: None,
+                workflow_sha: None,
+                workflow_repository: None,
+                secrets_map: BTreeMap::new(),
+                job_outputs: job
+                    .outputs
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.as_str().unwrap_or(&v.to_string()).to_string()))
+                    .collect(),
             });
         }
     }
     Ok(plans)
 }
 
-fn is_local_reusable_workflow(uses: &str) -> bool {
-    uses.starts_with("./") || uses.starts_with(".github/")
+/// Expand jobs and inline local reusable workflows when their YAML is supplied.
+pub fn expand_jobs_with_reusables(
+    workflow: &Workflow,
+    reusable_workflows: &BTreeMap<String, String>,
+) -> Result<ExpandedWorkflows, ParserError> {
+    let mut reusable_calls = BTreeMap::new();
+    let mut plans =
+        expand_jobs_with_reusables_internal(workflow, reusable_workflows, 0, &mut reusable_calls)?;
+
+    // Post-process: Rewrite needs to replace base job IDs of reusable calls with their expanded inner job IDs.
+    let expanded_ids: std::collections::HashSet<String> =
+        plans.iter().map(|p| p.id.0.clone()).collect();
+    for plan in &mut plans {
+        let mut new_needs = Vec::new();
+        for need in &plan.needs {
+            if expanded_ids.contains(&need.0) {
+                new_needs.push(need.clone());
+            } else {
+                let prefix = format!("{}/", need.0);
+                let mut matched = false;
+                for id in &expanded_ids {
+                    if id.starts_with(&prefix) {
+                        new_needs.push(JobId(id.clone()));
+                        matched = true;
+                    }
+                }
+                if !matched {
+                    new_needs.push(need.clone());
+                }
+            }
+        }
+        plan.needs = new_needs;
+    }
+
+    Ok(ExpandedWorkflows {
+        jobs: plans,
+        reusable_calls,
+    })
 }
 
 fn is_secrets_inherit(secrets: &Option<Value>) -> bool {
@@ -729,7 +1180,6 @@ fn is_secrets_inherit(secrets: &Option<Value>) -> bool {
         _ => false,
     }
 }
-
 fn normalize_reusable_path(uses: &str) -> String {
     let without_ref = uses.split('@').next().unwrap_or(uses);
     let path = without_ref.strip_prefix("./").unwrap_or(without_ref);
@@ -1037,7 +1487,7 @@ jobs:
             .to_owned(),
         );
 
-        let jobs = expand_jobs_with_reusables(&caller, &reusable).unwrap();
+        let jobs = expand_jobs_with_reusables(&caller, &reusable).unwrap().jobs;
 
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].id.0, "call/test");
@@ -1071,8 +1521,418 @@ jobs:
             .to_owned(),
         );
 
-        let jobs = expand_jobs_with_reusables(&caller, &reusable).unwrap();
+        let jobs = expand_jobs_with_reusables(&caller, &reusable).unwrap().jobs;
         assert_eq!(jobs.len(), 1);
         assert!(jobs[0].secrets_inherit);
+    }
+    #[test]
+    fn reusable_workflow_input_validation_and_coercion() {
+        let caller = parse_workflow(
+            r#"
+on: push
+jobs:
+  call:
+    uses: ./.github/workflows/reusable.yml
+    with:
+      name: "Alice"
+      enable: "true"
+      count: "42"
+"#,
+        )
+        .unwrap();
+
+        let mut reusable = BTreeMap::new();
+        reusable.insert(
+            ".github/workflows/reusable.yml".to_owned(),
+            r#"
+on:
+  workflow_call:
+    inputs:
+      name:
+        type: string
+        required: true
+      enable:
+        type: boolean
+        required: false
+      count:
+        type: number
+        required: false
+        default: 100
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo reusable
+"#
+            .to_owned(),
+        );
+
+        let expanded = expand_jobs_with_reusables(&caller, &reusable).unwrap();
+        let jobs = expanded.jobs;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(
+            jobs[0].inputs.get("name"),
+            Some(&Value::String("Alice".to_string()))
+        );
+        assert_eq!(jobs[0].inputs.get("enable"), Some(&Value::Bool(true)));
+        assert_eq!(jobs[0].inputs.get("count"), Some(&Value::Number(42.into())));
+    }
+
+    #[test]
+    fn reusable_workflow_missing_required_input() {
+        let caller = parse_workflow(
+            r#"
+on: push
+jobs:
+  call:
+    uses: ./.github/workflows/reusable.yml
+"#,
+        )
+        .unwrap();
+
+        let mut reusable = BTreeMap::new();
+        reusable.insert(
+            ".github/workflows/reusable.yml".to_owned(),
+            r#"
+on:
+  workflow_call:
+    inputs:
+      name:
+        type: string
+        required: true
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo reusable
+"#
+            .to_owned(),
+        );
+
+        let res = expand_jobs_with_reusables(&caller, &reusable);
+        assert!(res.is_err());
+        assert!(matches!(
+            res.unwrap_err(),
+            ParserError::MissingRequiredInput { .. }
+        ));
+    }
+
+    #[test]
+    fn reusable_workflow_undeclared_input() {
+        let caller = parse_workflow(
+            r#"
+on: push
+jobs:
+  call:
+    uses: ./.github/workflows/reusable.yml
+    with:
+      age: 25
+"#,
+        )
+        .unwrap();
+
+        let mut reusable = BTreeMap::new();
+        reusable.insert(
+            ".github/workflows/reusable.yml".to_owned(),
+            r#"
+on:
+  workflow_call:
+    inputs:
+      name:
+        type: string
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo reusable
+"#
+            .to_owned(),
+        );
+
+        let res = expand_jobs_with_reusables(&caller, &reusable);
+        assert!(res.is_err());
+        assert!(matches!(
+            res.unwrap_err(),
+            ParserError::UndeclaredInput { .. }
+        ));
+    }
+
+    #[test]
+    fn reusable_workflow_max_depth_exceeded() {
+        let caller = parse_workflow(
+            r#"
+on: push
+jobs:
+  call1:
+    uses: ./.github/workflows/level1.yml
+"#,
+        )
+        .unwrap();
+
+        let mut reusable = BTreeMap::new();
+        reusable.insert(
+            ".github/workflows/level1.yml".to_owned(),
+            "on: { workflow_call: {} }\njobs:\n  call2:\n    uses: ./.github/workflows/level2.yml"
+                .to_owned(),
+        );
+        reusable.insert(
+            ".github/workflows/level2.yml".to_owned(),
+            "on: { workflow_call: {} }\njobs:\n  call3:\n    uses: ./.github/workflows/level3.yml"
+                .to_owned(),
+        );
+        reusable.insert(
+            ".github/workflows/level3.yml".to_owned(),
+            "on: { workflow_call: {} }\njobs:\n  call4:\n    uses: ./.github/workflows/level4.yml"
+                .to_owned(),
+        );
+        reusable.insert(
+            ".github/workflows/level4.yml".to_owned(),
+            "on: { workflow_call: {} }\njobs:\n  call5:\n    uses: ./.github/workflows/level5.yml"
+                .to_owned(),
+        );
+        reusable.insert(
+            ".github/workflows/level5.yml".to_owned(),
+            "on: { workflow_call: {} }\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo leaf".to_owned(),
+        );
+
+        let res = expand_jobs_with_reusables(&caller, &reusable);
+        assert!(res.is_err());
+        assert!(matches!(
+            res.unwrap_err(),
+            ParserError::MaxNestingDepthExceeded
+        ));
+    }
+
+    #[test]
+    fn reusable_workflow_outer_needs_propagated() {
+        let caller = parse_workflow(
+            r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo build
+  call:
+    needs: build
+    uses: ./.github/workflows/reusable.yml
+"#,
+        )
+        .unwrap();
+
+        let mut reusable = BTreeMap::new();
+        reusable.insert(
+            ".github/workflows/reusable.yml".to_owned(),
+            r#"
+on:
+  workflow_call:
+jobs:
+  test1:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo test1
+  test2:
+    needs: test1
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo test2
+"#
+            .to_owned(),
+        );
+
+        let expanded = expand_jobs_with_reusables(&caller, &reusable).unwrap();
+        let jobs = expanded.jobs;
+        assert_eq!(jobs.len(), 3);
+        let test1 = jobs.iter().find(|j| j.id.0 == "call/test1").unwrap();
+        let test2 = jobs.iter().find(|j| j.id.0 == "call/test2").unwrap();
+
+        assert!(test1.needs.contains(&JobId("build".to_string())));
+        assert!(test2.needs.contains(&JobId("call/test1".to_string())));
+        assert!(test2.needs.contains(&JobId("build".to_string())));
+    }
+
+    mod coerce_value_properties {
+        use super::coerce_value;
+        use crate::InputType;
+        use proptest::prelude::*;
+        use serde_json::Value;
+
+        /// Values that should be accepted for boolean coercion.
+        fn arb_valid_bool_value() -> impl Strategy<Value = Value> {
+            prop_oneof![
+                any::<bool>().prop_map(Value::Bool),
+                Just(Value::String("true".into())),
+                Just(Value::String("false".into())),
+                Just(Value::String("TRUE".into())),
+                Just(Value::String("False".into())),
+                Just(Value::String("${{ inputs.x }}".into())),
+            ]
+        }
+
+        /// Values that should be accepted for number coercion.
+        fn arb_valid_num_value() -> impl Strategy<Value = Value> {
+            prop_oneof![
+                (-1000i64..1000i64).prop_map(|n| Value::Number(n.into())),
+                Just(Value::String("42".into())),
+                Just(Value::String("-7".into())),
+                Just(Value::String("3.14".into())),
+                Just(Value::String("${{ inputs.x }}".into())),
+            ]
+        }
+
+        proptest! {
+            /// Idempotence: coercing an already-valid value twice = coercing once.
+            #[test]
+            fn coercion_idempotent_bool(val in arb_valid_bool_value()) {
+                let once = coerce_value(&val, InputType::Boolean, "test").unwrap();
+                let twice = coerce_value(&once, InputType::Boolean, "test").unwrap();
+                prop_assert_eq!(once, twice);
+            }
+
+            #[test]
+            fn coercion_idempotent_number(val in arb_valid_num_value()) {
+                let once = coerce_value(&val, InputType::Number, "test").unwrap();
+                let twice = coerce_value(&once, InputType::Number, "test").unwrap();
+                prop_assert_eq!(once, twice);
+            }
+
+            /// Never panics — any value + any type produces a Result (Ok or Err), never a panic.
+            #[test]
+            fn coercion_never_panics(val in prop_oneof![
+                Just(Value::Null),
+                any::<bool>().prop_map(Value::Bool),
+                (-1000i64..1000i64).prop_map(|n| Value::Number(n.into())),
+                r#"[a-zA-Z0-9_ -]{0,30}"#.prop_map(Value::String),
+            ]) {
+                let _ = coerce_value(&val, InputType::Boolean, "test");
+                let _ = coerce_value(&val, InputType::Number, "test");
+                let _ = coerce_value(&val, InputType::String, "test");
+            }
+
+            /// Boolean coercion of valid values produces only Bool (or expression passthrough).
+            #[test]
+            fn boolean_coercion_always_bool(val in arb_valid_bool_value()) {
+                let result = coerce_value(&val, InputType::Boolean, "test").unwrap();
+                // Expression passthrough stays as string
+                if !val.as_str().is_some_and(|s| s.starts_with("${{")) {
+                    prop_assert!(result.is_boolean(),
+                        "boolean coercion of {:?} produced {:?}", val, result);
+                }
+            }
+
+            /// Number coercion of valid values produces only Number (or expression passthrough).
+            #[test]
+            fn number_coercion_always_number(val in arb_valid_num_value()) {
+                let result = coerce_value(&val, InputType::Number, "test").unwrap();
+                if !val.as_str().is_some_and(|s| s.starts_with("${{")) {
+                    prop_assert!(result.is_number(),
+                        "number coercion of {:?} produced {:?}", val, result);
+                }
+            }
+
+            /// String coercion always succeeds.
+            #[test]
+            fn string_coercion_always_ok(val in prop_oneof![
+                Just(Value::Null),
+                any::<bool>().prop_map(Value::Bool),
+                (-1000i64..1000i64).prop_map(|n| Value::Number(n.into())),
+                r#"[a-zA-Z0-9_ -]{0,30}"#.prop_map(Value::String),
+            ]) {
+                let result = coerce_value(&val, InputType::String, "test");
+                prop_assert!(result.is_ok(), "string coercion should always succeed");
+                prop_assert!(result.unwrap().is_string());
+            }
+
+            /// Roundtrip: bool→string→bool preserves truth value.
+            #[test]
+            fn bool_string_bool_roundtrip(val in arb_valid_bool_value()) {
+                if let Ok(b) = coerce_value(&val, InputType::Boolean, "test") {
+                    let s = coerce_value(&b, InputType::String, "test").unwrap();
+                    if let Ok(b2) = coerce_value(&s, InputType::Boolean, "test") {
+                        if b.is_boolean() {
+                            prop_assert_eq!(b, b2);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Deterministic rejection tests matching GitHub behavior.
+
+        #[test]
+        fn rejects_arbitrary_string_as_boolean() {
+            let result = coerce_value(&Value::String("0".into()), InputType::Boolean, "flag");
+            assert!(result.is_err(), "\"0\" should be rejected for boolean");
+            let result = coerce_value(&Value::String("sure".into()), InputType::Boolean, "flag");
+            assert!(result.is_err(), "\"sure\" should be rejected for boolean");
+            let result = coerce_value(&Value::String("yes".into()), InputType::Boolean, "flag");
+            assert!(result.is_err(), "\"yes\" should be rejected for boolean");
+        }
+
+        #[test]
+        fn rejects_number_as_boolean() {
+            let result = coerce_value(&Value::Number(1.into()), InputType::Boolean, "flag");
+            assert!(result.is_err(), "number 1 should be rejected for boolean");
+        }
+
+        #[test]
+        fn rejects_null_as_boolean() {
+            let result = coerce_value(&Value::Null, InputType::Boolean, "flag");
+            assert!(result.is_err(), "null should be rejected for boolean");
+        }
+
+        #[test]
+        fn rejects_arbitrary_string_as_number() {
+            let result = coerce_value(&Value::String("abc".into()), InputType::Number, "count");
+            assert!(result.is_err(), "\"abc\" should be rejected for number");
+        }
+
+        #[test]
+        fn rejects_bool_as_number() {
+            let result = coerce_value(&Value::Bool(true), InputType::Number, "count");
+            assert!(result.is_err(), "bool should be rejected for number");
+        }
+
+        #[test]
+        fn rejects_null_as_number() {
+            let result = coerce_value(&Value::Null, InputType::Number, "count");
+            assert!(result.is_err(), "null should be rejected for number");
+        }
+
+        #[test]
+        fn accepts_true_false_strings_for_boolean() {
+            assert_eq!(
+                coerce_value(&Value::String("true".into()), InputType::Boolean, "f").unwrap(),
+                Value::Bool(true)
+            );
+            assert_eq!(
+                coerce_value(&Value::String("false".into()), InputType::Boolean, "f").unwrap(),
+                Value::Bool(false)
+            );
+            assert_eq!(
+                coerce_value(&Value::String("TRUE".into()), InputType::Boolean, "f").unwrap(),
+                Value::Bool(true)
+            );
+        }
+
+        #[test]
+        fn accepts_numeric_strings_for_number() {
+            assert_eq!(
+                coerce_value(&Value::String("42".into()), InputType::Number, "n").unwrap(),
+                Value::Number(42.into())
+            );
+            assert_eq!(
+                coerce_value(&Value::String("-7".into()), InputType::Number, "n").unwrap(),
+                Value::Number((-7).into())
+            );
+        }
+
+        #[test]
+        fn expression_passthrough() {
+            let expr = Value::String("${{ inputs.x }}".into());
+            assert_eq!(coerce_value(&expr, InputType::Boolean, "f").unwrap(), expr);
+            assert_eq!(coerce_value(&expr, InputType::Number, "n").unwrap(), expr);
+            assert_eq!(coerce_value(&expr, InputType::String, "s").unwrap(), expr);
+        }
     }
 }
