@@ -3,10 +3,10 @@
 //! Wraps the job context with step-specific state: env stack,
 //! secret masking, issue/annotation collection, debug flag.
 
-use std::collections::HashMap;
-use std::sync::Arc;
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::io::{BufWriter, Write};
+use std::sync::Arc;
 
 use super::contexts::JobContext;
 pub struct StepContext<'a> {
@@ -92,7 +92,6 @@ impl<'a> StepContext<'a> {
             keep_in_memory,
         }
     }
-
 
     /// Write a raw byte chunk from process output.
     ///
