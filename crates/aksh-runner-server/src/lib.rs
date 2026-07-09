@@ -758,6 +758,8 @@ pub(crate) struct RunRecord {
     pub(crate) job_fail_fast: BTreeMap<String, bool>,
     #[serde(default)]
     pub(crate) job_check_run_ids: BTreeMap<JobId, u64>,
+    #[serde(default)]
+    pub(crate) reusable_calls: BTreeMap<String, aksh_gha_parser::ReusableCallMetadata>,
 }
 
 #[derive(Debug, Clone)]
@@ -889,9 +891,125 @@ async fn healthz(State(shared): State<Arc<SharedState>>) -> Json<serde_json::Val
     }))
 }
 
+async fn fetch_remote_workflow(uses: &str) -> Result<String, String> {
+    let parts: Vec<&str> = uses.split('@').collect();
+    if parts.len() != 2 {
+        return Err(format!("invalid remote uses reference: {}", uses));
+    }
+    let path_part = parts[0];
+    let git_ref = parts[1];
+
+    let path_segments: Vec<&str> = path_part.splitn(3, '/').collect();
+    if path_segments.len() != 3 {
+        return Err(format!("invalid remote uses reference path: {}", path_part));
+    }
+    let owner = path_segments[0];
+    let repo = path_segments[1];
+    let path = path_segments[2];
+
+    let url = format!(
+        "https://raw.githubusercontent.com/{}/{}/{}/{}",
+        owner, repo, git_ref, path
+    );
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(&url)
+        .header("User-Agent", "aksh-runner-server")
+        .send()
+        .await
+        .map_err(|e| format!("failed to send request to {}: {}", url, e))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "failed to fetch remote workflow from {}, status: {}",
+            url,
+            response.status()
+        ));
+    }
+
+    let text = response
+        .text()
+        .await
+        .map_err(|e| format!("failed to read response text: {}", e))?;
+
+    Ok(text)
+}
+
+async fn resolve_remote_sha(owner: &str, repo: &str, git_ref: &str) -> Option<String> {
+    let url = format!(
+        "https://api.github.com/repos/{}/{}/commits/{}",
+        owner, repo, git_ref
+    );
+    let client = reqwest::Client::new();
+    let res = client
+        .get(&url)
+        .header("User-Agent", "aksh-runner-server")
+        .header("Accept", "application/vnd.github.sha")
+        .send()
+        .await
+        .ok()?;
+    if res.status().is_success() {
+        res.text().await.ok()
+    } else {
+        None
+    }
+}
+
+async fn resolve_all_reusable_workflows(
+    workflow: &aksh_gha_parser::Workflow,
+    reusable_workflows: &mut BTreeMap<String, String>,
+    reusable_shas: &mut BTreeMap<String, String>,
+    depth: usize,
+) -> Result<(), ApiError> {
+    if depth >= 4 {
+        return Ok(());
+    }
+    for job in workflow.jobs.values() {
+        if let Some(uses) = &job.uses {
+            if !uses.starts_with("./") && !uses.starts_with(".github/") {
+                if !reusable_workflows.contains_key(uses) {
+                    let text = fetch_remote_workflow(uses).await.map_err(|e| {
+                        ApiError::bad_request(format!(
+                            "failed to fetch remote workflow `{}`: {}",
+                            uses, e
+                        ))
+                    })?;
+                    reusable_workflows.insert(uses.clone(), text.clone());
+                    if let Ok(called) = parse_workflow(&text) {
+                        Box::pin(resolve_all_reusable_workflows(
+                            &called,
+                            reusable_workflows,
+                            reusable_shas,
+                            depth + 1,
+                        ))
+                        .await?;
+                    }
+                }
+                if !reusable_shas.contains_key(uses) {
+                    let parts: Vec<&str> = uses.split('@').collect();
+                    if parts.len() == 2 {
+                        let path_part = parts[0];
+                        let git_ref = parts[1];
+                        let path_segments: Vec<&str> = path_part.splitn(3, '/').collect();
+                        if path_segments.len() == 3 {
+                            let owner = path_segments[0];
+                            let repo = path_segments[1];
+                            if let Some(sha) = resolve_remote_sha(owner, repo, git_ref).await {
+                                reusable_shas.insert(uses.clone(), sha);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn submit_run_inner(
     shared: &Arc<SharedState>,
-    submission: WorkflowSubmission,
+    mut submission: WorkflowSubmission,
 ) -> Result<RunAccepted, ApiError> {
     let workflow = parse_workflow(&submission.workflow_yaml)?;
     let (branch, tag) = git_ref_context(&submission.git_ref);
@@ -912,7 +1030,50 @@ pub(crate) async fn submit_run_inner(
             submission.event
         )));
     }
-    let jobs = expand_jobs_with_reusables(&workflow, &submission.reusable_workflows)?;
+
+    let mut reusable_shas = BTreeMap::new();
+    resolve_all_reusable_workflows(
+        &workflow,
+        &mut submission.reusable_workflows,
+        &mut reusable_shas,
+        0,
+    )
+    .await?;
+
+    let expanded = expand_jobs_with_reusables(&workflow, &submission.reusable_workflows)?;
+    let mut jobs = expanded.jobs;
+    let reusable_calls = expanded.reusable_calls;
+
+    for job in &mut jobs {
+        if let Some(uses) = &job.workflow_ref {
+            if !uses.starts_with("./") && !uses.starts_with(".github/") {
+                if let Some(sha) = reusable_shas.get(uses) {
+                    job.workflow_sha = Some(sha.clone());
+                }
+                let parts: Vec<&str> = uses.split('@').collect();
+                if !parts.is_empty() {
+                    let path_part = parts[0];
+                    let segments: Vec<&str> = path_part.split('/').collect();
+                    if segments.len() >= 2 {
+                        job.workflow_repository = Some(format!("{}/{}", segments[0], segments[1]));
+                    }
+                }
+            } else {
+                let sha = submission
+                    .payload
+                    .get("after")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                job.workflow_sha = Some(if sha.is_empty() {
+                    "0000000000000000000000000000000000000000".to_string()
+                } else {
+                    sha.to_string()
+                });
+                job.workflow_repository = Some(submission.repository.clone());
+            }
+        }
+    }
+
     let run_id = RunId::new();
     let github = json!({
         "event_name": submission.event,
@@ -1023,6 +1184,7 @@ pub(crate) async fn submit_run_inner(
                 job_fail_fast,
                 status: ExecutionStatus::Queued,
                 job_check_run_ids: BTreeMap::new(),
+                reusable_calls,
             },
         );
         drop(inner);
@@ -1209,11 +1371,7 @@ async fn live_logs_sse(
         let mut inner = shared.state.inner.lock().await;
         let key = live_log_key_for_job(&inner, run_id, &job_id)
             .ok_or_else(|| ApiError::not_found("job not found"))?;
-        let lines_arc = inner
-            .live_log_lines
-            .entry(key.clone())
-            .or_default()
-            .clone();
+        let lines_arc = inner.live_log_lines.entry(key.clone()).or_default().clone();
         let tx = live_log_sender(&mut inner, &key);
         (lines_arc, tx.subscribe())
     };
@@ -1499,6 +1657,8 @@ struct BrokerRenewJobRequest {
     job_id: uuid::Uuid,
     plan_id: String,
     conclusion: Option<String>,
+    #[serde(default)]
+    outputs: serde_json::Map<String, serde_json::Value>,
 }
 
 fn execution_status_from_runner_result(result: &str) -> Option<ExecutionStatus> {
@@ -1677,12 +1837,24 @@ async fn next_message_broker_ref(
 async fn broker_session_root(
     State(shared): State<Arc<SharedState>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let session_id = uuid::Uuid::new_v4().to_string();
+    let session_uuid = uuid::Uuid::new_v4();
+    let session_id = session_uuid.to_string();
     {
         let mut inner = shared.state.inner.lock().await;
         inner
             .session_keys
             .insert(session_id.clone(), SessionEncryption::generate());
+        // Link session to the most recently registered runner so label
+        // matching works when the runner polls for jobs.
+        if let Some((&runner_id, _)) = inner.runners.iter().next_back() {
+            inner.sessions.insert(
+                session_id.clone(),
+                RunnerSession {
+                    session_id: aksh_gha_protocol::SessionId(session_uuid),
+                    runner_id,
+                },
+            );
+        }
     }
     (
         StatusCode::CREATED,
@@ -1909,7 +2081,7 @@ async fn broker_complete_job(
                 run_id,
                 job_id,
                 status,
-                outputs: Default::default(),
+                outputs: request.outputs.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             })
     };
     if let Some(completion) = completion {
@@ -2480,9 +2652,21 @@ async fn complete_job_inner(
             completion
                 .outputs
                 .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
+                .map(|(k, v)| {
+                    let val = if let Some(obj) = v.as_object() {
+                        if let Some(inner_val) = obj.get("value") {
+                            inner_val.clone()
+                        } else {
+                            v.clone()
+                        }
+                    } else {
+                        v.clone()
+                    };
+                    (k.clone(), val)
+                })
                 .collect(),
         );
+        propagate_reusable_outputs(run);
         run.status = summarize_run(run.jobs.values().copied());
     }
     let cancelled_siblings = if completion.status == ExecutionStatus::Failure {
@@ -2698,12 +2882,140 @@ fn apply_matrix_fail_fast(inner: &mut InnerState, run_id: RunId, failed_job: &Jo
     count
 }
 
+fn propagate_reusable_outputs(run: &mut RunRecord) {
+    let mut outputs_to_add = Vec::new();
+    for (caller_job_id, call) in &run.reusable_calls {
+        let caller_job_id_typed = JobId(caller_job_id.clone());
+        if run.job_outputs.contains_key(&caller_job_id_typed) {
+            continue;
+        }
+
+        // Check if all inner jobs are complete
+        let all_complete = !call.inner_job_ids.is_empty()
+            && call.inner_job_ids.iter().all(|id| {
+                run.jobs.get(&JobId(id.clone())).is_some_and(|status| {
+                    matches!(
+                        status,
+                        ExecutionStatus::Success
+                            | ExecutionStatus::Failure
+                            | ExecutionStatus::Skipped
+                            | ExecutionStatus::Cancelled
+                    )
+                })
+            });
+
+        if all_complete {
+            // Build expression context
+            let mut jobs_map = serde_json::Map::new();
+            for inner_id in &call.inner_job_ids {
+                let prefix = format!("{}/", caller_job_id);
+                let inner_id_without_prefix = if inner_id.starts_with(&prefix) {
+                    &inner_id[prefix.len()..]
+                } else {
+                    inner_id
+                };
+
+                let mut job_outputs_map = serde_json::Map::new();
+                if let Some(outputs) = run.job_outputs.get(&JobId(inner_id.clone())) {
+                    for (k, v) in outputs {
+                        job_outputs_map.insert(k.clone(), v.clone());
+                    }
+                }
+
+                let mut job_record = serde_json::Map::new();
+                job_record.insert(
+                    "outputs".to_owned(),
+                    serde_json::Value::Object(job_outputs_map),
+                );
+                jobs_map.insert(
+                    inner_id_without_prefix.to_owned(),
+                    serde_json::Value::Object(job_record),
+                );
+            }
+
+            let mut context = aksh_gha_expressions::Context::default();
+            context.insert("jobs", serde_json::Value::Object(jobs_map));
+
+            let mut inputs_map = serde_json::Map::new();
+            for (k, v) in &call.inputs {
+                inputs_map.insert(k.clone(), v.clone());
+            }
+            context.insert("inputs", serde_json::Value::Object(inputs_map));
+
+            let mut caller_outputs = BTreeMap::new();
+            for (name, expr) in &call.output_definitions {
+                let resolved = aksh_gha_parser::eval::resolve_string(expr, &context)
+                    .unwrap_or_else(|_| expr.clone());
+                let val =
+                    serde_json::from_str(&resolved).unwrap_or(serde_json::Value::String(resolved));
+                caller_outputs.insert(name.clone(), val);
+            }
+
+            outputs_to_add.push((caller_job_id_typed, caller_outputs));
+        }
+    }
+
+    for (job_id, outputs) in outputs_to_add {
+        run.job_outputs.insert(job_id, outputs);
+    }
+}
+
+fn parent_need_context(
+    run: &RunRecord,
+    parent_job_id: &JobId,
+) -> Option<azdo::PipelineContextData> {
+    let prefix = format!("{}/", parent_job_id.0);
+    let mut inner_statuses = Vec::new();
+    for (job_id, status) in &run.jobs {
+        if job_id.0.starts_with(&prefix) {
+            inner_statuses.push(*status);
+        }
+    }
+
+    if inner_statuses.is_empty() {
+        return None;
+    }
+
+    let result = summarize_run(inner_statuses.into_iter());
+    let mut outputs = BTreeMap::new();
+    if let Some(job_outputs) = run.job_outputs.get(parent_job_id) {
+        for (key, value) in job_outputs {
+            outputs.insert(key.clone(), json_to_context_data(value));
+        }
+    }
+
+    let mut dict = BTreeMap::new();
+    dict.insert(
+        "result".to_owned(),
+        azdo::PipelineContextData::String(status_string(result)),
+    );
+    dict.insert(
+        "outputs".to_owned(),
+        azdo::PipelineContextData::Dict(outputs),
+    );
+    Some(azdo::PipelineContextData::Dict(dict))
+}
+
 fn hydrate_needs_context(job: &mut QueuedJob, run: &RunRecord) {
-    let needs = job
-        .needs
-        .iter()
-        .filter_map(|need| need_context(run, need).map(|context| (need.0.clone(), context)))
-        .collect();
+    let mut needs = BTreeMap::new();
+    for need in &job.needs {
+        if let Some(context) = need_context(run, need) {
+            needs.insert(need.0.clone(), context);
+        }
+
+        let mut current = need.0.clone();
+        while let Some(last_slash) = current.rfind('/') {
+            let parent = current[..last_slash].to_string();
+            let parent_job_id = JobId(parent.clone());
+
+            if !needs.contains_key(&parent) {
+                if let Some(context) = parent_need_context(run, &parent_job_id) {
+                    needs.insert(parent.clone(), context);
+                }
+            }
+            current = parent;
+        }
+    }
     job.message
         .context_data
         .insert("needs".to_owned(), azdo::PipelineContextData::Dict(needs));
@@ -5074,6 +5386,95 @@ jobs:
     }
 
     #[tokio::test]
+    async fn scenario_reusable_workflow_e2e() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+name: main workflow
+on: workflow_dispatch
+jobs:
+  call:
+    uses: ./.github/workflows/reusable.yml
+    with:
+      x: "Hello"
+  consumer:
+    needs: call
+    runs-on: [self-hosted, mitm]
+    steps:
+      - run: echo "got ${{ needs.call.outputs.y }}"
+"#,
+                "event": "workflow_dispatch",
+                "repository": "owner/repo",
+                "reusable_workflows": {
+                    ".github/workflows/reusable.yml": r#"
+on:
+  workflow_call:
+    inputs:
+      x:
+        type: string
+        required: true
+    outputs:
+      y:
+        value: ${{ jobs.inner.outputs.z }}
+jobs:
+  inner:
+    runs-on: [self-hosted, mitm]
+    outputs:
+      z: ${{ steps.step1.outputs.out1 }}
+    steps:
+      - id: step1
+        run: echo "out1=World" >> "$GITHUB_OUTPUT"
+"#
+                }
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        request_json(
+            &app,
+            Method::POST,
+            "/api/v1/jobs/complete",
+            json!({
+                "run_id": run_id,
+                "job_id": "call/inner",
+                "status": "success",
+                "outputs": {"z": "World"}
+            }),
+        )
+        .await;
+
+        let inner = state.inner.lock().await;
+        let consumer = inner
+            .queue
+            .iter()
+            .find(|job| job.job_id.0 == "consumer")
+            .expect("consumer job should be promoted");
+        let azdo::PipelineContextData::Dict(needs) =
+            consumer.message.context_data.get("needs").unwrap()
+        else {
+            panic!("needs context should be a dict");
+        };
+        let azdo::PipelineContextData::Dict(call) = needs.get("call").unwrap() else {
+            panic!("call needs entry should be a dict");
+        };
+        let azdo::PipelineContextData::Dict(outputs) = call.get("outputs").unwrap() else {
+            panic!("call outputs should be a dict");
+        };
+        assert!(matches!(
+            outputs.get("y"),
+            Some(azdo::PipelineContextData::String(value)) if value == "World"
+        ));
+    }
+
+    #[tokio::test]
     async fn scenario_09_matrix_fail_fast_cancels_siblings() {
         let temp = tempfile::tempdir().unwrap();
         let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
@@ -7174,5 +7575,81 @@ jobs:
     #[test]
     fn label_matching_empty_job_matches_all() {
         assert!(job_matches_runner(&[], &["self-hosted".into()]));
+    }
+
+    mod label_matching_properties {
+        use super::job_matches_runner;
+        use proptest::prelude::*;
+        use std::collections::HashSet;
+
+        fn arb_label() -> impl Strategy<Value = String> {
+            r#"[a-z][a-z0-9_-]{0,15}"#.prop_map(|s| s)
+        }
+
+        fn arb_label_set(size: std::ops::Range<usize>) -> impl Strategy<Value = Vec<String>> {
+            prop::collection::vec(arb_label(), size).prop_map(|v| {
+                let mut seen = HashSet::new();
+                v.into_iter().filter(|l| seen.insert(l.to_lowercase())).collect()
+            })
+        }
+
+        proptest! {
+            /// S1: Empty job labels match any runner.
+            #[test]
+            fn empty_job_matches_any_runner(
+                runner_labels in arb_label_set(0..8),
+            ) {
+                assert!(job_matches_runner(&[], &runner_labels));
+            }
+
+            /// S2: Empty runner labels match any job.
+            #[test]
+            fn empty_runner_matches_any_job(
+                job_labels in arb_label_set(1..8),
+            ) {
+                assert!(job_matches_runner(&job_labels, &[]));
+            }
+
+            /// S3: Reflexive — a label set always matches itself.
+            #[test]
+            fn reflexive_matching(labels in arb_label_set(1..8)) {
+                assert!(job_matches_runner(&labels, &labels));
+            }
+
+            /// S4: Superset — if runner has all job labels plus extras, match.
+            #[test]
+            fn superset_matches(
+                mut job_labels in arb_label_set(1..6),
+                extra in arb_label_set(1..4),
+            ) {
+                let mut runner_labels = job_labels.clone();
+                runner_labels.extend(extra);
+                assert!(job_matches_runner(&job_labels, &runner_labels));
+            }
+
+            /// S5: Missing required label — no match.
+            #[test]
+            fn missing_label_rejected(labels in arb_label_set(2..6)) {
+                // runner has all but the last label
+                let job = labels.clone();
+                let runner: Vec<_> = labels[..labels.len()-1].to_vec();
+                if job.iter().any(|j| j.starts_with("ubuntu") || j.starts_with("macos") || j.starts_with("windows"))
+                    && runner.iter().any(|r| r == "linux" || r == "macos" || r == "windows" || r == "self-hosted")
+                {
+                    // GitHub alias or self-hosted fallback could override
+                } else {
+                    assert!(!job_matches_runner(&job, &runner));
+                }
+            }
+
+            /// S6: Case-insensitive matching.
+            #[test]
+            fn case_insensitive(labels in arb_label_set(1..6)) {
+                let upper: Vec<String> = labels.iter().map(|l| l.to_uppercase()).collect();
+                let lower: Vec<String> = labels.iter().map(|l| l.to_lowercase()).collect();
+                assert!(job_matches_runner(&upper, &lower));
+                assert!(job_matches_runner(&lower, &upper));
+            }
+        }
     }
 }
