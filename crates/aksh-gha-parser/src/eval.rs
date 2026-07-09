@@ -128,6 +128,7 @@ pub fn build_context(
     matrix: &IndexMap<String, Value>,
     strategy: &Value,
     secrets: &BTreeMap<String, String>,
+    inputs: &BTreeMap<String, Value>,
 ) -> Context {
     let mut ctx = Context::default();
 
@@ -158,6 +159,9 @@ pub fn build_context(
         .collect();
     ctx.insert("secrets", Value::Object(secrets_value));
 
+    let inputs_value: Map<String, Value> =
+        inputs.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    ctx.insert("inputs", Value::Object(inputs_value));
     ctx
 }
 
