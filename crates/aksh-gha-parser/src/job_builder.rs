@@ -10,7 +10,7 @@ use aksh_gha_protocol::azdo::{
     PlanReference, ServiceEndpoint, TaskResources, TaskStep, TimelineReference, VariableValue,
 };
 
-use crate::eval::{build_context, resolve_map, resolve_string};
+use crate::eval::{build_context, resolve_string};
 use crate::JobPlan;
 use aksh_gha_expressions::Context;
 use serde_json::Value;
@@ -338,8 +338,16 @@ fn non_empty_services(services: Option<serde_json::Value>) -> Option<serde_json:
 fn build_task_step(step: &crate::StepPlan, context: &Context) -> TaskStep {
     let step_id = uuid::Uuid::new_v4();
 
-    // Resolve expressions in env and with
-    let env = resolve_map(&step.env, context).unwrap_or_else(|_| step.env.clone());
+    // Do NOT pre-resolve env or the run script here.
+    //
+    // The runner evaluates these at step execution time via evaluate_template()
+    // with the full job context (including workspace for hashFiles, github.action,
+    // steps.*.outputs, etc.). Pre-resolving at job-build time runs without a
+    // workspace and silently zeros out hashFiles() results (PEXP-01 root cause).
+    //
+    // `with` inputs are still resolved because action handlers need resolved values
+    // to locate and configure the action before step execution.
+    let env = step.env.clone();
     let with: BTreeMap<String, String> = step
         .with
         .iter()
@@ -350,11 +358,8 @@ fn build_task_step(step: &crate::StepPlan, context: &Context) -> TaskStep {
         })
         .collect();
 
-    // Resolve expressions in run script
-    let run = step
-        .run
-        .as_ref()
-        .map(|r| resolve_string(r, context).unwrap_or_else(|_| r.clone()));
+    // Run script: pass as-is; the runner evaluates ${{ }} at step execution time.
+    let run = step.run.clone();
 
     // The runner always evaluates a step condition. Omitted conditions are
     // the same as GitHub's default `success()`.
