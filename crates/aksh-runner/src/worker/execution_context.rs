@@ -9,6 +9,7 @@ use std::io::{BufWriter, Write};
 use std::sync::Arc;
 
 use super::contexts::JobContext;
+use super::live_logs::LiveLogQueue;
 pub struct StepContext<'a> {
     pub job: &'a mut JobContext,
     pub step_id: String,
@@ -37,6 +38,10 @@ pub struct StepContext<'a> {
     line_buffer: Arc<Mutex<Vec<u8>>>,
     /// Whether to also accumulate log lines in memory (for tests).
     pub keep_in_memory: bool,
+    /// Live log queue for WebSocket streaming (best-effort, None when not connected).
+    pub live_logs: Option<Arc<LiveLogQueue>>,
+    /// Monotonic line counter for live log feed (per step).
+    live_line_counter: std::sync::atomic::AtomicU64,
 }
 /// A workflow annotation (error/warning/notice).
 #[derive(Debug, Clone)]
@@ -74,6 +79,7 @@ impl<'a> StepContext<'a> {
         let temp_file = tempfile::tempfile().expect("failed to create log temp file");
         let log_file = Arc::new(Mutex::new(BufWriter::new(temp_file)));
         let keep_in_memory = cfg!(test);
+        let live_logs = job.live_logs.clone();
         Self {
             job,
             step_id,
@@ -90,6 +96,8 @@ impl<'a> StepContext<'a> {
             log_file,
             line_buffer: Arc::new(Mutex::new(Vec::new())),
             keep_in_memory,
+            live_logs,
+            live_line_counter: std::sync::atomic::AtomicU64::new(1),
         }
     }
 
@@ -119,6 +127,14 @@ impl<'a> StepContext<'a> {
                 let mut lock = self.log_file.lock();
                 let _ = writeln!(lock, "{}", fmt);
             }
+            // Feed to live log WebSocket (best-effort, matching official runner
+            // OutputManager per-line callback behavior).
+            if let Some(ref live) = self.live_logs {
+                let line_num = self
+                    .live_line_counter
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                live.enqueue(&self.step_id, &masked, line_num);
+            }
         }
     }
 
@@ -135,6 +151,13 @@ impl<'a> StepContext<'a> {
         {
             let mut lock = self.log_file.lock();
             let _ = writeln!(lock, "{}", fmt);
+        }
+        // Feed final partial line to live log WebSocket.
+        if let Some(ref live) = self.live_logs {
+            let line_num = self
+                .live_line_counter
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            live.enqueue(&self.step_id, &masked, line_num);
         }
         buf.clear();
     }
