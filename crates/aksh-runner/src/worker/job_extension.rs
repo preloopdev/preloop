@@ -563,6 +563,7 @@ pub fn build_step_list(steps: &[serde_json::Value], job_message: &serde_json::Va
             timeout_minutes,
             env,
             raw: step.clone(),
+            is_background: false,
         });
     }
 
@@ -635,6 +636,7 @@ pub fn build_step_list_with_lifecycle(
                     "__pre_main": pre_main,
                     "uses": uses,
                 }),
+                is_background: false,
             });
         }
 
@@ -660,6 +662,7 @@ pub fn build_step_list_with_lifecycle(
                     "__post_main": post_main,
                     "uses": uses,
                 }),
+                is_background: false,
             });
         }
     }
@@ -1241,6 +1244,7 @@ runs:
             timeout_minutes: None,
             env: std::collections::HashMap::new(),
             raw: serde_json::json!({}),
+            is_background: false,
         }];
         let mut action_paths = std::collections::HashMap::new();
         action_paths.insert(
@@ -1303,6 +1307,7 @@ runs:
             timeout_minutes: None,
             env: std::collections::HashMap::new(),
             raw: serde_json::json!({}),
+            is_background: false,
         }];
         let mut action_paths = std::collections::HashMap::new();
         action_paths.insert(
