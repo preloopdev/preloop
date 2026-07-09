@@ -385,6 +385,9 @@ pub struct TaskStep {
     /// Serialized as `contextName` to match GitHub's wire format.
     pub context_name: Option<String>,
     pub display_name: Option<String>,
+    /// TemplateToken for the display name — `{type:1, lit:"...", col, file, line}`.
+    /// Serialized as `displayNameToken` to match GitHub's wire format.
+    pub display_name_token: Option<serde_json::Value>,
     pub condition: Option<String>,
     pub script: Option<String>,
     pub reference: Option<TaskReference>,
@@ -411,6 +414,7 @@ impl Serialize for TaskStep {
             + usize::from(self.name.is_some())
             + usize::from(self.context_name.is_some())
             + usize::from(self.display_name.is_some())
+            + usize::from(self.display_name_token.is_some())
             + usize::from(self.condition.is_some())
             + usize::from(self.continue_on_error.is_some())
             + usize::from(self.working_directory.is_some())
@@ -429,6 +433,9 @@ impl Serialize for TaskStep {
         }
         if let Some(display_name) = &self.display_name {
             map.serialize_entry("displayName", display_name)?;
+        }
+        if let Some(token) = &self.display_name_token {
+            map.serialize_entry("displayNameToken", token)?;
         }
         if let Some(condition) = &self.condition {
             map.serialize_entry("condition", condition)?;
@@ -481,6 +488,7 @@ impl<'de> Deserialize<'de> for TaskStep {
                 .get("displayName")
                 .and_then(|v| v.as_str())
                 .map(str::to_owned),
+            display_name_token: obj.get("displayNameToken").cloned(),
             condition: obj
                 .get("condition")
                 .and_then(|v| v.as_str())
@@ -1228,6 +1236,7 @@ mod tests {
             name: None,
             context_name: None,
             display_name: None,
+            display_name_token: None,
             condition: None,
             script: Some("echo hi".to_owned()),
             reference: None,
