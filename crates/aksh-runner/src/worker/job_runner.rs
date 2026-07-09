@@ -408,6 +408,7 @@ fn spawn_renew_loop(
                             .header("Connection", "Upgrade")
                             .header("Sec-WebSocket-Version", "13")
                             .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+                            .header("Authorization", format!("Bearer {}", rpt.access_token))
                             .send()
                             .await;
                     },
@@ -1186,9 +1187,62 @@ async fn report_completion(
 
     let step_results = build_completejob_step_results(ordered_steps, job_ctx, &step_annotations);
 
-    // Official runner sends empty outputs in completejob — step outputs are
-    // already available to downstream jobs via the results service.
-    let outputs = serde_json::Map::new();
+    // Evaluate job-level output expressions (e.g. `outputs: z: ${{ steps.step1.outputs.out1 }}`)
+    // and include them in the completejob body so the server can propagate
+    // them to downstream jobs and reusable workflow callers.
+    let outputs = {
+        let mut map = serde_json::Map::new();
+        if let Some(output_decls) = job_message.get("jobOutputs") {
+            let expr_ctx = job_ctx.build_expression_context();
+            if let Some(obj) = output_decls.as_object() {
+                if obj.contains_key("type") {
+                    // Format 2: TemplateToken mapping
+                    if let Some(map_arr) = obj.get("map").and_then(|m| m.as_array()) {
+                        for item in map_arr {
+                            if let Some(item_obj) = item.as_object() {
+                                let key_lit = item_obj.get("Key")
+                                    .and_then(|k| k.get("lit"))
+                                    .and_then(|l| l.as_str());
+                                let val_expr = item_obj.get("Value")
+                                    .and_then(|v| v.get("expr"))
+                                    .and_then(|e| e.as_str());
+                                let val_lit = item_obj.get("Value")
+                                    .and_then(|v| v.get("lit"))
+                                    .and_then(|l| l.as_str());
+
+                                if let Some(name) = key_lit {
+                                    if let Some(expr) = val_expr {
+                                        let expr_wrapped = format!("${{{{ {expr} }}}}");
+                                        match crate::worker::template::evaluate_template(&expr_wrapped, &expr_ctx) {
+                                            Ok(val) => { map.insert(name.to_string(), serde_json::json!({ "value": val })); }
+                                            Err(e) => {
+                                                tracing::warn!("job output '{name}' expression failed: {e}");
+                                            }
+                                        }
+                                    } else if let Some(lit) = val_lit {
+                                        map.insert(name.to_string(), serde_json::json!({ "value": lit }));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Format 1: Simple JSON map (string -> string)
+                    for (name, expr_val) in obj {
+                        if let Some(expr) = expr_val.as_str() {
+                            match crate::worker::template::evaluate_template(expr, &expr_ctx) {
+                                Ok(val) => { map.insert(name.clone(), serde_json::json!({ "value": val })); }
+                                Err(e) => {
+                                    tracing::warn!("job output '{name}' expression failed: {e}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        map
+    };
 
     // F048: Collect job-level annotations for completejob body.
     // These are infrastructure-level issues (container failures, action download errors)
