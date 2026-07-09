@@ -1,6 +1,0 @@
-2026-07-08T02:21:07.086Z ##[group]Run # Intentionally don't set never_set_var
-2026-07-08T02:21:07.086Z # Intentionally don't set never_set_var
-2026-07-08T02:21:07.086Z echo "Step executed but output variable never defined"
-2026-07-08T02:21:07.086Z shell: bash --noprofile --norc -e -o pipefail {0}
-2026-07-08T02:21:07.087Z ##[endgroup]
-2026-07-08T02:21:07.089Z Step executed but output variable never defined

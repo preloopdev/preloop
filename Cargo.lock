@@ -131,6 +131,7 @@ dependencies = [
  "hostname",
  "indexmap",
  "parking_lot",
+ "proptest",
  "rand 0.8.6",
  "regex",
  "reqwest",
@@ -169,6 +170,7 @@ version = "0.1.0"
 dependencies = [
  "aksh-artifacts",
  "aksh-cache",
+ "aksh-gha-expressions",
  "aksh-gha-parser",
  "aksh-gha-protocol",
  "anyhow",
@@ -178,6 +180,7 @@ dependencies = [
  "clap",
  "futures",
  "hmac",
+ "proptest",
  "rand 0.8.6",
  "reqwest",
  "serde",
