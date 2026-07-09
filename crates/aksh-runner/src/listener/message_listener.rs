@@ -33,14 +33,31 @@ pub async fn run_message_loop(
             "name": config.settings.agent_name,
         },
         "useFipsEncryption": false,
+        // F030: opt in to full AzDO message format (PipelineAgentJobRequest) with
+        // encryption. AKSH-specific field; ignored by real GHES/GitHub servers.
+        "akshAzdo": true,
     });
 
-    let session_resp = client.create_session(token, &session_body).await?;
-    let session_id = session_resp
-        .get("sessionId")
-        .and_then(|v| v.as_str())
-        .context("missing sessionId in response")?
-        .to_string();
+    // Retry session creation on 409 conflict: a prior runner instance may still
+    // hold an active session.  GitHub typically frees it within ~30 s after the
+    // TCP connection drops.  Mirrors MessageListener.cs behaviour.
+    let (session_resp, session_id) = loop {
+        match client.create_session(token, &session_body).await {
+            Ok(resp) => {
+                let id = resp
+                    .get("sessionId")
+                    .and_then(|v| v.as_str())
+                    .context("missing sessionId in response")?
+                    .to_string();
+                break (resp, id);
+            }
+            Err(e) if e.to_string().contains("409") || e.to_string().contains("session") => {
+                warn!("Session conflict (409) — waiting 30 s before retry");
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+            Err(e) => return Err(e.context("creating session")),
+        }
+    };
 
     // Extract session key if present (optional — not all servers send one)
     let keypair =
@@ -81,11 +98,43 @@ pub async fn run_message_loop(
 
                         match dispatch {
                             Ok(Some(job_msg)) => {
+                                // F030: signal to GitHub that we accepted the job.
+                                // Mirrors JobDispatcher.cs PatchAgentRequestAsync(startTime).
+                                let request_id = job_msg
+                                    .get("requestId")
+                                    .and_then(|v| v.as_i64())
+                                    .unwrap_or(0);
+                                if request_id > 0 {
+                                    let patch = serde_json::json!({
+                                        "requestId": request_id,
+                                        "agentId": config.settings.agent_id,
+                                        "startTime": crate::worker::job_runner::iso_now(),
+                                    });
+                                    match client.patch_agent_request(token, request_id, &patch).await {
+                                        Ok(_) => info!("Patched agent request {request_id} (started)"),
+                                        Err(e) => warn!("patch_agent_request start failed (non-fatal): {e:#}"),
+                                    }
+                                }
+
                                 job_dispatcher::dispatch_job(
                                     job_msg,
                                     runner_root,
                                     crate::cli::ProtocolPath::Azdo,
                                 ).await?;
+
+                                // F030: signal job completed.
+                                if request_id > 0 {
+                                    let patch = serde_json::json!({
+                                        "requestId": request_id,
+                                        "agentId": config.settings.agent_id,
+                                        "finishTime": crate::worker::job_runner::iso_now(),
+                                    });
+                                    match client.patch_agent_request(token, request_id, &patch).await {
+                                        Ok(_) => info!("Patched agent request {request_id} (completed)"),
+                                        Err(e) => warn!("patch_agent_request complete failed (non-fatal): {e:#}"),
+                                    }
+                                }
+
                                 if once {
                                     info!("--once: exiting after first job");
                                     let _ = client.delete_session(token, &session_id).await;
@@ -100,7 +149,7 @@ pub async fn run_message_loop(
                     }
                     Ok(None) => {
                         consecutive_errors = 0;
-                        debug!("No message (long-poll timeout)");
+                        info!("Polling: no message received (long-poll timeout)");
                     }
                     Err(e) => {
                         consecutive_errors += 1;
