@@ -49,11 +49,18 @@ if [ "$BACKEND" = "aksh" ]; then
         echo "aksh backend requires a running aksh on $AKSH_BASE_URL — run bin/up-aksh.sh first or set AKSH_URL" >&2
         exit 2
     fi
-    echo "$AKSH_BASE_URL/runner/server" > "$CACHE/aksh.url"
+    echo "http://aksh.local:9090/runner/server" > "$CACHE/aksh.url"
     echo "ThisIsIgnored" > "$CACHE/aksh.token"
 fi
 STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 RUNNER_NAME="mitm-$BACKEND-$SCENARIO-$TIMESTAMP"
+
+# Determine backend port for mitm proxy port-80 forwarding.
+if [ "$BACKEND" = "runner-server" ]; then
+    export BACKEND_PORT=5000
+elif [ "$BACKEND" = "aksh" ]; then
+    export BACKEND_PORT=9090
+fi
 
 # Start mitmdump.
 echo "starting mitmdump..."
@@ -132,7 +139,7 @@ ENVEOF
         --url "$config_url" \
         --token "$config_token" \
         --name "$config_name" \
-        --labels mitm \
+        --labels self-hosted,mitm \
         --work _work \
         --replace || return 1
 }
