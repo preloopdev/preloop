@@ -187,9 +187,7 @@ pub async fn run_job(
             );
             let override_welcome = job_message
                 .get("variables")
-                .and_then(|v| {
-                    v.get("actions_runner_override_debugger_welcome_message")
-                })
+                .and_then(|v| v.get("actions_runner_override_debugger_welcome_message"))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             if let Some(tunnel_json) = debugger_tunnel_json {
@@ -229,9 +227,15 @@ pub async fn run_job(
             .iter()
             .map(|s| {
                 let is_pre = s.id.starts_with("__pre_")
-                    || s.raw.get("isPre").and_then(|v| v.as_bool()).unwrap_or(false);
+                    || s.raw
+                        .get("isPre")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                 let is_post = s.id.starts_with("__post_")
-                    || s.raw.get("isPost").and_then(|v| v.as_bool()).unwrap_or(false);
+                    || s.raw
+                        .get("isPost")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                 aksh_dap::SourceEntry {
                     display_name: s.display_name.clone(),
                     is_pre,
@@ -248,7 +252,8 @@ pub async fn run_job(
             display_name: "Complete job".into(),
             frame_id: 1,
         }];
-        dbg.on_job_steps_initialized(&entries, &post, &predicted).await;
+        dbg.on_job_steps_initialized(&entries, &post, &predicted)
+            .await;
     }
     // Set up reporting context (F018/F019/F020/F030)
     let reporting = if let Some((service_url, access_token)) =
@@ -402,16 +407,16 @@ pub async fn run_job(
             ));
         } else {
             // Register the bound local port with the server
-            if let Some(run_id_str) = job_message
-                .get("akshDebugRunId")
-                .and_then(|v| v.as_str())
-            {
+            if let Some(run_id_str) = job_message.get("akshDebugRunId").and_then(|v| v.as_str()) {
                 if let Some((svc_url, token)) = extract_service_endpoint(&job_message) {
                     let port = dbg.local_port().unwrap_or(aksh_dap::DAP_TUNNEL_PORT);
                     let url = format!("{svc_url}/api/v1/runs/{run_id_str}/debug");
                     if let Ok(http) = HttpClient::new(None) {
                         let body = serde_json::json!({ "port": port, "job_id": job_id });
-                        if let Err(e) = http.post_json_bearer::<serde_json::Value>(&url, &body, &token).await {
+                        if let Err(e) = http
+                            .post_json_bearer::<serde_json::Value>(&url, &body, &token)
+                            .await
+                        {
                             warn!("Failed to register DAP port with server: {e}");
                         }
                     }
@@ -647,14 +652,20 @@ fn spawn_renew_loop(
                         let _ = http.get_json::<serde_json::Value>(&run_health).await;
                     },
                     async {
-                        // WebSocket upgrade probe — official gets 101 Switching Protocols
+                        // WebSocket upgrade probe — matching official runner headers exactly.
+                        // Official sends: Authorization, Connection: Upgrade, Upgrade: websocket,
+                        // Sec-WebSocket-Key (random), Sec-WebSocket-Version: 13
+                        use base64::Engine;
+                        let mut nonce = [0u8; 16];
+                        rand::Rng::fill(&mut rand::thread_rng(), &mut nonce);
+                        let ws_key = base64::engine::general_purpose::STANDARD.encode(nonce);
                         let _ = inner
                             .get(&results_ws)
-                            .header("Upgrade", "websocket")
-                            .header("Connection", "Upgrade")
-                            .header("Sec-WebSocket-Version", "13")
-                            .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
                             .header("Authorization", format!("Bearer {}", rpt.access_token))
+                            .header("Connection", "Upgrade")
+                            .header("Upgrade", "websocket")
+                            .header("Sec-WebSocket-Version", "13")
+                            .header("Sec-WebSocket-Key", ws_key)
                             .send()
                             .await;
                     },
