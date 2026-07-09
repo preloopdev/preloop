@@ -31,10 +31,12 @@ impl HttpClient {
                 crate::VERSION,
                 crate::PROTOCOL_COMPAT_VERSION
             ));
+        let env_ca = std::env::var("SSL_CERT_FILE").ok().map(std::path::PathBuf::from);
+        let ca_path = ca_bundle.or(env_ca.as_deref());
 
-        if let Some(ca_path) = ca_bundle {
-            let pem = std::fs::read(ca_path)
-                .with_context(|| format!("reading CA bundle {}", ca_path.display()))?;
+        if let Some(path) = ca_path {
+            let pem = std::fs::read(path)
+                .with_context(|| format!("reading CA bundle {}", path.display()))?;
             let cert = reqwest::Certificate::from_pem(&pem)?;
             builder = builder.add_root_certificate(cert);
         }
