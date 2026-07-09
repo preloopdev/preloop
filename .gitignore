@@ -34,3 +34,16 @@ __pycache__/
 .cargo/
 .rustup/
 actions-runner/
+official-runner.tar.gz
+
+# Large binary artifacts — never track
+bin-linux/
+libs/*.so*
+benchmarks/real-world/aksh-runner
+benchmarks/real-world/aksh-runner-new
+benchmarks/real-world/official-runner.tar.gz
+benchmarks/real-world/results/runner-flow/**/flows.jsonl
+benchmarks/real-world/results/runner-flow/**/flows.mitm
+benchmarks/real-world/results/runner-flow/**/flow.*.bin
+benchmarks/real-world/results/runner-flow/**/*.pid
+benchmarks/real-world/results/mitm/**/flow.*.bin
