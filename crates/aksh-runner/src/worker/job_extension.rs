@@ -812,7 +812,7 @@ fn template_scalar(value: &serde_json::Value) -> Option<String> {
 
 /// F029: Generate display names matching official runner conventions.
 /// Script steps: "Run {first_line}" truncated to 80 chars.
-/// Action steps: the full `uses` ref (e.g. "actions/checkout@v4").
+/// Action steps: "Run {uses}" (e.g. "Run actions/checkout@v4").
 pub(crate) fn display_name_for_step(id: &str, step_type: &StepType) -> String {
     match step_type {
         StepType::Script { script, .. } if !script.trim().is_empty() => {
@@ -825,7 +825,7 @@ pub(crate) fn display_name_for_step(id: &str, step_type: &StepType) -> String {
                 format!("Run {first_line}")
             }
         }
-        StepType::Action { uses, .. } if !uses.is_empty() => uses.clone(),
+        StepType::Action { uses, .. } if !uses.is_empty() => format!("Run {uses}"),
         _ => id.to_string(),
     }
 }

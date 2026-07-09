@@ -182,10 +182,10 @@ pub async fn run_broker_loop(
                 }
                 return Ok(());
             }
-            // When a job is active, await its exit directly instead of
-            // polling try_wait() every 200ms.  This avoids generating a
-            // new GET /message?status=Busy every 200ms — the official
-            // runner issues only ONE busy poll per job.
+            // When a job is active, race between job completion and broker
+            // message polling.  The broker poll uses a short ~3s timeout when
+            // busy (matching the official runner's ~3s cancel-detection cadence)
+            // so cancellation messages are detected promptly.
             result = async { active_job.as_mut().unwrap().wait().await }, if busy => {
                 match result {
                     Ok(success) => {
@@ -334,7 +334,7 @@ pub async fn run_broker_loop(
                     }
                     Ok(None) => {
                         consecutive_errors = 0;
-                        debug!("Broker poll returned no message (idle cycle)");
+                        debug!("Broker poll returned no message");
                     }
                     Err(e) => {
                         if is_unauthorized(&e) {
@@ -504,7 +504,7 @@ async fn acquire_job_from_ref(
     }
 }
 async fn re_resolve_broker_url(http: &HttpClient, server_url: &str) -> Option<String> {
-    let url = format!("{}/_apis/connectionData?connectOptions=0", server_url);
+    let url = format!("{}/_apis/connectionData?connectOptions=1", server_url);
     if let Ok(resp) = http.get_json::<serde_json::Value>(&url).await {
         if let Some(broker_url) = resp.get("brokerUrl").and_then(|v| v.as_str()) {
             return Some(broker_url.to_string());
