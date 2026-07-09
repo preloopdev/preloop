@@ -56,7 +56,7 @@ pub struct StepUpdate {
 /// The full WorkflowStepsUpdate request body.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WorkflowStepsUpdateBody {
-    /// Step updates.
+    /// Step updates — cumulative: includes ALL steps with their latest status.
     pub steps: Vec<StepUpdate>,
     /// Monotonically increasing change counter.
     pub change_order: u64,
@@ -76,8 +76,17 @@ pub struct StepLog {
 }
 
 /// The server reporting queue.
+///
+/// Tracks cumulative step state matching the official runner's behavior:
+/// each WorkflowStepsUpdate includes ALL steps with their latest status,
+/// not just the ones that changed since the last update.
 pub struct ServerQueue {
-    pending_updates: Vec<StepUpdate>,
+    /// Cumulative step state — tracks the latest status for every step seen.
+    /// Sent in full on each WorkflowStepsUpdate (matching official runner behavior).
+    all_steps: HashMap<String, StepUpdate>,
+    /// Ordered keys matching insertion order (BTreeMap would work but
+    /// HashMap + sorting by number at flush time is simpler).
+    pending_keys: Vec<String>,
     pending_logs: HashMap<String, Vec<String>>,
     /// Accumulated log content temp file (used for job log).
     job_log_file: std::io::BufWriter<std::fs::File>,
@@ -93,7 +102,8 @@ impl ServerQueue {
     /// Create a new server queue for a specific job.
     pub fn new(job_id: String, plan_id: String) -> Self {
         Self {
-            pending_updates: Vec::new(),
+            all_steps: HashMap::new(),
+            pending_keys: Vec::new(),
             pending_logs: HashMap::new(),
             job_log_file: std::io::BufWriter::new(
                 tempfile::tempfile().expect("failed to create job log temp file"),
@@ -107,6 +117,9 @@ impl ServerQueue {
     }
 
     /// Queue a step status update.
+    ///
+    /// Updates the cumulative step state. If this is a new step, it's added
+    /// to the pending keys list so it appears in the next flush.
     pub fn queue_update(&mut self, update: StepUpdate) {
         debug!(
             "Queued update for step {}: status={} conclusion={}",
@@ -114,7 +127,11 @@ impl ServerQueue {
         );
         #[cfg(test)]
         self.all_updates_log.push(update.clone());
-        self.pending_updates.push(update);
+        let key = update.external_id.clone();
+        if !self.all_steps.contains_key(&key) {
+            self.pending_keys.push(key.clone());
+        }
+        self.all_steps.insert(key, update);
     }
 
     /// Queue log lines for a step.
@@ -123,14 +140,20 @@ impl ServerQueue {
         entry.extend(lines);
     }
 
-    /// Build the WorkflowStepsUpdate request body and drain pending updates.
+    /// Build the WorkflowStepsUpdate request body.
+    ///
+    /// Returns ALL steps with their latest status (cumulative), matching
+    /// the official runner's behavior. Increments change_order.
     pub fn take_steps_update_body(&mut self) -> Option<WorkflowStepsUpdateBody> {
-        if self.pending_updates.is_empty() {
+        if self.all_steps.is_empty() {
             return None;
         }
         self.change_order += 1;
+        // Collect all steps sorted by number (matching official runner ordering)
+        let mut steps: Vec<StepUpdate> = self.all_steps.values().cloned().collect();
+        steps.sort_by_key(|s| s.number);
         Some(WorkflowStepsUpdateBody {
-            steps: std::mem::take(&mut self.pending_updates),
+            steps,
             change_order: self.change_order,
             workflow_job_run_backend_id: self.job_id.clone(),
             workflow_run_backend_id: self.plan_id.clone(),
@@ -144,7 +167,7 @@ impl ServerQueue {
 
     /// Check if there are any pending items.
     pub fn has_pending(&self) -> bool {
-        !self.pending_updates.is_empty() || !self.pending_logs.is_empty()
+        !self.all_steps.is_empty() || !self.pending_logs.is_empty()
     }
 
     /// Map a conclusion string to the proto enum value.
@@ -219,13 +242,75 @@ mod tests {
         assert_eq!(body.change_order, 1);
         assert_eq!(body.workflow_job_run_backend_id, "job-1");
         assert_eq!(body.workflow_run_backend_id, "plan-1");
-        assert!(!q.has_pending());
+        // all_steps is cumulative — has_pending stays true until steps are taken
+        assert!(q.has_pending());
 
         // Serializes correctly
         let json = serde_json::to_value(&body).unwrap();
         assert!(json.get("change_order").is_some());
         assert!(json.get("workflow_job_run_backend_id").is_some());
         assert!(json.get("workflow_run_backend_id").is_some());
+    }
+
+    #[test]
+    fn cumulative_updates_include_all_steps() {
+        let mut q = ServerQueue::new("job-1".into(), "plan-1".into());
+
+        // Step 1 completes
+        q.queue_update(StepUpdate {
+            external_id: "step-1".into(),
+            number: 1,
+            name: "Set up job".into(),
+            status: step_status::COMPLETED,
+            started_at: Some("2024-01-01T00:00:00Z".into()),
+            completed_at: Some("2024-01-01T00:00:01Z".into()),
+            conclusion: step_conclusion::SUCCEEDED,
+        });
+        // Step 2 starts
+        q.queue_update(StepUpdate {
+            external_id: "step-2".into(),
+            number: 2,
+            name: "Run echo hello".into(),
+            status: step_status::IN_PROGRESS,
+            started_at: Some("2024-01-01T00:00:02Z".into()),
+            completed_at: None,
+            conclusion: 0,
+        });
+
+        let body = q.take_steps_update_body().unwrap();
+        // Both steps should be in the update
+        assert_eq!(body.steps.len(), 2);
+        assert_eq!(body.steps[0].external_id, "step-1");
+        assert_eq!(body.steps[1].external_id, "step-2");
+
+        // Step 2 completes, step 3 starts
+        q.queue_update(StepUpdate {
+            external_id: "step-2".into(),
+            number: 2,
+            name: "Run echo hello".into(),
+            status: step_status::COMPLETED,
+            started_at: Some("2024-01-01T00:00:02Z".into()),
+            completed_at: Some("2024-01-01T00:00:03Z".into()),
+            conclusion: step_conclusion::SUCCEEDED,
+        });
+        q.queue_update(StepUpdate {
+            external_id: "step-3".into(),
+            number: 3,
+            name: "Complete job".into(),
+            status: step_status::COMPLETED,
+            started_at: Some("2024-01-01T00:00:04Z".into()),
+            completed_at: Some("2024-01-01T00:00:05Z".into()),
+            conclusion: step_conclusion::SUCCEEDED,
+        });
+
+        let body2 = q.take_steps_update_body().unwrap();
+        // All 3 steps should be in the update (cumulative)
+        assert_eq!(body2.steps.len(), 3);
+        assert_eq!(body2.steps[0].external_id, "step-1");
+        assert_eq!(body2.steps[1].external_id, "step-2");
+        assert_eq!(body2.steps[2].external_id, "step-3");
+        // Step 2 should have updated status
+        assert_eq!(body2.steps[1].status, step_status::COMPLETED);
     }
 
     #[test]
