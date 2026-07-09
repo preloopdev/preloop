@@ -1,9 +1,9 @@
-# Runner flow diff: 54-job-annotations
+# Runner flow diff: 58-auth-and-diag
 
-- official capture: `benchmarks/real-world/results/runner-flow/54-job-annotations/official/latest`
-- aksh capture: `benchmarks/real-world/results/runner-flow/54-job-annotations/aksh/latest`
-- official summary: status=ok flows=39
-- aksh summary: status=ok flows=39
+- official capture: `benchmarks/real-world/results/runner-flow/58-auth-and-diag/official/latest`
+- aksh capture: `benchmarks/real-world/results/runner-flow/58-auth-and-diag/aksh/latest`
+- official summary: status=ok flows=42
+- aksh summary: status=ok flows=43
 
 ## Endpoint counts
 
@@ -13,8 +13,7 @@
 | `GET broker.actions.githubusercontent.com/health` | 1 | 1 |
 | `GET broker.actions.githubusercontent.com/message?sessionId={volatile}&status=Busy&runnerVersion=2.335.1&os=Linux&architecture=ARM64&disableUpdate={volatile}` | 1 | 1 |
 | `GET broker.actions.githubusercontent.com/message?sessionId={volatile}&status=Online&runnerVersion=2.335.1&os=Linux&architecture=ARM64&disableUpdate={volatile}` | 1 | 1 |
-| `GET pipelinesghubeus24.actions.githubusercontent.com/BFN7BKzVl83fPD2KzdF2rk4xW0Zdbq5VxD0SKYZ56hyKNWR3f3/_apis/connectionData?connectOptions=0&lastChangeId={volatile}&lastChangeId64={volatile}` | 3 | 6 ⚠ |
-| `GET pipelinesghubeus24.actions.githubusercontent.com/BFN7BKzVl83fPD2KzdF2rk4xW0Zdbq5VxD0SKYZ56hyKNWR3f3/_apis/connectionData?connectOptions=1&lastChangeId={volatile}&lastChangeId64={volatile}` | 3 | 0 ⚠ |
+| `GET pipelinesghubeus24.actions.githubusercontent.com/BFN7BKzVl83fPD2KzdF2rk4xW0Zdbq5VxD0SKYZ56hyKNWR3f3/_apis/connectionData?connectOptions=0&lastChangeId={volatile}&lastChangeId64={volatile}` | 6 | 6 |
 | `GET pipelinesghubeus24.actions.githubusercontent.com/BFN7BKzVl83fPD2KzdF2rk4xW0Zdbq5VxD0SKYZ56hyKNWR3f3/_apis/distributedtask/pools//{n}/agents?agentName={volatile}&includeCapabilities=False` | 1 | 1 |
 | `GET pipelinesghubeus24.actions.githubusercontent.com/BFN7BKzVl83fPD2KzdF2rk4xW0Zdbq5VxD0SKYZ56hyKNWR3f3/_apis/distributedtask/pools?poolType=Automation` | 1 | 1 |
 | `GET results-receiver.actions.githubusercontent.com/_ws/ingest.sock` | 1 | 1 |
@@ -26,47 +25,36 @@
 | `POST pipelinesghubeus24.actions.githubusercontent.com/BFN7BKzVl83fPD2KzdF2rk4xW0Zdbq5VxD0SKYZ56hyKNWR3f3/_apis/oauth2/token` | 2 | 2 |
 | `POST results-receiver.actions.githubusercontent.com/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate` | 1 | 1 |
 | `POST results-receiver.actions.githubusercontent.com/twirp/results.services.receiver.Receiver/CreateJobLogsMetadata` | 1 | 1 |
-| `POST results-receiver.actions.githubusercontent.com/twirp/results.services.receiver.Receiver/CreateStepLogsMetadata` | 4 | 4 |
+| `POST results-receiver.actions.githubusercontent.com/twirp/results.services.receiver.Receiver/CreateResultsDiagnosticLogsSignedBlobURL` | 0 | 1 ⚠ |
+| `POST results-receiver.actions.githubusercontent.com/twirp/results.services.receiver.Receiver/CreateStepLogsMetadata` | 5 | 5 |
 | `POST results-receiver.actions.githubusercontent.com/twirp/results.services.receiver.Receiver/GetJobLogsSignedBlobURL` | 1 | 1 |
-| `POST results-receiver.actions.githubusercontent.com/twirp/results.services.receiver.Receiver/GetStepLogsSignedBlobURL` | 4 | 4 |
+| `POST results-receiver.actions.githubusercontent.com/twirp/results.services.receiver.Receiver/GetStepLogsSignedBlobURL` | 5 | 5 |
 | `POST run-actions-{n}-azure-eastus.actions.githubusercontent.com//{n}/acquirejob` | 1 | 1 |
 | `POST run-actions-{n}-azure-eastus.actions.githubusercontent.com//{n}/completejob` | 1 | 1 |
 | `POST run-actions-{n}-azure-eastus.actions.githubusercontent.com//{n}/renewjob` | 1 | 1 |
 | `PUT productionresultssa{n}.blob.core.windows.net/actions-results/{guid}/workflow-job-run-{guid}/logs/job/job-logs.txt` | 1 | 1 |
-| `PUT productionresultssa{n}.blob.core.windows.net/actions-results/{guid}/workflow-job-run-{guid}/logs/steps/step-logs-{guid}.txt` | 4 | 4 |
+| `PUT productionresultssa{n}.blob.core.windows.net/actions-results/{guid}/workflow-job-run-{guid}/logs/steps/step-logs-{guid}.txt` | 5 | 5 |
 
 ## Endpoint sequence diff
 
 ```diff
 --- official
 +++ aksh
-@@ -1,7 +1,7 @@
- [
--  "GET pipelinesghubeus24.actions.githubusercontent.com/BFN7BKzVl83fPD2KzdF2rk4xW0Zdbq5VxD0SKYZ56hyKNWR3f3/_apis/connectionData?connectOptions=1&lastChangeId={volatile}&lastChangeId64={volatile}",
--  "GET pipelinesghubeus24.actions.githubusercontent.com/BFN7BKzVl83fPD2KzdF2rk4xW0Zdbq5VxD0SKYZ56hyKNWR3f3/_apis/connectionData?connectOptions=1&lastChangeId={volatile}&lastChangeId64={volatile}",
--  "GET pipelinesghubeus24.actions.githubusercontent.com/BFN7BKzVl83fPD2KzdF2rk4xW0Zdbq5VxD0SKYZ56hyKNWR3f3/_apis/connectionData?connectOptions=1&lastChangeId={volatile}&lastChangeId64={volatile}",
-+  "GET pipelinesghubeus24.actions.githubusercontent.com/BFN7BKzVl83fPD2KzdF2rk4xW0Zdbq5VxD0SKYZ56hyKNWR3f3/_apis/connectionData?connectOptions=0&lastChangeId={volatile}&lastChangeId64={volatile}",
-+  "GET pipelinesghubeus24.actions.githubusercontent.com/BFN7BKzVl83fPD2KzdF2rk4xW0Zdbq5VxD0SKYZ56hyKNWR3f3/_apis/connectionData?connectOptions=0&lastChangeId={volatile}&lastChangeId64={volatile}",
-+  "GET pipelinesghubeus24.actions.githubusercontent.com/BFN7BKzVl83fPD2KzdF2rk4xW0Zdbq5VxD0SKYZ56hyKNWR3f3/_apis/connectionData?connectOptions=0&lastChangeId={volatile}&lastChangeId64={volatile}",
-   "GET pipelinesghubeus24.actions.githubusercontent.com/BFN7BKzVl83fPD2KzdF2rk4xW0Zdbq5VxD0SKYZ56hyKNWR3f3/_apis/distributedtask/pools?poolType=Automation",
-   "GET pipelinesghubeus24.actions.githubusercontent.com/BFN7BKzVl83fPD2KzdF2rk4xW0Zdbq5VxD0SKYZ56hyKNWR3f3/_apis/distributedtask/pools//{n}/agents?agentName={volatile}&includeCapabilities=False",
-   "POST pipelinesghubeus24.actions.githubusercontent.com/BFN7BKzVl83fPD2KzdF2rk4xW0Zdbq5VxD0SKYZ56hyKNWR3f3/_apis/distributedtask/pools//{n}/agents",
 @@ -16,11 +16,11 @@
    "POST run-actions-{n}-azure-eastus.actions.githubusercontent.com//{n}/acquirejob",
    "GET broker.actions.githubusercontent.com/message?sessionId={volatile}&status=Busy&runnerVersion=2.335.1&os=Linux&architecture=ARM64&disableUpdate={volatile}",
    "POST run-actions-{n}-azure-eastus.actions.githubusercontent.com//{n}/renewjob",
 +  "POST results-receiver.actions.githubusercontent.com/twirp/results.services.receiver.Receiver/GetStepLogsSignedBlobURL",
-+  "GET broker.actions.githubusercontent.com/health",
-   "GET results-receiver.actions.githubusercontent.com/_ws/ingest.sock",
--  "GET broker.actions.githubusercontent.com/health",
 +  "GET run.actions.githubusercontent.com/health",
-   "GET token.actions.githubusercontent.com/ready",
+   "GET results-receiver.actions.githubusercontent.com/_ws/ingest.sock",
 -  "GET run.actions.githubusercontent.com/health",
+   "GET token.actions.githubusercontent.com/ready",
+   "GET broker.actions.githubusercontent.com/health",
 -  "POST results-receiver.actions.githubusercontent.com/twirp/results.services.receiver.Receiver/GetStepLogsSignedBlobURL",
    "PUT productionresultssa{n}.blob.core.windows.net/actions-results/{guid}/workflow-job-run-{guid}/logs/steps/step-logs-{guid}.txt",
    "POST results-receiver.actions.githubusercontent.com/twirp/results.services.receiver.Receiver/CreateStepLogsMetadata",
    "POST results-receiver.actions.githubusercontent.com/twirp/results.services.receiver.Receiver/GetStepLogsSignedBlobURL",
-@@ -32,10 +32,10 @@
+@@ -35,10 +35,11 @@
    "POST results-receiver.actions.githubusercontent.com/twirp/results.services.receiver.Receiver/GetStepLogsSignedBlobURL",
    "PUT productionresultssa{n}.blob.core.windows.net/actions-results/{guid}/workflow-job-run-{guid}/logs/steps/step-logs-{guid}.txt",
    "POST results-receiver.actions.githubusercontent.com/twirp/results.services.receiver.Receiver/CreateStepLogsMetadata",
@@ -75,6 +63,7 @@
    "PUT productionresultssa{n}.blob.core.windows.net/actions-results/{guid}/workflow-job-run-{guid}/logs/job/job-logs.txt",
    "POST results-receiver.actions.githubusercontent.com/twirp/results.services.receiver.Receiver/CreateJobLogsMetadata",
 -  "POST results-receiver.actions.githubusercontent.com/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate",
++  "POST results-receiver.actions.githubusercontent.com/twirp/results.services.receiver.Receiver/CreateResultsDiagnosticLogsSignedBlobURL",
    "POST run-actions-{n}-azure-eastus.actions.githubusercontent.com//{n}/completejob",
    "DELETE broker.actions.githubusercontent.com/session"
  ]
@@ -91,10 +80,10 @@
 +++ aksh
 @@ -1,5 +1,5 @@
  {
--  "body": "{\"runner_request_id\":\"{guid}\",\"run_service_url\":\"https://{token}.actions.githubusercontent.com/179/\",\"billing_owner_id\":\"O_kgDOEbddog\",\"should_acknowledge\":true}",
--  "messageId": 3518029983685218592,
-+  "body": "{\"runner_request_id\":\"{guid}\",\"run_service_url\":\"https://{token}.actions.githubusercontent.com/196/\",\"billing_owner_id\":\"O_kgDOEbddog\",\"should_acknowledge\":true}",
-+  "messageId": 6715567716402673015,
+-  "body": "{\"runner_request_id\":\"{guid}\",\"run_service_url\":\"https://{token}.actions.githubusercontent.com/216/\",\"billing_owner_id\":\"O_kgDOEbddog\",\"should_acknowledge\":true}",
+-  "messageId": 5817407475219093539,
++  "body": "{\"runner_request_id\":\"{guid}\",\"run_service_url\":\"https://{token}.actions.githubusercontent.com/119/\",\"billing_owner_id\":\"O_kgDOEbddog\",\"should_acknowledge\":true}",
++  "messageId": 5206121447850105490,
    "messageType": "RunnerJobRequest"
  }
 ```
@@ -130,10 +119,10 @@
 +++ aksh
 @@ -1,4 +1,4 @@
  {
--  "bytes": 50,
--  "sha256": "75b40eb0403e0b1469430bab30d2a024e94c39086611f9034c788bfc77e48063"
-+  "bytes": 49,
-+  "sha256": "f08d501676e8f70b0bcce740b492fedc555539fd49d33525dfb8f9ebe4b6fe73"
+-  "bytes": 51,
+-  "sha256": "5d41d3b85f354ebe5df87fd10260acbd947fad0620b30c2bbc6d5ae6e1565b3f"
++  "bytes": 50,
++  "sha256": "f61830021e36e1e631cdd938ba67f274f7c4fe1946b979e8715d57dfa2e44929"
  }
 ```
 
@@ -147,8 +136,8 @@
 @@ -1,6 +1,6 @@
  {
    "agent": "{volatile}",
--  "ownerName": "container (PID: 4012)",
-+  "ownerName": "container (PID: 876)",
+-  "ownerName": "container (PID: 4743)",
++  "ownerName": "container (PID: 5085)",
    "sessionId": "{guid}",
    "useFipsEncryption": false
  }
@@ -161,8 +150,8 @@
  {
    "assignmentQueued": false,
    "orchestrationId": "",
--  "ownerName": "container (PID: 4012)",
-+  "ownerName": "container (PID: 876)",
+-  "ownerName": "container (PID: 4743)",
++  "ownerName": "container (PID: 5085)",
    "sessionId": "{guid}"
  }
 ```
@@ -178,8 +167,8 @@
    "authorization": {
      "publicKey": {
        "exponent": "AQAB",
--      "modulus": "{token}/d8Sm4vGZyKiqX+GnPVmx/f5TBgZ/cl2wMvhwp/{token}+WVoFY+{token}+{token}/{token}+{token}+{token}/EHPfIyml4hV8EvLxqAxMJt+EWweKbd1GAKYNNPMw=="
-+      "modulus": "{token}/223U9Zpxs+{token}/{token}/{token}+{token}/{token}+R999GoFcmyaghh+qJdXlw=="
+-      "modulus": "{token}/{token}+{token}/uT/Dlh47Z5SrMiTGmJ2ex5Dq+{token}+UZgQNZEG+{token}+66eJtxg/xQDWoNgoOPLqj8ojD5J9T+v25e4/{token}/V/Zv7nTL5K4lzjMNYQEtxNkQ=="
++      "modulus": "r9DR4KX0fBL++{token}/{token}+{token}/kJsvBopGRyBSRrtkq/{token}+pRbhlQeAVvE51OLs308F/Ob09Nf2BZ+V69cfp1GtxPsZol5sd+tGF3BAecAflZ3QMrG+ZsjZsppKviH/cYVAPhxttEPCu8tNBUi0Q=="
      }
    },
    "createdOn": "{time}",
@@ -206,8 +195,8 @@
      "clientId": "{guid}",
      "publicKey": {
        "exponent": "AQAB",
--      "modulus": "{token}/d8Sm4vGZyKiqX+GnPVmx/f5TBgZ/cl2wMvhwp/{token}+WVoFY+{token}+{token}/{token}+{token}+{token}/EHPfIyml4hV8EvLxqAxMJt+EWweKbd1GAKYNNPMw=="
-+      "modulus": "{token}/223U9Zpxs+{token}/{token}/{token}+{token}/{token}+R999GoFcmyaghh+qJdXlw=="
+-      "modulus": "{token}/{token}+{token}/uT/Dlh47Z5SrMiTGmJ2ex5Dq+{token}+UZgQNZEG+{token}+66eJtxg/xQDWoNgoOPLqj8ojD5J9T+v25e4/{token}/V/Zv7nTL5K4lzjMNYQEtxNkQ=="
++      "modulus": "r9DR4KX0fBL++{token}/{token}+{token}/kJsvBopGRyBSRrtkq/{token}+pRbhlQeAVvE51OLs308F/Ob09Nf2BZ+V69cfp1GtxPsZol5sd+tGF3BAecAflZ3QMrG+ZsjZsppKviH/cYVAPhxttEPCu8tNBUi0Q=="
      }
    },
    "createdOn": "{time}",
@@ -230,8 +219,8 @@
      }
    },
    "provisioningState": "Provisioned",
--  "queueName": "taskagent-764",
-+  "queueName": "taskagent-768",
+-  "queueName": "taskagent-770",
++  "queueName": "taskagent-769",
    "runnerGroupId": 1,
    "runnerGroupName": null,
    "status": "offline",
@@ -247,8 +236,8 @@
 @@ -1,4 +1,4 @@
  {
    "bytes": 921,
--  "sha256": "4ccf310158cbf54da92d9951c4b1e061cdf7034362609c19c114d41a03a2db69"
-+  "sha256": "310b28c565a57097a5e970fe4319af7d3c11b071c107dd1f194c3ac802c3bb16"
+-  "sha256": "cfa17cb161236f01d3ee653ddff9b0c02e92b0e360d5f9d53b4e470d93398bde"
++  "sha256": "30b63ce14bf63e1b05f0879f054dc5f5f8df91fa44fb5377cfdb48d37dca331d"
  }
 ```
 
@@ -260,8 +249,8 @@
 @@ -1,4 +1,4 @@
  {
    "bytes": 921,
--  "sha256": "b6cffd4134bdfdc1826e4a39520e0f2db452a096817b949241efb2429667af8a"
-+  "sha256": "1f295f8f8ee509f7f25528382fc3efe3cf78303564716f46e5ecc1ad776564a3"
+-  "sha256": "39b6bf505589e5cc95f2a491ef1308918d95831eb5dce5fc7a25342331b0af17"
++  "sha256": "66d3983fde168245c499b5048664a3f1a5e341008b3fd63aed0c2e3e1c9f08ef"
  }
 ```
 
@@ -274,8 +263,8 @@
 +++ aksh
 @@ -1,5 +1,5 @@
  {
--  "line_count": 32,
-+  "line_count": 25,
+-  "line_count": 45,
++  "line_count": 38,
    "uploaded_at": "{time}",
    "workflow_job_run_backend_id": "{volatile}",
    "workflow_run_backend_id": "{volatile}"
@@ -308,13 +297,13 @@
          },
          {
            "k": "run_id",
--          "v": "29041170222"
-+          "v": "29041800087"
+-          "v": "29043256442"
++          "v": "29043198309"
          },
          {
            "k": "run_number",
--          "v": "5"
-+          "v": "6"
+-          "v": "6"
++          "v": "5"
          },
          {
            "k": "retention_days",
@@ -322,8 +311,8 @@
      },
      {
        "type": "regex",
--      "value": "{token}\\.yryuK3zQYL0Gxmp"
-+      "value": "{token}\\.f1HhLxzrb3lkTGd"
+-      "value": "{token}\\.7WQLgyeMkMgtZoA"
++      "value": "{token}\\.geHZZt6V5YUKEh1"
      },
      {
        "type": "regex",
@@ -332,38 +321,29 @@
 ### `POST run-actions-{n}-azure-eastus.actions.githubusercontent.com//{n}/completejob`
 
 #### occurrence 1
-- request schema differs
+- request redacted value differs
 ```diff
 --- official
 +++ aksh
-@@ -17,27 +17,6 @@
-       "started_at": "string",
-       "status": "string",
-       "type": "string"
--    },
--    {
--      "action_name": "string",
--      "annotations": [
--        {
--          "endLine": "number",
--          "level": "string",
--          "message": "string",
--          "startLine": "number",
--          "stepNumber": "number",
--          "title": "string"
--        }
--      ],
--      "completed_at": "string",
--      "conclusion": "string",
--      "external_id": "string",
--      "name": "string",
--      "number": "number",
--      "started_at": "string",
--      "status": "string",
--      "type": "string"
-     }
+@@ -69,16 +69,8 @@
    ],
    "telemetry": [
+     {
+-      "message": "https://broker.actions.githubusercontent.com/health: OK",
+-      "type": "ConnectivityCheck"
+-    },
+-    {
+-      "message": "https://token.actions.githubusercontent.com/ready: NoContent",
+-      "type": "ConnectivityCheck"
+-    },
+-    {
+-      "message": "https://run.actions.githubusercontent.com/health: OK",
+-      "type": "ConnectivityCheck"
++      "message": "{\"ClassType\":\"StepsRunner\",\"FinishResult\":\"succeeded\"}",
++      "type": "task"
+     }
+   ]
+ }
 ```
 
 ### `PUT productionresultssa{n}.blob.core.windows.net/actions-results/{guid}/workflow-job-run-{guid}/logs/job/job-logs.txt`
@@ -375,10 +355,10 @@
 +++ aksh
 @@ -1,4 +1,4 @@
  {
--  "bytes": 2461,
--  "sha256": "f1989bdd4b494c9264fc90570bf8f943174a09613c35211f3b7ad7bbb85ec05c"
-+  "bytes": 1929,
-+  "sha256": "cce371263ba7ced9dbf12528ac222ef11f63a0ea650beb3b212a071968b431b5"
+-  "bytes": 3396,
+-  "sha256": "19095ca854851bd7598d0ff1761e5fb64a4ee045c43af665f9b4cf0c8c32dcfb"
++  "bytes": 2713,
++  "sha256": "f943a673d1aa1bd37de161186760289de1fb2dcdd358cbd668ab219a316747d4"
  }
 ```
 
@@ -391,10 +371,10 @@
 +++ aksh
 @@ -1,4 +1,4 @@
  {
--  "bytes": 965,
--  "sha256": "f2048e62030dddf92ab7947dc58173840bcb0d83ee83b45bf70b4a567f45cc66"
-+  "bytes": 457,
-+  "sha256": "83f01fbdeba241e8e055139c8a558a9bf30be8641e3a9a659c49360ae8b7ee31"
+-  "bytes": 964,
+-  "sha256": "4002352d58851bcbab923f143a903ba9c081e8e04fd6ecc32e98519a6c80d336"
++  "bytes": 456,
++  "sha256": "16d72f52ab8df850c7ec3d4546c8344cf676f09663bd7816ac5ce29954a73569"
  }
 ```
 
@@ -405,10 +385,10 @@
 +++ aksh
 @@ -1,4 +1,4 @@
  {
--  "bytes": 947,
--  "sha256": "1cd4448e0e987b3f8d6fe5bcb5b5e4ebd1a859a7c6d2d31e03144f24dc1e461d"
-+  "bytes": 932,
-+  "sha256": "8a2b66a86757893b4918db82222df504f8b443f3e0e146b30c462e6459ca7fcb"
+-  "bytes": 546,
+-  "sha256": "b569c01a8c9dc5f994a8cace5f230e5b029342dacad42370c4e0941ef0a344ea"
++  "bytes": 515,
++  "sha256": "8c52b55c90ec005dc82513966aec61101c9de09bb3ffaf8d97efc0fa47b910df"
  }
 ```
 
@@ -419,10 +399,10 @@
 +++ aksh
 @@ -1,4 +1,4 @@
  {
--  "bytes": 497,
--  "sha256": "9206d97da629dec422ab86cfa0cf122580dcfab923fa9a51601a82a39366449f"
-+  "bytes": 485,
-+  "sha256": "81a95f804e16254bbf5c95b3da53cc12e6aa59d7987ab60f8b7b22c5f57dd855"
+-  "bytes": 1427,
+-  "sha256": "a5423c01f1abbb5f66bf8969ad45a0bd397443353abe83ce9f792088a6611b3b"
++  "bytes": 1289,
++  "sha256": "2bac14a2c35f3f83bc4f863bcd5011b7d63403302b11be07323ae4c6a18bea98"
  }
 ```
 
@@ -433,21 +413,34 @@
 +++ aksh
 @@ -1,4 +1,4 @@
  {
+-  "bytes": 410,
+-  "sha256": "b6d8b513ab52dc571f617a400d27d78f28a996a8e87bdc20d55c0f95f9b306e2"
++  "bytes": 398,
++  "sha256": "049f16196c7fad02f00c1e6cba2b484ef96226f867329a71257986e65e74be5b"
+ }
+```
+
+#### occurrence 5
+- request binary body differs
+```diff
+--- official
++++ aksh
+@@ -1,4 +1,4 @@
+ {
 -  "bytes": 61,
--  "sha256": "28a6d5cbfface834df507f08811f7dc5c079bb5e6b2db69491942450be87c85b"
+-  "sha256": "d5b6603c2d13b329b529953ded6cc3badedbcde13226673fd1df50e1a4a68706"
 +  "bytes": 53,
-+  "sha256": "68dd9326f5ee71070437ea33a04ac4e1188eb7999c4ac950547e20ed71384a23"
++  "sha256": "16bf3753f50f89c1a69b7532d392fb5a695960e9a0c5b6e2251c637b28e60668"
  }
 ```
 
 ## Verdict
 
-FAIL: 20 contract differences found.
+FAIL: 21 contract differences found.
 
 - endpoint-sequence: 1
-- request-binary: 7
-- request-schema: 1
-- request-value: 4
+- request-binary: 8
+- request-value: 5
 - response-binary: 1
 - response-schema: 1
 - response-value: 4

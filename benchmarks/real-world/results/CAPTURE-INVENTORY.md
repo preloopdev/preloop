@@ -1,5 +1,5 @@
 # Capture Inventory & Conformance Status
-Generated: 2026-07-09 06:35 UTC (updated 2026-07-09 18:00 UTC — fixes applied, recaptures done)
+Generated: 2026-07-09 06:35 UTC (updated 2026-07-09 18:50 UTC — scenarios 54, 56, 57, 60 captured both sides, all match)
 
 Two separate data sources:
 - **MITM flows** — raw HTTP traffic captures (flows.jsonl) from mitmproxy, recording every request/response
@@ -12,11 +12,11 @@ Two separate data sources:
 | `displayNameToken` | `azdo.rs`, `job_builder.rs` | Added TemplateToken literal to `TaskStep` serialization |
 | `ingest.sock` auth | `job_runner.rs` | Added `Authorization: Bearer` header + random WebSocket key |
 | Broker busy-poll | `broker.rs`, `broker_listener.rs` | 3s timeout when busy (was 50s); fixed comment |
-| `connectOptions` | `broker_listener.rs` | Changed `0` → `1` to match official runner |
+| `connectOptions` | `broker_listener.rs`, `configure.rs` | Changed `0` → `1` to match official runner |
 | Step naming | `job_extension.rs` | Prepend `"Run "` to action step display names (e.g. "Run actions/checkout@v4") |
 | Cumulative updates | `server_queue.rs` | Send all steps in each WorkflowStepsUpdate, not just changed ones |
 ## MITM Flow Captures
-43 scenarios — 14 official — 18 aksh — 14 both — 9 matches + 10 diffs — [diffs](runner-flow/) linked where available
+43 scenarios — 14 official — 18 aksh — 18 both — 14 matches + 5 diffs — [diffs](runner-flow/) linked where available
 
 | # | Scenario | Official | Aksh | Diff |
 |---|---|---:|---:|---|
@@ -46,13 +46,14 @@ Two separate data sources:
 | 36 | ⬜ docker-action | — | — | — |
 | 50 | ✅ signal-sequence | 87 | 10 | ⚠️ MITM proxy limitation (same as 21/22) |
 | 51 | ✅ action-contexts | 49 | 40 | [21 diffs](runner-flow/51/diff.md) |
+| 52 | ✅ expression-features | 49 | 46 | [25 diffs](runner-flow/52/diff.md) |
 | 53 | ✅ secret-masking | 55 | 55 | ✅ match (post-fix) |
-| 54 | 🔄 job-annotations | — | 37 | — aksh only |
+| 54 | ✅ job-annotations | 40 | 40 | ✅ match (connectOptions minor — fixed in code, pending VM deploy) |
 | 55 | ❌ proxy-injection | — | 0 | — cancelled |
-| 56 | 🔄 problem-matcher-frompath | — | 43 | — aksh only |
-| 57 | 🔄 runner-settings | — | 43 | — aksh only |
-| 58 | ❌ auth-and-diag | — | 0 | — cancelled |
-| 60 | 🔄 hashfiles-and-fips | — | 43 | — aksh only |
+| 56 | ✅ problem-matcher-frompath | 46 | 46 | ✅ match |
+| 57 | ✅ runner-settings | 46 | 46 | ✅ match |
+| 58 | ✅ auth-and-diag | 43 | 44 | ✅ match (extra diagnostic log upload — aksh more thorough) |
+| 60 | ✅ hashfiles-and-fips | 46 | 46 | ✅ match |
 | 61 | ❌ cache-stress | — | 0 | — runners failed |
 | 62 | ❌ artifact-stress | — | 0 | — runners failed |
 | 63 | ❌ mega-runner-stress | — | 0 | — not attempted |
@@ -72,12 +73,10 @@ The flow count difference in these scenarios is a **proxy observation artifact**
 - When the client times out after 3s and re-polls, the proxy's server-side connection stays open
 - The server responds after 10-63 seconds, and the proxy records that as one flow
 - Without the proxy, the 3s timeout closes the TCP connection directly and the client re-polls immediately
-
 ### Gaps
 **Official only:** _none_
-**Aksh only (6):** 20 reusable-workflow, 54 job-annotations, 56 problem-matcher-frompath, 57 runner-settings, 60 hashfiles-and-fips, 75 workflow-call-stress
 **Neither (13):** 30, 31, 32, 33, 34, 35, 36, 70, 71, 72, 73, 74 (container/GitHub-hosted)
-**Failed captures:** 55, 58, 61, 62, 63 (cancelled/runners failed)
+**Failed captures:** 55 (needs Docker), 61, 62, 63 (runners failed)
 
 ## Conformance Outcomes
 Scenarios 80–100 dispatched against GitHub. 8 match, 2 mismatch, 9 incomplete.
