@@ -50,6 +50,29 @@ pub fn build_agent_job_message(
         &plan.matrix,
         &strategy_value,
         secrets,
+        &plan.inputs,
+    );
+
+    let mut resolved_secrets = BTreeMap::new();
+    if plan.workflow_file.is_none() {
+        resolved_secrets = secrets.clone();
+    } else if plan.secrets_inherit {
+        resolved_secrets = secrets.clone();
+    } else if !plan.secrets_map.is_empty() {
+        for (k, expr) in &plan.secrets_map {
+            let resolved = resolve_string(expr, &expr_context).unwrap_or_else(|_| expr.clone());
+            resolved_secrets.insert(k.clone(), resolved);
+        }
+    }
+
+    let job_expr_context = build_context(
+        github,
+        &plan.env,
+        vars,
+        &plan.matrix,
+        &strategy_value,
+        &resolved_secrets,
+        &plan.inputs,
     );
 
     // Resolve expressions in step env and with.
@@ -94,7 +117,7 @@ pub fn build_agent_job_message(
             context_name
         };
         used_names.insert(final_name.clone());
-        let mut task_step = build_task_step(step, &expr_context);
+        let mut task_step = build_task_step(step, &job_expr_context);
         task_step.context_name = Some(final_name);
         steps.push(task_step);
     }
@@ -112,7 +135,7 @@ pub fn build_agent_job_message(
     for (k, v) in vars {
         variables.insert(k.clone(), VariableValue::new(v));
     }
-    for (k, v) in secrets {
+    for (k, v) in &resolved_secrets {
         variables.insert(k.clone(), VariableValue::secret(v));
     }
 
@@ -121,9 +144,15 @@ pub fn build_agent_job_message(
         "system.pullRequestTargetBranch".to_owned(),
         VariableValue::new(""),
     );
+    if let Some(wf_file) = &plan.workflow_file {
+        variables.insert(
+            "system.workflowFileFullPath".to_owned(),
+            VariableValue::new(wf_file),
+        );
+    }
 
     // Mask hints for secrets
-    let mask_hints: Vec<MaskHint> = secrets
+    let mask_hints: Vec<MaskHint> = resolved_secrets
         .values()
         .filter(|v| !v.is_empty())
         .map(|v| MaskHint {
@@ -181,6 +210,36 @@ pub fn build_agent_job_message(
     let mut context_data = BTreeMap::new();
     context_data.insert("system".to_owned(), PipelineContextData::Dict(system_ctx));
     context_data.insert("github".to_owned(), to_context_data(github));
+    if !plan.inputs.is_empty() {
+        let inputs_ctx = plan
+            .inputs
+            .iter()
+            .map(|(k, v)| (k.clone(), to_context_data(v)))
+            .collect();
+        context_data.insert("inputs".to_owned(), PipelineContextData::Dict(inputs_ctx));
+    }
+    let mut job_ctx = BTreeMap::new();
+    if let Some(wref) = &plan.workflow_ref {
+        job_ctx.insert(
+            "workflow_ref".to_owned(),
+            PipelineContextData::String(wref.clone()),
+        );
+    }
+    if let Some(wsha) = &plan.workflow_sha {
+        job_ctx.insert(
+            "workflow_sha".to_owned(),
+            PipelineContextData::String(wsha.clone()),
+        );
+    }
+    if let Some(wrepo) = &plan.workflow_repository {
+        job_ctx.insert(
+            "workflow_repository".to_owned(),
+            PipelineContextData::String(wrepo.clone()),
+        );
+    }
+    if !job_ctx.is_empty() {
+        context_data.insert("job".to_owned(), PipelineContextData::Dict(job_ctx));
+    }
 
     let env_ctx: Map<String, Value> = plan
         .env
@@ -254,6 +313,11 @@ pub fn build_agent_job_message(
         job_timeout: None,
         job_container: plan.container.clone(),
         job_service_containers: non_empty_services(plan.services.clone()),
+        job_outputs: if plan.job_outputs.is_empty() {
+            None
+        } else {
+            Some(plan.job_outputs.clone())
+        },
     })
 }
 
