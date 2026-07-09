@@ -174,9 +174,10 @@ pub struct TaskAgentMessage {
     #[serde(rename = "body")]
     pub body: String,
     /// Base64-encoded initialization vector for AES decryption.
+    /// Serialized as a base64 string (matching the official runner wire format).
     /// Present only when the message body is encrypted.
     #[serde(rename = "iv", skip_serializing_if = "Option::is_none")]
-    pub iv: Option<Vec<u8>>,
+    pub iv: Option<String>,
 }
 
 /// Known message types the runner handles.
@@ -295,6 +296,15 @@ pub struct AgentJobRequestMessage {
         skip_serializing_if = "Option::is_none"
     )]
     pub job_service_containers: Option<serde_json::Value>,
+
+    /// Job-level output declarations — output name → value expression.
+    /// The runner evaluates these after step execution.
+    #[serde(
+        rename = "jobOutputs",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub job_outputs: Option<BTreeMap<String, String>>,
 }
 
 /// Plan reference — identifies the orchestration plan.
@@ -998,6 +1008,7 @@ pub struct LogReference {
 /// `Microsoft.VisualStudio.Services.WebApi`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VssJsonCollectionWrapper<T> {
+    #[serde(default)]
     pub count: usize,
     pub value: Vec<T>,
 }
@@ -1049,7 +1060,7 @@ mod tests {
             message_id: 1,
             message_type: "PipelineAgentJobRequest".to_owned(),
             body: "aGVsbG8=".to_owned(),
-            iv: Some(vec![1, 2, 3]),
+            iv: Some("AQID".to_owned()),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"messageId\":1"));
