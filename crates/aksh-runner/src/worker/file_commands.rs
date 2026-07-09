@@ -218,24 +218,10 @@ pub fn apply_file_commands(
         job.extra_path.insert(0, p);
     }
 
-    // Apply GITHUB_OUTPUT with size limits matching official runner.
-    // GitHub enforces 1 MB per job (measured in UTF-16 bytes).
-    const MAX_OUTPUT_UTF16_BYTES: usize = 1_048_576; // 1 MiB
+    // Apply GITHUB_OUTPUT
     let outputs = parse_kv_file(&paths.output_file)?;
     if let Some(step_result) = job.steps.get_mut(step_id) {
         for (k, v) in &outputs {
-            let utf16_size = v.len() * 2; // UTF-16 approximation
-            if job.output_size_utf16 + utf16_size > MAX_OUTPUT_UTF16_BYTES {
-                anyhow::bail!(
-                    "Output '{}' exceeds the 1 MB size limit for job outputs. \
-                     Current job total: {} bytes (UTF-16), this output: {} bytes (UTF-16). \
-                     Consider using artifacts for large data.",
-                    k,
-                    job.output_size_utf16,
-                    utf16_size
-                );
-            }
-            job.output_size_utf16 += utf16_size;
             step_result.outputs.insert(k.clone(), v.clone());
         }
     }
