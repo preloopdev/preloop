@@ -69,6 +69,24 @@ impl AgentRsaPublicKey {
             .encrypt(&mut rand::thread_rng(), Oaep::new::<Sha1>(), plaintext)
             .map_err(|e| CryptoError::Wrap(e.to_string()))
     }
+
+    /// Verify a signature signed with PS256 (RSA-PSS SHA-256).
+    pub fn verify_signature_ps256(
+        &self,
+        data: &[u8],
+        signature: &[u8],
+    ) -> Result<(), anyhow::Error> {
+        use rsa::pss::{Signature, VerifyingKey};
+        use rsa::signature::Verifier;
+        use sha2::Sha256;
+
+        let verifying_key = VerifyingKey::<Sha256>::new(self.public_key.clone());
+        let sig = Signature::try_from(signature)
+            .map_err(|e| anyhow::anyhow!("invalid signature format: {e}"))?;
+        verifying_key
+            .verify(data, &sig)
+            .map_err(|e| anyhow::anyhow!("signature verification failed: {e}"))
+    }
 }
 
 fn parse_xml_public_key(value: &str) -> Result<rsa::RsaPublicKey, CryptoError> {
