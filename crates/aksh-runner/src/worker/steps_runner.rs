@@ -395,9 +395,17 @@ pub async fn run_steps(
                 let masks: std::collections::HashSet<String> = step_ctx.job.masks.clone();
                 dbg.update_context(context_val, masks);
                 let is_pre = step.id.starts_with("__pre_")
-                    || step.raw.get("isPre").and_then(|v| v.as_bool()).unwrap_or(false);
+                    || step
+                        .raw
+                        .get("isPre")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                 let is_post = step.id.starts_with("__post_")
-                    || step.raw.get("isPost").and_then(|v| v.as_bool()).unwrap_or(false);
+                    || step
+                        .raw
+                        .get("isPost")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                 let source_entry = aksh_dap::SourceEntry {
                     display_name: resolved_display_name.clone(),
                     is_pre,
@@ -540,9 +548,17 @@ pub async fn run_steps(
         if !step.is_background {
             if let Some(dbg) = dap_debugger.as_ref() {
                 let is_pre = step.id.starts_with("__pre_")
-                    || step.raw.get("isPre").and_then(|v| v.as_bool()).unwrap_or(false);
+                    || step
+                        .raw
+                        .get("isPre")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                 let is_post = step.id.starts_with("__post_")
-                    || step.raw.get("isPost").and_then(|v| v.as_bool()).unwrap_or(false);
+                    || step
+                        .raw
+                        .get("isPost")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                 let source_entry = aksh_dap::SourceEntry {
                     display_name: resolved_display_name.clone(),
                     is_pre,
