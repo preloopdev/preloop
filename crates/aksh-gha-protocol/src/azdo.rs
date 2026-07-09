@@ -305,6 +305,49 @@ pub struct AgentJobRequestMessage {
         skip_serializing_if = "Option::is_none"
     )]
     pub job_outputs: Option<BTreeMap<String, String>>,
+
+    /// Whether the debugger is enabled for this job.
+    /// Mirrors `AgentJobRequestMessage.EnableDebugger` in `actions/runner` v2.335.0+.
+    #[serde(rename = "enableDebugger", default, skip_serializing_if = "is_false")]
+    pub enable_debugger: bool,
+
+    /// Dev Tunnel info for remote debugging.
+    /// Mirrors `AgentJobRequestMessage.DebuggerTunnel`.
+    #[serde(
+        rename = "debuggerTunnel",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub debugger_tunnel: Option<DebuggerTunnelInfo>,
+
+    /// Optional welcome message for the debugger console.
+    /// Mirrors `AgentJobRequestMessage.DebuggerWelcomeMessage`.
+    #[serde(
+        rename = "debuggerWelcomeMessage",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub debugger_welcome_message: Option<String>,
+
+    /// aksh extension: workflow run id for local DAP proxy port registration.
+    #[serde(
+        rename = "akshDebugRunId",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub aksh_debug_run_id: Option<String>,
+
+    /// aksh extension: transport mode for DAP traffic.
+    #[serde(
+        rename = "akshDebugTransport",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub aksh_debug_transport: Option<String>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Plan reference — identifies the orchestration plan.
@@ -314,6 +357,22 @@ pub struct PlanReference {
     pub plan_id: String,
     #[serde(rename = "planType", skip_serializing_if = "Option::is_none")]
     pub plan_type: Option<String>,
+}
+
+/// Dev Tunnel info for remote debugging.
+///
+/// 1:1 port of `src/Sdk/DTPipelines/Pipelines/DebuggerTunnelInfo.cs`
+/// in `actions/runner` v2.335.1.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct DebuggerTunnelInfo {
+    #[serde(rename = "tunnelId", default)]
+    pub tunnel_id: String,
+    #[serde(rename = "clusterId", default)]
+    pub cluster_id: String,
+    #[serde(rename = "hostToken", default)]
+    pub host_token: String,
+    #[serde(rename = "port", default)]
+    pub port: u16,
 }
 
 /// Task step — a single unit of work within a job.
