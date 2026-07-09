@@ -477,7 +477,10 @@ impl DapDebugger {
                         }
                     }
                 }
-                if matches!(req.raw.command.as_str(), "continue" | "next" | "stepIn" | "stepOut") {
+                if matches!(
+                    req.raw.command.as_str(),
+                    "continue" | "next" | "stepIn" | "stepOut"
+                ) {
                     let event_seq = next_seq(&core).await;
                     let _ = out_tx_dispatch.send(Outbound::Event(
                         Event::new(event_seq, EVENT_CONTINUED).with_body(json!({
@@ -916,12 +919,16 @@ impl IDapDebugger for DapDebugger {
         ));
         // Official runner sends a host info message after the stopped event.
         let seq = self.next_seq_internal().await;
-        let _ = self.core.out_tx.lock().send(Outbound::Event(
-            Event::new(seq, EVENT_OUTPUT).with_body(json!({
-                "category": "console",
-                "output": "\nCommands will run on runner host\n",
-            })),
-        ));
+        let _ =
+            self.core
+                .out_tx
+                .lock()
+                .send(Outbound::Event(Event::new(seq, EVENT_OUTPUT).with_body(
+                    json!({
+                        "category": "console",
+                        "output": "\nCommands will run on runner host\n",
+                    }),
+                )));
         *self.core.state.lock() = DapSessionState::Paused;
 
         let mut rx = self.core.resume_tx.subscribe();

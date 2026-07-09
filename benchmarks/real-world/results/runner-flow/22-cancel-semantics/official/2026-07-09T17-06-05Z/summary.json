@@ -1,0 +1,10 @@
+{
+  "runner": "official",
+  "scenario": "22-cancel-semantics.yml",
+  "github_repo": "preloopdev/aksh-conformance-sample",
+  "run_id": "29035871692",
+  "status": "ok",
+  "conclusion": "cancelled",
+  "total_ms": 0,
+  "flows_count":      230
+}
