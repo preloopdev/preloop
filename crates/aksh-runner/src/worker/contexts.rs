@@ -301,19 +301,20 @@ impl JobContext {
         ctx.insert("steps", serde_json::Value::Object(steps_map));
 
         // job context — P1.12: add container and services (empty objects when not containerized)
-        let job_container = self
+        let job_decoded = self
             .context_data
             .get("job")
-            .and_then(|j| j.get("container"))
+            .map(super::job_extension::decode_typed_value)
+            .unwrap_or_else(|| serde_json::json!({}));
+        let job_container = job_decoded
+            .get("container")
             .cloned()
             .unwrap_or(serde_json::json!({}));
-        let job_services = self
-            .context_data
-            .get("job")
-            .and_then(|j| j.get("services"))
+        let job_services = job_decoded
+            .get("services")
             .cloned()
             .unwrap_or(serde_json::json!({}));
-        let job_ctx = serde_json::json!({
+        let mut job_ctx_obj = serde_json::json!({
             "status": match self.job_status {
                 JobStatus::Success => "success",
                 JobStatus::Failure => "failure",
@@ -322,7 +323,18 @@ impl JobContext {
             "container": job_container,
             "services": job_services,
         });
-        ctx.insert("job", job_ctx);
+        if let Some(obj) = job_ctx_obj.as_object_mut() {
+            if let Some(wref) = job_decoded.get("workflow_ref").cloned() {
+                obj.insert("workflow_ref".to_string(), wref);
+            }
+            if let Some(wsha) = job_decoded.get("workflow_sha").cloned() {
+                obj.insert("workflow_sha".to_string(), wsha);
+            }
+            if let Some(wrepo) = job_decoded.get("workflow_repository").cloned() {
+                obj.insert("workflow_repository".to_string(), wrepo);
+            }
+        }
+        ctx.insert("job", job_ctx_obj);
 
         // env context
         let env_map: serde_json::Value = self

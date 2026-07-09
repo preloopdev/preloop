@@ -593,7 +593,16 @@ pub async fn docker_exec<'a>(
     let args_ref: Vec<&str> = exec_args.iter().map(|s| s.as_str()).collect();
 
     let keep_lines = on_chunk.is_none();
-    process::invoke("docker", &args_ref, Path::new("."), env, on_chunk, cancel_rx, keep_lines).await
+    process::invoke(
+        "docker",
+        &args_ref,
+        Path::new("."),
+        env,
+        on_chunk,
+        cancel_rx,
+        keep_lines,
+    )
+    .await
 }
 
 /// Get port mappings for a service container.
@@ -708,9 +717,17 @@ async fn docker_cmd(args: &[&str], log: &mut Vec<String>) -> Result<Vec<String>>
     log.push(format!("##[command]{cmd_line}"));
     debug!("docker {}", args.join(" "));
 
-    let result = process::invoke("docker", args, Path::new("."), &HashMap::new(), None, None, true)
-        .await
-        .with_context(|| format!("docker {}", args.first().unwrap_or(&"")))?;
+    let result = process::invoke(
+        "docker",
+        args,
+        Path::new("."),
+        &HashMap::new(),
+        None,
+        None,
+        true,
+    )
+    .await
+    .with_context(|| format!("docker {}", args.first().unwrap_or(&"")))?;
 
     // Log output lines
     for line in &result.lines {
