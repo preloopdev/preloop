@@ -18,6 +18,7 @@ pub async fn run_broker_loop(
     http: &HttpClient,
     config: &RunnerConfig,
     initial_token: &str,
+    initial_expires_at: Option<std::time::Instant>,
     once: bool,
     runner_root: &std::path::Path,
 ) -> Result<()> {
@@ -36,6 +37,7 @@ pub async fn run_broker_loop(
     let mut client = BrokerClient::new(http.clone(), broker_url);
 
     let mut token = initial_token.to_string();
+    let mut token_expires_at: Option<std::time::Instant> = initial_expires_at;
     let mut session_id = String::new();
     let mut session_key: Option<Vec<u8>> = None;
 
@@ -93,7 +95,7 @@ pub async fn run_broker_loop(
                     "id": config.settings.agent_id,
                     "name": config.settings.agent_name,
                     "version": crate::PROTOCOL_COMPAT_VERSION,
-                    "osDescription": format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+                    "osDescription": crate::os_description(),
                     "ephemeral": serde_json::Value::Null,
                     "status": 0,
                     "provisioningState": serde_json::Value::Null,
@@ -120,8 +122,9 @@ pub async fn run_broker_loop(
                     if is_unauthorized(&e) {
                         info!("OAuth token expired during session creation. Re-acquiring token...");
                         match crate::listener::oauth::get_oauth_token(http, config).await {
-                            Ok(t) => {
-                                token = t;
+                            Ok((new_token, new_expires)) => {
+                                token = new_token;
+                                token_expires_at = new_expires;
                                 consecutive_errors = 0;
                             }
                             Err(oe) => {
@@ -234,7 +237,7 @@ pub async fn run_broker_loop(
                                 }
                                 // Renew OAuth token before job acquisition (official runner refreshes here)
                                 match crate::listener::oauth::get_oauth_token(http, config).await {
-                                    Ok(new_token) => token = new_token,
+                                    Ok((new_token, new_expires)) => { token = new_token; token_expires_at = new_expires; }
                                     Err(e) => warn!("OAuth token renewal before job failed: {e:#}"),
                                 }
                                 let job = acquire_job_from_ref(&body, http, &token).await?;
@@ -315,10 +318,10 @@ pub async fn run_broker_loop(
                         if is_unauthorized(&e) {
                             info!("OAuth token expired during message poll. Re-acquiring token...");
                             match crate::listener::oauth::get_oauth_token(http, config).await {
-                                Ok(t) => {
-                                    token = t;
+                                Ok((new_token, new_expires)) => {
+                                    token = new_token;
+                                    token_expires_at = new_expires;
                                     consecutive_errors = 0;
-                                    // Try to recreate the session with the new token
                                     need_session = true;
                                 }
                                 Err(oe) => {
@@ -373,7 +376,6 @@ fn is_session_expired(err: &anyhow::Error) -> bool {
         false
     }
 }
-
 
 /// F011: Extract session key only if present.
 fn extract_session_key_if_present(
