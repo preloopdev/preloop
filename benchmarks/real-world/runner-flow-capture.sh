@@ -35,8 +35,8 @@ ensure_vms() {
     if ! smolvm machine status --name "$vm" >/dev/null 2>&1; then
       log "Creating $vm (${VM_CPUS} CPU, ${VM_MEM} MiB)"
       smolvm machine create --name "$vm" --image ubuntu:24.04 --cpus "$VM_CPUS" --mem "$VM_MEM" --storage 20 --net >/dev/null
-      smolvm machine update --name "$vm" --mount "$PWD:/workspace" >/dev/null
-      smolvm machine update --name "$vm" --mount "/private/tmp/bench-runners:/opt/runners" >/dev/null || true
+      smolvm machine update --name "$vm" --volume "$PWD:/workspace" >/dev/null
+      smolvm machine update --name "$vm" --volume "/private/tmp/bench-runners:/opt/runners" >/dev/null || true
     fi
   done
 }
@@ -65,14 +65,24 @@ prepare_vm() {
   smolvm machine start --name "$vm" >/dev/null 2>&1
   smolvm machine exec --name "$vm" -- bash -lc "
     set -euo pipefail
+    # Wait up to 30s for mounts to appear
+    for i in \$(seq 1 30); do
+      if [ -x '$AKSH_RUNNER' ] && [ -d '$OFFICIAL_SRC' ]; then
+        break
+      fi
+      sleep 1
+    done
+
     export DEBIAN_FRONTEND=noninteractive
+    if [ -f '$OFFICIAL_SRC/bin/installdependencies.sh' ]; then
+      apt-get update -qq
+      bash '$OFFICIAL_SRC/bin/installdependencies.sh' >/dev/null 2>&1 || true
+    fi
     if ! command -v mitmdump >/dev/null 2>&1; then
       apt-get update -qq
       apt-get install -y -qq python3-pip >/dev/null
       python3 -m pip install --break-system-packages -q mitmproxy==12.2.3
     fi
-    if [ ! -x '$AKSH_RUNNER' ]; then echo 'missing aksh runner: $AKSH_RUNNER' >&2; exit 2; fi
-    if [ ! -d '$OFFICIAL_SRC' ]; then echo 'missing official runner: $OFFICIAL_SRC' >&2; exit 2; fi
   "
 }
 

@@ -1,12 +1,20 @@
 # Runner Conformance Comparison Report
 
 Generated from conformance JSONL data.
-Official scenarios: 19, Aksh scenarios: 21
+Official scenarios: 19, Aksh scenarios: 29
 
 ## Summary Matrix
 
 | # | Scenario | Official | Aksh | Match | Issues |
 |---|---|---|---|---|---|
+| 07 | Scenario 07 | N/A | failure | ⏳ | no-official-data |
+| 08 | Scenario 08 | N/A | success | ⏳ | no-official-data |
+| 10 | Scenario 10 | N/A | success | ⏳ | no-official-data |
+| 11 | Scenario 11 | N/A | success | ⏳ | no-official-data |
+| 12 | Scenario 12 | N/A | success | ⏳ | no-official-data |
+| 13 | Scenario 13 | N/A | success | ⏳ | no-official-data |
+| 14 | Scenario 14 | N/A | failure | ⏳ | no-official-data |
+| 15 | Scenario 15 | N/A | failure | ⏳ | no-official-data |
 | 80 | Custom Shells | (empty) | failure | ⏳ | incomplete-run |
 | 81 | Step Timeout | (empty) | failure | ⏳ | incomplete-run |
 | 82 | Reusable Workflow | failure | cancelled | ❌ | conclusion-mismatch, job-conclusion-mismatch, no-aksh-steps |
@@ -20,18 +28,58 @@ Official scenarios: 19, Aksh scenarios: 21
 | 90 | Shell Exit Behavior | failure | failure | ✅ | duplicate-steps |
 | 91 | Large Output | failure | success | ❌ | conclusion-mismatch, duplicate-steps, job-conclusion-mismatc |
 | 92 | Unicode Special Chars | failure | success | ❌ | conclusion-mismatch, duplicate-steps, job-conclusion-mismatc |
-| 93 | Empty/Null Values | success | success | ✅ | duplicate-steps, step-display-name |
+| 93 | Empty/Null Values | success | success | ✅ |  |
 | 94 | Action Pinning | success | success | ✅ | duplicate-steps, step-display-name |
-| 95 | Nested Composite | success | (empty) | ⏳ | incomplete-run, no-aksh-steps |
-| 96 | Env Inheritance | success | cancelled | ❌ | conclusion-mismatch, duplicate-steps, job-conclusion-mismatc |
+| 95 | Nested Composite | success | success | ✅ | step-count, step-display-name, step-missing-in-aksh, step-na |
+| 96 | Env Inheritance | success | success | ✅ |  |
 | 97 | Artifact Cross-Job | N/A | (empty) | ⏳ | no-official-data |
 | 98 | Outcome vs Conclusion | failure | failure | ✅ | duplicate-steps, step-conclusion |
-| 99 | Workspace Defaults | (empty) | (empty) | ✅ |  |
+| 99 | Workspace Defaults | (empty) | failure | ⏳ | incomplete-run |
 | 100 | Tool Cache | success | success | ✅ | duplicate-steps |
 
-**Totals**: 8 matching, 4 mismatched, 9 incomplete/missing
+**Totals**: 9 matching, 3 mismatched, 17 incomplete/missing
 
 ## Detailed Comparison
+
+### 07 — Scenario 07
+
+- Aksh run: 28965602941
+- Conclusions: official=N/A, aksh=failure
+
+### 08 — Scenario 08
+
+- Aksh run: 28965799330
+- Conclusions: official=N/A, aksh=success
+
+### 10 — Scenario 10
+
+- Aksh run: 28965623676
+- Conclusions: official=N/A, aksh=success
+
+### 11 — Scenario 11
+
+- Aksh run: 28965714482
+- Conclusions: official=N/A, aksh=success
+
+### 12 — Scenario 12
+
+- Aksh run: 28965742253
+- Conclusions: official=N/A, aksh=success
+
+### 13 — Scenario 13
+
+- Aksh run: 28965647856
+- Conclusions: official=N/A, aksh=success
+
+### 14 — Scenario 14
+
+- Aksh run: 28965668675
+- Conclusions: official=N/A, aksh=failure
+
+### 15 — Scenario 15
+
+- Aksh run: 28965692945
+- Conclusions: official=N/A, aksh=failure
 
 ### 80 — Custom Shells
 
@@ -149,26 +197,6 @@ Official scenarios: 19, Aksh scenarios: 21
 - Step 8 name: official='Verify special character round-trip' vs aksh='Run ${{ format('HEX=''{0}'''
 - Step 8 'Verify special character round-trip': official=skipped, aksh=success
 
-### 93 — Empty/Null Values
-
-- Official run: 28898519251
-- Aksh run: 28895810084
-- Conclusions: official=success, aksh=success
-
-- Aksh has 2 duplicate step entries
-- Step 2 name: official='Set empty string output' vs aksh='Run echo 'empty_var=' >> $GITHUB_OUTPUT'
-- Step 3 name: official='Verify empty string output' vs aksh='Run EMPTY='''
-- Step 4 name: official='Test empty string comparison' vs aksh='Run EMPTY='''
-- Step 5 name: official='Test unset env var reference' vs aksh='Run # Unset env var should be empty/null'
-- Step 6 name: official='Test step output that is never set' vs aksh='Run # Intentionally don't set never_set_var'
-- Step 7 name: official='Access undefined step output' vs aksh='Run ${{ format('UNDEFINED=''{0}'''
-- Step 8 name: official='Test empty string in matrix (simulated)' vs aksh='Run # Simulate matrix with empty value'
-- Step 9 name: official='Test empty string vs null handling' vs aksh='Run if [[ "$EXPLICIT_EMPTY" == "" ]]; then'
-- Step 10 name: official='Test default value with empty' vs aksh='Run EMPTY_VAR=""'
-- Step 11 name: official='Test empty string in conditions' vs aksh='Run EMPTY=""'
-- Step 12 name: official='Test null output field access' vs aksh='Run # Set one output but not another'
-- Step 13 name: official='Access defined and undefined outputs' vs aksh='Run DEFINED='has_value''
-
 ### 94 — Action Pinning
 
 - Official run: 28898523050
@@ -190,22 +218,13 @@ Official scenarios: 19, Aksh scenarios: 21
 ### 95 — Nested Composite
 
 - Official run: 28898566813
-- Aksh run: 28895666108
-- Conclusions: official=success, aksh=(empty)
+- Aksh run: 28946678754
+- Conclusions: official=success, aksh=success
 
-- Aksh runner did not complete
-- Job 'test-nested-composite': official has 8 steps, aksh has none (did not run?)
-
-### 96 — Env Inheritance
-
-- Official run: 28898571117
-- Aksh run: 28917468833
-- Conclusions: official=success, aksh=cancelled
-
-- Conclusion: official=success, aksh=cancelled
-- Job 'test-env-job-1': official=success, aksh=cancelled
-- Job 'test-env-job-1': official has 4 steps, aksh has none (did not run?)
-- Aksh has 2 duplicate step entries
+- Step count: official=8, aksh=7 (raw: official=8, aksh=7)
+- Step 6 name: official='Post Call outer composite action' vs aksh='Post Checkout repository'
+- Step 7 name: official='Post Checkout repository' vs aksh='Complete job'
+- Missing in aksh: 'Complete job' (success)
 
 ### 97 — Artifact Cross-Job
 
@@ -225,6 +244,14 @@ Official scenarios: 19, Aksh scenarios: 21
 - Step 6 'Failing step without continue-on-error': official=failure, aksh=skipped
 - Step 8 'Complete job': official=success, aksh=failure
 
+### 99 — Workspace Defaults
+
+- Official run: 28898579992
+- Aksh run: 28946775474
+- Conclusions: official=(empty), aksh=failure
+
+- Official runner did not complete
+
 ### 100 — Tool Cache
 
 - Official run: 28898911605
@@ -237,14 +264,17 @@ Official scenarios: 19, Aksh scenarios: 21
 
 | Issue Type | Count |
 |---|---:|
-| step-display-name | 39 |
-| duplicate-steps | 9 |
+| step-display-name | 28 |
+| no-official-data | 10 |
 | step-conclusion | 9 |
 | incomplete-run | 7 |
-| no-aksh-steps | 6 |
-| conclusion-mismatch | 4 |
-| job-conclusion-mismatch | 4 |
-| no-official-data | 2 |
+| duplicate-steps | 7 |
+| no-aksh-steps | 4 |
+| conclusion-mismatch | 3 |
+| job-conclusion-mismatch | 3 |
+| step-count | 1 |
+| step-name-mismatch | 1 |
+| step-missing-in-aksh | 1 |
 
 ## Issue Type Reference
 
