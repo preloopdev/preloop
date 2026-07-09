@@ -295,6 +295,15 @@ pub struct AgentJobRequestMessage {
         skip_serializing_if = "Option::is_none"
     )]
     pub job_service_containers: Option<serde_json::Value>,
+
+    /// Job-level output declarations — output name → value expression.
+    /// The runner evaluates these after step execution.
+    #[serde(
+        rename = "jobOutputs",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub job_outputs: Option<BTreeMap<String, String>>,
 }
 
 /// Plan reference — identifies the orchestration plan.
