@@ -1,0 +1,111 @@
+name: cache-artifact-v2
+
+on:
+  push:
+  pull_request:
+
+# Verifies actions/cache@v4 (CacheService Twirp) and
+# actions/upload-artifact@v4 / download-artifact@v4 (ArtifactService Twirp)
+# against the local aksh server.
+#
+# Requires ACTIONS_CACHE_SERVICE_V2=true, which the server injects via the
+# runtime token's scp claim and the CacheServerUrl endpoint data.
+
+jobs:
+  cache-v2:
+    runs-on: self-hosted
+    steps:
+      - name: write cache content
+        run: |
+          mkdir -p /tmp/cache-test
+          echo "cache-payload-$(date +%s)" > /tmp/cache-test/data.txt
+
+      - name: save cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/cache-test
+          key: aksh-cache-v2-${{ github.run_id }}
+
+      - name: bust local copy
+        run: rm -rf /tmp/cache-test
+
+      - name: restore cache
+        id: restore
+        uses: actions/cache@v4
+        with:
+          path: /tmp/cache-test
+          key: aksh-cache-v2-${{ github.run_id }}
+
+      - name: verify cache hit
+        run: |
+          if [ "${{ steps.restore.outputs.cache-hit }}" != "true" ]; then
+            echo "ERROR: cache miss — expected a hit"
+            exit 1
+          fi
+          echo "Cache content: $(cat /tmp/cache-test/data.txt)"
+          echo "cache-v2 PASS"
+
+  artifact-v2:
+    runs-on: self-hosted
+    steps:
+      - name: create artifact content
+        run: |
+          mkdir -p /tmp/artifact-test
+          echo "artifact-payload-${{ github.run_id }}" > /tmp/artifact-test/result.txt
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-result-${{ github.run_id }}
+          path: /tmp/artifact-test/result.txt
+
+      - name: download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: test-result-${{ github.run_id }}
+          path: /tmp/artifact-downloaded
+
+      - name: verify artifact content
+        run: |
+          expected="artifact-payload-${{ github.run_id }}"
+          got="$(cat /tmp/artifact-downloaded/result.txt)"
+          if [ "$got" != "$expected" ]; then
+            echo "ERROR: artifact mismatch — expected '$expected', got '$got'"
+            exit 1
+          fi
+          echo "artifact-v2 PASS"
+
+  cache-restore-key:
+    runs-on: self-hosted
+    steps:
+      - name: seed a cache under a base key
+        run: |
+          mkdir -p /tmp/restore-key-test
+          echo "restore-key-seed" > /tmp/restore-key-test/seed.txt
+
+      - name: save under base key
+        uses: actions/cache@v4
+        with:
+          path: /tmp/restore-key-test
+          key: aksh-restore-key-base-${{ github.run_id }}
+
+      - name: bust local copy
+        run: rm -rf /tmp/restore-key-test
+
+      - name: restore via prefix restore key (miss on exact, hit on prefix)
+        id: prefix-restore
+        uses: actions/cache@v4
+        with:
+          path: /tmp/restore-key-test
+          key: aksh-restore-key-new-${{ github.run_id }}
+          restore-keys: |
+            aksh-restore-key-base-
+
+      - name: verify prefix restore
+        run: |
+          echo "cache-hit=${{ steps.prefix-restore.outputs.cache-hit }}"
+          if [ ! -f /tmp/restore-key-test/seed.txt ]; then
+            echo "ERROR: restore-key lookup failed — seed.txt not found"
+            exit 1
+          fi
+          echo "restore-key PASS"

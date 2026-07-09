@@ -1,0 +1,60 @@
+name: Audit PEXP-01 hashFiles binary digest
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  hashfiles:
+    runs-on: [self-hosted, p1-test]
+    steps:
+      # Create test files inside workspace (relative paths work with hashFiles)
+      - name: Create test files
+        run: |
+          echo "hello aksh" > data.txt
+          echo "hello world" > other.txt
+
+      # hashFiles should return a non-empty 64-char lowercase hex string
+      - name: Compute hash and verify format
+        env:
+          HASH: ${{ hashFiles('data.txt') }}
+        run: |
+          echo "hash=$HASH"
+          if [ -z "$HASH" ]; then
+            echo "FAIL: hashFiles returned empty string"
+            exit 1
+          fi
+          if ! printf '%s' "$HASH" | grep -qE '^[0-9a-f]{64}$'; then
+            echo "FAIL: hash '$HASH' is not a 64-char lowercase hex string"
+            exit 1
+          fi
+          echo "PASS: hash format correct (${#HASH} chars)"
+
+      # Same content must produce the same hash on repeated calls (determinism)
+      - name: Determinism check
+        env:
+          H1: ${{ hashFiles('data.txt') }}
+          H2: ${{ hashFiles('data.txt') }}
+        run: |
+          echo "H1=$H1"
+          echo "H2=$H2"
+          if [ "$H1" != "$H2" ]; then
+            echo "FAIL: hash not deterministic ($H1 != $H2)"
+            exit 1
+          fi
+          echo "PASS: hashFiles is deterministic"
+
+      # Different file content must produce a different hash
+      - name: Distinct files have distinct hashes
+        env:
+          HA: ${{ hashFiles('data.txt') }}
+          HB: ${{ hashFiles('other.txt') }}
+        run: |
+          echo "HA=$HA"
+          echo "HB=$HB"
+          if [ "$HA" = "$HB" ]; then
+            echo "FAIL: distinct files produced same hash"
+            exit 1
+          fi
+          echo "PASS: distinct files produce distinct hashes"
+
+      - name: PEXP-01 hashFiles PASS
+        run: echo "ALL_HASHFILES_CHECKS_PASSED"
