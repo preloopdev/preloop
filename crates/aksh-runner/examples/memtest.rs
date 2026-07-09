@@ -8,7 +8,8 @@ use std::time::Instant;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let line_count: u64 = args.get(1)
+    let line_count: u64 = args
+        .get(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(1_000_000);
 
@@ -66,15 +67,24 @@ fn main() {
     eprintln!("RSS before:      {rss_before} KB");
     eprintln!("RSS after:       {rss_after} KB");
     eprintln!("RSS peak:        {rss_peak_kb} KB");
-    eprintln!("RSS delta (peak - before): {} KB", rss_peak_kb.saturating_sub(rss_before));
-    eprintln!("RSS delta (after - before): {} KB", rss_after.saturating_sub(rss_before));
+    eprintln!(
+        "RSS delta (peak - before): {} KB",
+        rss_peak_kb.saturating_sub(rss_before)
+    );
+    eprintln!(
+        "RSS delta (after - before): {} KB",
+        rss_after.saturating_sub(rss_before)
+    );
 
     if rss_peak_kb.saturating_sub(rss_before) < 10_000 {
         eprintln!();
         eprintln!("VERDICT: Memory is CONSTANT (<10 MB growth for 1M lines)");
     } else {
         eprintln!();
-        eprintln!("VERDICT: Memory GROWS significantly ({} MB growth)", (rss_peak_kb - rss_before) / 1024);
+        eprintln!(
+            "VERDICT: Memory GROWS significantly ({} MB growth)",
+            (rss_peak_kb - rss_before) / 1024
+        );
     }
 }
 
@@ -109,6 +119,10 @@ fn get_peak_rss_kb() -> u64 {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn get_rss_kb() -> u64 { 0 }
+fn get_rss_kb() -> u64 {
+    0
+}
 #[cfg(not(target_os = "linux"))]
-fn get_peak_rss_kb() -> u64 { 0 }
+fn get_peak_rss_kb() -> u64 {
+    0
+}
