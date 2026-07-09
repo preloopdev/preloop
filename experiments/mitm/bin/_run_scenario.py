@@ -146,8 +146,19 @@ def cancel_workflow_runner_server(run_id: str):
 
 def submit_workflow_aksh(workflow_path: str) -> str | None:
     """Submit a workflow to aksh via its native REST API."""
-    wf_abs = str(Path(workflow_path).resolve())
-    wf_yaml = Path(wf_abs).read_text()
+    wf_path_obj = Path(workflow_path)
+    wf_abs = str(wf_path_obj.resolve())
+    wf_yaml = wf_path_obj.read_text()
+    
+    reusable_workflows = {}
+    scenario_dir = wf_path_obj.parent
+    for p in scenario_dir.rglob("*"):
+        if p.is_file() and p.suffix in (".yml", ".yaml"):
+            rel_str = str(p.relative_to(scenario_dir))
+            if p.resolve() == wf_path_obj.resolve():
+                continue
+            reusable_workflows[rel_str] = p.read_text()
+
     aksh_url = os.environ.get("AKSH_API_URL") or os.environ.get("AKSH_URL", "http://127.0.0.1:9090")
     aksh_url = aksh_url.removesuffix("/runner/server").rstrip("/")
     payload = json.dumps({
@@ -155,6 +166,7 @@ def submit_workflow_aksh(workflow_path: str) -> str | None:
         "event": "workflow_dispatch",
         "repository": "local/test",
         "git_ref": "refs/heads/main",
+        "reusable_workflows": reusable_workflows,
     }).encode()
     log(f"submitting workflow {Path(workflow_path).name} to aksh")
     req = urllib.request.Request(
