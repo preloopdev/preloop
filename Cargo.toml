@@ -2,6 +2,7 @@
 members = [
     "crates/aksh-artifacts",
     "crates/aksh-cache",
+    "crates/aksh-dap",
     "crates/aksh-conformance",
     "crates/aksh-gha-expressions",
     "crates/aksh-gha-parser",
