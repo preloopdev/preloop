@@ -2643,7 +2643,6 @@ async fn save_artifact_v2_registry(shared: &Arc<SharedState>) -> Result<(), std:
     tokio::fs::write(&registry_path, serialized.as_bytes()).await?;
     Ok(())
 }
-
 async fn twirp_artifact_v2_create(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<ArtifactV2CreateRequest>,
