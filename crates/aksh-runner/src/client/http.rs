@@ -337,31 +337,6 @@ impl HttpClient {
         }
         Err(last_err.unwrap_or_else(|| anyhow::anyhow!("PUT {url} failed after 3 retries")))
     }
-    /// PUT bytes with Bearer token authentication (for AzDO log append).
-    pub async fn put_bytes_bearer(
-        &self,
-        url: &str,
-        data: Vec<u8>,
-        content_type: &str,
-        token: &str,
-    ) -> Result<()> {
-        let resp = self
-            .inner
-            .put(url)
-            .header(CONTENT_TYPE, content_type)
-            .header(AUTHORIZATION, format!("Bearer {token}"))
-            .header("x-ms-blob-type", "BlockBlob")
-            .body(data)
-            .send()
-            .await
-            .with_context(|| format!("PUT {url}"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow::Error::new(HttpError::Status { status, body }));
-        }
-        Ok(())
-    }
 
     /// PUT bytes with Bearer token authentication (for AzDO log append).
     pub async fn put_bytes_bearer(
