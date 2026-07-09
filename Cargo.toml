@@ -28,6 +28,8 @@ missing_docs = "warn"
 anyhow = "1.0"
 async-trait = "0.1"
 axum = { version = "0.7", features = ["ws"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rcgen = "0.13"
 base64 = "0.22"
 bytes = "1.6"
 clap = { version = "4.5", features = ["derive", "env"] }
