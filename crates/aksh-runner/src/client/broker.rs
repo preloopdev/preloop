@@ -61,8 +61,15 @@ impl BrokerClient {
             os_label(),
             arch_label(),
         );
+        // Official runner polls every ~3s when busy (for cancellation detection),
+        // and uses a long ~50s poll when idle (waiting for a job).
+        let timeout = if busy {
+            Duration::from_secs(3)
+        } else {
+            Duration::from_secs(50)
+        };
         self.http
-            .get_long_poll(&url, &format!("Bearer {token}"), Duration::from_secs(50))
+            .get_long_poll(&url, &format!("Bearer {token}"), timeout)
             .await
             .context("polling broker message")
     }

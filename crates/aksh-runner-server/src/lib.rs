@@ -1713,7 +1713,6 @@ async fn pump_axum_ws_to_dap(ws: WebSocket, target_port: u16) -> Result<(), anyh
     Ok(())
 }
 
-
 async fn record_live_log_wrapper(
     shared: &Arc<SharedState>,
     job_id: &str,
@@ -5968,7 +5967,6 @@ fn propagate_reusable_outputs(run: &mut RunRecord) {
         run.job_outputs.insert(job_id, outputs);
     }
 }
-
 
 #[cfg(test)]
 mod tests {

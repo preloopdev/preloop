@@ -369,11 +369,24 @@ fn build_task_step(step: &crate::StepPlan, context: &Context) -> TaskStep {
             .unwrap_or_else(|| "success()".to_owned()),
     );
 
+    // Build displayNameToken — TemplateToken literal matching GitHub's wire format.
+    // type=1 is a literal token; lit contains the human-readable step name.
+    let display_name_token = step.name.as_ref().map(|n| {
+        serde_json::json!({
+            "type": 1,
+            "lit": n,
+            "col": 0,
+            "file": 0,
+            "line": 0
+        })
+    });
+
     TaskStep {
         id: step_id,
         name: step.name.clone(),
         context_name: None, // Set by caller after construction
         display_name: step.name.clone(),
+        display_name_token,
         condition,
         script: run,
         reference: step
