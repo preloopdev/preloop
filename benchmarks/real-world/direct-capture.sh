@@ -13,7 +13,7 @@ MITM_PORT="${MITM_PORT:-18081}"
 HOST_WORKSPACE="$PWD"
 VM_WORKSPACE="/workspace"
 RESULTS_ROOT="${RESULTS_ROOT:-$PWD/benchmarks/real-world/results/runner-flow}"
-AKSH_RUNNER="/workspace/target/aarch64-unknown-linux-musl/release/aksh-runner"
+AKSH_RUNNER="/usr/local/bin/aksh-runner"
 OFFICIAL_SRC="/opt/runners/actions-runner"
 MITM_ADDON="/workspace/experiments/mitm/addons/capture.py"
 
@@ -98,7 +98,7 @@ capture_one() {
       RUST_LOG=info '$AKSH_RUNNER' --ca-bundle '$ca_bundle' --runner-root '$root' configure \
         --url 'https://github.com/$GH_REPO' --token '$token' --name '$runner_name' \
         --unattended --replace --ephemeral --labels "self-hosted,linux,x64,$wf_label" 2>&1
-      RUST_LOG=info '$AKSH_RUNNER' --ca-bundle '$ca_bundle' --runner-root '$root' run --once 2>&1
+      RUST_LOG=info '$AKSH_RUNNER' --ca-bundle '$ca_bundle' --runner-root '$root' run 2>&1
     " > "$capture_dir/vm-runner.log" 2>&1 &
   else
     smolvm machine exec --name "$VM" -- bash -lc "
