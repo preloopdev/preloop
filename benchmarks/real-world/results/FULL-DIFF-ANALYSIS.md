@@ -1,13 +1,13 @@
 # Full Flow Diff Analysis — Aksh vs Official Runner
 
-Generated: 2026-07-09 06:30 UTC (updated 2026-07-09 18:00 UTC — fixes applied, recaptures done)
+Generated: 2026-07-09 06:30 UTC (updated 2026-07-09 18:30 UTC — step naming + cumulative update fixes, scenario 53 captured)
 
 ## Summary
 
 | Category | Scenarios | Diffs Found | Nature |
 |---|---|---|---|
 | **Runner-flow (runner-watcher conformance)** | 07-15 (9 scenarios) | ✅ Match (endpoint-sequence only) | Expected: captures used aksh+aksh-server path |
-| **Runner-flow (VM capture — GitHub)** | 15, 19-24, 50-52, 91-93 (14 scenarios) | Mixed | See fixes section |
+| **Runner-flow (VM capture — GitHub)** | 15, 19-24, 50-53, 91-93 (15 scenarios) | Mixed | See fixes section |
 | **Conformance outcomes** | 80-100 (21 scenarios) | 3 mismatched | See conformance section |
 | **Aksh-only captures** | 54, 56, 57, 60 (4 scenarios) | N/A | Flows captured, official pending |
 | **Remaining uncaptured** | 30-36, 53, 55, 58, 61-63, 70-74 (18 scenarios) | N/A | Needs Docker/special infra |
@@ -35,6 +35,14 @@ Generated: 2026-07-09 06:30 UTC (updated 2026-07-09 18:00 UTC — fixes applied,
 ### 4. `connectOptions` query param
 - **File**: `crates/aksh-runner/src/listener/broker_listener.rs` — changed `connectOptions=0` to `connectOptions=1` in `re_resolve_broker_url` to match the official runner's `IncludeServices` flag.
 
+### 5. Step naming — prepend `"Run "` to action display names
+- **File**: `crates/aksh-runner/src/worker/job_extension.rs` — `display_name_for_step` for action steps now returns `"Run {uses}"` instead of just `"{uses}"`
+- Post steps automatically become `"Post Run {uses}"` since they prepend `"Post "` to the step display name
+
+### 6. Cumulative WorkflowStepsUpdate
+- **File**: `crates/aksh-runner/src/worker/server_queue.rs` — `ServerQueue` now tracks cumulative step state in `all_steps` HashMap
+- `take_steps_update_body` returns ALL steps with their latest status (sorted by number), matching the official runner's behavior
+- Previously only sent the steps that changed since the last update
 ---
 
 ## I. Runner-Flow Diffs — Runner-Watcher Conformance Data (Scenarios 07-15)
@@ -55,21 +63,14 @@ Diff tool: `benchmarks/real-world/runner-flow-diff.py`
 | 13 composite-action | 28 | 29 | 1 | 1 | ✅ None |
 | 14 annotations | 22 | 23 | 1 | 1 | ✅ None |
 | 15 oidc-id-token | 24 | 25 | 1 | 1 | ✅ None |
-
----
-
-## II. Runner-Flow Diffs — GitHub Direct Captures (Post-Fix)
-
-Source: `benchmarks/real-world/results/runner-flow/` (captured 2026-07-09)
-Method: `direct-capture.sh` on smolvm VMs with mitmproxy, dispatching workflows against GitHub
-
-### Scenarios 15, 23, 24 — ✅ Near-Perfect Parity
+### Scenarios 15, 23, 24, 53 — ✅ Near-Perfect Parity
 
 | Scenario | Official | Aksh | Diffs | Notes |
 |---|---:|---:|---:|---|
 | 15 oidc-id-token | 38 | 38 | 0 | After `connectOptions` fix |
 | 23 context-fields | 40 | 41 | 1 | Extra Node.js download (expected — no cache on VM) |
 | 24 problem-matcher | 40 | 41 | 1 | Extra Node.js download (expected — no cache on VM) |
+| 53 secret-masking | 55 | 55 | 0 | After step naming + cumulative update fixes |
 
 ### Scenarios 21, 22 — ✅ Protocol Match (MITM Proxy Limitation)
 
@@ -153,8 +154,7 @@ Source: `benchmarks/real-world/results/mitm-diffs/`
 ### Still uncaptured (18 scenarios)
 
 | Group | Scenarios | Status | Notes |
-|---|---|---|---|
-| **Aksh captured, official pending** | 53, 54, 56, 57, 60 | 🔄 | Aksh flows pulled, need official on bench-aksh-2 |
+| **Aksh captured, official pending** | 54, 56, 57, 60 | 🔄 | Aksh flows pulled, need official on bench-aksh-2 |
 | **Attempted, failed** | 55, 58, 61, 62, 63 | ❌ | Workflows cancelled or runners failed |
 | **Need Docker** | 30, 31, 32, 33, 34, 35, 36 | ⬜ | Container jobs need Docker in smolvm |
 | **GitHub-hosted only** | 70, 71, 72, 73, 74 | ⬜ | `runs-on: ubuntu-latest` — can't capture with self-hosted |
@@ -183,6 +183,6 @@ Source: `benchmarks/real-world/results/mitm-diffs/`
 
 ### Build & Test
 
-- 534 tests pass (`cargo test --workspace`)
+- 535 tests pass (`cargo test --workspace`)
 - Musl binary (7.8MB, ELF ARM64 static) built and verified on VM
 - Cross-compiled from macOS using `aarch64-linux-musl-gcc` (installed via `brew install musl-cross`)

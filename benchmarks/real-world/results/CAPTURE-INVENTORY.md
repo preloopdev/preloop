@@ -13,7 +13,8 @@ Two separate data sources:
 | `ingest.sock` auth | `job_runner.rs` | Added `Authorization: Bearer` header + random WebSocket key |
 | Broker busy-poll | `broker.rs`, `broker_listener.rs` | 3s timeout when busy (was 50s); fixed comment |
 | `connectOptions` | `broker_listener.rs` | Changed `0` → `1` to match official runner |
-
+| Step naming | `job_extension.rs` | Prepend `"Run "` to action step display names (e.g. "Run actions/checkout@v4") |
+| Cumulative updates | `server_queue.rs` | Send all steps in each WorkflowStepsUpdate, not just changed ones |
 ## MITM Flow Captures
 43 scenarios — 14 official — 18 aksh — 14 both — 9 matches + 10 diffs — [diffs](runner-flow/) linked where available
 
@@ -45,8 +46,7 @@ Two separate data sources:
 | 36 | ⬜ docker-action | — | — | — |
 | 50 | ✅ signal-sequence | 87 | 10 | ⚠️ MITM proxy limitation (same as 21/22) |
 | 51 | ✅ action-contexts | 49 | 40 | [21 diffs](runner-flow/51/diff.md) |
-| 52 | ✅ expression-features | 49 | 46 | [25 diffs](runner-flow/52/diff.md) |
-| 53 | ✅ secret-masking | 55 | 0 | — aksh failed |
+| 53 | ✅ secret-masking | 55 | 55 | ✅ match (post-fix) |
 | 54 | 🔄 job-annotations | — | 37 | — aksh only |
 | 55 | ❌ proxy-injection | — | 0 | — cancelled |
 | 56 | 🔄 problem-matcher-frompath | — | 43 | — aksh only |
