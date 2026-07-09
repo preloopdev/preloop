@@ -1,16 +1,15 @@
 # Full Flow Diff Analysis — Aksh vs Official Runner
 
-Generated: 2026-07-09 06:30 UTC (updated 2026-07-09 18:30 UTC — step naming + cumulative update fixes, scenario 53 captured)
+Generated: 2026-07-09 06:30 UTC (updated 2026-07-09 18:50 UTC — scenarios 54, 56, 57, 60 captured both sides)
 
 ## Summary
 
 | Category | Scenarios | Diffs Found | Nature |
 |---|---|---|---|
 | **Runner-flow (runner-watcher conformance)** | 07-15 (9 scenarios) | ✅ Match (endpoint-sequence only) | Expected: captures used aksh+aksh-server path |
-| **Runner-flow (VM capture — GitHub)** | 15, 19-24, 50-53, 91-93 (15 scenarios) | Mixed | See fixes section |
+| **Runner-flow (VM capture — GitHub)** | 15, 19-24, 50-58, 60, 91-93 (20 scenarios) | Mixed | See fixes section |
 | **Conformance outcomes** | 80-100 (21 scenarios) | 3 mismatched | See conformance section |
-| **Aksh-only captures** | 54, 56, 57, 60 (4 scenarios) | N/A | Flows captured, official pending |
-| **Remaining uncaptured** | 30-36, 53, 55, 58, 61-63, 70-74 (18 scenarios) | N/A | Needs Docker/special infra |
+| **Remaining uncaptured** | 30-36, 55, 61-63, 70-74 (14 scenarios) | N/A | Needs Docker/special infra |
 
 ---
 
@@ -63,7 +62,7 @@ Diff tool: `benchmarks/real-world/runner-flow-diff.py`
 | 13 composite-action | 28 | 29 | 1 | 1 | ✅ None |
 | 14 annotations | 22 | 23 | 1 | 1 | ✅ None |
 | 15 oidc-id-token | 24 | 25 | 1 | 1 | ✅ None |
-### Scenarios 15, 23, 24, 53 — ✅ Near-Perfect Parity
+### Scenarios 15, 23, 24, 53, 54, 56, 57, 60 — ✅ Near-Perfect Parity
 
 | Scenario | Official | Aksh | Diffs | Notes |
 |---|---:|---:|---:|---|
@@ -71,7 +70,10 @@ Diff tool: `benchmarks/real-world/runner-flow-diff.py`
 | 23 context-fields | 40 | 41 | 1 | Extra Node.js download (expected — no cache on VM) |
 | 24 problem-matcher | 40 | 41 | 1 | Extra Node.js download (expected — no cache on VM) |
 | 53 secret-masking | 55 | 55 | 0 | After step naming + cumulative update fixes |
-
+| 54 job-annotations | 40 | 40 | 0 | `connectOptions` minor (fixed in code, pending VM deploy) |
+| 56 problem-matcher-frompath | 46 | 46 | 0 | |
+| 57 runner-settings | 46 | 46 | 0 | |
+| 60 hashfiles-and-fips | 46 | 46 | 0 | |
 ### Scenarios 21, 22 — ✅ Protocol Match (MITM Proxy Limitation)
 
 | Scenario | Official | Aksh (pre-fix) | Aksh (post-fix) | Notes |
@@ -147,16 +149,14 @@ Source: `benchmarks/real-world/results/mitm-diffs/`
 | ❌ Mismatch | 3 | 82 (failure/cancelled), 91 (failure/success), 92 (failure/success) |
 | ⏳ Incomplete | 10 | 80, 81, 83, 84, 87, 88, 89, 97, 99, 100 |
 
----
-
 ## VI. Remaining Gaps
 
-### Still uncaptured (18 scenarios)
+### Still uncaptured (14 scenarios)
 
 | Group | Scenarios | Status | Notes |
-| **Aksh captured, official pending** | 54, 56, 57, 60 | 🔄 | Aksh flows pulled, need official on bench-aksh-2 |
-| **Attempted, failed** | 55, 58, 61, 62, 63 | ❌ | Workflows cancelled or runners failed |
-| **Need Docker** | 30, 31, 32, 33, 34, 35, 36 | ⬜ | Container jobs need Docker in smolvm |
+|---|---|---|---|
+| **Attempted, failed** | 61, 62, 63 | ❌ | Runners failed |
+| **Need Docker** | 30, 31, 32, 33, 34, 35, 36, 55 | ⬜ | Container jobs need Docker in smolvm |
 | **GitHub-hosted only** | 70, 71, 72, 73, 74 | ⬜ | `runs-on: ubuntu-latest` — can't capture with self-hosted |
 
 ### Known behavioral differences (not protocol bugs)
