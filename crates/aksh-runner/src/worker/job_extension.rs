@@ -445,16 +445,16 @@ pub fn build_step_list(steps: &[serde_json::Value], job_message: &serde_json::Va
         // Wire ID: prefer id (GUID on live GitHub), fall back to context_name
         let id = raw_id.unwrap_or(&context_name).to_string();
 
-        let display_name_override = step
-            .get("displayName")
-            .and_then(template_scalar)
-            .or_else(|| {
-                // Live GitHub payloads use displayNameToken.lit instead of displayName
-                step.get("displayNameToken")
-                    .and_then(|t| t.get("lit"))
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-            });
+        let display_name_override =
+            step.get("displayName")
+                .and_then(template_scalar)
+                .or_else(|| {
+                    // Live GitHub payloads use displayNameToken.lit instead of displayName
+                    step.get("displayNameToken")
+                        .and_then(|t| t.get("lit"))
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                });
 
         let condition = step
             .get("condition")
@@ -850,6 +850,64 @@ fn runner_arch() -> &'static str {
     } else {
         "X64"
     }
+}
+
+/// Kill any child processes still carrying a `RUNNER_TRACKING_ID` env var
+/// matching `tracking_id`. This mirrors the official runner's orphan-process
+/// cleanup in `JobExtension.cs` (`FinalizeJob`).
+pub fn kill_orphan_processes(tracking_id: &str) {
+    let needle = format!("RUNNER_TRACKING_ID={tracking_id}");
+    for pid in orphan_pids_with_tracking_id(&needle) {
+        tracing::warn!(pid, %tracking_id, "killing orphan process");
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
+    }
+}
+
+/// Enumerate PIDs whose environment contains `needle`.
+fn orphan_pids_with_tracking_id(needle: &str) -> Vec<u32> {
+    let mut pids = Vec::new();
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(proc_dir) = std::fs::read_dir("/proc") {
+            for entry in proc_dir.flatten() {
+                let name = entry.file_name();
+                let pid_str = name.to_string_lossy();
+                if let Ok(pid) = pid_str.parse::<u32>() {
+                    let env_path = format!("/proc/{pid}/environ");
+                    if let Ok(data) = std::fs::read(&env_path) {
+                        let has = data.split(|&b| b == 0).any(|kv| kv == needle.as_bytes());
+                        if has {
+                            pids.push(pid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(out) = std::process::Command::new("ps")
+            .args(["-Ewwx", "-o", "pid=,command="])
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            for line in stdout.lines() {
+                if line.contains(needle) {
+                    if let Some(pid) = line
+                        .trim()
+                        .split_whitespace()
+                        .next()
+                        .and_then(|s| s.parse().ok())
+                    {
+                        pids.push(pid);
+                    }
+                }
+            }
+        }
+    }
+    pids
 }
 
 #[cfg(test)]

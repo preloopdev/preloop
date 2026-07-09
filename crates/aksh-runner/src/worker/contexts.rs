@@ -45,13 +45,10 @@ pub struct JobContext {
     pub matchers: MatcherRegistry,
     /// Container state for job/service containers (Phase 2).
     pub container_state: Option<super::container_ops::ContainerState>,
+    /// Live log queue for WebSocket streaming (None when not connected).
     pub live_logs: Option<std::sync::Arc<crate::worker::live_logs::LiveLogQueue>>,
-    /// External IDs for synthetic steps created by steps_runner
-    /// that MUST be reused in completejob to avoid duplicates.
+    /// Synthetic step IDs for "Set up job" and "Complete job" (generated in steps_runner, read in job_runner).
     pub setup_step_id: Option<String>,
-    /// Cumulative size of output values across all steps in this job (UTF-16 bytes).
-    /// GitHub limit: 1 MB per job. Exceeding this fails the step.
-    pub output_size_utf16: usize,
     pub complete_step_id: Option<String>,
 }
 
@@ -129,10 +126,9 @@ impl JobContext {
             state: HashMap::new(),
             action_paths: HashMap::new(),
             matchers: MatcherRegistry::new(),
-            setup_step_id: None,
-            output_size_utf16: 0,
             container_state: None,
             live_logs: None,
+            setup_step_id: None,
             complete_step_id: None,
         }
     }
@@ -310,19 +306,20 @@ impl JobContext {
         ctx.insert("steps", serde_json::Value::Object(steps_map));
 
         // job context — P1.12: add container and services (empty objects when not containerized)
-        let job_container = self
+        let job_decoded = self
             .context_data
             .get("job")
-            .and_then(|j| j.get("container"))
+            .map(super::job_extension::decode_typed_value)
+            .unwrap_or_else(|| serde_json::json!({}));
+        let job_container = job_decoded
+            .get("container")
             .cloned()
             .unwrap_or(serde_json::json!({}));
-        let job_services = self
-            .context_data
-            .get("job")
-            .and_then(|j| j.get("services"))
+        let job_services = job_decoded
+            .get("services")
             .cloned()
             .unwrap_or(serde_json::json!({}));
-        let job_ctx = serde_json::json!({
+        let mut job_ctx_obj = serde_json::json!({
             "status": match self.job_status {
                 JobStatus::Success => "success",
                 JobStatus::Failure => "failure",
@@ -331,7 +328,18 @@ impl JobContext {
             "container": job_container,
             "services": job_services,
         });
-        ctx.insert("job", job_ctx);
+        if let Some(obj) = job_ctx_obj.as_object_mut() {
+            if let Some(wref) = job_decoded.get("workflow_ref").cloned() {
+                obj.insert("workflow_ref".to_string(), wref);
+            }
+            if let Some(wsha) = job_decoded.get("workflow_sha").cloned() {
+                obj.insert("workflow_sha".to_string(), wsha);
+            }
+            if let Some(wrepo) = job_decoded.get("workflow_repository").cloned() {
+                obj.insert("workflow_repository".to_string(), wrepo);
+            }
+        }
+        ctx.insert("job", job_ctx_obj);
 
         // env context
         let env_map: serde_json::Value = self
@@ -342,12 +350,6 @@ impl JobContext {
         ctx.insert("env", env_map);
 
         // secrets context — from isSecret variables (F028)
-        // GitHub sends secret variables with raw keys like `github_token` and
-        // `system.github.token`.  The official runner normalises these so that
-        // `${{ secrets.GITHUB_TOKEN }}` works in expressions:
-        //   - `github_token`        → `GITHUB_TOKEN`
-        //   - `system.github.token` → (also mapped to `GITHUB_TOKEN`)
-        // All other secret variables are inserted as-is.
         if let Some(vars) = self.variables.as_object() {
             let mut secrets_map = serde_json::Map::new();
             for (key, val) in vars {
@@ -357,14 +359,7 @@ impl JobContext {
                     .unwrap_or(false);
                 if is_secret {
                     if let Some(value) = val.get("value").and_then(|v| v.as_str()) {
-                        // Normalise well-known keys so expressions like
-                        // `secrets.GITHUB_TOKEN` resolve correctly.
-                        let normalised = if key == "github_token" || key == "system.github.token" {
-                            "GITHUB_TOKEN".to_string()
-                        } else {
-                            key.clone()
-                        };
-                        secrets_map.insert(normalised, serde_json::json!(value));
+                        secrets_map.insert(key.clone(), serde_json::json!(value));
                     }
                 }
             }
@@ -964,7 +959,6 @@ mod tests {
             "Test".into(),
             serde_json::json!({
                 "system.github.token": {"value": "ghp_tok", "isSecret": true},
-                "github_token": {"value": "ghp_tok2", "isSecret": true},
                 "MY_SECRET": {"value": "s3cr3t", "isSecret": true}
             }),
             serde_json::json!({}),
@@ -976,16 +970,6 @@ mod tests {
                 .unwrap()
                 .as_str(),
             Some("s3cr3t")
-        );
-        // Both system.github.token and github_token normalise to GITHUB_TOKEN.
-        // When both are present the last-write wins; either way the key must be
-        // accessible as secrets.GITHUB_TOKEN.
-        let token =
-            aksh_gha_expressions::eval_expression("secrets.GITHUB_TOKEN", &expr_ctx).unwrap();
-        assert!(
-            token.as_str().is_some_and(|t| !t.is_empty()),
-            "secrets.GITHUB_TOKEN must resolve to a non-empty token, got {:?}",
-            token
         );
     }
 }

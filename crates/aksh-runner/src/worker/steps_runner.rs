@@ -76,6 +76,7 @@ pub async fn run_steps(
 
     // F019: Queue initial "Set up job" step as completed (number 1, official convention)
     let setup_step_id = uuid::Uuid::new_v4().to_string();
+    job.setup_step_id = Some(setup_step_id.clone());
     {
         let mut q = queue.lock().await;
         q.queue_update(StepUpdate {
@@ -88,7 +89,6 @@ pub async fn run_steps(
             conclusion: step_conclusion::SUCCEEDED,
         });
     }
-    job.setup_step_id = Some(setup_step_id.clone());
 
     // Build "Set up job" log content matching official runner
     {
@@ -105,7 +105,10 @@ pub async fn run_steps(
         let ts = crate::worker::job_runner::iso_now();
 
         let mut setup_lines = Vec::new();
-        setup_lines.push(format!("{ts} Current runner version: '{}'", crate::PROTOCOL_COMPAT_VERSION));
+        setup_lines.push(format!(
+            "{ts} Current runner version: '{}'",
+            crate::PROTOCOL_COMPAT_VERSION
+        ));
         setup_lines.push(format!("{ts} Runner name: '{runner_name}'"));
         setup_lines.push(format!("{ts} Runner group name: 'Default'"));
         setup_lines.push(format!("{ts} Machine name: '{machine_name}'"));
@@ -442,16 +445,11 @@ pub async fn run_steps(
         }
 
         // Determine initial outcome and conclusion from step execution.
-        // If cancel was requested AND we're NOT already in cancel-unwind mode,
-        // treat any error as Cancelled — the process may have been killed by signal
-        // before our "process cancelled" error path could fire (race between
-        // try_wait() and the cancel channel watcher).
-        let cancel_was_active = !cancelled && *cancel_rx.borrow();
         let (mut outcome_str, mut conclusion_str) = match &outcome {
             Ok(()) => ("Success".to_string(), "Success".to_string()),
             Err(e) => {
                 let msg = e.to_string();
-                if msg.contains("cancelled") || cancel_was_active {
+                if msg.contains("cancelled") {
                     ("Cancelled".to_string(), "Cancelled".to_string())
                 } else {
                     step_ctx.log(&format!("##[error]{e:#}"));
@@ -667,11 +665,13 @@ pub async fn run_steps(
     let ts = crate::worker::job_runner::iso_now();
     // Step number: step_offset + user_steps + extra_steps (stop containers) + 1
     let complete_step_number = step_offset + steps.len() as u32 + extra_steps;
-    // Complete job always reports succeeded regardless of step outcomes —
-    // the official runner follows this convention. The job-level conclusion
-    // (cancelled/failure) is communicated via the completejob payload, not here.
-    let final_conclusion = step_conclusion::SUCCEEDED;
+    let final_conclusion = if cancelled || any_failed {
+        step_conclusion::FAILED
+    } else {
+        step_conclusion::SUCCEEDED
+    };
     let complete_step_id = uuid::Uuid::new_v4().to_string();
+    job.complete_step_id = Some(complete_step_id.clone());
     {
         let mut q = queue.lock().await;
         q.queue_update(StepUpdate {
@@ -684,7 +684,6 @@ pub async fn run_steps(
             conclusion: final_conclusion,
         });
     }
-    job.complete_step_id = Some(complete_step_id.clone());
 
     // Upload "Complete job" log matching official runner
     {
@@ -700,7 +699,7 @@ pub async fn run_steps(
     }
 
     Ok(if cancelled {
-        "Canceled".to_string()
+        "Cancelled".to_string()
     } else if any_failed {
         "Failed".to_string()
     } else {
@@ -1786,7 +1785,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(result, "Canceled");
+        assert_eq!(result, "Cancelled");
         assert_eq!(job.job_status, JobStatus::Cancelled);
         // slow step was cancelled
         assert_eq!(job.steps.get("slow").unwrap().conclusion, "Cancelled");

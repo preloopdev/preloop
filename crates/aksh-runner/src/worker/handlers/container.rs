@@ -69,7 +69,6 @@ pub async fn run_docker_action_from_manifest(
             false,
         )
         .await?;
-        ctx.flush_line_buffer();
         if build_result.exit_code != 0 {
             anyhow::bail!(
                 "docker build failed with exit code {}",
@@ -122,7 +121,6 @@ async fn run_docker_image(
         false,
     )
     .await?;
-    ctx.flush_line_buffer();
 
     if result.exit_code != 0 {
         anyhow::bail!("docker action exited with code {}", result.exit_code);
