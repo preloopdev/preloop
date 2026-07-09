@@ -1,8 +1,0 @@
-2026-07-08T02:22:10.059Z Current runner version: '2.335.1'
-2026-07-08T02:22:10.059Z Runner name: 'flow-aksh-92-unicode-special-chars-1-1783477308'
-2026-07-08T02:22:10.059Z Runner group name: 'Default'
-2026-07-08T02:22:10.059Z Machine name: 'container'
-2026-07-08T02:22:10.059Z Secret source: Actions
-2026-07-08T02:22:10.059Z Prepare workflow directory
-2026-07-08T02:22:10.059Z Prepare all required actions
-2026-07-08T02:22:10.059Z Complete job name: test-unicode-special-chars
