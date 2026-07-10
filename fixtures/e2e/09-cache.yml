@@ -1,0 +1,16 @@
+name: cache-test
+on: push
+jobs:
+  cache-save:
+    runs-on: self-hosted
+    steps:
+      - name: Create cache data
+        run: |
+          mkdir -p /tmp/cache-test-data
+          echo "cached-content-$(date +%s)" > /tmp/cache-test-data/data.txt
+          cat /tmp/cache-test-data/data.txt
+      - name: Save cache
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/cache-test-data
+          key: test-cache-key-${{ github.run_id }}

@@ -1,0 +1,19 @@
+name: step-failure-test
+on: push
+jobs:
+  failure-test:
+    runs-on: self-hosted
+    steps:
+      - name: Passing step
+        run: echo "This passes"
+      - name: Failing step
+        run: exit 1
+        continue-on-error: true
+      - name: After continue-on-error
+        run: echo "This should still run"
+      - name: Always runs
+        if: always()
+        run: echo "Always step ran"
+      - name: Only on failure
+        if: failure()
+        run: echo "This should NOT run (job not failed due to continue-on-error)"
