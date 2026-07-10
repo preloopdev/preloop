@@ -437,11 +437,18 @@ fn build_task_step(step: &crate::StepPlan, context: &Context) -> TaskStep {
         reference: step
             .uses
             .as_ref()
-            .map(|uses| aksh_gha_protocol::azdo::TaskReference {
-                id: None,
-                name: Some(uses.clone()),
-                version: None,
-                reference_type: None,
+            .map(|uses| {
+                let (name, version) = if let Some((n, v)) = uses.split_once('@') {
+                    (n.to_owned(), Some(v.to_owned()))
+                } else {
+                    (uses.clone(), None)
+                };
+                aksh_gha_protocol::azdo::TaskReference {
+                    id: None,
+                    name: Some(name),
+                    version,
+                    reference_type: None,
+                }
             }),
         inputs: with,
         env,
