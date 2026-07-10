@@ -385,7 +385,7 @@ fn build_task_step(step: &crate::StepPlan, context: &Context) -> TaskStep {
     // `with` inputs are still resolved because action handlers need resolved values
     // to locate and configure the action before step execution.
     let env = step.env.clone();
-    let with: BTreeMap<String, String> = step
+    let mut with: BTreeMap<String, String> = step
         .with
         .iter()
         .map(|(k, v)| {
@@ -397,6 +397,14 @@ fn build_task_step(step: &crate::StepPlan, context: &Context) -> TaskStep {
 
     // Run script: pass as-is; the runner evaluates ${{ }} at step execution time.
     let run = step.run.clone();
+
+    // For script steps, include the shell as an input so the runner's
+    // ScriptHandler picks the correct invocation (e.g. bash --noprofile
+    // --norc -e -o pipefail vs sh -e). GitHub's server always sends this.
+    if run.is_some() {
+        let shell = step.shell.clone().unwrap_or_else(|| "bash".to_owned());
+        with.insert("shell".to_owned(), shell);
+    }
 
     // The runner always evaluates a step condition. Omitted conditions are
     // the same as GitHub's default `success()`.
