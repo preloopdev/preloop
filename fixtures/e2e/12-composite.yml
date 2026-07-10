@@ -1,0 +1,19 @@
+name: composite-test
+on: push
+jobs:
+  composite:
+    runs-on: self-hosted
+    steps:
+      - name: Use local composite action
+        id: greet
+        uses: ./fixtures/e2e/actions/greet
+        with:
+          name: aksh
+      - name: Check output
+        run: |
+          echo "Greeting: ${{ steps.greet.outputs.greeting }}"
+          if [ "${{ steps.greet.outputs.greeting }}" = "Hello, aksh!" ]; then
+            echo "Composite action output works!"
+          else
+            echo "Got: '${{ steps.greet.outputs.greeting }}'"
+          fi
