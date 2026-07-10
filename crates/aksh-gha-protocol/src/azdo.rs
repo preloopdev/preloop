@@ -421,8 +421,7 @@ impl Serialize for TaskStep {
             + usize::from(self.working_directory.is_some())
             + usize::from(self.timeout_in_minutes.is_some());
         let mut map = serializer.serialize_map(Some(field_count))?;
-        let step_type = if self.script.is_some() { "script" } else { "action" };
-        map.serialize_entry("type", step_type)?;
+        map.serialize_entry("type", "action")?;
         map.serialize_entry("reference", &SerializedActionReference { step: self })?;
         map.serialize_entry("environment", &TemplateStringMap(&self.env))?;
         map.serialize_entry("inputs", &TemplateStringMap(&inputs))?;
@@ -1333,7 +1332,7 @@ mod tests {
 
         let json = serde_json::to_value(&step).unwrap();
 
-        assert_eq!(json["type"], "script");
+        assert_eq!(json["type"], "action");
         assert_eq!(json["reference"]["type"], "script");
         assert_eq!(json["environment"]["type"], 2);
         assert_eq!(json["inputs"]["type"], 2);
