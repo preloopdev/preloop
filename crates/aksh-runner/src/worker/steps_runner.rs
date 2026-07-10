@@ -1448,6 +1448,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_steps_multiline_outputs_are_visible_to_later_steps() {
+        let dir = TempDir::new().unwrap();
+        let mut job = JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+        let (_tx, cancel_rx) = watch::channel(false);
+        let mut produce = test_step("produce", None);
+        produce.step_type = StepType::Script {
+            script: "echo 'json_data<<EOF' >> \"$GITHUB_OUTPUT\"\necho '{\"key\": \"value\"}' >> \"$GITHUB_OUTPUT\"\necho 'EOF' >> \"$GITHUB_OUTPUT\"".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+        let mut consume = test_step("consume", None);
+        consume.step_type = StepType::Script {
+            script: "OUTPUT='${{ steps.produce.outputs.json_data }}'\ntest \"$OUTPUT\" = '{\"key\": \"value\"}'".to_string(),
+            shell: Some("bash".to_string()),
+            working_directory: None,
+        };
+        let result = run_steps(
+            &[produce, consume],
+            &mut job,
+            dir.path().to_str().unwrap(),
+            cancel_rx,
+            queue,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, "Succeeded");
+        assert_eq!(
+            job.steps
+                .get("produce")
+                .and_then(|step| step.outputs.get("json_data"))
+                .map(String::as_str),
+            Some("{\"key\": \"value\"}")
+        );
+    }
+
+    #[tokio::test]
     async fn run_steps_file_command_parse_error_fails_successful_step() {
         let dir = TempDir::new().unwrap();
         let mut job = JobContext::new(
