@@ -77,11 +77,21 @@ for wlog in worker_logs:
     chunks = text.split("Processing step: DisplayName='")[1:]
     for chunk in chunks:
         name, _, body = chunk.partition("'")
+        # Limit search to this step's section — stop before next step or job finalization
+        step_body = body.split("Processing step: DisplayName=", 1)[0]
+        for boundary in ["Finalize job", "JobRunner] Job result", "complete_job"]:
+            step_body = step_body.split(boundary, 1)[0]
         results = re.findall(
             r'"result": "(Succeeded|Failed|Skipped|succeeded|failed|skipped)"',
-            body.split("Processing step: DisplayName=", 1)[0]
+            step_body,
         )
-        aksh_steps_all.append((name, results[-1].lower() if results else "unknown"))
+        # Use first result (the step's own result), not last (could be telemetry)
+        if results:
+            aksh_steps_all.append((name, results[0].lower()))
+        elif "Skipping step" in step_body or "condition evaluation" in step_body:
+            aksh_steps_all.append((name, "skipped"))
+        else:
+            aksh_steps_all.append((name, "unknown"))
 
 step_order_match = True
 step_results_match = True
