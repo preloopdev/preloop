@@ -143,9 +143,9 @@ service-location richness, and lower-priority/currently unexercised surfaces.
 | Results-service Twirp logs/update | 5 Twirp routes registered outside `require_bearer` (runner job token uses different signing key); handlers return real data with signed blob URLs | ✅ good |
 | Timeline / logs / web-console feed | AzDO timeline/log routes exist; current service path now includes Twirp results surfaces, but the response payloads are not yet faithful | ⚠️ partial |
 | Job/step completion events + annotations | AgentRequest PATCH and broker complete paths exist; annotation/body fidelity remains partial | ⚠️ partial |
-| Action download info | server endpoint returns empty stub; runner-side `actions_download.rs` has full batch `runnerresolve/actions` + bearer token for codeload — action downloads work end-to-end via GitHub API fallback | ⚠️ server stub, runner fallback works |
+| Action download info | server endpoint returns empty stub; runner-side `actions_download.rs` has full batch `runnerresolve/actions` + bearer token for codeload — common remote actions work end-to-end; subpath keys are normalized before resolution | ⚠️ server stub, runner path good |
 | Cache v1 / Artifact v1 shapes | in-memory stubs | ⚠️ partial |
-| Cache v2 / Artifact v2 / blob/Twirp | absent | ❌ missing |
+| Cache v2 / Artifact v2 / blob/Twirp | local server implementation remains absent; runner-side `actions/cache@v4` v2 save/restore against GitHub is verified with separate ephemeral runners | ⚠️ server missing, runner verified |
 | Background steps | `TimelineRecord` DTO now accepts background-step fields; control-flow behavior remains unexercised by the idle replay | ⚠️ partial |
 | DAP debugger integration | absent; non-blocking unless debugging requested | ❌ missing |
 | Runner config refresh | not exercised in this replay; support remains incomplete/untested | ⚠️ unknown/partial |
