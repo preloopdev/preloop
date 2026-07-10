@@ -96,6 +96,8 @@ for i in $(seq 1 "$RUNNER_COUNT"); do
       cd '$INSTALL'
       RUNNER_ALLOW_RUNASROOT=1 ./config.sh --unattended --url 'https://github.com/$GH_REPO' --token '$TOKEN' \
         --name '$NAME' --labels 'self-hosted,linux,x64,$WF_LABEL' --work '$ROOT/_work' --replace --ephemeral 2>&1
+      rm -rf '$ROOT/_work'
+      mkdir -p '$ROOT/_work'
       timeout 1200 ./run.sh 2>&1
     " >> "$CAPTURE_DIR/vm-runner.log" 2>&1 &
   fi
