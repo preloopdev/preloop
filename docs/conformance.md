@@ -2,23 +2,25 @@
 
 aksh treats compatibility as a test artifact, not an assertion in prose.
 
-## Current State (2026-06-26)
+## Current State (2026-07-10)
 
-The official `actions/runner` v2.322.0 completes the full lifecycle against aksh:
-configure → session → message → execute → report completion. 62 workspace tests pass.
+The official `actions/runner` v2.335.1 completes the broker lifecycle against aksh:
+configure → session → message → acquire → execute → report completion. The current
+workspace runner test suite passes.
 
-**Verified with real runner:**
-- Registration (GHES-style org URL, `RemoteAuth` header)
-- ConnectionData (18 service GUIDs, org-prefix routing)
-- Session creation (AES key exchange)
-- Message delivery (encrypted `TaskAgentMessage`)
-- Job execution (runner runs steps, reports completion)
-- Ephemeral mode (cleanup after job)
+**Verified with real GitHub service (scenario 61):**
+- Three independent GitHub-ephemeral runners receive the three jobs.
+- `actions/cache@v4` v2 save/restore works across runner instances.
+- Cache `CreateCacheEntry`, Azure Blob upload/download, `FinalizeCacheEntryUpload`,
+  and `GetCacheEntryDownloadURL` all complete successfully.
+- Runner-side ephemeral cleanup and subpath action-resolution fixes are committed in
+  `ab77a23` and `32ee008` respectively.
 
-**Not yet verified:**
-- Timeline/log endpoint fidelity (worker reports "Failed")
-- Cache/artifact v2 protocols
-- Action download (stub endpoint only)
+**Still server-side / intentionally separate:**
+- aksh's local server CacheService/ArtifactService v2 blob endpoints remain a separate
+  implementation gap; the scenario above exercises the Rust runner against GitHub's
+  service, not the local control plane.
+- Timeline/log payload fidelity remains partial.
 
 ## Fixture Expansion
 
