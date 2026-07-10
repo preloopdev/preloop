@@ -1,0 +1,25 @@
+name: needs-outputs-test
+on: push
+jobs:
+  producer:
+    runs-on: self-hosted
+    outputs:
+      greeting: ${{ steps.set-output.outputs.greeting }}
+    steps:
+      - name: Set output
+        id: set-output
+        run: echo "greeting=Hello from producer" >> "$GITHUB_OUTPUT"
+
+  consumer:
+    runs-on: self-hosted
+    needs: producer
+    steps:
+      - name: Read output
+        run: |
+          echo "Producer said: ${{ needs.producer.outputs.greeting }}"
+          if [ "${{ needs.producer.outputs.greeting }}" = "Hello from producer" ]; then
+            echo "Output propagation works!"
+          else
+            echo "ERROR: Expected 'Hello from producer' but got '${{ needs.producer.outputs.greeting }}'"
+            exit 1
+          fi

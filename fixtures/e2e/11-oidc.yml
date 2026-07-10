@@ -1,0 +1,22 @@
+name: oidc-test
+on: push
+permissions:
+  id-token: write
+jobs:
+  oidc:
+    runs-on: self-hosted
+    permissions:
+      id-token: write
+    steps:
+      - name: Get OIDC token
+        id: oidc
+        run: |
+          # The ACTIONS_ID_TOKEN_REQUEST_URL and ACTIONS_ID_TOKEN_REQUEST_TOKEN
+          # should be set if id-token: write is granted
+          echo "Request URL available: ${ACTIONS_ID_TOKEN_REQUEST_URL:+yes}"
+          echo "Request token available: ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:+yes}"
+          if [ -n "$ACTIONS_ID_TOKEN_REQUEST_URL" ]; then
+            echo "OIDC endpoint configured"
+          else
+            echo "OIDC endpoint not configured - ok for local testing"
+          fi
