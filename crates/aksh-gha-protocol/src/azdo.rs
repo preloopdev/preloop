@@ -297,14 +297,15 @@ pub struct AgentJobRequestMessage {
     )]
     pub job_service_containers: Option<serde_json::Value>,
 
-    /// Job-level output declarations — output name → value expression.
-    /// The runner evaluates these after step execution.
+    /// Job-level output declarations as a TemplateToken map.
+    /// GitHub sends `{type:2,map:[{Key:{...},Value:{...}}]}` and the runner
+    /// evaluates the expression tokens after step execution.
     #[serde(
         rename = "jobOutputs",
         default,
         skip_serializing_if = "Option::is_none"
     )]
-    pub job_outputs: Option<BTreeMap<String, String>>,
+    pub job_outputs: Option<serde_json::Value>,
 
     /// Whether the debugger is enabled for this job.
     /// Mirrors `AgentJobRequestMessage.EnableDebugger` in `actions/runner` v2.335.0+.
@@ -523,9 +524,18 @@ fn extract_template_map(value: Option<&serde_json::Value>) -> Option<BTreeMap<St
     if let Some(pairs) = value.get("map").and_then(|v| v.as_array()) {
         let mut map = BTreeMap::new();
         for pair in pairs {
-            let key = pair.get("key").and_then(|v| v.as_str())?;
-            let val = pair.get("value").and_then(|v| v.as_str()).unwrap_or("");
-            map.insert(key.to_owned(), val.to_owned());
+            let key = pair
+                .get("key")
+                .and_then(|v| v.as_str().map(str::to_owned).or_else(|| v.get("lit").and_then(|l| l.as_str()).map(str::to_owned)))?;
+            let val = pair
+                .get("value")
+                .and_then(|v| {
+                    v.as_str()
+                        .map(str::to_owned)
+                        .or_else(|| v.get("lit").and_then(|l| l.as_str()).map(str::to_owned))
+                })
+                .unwrap_or_default();
+            map.insert(key, val);
         }
         return Some(map);
     }
@@ -607,10 +617,51 @@ impl Serialize for TemplateStringMap<'_> {
     }
 }
 
-#[derive(Serialize)]
 struct TemplateStringMapPair<'a> {
     key: &'a str,
     value: &'a str,
+}
+
+impl Serialize for TemplateStringMapPair<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("key", &self.key)?;
+        map.serialize_entry("value", &template_string_token(self.value))?;
+        map.end()
+    }
+}
+
+fn template_string_token(value: &str) -> serde_json::Value {
+    let Some(first) = value.find("${{") else {
+        return serde_json::json!({"type": 0, "lit": value});
+    };
+    let mut literal = String::new();
+    let mut expressions = Vec::new();
+    let mut rest = value;
+    loop {
+        let Some(start) = rest.find("${{") else {
+            literal.push_str(rest);
+            break;
+        };
+        literal.push_str(&rest[..start]);
+        let after = &rest[start + 3..];
+        let Some(end) = after.find("}}") else {
+            return serde_json::json!({"type": 0, "lit": value});
+        };
+        expressions.push(after[..end].trim().to_owned());
+        literal.push_str(&format!("{{{}}}", expressions.len() - 1));
+        rest = &after[end + 2..];
+    }
+    if first == 0 && literal == "{0}" && expressions.len() == 1 {
+        return serde_json::json!({"type": 3, "expr": expressions[0]});
+    }
+    let escaped = literal.replace('\'', "''");
+    let expr = format!("format('{}', {})", escaped, expressions.join(", "));
+    serde_json::json!({"type": 3, "expr": expr})
 }
 
 /// Reference to an action or task.
@@ -1254,7 +1305,39 @@ mod tests {
         assert_eq!(json["environment"]["type"], 2);
         assert_eq!(json["inputs"]["type"], 2);
         assert_eq!(json["inputs"]["map"][0]["key"], "script");
-        assert_eq!(json["inputs"]["map"][0]["value"], "echo hi");
+        assert_eq!(json["inputs"]["map"][0]["value"]["type"], 0);
+        assert_eq!(json["inputs"]["map"][0]["value"]["lit"], "echo hi");
+    }
+
+    #[test]
+    fn task_step_serializes_expression_as_format_token() {
+        let mut inputs = BTreeMap::new();
+        inputs.insert(
+            "script".to_owned(),
+            "OUTPUT='${{ steps.make.outputs.value }}'".to_owned(),
+        );
+        let step = TaskStep {
+            id: uuid::Uuid::nil(),
+            name: None,
+            context_name: None,
+            display_name: None,
+            display_name_token: None,
+            condition: None,
+            script: None,
+            reference: None,
+            inputs,
+            env: BTreeMap::new(),
+            continue_on_error: None,
+            working_directory: None,
+            timeout_in_minutes: None,
+        };
+        let value = serde_json::to_value(step).unwrap();
+        let token = &value["inputs"]["map"][0]["value"];
+        assert_eq!(token["type"], 3);
+        assert_eq!(
+            token["expr"],
+            "format('OUTPUT=''{0}''', steps.make.outputs.value)"
+        );
     }
 
     #[test]

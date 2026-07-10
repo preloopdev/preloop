@@ -1936,4 +1936,24 @@ jobs:
             assert_eq!(coerce_value(&expr, InputType::String, "s").unwrap(), expr);
         }
     }
+    #[test]
+    fn preserves_job_output_expressions() {
+        let workflow = parse_workflow(
+            r#"jobs:
+  producer:
+    runs-on: self-hosted
+    outputs:
+      value: ${{ steps.gen.outputs.value }}
+    steps:
+      - id: gen
+        run: echo value=42 >> "$GITHUB_OUTPUT"
+"#,
+        )
+        .unwrap();
+        let plans = expand_jobs(&workflow).unwrap();
+        assert_eq!(
+            plans[0].job_outputs.get("value").map(String::as_str),
+            Some("${{ steps.gen.outputs.value }}")
+        );
+    }
 }
