@@ -649,7 +649,8 @@ fn template_string_token(value: &str) -> serde_json::Value {
         };
         literal.push_str(&rest[..start]);
         let after = &rest[start + 3..];
-        let Some(end) = after.find("}}") else {
+        // Find the closing }} that isn't inside a string literal.
+        let Some(end) = find_expression_end(after) else {
             return serde_json::json!({"type": 0, "lit": value});
         };
         expressions.push(after[..end].trim().to_owned());
@@ -662,6 +663,37 @@ fn template_string_token(value: &str) -> serde_json::Value {
     let escaped = literal.replace('\'', "''");
     let expr = format!("format('{}', {})", escaped, expressions.join(", "));
     serde_json::json!({"type": 3, "expr": expr})
+}
+
+/// Find the position of `}}` that closes a `${{ ... }}` expression,
+/// skipping over `}}` that appears inside string literals (single-quoted).
+fn find_expression_end(s: &str) -> Option<usize> {
+    let mut in_string = false;
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if in_string {
+            if bytes[i] == b'\'' {
+                // Check for escaped quote ''
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 2;
+                } else {
+                    in_string = false;
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+        } else if bytes[i] == b'\'' {
+            in_string = true;
+            i += 1;
+        } else if i + 1 < bytes.len() && bytes[i] == b'}' && bytes[i + 1] == b'}' {
+            return Some(i);
+        } else {
+            i += 1;
+        }
+    }
+    None
 }
 
 /// Reference to an action or task.
@@ -1338,6 +1370,34 @@ mod tests {
             token["expr"],
             "format('OUTPUT=''{0}''', steps.make.outputs.value)"
         );
+    }
+
+    #[test]
+    fn template_string_token_handles_braces_inside_string_literals() {
+        // Expression containing }} inside a single-quoted JSON string
+        let token = template_string_token(
+            r#"${{ fromJSON('{"a":{"b":{"c":"deep"}}}')['a']['b']['c'] }}"#,
+        );
+        assert_eq!(token["type"], 3);
+        let expr = token["expr"].as_str().unwrap();
+        // Should preserve the full expression, not truncate at the first }}
+        assert!(
+            expr.contains("fromJSON") && expr.contains("deep"),
+            "expression was truncated: {expr}"
+        );
+    }
+
+    #[test]
+    fn find_expression_end_skips_braces_in_strings() {
+        // }} inside a string should be skipped
+        assert_eq!(
+            find_expression_end(" fromJSON('{}}')'a' }}"),
+            Some(20)
+        );
+        // Plain expression
+        assert_eq!(find_expression_end(" x }}"), Some(3));
+        // No closing
+        assert_eq!(find_expression_end(" x "), None);
     }
 
     #[test]
