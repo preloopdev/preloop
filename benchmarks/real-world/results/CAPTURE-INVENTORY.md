@@ -57,7 +57,7 @@ Two separate data sources:
 | 58 | ✅ auth-and-diag | 43 | 44 | ✅ match (extra diagnostic log upload — aksh more thorough) |
 | 60 | ✅ hashfiles-and-fips | 46 | 46 | ✅ match |
 | 61 | ✅ runner-side cache round-trip verified | 144 | 134 | [diffs](runner-flow/61-cache-stress/diff-ephemeral.md) — three independent ephemeral runners; `actions/cache@v4` save/restore succeeded. Follow-up fixes `ab77a23` (ephemeral DELETE/exit) and `32ee008` (subpath action key) address the observed lifecycle/resolution gaps. |
-| 62 | 🟡 artifact round-trip verified; lifecycle recapture pending | 212 | 195 | [successful comparison](runner-flow/62-artifact-stress/diff-success.md) — official now succeeds after forcing a clean runner work directory; aksh artifact upload/download also succeeds. The comparison uses the prior aksh capture, whose VM binary predates the ephemeral-session DELETE fix. |
+| 62 | ✅ artifact round-trip and ephemeral lifecycle verified | 212 | 196 | [comparison](runner-flow/62-artifact-stress/diff-success.md) — official and aksh both completed all artifact jobs successfully; `ArtifactService` and Azure Blob upload/download paths returned success. Fixed aksh capture confirmed `DELETE /session?sessionId={guid}` → 204, matching official lifecycle. |
 | 63 | 🟡 mega-runner-stress | 164 | 113 | [diffs](runner-flow/63-mega-runner-stress/diff.md) — both failed (container/Docker/matrix) |
 | 71 | ⬜ composite-advanced | — | — | — |
 | 72 | ⬜ label-matching | — | — | — |
