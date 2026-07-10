@@ -724,6 +724,14 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             "/twirp/results.services.receiver.Receiver/CreateStepSummaryMetadata",
             post(twirp_create_step_summary_metadata),
         )
+        .route(
+            "/twirp/results.services.receiver.Receiver/CreateStepLogsMetadata",
+            post(twirp_create_step_logs_metadata),
+        )
+        .route(
+            "/twirp/results.services.receiver.Receiver/CreateJobLogsMetadata",
+            post(twirp_create_job_logs_metadata),
+        )
         // Cache v2 Twirp (CacheService) — used by actions/cache@v4 when ACTIONS_CACHE_SERVICE_V2=true.
         // Auth: bearer from job runtime token (verified by having correct scp in the JWT).
         // These routes are outside require_bearer because the job JWT uses its own signing context.
@@ -1909,6 +1917,8 @@ struct BrokerRenewJobRequest {
     job_id: uuid::Uuid,
     plan_id: String,
     conclusion: Option<String>,
+    #[serde(default)]
+    outputs: BTreeMap<String, serde_json::Value>,
 }
 
 fn execution_status_from_runner_result(result: &str) -> Option<ExecutionStatus> {
@@ -2223,14 +2233,13 @@ async fn next_message_broker_ref_root(
 }
 
 async fn broker_acknowledge_root(
-    State(shared): State<Arc<SharedState>>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
+    State(_shared): State<Arc<SharedState>>,
+    Query(_params): Query<std::collections::HashMap<String, String>>,
 ) -> StatusCode {
-    let session_id = params.get("sessionId").map(String::as_str).unwrap_or("");
-    if !session_id.is_empty() {
-        let mut inner = shared.state.inner.lock().await;
-        inner.session_active_requests.remove(session_id);
-    }
+    // Acknowledge receipt of the message. Do NOT clear session_active_requests
+    // here — the runner is still working on the job. The session's active
+    // request is cleared when completejob sets the result and the next poll
+    // sees result.is_some() at line 2190.
     StatusCode::OK
 }
 
@@ -2324,31 +2333,68 @@ async fn broker_complete_job(
         .as_deref()
         .and_then(execution_status_from_runner_result)
         .unwrap_or(ExecutionStatus::Success);
+
+    // Extract outputs from the completejob body.
+    // Runner sends: { "outputName": {"value": "theValue"} }
+    // Server stores: { "outputName": "theValue" }
+    let mut outputs = aksh_gha_protocol::OutputMap::new();
+    for (key, val) in &request.outputs {
+        if let Some(v) = val.get("value").and_then(|v| v.as_str()) {
+            outputs.insert(key.clone(), serde_json::Value::String(v.to_owned()));
+        } else if let Some(v) = val.get("value") {
+            outputs.insert(key.clone(), v.clone());
+        } else if let Some(s) = val.as_str() {
+            outputs.insert(key.clone(), serde_json::Value::String(s.to_owned()));
+        } else {
+            outputs.insert(key.clone(), val.clone());
+        }
+    }
+
     let completion = {
         let mut inner = shared.state.inner.lock().await;
-        let request_id = inner
+        let request_id = match inner
             .agent_job_requests
             .get(&request.job_id)
             .copied()
             .or_else(|| inner.plan_requests.get(&request.plan_id).copied())
             .or_else(|| sole_active_unfinished_request(&inner))
-            .ok_or_else(|| ApiError::not_found("broker complete request not found"))?;
+        {
+            Some(id) => id,
+            None => {
+                warn!(
+                    job_id = %request.job_id,
+                    plan_id = %request.plan_id,
+                    "broker complete: could not find request_id"
+                );
+                return Ok(StatusCode::NO_CONTENT);
+            }
+        };
+        debug!(request_id, job_id = %request.job_id, "broker complete: found request");
         if let Some(record) = inner.job_requests.get_mut(&request_id) {
             record.result = Some(status);
             record.locked_until = agent_request_locked_until();
         }
-        inner
-            .inflight_requests
-            .remove(&request_id)
-            .or_else(|| {
-                job_request_tuple(&inner, request_id).map(|(_, run_id, job_id)| (run_id, job_id))
-            })
-            .map(|(run_id, job_id)| JobCompletion {
-                run_id,
-                job_id,
-                status,
-                outputs: Default::default(),
-            })
+        let run_job = inner.inflight_requests.remove(&request_id).or_else(|| {
+            job_request_tuple(&inner, request_id).map(|(_, run_id, job_id)| (run_id, job_id))
+        });
+        match run_job {
+            Some((run_id, job_id)) => {
+                info!(%run_id, %job_id, "broker complete: completing job");
+                Some(JobCompletion {
+                    run_id,
+                    job_id,
+                    status,
+                    outputs,
+                })
+            }
+            None => {
+                warn!(
+                    request_id,
+                    "broker complete: no inflight_requests entry found"
+                );
+                None
+            }
+        }
     };
     if let Some(completion) = completion {
         let _ = complete_job_inner(shared, completion).await?;
@@ -2432,6 +2478,39 @@ struct StepSummaryMetadataRequest {
 
 async fn twirp_create_step_summary_metadata(
     Json(_request): Json<StepSummaryMetadataRequest>,
+) -> Json<serde_json::Value> {
+    Json(json!({"ok": true}))
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct StepLogsMetadataRequest {
+    step_backend_id: Option<String>,
+    workflow_job_run_backend_id: Option<String>,
+    workflow_run_backend_id: Option<String>,
+    upload_url: Option<String>,
+    line_count: Option<u64>,
+}
+
+/// POST CreateStepLogsMetadata — runner calls this after uploading step logs.
+async fn twirp_create_step_logs_metadata(
+    Json(_request): Json<StepLogsMetadataRequest>,
+) -> Json<serde_json::Value> {
+    Json(json!({"ok": true}))
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct JobLogsMetadataRequest {
+    workflow_job_run_backend_id: Option<String>,
+    workflow_run_backend_id: Option<String>,
+    upload_url: Option<String>,
+    line_count: Option<u64>,
+}
+
+/// POST CreateJobLogsMetadata — runner calls this after uploading job logs.
+async fn twirp_create_job_logs_metadata(
+    Json(_request): Json<JobLogsMetadataRequest>,
 ) -> Json<serde_json::Value> {
     Json(json!({"ok": true}))
 }

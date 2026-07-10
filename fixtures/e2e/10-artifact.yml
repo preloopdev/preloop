@@ -1,0 +1,16 @@
+name: artifact-test
+on: push
+jobs:
+  upload:
+    runs-on: self-hosted
+    steps:
+      - name: Create artifact data
+        run: |
+          mkdir -p /tmp/artifact-test
+          echo "artifact-content-$(date +%s)" > /tmp/artifact-test/result.txt
+          echo "second line" >> /tmp/artifact-test/result.txt
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: /tmp/artifact-test/result.txt
