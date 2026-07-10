@@ -7734,10 +7734,17 @@ jobs:
                     || step["inputs"]["script"]["expr"].as_str() == Some("echo current")
                     || step["inputs"]["map"].as_array().is_some_and(|entries| {
                         entries.iter().any(|entry| {
-                            (entry["key"].as_str() == Some("script")
-                                || entry["key"]["lit"].as_str() == Some("script"))
-                                && (entry["value"].as_str() == Some("echo current")
-                                    || entry["value"]["lit"].as_str() == Some("echo current"))
+                            let key = entry.get("Key").or(entry.get("key"));
+                            let val = entry.get("Value").or(entry.get("value"));
+                            let key_match = key.is_some_and(|k| {
+                                k.as_str() == Some("script")
+                                    || k.get("lit").and_then(|l| l.as_str()) == Some("script")
+                            });
+                            let val_match = val.is_some_and(|v| {
+                                v.as_str() == Some("echo current")
+                                    || v.get("lit").and_then(|l| l.as_str()) == Some("echo current")
+                            });
+                            key_match && val_match
                         })
                     })
             }),
