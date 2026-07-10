@@ -524,11 +524,11 @@ fn extract_template_map(value: Option<&serde_json::Value>) -> Option<BTreeMap<St
     if let Some(pairs) = value.get("map").and_then(|v| v.as_array()) {
         let mut map = BTreeMap::new();
         for pair in pairs {
-            let key = pair
-                .get("key")
+            let key_val = pair.get("Key").or_else(|| pair.get("key"));
+            let val_val = pair.get("Value").or_else(|| pair.get("value"));
+            let key = key_val
                 .and_then(|v| v.as_str().map(str::to_owned).or_else(|| v.get("lit").and_then(|l| l.as_str()).map(str::to_owned)))?;
-            let val = pair
-                .get("value")
+            let val = val_val
                 .and_then(|v| {
                     v.as_str()
                         .map(str::to_owned)
@@ -629,8 +629,8 @@ impl Serialize for TemplateStringMapPair<'_> {
     {
         use serde::ser::SerializeMap;
         let mut map = serializer.serialize_map(Some(2))?;
-        map.serialize_entry("key", &self.key)?;
-        map.serialize_entry("value", &template_string_token(self.value))?;
+        map.serialize_entry("Key", &serde_json::json!({"type": 0, "lit": self.key}))?;
+        map.serialize_entry("Value", &template_string_token(self.value))?;
         map.end()
     }
 }
@@ -1336,9 +1336,10 @@ mod tests {
         assert_eq!(json["reference"]["type"], "script");
         assert_eq!(json["environment"]["type"], 2);
         assert_eq!(json["inputs"]["type"], 2);
-        assert_eq!(json["inputs"]["map"][0]["key"], "script");
-        assert_eq!(json["inputs"]["map"][0]["value"]["type"], 0);
-        assert_eq!(json["inputs"]["map"][0]["value"]["lit"], "echo hi");
+        assert_eq!(json["inputs"]["map"][0]["Key"]["type"], 0);
+        assert_eq!(json["inputs"]["map"][0]["Key"]["lit"], "script");
+        assert_eq!(json["inputs"]["map"][0]["Value"]["type"], 0);
+        assert_eq!(json["inputs"]["map"][0]["Value"]["lit"], "echo hi");
     }
 
     #[test]
@@ -1364,7 +1365,7 @@ mod tests {
             timeout_in_minutes: None,
         };
         let value = serde_json::to_value(step).unwrap();
-        let token = &value["inputs"]["map"][0]["value"];
+        let token = &value["inputs"]["map"][0]["Value"];
         assert_eq!(token["type"], 3);
         assert_eq!(
             token["expr"],
