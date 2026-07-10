@@ -7730,11 +7730,14 @@ jobs:
         assert!(
             acquired["steps"].as_array().unwrap().iter().any(|step| {
                 step["inputs"]["script"].as_str() == Some("echo current")
+                    || step["inputs"]["script"]["lit"].as_str() == Some("echo current")
                     || step["inputs"]["script"]["expr"].as_str() == Some("echo current")
                     || step["inputs"]["map"].as_array().is_some_and(|entries| {
                         entries.iter().any(|entry| {
-                            entry["key"].as_str() == Some("script")
-                                && entry["value"].as_str() == Some("echo current")
+                            (entry["key"].as_str() == Some("script")
+                                || entry["key"]["lit"].as_str() == Some("script"))
+                                && (entry["value"].as_str() == Some("echo current")
+                                    || entry["value"]["lit"].as_str() == Some("echo current"))
                         })
                     })
             }),
