@@ -1,0 +1,16 @@
+name: checkout-test
+on: push
+jobs:
+  checkout:
+    runs-on: self-hosted
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          repository: octocat/Hello-World
+          path: hello-world
+      - name: Verify checkout
+        run: |
+          ls -la hello-world/
+          cat hello-world/README 2>/dev/null || echo "README not found, checking other files"
+          ls hello-world/ | head -5

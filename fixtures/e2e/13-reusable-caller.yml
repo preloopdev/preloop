@@ -1,0 +1,15 @@
+name: reusable-caller
+on: push
+jobs:
+  call-reusable:
+    uses: ./.github/workflows/called.yml
+    with:
+      greeting: hello-from-caller
+
+  check-result:
+    runs-on: self-hosted
+    needs: call-reusable
+    steps:
+      - name: Check result
+        run: |
+          echo "Result: ${{ needs.call-reusable.outputs.result }}"
