@@ -1,0 +1,22 @@
+name: annotations-test
+on: push
+jobs:
+  annotate:
+    runs-on: self-hosted
+    steps:
+      - name: Warning annotation
+        run: echo "::warning file=app.js,line=1,col=5::Missing semicolon"
+      - name: Error annotation
+        run: echo "::error file=test.js,line=10::Test assertion failed"
+      - name: Notice annotation
+        run: echo "::notice::Deployment successful"
+      - name: Group output
+        run: |
+          echo "::group::My group title"
+          echo "Inside the group"
+          echo "::endgroup::"
+      - name: Set output via env
+        run: |
+          echo "MY_VAR=hello" >> "$GITHUB_ENV"
+      - name: Read env
+        run: echo "MY_VAR=$MY_VAR"
