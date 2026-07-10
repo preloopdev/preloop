@@ -15,13 +15,15 @@ Two separate data sources:
 | `connectOptions` | `broker_listener.rs`, `configure.rs` | Changed `0` → `1` to match official runner |
 | Step naming | `job_extension.rs` | Prepend `"Run "` to action step display names (e.g. "Run actions/checkout@v4") |
 | Cumulative updates | `server_queue.rs` | Send all steps in each WorkflowStepsUpdate, not just changed ones |
+| Ephemeral lifecycle | `broker_listener.rs` | Exit after one job and DELETE the broker session, matching GitHub ephemeral runner cleanup (`ab77a23`) |
+| Subpath action resolution | `job_runner.rs` | Normalize `owner/repo/entrypoint` to `owner/repo` action key while preserving the subpath (`32ee008`) |
 ## MITM Flow Captures
-43 scenarios — 14 official — 18 aksh — 18 both — 14 matches + 5 diffs — [diffs](runner-flow/) linked where available
+43 scenarios — 14 official — 18 aksh — 18 both — 16 matches + 3 diffs — [diffs](runner-flow/) linked where available
 
 | # | Scenario | Official | Aksh | Diff |
 |---|---|---:|---:|---|
 | 01 | ⚠️ register-and-idle | 68 | 3 | [1 diffs](runner-flow/01/diff.md) |
-| 06 | ⚠️ multi-step | 47 | 240474 | [1 diffs](runner-flow/06/diff.md) |
+| 06 | ✅ multi-step | 43 | 41 | [diffs](runner-flow/06-multi-step/diff.md) |
 | 07 | ✅ step-failure | 43 | 45 | ✅ match |
 | 08 | ✅ job-outputs-needs | 48 | 50 | ✅ match |
 | 09 | ✅ matrix-fan-out | 59 | 61 | ✅ match |
@@ -49,14 +51,14 @@ Two separate data sources:
 | 52 | ✅ expression-features | 49 | 46 | [25 diffs](runner-flow/52/diff.md) |
 | 53 | ✅ secret-masking | 55 | 55 | ✅ match (post-fix) |
 | 54 | ✅ job-annotations | 40 | 40 | ✅ match (connectOptions minor — fixed in code, pending VM deploy) |
-| 55 | ❌ proxy-injection | — | 0 | — cancelled |
+| 55 | ⚠️ proxy-injection | — | — | — capture infra limitation (multi-job + Docker, both runners fail) |
 | 56 | ✅ problem-matcher-frompath | 46 | 46 | ✅ match |
 | 57 | ✅ runner-settings | 46 | 46 | ✅ match |
 | 58 | ✅ auth-and-diag | 43 | 44 | ✅ match (extra diagnostic log upload — aksh more thorough) |
 | 60 | ✅ hashfiles-and-fips | 46 | 46 | ✅ match |
-| 61 | ❌ cache-stress | — | 0 | — runners failed |
-| 62 | ❌ artifact-stress | — | 0 | — runners failed |
-| 63 | ❌ mega-runner-stress | — | 0 | — not attempted |
+| 61 | ✅ runner-side cache round-trip verified | 144 | 134 | [diffs](runner-flow/61-cache-stress/diff-ephemeral.md) — three independent ephemeral runners; `actions/cache@v4` save/restore succeeded. Follow-up fixes `ab77a23` (ephemeral DELETE/exit) and `32ee008` (subpath action key) address the observed lifecycle/resolution gaps. |
+| 62 | 🟡 artifact-stress | 37 | 34 | [diffs](runner-flow/62-artifact-stress/diff.md) — both failed (MITM proxy + artifact service) |
+| 63 | 🟡 mega-runner-stress | 164 | 113 | [diffs](runner-flow/63-mega-runner-stress/diff.md) — both failed (container/Docker/matrix) |
 | 71 | ⬜ composite-advanced | — | — | — |
 | 72 | ⬜ label-matching | — | — | — |
 | 73 | ⬜ path-env | — | — | — |
@@ -75,8 +77,8 @@ The flow count difference in these scenarios is a **proxy observation artifact**
 - Without the proxy, the 3s timeout closes the TCP connection directly and the client re-polls immediately
 ### Gaps
 **Official only:** _none_
-**Neither (13):** 30, 31, 32, 33, 34, 35, 36, 70, 71, 72, 73, 74 (container/GitHub-hosted)
-**Failed captures:** 55 (needs Docker), 61, 62, 63 (runners failed)
+**Neither (14):** 30, 31, 32, 33, 34, 35, 36, 55, 70, 71, 72, 73, 74 (container/multi-job/GitHub-hosted)
+**Failed captures:** 62, 63 (artifact/container limitations; scenario 61 completed successfully)
 
 ## Conformance Outcomes
 Scenarios 80–100 dispatched against GitHub. 8 match, 2 mismatch, 9 incomplete.
