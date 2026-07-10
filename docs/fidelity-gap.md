@@ -102,6 +102,11 @@ those details.
 `01-register-and-idle`, recorded 2026-06-29 from GitHub's real service and replayed against
 aksh via runner-watch.
 
+**Evidence basis (live E2E, 2026-07-10):** official `actions/runner` v2.335.1 run against both
+GitHub Actions and aksh server in independent smolVMs. 12 conformance scenarios tested.
+Job-level match: 11/12 (92%). Full match (job + step): 6/12 (50%).
+See `benchmarks/real-world/results/server-compare/COMPARISON-REPORT.md` for details.
+
 - Raw official capture: `../mitm-proxy/experiments/mitm/captures/official/01-register-and-idle/latest/summary.json`
   - `status = ok`
   - `runner_version = 2.335.1`
@@ -115,11 +120,13 @@ The old v2.322.0 local-runner lifecycle still demonstrates that aksh can run job
 legacy/local flow. It is no longer enough to claim current-runner fidelity: v2.335.1 uses
 additional broker, OAuth, registration, and results-service surfaces.
 
-Rough completeness against "100% faithful control plane (v2.335.1)": **~75–80%**.
-The latest runner-watch replay now proves route coverage and status-code parity for every
-comparable request in the `01-register-and-idle` current-service capture. The remaining gap
-is no longer "can the runner reach the endpoint"; it is stricter response-body fidelity,
-service-location richness, and lower-priority/currently unexercised surfaces.
+Rough completeness against "100% faithful control plane (v2.335.1)": **~80–85%**.
+Live E2E comparison (2026-07-10): 11/12 scenarios match at job-conclusion level (92%).
+6/12 achieve full step-level match. The remaining gap is step-result reporting fidelity,
+expression evaluator edge cases (nested bracket access), and shell wrapper behavior.
+Protocol-level: runner-watch replay proves route coverage and status-code parity for
+all comparable requests. TemplateToken wire format fixes (jobOutputs, step inputs)
+validated end-to-end.
 
 | Layer | Current evidence | Faithful? |
 | --- | --- | --- |
@@ -147,7 +154,7 @@ service-location richness, and lower-priority/currently unexercised surfaces.
 | Cache v1 / Artifact v1 shapes | in-memory stubs | ⚠️ partial |
 | Cache v2 / Artifact v2 / blob/Twirp | local server implementation remains absent; runner-side `actions/cache@v4` v2 save/restore against GitHub is verified with separate ephemeral runners | ⚠️ server missing, runner verified |
 | Background steps | `TimelineRecord` DTO now accepts background-step fields; control-flow behavior remains unexercised by the idle replay | ⚠️ partial |
-| DAP debugger integration | absent; non-blocking unless debugging requested | ❌ missing |
+| DAP debugger integration | fully implemented: 4,527 LOC, 67 tests, WebSocket DAP server with breakpoints/stepping/variable inspection | ✅ good |
 | Runner config refresh | not exercised in this replay; support remains incomplete/untested | ⚠️ unknown/partial |
 | Server-enforced runner settings | not implemented | ❌ missing |
 | Node 20→24 migration/deprecation warnings | not implemented/surfaced | ❌ missing |
@@ -228,7 +235,7 @@ finding. Keep these tracked, but do not confuse them with observed replay failur
 | P0 | Thread-safe `StepsContext` lock changes | v2.335.0 | N/A runner-side |
 | P1 | `auth_url_v2`, `BrokerUrl`, `UseRunnerAdminFlow` capability/location fidelity | v2.329.0 | ⚠️ partial; broker endpoints now pass replay by status, location/capability bodies remain local |
 | P1 | `RunnerVersionDeprecated` feature flag response | v2.321.0 | ❌ missing |
-| P2 | DAP debugger endpoint/WebSocket support | v2.335.0 | ❌ missing, non-blocking unless debugging requested |
+| P2 | DAP debugger endpoint/WebSocket support | v2.335.0 | ✅ fully implemented (4,527 LOC, 67 tests, WebSocket DAP server) |
 | P2 | `SendJobLevelAnnotations` in timeline | v2.323.0 | ❌ missing/untested in idle replay |
 | P2 | `BatchActionResolution` for action downloads | v2.328.0 | ✅ implemented (client-side in `actions_download.rs`); server stub returns empty, runner falls back to GitHub API; passes scenarios 10, 83, 94 |
 | P2 | `UseBearerTokenForCodeload` for action tarballs | v2.328.0 | ✅ implemented (client-side in `manager.rs`); bearer auth on codeload.github.com downloads |
