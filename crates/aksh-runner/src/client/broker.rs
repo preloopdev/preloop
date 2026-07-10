@@ -35,7 +35,7 @@ impl BrokerClient {
 
     /// Delete a broker session.
     pub async fn delete_session(&self, token: &str, session_id: &str) -> Result<()> {
-        let url = format!("{}/session/{session_id}", self.base_url);
+        let url = format!("{}/session?sessionId={session_id}", self.base_url);
         self.http
             .delete_with_token(&url, token)
             .await
