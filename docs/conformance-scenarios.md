@@ -45,7 +45,7 @@ a unique workflow fixture basename matching the directory name because the offic
 | 08 | `08-job-outputs-needs` | `08-job-outputs-needs.yml` | job outputs propagated through `needs` context | implemented | yes |
 | 09 | `09-matrix-fan-out` | `09-matrix-fan-out.yml` | matrix expansion and fail-fast sibling cancellation | implemented | yes |
 | 10 | `10-uses-checkout` | `10-uses-checkout.yml` | action resolution/download and codeload auth | partial/stubbed | yes |
-| 11 | `11-cache-roundtrip` | `11-cache-roundtrip.yml` | modern cache restore/save paths | partial/missing v4 parity | yes |
+| 11 | `11-cache-roundtrip` | `11-cache-roundtrip.yml` | modern cache restore/save paths | runner-side v2 save/restore verified against GitHub with ephemeral runners; local server v2 remains separate gap | yes |
 | 12 | `12-artifact` | `12-artifact.yml` | artifact upload/download v4 paths | partial/missing v4 parity | yes |
 | 13 | `13-composite-action` | `13-composite-action.yml` | local composite action resolution | partial | yes |
 | 14 | `14-annotations` | `14-annotations.yml` | workflow command annotations and timeline issues | partial | yes |
