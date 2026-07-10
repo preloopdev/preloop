@@ -1053,6 +1053,29 @@ mod tests {
     }
 
     #[test]
+    fn chained_bracket_access_on_from_json() {
+        let context = Context::default();
+        // Chained bracket: fromJSON(...)['a']['b']['c']
+        assert_eq!(
+            eval_expression(
+                r#"fromJSON('{"a":{"b":{"c":"deep"}}}')['a']['b']['c']"#,
+                &context,
+            )
+            .unwrap(),
+            Value::String("deep".to_owned())
+        );
+        // Mixed dot and bracket
+        assert_eq!(
+            eval_expression(
+                r#"fromJSON('{"a":{"b":{"c":"deep"}}}').a.b.c"#,
+                &context,
+            )
+            .unwrap(),
+            Value::String("deep".to_owned())
+        );
+    }
+
+    #[test]
     fn hashfiles_follow_symlinks_flag() {
         // F055: hashFiles('--follow-symbolic-links', 'pattern') should parse
         // the flag without treating it as a glob pattern.
