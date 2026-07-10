@@ -1296,7 +1296,7 @@ fn parse_remote_uses(uses: &str) -> Option<ParsedUses> {
         repo: repo.clone(),
         subpath,
         git_ref: git_ref.to_string(),
-        action_name: repo_part.to_string(),
+        action_name: format!("{owner}/{repo}"),
     })
 }
 
@@ -1995,5 +1995,12 @@ mod tests {
             "Expected run_job to handle timeout gracefully, got: {:?}",
             res
         );
+    }
+    #[test]
+    fn action_resolution_key_excludes_subpath() {
+        let parsed = parse_remote_uses("actions/cache/restore@v4").expect("valid action ref");
+        assert_eq!(parsed.action_name, "actions/cache");
+        assert_eq!(parsed.subpath, "restore");
+        assert_eq!(parsed.git_ref, "v4");
     }
 }
