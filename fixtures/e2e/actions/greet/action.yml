@@ -1,0 +1,21 @@
+name: 'Greet'
+description: 'A simple greeting composite action'
+inputs:
+  name:
+    description: 'Who to greet'
+    required: true
+    default: 'World'
+outputs:
+  greeting:
+    description: 'The greeting message'
+    value: ${{ steps.greet.outputs.greeting }}
+runs:
+  using: 'composite'
+  steps:
+    - name: Generate greeting
+      id: greet
+      shell: bash
+      run: |
+        GREETING="Hello, ${{ inputs.name }}!"
+        echo "$GREETING"
+        echo "greeting=$GREETING" >> "$GITHUB_OUTPUT"

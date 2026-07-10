@@ -1,0 +1,22 @@
+name: reusable-called
+on:
+  workflow_call:
+    inputs:
+      greeting:
+        required: true
+        type: string
+    outputs:
+      result:
+        description: "The result"
+        value: ${{ jobs.worker.outputs.result }}
+jobs:
+  worker:
+    runs-on: self-hosted
+    outputs:
+      result: ${{ steps.work.outputs.result }}
+    steps:
+      - name: Do work
+        id: work
+        run: |
+          echo "Received: ${{ inputs.greeting }}"
+          echo "result=processed-${{ inputs.greeting }}" >> "$GITHUB_OUTPUT"

@@ -1,0 +1,69 @@
+name: comprehensive-test
+on: push
+jobs:
+  test-secrets:
+    runs-on: self-hosted
+    steps:
+      - name: Use secret
+        run: |
+          echo "Secret available: ${MY_SECRET:+yes}"
+          if [ -n "$MY_SECRET" ]; then
+            echo "Secret is: $MY_SECRET"
+          fi
+        env:
+          MY_SECRET: ${{ secrets.TEST_SECRET }}
+
+  test-annotations:
+    runs-on: self-hosted
+    needs: test-secrets
+    steps:
+      - name: Warning annotation
+        run: echo "::warning file=app.js,line=1::Missing semicolon"
+      - name: Error annotation
+        continue-on-error: true
+        run: |
+          echo "::error file=test.js,line=10::Test assertion failed"
+          exit 0
+      - name: Notice annotation
+        run: echo "::notice::Deployment successful"
+      - name: Group output
+        run: |
+          echo "::group::Build output"
+          echo "Building..."
+          echo "Done!"
+          echo "::endgroup::"
+      - name: Set env and output
+        id: setenv
+        run: |
+          echo "MY_VAR=hello-from-env" >> "$GITHUB_ENV"
+          echo "my_output=hello-from-output" >> "$GITHUB_OUTPUT"
+      - name: Read env
+        run: |
+          echo "MY_VAR=$MY_VAR"
+          if [ "$MY_VAR" = "hello-from-env" ]; then
+            echo "GITHUB_ENV works!"
+          else
+            echo "ERROR: GITHUB_ENV not propagated"
+            exit 1
+          fi
+      - name: Read output
+        run: |
+          echo "Output: ${{ steps.setenv.outputs.my_output }}"
+          if [ "${{ steps.setenv.outputs.my_output }}" = "hello-from-output" ]; then
+            echo "GITHUB_OUTPUT works!"
+          else
+            echo "ERROR: GITHUB_OUTPUT not propagated"
+            exit 1
+          fi
+
+  test-expressions:
+    runs-on: self-hosted
+    needs: [test-secrets, test-annotations]
+    steps:
+      - name: Test expressions
+        run: |
+          echo "contains: ${{ contains('hello world', 'world') }}"
+          echo "startsWith: ${{ startsWith('hello', 'hel') }}"
+          echo "format: ${{ format('Hello {0}!', 'World') }}"
+          echo "join: ${{ join(fromJSON('["a","b","c"]'), ',') }}"
+          echo "toJSON: ${{ toJSON(github.event_name) }}"
