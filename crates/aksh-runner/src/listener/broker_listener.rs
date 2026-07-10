@@ -82,15 +82,16 @@ pub async fn run_broker_loop(
                     } else {
                         warn!("Worker failed for job {id}");
                     }
-                    if once {
-                        info!("exiting after first job (--once)");
+                    if once || config.settings.ephemeral {
+                        if once {
+                            info!("exiting after first job (--once)");
+                        } else {
+                            info!("exiting after first job (--ephemeral)");
+                        }
                         if !session_id.is_empty() {
                             let _ = client.delete_session(&token, &session_id).await;
                         }
                         return Ok(());
-                    }
-                    if config.settings.ephemeral {
-                        info!("ephemeral runner completed job {id}, polling for next job");
                     }
                     active_job = None;
                 }
@@ -201,16 +202,16 @@ pub async fn run_broker_loop(
                     }
                     Err(e) => warn!("Worker wait error: {e:#}"),
                 }
-                if once {
-                    info!("exiting after first job (--once)");
+                if once || config.settings.ephemeral {
+                    if once {
+                        info!("exiting after first job (--once)");
+                    } else {
+                        info!("exiting after first job (--ephemeral)");
+                    }
                     if !session_id.is_empty() {
                         let _ = client.delete_session(&token, &session_id).await;
                     }
                     return Ok(());
-                }
-                if config.settings.ephemeral {
-                    let id = &active_job.as_ref().unwrap().request_id;
-                    info!("ephemeral runner completed job {id}, polling for next job");
                 }
                 active_job = None;
                 continue;
