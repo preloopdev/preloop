@@ -13,8 +13,49 @@ use aksh_gha_protocol::azdo::{
 use crate::eval::{build_context, resolve_string};
 use crate::JobPlan;
 use aksh_gha_expressions::Context;
-use serde_json::Value;
+use serde_json::{json, Value};
 
+fn job_outputs_token(outputs: &BTreeMap<String, String>) -> Option<Value> {
+    if outputs.is_empty() {
+        return None;
+    }
+    let map = outputs
+        .iter()
+        .map(|(key, raw)| {
+            let expression = raw
+                .trim()
+                .strip_prefix("${{")
+                .and_then(|value| value.strip_suffix("}}").map(str::trim));
+            let value = match expression {
+                Some(expr) => json!({
+                    "type": 3,
+                    "file": 1,
+                    "line": 1,
+                    "col": 1,
+                    "expr": expr,
+                }),
+                None => json!({
+                    "type": 0,
+                    "file": 1,
+                    "line": 1,
+                    "col": 1,
+                    "lit": raw,
+                }),
+            };
+            json!({
+                "Key": {"type": 0, "file": 1, "line": 1, "col": 1, "lit": key},
+                "Value": value,
+            })
+        })
+        .collect::<Vec<_>>();
+    Some(json!({
+        "type": 2,
+        "file": 1,
+        "line": 1,
+        "col": 1,
+        "map": map,
+    }))
+}
 /// Build a full `AgentJobRequestMessage` from a job plan and context.
 ///
 /// This resolves `${{ }}` in env/with/run fields, builds contextData,
@@ -313,11 +354,7 @@ pub fn build_agent_job_message(
         job_timeout: None,
         job_container: plan.container.clone(),
         job_service_containers: non_empty_services(plan.services.clone()),
-        job_outputs: if plan.job_outputs.is_empty() {
-            None
-        } else {
-            Some(plan.job_outputs.clone())
-        },
+        job_outputs: job_outputs_token(&plan.job_outputs),
         enable_debugger: false,
         debugger_tunnel: None,
         debugger_welcome_message: None,
