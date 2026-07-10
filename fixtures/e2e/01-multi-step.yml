@@ -1,0 +1,19 @@
+name: multi-step-test
+on: push
+jobs:
+  steps-test:
+    runs-on: self-hosted
+    steps:
+      - name: Step 1 - Echo
+        run: echo "Step 1 executed"
+      - name: Step 2 - Env var
+        run: echo "GITHUB_SHA=$GITHUB_SHA"
+        env:
+          CUSTOM_VAR: hello-world
+      - name: Step 3 - Multi-line
+        run: |
+          echo "Line 1"
+          echo "Line 2"
+          echo "Line 3"
+      - name: Step 4 - Exit code
+        run: exit 0
