@@ -1,0 +1,50 @@
+name: smolvm-comprehensive
+on: push
+jobs:
+  basics:
+    runs-on: self-hosted
+    outputs:
+      msg: ${{ steps.out.outputs.msg }}
+    steps:
+      - name: Multi-step script
+        run: |
+          echo "Line 1"
+          echo "Line 2"
+          echo "Line 3"
+      - name: Environment variable
+        run: echo "CUSTOM=$CUSTOM_VAR"
+        env:
+          CUSTOM_VAR: hello-from-env
+      - name: Set output
+        id: out
+        run: echo "msg=hello-from-basics" >> "$GITHUB_OUTPUT"
+      - name: Set env for next step
+        run: echo "PROPAGATED=yes" >> "$GITHUB_ENV"
+      - name: Read propagated env
+        run: |
+          if [ "$PROPAGATED" = "yes" ]; then
+            echo "GITHUB_ENV works!"
+          else
+            echo "GITHUB_ENV failed" && exit 1
+          fi
+
+  downstream:
+    runs-on: self-hosted
+    needs: basics
+    steps:
+      - name: Read upstream output
+        run: |
+          echo "Got: ${{ needs.basics.outputs.msg }}"
+          if [ "${{ needs.basics.outputs.msg }}" = "hello-from-basics" ]; then
+            echo "Needs/outputs propagation works!"
+          else
+            echo "ERROR: expected hello-from-basics" && exit 1
+          fi
+      - name: Annotations
+        run: |
+          echo "::warning::This is a warning"
+          echo "::notice::This is a notice"
+      - name: Expressions
+        run: |
+          echo "contains: ${{ contains('hello world', 'world') }}"
+          echo "format: ${{ format('{0}-{1}', 'a', 'b') }}"
