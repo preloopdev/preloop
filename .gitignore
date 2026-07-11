@@ -42,8 +42,26 @@ libs/*.so*
 benchmarks/real-world/aksh-runner
 benchmarks/real-world/aksh-runner-new
 benchmarks/real-world/official-runner.tar.gz
-benchmarks/real-world/results/runner-flow/**/flows.jsonl
-benchmarks/real-world/results/runner-flow/**/flows.mitm
-benchmarks/real-world/results/runner-flow/**/flow.*.bin
-benchmarks/real-world/results/runner-flow/**/*.pid
-benchmarks/real-world/results/mitm/**/flow.*.bin
+benchmarks/compatibility/runner/protocol/**/flows.jsonl
+benchmarks/compatibility/runner/protocol/**/flows.mitm
+benchmarks/compatibility/runner/protocol/**/flow.*.bin
+benchmarks/compatibility/runner/protocol/**/*.pid
+benchmarks/compatibility/server/protocol/captures/**/flow.*.bin
+
+# Disposable official-runner installations used by smolVM comparisons.
+/.runner-e2e/
+/.runner-mount/
+
+# Large live-comparison byproducts. Keep compact summaries, reports, and
+# protocol metadata; discard runner diagnostics, workspaces, and payloads.
+/benchmarks/compatibility/server/behavior/.payloads/
+/benchmarks/compatibility/server/behavior/**/diag/
+/benchmarks/compatibility/server/behavior/**/work/
+/benchmarks/compatibility/server/behavior/**/blocks/
+/benchmarks/compatibility/server/behavior/**/pages/
+/benchmarks/compatibility/server/behavior/**/config-*.log
+/benchmarks/compatibility/server/behavior/**/runner-*.log
+/benchmarks/compatibility/server/behavior/**/official-runner.log
+/benchmarks/compatibility/server/behavior/**/server.log
+/benchmarks/compatibility/server/protocol/captures/**/flows.jsonl
+/benchmarks/compatibility/server/protocol/captures/**/mitm.log
