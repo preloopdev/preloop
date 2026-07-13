@@ -142,6 +142,16 @@ pub enum ExpressionError {
     UnknownFunction(String),
 }
 
+/// Parse an expression without evaluating it.
+pub fn validate_expression(input: &str) -> Result<(), ExpressionError> {
+    let trimmed = trim_expression_markers(input);
+    let tokens = Lexer::new(trimmed).lex()?;
+    let mut parser = Parser::new(tokens);
+    let expr = parser.parse_expr()?;
+    parser.expect_end()?;
+    validate_function_calls(&expr)
+}
+
 /// Parse and evaluate a GitHub Actions expression.
 pub fn eval_expression(input: &str, context: &Context) -> Result<Value, ExpressionError> {
     let trimmed = trim_expression_markers(input);
@@ -164,6 +174,68 @@ pub fn trim_expression_markers(input: &str) -> &str {
         inner.trim()
     } else {
         value
+    }
+}
+/// Whether an expression contains a status-check call outside string literals.
+///
+/// GitHub's condition conversion adds an implicit `success()` gate unless the
+/// expression calls `success`, `failure`, `cancelled`, or `always` itself.
+pub fn contains_status_check_function(condition: &str) -> bool {
+    let mut chars = condition.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\'' {
+            while let Some(quoted) = chars.next() {
+                if quoted == '\'' {
+                    if chars.peek() == Some(&'\'') {
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+
+        if ch == '_' || ch == '-' || ch.is_ascii_alphabetic() {
+            let mut ident = String::from(ch);
+            while let Some(next) = chars.peek().copied() {
+                if next == '_' || next == '-' || next.is_ascii_alphanumeric() {
+                    ident.push(next);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            while let Some(whitespace) = chars.peek().copied() {
+                if whitespace.is_whitespace() {
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            if matches!(
+                ident.to_ascii_lowercase().as_str(),
+                "success" | "failure" | "cancelled" | "always"
+            ) && chars.peek() == Some(&'(')
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Apply GitHub's implicit success gate to a job or step condition.
+pub fn effective_condition(raw: Option<&str>) -> String {
+    let condition = match raw {
+        Some(condition) if !condition.trim().is_empty() => condition,
+        _ => return "success()".to_owned(),
+    };
+    let stripped = trim_expression_markers(condition);
+    if contains_status_check_function(stripped) {
+        stripped.to_owned()
+    } else {
+        format!("success() && ({stripped})")
     }
 }
 
@@ -210,6 +282,39 @@ enum BinaryOp {
     Ge,
     Lt,
     Le,
+}
+
+fn validate_function_calls(expr: &Expr) -> Result<(), ExpressionError> {
+    match expr {
+        Expr::Literal(_) | Expr::Path(_) => Ok(()),
+        Expr::UnaryNot(inner) | Expr::MemberAccess { expr: inner, .. } => {
+            validate_function_calls(inner)
+        }
+        Expr::Binary { left, right, .. } => {
+            validate_function_calls(left)?;
+            validate_function_calls(right)
+        }
+        Expr::Call { name, args } => {
+            if !matches!(
+                name.to_ascii_lowercase().as_str(),
+                "always"
+                    | "success"
+                    | "failure"
+                    | "cancelled"
+                    | "contains"
+                    | "startswith"
+                    | "endswith"
+                    | "format"
+                    | "fromjson"
+                    | "join"
+                    | "hashfiles"
+                    | "tojson"
+            ) {
+                return Err(ExpressionError::UnknownFunction(name.clone()));
+            }
+            args.iter().try_for_each(validate_function_calls)
+        }
+    }
 }
 
 fn eval(expr: &Expr, context: &Context) -> Result<Value, ExpressionError> {
@@ -1066,11 +1171,7 @@ mod tests {
         );
         // Mixed dot and bracket
         assert_eq!(
-            eval_expression(
-                r#"fromJSON('{"a":{"b":{"c":"deep"}}}').a.b.c"#,
-                &context,
-            )
-            .unwrap(),
+            eval_expression(r#"fromJSON('{"a":{"b":{"c":"deep"}}}').a.b.c"#, &context,).unwrap(),
             Value::String("deep".to_owned())
         );
     }
