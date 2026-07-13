@@ -36,6 +36,12 @@ enum Command {
         /// Generate an ephemeral self-signed cert (local dev only).
         #[arg(long, conflicts_with = "tls_cert")]
         tls_self_signed: bool,
+        /// Enable privileged local/CI simulation endpoints (loopback only).
+        #[arg(long)]
+        enable_test_api: bool,
+        /// Bearer token for privileged simulation endpoints.
+        #[arg(long, requires = "enable_test_api")]
+        test_api_token: Option<String>,
     },
     /// Generate a persistent self-signed TLS certificate (no openssl needed).
     Cert {
@@ -82,6 +88,8 @@ async fn main() -> anyhow::Result<()> {
             tls_cert,
             tls_key,
             tls_self_signed,
+            enable_test_api,
+            test_api_token,
         } => {
             let tls = match (tls_cert, tls_key, tls_self_signed) {
                 (Some(cert), Some(key), false) => TlsMode::PemFiles { cert, key },
@@ -94,6 +102,8 @@ async fn main() -> anyhow::Result<()> {
                 state_dir,
                 record_flows,
                 tls,
+                enable_test_api,
+                test_api_token,
             })
             .await?;
         }
