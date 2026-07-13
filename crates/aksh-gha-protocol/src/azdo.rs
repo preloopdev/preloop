@@ -526,8 +526,11 @@ fn extract_template_map(value: Option<&serde_json::Value>) -> Option<BTreeMap<St
         for pair in pairs {
             let key_val = pair.get("Key").or_else(|| pair.get("key"));
             let val_val = pair.get("Value").or_else(|| pair.get("value"));
-            let key = key_val
-                .and_then(|v| v.as_str().map(str::to_owned).or_else(|| v.get("lit").and_then(|l| l.as_str()).map(str::to_owned)))?;
+            let key = key_val.and_then(|v| {
+                v.as_str()
+                    .map(str::to_owned)
+                    .or_else(|| v.get("lit").and_then(|l| l.as_str()).map(str::to_owned))
+            })?;
             let val = val_val
                 .and_then(|v| {
                     v.as_str()
@@ -1376,9 +1379,8 @@ mod tests {
     #[test]
     fn template_string_token_handles_braces_inside_string_literals() {
         // Expression containing }} inside a single-quoted JSON string
-        let token = template_string_token(
-            r#"${{ fromJSON('{"a":{"b":{"c":"deep"}}}')['a']['b']['c'] }}"#,
-        );
+        let token =
+            template_string_token(r#"${{ fromJSON('{"a":{"b":{"c":"deep"}}}')['a']['b']['c'] }}"#);
         assert_eq!(token["type"], 3);
         let expr = token["expr"].as_str().unwrap();
         // Should preserve the full expression, not truncate at the first }}
@@ -1391,10 +1393,7 @@ mod tests {
     #[test]
     fn find_expression_end_skips_braces_in_strings() {
         // }} inside a string should be skipped
-        assert_eq!(
-            find_expression_end(" fromJSON('{}}')'a' }}"),
-            Some(20)
-        );
+        assert_eq!(find_expression_end(" fromJSON('{}}')'a' }}"), Some(20));
         // Plain expression
         assert_eq!(find_expression_end(" x }}"), Some(3));
         // No closing
