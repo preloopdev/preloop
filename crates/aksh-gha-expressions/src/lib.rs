@@ -196,10 +196,10 @@ pub fn contains_status_check_function(condition: &str) -> bool {
             continue;
         }
 
-        if ch == '_' || ch == '-' || ch.is_ascii_alphabetic() {
+        if ch == '_' || ch.is_ascii_alphabetic() {
             let mut ident = String::from(ch);
             while let Some(next) = chars.peek().copied() {
-                if next == '_' || next == '-' || next.is_ascii_alphanumeric() {
+                if next == '_' || next.is_ascii_alphanumeric() {
                     ident.push(next);
                     chars.next();
                 } else {
