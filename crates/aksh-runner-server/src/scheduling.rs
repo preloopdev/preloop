@@ -57,65 +57,8 @@ pub struct SchedulerState {
     pub queue: VecDeque<SchedJob>,
 }
 
-/// Error when a needs graph is not a DAG.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CycleError {
-    /// One job id participating in a cycle (representative).
-    pub witness: String,
-}
-
-/// Detect a cycle in a needs graph.
-///
-/// `edges` maps job id → list of needed job ids.
-/// Returns `Ok(())` when acyclic, else a witness job id on a cycle.
-pub fn detect_needs_cycle(edges: &BTreeMap<String, Vec<String>>) -> Result<(), CycleError> {
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Color {
-        White,
-        Gray,
-        Black,
-    }
-
-    let mut color: BTreeMap<&str, Color> =
-        edges.keys().map(|k| (k.as_str(), Color::White)).collect();
-    // Also color referenced nodes that may be missing as keys.
-    for deps in edges.values() {
-        for d in deps {
-            color.entry(d.as_str()).or_insert(Color::White);
-        }
-    }
-
-    fn visit<'a>(
-        node: &'a str,
-        edges: &'a BTreeMap<String, Vec<String>>,
-        color: &mut BTreeMap<&'a str, Color>,
-    ) -> Result<(), CycleError> {
-        color.insert(node, Color::Gray);
-        if let Some(deps) = edges.get(node) {
-            for dep in deps {
-                match color.get(dep.as_str()).copied().unwrap_or(Color::White) {
-                    Color::Gray => {
-                        return Err(CycleError {
-                            witness: dep.clone(),
-                        });
-                    }
-                    Color::White => visit(dep.as_str(), edges, color)?,
-                    Color::Black => {}
-                }
-            }
-        }
-        color.insert(node, Color::Black);
-        Ok(())
-    }
-
-    let nodes: Vec<&str> = color.keys().copied().collect();
-    for node in nodes {
-        if color.get(node) == Some(&Color::White) {
-            visit(node, edges, &mut color)?;
-        }
-    }
-    Ok(())
-}
+/// Re-export cycle detection from the parser crate (single source of truth).
+pub use aksh_gha_parser::dag::detect_needs_cycle;
 
 /// Whether a single `needs` entry completed successfully.
 ///
@@ -222,6 +165,7 @@ enum DependencyDecision {
     Wait,
     Run,
     Skip,
+    Error,
 }
 
 fn dependency_decision(state: &SchedulerState, job: &SchedJob) -> DependencyDecision {
@@ -246,7 +190,8 @@ fn dependency_decision(state: &SchedulerState, job: &SchedJob) -> DependencyDeci
     let context = aksh_gha_expressions::Context::default().with_status(success, failure, cancelled);
     match aksh_gha_expressions::eval_bool(&condition, &context) {
         Ok(true) => DependencyDecision::Run,
-        Ok(false) | Err(_) => DependencyDecision::Skip,
+        Ok(false) => DependencyDecision::Skip,
+        Err(_) => DependencyDecision::Error,
     }
 }
 
@@ -297,6 +242,10 @@ pub fn promote_ready_jobs(state: &mut SchedulerState) -> usize {
                 }
                 DependencyDecision::Skip => {
                     state.jobs.insert(job.id, ExecutionStatus::Skipped);
+                    skipped = true;
+                }
+                DependencyDecision::Error => {
+                    state.jobs.insert(job.id, ExecutionStatus::Failure);
                     skipped = true;
                 }
                 DependencyDecision::Wait | DependencyDecision::Run => remaining.push_back(job),
