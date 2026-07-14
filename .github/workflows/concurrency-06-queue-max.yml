@@ -1,0 +1,14 @@
+name: concurrency-06-queue-max
+on: workflow_dispatch
+concurrency:
+  group: queue-max-group
+  queue: max
+jobs:
+  build:
+    runs-on: self-hosted
+    steps:
+      - name: marker
+        run: |
+          echo "SCENARIO=06-queue-max"
+          sleep 5
+          echo "DONE=06"

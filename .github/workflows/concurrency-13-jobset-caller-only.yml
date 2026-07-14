@@ -1,0 +1,10 @@
+name: concurrency-13-jobset-caller-only
+on: workflow_dispatch
+jobs:
+  caller-job:
+    concurrency:
+      group: caller-only-group
+      cancel-in-progress: false
+    uses: ./.github/workflows/reusable-callee.yml
+    with:
+      val: "caller-only"

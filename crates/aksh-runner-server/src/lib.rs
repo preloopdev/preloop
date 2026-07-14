@@ -659,6 +659,7 @@ fn build_app(
         .route("/api/v1/runs/:run_id/cancel", post(cancel_run))
         .route("/api/v1/runs/:run_id/rerun", post(rerun_run))
         .route("/api/v1/runs/:run_id/events.ndjson", get(run_events))
+        .route("/api/v1/runs/:run_id/logs", get(get_run_logs))
         .route("/api/v1/runs/:run_id/debug", get(ws_dap_debug))
         .route("/api/v1/runs/:run_id/debug", post(register_dap_port))
         .route(
@@ -1928,6 +1929,21 @@ async fn get_run(
         .cloned()
         .map(Json)
         .ok_or_else(|| ApiError::not_found("run not found"))
+}
+
+async fn get_run_logs(
+    State(shared): State<Arc<SharedState>>,
+    Path(run_id): Path<RunId>,
+) -> impl axum::response::IntoResponse {
+    let inner = shared.state.inner.lock().await;
+    let run_id_str = run_id.to_string();
+    let mut merged = String::new();
+    for (k, v) in &inner.logs {
+        if k.starts_with(&format!("{}/", run_id_str)) {
+            merged.push_str(&String::from_utf8_lossy(v));
+        }
+    }
+    merged
 }
 
 async fn cancel_run(
@@ -8670,6 +8686,59 @@ jobs:
             inner.logs.get("plan-1/log-1").map(Vec::as_slice),
             Some(&b"hello log"[..])
         );
+    }
+
+    #[tokio::test]
+    async fn log_get_run_logs_endpoint_returns_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let run_id = uuid::Uuid::new_v4();
+        let run_id_str = run_id.to_string();
+
+        request_json(
+            &app,
+            Method::POST,
+            &format!("/_apis/v1/Logfiles/scope/actions/{run_id_str}"),
+            json!({"path": "log-1"}),
+        )
+        .await;
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/_apis/v1/Logfiles/scope/actions/{run_id_str}/log-1"
+                    ))
+                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                    .body(Body::from("hello log lines"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let response_get = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/v1/runs/{run_id_str}/logs"))
+                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response_get.status(), StatusCode::OK);
+        let body = to_bytes(response_get.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let logs_str = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(logs_str, "hello log lines");
     }
 
     #[tokio::test]

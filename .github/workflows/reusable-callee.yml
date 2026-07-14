@@ -1,0 +1,22 @@
+name: reusable-callee
+on:
+  workflow_call:
+    inputs:
+      val:
+        required: true
+        type: string
+      concurrency_group:
+        required: false
+        type: string
+        default: ""
+concurrency:
+  group: ${{ inputs.concurrency_group }}
+jobs:
+  inner:
+    runs-on: self-hosted
+    steps:
+      - name: run-inner
+        run: |
+          echo "SCENARIO=reusable-callee input=${{ inputs.val }}"
+          sleep 4
+          echo "DONE=reusable"

@@ -1,0 +1,20 @@
+name: concurrency-09-multi-job-hold
+on: workflow_dispatch
+concurrency: multi-job-workflow-group
+jobs:
+  one:
+    runs-on: self-hosted
+    steps:
+      - name: one
+        run: |
+          echo "SCENARIO=09-multi-job job=one"
+          sleep 3
+          echo "DONE=one"
+  two:
+    runs-on: self-hosted
+    steps:
+      - name: two
+        run: |
+          echo "SCENARIO=09-multi-job job=two"
+          sleep 3
+          echo "DONE=two"
