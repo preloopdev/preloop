@@ -118,15 +118,39 @@ pub struct TaskAgent {
 /// If `encrypted` is true, the `value` is RSA-OAEP wrapped and must be
 /// decrypted with the runner's private key before use as an AES key.
 ///
-/// Upstream source: `AgentSessionController.cs`
+/// Upstream wire contract:
+/// <https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Sdk/DTWebApi/WebApi/TaskAgentSessionKey.cs#L8-L32>
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncryptionKey {
-    /// The raw or wrapped key bytes (base64-encoded in JSON).
-    #[serde(rename = "value")]
+    /// The raw or wrapped key bytes, encoded as a JSON base64 string by
+    /// `byte[]` in the official runner DTO.
+    #[serde(rename = "value", with = "base64_bytes")]
     pub value: Vec<u8>,
     /// Whether this key is RSA-wrapped (true) or plaintext (false).
     #[serde(rename = "encrypted")]
     pub encrypted: bool,
+}
+
+mod base64_bytes {
+    use base64::Engine;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(value))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 /// Agent session creation response.
@@ -464,7 +488,8 @@ impl<'de> Deserialize<'de> for TaskStep {
             .as_object()
             .ok_or_else(|| serde::de::Error::custom("expected object"))?;
 
-        let env = extract_template_map(obj.get("env")).unwrap_or_default();
+        let env = extract_template_map(obj.get("environment").or_else(|| obj.get("env")))
+            .unwrap_or_default();
         let inputs = extract_template_map(obj.get("inputs")).unwrap_or_default();
 
         // In the new serialization format, `script` lives inside the `inputs`
@@ -518,6 +543,13 @@ impl<'de> Deserialize<'de> for TaskStep {
 fn extract_template_map(value: Option<&serde_json::Value>) -> Option<BTreeMap<String, String>> {
     let value = value?;
     if value.as_object()?.is_empty() {
+        return Some(BTreeMap::new());
+    }
+    // TemplateToken mapping: type 2 with no `map` member is the canonical
+    // empty mapping emitted by `TemplateStringMap::serialize` below.
+    if value.get("type").and_then(serde_json::Value::as_u64) == Some(2)
+        && value.get("map").is_none()
+    {
         return Some(BTreeMap::new());
     }
     // TemplateToken map: {"type": 2, "map": [{"key": ..., "value": ...}]}
@@ -1206,6 +1238,273 @@ pub struct VssError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
+    use proptest::prelude::*;
+    use proptest::test_runner::{FileFailurePersistence, RngSeed};
+    use serde_json::{json, Map, Value};
+
+    fn codec_config() -> ProptestConfig {
+        let mut config = ProptestConfig::with_failure_persistence(
+            FileFailurePersistence::SourceParallel("proptest-regressions"),
+        );
+        config.cases = 1_000;
+        config.rng_seed = RngSeed::Fixed(0xA2D0_2026);
+        config.verbose = 1;
+        config
+    }
+
+    fn arb_key() -> impl Strategy<Value = String> {
+        proptest::string::string_regex("[a-z][a-z0-9_]{0,7}").unwrap()
+    }
+
+    fn arb_text() -> impl Strategy<Value = String> {
+        proptest::string::string_regex("[A-Za-z0-9 _./:'-]{0,16}").unwrap()
+    }
+    fn arb_expression() -> impl Strategy<Value = String> {
+        proptest::string::string_regex("[A-Za-z0-9_. ]{0,16}").unwrap()
+    }
+
+    fn arb_non_script_inputs() -> impl Strategy<Value = BTreeMap<String, String>> {
+        proptest::collection::btree_map(
+            prop::sample::select(vec![
+                "input_a".to_owned(),
+                "input_b".to_owned(),
+                "shell".to_owned(),
+            ]),
+            arb_text(),
+            0..=3,
+        )
+    }
+
+    fn expected_template_token(value: &str) -> Value {
+        if let Some(expression) = value
+            .strip_prefix("${{")
+            .and_then(|rest| rest.strip_suffix("}}"))
+        {
+            json!({"type": 3, "expr": expression.trim()})
+        } else {
+            json!({"type": 0, "lit": value})
+        }
+    }
+
+    fn expected_template_map(values: &BTreeMap<String, String>) -> Value {
+        let pairs: Vec<Value> = values
+            .iter()
+            .map(|(key, value)| {
+                json!({
+                    "Key": {"type": 0, "lit": key},
+                    "Value": expected_template_token(value),
+                })
+            })
+            .collect();
+        if pairs.is_empty() {
+            json!({"type": 2})
+        } else {
+            json!({"type": 2, "map": pairs})
+        }
+    }
+
+    fn assert_context_semantics(left: &PipelineContextData, right: &PipelineContextData) {
+        match (left, right) {
+            (PipelineContextData::String(a), PipelineContextData::String(b)) => assert_eq!(a, b),
+            (PipelineContextData::Bool(a), PipelineContextData::Bool(b)) => assert_eq!(a, b),
+            (PipelineContextData::Number(a), PipelineContextData::Number(b)) => {
+                assert_eq!(a.to_bits(), b.to_bits())
+            }
+            (PipelineContextData::Array(a), PipelineContextData::Array(b)) => {
+                assert_eq!(a.len(), b.len());
+                for (a, b) in a.iter().zip(b) {
+                    assert_context_semantics(a, b);
+                }
+            }
+            (PipelineContextData::Dict(a), PipelineContextData::Dict(b)) => {
+                assert_eq!(a.keys().collect::<Vec<_>>(), b.keys().collect::<Vec<_>>());
+                for (key, value) in a {
+                    assert_context_semantics(value, &b[key]);
+                }
+            }
+            _ => panic!("context variant changed: {left:?} vs {right:?}"),
+        }
+    }
+
+    fn expected_context_wire(value: &PipelineContextData) -> Value {
+        match value {
+            PipelineContextData::String(value) => Value::String(value.clone()),
+            PipelineContextData::Bool(value) => Value::Bool(*value),
+            PipelineContextData::Number(value) => json!(value),
+            PipelineContextData::Array(values) => {
+                let mut object = Map::new();
+                object.insert("t".to_owned(), json!(1));
+                if !values.is_empty() {
+                    object.insert(
+                        "a".to_owned(),
+                        Value::Array(values.iter().map(expected_context_wire).collect()),
+                    );
+                }
+                Value::Object(object)
+            }
+            PipelineContextData::Dict(values) => {
+                let mut object = Map::new();
+                object.insert("t".to_owned(), json!(2));
+                if !values.is_empty() {
+                    object.insert(
+                        "d".to_owned(),
+                        Value::Array(
+                            values
+                                .iter()
+                                .map(|(key, value)| {
+                                    json!({"k": key, "v": expected_context_wire(value)})
+                                })
+                                .collect(),
+                        ),
+                    );
+                }
+                Value::Object(object)
+            }
+        }
+    }
+
+    fn arb_context_data() -> impl Strategy<Value = PipelineContextData> {
+        let leaf = prop_oneof![
+            arb_text().prop_map(PipelineContextData::String),
+            any::<bool>().prop_map(PipelineContextData::Bool),
+            (-1000.0f64..1000.0).prop_map(PipelineContextData::Number),
+        ];
+        leaf.prop_recursive(3, 32, 4, |inner| {
+            prop_oneof![
+                proptest::collection::vec(inner.clone(), 0..=3)
+                    .prop_map(PipelineContextData::Array),
+                proptest::collection::btree_map(arb_key(), inner, 0..=3)
+                    .prop_map(PipelineContextData::Dict),
+            ]
+        })
+    }
+
+    fn arb_variable_value() -> impl Strategy<Value = VariableValue> {
+        (
+            prop_oneof![Just(None), arb_text().prop_map(Some)],
+            prop_oneof![Just(None), Just(Some(false)), Just(Some(true))],
+        )
+            .prop_map(|(value, is_secret)| VariableValue { value, is_secret })
+    }
+
+    fn arb_mask_hints() -> impl Strategy<Value = Vec<MaskHint>> {
+        proptest::collection::vec(arb_text(), 0..=3).prop_map(|values| {
+            values
+                .into_iter()
+                .map(|value| MaskHint {
+                    hint_type: MaskType::Hash,
+                    value,
+                })
+                .collect()
+        })
+    }
+
+    fn arb_literal_step() -> impl Strategy<Value = TaskStep> {
+        (
+            any::<bool>(),
+            arb_text(),
+            arb_non_script_inputs(),
+            proptest::collection::btree_map(arb_key(), arb_text(), 0..=2),
+            prop::option::of(arb_text()),
+            prop::option::of(arb_text()),
+            prop::option::of(arb_text()),
+            prop::option::of(arb_text()),
+        )
+            .prop_map(
+                |(has_script, script, inputs, env, name, context_name, display_name, condition)| {
+                    let display_name_token = Some(json!({
+                        "type": 1,
+                        "lit": display_name.clone().unwrap_or_default()
+                    }));
+                    TaskStep {
+                        id: uuid::Uuid::nil(),
+                        name,
+                        context_name,
+                        display_name,
+                        display_name_token,
+                        condition,
+                        script: has_script.then_some(script),
+                        reference: None,
+                        inputs,
+                        env,
+                        continue_on_error: Some(false),
+                        working_directory: None,
+                        timeout_in_minutes: None,
+                    }
+                },
+            )
+    }
+
+    fn arb_job() -> impl Strategy<Value = AgentJobRequestMessage> {
+        (
+            arb_variable_value(),
+            arb_mask_hints(),
+            arb_literal_step(),
+            arb_context_data(),
+            any::<bool>(),
+            arb_text(),
+            any::<bool>(),
+            proptest::collection::vec(any::<u8>(), 0..=12),
+        )
+            .prop_map(
+                |(
+                    variable,
+                    mask_hints,
+                    step,
+                    context,
+                    enable_debugger,
+                    welcome,
+                    has_tunnel,
+                    key_bytes,
+                )| {
+                    let mut variables = BTreeMap::new();
+                    variables.insert("VAR".to_owned(), variable);
+                    let mut context_data = BTreeMap::new();
+                    context_data.insert("github".to_owned(), context);
+                    AgentJobRequestMessage {
+                        message_type: Some("PipelineAgentJobRequest".to_owned()),
+                        job_id: uuid::Uuid::nil(),
+                        request_id: 7,
+                        plan: PlanReference {
+                            plan_id: "plan".to_owned(),
+                            plan_type: Some("workflow".to_owned()),
+                        },
+                        timeline: TimelineReference {
+                            id: uuid::Uuid::nil(),
+                        },
+                        display_name: Some("job".to_owned()),
+                        condition: Some("success()".to_owned()),
+                        variables,
+                        mask_hints,
+                        resources: TaskResources {
+                            endpoints: vec![],
+                            repositories: vec![],
+                        },
+                        context_data,
+                        steps: vec![step],
+                        actions_download_info: BTreeMap::new(),
+                        job_display_name: Some("job".to_owned()),
+                        retry_count: Some(0),
+                        pre_job_timeout: None,
+                        job_timeout: Some(3600),
+                        job_container: None,
+                        job_service_containers: None,
+                        job_outputs: None,
+                        enable_debugger,
+                        debugger_tunnel: has_tunnel.then_some(DebuggerTunnelInfo {
+                            tunnel_id: "tunnel".to_owned(),
+                            cluster_id: "cluster".to_owned(),
+                            host_token: base64::engine::general_purpose::STANDARD.encode(key_bytes),
+                            port: 443,
+                        }),
+                        debugger_welcome_message: Some(welcome),
+                        aksh_debug_run_id: None,
+                        aksh_debug_transport: None,
+                    }
+                },
+            )
+    }
 
     #[test]
     fn task_agent_message_roundtrip() {
@@ -1459,5 +1758,124 @@ mod tests {
         assert!(json.contains("\"type\":\"error\""));
         let back: Issue = serde_json::from_str(&json).unwrap();
         assert_eq!(back.issue_type, IssueType::Error);
+    }
+    // Tier 2 authority (actions/runner v2.335.1, commit 7d737449ef346f6524f75688d0c9c95fa10ba10a):
+    // VariableValue: https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Sdk/DTWebApi/WebApi/VariableValue.cs#L8-L38
+    // ActionStep/JobStep wire fields: https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Sdk/DTPipelines/Pipelines/ActionStep.cs#L9-L46
+    // PipelineContextData converter and tagged collection shapes: https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Sdk/DTPipelines/Pipelines/ContextData/PipelineContextDataJsonConverter.cs#L20-L151
+    // TaskAgentSessionKey bytes/encrypted flag: https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Sdk/DTWebApi/WebApi/TaskAgentSessionKey.cs#L8-L32
+    // AgentJobRequestMessage core/debugger wire members: https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Sdk/DTPipelines/Pipelines/AgentJobRequestMessage.cs#L15-L220 and https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Sdk/DTPipelines/Pipelines/AgentJobRequestMessage.cs#L221-L267
+    proptest! {
+        #![proptest_config(codec_config())]
+
+        #[test]
+        fn tier2_codec_variable_value_tristate(value in arb_variable_value()) {
+            let encoded = serde_json::to_value(&value).unwrap();
+            let decoded: VariableValue = serde_json::from_value(encoded.clone()).unwrap();
+            prop_assert_eq!(serde_json::to_value(&decoded).unwrap(), encoded);
+            prop_assert_eq!(&value.value, &decoded.value);
+            prop_assert_eq!(&value.is_secret, &decoded.is_secret);
+
+            let omitted: BTreeMap<String, VariableValue> = serde_json::from_value(json!({})).unwrap();
+            let explicit_null: BTreeMap<String, VariableValue> =
+                serde_json::from_value(json!({"VAR": {"value": null}})).unwrap();
+            let empty: BTreeMap<String, VariableValue> =
+                serde_json::from_value(json!({"VAR": {"value": ""}})).unwrap();
+            prop_assert!(!omitted.contains_key("VAR"));
+            prop_assert_eq!(explicit_null.get("VAR").and_then(|v| v.value.as_deref()), None);
+            prop_assert_eq!(empty.get("VAR").and_then(|v| v.value.as_deref()), Some(""));
+            prop_assert_eq!(serde_json::to_value(omitted).unwrap(), json!({}));
+            prop_assert_eq!(serde_json::to_value(explicit_null).unwrap(), json!({"VAR": {}}));
+            prop_assert_eq!(serde_json::to_value(empty).unwrap(), json!({"VAR": {"value": ""}}));
+        }
+
+        #[test]
+        fn tier2_codec_task_step_canonical_roundtrip(step in arb_literal_step(), expression in arb_expression()) {
+            let mut expected_inputs = step.inputs.clone();
+            if let Some(script) = &step.script {
+                expected_inputs.insert("script".to_owned(), script.clone());
+            }
+            let encoded = serde_json::to_value(&step).unwrap();
+            prop_assert_eq!(&encoded["type"], &json!("action"));
+            prop_assert_eq!(&encoded["reference"], &json!({"type": "script"}));
+            prop_assert_eq!(&encoded["environment"], &expected_template_map(&step.env));
+            prop_assert_eq!(&encoded["inputs"], &expected_template_map(&expected_inputs));
+            prop_assert_eq!(&encoded["id"], &json!(step.id));
+            prop_assert_eq!(encoded.get("contextName").is_some(), step.context_name.is_some());
+            prop_assert_eq!(encoded.get("displayName").is_some(), step.display_name.is_some());
+            prop_assert_eq!(encoded.get("displayNameToken").is_some(), step.display_name_token.is_some());
+            if let Some(context_name) = &step.context_name {
+                prop_assert_eq!(&encoded["contextName"], &json!(context_name));
+            }
+            if let Some(display_name) = &step.display_name {
+                prop_assert_eq!(&encoded["displayName"], &json!(display_name));
+            }
+            if let Some(display_name_token) = &step.display_name_token {
+                prop_assert_eq!(&encoded["displayNameToken"], display_name_token);
+            }
+
+            let decoded: TaskStep = serde_json::from_value(encoded.clone()).unwrap();
+            prop_assert_eq!(&decoded.id, &step.id);
+            prop_assert_eq!(&decoded.name, &step.name);
+            prop_assert_eq!(&decoded.context_name, &step.context_name);
+            prop_assert_eq!(&decoded.display_name, &step.display_name);
+            prop_assert_eq!(&decoded.display_name_token, &step.display_name_token);
+            prop_assert_eq!(&decoded.condition, &step.condition);
+            prop_assert_eq!(&decoded.script, &step.script);
+            prop_assert_eq!(&decoded.inputs, &expected_inputs);
+            prop_assert_eq!(&decoded.env, &step.env);
+            prop_assert_eq!(&decoded.continue_on_error, &step.continue_on_error);
+            prop_assert_eq!(&decoded.working_directory, &step.working_directory);
+            prop_assert_eq!(&decoded.timeout_in_minutes, &step.timeout_in_minutes);
+            prop_assert_eq!(serde_json::to_value(&decoded).unwrap(), encoded);
+
+            let mut expression_step = step.clone();
+            expression_step.script = None;
+            expression_step.inputs.insert("script".to_owned(), format!("${{{{ {expression} }}}}"));
+            let expression_wire = serde_json::to_value(expression_step).unwrap();
+            let script_token = expression_wire["inputs"]["map"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|pair| pair["Key"]["lit"] == "script")
+                .map(|pair| pair["Value"].clone())
+                .unwrap();
+            prop_assert_eq!(&script_token, &json!({"type": 3, "expr": expression.trim()}));
+        }
+
+        #[test]
+        fn tier2_codec_pipeline_context_data_roundtrip(value in arb_context_data()) {
+            let encoded = serde_json::to_value(&value).unwrap();
+            prop_assert_eq!(&encoded, &expected_context_wire(&value));
+            let decoded: PipelineContextData = serde_json::from_value(encoded.clone()).unwrap();
+            assert_context_semantics(&value, &decoded);
+            prop_assert_eq!(serde_json::to_value(&decoded).unwrap(), encoded);
+        }
+
+        #[test]
+        fn tier2_codec_encryption_key_base64_and_flag(bytes in proptest::collection::vec(any::<u8>(), 0..=64), encrypted in any::<bool>()) {
+            let key = EncryptionKey { value: bytes.clone(), encrypted };
+            let encoded = serde_json::to_value(&key).unwrap();
+            prop_assert_eq!(&encoded["value"], &json!(base64::engine::general_purpose::STANDARD.encode(&bytes)));
+            prop_assert_eq!(&encoded["encrypted"], &json!(encrypted));
+            let decoded: EncryptionKey = serde_json::from_value(encoded.clone()).unwrap();
+            prop_assert_eq!(&decoded.value, &bytes);
+            prop_assert_eq!(&decoded.encrypted, &encrypted);
+            prop_assert_eq!(serde_json::to_value(&decoded).unwrap(), encoded);
+        }
+
+        #[test]
+        fn tier2_codec_agent_job_request_canonical_roundtrip(job in arb_job()) {
+            let encoded = serde_json::to_value(&job).unwrap();
+            prop_assert_eq!(&encoded["messageType"], &json!("PipelineAgentJobRequest"));
+            prop_assert_eq!(&encoded["jobId"], &json!(uuid::Uuid::nil()));
+            prop_assert_eq!(&encoded["requestId"], &json!(7));
+            prop_assert_eq!(&encoded["plan"]["planId"], &json!("plan"));
+            prop_assert_eq!(&encoded["timeline"]["id"], &json!(uuid::Uuid::nil()));
+            prop_assert!(encoded["resources"]["endpoints"].is_array());
+            prop_assert!(encoded["resources"]["repositories"].is_array());
+            let decoded: AgentJobRequestMessage = serde_json::from_value(encoded.clone()).unwrap();
+            prop_assert_eq!(serde_json::to_value(&decoded).unwrap(), encoded);
+        }
     }
 }
