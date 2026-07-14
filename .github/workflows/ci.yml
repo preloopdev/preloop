@@ -43,3 +43,5 @@ jobs:
           # Run client separately but allow warnings on it to avoid enum size variants block
           cargo clippy -p aksh-runner-client --all-targets
       - run: cargo test --workspace
+        env:
+          RUSTFLAGS: "-A warnings"
