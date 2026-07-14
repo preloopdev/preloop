@@ -95,6 +95,9 @@ pub enum ParserError {
         /// Name of the missing secret.
         name: String,
     },
+    /// Invalid concurrency configuration.
+    #[error("{0}")]
+    InvalidConcurrency(String),
     /// Input value cannot be coerced to the declared type.
     #[error("unexpected value `{value}` for input `{name}` of type {expected_type}")]
     InvalidInputValue {
@@ -119,6 +122,9 @@ pub struct Workflow {
     /// Global environment.
     #[serde(default)]
     pub env: Env,
+    /// Workflow-level concurrency group.
+    #[serde(default)]
+    pub concurrency: Option<Concurrency>,
     /// Job definitions.
     pub jobs: IndexMap<String, Job>,
 }
@@ -259,6 +265,12 @@ pub struct ReusableCallMetadata {
     /// Evaluated inputs.
     #[serde(default)]
     pub inputs: BTreeMap<String, Value>,
+    /// Caller job-level concurrency (applies to the whole invocation as a JobSet).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_concurrency: Option<Concurrency>,
+    /// Callee workflow-level concurrency (`EmbeddedConcurrency`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedded_concurrency: Option<Concurrency>,
 }
 
 /// Trigger syntax.
@@ -503,6 +515,9 @@ pub struct Job {
     /// Strategy block.
     #[serde(default)]
     pub strategy: Strategy,
+    /// Job-level concurrency group.
+    #[serde(default)]
+    pub concurrency: Option<Concurrency>,
     /// Job environment.
     #[serde(default)]
     pub env: Env,
@@ -615,6 +630,93 @@ pub struct Strategy {
     /// Max parallel jobs.
     #[serde(default, rename = "max-parallel")]
     pub max_parallel: Option<u64>,
+}
+
+/// Concurrency queue mode for a group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConcurrencyQueue {
+    /// At most one pending holder; newer arrivals replace existing pending.
+    #[default]
+    Single,
+    /// Up to 100 pending holders wait FIFO.
+    Max,
+}
+
+/// Workflow- or job-level concurrency configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Concurrency {
+    /// Raw group string; may contain `${{ }}` — evaluated server-side.
+    pub group: String,
+    /// Raw `cancel-in-progress` value: "true" / "false" / a `${{ }}` expression.
+    pub cancel_in_progress: Option<String>,
+    /// Queue mode.
+    pub queue: ConcurrencyQueue,
+}
+
+impl<'de> Deserialize<'de> for Concurrency {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct ConcurrencyMap {
+            group: String,
+            #[serde(default, rename = "cancel-in-progress")]
+            cancel_in_progress: Option<CancelInProgressValue>,
+            #[serde(default)]
+            queue: Option<String>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum CancelInProgressValue {
+            Bool(bool),
+            String(String),
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum ConcurrencyRaw {
+            String(String),
+            Map(ConcurrencyMap),
+        }
+
+        match ConcurrencyRaw::deserialize(deserializer)? {
+            ConcurrencyRaw::String(group) => Ok(Self {
+                group,
+                cancel_in_progress: None,
+                queue: ConcurrencyQueue::Single,
+            }),
+            ConcurrencyRaw::Map(map) => {
+                let queue = match map.queue.as_deref() {
+                    None | Some("single") => ConcurrencyQueue::Single,
+                    Some("max") => ConcurrencyQueue::Max,
+                    Some(other) => {
+                        return Err(serde::de::Error::custom(format!(
+                            "concurrency.queue must be `single` or `max`, got `{other}`"
+                        )));
+                    }
+                };
+                let cancel_in_progress = map.cancel_in_progress.map(|v| match v {
+                    CancelInProgressValue::Bool(b) => b.to_string(),
+                    CancelInProgressValue::String(s) => s,
+                });
+                if matches!(queue, ConcurrencyQueue::Max)
+                    && cancel_in_progress.as_deref() == Some("true")
+                {
+                    return Err(serde::de::Error::custom(
+                        "concurrency: `queue: max` cannot be combined with `cancel-in-progress: true`",
+                    ));
+                }
+                Ok(Self {
+                    group: map.group,
+                    cancel_in_progress,
+                    queue,
+                })
+            }
+        }
+    }
 }
 
 /// Matrix definition.
@@ -840,42 +942,73 @@ pub fn expand_jobs(workflow: &Workflow) -> Result<Vec<JobPlan>, ParserError> {
             let expanded_id = expanded_job_id(job_id, &matrix);
             let mut env = global_env.clone();
             env.extend(job.env.clone().into_strings());
-            plans.push(JobPlan {
-                id: JobId(expanded_id),
-                base_id: job_id.clone(),
-                name: job.name.clone().unwrap_or_else(|| job_id.clone()),
-                runs_on: job.runs_on.labels(),
-                needs: job.needs.ids(),
-                matrix,
-                env,
-                steps: job
-                    .steps
-                    .iter()
-                    .cloned()
-                    .map(|s| step_plan(s, &job.defaults))
-                    .collect(),
-                if_condition: job.if_condition.clone(),
-                fail_fast: job.strategy.fail_fast.unwrap_or(true),
-                max_parallel: job.strategy.max_parallel,
-                secrets_inherit: false,
-                container: job.container.clone(),
-                services: non_empty_services(job.services.clone()),
-                inputs: BTreeMap::new(),
-                workflow_file: None,
-                workflow_ref: None,
-                workflow_sha: None,
-                workflow_repository: None,
-                secrets_map: BTreeMap::new(),
-                job_outputs: job
-                    .outputs
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.as_str().unwrap_or(&v.to_string()).to_string()))
-                    .collect(),
-            });
+            plans.push(job_plan_from_job(job_id, job, expanded_id, matrix, env));
         }
     }
     dag::validate_job_plans(&plans)?;
     Ok(plans)
+}
+
+fn job_plan_from_job(
+    job_id: &str,
+    job: &Job,
+    expanded_id: String,
+    matrix: IndexMap<String, Value>,
+    env: BTreeMap<String, String>,
+) -> JobPlan {
+    let (concurrency_group, concurrency_cancel_in_progress, concurrency_queue) =
+        concurrency_fields(job.concurrency.as_ref());
+    JobPlan {
+        id: JobId(expanded_id),
+        base_id: job_id.to_owned(),
+        name: job.name.clone().unwrap_or_else(|| job_id.to_owned()),
+        runs_on: job.runs_on.labels(),
+        needs: job.needs.ids(),
+        matrix,
+        env,
+        steps: job
+            .steps
+            .iter()
+            .cloned()
+            .map(|s| step_plan(s, &job.defaults))
+            .collect(),
+        if_condition: job.if_condition.clone(),
+        fail_fast: job.strategy.fail_fast.unwrap_or(true),
+        max_parallel: job.strategy.max_parallel,
+        secrets_inherit: false,
+        container: job.container.clone(),
+        services: non_empty_services(job.services.clone()),
+        inputs: BTreeMap::new(),
+        workflow_file: None,
+        workflow_ref: None,
+        workflow_sha: None,
+        workflow_repository: None,
+        secrets_map: BTreeMap::new(),
+        job_outputs: job
+            .outputs
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_str().unwrap_or(&v.to_string()).to_string()))
+            .collect(),
+        concurrency_group,
+        concurrency_cancel_in_progress,
+        concurrency_queue,
+    }
+}
+
+fn concurrency_fields(
+    concurrency: Option<&Concurrency>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    match concurrency {
+        Some(c) => (
+            Some(c.group.clone()),
+            c.cancel_in_progress.clone(),
+            Some(match c.queue {
+                ConcurrencyQueue::Single => "single".to_owned(),
+                ConcurrencyQueue::Max => "max".to_owned(),
+            }),
+        ),
+        None => (None, None, None),
+    }
 }
 
 /// Coerce value to the declared input type, matching GitHub's validation.
@@ -1112,6 +1245,8 @@ fn expand_jobs_with_reusables_internal(
                         output_definitions: output_definitions.clone(),
                         inner_job_ids,
                         inputs: resolved_inputs.clone(),
+                        caller_concurrency: job.concurrency.clone(),
+                        embedded_concurrency: called.concurrency.clone(),
                     },
                 );
 
@@ -1124,38 +1259,7 @@ fn expand_jobs_with_reusables_internal(
             let expanded_id = expanded_job_id(job_id, &matrix);
             let mut env = global_env.clone();
             env.extend(job.env.clone().into_strings());
-            plans.push(JobPlan {
-                id: JobId(expanded_id),
-                base_id: job_id.clone(),
-                name: job.name.clone().unwrap_or_else(|| job_id.clone()),
-                runs_on: job.runs_on.labels(),
-                needs: job.needs.ids(),
-                matrix,
-                env,
-                steps: job
-                    .steps
-                    .iter()
-                    .cloned()
-                    .map(|s| step_plan(s, &job.defaults))
-                    .collect(),
-                if_condition: job.if_condition.clone(),
-                fail_fast: job.strategy.fail_fast.unwrap_or(true),
-                max_parallel: job.strategy.max_parallel,
-                secrets_inherit: false,
-                container: job.container.clone(),
-                services: non_empty_services(job.services.clone()),
-                inputs: BTreeMap::new(),
-                workflow_file: None,
-                workflow_ref: None,
-                workflow_sha: None,
-                workflow_repository: None,
-                secrets_map: BTreeMap::new(),
-                job_outputs: job
-                    .outputs
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.as_str().unwrap_or(&v.to_string()).to_string()))
-                    .collect(),
-            });
+            plans.push(job_plan_from_job(job_id, job, expanded_id, matrix, env));
         }
     }
     Ok(plans)
@@ -1982,6 +2086,118 @@ jobs:
         assert_eq!(
             plans[0].job_outputs.get("value").map(String::as_str),
             Some("${{ steps.gen.outputs.value }}")
+        );
+    }
+    #[test]
+    fn concurrency_bare_string_shorthand() {
+        let wf = parse_workflow(
+            r#"
+on: push
+concurrency: ci-${{ github.ref }}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"#,
+        )
+        .unwrap();
+        let c = wf.concurrency.unwrap();
+        assert_eq!(c.group, "ci-${{ github.ref }}");
+        assert_eq!(c.cancel_in_progress, None);
+        assert_eq!(c.queue, ConcurrencyQueue::Single);
+    }
+
+    #[test]
+    fn concurrency_mapping_form() {
+        let wf = parse_workflow(
+            r#"
+on: push
+concurrency:
+  group: g
+  cancel-in-progress: true
+  queue: single
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"#,
+        )
+        .unwrap();
+        let c = wf.concurrency.unwrap();
+        assert_eq!(c.group, "g");
+        assert_eq!(c.cancel_in_progress.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn concurrency_preserves_expression_cancel() {
+        let wf = parse_workflow(
+            r#"
+on: push
+concurrency:
+  group: g
+  cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"#,
+        )
+        .unwrap();
+        let c = wf.concurrency.unwrap();
+        assert_eq!(
+            c.cancel_in_progress.as_deref(),
+            Some("${{ github.ref == 'refs/heads/main' }}")
+        );
+    }
+
+    #[test]
+    fn concurrency_queue_max_with_literal_cancel_is_error() {
+        let err = parse_workflow(
+            r#"
+on: push
+concurrency:
+  group: g
+  cancel-in-progress: true
+  queue: max
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"#,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("queue: max") && msg.contains("cancel-in-progress"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn job_level_concurrency_on_plan() {
+        let wf = parse_workflow(
+            r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: jg
+      cancel-in-progress: false
+    steps:
+      - run: echo hi
+"#,
+        )
+        .unwrap();
+        let plans = expand_jobs(&wf).unwrap();
+        assert_eq!(plans[0].concurrency_group.as_deref(), Some("jg"));
+        assert_eq!(
+            plans[0].concurrency_cancel_in_progress.as_deref(),
+            Some("false")
         );
     }
 }
