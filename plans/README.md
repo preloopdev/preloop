@@ -58,7 +58,7 @@ cache/artifact Twirp route names + Azure block-blob subset + `ListArtifacts` res
 | 003 | Conform job-lease renewal semantics (runner + server) | P1 | M | — | TODO |
 | 004 | Handle ForceTokenRefresh / HostedRunnerShutdown / RunnerRefresh broker messages | P2 | S | — | TODO |
 | 005 | Close results-Twirp gaps: diagnostic-logs route + verify /twirp auth | P2 | S | — | TODO |
-| 006 | Establish model-based property testing for concurrency | P1 | L | — | IN PROGRESS |
+| 006 | Establish model-based property testing for concurrency | P1 | L | — | BLOCKED (live differential prerequisites) |
 
 All five are independent (no inter-plan dependencies). 003 and 004 touch
 `crates/aksh-runner/src/listener/broker_listener.rs`, which has uncommitted concurrency changes
