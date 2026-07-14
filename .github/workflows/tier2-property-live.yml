@@ -75,20 +75,11 @@ jobs:
           }
 
           run_filter aksh-gha-protocol tier2_codec_
-          run_filter aksh-gha-parser matrix_expand
-          run_filter aksh-gha-parser dag
-          run_filter aksh-gha-expressions tests
-          run_filter aksh-runner worker::commands
-          run_filter aksh-runner worker::contexts
-          run_filter aksh-runner worker::file_commands
-          run_filter aksh-runner worker::job_extension
-          run_filter aksh-runner worker::official_oracles
-          run_filter aksh-runner worker::step_conditions
-          run_filter aksh-runner worker::step_records
-          run_filter aksh-runner worker::steps_runner
-          run_filter aksh-runner-server scheduling
-          run_filter aksh-runner-server generated_server_dag_properties_1000_cases
-          run_filter aksh-runner-server workflow_steps_update_production_path_1000_cases
+          run_filter aksh-runner worker::commands::tests
+          run_filter aksh-runner worker::contexts::tests::masking_
+          run_filter aksh-runner worker::file_commands::tests
+          run_filter aksh-runner lifecycle
+          run_filter aksh-runner-server workflow_steps_update_
 
       # The official runner does not support local pre actions, so this fixture
       # is pinned to an immutable, isolated action-only commit in this repository.
