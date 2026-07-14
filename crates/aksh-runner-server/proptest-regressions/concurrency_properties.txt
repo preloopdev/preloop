@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 67dbe31a1f5c44a3d23b2a509fabf0348e112ce1aef5c27be6b47ff49d45f96b # shrinks to ops = [Submit { run: 3, kind: Run, repo: "repo-b", group: "grp-1", queue: Single, cancel_in_progress: false }, Submit { run: 0, kind: Run, repo: "repo-b", group: "grp-1", queue: Single, cancel_in_progress: false }, Submit { run: 2, kind: Run, repo: "repo-b", group: "Grp-1", queue: Max, cancel_in_progress: false }, Submit { run: 1, kind: Run, repo: "repo-b", group: "grp-1", queue: Single, cancel_in_progress: true }]

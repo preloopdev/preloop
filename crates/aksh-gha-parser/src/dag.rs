@@ -287,6 +287,9 @@ mod tests {
             workflow_repository: None,
             secrets_map: Default::default(),
             job_outputs: Default::default(),
+            concurrency_group: None,
+            concurrency_cancel_in_progress: None,
+            concurrency_queue: None,
         }
     }
 
