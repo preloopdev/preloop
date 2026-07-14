@@ -1,0 +1,13 @@
+name: concurrency-01-bare-string
+on: workflow_dispatch
+concurrency: bare-string-group
+jobs:
+  build:
+    runs-on: self-hosted
+    steps:
+      - name: marker
+        run: |
+          echo "SCENARIO=01-bare-string"
+          echo "RUN_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          sleep 5
+          echo "DONE=01"

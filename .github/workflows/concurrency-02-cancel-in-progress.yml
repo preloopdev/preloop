@@ -1,0 +1,15 @@
+name: concurrency-02-cancel-in-progress
+on: workflow_dispatch
+concurrency:
+  group: cancel-ip-group
+  cancel-in-progress: true
+jobs:
+  long:
+    runs-on: self-hosted
+    steps:
+      - name: sleep-long
+        run: |
+          echo "SCENARIO=02-cancel-in-progress"
+          echo "START=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          sleep 30
+          echo "SHOULD_NOT_REACH"

@@ -1,0 +1,25 @@
+name: concurrency-08-job-level
+on: workflow_dispatch
+jobs:
+  one:
+    runs-on: self-hosted
+    concurrency:
+      group: job-level-serial
+      cancel-in-progress: false
+    steps:
+      - name: one
+        run: |
+          echo "SCENARIO=08-job-level job=one"
+          sleep 5
+          echo "DONE=one"
+  two:
+    runs-on: self-hosted
+    concurrency:
+      group: job-level-serial
+      cancel-in-progress: false
+    steps:
+      - name: two
+        run: |
+          echo "SCENARIO=08-job-level job=two"
+          sleep 4
+          echo "DONE=two"
