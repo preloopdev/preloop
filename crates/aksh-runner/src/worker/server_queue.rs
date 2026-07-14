@@ -33,7 +33,7 @@ pub mod step_conclusion {
 }
 
 /// A step update matching the WorkflowStepsUpdate Twirp schema.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct StepUpdate {
     /// Step external ID (UUID from the job message step).
     pub external_id: String,
@@ -118,8 +118,9 @@ impl ServerQueue {
 
     /// Queue a step status update.
     ///
-    /// Updates the cumulative step state. If this is a new step, it's added
-    /// to the pending keys list so it appears in the next flush.
+    /// Updates the cumulative step state using identity-safe merge rules:
+    /// `external_id` is the key, status is monotonic, and conclusions are not
+    /// erased by empty partials. Matches official WorkflowStepsUpdate behavior.
     pub fn queue_update(&mut self, update: StepUpdate) {
         debug!(
             "Queued update for step {}: status={} conclusion={}",
@@ -131,7 +132,10 @@ impl ServerQueue {
         if !self.all_steps.contains_key(&key) {
             self.pending_keys.push(key.clone());
         }
-        self.all_steps.insert(key, update);
+        let partial = crate::worker::step_records::PartialStepUpdate::from_full(&update);
+        let merged =
+            crate::worker::step_records::merge_step_update(self.all_steps.get(&key), &partial);
+        self.all_steps.insert(key, merged);
     }
 
     /// Queue log lines for a step.
