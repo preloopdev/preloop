@@ -38,6 +38,10 @@ pub struct RunningJob {
     stdin: Option<tokio::process::ChildStdin>,
     /// The job/request ID for matching cancellation messages.
     pub request_id: String,
+    /// Agent job GUID from the job message body (`jobId`), for JobCancellation matching.
+    pub job_id: Option<uuid::Uuid>,
+    /// Hard-kill deadline after cancel (official: timeout − 15s).
+    pub kill_at: Option<tokio::time::Instant>,
 }
 
 impl RunningJob {
@@ -91,6 +95,10 @@ pub async fn spawn_job(
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
+    let job_id = job_message
+        .get("jobId")
+        .and_then(|v| v.as_str())
+        .and_then(|s| uuid::Uuid::parse_str(s).ok());
 
     info!("Dispatching job {request_id} to worker");
 
@@ -181,7 +189,60 @@ pub async fn spawn_job(
         child,
         stdin,
         request_id,
+        job_id,
+        kill_at: None,
     })
+}
+
+/// Parse a .NET TimeSpan string (`hh:mm:ss` or `d.hh:mm:ss[.fffffff]`) into seconds.
+pub fn parse_timespan_secs(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (days, rest) = if let Some((d, r)) = s.split_once('.') {
+        // Could be days.hh:mm:ss or fractional seconds on last component.
+        // If `d` is all digits and `r` contains ':', treat as days.
+        if d.chars().all(|c| c.is_ascii_digit()) && r.contains(':') {
+            (d.parse::<u64>().ok()?, r)
+        } else {
+            (0, s)
+        }
+    } else {
+        (0, s)
+    };
+    // Strip fractional seconds
+    let rest = rest.split('.').next().unwrap_or(rest);
+    let parts: Vec<&str> = rest.split(':').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let hours: u64 = parts[0].parse().ok()?;
+    let mins: u64 = parts[1].parse().ok()?;
+    let secs: u64 = parts[2].parse().ok()?;
+    Some(days * 86400 + hours * 3600 + mins * 60 + secs)
+}
+
+#[cfg(test)]
+mod timespan_tests {
+    use super::parse_timespan_secs;
+
+    #[test]
+    fn parses_hh_mm_ss() {
+        assert_eq!(parse_timespan_secs("00:05:00"), Some(300));
+        assert_eq!(parse_timespan_secs("01:00:00"), Some(3600));
+    }
+
+    #[test]
+    fn parses_days() {
+        assert_eq!(parse_timespan_secs("1.00:00:00"), Some(86400));
+    }
+
+    #[test]
+    fn garbage_returns_none() {
+        assert_eq!(parse_timespan_secs("not-a-timespan"), None);
+        assert_eq!(parse_timespan_secs(""), None);
+    }
 }
 
 /// Blocking dispatch — spawns and waits. Used by the AzDO message listener

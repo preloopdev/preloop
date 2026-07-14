@@ -10,7 +10,7 @@ use tracing::{debug, info, warn};
 
 use crate::client::broker::BrokerClient;
 use crate::client::http::HttpClient;
-use crate::listener::job_dispatcher::{self, RunningJob};
+use crate::listener::job_dispatcher::{self, parse_timespan_secs, RunningJob};
 use crate::settings::RunnerConfig;
 
 /// Run the broker message polling loop.
@@ -173,6 +173,7 @@ pub async fn run_broker_loop(
         }
 
         let busy = active_job.is_some();
+        let kill_at = active_job.as_ref().and_then(|j| j.kill_at);
 
         tokio::select! {
             _ = &mut shutdown => {
@@ -215,6 +216,15 @@ pub async fn run_broker_loop(
                 }
                 active_job = None;
                 continue;
+            }
+            // Hard-kill after cancel grace (official: kill_at = timeout − 15s).
+            _ = tokio::time::sleep_until(kill_at.unwrap_or_else(tokio::time::Instant::now)),
+                if kill_at.is_some() => {
+                if let Some(job) = active_job.as_mut() {
+                    warn!("Cancel grace expired — hard-killing worker {}", job.request_id);
+                    job.kill().await;
+                    job.kill_at = None;
+                }
             }
             result = client.get_message(&token, &session_id, busy) => {
                 match result {
@@ -261,11 +271,37 @@ pub async fn run_broker_loop(
 
                         match message_type.as_str() {
                             "RunnerJobRequest" => {
-                                if active_job.is_some() {
-                                    warn!("Received job while another is running — ignoring");
-                                    continue;
+                                if let Some(mut prev) = active_job.take() {
+                                    // C-04: Official run-service dispatcher cancels
+                                    // the previous worker immediately on overlap
+                                    // rather than blocking 45s. The successor is
+                                    // NEVER dropped after acknowledge.
+                                    info!(
+                                        "RunnerJobRequest while busy — cancelling previous job {}",
+                                        prev.request_id
+                                    );
+                                    prev.cancel(300).await;
+                                    prev.kill_at = Some(
+                                        tokio::time::Instant::now()
+                                            + std::time::Duration::from_secs(45),
+                                    );
+                                    // Wait briefly for graceful exit, but do NOT
+                                    // block the listener for long. If the worker
+                                    // is still alive the kill_at timer in the
+                                    // select loop will reap it on the next
+                                    // iteration via the kill branch.
+                                    let _ = tokio::time::timeout(
+                                        std::time::Duration::from_millis(500),
+                                        prev.wait(),
+                                    )
+                                    .await;
+                                    // Check once/ephemeral AFTER the old job drains
+                                    if once || config.settings.ephemeral {
+                                        info!("exiting after first job finished during overlap (run-service)");
+                                        let _ = client.delete_session(&token, &session_id).await;
+                                        return Ok(());
+                                    }
                                 }
-                                // Renew OAuth token before job acquisition (official runner refreshes here)
                                 match crate::listener::oauth::get_oauth_token(http, config).await {
                                     Ok((new_token, new_expires)) => { token = new_token; token_expires_at = new_expires; }
                                     Err(e) => warn!("OAuth token renewal before job failed: {e:#}"),
@@ -281,9 +317,22 @@ pub async fn run_broker_loop(
                                 }
                             }
                             "PipelineAgentJobRequest" => {
-                                if active_job.is_some() {
-                                    warn!("Received job while another is running — ignoring");
-                                    continue;
+                                if let Some(mut prev) = active_job.take() {
+                                    // Same cancel-immediately pattern for AzDO path
+                                    info!(
+                                        "PipelineAgentJobRequest while busy — cancelling previous job {}",
+                                        prev.request_id
+                                    );
+                                    prev.cancel(300).await;
+                                    let _ = tokio::time::timeout(
+                                        std::time::Duration::from_millis(500),
+                                        prev.wait(),
+                                    )
+                                    .await;
+                                    if once || config.settings.ephemeral {
+                                        let _ = client.delete_session(&token, &session_id).await;
+                                        return Ok(());
+                                    }
                                 }
                                 let running = job_dispatcher::spawn_job(
                                     body,
@@ -293,29 +342,41 @@ pub async fn run_broker_loop(
                                 active_job = Some(running);
                             }
                             "JobCancellation" => {
-                                if let Some(job) = &mut active_job {
-                                    info!("Cancelling active job {}", job.request_id);
-                                    // F031/P1.4: Graceful cancel first — sends IPC cancel
-                                    // message so worker can run always()/post steps and
-                                    // flush reporting. Hard kill after 5-minute grace period
-                                    // (matching upstream's default cancel timeout).
-                                    job.cancel(300).await;
-                                    let grace = std::time::Duration::from_secs(300);
-                                    match tokio::time::timeout(grace, job.wait()).await {
-                                        Ok(_) => {
-                                            info!("Worker exited gracefully after cancel");
-                                        }
-                                        Err(_) => {
-                                            warn!("Worker did not exit within grace period — killing");
-                                            job.kill().await;
+                                // Official shape: { jobId: Guid, timeout: TimeSpan }
+                                let cancel_job_id = body
+                                    .get("jobId")
+                                    .and_then(|v| v.as_str())
+                                    .and_then(|s| uuid::Uuid::parse_str(s).ok());
+                                let timeout_secs = body
+                                    .get("timeout")
+                                    .and_then(|v| v.as_str())
+                                    .and_then(parse_timespan_secs)
+                                    .unwrap_or(300);
+                                // Clamp per JobDispatcher.cs: max(timeout, 60); kill at timeout-15.
+                                let timeout_secs = timeout_secs.max(60);
+                                let kill_after = timeout_secs.saturating_sub(15);
+
+                                if let Some(job) = active_job.as_mut() {
+                                    if let (Some(msg_id), Some(active_id)) =
+                                        (cancel_job_id, job.job_id)
+                                    {
+                                        if msg_id != active_id {
+                                            debug!(
+                                                "JobCancellation jobId {msg_id} does not match active {active_id} — ignoring"
+                                            );
+                                            continue;
                                         }
                                     }
-                                    if once || config.settings.ephemeral {
-                                        info!("exiting after cancelled job");
-                                        let _ = client.delete_session(&token, &session_id).await;
-                                        return Ok(());
-                                    }
-                                    active_job = None;
+                                    info!(
+                                        "Cancelling active job {} (timeout={timeout_secs}s, kill_after={kill_after}s)",
+                                        job.request_id
+                                    );
+                                    // Non-blocking: send IPC cancel and return to poll loop.
+                                    job.cancel(timeout_secs).await;
+                                    job.kill_at = Some(
+                                        tokio::time::Instant::now()
+                                            + std::time::Duration::from_secs(kill_after),
+                                    );
                                 } else {
                                     debug!("Received cancellation but no active job");
                                 }
