@@ -1,0 +1,162 @@
+name: tier2-property-live
+
+# The official GitHub-hosted runner is the oracle for this live conformance job.
+# Workflow command documentation (file commands, stop-commands, and add-mask):
+# https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands
+# Action metadata and pre/main/post lifecycle documentation:
+# https://docs.github.com/en/actions/creating-actions/metadata-syntax-for-github-actions
+# Pinned runner reference: actions/runner v2.335.1, commit
+# 7d737449ef346f6524f75688d0c9c95fa10ba10a.
+# ActionRunner.cs:
+# https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/ActionRunner.cs
+# ActionManager.cs:
+# https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/ActionManager.cs
+
+on:
+  push:
+    paths:
+      - .github/actions/tier2-property-oracle/**
+      - .github/workflows/tier2-property-live.yml
+      - crates/aksh-gha-protocol/Cargo.toml
+      - crates/aksh-gha-protocol/src/azdo.rs
+      - crates/aksh-runner/Cargo.toml
+      - crates/aksh-runner-server/Cargo.toml
+      - crates/aksh-gha-parser/src/dag.rs
+      - crates/aksh-gha-parser/src/lib.rs
+      - crates/aksh-gha-parser/src/matrix_expand.rs
+      - crates/aksh-gha-expressions/src/lib.rs
+      - crates/aksh-runner/src/worker/commands.rs
+      - crates/aksh-runner/src/worker/contexts.rs
+      - crates/aksh-runner/src/worker/file_commands.rs
+      - crates/aksh-runner/src/worker/job_extension.rs
+      - crates/aksh-runner/src/worker/official_oracles.rs
+      - crates/aksh-runner/src/worker/step_conditions.rs
+      - crates/aksh-runner/src/worker/step_records.rs
+      - crates/aksh-runner/src/worker/steps_runner.rs
+      - crates/aksh-runner-server/src/lib.rs
+      - crates/aksh-runner-server/src/scheduling.rs
+      - crates/aksh-runner-server/proptest-regressions/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tier2-property-live:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@1.86
+
+      - name: Run targeted Tier 2 Rust property filters
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Cargo exits successfully when a filter matches zero tests. Keep this
+          # gate explicit so a renamed or removed property cannot silently pass.
+          run_filter() {
+            local package="$1"
+            local filter="$2"
+            local output
+            echo "=== cargo test -p ${package} ${filter} --lib ==="
+            if ! output="$(cargo test -p "$package" "$filter" --lib -- --nocapture 2>&1)"; then
+              printf '%s\n' "$output"
+              return 1
+            fi
+            printf '%s\n' "$output"
+            if [[ "$output" == *"running 0 tests"* ]]; then
+              echo "filter matched zero tests: ${package} ${filter}" >&2
+              return 1
+            fi
+          }
+
+          run_filter aksh-gha-protocol tier2_codec_
+          run_filter aksh-gha-parser matrix_expand
+          run_filter aksh-gha-parser dag
+          run_filter aksh-gha-expressions tests
+          run_filter aksh-runner worker::commands
+          run_filter aksh-runner worker::contexts
+          run_filter aksh-runner worker::file_commands
+          run_filter aksh-runner worker::job_extension
+          run_filter aksh-runner worker::official_oracles
+          run_filter aksh-runner worker::step_conditions
+          run_filter aksh-runner worker::step_records
+          run_filter aksh-runner worker::steps_runner
+          run_filter aksh-runner-server scheduling
+          run_filter aksh-runner-server generated_server_dag_properties_1000_cases
+          run_filter aksh-runner-server workflow_steps_update_production_path_1000_cases
+
+      # The official runner does not support local pre actions, so the fixture
+      # is fetched remotely from the immutable implementation commit above.
+      - name: Run remote JavaScript oracle (declaration 1)
+        uses: preloopdev/aksh/.github/actions/tier2-property-oracle@660851c9506c48e4cac879c41c98ffddc9a8dbc4
+        with:
+          id: first
+
+      - name: Run remote JavaScript oracle (declaration 2)
+        uses: preloopdev/aksh/.github/actions/tier2-property-oracle@660851c9506c48e4cac879c41c98ffddc9a8dbc4
+        with:
+          id: second
+
+      - name: Exercise workflow command files and controls
+        id: command_contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          env_delimiter="TIER2_ENV_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+          output_delimiter="TIER2_OUTPUT_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+          path_dir="${RUNNER_TEMP}/tier2-property-path-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "$path_dir"
+          cat > "$path_dir/tier2-path-probe" <<'SCRIPT'
+          #!/usr/bin/env bash
+          printf '%s\n' path-propagated
+          SCRIPT
+          chmod +x "$path_dir/tier2-path-probe"
+
+          {
+            printf 'TIER2_HEREDOC_ENV<<%s\n' "$env_delimiter"
+            printf 'line-one\nline-two:%s\n' "$GITHUB_RUN_ATTEMPT"
+            printf '%s\n' "$env_delimiter"
+          } >> "$GITHUB_ENV"
+
+          {
+            printf 'heredoc<<%s\n' "$output_delimiter"
+            printf 'output-line-one\noutput-line-two\n'
+            printf '%s\n' "$output_delimiter"
+          } >> "$GITHUB_OUTPUT"
+
+          printf '%s\n' "$path_dir" >> "$GITHUB_PATH"
+
+          stop_token="tier2-stop-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          printf '::stop-commands::%s\n' "$stop_token"
+          printf '::error::this-error-must-be-suppressed-while-stopped\n'
+          printf '::%s::\n' "$stop_token"
+          printf '::notice::stop-commands-resumed\n'
+
+          # The sentinel is deliberately printed after add-mask for inspection
+          # in the live job log; the official runner must redact its value.
+          mask_sentinel="tier2-mask-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_SHA:0:12}"
+          printf '::add-mask::%s\n' "$mask_sentinel"
+          printf 'tier2-mask-sentinel-after=%s\n' "$mask_sentinel"
+
+      - name: Verify caller-visible command propagation
+        shell: bash
+        env:
+          FIRST_RESULT: ${{ steps.oracle_first.outputs.result }}
+          SECOND_RESULT: ${{ steps.oracle_second.outputs.result }}
+          OUTPUT_HEREDOC: ${{ steps.command_contracts.outputs.heredoc }}
+        run: |
+          set -euo pipefail
+          [[ "$FIRST_RESULT" == "tier2-oracle-first-main-state-ok" ]]
+          [[ "$SECOND_RESULT" == "tier2-oracle-second-main-state-ok" ]]
+          expected_env=$'line-one\nline-two:'"$GITHUB_RUN_ATTEMPT"
+          [[ "$TIER2_HEREDOC_ENV" == "$expected_env" ]]
+          expected_output=$'output-line-one\noutput-line-two'
+          [[ "$OUTPUT_HEREDOC" == "$expected_output" ]]
+          [[ "$(tier2-path-probe)" == "path-propagated" ]]
+          echo "GITHUB_ENV, GITHUB_OUTPUT heredocs, and GITHUB_PATH propagated to caller"
