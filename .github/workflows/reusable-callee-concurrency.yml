@@ -1,4 +1,4 @@
-name: reusable-callee
+name: reusable-callee-concurrency
 on:
   workflow_call:
     inputs:
@@ -6,10 +6,10 @@ on:
         required: true
         type: string
       concurrency_group:
-        required: false
+        required: true
         type: string
-        default: ""
-
+concurrency:
+  group: ${{ inputs.concurrency_group }}
 jobs:
   inner:
     runs-on: self-hosted
