@@ -410,6 +410,102 @@ fn generate_random_yaml(seed: u64) -> String {
     yaml
 }
 
+fn copy_workspace_code(dest: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    let items = ["Cargo.toml", "Cargo.lock", "crates", "fixtures"];
+    for item in items {
+        let src = std::path::Path::new(item);
+        if src.exists() {
+            if src.is_dir() {
+                copy_dir_all(src, &dest.join(item))?;
+            } else {
+                std::fs::copy(src, dest.join(item))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &dst.join(entry.file_name()))?;
+        } else {
+            std::fs::copy(entry.path(), dst.join(entry.file_name()))?;
+        }
+    }
+    Ok(())
+}
+
+fn modify_workflow_for_local_run(workflow_path: &std::path::Path) -> anyhow::Result<String> {
+    let file = std::fs::File::open(workflow_path)?;
+    let mut doc: serde_yaml::Value = serde_yaml::from_reader(file)?;
+    if let Some(jobs) = doc.get_mut("jobs").and_then(|j| j.as_mapping_mut()) {
+        for (_job_id, job) in jobs.iter_mut() {
+            if let Some(steps) = job.get_mut("steps").and_then(|s| s.as_sequence_mut()) {
+                steps.retain(|step| {
+                    if let Some(uses) = step.get("uses").and_then(|u| u.as_str()) {
+                        !uses.starts_with("actions/checkout")
+                            && !uses.starts_with("dtolnay/rust-toolchain")
+                    } else {
+                        true
+                    }
+                });
+            }
+        }
+    }
+    let modified = serde_yaml::to_string(&doc)?;
+    Ok(modified)
+}
+
+fn preseed_private_actions(
+    workflow: &std::path::Path,
+    state_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    let content = std::fs::read_to_string(workflow)?;
+    let search_str = "preloopdev/aksh/.github/actions/tier2-property-oracle@";
+    let mut cursor = 0;
+    while let Some(pos) = content[cursor..].find(search_str) {
+        let abs_pos = cursor + pos;
+        let sha_start = abs_pos + search_str.len();
+        let sha_end = content[sha_start..]
+            .find(|c: char| !c.is_ascii_hexdigit())
+            .map(|offset| sha_start + offset)
+            .unwrap_or(content.len());
+        let sha = &content[sha_start..sha_end];
+        if sha.len() >= 7 {
+            let dest_dir = state_dir
+                .join("actions")
+                .join("preloopdev")
+                .join("aksh")
+                .join(sha);
+            std::fs::create_dir_all(&dest_dir)?;
+            let archive_path = dest_dir.join("action.tar.gz");
+            let action_dir = std::path::Path::new(".github/actions/tier2-property-oracle");
+            if action_dir.exists() {
+                let file = std::fs::File::create(&archive_path)?;
+                let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+                let mut tar = tar::Builder::new(enc);
+                tar.append_dir_all(
+                    "archive-root/.github/actions/tier2-property-oracle",
+                    action_dir,
+                )?;
+                tar.finish()?;
+                println!(
+                    "Pre-seeded local action cache for commit {} at {}",
+                    sha,
+                    archive_path.display()
+                );
+            }
+        }
+        cursor = sha_end;
+    }
+    Ok(())
+}
+
 async fn run_runner_e2e(
     runner_bin: PathBuf,
     workflow: PathBuf,
@@ -449,6 +545,9 @@ async fn run_runner_e2e(
     let runner_root = temp_dir.path().join("runner-root");
     std::fs::create_dir_all(&state_dir)?;
     std::fs::create_dir_all(&runner_root)?;
+
+    // Pre-seed any private action references locally before starting the server
+    preseed_private_actions(&workflow, &state_dir)?;
 
     // Start server in background on port 9191
     let mut server_cmd = Command::new(server_bin);
@@ -505,11 +604,26 @@ async fn run_runner_e2e(
         let _ = server.kill().await;
         anyhow::bail!("runner configure failed");
     }
+    // If testing live/CI workflows locally, rewrite them to skip Git clone & toolchain setup
+    let is_live_workflow = workflow
+        .file_name()
+        .and_then(|f| f.to_str())
+        .map(|s| s.contains("live") || s.contains("ci") || s.contains("dogfood"))
+        .unwrap_or(false);
+    let submit_workflow_path = if is_live_workflow {
+        copy_workspace_code(&runner_root.join("_work/default/default"))?;
+        let modified = modify_workflow_for_local_run(&workflow)?;
+        let temp_wf = temp_dir.path().join("local-wf.yml");
+        std::fs::write(&temp_wf, modified)?;
+        temp_wf
+    } else {
+        workflow.clone()
+    };
 
     // Submit workflow
     let submit_output = Command::new(client_bin)
         .args(["--server", "http://127.0.0.1:9191", "submit", "-W"])
-        .arg(&workflow)
+        .arg(&submit_workflow_path)
         .output()
         .await?;
     if !submit_output.status.success() {
@@ -550,6 +664,34 @@ async fn run_runner_e2e(
     }
     if runner_status.success() {
         run_success = true;
+    }
+
+    if run_status != "success" {
+        println!("=== Debug: Listing step log files from server state ===");
+        for entry in walkdir::WalkDir::new(&state_dir) {
+            if let Ok(entry) = entry {
+                let path = entry.path();
+                if path.is_file() {
+                    // Skip printing the tar.gz binary archive itself
+                    if path.extension().map(|e| e == "gz").unwrap_or(false) {
+                        continue;
+                    }
+                    if let Ok(bytes) = std::fs::read(path) {
+                        println!(
+                            "--- Log File: {} ({} bytes) ---",
+                            path.display(),
+                            bytes.len()
+                        );
+                        let len = std::cmp::min(100, bytes.len());
+                        println!("  Hex: {:02x?}", &bytes[..len]);
+                        let content = String::from_utf8_lossy(&bytes);
+                        if !content.trim().is_empty() {
+                            println!("{}", content);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     let verdict = serde_json::json!({
