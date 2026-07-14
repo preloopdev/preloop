@@ -1,0 +1,10 @@
+name: concurrency-10-empty-group
+on: workflow_dispatch
+concurrency:
+  group: ${{ github.event.head_commit.id_missing }}
+jobs:
+  probe:
+    runs-on: self-hosted
+    steps:
+      - name: should-not-run
+        run: echo "SCENARIO=10-empty-group SHOULD_NOT_RUN"

@@ -1,0 +1,15 @@
+name: concurrency-03-fifo-pending
+on: workflow_dispatch
+concurrency:
+  group: fifo-group
+  cancel-in-progress: false
+jobs:
+  long:
+    runs-on: self-hosted
+    steps:
+      - name: sleep-a-bit
+        run: |
+          echo "SCENARIO=03-fifo-pending"
+          echo "START=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          sleep 6
+          echo "DONE=03"
