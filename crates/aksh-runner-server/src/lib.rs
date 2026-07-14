@@ -652,6 +652,7 @@ fn build_app(
         .route("/api/v1/github/register", get(github::github_register))
         .route("/api/v1/github/callback", get(github::github_callback))
         .route("/api/v1/runs/:run_id", get(get_run))
+        .route("/api/v1/runs/:run_id/logs", get(get_run_logs))
         .route("/api/v1/runs/:run_id/cancel", post(cancel_run))
         .route("/api/v1/runs/:run_id/rerun", post(rerun_run))
         .route("/api/v1/runs/:run_id/events.ndjson", get(run_events))
@@ -1501,6 +1502,20 @@ async fn get_run(
         .cloned()
         .map(Json)
         .ok_or_else(|| ApiError::not_found("run not found"))
+}
+
+async fn get_run_logs(
+    State(shared): State<Arc<SharedState>>,
+    Path(_run_id): Path<String>,
+) -> Result<String, ApiError> {
+    let inner = shared.state.inner.lock().await;
+    let mut out = String::new();
+    for (key, bytes) in &inner.logs {
+        out.push_str(&format!("--- Log: {key} ---\n"));
+        out.push_str(&String::from_utf8_lossy(bytes));
+        out.push_str("\n");
+    }
+    Ok(out)
 }
 
 async fn cancel_run(
