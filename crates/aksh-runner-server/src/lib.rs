@@ -10272,6 +10272,18 @@ jobs:
             }
             let failed_root = (0..count).find(|job| needs[*job].is_empty()).unwrap();
 
+            // Assign conditions to non-root jobs based on PRNG
+            let mut conditions: Vec<Option<&str>> = vec![None; count];
+            for job in 1..count {
+                if !needs[job].is_empty() {
+                    conditions[job] = match next(&mut seed) % 5 {
+                        0 => Some("always()"),
+                        1 => Some("failure()"),
+                        _ => None, // default gate
+                    };
+                }
+            }
+
             let mut yaml = String::from("on: push\njobs:\n");
             for job in 0..count {
                 yaml.push_str(&format!("  j{job}:\n"));
@@ -10284,6 +10296,9 @@ jobs:
                         yaml.push_str(&format!("j{dependency}"));
                     }
                     yaml.push_str("]\n");
+                }
+                if let Some(cond) = conditions[job] {
+                    yaml.push_str(&format!("    if: {cond}\n"));
                 }
                 yaml.push_str("    runs-on: ubuntu-latest\n");
                 yaml.push_str("    steps:\n      - run: echo property\n");
@@ -10342,11 +10357,25 @@ jobs:
                 let expected = if job == failed_root {
                     ExecutionStatus::Failure
                 } else if failed_ancestor[job] {
-                    ExecutionStatus::Skipped
+                    // Job has a failed ancestor — what does the condition say?
+                    match conditions[job] {
+                        Some("always()") => ExecutionStatus::Success, // always runs, completed successfully
+                        Some("failure()") => ExecutionStatus::Success, // failure() is true, job runs
+                        _ => ExecutionStatus::Skipped,                 // default gate blocks
+                    }
                 } else {
-                    ExecutionStatus::Success
+                    // No failed ancestor
+                    match conditions[job] {
+                        Some("failure()") => ExecutionStatus::Skipped, // failure() is false, skip
+                        _ => ExecutionStatus::Success,                 // default or always() runs
+                    }
                 };
-                assert_eq!(run.jobs[&JobId(format!("j{job}"))], expected, "case {case}");
+                assert_eq!(
+                    run.jobs[&JobId(format!("j{job}"))],
+                    expected,
+                    "case {case} job j{job} condition={:?}",
+                    conditions[job]
+                );
             }
         }
     }
