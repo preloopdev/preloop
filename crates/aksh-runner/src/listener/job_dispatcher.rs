@@ -42,6 +42,8 @@ pub struct RunningJob {
     pub job_id: Option<uuid::Uuid>,
     /// Hard-kill deadline after cancel (official: timeout − 15s).
     pub kill_at: Option<tokio::time::Instant>,
+    /// Whether graceful cancellation was already delivered to the worker.
+    cancel_sent: bool,
 }
 
 impl RunningJob {
@@ -60,9 +62,14 @@ impl RunningJob {
         Ok(status.success())
     }
 
-    /// Send a cancel message to the worker via stdin.
-    /// The worker's stdin reader task picks this up and signals cancellation.
-    pub async fn cancel(&mut self, timeout_secs: u64) {
+    /// Send graceful cancellation once. Repeated official cancellation
+    /// messages only reset `kill_at`; the worker cancellation token is
+    /// idempotent in `actions/runner`.
+    pub async fn cancel(&mut self, timeout_secs: u64) -> bool {
+        if self.cancel_sent {
+            return false;
+        }
+        self.cancel_sent = true;
         if let Some(stdin) = &mut self.stdin {
             let msg = WorkerMessage::Cancel { timeout_secs };
             if let Ok(line) = serde_json::to_string(&msg) {
@@ -71,6 +78,7 @@ impl RunningJob {
                 let _ = stdin.flush().await;
             }
         }
+        true
     }
 
     /// Hard-kill the worker process group (after cancel timeout expires).
@@ -191,41 +199,74 @@ pub async fn spawn_job(
         request_id,
         job_id,
         kill_at: None,
+        cancel_sent: false,
     })
 }
 
-/// Parse a .NET TimeSpan string (`hh:mm:ss` or `d.hh:mm:ss[.fffffff]`) into seconds.
+/// Effective cancellation timing from official `JobDispatcher.Cancel`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CancellationTiming {
+    /// Timeout sent to the worker after the official 60-second clamp.
+    pub effective_timeout_secs: u64,
+    /// Forced-kill delay: effective timeout minus 15 seconds.
+    pub kill_after_secs: u64,
+}
+
+/// Clamp a cancellation timeout and derive the official forced-kill delay.
+pub fn cancellation_timing(timeout_secs: u64) -> CancellationTiming {
+    let effective_timeout_secs = timeout_secs.max(60);
+    CancellationTiming {
+        effective_timeout_secs,
+        kill_after_secs: effective_timeout_secs - 15,
+    }
+}
+
+/// Parse a non-negative .NET invariant TimeSpan (`hh:mm:ss` or
+/// `d.hh:mm:ss[.fffffff]`) into whole seconds, rounding a non-zero fractional
+/// component up so the runner never kills earlier than the requested timeout.
 pub fn parse_timespan_secs(s: &str) -> Option<u64> {
     let s = s.trim();
     if s.is_empty() {
         return None;
     }
-    let (days, rest) = if let Some((d, r)) = s.split_once('.') {
-        // Could be days.hh:mm:ss or fractional seconds on last component.
-        // If `d` is all digits and `r` contains ':', treat as days.
-        if d.chars().all(|c| c.is_ascii_digit()) && r.contains(':') {
-            (d.parse::<u64>().ok()?, r)
-        } else {
-            (0, s)
+    let (days, clock) = match s.split_once('.') {
+        Some((days, rest)) if days.chars().all(|c| c.is_ascii_digit()) && rest.contains(':') => {
+            (days.parse::<u64>().ok()?, rest)
         }
-    } else {
-        (0, s)
+        _ => (0, s),
     };
-    // Strip fractional seconds
-    let rest = rest.split('.').next().unwrap_or(rest);
-    let parts: Vec<&str> = rest.split(':').collect();
-    if parts.len() != 3 {
+    let (clock, fraction) = match clock.split_once('.') {
+        Some((clock, fraction)) => {
+            if fraction.is_empty()
+                || fraction.len() > 7
+                || !fraction.chars().all(|c| c.is_ascii_digit())
+            {
+                return None;
+            }
+            (clock, Some(fraction))
+        }
+        None => (clock, None),
+    };
+    let mut parts = clock.split(':');
+    let hours = parts.next()?.parse::<u64>().ok()?;
+    let minutes = parts.next()?.parse::<u64>().ok()?;
+    let seconds = parts.next()?.parse::<u64>().ok()?;
+    if parts.next().is_some() || hours >= 24 || minutes >= 60 || seconds >= 60 {
         return None;
     }
-    let hours: u64 = parts[0].parse().ok()?;
-    let mins: u64 = parts[1].parse().ok()?;
-    let secs: u64 = parts[2].parse().ok()?;
-    Some(days * 86400 + hours * 3600 + mins * 60 + secs)
+    let whole = days
+        .checked_mul(86_400)?
+        .checked_add(hours.checked_mul(3_600)?)?
+        .checked_add(minutes.checked_mul(60)?)?
+        .checked_add(seconds)?;
+    let round_up = fraction.is_some_and(|value| value.bytes().any(|digit| digit != b'0'));
+    whole.checked_add(u64::from(round_up))
 }
 
 #[cfg(test)]
 mod timespan_tests {
-    use super::parse_timespan_secs;
+    use super::{cancellation_timing, parse_timespan_secs, WorkerMessage};
+    use proptest::prelude::*;
 
     #[test]
     fn parses_hh_mm_ss() {
@@ -242,6 +283,71 @@ mod timespan_tests {
     fn garbage_returns_none() {
         assert_eq!(parse_timespan_secs("not-a-timespan"), None);
         assert_eq!(parse_timespan_secs(""), None);
+    }
+
+    proptest! {
+        #[test]
+        fn run_time_01_parses_valid_timespans(
+            days in 0_u64..=10_000,
+            hours in 0_u64..24,
+            minutes in 0_u64..60,
+            seconds in 0_u64..60,
+            fractional_tick in any::<bool>(),
+        ) {
+            let fraction = if fractional_tick { "1" } else { "0" };
+            let input = format!("{days}.{hours:02}:{minutes:02}:{seconds:02}.{fraction}");
+            let expected = days * 86_400
+                + hours * 3_600
+                + minutes * 60
+                + seconds
+                + u64::from(fractional_tick);
+            prop_assert_eq!(
+                parse_timespan_secs(&input),
+                Some(expected),
+                "RUN-TIME-01: valid TimeSpan must preserve its duration without an early fractional truncation",
+            );
+        }
+
+        #[test]
+        fn run_time_01_rejects_out_of_range_clock_fields(
+            hours in 24_u64..=99,
+            minutes in 60_u64..=99,
+            seconds in 60_u64..=99,
+        ) {
+            prop_assert_eq!(parse_timespan_secs(&format!("{hours:02}:00:00")), None);
+            prop_assert_eq!(parse_timespan_secs(&format!("00:{minutes:02}:00")), None);
+            prop_assert_eq!(parse_timespan_secs(&format!("00:00:{seconds:02}")), None);
+        }
+
+        #[test]
+        fn run_time_01_never_schedules_forced_kill_before_45_seconds(
+            timeout_secs in any::<u64>(),
+        ) {
+            let timing = cancellation_timing(timeout_secs);
+            prop_assert!(timing.effective_timeout_secs >= 60);
+            prop_assert!(timing.kill_after_secs >= 45);
+            prop_assert_eq!(timing.kill_after_secs, timing.effective_timeout_secs - 15);
+        }
+
+        #[test]
+        fn run_scope_01_cancel_ipc_excludes_server_concurrency_metadata(
+            timeout_secs in any::<u64>(),
+        ) {
+            let encoded = serde_json::to_value(WorkerMessage::Cancel { timeout_secs }).unwrap();
+            let object = encoded.as_object().unwrap();
+            prop_assert_eq!(object.len(), 2);
+            prop_assert_eq!(object.get("t").and_then(serde_json::Value::as_str), Some("cancel"));
+            prop_assert_eq!(
+                object.get("timeout_secs").and_then(serde_json::Value::as_u64),
+                Some(timeout_secs),
+            );
+            for server_only in ["concurrency", "group", "queue", "matrix", "reusable"] {
+                prop_assert!(
+                    !object.contains_key(server_only),
+                    "RUN-SCOPE-01: runner IPC exposed server-only field {server_only}",
+                );
+            }
+        }
     }
 }
 
