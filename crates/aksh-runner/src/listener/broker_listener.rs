@@ -10,7 +10,7 @@ use tracing::{debug, info, warn};
 
 use crate::client::broker::BrokerClient;
 use crate::client::http::HttpClient;
-use crate::listener::job_dispatcher::{self, parse_timespan_secs, RunningJob};
+use crate::listener::job_dispatcher::{self, cancellation_timing, parse_timespan_secs, RunningJob};
 use crate::settings::RunnerConfig;
 
 /// Run the broker message polling loop.
@@ -280,21 +280,17 @@ pub async fn run_broker_loop(
                                         "RunnerJobRequest while busy — cancelling previous job {}",
                                         prev.request_id
                                     );
-                                    prev.cancel(300).await;
-                                    prev.kill_at = Some(
-                                        tokio::time::Instant::now()
-                                            + std::time::Duration::from_secs(45),
-                                    );
-                                    // Wait briefly for graceful exit, but do NOT
-                                    // block the listener for long. If the worker
-                                    // is still alive the kill_at timer in the
-                                    // select loop will reap it on the next
-                                    // iteration via the kill branch.
-                                    let _ = tokio::time::timeout(
-                                        std::time::Duration::from_millis(500),
+                                    let timing = cancellation_timing(60);
+                                    prev.cancel(timing.effective_timeout_secs).await;
+                                    if tokio::time::timeout(
+                                        std::time::Duration::from_secs(timing.kill_after_secs),
                                         prev.wait(),
                                     )
-                                    .await;
+                                    .await
+                                    .is_err()
+                                    {
+                                        prev.kill().await;
+                                    }
                                     // Check once/ephemeral AFTER the old job drains
                                     if once || config.settings.ephemeral {
                                         info!("exiting after first job finished during overlap (run-service)");
@@ -323,12 +319,17 @@ pub async fn run_broker_loop(
                                         "PipelineAgentJobRequest while busy — cancelling previous job {}",
                                         prev.request_id
                                     );
-                                    prev.cancel(300).await;
-                                    let _ = tokio::time::timeout(
-                                        std::time::Duration::from_millis(500),
+                                    let timing = cancellation_timing(60);
+                                    prev.cancel(timing.effective_timeout_secs).await;
+                                    if tokio::time::timeout(
+                                        std::time::Duration::from_secs(timing.kill_after_secs),
                                         prev.wait(),
                                     )
-                                    .await;
+                                    .await
+                                    .is_err()
+                                    {
+                                        prev.kill().await;
+                                    }
                                     if once || config.settings.ephemeral {
                                         let _ = client.delete_session(&token, &session_id).await;
                                         return Ok(());
@@ -352,9 +353,7 @@ pub async fn run_broker_loop(
                                     .and_then(|v| v.as_str())
                                     .and_then(parse_timespan_secs)
                                     .unwrap_or(300);
-                                // Clamp per JobDispatcher.cs: max(timeout, 60); kill at timeout-15.
-                                let timeout_secs = timeout_secs.max(60);
-                                let kill_after = timeout_secs.saturating_sub(15);
+                                let timing = cancellation_timing(timeout_secs);
 
                                 if let Some(job) = active_job.as_mut() {
                                     if let (Some(msg_id), Some(active_id)) =
@@ -368,14 +367,18 @@ pub async fn run_broker_loop(
                                         }
                                     }
                                     info!(
-                                        "Cancelling active job {} (timeout={timeout_secs}s, kill_after={kill_after}s)",
-                                        job.request_id
+                                        "Cancelling active job {} (timeout={}s, kill_after={}s)",
+                                        job.request_id,
+                                        timing.effective_timeout_secs,
+                                        timing.kill_after_secs,
                                     );
-                                    // Non-blocking: send IPC cancel and return to poll loop.
-                                    job.cancel(timeout_secs).await;
+                                    // Graceful cancel is delivered once. Every matching
+                                    // repeat resets the forced-kill deadline, like
+                                    // CancellationTokenSource.CancelAfter in the official runner.
+                                    job.cancel(timing.effective_timeout_secs).await;
                                     job.kill_at = Some(
                                         tokio::time::Instant::now()
-                                            + std::time::Duration::from_secs(kill_after),
+                                            + std::time::Duration::from_secs(timing.kill_after_secs),
                                     );
                                 } else {
                                     debug!("Received cancellation but no active job");
