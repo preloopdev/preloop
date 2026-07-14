@@ -90,15 +90,15 @@ jobs:
           run_filter aksh-runner-server generated_server_dag_properties_1000_cases
           run_filter aksh-runner-server workflow_steps_update_production_path_1000_cases
 
-      # The official runner does not support local pre actions, so the fixture
-      # is fetched remotely from the immutable implementation commit above.
+      # The official runner does not support local pre actions, so this fixture
+      # is pinned to an immutable, isolated action-only commit in this repository.
       - name: Run remote JavaScript oracle (declaration 1)
-        uses: preloopdev/aksh/.github/actions/tier2-property-oracle@6afa178f1ef1ae8ab53a66bc47716647c04747ed
+        uses: preloopdev/aksh/.github/actions/tier2-property-oracle@1f4a94439dac11f76ba014c5e777a83cefd02780
         with:
           id: first
 
       - name: Run remote JavaScript oracle (declaration 2)
-        uses: preloopdev/aksh/.github/actions/tier2-property-oracle@6afa178f1ef1ae8ab53a66bc47716647c04747ed
+        uses: preloopdev/aksh/.github/actions/tier2-property-oracle@1f4a94439dac11f76ba014c5e777a83cefd02780
         with:
           id: second
 
