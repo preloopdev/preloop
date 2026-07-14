@@ -95,9 +95,7 @@ pub fn build_agent_job_message(
     );
 
     let mut resolved_secrets = BTreeMap::new();
-    if plan.workflow_file.is_none() {
-        resolved_secrets = secrets.clone();
-    } else if plan.secrets_inherit {
+    if plan.workflow_file.is_none() || plan.secrets_inherit {
         resolved_secrets = secrets.clone();
     } else if !plan.secrets_map.is_empty() {
         for (k, expr) in &plan.secrets_map {
