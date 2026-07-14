@@ -5,7 +5,7 @@ jobs:
     concurrency:
       group: caller-key-15
       cancel-in-progress: false
-    uses: ./.github/workflows/reusable-callee.yml
+    uses: ./.github/workflows/reusable-callee-concurrency.yml
     with:
       val: "different-key"
       concurrency_group: "embedded-key-15"
