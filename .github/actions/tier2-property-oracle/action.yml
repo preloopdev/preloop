@@ -1,0 +1,23 @@
+name: Tier 2 property oracle
+description: Exercise official GitHub Actions JavaScript action lifecycle and file-command contracts.
+
+# Metadata syntax, including JavaScript action lifecycle hooks:
+# https://docs.github.com/en/actions/creating-actions/metadata-syntax-for-github-actions
+# Workflow command and environment-file contracts (GITHUB_STATE, GITHUB_OUTPUT,
+# GITHUB_ENV, GITHUB_PATH, stop-commands, and add-mask):
+# https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands
+# Pinned official runner v2.335.1 (commit 7d737449ef346f6524f75688d0c9c95fa10ba10a):
+# ActionRunner.cs: https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/ActionRunner.cs
+# ActionManager.cs: https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/ActionManager.cs
+inputs:
+  id:
+    description: Declaration-order identity used by the two-action lifecycle oracle.
+    required: true
+outputs:
+  result:
+    description: Main lifecycle result emitted through GITHUB_OUTPUT.
+runs:
+  using: node24
+  pre: index.js
+  main: index.js
+  post: index.js
