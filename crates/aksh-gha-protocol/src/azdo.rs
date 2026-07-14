@@ -188,8 +188,11 @@ pub mod message_type {
     pub const RUNNER_JOB_REQUEST: &str = "RunnerJobRequest";
     /// Cancellation signal — runner should abort the current job.
     pub const CANCEL_JOB: &str = "CancelJob";
-    /// Job cancellation (newer API).
-    pub const JOB_CANCELLED: &str = "JobCancelled";
+    /// Job cancellation — official `JobCancelMessage.MessageType`.
+    ///
+    /// Must be exactly `"JobCancellation"` (not `"JobCancelled"`): the
+    /// official runner matches this string in `Runner.cs` / broker dispatch.
+    pub const JOB_CANCELLED: &str = "JobCancellation";
     /// Runner should shut down gracefully.
     pub const RUNNER_SHUTDOWN: &str = "RunnerShutdown";
 }
