@@ -666,34 +666,6 @@ async fn run_runner_e2e(
         run_success = true;
     }
 
-    if run_status != "success" {
-        println!("=== Debug: Listing step log files from server state ===");
-        for entry in walkdir::WalkDir::new(&state_dir) {
-            if let Ok(entry) = entry {
-                let path = entry.path();
-                if path.is_file() {
-                    // Skip printing the tar.gz binary archive itself
-                    if path.extension().map(|e| e == "gz").unwrap_or(false) {
-                        continue;
-                    }
-                    if let Ok(bytes) = std::fs::read(path) {
-                        println!(
-                            "--- Log File: {} ({} bytes) ---",
-                            path.display(),
-                            bytes.len()
-                        );
-                        let len = std::cmp::min(100, bytes.len());
-                        println!("  Hex: {:02x?}", &bytes[..len]);
-                        let content = String::from_utf8_lossy(&bytes);
-                        if !content.trim().is_empty() {
-                            println!("{}", content);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     let verdict = serde_json::json!({
         "success": run_success,
         "run_id": run_id,
