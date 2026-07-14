@@ -449,17 +449,6 @@ impl ProdState {
             .collect()
     }
 
-    fn holder_keys_snapshot(&self) -> BTreeMap<u32, BTreeSet<(String, String)>> {
-        self.inner
-            .holder_keys
-            .iter()
-            .map(|(run_id, keys)| {
-                let n = (run_id.0.as_u128() - 0x1000_0000) as u32;
-                (n, keys.iter().cloned().collect())
-            })
-            .collect()
-    }
-
     fn holder_to_token(holder: &Holder) -> HolderToken {
         match holder {
             Holder::Run(id) => HolderToken {
