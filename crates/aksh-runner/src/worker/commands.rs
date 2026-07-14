@@ -30,7 +30,7 @@ pub fn parse_command(line: &str) -> Option<WorkflowCommand> {
 
 /// Parse `::name key=val,key2=val2::data` format.
 fn parse_double_colon(line: &str) -> Option<WorkflowCommand> {
-    let line = line.trim();
+    let line = line.trim_start();
     if !line.starts_with("::") {
         return None;
     }
@@ -60,11 +60,13 @@ fn parse_double_colon(line: &str) -> Option<WorkflowCommand> {
 
     let mut properties = HashMap::new();
     if let Some(props) = props_str {
-        for pair in props.split(',') {
+        for pair in props.trim().split(',') {
             if let Some(eq_pos) = pair.find('=') {
                 let key = &pair[..eq_pos];
                 let val = &pair[eq_pos + 1..];
-                properties.insert(key.to_string(), unescape_property(val));
+                if !key.is_empty() && !val.is_empty() {
+                    properties.insert(key.to_lowercase(), unescape_property(val));
+                }
             }
         }
     }
@@ -218,15 +220,236 @@ fn build_annotation(
         title: cmd.properties.get("title").cloned(),
         file: cmd.properties.get("file").cloned(),
         line: cmd.properties.get("line").and_then(|v| v.parse().ok()),
-        end_line: cmd.properties.get("endLine").and_then(|v| v.parse().ok()),
+        end_line: cmd.properties.get("endline").and_then(|v| v.parse().ok()),
         col: cmd.properties.get("col").and_then(|v| v.parse().ok()),
-        end_column: cmd.properties.get("endColumn").and_then(|v| v.parse().ok()),
+        end_column: cmd.properties.get("endcolumn").and_then(|v| v.parse().ok()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use proptest::test_runner::{FileFailurePersistence, RngSeed};
+
+    fn command_config() -> ProptestConfig {
+        ProptestConfig {
+            cases: 1_000,
+            rng_seed: RngSeed::Fixed(0xAC710C0DE),
+            failure_persistence: Some(Box::new(FileFailurePersistence::SourceParallel(
+                "proptest-regressions",
+            ))),
+            ..ProptestConfig::default()
+        }
+    }
+
+    // Independent oracle: Runner.Common/ActionCommand.EscapeDataMappings and
+    // EscapePropertyMappings (actions/runner@7d737449ef346f6524f75688d0c9c95fa10ba10a,
+    // https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Common/ActionCommand.cs#L19-L31).
+    fn oracle_escape_data(value: &str) -> String {
+        value
+            .replace('%', "%25")
+            .replace('\r', "%0D")
+            .replace('\n', "%0A")
+    }
+
+    fn oracle_escape_property(value: &str) -> String {
+        value
+            .replace('%', "%25")
+            .replace(',', "%2C")
+            .replace(':', "%3A")
+            .replace('\r', "%0D")
+            .replace('\n', "%0A")
+    }
+
+    fn escaped_data_value() -> impl Strategy<Value = String> {
+        prop::collection::vec(
+            prop_oneof![
+                Just('a'),
+                Just('Z'),
+                Just('7'),
+                Just(' '),
+                Just('%'),
+                Just('\r'),
+                Just('\n'),
+                Just('é'),
+            ],
+            0..=64,
+        )
+        .prop_map(|chars| chars.into_iter().collect())
+    }
+
+    fn escaped_property_value() -> impl Strategy<Value = String> {
+        prop::collection::vec(
+            prop_oneof![
+                Just('a'),
+                Just('Z'),
+                Just('7'),
+                Just(' '),
+                Just('%'),
+                Just(','),
+                Just(':'),
+                Just('='),
+                Just('\r'),
+                Just('\n'),
+                Just('é'),
+            ],
+            1..=64,
+        )
+        .prop_map(|chars| chars.into_iter().collect())
+    }
+
+    fn mixed_case_name() -> impl Strategy<Value = String> {
+        prop::sample::select(vec![
+            "debug",
+            "error",
+            "warning",
+            "notice",
+            "add-mask",
+            "stop-commands",
+        ])
+        .prop_flat_map(|name| {
+            prop::collection::vec(any::<bool>(), name.len()).prop_map(move |upper| {
+                name.chars()
+                    .enumerate()
+                    .map(|(index, ch)| {
+                        if upper[index] {
+                            ch.to_ascii_uppercase()
+                        } else {
+                            ch
+                        }
+                    })
+                    .collect()
+            })
+        })
+    }
+
+    fn mixed_case_property_name() -> impl Strategy<Value = String> {
+        prop::sample::select(vec!["file", "line", "endLine", "col", "endColumn", "title"])
+            .prop_flat_map(|name| {
+                prop::collection::vec(any::<bool>(), name.len()).prop_map(move |upper| {
+                    name.chars()
+                        .enumerate()
+                        .map(|(index, ch)| {
+                            if upper[index] {
+                                ch.to_ascii_uppercase()
+                            } else {
+                                ch
+                            }
+                        })
+                        .collect()
+                })
+            })
+    }
+
+    // Modern parser oracle: ActionCommand.TryParseV2 (actions/runner@7d737449ef346f6524f75688d0c9c95fa10ba10a,
+    // https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Common/ActionCommand.cs#L48-L114)
+    // plus the workflow-command contract that command and parameter names are case insensitive
+    // (https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands#about-workflow-commands).
+    proptest! {
+        #![proptest_config(command_config())]
+
+        #[test]
+        fn modern_command_roundtrips_escaped_data_and_properties(
+            name in mixed_case_name(),
+            pairs in prop::collection::vec((mixed_case_property_name(), escaped_property_value()), 0..=6)
+                .prop_filter("official parser trims trailing command-info whitespace", |pairs| {
+                    pairs.last().is_none_or(|(_, value)| !value.ends_with(' '))
+                }),
+            data in escaped_data_value(),
+        ) {
+            let properties = pairs
+                .iter()
+                .map(|(key, value)| format!("{key}={}", oracle_escape_property(value)))
+                .collect::<Vec<_>>()
+                .join(",");
+            let command_info = if properties.is_empty() {
+                name.clone()
+            } else {
+                format!("{name} {properties}")
+            };
+            let line = format!("  ::{command_info}::{}", oracle_escape_data(&data));
+
+            let parsed = parse_command(&line).expect("structured modern command must parse");
+            prop_assert_eq!(parsed.name, name.to_ascii_lowercase());
+            prop_assert_eq!(parsed.data, data);
+
+            let mut expected = HashMap::new();
+            for (key, value) in pairs {
+                expected.insert(key.to_ascii_lowercase(), value);
+            }
+            prop_assert_eq!(parsed.properties, expected);
+        }
+
+        #[test]
+        fn malformed_lines_never_panic(
+            chars in prop::collection::vec(any::<char>(), 0..=128),
+        ) {
+            let line: String = chars.into_iter().collect();
+            let outcome = std::panic::catch_unwind(|| parse_command(&line));
+            prop_assert!(outcome.is_ok(), "parser panicked for malformed input: {line:?}");
+        }
+    }
+
+    // StepContext::log must suspend command handling and resume only on the exact token,
+    // matching the documented stop-commands protocol (https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands#stopping-and-starting-workflow-commands)
+    // and Runner.Worker command processing (`ActionCommand.TryParseV2`, actions/runner@7d737449ef346f6524f75688d0c9c95fa10ba10a,
+    // https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Common/ActionCommand.cs#L48-L114).
+    proptest! {
+        #![proptest_config(command_config())]
+
+        #[test]
+        fn stop_commands_suspends_then_resumes(token in prop::collection::vec(
+            prop_oneof![Just('a'), Just('Z'), Just('0'), Just('_'), Just('-')],
+            1..=48,
+        ).prop_map(|chars| chars.into_iter().collect::<String>())) {
+            let mut job = make_job();
+            let mut ctx = make_ctx(&mut job);
+            ctx.log(&format!("::stop-commands::{token}"));
+            prop_assert_eq!(ctx.stop_commands_token.as_deref(), Some(token.as_str()));
+
+            ctx.log("::error::blocked");
+            prop_assert!(ctx.annotations.is_empty());
+
+            ctx.log(&format!("  ::{token}::  "));
+            prop_assert!(ctx.stop_commands_token.is_none());
+            ctx.log("::error::active");
+            prop_assert_eq!(ctx.annotations.len(), 1);
+            prop_assert_eq!(&ctx.annotations[0].message, "active");
+        }
+    }
+
+    // Annotation behavior is observed through StepContext::log: add-mask affects the
+    // subsequently emitted annotation message, while mixed-case parameter names resolve
+    // case-insensitively per the workflow-command docs above.
+    proptest! {
+        #![proptest_config(command_config())]
+
+        #[test]
+        fn masked_annotations_preserve_structured_fields(secret in prop::collection::vec(
+            prop_oneof![Just('Z'), Just('0'), Just('%'), Just('\r'), Just('\n')],
+            1..=32,
+        ).prop_map(|chars| chars.into_iter().collect::<String>())
+          .prop_filter("official add-mask ignores whitespace-only data", |secret| !secret.trim().is_empty()),
+          line in 1u32..=10_000u32) {
+            let mut job = make_job();
+            let mut ctx = make_ctx(&mut job);
+            ctx.log(&format!("::add-mask::{}", oracle_escape_data(&secret)));
+            ctx.log(&format!(
+                "::ErRoR FiLe=src/main.rs,LiNe={line},EnDLine={line},TiTle=Build::{}",
+                oracle_escape_data(&format!("failed: {secret}")),
+            ));
+
+            prop_assert_eq!(ctx.annotations.len(), 1);
+            let annotation = &ctx.annotations[0];
+            prop_assert_eq!(annotation.level, crate::worker::execution_context::AnnotationLevel::Error);
+            prop_assert_eq!(&annotation.message, &format!("failed: ***"));
+            prop_assert_eq!(annotation.file.as_deref(), Some("src/main.rs"));
+            prop_assert_eq!(annotation.line, Some(line));
+            prop_assert_eq!(annotation.end_line, Some(line));
+            prop_assert_eq!(annotation.title.as_deref(), Some("Build"));
+        }
+    }
 
     #[test]
     fn parse_simple_command() {

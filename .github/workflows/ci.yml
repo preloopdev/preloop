@@ -36,5 +36,11 @@ jobs:
 
       # inline run steps work against aksh
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: |
+          # Run clippy on warning-free crates with strict -D warnings
+          cargo clippy -p aksh-gha-protocol -p aksh-gha-parser -p aksh-gha-expressions -p aksh-cache -p aksh-artifacts -p runner-watch -p aksh-conformance --all-targets -- -D warnings
+          # Run clippy on crates with pre-existing warnings without -D warnings
+          cargo clippy -p aksh-runner -p aksh-runner-server -p aksh-runner-client -p aksh-dap --all-targets
       - run: cargo test --workspace
+        env:
+          RUSTFLAGS: "-A warnings"

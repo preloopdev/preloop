@@ -44,3 +44,4 @@ rustls = { version = "0.23", features = ["ring"] }
 tempfile.workspace = true
 tower.workspace = true
 proptest.workspace = true
+aksh-runner = { path = "../aksh-runner" }
