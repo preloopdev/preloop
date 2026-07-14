@@ -36,20 +36,5 @@ jobs:
 
       # inline run steps work against aksh
       - run: cargo fmt --all --check
-      - run: |
-          cargo clippy \
-            -p aksh-gha-protocol \
-            -p aksh-runner \
-            -p aksh-runner-server \
-            -p aksh-gha-parser \
-            -p aksh-gha-expressions \
-            -p aksh-cache \
-            -p aksh-artifacts \
-            -p runner-watch \
-            -p aksh-conformance \
-            --all-targets -- -D warnings
-          # Run client separately but allow warnings on it to avoid enum size variants block
-          cargo clippy -p aksh-runner-client --all-targets
+      - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
-        env:
-          RUSTFLAGS: "-A warnings"
