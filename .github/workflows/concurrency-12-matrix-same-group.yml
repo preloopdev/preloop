@@ -1,0 +1,18 @@
+name: concurrency-12-matrix-same-group
+on: workflow_dispatch
+jobs:
+  matrix-job:
+    runs-on: self-hosted
+    strategy:
+      max-parallel: 1
+      matrix:
+        val: [1, 2, 3]
+    concurrency:
+      group: matrix-group-${{ matrix.val }}
+      cancel-in-progress: false
+    steps:
+      - name: run-cell
+        run: |
+          echo "SCENARIO=12-matrix val=${{ matrix.val }}"
+          sleep 3
+          echo "DONE=${{ matrix.val }}"

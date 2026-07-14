@@ -1,0 +1,14 @@
+name: concurrency-05-cancel-expr-false
+on: workflow_dispatch
+concurrency:
+  group: cancel-expr-false
+  cancel-in-progress: ${{ false }}
+jobs:
+  long:
+    runs-on: self-hosted
+    steps:
+      - name: sleep-a-bit
+        run: |
+          echo "SCENARIO=05-cancel-expr-false"
+          sleep 5
+          echo "DONE=05"

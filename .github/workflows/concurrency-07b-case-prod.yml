@@ -1,0 +1,14 @@
+name: concurrency-07b-case-prod
+on: workflow_dispatch
+concurrency:
+  group: casegroup
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: self-hosted
+    steps:
+      - name: marker
+        run: |
+          echo "SCENARIO=07-case-prod"
+          sleep 5
+          echo "DONE=07b"
