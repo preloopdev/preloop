@@ -1,4 +1,3 @@
-#[allow(warnings)]
 //! Preloop runner client binary.
 
 use std::collections::BTreeMap;
