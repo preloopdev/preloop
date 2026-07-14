@@ -650,4 +650,97 @@ mod tests {
             ]
         );
     }
+
+    /// Size limit: cartesian count stays bounded for generated specs.
+    /// Oracle: docs/property-tests.md §2.14 — size limits enforced before expansion.
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 1_000, ..ProptestConfig::default() })]
+
+        #[test]
+        fn cartesian_count_bounded(
+            axis_count in 0usize..=4,
+            sizes in proptest::collection::vec(0usize..=6, 0..=4),
+        ) {
+            let mut axes = IndexMap::new();
+            for i in 0..axis_count.min(sizes.len()) {
+                let vals: Vec<Value> = (0..sizes[i]).map(|v| json!(v)).collect();
+                if !vals.is_empty() {
+                    axes.insert(format!("a{i}"), vals);
+                }
+            }
+            let spec = MatrixSpec { axes, exclude: vec![], include: vec![] };
+            let count = cartesian_count(&spec);
+            prop_assert!(count <= 1296, "cartesian count {count} exceeds 6^4 bound");
+            let combos = expand_matrix_spec(&spec);
+            prop_assert!(combos.len() <= count + 1); // +1 for empty-fallback
+        }
+    }
+
+    /// Declaration-order permutation: same axes in different order produce
+    /// the same set of value combinations.
+    /// Oracle: docs/property-tests.md §2.13 — reordering does not change values.
+    #[test]
+    fn declaration_order_permutation_stable() {
+        let mut axes_ab = IndexMap::new();
+        axes_ab.insert("os".into(), vec![json!("linux"), json!("mac")]);
+        axes_ab.insert("node".into(), vec![json!(18), json!(20)]);
+        let mut axes_ba = IndexMap::new();
+        axes_ba.insert("node".into(), vec![json!(18), json!(20)]);
+        axes_ba.insert("os".into(), vec![json!("linux"), json!("mac")]);
+
+        let combos_ab = expand_matrix_spec(&MatrixSpec { axes: axes_ab, exclude: vec![], include: vec![] });
+        let combos_ba = expand_matrix_spec(&MatrixSpec { axes: axes_ba, exclude: vec![], include: vec![] });
+        assert_eq!(combos_ab.len(), combos_ba.len());
+        // Same value sets (order may differ by declaration order, which is correct)
+        let set_ab: std::collections::BTreeSet<_> = combos_ab.iter().map(|c| {
+            let mut sorted: Vec<_> = c.values.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            sorted.sort_by(|a, b| a.0.cmp(&b.0));
+            sorted
+        }).collect();
+        let set_ba: std::collections::BTreeSet<_> = combos_ba.iter().map(|c| {
+            let mut sorted: Vec<_> = c.values.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            sorted.sort_by(|a, b| a.0.cmp(&b.0));
+            sorted
+        }).collect();
+        assert_eq!(set_ab, set_ba);
+    }
+
+    /// Production-path: generated matrix → YAML → parse → expand → job count matches model.
+    /// Oracle: docs/property-tests.md §2 production-path requirements.
+    #[test]
+    fn matrix_production_path_count_matches_model() {
+        // 100 deterministic cases
+        for case in 0u64..100 {
+            let n_vals = ((case * 7 + 3) % 3 + 1) as usize; // 1-3 values
+            let vals: Vec<Value> = (0..n_vals).map(|v| json!(format!("v{v}"))).collect();
+            let mut axes = IndexMap::new();
+            axes.insert("x".into(), vals);
+            if case % 3 == 0 {
+                let vals2: Vec<Value> = (0..((case % 2 + 1) as usize)).map(|v| json!(format!("w{v}"))).collect();
+                axes.insert("y".into(), vals2);
+            }
+            let spec = MatrixSpec { axes: axes.clone(), exclude: vec![], include: vec![] };
+            let model_count = expand_matrix_spec(&spec).len();
+
+            // Render as YAML
+            let mut yaml = String::from("on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n");
+            for (name, values) in &axes {
+                yaml.push_str(&format!("        {name}: ["));
+                for (i, v) in values.iter().enumerate() {
+                    if i > 0 { yaml.push_str(", "); }
+                    yaml.push_str(v.as_str().unwrap_or("0"));
+                }
+                yaml.push_str("]\n");
+            }
+            yaml.push_str("    steps:\n      - run: echo test\n");
+
+            let workflow = crate::parse_workflow(&yaml).unwrap();
+            let jobs = crate::expand_jobs(&workflow).unwrap();
+            assert_eq!(
+                jobs.len(), model_count,
+                "case {case}: production {}, model {model_count}",
+                jobs.len()
+            );
+        }
+    }
 }
