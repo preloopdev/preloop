@@ -76,7 +76,12 @@ pub enum TlsMode {
     /// Generate an ephemeral self-signed cert at startup.
     SelfSigned,
     /// Load cert and key from PEM files.
-    PemFiles { cert: PathBuf, key: PathBuf },
+    PemFiles {
+        /// Path to the TLS certificate file (PEM format).
+        cert: PathBuf,
+        /// Path to the private key file (PEM format).
+        key: PathBuf,
+    },
 }
 
 /// A self-signed TLS certificate + private key in PEM format.
@@ -647,6 +652,7 @@ fn build_app(
         .route("/api/v1/github/register", get(github::github_register))
         .route("/api/v1/github/callback", get(github::github_callback))
         .route("/api/v1/runs/:run_id", get(get_run))
+        .route("/api/v1/runs/:run_id/logs", get(get_run_logs))
         .route("/api/v1/runs/:run_id/cancel", post(cancel_run))
         .route("/api/v1/runs/:run_id/rerun", post(rerun_run))
         .route("/api/v1/runs/:run_id/events.ndjson", get(run_events))
@@ -1241,14 +1247,50 @@ pub(crate) async fn submit_run_inner(
     let jobs = expanded.jobs;
     let reusable_calls = expanded.reusable_calls;
     let run_id = RunId::new();
+    let repository_owner = submission
+        .repository
+        .split('/')
+        .next()
+        .unwrap_or("owner")
+        .to_string();
+    let sha = submission
+        .payload
+        .get("after")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            submission
+                .payload
+                .get("pull_request")
+                .and_then(|pr| pr.get("head"))
+                .and_then(|h| h.get("sha"))
+                .and_then(|v| v.as_str())
+        })
+        .unwrap_or_else(|| {
+            if submission.git_ref.len() == 40
+                && submission.git_ref.chars().all(|c| c.is_ascii_hexdigit())
+            {
+                &submission.git_ref
+            } else {
+                "0000000000000000000000000000000000000000"
+            }
+        })
+        .to_string();
+
     let github = json!({
         "event_name": submission.event,
         "event": submission.payload,
         "repository": submission.repository,
+        "repository_owner": repository_owner,
         "ref": submission.git_ref,
         "run_id": run_id.to_string(),
+        "run_number": "1",
+        "run_attempt": "1",
+        "actor": "aksh-system",
+        "sha": sha,
         "workflow": workflow.name.clone().unwrap_or_default(),
-        "server_url": "https://github.com"
+        "server_url": "https://github.com",
+        "api_url": "https://api.github.com",
+        "graphql_url": "https://api.github.com/graphql"
     });
 
     {
@@ -1496,6 +1538,20 @@ async fn get_run(
         .cloned()
         .map(Json)
         .ok_or_else(|| ApiError::not_found("run not found"))
+}
+
+async fn get_run_logs(
+    State(shared): State<Arc<SharedState>>,
+    Path(_run_id): Path<String>,
+) -> Result<String, ApiError> {
+    let inner = shared.state.inner.lock().await;
+    let mut out = String::new();
+    for (key, bytes) in &inner.logs {
+        out.push_str(&format!("--- Log: {key} ---\n"));
+        out.push_str(&String::from_utf8_lossy(bytes));
+        out.push_str("\n");
+    }
+    Ok(out)
 }
 
 async fn cancel_run(
@@ -2552,8 +2608,31 @@ struct StepLogsSignedBlobUrlRequest {
     workflow_run_backend_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct WorkflowStepUpdateRequest {
+    external_id: String,
+    number: u32,
+    name: String,
+    status: u32,
+    #[serde(default)]
+    started_at: Option<String>,
+    #[serde(default)]
+    completed_at: Option<String>,
+    conclusion: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct WorkflowStepsUpdateRequest {
+    steps: Vec<WorkflowStepUpdateRequest>,
+    change_order: u64,
+    workflow_job_run_backend_id: String,
+    workflow_run_backend_id: String,
+}
+
 async fn twirp_workflow_steps_update(
-    Json(_request): Json<serde_json::Value>,
+    Json(_request): Json<WorkflowStepsUpdateRequest>,
 ) -> Json<serde_json::Value> {
     Json(json!({"ok": true}))
 }
@@ -6225,6 +6304,7 @@ fn server_iso_now() -> String {
     format!("{y:04}-{m:02}-{d:02}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z")
 }
 
+#[allow(dead_code)]
 /// Fetch a remote reusable workflow YAML from GitHub.
 /// `uses` format: `owner/repo/path/.github/workflows/workflow.yml@ref`
 async fn fetch_remote_workflow(uses: &str) -> Result<String, anyhow::Error> {
@@ -6250,6 +6330,7 @@ async fn fetch_remote_workflow(uses: &str) -> Result<String, anyhow::Error> {
     Ok(resp.text().await?)
 }
 
+#[allow(dead_code)]
 /// Resolve a git ref (branch/tag) to a commit SHA via the GitHub API.
 async fn resolve_remote_sha(owner: &str, repo: &str, git_ref: &str) -> Option<String> {
     let url = format!(
@@ -6291,7 +6372,7 @@ async fn resolve_remote_sha(owner: &str, repo: &str, git_ref: &str) -> Option<St
         .and_then(|s| s.as_str())
         .map(String::from)
 }
-
+#[allow(dead_code)]
 async fn resolve_all_reusable_workflows(
     workflow: &aksh_gha_parser::Workflow,
     reusable_workflows: &mut BTreeMap<String, String>,
@@ -6437,6 +6518,8 @@ fn propagate_reusable_outputs(run: &mut RunRecord) {
 mod tests {
     use axum::body::{to_bytes, Body};
     use axum::http::{Method, Request, StatusCode};
+    use proptest::prelude::*;
+    use proptest::test_runner::{FileFailurePersistence, RngSeed};
     use serde_json::Value;
     use tokio_util::sync::CancellationToken;
     use tower::ServiceExt;
@@ -10377,6 +10460,239 @@ jobs:
                     conditions[job]
                 );
             }
+        }
+    }
+    /// Oracle sources for this production-path group:
+    /// * GitHub Actions workflow step syntax (the public contract for ordered
+    ///   steps): <https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#jobsjob_idsteps>.
+    /// * actions/runner v2.335.1 `RunServiceHttpClient.GetJobMessageAsync`,
+    ///   `RenewJobAsync`, and `CompleteJobAsync` (POST request shape and IDs):
+    ///   <https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Sdk/RSWebApi/RunServiceHttpClient.cs#L25-L166>.
+    /// * The captured v2.335.1 golden exchange records the observable
+    ///   `POST /twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate`
+    ///   at `.runner-watch/golden/v2.335.1/06-multi-step/flows.jsonl` (flow 40).
+    ///
+    /// This oracle deliberately asserts only the public JSON contract and the
+    /// response accepted by the router; it does not claim private service
+    /// implementation semantics.
+    fn arb_production_step_update(
+    ) -> impl Strategy<Value = aksh_runner::worker::server_queue::StepUpdate> {
+        use aksh_runner::worker::server_queue::{step_conclusion, step_status, StepUpdate};
+
+        (
+            0u8..4,
+            1u32..8,
+            "[a-z]{1,8}",
+            prop_oneof![Just(step_status::IN_PROGRESS), Just(step_status::COMPLETED)],
+            prop::option::of("2026-07-[0-9]{2}T00:00:00Z"),
+            prop::option::of("2026-07-[0-9]{2}T00:00:01Z"),
+            prop_oneof![
+                Just(0u32),
+                Just(step_conclusion::SUCCEEDED),
+                Just(step_conclusion::FAILED),
+                Just(step_conclusion::SKIPPED),
+            ],
+        )
+            .prop_map(
+                |(id, number, name, status, started_at, completed_at, conclusion)| StepUpdate {
+                    external_id: format!("step-{id}"),
+                    number,
+                    name,
+                    status,
+                    started_at,
+                    completed_at,
+                    conclusion,
+                },
+            )
+    }
+
+    fn oracle_status_rank(status: u32) -> u8 {
+        match status {
+            2 => 1,
+            6 => 2,
+            _ => 0,
+        }
+    }
+
+    fn oracle_merge_step(
+        store: &mut std::collections::BTreeMap<
+            String,
+            aksh_runner::worker::server_queue::StepUpdate,
+        >,
+        incoming: aksh_runner::worker::server_queue::StepUpdate,
+    ) {
+        use aksh_runner::worker::server_queue::StepUpdate;
+
+        let merged = if let Some(previous) = store.get(&incoming.external_id) {
+            let mut next = incoming.clone();
+            // The public wire identity is external_id; numbers and names are
+            // payload fields, while status follows the lifecycle order.
+            next.status =
+                if oracle_status_rank(incoming.status) >= oracle_status_rank(previous.status) {
+                    incoming.status
+                } else {
+                    previous.status
+                };
+            // Cumulative reports keep the first start timestamp when present.
+            next.started_at = previous.started_at.clone().or(incoming.started_at.clone());
+            next.completed_at = incoming
+                .completed_at
+                .clone()
+                .or(previous.completed_at.clone());
+            // A zero/unset conclusion cannot erase a concrete conclusion.
+            next.conclusion = if incoming.conclusion != 0 || previous.conclusion == 0 {
+                incoming.conclusion
+            } else {
+                previous.conclusion
+            };
+            next
+        } else {
+            incoming
+        };
+        let id = merged.external_id.clone();
+        store.insert(id, merged);
+        let _ = StepUpdate {
+            external_id: String::new(),
+            number: 0,
+            name: String::new(),
+            status: 0,
+            started_at: None,
+            completed_at: None,
+            conclusion: 0,
+        };
+    }
+
+    async fn post_typed_workflow_steps_update(app: Router, body: Value) -> (StatusCode, Value) {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate")
+            .header("authorization", "Bearer aksh-system-token")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        (status, value)
+    }
+
+    fn workflow_steps_update_config() -> ProptestConfig {
+        let mut config = ProptestConfig::with_failure_persistence(
+            FileFailurePersistence::SourceParallel("proptest-regressions"),
+        );
+        config.cases = 1_000;
+        config.rng_seed = RngSeed::Fixed(0x57E0_2026);
+        config.verbose = 1;
+        config
+    }
+
+    static WORKFLOW_STEPS_TEST_APP: std::sync::LazyLock<Router> = std::sync::LazyLock::new(|| {
+        std::thread::spawn(|| {
+            let state_dir = tempfile::tempdir().unwrap().keep();
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let state = runtime.block_on(AppState::new(state_dir)).unwrap();
+            app(state, CancellationToken::new())
+        })
+        .join()
+        .expect("step-update test router initializer panicked")
+    });
+
+    proptest! {
+        #![proptest_config(workflow_steps_update_config())]
+
+        /// 1,000 bounded queue → merge → body → JSON → real Twirp router cases.
+        /// This catches cumulative snapshots, change_order, IDs, duplicate and
+        /// out-of-order updates, and omitted timestamps without asserting internals.
+        #[test]
+        fn workflow_steps_update_production_path_1000_cases(
+        updates in prop::collection::vec(arb_production_step_update(), 1..9)
+    ) {
+        let app = WORKFLOW_STEPS_TEST_APP.clone();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut queue = aksh_runner::worker::server_queue::ServerQueue::new(
+                "job-prop".into(),
+                "plan-prop".into(),
+            );
+            let mut oracle = std::collections::BTreeMap::new();
+
+            for (index, update) in updates.into_iter().enumerate() {
+                queue.queue_update(update.clone());
+                oracle_merge_step(&mut oracle, update);
+                let body = queue.take_steps_update_body().expect("queued update has a body");
+                assert_eq!(body.change_order, (index + 1) as u64);
+                assert_eq!(body.workflow_job_run_backend_id, "job-prop");
+                assert_eq!(body.workflow_run_backend_id, "plan-prop");
+                let actual: std::collections::BTreeMap<_, _> = body
+                    .steps
+                    .iter()
+                    .map(|step| (step.external_id.clone(), step.clone()))
+                    .collect();
+                assert_eq!(actual, oracle, "snapshot {index}");
+
+                let (status, response) = post_typed_workflow_steps_update(
+                    app.clone(),
+                    serde_json::to_value(&body).unwrap(),
+                ).await;
+                assert_eq!(status, StatusCode::OK, "snapshot {index}");
+                assert_eq!(response, json!({"ok": true}));
+            }
+        });
+    }
+    }
+
+    /// The typed Twirp DTO rejects malformed field types at the HTTP boundary.
+    /// Source: pinned `RunServiceHttpClient` JSON request construction above;
+    /// endpoint and response shape are captured in the golden flow cited above.
+    #[tokio::test]
+    async fn workflow_steps_update_rejects_invalid_types() {
+        let app = WORKFLOW_STEPS_TEST_APP.clone();
+        let valid_step = json!({
+            "external_id": "step-1",
+            "number": 1,
+            "name": "build",
+            "status": 2,
+            "started_at": "2026-07-14T00:00:00Z",
+            "completed_at": null,
+            "conclusion": 0
+        });
+        let cases = [
+            (
+                "steps",
+                json!({"steps": "not-an-array", "change_order": 1, "workflow_job_run_backend_id": "j", "workflow_run_backend_id": "p"}),
+            ),
+            (
+                "status",
+                json!({"steps": [{"external_id": "step-1", "number": 1, "name": "build", "status": "in-progress", "conclusion": 0}], "change_order": 1, "workflow_job_run_backend_id": "j", "workflow_run_backend_id": "p"}),
+            ),
+            (
+                "change_order",
+                json!({"steps": [valid_step.clone()], "change_order": "1", "workflow_job_run_backend_id": "j", "workflow_run_backend_id": "p"}),
+            ),
+            (
+                "timestamp",
+                json!({"steps": [{"external_id": "step-1", "number": 1, "name": "build", "status": 2, "started_at": 7, "conclusion": 0}], "change_order": 1, "workflow_job_run_backend_id": "j", "workflow_run_backend_id": "p"}),
+            ),
+        ];
+        for (name, body) in cases {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate")
+                .header("authorization", "Bearer aksh-system-token")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert!(
+                response.status().is_client_error(),
+                "case {name} unexpectedly returned {}",
+                response.status()
+            );
         }
     }
 }
