@@ -1,0 +1,15 @@
+name: concurrency-11-expr-group-ref
+on: workflow_dispatch
+concurrency:
+  group: ref-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: self-hosted
+    steps:
+      - name: marker
+        run: |
+          echo "SCENARIO=11-expr-group-ref"
+          echo "REF=refs/heads/main"
+          sleep 3
+          echo "DONE=11"

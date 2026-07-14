@@ -1,0 +1,14 @@
+name: concurrency-04-cancel-expr-true
+on: workflow_dispatch
+concurrency:
+  group: cancel-expr-true
+  cancel-in-progress: ${{ true }}
+jobs:
+  long:
+    runs-on: self-hosted
+    steps:
+      - name: sleep-long
+        run: |
+          echo "SCENARIO=04-cancel-expr-true"
+          sleep 30
+          echo "SHOULD_NOT_REACH"

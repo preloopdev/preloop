@@ -1,0 +1,11 @@
+name: concurrency-15-jobset-different-key
+on: workflow_dispatch
+jobs:
+  caller-job:
+    concurrency:
+      group: caller-key-15
+      cancel-in-progress: false
+    uses: ./.github/workflows/reusable-callee.yml
+    with:
+      val: "different-key"
+      concurrency_group: "embedded-key-15"
