@@ -13,6 +13,9 @@ inputs:
   id:
     description: Declaration-order identity used by the two-action lifecycle oracle.
     required: true
+outputs:
+  result:
+    description: Main lifecycle result emitted through GITHUB_OUTPUT.
 runs:
   using: node24
   pre: index.js
