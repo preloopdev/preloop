@@ -265,3 +265,135 @@ This validates parser, dependency promotion, terminal skip propagation, and
 run settlement through the real server state machine. It does not execute
 shell steps in microVMs; those remain covered by the real-world runner/SmolVM
 benchmarks.
+
+---
+
+## Tier 2 runner contracts, excluding concurrency (2026-07-14)
+
+### Scope and authority
+
+Implemented the requested Tier 2 properties for action lifecycle expansion,
+runner-facing DTO codecs, workflow commands, secret masking, file commands, and
+production-path workflow-step updates. Concurrency and interleaving properties
+were intentionally excluded.
+
+Every property uses a deterministic 1,000-case `ProptestConfig`. Oracles are
+derived from GitHub's public documentation and the official `actions/runner`
+v2.335.1 source pinned at commit
+`7d737449ef346f6524f75688d0c9c95fa10ba10a`, rather than from Aksh's own
+implementation. Exact source URLs are adjacent to the corresponding production
+logic and property blocks.
+
+Primary sources:
+
+- action lifecycle: [`ActionManager.cs`](https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/ActionManager.cs)
+  and [`ActionRunner.cs#L79-L110`](https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/ActionRunner.cs#L79-L110);
+- workflow-command parsing: [`ActionCommand.cs#L19-L114`](https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Common/ActionCommand.cs#L19-L114)
+  and GitHub's [workflow-command reference](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands);
+- secret masking: [`ActionCommandManager.cs#L419-L448`](https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/ActionCommandManager.cs#L419-L448);
+- environment files: [`FileCommandManager.cs#L113-L209`](https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/FileCommandManager.cs#L113-L209)
+  and [`FileCommandManager.cs#L296-L451`](https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/FileCommandManager.cs#L296-L451);
+- DTOs: [`VariableValue.cs#L8-L38`](https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Sdk/DTWebApi/WebApi/VariableValue.cs#L8-L38),
+  [`ActionStep.cs#L9-L46`](https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Sdk/DTPipelines/Pipelines/ActionStep.cs#L9-L46),
+  [`PipelineContextDataJsonConverter.cs#L20-L151`](https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Sdk/DTPipelines/Pipelines/ContextData/PipelineContextDataJsonConverter.cs#L20-L151),
+  [`TaskAgentSessionKey.cs#L8-L32`](https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Sdk/DTWebApi/WebApi/TaskAgentSessionKey.cs#L8-L32),
+  and [`AgentJobRequestMessage.cs#L15-L267`](https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Sdk/DTPipelines/Pipelines/AgentJobRequestMessage.cs#L15-L267);
+- step-update transport: [`RunServiceHttpClient.cs#L25-L166`](https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Sdk/RSWebApi/RunServiceHttpClient.cs#L25-L166)
+  plus the captured v2.335.1 `WorkflowStepsUpdate` golden exchange.
+
+### Properties added
+
+- `crates/aksh-runner/src/worker/job_extension.rs`: declaration-ordered pre
+  and main stages, LIFO post stages, default and explicit stage conditions,
+  metadata preservation, missing/unsupported definitions, and the official
+  local-action rule that skips `pre` but retains `main` and `post`.
+- `crates/aksh-gha-protocol/src/azdo.rs`: five `tier2_codec_` properties for
+  `VariableValue` omission/null/empty semantics, canonical `TaskStep` tokens,
+  recursive `PipelineContextData`, base64 session-key bytes and encrypted flag,
+  and full `AgentJobRequestMessage` canonical round trips.
+- `crates/aksh-runner/src/worker/commands.rs`: modern command escaping and
+  parsing, case-insensitive properties, malformed-input safety, exact-token
+  `stop-commands` behavior, and masked annotation fields.
+- `crates/aksh-runner/src/worker/contexts.rs`: raw, trimmed-line, base64,
+  overlapping, empty, multiline, idempotent, and live-mask behavior.
+- `crates/aksh-runner/src/worker/file_commands.rs`: ordinary and heredoc
+  key/value parsing for LF and CRLF, missing delimiters, duplicate keys,
+  step-local outputs, pre/post state ownership, path order, and the
+  case-insensitive `NODE_OPTIONS` prohibition.
+- `crates/aksh-runner-server/src/lib.rs`: generated runner
+  `ServerQueue` updates are serialized, posted through the real Axum router,
+  decoded by the typed production handler, and checked for cumulative snapshots,
+  merge semantics, change order, IDs, and invalid field types.
+
+### Fidelity fixes exposed by the properties
+
+1. Local JavaScript actions no longer receive an unsupported pre stage.
+2. Workflow-command parsing now follows the official leading-whitespace and
+   case-insensitive property rules.
+3. `add-mask` registers the raw value and each non-empty trimmed CR/LF line,
+   and ignores whitespace-only values.
+4. `GITHUB_PATH` entries retain official file order; composite execution now
+   blocks every case variant of `NODE_OPTIONS` too.
+5. Session-key bytes serialize as the official base64 JSON string instead of a
+   numeric array.
+6. Empty TemplateToken maps and the canonical `environment` member survive
+   `TaskStep` decode/encode round trips.
+7. `WorkflowStepsUpdate` now uses typed request DTOs at the HTTP boundary rather
+   than accepting arbitrary JSON.
+
+### Local verification
+
+```
+aksh-gha-protocol tier2_codec_                         5 passed
+aksh-runner worker::commands::tests                  20 passed
+aksh-runner worker::contexts::tests::masking_         4 passed
+aksh-runner worker::file_commands::tests             28 passed
+aksh-runner lifecycle                                12 passed
+aksh-runner-server workflow_steps_update_             2 passed
+cargo fmt --all --check                              passed
+```
+
+Each property function above executes 1,000 deterministic generated cases.
+The live workflow rejects Cargo's otherwise-successful `running 0 tests`
+behavior, so renamed or missing filters fail explicitly.
+
+### Official GitHub-hosted live conformance
+
+The final live test ran on the official runner v2.335.1, Ubuntu 24.04.4,
+`ubuntu-24.04` image `20260705.232.1`:
+
+- run: <https://github.com/preloopdev/aksh/actions/runs/29337898129>
+- job: <https://github.com/preloopdev/aksh/actions/runs/29337898129/job/87101716570>
+- branch commit: `aa5d058593bde985bcf093e0c4e69bbb5d49fa1c`
+- result: **success**, all six non-zero property filters passed with counts
+  `5 / 20 / 4 / 28 / 12 / 2`.
+
+The remote action oracle observed pre hooks in declaration order, mains in
+declaration order, and posts in reverse declaration order. Its per-action
+`GITHUB_STATE` checks passed, declared outputs reached the caller, multiline
+`GITHUB_ENV` and `GITHUB_OUTPUT` values were preserved, and the `GITHUB_PATH`
+probe executed successfully. While command handling was stopped, an emitted
+`::error::` string produced no error annotation; the resumed notice was
+processed. The post-registration masking log was exactly
+`tier2-mask-sentinel-after=***`, with no raw sentinel present afterward.
+
+GitHub cannot execute a local JavaScript action's `pre` hook, so the fixture is
+pinned to isolated action-only commit
+`88e5328dd1ee742206bc5e4f12823613744aa311`. This also avoids unrelated tracked
+benchmark symlinks in the normal repository archive. The only live annotation
+warning was GitHub's Node.js 20 deprecation notice for `actions/checkout@v4`;
+the hosted runner forced that action to Node.js 24.
+
+Workspace cleanup checks on the final tree:
+
+- `cargo fmt --all --check`: passed.
+- `cargo clippy --workspace --all-targets`: exited successfully with the
+  repository's existing warning set; new typed step-update request fields also
+  produce a non-fatal dead-code warning because deserialization, rather than
+  field reads, is the boundary being tested.
+- `cargo test --workspace --quiet`: the Tier 2 suites passed, but the workspace
+  command is not fully green. Two dispatcher tests outside this change fail
+  because their spawned worker rejects `--via` (`Unrecognized option: 'via'`):
+  `test_worker_dispatch_run_new_job` and
+  `test_worker_dispatch_cancellation`. Both failures reproduce when run alone;
+  no Tier 2 property or live conformance assertion failed.
