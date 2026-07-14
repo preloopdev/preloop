@@ -18,6 +18,10 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 walkdir.workspace = true
+flate2.workspace = true
+tar.workspace = true
+serde_yaml.workspace = true
+
 
 runner-watch = { path = "../runner-watch" }
 tempfile.workspace = true

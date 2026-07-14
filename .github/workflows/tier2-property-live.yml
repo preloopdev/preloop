@@ -101,9 +101,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          env_delimiter="TIER2_ENV_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
-          output_delimiter="TIER2_OUTPUT_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
-          path_dir="${RUNNER_TEMP}/tier2-property-path-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          run_id="${GITHUB_RUN_ID:-1}"
+          run_attempt="${GITHUB_RUN_ATTEMPT:-1}"
+          env_delimiter="TIER2_ENV_${run_id}_${run_attempt}"
+          output_delimiter="TIER2_OUTPUT_${run_id}_${run_attempt}"
+          path_dir="${RUNNER_TEMP}/tier2-property-path-${run_id}-${run_attempt}"
           mkdir -p "$path_dir"
           cat > "$path_dir/tier2-path-probe" <<'SCRIPT'
           #!/usr/bin/env bash
@@ -113,7 +115,7 @@ jobs:
 
           {
             printf 'TIER2_HEREDOC_ENV<<%s\n' "$env_delimiter"
-            printf 'line-one\nline-two:%s\n' "$GITHUB_RUN_ATTEMPT"
+            printf 'line-one\nline-two:%s\n' "$run_attempt"
             printf '%s\n' "$env_delimiter"
           } >> "$GITHUB_ENV"
 
@@ -125,7 +127,7 @@ jobs:
 
           printf '%s\n' "$path_dir" >> "$GITHUB_PATH"
 
-          stop_token="tier2-stop-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          stop_token="tier2-stop-${run_id}-${run_attempt}"
           printf '::stop-commands::%s\n' "$stop_token"
           printf '::error::this-error-must-be-suppressed-while-stopped\n'
           printf '::%s::\n' "$stop_token"
@@ -133,7 +135,9 @@ jobs:
 
           # The sentinel is deliberately printed after add-mask for inspection
           # in the live job log; the official runner must redact its value.
-          mask_sentinel="tier2-mask-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_SHA:0:12}"
+          sha="${GITHUB_SHA:-000000000000}"
+          sha_short="${sha:0:12}"
+          mask_sentinel="tier2-mask-${run_id}-${run_attempt}-${sha_short}"
           printf '::add-mask::%s\n' "$mask_sentinel"
           printf 'tier2-mask-sentinel-after=%s\n' "$mask_sentinel"
 
@@ -147,7 +151,8 @@ jobs:
           set -euo pipefail
           [[ "$FIRST_RESULT" == "tier2-oracle-first-main-state-ok" ]]
           [[ "$SECOND_RESULT" == "tier2-oracle-second-main-state-ok" ]]
-          expected_env=$'line-one\nline-two:'"$GITHUB_RUN_ATTEMPT"
+          run_attempt="${GITHUB_RUN_ATTEMPT:-1}"
+          expected_env=$'line-one\nline-two:'"$run_attempt"
           [[ "$TIER2_HEREDOC_ENV" == "$expected_env" ]]
           expected_output=$'output-line-one\noutput-line-two'
           [[ "$OUTPUT_HEREDOC" == "$expected_output" ]]
