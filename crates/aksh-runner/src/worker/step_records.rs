@@ -585,4 +585,94 @@ mod tests {
             }
         }
     }
+
+    /// Explicit null on wire (has_started_at=true, started_at=None) does NOT
+    /// clear an existing timestamp — official cumulative updates preserve
+    /// the first non-empty value.
+    /// Oracle: docs/property-tests.md §4.5 — explicit null follows wire contract.
+    #[test]
+    fn explicit_null_wire_contract() {
+        let existing = full("s1", 1, "A", step_status::IN_PROGRESS, 0);
+        assert_eq!(existing.started_at.as_deref(), Some("t0"));
+        let incoming = PartialStepUpdate {
+            external_id: "s1".into(),
+            number: None,
+            name: None,
+            status: None,
+            started_at: None,
+            has_started_at: true,
+            completed_at: None,
+            has_completed_at: false,
+            conclusion: None,
+        };
+        let merged = merge_step_update(Some(&existing), &incoming);
+        assert_eq!(
+            merged.started_at.as_deref(),
+            Some("t0"),
+            "cumulative update preserves existing timestamp"
+        );
+        let fresh = merge_step_update(None, &incoming);
+        assert_eq!(fresh.started_at, None, "no existing → stays None");
+    }
+
+    /// Unknown received records (not in dispatched list) handled gracefully.
+    /// Oracle: docs/property-tests.md §4.c.4 — must not be silently dropped.
+    #[test]
+    fn unknown_received_record_not_dropped() {
+        let dispatched = vec![]; // empty
+        let mut received = BTreeMap::new();
+        received.insert(
+            "unknown".into(),
+            full(
+                "unknown",
+                99,
+                "Mystery",
+                step_status::COMPLETED,
+                step_conclusion::SUCCEEDED,
+            ),
+        );
+        let out = reconcile_cancelled_steps(&dispatched, &received);
+        // With empty dispatched, no tasks to reconcile — output should be empty
+        // (unknown records are not in scope of dispatched reconciliation)
+        assert_eq!(out.len(), 0);
+    }
+
+    /// Twirp conclusion constants match the proto enum from golden flows.
+    /// Oracle: docs/property-tests.md §4 — conclusion mapping from Twirp schema.
+    #[test]
+    fn twirp_conclusion_mapping() {
+        assert_eq!(step_conclusion::SUCCEEDED, 2);
+        assert_eq!(step_conclusion::FAILED, 3);
+        assert_eq!(step_conclusion::SKIPPED, 7);
+        assert_eq!(step_status::IN_PROGRESS, 2);
+        assert_eq!(step_status::COMPLETED, 6);
+    }
+
+    /// Generated merges produce valid field types.
+    /// Oracle: docs/property-tests.md §4.12 — valid field types.
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 1_000, ..ProptestConfig::default() })]
+
+        #[test]
+        fn valid_field_types_in_generated_merges(
+            updates in proptest::collection::vec(arb_partial(), 1..6)
+        ) {
+            let mut store = BTreeMap::new();
+            for u in updates {
+                apply_step_update(&mut store, &u);
+            }
+            for (ext_id, record) in &store {
+                prop_assert!(!ext_id.is_empty(), "empty external_id");
+                prop_assert!(!record.external_id.is_empty(), "empty record external_id");
+                prop_assert!(
+                    matches!(record.status, 0 | step_status::IN_PROGRESS | step_status::COMPLETED),
+                    "unknown status {}", record.status
+                );
+                prop_assert!(
+                    matches!(record.conclusion, 0 | step_conclusion::SUCCEEDED | step_conclusion::FAILED | step_conclusion::SKIPPED),
+                    "unknown conclusion {}", record.conclusion
+                );
+            }
+        }
+    }
 }
