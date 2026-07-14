@@ -76,7 +76,12 @@ pub enum TlsMode {
     /// Generate an ephemeral self-signed cert at startup.
     SelfSigned,
     /// Load cert and key from PEM files.
-    PemFiles { cert: PathBuf, key: PathBuf },
+    PemFiles {
+        /// Path to the TLS certificate file (PEM format).
+        cert: PathBuf,
+        /// Path to the private key file (PEM format).
+        key: PathBuf,
+    },
 }
 
 /// A self-signed TLS certificate + private key in PEM format.
@@ -2553,6 +2558,7 @@ struct StepLogsSignedBlobUrlRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct WorkflowStepUpdateRequest {
     external_id: String,
     number: u32,
@@ -2566,6 +2572,7 @@ struct WorkflowStepUpdateRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct WorkflowStepsUpdateRequest {
     steps: Vec<WorkflowStepUpdateRequest>,
     change_order: u64,
@@ -6246,6 +6253,7 @@ fn server_iso_now() -> String {
     format!("{y:04}-{m:02}-{d:02}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z")
 }
 
+#[allow(dead_code)]
 /// Fetch a remote reusable workflow YAML from GitHub.
 /// `uses` format: `owner/repo/path/.github/workflows/workflow.yml@ref`
 async fn fetch_remote_workflow(uses: &str) -> Result<String, anyhow::Error> {
@@ -6271,6 +6279,7 @@ async fn fetch_remote_workflow(uses: &str) -> Result<String, anyhow::Error> {
     Ok(resp.text().await?)
 }
 
+#[allow(dead_code)]
 /// Resolve a git ref (branch/tag) to a commit SHA via the GitHub API.
 async fn resolve_remote_sha(owner: &str, repo: &str, git_ref: &str) -> Option<String> {
     let url = format!(
@@ -6312,7 +6321,7 @@ async fn resolve_remote_sha(owner: &str, repo: &str, git_ref: &str) -> Option<St
         .and_then(|s| s.as_str())
         .map(String::from)
 }
-
+#[allow(dead_code)]
 async fn resolve_all_reusable_workflows(
     workflow: &aksh_gha_parser::Workflow,
     reusable_workflows: &mut BTreeMap<String, String>,
