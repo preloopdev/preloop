@@ -576,6 +576,7 @@ pub(crate) async fn handle_github_webhook(
                 reusable_workflows: BTreeMap::new(),
                 enable_debugger: false,
                 debugger_welcome_message: None,
+                inputs: BTreeMap::new(),
             };
 
             // Call submit_run_inner
