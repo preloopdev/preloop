@@ -392,9 +392,22 @@ Workspace cleanup checks on the final tree:
   repository's existing warning set; new typed step-update request fields also
   produce a non-fatal dead-code warning because deserialization, rather than
   field reads, is the boundary being tested.
-- `cargo test --workspace --quiet`: the Tier 2 suites passed, but the workspace
-  command is not fully green. Two dispatcher tests outside this change fail
-  because their spawned worker rejects `--via` (`Unrecognized option: 'via'`):
-  `test_worker_dispatch_run_new_job` and
-  `test_worker_dispatch_cancellation`. Both failures reproduce when run alone;
-  no Tier 2 property or live conformance assertion failed.
+- `cargo test --workspace --quiet`: **656 passed, 1 ignored**.
+
+### Dispatcher repair (2026-07-14)
+
+The two previously failing dispatcher tests were fixed. Unit tests were
+spawning Cargo's test harness executable instead of the `aksh-runner` CLI; the
+harness correctly rejected the worker-only `--via` argument. Test dispatch now
+builds and launches the real `aksh-runner` binary once, while production keeps
+the existing direct-binary and `AKSH_RUNNER_BIN` resolution paths. The
+cancellation assertion now allows the documented SIGINT/SIGTERM grace budget
+while still rejecting the ten-second sleep payload.
+
+Focused result:
+
+```
+listener::job_dispatcher::tests::test_worker_dispatch  2 passed
+```
+
+The full workspace test run is now green: 656 passed, 1 ignored.
