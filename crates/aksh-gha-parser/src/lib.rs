@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use aksh_gha_protocol::{JobId, JobPlan, StepPlan};
 use indexmap::IndexMap;
 
+/// Workflow dependency graph validation.
+pub mod dag;
 /// Expression evaluation for workflow fields.
 pub mod eval;
 
@@ -23,6 +25,29 @@ pub enum ParserError {
     /// Workflow did not define jobs.
     #[error("workflow does not define any jobs")]
     EmptyJobs,
+    /// A job references a dependency that does not exist after expansion.
+    #[error("job `{job_id}` needs unknown job `{need}`")]
+    UnknownNeed {
+        /// Dependent job id.
+        job_id: String,
+        /// Missing dependency id.
+        need: String,
+    },
+    /// The expanded workflow dependency graph contains a cycle.
+    #[error("workflow job dependency cycle contains `{witness}`")]
+    NeedsCycle {
+        /// One job participating in the cycle.
+        witness: String,
+    },
+    /// A job-level condition is syntactically invalid.
+    #[error("invalid condition for job `{job_id}`: {message}")]
+    InvalidJobCondition {
+        /// Expanded job id.
+        job_id: String,
+        /// Expression parser error.
+        message: String,
+    },
+
     /// Matrix include/exclude entries must be objects.
     #[error("matrix entry for `{job_id}` in `{field}` must be an object")]
     InvalidMatrixEntry {
@@ -849,6 +874,7 @@ pub fn expand_jobs(workflow: &Workflow) -> Result<Vec<JobPlan>, ParserError> {
             });
         }
     }
+    dag::validate_job_plans(&plans)?;
     Ok(plans)
 }
 
@@ -1168,6 +1194,8 @@ pub fn expand_jobs_with_reusables(
         }
         plan.needs = new_needs;
     }
+
+    dag::validate_job_plans(&plans)?;
 
     Ok(ExpandedWorkflows {
         jobs: plans,
