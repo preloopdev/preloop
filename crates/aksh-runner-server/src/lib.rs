@@ -1554,6 +1554,7 @@ pub(crate) async fn submit_run_inner(
                 .map(|s| JobId(s.clone()))
                 .collect();
             // Try caller concurrency (caller job-level concurrency on the `uses:` job).
+            let mut caller_acquired_key: Option<(String, String)> = None;
             if let Some(raw) = &call.caller_concurrency {
                 let eval_ctx = concurrency::ConcurrencyContext {
                     scope: concurrency::ConcurrencyScope::Job,
@@ -1571,9 +1572,17 @@ pub(crate) async fn submit_run_inner(
                             run_id,
                             job_ids: member_ids.clone(),
                         };
-                        match try_acquire_concurrency(&mut inner, key, group, holder, cancel, queue)
-                        {
-                            Ok(true) => { /* acquired — members proceed normally */ }
+                        match try_acquire_concurrency(
+                            &mut inner,
+                            key.clone(),
+                            group,
+                            holder,
+                            cancel,
+                            queue,
+                        ) {
+                            Ok(true) => {
+                                caller_acquired_key = Some(key);
+                            }
                             Ok(false) => {
                                 // Entire set blocked — park all members.
                                 jobset_blocked.extend(member_ids.iter().cloned());
@@ -1640,12 +1649,20 @@ pub(crate) async fn submit_run_inner(
                                         statuses.insert(mid.clone(), ExecutionStatus::Cancelled);
                                     }
                                     jobset_blocked.extend(member_ids.iter().cloned());
+                                    // Release caller key — members are terminally cancelled.
+                                    if let Some(ckey) = caller_acquired_key.take() {
+                                        release_acquired_key(&mut inner, &ckey, run_id);
+                                    }
                                 }
                                 Err(_) => {
                                     for mid in &member_ids {
                                         statuses.insert(mid.clone(), ExecutionStatus::Failure);
                                     }
                                     jobset_blocked.extend(member_ids.iter().cloned());
+                                    // Release caller key — members are terminally failed.
+                                    if let Some(ckey) = caller_acquired_key.take() {
+                                        release_acquired_key(&mut inner, &ckey, run_id);
+                                    }
                                 }
                             }
                         }
@@ -1654,6 +1671,9 @@ pub(crate) async fn submit_run_inner(
                                 statuses.insert(mid.clone(), ExecutionStatus::Failure);
                             }
                             jobset_blocked.extend(member_ids.iter().cloned());
+                            if let Some(ckey) = caller_acquired_key.take() {
+                                release_acquired_key(&mut inner, &ckey, run_id);
+                            }
                         }
                         Err(e) => {
                             concurrency::log_eval_error("embedded concurrency (JobSet)", &e);
@@ -1661,6 +1681,9 @@ pub(crate) async fn submit_run_inner(
                                 statuses.insert(mid.clone(), ExecutionStatus::Failure);
                             }
                             jobset_blocked.extend(member_ids.iter().cloned());
+                            if let Some(ckey) = caller_acquired_key.take() {
+                                release_acquired_key(&mut inner, &ckey, run_id);
+                            }
                         }
                     }
                 }
@@ -2133,6 +2156,32 @@ fn release_concurrency_for_job(inner: &mut InnerState, run_id: RunId, job_id: &J
     }
 }
 
+/// Release a single concurrency key acquired by a JobSet whose members all
+/// became terminal before any could dispatch (e.g. embedded gate overflow).
+/// Removes the running holder from the group and promotes the next pending.
+fn release_acquired_key(inner: &mut InnerState, key: &(String, String), run_id: RunId) {
+    if let Some(group) = inner.concurrency_groups.get_mut(key) {
+        if group.running.as_ref().is_some_and(|h| h.run_id() == run_id) {
+            let done = group.running.take();
+            if let Some(done) = done {
+                promote_next_from_group(inner, key, done);
+            }
+        } else {
+            group.pending.retain(|h| h.run_id() != run_id);
+            if group.running.is_none() && group.pending.is_empty() {
+                inner.concurrency_groups.remove(key);
+            }
+        }
+    }
+    // Clean up holder_keys tracking for this run + key.
+    if let Some(rkeys) = inner.holder_keys.get_mut(&run_id) {
+        rkeys.retain(|k| k != key);
+        if rkeys.is_empty() {
+            inner.holder_keys.remove(&run_id);
+        }
+    }
+}
+
 /// After a holder finishes, promote the next pending holder for the group.
 fn promote_next_from_group(
     inner: &mut InnerState,
@@ -2302,11 +2351,17 @@ fn try_acquire_concurrency(
 
     if cancel_in_progress {
         let prev = group.running.take();
+        // Docs: "any existing pending job or workflow in the same concurrency
+        // group will be canceled" — drain all pending holders too.
+        let stale_pending: Vec<concurrency::Holder> = group.pending.drain(..).collect();
         group.running = Some(holder.clone());
         let _ = group;
         track_holder_key(inner, &holder, key.clone());
         if let Some(prev) = prev {
             cancel_holder(inner, &prev, concurrency::cancelled_reason().as_deref());
+        }
+        for pending in stale_pending {
+            cancel_holder(inner, &pending, concurrency::cancelled_reason().as_deref());
         }
         return Ok(true);
     }
