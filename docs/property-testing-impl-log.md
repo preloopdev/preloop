@@ -307,10 +307,11 @@ Primary sources:
   and main stages, LIFO post stages, default and explicit stage conditions,
   metadata preservation, missing/unsupported definitions, and the official
   local-action rule that skips `pre` but retains `main` and `post`.
-- `crates/aksh-gha-protocol/src/azdo.rs`: five `tier2_codec_` properties for
-  `VariableValue` omission/null/empty semantics, canonical `TaskStep` tokens,
-  recursive `PipelineContextData`, base64 session-key bytes and encrypted flag,
-  and full `AgentJobRequestMessage` canonical round trips.
+- `crates/aksh-gha-protocol/src/azdo.rs`: six `tier2_codec_` properties for
+  `VariableValue` omission/null/empty semantics, canonical and compatibility
+  `TaskStep` environment tokens, recursive `PipelineContextData`, base64
+  session-key bytes and encrypted flag, and an independently constructed
+  field-by-field `AgentJobRequestMessage` wire oracle.
 - `crates/aksh-runner/src/worker/commands.rs`: modern command escaping and
   parsing, case-insensitive properties, malformed-input safety, exact-token
   `stop-commands` behavior, and masked annotation fields.
@@ -344,7 +345,7 @@ Primary sources:
 ### Local verification
 
 ```
-aksh-gha-protocol tier2_codec_                         5 passed
+aksh-gha-protocol tier2_codec_                         6 passed
 aksh-runner worker::commands::tests                  20 passed
 aksh-runner worker::contexts::tests::masking_         4 passed
 aksh-runner worker::file_commands::tests             28 passed
