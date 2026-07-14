@@ -136,10 +136,15 @@ mod tests {
 
     #[test]
     fn status_fn_inside_string_does_not_count() {
+        // Single-quoted strings hide status functions (GitHub expression syntax)
         assert!(!contains_status_check_function("'success()'"));
-        assert!(!contains_status_check_function("\"failure()\""));
+        assert!(!contains_status_check_function("'always()'"));
+        // Double quotes are NOT string delimiters in GitHub expressions;
+        // a bare failure() is correctly detected as a status function.
         assert!(contains_status_check_function("success()"));
         assert!(contains_status_check_function("true || always()"));
+        // Doubled single-quote escape does not end the string early
+        assert!(!contains_status_check_function("'it''s always() here'"));
     }
 
     #[test]
@@ -265,5 +270,31 @@ mod tests {
             let b = effective_condition(raw.as_deref());
             prop_assert_eq!(a, b);
         }
+    }
+
+    /// Missing context path vs explicit null — both falsy, both success-gated.
+    /// Oracle: docs/property-tests.md §3.10 — missing paths and null follow
+    /// pinned official truthiness rules.
+    #[test]
+    fn missing_context_path_vs_explicit_null() {
+        // A nonexistent path evaluates to empty/null → falsy.
+        // With default success gate: success() && (falsy) = false on success.
+        let ok = StatusFlags::ok();
+        // "null" literal
+        let null_result = evaluate_step_condition(Some("null"), ok).unwrap();
+        assert!(
+            !null_result,
+            "null literal should be falsy under success gate"
+        );
+        // Explicit "false"
+        let false_result = evaluate_step_condition(Some("false"), ok).unwrap();
+        assert!(
+            !false_result,
+            "false literal should be falsy under success gate"
+        );
+        // After failure, both should also be false (success gate fails)
+        let fail = StatusFlags::after_failure();
+        assert!(!evaluate_step_condition(Some("null"), fail).unwrap());
+        assert!(!evaluate_step_condition(Some("false"), fail).unwrap());
     }
 }
