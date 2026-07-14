@@ -1247,14 +1247,50 @@ pub(crate) async fn submit_run_inner(
     let jobs = expanded.jobs;
     let reusable_calls = expanded.reusable_calls;
     let run_id = RunId::new();
+    let repository_owner = submission
+        .repository
+        .split('/')
+        .next()
+        .unwrap_or("owner")
+        .to_string();
+    let sha = submission
+        .payload
+        .get("after")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            submission
+                .payload
+                .get("pull_request")
+                .and_then(|pr| pr.get("head"))
+                .and_then(|h| h.get("sha"))
+                .and_then(|v| v.as_str())
+        })
+        .unwrap_or_else(|| {
+            if submission.git_ref.len() == 40
+                && submission.git_ref.chars().all(|c| c.is_ascii_hexdigit())
+            {
+                &submission.git_ref
+            } else {
+                "0000000000000000000000000000000000000000"
+            }
+        })
+        .to_string();
+
     let github = json!({
         "event_name": submission.event,
         "event": submission.payload,
         "repository": submission.repository,
+        "repository_owner": repository_owner,
         "ref": submission.git_ref,
         "run_id": run_id.to_string(),
+        "run_number": "1",
+        "run_attempt": "1",
+        "actor": "aksh-system",
+        "sha": sha,
         "workflow": workflow.name.clone().unwrap_or_default(),
-        "server_url": "https://github.com"
+        "server_url": "https://github.com",
+        "api_url": "https://api.github.com",
+        "graphql_url": "https://api.github.com/graphql"
     });
 
     {
