@@ -84,11 +84,13 @@ jobs:
       # The official runner does not support local pre actions, so this fixture
       # is pinned to an immutable, isolated action-only commit in this repository.
       - name: Run remote JavaScript oracle (declaration 1)
+        id: oracle_first
         uses: preloopdev/aksh/.github/actions/tier2-property-oracle@88e5328dd1ee742206bc5e4f12823613744aa311
         with:
           id: first
 
       - name: Run remote JavaScript oracle (declaration 2)
+        id: oracle_second
         uses: preloopdev/aksh/.github/actions/tier2-property-oracle@88e5328dd1ee742206bc5e4f12823613744aa311
         with:
           id: second
