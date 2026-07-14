@@ -434,22 +434,19 @@ fn build_task_step(step: &crate::StepPlan, context: &Context) -> TaskStep {
         display_name_token,
         condition,
         script: run,
-        reference: step
-            .uses
-            .as_ref()
-            .map(|uses| {
-                let (name, version) = if let Some((n, v)) = uses.split_once('@') {
-                    (n.to_owned(), Some(v.to_owned()))
-                } else {
-                    (uses.clone(), None)
-                };
-                aksh_gha_protocol::azdo::TaskReference {
-                    id: None,
-                    name: Some(name),
-                    version,
-                    reference_type: None,
-                }
-            }),
+        reference: step.uses.as_ref().map(|uses| {
+            let (name, version) = if let Some((n, v)) = uses.split_once('@') {
+                (n.to_owned(), Some(v.to_owned()))
+            } else {
+                (uses.clone(), None)
+            };
+            aksh_gha_protocol::azdo::TaskReference {
+                id: None,
+                name: Some(name),
+                version,
+                reference_type: None,
+            }
+        }),
         inputs: with,
         env,
         continue_on_error: step.continue_on_error,
