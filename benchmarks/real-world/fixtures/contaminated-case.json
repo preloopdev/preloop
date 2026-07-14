@@ -1,0 +1,28 @@
+{
+  "$schema": "https://raw.githubusercontent.com/actions/runner/32e89e2afd4549a362dbec337a589b81fd17a0c5/src/Runner.Listener/JobCancelMessage.cs",
+  "schema_version": 1,
+  "runner_pin": "32e89e2afd4549a362dbec337a589b81fd17a0c5",
+  "docs_date": "2026-07-14",
+  "cases": [
+    {
+      "id": "contaminated-single-replacement",
+      "invariant": "GH-SINGLE-01",
+      "description": "CONTAMINATED: expect fields intentionally contradict the documented invariant — pending holds the running holder instead of the arriving one; harness must detect this as semantic mismatch",
+      "kind": "control_plane",
+      "group": "test-contaminated",
+      "queue": "single",
+      "cancel_in_progress": false,
+      "arrivals": [
+        {"label": "A", "repo": "org/repo"},
+        {"label": "B", "repo": "org/repo"},
+        {"label": "C", "repo": "org/repo"}
+      ],
+      "expect": {
+        "running_label": "A",
+        "pending_labels": ["B"],
+        "cancelled_labels": ["C"],
+        "_contamination_marker": "pending holds old holder; arrival incorrectly modelled as cancelled — must be rejected by GH-SINGLE-01 validation"
+      }
+    }
+  ]
+}
