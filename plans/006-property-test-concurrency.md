@@ -269,8 +269,8 @@ Properties:
 - `GH-MATRIX-01`: active plus dispatchable matrix siblings never exceed `max-parallel`; a job does not become group-running while the matrix gate is full.
 - Completing any active sibling eventually makes the oldest eligible blocked sibling dispatchable; bounded liveness is checked after at most `number_of_jobs + pending_holders` release steps.
 - Needs-blocked jobs never acquire job-level concurrency early. Once all needs are terminal-success, concurrency evaluates from the hydrated outputs and acquisition happens exactly once.
-- `GH-REUSE-01`: no JobSet member dispatches until caller and embedded keys are both acquired.
-- Multi-key JobSet acquisition is all-or-nothing. If key 2 blocks or overflows, key 1 must not remain held by a non-dispatchable set.
+- `GH-REUSE-01`: no JobSet member dispatches until caller and embedded keys are both acquired. Gates are sequential: caller acquires first, then embedded. This matches live GitHub behavior where the caller `uses:` job starts before the callee workflow queues on its own group.
+- If a later gate (embedded) fails terminally (overflow or eval error) after the caller key was acquired, the caller key must be released and all members terminally failed. This prevents a permanently-wedged group slot held by an all-terminal JobSet.
 - Releasing one JobSet member does not release the set; releasing the final member releases every held key once.
 - Cancelling a JobSet makes every non-terminal member cancelled and releases keys only after terminal aggregation.
 - Nested reusable calls preserve outer and embedded scope without duplicate inner jobs.

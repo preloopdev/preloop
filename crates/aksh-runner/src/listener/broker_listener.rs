@@ -355,10 +355,14 @@ pub async fn run_broker_loop(
                                     .unwrap_or(300);
                                 let timing = cancellation_timing(timeout_secs);
 
+                                // Official runner deserializes jobId as Guid;
+                                // a missing/malformed value never reaches Cancel().
+                                let Some(msg_id) = cancel_job_id else {
+                                    debug!("JobCancellation has no valid jobId — ignoring");
+                                    continue;
+                                };
                                 if let Some(job) = active_job.as_mut() {
-                                    if let (Some(msg_id), Some(active_id)) =
-                                        (cancel_job_id, job.job_id)
-                                    {
+                                    if let Some(active_id) = job.job_id {
                                         if msg_id != active_id {
                                             debug!(
                                                 "JobCancellation jobId {msg_id} does not match active {active_id} — ignoring"
