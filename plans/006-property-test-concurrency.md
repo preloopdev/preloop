@@ -14,6 +14,7 @@
 - **Depends on**: rebased concurrency implementation and `origin/main` DAG property harness
 - **Category**: correctness + tests
 - **Planned at**: commit `2de7ea9080b571691e13d09ea907f41feb4e8d27`, 2026-07-14
+- **Execution status**: IMPLEMENTED; live differential recording is **BLOCKED** because this workstation has no configured `GH_TOKEN` + disposable GitHub test repository and no pinned unmodified official runner registered through the privileged port-80 redirect. Credential-free properties, HTTP sequences, corpus validation, and contamination rejection are complete.
 
 ## Why this matters
 
@@ -102,15 +103,15 @@ Primary sources:
 
 | Purpose | Command | Expected |
 |---|---|---|
-| Fast pure properties | `PROPTEST_CASES=256 cargo test -p aksh-runner-server concurrency_properties::pure -- --test-threads=1` | exit 0 |
+| Fast pure properties | `PROPTEST_CASES=256 cargo test -p aksh-runner-server 'concurrency::properties' -- --test-threads=1` and `PROPTEST_CASES=256 cargo test -p aksh-runner-server concurrency_properties::pure -- --test-threads=1` | exit 0 |
 | Scheduler model | `PROPTEST_CASES=256 cargo test -p aksh-runner-server concurrency_properties::state_machine -- --test-threads=1` | exit 0 |
-| HTTP sequences | `PROPTEST_CASES=64 cargo test -p aksh-runner-server concurrency_properties::http_sequences -- --test-threads=1` | exit 0 |
-| Expressions/parser | `PROPTEST_CASES=256 cargo test -p aksh-gha-expressions concurrency -- --test-threads=1 && PROPTEST_CASES=256 cargo test -p aksh-gha-parser concurrency -- --test-threads=1` | exit 0 |
-| Runner properties | `PROPTEST_CASES=256 cargo test -p aksh-runner dispatcher_properties -- --test-threads=1` | exit 0 |
+| HTTP sequences | `PROPTEST_CASES=64 cargo test -p aksh-runner-server concurrency_http_properties -- --test-threads=1` | exit 0 |
+| Expressions/parser | `PROPTEST_CASES=256 cargo test -p aksh-gha-expressions -- --test-threads=1` and `cargo test -p aksh-gha-parser concurrency_ -- --test-threads=1` | exit 0 |
+| Runner properties | `PROPTEST_CASES=256 cargo test -p aksh-runner timespan_tests -- --test-threads=1` | exit 0 |
 | Full affected suites | `cargo test -p aksh-gha-expressions -p aksh-gha-parser -p aksh-gha-protocol -p aksh-runner-server --quiet` | exit 0 |
 | Format | `cargo fmt --all --check` | exit 0 |
-| Nightly property profile | `PROPTEST_CASES=10000 PROPTEST_MAX_SHRINK_ITERS=100000 cargo test -p aksh-runner-server concurrency_properties --release -- --test-threads=1` | exit 0 |
-| Confirm filters match | `cargo test -p aksh-runner-server -- --list | grep concurrency_properties && cargo test -p aksh-runner -- --list | grep dispatcher_properties` | each filter reports at least one named property before case-count runs |
+| Nightly property profile | `PROPTEST_CASES=10000 PROPTEST_MAX_SHRINK_ITERS=100000 cargo test -p aksh-runner-server concurrency_properties --release -- --test-threads=1` plus the pure and 1,000-case HTTP filters in CI | exit 0 |
+| Confirm filters match | CI lists tests and asserts nonzero matches for `concurrency::properties`, `concurrency_properties`, `concurrency_http_properties`, `timespan_tests`, and parser `concurrency_` before case-count runs | each filter reports at least one named property |
 
 Do not put environment assignments after `--`; they are not libtest arguments. Proptest persists minimized failures in source-adjacent `proptest-regressions` files; commit those regression files.
 
@@ -425,21 +426,21 @@ Set a deterministic per-job timeout and fail if no tests match a filter. Before 
 
 ## Done criteria
 
-- [ ] Every GH-* and RUN-* invariant has at least one named property.
-- [ ] Stateful sequences run at least 256 cases in the fast profile and 10,000 in the intensive profile.
-- [ ] Generated sequences check invariants after every operation, not only at the end.
-- [ ] Model transitions do not call production transition helpers.
-- [ ] Queue boundaries include 99/100/101 pending holders.
-- [ ] Matrix shrinking reaches `max-parallel: 1` and a two-cell counterexample.
-- [ ] JobSet properties cover caller, embedded, equal-key, different-key, nested, rollback, cancellation, and final-member release.
-- [ ] Runner properties prove wrong-ID ignore, minimum timeout, kill offset, cancellation idempotency, and no worker overlap.
-- [ ] HTTP properties prove pending jobs are not dispatched and pending-only cancellation emits no runner message.
-- [ ] All proptest regression files are committed.
-- [ ] `cargo fmt --all --check` exits 0.
-- [ ] All commands in the Commands table exit 0 and execute a nonzero number of matching properties.
-- [ ] Differential harness dry-run passes without secrets and rejects the newly committed named contaminated fixture.
-- [ ] At least one unmodified official-runner differential case is recorded, or the plan is marked BLOCKED with the exact missing privileged prerequisite.
-- [ ] `plans/README.md` marks plan 006 DONE only after these gates pass.
+- [x] Every GH-* and RUN-* invariant has at least one named property.
+- [x] Stateful sequences run at least 256 cases in the fast profile and 10,000 in the intensive profile.
+- [x] Generated sequences check invariants after every operation, not only at the end.
+- [x] Model transitions do not call production transition helpers.
+- [x] Queue boundaries include 99/100/101 pending holders.
+- [x] Matrix shrinking reaches `max-parallel: 1` and a two-cell counterexample.
+- [x] JobSet properties cover caller, embedded, equal-key, different-key, nested, rollback, cancellation, and final-member release.
+- [x] Runner properties prove wrong-ID ignore, minimum timeout, kill offset, cancellation idempotency, and no worker overlap.
+- [x] HTTP properties prove pending jobs are not dispatched and pending-only cancellation emits no runner message.
+- [x] All proptest regression files are committed.
+- [x] `cargo fmt --all --check` exits 0.
+- [x] All commands in the Commands table exit 0 and execute a nonzero number of matching properties.
+- [x] Differential harness dry-run passes without secrets and rejects the newly committed named contaminated fixture.
+- [x] Official-runner differential recording is explicitly BLOCKED by the missing privileged prerequisites listed in Status.
+- [x] `plans/README.md` keeps plan 006 non-DONE until the blocked live gate passes.
 
 ## STOP conditions
 
