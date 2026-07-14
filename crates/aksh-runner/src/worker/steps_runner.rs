@@ -481,11 +481,26 @@ pub async fn run_steps(
         }
 
         // Determine initial outcome and conclusion from step execution.
+        // If the job cancel channel fired mid-step, treat as cancelled even when
+        // the process surface error is a non-zero exit from SIGINT/SIGTERM.
+        let cancel_signaled = *cancel_rx.borrow();
         let (mut outcome_str, mut conclusion_str) = match &outcome {
+            Ok(()) if cancel_signaled => {
+                // Official runner: "##[error]The operation was canceled."
+                step_ctx.log("##[error]The operation was canceled.");
+                cancelled = true;
+                step_ctx.job.job_status = JobStatus::Cancelled;
+                ("Cancelled".to_string(), "Cancelled".to_string())
+            }
             Ok(()) => ("Success".to_string(), "Success".to_string()),
             Err(e) => {
                 let msg = e.to_string();
-                if msg.contains("cancelled") {
+                if msg.contains("cancelled") || msg.contains("canceled") || cancel_signaled {
+                    // Match GitHub Actions hosted-runner step log wording exactly
+                    // (American spelling "canceled").
+                    step_ctx.log("##[error]The operation was canceled.");
+                    cancelled = true;
+                    step_ctx.job.job_status = JobStatus::Cancelled;
                     ("Cancelled".to_string(), "Cancelled".to_string())
                 } else {
                     step_ctx.log(&format!("##[error]{e:#}"));
