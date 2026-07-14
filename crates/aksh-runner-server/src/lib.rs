@@ -7,6 +7,9 @@ use std::sync::Arc;
 
 pub mod github;
 
+/// Pure job-graph scheduler model and property tests.
+pub mod scheduling;
+
 use axum_server::{tls_rustls::RustlsConfig, Handle};
 use rcgen::generate_simple_self_signed;
 
@@ -59,6 +62,10 @@ pub struct ServerConfig {
     pub record_flows: Option<PathBuf>,
     /// TLS mode (default: no TLS).
     pub tls: TlsMode,
+    /// Enable privileged local/CI simulation endpoints.
+    pub enable_test_api: bool,
+    /// Bearer token required by privileged simulation endpoints.
+    pub test_api_token: Option<String>,
 }
 
 /// TLS configuration.
@@ -227,7 +234,27 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
         inner.flows_file = Some(file);
     }
     let shutdown = CancellationToken::new();
-    let router = app(state.clone(), shutdown.clone());
+    let test_api_token = if config.enable_test_api {
+        if !config.listen.ip().is_loopback() {
+            anyhow::bail!("the test API may only be enabled on a loopback listener");
+        }
+        let token = config
+            .test_api_token
+            .clone()
+            .filter(|token| !token.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("--enable-test-api requires --test-api-token"))?;
+        warn!(
+            listen = %config.listen,
+            "PRIVILEGED TEST API ENABLED; simulated sessions and completions are accepted"
+        );
+        Some(token)
+    } else {
+        if config.test_api_token.is_some() {
+            anyhow::bail!("--test-api-token requires --enable-test-api");
+        }
+        None
+    };
+    let router = build_app(state.clone(), shutdown.clone(), test_api_token);
 
     let shared = Arc::new(SharedState {
         state,
@@ -302,8 +329,28 @@ async fn shutdown_signal(shutdown: CancellationToken) {
     shutdown.cancel();
 }
 
-/// Build the server router.
+/// Build the production server router without simulation endpoints.
 pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
+    build_app(state, shutdown, None)
+}
+
+/// Build an in-process router with privileged local/CI simulation endpoints.
+///
+/// Network servers should use [`serve`], which additionally enforces a
+/// loopback-only listener when this API is enabled.
+pub fn app_with_test_api(
+    state: AppState,
+    shutdown: CancellationToken,
+    token: impl Into<String>,
+) -> Router {
+    build_app(state, shutdown, Some(token.into()))
+}
+
+fn build_app(
+    state: AppState,
+    shutdown: CancellationToken,
+    test_api_token: Option<String>,
+) -> Router {
     let shared = Arc::new(SharedState {
         state: state.clone(),
         shutdown: shutdown.clone(),
@@ -471,7 +518,7 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         )
         .route_layer(middleware::from_fn(require_bearer));
 
-    Router::new()
+    let router = Router::new()
         .route("/healthz", get(healthz))
         // GHES-style org-prefixed routes
         .route("/:org/_apis/connectionData", get(connection_data))
@@ -610,15 +657,6 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             get(download_action_tarball),
         )
         .route("/api/v1/runners", post(register_runner))
-        .route("/api/v1/runners/sessions", post(create_session))
-        .route(
-            "/api/v1/runners/sessions/:session_id/messages",
-            get(next_message),
-        )
-        .route(
-            "/api/v1/runners/sessions/:session_id/messages/:message_id",
-            delete(delete_session_message),
-        )
         .route(
             "/runner/session",
             post(broker_session_root).delete(broker_delete_session_root),
@@ -665,7 +703,6 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         )
         .route("/runner/server/message", get(next_message_broker_ref_root))
         .route("/runner/server/acknowledge", post(broker_acknowledge_root))
-        .route("/api/v1/jobs/complete", post(complete_job))
         .route("/api/v1/cache", post(cache_put))
         .route("/api/v1/cache", get(cache_get))
         .route("/api/v1/artifacts", post(artifact_put))
@@ -778,7 +815,48 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             state.clone(),
             record_flows_middleware,
         ))
-        .with_state(shared)
+        .with_state(shared.clone());
+
+    match test_api_token {
+        Some(token) => router.merge(
+            Router::new()
+                .route(
+                    "/internal/test/runners/sessions/:session_id/messages",
+                    get(next_message),
+                )
+                .route(
+                    "/internal/test/runners/sessions/:session_id/messages/:message_id",
+                    delete(delete_session_message),
+                )
+                .route("/internal/test/runners/sessions", post(create_session))
+                .route("/internal/test/jobs/complete", post(complete_job))
+                .route_layer(middleware::from_fn_with_state(
+                    Arc::<str>::from(token),
+                    require_test_api_token,
+                ))
+                .with_state(shared),
+        ),
+        None => router,
+    }
+}
+
+async fn require_test_api_token(
+    State(expected): State<Arc<str>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let authorized = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|token| token == expected.as_ref());
+    if !authorized {
+        warn!(path = %request.uri().path(), "rejected privileged test API request");
+        return Err(ApiError::unauthorized("missing or invalid test API token"));
+    }
+    warn!(path = %request.uri().path(), "privileged test API request");
+    Ok(next.run(request).await)
 }
 
 /// HMAC key used for local JWT signing/verification.
@@ -968,6 +1046,8 @@ pub(crate) struct RunRecord {
     pub(crate) status: ExecutionStatus,
     pub(crate) job_outputs: BTreeMap<JobId, BTreeMap<String, serde_json::Value>>,
     pub(crate) job_base_ids: BTreeMap<JobId, String>,
+    #[serde(skip)]
+    pub(crate) job_needs: BTreeMap<JobId, Vec<JobId>>,
     pub(crate) job_fail_fast: BTreeMap<String, bool>,
     #[serde(default)]
     pub(crate) job_check_run_ids: BTreeMap<JobId, u64>,
@@ -998,6 +1078,8 @@ struct QueuedJob {
     job_id: JobId,
     base_id: String,
     needs: Vec<JobId>,
+    if_condition: Option<String>,
+    condition_context: aksh_gha_expressions::Context,
     fail_fast: bool,
     max_parallel: Option<u64>,
     /// Required runner labels from `runs-on`.
@@ -1156,7 +1238,7 @@ pub(crate) async fn submit_run_inner(
         )));
     }
     let expanded = expand_jobs_with_reusables(&workflow, &submission.reusable_workflows)?;
-    let mut jobs = expanded.jobs;
+    let jobs = expanded.jobs;
     let reusable_calls = expanded.reusable_calls;
     let run_id = RunId::new();
     let github = json!({
@@ -1174,9 +1256,32 @@ pub(crate) async fn submit_run_inner(
         let mut statuses = BTreeMap::new();
         let mut ready_jobs = 0usize;
         let mut job_base_ids = BTreeMap::new();
+        let mut job_needs = BTreeMap::new();
         let mut job_fail_fast = BTreeMap::new();
         let mut ready_by_base: BTreeMap<String, u64> = BTreeMap::new();
+        let mut initially_skipped = Vec::new();
         for job in jobs {
+            job_base_ids.insert(job.id.clone(), job.base_id.clone());
+            job_needs.insert(job.id.clone(), job.needs.clone());
+            job_fail_fast.insert(job.base_id.clone(), job.fail_fast);
+            statuses.insert(job.id.clone(), ExecutionStatus::Queued);
+            let condition_context = job_condition_context(&job, &github, &submission);
+            if job.needs.is_empty() {
+                let condition =
+                    aksh_gha_expressions::effective_condition(job.if_condition.as_deref());
+                let should_run = aksh_gha_expressions::eval_bool(&condition, &condition_context)
+                    .map_err(|error| {
+                        ApiError::bad_request(format!(
+                            "failed to evaluate condition for job `{}`: {error}",
+                            job.id
+                        ))
+                    })?;
+                if !should_run {
+                    statuses.insert(job.id.clone(), ExecutionStatus::Skipped);
+                    initially_skipped.push((run_id, job.id.clone()));
+                    continue;
+                }
+            }
             let mut agent_msg = aksh_gha_parser::job_builder::build_agent_job_message(
                 &job,
                 &github,
@@ -1258,13 +1363,13 @@ pub(crate) async fn submit_run_inner(
                 job_id: job.id.clone(),
                 base_id: job.base_id.clone(),
                 needs: job.needs.clone(),
+                if_condition: job.if_condition.clone(),
+                condition_context,
                 fail_fast: job.fail_fast,
                 max_parallel: job.max_parallel,
                 runs_on: job.runs_on.clone(),
                 message: agent_msg,
             };
-            job_base_ids.insert(job.id.clone(), job.base_id.clone());
-            job_fail_fast.insert(job.base_id.clone(), job.fail_fast);
 
             // Check if dependencies are met (no needs = ready immediately)
             if job.needs.is_empty()
@@ -1272,17 +1377,20 @@ pub(crate) async fn submit_run_inner(
                     .max_parallel
                     .is_none_or(|max| ready_by_base.get(&job.base_id).copied().unwrap_or(0) < max)
             {
-                statuses.insert(job.id.clone(), ExecutionStatus::Queued);
                 inner.queue.push_back(queued_job);
                 *ready_by_base.entry(job.base_id.clone()).or_default() += 1;
                 ready_jobs += 1;
             } else {
                 // Job has dependencies — queue it as pending
-                statuses.insert(job.id.clone(), ExecutionStatus::Queued);
                 inner.pending_jobs.push_back(queued_job);
             }
         }
         let queued_jobs = statuses.len();
+        let initial_status = if statuses.values().copied().all(is_terminal_status) {
+            summarize_run(statuses.values().copied())
+        } else {
+            ExecutionStatus::Queued
+        };
         inner.runs.insert(
             run_id,
             RunRecord {
@@ -1291,15 +1399,29 @@ pub(crate) async fn submit_run_inner(
                 jobs: statuses,
                 job_outputs: BTreeMap::new(),
                 job_base_ids,
+                job_needs,
                 job_fail_fast,
-                status: ExecutionStatus::Queued,
+                status: initial_status,
                 job_check_run_ids: BTreeMap::new(),
                 reusable_calls,
             },
         );
+        let scheduling = promote_ready_jobs(&mut inner);
+        ready_jobs += scheduling.promoted;
+        initially_skipped.extend(scheduling.skipped);
         drop(inner);
         if ready_jobs > 0 {
             shared.state.message_notify.notify_waiters();
+        }
+        for (event_run_id, job_id) in initially_skipped {
+            shared
+                .state
+                .emit(NdjsonEvent::JobStatus {
+                    run_id: event_run_id,
+                    job_id,
+                    status: ExecutionStatus::Skipped,
+                })
+                .await;
         }
         shared
             .state
@@ -1382,12 +1504,22 @@ async fn cancel_run(
 ) -> Result<Json<RunRecord>, ApiError> {
     let mut inner = shared.state.inner.lock().await;
     let mut cancellations = Vec::new();
+    let changed;
     {
         let record = inner
             .runs
             .get_mut(&run_id)
             .ok_or_else(|| ApiError::not_found("run not found"))?;
-        record.status = ExecutionStatus::Cancelled;
+        let was_active = record.jobs.values().any(|status| {
+            matches!(
+                status,
+                ExecutionStatus::Queued | ExecutionStatus::InProgress
+            )
+        });
+        changed = was_active;
+        if was_active {
+            record.status = ExecutionStatus::Cancelled;
+        }
         for (job_id, status) in &mut record.jobs {
             if matches!(*status, ExecutionStatus::InProgress) {
                 cancellations.push(QueuedCancellation {
@@ -1417,13 +1549,15 @@ async fn cancel_run(
     if cancellation_count > 0 {
         shared.state.message_notify.notify_waiters();
     }
-    shared
-        .state
-        .emit(NdjsonEvent::RunStatus {
-            run_id,
-            status: ExecutionStatus::Cancelled,
-        })
-        .await;
+    if changed {
+        shared
+            .state
+            .emit(NdjsonEvent::RunStatus {
+                run_id,
+                status: record.status,
+            })
+            .await;
+    }
     Ok(Json(record))
 }
 
@@ -1922,10 +2056,11 @@ struct BrokerRenewJobRequest {
 }
 
 fn execution_status_from_runner_result(result: &str) -> Option<ExecutionStatus> {
-    match result {
-        "success" | "succeeded" | "succeededWithIssues" => Some(ExecutionStatus::Success),
+    match result.to_ascii_lowercase().as_str() {
+        "success" | "succeeded" | "succeededwithissues" => Some(ExecutionStatus::Success),
         "failure" | "failed" => Some(ExecutionStatus::Failure),
         "cancelled" | "canceled" => Some(ExecutionStatus::Cancelled),
+        "skipped" => Some(ExecutionStatus::Skipped),
         _ => None,
     }
 }
@@ -2328,11 +2463,13 @@ async fn broker_complete_job(
     Path(_runner_id): Path<i64>,
     Json(request): Json<BrokerRenewJobRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let status = request
-        .conclusion
-        .as_deref()
-        .and_then(execution_status_from_runner_result)
-        .unwrap_or(ExecutionStatus::Success);
+    let status = match request.conclusion.as_deref() {
+        Some(conclusion) => execution_status_from_runner_result(conclusion).ok_or_else(|| {
+            ApiError::bad_request(format!("unknown broker conclusion `{conclusion}`"))
+        })?,
+        // Older broker clients omit this field on successful completion.
+        None => ExecutionStatus::Success,
+    };
 
     // Extract outputs from the completejob body.
     // Runner sends: { "outputName": {"value": "theValue"} }
@@ -3627,12 +3764,25 @@ async fn complete_job_inner(
     shared: Arc<SharedState>,
     completion: JobCompletion,
 ) -> Result<Json<RunRecord>, ApiError> {
+    if !is_terminal_status(completion.status) {
+        return Err(ApiError::bad_request(
+            "job completion status must be terminal",
+        ));
+    }
     let mut inner = shared.state.inner.lock().await;
     {
         let run = inner
             .runs
             .get_mut(&completion.run_id)
             .ok_or_else(|| ApiError::not_found("run not found"))?;
+        let current = run
+            .jobs
+            .get(&completion.job_id)
+            .copied()
+            .ok_or_else(|| ApiError::bad_request("job does not belong to run"))?;
+        if is_terminal_status(current) {
+            return Ok(Json(run.clone()));
+        }
         run.jobs
             .insert(completion.job_id.clone(), completion.status);
         run.job_outputs.insert(
@@ -3649,9 +3799,9 @@ async fn complete_job_inner(
     let cancelled_siblings = if completion.status == ExecutionStatus::Failure {
         apply_matrix_fail_fast(&mut inner, completion.run_id, &completion.job_id)
     } else {
-        0
+        Vec::new()
     };
-    let promoted_jobs = promote_ready_jobs(&mut inner);
+    let scheduling = promote_ready_jobs(&mut inner);
     let record = inner
         .runs
         .get(&completion.run_id)
@@ -3679,7 +3829,7 @@ async fn complete_job_inner(
     )
     .await;
 
-    if promoted_jobs > 0 || cancelled_siblings > 0 {
+    if scheduling.promoted > 0 || !cancelled_siblings.is_empty() {
         shared.state.message_notify.notify_waiters();
     }
 
@@ -3691,6 +3841,43 @@ async fn complete_job_inner(
             status: completion.status,
         })
         .await;
+    for job_id in cancelled_siblings {
+        github::report_check_run_completed(
+            &shared,
+            completion.run_id,
+            &job_id,
+            ExecutionStatus::Cancelled,
+        )
+        .await;
+        shared
+            .state
+            .emit(NdjsonEvent::JobStatus {
+                run_id: completion.run_id,
+                job_id,
+                status: ExecutionStatus::Cancelled,
+            })
+            .await;
+    }
+    for (run_id, job_id) in scheduling.skipped {
+        shared
+            .state
+            .emit(NdjsonEvent::JobStatus {
+                run_id,
+                job_id,
+                status: ExecutionStatus::Skipped,
+            })
+            .await;
+    }
+    for (run_id, job_id) in scheduling.failed {
+        shared
+            .state
+            .emit(NdjsonEvent::JobStatus {
+                run_id,
+                job_id,
+                status: ExecutionStatus::Failure,
+            })
+            .await;
+    }
     shared
         .state
         .emit(NdjsonEvent::RunStatus {
@@ -3701,34 +3888,187 @@ async fn complete_job_inner(
     Ok(Json(record))
 }
 
-/// Check if pending jobs can be dispatched and promote them to the queue.
-fn promote_ready_jobs(inner: &mut InnerState) -> usize {
-    let mut promoted = Vec::new();
-    let mut remaining = VecDeque::new();
+fn job_condition_context(
+    job: &aksh_gha_protocol::JobPlan,
+    github: &serde_json::Value,
+    submission: &WorkflowSubmission,
+) -> aksh_gha_expressions::Context {
+    let mut context = aksh_gha_expressions::Context::default();
+    context.insert("github", github.clone());
+    context.insert(
+        "vars",
+        serde_json::to_value(&submission.vars).unwrap_or_default(),
+    );
+    context.insert(
+        "inputs",
+        serde_json::to_value(&job.inputs).unwrap_or_default(),
+    );
+    context.insert("needs", serde_json::Value::Object(Default::default()));
+    context
+}
 
-    while let Some(mut job) = inner.pending_jobs.pop_front() {
-        let needs_satisfied = inner
-            .runs
-            .get(&job.run_id)
-            .is_some_and(|run| job.needs.iter().all(|need| need_satisfied(run, need)))
-            && under_max_parallel(inner, &job);
+#[derive(Default)]
+struct SchedulingOutcome {
+    promoted: usize,
+    skipped: Vec<(RunId, JobId)>,
+    failed: Vec<(RunId, JobId)>,
+}
 
-        if needs_satisfied {
-            if let Some(run) = inner.runs.get(&job.run_id) {
-                hydrate_needs_context(&mut job, run);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DependencyDecision {
+    Wait,
+    Run,
+    Skip,
+    Error,
+}
+
+/// Promote or skip pending jobs once every declared dependency is terminal.
+fn promote_ready_jobs(inner: &mut InnerState) -> SchedulingOutcome {
+    let mut outcome = SchedulingOutcome::default();
+    loop {
+        let mut promoted_by_base: BTreeMap<(RunId, String), u64> = BTreeMap::new();
+        let mut promoted = Vec::new();
+        let mut remaining = VecDeque::new();
+        let mut settled = false;
+
+        while let Some(mut job) = inner.pending_jobs.pop_front() {
+            let decision = inner
+                .runs
+                .get(&job.run_id)
+                .map(|run| dependency_decision(run, &job))
+                .unwrap_or(DependencyDecision::Wait);
+            match decision {
+                DependencyDecision::Run
+                    if under_max_parallel(inner, &job)
+                        && promoted_by_base
+                            .get(&(job.run_id, job.base_id.clone()))
+                            .copied()
+                            .unwrap_or(0)
+                            < job.max_parallel.unwrap_or(u64::MAX) =>
+                {
+                    if let Some(run) = inner.runs.get(&job.run_id) {
+                        hydrate_needs_context(&mut job, run);
+                    }
+                    *promoted_by_base
+                        .entry((job.run_id, job.base_id.clone()))
+                        .or_default() += 1;
+                    promoted.push(job);
+                }
+                DependencyDecision::Skip | DependencyDecision::Error => {
+                    if let Some(run) = inner.runs.get_mut(&job.run_id) {
+                        let status = if decision == DependencyDecision::Skip {
+                            ExecutionStatus::Skipped
+                        } else {
+                            ExecutionStatus::Failure
+                        };
+                        run.jobs.insert(job.job_id.clone(), status);
+                        run.status = summarize_run(run.jobs.values().copied());
+                    }
+                    if decision == DependencyDecision::Skip {
+                        outcome.skipped.push((job.run_id, job.job_id));
+                    } else {
+                        outcome.failed.push((job.run_id, job.job_id));
+                    }
+                    settled = true;
+                }
+                DependencyDecision::Wait | DependencyDecision::Run => remaining.push_back(job),
             }
-            promoted.push(job);
-        } else {
-            remaining.push_back(job);
+        }
+
+        outcome.promoted += promoted.len();
+        inner.pending_jobs = remaining;
+        inner.queue.extend(promoted);
+        if !settled {
+            return outcome;
         }
     }
+}
 
-    let promoted_count = promoted.len();
-    inner.pending_jobs = remaining;
-    for job in promoted {
-        inner.queue.push_back(job);
+fn dependency_decision(run: &RunRecord, job: &QueuedJob) -> DependencyDecision {
+    if job.needs.is_empty() {
+        return DependencyDecision::Run;
     }
-    promoted_count
+    let direct_statuses = job
+        .needs
+        .iter()
+        .flat_map(|need| matching_need_statuses(run, need))
+        .collect::<Vec<_>>();
+    if direct_statuses.is_empty()
+        || direct_statuses
+            .iter()
+            .any(|status| !is_terminal_status(*status))
+    {
+        return DependencyDecision::Wait;
+    }
+    let statuses = ancestor_statuses(run, job);
+    let aggregate = aggregate_need_status(&statuses).unwrap_or(ExecutionStatus::Skipped);
+    let context = job.condition_context.clone().with_status(
+        aggregate == ExecutionStatus::Success,
+        aggregate == ExecutionStatus::Failure,
+        aggregate == ExecutionStatus::Cancelled,
+    );
+    let mut context = context;
+    context.insert("needs", needs_json_context(run, &job.needs));
+    let condition = aksh_gha_expressions::effective_condition(job.if_condition.as_deref());
+    match aksh_gha_expressions::eval_bool(&condition, &context) {
+        Ok(true) => DependencyDecision::Run,
+        Ok(false) => DependencyDecision::Skip,
+        Err(_) => DependencyDecision::Error,
+    }
+}
+
+fn matching_need_ids(run: &RunRecord, need: &JobId) -> Vec<JobId> {
+    run.jobs
+        .keys()
+        .filter(|job_id| {
+            *job_id == need
+                || run
+                    .job_base_ids
+                    .get(*job_id)
+                    .is_some_and(|base| base == &need.0)
+        })
+        .cloned()
+        .collect()
+}
+
+fn matching_need_statuses(run: &RunRecord, need: &JobId) -> Vec<ExecutionStatus> {
+    matching_need_ids(run, need)
+        .iter()
+        .filter_map(|job_id| run.jobs.get(job_id).copied())
+        .collect()
+}
+
+fn ancestor_statuses(run: &RunRecord, job: &QueuedJob) -> Vec<ExecutionStatus> {
+    let mut pending = job
+        .needs
+        .iter()
+        .flat_map(|need| matching_need_ids(run, need))
+        .collect::<Vec<_>>();
+    let mut visited = std::collections::BTreeSet::new();
+    let mut statuses = Vec::new();
+
+    while let Some(job_id) = pending.pop() {
+        if !visited.insert(job_id.clone()) {
+            continue;
+        }
+        if let Some(status) = run.jobs.get(&job_id) {
+            statuses.push(*status);
+        }
+        if let Some(needs) = run.job_needs.get(&job_id) {
+            pending.extend(needs.iter().flat_map(|need| matching_need_ids(run, need)));
+        }
+    }
+    statuses
+}
+
+fn is_terminal_status(status: ExecutionStatus) -> bool {
+    matches!(
+        status,
+        ExecutionStatus::Success
+            | ExecutionStatus::Failure
+            | ExecutionStatus::Skipped
+            | ExecutionStatus::Cancelled
+    )
 }
 
 /// Check if a job's `runs-on` labels match a runner's registered labels.
@@ -3816,20 +4156,21 @@ fn under_max_parallel(inner: &InnerState, job: &QueuedJob) -> bool {
     active_in_queue + active_running < max_parallel
 }
 
-fn apply_matrix_fail_fast(inner: &mut InnerState, run_id: RunId, failed_job: &JobId) -> usize {
+fn apply_matrix_fail_fast(inner: &mut InnerState, run_id: RunId, failed_job: &JobId) -> Vec<JobId> {
     let Some(run) = inner.runs.get_mut(&run_id) else {
-        return 0;
+        return Vec::new();
     };
     let Some(base_id) = run.job_base_ids.get(failed_job).cloned() else {
-        return 0;
+        return Vec::new();
     };
     if !run.job_fail_fast.get(&base_id).copied().unwrap_or(true) {
-        return 0;
+        return Vec::new();
     }
 
     // Track in-progress siblings: they need a JOB_CANCELLED message so the
     // runner aborts the worker. Queued siblings only need their state flipped
     // — they were never dispatched.
+    let mut cancelled_jobs = Vec::new();
     let mut cancellations = Vec::new();
     for (job_id, status) in &mut run.jobs {
         if job_id != failed_job
@@ -3845,6 +4186,7 @@ fn apply_matrix_fail_fast(inner: &mut InnerState, run_id: RunId, failed_job: &Jo
                     job_id: job_id.clone(),
                 });
             }
+            cancelled_jobs.push(job_id.clone());
             *status = ExecutionStatus::Cancelled;
         }
     }
@@ -3855,9 +4197,8 @@ fn apply_matrix_fail_fast(inner: &mut InnerState, run_id: RunId, failed_job: &Jo
     inner
         .pending_jobs
         .retain(|job| !(job.run_id == run_id && job.base_id == base_id));
-    let count = cancellations.len();
     inner.cancellation_queue.extend(cancellations);
-    count
+    cancelled_jobs
 }
 
 fn hydrate_needs_context(job: &mut QueuedJob, run: &RunRecord) {
@@ -3870,19 +4211,66 @@ fn hydrate_needs_context(job: &mut QueuedJob, run: &RunRecord) {
         .context_data
         .insert("needs".to_owned(), azdo::PipelineContextData::Dict(needs));
 }
+fn needs_json_context(run: &RunRecord, needs: &[JobId]) -> serde_json::Value {
+    let values = needs
+        .iter()
+        .filter_map(|need| {
+            let statuses = matching_need_statuses(run, need);
+            let result = aggregate_need_status(&statuses)?;
+            let matching_ids = matching_need_ids(run, need);
+            let mut outputs = serde_json::Map::new();
+            for job_id in matching_ids {
+                if let Some(job_outputs) = run.job_outputs.get(&job_id) {
+                    outputs.extend(job_outputs.clone());
+                }
+            }
+            Some((
+                need.0.clone(),
+                json!({
+                    "result": status_string(result),
+                    "outputs": outputs,
+                }),
+            ))
+        })
+        .collect();
+    serde_json::Value::Object(values)
+}
+
+fn aggregate_need_status(statuses: &[ExecutionStatus]) -> Option<ExecutionStatus> {
+    if statuses
+        .iter()
+        .any(|status| *status == ExecutionStatus::Failure)
+    {
+        Some(ExecutionStatus::Failure)
+    } else if statuses
+        .iter()
+        .any(|status| *status == ExecutionStatus::Cancelled)
+    {
+        Some(ExecutionStatus::Cancelled)
+    } else if statuses
+        .iter()
+        .any(|status| *status == ExecutionStatus::Skipped)
+    {
+        Some(ExecutionStatus::Skipped)
+    } else if !statuses.is_empty()
+        && statuses
+            .iter()
+            .all(|status| *status == ExecutionStatus::Success)
+    {
+        Some(ExecutionStatus::Success)
+    } else {
+        None
+    }
+}
 
 fn need_context(run: &RunRecord, need: &JobId) -> Option<azdo::PipelineContextData> {
-    let mut result = None;
+    let statuses = matching_need_statuses(run, need);
+    let result = aggregate_need_status(&statuses)?;
     let mut outputs = BTreeMap::new();
-    let matrix_prefix = format!("{} (", need.0);
-
-    for (job_id, status) in &run.jobs {
-        if job_id == need || job_id.0.starts_with(&matrix_prefix) {
-            result = Some(status_string(*status));
-            if let Some(job_outputs) = run.job_outputs.get(job_id) {
-                for (key, value) in job_outputs {
-                    outputs.insert(key.clone(), json_to_context_data(value));
-                }
+    for job_id in matching_need_ids(run, need) {
+        if let Some(job_outputs) = run.job_outputs.get(&job_id) {
+            for (key, value) in job_outputs {
+                outputs.insert(key.clone(), json_to_context_data(value));
             }
         }
     }
@@ -3890,7 +4278,7 @@ fn need_context(run: &RunRecord, need: &JobId) -> Option<azdo::PipelineContextDa
     let mut context = BTreeMap::new();
     context.insert(
         "result".to_owned(),
-        azdo::PipelineContextData::String(result?),
+        azdo::PipelineContextData::String(status_string(result)),
     );
     context.insert(
         "outputs".to_owned(),
@@ -3929,22 +4317,6 @@ fn json_to_context_data(value: &serde_json::Value) -> azdo::PipelineContextData 
         ),
         serde_json::Value::Null => azdo::PipelineContextData::String(String::new()),
     }
-}
-
-fn need_satisfied(run: &RunRecord, need: &JobId) -> bool {
-    let matrix_prefix = format!("{} (", need.0);
-    let mut matched = false;
-
-    for (job_id, status) in &run.jobs {
-        if job_id == need || job_id.0.starts_with(&matrix_prefix) {
-            matched = true;
-            if !matches!(status, ExecutionStatus::Success | ExecutionStatus::Skipped) {
-                return false;
-            }
-        }
-    }
-
-    matched
 }
 
 // ─── Phase E: Timeline, logs, completion ────────────────────────────────────
@@ -4578,7 +4950,14 @@ fn runnerresolve_action(
 
 fn summarize_run(statuses: impl Iterator<Item = ExecutionStatus>) -> ExecutionStatus {
     let statuses = statuses.collect::<Vec<_>>();
-    if statuses
+    if statuses.iter().any(|status| {
+        matches!(
+            status,
+            ExecutionStatus::Queued | ExecutionStatus::InProgress
+        )
+    }) {
+        ExecutionStatus::InProgress
+    } else if statuses
         .iter()
         .any(|status| *status == ExecutionStatus::Failure)
     {
@@ -4588,13 +4967,8 @@ fn summarize_run(statuses: impl Iterator<Item = ExecutionStatus>) -> ExecutionSt
         .any(|status| *status == ExecutionStatus::Cancelled)
     {
         ExecutionStatus::Cancelled
-    } else if statuses
-        .iter()
-        .all(|status| matches!(status, ExecutionStatus::Success | ExecutionStatus::Skipped))
-    {
-        ExecutionStatus::Success
     } else {
-        ExecutionStatus::InProgress
+        ExecutionStatus::Success
     }
 }
 
@@ -6048,6 +6422,18 @@ fn propagate_reusable_outputs(run: &mut RunRecord) {
 }
 
 #[cfg(test)]
+/// Production-path DAG/workflow properties.
+///
+/// Oracle sources:
+/// - `needs`, skipped dependencies, and job-level conditions:
+///   <https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idneeds>.
+/// - status functions: <https://docs.github.com/en/actions/learn-github-actions/expressions#status-check-functions>.
+/// - runner v2.335.1: `src/Runner.Worker/StepsRunner.cs` and
+///   `src/Runner.Worker/Expressions/{Success,Failure,Cancelled,Always}Function.cs`.
+///
+/// These tests submit YAML through the real parser/router and use only the
+/// explicitly gated internal test API to simulate worker completions. The
+/// oracle compares observable job/run state; it does not copy scheduler code.
 mod tests {
     use axum::body::{to_bytes, Body};
     use axum::http::{Method, Request, StatusCode};
@@ -6056,6 +6442,11 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+    const TEST_API_TOKEN: &str = "property-test-token";
+
+    fn app(state: AppState, shutdown: CancellationToken) -> Router {
+        app_with_test_api(state, shutdown, TEST_API_TOKEN)
+    }
 
     #[tokio::test]
     async fn matrix_max_parallel_and_fail_fast_are_enforced() {
@@ -6097,7 +6488,7 @@ jobs:
         request_json(
             &app,
             Method::POST,
-            "/api/v1/jobs/complete",
+            "/internal/test/jobs/complete",
             json!({
                 "run_id": run_id,
                 "job_id": first_job,
@@ -6643,7 +7034,7 @@ jobs:
         request_json(
             &app,
             Method::POST,
-            "/api/v1/jobs/complete",
+            "/internal/test/jobs/complete",
             json!({
                 "run_id": run_id,
                 "job_id": failing_job,
@@ -6702,7 +7093,7 @@ jobs:
         request_json(
             &app,
             Method::POST,
-            "/api/v1/jobs/complete",
+            "/internal/test/jobs/complete",
             json!({
                 "run_id": run_id,
                 "job_id": "build",
@@ -6799,7 +7190,7 @@ jobs:
         request_json(
             &app,
             Method::POST,
-            "/api/v1/jobs/complete",
+            "/internal/test/jobs/complete",
             json!({
                 "run_id": run_id,
                 "job_id": "build",
@@ -6863,7 +7254,7 @@ jobs:
         request_json(
             &app,
             Method::POST,
-            "/api/v1/jobs/complete",
+            "/internal/test/jobs/complete",
             json!({
                 "run_id": run_id,
                 "job_id": "build",
@@ -6919,7 +7310,7 @@ jobs:
         request_json(
             &app,
             Method::POST,
-            "/api/v1/jobs/complete",
+            "/internal/test/jobs/complete",
             json!({
                 "run_id": run_id,
                 "job_id": "producer",
@@ -7033,7 +7424,7 @@ jobs:
         request_json(
             &app,
             Method::POST,
-            "/api/v1/jobs/complete",
+            "/internal/test/jobs/complete",
             json!({
                 "run_id": run_id,
                 "job_id": failing_job,
@@ -7391,7 +7782,7 @@ jobs:
         let session = request_json(
             &app,
             Method::POST,
-            "/api/v1/runners/sessions",
+            "/internal/test/runners/sessions",
             json!({"runner_id": runner_id, "name": "local"}),
         )
         .await;
@@ -7427,7 +7818,7 @@ jobs:
         let session = request_json(
             &app,
             Method::POST,
-            "/api/v1/runners/sessions",
+            "/internal/test/runners/sessions",
             json!({"runner_id": runner_id, "name": "local"}),
         )
         .await;
@@ -8388,7 +8779,7 @@ jobs:
         let session = request_json(
             &app,
             Method::POST,
-            "/api/v1/runners/sessions",
+            "/internal/test/runners/sessions",
             json!({"runner_id": 1, "name": "local"}),
         )
         .await;
@@ -8419,7 +8810,9 @@ jobs:
         let message = request_json(
             &app,
             Method::GET,
-            &format!("/api/v1/runners/sessions/{session_id}/messages?sessionId={session_id}"),
+            &format!(
+                "/internal/test/runners/sessions/{session_id}/messages?sessionId={session_id}"
+            ),
             Value::Null,
         )
         .await;
@@ -8626,6 +9019,8 @@ jobs:
                 || uri.starts_with("/twirp/")
             {
                 builder = builder.header(header::AUTHORIZATION, "Bearer aksh-system-token");
+            } else if uri.starts_with("/internal/test/") {
+                builder = builder.header(header::AUTHORIZATION, format!("Bearer {TEST_API_TOKEN}"));
             } else if uri.starts_with("/api/v3/actions/runner-registration") {
                 builder =
                     builder.header(header::AUTHORIZATION, "RemoteAuth aksh-registration-token");
@@ -8681,7 +9076,7 @@ jobs:
         let (s, sess) = try_req(
             &app,
             Method::POST,
-            "/api/v1/runners/sessions",
+            "/internal/test/runners/sessions",
             json!({"runner_id": runner_id, "name": "test-runner"}),
         )
         .await;
@@ -8699,7 +9094,7 @@ jobs:
             &app,
             Method::GET,
             &format!(
-                "/api/v1/runners/sessions/{}/messages?sessionId={}&waitSeconds=0",
+                "/internal/test/runners/sessions/{}/messages?sessionId={}&waitSeconds=0",
                 session_id, session_id
             ),
             Value::Null,
@@ -8717,7 +9112,7 @@ jobs:
         let (s, _) = try_req(
             &app,
             Method::POST,
-            "/api/v1/jobs/complete",
+            "/internal/test/jobs/complete",
             json!({"run_id": run_id, "job_id": job_id, "status": "success"}),
         )
         .await;
@@ -8743,6 +9138,8 @@ jobs:
             || uri.starts_with("/twirp/")
         {
             builder = builder.header(header::AUTHORIZATION, "Bearer aksh-system-token");
+        } else if uri.starts_with("/internal/test/") {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {TEST_API_TOKEN}"));
         } else if uri.starts_with("/api/v3/actions/runner-registration") {
             builder = builder.header(header::AUTHORIZATION, "RemoteAuth aksh-registration-token");
         }
@@ -8755,12 +9152,14 @@ jobs:
                 .unwrap()
         };
         let response = app.clone().oneshot(request).await.unwrap();
-        assert!(
-            response.status().is_success(),
-            "unexpected status: {}",
-            response.status()
-        );
+        let status = response.status();
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            status.is_success(),
+            "unexpected status: {} body={}",
+            status,
+            String::from_utf8_lossy(&bytes)
+        );
         if bytes.is_empty() {
             Value::Null
         } else {
@@ -9338,5 +9737,646 @@ jobs:
     #[test]
     fn label_matching_empty_job_matches_all() {
         assert!(job_matches_runner(&[], &["self-hosted".into()]));
+    }
+
+    // Oracle: GitHub `needs` and status-function contracts, with worker-side
+    // condition semantics pinned to actions/runner v2.335.1. These tests are
+    // production-path checks: YAML is parsed and expanded by Aksh, then the
+    // real queue/promotion state is driven through the explicitly gated test
+    // completion API and compared with the documented outcome.
+    // ─── DAG scheduling regression tests (spec §1) ─────────────────────────
+
+    /// Production path: build fails → test with default condition is skipped.
+    /// Verifies the server's promote_ready_jobs correctly propagates failure.
+    #[tokio::test]
+    async fn dag_build_fails_test_skipped_production() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo build
+  test:
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo test
+"#,
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        request_json(
+            &app,
+            Method::POST,
+            "/internal/test/jobs/complete",
+            json!({
+                "run_id": run_id,
+                "job_id": "build",
+                "status": "failure"
+            }),
+        )
+        .await;
+
+        let inner = state.inner.lock().await;
+        let run = inner.runs.get(&run_id).unwrap();
+        assert_eq!(
+            run.jobs.get(&JobId("build".to_owned())),
+            Some(&ExecutionStatus::Failure)
+        );
+        assert_eq!(
+            run.jobs.get(&JobId("test".to_owned())),
+            Some(&ExecutionStatus::Skipped),
+            "test must be skipped when build fails under default gate"
+        );
+        // No new jobs should have been promoted to queue
+        assert!(
+            !inner.queue.iter().any(|j| j.job_id.0 == "test"),
+            "test must not be in queue"
+        );
+        assert!(inner.pending_jobs.is_empty(), "no jobs should be pending");
+    }
+
+    /// Production path: build fails → cleanup with `if: always()` runs.
+    #[tokio::test]
+    async fn dag_always_runs_after_failure_production() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo build
+  cleanup:
+    needs: [build]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo cleanup
+"#,
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        request_json(
+            &app,
+            Method::POST,
+            "/internal/test/jobs/complete",
+            json!({
+                "run_id": run_id,
+                "job_id": "build",
+                "status": "failure"
+            }),
+        )
+        .await;
+
+        let inner = state.inner.lock().await;
+        assert!(
+            inner.queue.iter().any(|job| job.job_id.0 == "cleanup"),
+            "cleanup with always() must be promoted after build failure"
+        );
+    }
+
+    /// Production path: build fails → notify with `if: failure()` runs.
+    #[tokio::test]
+    async fn dag_failure_condition_runs_after_failure_production() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo build
+  notify:
+    needs: [build]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo notify
+"#,
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        request_json(
+            &app,
+            Method::POST,
+            "/internal/test/jobs/complete",
+            json!({
+                "run_id": run_id,
+                "job_id": "build",
+                "status": "failure"
+            }),
+        )
+        .await;
+
+        let inner = state.inner.lock().await;
+        assert!(
+            inner.queue.iter().any(|job| job.job_id.0 == "notify"),
+            "notify with failure() must be promoted after build failure"
+        );
+    }
+
+    /// Production path: diamond graph build → test-a/test-b → deploy.
+    /// All succeed → deploy runs → run completes successfully.
+    #[tokio::test]
+    async fn dag_diamond_settlement_production() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo build
+  test-a:
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo test-a
+  test-b:
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo test-b
+  deploy:
+    needs: [test-a, test-b]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo deploy
+"#,
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        // Only build queued initially
+        {
+            let inner = state.inner.lock().await;
+            assert_eq!(inner.queue.len(), 1);
+            assert_eq!(inner.queue[0].job_id.0, "build");
+        }
+
+        // Complete build
+        request_json(
+            &app,
+            Method::POST,
+            "/internal/test/jobs/complete",
+            json!({"run_id": run_id, "job_id": "build", "status": "success"}),
+        )
+        .await;
+
+        // test-a and test-b promoted (build QueuedJob remains until dispatched)
+        {
+            let inner = state.inner.lock().await;
+            let queued_ids: std::collections::BTreeSet<_> =
+                inner.queue.iter().map(|j| j.job_id.0.clone()).collect();
+            assert!(queued_ids.contains("test-a"), "test-a should be promoted");
+            assert!(queued_ids.contains("test-b"), "test-b should be promoted");
+        }
+
+        // Complete test-a and test-b
+        request_json(
+            &app,
+            Method::POST,
+            "/internal/test/jobs/complete",
+            json!({"run_id": run_id, "job_id": "test-a", "status": "success"}),
+        )
+        .await;
+        request_json(
+            &app,
+            Method::POST,
+            "/internal/test/jobs/complete",
+            json!({"run_id": run_id, "job_id": "test-b", "status": "success"}),
+        )
+        .await;
+
+        // deploy promoted (other completed jobs' QueuedJobs may linger)
+        {
+            let inner = state.inner.lock().await;
+            assert!(
+                inner.queue.iter().any(|j| j.job_id.0 == "deploy"),
+                "deploy should be promoted after test-a and test-b complete"
+            );
+        }
+
+        // Complete deploy
+        request_json(
+            &app,
+            Method::POST,
+            "/internal/test/jobs/complete",
+            json!({"run_id": run_id, "job_id": "deploy", "status": "success"}),
+        )
+        .await;
+
+        let inner = state.inner.lock().await;
+        let run = inner.runs.get(&run_id).unwrap();
+        assert_eq!(run.status, ExecutionStatus::Success);
+        assert!(inner.pending_jobs.is_empty());
+    }
+
+    /// Production path: cyclic graph rejected at submission time.
+    #[tokio::test]
+    async fn dag_cyclic_graph_rejected_production() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/runs")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "workflow_yaml": r#"
+on: push
+jobs:
+  a:
+    needs: [b]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo a
+  b:
+    needs: [a]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo b
+"#,
+                            "event": "push",
+                            "repository": "owner/repo"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "cyclic graph must be rejected before dispatch"
+        );
+    }
+
+    /// Production path: duplicate completion does not create a second promotion.
+    #[tokio::test]
+    async fn dag_duplicate_completion_idempotent_production() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo build
+  test:
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo test
+"#,
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        // Complete build once
+        request_json(
+            &app,
+            Method::POST,
+            "/internal/test/jobs/complete",
+            json!({"run_id": run_id, "job_id": "build", "status": "success"}),
+        )
+        .await;
+
+        // test should be queued exactly once
+        {
+            let inner = state.inner.lock().await;
+            assert_eq!(
+                inner.queue.iter().filter(|j| j.job_id.0 == "test").count(),
+                1,
+                "test must appear exactly once in queue"
+            );
+        }
+
+        // Complete build again (duplicate)
+        request_json(
+            &app,
+            Method::POST,
+            "/internal/test/jobs/complete",
+            json!({"run_id": run_id, "job_id": "build", "status": "success"}),
+        )
+        .await;
+
+        // test must still appear exactly once
+        {
+            let inner = state.inner.lock().await;
+            assert_eq!(
+                inner.queue.iter().filter(|j| j.job_id.0 == "test").count(),
+                1,
+                "duplicate completion must not create second promotion"
+            );
+        }
+    }
+
+    /// Production path: small structured YAML → parse → expand → server
+    /// submission → promote/complete verifies the full pipeline.
+    #[tokio::test]
+    async fn dag_yaml_parse_expand_server_production() {
+        let yaml = r#"
+on: push
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo lint
+  build:
+    needs: [lint]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo build
+  test:
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo test
+  deploy:
+    needs: [test]
+    if: success()
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo deploy
+"#;
+        // Verify parser round-trip
+        let workflow = aksh_gha_parser::parse_workflow(yaml).unwrap();
+        let plans = aksh_gha_parser::expand_jobs(&workflow).unwrap();
+        let plan_ids: Vec<_> = plans.iter().map(|p| p.id.0.as_str()).collect();
+        assert!(plan_ids.contains(&"lint"));
+        assert!(plan_ids.contains(&"build"));
+        assert!(plan_ids.contains(&"test"));
+        assert!(plan_ids.contains(&"deploy"));
+
+        // Verify DAG validation passes
+        aksh_gha_parser::dag::validate_job_plans(&plans).unwrap();
+
+        // Run through real server
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": yaml,
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        // Queued jobs = parser's expanded IDs (lint is root)
+        {
+            let inner = state.inner.lock().await;
+            assert_eq!(inner.queue.len(), 1);
+            assert_eq!(inner.queue[0].job_id.0, "lint");
+        }
+
+        // Walk the chain: lint → build → test → deploy
+        for (job, next_queued) in [
+            ("lint", Some("build")),
+            ("build", Some("test")),
+            ("test", Some("deploy")),
+            ("deploy", None),
+        ] {
+            request_json(
+                &app,
+                Method::POST,
+                "/internal/test/jobs/complete",
+                json!({"run_id": run_id, "job_id": job, "status": "success"}),
+            )
+            .await;
+
+            let inner = state.inner.lock().await;
+            if let Some(next) = next_queued {
+                assert!(
+                    inner.queue.iter().any(|j| j.job_id.0 == next),
+                    "after completing {job}, {next} should be queued"
+                );
+            }
+        }
+
+        // Run is terminal — all jobs completed successfully
+        let inner = state.inner.lock().await;
+        let run = inner.runs.get(&run_id).unwrap();
+        assert_eq!(run.status, ExecutionStatus::Success);
+        assert!(inner.pending_jobs.is_empty());
+        for (job_id, status) in &run.jobs {
+            assert_eq!(
+                *status,
+                ExecutionStatus::Success,
+                "job {} should be Success, got {:?}",
+                job_id.0,
+                status
+            );
+        }
+    }
+    /// Exercises the real parser → queue → completion → dependency-promotion path
+    /// over 1,000 deterministic bounded DAGs.
+    #[tokio::test]
+    async fn generated_server_dag_properties_1000_cases() {
+        fn next(seed: &mut u64) -> u64 {
+            *seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *seed
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        for case in 0..1_000u64 {
+            let mut seed = 20250713u64 ^ case.wrapping_mul(0x9E37_79B9);
+            let count = 2 + (next(&mut seed) % 4) as usize;
+            let mut needs = vec![Vec::<usize>::new(); count];
+            for job in 1..count {
+                for dependency in 0..job {
+                    if next(&mut seed) & 1 == 1 {
+                        needs[job].push(dependency);
+                    }
+                }
+            }
+            let failed_root = (0..count).find(|job| needs[*job].is_empty()).unwrap();
+
+            // Assign conditions to non-root jobs based on PRNG
+            let mut conditions: Vec<Option<&str>> = vec![None; count];
+            for job in 1..count {
+                if !needs[job].is_empty() {
+                    conditions[job] = match next(&mut seed) % 5 {
+                        0 => Some("always()"),
+                        1 => Some("failure()"),
+                        _ => None, // default gate
+                    };
+                }
+            }
+
+            let mut yaml = String::from("on: push\njobs:\n");
+            for job in 0..count {
+                yaml.push_str(&format!("  j{job}:\n"));
+                if !needs[job].is_empty() {
+                    yaml.push_str("    needs: [");
+                    for (index, dependency) in needs[job].iter().enumerate() {
+                        if index > 0 {
+                            yaml.push_str(", ");
+                        }
+                        yaml.push_str(&format!("j{dependency}"));
+                    }
+                    yaml.push_str("]\n");
+                }
+                if let Some(cond) = conditions[job] {
+                    yaml.push_str(&format!("    if: {cond}\n"));
+                }
+                yaml.push_str("    runs-on: ubuntu-latest\n");
+                yaml.push_str("    steps:\n      - run: echo property\n");
+            }
+
+            let accepted = request_json(
+                &app,
+                Method::POST,
+                "/api/v1/runs",
+                json!({
+                    "workflow_yaml": yaml,
+                    "event": "push",
+                    "repository": "property/test"
+                }),
+            )
+            .await;
+            let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+            for _ in 0..=count {
+                let queued = {
+                    let inner = state.inner.lock().await;
+                    inner
+                        .queue
+                        .iter()
+                        .filter(|job| job.run_id == run_id)
+                        .map(|job| job.job_id.0.clone())
+                        .collect::<Vec<_>>()
+                };
+                if queued.is_empty() {
+                    break;
+                }
+                for job_id in queued {
+                    let status = if job_id == format!("j{failed_root}") {
+                        "failure"
+                    } else {
+                        "success"
+                    };
+                    request_json(
+                        &app,
+                        Method::POST,
+                        "/internal/test/jobs/complete",
+                        json!({"run_id": run_id, "job_id": job_id, "status": status}),
+                    )
+                    .await;
+                }
+            }
+
+            let inner = state.inner.lock().await;
+            let run = inner.runs.get(&run_id).unwrap();
+            let mut failed_ancestor = vec![false; count];
+            for job in 0..count {
+                failed_ancestor[job] = job == failed_root
+                    || needs[job]
+                        .iter()
+                        .any(|dependency| failed_ancestor[*dependency]);
+                let expected = if job == failed_root {
+                    ExecutionStatus::Failure
+                } else if failed_ancestor[job] {
+                    // Job has a failed ancestor — what does the condition say?
+                    match conditions[job] {
+                        Some("always()") => ExecutionStatus::Success, // always runs, completed successfully
+                        Some("failure()") => ExecutionStatus::Success, // failure() is true, job runs
+                        _ => ExecutionStatus::Skipped,                 // default gate blocks
+                    }
+                } else {
+                    // No failed ancestor
+                    match conditions[job] {
+                        Some("failure()") => ExecutionStatus::Skipped, // failure() is false, skip
+                        _ => ExecutionStatus::Success,                 // default or always() runs
+                    }
+                };
+                assert_eq!(
+                    run.jobs[&JobId(format!("j{job}"))],
+                    expected,
+                    "case {case} job j{job} condition={:?}",
+                    conditions[job]
+                );
+            }
+        }
     }
 }

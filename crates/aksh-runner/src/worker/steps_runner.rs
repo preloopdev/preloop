@@ -769,83 +769,32 @@ pub async fn run_steps(
 }
 
 fn should_run_step(step: &Step, job: &JobContext) -> Result<bool> {
-    let condition = match &step.condition {
-        Some(c) if !c.is_empty() => c.as_str(),
-        _ => "success()",
-    };
-    let stripped = aksh_gha_expressions::trim_expression_markers(condition);
-    let effective_condition = if contains_status_check_function(stripped) {
-        stripped.to_string()
-    } else {
-        format!("success() && ({stripped})")
-    };
+    use super::step_conditions::{contains_status_check_function, effective_condition};
 
+    let raw = step.condition.as_deref();
+    let effective = effective_condition(raw);
     let ctx = job.build_expression_context();
-    match aksh_gha_expressions::eval_bool(&effective_condition, &ctx) {
+    match aksh_gha_expressions::eval_bool(&effective, &ctx) {
         Ok(result) => Ok(result),
         Err(effective_error) => {
+            // Fallback: retry with untrimmed markers if the strip path failed.
+            let condition = match raw {
+                Some(c) if !c.is_empty() => c,
+                _ => return Err(effective_error.into()),
+            };
+            let stripped = aksh_gha_expressions::trim_expression_markers(condition);
             if stripped == condition {
                 Err(effective_error.into())
             } else {
-                aksh_gha_expressions::eval_bool(
-                    &if contains_status_check_function(condition) {
-                        condition.to_string()
-                    } else {
-                        format!("success() && ({condition})")
-                    },
-                    &ctx,
-                )
-                .map_err(Into::into)
+                let fallback = if contains_status_check_function(condition) {
+                    condition.to_string()
+                } else {
+                    format!("success() && ({condition})")
+                };
+                aksh_gha_expressions::eval_bool(&fallback, &ctx).map_err(Into::into)
             }
         }
     }
-}
-
-fn contains_status_check_function(condition: &str) -> bool {
-    let mut chars = condition.char_indices().peekable();
-    while let Some((_, ch)) = chars.next() {
-        if ch == '\'' || ch == '"' {
-            let quote = ch;
-            while let Some((_, quoted)) = chars.next() {
-                if quoted == '\\' {
-                    let _ = chars.next();
-                } else if quoted == quote {
-                    break;
-                }
-            }
-            continue;
-        }
-
-        if ch == '_' || ch.is_ascii_alphabetic() {
-            let mut ident = String::from(ch);
-            while let Some((_, next)) = chars.peek().copied() {
-                if next == '_' || next.is_ascii_alphanumeric() {
-                    ident.push(next);
-                    let _ = chars.next();
-                } else {
-                    break;
-                }
-            }
-
-            while let Some((_, whitespace)) = chars.peek().copied() {
-                if whitespace.is_whitespace() {
-                    let _ = chars.next();
-                } else {
-                    break;
-                }
-            }
-
-            if matches!(
-                ident.to_ascii_lowercase().as_str(),
-                "success" | "failure" | "cancelled" | "always"
-            ) && chars.peek().is_some_and(|(_, next)| *next == '(')
-            {
-                return true;
-            }
-        }
-    }
-
-    false
 }
 
 /// Execute a single step, threading cancel_rx to the process invoker.
@@ -1086,6 +1035,7 @@ mod tests {
     use super::*;
     use crate::worker::contexts::JobContext;
     use crate::worker::server_queue::ServerQueue;
+    use crate::worker::step_conditions::contains_status_check_function;
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::sync::{watch, Mutex};
