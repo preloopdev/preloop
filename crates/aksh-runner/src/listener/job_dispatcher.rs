@@ -106,14 +106,18 @@ pub async fn spawn_job(
                 .status()
                 .expect("build aksh-runner test worker");
             assert!(status.success(), "building aksh-runner test worker failed");
-            manifest
-                .parent()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .join("target/debug/aksh-runner")
+            if let Ok(target_dir_env) = std::env::var("CARGO_TARGET_DIR") {
+                std::path::PathBuf::from(target_dir_env).join("debug/aksh-runner")
+            } else {
+                manifest
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .join("target/debug/aksh-runner")
+            }
         });
         let mut command = tokio::process::Command::new(binary);
         command.arg("worker");
