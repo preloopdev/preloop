@@ -328,7 +328,11 @@ pub fn in_progress_ids(state: &SchedulerState) -> BTreeSet<JobId> {
         .jobs
         .iter()
         .filter_map(|(id, status)| {
-            matches!(status, ExecutionStatus::InProgress).then(|| id.clone())
+            if matches!(status, ExecutionStatus::InProgress) {
+                Some(id.clone())
+            } else {
+                None
+            }
         })
         .collect()
 }
