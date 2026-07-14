@@ -11,6 +11,11 @@ pub mod github;
 /// Pure job-graph scheduler model and property tests.
 pub mod scheduling;
 
+#[cfg(test)]
+mod concurrency_http_properties;
+#[cfg(test)]
+mod concurrency_properties;
+
 use axum_server::{tls_rustls::RustlsConfig, Handle};
 use rcgen::generate_simple_self_signed;
 
@@ -1775,7 +1780,7 @@ fn try_enqueue_with_job_concurrency(
     inner: &mut InnerState,
     github: &serde_json::Value,
     submission: &WorkflowSubmission,
-    mut queued_job: QueuedJob,
+    queued_job: QueuedJob,
     statuses: &mut BTreeMap<JobId, ExecutionStatus>,
 ) -> Result<bool, ()> {
     let Some(raw) = queued_job.concurrency.clone() else {
@@ -2167,10 +2172,11 @@ fn promote_next_from_group(
                         run.jobs.insert(job.job_id.clone(), ExecutionStatus::Queued);
                     }
                     // Re-check needs/max_parallel before queueing.
-                    let needs_ok = inner
-                        .runs
-                        .get(&run_id)
-                        .is_some_and(|run| job.needs.iter().all(|n| scheduling::need_satisfied(&run.jobs, n)));
+                    let needs_ok = inner.runs.get(&run_id).is_some_and(|run| {
+                        job.needs
+                            .iter()
+                            .all(|n| scheduling::need_satisfied(&run.jobs, n))
+                    });
                     if needs_ok && under_max_parallel(inner, &job) {
                         if let Some(run) = inner.runs.get(&run_id) {
                             hydrate_needs_context(&mut job, run);
@@ -2289,7 +2295,7 @@ fn try_acquire_concurrency(
 
     if group.running.is_none() {
         group.running = Some(holder.clone());
-        drop(group);
+        let _ = group;
         track_holder_key(inner, &holder, key);
         return Ok(true);
     }
@@ -2297,14 +2303,14 @@ fn try_acquire_concurrency(
     if cancel_in_progress {
         let prev = group.running.take();
         group.running = Some(holder.clone());
-        drop(group);
+        let _ = group;
         track_holder_key(inner, &holder, key.clone());
         if let Some(prev) = prev {
             cancel_holder(inner, &prev, concurrency::cancelled_reason().as_deref());
         }
         return Ok(true);
     }
-    drop(group);
+    let _ = group;
 
     // Contended — apply queue mode for this arrival.
     let join = {
@@ -4666,6 +4672,23 @@ async fn complete_job_inner(
     } else {
         Vec::new()
     };
+    // A terminal job must not remain dispatchable, including completion via
+    // the native/internal API before a runner acquires it.
+    inner
+        .queue
+        .retain(|job| !(job.run_id == completion.run_id && job.job_id == completion.job_id));
+    inner
+        .pending_jobs
+        .retain(|job| !(job.run_id == completion.run_id && job.job_id == completion.job_id));
+    inner
+        .concurrency_blocked
+        .retain(|job| !(job.run_id == completion.run_id && job.job_id == completion.job_id));
+    if let Some(held) = inner.held_runs.get_mut(&completion.run_id) {
+        held.retain(|job| job.job_id != completion.job_id);
+        if held.is_empty() {
+            inner.held_runs.remove(&completion.run_id);
+        }
+    }
     // Release concurrency for the completed job / run, which may promote held work.
     release_concurrency_for_job(&mut inner, completion.run_id, &completion.job_id);
     let scheduling = promote_ready_jobs(&mut inner);
@@ -11022,7 +11045,7 @@ jobs:
         request_json(
             app,
             Method::POST,
-            "/api/v1/jobs/complete",
+            "/internal/test/jobs/complete",
             json!({
                 "run_id": run_id,
                 "job_id": job_id,
@@ -11437,77 +11460,6 @@ jobs:
             )
             .await
             .unwrap();
-    /// Production path: duplicate completion does not create a second promotion.
-    #[tokio::test]
-    async fn dag_duplicate_completion_idempotent_production() {
-        let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
-        let app = app(state.clone(), CancellationToken::new());
-
-        let accepted = request_json(
-            &app,
-            Method::POST,
-            "/api/v1/runs",
-            json!({
-                "workflow_yaml": r#"
-on: push
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo build
-  test:
-    needs: [build]
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo test
-"#,
-                "event": "push",
-                "repository": "owner/repo"
-            }),
-        )
-        .await;
-        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
-
-        // Complete build once
-        request_json(
-            &app,
-            Method::POST,
-            "/internal/test/jobs/complete",
-            json!({"run_id": run_id, "job_id": "build", "status": "success"}),
-        )
-        .await;
-
-        // test should be queued exactly once
-        {
-            let inner = state.inner.lock().await;
-            assert_eq!(
-                inner.queue.iter().filter(|j| j.job_id.0 == "test").count(),
-                1,
-                "test must appear exactly once in queue"
-            );
-        }
-
-        // Complete build again (duplicate)
-        request_json(
-            &app,
-            Method::POST,
-            "/internal/test/jobs/complete",
-            json!({"run_id": run_id, "job_id": "build", "status": "success"}),
-        )
-        .await;
-
-        // test must still appear exactly once
-        {
-            let inner = state.inner.lock().await;
-            assert_eq!(
-                inner.queue.iter().filter(|j| j.job_id.0 == "test").count(),
-                1,
-                "duplicate completion must not create second promotion"
-            );
-        }
-    }
-
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
@@ -12562,7 +12514,7 @@ jobs:
         let run_id = accepted["run_id"].as_str().unwrap();
 
         // One cell should be queued, the other pending (concurrency-blocked).
-        let (queued_job, blocked_count) = {
+        let (queued_job, _blocked_count) = {
             let inner = state.inner.lock().await;
             let q = inner.queue.len();
             let cb = inner.concurrency_blocked.len();
