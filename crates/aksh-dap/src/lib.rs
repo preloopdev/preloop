@@ -34,7 +34,6 @@
 //! existing C# L0 tests can be ported with a one-to-one
 //! `name: action` mapping.
 
-#[allow(warnings)]
 #![doc(html_root_url = "https://docs.rs/aksh-dap/0.1.0")]
 
 pub mod bridge;
