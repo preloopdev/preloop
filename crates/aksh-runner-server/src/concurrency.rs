@@ -1,5 +1,5 @@
 //! GitHub Actions `concurrency:` group enforcement (control-plane only).
-//!
+//
 //! Runners never learn about concurrency groups; they only observe
 //! `JobCancellation` when a holder is cancelled.
 

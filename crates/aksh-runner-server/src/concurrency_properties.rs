@@ -50,7 +50,7 @@ enum HolderKind {
     JobSet(BTreeSet<u32>),
 }
 
-/// Independent concurrency model — no production code.
+/// Independent concurrency model
 #[derive(Debug, Clone, Default)]
 struct Model {
     /// (repo, group) → group state
@@ -96,6 +96,8 @@ impl Model {
 
         if cancel_in_progress {
             let prev = group.running.replace(token.clone());
+            // Docs: cancel-in-progress also cancels all pending holders.
+            let stale_pending: Vec<_> = group.pending.drain(..).collect();
             if let Some(prev) = prev {
                 self.holder_state
                     .insert(prev.clone(), HolderState::Cancelled);
@@ -106,13 +108,22 @@ impl Model {
                     }
                 }
             }
+            for p in stale_pending {
+                self.holder_state.insert(p.clone(), HolderState::Cancelled);
+                if let Some(keys) = self.holder_keys.get_mut(&p) {
+                    keys.remove(&key);
+                    if keys.is_empty() {
+                        self.holder_keys.remove(&p);
+                    }
+                }
+            }
             self.holder_state
                 .insert(token.clone(), HolderState::Running);
             self.holder_keys.entry(token).or_default().insert(key);
             return Ok(true);
         }
 
-        // Contended — apply queue mode
+        // Contended so we apply queue mode
         match queue {
             ConcurrencyQueue::Single => {
                 // Cancel all existing pending
@@ -154,7 +165,7 @@ impl Model {
             return;
         };
         if group.running.as_ref() != Some(token) {
-            // Maybe it's pending — remove from pending
+            // Maybe it's pending so remove from pending
             group.pending.retain(|t| t != token);
             if let Some(keys) = self.holder_keys.get_mut(token) {
                 keys.remove(key);
