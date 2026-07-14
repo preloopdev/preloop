@@ -1303,6 +1303,436 @@ mod tests {
             json!({"type": 2, "map": pairs})
         }
     }
+    // Independent AgentJobRequest oracle. These rules follow the official
+    // DataMember contract, not AgentJobRequestMessage's Serialize impl:
+    // MessageType/Plan/Timeline/JobId/JobDisplayName/RequestId are required
+    // members (official source lines 64-116); JobContainer, JobServiceContainers,
+    // and JobOutputs omit null (lines 94-110); Resources is required (lines
+    // 118-122); ContextData is EmitDefaultValue=false (lines 124-136), but
+    // the official constructor initializes it, so the empty map is emitted.
+    // EnableDebugger, DebuggerTunnel, and DebuggerWelcomeMessage omit defaults
+    // (official source lines 219-245). Aksh does not model JobName, LockedUntil,
+    // Workspace, ActionsEnvironment, Snapshot, BillingOwnerId, Defaults,
+    // EnvironmentVariables, ActionsDependencies, or FileTable, so this oracle
+    // intentionally makes no claims about those absent DTO fields.
+    // No local golden AgentJobRequest flow exists; protocol_golden.rs:6-20 is
+    // an unrelated NDJSON event golden and is therefore not used as an oracle.
+    fn expected_variable_wire(value: &VariableValue) -> Value {
+        let mut object = Map::new();
+        if let Some(value) = &value.value {
+            object.insert("value".to_owned(), json!(value));
+        }
+        if let Some(is_secret) = value.is_secret {
+            object.insert("isSecret".to_owned(), json!(is_secret));
+        }
+        Value::Object(object)
+    }
+
+    fn expected_endpoint_wire(endpoint: &ServiceEndpoint) -> Value {
+        let mut object = Map::new();
+        object.insert("data".to_owned(), json!(endpoint.data));
+        object.insert("name".to_owned(), json!(endpoint.name));
+        if let Some(value) = &endpoint.endpoint_type {
+            object.insert("type".to_owned(), json!(value));
+        }
+        if let Some(value) = &endpoint.url {
+            object.insert("url".to_owned(), json!(value));
+        }
+        let mut authorization = Map::new();
+        authorization.insert(
+            "parameters".to_owned(),
+            json!(endpoint.authorization.parameters),
+        );
+        if let Some(value) = &endpoint.authorization.scheme {
+            authorization.insert("scheme".to_owned(), json!(value));
+        }
+        object.insert("authorization".to_owned(), Value::Object(authorization));
+        if let Some(value) = endpoint.is_shared {
+            object.insert("isShared".to_owned(), json!(value));
+        }
+        if let Some(value) = &endpoint.service_owner {
+            object.insert("serviceOwner".to_owned(), json!(value));
+        }
+        Value::Object(object)
+    }
+
+    fn expected_repository_wire(repository: &RepositoryReference) -> Value {
+        let mut object = Map::new();
+        if let Some(value) = &repository.repository {
+            object.insert("repository".to_owned(), json!(value));
+        }
+        if let Some(value) = &repository.git_ref {
+            object.insert("ref".to_owned(), json!(value));
+        }
+        if let Some(connector) = &repository.connector {
+            let mut connector_wire = Map::new();
+            if let Some(value) = &connector.id {
+                connector_wire.insert("id".to_owned(), json!(value));
+            }
+            if let Some(value) = &connector.name {
+                connector_wire.insert("name".to_owned(), json!(value));
+            }
+            object.insert("connector".to_owned(), Value::Object(connector_wire));
+        }
+        Value::Object(object)
+    }
+
+    fn expected_step_wire(step: &TaskStep) -> Value {
+        let mut inputs = step.inputs.clone();
+        if let Some(script) = &step.script {
+            inputs.insert("script".to_owned(), script.clone());
+        }
+        let reference = match &step.reference {
+            None => json!({"type": "script"}),
+            Some(reference) => {
+                let mut object = Map::new();
+                object.insert(
+                    "type".to_owned(),
+                    json!(reference.reference_type.as_deref().unwrap_or("repository")),
+                );
+                if let Some(value) = &reference.name {
+                    object.insert("name".to_owned(), json!(value));
+                }
+                if let Some(value) = &reference.version {
+                    object.insert("ref".to_owned(), json!(value));
+                }
+                if reference.reference_type.is_none() {
+                    object.insert("repositoryType".to_owned(), json!("GitHub"));
+                }
+                Value::Object(object)
+            }
+        };
+        let mut object = Map::new();
+        object.insert("type".to_owned(), json!("action"));
+        object.insert("reference".to_owned(), reference);
+        object.insert("environment".to_owned(), expected_template_map(&step.env));
+        object.insert("inputs".to_owned(), expected_template_map(&inputs));
+        object.insert("id".to_owned(), json!(step.id));
+        if let Some(value) = &step.name {
+            object.insert("name".to_owned(), json!(value));
+        }
+        if let Some(value) = &step.context_name {
+            object.insert("contextName".to_owned(), json!(value));
+        }
+        if let Some(value) = &step.display_name {
+            object.insert("displayName".to_owned(), json!(value));
+        }
+        if let Some(value) = &step.display_name_token {
+            object.insert("displayNameToken".to_owned(), value.clone());
+        }
+        if let Some(value) = &step.condition {
+            object.insert("condition".to_owned(), json!(value));
+        }
+        if let Some(value) = step.continue_on_error {
+            object.insert("continueOnError".to_owned(), json!(value));
+        }
+        if let Some(value) = &step.working_directory {
+            object.insert("workingDirectory".to_owned(), json!(value));
+        }
+        if let Some(value) = step.timeout_in_minutes {
+            object.insert("timeoutInMinutes".to_owned(), json!(value));
+        }
+        Value::Object(object)
+    }
+
+    fn expected_job_wire(job: &AgentJobRequestMessage) -> Value {
+        let mut object = Map::new();
+        // Official [DataMember] names: AgentJobRequestMessage.cs:64-116.
+        if let Some(value) = &job.message_type {
+            object.insert("messageType".to_owned(), json!(value));
+        }
+        object.insert("jobId".to_owned(), json!(job.job_id));
+        object.insert("requestId".to_owned(), json!(job.request_id));
+
+        let mut plan = Map::new();
+        plan.insert("planId".to_owned(), json!(job.plan.plan_id));
+        if let Some(value) = &job.plan.plan_type {
+            plan.insert("planType".to_owned(), json!(value));
+        }
+        object.insert("plan".to_owned(), Value::Object(plan));
+        object.insert("timeline".to_owned(), json!({"id": job.timeline.id}));
+        if let Some(value) = &job.display_name {
+            object.insert("displayName".to_owned(), json!(value));
+        }
+        if let Some(value) = &job.condition {
+            object.insert("condition".to_owned(), json!(value));
+        }
+        if let Some(value) = &job.job_display_name {
+            object.insert("jobDisplayName".to_owned(), json!(value));
+        }
+        if let Some(value) = job.retry_count {
+            object.insert("retryCount".to_owned(), json!(value));
+        }
+        if let Some(value) = job.pre_job_timeout {
+            object.insert("preJobTimeout".to_owned(), json!(value));
+        }
+        if let Some(value) = job.job_timeout {
+            object.insert("jobTimeout".to_owned(), json!(value));
+        }
+        // Official JobContainer/JobServiceContainers/JobOutputs are
+        // EmitDefaultValue=false (AgentJobRequestMessage.cs:94-110).
+        if let Some(value) = &job.job_container {
+            object.insert("jobContainer".to_owned(), value.clone());
+        }
+        if let Some(value) = &job.job_service_containers {
+            object.insert("jobServiceContainers".to_owned(), value.clone());
+        }
+        if let Some(value) = &job.job_outputs {
+            object.insert("jobOutputs".to_owned(), value.clone());
+        }
+
+        // Variables/Mask/Steps backing members: AgentJobRequestMessage.cs
+        // lines 193-202 and 303-321. The Aksh wire names are the DTO's
+        // explicit lower-camel serde names.
+        // Resources is the required official member at lines 118-122;
+        // ContextData is EmitDefaultValue=false at lines 124-136, but its
+        // official constructor initializes the dictionary, so `{}` is valid.
+        // ActionsDownloadInfo is an Aksh-modeled field (azdo.rs:289-290), not
+        // an AgentJobRequestMessage DataMember at the pinned official commit;
+        // this rule verifies only the local DTO's explicit wire contract.
+        let variables = job
+            .variables
+            .iter()
+            .map(|(key, value)| (key.clone(), expected_variable_wire(value)))
+            .collect::<Map<String, Value>>();
+        object.insert("variables".to_owned(), Value::Object(variables));
+        object.insert(
+            "maskHints".to_owned(),
+            Value::Array(
+                job.mask_hints
+                    .iter()
+                    .map(|hint| json!({"type": "hash", "value": hint.value}))
+                    .collect(),
+            ),
+        );
+        let resources = json!({
+            "endpoints": job.resources.endpoints.iter().map(expected_endpoint_wire).collect::<Vec<_>>(),
+            "repositories": job.resources.repositories.iter().map(expected_repository_wire).collect::<Vec<_>>(),
+        });
+        object.insert("resources".to_owned(), resources);
+        let context = job
+            .context_data
+            .iter()
+            .map(|(key, value)| (key.clone(), expected_context_wire(value)))
+            .collect::<Map<String, Value>>();
+        object.insert("contextData".to_owned(), Value::Object(context));
+        object.insert(
+            "steps".to_owned(),
+            Value::Array(job.steps.iter().map(expected_step_wire).collect()),
+        );
+        let actions = job
+            .actions_download_info
+            .iter()
+            .map(|(key, value)| {
+                let mut info = Map::new();
+                if let Some(value) = &value.download_type {
+                    info.insert("type".to_owned(), json!(value));
+                }
+                if let Some(value) = &value.url {
+                    info.insert("url".to_owned(), json!(value));
+                }
+                if let Some(value) = &value.auth {
+                    info.insert("auth".to_owned(), json!(value));
+                }
+                (key.clone(), Value::Object(info))
+            })
+            .collect::<Map<String, Value>>();
+        object.insert("actionsDownloadInfo".to_owned(), Value::Object(actions));
+        // Official debugger members are EmitDefaultValue=false (lines 219-245).
+        if job.enable_debugger {
+            object.insert("enableDebugger".to_owned(), json!(true));
+        }
+        if let Some(value) = &job.debugger_tunnel {
+            object.insert(
+                "debuggerTunnel".to_owned(),
+                json!({
+                    "tunnelId": value.tunnel_id,
+                    "clusterId": value.cluster_id,
+                    "hostToken": value.host_token,
+                    "port": value.port,
+                }),
+            );
+        }
+        if let Some(value) = &job.debugger_welcome_message {
+            object.insert("debuggerWelcomeMessage".to_owned(), json!(value));
+        }
+        Value::Object(object)
+    }
+
+    fn arb_variables() -> impl Strategy<Value = BTreeMap<String, VariableValue>> {
+        proptest::collection::btree_map(arb_key(), arb_variable_value(), 0..=3)
+    }
+
+    fn arb_resources() -> impl Strategy<Value = TaskResources> {
+        (
+            proptest::collection::vec(
+                (
+                    proptest::collection::btree_map(arb_key(), arb_text(), 0..=2),
+                    arb_text(),
+                    prop::option::of(arb_text()),
+                    prop::option::of(arb_text()),
+                    proptest::collection::btree_map(arb_key(), arb_text(), 0..=2),
+                    prop::option::of(arb_text()),
+                    prop::option::of(arb_text()),
+                )
+                    .prop_map(
+                        |(data, name, endpoint_type, url, parameters, scheme, service_owner)| {
+                            ServiceEndpoint {
+                                data,
+                                name,
+                                endpoint_type,
+                                url,
+                                authorization: EndpointAuthorization { parameters, scheme },
+                                is_shared: Some(false),
+                                service_owner,
+                            }
+                        },
+                    ),
+                0..=2,
+            ),
+            proptest::collection::vec(
+                (
+                    prop::option::of(arb_text()),
+                    prop::option::of(arb_text()),
+                    prop::option::of(
+                        (prop::option::of(arb_text()), prop::option::of(arb_text()))
+                            .prop_map(|(id, name)| RepositoryConnector { id, name }),
+                    ),
+                )
+                    .prop_map(|(repository, git_ref, connector)| {
+                        RepositoryReference {
+                            repository,
+                            git_ref,
+                            connector,
+                        }
+                    }),
+                0..=2,
+            ),
+        )
+            .prop_map(|(endpoints, repositories)| TaskResources {
+                endpoints,
+                repositories,
+            })
+    }
+
+    fn arb_actions_download_info() -> impl Strategy<Value = BTreeMap<String, ActionsDownloadInfo>> {
+        proptest::collection::btree_map(
+            arb_key(),
+            (
+                prop::option::of(arb_text()),
+                prop::option::of(arb_text()),
+                prop::option::of(arb_text()),
+            )
+                .prop_map(|(download_type, url, auth)| ActionsDownloadInfo {
+                    download_type,
+                    url,
+                    auth,
+                }),
+            0..=2,
+        )
+    }
+
+    fn arb_job() -> impl Strategy<Value = AgentJobRequestMessage> {
+        (
+            (
+                proptest::array::uniform16(any::<u8>()),
+                proptest::array::uniform16(any::<u8>()),
+                -100_000i64..=100_000,
+                arb_text(),
+                prop::option::of(arb_text()),
+                prop::option::of(arb_text()),
+                prop::option::of(arb_text()),
+                prop::option::of(arb_text()),
+                prop::option::of(-10i32..=10),
+                prop::option::of(-100_000i64..=100_000),
+                prop::option::of(-100_000i64..=100_000),
+            ),
+            (
+                arb_variables(),
+                arb_mask_hints(),
+                proptest::collection::vec(arb_literal_step(), 0..=2),
+                proptest::collection::btree_map(arb_key(), arb_context_data(), 0..=2),
+                arb_resources(),
+                arb_actions_download_info(),
+                prop::option::of(arb_text().prop_map(|value| json!({"type": 0, "lit": value}))),
+                prop::option::of(arb_text().prop_map(|value| json!({"type": 2, "lit": value}))),
+                prop::option::of(arb_text().prop_map(|value| json!({"type": 2, "lit": value}))),
+            ),
+            (
+                any::<bool>(),
+                prop::option::of(arb_text()),
+                any::<bool>(),
+                proptest::collection::vec(any::<u8>(), 0..=12),
+            ),
+        )
+            .prop_map(
+                |(
+                    (
+                        job_id,
+                        timeline_id,
+                        request_id,
+                        plan_id,
+                        plan_type,
+                        display_name,
+                        condition,
+                        job_display_name,
+                        retry_count,
+                        pre_job_timeout,
+                        job_timeout,
+                    ),
+                    (
+                        variables,
+                        mask_hints,
+                        steps,
+                        context_data,
+                        resources,
+                        actions_download_info,
+                        job_container,
+                        job_service_containers,
+                        job_outputs,
+                    ),
+                    (enable_debugger, debugger_welcome_message, has_tunnel, key_bytes),
+                )| AgentJobRequestMessage {
+                    message_type: Some("PipelineAgentJobRequest".to_owned()),
+                    job_id: uuid::Uuid::from_bytes(job_id),
+                    request_id,
+                    plan: PlanReference { plan_id, plan_type },
+                    timeline: TimelineReference {
+                        id: uuid::Uuid::from_bytes(timeline_id),
+                    },
+                    display_name,
+                    condition,
+                    variables,
+                    mask_hints,
+                    resources,
+                    context_data,
+                    steps,
+                    actions_download_info,
+                    job_display_name,
+                    retry_count,
+                    pre_job_timeout,
+                    job_timeout,
+                    job_container,
+                    job_service_containers,
+                    job_outputs,
+                    enable_debugger,
+                    debugger_tunnel: has_tunnel.then_some(DebuggerTunnelInfo {
+                        tunnel_id: "tunnel".to_owned(),
+                        cluster_id: "cluster".to_owned(),
+                        host_token: base64::engine::general_purpose::STANDARD.encode(key_bytes),
+                        port: 443,
+                    }),
+                    debugger_welcome_message,
+                    aksh_debug_run_id: None,
+                    aksh_debug_transport: None,
+                },
+            )
+    }
+    // Variables and steps are official backing DataMembers (source lines
+    // 303-321); MaskHints is the official accessor over the Mask backing member
+    // (lines 193-202). ActionsDownloadInfo/actionsDownloadInfo is not present
+    // in this pinned AgentJobRequestMessage.cs; its oracle below is limited to
+    // the Aksh DTO's explicitly modeled local field (azdo.rs:289-290).
 
     fn assert_context_semantics(left: &PipelineContextData, right: &PipelineContextData) {
         match (left, right) {
@@ -1431,76 +1861,6 @@ mod tests {
                         continue_on_error: Some(false),
                         working_directory: None,
                         timeout_in_minutes: None,
-                    }
-                },
-            )
-    }
-
-    fn arb_job() -> impl Strategy<Value = AgentJobRequestMessage> {
-        (
-            arb_variable_value(),
-            arb_mask_hints(),
-            arb_literal_step(),
-            arb_context_data(),
-            any::<bool>(),
-            arb_text(),
-            any::<bool>(),
-            proptest::collection::vec(any::<u8>(), 0..=12),
-        )
-            .prop_map(
-                |(
-                    variable,
-                    mask_hints,
-                    step,
-                    context,
-                    enable_debugger,
-                    welcome,
-                    has_tunnel,
-                    key_bytes,
-                )| {
-                    let mut variables = BTreeMap::new();
-                    variables.insert("VAR".to_owned(), variable);
-                    let mut context_data = BTreeMap::new();
-                    context_data.insert("github".to_owned(), context);
-                    AgentJobRequestMessage {
-                        message_type: Some("PipelineAgentJobRequest".to_owned()),
-                        job_id: uuid::Uuid::nil(),
-                        request_id: 7,
-                        plan: PlanReference {
-                            plan_id: "plan".to_owned(),
-                            plan_type: Some("workflow".to_owned()),
-                        },
-                        timeline: TimelineReference {
-                            id: uuid::Uuid::nil(),
-                        },
-                        display_name: Some("job".to_owned()),
-                        condition: Some("success()".to_owned()),
-                        variables,
-                        mask_hints,
-                        resources: TaskResources {
-                            endpoints: vec![],
-                            repositories: vec![],
-                        },
-                        context_data,
-                        steps: vec![step],
-                        actions_download_info: BTreeMap::new(),
-                        job_display_name: Some("job".to_owned()),
-                        retry_count: Some(0),
-                        pre_job_timeout: None,
-                        job_timeout: Some(3600),
-                        job_container: None,
-                        job_service_containers: None,
-                        job_outputs: None,
-                        enable_debugger,
-                        debugger_tunnel: has_tunnel.then_some(DebuggerTunnelInfo {
-                            tunnel_id: "tunnel".to_owned(),
-                            cluster_id: "cluster".to_owned(),
-                            host_token: base64::engine::general_purpose::STANDARD.encode(key_bytes),
-                            port: 443,
-                        }),
-                        debugger_welcome_message: Some(welcome),
-                        aksh_debug_run_id: None,
-                        aksh_debug_transport: None,
                     }
                 },
             )
@@ -1866,16 +2226,69 @@ mod tests {
 
         #[test]
         fn tier2_codec_agent_job_request_canonical_roundtrip(job in arb_job()) {
+            // Compare against a field-by-field oracle derived from the semantic
+            // values and the official AgentJobRequestMessage DataMembers; this
+            // must remain independent of AgentJobRequestMessage::serialize.
+            let expected = expected_job_wire(&job);
             let encoded = serde_json::to_value(&job).unwrap();
-            prop_assert_eq!(&encoded["messageType"], &json!("PipelineAgentJobRequest"));
-            prop_assert_eq!(&encoded["jobId"], &json!(uuid::Uuid::nil()));
-            prop_assert_eq!(&encoded["requestId"], &json!(7));
-            prop_assert_eq!(&encoded["plan"]["planId"], &json!("plan"));
-            prop_assert_eq!(&encoded["timeline"]["id"], &json!(uuid::Uuid::nil()));
-            prop_assert!(encoded["resources"]["endpoints"].is_array());
-            prop_assert!(encoded["resources"]["repositories"].is_array());
+            prop_assert_eq!(&encoded, &expected);
+            prop_assert!(encoded.get("env").is_none());
+            prop_assert_eq!(encoded["steps"].as_array().unwrap().len(), job.steps.len());
             let decoded: AgentJobRequestMessage = serde_json::from_value(encoded.clone()).unwrap();
             prop_assert_eq!(serde_json::to_value(&decoded).unwrap(), encoded);
+        }
+
+    }
+    #[test]
+    fn tier2_codec_task_step_environment_aliases() {
+        let empty_cases = ["environment", "env"];
+        for field in empty_cases {
+            let wire = json!({
+                "type": "action",
+                "reference": {"type": "script"},
+                "id": uuid::Uuid::nil(),
+                field: {"type": 2},
+                "inputs": {"type": 2},
+            });
+            let decoded: TaskStep = serde_json::from_value(wire).unwrap();
+            assert!(
+                decoded.env.is_empty(),
+                "empty {field} token must decode as empty env"
+            );
+            let encoded = serde_json::to_value(&decoded).unwrap();
+            assert_eq!(encoded["environment"], json!({"type": 2}));
+            assert!(encoded.get("env").is_none());
+        }
+
+        // Construct this TemplateToken map directly rather than through
+        // TemplateStringMap, proving the decoder accepts official token
+        // members independently of this DTO's serializer.
+        let token_map = json!({
+            "type": 2,
+            "map": [
+                {"Key": {"type": 0, "lit": "ALPHA"}, "Value": {"type": 0, "lit": "one"}},
+                {"key": {"type": 0, "lit": "BETA"}, "value": {"type": 0, "lit": "two"}},
+            ],
+        });
+        for field in ["environment", "env"] {
+            let mut wire = json!({
+                "type": "action",
+                "reference": {"type": "script"},
+                "id": uuid::Uuid::nil(),
+                "inputs": {"type": 2},
+            });
+            wire[field] = token_map.clone();
+            let decoded: TaskStep = serde_json::from_value(wire).unwrap();
+            assert_eq!(
+                decoded.env,
+                BTreeMap::from([
+                    ("ALPHA".to_owned(), "one".to_owned()),
+                    ("BETA".to_owned(), "two".to_owned()),
+                ])
+            );
+            let encoded = serde_json::to_value(&decoded).unwrap();
+            assert_eq!(encoded["environment"], expected_template_map(&decoded.env));
+            assert!(encoded.get("env").is_none());
         }
     }
 }
