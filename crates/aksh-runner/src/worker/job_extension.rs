@@ -1694,8 +1694,8 @@ runs:
 
     // Oracle: ActionManager.PrepareActionsRecursiveAsync pre/post registration and stack order
     // (lines 301-360), plus ActionRunner.RunAsync lifecycle stage registration (lines 79-105).
-    // https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/ActionManager.cs
-    // https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/ActionRunner.cs
+    // https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/ActionManager.cs#L301-L360
+    // https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/ActionRunner.cs#L79-L110
     proptest! {
         #![proptest_config(lifecycle_config())]
 
@@ -1755,8 +1755,8 @@ runs:
     // Oracle: ActionManager.PrepareActionsAsync only tracks resolved actions with lifecycle
     // definitions (lines 301-360); ActionRunner.RunAsync preserves action-step metadata while
     // selecting a lifecycle Stage (lines 79-105).
-    // https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/ActionManager.cs
-    // https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/ActionRunner.cs
+    // https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/ActionManager.cs#L301-L360
+    // https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/ActionRunner.cs#L79-L110
     proptest! {
         #![proptest_config(lifecycle_config())]
 
@@ -1804,7 +1804,7 @@ runs:
 
     // Oracle: ActionManager.PrepareActionsAsync resolves action manifests before lifecycle
     // registration and skips actions that cannot provide a definition (lines 301-360).
-    // https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/ActionManager.cs
+    // https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/ActionManager.cs#L301-L360
     #[test]
     fn mixed_lifecycle_regression_does_not_invent_steps() {
         let specs = vec![

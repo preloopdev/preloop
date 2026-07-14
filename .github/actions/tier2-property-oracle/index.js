@@ -9,8 +9,8 @@ const path = require('node:path');
 // Metadata and pre/main/post action hooks:
 // https://docs.github.com/en/actions/creating-actions/metadata-syntax-for-github-actions
 // Pinned official runner v2.335.1 (commit 7d737449ef346f6524f75688d0c9c95fa10ba10a):
-// ActionRunner.cs: https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/ActionRunner.cs
-// ActionManager.cs: https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/ActionManager.cs
+// ActionRunner.cs lifecycle dispatch: https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/ActionRunner.cs#L79-L110
+// ActionManager.cs preparation/order: https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/ActionManager.cs#L301-L360
 
 const id = process.env.INPUT_ID;
 if (id !== 'first' && id !== 'second') {
