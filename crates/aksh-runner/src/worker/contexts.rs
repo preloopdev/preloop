@@ -184,10 +184,25 @@ impl JobContext {
 
     /// Add a mask value (secrets, add-mask command).
     pub fn add_mask(&mut self, value: &str) {
-        if !value.is_empty() {
-            self.masks.insert(value.to_string());
+        // actions/runner v2.335.1 AddMaskCommandExtension.ProcessCommand registers
+        // Pinned upstream contract (actions/runner v2.335.1, AddMaskCommandExtension):
+        // https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/ActionCommandManager.cs#L419-L448
+        // the raw command data and each non-empty, trimmed CR/LF-delimited line.
+        if value.trim().is_empty() {
+            return;
+        }
+        self.masks.insert(value.to_string());
+        if let Ok(mut live) = self.live_masks.write() {
+            live.insert(value.to_string());
+        }
+        for line in value
+            .split(['\r', '\n'])
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
+            self.masks.insert(line.to_string());
             if let Ok(mut live) = self.live_masks.write() {
-                live.insert(value.to_string());
+                live.insert(line.to_string());
             }
         }
     }
@@ -503,6 +518,174 @@ fn current_arch() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
+    use proptest::prelude::*;
+    use proptest::test_runner::{FileFailurePersistence, RngSeed};
+
+    fn masking_config() -> ProptestConfig {
+        let mut config = ProptestConfig::with_failure_persistence(
+            FileFailurePersistence::SourceParallel("proptest-regressions"),
+        );
+        config.cases = 1_000;
+        config.rng_seed = RngSeed::Fixed(0x5EC2_0260);
+        config.verbose = 1;
+        config
+    }
+
+    fn arb_secret_core() -> impl Strategy<Value = String> {
+        prop::collection::vec(
+            prop_oneof![
+                Just('a'),
+                Just('b'),
+                Just('c'),
+                Just('x'),
+                Just('y'),
+                Just('z'),
+                Just('0'),
+                Just('7'),
+                Just('9'),
+            ],
+            1..=48,
+        )
+        .prop_map(|chars| chars.into_iter().collect())
+    }
+
+    fn arb_secret_padding() -> impl Strategy<Value = String> {
+        prop::collection::vec(prop_oneof![Just(' '), Just('\t')], 0..=4)
+            .prop_map(|chars| chars.into_iter().collect())
+    }
+
+    // JobContext::new registers the raw secret, its trimmed form, and the
+    // standard/url-safe padded and unpadded Base64 encodings.
+    proptest! {
+        #![proptest_config(masking_config())]
+
+        #[test]
+        fn masking_secret_variable_variants_are_redacted(
+            core in arb_secret_core(),
+            leading in arb_secret_padding(),
+            trailing in arb_secret_padding(),
+        ) {
+            let raw = format!("{leading}{core}{trailing}");
+            let trimmed = raw.trim().to_owned();
+            let standard = base64::engine::general_purpose::STANDARD.encode(raw.as_bytes());
+            let standard_no_pad =
+                base64::engine::general_purpose::STANDARD_NO_PAD.encode(raw.as_bytes());
+            let url_safe = base64::engine::general_purpose::URL_SAFE.encode(raw.as_bytes());
+            let url_safe_no_pad =
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw.as_bytes());
+            let ctx = JobContext::new(
+                "job".into(),
+                "Job".into(),
+                serde_json::json!({
+                    "SECRET": {"value": raw.clone(), "isSecret": true},
+                    "PUBLIC": {"value": "PUBLIC_VALUE", "isSecret": false},
+                }),
+                serde_json::json!({}),
+            );
+
+            let input = format!(
+                "LEFT::{raw}::{trimmed}::{standard}::{standard_no_pad}::{url_safe}::{url_safe_no_pad}::PUBLIC_MARKER"
+            );
+            let masked = ctx.mask_secrets(&input);
+            prop_assert_eq!(
+                masked.as_str(),
+                "LEFT::***::***::***::***::***::***::PUBLIC_MARKER"
+            );
+            prop_assert_eq!(ctx.mask_secrets(&masked), masked.as_str());
+        }
+    }
+
+    // Replacement order must prevent a shorter mask from exposing a longer
+    // overlapping secret; masking an already masked string is idempotent.
+    proptest! {
+        #![proptest_config(masking_config())]
+
+        #[test]
+        fn masking_overlapping_masks_do_not_leak_and_are_idempotent(
+            short in arb_secret_core(),
+            suffix in arb_secret_core(),
+        ) {
+            let long = format!("{short}{suffix}");
+            let mut ctx = JobContext::new(
+                "job".into(),
+                "Job".into(),
+                serde_json::json!({
+                    "LONG_SECRET": {"value": long.clone(), "isSecret": true},
+                }),
+                serde_json::json!({}),
+            );
+            ctx.add_mask(&short);
+
+            let input = format!(
+                "LEFT::{short}::MIDDLE::{long}::PUBLIC_MARKER::{short}::{long}::RIGHT"
+            );
+            let masked = ctx.mask_secrets(&input);
+            prop_assert_eq!(
+                masked.as_str(),
+                "LEFT::***::MIDDLE::***::PUBLIC_MARKER::***::***::RIGHT"
+            );
+            prop_assert_eq!(ctx.mask_secrets(&masked), masked.as_str());
+        }
+    }
+
+    // AddMaskCommandExtension ignores whitespace-only data, matching the
+    // pinned actions/runner v2.335.1 implementation:
+    // https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/ActionCommandManager.cs#L419-L448
+    proptest! {
+        #![proptest_config(masking_config())]
+
+        #[test]
+        fn masking_empty_add_masks_are_ignored(
+            empty in prop::collection::vec(
+                prop_oneof![Just(' '), Just('\t'), Just('\r'), Just('\n')],
+                0..=32,
+            ).prop_map(|chars| chars.into_iter().collect::<String>()),
+        ) {
+            let mut ctx = JobContext::new(
+                "job".into(),
+                "Job".into(),
+                serde_json::json!({}),
+                serde_json::json!({}),
+            );
+            ctx.add_mask(&empty);
+            let input = format!("LEFT{empty}RIGHT");
+            prop_assert_eq!(ctx.mask_secrets(&input), input);
+            prop_assert!(ctx.live_masks.read().map(|m| m.is_empty()).unwrap_or(false));
+        }
+    }
+
+    // AddMaskCommandExtension registers the complete command data and every
+    // non-empty CR/LF-delimited, trimmed line (same pinned source as above).
+    proptest! {
+        #![proptest_config(masking_config())]
+
+        #[test]
+        fn masking_multiline_add_masks_update_live_masks_and_redact_each_line(
+            first in arb_secret_core(),
+            second in arb_secret_core(),
+        ) {
+            let raw = format!(" \t{first}\r\n\n\t{second} \r");
+            let mut ctx = JobContext::new(
+                "job".into(),
+                "Job".into(),
+                serde_json::json!({}),
+                serde_json::json!({}),
+            );
+            ctx.add_mask(&raw);
+
+            let live_has_masks = ctx.live_masks.read().map(|live| {
+                live.contains(&raw) && live.contains(&first) && live.contains(&second)
+            }).unwrap_or(false);
+            prop_assert!(live_has_masks);
+
+            let input = format!("LEFT::{raw}::{first}::{second}::PUBLIC_MARKER");
+            prop_assert_eq!(
+                ctx.mask_secrets(&input),
+                "LEFT::***::***::***::PUBLIC_MARKER"
+            );
+        }
+    }
 
     fn make_variables() -> serde_json::Value {
         serde_json::json!({
