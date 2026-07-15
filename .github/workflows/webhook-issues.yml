@@ -1,0 +1,15 @@
+name: Webhook Issues
+on:
+  issues:
+    types: [opened, edited, closed, reopened, assigned, labeled]
+  issue_comment:
+    types: [created, edited, deleted]
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log event
+        run: |
+          echo "EVENT: ${{ github.event_name }}"
+          echo "ACTION: ${{ github.event.action }}"
+          echo "REF: ${{ github.ref }}"
