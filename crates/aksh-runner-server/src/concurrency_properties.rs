@@ -373,6 +373,7 @@ impl ProdState {
             job_fail_fast: BTreeMap::new(),
             job_check_run_ids: BTreeMap::new(),
             reusable_calls: BTreeMap::new(),
+            jobs_list: Vec::new(),
         };
         self.inner.runs.insert(run_id, record);
     }
@@ -479,6 +480,21 @@ impl ProdState {
                         .collect(),
                 ),
             },
+        }
+    }
+
+    fn clone_concurrency(&self) -> Self {
+        Self {
+            inner: InnerState {
+                runs: self.inner.runs.clone(),
+                queue: self.inner.queue.clone(),
+                pending_jobs: self.inner.pending_jobs.clone(),
+                concurrency_blocked: self.inner.concurrency_blocked.clone(),
+                concurrency_groups: self.inner.concurrency_groups.clone(),
+                holder_keys: self.inner.holder_keys.clone(),
+                jobset_admissions: self.inner.jobset_admissions.clone(),
+                ..Default::default()
+            }
         }
     }
 }
@@ -1180,6 +1196,99 @@ pub mod state_machine {
                 }
             }
         }
+
+    }
+    #[test]
+    fn test_exhaustive_state_space_model_check() {
+        let mut model = Model::default();
+        let mut prod = ProdState::new();
+        let mut path = Vec::new();
+        let mut visited = BTreeSet::new();
+
+        fn dfs(
+            depth: usize,
+            model: &mut Model,
+            prod: &mut ProdState,
+            path: &mut Vec<Op>,
+            visited: &mut BTreeSet<String>,
+        ) {
+            assert!(model.check_all_invariants().is_ok());
+            assert!(check_production_invariants(&prod.inner).is_ok());
+
+            let model_snap: BTreeMap<_, _> = model.groups.iter().map(|(k, g)| {
+                let running = g.running.clone();
+                let pending: Vec<_> = g.pending.iter().cloned().collect();
+                (k.clone(), (running, pending))
+            }).collect();
+            let prod_snap = prod.snapshot();
+            for (key, m_group) in &model_snap {
+                if let Some((p_running, p_pending)) = prod_snap.get(key) {
+                    assert_eq!(&m_group.0, p_running, "Running mismatch in path: {:?}", path);
+                    assert_eq!(&m_group.1, p_pending, "Pending mismatch in path: {:?}", path);
+                }
+            }
+
+            if depth >= 6 {
+                return;
+            }
+
+            let mut ops = Vec::new();
+
+            for run in 0..3u32 {
+                let token = HolderToken {
+                    run,
+                    kind: HolderKind::Run,
+                };
+                if !model.holder_state.contains_key(&token) {
+                    for group_name in ["grp-1", "grp-2"] {
+                        for queue in [ConcurrencyQueue::Single, ConcurrencyQueue::Max] {
+                            for cancel in [false, true] {
+                                ops.push(Op::Submit {
+                                    run,
+                                    kind: HolderKind::Run,
+                                    repo: "repo-a".to_owned(),
+                                    group: group_name.to_owned(),
+                                    queue,
+                                    cancel_in_progress: cancel,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            for (_key, group) in &model.groups {
+                if let Some(running) = &group.running {
+                    ops.push(Op::Release {
+                        run: running.run,
+                        kind: running.kind.clone(),
+                    });
+                }
+            }
+
+            for (token, state) in &model.holder_state {
+                if matches!(state, HolderState::Running | HolderState::Pending) {
+                    ops.push(Op::Cancel { run: token.run });
+                }
+            }
+
+            for op in ops {
+                let mut next_model = model.clone();
+                let mut next_prod = prod.clone_concurrency();
+
+                execute_op(&mut next_model, &mut next_prod, &op);
+
+                let state_key = format!("{:?}_{:?}", next_model.groups, next_model.holder_state);
+                if visited.insert(state_key) {
+                    path.push(op);
+                    dfs(depth + 1, &mut next_model, &mut next_prod, path, visited);
+                    path.pop();
+                }
+            }
+        }
+
+        dfs(0, &mut model, &mut prod, &mut path, &mut visited);
+        println!("Exhaustive state space traversal complete. Visited {} unique states.", visited.len());
     }
 }
 
