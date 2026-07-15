@@ -1,0 +1,29 @@
+{
+  "workflow": "06-queue-max-B",
+  "run_id": "d24487ba-c974-41cf-949c-4c36602f34ec",
+  "status": "completed",
+  "conclusion": "success",
+  "jobs": [
+    {
+      "name": "build",
+      "id": "build",
+      "status": "success",
+      "conclusion": "success",
+      "steps": [
+        {
+          "name": "Set up job",
+          "conclusion": "success"
+        },
+        {
+          "name": "marker",
+          "conclusion": "success"
+        },
+        {
+          "name": "Complete job",
+          "conclusion": "success"
+        }
+      ]
+    }
+  ],
+  "source": "aksh"
+}
