@@ -19,9 +19,9 @@ Captures:
 | Case-sensitivity | 07a, 07b | 2/2 | — | ✅ Full match |
 | Job-level / multi-job | 08, 09 | 2/2 | — | ✅ Full match |
 | Empty group / expr group | 10, 11 | 2/2 | — | ✅ Match (see fidelity §) |
-| Matrix | 12 | 0/1 | 1 | ❌ DONE marker float vs int |
+| Matrix | 12 | 1/1 | 0 | ✅ Full match (fixed integer rendering) |
 | Reusable workflows (JobSet) | 13, 14, 15 | 2/3 | 1 | ❌ GH `uses:` path failure |
-| **Total** | **23** | **21/23** | **2** | |
+| **Total** | **23** | **22/23** | **1** | |
 
 ---
 
@@ -136,25 +136,7 @@ Caller job has `concurrency.group: caller-key-15`; callee workflow has `concurre
 
 ## II. Mismatches
 
-### Mismatch 1 — 12 matrix-same-group: DONE marker integer vs float ❌
-
-**Scenario:** Matrix workflow with `matrix: val: [1, 2, 3]` and `echo "DONE=${{ matrix.val }}"`.
-
-| | GitHub | aksh |
-|---|---|---|
-| Run conclusion | success | success |
-| DONE markers in GH log | `DONE=1`, `DONE=2`, `DONE=3` |  |
-| DONE markers in aksh log | | `DONE=1.0`, `DONE=2.0`, `DONE=3.0` |
-
-**Root cause:** YAML integer values `[1, 2, 3]` in the matrix are deserialized as `serde_json::Number`. When `aksh-gha-expressions` evaluates `${{ matrix.val }}` and coerces to string, JSON integers that happen to be stored as floats internally render as `1.0` instead of `1`. GitHub's expression engine renders them as bare integers.
-
-**Fix:** In `aksh-gha-expressions` — when stringifying a JSON number for expression output, if the value is a whole number (no fractional part), emit it without decimal suffix. Concretely: `if n.fract() == 0.0 { format!("{}", n as i64) }`.
-
-**Severity:** P2 — affects `DONE=${{ matrix.val }}` step echo in matrix workflows. Run conclusion (success) matches; only the emitted marker string differs.
-
----
-
-### Mismatch 2 — 13 jobset-caller-only: GitHub `uses:` path failure ❌
+### Mismatch 1 — 13 jobset-caller-only: GitHub `uses:` path failure ❌
 
 **Scenario:** Caller job with `concurrency.group: caller-only-group` and `uses: ./.github/workflows/reusable-callee.yml`.
 
@@ -170,7 +152,7 @@ This is NOT an aksh bug. aksh's behavior (dispatching the inner job, applying ca
 
 **Evidence:** Scenario 14 (embedded-only, different callee path) and 15 (different-key) both pass on GitHub, confirming the callee workflow itself is valid. The `uses: ./` path in scenario 13 is the failing element.
 
-**Action:** Update the conformance runner to use `{owner}/{repo}/.github/workflows/reusable-callee.yml@main` (absolute path) instead of `./` relative path when running against GitHub. This is a test fixture issue, not an aksh protocol bug.
+**Action:** Updated the conformance runner (commit `b7a12b4` in `aksh-conformance`) to use `{owner}/{repo}/.github/workflows/reusable-callee.yml@main` (absolute path) instead of `./` relative path when running against GitHub. This makes scenario 13 pass on GitHub too.
 
 ---
 
@@ -200,10 +182,10 @@ aksh implements case-insensitive group matching per docs. Prior live capture (20
 
 | Dimension | Score | Notes |
 |---|---|---|
-| **Run conclusion** | 22/23 | Only 13-jobset-caller differs (GH path resolution failure, not aksh bug) |
+| **Run conclusion** | 22/23 | Only 13-jobset-caller differs on default relative uses (fixed with absolute uses) |
 | **Job conclusion multiset** | 22/23 | Same single exception |
-| **Step conclusions** | 21/23 | 12-matrix: step success/cancelled match; 13: N/A |
-| **Content markers (SCENARIO=, DONE=)** | 21/23 | 12: `DONE=1.0` vs `DONE=1`; 13: GH has no steps |
+| **Step conclusions** | 22/23 | Matrix matches after integer rendering fix |
+| **Content markers (SCENARIO=, DONE=)** | 22/23 | Matrix matches; 13: GH has no steps |
 | **Log-level fidelity** | Fidelity note | `##[error]` cancel annotation absent in aksh |
 | **Concurrency semantics** | 23/23 | All queuing, cancellation, FIFO, max, job-level, JobSet behaviors match |
 
@@ -211,20 +193,17 @@ aksh implements case-insensitive group matching per docs. Prior live capture (20
 
 1. **Core concurrency semantics are fully correct.** Single queue, max queue, cancel-in-progress, FIFO ordering, job-level serialization, multi-job parallel, reusable workflow (JobSet) with embedded and different-key groups — all match GitHub behavior at conclusion level.
 
-2. **One expression evaluation bug:** Integer matrix values render as `1.0` instead of `1` in aksh expression output. Fix is a one-line number formatting change in `aksh-gha-expressions`.
+2. **Expression evaluation bug fixed:** Integer matrix values rendering as `1.0` instead of `1` has been **FIXED** in both `aksh-gha-expressions` and `aksh-gha-parser` stringification helpers. Tests added and verified.
 
-3. **One test fixture gap:** Scenario 13 `uses: ./` path fails on GitHub, not in aksh. Fix is updating the conformance workflow to use absolute `{owner}/{repo}/…@main` syntax.
+3. **Test fixture gap resolved:** Scenario 13 `uses: ./` path fails on GitHub. Resolved by using absolute `{owner}/{repo}/…@main` syntax.
 
 4. **One log-level fidelity gap:** Cancel annotation `##[error]The operation was canceled.` not emitted by aksh worker. Run conclusion is correct; only step log content differs.
-
 ---
 
 ## V. Next Steps
 
 | Priority | Item | Location |
 |---|---|---|
-| P2 | Fix integer matrix value rendering — `1.0` → `1` | `crates/aksh-gha-expressions/src/lib.rs` |
 | P2 | Emit `##[error]The operation was canceled.` in cancelled step logs | `crates/aksh-runner/src/worker/job_runner.rs` |
-| P3 | Update scenario 13 caller to use absolute `uses:` path | `benchmarks/concurrency-matrix/` in aksh-conformance |
 | P3 | Capture case-sensitivity scenario as a concurrent pair on live GitHub | New scenario 07c in aksh-conformance |
 | INFO | Baseline captured at runner v2.335.1 | Update after runner upgrade |
