@@ -1,12 +1,14 @@
 [
   {
-    "ok": true,
-    "issues": [],
+    "ok": false,
+    "issues": [
+      "user step count: gh=1 aksh=0",
+      "missing aksh step matching GH step 'marker' (success)"
+    ],
     "notes": [
       "run conclusion match: success",
       "scenario marker present: SCENARIO=01-bare-string",
       "DONE marker present: DONE=01",
-      "step 'marker'\u2248'marker' conclusion=success",
       "job conclusions match: ['success']"
     ],
     "gh": {
@@ -25,18 +27,20 @@
         "SCENARIO=01-bare-string"
       ]
     },
-    "name": "01 bare-string A",
+    "name": "01 bare A",
     "gh_path": "/tmp/aksh-conformance/results/github-official/01-bare-A",
-    "aksh_path": "/tmp/aksh-sync/aksh-capture/01-bare-A"
+    "aksh_path": "/tmp/aksh-conformance/results/final-2026-07-15/aksh-aksh/01-bare-A"
   },
   {
-    "ok": true,
-    "issues": [],
+    "ok": false,
+    "issues": [
+      "user step count: gh=1 aksh=0",
+      "missing aksh step matching GH step 'marker' (success)"
+    ],
     "notes": [
       "run conclusion match: success",
       "scenario marker present: SCENARIO=01-bare-string",
       "DONE marker present: DONE=01",
-      "step 'marker'\u2248'marker' conclusion=success",
       "job conclusions match: ['success']"
     ],
     "gh": {
@@ -55,18 +59,20 @@
         "SCENARIO=01-bare-string"
       ]
     },
-    "name": "01 bare-string B",
+    "name": "01 bare B",
     "gh_path": "/tmp/aksh-conformance/results/github-official/01-bare-B",
-    "aksh_path": "/tmp/aksh-sync/aksh-capture/01-bare-B"
+    "aksh_path": "/tmp/aksh-conformance/results/final-2026-07-15/aksh-aksh/01-bare-B"
   },
   {
-    "ok": true,
-    "issues": [],
+    "ok": false,
+    "issues": [
+      "user step count: gh=1 aksh=0",
+      "missing aksh step matching GH step 'sleep-long' (cancelled)"
+    ],
     "notes": [
       "run conclusion match: cancelled",
       "scenario marker present: SCENARIO=02-cancel-in-progress",
       "cancel error annotation present on both",
-      "step 'sleep-long'\u2248'sleep-long' conclusion=cancelled",
       "job conclusions match: ['cancelled']"
     ],
     "gh": {
@@ -87,15 +93,17 @@
     },
     "name": "02 cancel-in-progress A",
     "gh_path": "/tmp/aksh-conformance/results/github-official/02-cancel-A",
-    "aksh_path": "/tmp/aksh-sync/aksh-capture/02-cancel-A"
+    "aksh_path": "/tmp/aksh-conformance/results/final-2026-07-15/aksh-aksh/02-cancel-A"
   },
   {
-    "ok": true,
-    "issues": [],
+    "ok": false,
+    "issues": [
+      "user step count: gh=1 aksh=0",
+      "missing aksh step matching GH step 'sleep-long' (success)"
+    ],
     "notes": [
       "run conclusion match: success",
       "scenario marker present: SCENARIO=02-cancel-in-progress",
-      "step 'sleep-long'\u2248'sleep-long' conclusion=success",
       "job conclusions match: ['success']"
     ],
     "gh": {
@@ -116,16 +124,18 @@
     },
     "name": "02 cancel-in-progress B",
     "gh_path": "/tmp/aksh-conformance/results/github-official/02-cancel-B",
-    "aksh_path": "/tmp/aksh-sync/aksh-capture/02-cancel-B"
+    "aksh_path": "/tmp/aksh-conformance/results/final-2026-07-15/aksh-aksh/02-cancel-B"
   },
   {
-    "ok": true,
-    "issues": [],
+    "ok": false,
+    "issues": [
+      "user step count: gh=1 aksh=0",
+      "missing aksh step matching GH step 'sleep-a-bit' (success)"
+    ],
     "notes": [
       "run conclusion match: success",
       "scenario marker present: SCENARIO=03-fifo-pending",
       "DONE marker present: DONE=03",
-      "step 'sleep-a-bit'\u2248'sleep-a-bit' conclusion=success",
       "job conclusions match: ['success']"
     ],
     "gh": {
@@ -144,18 +154,20 @@
         "SCENARIO=03-fifo-pending"
       ]
     },
-    "name": "03 fifo-pending A",
+    "name": "03 FIFO A",
     "gh_path": "/tmp/aksh-conformance/results/github-official/03-fifo-A",
-    "aksh_path": "/tmp/aksh-sync/aksh-capture/03-fifo-A"
+    "aksh_path": "/tmp/aksh-conformance/results/final-2026-07-15/aksh-aksh/03-fifo-A"
   },
   {
-    "ok": true,
-    "issues": [],
+    "ok": false,
+    "issues": [
+      "user step count: gh=1 aksh=0",
+      "missing aksh step matching GH step 'sleep-a-bit' (success)"
+    ],
     "notes": [
       "run conclusion match: success",
       "scenario marker present: SCENARIO=03-fifo-pending",
       "DONE marker present: DONE=03",
-      "step 'sleep-a-bit'\u2248'sleep-a-bit' conclusion=success",
       "job conclusions match: ['success']"
     ],
     "gh": {
@@ -174,18 +186,20 @@
         "SCENARIO=03-fifo-pending"
       ]
     },
-    "name": "03 fifo-pending B",
+    "name": "03 FIFO B",
     "gh_path": "/tmp/aksh-conformance/results/github-official/03-fifo-B",
-    "aksh_path": "/tmp/aksh-sync/aksh-capture/03-fifo-B"
+    "aksh_path": "/tmp/aksh-conformance/results/final-2026-07-15/aksh-aksh/03-fifo-B"
   },
   {
-    "ok": true,
-    "issues": [],
+    "ok": false,
+    "issues": [
+      "user step count: gh=1 aksh=0",
+      "missing aksh step matching GH step 'sleep-long' (cancelled)"
+    ],
     "notes": [
       "run conclusion match: cancelled",
       "scenario marker present: SCENARIO=04-cancel-expr-true",
       "cancel error annotation present on both",
-      "step 'sleep-long'\u2248'sleep-long' conclusion=cancelled",
       "job conclusions match: ['cancelled']"
     ],
     "gh": {
@@ -204,17 +218,19 @@
         "SCENARIO=04-cancel-expr-true"
       ]
     },
-    "name": "04 cancel-expr-true A",
+    "name": "04 cancel expression A",
     "gh_path": "/tmp/aksh-conformance/results/github-official/04-cancel-expr-A",
-    "aksh_path": "/tmp/aksh-sync/aksh-capture/04-cancel-expr-A"
+    "aksh_path": "/tmp/aksh-conformance/results/final-2026-07-15/aksh-aksh/04-cancel-expr-A"
   },
   {
-    "ok": true,
-    "issues": [],
+    "ok": false,
+    "issues": [
+      "user step count: gh=1 aksh=0",
+      "missing aksh step matching GH step 'sleep-long' (success)"
+    ],
     "notes": [
       "run conclusion match: success",
       "scenario marker present: SCENARIO=04-cancel-expr-true",
-      "step 'sleep-long'\u2248'sleep-long' conclusion=success",
       "job conclusions match: ['success']"
     ],
     "gh": {
@@ -233,18 +249,20 @@
         "SHOULD_NOT_REACH_EXECUTED"
       ]
     },
-    "name": "04 cancel-expr-true B",
+    "name": "04 cancel expression B",
     "gh_path": "/tmp/aksh-conformance/results/github-official/04-cancel-expr-B",
-    "aksh_path": "/tmp/aksh-sync/aksh-capture/04-cancel-expr-B"
+    "aksh_path": "/tmp/aksh-conformance/results/final-2026-07-15/aksh-aksh/04-cancel-expr-B"
   },
   {
-    "ok": true,
-    "issues": [],
+    "ok": false,
+    "issues": [
+      "user step count: gh=1 aksh=0",
+      "missing aksh step matching GH step 'sleep-a-bit' (success)"
+    ],
     "notes": [
       "run conclusion match: success",
       "scenario marker present: SCENARIO=05-cancel-expr-false",
       "DONE marker present: DONE=05",
-      "step 'sleep-a-bit'\u2248'sleep-a-bit' conclusion=success",
       "job conclusions match: ['success']"
     ],
     "gh": {
@@ -263,18 +281,20 @@
         "SCENARIO=05-cancel-expr-false"
       ]
     },
-    "name": "05 cancel-expr-false A",
+    "name": "05 false expression A",
     "gh_path": "/tmp/aksh-conformance/results/github-official/05-expr-false-A",
-    "aksh_path": "/tmp/aksh-sync/aksh-capture/05-expr-false-A"
+    "aksh_path": "/tmp/aksh-conformance/results/final-2026-07-15/aksh-aksh/05-expr-false-A"
   },
   {
-    "ok": true,
-    "issues": [],
+    "ok": false,
+    "issues": [
+      "user step count: gh=1 aksh=0",
+      "missing aksh step matching GH step 'sleep-a-bit' (success)"
+    ],
     "notes": [
       "run conclusion match: success",
       "scenario marker present: SCENARIO=05-cancel-expr-false",
       "DONE marker present: DONE=05",
-      "step 'sleep-a-bit'\u2248'sleep-a-bit' conclusion=success",
       "job conclusions match: ['success']"
     ],
     "gh": {
@@ -293,18 +313,20 @@
         "SCENARIO=05-cancel-expr-false"
       ]
     },
-    "name": "05 cancel-expr-false B",
+    "name": "05 false expression B",
     "gh_path": "/tmp/aksh-conformance/results/github-official/05-expr-false-B",
-    "aksh_path": "/tmp/aksh-sync/aksh-capture/05-expr-false-B"
+    "aksh_path": "/tmp/aksh-conformance/results/final-2026-07-15/aksh-aksh/05-expr-false-B"
   },
   {
-    "ok": true,
-    "issues": [],
+    "ok": false,
+    "issues": [
+      "user step count: gh=1 aksh=0",
+      "missing aksh step matching GH step 'marker' (success)"
+    ],
     "notes": [
       "run conclusion match: success",
       "scenario marker present: SCENARIO=06-queue-max",
       "DONE marker present: DONE=06",
-      "step 'marker'\u2248'marker' conclusion=success",
       "job conclusions match: ['success']"
     ],
     "gh": {
@@ -323,18 +345,20 @@
         "SCENARIO=06-queue-max"
       ]
     },
-    "name": "06 queue-max A",
+    "name": "06 queue max A",
     "gh_path": "/tmp/aksh-conformance/results/github-official/06-queue-max-A",
-    "aksh_path": "/tmp/aksh-sync/aksh-capture/06-queue-max-A"
+    "aksh_path": "/tmp/aksh-conformance/results/final-2026-07-15/aksh-aksh/06-queue-max-A"
   },
   {
-    "ok": true,
-    "issues": [],
+    "ok": false,
+    "issues": [
+      "user step count: gh=1 aksh=0",
+      "missing aksh step matching GH step 'marker' (success)"
+    ],
     "notes": [
       "run conclusion match: success",
       "scenario marker present: SCENARIO=06-queue-max",
       "DONE marker present: DONE=06",
-      "step 'marker'\u2248'marker' conclusion=success",
       "job conclusions match: ['success']"
     ],
     "gh": {
@@ -353,18 +377,20 @@
         "SCENARIO=06-queue-max"
       ]
     },
-    "name": "06 queue-max B",
+    "name": "06 queue max B",
     "gh_path": "/tmp/aksh-conformance/results/github-official/06-queue-max-B",
-    "aksh_path": "/tmp/aksh-sync/aksh-capture/06-queue-max-B"
+    "aksh_path": "/tmp/aksh-conformance/results/final-2026-07-15/aksh-aksh/06-queue-max-B"
   },
   {
-    "ok": true,
-    "issues": [],
+    "ok": false,
+    "issues": [
+      "user step count: gh=1 aksh=0",
+      "missing aksh step matching GH step 'marker' (success)"
+    ],
     "notes": [
       "run conclusion match: success",
       "scenario marker present: SCENARIO=06-queue-max",
       "DONE marker present: DONE=06",
-      "step 'marker'\u2248'marker' conclusion=success",
       "job conclusions match: ['success']"
     ],
     "gh": {
@@ -383,18 +409,20 @@
         "SCENARIO=06-queue-max"
       ]
     },
-    "name": "06 queue-max C",
+    "name": "06 queue max C",
     "gh_path": "/tmp/aksh-conformance/results/github-official/06-queue-max-C",
-    "aksh_path": "/tmp/aksh-sync/aksh-capture/06-queue-max-C"
+    "aksh_path": "/tmp/aksh-conformance/results/final-2026-07-15/aksh-aksh/06-queue-max-C"
   },
   {
-    "ok": true,
-    "issues": [],
+    "ok": false,
+    "issues": [
+      "user step count: gh=1 aksh=0",
+      "missing aksh step matching GH step 'marker' (success)"
+    ],
     "notes": [
       "run conclusion match: success",
       "scenario marker present: SCENARIO=07-case-Prod",
       "DONE marker present: DONE=07a",
-      "step 'marker'\u2248'marker' conclusion=success",
       "job conclusions match: ['success']"
     ],
     "gh": {
@@ -413,18 +441,20 @@
         "SCENARIO=07-case-Prod"
       ]
     },
-    "name": "07a case-Prod",
+    "name": "07 case Prod",
     "gh_path": "/tmp/aksh-conformance/results/github-official/07a-case-Prod",
-    "aksh_path": "/tmp/aksh-sync/aksh-capture/07a-case-Prod"
+    "aksh_path": "/tmp/aksh-conformance/results/final-2026-07-15/aksh-aksh/07a-case-Prod"
   },
   {
-    "ok": true,
-    "issues": [],
+    "ok": false,
+    "issues": [
+      "user step count: gh=1 aksh=0",
+      "missing aksh step matching GH step 'marker' (success)"
+    ],
     "notes": [
       "run conclusion match: success",
       "scenario marker present: SCENARIO=07-case-prod",
       "DONE marker present: DONE=07b",
-      "step 'marker'\u2248'marker' conclusion=success",
       "job conclusions match: ['success']"
     ],
     "gh": {
@@ -443,20 +473,22 @@
         "SCENARIO=07-case-prod"
       ]
     },
-    "name": "07b case-prod",
+    "name": "07 case prod",
     "gh_path": "/tmp/aksh-conformance/results/github-official/07b-case-prod",
-    "aksh_path": "/tmp/aksh-sync/aksh-capture/07b-case-prod"
+    "aksh_path": "/tmp/aksh-conformance/results/final-2026-07-15/aksh-aksh/07b-case-prod"
   },
   {
-    "ok": true,
-    "issues": [],
+    "ok": false,
+    "issues": [
+      "user step count: gh=2 aksh=0",
+      "missing aksh step matching GH step 'one' (success)",
+      "missing aksh step matching GH step 'two' (success)"
+    ],
     "notes": [
       "run conclusion match: success",
       "scenario marker present: SCENARIO=08-job-level",
       "DONE marker present: DONE=one",
       "DONE marker present: DONE=two",
-      "step 'one'\u2248'one' conclusion=success",
-      "step 'two'\u2248'two' conclusion=success",
       "job conclusions match: ['success', 'success']"
     ],
     "gh": {
@@ -479,18 +511,20 @@
     },
     "name": "08 job-level",
     "gh_path": "/tmp/aksh-conformance/results/github-official/08-job-level",
-    "aksh_path": "/tmp/aksh-sync/aksh-capture/08-job-level"
+    "aksh_path": "/tmp/aksh-conformance/results/final-2026-07-15/aksh-aksh/08-job-level"
   },
   {
-    "ok": true,
-    "issues": [],
+    "ok": false,
+    "issues": [
+      "user step count: gh=2 aksh=0",
+      "missing aksh step matching GH step 'two' (success)",
+      "missing aksh step matching GH step 'one' (success)"
+    ],
     "notes": [
       "run conclusion match: success",
       "scenario marker present: SCENARIO=09-multi-job",
       "DONE marker present: DONE=one",
       "DONE marker present: DONE=two",
-      "step 'two'\u2248'two' conclusion=success",
-      "step 'one'\u2248'one' conclusion=success",
       "job conclusions match: ['success', 'success']"
     ],
     "gh": {
@@ -511,15 +545,16 @@
         "SCENARIO=09-multi-job"
       ]
     },
-    "name": "09 multi-job-hold",
+    "name": "09 multi-job",
     "gh_path": "/tmp/aksh-conformance/results/github-official/09-multi-job",
-    "aksh_path": "/tmp/aksh-sync/aksh-capture/09-multi-job"
+    "aksh_path": "/tmp/aksh-conformance/results/final-2026-07-15/aksh-aksh/09-multi-job"
   },
   {
     "ok": true,
     "issues": [],
     "notes": [
-      "run conclusion match: failure"
+      "run conclusion match: failure",
+      "job conclusions match: []"
     ],
     "gh": {
       "name": "10-empty",
@@ -531,18 +566,20 @@
       "conclusion": "failure",
       "markers": []
     },
-    "name": "10 empty-group",
+    "name": "10 empty group",
     "gh_path": "/tmp/aksh-conformance/results/github-official/10-empty",
-    "aksh_path": "/tmp/aksh-sync/aksh-capture/10-empty-group"
+    "aksh_path": "/tmp/aksh-conformance/results/final-2026-07-15/aksh-aksh/10-empty-group"
   },
   {
-    "ok": true,
-    "issues": [],
+    "ok": false,
+    "issues": [
+      "user step count: gh=1 aksh=0",
+      "missing aksh step matching GH step 'marker' (success)"
+    ],
     "notes": [
       "run conclusion match: success",
       "scenario marker present: SCENARIO=11-expr-group-ref",
       "DONE marker present: DONE=11",
-      "step 'marker'\u2248'marker' conclusion=success",
       "job conclusions match: ['success']"
     ],
     "gh": {
@@ -561,22 +598,22 @@
         "SCENARIO=11-expr-group-ref"
       ]
     },
-    "name": "11 expr-group-ref",
+    "name": "11 expression group",
     "gh_path": "/tmp/aksh-conformance/results/github-official/11-expr-group",
-    "aksh_path": "/tmp/aksh-sync/aksh-capture/11-expr-group"
+    "aksh_path": "/tmp/aksh-conformance/results/final-2026-07-15/aksh-aksh/11-expr-group"
   },
   {
     "ok": false,
     "issues": [
-      "cross-run log contamination: aksh extra DONE markers ['DONE=1.0', 'DONE=2.0', 'DONE=3.0']",
-      "DONE marker missing in aksh: DONE=1",
-      "DONE marker missing in aksh: DONE=2",
-      "DONE marker missing in aksh: DONE=3"
+      "user step count: gh=1 aksh=0",
+      "missing aksh step matching GH step 'run-cell' (success)"
     ],
     "notes": [
       "run conclusion match: success",
       "scenario marker present: SCENARIO=12-matrix",
-      "step 'run-cell'\u2248'run-cell' conclusion=success",
+      "DONE marker present: DONE=1",
+      "DONE marker present: DONE=2",
+      "DONE marker present: DONE=3",
       "job conclusions match: ['success', 'success', 'success']"
     ],
     "gh": {
@@ -593,22 +630,24 @@
       "name": "12-matrix",
       "conclusion": "success",
       "markers": [
-        "DONE=1.0",
-        "DONE=2.0",
-        "DONE=3.0",
+        "DONE=1",
+        "DONE=2",
+        "DONE=3",
         "SCENARIO=12-matrix"
       ]
     },
-    "name": "12 matrix-same-group",
+    "name": "12 matrix",
     "gh_path": "/tmp/aksh-conformance/results/github-official/12-matrix",
-    "aksh_path": "/tmp/aksh-sync/aksh-capture/12-matrix"
+    "aksh_path": "/tmp/aksh-conformance/results/final-2026-07-15/aksh-aksh/12-matrix"
   },
   {
     "ok": false,
     "issues": [
       "run conclusion: gh=failure aksh=success",
-      "cross-run log contamination: aksh has extra SCENARIO markers ['SCENARIO=reusable-callee']",
-      "cross-run log contamination: aksh extra DONE markers ['DONE=reusable']"
+      "cross-run log contamination: aksh has SCENARIO markers ['SCENARIO=reusable-callee'] not present in GH capture []; capture run.log was not isolated to this run",
+      "cross-run log contamination: aksh has DONE markers ['DONE=reusable'] not present in GH capture []; capture run.log was not isolated to this run",
+      "job count: gh=0 aksh=1",
+      "job conclusions multiset: gh=[] aksh=['success']"
     ],
     "notes": [],
     "gh": {
@@ -624,18 +663,20 @@
         "SCENARIO=reusable-callee"
       ]
     },
-    "name": "13 jobset-caller-only",
+    "name": "13 caller JobSet",
     "gh_path": "/tmp/aksh-conformance/results/github-official/13-jobset-caller",
-    "aksh_path": "/tmp/aksh-sync/aksh-capture/13-jobset-caller"
+    "aksh_path": "/tmp/aksh-conformance/results/final-2026-07-15/aksh-aksh/13-jobset-caller"
   },
   {
-    "ok": true,
-    "issues": [],
+    "ok": false,
+    "issues": [
+      "user step count: gh=1 aksh=0",
+      "missing aksh step matching GH step 'run-inner' (success)"
+    ],
     "notes": [
       "run conclusion match: success",
       "scenario marker present: SCENARIO=reusable-callee",
       "DONE marker present: DONE=reusable",
-      "step 'run-inner'\u2248'run-inner' conclusion=success",
       "job conclusions match: ['success']"
     ],
     "gh": {
@@ -654,18 +695,20 @@
         "SCENARIO=reusable-callee"
       ]
     },
-    "name": "14 jobset-embedded-only",
+    "name": "14 embedded JobSet",
     "gh_path": "/tmp/aksh-conformance/results/github-official/14-jobset-embedded",
-    "aksh_path": "/tmp/aksh-sync/aksh-capture/14-jobset-embedded"
+    "aksh_path": "/tmp/aksh-conformance/results/final-2026-07-15/aksh-aksh/14-jobset-embedded"
   },
   {
-    "ok": true,
-    "issues": [],
+    "ok": false,
+    "issues": [
+      "user step count: gh=1 aksh=0",
+      "missing aksh step matching GH step 'run-inner' (success)"
+    ],
     "notes": [
       "run conclusion match: success",
       "scenario marker present: SCENARIO=reusable-callee",
       "DONE marker present: DONE=reusable",
-      "step 'run-inner'\u2248'run-inner' conclusion=success",
       "job conclusions match: ['success']"
     ],
     "gh": {
@@ -684,8 +727,8 @@
         "SCENARIO=reusable-callee"
       ]
     },
-    "name": "15 jobset-different-key",
+    "name": "15 different-key JobSet",
     "gh_path": "/tmp/aksh-conformance/results/github-official/15-jobset-diffkey",
-    "aksh_path": "/tmp/aksh-sync/aksh-capture/15-jobset-diffkey"
+    "aksh_path": "/tmp/aksh-conformance/results/final-2026-07-15/aksh-aksh/15-jobset-diffkey"
   }
 ]
