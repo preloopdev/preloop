@@ -10,6 +10,9 @@ pub mod github;
 /// Pure job-graph scheduler model and property tests.
 pub mod scheduling;
 
+/// GitHub-compatible OIDC id-token provider.
+pub mod oidc;
+
 use axum_server::{tls_rustls::RustlsConfig, Handle};
 use rcgen::generate_simple_self_signed;
 
@@ -52,7 +55,6 @@ use tracing::{debug, info, warn};
 const AKSH_SYSTEM_TOKEN: &str = "aksh-system-token";
 
 /// Server configuration.
-#[derive(Debug, Clone)]
 pub struct ServerConfig {
     /// Address to bind.
     pub listen: SocketAddr,
@@ -66,6 +68,9 @@ pub struct ServerConfig {
     pub enable_test_api: bool,
     /// Bearer token required by privileged simulation endpoints.
     pub test_api_token: Option<String>,
+    /// OIDC issuer URL. Defaults to `{public_base_url}/oidc`.
+    /// Set to `https://token.actions.githubusercontent.com` to mimic GitHub.
+    pub oidc_issuer: Option<String>,
 }
 
 /// TLS configuration.
@@ -229,6 +234,14 @@ async fn run_background_reaper(shared: Arc<SharedState>) {
 /// Start the server and block until shutdown.
 pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     let state = AppState::new(config.state_dir.clone()).await?;
+    // Resolve OIDC issuer: explicit config > default (public_base_url/oidc).
+    let oidc_issuer = config
+        .oidc_issuer
+        .unwrap_or_else(|| format!("{}/oidc", public_base_url()));
+    {
+        let mut inner = state.inner.lock().await;
+        inner.oidc_issuer = oidc_issuer;
+    }
     if let Some(path) = &config.record_flows {
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -450,6 +463,10 @@ fn build_app(
             get(oidc_token),
         )
         .route(
+            "/:orchestration_id//idtoken/:plan_id/:job_id",
+            get(oidc_token),
+        )
+        .route(
             "/_apis/v1/ActionDownloadInfo/:scope/:hub/:plan_id",
             post(action_download_info),
         )
@@ -525,6 +542,8 @@ fn build_app(
 
     let router = Router::new()
         .route("/healthz", get(healthz))
+        .route("/.well-known/openid-configuration", get(oidc_discovery))
+        .route("/.well-known/jwks.json", get(oidc_jwks))
         // GHES-style org-prefixed routes
         .route("/:org/_apis/connectionData", get(connection_data))
         .route("/:org/_apis/v1/oauth2/token", post(oauth2_token))
@@ -933,6 +952,7 @@ impl AppState {
         let (events, _) = broadcast::channel(1024);
         let keypair = AgentRsaKeypair::generate()
             .map_err(|e| anyhow::anyhow!("Failed to generate RSA keypair: {}", e))?;
+        let oidc_keypair = load_or_generate_oidc_keypair(&state_dir);
         let registry_path = state_dir.join("artifact_v2_registry.json");
         let (registry, next_id) = if registry_path.exists() {
             if let Ok(content) = std::fs::read_to_string(&registry_path) {
@@ -953,6 +973,7 @@ impl AppState {
             agent_keypair: Some(keypair),
             artifact_v2_registry: registry,
             next_artifact_v2_id: next_id,
+            oidc_keypair,
             ..Default::default()
         };
         let webhook_secret = std::env::var("AKSH_WEBHOOK_SECRET").ok();
@@ -973,6 +994,36 @@ impl AppState {
 
     async fn emit(&self, event: NdjsonEvent) {
         let _ = self.events.send(event);
+    }
+}
+
+/// Load the OIDC signing keypair from `<state_dir>/oidc-key.json`, or generate
+/// a new one and persist it for reuse across restarts.
+fn load_or_generate_oidc_keypair(state_dir: &std::path::Path) -> Option<oidc::OidcKeypair> {
+    let key_path = state_dir.join("oidc-key.json");
+    if key_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&key_path) {
+            if let Ok(params) =
+                serde_json::from_str::<aksh_gha_protocol::crypto::RsaParametersExport>(&content)
+            {
+                if let Ok(kp) = oidc::OidcKeypair::from_params(&params) {
+                    return Some(kp);
+                }
+            }
+        }
+    }
+    match oidc::OidcKeypair::generate() {
+        Ok(kp) => {
+            let params = kp.params();
+            if let Ok(json) = serde_json::to_string(&params) {
+                let _ = std::fs::write(&key_path, json);
+            }
+            Some(kp)
+        }
+        Err(e) => {
+            warn!("Failed to generate OIDC keypair: {e}");
+            None
+        }
     }
 }
 
@@ -1036,6 +1087,12 @@ struct InnerState {
     /// Monotonic artifact v2 ID counter.
     next_artifact_v2_id: u64,
     dap_ports: BTreeMap<RunId, DapPortRegistration>,
+    /// OIDC signing keypair (RS256) for id-token minting.
+    oidc_keypair: Option<oidc::OidcKeypair>,
+    /// Per-job `id-token: write` grant, keyed by (run_id, job_id).
+    id_token_grants: BTreeMap<(RunId, JobId), bool>,
+    /// OIDC issuer URL used in the `iss` claim and discovery document.
+    oidc_issuer: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1361,6 +1418,28 @@ pub(crate) async fn submit_run_inner(
             inner.next_request_id += 1;
             let request_id = inner.next_request_id;
             agent_msg.request_id = request_id;
+            // Track id-token:write grant for OIDC permission enforcement.
+            let id_token_granted =
+                oidc::parse_id_token_grant(&submission.workflow_yaml, Some(&job.id.0));
+            inner
+                .id_token_grants
+                .insert((run_id, job.id.clone()), id_token_granted);
+            // Inject GenerateIdTokenUrl into SystemVssConnection when id-token:write is granted.
+            if id_token_granted {
+                let oidc_url = format!(
+                    "{}/runner/server/_apis/distributedtask/hubs/actions/plans/{}/jobs/{}/oidctoken?api-version=2.0",
+                    public_base_url(),
+                    agent_msg.plan.plan_id,
+                    agent_msg.job_id,
+                );
+                for endpoint in &mut agent_msg.resources.endpoints {
+                    if endpoint.name.eq_ignore_ascii_case("SystemVssConnection") {
+                        endpoint
+                            .data
+                            .insert("GenerateIdTokenUrl".to_owned(), oidc_url.clone());
+                    }
+                }
+            }
             // Wire DAP debugger fields from submission
             agent_msg.enable_debugger = submission.enable_debugger;
             agent_msg.debugger_welcome_message = submission.debugger_welcome_message.clone();
@@ -2130,6 +2209,16 @@ fn public_base_url() -> String {
         .unwrap_or_else(|_| "http://127.0.0.1:9090".to_owned())
         .trim_end_matches('/')
         .to_owned()
+}
+
+/// Return the effective OIDC issuer URL, falling back to
+/// `{public_base_url}/oidc` when not explicitly configured.
+fn oidc_issuer_url(inner: &InnerState) -> String {
+    if inner.oidc_issuer.is_empty() {
+        format!("{}/oidc", public_base_url())
+    } else {
+        inner.oidc_issuer.clone()
+    }
 }
 
 fn websocket_base_url() -> String {
@@ -5800,6 +5889,8 @@ fn mint_runtime_token(plan_id: &str, job_id: &uuid::Uuid) -> String {
 #[derive(Debug, Deserialize)]
 struct OidcTokenQuery {
     audience: Option<String>,
+    #[serde(rename = "api-version")]
+    api_version: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -5807,45 +5898,217 @@ struct OidcTokenResponse {
     value: String,
 }
 
+/// `GET /runner/server/_apis/distributedtask/hubs/actions/plans/:plan_id/jobs/:job_id/oidctoken`
+///
+/// Mints a GitHub-compatible RS256-signed OIDC id-token JWT. Looks up the
+/// originating workflow run to populate claims, and enforces `id-token: write`.
 async fn oidc_token(
+    State(shared): State<Arc<SharedState>>,
     Path((plan_id, job_id)): Path<(String, String)>,
     Query(query): Query<OidcTokenQuery>,
 ) -> Result<Json<OidcTokenResponse>, ApiError> {
+    let inner = shared.state.inner.lock().await;
+
+    // Resolve plan_id → (run_id, job_id) to look up workflow context.
+    let (_, run_id, resolved_job_id) = resolve_callback_job(&inner, &plan_id, None, None)
+        .or_else(|| {
+            // Fallback: plan_id might itself be a job_id string.
+            let _ = &job_id;
+            None
+        })
+        .ok_or_else(|| ApiError::not_found("OIDC: job not found for plan_id"))?;
+
+    // Permission enforcement: id-token:write must be granted.
+    let granted = inner
+        .id_token_grants
+        .get(&(run_id, resolved_job_id.clone()))
+        .copied()
+        .unwrap_or(false);
+    if !granted {
+        return Err(ApiError::forbidden(
+            "id-token: write permission is required to request an OIDC token",
+        ));
+    }
+
+    // Get the OIDC signing keypair.
+    let oidc_kp = inner
+        .oidc_keypair
+        .as_ref()
+        .ok_or_else(|| ApiError::internal("OIDC signing keypair not available"))?;
+
+    // Build claims from the run's submission.
+    let run = inner
+        .runs
+        .get(&run_id)
+        .ok_or_else(|| ApiError::not_found("OIDC: run not found"))?;
+    let submission = &run.submission;
+    let repository_owner = submission
+        .repository
+        .split('/')
+        .next()
+        .unwrap_or("owner")
+        .to_string();
+
+    // Use sha from submission first-class field, fallback to payload extraction.
+    let sha = if submission.sha != "0000000000000000000000000000000000000000" {
+        submission.sha.clone()
+    } else {
+        submission
+            .payload
+            .get("after")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                submission
+                    .payload
+                    .get("pull_request")
+                    .and_then(|pr| pr.get("head"))
+                    .and_then(|h| h.get("sha"))
+                    .and_then(|v| v.as_str())
+            })
+            .unwrap_or("0000000000000000000000000000000000000000")
+            .to_string()
+    };
+
+    // Use actor from submission first-class field, fallback to payload extraction.
+    let actor = if submission.actor != "aksh-system" {
+        submission.actor.clone()
+    } else {
+        submission
+            .payload
+            .get("pusher")
+            .and_then(|p| p.get("name"))
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                submission
+                    .payload
+                    .get("sender")
+                    .and_then(|s| s.get("login"))
+                    .and_then(|v| v.as_str())
+            })
+            .unwrap_or("aksh-system")
+            .to_string()
+    };
+
+    // Extract actor_id from payload if available.
+    let actor_id = submission
+        .payload
+        .get("sender")
+        .and_then(|s| s.get("id"))
+        .and_then(|v| v.as_u64())
+        .map(|id| id.to_string())
+        .unwrap_or_default();
+
+    // Extract repository_id and repository_owner_id from payload.
+    let repository_id = submission
+        .payload
+        .get("repository")
+        .and_then(|r| r.get("id"))
+        .and_then(|v| v.as_u64())
+        .map(|id| id.to_string())
+        .unwrap_or_default();
+    let repository_owner_id = submission
+        .payload
+        .get("repository")
+        .and_then(|r| r.get("owner"))
+        .and_then(|o| o.get("id"))
+        .and_then(|v| v.as_u64())
+        .map(|id| id.to_string())
+        .unwrap_or_default();
+
+    let workflow_name = parse_workflow(&submission.workflow_yaml)
+        .ok()
+        .and_then(|w| w.name)
+        .unwrap_or_default();
+
+    // Derive the workflow filename: explicit > parsed from YAML > "workflow.yml"
+    let workflow_file = submission
+        .workflow_file
+        .clone()
+        .unwrap_or_else(|| "workflow.yml".to_owned());
+
+    let head_ref = submission
+        .payload
+        .get("pull_request")
+        .and_then(|pr| pr.get("head"))
+        .and_then(|h| h.get("ref"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let base_ref = submission
+        .payload
+        .get("pull_request")
+        .and_then(|pr| pr.get("base"))
+        .and_then(|b| b.get("ref"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let workflow_ref = format!(
+        "{}/.github/workflows/{}@{}",
+        submission.repository, workflow_file, submission.git_ref
+    );
+
+    let claims_input = oidc::OidcClaimsInput {
+        repository: submission.repository.clone(),
+        repository_owner,
+        git_ref: submission.git_ref.clone(),
+        event_name: submission.event.clone(),
+        sha: sha.clone(),
+        actor,
+        actor_id,
+        workflow: workflow_name,
+        run_id: run_id.to_string(),
+        run_number: "1".to_string(),
+        run_attempt: "1".to_string(),
+        head_ref,
+        base_ref,
+        environment: submission.environment.clone(),
+        repository_visibility: "private".to_string(),
+        repository_id,
+        repository_owner_id,
+        workflow_ref: Some(workflow_ref),
+        workflow_sha: Some(sha),
+        job_workflow_ref: None,
+        job_workflow_sha: None,
+    };
+
+    let audience = query
+        .audience
+        .unwrap_or_else(|| oidc::default_audience(&claims_input.repository_owner));
+
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| ApiError::bad_request(format!("system clock before epoch: {error}")))?
         .as_secs();
-    let audience = query.audience.unwrap_or_else(|| "api://aksh".to_owned());
-    let header = json!({
-        "alg": "HS256",
-        "typ": "JWT",
-        "kid": "aksh-local"
-    });
-    let claims = json!({
-        "iss": "https://aksh.local",
-        "sub": format!("repo:local:job:{job_id}"),
-        "aud": audience,
-        "iat": now,
-        "nbf": now,
-        "exp": now + 600,
-        "jti": uuid::Uuid::new_v4().to_string(),
-        "job_id": job_id,
-        "plan_id": plan_id,
-    });
 
-    let signing_input = format!(
-        "{}.{}",
-        base64_url_json(&header)?,
-        base64_url_json(&claims)?
-    );
-    let mut mac = Hmac::<Sha256>::new_from_slice(b"aksh-local-oidc-signing-key")
-        .map_err(|error| ApiError::bad_request(format!("invalid signing key: {error}")))?;
-    mac.update(signing_input.as_bytes());
-    let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    let issuer = oidc_issuer_url(&inner);
+    let claims = oidc::build_claims(&claims_input, &audience, &issuer, now);
 
-    Ok(Json(OidcTokenResponse {
-        value: format!("{signing_input}.{signature}"),
-    }))
+    let jwt = oidc_kp
+        .sign_jwt(&claims)
+        .map_err(|e| ApiError::internal(format!("OIDC token signing failed: {e}")))?;
+
+    Ok(Json(OidcTokenResponse { value: jwt }))
+}
+
+/// `GET /.well-known/openid-configuration` — OIDC discovery document.
+async fn oidc_discovery(
+    State(shared): State<Arc<SharedState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let inner = shared.state.inner.lock().await;
+    let issuer = oidc_issuer_url(&inner);
+    let jwks_uri = format!("{}/.well-known/jwks.json", public_base_url());
+    Ok(Json(oidc::discovery_document(&issuer, &jwks_uri)))
+}
+
+/// `GET /.well-known/jwks.json` — JSON Web Key Set for OIDC token verification.
+async fn oidc_jwks(
+    State(shared): State<Arc<SharedState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let inner = shared.state.inner.lock().await;
+    let kp = inner
+        .oidc_keypair
+        .as_ref()
+        .ok_or_else(|| ApiError::internal("OIDC keypair not available"))?;
+    Ok(Json(kp.jwks()))
 }
 
 fn base64_url_json(value: &serde_json::Value) -> Result<String, ApiError> {
@@ -6126,6 +6389,13 @@ impl ApiError {
     fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
+            message: message.into(),
+        }
+    }
+
+    fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
             message: message.into(),
         }
     }
@@ -8613,55 +8883,192 @@ jobs:
     }
 
     #[tokio::test]
-    async fn oidc_endpoint_mints_jwt_with_requested_audience() {
+    async fn oidc_endpoint_mints_rs256_jwt_with_requested_audience() {
         let temp = tempfile::tempdir().unwrap();
-        let app = app(
-            AppState::new(temp.path().to_path_buf()).await.unwrap(),
-            CancellationToken::new(),
-        );
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let workflow = json!({
+            "workflow_yaml": "name: oidc-test\non: push\npermissions:\n  id-token: write\n  contents: read\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo",
+        });
+        let resp = request_json(&app, Method::POST, "/api/v1/runs", workflow).await;
+        let _run_id: RunId = resp["run_id"].as_str().unwrap().parse().unwrap();
+
+        // Get the plan_id from the queued job's message.
+        let plan_id = {
+            let inner = state.inner.lock().await;
+            inner
+                .queue
+                .front()
+                .or_else(|| inner.pending_jobs.front())
+                .map(|j| j.message.plan.plan_id.clone())
+                .unwrap()
+        };
 
         let token = request_json(
             &app,
             Method::GET,
-            "/runner/server/_apis/distributedtask/hubs/actions/plans/plan-1/jobs/job-1/oidctoken?audience=api://custom",
+            &format!("/runner/server/_apis/distributedtask/hubs/actions/plans/{plan_id}/jobs/job-1/oidctoken?audience=api://custom"),
             Value::Null,
         )
         .await;
         let jwt = token["value"].as_str().unwrap();
         let parts: Vec<&str> = jwt.split('.').collect();
         assert_eq!(parts.len(), 3);
-        let claims = URL_SAFE_NO_PAD.decode(parts[1]).unwrap();
-        let claims: Value = serde_json::from_slice(&claims).unwrap();
 
+        // Verify header is RS256 with a kid.
+        let header: Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[0]).unwrap()).unwrap();
+        assert_eq!(header["alg"], "RS256");
+        assert!(header["kid"].as_str().unwrap().len() > 10);
+
+        // Verify claims.
+        let claims: Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
         assert_eq!(claims["aud"], "api://custom");
-        assert_eq!(claims["job_id"], "job-1");
-        assert_eq!(claims["plan_id"], "plan-1");
+        assert_eq!(claims["iss"], "http://127.0.0.1:9090/oidc");
+        assert_eq!(claims["repository"], "owner/repo");
+        assert_eq!(claims["repository_owner"], "owner");
+        assert_eq!(claims["event_name"], "push");
+        assert_eq!(claims["runner_environment"], "self-hosted");
+        assert!(claims["sub"]
+            .as_str()
+            .unwrap()
+            .starts_with("repo:owner/repo:"));
+        assert!(claims["jti"].is_string());
+        assert!(claims["exp"].as_u64().unwrap() > claims["iat"].as_u64().unwrap());
+
+        // Verify the OIDC keypair is persisted.
+        assert!(temp.path().join("oidc-key.json").exists());
     }
 
     #[tokio::test]
-    async fn scenario_15_oidc_token_carries_requested_audience() {
+    async fn oidc_default_audience_is_owner_url() {
         let temp = tempfile::tempdir().unwrap();
-        let app = app(
-            AppState::new(temp.path().to_path_buf()).await.unwrap(),
-            CancellationToken::new(),
-        );
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let workflow = json!({
+            "workflow_yaml": "on: push\npermissions:\n  id-token: write\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps: [{ run: \"echo hi\" }]\n",
+            "event": "push",
+            "repository": "octo-org/octo-repo",
+        });
+        let resp = request_json(&app, Method::POST, "/api/v1/runs", workflow).await;
+        let _run_id: RunId = resp["run_id"].as_str().unwrap().parse().unwrap();
+
+        let plan_id = {
+            let inner = state.inner.lock().await;
+            inner
+                .queue
+                .front()
+                .or_else(|| inner.pending_jobs.front())
+                .map(|j| j.message.plan.plan_id.clone())
+                .unwrap()
+        };
 
         let token = request_json(
             &app,
             Method::GET,
-            "/runner/server/_apis/distributedtask/hubs/actions/plans/plan-15/jobs/job-15/oidctoken?audience=api://aksh",
+            &format!("/runner/server/_apis/distributedtask/hubs/actions/plans/{plan_id}/jobs/job-1/oidctoken"),
             Value::Null,
         )
         .await;
         let jwt = token["value"].as_str().unwrap();
         let parts: Vec<&str> = jwt.split('.').collect();
-        assert_eq!(parts.len(), 3);
-        let claims = URL_SAFE_NO_PAD.decode(parts[1]).unwrap();
-        let claims: Value = serde_json::from_slice(&claims).unwrap();
+        let claims: Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
+        assert_eq!(claims["aud"], "https://github.com/octo-org");
+    }
 
-        assert_eq!(claims["aud"], "api://aksh");
-        assert_eq!(claims["job_id"], "job-15");
-        assert_eq!(claims["plan_id"], "plan-15");
+    #[tokio::test]
+    async fn oidc_forbidden_without_id_token_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let workflow = json!({
+            "workflow_yaml": "on: push\npermissions:\n  contents: read\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps: [{ run: \"echo hi\" }]\n",
+            "event": "push",
+            "repository": "owner/repo",
+        });
+        let _resp = request_json(&app, Method::POST, "/api/v1/runs", workflow).await;
+
+        let plan_id = {
+            let inner = state.inner.lock().await;
+            inner
+                .queue
+                .front()
+                .or_else(|| inner.pending_jobs.front())
+                .map(|j| j.message.plan.plan_id.clone())
+                .unwrap()
+        };
+
+        // The OIDC endpoint should return 403 Forbidden.
+        let uri = format!(
+            "/runner/server/_apis/distributedtask/hubs/actions/plans/{plan_id}/jobs/job-1/oidctoken?audience=api://test"
+        );
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(&uri)
+            .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn oidc_discovery_and_jwks_endpoints() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state, CancellationToken::new());
+
+        let discovery = request_json(
+            &app,
+            Method::GET,
+            "/.well-known/openid-configuration",
+            Value::Null,
+        )
+        .await;
+        assert!(discovery["jwks_uri"]
+            .as_str()
+            .unwrap()
+            .ends_with("/.well-known/jwks.json"));
+        assert_eq!(discovery["issuer"], "http://127.0.0.1:9090/oidc");
+
+        let jwks = request_json(&app, Method::GET, "/.well-known/jwks.json", Value::Null).await;
+        let keys = jwks["keys"].as_array().unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0]["kty"], "RSA");
+        assert_eq!(keys[0]["alg"], "RS256");
+        assert_eq!(keys[0]["use"], "sig");
+        assert!(keys[0]["kid"].is_string());
+        assert!(keys[0]["n"].is_string());
+        assert_eq!(keys[0]["e"], "AQAB");
+    }
+
+    #[tokio::test]
+    async fn oidc_keypair_persists_across_restarts() {
+        let temp = tempfile::tempdir().unwrap();
+        let state1 = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let kid1 = {
+            let inner = state1.inner.lock().await;
+            inner.oidc_keypair.as_ref().unwrap().kid().to_string()
+        };
+        drop(state1);
+
+        // Second instance should load the same keypair.
+        let state2 = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let kid2 = {
+            let inner = state2.inner.lock().await;
+            inner.oidc_keypair.as_ref().unwrap().kid().to_string()
+        };
+        assert_eq!(
+            kid1, kid2,
+            "OIDC keypair kid must be stable across restarts"
+        );
     }
 
     #[tokio::test]
