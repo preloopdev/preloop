@@ -1964,16 +1964,80 @@ async fn get_run(
 async fn get_run_logs(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
-) -> impl axum::response::IntoResponse {
-    let inner = shared.state.inner.lock().await;
-    let run_id_str = run_id.to_string();
-    let mut merged = String::new();
-    for (k, v) in &inner.logs {
-        if k.starts_with(&format!("{}/", run_id_str)) {
-            merged.push_str(&String::from_utf8_lossy(v));
+) -> Result<Response, ApiError> {
+    let (state_dir, sources) = {
+        let inner = shared.state.inner.lock().await;
+        if !inner.runs.contains_key(&run_id) {
+            return Err(ApiError::not_found("run not found"));
+        }
+
+        let mut requests: Vec<&TaskAgentJobRequestRecord> = inner
+            .job_requests
+            .values()
+            .filter(|request| request.run_id == run_id)
+            .collect();
+        requests.sort_by_key(|request| request.request_id);
+        let sources = requests
+            .into_iter()
+            .map(|request| {
+                let prefix = format!("{}/", request.plan_id);
+                let mut blocks: Vec<(&str, &[u8])> = inner
+                    .logs
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        key.strip_prefix(&prefix)
+                            .map(|log_id| (log_id, value.as_slice()))
+                    })
+                    .collect();
+                blocks.sort_by(|(left, _), (right, _)| {
+                    match (left.parse::<u64>(), right.parse::<u64>()) {
+                        (Ok(left), Ok(right)) => left.cmp(&right),
+                        (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+                        (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+                        (Err(_), Err(_)) => left.cmp(right),
+                    }
+                });
+                (
+                    request.plan_id.clone(),
+                    request.agent_job_id.to_string(),
+                    blocks
+                        .into_iter()
+                        .map(|(_, block)| block.to_vec())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        (shared.state.state_dir.clone(), sources)
+    };
+
+    let mut merged = Vec::new();
+    for (plan_id, agent_job_id, fallback_blocks) in sources {
+        let results_log = state_dir
+            .join("replay")
+            .join("results")
+            .join(plan_id)
+            .join(agent_job_id)
+            .join("job-logs.txt");
+        match tokio::fs::read(&results_log).await {
+            Ok(contents) => merged.extend_from_slice(&contents),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                for block in fallback_blocks {
+                    merged.extend_from_slice(&block);
+                }
+            }
+            Err(error) => {
+                return Err(ApiError::internal(format!(
+                    "failed to read run log `{}`: {error}",
+                    results_log.display()
+                )));
+            }
         }
     }
-    merged
+
+    Ok(Response::builder()
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Body::from(merged))
+        .expect("static run log response"))
 }
 
 async fn cancel_run(
