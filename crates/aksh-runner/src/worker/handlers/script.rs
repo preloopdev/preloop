@@ -184,7 +184,12 @@ pub async fn run_script_in_container(
     } else {
         let mut desc_args = container_args.clone();
         if let Some(last) = desc_args.last_mut() {
-            if last == &crate::worker::container_ops::translate_to_container_path(&script_path.to_string_lossy(), &host_work) {
+            if last
+                == &crate::worker::container_ops::translate_to_container_path(
+                    &script_path.to_string_lossy(),
+                    &host_work,
+                )
+            {
                 *last = "{0}".to_string();
             }
         }
