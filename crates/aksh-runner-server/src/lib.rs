@@ -1471,6 +1471,17 @@ pub(crate) async fn submit_run_inner(
                     "token".to_owned(),
                     aksh_gha_protocol::azdo::PipelineContextData::String(token),
                 );
+                let mut perms = std::collections::BTreeMap::new();
+                for perm in &["actions", "contents", "issues", "metadata", "pull-requests", "statuses"] {
+                    perms.insert(
+                        perm.to_string(),
+                        aksh_gha_protocol::azdo::PipelineContextData::String("write".to_string()),
+                    );
+                }
+                github_dict.insert(
+                    "token_permissions".to_owned(),
+                    aksh_gha_protocol::azdo::PipelineContextData::Dict(perms),
+                );
             }
 
             // Give every dispatched job a unique requestId so PATCH
