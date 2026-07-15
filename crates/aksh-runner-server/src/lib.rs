@@ -929,8 +929,42 @@ pub struct AppState {
     pub state_dir: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct JobSetId {
+    run_id: RunId,
+    job_ids: BTreeSet<JobId>,
+}
+
+impl JobSetId {
+    fn holder(&self) -> concurrency::Holder {
+        concurrency::Holder::JobSet {
+            run_id: self.run_id,
+            job_ids: self.job_ids.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct JobSetGate {
+    key: (String, String),
+    display_name: String,
+    cancel_in_progress: bool,
+    queue: aksh_gha_parser::ConcurrencyQueue,
+}
+
+#[derive(Debug, Clone)]
+struct JobSetAdmission {
+    gates: Vec<JobSetGate>,
+    acquired_keys: BTreeSet<(String, String)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobSetAdmissionResult {
+    Ready,
+    Blocked,
+}
+
 impl AppState {
-    /// Build state rooted in a state directory.
     pub async fn new(state_dir: PathBuf) -> anyhow::Result<Self> {
         let cache = CacheStore::new(state_dir.join("cache")).await?;
         let artifacts = ArtifactStore::new(state_dir.join("artifacts")).await?;
@@ -1046,6 +1080,8 @@ struct InnerState {
     held_runs: BTreeMap<RunId, Vec<QueuedJob>>,
     /// Job-level concurrency-blocked jobs (FIFO).
     concurrency_blocked: VecDeque<QueuedJob>,
+    /// Multi-key admission state for reusable workflow invocations.
+    jobset_admissions: BTreeMap<JobSetId, JobSetAdmission>,
     /// Evaluated workflow-level concurrency raw config per run (for release/debug).
     run_concurrency: BTreeMap<RunId, aksh_gha_parser::Concurrency>,
     /// Which concurrency key a holder currently occupies (for release).
