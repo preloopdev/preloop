@@ -42,6 +42,11 @@ enum Command {
         /// Bearer token for privileged simulation endpoints.
         #[arg(long, requires = "enable_test_api")]
         test_api_token: Option<String>,
+        /// OIDC issuer URL for the `iss` claim in id-tokens.
+        /// Defaults to `{public_base_url}/oidc`.
+        /// Set to `https://token.actions.githubusercontent.com` to mimic GitHub.
+        #[arg(long)]
+        oidc_issuer: Option<String>,
     },
     /// Generate a persistent self-signed TLS certificate (no openssl needed).
     Cert {
@@ -90,6 +95,7 @@ async fn main() -> anyhow::Result<()> {
             tls_self_signed,
             enable_test_api,
             test_api_token,
+            oidc_issuer,
         } => {
             let tls = match (tls_cert, tls_key, tls_self_signed) {
                 (Some(cert), Some(key), false) => TlsMode::PemFiles { cert, key },
@@ -104,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
                 tls,
                 enable_test_api,
                 test_api_token,
+                oidc_issuer,
             })
             .await?;
         }

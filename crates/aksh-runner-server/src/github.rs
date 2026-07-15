@@ -566,7 +566,7 @@ pub(crate) async fn handle_github_webhook(
 
             // Construct WorkflowSubmission
             let submission = WorkflowSubmission {
-                workflow_yaml: content,
+                workflow_yaml: content.clone(),
                 event: event_name.to_owned(),
                 payload: payload_val.clone(),
                 repository: repo_full_name.clone(),
@@ -576,6 +576,19 @@ pub(crate) async fn handle_github_webhook(
                 reusable_workflows: BTreeMap::new(),
                 enable_debugger: false,
                 debugger_welcome_message: None,
+                sha: payload_val
+                    .get("after")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("0000000000000000000000000000000000000000")
+                    .to_owned(),
+                actor: payload_val
+                    .get("sender")
+                    .and_then(|s| s.get("login"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("aksh-system")
+                    .to_owned(),
+                environment: None,
+                workflow_file: Some(filename.clone()),
             };
 
             // Call submit_run_inner
