@@ -8959,56 +8959,113 @@ jobs:
     }
 
     #[tokio::test]
-    async fn log_get_run_logs_endpoint_returns_payload() {
+    async fn log_get_run_logs_uses_production_plan_ids_and_numeric_order() {
         let temp = tempfile::tempdir().unwrap();
         let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
         let app = app(state.clone(), CancellationToken::new());
-
-        let run_id = uuid::Uuid::new_v4();
-        let run_id_str = run_id.to_string();
-
-        request_json(
+        let accepted = submit_yaml(
             &app,
-            Method::POST,
-            &format!("/_apis/v1/Logfiles/scope/actions/{run_id_str}"),
-            json!({"path": "log-1"}),
+            r#"
+on: push
+jobs:
+  first:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo first
+  second:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo second
+"#,
+            "owner/repo",
         )
         .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+        let requests = {
+            let inner = state.inner.lock().await;
+            let mut requests: Vec<_> = inner
+                .job_requests
+                .values()
+                .filter(|request| request.run_id == run_id)
+                .collect();
+            requests.sort_by_key(|request| request.request_id);
+            requests
+                .into_iter()
+                .map(|request| (request.plan_id.clone(), request.agent_job_id.to_string()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(requests.len(), 2);
+
+        for (plan_id, log_id, body) in [
+            (&requests[0].0, "10", "first-ten
+"),
+            (&requests[0].0, "2", "first-two
+"),
+            (&requests[1].0, "1", "ignored-fallback
+"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!(
+                            "/_apis/v1/Logfiles/scope/actions/{plan_id}/{log_id}"
+                        ))
+                        .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+        }
+
+        let results_dir = temp
+            .path()
+            .join("replay")
+            .join("results")
+            .join(&requests[1].0)
+            .join(&requests[1].1);
+        tokio::fs::create_dir_all(&results_dir).await.unwrap();
+        tokio::fs::write(results_dir.join("job-logs.txt"), b"results-second
+")
+            .await
+            .unwrap();
 
         let response = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .method(Method::POST)
-                    .uri(format!(
-                        "/_apis/v1/Logfiles/scope/actions/{run_id_str}/log-1"
-                    ))
-                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
-                    .body(Body::from("hello log lines"))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
-
-        let response_get = app
-            .clone()
-            .oneshot(
-                Request::builder()
                     .method(Method::GET)
-                    .uri(format!("/api/v1/runs/{run_id_str}/logs"))
-                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                    .uri(format!("/api/v1/runs/{run_id}/logs"))
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(response_get.status(), StatusCode::OK);
-        let body = to_bytes(response_get.into_body(), usize::MAX)
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), b"first-two
+first-ten
+results-second
+");
+
+        let unknown = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/v1/runs/{}/logs", RunId::new()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
-        let logs_str = String::from_utf8(body.to_vec()).unwrap();
-        assert_eq!(logs_str, "hello log lines");
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
