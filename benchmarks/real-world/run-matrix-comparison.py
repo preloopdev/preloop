@@ -329,13 +329,14 @@ def start_runner(runner_type: str, server_url: str, runner_dir: Path, state_dir:
             "--token", "aksh-system-token",
             "--name", f"aksh-{int(time.time())}",
             "--labels", "self-hosted,fidelity-test",
-            "--work", str(work_dir)
+            "--work", "_work",
+            "--unattended",
+            "--replace",
+            "--ephemeral",
+            "--no-externals",
         ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        
         # run
-        p = subprocess.Popen([str(runner_bin), "run"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return p
-
+        p = subprocess.Popen([str(runner_bin), "run", "--runner-root", str(state_dir)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 # ─── Scenario Runner ──────────────────────────────────────────────────────────
 
 def execute_local_scenario(scenario: str, server_url: str, state_dir: Path, out_dir: Path) -> dict:
@@ -353,7 +354,7 @@ def execute_local_scenario(scenario: str, server_url: str, state_dir: Path, out_
     def submit_one(name_suffix: str = ""):
         body = {
             "workflow_yaml": yaml_text,
-            "event": "push",
+            "event": "workflow_dispatch",
             "repository": "owner/repo",
             "reusable_workflows": reusable_map
         }
