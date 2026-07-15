@@ -1,0 +1,9 @@
+{
+  "workflow": "10-empty-group",
+  "run_id": null,
+  "status": "completed",
+  "conclusion": "failure",
+  "jobs": [],
+  "source": "aksh",
+  "note": "rejected at submit"
+}
