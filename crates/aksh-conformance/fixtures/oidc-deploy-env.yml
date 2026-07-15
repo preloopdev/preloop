@@ -1,0 +1,23 @@
+name: oidc-deploy-env
+on: deployment
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Request deployment OIDC token
+        run: |
+          if [ -z "$ACTIONS_ID_TOKEN_REQUEST_URL" ]; then echo "FAIL: URL not set"; exit 1; fi
+          RESP=$(curl -s -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=vault/hcp")
+          echo "$RESP" | python3 -c "
+import sys,json,base64
+t=json.load(sys.stdin)['value']
+c=json.loads(base64.urlsafe_b64decode(t.split('.')[1]+'=='))
+sub=c['sub']
+assert c['event_name']=='deployment', f'event_name must be deployment: {c[\"event_name\"]}'
+assert ':environment:' in sub, f'sub must use :environment: format: {sub}'
+print(f'PASS: sub={sub}, event={c[\"event_name\"]}')
+"
