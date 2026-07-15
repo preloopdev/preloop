@@ -158,10 +158,30 @@ pub struct WorkflowSubmission {
     /// Welcome message to show when debugger attaches.
     #[serde(default)]
     pub debugger_welcome_message: Option<String>,
+    /// Commit SHA for the run. Defaults to zeroes if not supplied.
+    #[serde(default = "default_sha")]
+    pub sha: String,
+    /// The actor (user) who initiated the run. Defaults to `"aksh-system"`.
+    #[serde(default = "default_actor")]
+    pub actor: String,
+    /// Deployment environment name (for OIDC `sub` claim formatting).
+    #[serde(default)]
+    pub environment: Option<String>,
+    /// Workflow filename (e.g. `"ci.yml"`). Derived from YAML or overridden.
+    #[serde(default)]
+    pub workflow_file: Option<String>,
 }
 
 fn default_ref() -> String {
     "refs/heads/main".to_owned()
+}
+
+fn default_sha() -> String {
+    "0000000000000000000000000000000000000000".to_owned()
+}
+
+fn default_actor() -> String {
+    "aksh-system".to_owned()
 }
 
 /// Result returned after accepting a workflow run.
