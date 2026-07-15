@@ -159,13 +159,23 @@ def load_aksh_capture(dir_path: Path) -> SideCapture:
         markers |= extract_markers(lines)
     markers |= extract_markers([strip_noise(l) for l in log.splitlines()])
 
-    jobs = {j.get("name") or j.get("id") or "": j.get("conclusion") or j.get("status") or ""
-            for j in (summary.get("jobs") or [])}
-    step_conc = {}
-    for j in summary.get("jobs") or []:
-        for s in j.get("steps") or []:
-            if s.get("name"):
-                step_conc[s["name"]] = s.get("conclusion") or s.get("status") or ""
+    raw_jobs = summary.get("jobs") or []
+    if isinstance(raw_jobs, dict):
+        jobs = {str(job_id): str(status or "") for job_id, status in raw_jobs.items()}
+        step_conc = {}
+    else:
+        jobs = {
+            job.get("name") or job.get("id") or "":
+            job.get("conclusion") or job.get("status") or ""
+            for job in raw_jobs
+        }
+        step_conc = {}
+        for job in raw_jobs:
+            for step in job.get("steps") or []:
+                if step.get("name"):
+                    step_conc[step["name"]] = (
+                        step.get("conclusion") or step.get("status") or ""
+                    )
 
     return SideCapture(
         name=dir_path.name,
@@ -235,17 +245,17 @@ def compare(gh: SideCapture, aksh: SideCapture) -> dict:
         else:
             notes.append(f"DONE marker present: {dm}")
 
-    # CANCEL_ERROR: GH writes ##[error]The operation was canceled. into step log.
-    # aksh does not currently emit ##[error] annotations, so treat absence as a fidelity
-    # note rather than a hard failure (run/job conclusion is the authoritative signal).
-    if norm(gh.conclusion) == "cancelled" and "CANCEL_ERROR" in gh.markers:
-        if "CANCEL_ERROR" in aksh.markers:
-            notes.append("cancel error annotation present on both")
-        else:
-            notes.append(
-                "FIDELITY: GH step log has ##[error] cancel annotation; "
-                "aksh step blob may omit it (job conclusion still cancelled)"
-            )
+    # Cancellation annotations are part of step-log fidelity. Presence must
+    # match in both directions; conclusions do not substitute for log parity.
+    gh_cancel_error = "CANCEL_ERROR" in gh.markers
+    aksh_cancel_error = "CANCEL_ERROR" in aksh.markers
+    if gh_cancel_error != aksh_cancel_error:
+        issues.append(
+            "cancel error annotation presence differs: "
+            f"gh={gh_cancel_error} aksh={aksh_cancel_error}"
+        )
+    elif gh_cancel_error:
+        notes.append("cancel error annotation present on both")
 
     # SHOULD_NOT_REACH executed in aksh capture is always a hard failure when GH did not
     # execute it. This marker appears in steps that must not run (e.g., a sleep after
@@ -257,47 +267,73 @@ def compare(gh: SideCapture, aksh: SideCapture) -> dict:
             "real concurrency bug or cross-run log contamination; capture is invalid"
         )
 
-    # Step conclusion: compare user steps by fuzzy name match
-    gh_user = {k: v for k, v in gh.step_conclusions.items() if k not in ("Set up job", "Complete job")}
-    ak_user = {
-        k: v
-        for k, v in aksh.step_conclusions.items()
-        if k not in ("Set up job", "Complete job", "Set up runner", "Complete runner")
+    # Step conclusions: compare user steps one-to-one. Missing or additional
+    # steps are structural mismatches, not fidelity notes.
+    gh_user = {
+        key: value
+        for key, value in gh.step_conclusions.items()
+        if key not in ("Set up job", "Complete job")
     }
-    for gname, gconc in gh_user.items():
-        matched = None
-        for aname, aconc in ak_user.items():
-            if gname == aname or gname in aname or aname in gname:
-                matched = (aname, aconc)
-                break
-        if not matched and len(ak_user) == 1:
-            aname, aconc = next(iter(ak_user.items()))
-            matched = (aname, aconc)
-        if not matched:
-            notes.append(f"no aksh step matched GH step '{gname}' ({gconc})")
-            continue
-        aname, aconc = matched
-        if norm(gconc) != norm(aconc):
-            issues.append(f"step '{gname}' conclusion: gh={gconc} aksh={aname}/{aconc}")
-        else:
-            notes.append(f"step '{gname}'≈'{aname}' conclusion={norm(gconc)}")
+    ak_user = {
+        key: value
+        for key, value in aksh.step_conclusions.items()
+        if key not in ("Set up job", "Complete job", "Set up runner", "Complete runner")
+    }
+    if len(gh_user) != len(ak_user):
+        issues.append(f"user step count: gh={len(gh_user)} aksh={len(ak_user)}")
 
-    # Job conclusions — prefer run-level if single-job; else multiset
-    if gh.jobs and aksh.jobs:
-        gh_vals = sorted(norm(v) for v in gh.jobs.values() if v)
-        ak_vals = sorted(norm(v) for v in aksh.jobs.values() if v)
-        # Contradictory job success + run cancelled is a hard failure: the job conclusion
-        # must be sourced from the run API response, not from heuristic global runner log
-        # parsing. A capture with success jobs on a cancelled run is a corrupt capture.
-        if norm(aksh.conclusion) == "cancelled" and ak_vals and all(v == "success" for v in ak_vals):
+    unmatched_aksh = set(ak_user)
+    for gh_name, gh_conclusion in gh_user.items():
+        candidates = [name for name in unmatched_aksh if name == gh_name]
+        if not candidates:
+            candidates = [
+                name
+                for name in unmatched_aksh
+                if gh_name in name or name in gh_name
+            ]
+        if not candidates and len(gh_user) == 1 and len(unmatched_aksh) == 1:
+            candidates = list(unmatched_aksh)
+        if not candidates:
             issues.append(
-                f"contradictory aksh capture: job conclusions={ak_vals} but run conclusion=cancelled; "
-                "job conclusion must come from run API, not from heuristic runner log"
+                f"missing aksh step matching GH step '{gh_name}' ({gh_conclusion})"
             )
-        elif gh_vals != ak_vals:
-            issues.append(f"job conclusions multiset: gh={gh_vals} aksh={ak_vals}")
+            continue
+        aksh_name = sorted(candidates)[0]
+        unmatched_aksh.remove(aksh_name)
+        aksh_conclusion = ak_user[aksh_name]
+        if norm(gh_conclusion) != norm(aksh_conclusion):
+            issues.append(
+                f"step '{gh_name}' conclusion: "
+                f"gh={gh_conclusion} aksh={aksh_name}/{aksh_conclusion}"
+            )
         else:
-            notes.append(f"job conclusions match: {gh_vals}")
+            notes.append(
+                f"step '{gh_name}'≈'{aksh_name}' conclusion={norm(gh_conclusion)}"
+            )
+    for aksh_name in sorted(unmatched_aksh):
+        issues.append(
+            f"unexpected aksh step '{aksh_name}' ({ak_user[aksh_name]})"
+        )
+
+    # Job conclusions are always compared, including zero-job captures.
+    gh_values = sorted(norm(value) for value in gh.jobs.values())
+    aksh_values = sorted(norm(value) for value in aksh.jobs.values())
+    if len(gh.jobs) != len(aksh.jobs):
+        issues.append(f"job count: gh={len(gh.jobs)} aksh={len(aksh.jobs)}")
+    if norm(aksh.conclusion) == "cancelled" and aksh_values and all(
+        value == "success" for value in aksh_values
+    ):
+        issues.append(
+            f"contradictory aksh capture: job conclusions={aksh_values} "
+            "but run conclusion=cancelled; job conclusion must come from run API, "
+            "not from heuristic runner log"
+        )
+    elif gh_values != aksh_values:
+        issues.append(
+            f"job conclusions multiset: gh={gh_values} aksh={aksh_values}"
+        )
+    else:
+        notes.append(f"job conclusions match: {gh_values}")
 
     return {
         "ok": len(issues) == 0,
@@ -308,25 +344,31 @@ def compare(gh: SideCapture, aksh: SideCapture) -> dict:
     }
 
 
-# Scenario pairing: GH capture prefix -> aksh capture name
-SCENARIO_PAIRS = [
-    ("01-bare-string", "success", "01-bare-A", "01-bare-B"),
-    ("02-cancel-in-progress", "cancelled", "02-cancel-A", None),
-    ("02-cancel-in-progress", "success", "02-cancel-B", None),
-    ("03-fifo-pending", "success", "03-fifo-A", "03-fifo-B"),
-    ("08-job-level", "success", "08-job-level", None),
-    ("10-empty-group", "failure", "10-empty-group", None),
-    ("11-expr-group-ref", "success", "11-expr-group", None),
+CAPTURE_PAIRS = [
+    ("01 bare A", "01-bare-A", "01-bare-A"),
+    ("01 bare B", "01-bare-B", "01-bare-B"),
+    ("02 cancel-in-progress A", "02-cancel-A", "02-cancel-A"),
+    ("02 cancel-in-progress B", "02-cancel-B", "02-cancel-B"),
+    ("03 FIFO A", "03-fifo-A", "03-fifo-A"),
+    ("03 FIFO B", "03-fifo-B", "03-fifo-B"),
+    ("04 cancel expression A", "04-cancel-expr-A", "04-cancel-expr-A"),
+    ("04 cancel expression B", "04-cancel-expr-B", "04-cancel-expr-B"),
+    ("05 false expression A", "05-expr-false-A", "05-expr-false-A"),
+    ("05 false expression B", "05-expr-false-B", "05-expr-false-B"),
+    ("06 queue max A", "06-queue-max-A", "06-queue-max-A"),
+    ("06 queue max B", "06-queue-max-B", "06-queue-max-B"),
+    ("06 queue max C", "06-queue-max-C", "06-queue-max-C"),
+    ("07 case Prod", "07a-case-Prod", "07a-case-Prod"),
+    ("07 case prod", "07b-case-prod", "07b-case-prod"),
+    ("08 job-level", "08-job-level", "08-job-level"),
+    ("09 multi-job", "09-multi-job", "09-multi-job"),
+    ("10 empty group", "10-empty", "10-empty-group"),
+    ("11 expression group", "11-expr-group", "11-expr-group"),
+    ("12 matrix", "12-matrix", "12-matrix"),
+    ("13 caller JobSet", "13-jobset-caller", "13-jobset-caller"),
+    ("14 embedded JobSet", "14-jobset-embedded", "14-jobset-embedded"),
+    ("15 different-key JobSet", "15-jobset-diffkey", "15-jobset-diffkey"),
 ]
-
-
-def find_gh(root: Path, prefix: str, conclusion: str) -> Path | None:
-    cands = sorted(root.glob(f"{prefix}_*_{conclusion}"))
-    if cands:
-        return cands[0]
-    # rerun_
-    cands = sorted(root.glob(f"rerun_{prefix}_*_{conclusion}"))
-    return cands[0] if cands else None
 
 
 def main() -> int:
@@ -339,30 +381,10 @@ def main() -> int:
 
     comparisons = []
 
-    # Pair known scenarios present on both sides
     pairs = [
-        ("01 bare A", find_gh(args.github_root, "01-bare-string", "success"), args.aksh_root / "01-bare-A"),
-        ("01 bare B", sorted(args.github_root.glob("01-bare-string_*_success"))[-1] if list(args.github_root.glob("01-bare-string_*_success")) else None, args.aksh_root / "01-bare-B"),
-        ("02 cancel A", find_gh(args.github_root, "02-cancel-in-progress", "cancelled") or find_gh(args.github_root, "rerun_02-cancel-in-progress", "cancelled"), args.aksh_root / "02-cancel-A"),
-        ("02 cancel B", find_gh(args.github_root, "02-cancel-in-progress", "success"), args.aksh_root / "02-cancel-B"),
-        ("03 fifo A", sorted(args.github_root.glob("03-fifo-pending_*_success"))[0] if list(args.github_root.glob("03-fifo-pending_*_success")) else None, args.aksh_root / "03-fifo-A"),
-        ("03 fifo B", sorted(args.github_root.glob("03-fifo-pending_*_success"))[-1] if list(args.github_root.glob("03-fifo-pending_*_success")) else None, args.aksh_root / "03-fifo-B"),
-        ("08 job-level", find_gh(args.github_root, "08-job-level", "success"), args.aksh_root / "08-job-level"),
-        ("10 empty", find_gh(args.github_root, "10-empty-group", "failure"), args.aksh_root / "10-empty-group"),
-        ("11 expr group", find_gh(args.github_root, "11-expr-group-ref", "success"), args.aksh_root / "11-expr-group"),
-        ("05 fifo expr false A", sorted(args.github_root.glob("05-cancel-expr-false_*_success"))[0] if list(args.github_root.glob("05-cancel-expr-false_*_success")) else None, args.aksh_root / "05-expr-false-A"),
-        ("04 cancel expr true A", find_gh(args.github_root, "04-cancel-expr-true", "cancelled"), args.aksh_root / "04-cancel-expr-A"),
-        ("04 cancel expr true B", find_gh(args.github_root, "04-cancel-expr-true", "success"), args.aksh_root / "04-cancel-expr-B"),
+        (name, args.github_root / github_dir, args.aksh_root / aksh_dir)
+        for name, github_dir, aksh_dir in CAPTURE_PAIRS
     ]
-
-    # Fix 02 cancel A path for rerun folders
-    fixed = []
-    for name, gh_path, ak_path in pairs:
-        if gh_path is None and "02 cancel A" in name:
-            cands = list(args.github_root.glob("*02-cancel-in-progress*_cancelled"))
-            gh_path = cands[0] if cands else None
-        fixed.append((name, gh_path, ak_path))
-    pairs = fixed
 
     for name, gh_path, ak_path in pairs:
         if gh_path is None or not Path(gh_path).exists():
@@ -428,7 +450,11 @@ def main() -> int:
         lines.append("")
 
     out.write_text("\n".join(lines))
-    (args.aksh_root / "LOG-CONTENT-COMPARE.json").write_text(json.dumps(comparisons, indent=2))
+    comparison_json = json.dumps(comparisons, indent=2)
+    out.with_suffix(".json").write_text(comparison_json)
+    default_json = args.aksh_root / "LOG-CONTENT-COMPARE.json"
+    if default_json != out.with_suffix(".json"):
+        default_json.write_text(comparison_json)
     print(f"{passed}/{total} passed")
     print(out)
     return 0 if passed == total else 1
