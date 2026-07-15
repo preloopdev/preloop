@@ -1630,151 +1630,106 @@ pub(crate) async fn submit_run_inner(
             });
         }
 
-        // ── C-02: Reusable workflow JobSet concurrency gates ──────────
-        // For each reusable call that carries caller or embedded concurrency,
-        // evaluate the group and acquire a Holder::JobSet before any inner
-        // member is individually enqueued.  If blocked, park all members
-        // in concurrency_blocked together.
+        // Reusable workflow invocations must acquire caller and embedded
+        // concurrency gates as one ordered, deduplicated admission set. A
+        // partially admitted JobSet keeps its earlier keys while waiting on
+        // the next key, preventing it from bypassing either scope.
         let mut jobset_blocked: std::collections::HashSet<JobId> = std::collections::HashSet::new();
-        for (_caller_id, call) in &reusable_calls {
+        for call in reusable_calls.values() {
             let member_ids: BTreeSet<JobId> = call
                 .inner_job_ids
                 .iter()
-                .map(|s| JobId(s.clone()))
+                .map(|id| JobId(id.clone()))
                 .collect();
-            // Try caller concurrency (caller job-level concurrency on the `uses:` job).
-            let mut caller_acquired_key: Option<(String, String)> = None;
-            if let Some(raw) = &call.caller_concurrency {
+            let id = JobSetId {
+                run_id,
+                job_ids: member_ids.clone(),
+            };
+            let mut gates = Vec::new();
+            let mut evaluation_failed = false;
+
+            for (raw, scope, label, inputs) in [
+                (
+                    call.caller_concurrency.as_ref(),
+                    concurrency::ConcurrencyScope::Job,
+                    "caller concurrency (JobSet)",
+                    &submission.inputs,
+                ),
+                (
+                    call.embedded_concurrency.as_ref(),
+                    concurrency::ConcurrencyScope::Workflow,
+                    "embedded concurrency (JobSet)",
+                    &call.inputs,
+                ),
+            ] {
+                let Some(raw) = raw else { continue };
                 let eval_ctx = concurrency::ConcurrencyContext {
-                    scope: concurrency::ConcurrencyScope::Job,
+                    scope,
                     github: &github,
                     vars: &submission.vars,
-                    inputs: &submission.inputs,
+                    inputs,
                     matrix: None,
                     strategy: None,
                     needs: None,
                 };
                 match concurrency::evaluate_concurrency(raw, &eval_ctx) {
-                    Ok((group, cancel, queue)) if !group.trim().is_empty() => {
-                        let key = concurrency::concurrency_key(&submission.repository, &group);
-                        let holder = concurrency::Holder::JobSet {
-                            run_id,
-                            job_ids: member_ids.clone(),
-                        };
-                        match try_acquire_concurrency(
-                            &mut inner,
-                            key.clone(),
-                            group,
-                            holder,
-                            cancel,
-                            queue,
-                        ) {
-                            Ok(true) => {
-                                caller_acquired_key = Some(key);
-                            }
-                            Ok(false) => {
-                                // Entire set blocked — park all members.
-                                jobset_blocked.extend(member_ids.iter().cloned());
-                            }
-                            Err(e) if e == "concurrency_queue_overflow" => {
-                                for mid in &member_ids {
-                                    statuses.insert(mid.clone(), ExecutionStatus::Cancelled);
-                                }
-                                jobset_blocked.extend(member_ids.iter().cloned());
-                            }
-                            Err(_) => {
-                                for mid in &member_ids {
-                                    statuses.insert(mid.clone(), ExecutionStatus::Failure);
-                                }
-                                jobset_blocked.extend(member_ids.iter().cloned());
-                            }
-                        }
+                    Ok((group, cancel_in_progress, queue)) if !group.trim().is_empty() => {
+                        merge_jobset_gate(
+                            &mut gates,
+                            JobSetGate {
+                                key: concurrency::concurrency_key(
+                                    &submission.repository,
+                                    &group,
+                                ),
+                                display_name: group,
+                                cancel_in_progress,
+                                queue,
+                            },
+                        );
                     }
                     Ok((_, _, _)) => {
-                        // Empty group — fail all members.
-                        for mid in &member_ids {
-                            statuses.insert(mid.clone(), ExecutionStatus::Failure);
-                        }
-                        jobset_blocked.extend(member_ids.iter().cloned());
+                        evaluation_failed = true;
                     }
-                    Err(e) => {
-                        concurrency::log_eval_error("caller concurrency (JobSet)", &e);
-                        for mid in &member_ids {
-                            statuses.insert(mid.clone(), ExecutionStatus::Failure);
-                        }
-                        jobset_blocked.extend(member_ids.iter().cloned());
+                    Err(error) => {
+                        concurrency::log_eval_error(label, &error);
+                        evaluation_failed = true;
                     }
                 }
             }
-            // Try embedded (callee workflow-level) concurrency.
-            if let Some(raw) = &call.embedded_concurrency {
-                // Skip if members are already fully blocked/failed from caller gate.
-                if !member_ids.iter().all(|id| jobset_blocked.contains(id)) {
-                    let eval_ctx = concurrency::ConcurrencyContext {
-                        scope: concurrency::ConcurrencyScope::Workflow,
-                        github: &github,
-                        vars: &submission.vars,
-                        inputs: &submission.inputs,
-                        matrix: None,
-                        strategy: None,
-                        needs: None,
+
+            if evaluation_failed {
+                for member_id in &member_ids {
+                    statuses.insert(member_id.clone(), ExecutionStatus::Failure);
+                }
+                jobset_blocked.extend(member_ids);
+                continue;
+            }
+            if gates.is_empty() {
+                continue;
+            }
+
+            inner.jobset_admissions.insert(
+                id.clone(),
+                JobSetAdmission {
+                    gates,
+                    acquired_keys: BTreeSet::new(),
+                },
+            );
+            match advance_jobset_admission(&mut inner, &id, None) {
+                Ok(JobSetAdmissionResult::Ready) => {}
+                Ok(JobSetAdmissionResult::Blocked) => {
+                    jobset_blocked.extend(member_ids);
+                }
+                Err(error) => {
+                    let status = if error == "concurrency_queue_overflow" {
+                        ExecutionStatus::Cancelled
+                    } else {
+                        ExecutionStatus::Failure
                     };
-                    match concurrency::evaluate_concurrency(raw, &eval_ctx) {
-                        Ok((group, cancel, queue)) if !group.trim().is_empty() => {
-                            let key = concurrency::concurrency_key(&submission.repository, &group);
-                            let holder = concurrency::Holder::JobSet {
-                                run_id,
-                                job_ids: member_ids.clone(),
-                            };
-                            match try_acquire_concurrency(
-                                &mut inner, key, group, holder, cancel, queue,
-                            ) {
-                                Ok(true) => { /* acquired */ }
-                                Ok(false) => {
-                                    jobset_blocked.extend(member_ids.iter().cloned());
-                                }
-                                Err(e) if e == "concurrency_queue_overflow" => {
-                                    for mid in &member_ids {
-                                        statuses.insert(mid.clone(), ExecutionStatus::Cancelled);
-                                    }
-                                    jobset_blocked.extend(member_ids.iter().cloned());
-                                    // Release caller key — members are terminally cancelled.
-                                    if let Some(ckey) = caller_acquired_key.take() {
-                                        release_acquired_key(&mut inner, &ckey, run_id);
-                                    }
-                                }
-                                Err(_) => {
-                                    for mid in &member_ids {
-                                        statuses.insert(mid.clone(), ExecutionStatus::Failure);
-                                    }
-                                    jobset_blocked.extend(member_ids.iter().cloned());
-                                    // Release caller key — members are terminally failed.
-                                    if let Some(ckey) = caller_acquired_key.take() {
-                                        release_acquired_key(&mut inner, &ckey, run_id);
-                                    }
-                                }
-                            }
-                        }
-                        Ok((_, _, _)) => {
-                            for mid in &member_ids {
-                                statuses.insert(mid.clone(), ExecutionStatus::Failure);
-                            }
-                            jobset_blocked.extend(member_ids.iter().cloned());
-                            if let Some(ckey) = caller_acquired_key.take() {
-                                release_acquired_key(&mut inner, &ckey, run_id);
-                            }
-                        }
-                        Err(e) => {
-                            concurrency::log_eval_error("embedded concurrency (JobSet)", &e);
-                            for mid in &member_ids {
-                                statuses.insert(mid.clone(), ExecutionStatus::Failure);
-                            }
-                            jobset_blocked.extend(member_ids.iter().cloned());
-                            if let Some(ckey) = caller_acquired_key.take() {
-                                release_acquired_key(&mut inner, &ckey, run_id);
-                            }
-                        }
+                    for member_id in &member_ids {
+                        statuses.insert(member_id.clone(), status);
                     }
+                    jobset_blocked.extend(member_ids);
                 }
             }
         }
@@ -2263,25 +2218,120 @@ fn release_concurrency_for_job(inner: &mut InnerState, run_id: RunId, job_id: &J
 /// Release a single concurrency key acquired by a JobSet whose members all
 /// became terminal before any could dispatch (e.g. embedded gate overflow).
 /// Removes the running holder from the group and promotes the next pending.
-fn release_acquired_key(inner: &mut InnerState, key: &(String, String), run_id: RunId) {
+fn merge_jobset_gate(gates: &mut Vec<JobSetGate>, mut gate: JobSetGate) {
+    if let Some(existing) = gates.iter_mut().find(|existing| existing.key == gate.key) {
+        existing.cancel_in_progress |= gate.cancel_in_progress;
+        if gate.queue == aksh_gha_parser::ConcurrencyQueue::Single {
+            existing.queue = aksh_gha_parser::ConcurrencyQueue::Single;
+        }
+        return;
+    }
+    gate.display_name = gate.display_name.trim().to_owned();
+    gates.push(gate);
+    gates.sort_by(|left, right| left.key.cmp(&right.key));
+}
+
+fn release_holder_key(
+    inner: &mut InnerState,
+    key: &(String, String),
+    holder: &concurrency::Holder,
+) {
+    let mut promote = None;
     if let Some(group) = inner.concurrency_groups.get_mut(key) {
-        if group.running.as_ref().is_some_and(|h| h.run_id() == run_id) {
-            let done = group.running.take();
-            if let Some(done) = done {
-                promote_next_from_group(inner, key, done);
-            }
+        if group.running.as_ref() == Some(holder) {
+            promote = group.running.take();
         } else {
-            group.pending.retain(|h| h.run_id() != run_id);
-            if group.running.is_none() && group.pending.is_empty() {
-                inner.concurrency_groups.remove(key);
+            group.pending.retain(|pending| pending != holder);
+        }
+    }
+    if let Some(done) = promote {
+        promote_next_from_group(inner, key, done);
+    }
+    if inner
+        .concurrency_groups
+        .get(key)
+        .is_some_and(|group| group.running.is_none() && group.pending.is_empty())
+    {
+        inner.concurrency_groups.remove(key);
+    }
+
+    let run_id = holder.run_id();
+    let run_still_present = inner.concurrency_groups.get(key).is_some_and(|group| {
+        group
+            .running
+            .as_ref()
+            .is_some_and(|candidate| candidate.run_id() == run_id)
+            || group
+                .pending
+                .iter()
+                .any(|candidate| candidate.run_id() == run_id)
+    });
+    if !run_still_present {
+        if let Some(keys) = inner.holder_keys.get_mut(&run_id) {
+            keys.retain(|candidate| candidate != key);
+            if keys.is_empty() {
+                inner.holder_keys.remove(&run_id);
             }
         }
     }
-    // Clean up holder_keys tracking for this run + key.
-    if let Some(rkeys) = inner.holder_keys.get_mut(&run_id) {
-        rkeys.retain(|k| k != key);
-        if rkeys.is_empty() {
-            inner.holder_keys.remove(&run_id);
+}
+
+fn release_jobset_admission(inner: &mut InnerState, id: &JobSetId) {
+    let Some(admission) = inner.jobset_admissions.remove(id) else {
+        return;
+    };
+    let holder = id.holder();
+    for key in admission.acquired_keys {
+        release_holder_key(inner, &key, &holder);
+    }
+}
+
+fn advance_jobset_admission(
+    inner: &mut InnerState,
+    id: &JobSetId,
+    promoted_key: Option<&(String, String)>,
+) -> Result<JobSetAdmissionResult, String> {
+    if let Some(key) = promoted_key {
+        if let Some(admission) = inner.jobset_admissions.get_mut(id) {
+            admission.acquired_keys.insert(key.clone());
+        }
+    }
+
+    loop {
+        let next_gate = {
+            let Some(admission) = inner.jobset_admissions.get(id) else {
+                return Ok(JobSetAdmissionResult::Ready);
+            };
+            admission
+                .gates
+                .iter()
+                .find(|gate| !admission.acquired_keys.contains(&gate.key))
+                .cloned()
+        };
+        let Some(gate) = next_gate else {
+            inner.jobset_admissions.remove(id);
+            return Ok(JobSetAdmissionResult::Ready);
+        };
+
+        let holder = id.holder();
+        match try_acquire_concurrency(
+            inner,
+            gate.key.clone(),
+            gate.display_name,
+            holder,
+            gate.cancel_in_progress,
+            gate.queue,
+        ) {
+            Ok(true) => {
+                if let Some(admission) = inner.jobset_admissions.get_mut(id) {
+                    admission.acquired_keys.insert(gate.key);
+                }
+            }
+            Ok(false) => return Ok(JobSetAdmissionResult::Blocked),
+            Err(error) => {
+                release_jobset_admission(inner, id);
+                return Err(error);
+            }
         }
     }
 }
