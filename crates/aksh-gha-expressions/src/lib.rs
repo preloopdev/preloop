@@ -459,7 +459,24 @@ fn string_value(value: &Value) -> String {
     match value {
         Value::Null => String::new(),
         Value::Bool(value) => value.to_string(),
-        Value::Number(value) => value.to_string(),
+        Value::Number(value) => {
+            // GitHub Actions renders whole numbers as integers, not floats.
+            // serde_yaml 0.9 may deserialise YAML integer `1` as f64(1.0),
+            // which serde_json prints as "1.0".  Normalise: if the number has
+            // no fractional part, emit it as a plain integer string.
+            if let Some(i) = value.as_i64() {
+                return i.to_string();
+            }
+            if let Some(u) = value.as_u64() {
+                return u.to_string();
+            }
+            if let Some(f) = value.as_f64() {
+                if f.fract() == 0.0 && f.abs() < 1e15 {
+                    return (f as i64).to_string();
+                }
+            }
+            value.to_string()
+        }
         Value::String(value) => value.clone(),
         other => serde_json::to_string(other).unwrap_or_default(),
     }
@@ -1429,5 +1446,47 @@ mod tests {
                 "echo \"name=Linux ARM64\"\necho \"target=aarch64\"\n".to_string()
             )
         );
+    }
+
+    /// GH-MATRIX-INT: integer matrix values must stringify as "1" not "1.0".
+    /// Tests the `string_value` path used by `format()` and other string functions.
+    #[test]
+    fn matrix_integer_renders_without_decimal_suffix() {
+        let mut ctx = Context::default();
+        // Simulate matrix.val = 1 as f64 (what serde_yaml 0.9 may produce)
+        ctx.insert("matrix", serde_json::json!({"val": 1.0_f64}));
+
+        // format() goes through string_value — must produce "1" not "1.0"
+        let result = eval_expression("format('{0}', matrix.val)", &ctx).unwrap();
+        assert_eq!(
+            result,
+            serde_json::Value::String("1".to_owned()),
+            "f64(1.0) must render as '1' via format()"
+        );
+
+        // join() also goes through string_value
+        ctx.insert(
+            "matrix",
+            serde_json::json!({"vals": [1.0_f64, 2.0_f64, 3.0_f64]}),
+        );
+        let joined = eval_expression("join(matrix.vals, ',')", &ctx).unwrap();
+        assert_eq!(
+            joined,
+            serde_json::Value::String("1,2,3".to_owned()),
+            "f64 array join must produce '1,2,3' not '1.0,2.0,3.0'"
+        );
+    }
+
+    /// Genuine floats (1.5) must not be truncated.
+    #[test]
+    fn matrix_genuine_float_preserved() {
+        let mut ctx = Context::default();
+        ctx.insert("matrix", serde_json::json!({"val": 1.5_f64}));
+        let result = eval_expression("matrix.val", &ctx).unwrap();
+        let s = match &result {
+            serde_json::Value::String(st) => st.clone(),
+            other => other.to_string(),
+        };
+        assert!(s.contains('.'), "1.5 must retain decimal: got {s}");
     }
 }
