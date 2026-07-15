@@ -1,7 +1,7 @@
 # Runner flow diff: 93-empty-null-values
 
-- official capture: `/Users/bnjoroge/macos-runners/benchmarks/real-world/results/runner-flow/93-empty-null-values/official/latest`
-- aksh capture: `/Users/bnjoroge/macos-runners/benchmarks/real-world/results/runner-flow/93-empty-null-values/aksh/latest`
+- official capture: `/Users/bnjoroge/workflow-triggers/benchmarks/real-world/results/runner-flow/93-empty-null-values/official/latest`
+- aksh capture: `/Users/bnjoroge/workflow-triggers/benchmarks/real-world/results/runner-flow/93-empty-null-values/aksh/latest`
 - official summary: status=ok flows=69
 - aksh summary: status=ok flows=71
 
