@@ -1,0 +1,14 @@
+name: Webhook Discussions
+on:
+  discussion:
+    types: [created, edited, answered, unanswered]
+  discussion_comment:
+    types: [created, edited, deleted]
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log event
+        run: |
+          echo "EVENT: ${{ github.event_name }}"
+          echo "ACTION: ${{ github.event.action }}"

@@ -1,0 +1,17 @@
+name: Webhook Push
+on:
+  push:
+    branches: [main, 'feature/**']
+    tags: ['v*']
+    paths: ['src/**', 'crates/**']
+    paths-ignore: ['docs/**']
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log event
+        run: |
+          echo "EVENT: push"
+          echo "REF: ${{ github.ref }}"
+          echo "SHA: ${{ github.sha }}"
+          echo "BRANCH: ${{ github.ref_name }}"

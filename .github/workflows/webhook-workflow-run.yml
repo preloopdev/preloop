@@ -1,0 +1,15 @@
+name: Webhook Workflow Run
+on:
+  workflow_run:
+    workflows: [Webhook Push, Webhook PR]
+    types: [requested, completed]
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log event
+        run: |
+          echo "EVENT: workflow_run"
+          echo "TYPE: ${{ github.event.action }}"
+          echo "UPSTREAM: ${{ github.event.workflow_run.name }}"
+          echo "HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}"
