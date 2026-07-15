@@ -1,0 +1,20 @@
+name: Webhook Pull Request
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed, ready_for_review]
+    branches: [main]
+    paths: ['src/**']
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log event
+        run: |
+          echo "EVENT: ${{ github.event_name }}"
+          echo "ACTION: ${{ github.event.action }}"
+          echo "PR_REF: ${{ github.ref }}"
+          echo "HEAD_SHA: ${{ github.event.pull_request.head.sha }}"

@@ -1,0 +1,19 @@
+name: Webhook Repo Social
+on:
+  label:
+    types: [created, edited, deleted]
+  milestone:
+    types: [created, closed, opened, edited, deleted]
+  watch:
+  fork:
+  member:
+    types: [added, removed, edited]
+  public:
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log event
+        run: |
+          echo "EVENT: ${{ github.event_name }}"
+          echo "ACTION: ${{ github.event.action }}"
