@@ -2119,6 +2119,9 @@ fn cancel_run_inner(inner: &mut InnerState, run_id: RunId, reason: Option<&str>)
 
     // Release any concurrency holders belonging to this run and promote next.
     release_concurrency_for_run(inner, run_id);
+    inner
+        .jobset_admissions
+        .retain(|id, _| id.run_id != run_id);
 
     let _ = reason; // events emitted by caller when needed
     count
@@ -2615,6 +2618,10 @@ fn cancel_holder(inner: &mut InnerState, holder: &concurrency::Holder, _reason: 
             cancel_job_inner(inner, *run_id, job_id);
         }
         concurrency::Holder::JobSet { run_id, job_ids } => {
+            inner.jobset_admissions.remove(&JobSetId {
+                run_id: *run_id,
+                job_ids: job_ids.clone(),
+            });
             for job_id in job_ids {
                 cancel_job_inner(inner, *run_id, job_id);
             }
