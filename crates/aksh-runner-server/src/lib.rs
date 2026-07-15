@@ -12999,18 +12999,13 @@ jobs:
         }
     }
 
-    // ── C-02 regression: reusable JobSet holder constructed ──
+    // ── C-02 regression: reusable JobSet admission and promotion ──
 
     #[tokio::test]
-    async fn c02_reusable_call_jobset_blocks_members() {
-        // Simulate a reusable-call scenario: two runs with inner jobs
-        // that share a caller concurrency group should serialize.
+    async fn c02_reusable_call_jobset_blocks_and_promotes_members() {
         let temp = tempfile::tempdir().unwrap();
         let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
         let app = app(state.clone(), CancellationToken::new());
-
-        // This is a caller+callee workflow pair. The caller has concurrency
-        // on the `uses:` job, and the callee is a simple workflow.
         let caller_yaml = r#"
 on: push
 jobs:
@@ -13027,12 +13022,7 @@ jobs:
     steps:
       - run: echo callee
 "#;
-
-        // Submit with reusable workflow.
-        let a = request_json(
-            &app,
-            Method::POST,
-            "/api/v1/runs",
+        let submission = || {
             json!({
                 "workflow_yaml": caller_yaml,
                 "event": "push",
@@ -13040,45 +13030,198 @@ jobs:
                 "reusable_workflows": {
                     ".github/workflows/callee.yml": callee_yaml,
                 }
-            }),
-        )
-        .await;
+            })
+        };
 
-        let b = request_json(
-            &app,
-            Method::POST,
-            "/api/v1/runs",
-            json!({
-                "workflow_yaml": caller_yaml,
-                "event": "push",
-                "repository": "owner/repo",
-                "reusable_workflows": {
-                    ".github/workflows/callee.yml": callee_yaml,
-                }
-            }),
-        )
-        .await;
+        let first = request_json(&app, Method::POST, "/api/v1/runs", submission()).await;
+        let second = request_json(&app, Method::POST, "/api/v1/runs", submission()).await;
+        let first_run: RunId = first["run_id"].as_str().unwrap().parse().unwrap();
+        let second_run: RunId = second["run_id"].as_str().unwrap().parse().unwrap();
+        let (first_job, second_job) = {
+            let inner = state.inner.lock().await;
+            let first_job = inner.runs[&first_run].jobs.keys().next().unwrap().clone();
+            let second_job = inner.runs[&second_run].jobs.keys().next().unwrap().clone();
+            assert_eq!(inner.runs[&first_run].jobs[&first_job], ExecutionStatus::Queued);
+            assert_eq!(
+                inner.runs[&second_run].jobs[&second_job],
+                ExecutionStatus::Pending
+            );
+            assert!(inner
+                .queue
+                .iter()
+                .any(|job| job.run_id == first_run && job.job_id == first_job));
+            assert!(inner
+                .concurrency_blocked
+                .iter()
+                .any(|job| job.run_id == second_run && job.job_id == second_job));
+            (first_job, second_job)
+        };
 
-        // Check that the concurrency group has a JobSet holder.
+        complete_via_api(&app, &first_run.to_string(), &first_job.0).await;
         {
             let inner = state.inner.lock().await;
-            let has_jobset_running = inner
-                .concurrency_groups
-                .values()
-                .any(|g| matches!(&g.running, Some(concurrency::Holder::JobSet { .. })));
-            let has_jobset_pending = inner.concurrency_groups.values().any(|g| {
-                g.pending
-                    .iter()
-                    .any(|h| matches!(h, concurrency::Holder::JobSet { .. }))
-            });
-            // At least one should exist if both runs have caller concurrency.
-            assert!(
-                has_jobset_running || has_jobset_pending,
-                "reusable call with caller concurrency should produce Holder::JobSet"
+            assert_eq!(
+                inner.runs[&second_run].jobs[&second_job],
+                ExecutionStatus::Queued
             );
+            assert!(inner
+                .queue
+                .iter()
+                .any(|job| job.run_id == second_run && job.job_id == second_job));
+            assert!(!inner
+                .concurrency_blocked
+                .iter()
+                .any(|job| job.run_id == second_run && job.job_id == second_job));
         }
+        complete_via_api(&app, &second_run.to_string(), &second_job.0).await;
+        assert_eq!(
+            state.inner.lock().await.runs[&second_run].status,
+            ExecutionStatus::Success
+        );
+    }
 
-        let _ = (a, b);
+    #[tokio::test]
+    async fn c02_jobset_waits_for_embedded_gate_after_acquiring_caller_gate() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+        let holder = submit_yaml(
+            &app,
+            r#"
+on: push
+concurrency:
+  group: embedded-shared
+jobs:
+  hold:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hold
+"#,
+            "owner/repo",
+        )
+        .await;
+        let reusable = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+on: push
+jobs:
+  call:
+    uses: ./.github/workflows/callee.yml
+    concurrency:
+      group: caller-free
+    with:
+      concurrency_group: embedded-shared
+"#,
+                "event": "push",
+                "repository": "owner/repo",
+                "reusable_workflows": {
+                    ".github/workflows/callee.yml": r#"
+on:
+  workflow_call:
+    inputs:
+      concurrency_group:
+        required: true
+        type: string
+concurrency:
+  group: ${{ inputs.concurrency_group }}
+jobs:
+  inner:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo inner
+"#,
+                }
+            }),
+        )
+        .await;
+        let holder_run: RunId = holder["run_id"].as_str().unwrap().parse().unwrap();
+        let reusable_run: RunId = reusable["run_id"].as_str().unwrap().parse().unwrap();
+        let (holder_job, reusable_job) = {
+            let inner = state.inner.lock().await;
+            let holder_job = inner.runs[&holder_run].jobs.keys().next().unwrap().clone();
+            let reusable_job = inner.runs[&reusable_run]
+                .jobs
+                .keys()
+                .next()
+                .unwrap()
+                .clone();
+            assert_eq!(
+                inner.runs[&reusable_run].jobs[&reusable_job],
+                ExecutionStatus::Pending
+            );
+            assert_eq!(inner.jobset_admissions.len(), 1);
+            assert_eq!(inner.jobset_admissions.values().next().unwrap().acquired_keys.len(), 1);
+            (holder_job, reusable_job)
+        };
+
+        complete_via_api(&app, &holder_run.to_string(), &holder_job.0).await;
+        {
+            let inner = state.inner.lock().await;
+            assert_eq!(
+                inner.runs[&reusable_run].jobs[&reusable_job],
+                ExecutionStatus::Queued
+            );
+            assert!(inner.jobset_admissions.is_empty());
+            for group_name in ["caller-free", "embedded-shared"] {
+                let key = concurrency::concurrency_key("owner/repo", group_name);
+                assert!(matches!(
+                    inner.concurrency_groups[&key].running,
+                    Some(concurrency::Holder::JobSet { run_id, .. }) if run_id == reusable_run
+                ));
+            }
+        }
+        complete_via_api(&app, &reusable_run.to_string(), &reusable_job.0).await;
+    }
+
+    #[tokio::test]
+    async fn c02_jobset_deduplicates_identical_caller_and_embedded_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+on: push
+jobs:
+  call:
+    uses: ./.github/workflows/callee.yml
+    concurrency:
+      group: same-key
+"#,
+                "event": "push",
+                "repository": "owner/repo",
+                "reusable_workflows": {
+                    ".github/workflows/callee.yml": r#"
+on: workflow_call
+concurrency:
+  group: same-key
+jobs:
+  inner:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo inner
+"#,
+                }
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+        let inner = state.inner.lock().await;
+        let job_id = inner.runs[&run_id].jobs.keys().next().unwrap();
+        assert_eq!(inner.runs[&run_id].jobs[job_id], ExecutionStatus::Queued);
+        assert!(inner.jobset_admissions.is_empty());
+        let key = concurrency::concurrency_key("owner/repo", "same-key");
+        assert!(inner.concurrency_groups[&key].pending.is_empty());
+        assert!(matches!(
+            inner.concurrency_groups[&key].running,
+            Some(concurrency::Holder::JobSet { run_id: holder_run, .. }) if holder_run == run_id
+        ));
     }
     /// Production path: duplicate completion does not create a second promotion.
     #[tokio::test]
