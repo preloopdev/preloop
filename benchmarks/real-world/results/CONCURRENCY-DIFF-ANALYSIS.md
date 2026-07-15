@@ -2,206 +2,103 @@
 
 Generated: 2026-07-15 UTC
 
-Captures:
-- **GitHub + official runner**: `Bnjoroge1/aksh-conformance` repo, 23 scenarios, runner `conformance-test` (actions/runner v2.335.1)
-- **aksh-server + aksh-runner**: `http://127.0.0.1:9393`, same 23 workflow YAMLs submitted via `/api/v1/runs`
-- **Log compare script**: `benchmarks/real-world/results/concurrency-live/aksh-concurrency-compare-2026-07-15T00-47-09Z/LOG-CONTENT-COMPARE.md`
+## Evidence
 
----
+- **GitHub baseline:** 23 captures from `Bnjoroge1/aksh-conformance` using the official runner v2.335.1.
+- **Fresh aksh execution:** all 23 cases rerun against the current release builds of `aksh-runner-server` and `aksh-runner` using `workflow_dispatch` submissions.
+- **Strict comparison:** `benchmarks/real-world/results/concurrency-live/aksh-concurrency-compare-2026-07-15T00-47-09Z/LOG-CONTENT-COMPARE.md` and the adjacent JSON artifact.
+- **Comparator regressions:** `benchmarks/real-world/test_concurrency_log_compare.py`.
 
-## Summary
+The comparator now treats missing jobs, missing steps, job/step cardinality differences, and cancellation-annotation differences as hard failures. Previous 22/23 and 23/23 claims were produced by permissive comparison rules and are withdrawn.
 
-| Category | Scenarios | Passed | Mismatches | Nature |
-|---|---|---|---|---|
-| Bare-string / FIFO serialization | 01A/B, 03A/B | 4/4 | — | ✅ Full match |
-| Cancel-in-progress | 02A/B, 04A/B | 4/4 | — | ✅ Full match |
-| Queue mode / expression | 05A/B, 06A/B/C | 5/5 | — | ✅ Full match |
-| Case-sensitivity | 07a, 07b | 2/2 | — | ✅ Full match |
-| Job-level / multi-job | 08, 09 | 2/2 | — | ✅ Full match |
-| Empty group / expr group | 10, 11 | 2/2 | — | ✅ Full match (fixed runtime empty-group failure) |
-| Matrix | 12 | 1/1 | 0 | ✅ Full match (fixed integer rendering) |
-| Reusable workflows (JobSet) | 13, 14, 15 | 2/3 | 1 | ❌ GH `uses:` path failure |
-| **Total** | **23** | **22/23** | **1** | |
+## Current results
 
----
+### Fresh aksh runtime matrix
 
-## I. Passing Scenarios — Detailed Notes
+All 23 submitted runs reached their expected terminal outcomes:
 
-### 01 bare-string (A + B) ✅
+- success for the ordinary FIFO, queue-max, expression, case, job-level, multi-job, matrix, and reusable-workflow cases;
+- cancellation for 02A and 04A;
+- failure with zero jobs for the empty-group case;
+- success for caller-only, embedded-only, and different-key reusable JobSets.
 
-Two sequential runs against `concurrency: bare-string-group` (no cancel, default single queue).
+This establishes current aksh runtime behavior for the exercised cases. It does not, by itself, establish strict GitHub parity.
 
-| | GitHub | aksh |
-|---|---|---|
-| Run A conclusion | success | success |
-| Run B conclusion | success | success |
-| Markers A | `DONE=01`, `SCENARIO=01-bare-string` | `DONE=01`, `SCENARIO=01-bare-string` |
-| Markers B | `DONE=01`, `SCENARIO=01-bare-string` | `DONE=01`, `SCENARIO=01-bare-string` |
-| B started after A? | Yes (timestamp non-overlapping) | Yes (concurrency queue serialized) |
+### Strict GitHub comparison
 
-### 02 cancel-in-progress (A + B) ✅
+| Dimension | Result | Evidence |
+|---|---:|---|
+| Run conclusions | 22/23 | Scenario 13 differs because the retained GitHub baseline failed before creating a job while the fresh aksh run succeeded. |
+| Job conclusion multisets | 22/23 | Same scenario-13 fixture mismatch. |
+| Empty-group run shape | 1/1 | Both sides fail with zero jobs; aksh returns `queued_jobs: 0`. |
+| Cancellation annotation | 2/2 | `##[error]The operation was canceled.` is present on both sides for 02A and 04A. |
+| Content markers | 22/23 | Executed scenarios retain matching `SCENARIO=`/`DONE=` markers; scenario 13 has no GitHub job or markers in the retained baseline. |
+| Step conclusions | 2/23 structurally comparable | Native `GET /api/v1/runs/:run_id` currently exposes job conclusions but not per-step conclusions. The strict comparator therefore fails the 21 executed scenarios instead of silently accepting missing steps. |
+| Overall strict score | 1/23 | Only the zero-job empty-group case has fully comparable run, job, step-cardinality, and log-marker structures in the current capture schema. |
 
-`cancel-in-progress: true`; B cancels A in-flight.
+The low strict score is primarily an evidence-schema failure, not 22 newly observed scheduler failures. It is intentionally reported as a failure because absent step data cannot prove parity.
 
-| | GitHub | aksh |
-|---|---|---|
-| Run A conclusion | cancelled | cancelled |
-| Run B conclusion | success | success |
-| A step `sleep-long` | cancelled | cancelled |
-| `##[error] The operation was canceled` | ✅ present in GH log | ⚠️ absent (fidelity note — conclusion still correct) |
-| `SHOULD_NOT_REACH` executed | Not executed | Not executed |
+## Correctness fixes verified
 
-Fidelity gap: GH emits `##[error]The operation was canceled.` annotation in the step log. aksh does not inject this annotation — the step is marked cancelled via job conclusion but no error line is written. This is a log annotation divergence only; the observable conclusion (cancelled) matches.
+### Reusable JobSet admission
 
-### 03 fifo-pending (A + B) ✅
+Reusable invocations now evaluate caller and embedded concurrency gates before dispatch, normalize and deduplicate identical keys, acquire distinct keys in deterministic order, and persist partial admission state while waiting.
 
-`cancel-in-progress: false`; B waits in pending queue.
+Blocked members transition to `Pending` and remain in `concurrency_blocked`. Promotion resumes acquisition of any remaining gate before dispatch. Cancellation releases every acquired key and removes admission state.
 
-Both success; B's step logs show `START=` timestamp after A's `DONE=03`. FIFO ordering preserved.
+Coverage includes:
 
-### 04 cancel-expr-true (A + B) ✅
+- blocked caller-key promotion;
+- caller key acquired while the embedded key is occupied;
+- identical caller and embedded keys without self-contention;
+- reusable input evaluation for embedded expressions such as `${{ inputs.concurrency_group }}`.
 
-`cancel-in-progress: ${{ true }}` — expression evaluated to true at workflow scope. Identical to 02.
+Fresh scenarios 13, 14, and 15 all completed successfully on aksh.
 
-### 05 cancel-expr-false (A + B) ✅
+### Empty workflow concurrency groups
 
-`cancel-in-progress: ${{ false }}` — expression evaluated to false. Both runs succeed serially.
+An evaluated empty workflow-level group now creates an accepted terminal failed run with:
 
-### 06 queue-max (A, B, C) ✅
+- zero jobs;
+- `queued_jobs: 0`;
+- no job request records;
+- no ready, pending, or concurrency-blocked queue entries;
+- an explicit terminal run-status event.
 
-`queue: max` — allows up to 100 pending. All three runs queued and executed sequentially, all success.
+Malformed concurrency expressions and invalid configurations remain HTTP 400 request errors. They are no longer converted into accepted failed runs.
 
-| | GitHub | aksh |
-|---|---|---|
-| All three conclusions | success | success |
-| DONE=06 present in each | Yes | Yes |
+### Native run log retrieval
 
-### 07a/07b case-insensitive groups ✅
+`GET /api/v1/runs/:run_id/logs` now:
 
-`07a`: group `CaseGroup`. `07b`: group `casegroup`. Both run independently (separate submissions, no contention because the concurrency groups serialize separately or are treated as the same group depending on case-sensitivity).
+- returns 404 for an unknown run;
+- resolves the run through its production job-request records and plan IDs;
+- orders jobs by request ID and AzDO log blocks by numeric log ID;
+- reads modern results-service `job-logs.txt` files when present;
+- falls back to in-memory AzDO log blocks without duplicating results-service output;
+- returns deterministic `text/plain; charset=utf-8` content.
 
-**Note (documented fidelity gap from prior live capture, scenario 07):** A live GitHub capture from 2026-07-13 showed `CaseGroup` and `casegroup` ran **concurrently** — GitHub may implement case-**sensitive** group matching in practice despite docs saying case-insensitive. aksh implements case-insensitive per docs. Both scenarios here ran independently without contention so this difference was not exercised; it remains an open fidelity question. See `benchmarks/real-world/results/concurrency-live/2026-07-13T13-19-42Z/VERIFICATION-REPORT.md` scenario 07.
+The fresh matrix confirms that scenario markers and cancellation annotations are now retrievable through this endpoint.
 
-### 08 job-level ✅
+### Strict comparator
 
-Two peer jobs (`one`, `two`) sharing `job-level-serial` concurrency group. Both complete success; timestamps non-overlapping.
+The comparator now:
 
-| | GitHub | aksh |
-|---|---|---|
-| `one` conclusion | success | success |
-| `two` conclusion | success | success |
-| `DONE=one` + `DONE=two` | ✅ | ✅ |
-| Serially ordered | ✅ | ✅ |
+- covers an explicit 23-capture manifest;
+- compares zero-job captures instead of skipping them;
+- requires one-to-one user-step presence;
+- fails missing or additional steps;
+- fails job and step cardinality differences;
+- fails cancellation-annotation asymmetry;
+- supports native aksh job maps as well as captured job arrays;
+- writes synchronized Markdown and JSON artifacts beside the requested output path.
 
-### 09 multi-job-hold ✅
+Regression tests exercise the former false-pass cases directly.
 
-Two parallel jobs (`one`, `two`) under workflow-level `concurrency: multi-job-workflow-group`. Jobs within a single run execute in parallel; the group serializes competing *runs* not internal jobs. Both jobs complete success.
+## Remaining evidence limitations
 
-### 10 empty-group ✅
+1. **Per-step conclusions are not available in the native run capture.** The results-service step update endpoint currently acknowledges updates without retaining a native step projection. Strict step parity therefore remains unproven.
+2. **Scenario 13 needs a refreshed GitHub baseline.** The retained official capture failed before job creation, while the corrected absolute reusable-workflow reference and fresh aksh execution succeed.
+3. **Case sensitivity remains unexercised under contention.** The two case variants were submitted independently; this does not determine whether live GitHub treats `CaseGroup` and `casegroup` as one active group.
 
-Concurrency group `${{ github.event.head_commit.id_missing }}` evaluates to empty string.
-
-| | GitHub | aksh |
-|---|---|---|
-| Conclusion | failure | failure (submit-level 422) |
-| Jobs created | 0 | 0 (rejected before dispatch) |
-
-GitHub creates a run, evaluates the group at start, then fails the run with 0 jobs. aksh rejects the submission immediately with HTTP 422. Both reach conclusion = failure with no jobs executed — behavioral parity despite protocol difference in when the rejection happens.
-
-### 11 expr-group-ref ✅
-
-`group: ref-${{ github.ref }}` — expression using `github` context at workflow scope. Evaluates to `ref-` (no ref in local aksh push event context) or similar. Both succeed with `SCENARIO=11-expr-group-ref` and `DONE=11` present.
-
-### 14 jobset-embedded-only ✅
-
-Reusable workflow with embedded (callee) workflow-level `concurrency:`. Caller has no concurrency. Inner `inner` job dispatched after callee's concurrency group acquired.
-
-| | GitHub | aksh |
-|---|---|---|
-| Conclusion | success | success |
-| `SCENARIO=reusable-callee input=embedded-only` | ✅ | ✅ |
-| `DONE=reusable` | ✅ | ✅ |
-
-### 15 jobset-different-key ✅
-
-Caller job has `concurrency.group: caller-key-15`; callee workflow has `concurrency.group: embedded-key-15`. Both keys must be acquired before dispatch.
-
-| | GitHub | aksh |
-|---|---|---|
-| Conclusion | success | success |
-| `SCENARIO=reusable-callee input=different-key` | ✅ | ✅ |
-| `DONE=reusable` | ✅ | ✅ |
-
----
-
-## II. Mismatches
-
-### Mismatch 1 — 13 jobset-caller-only: GitHub `uses:` path failure ❌
-
-**Scenario:** Caller job with `concurrency.group: caller-only-group` and `uses: ./.github/workflows/reusable-callee.yml`.
-
-| | GitHub | aksh |
-|---|---|---|
-| Run conclusion | **failure** (0 jobs) | **success** |
-| Jobs created | 0 | 1 (`caller-job / inner`) |
-| `SCENARIO=reusable-callee input=caller-only` | Not executed | ✅ present |
-
-**Root cause (documented):** GitHub returned failure with 0 jobs when the caller uses `uses: ./.github/workflows/reusable-callee.yml` — this is a GitHub-side issue where relative `./` path resolution for `uses:` in certain trigger/callee configurations does not work as expected (separate from the `on: workflow_call` trigger requirement). aksh resolves the callee from the `reusable_workflows` map keyed by the path string and dispatches correctly.
-
-This is NOT an aksh bug. aksh's behavior (dispatching the inner job, applying caller concurrency, completing success) is *more correct* per the GitHub Actions spec. The GitHub failure is a path resolution limitation in the conformance repo setup.
-
-**Evidence:** Scenario 14 (embedded-only, different callee path) and 15 (different-key) both pass on GitHub, confirming the callee workflow itself is valid. The `uses: ./` path in scenario 13 is the failing element.
-
-**Action:** Updated the conformance runner (commit `b7a12b4` in `aksh-conformance`) to use `{owner}/{repo}/.github/workflows/reusable-callee.yml@main` (absolute path) instead of `./` relative path when running against GitHub. This makes scenario 13 pass on GitHub too.
-
----
-
-## III. Fidelity Notes (not failures)
-
-### F-01: `##[error]` cancel annotation absent in aksh step logs
-
-Scenarios 02A, 04A (and any future cancel-in-progress). GH writes `##[error]The operation was canceled.` inside the cancelled step's log. aksh marks the step as `cancelled` via job conclusion but does not inject this error line into the step log blob.
-
-**Impact:** Tooling that scrapes step logs for `##[error]` to detect cancellation will not find it in aksh captures. Run and job conclusion are correct.
-
-**Fix path:** Emit the cancellation error annotation in `crates/aksh-runner/src/worker/job_runner.rs` when a step is interrupted by cancellation token — write `##[error]The operation was canceled.` to the step log before closing.
-
-### F-03: Case-sensitivity (scenario 07) unexercised
-
-aksh implements case-insensitive group matching per docs. Prior live capture (2026-07-13 scenario 07) showed live GitHub may use case-sensitive matching. Both 07a/07b ran without contention in this capture so the difference was not observable. Remains an open fidelity question for a future capture that submits `CaseGroup` and `casegroup` in a concurrent pair.
-
----
-
-## IV. Overall Assessment
-
-### Concurrency Conformance Score
-
-| Dimension | Score | Notes |
-|---|---|---|
-| **Run conclusion** | 22/23 | Only 13-jobset-caller differs on default relative uses (fixed with absolute uses) |
-| **Job conclusion multiset** | 22/23 | Same single exception |
-| **Step conclusions** | 22/23 | Matrix matches after integer rendering fix |
-| **Content markers (SCENARIO=, DONE=)** | 22/23 | Matrix matches; 13: GH has no steps |
-| **Log-level fidelity** | Fidelity note | `##[error]` cancel annotation absent in aksh |
-| **Concurrency semantics** | 23/23 | All queuing, cancellation, FIFO, max, job-level, JobSet behaviors match |
-
-### Key Findings
-
-1. **Core concurrency semantics are fully correct.** Single queue, max queue, cancel-in-progress, FIFO ordering, job-level serialization, multi-job parallel, reusable workflow (JobSet) with embedded and different-key groups — all match GitHub behavior at conclusion level.
-
-2. **Expression evaluation bug fixed:** Integer matrix values rendering as `1.0` instead of `1` has been **FIXED** in both `aksh-gha-expressions` and `aksh-gha-parser` stringification helpers. Tests added and verified.
-
-3. **Empty concurrency group validation fixed:** The server now accepts empty group names at submission time (returning HTTP 201/200 OK) but immediately marks the run and all jobs as `Failure` with 0 jobs queued, matching GitHub Actions' runtime execution behavior exactly. Unit test `empty_concurrency_group_rejected` updated.
-
-4. **Test fixture gap resolved:** Scenario 13 `uses: ./` path fails on GitHub. Resolved by using absolute `{owner}/{repo}/…@main` syntax.
-
-5. **One log-level fidelity gap:** Cancel annotation `##[error]The operation was canceled.` not emitted by aksh worker. Run conclusion is correct; only step log content differs.
----
-
-## V. Next Steps
-
-| Priority | Item | Location |
-|---|---|---|
-| P2 | Emit `##[error]The operation was canceled.` in cancelled step logs | `crates/aksh-runner/src/worker/job_runner.rs` |
-| P3 | Capture case-sensitivity scenario as a concurrent pair on live GitHub | New scenario 07c in aksh-conformance |
-| INFO | Baseline captured at runner v2.335.1 | Update after runner upgrade |
+No 23/23 parity claim should be published until the capture schema stores per-step conclusions, scenario 13 is recaptured on GitHub, and the strict comparator passes the resulting artifacts.
