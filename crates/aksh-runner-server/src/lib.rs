@@ -1315,7 +1315,7 @@ pub(crate) async fn submit_run_inner(
 
     // Evaluate workflow-level concurrency before locking (pure).
     let workflow_concurrency = workflow.concurrency.clone();
-    let mut workflow_concurrency_error = None;
+    let mut empty_workflow_concurrency_group = false;
     let workflow_concurrency_eval = if let Some(raw) = &workflow_concurrency {
         let eval_ctx = concurrency::ConcurrencyContext {
             scope: concurrency::ConcurrencyScope::Workflow,
@@ -1326,20 +1326,15 @@ pub(crate) async fn submit_run_inner(
             strategy: None,
             needs: None,
         };
-        match concurrency::evaluate_concurrency(raw, &eval_ctx) {
-            Ok((group, cancel, queue)) => {
-                if group.trim().is_empty() {
-                    workflow_concurrency_error =
-                        Some("concurrency group name must not be empty".to_owned());
-                    None
-                } else {
-                    Some((group, cancel, queue, raw.clone()))
-                }
-            }
-            Err(e) => {
-                workflow_concurrency_error = Some(format!("concurrency evaluation failed: {e}"));
-                None
-            }
+        let (group, cancel, queue) = concurrency::evaluate_concurrency(raw, &eval_ctx)
+            .map_err(|error| {
+                ApiError::bad_request(format!("concurrency evaluation failed: {error}"))
+            })?;
+        if group.trim().is_empty() {
+            empty_workflow_concurrency_group = true;
+            None
+        } else {
+            Some((group, cancel, queue, raw.clone()))
         }
     } else {
         None
@@ -1355,24 +1350,18 @@ pub(crate) async fn submit_run_inner(
         let mut ready_by_base: BTreeMap<String, u64> = BTreeMap::new();
         let mut initially_skipped = Vec::new();
         let mut built_jobs: Vec<QueuedJob> = Vec::new();
-        if let Some(err_msg) = &workflow_concurrency_error {
-            for job in &jobs {
-                job_base_ids.insert(job.id.clone(), job.base_id.clone());
-                job_needs.insert(job.id.clone(), job.needs.clone());
-                job_fail_fast.insert(job.base_id.clone(), job.fail_fast);
-                statuses.insert(job.id.clone(), ExecutionStatus::Failure);
-            }
-            let queued_jobs = statuses.len();
+        if empty_workflow_concurrency_group {
+            let queued_jobs = 0;
             inner.runs.insert(
                 run_id,
                 RunRecord {
                     run_id,
                     submission,
-                    jobs: statuses,
+                    jobs: BTreeMap::new(),
                     job_outputs: BTreeMap::new(),
-                    job_base_ids,
-                    job_needs,
-                    job_fail_fast,
+                    job_base_ids: BTreeMap::new(),
+                    job_needs: BTreeMap::new(),
+                    job_fail_fast: BTreeMap::new(),
                     status: ExecutionStatus::Failure,
                     job_check_run_ids: BTreeMap::new(),
                     reusable_calls,
@@ -1391,7 +1380,7 @@ pub(crate) async fn submit_run_inner(
                 .emit(NdjsonEvent::RunStatus {
                     run_id,
                     status: ExecutionStatus::Failure,
-                    reason: Some(format!("concurrency_error: {err_msg}")),
+                    reason: Some("concurrency group name must not be empty".to_owned()),
                 })
                 .await;
             return Ok(RunAccepted {
