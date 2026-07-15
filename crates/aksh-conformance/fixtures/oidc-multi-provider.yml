@@ -1,0 +1,59 @@
+name: oidc-multi-provider
+on: push
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  multi-aud:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Request AWS token
+        run: |
+          if [ -z "$ACTIONS_ID_TOKEN_REQUEST_URL" ]; then echo "FAIL: URL not set"; exit 1; fi
+          RESP=$(curl -s -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com")
+          echo "$RESP" | python3 -c "
+import sys,json,base64
+t=json.load(sys.stdin)['value']
+c=json.loads(base64.urlsafe_b64decode(t.split('.')[1]+'=='))
+assert c['aud']=='sts.amazonaws.com', f'AWS aud mismatch: {c[\"aud\"]}'
+print(f'AWS token OK: jti={c[\"jti\"]}')"
+
+      - name: Request Azure token
+        run: |
+          RESP=$(curl -s -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://AzureADTokenExchange")
+          echo "$RESP" | python3 -c "
+import sys,json,base64
+t=json.load(sys.stdin)['value']
+c=json.loads(base64.urlsafe_b64decode(t.split('.')[1]+'=='))
+assert c['aud']=='api://AzureADTokenExchange', f'Azure aud mismatch: {c[\"aud\"]}'
+print(f'Azure token OK: jti={c[\"jti\"]}')"
+
+      - name: Request GCP token
+        run: |
+          RESP=$(curl -s -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://iam.googleapis.com/projects/123456")
+          echo "$RESP" | python3 -c "
+import sys,json,base64
+t=json.load(sys.stdin)['value']
+c=json.loads(base64.urlsafe_b64decode(t.split('.')[1]+'=='))
+assert c['aud']=='https://iam.googleapis.com/projects/123456', f'GCP aud mismatch: {c[\"aud\"]}'
+print(f'GCP token OK: jti={c[\"jti\"]}')"
+
+      - name: Verify multiple jti unique
+        run: |
+          # All three jti values from above steps should be different
+          # (they were different requests)
+          AWS_RESP=$(curl -s -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com")
+          AZURE_RESP=$(curl -s -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://AzureADTokenExchange")
+          python3 -c "
+import sys,json,base64
+t1=json.loads(sys.argv[1])['value']
+t2=json.loads(sys.argv[2])['value']
+c1=json.loads(base64.urlsafe_b64decode(t1.split('.')[1]+'=='))
+c2=json.loads(base64.urlsafe_b64decode(t2.split('.')[1]+'=='))
+assert c1['jti'] != c2['jti'], 'jti must be unique per request'
+print(f'jti uniqueness OK: {c1[\"jti\"]} != {c2[\"jti\"]}')" "$AWS_RESP" "$AZURE_RESP"
