@@ -1739,14 +1739,12 @@ pub(crate) async fn submit_run_inner(
             let job_id = queued_job.job_id.clone();
             let base_id = queued_job.base_id.clone();
 
-            // If this job is part of a JobSet that is blocked/failed, park it.
+            // A blocked JobSet member must remain durably parked until every
+            // required key is acquired. Terminal members are not parked.
             if jobset_blocked.contains(&job_id) {
-                if !statuses.contains_key(&job_id) {
+                let status = statuses.get(&job_id).copied();
+                if status.is_some_and(concurrency::is_awaiting_execution) {
                     statuses.insert(job_id, ExecutionStatus::Pending);
-                }
-                // Only park jobs that are pending (not already failed/cancelled).
-                let s = statuses.get(&queued_job.job_id);
-                if matches!(s, Some(ExecutionStatus::Pending)) {
                     inner.concurrency_blocked.push_back(queued_job);
                 }
                 continue;
