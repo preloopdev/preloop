@@ -87,6 +87,24 @@ impl AgentRsaPublicKey {
             .verify(data, &sig)
             .map_err(|e| anyhow::anyhow!("signature verification failed: {e}"))
     }
+
+    /// Verify a signature signed with RS256 (RSA-PKCS#1 v1.5 SHA-256).
+    pub fn verify_signature_rs256(
+        &self,
+        data: &[u8],
+        signature: &[u8],
+    ) -> Result<(), anyhow::Error> {
+        use rsa::pkcs1v15::{Signature, VerifyingKey};
+        use rsa::signature::Verifier;
+        use sha2::Sha256;
+
+        let verifying_key = VerifyingKey::<Sha256>::new(self.public_key.clone());
+        let sig = Signature::try_from(signature)
+            .map_err(|e| anyhow::anyhow!("invalid signature format: {e}"))?;
+        verifying_key
+            .verify(data, &sig)
+            .map_err(|e| anyhow::anyhow!("signature verification failed: {e}"))
+    }
 }
 
 fn parse_xml_public_key(value: &str) -> Result<rsa::RsaPublicKey, CryptoError> {
@@ -214,6 +232,14 @@ impl AgentRsaKeypair {
             BASE64_STANDARD.encode(self.public_key.n().to_bytes_be()),
             BASE64_STANDARD.encode(self.public_key.e().to_bytes_be())
         )
+    }
+
+    /// Return the JWK components `(n, e)` as base64url-encoded big-endian integers,
+    /// suitable for inclusion in a JWKS document or RFC 7638 thumbprint computation.
+    pub fn jwk_components(&self) -> (String, String) {
+        let n = URL_SAFE_NO_PAD.encode(self.public_key.n().to_bytes_be());
+        let e = URL_SAFE_NO_PAD.encode(self.public_key.e().to_bytes_be());
+        (n, e)
     }
 }
 
@@ -363,6 +389,32 @@ pub fn sign_jwt_ps256(
     let signature = signing_key.sign_with_rng(&mut rng, signing_input.as_bytes());
     let sig_bytes: Box<[u8]> = signature.into();
     let sig_b64 = URL_SAFE_NO_PAD.encode(&*sig_bytes);
+
+    Ok(format!("{signing_input}.{sig_b64}"))
+}
+
+/// Sign a JWT with RS256 (RSA-PKCS#1 v1.5 SHA-256) — the algorithm GitHub's OIDC
+/// provider uses for id-tokens.
+///
+/// Produces: base64url(header).base64url(claims).base64url(signature)
+pub fn sign_jwt_rs256(
+    header: &serde_json::Value,
+    claims: &serde_json::Value,
+    params: &dyn RsaParamsLike,
+) -> Result<String, anyhow::Error> {
+    use rsa::pkcs1v15::SigningKey;
+    use rsa::signature::{SignatureEncoding, Signer};
+    use sha2::Sha256;
+
+    let keypair = AgentRsaKeypair::from_rsaparams(params)?;
+
+    let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_string(header)?.as_bytes());
+    let claims_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_string(claims)?.as_bytes());
+    let signing_input = format!("{header_b64}.{claims_b64}");
+
+    let signing_key = SigningKey::<Sha256>::new(keypair.private_key);
+    let signature = signing_key.sign(signing_input.as_bytes());
+    let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
 
     Ok(format!("{signing_input}.{sig_b64}"))
 }
@@ -615,5 +667,65 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&decoded_header).unwrap();
         assert_eq!(parsed["alg"], "PS256");
         assert_eq!(parsed["typ"], "JWT");
+    }
+
+    #[test]
+    fn sign_jwt_rs256_produces_three_parts() {
+        let kp = AgentRsaKeypair::generate().unwrap();
+        let params = kp.to_rsaparams();
+
+        let header = serde_json::json!({"typ": "JWT", "alg": "RS256", "kid": "test-kid"});
+        let claims = serde_json::json!({
+            "sub": "repo:owner/repo:ref:refs/heads/main",
+            "iss": "https://token.actions.githubusercontent.com",
+            "aud": "https://github.com/owner",
+            "jti": "unique-id",
+            "nbf": 1700000000u64,
+            "exp": 1700000300u64,
+        });
+
+        let jwt = super::sign_jwt_rs256(&header, &claims, &params).unwrap();
+        let parts: Vec<&str> = jwt.split('.').collect();
+        assert_eq!(parts.len(), 3, "JWT should have 3 dot-separated parts");
+        assert!(!parts[0].is_empty());
+        assert!(!parts[1].is_empty());
+        assert!(!parts[2].is_empty());
+
+        let decoded_header = URL_SAFE_NO_PAD.decode(parts[0]).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&decoded_header).unwrap();
+        assert_eq!(parsed["alg"], "RS256");
+        assert_eq!(parsed["typ"], "JWT");
+        assert_eq!(parsed["kid"], "test-kid");
+    }
+
+    #[test]
+    fn rs256_signature_verifies_with_public_key() {
+        use rsa::pkcs1v15::VerifyingKey;
+        use rsa::signature::Verifier;
+        use sha2::Sha256;
+
+        let kp = AgentRsaKeypair::generate().unwrap();
+        let params = kp.to_rsaparams();
+
+        let header = serde_json::json!({"typ": "JWT", "alg": "RS256"});
+        let claims = serde_json::json!({"sub": "test", "iss": "test-iss"});
+        let jwt = super::sign_jwt_rs256(&header, &claims, &params).unwrap();
+        let parts: Vec<&str> = jwt.split('.').collect();
+        let signing_input = format!("{}.{}", parts[0], parts[1]);
+        let signature = URL_SAFE_NO_PAD.decode(parts[2]).unwrap();
+
+        let verifying_key = VerifyingKey::<Sha256>::new(kp.public_key.clone());
+        let sig = rsa::pkcs1v15::Signature::try_from(&signature[..]).unwrap();
+        assert!(verifying_key.verify(signing_input.as_bytes(), &sig).is_ok());
+    }
+
+    #[test]
+    fn jwk_components_are_base64url() {
+        let kp = AgentRsaKeypair::generate().unwrap();
+        let (n, e) = kp.jwk_components();
+        assert!(URL_SAFE_NO_PAD.decode(&n).is_ok(), "n should be base64url");
+        assert!(URL_SAFE_NO_PAD.decode(&e).is_ok(), "e should be base64url");
+        // e for RSA-2048 is typically 65537 = 0x010001 → "AQAB"
+        assert_eq!(e, "AQAB");
     }
 }
