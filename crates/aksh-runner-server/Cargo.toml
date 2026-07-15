@@ -39,6 +39,9 @@ tokio-tungstenite.workspace = true
 axum-server.workspace = true
 rcgen.workspace = true
 rustls = { version = "0.23", features = ["ring"] }
+cron.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
