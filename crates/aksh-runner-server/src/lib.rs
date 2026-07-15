@@ -1326,8 +1326,8 @@ pub(crate) async fn submit_run_inner(
             strategy: None,
             needs: None,
         };
-        let (group, cancel, queue) = concurrency::evaluate_concurrency(raw, &eval_ctx)
-            .map_err(|error| {
+        let (group, cancel, queue) =
+            concurrency::evaluate_concurrency(raw, &eval_ctx).map_err(|error| {
                 ApiError::bad_request(format!("concurrency evaluation failed: {error}"))
             })?;
         if group.trim().is_empty() {
@@ -1666,10 +1666,7 @@ pub(crate) async fn submit_run_inner(
                         merge_jobset_gate(
                             &mut gates,
                             JobSetGate {
-                                key: concurrency::concurrency_key(
-                                    &submission.repository,
-                                    &group,
-                                ),
+                                key: concurrency::concurrency_key(&submission.repository, &group),
                                 display_name: group,
                                 cancel_in_progress,
                                 queue,
@@ -2131,9 +2128,7 @@ fn cancel_run_inner(inner: &mut InnerState, run_id: RunId, reason: Option<&str>)
 
     // Release any concurrency holders belonging to this run and promote next.
     release_concurrency_for_run(inner, run_id);
-    inner
-        .jobset_admissions
-        .retain(|id, _| id.run_id != run_id);
+    inner.jobset_admissions.retain(|id, _| id.run_id != run_id);
 
     let _ = reason; // events emitted by caller when needed
     count
@@ -8928,12 +8923,24 @@ jobs:
         assert_eq!(requests.len(), 2);
 
         for (plan_id, log_id, body) in [
-            (&requests[0].0, "10", "first-ten
-"),
-            (&requests[0].0, "2", "first-two
-"),
-            (&requests[1].0, "1", "ignored-fallback
-"),
+            (
+                &requests[0].0,
+                "10",
+                "first-ten
+",
+            ),
+            (
+                &requests[0].0,
+                "2",
+                "first-two
+",
+            ),
+            (
+                &requests[1].0,
+                "1",
+                "ignored-fallback
+",
+            ),
         ] {
             let response = app
                 .clone()
@@ -8959,10 +8966,13 @@ jobs:
             .join(&requests[1].0)
             .join(&requests[1].1);
         tokio::fs::create_dir_all(&results_dir).await.unwrap();
-        tokio::fs::write(results_dir.join("job-logs.txt"), b"results-second
-")
-            .await
-            .unwrap();
+        tokio::fs::write(
+            results_dir.join("job-logs.txt"),
+            b"results-second
+",
+        )
+        .await
+        .unwrap();
 
         let response = app
             .clone()
@@ -8981,12 +8991,21 @@ jobs:
             "text/plain; charset=utf-8"
         );
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(body.as_ref(), b"first-two
+        assert_eq!(
+            body.as_ref(),
+            b"first-two
 first-ten
 results-second
-");
+"
+        );
+    }
 
-        let unknown = app
+    #[tokio::test]
+    async fn log_get_run_logs_returns_404_for_unknown_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+        let response = app
             .oneshot(
                 Request::builder()
                     .method(Method::GET)
@@ -8996,7 +9015,7 @@ results-second
             )
             .await
             .unwrap();
-        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -13161,7 +13180,10 @@ jobs:
             let inner = state.inner.lock().await;
             let first_job = inner.runs[&first_run].jobs.keys().next().unwrap().clone();
             let second_job = inner.runs[&second_run].jobs.keys().next().unwrap().clone();
-            assert_eq!(inner.runs[&first_run].jobs[&first_job], ExecutionStatus::Queued);
+            assert_eq!(
+                inner.runs[&first_run].jobs[&first_job],
+                ExecutionStatus::Queued
+            );
             assert_eq!(
                 inner.runs[&second_run].jobs[&second_job],
                 ExecutionStatus::Pending
@@ -13273,7 +13295,16 @@ jobs:
                 ExecutionStatus::Pending
             );
             assert_eq!(inner.jobset_admissions.len(), 1);
-            assert_eq!(inner.jobset_admissions.values().next().unwrap().acquired_keys.len(), 1);
+            assert_eq!(
+                inner
+                    .jobset_admissions
+                    .values()
+                    .next()
+                    .unwrap()
+                    .acquired_keys
+                    .len(),
+                1
+            );
             (holder_job, reusable_job)
         };
 
