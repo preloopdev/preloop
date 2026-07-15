@@ -1,6 +1,6 @@
 # Unified Runner Comparison Report
 
-Generated: 2026-07-08 04:27:23 UTC
+Generated: 2026-07-15 06:19:14 UTC
 
 ## Reports
 
@@ -10,9 +10,9 @@ Generated: 2026-07-08 04:27:23 UTC
 
 ## Quick Summary
 
-**Totals**: 8 matching, 4 mismatched, 9 incomplete/missing
+**Totals**: 9 matching, 3 mismatched, 17 incomplete/missing
 
-**Total**: 3 scenarios compared, 41 issues found
+**Total**: 27 scenarios compared, 104 issues found
 
-**Total**: 1 scenarios with flow captures compared
+**Total**: 19 scenarios with flow captures compared
 
