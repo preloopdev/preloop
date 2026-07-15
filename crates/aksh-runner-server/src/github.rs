@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-use crate::{submit_run_inner, ExecutionStatus, SharedState};
+use crate::{changed_paths_from_payload, submit_run_inner, ExecutionStatus, SharedState};
 use aksh_gha_protocol::{JobId, RunId, WorkflowSubmission};
 
 /// Webhook push event payload.
@@ -411,6 +411,51 @@ async fn fetch_remote_workflows(
     Ok(workflows)
 }
 
+async fn resolve_ref_sha(
+    local_workspace: &Option<PathBuf>,
+    repository: &str,
+    git_ref: &str,
+) -> anyhow::Result<Option<String>> {
+    if let Some(workspace) = local_workspace {
+        let output = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(workspace)
+            .args(["rev-parse", git_ref])
+            .output()
+            .await?;
+        if output.status.success() {
+            return Ok(String::from_utf8(output.stdout)
+                .ok()
+                .map(|sha| sha.trim().to_owned())
+                .filter(|sha| {
+                    sha.len() == 40 && sha.chars().all(|character| character.is_ascii_hexdigit())
+                }));
+        }
+        return Ok(None);
+    }
+    let Some(token) = std::env::var("AKSH_GITHUB_TOKEN").ok() else {
+        return Ok(None);
+    };
+    let commit_ref = git_ref
+        .strip_prefix("refs/heads/")
+        .or_else(|| git_ref.strip_prefix("refs/tags/"))
+        .unwrap_or(git_ref);
+    let response = reqwest::Client::new()
+        .get(format!(
+            "https://api.github.com/repos/{repository}/commits/{commit_ref}"
+        ))
+        .header("User-Agent", "aksh")
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        return Ok(None);
+    }
+    let commit: Value = response.json().await?;
+    Ok(commit.get("sha").and_then(Value::as_str).map(str::to_owned))
+}
+
 async fn get_pr_changed_files(
     token: &str,
     repo: &str,
@@ -484,106 +529,223 @@ pub(crate) async fn handle_github_webhook(
         .and_then(|h| h.to_str().ok())
         .ok_or(StatusCode::BAD_REQUEST)?;
 
-    // 3. Process the event payload
+    // 3. Parse the event payload
     let payload_val: Value = serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    let (repo_full_name, git_ref, sha, changed_paths) = match event_name {
-        "push" => {
-            let event: PushEvent =
-                serde_json::from_value(payload_val.clone()).map_err(|_| StatusCode::BAD_REQUEST)?;
-            let mut paths = Vec::new();
-            // Collect changed files from push commits
-            for commit in &event.commits {
-                paths.extend(commit.added.clone());
-                paths.extend(commit.modified.clone());
-                paths.extend(commit.removed.clone());
-            }
-            paths.sort();
-            paths.dedup();
-            (
-                event.repository.full_name,
-                event.git_ref,
-                event.after,
-                paths,
-            )
-        }
-        "pull_request" => {
-            let event: PullRequestEvent =
-                serde_json::from_value(payload_val.clone()).map_err(|_| StatusCode::BAD_REQUEST)?;
-            let repo = event.repository.full_name;
-            let git_ref = format!("refs/pull/{}/merge", event.number);
-            let sha = event.pull_request.head.sha;
-            let mut paths = Vec::new();
-            // Retrieve changed files from remote GitHub API if possible
-            if let Some(token) = &std::env::var("AKSH_GITHUB_TOKEN").ok() {
-                if let Ok(files) = get_pr_changed_files(token, &repo, event.number).await {
-                    paths = files;
-                }
-            }
-            (repo, git_ref, sha, paths)
-        }
-        _ => {
-            info!("Received unsupported GitHub webhook event: {}", event_name);
+    // 4. Look up the event adapter
+    let adapter = match crate::events::adapter_for(event_name) {
+        Some(a) => a,
+        None => {
+            info!("No adapter for event: {}", event_name);
             return Ok((StatusCode::OK, Json(serde_json::json!([]))));
         }
     };
 
-    // 4. Fetch workflows
-    let workflows = fetch_workflows(&shared.state.local_workspace, &repo_full_name, &git_ref)
-        .await
-        .map_err(|e| {
-            error!("Failed to fetch workflows: {:?}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    // 5. Project the payload into effective events
+    let effective_events = adapter.project(&payload_val);
+
+    if effective_events.is_empty() {
+        info!(
+            "Event {} produced no effective events (e.g. [skip ci] or fork-gated)",
+            event_name
+        );
+        return Ok((StatusCode::OK, Json(serde_json::json!([]))));
+    }
+
+    let repo_full_name = payload_val
+        .get("repository")
+        .and_then(|r| r.get("full_name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("local/repo")
+        .to_owned();
+    let changed_paths = if matches!(
+        event_name,
+        "pull_request" | "pull_request_target" | "pull_request_review"
+    ) {
+        let pr_number = payload_val
+            .get("number")
+            .or_else(|| {
+                payload_val
+                    .get("pull_request")
+                    .and_then(|pr| pr.get("number"))
+            })
+            .and_then(|value| value.as_u64());
+        match (std::env::var("AKSH_GITHUB_TOKEN").ok(), pr_number) {
+            (Some(token), Some(number)) => get_pr_changed_files(&token, &repo_full_name, number)
+                .await
+                .map_err(|error| {
+                    error!(?error, "failed to resolve pull request changed files");
+                    StatusCode::BAD_GATEWAY
+                })?,
+            _ => changed_paths_from_payload(&payload_val),
+        }
+    } else {
+        changed_paths_from_payload(&payload_val)
+    };
+    let changed_paths_known = !matches!(
+        event_name,
+        "pull_request" | "pull_request_target" | "pull_request_review"
+    ) || std::env::var("AKSH_GITHUB_TOKEN").is_ok()
+        || payload_val.get("paths").is_some()
+        || payload_val.get("commits").is_some();
 
     let mut triggered_runs = Vec::new();
 
-    // 5. Evaluate and trigger matching workflows
-    for (filename, content) in workflows {
-        // Parse workflow to check triggers
-        let parsed = match aksh_gha_parser::parse_workflow(&content) {
-            Ok(w) => w,
-            Err(e) => {
-                warn!("Failed to parse workflow file {}: {:?}", filename, e);
-                continue;
-            }
+    // 5. For each effective event, fetch workflows and submit runs
+    for effective in &effective_events {
+        if effective.skip {
+            info!("Skipping event {} (skip flag set)", effective.event);
+            continue;
+        }
+
+        let default_branch = payload_val
+            .get("repository")
+            .and_then(|r| r.get("default_branch"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("main");
+        let ref_default = format!("refs/heads/{default_branch}");
+
+        // Log filter validity warnings (non-fatal — GitHub only warns)
+        // This is done per-workflow later, but we log at the event level too
+
+        // `workflow_run` is privileged: downstream workflow YAML must always
+        // come from the repository default branch, never the upstream head.
+        let workflow_ref = if effective.event == "workflow_run" {
+            &ref_default
+        } else {
+            &effective.git_ref
         };
+        let workflows =
+            fetch_workflows(&shared.state.local_workspace, &repo_full_name, workflow_ref)
+                .await
+                .map_err(|e| {
+                    error!("Failed to fetch workflows: {:?}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+        let resolved_sha = match &effective.sha {
+            Some(sha) => sha.clone(),
+            None => resolve_ref_sha(
+                &shared.state.local_workspace,
+                &repo_full_name,
+                &effective.git_ref,
+            )
+            .await
+            .map_err(|error| {
+                error!(?error, "failed to resolve webhook ref SHA");
+                StatusCode::BAD_GATEWAY
+            })?
+            .ok_or_else(|| {
+                error!(ref_name = %effective.git_ref, "webhook ref has no resolvable commit SHA");
+                StatusCode::BAD_GATEWAY
+            })?,
+        };
+        if effective.event == "push" && effective.git_ref == ref_default {
+            if let Some(scheduler) = &shared.state.scheduler {
+                scheduler
+                    .reconcile_all(&workflows, payload_val.clone(), shared.clone())
+                    .await;
+            }
+        }
 
-        let (branch, tag) = crate::git_ref_context(&git_ref);
-        let activity_type = payload_val.get("action").and_then(|v| v.as_str());
+        for (filename, content) in workflows {
+            // Scheduler reconciliation runs once for the complete workflow
+            // inventory above so deletions are observable too.
+            // Validate filter keys / conflicting filters (warning only — submit_run_inner
+            // does the actual match; we warn early so the log is tied to the file).
+            match aksh_gha_parser::parse_workflow(&content) {
+                Ok(parsed) => {
+                    if let Err(e) = parsed.on.validate_filters(&effective.event) {
+                        warn!("Filter validation warning for {filename}: {e}");
+                    }
+                    if let Err(e) = parsed.on.check_conflicting_filters(&effective.event) {
+                        warn!("Conflicting filters in {filename}: {e}");
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to parse workflow file {filename}: {e:?}");
+                    continue;
+                }
+            }
 
-        if parsed.on.matches_with_context(
-            event_name,
-            branch.as_deref(),
-            tag.as_deref(),
-            &changed_paths,
-            activity_type,
-        ) {
-            info!(
-                "Triggering workflow run for {} matching {}",
-                filename, event_name
-            );
+            let filter_branch = if effective.event == "workflow_run" {
+                effective
+                    .payload
+                    .get("workflow_run")
+                    .and_then(|run| run.get("head_branch"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            } else if matches!(
+                effective.event.as_str(),
+                "pull_request" | "pull_request_target"
+            ) {
+                effective
+                    .payload
+                    .get("pull_request")
+                    .and_then(|pr| pr.get("base"))
+                    .and_then(|base| base.get("ref"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            } else {
+                None
+            };
+            let dispatch_inputs = effective
+                .payload
+                .get("inputs")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<BTreeMap<_, _>>();
+            let dispatch_inputs_stringified = dispatch_inputs
+                .iter()
+                .map(|(name, value)| {
+                    let rendered = match value {
+                        Value::String(value) => value.clone(),
+                        Value::Bool(value) => value.to_string(),
+                        Value::Number(value) => value.to_string(),
+                        _ => value.to_string(),
+                    };
+                    (name.clone(), rendered)
+                })
+                .collect::<BTreeMap<_, _>>();
 
-            // Construct WorkflowSubmission
+            // Construct a fully resolved submission. Adapters own event ref,
+            // SHA, activity, and upstream workflow identity semantics.
             let submission = WorkflowSubmission {
                 workflow_yaml: content,
-                event: event_name.to_owned(),
-                payload: payload_val.clone(),
+                event: effective.event.clone(),
+                payload: effective.payload.clone(),
                 repository: repo_full_name.clone(),
-                git_ref: git_ref.clone(),
+                git_ref: effective.git_ref.clone(),
                 vars: BTreeMap::new(),
                 secrets: BTreeMap::new(),
                 reusable_workflows: BTreeMap::new(),
                 enable_debugger: false,
                 debugger_welcome_message: None,
+                trust_tier: effective.trust_tier.as_ref().and_then(|tier| {
+                    serde_json::to_value(tier)
+                        .ok()
+                        .and_then(|value| value.as_str().map(str::to_owned))
+                }),
+                workflow_run_upstream_names: effective.upstream_workflow_names.clone(),
+                activity_type: effective.activity_type.clone(),
+                changed_paths: changed_paths.clone(),
+                changed_paths_known,
+                resolved_sha: Some(resolved_sha.clone()),
+                filter_branch,
+                dispatch_inputs,
+                dispatch_inputs_stringified,
             };
 
-            // Call submit_run_inner
+            // Call submit_run_inner — it performs the authoritative trigger match.
             match submit_run_inner(&shared, submission).await {
                 Ok(accepted) => {
                     let run_id = accepted.run_id;
-
-                    // Create GitHub Check Runs for each job in the run
+                    let sha = effective
+                        .status_check_sha
+                        .clone()
+                        .unwrap_or_else(|| resolved_sha.clone());
                     let jobs = {
                         let inner = shared.state.inner.lock().await;
                         inner
@@ -591,7 +753,6 @@ pub(crate) async fn handle_github_webhook(
                             .get(&run_id)
                             .map(|r| r.jobs.keys().cloned().collect::<Vec<_>>())
                     };
-
                     if let Some(jobs) = jobs {
                         for job_id in jobs {
                             report_check_run_queued(
@@ -604,11 +765,10 @@ pub(crate) async fn handle_github_webhook(
                             .await;
                         }
                     }
-
                     triggered_runs.push(accepted);
                 }
                 Err(e) => {
-                    error!("Failed to submit run for {}: {:?}", filename, e);
+                    error!("Failed to submit run for {filename}: {e:?}");
                 }
             }
         }
