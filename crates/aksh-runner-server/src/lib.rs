@@ -1094,6 +1094,19 @@ struct DapPortRegistration {
     job_id: JobId,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct StepRecord {
+    pub(crate) name: String,
+    pub(crate) conclusion: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct JobDetail {
+    pub(crate) name: String,
+    pub(crate) conclusion: String,
+    pub(crate) steps: Vec<StepRecord>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct RunRecord {
     pub(crate) run_id: RunId,
@@ -1109,6 +1122,8 @@ pub(crate) struct RunRecord {
     pub(crate) job_check_run_ids: BTreeMap<JobId, u64>,
     #[serde(default)]
     pub(crate) reusable_calls: BTreeMap<String, aksh_gha_parser::ReusableCallMetadata>,
+    #[serde(default)]
+    pub(crate) jobs_list: Vec<JobDetail>,
 }
 
 #[derive(Debug, Clone)]
@@ -1365,6 +1380,7 @@ pub(crate) async fn submit_run_inner(
                     status: ExecutionStatus::Failure,
                     job_check_run_ids: BTreeMap::new(),
                     reusable_calls,
+                    jobs_list: Vec::new(),
                 },
             );
             drop(inner);
@@ -1547,6 +1563,7 @@ pub(crate) async fn submit_run_inner(
                             status: ExecutionStatus::Cancelled,
                             job_check_run_ids: BTreeMap::new(),
                             reusable_calls,
+                            jobs_list: Vec::new(),
                         },
                     );
                     drop(inner);
@@ -1595,6 +1612,7 @@ pub(crate) async fn submit_run_inner(
                     status: ExecutionStatus::Pending,
                     job_check_run_ids: BTreeMap::new(),
                     reusable_calls,
+                    jobs_list: Vec::new(),
                 },
             );
             drop(inner);
@@ -1793,6 +1811,7 @@ pub(crate) async fn submit_run_inner(
                 status: initial_status,
                 job_check_run_ids: BTreeMap::new(),
                 reusable_calls,
+                jobs_list: Vec::new(),
             },
         );
         let cancel_count = inner.cancellation_queue.len();
@@ -1950,12 +1969,19 @@ async fn get_run(
     Path(run_id): Path<RunId>,
 ) -> Result<Json<RunRecord>, ApiError> {
     let inner = shared.state.inner.lock().await;
-    inner
+    let mut run = inner
         .runs
         .get(&run_id)
         .cloned()
-        .map(Json)
-        .ok_or_else(|| ApiError::not_found("run not found"))
+        .ok_or_else(|| ApiError::not_found("run not found"))?;
+    
+    for job_detail in &mut run.jobs_list {
+        if let Some(status) = run.jobs.get(&JobId(job_detail.name.clone())) {
+            job_detail.conclusion = status_string(*status);
+        }
+    }
+    
+    Ok(Json(run))
 }
 
 async fn get_run_logs(
@@ -3682,9 +3708,78 @@ struct StepLogsSignedBlobUrlRequest {
 }
 
 async fn twirp_workflow_steps_update(
-    Json(_request): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
-    Json(json!({"ok": true}))
+    State(shared): State<Arc<SharedState>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut inner = shared.state.inner.lock().await;
+    
+    let plan_id = payload["workflow_run_backend_id"].as_str().unwrap_or("");
+    let agent_job_id_str = payload["workflow_job_run_backend_id"].as_str().unwrap_or("");
+    
+    if let (Some(plan_uuid), Some(job_uuid)) = (
+        uuid::Uuid::parse_str(plan_id).ok(),
+        uuid::Uuid::parse_str(agent_job_id_str).ok(),
+    ) {
+        if let Some((_, run_id, job_id)) = resolve_callback_job(&inner, &plan_uuid.to_string(), None, Some(job_uuid)) {
+            if let Some(run) = inner.runs.get_mut(&run_id) {
+                let job_name = job_id.0.clone();
+                let job_detail = if let Some(pos) = run.jobs_list.iter().position(|j| j.name == job_name) {
+                    &mut run.jobs_list[pos]
+                } else {
+                    run.jobs_list.push(JobDetail {
+                        name: job_name,
+                        conclusion: "success".to_owned(),
+                        steps: Vec::new(),
+                    });
+                    run.jobs_list.last_mut().unwrap()
+                };
+                
+                if let Some(status) = run.jobs.get(&job_id) {
+                    job_detail.conclusion = format!("{:?}", status).to_lowercase();
+                }
+                if let Some(steps) = payload["steps"].as_array() {
+                    for step in steps {
+                        let name = step["name"].as_str().unwrap_or("").to_owned();
+                        let conclusion_num = step["conclusion"].as_u64().unwrap_or(0);
+                        let status_num = step["status"].as_u64().unwrap_or(0);
+                        
+                        let job_status = run.jobs.get(&job_id).copied();
+                        let conclusion_str = if status_num == 6 {
+                            match conclusion_num {
+                                2 => "success",
+                                3 => {
+                                    if job_status == Some(ExecutionStatus::Cancelled) {
+                                        "cancelled"
+                                    } else {
+                                        "failure"
+                                    }
+                                }
+                                7 => "skipped",
+                                _ => "success",
+                            }
+                        } else {
+                            "in_progress"
+                        };
+                        
+                        println!(
+                            "DEBUG_STEP_UPDATE: step_name={} status_num={} conclusion_num={} job_status={:?} conclusion_str={}",
+                            name, status_num, conclusion_num, job_status, conclusion_str
+                        );
+                        if let Some(pos) = job_detail.steps.iter().position(|s| s.name == name) {
+                            job_detail.steps[pos].conclusion = conclusion_str.to_owned();
+                        } else {
+                            job_detail.steps.push(StepRecord {
+                                name,
+                                conclusion: conclusion_str.to_owned(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok(Json(json!({"ok": true})))
 }
 
 async fn twirp_get_job_logs_signed_blob_url(
@@ -4917,6 +5012,16 @@ async fn complete_job_inner(
             _ => completion.status,
         };
         run.jobs.insert(completion.job_id.clone(), effective);
+        let job_name = completion.job_id.0.clone();
+        if let Some(pos) = run.jobs_list.iter().position(|j| j.name == job_name) {
+            run.jobs_list[pos].conclusion = format!("{:?}", effective).to_lowercase();
+        } else {
+            run.jobs_list.push(JobDetail {
+                name: job_name,
+                conclusion: format!("{:?}", effective).to_lowercase(),
+                steps: Vec::new(),
+            });
+        }
         run.job_outputs.insert(
             completion.job_id.clone(),
             completion
@@ -5575,13 +5680,64 @@ async fn patch_timeline_records(
             .entry(run_id)
             .or_default()
             .extend(projected.clone());
+
+        if let Some(job_id) = logical_job_id {
+            if let Some(run) = inner.runs.get_mut(&run_id) {
+                let job_name = job_id.0.clone();
+                let job_detail = if let Some(pos) = run.jobs_list.iter().position(|j| j.name == job_name) {
+                    &mut run.jobs_list[pos]
+                } else {
+                    run.jobs_list.push(JobDetail {
+                        name: job_name,
+                        conclusion: "success".to_owned(),
+                        steps: Vec::new(),
+                    });
+                    run.jobs_list.last_mut().unwrap()
+                };
+                
+                if let Some(status) = run.jobs.get(&job_id) {
+                    job_detail.conclusion = format!("{:?}", status).to_lowercase();
+                }
+                
+                for record in &records {
+                    let Some(name) = &record.display_name else { continue };
+                    if record.id.to_string() == job_id.0 {
+                        continue;
+                    }
+                    
+                    let conclusion_str = match record.result {
+                        Some(azdo::TaskResult::Succeeded | azdo::TaskResult::SucceededWithIssues) => "success",
+                        Some(azdo::TaskResult::Failed) => {
+                            if run.jobs.get(&job_id) == Some(&ExecutionStatus::Cancelled) {
+                                "cancelled"
+                            } else {
+                                "failure"
+                            }
+                        }
+                        Some(azdo::TaskResult::Cancelled) => "cancelled",
+                        Some(azdo::TaskResult::Skipped) => "skipped",
+                        None if record.state == Some(azdo::TimelineRecordState::InProgress) => "in_progress",
+                        _ => "success",
+                    };
+                    
+                    if let Some(pos) = job_detail.steps.iter().position(|s| s.name == *name) {
+                        job_detail.steps[pos].conclusion = conclusion_str.to_owned();
+                    } else {
+                        job_detail.steps.push(StepRecord {
+                            name: name.clone(),
+                            conclusion: conclusion_str.to_owned(),
+                        });
+                    }
+                }
+            }
+        }
     }
     for event in projected {
         shared.state.emit(event).await;
     }
     Json(json!({ "count": count, "value": records }))
-}
 
+}
 fn timeline_status(record: &azdo::TimelineRecord) -> Option<ExecutionStatus> {
     match record.result {
         Some(azdo::TaskResult::Succeeded | azdo::TaskResult::SucceededWithIssues) => {
