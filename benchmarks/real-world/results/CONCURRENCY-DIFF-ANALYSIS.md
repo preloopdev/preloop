@@ -18,7 +18,7 @@ Captures:
 | Queue mode / expression | 05A/B, 06A/B/C | 5/5 | — | ✅ Full match |
 | Case-sensitivity | 07a, 07b | 2/2 | — | ✅ Full match |
 | Job-level / multi-job | 08, 09 | 2/2 | — | ✅ Full match |
-| Empty group / expr group | 10, 11 | 2/2 | — | ✅ Match (see fidelity §) |
+| Empty group / expr group | 10, 11 | 2/2 | — | ✅ Full match (fixed runtime empty-group failure) |
 | Matrix | 12 | 1/1 | 0 | ✅ Full match (fixed integer rendering) |
 | Reusable workflows (JobSet) | 13, 14, 15 | 2/3 | 1 | ❌ GH `uses:` path failure |
 | **Total** | **23** | **22/23** | **1** | |
@@ -166,10 +166,6 @@ Scenarios 02A, 04A (and any future cancel-in-progress). GH writes `##[error]The 
 
 **Fix path:** Emit the cancellation error annotation in `crates/aksh-runner/src/worker/job_runner.rs` when a step is interrupted by cancellation token — write `##[error]The operation was canceled.` to the step log before closing.
 
-### F-02: 10-empty-group submission-level vs runtime failure
-
-GH: run created, evaluates group at start, fails at runtime. aksh: 422 at submit. Both result in `conclusion=failure` with 0 steps executed. Behavioral parity; protocol timing differs.
-
 ### F-03: Case-sensitivity (scenario 07) unexercised
 
 aksh implements case-insensitive group matching per docs. Prior live capture (2026-07-13 scenario 07) showed live GitHub may use case-sensitive matching. Both 07a/07b ran without contention in this capture so the difference was not observable. Remains an open fidelity question for a future capture that submits `CaseGroup` and `casegroup` in a concurrent pair.
@@ -195,9 +191,11 @@ aksh implements case-insensitive group matching per docs. Prior live capture (20
 
 2. **Expression evaluation bug fixed:** Integer matrix values rendering as `1.0` instead of `1` has been **FIXED** in both `aksh-gha-expressions` and `aksh-gha-parser` stringification helpers. Tests added and verified.
 
-3. **Test fixture gap resolved:** Scenario 13 `uses: ./` path fails on GitHub. Resolved by using absolute `{owner}/{repo}/…@main` syntax.
+3. **Empty concurrency group validation fixed:** The server now accepts empty group names at submission time (returning HTTP 201/200 OK) but immediately marks the run and all jobs as `Failure` with 0 jobs queued, matching GitHub Actions' runtime execution behavior exactly. Unit test `empty_concurrency_group_rejected` updated.
 
-4. **One log-level fidelity gap:** Cancel annotation `##[error]The operation was canceled.` not emitted by aksh worker. Run conclusion is correct; only step log content differs.
+4. **Test fixture gap resolved:** Scenario 13 `uses: ./` path fails on GitHub. Resolved by using absolute `{owner}/{repo}/…@main` syntax.
+
+5. **One log-level fidelity gap:** Cancel annotation `##[error]The operation was canceled.` not emitted by aksh worker. Run conclusion is correct; only step log content differs.
 ---
 
 ## V. Next Steps
