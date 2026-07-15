@@ -42,6 +42,9 @@ enum Command {
         /// Bearer token for privileged simulation endpoints.
         #[arg(long, requires = "enable_test_api")]
         test_api_token: Option<String>,
+        /// Enable the cron scheduler for schedule-triggered workflows.
+        #[arg(long)]
+        enable_scheduler: bool,
     },
     /// Generate a persistent self-signed TLS certificate (no openssl needed).
     Cert {
@@ -90,6 +93,7 @@ async fn main() -> anyhow::Result<()> {
             tls_self_signed,
             enable_test_api,
             test_api_token,
+            enable_scheduler,
         } => {
             let tls = match (tls_cert, tls_key, tls_self_signed) {
                 (Some(cert), Some(key), false) => TlsMode::PemFiles { cert, key },
@@ -104,6 +108,7 @@ async fn main() -> anyhow::Result<()> {
                 tls,
                 enable_test_api,
                 test_api_token,
+                enable_scheduler,
             })
             .await?;
         }
