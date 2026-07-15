@@ -2430,27 +2430,32 @@ fn promote_next_from_group(
             inner.queue.push_back(job);
         }
         concurrency::Holder::JobSet { run_id, job_ids } => {
+            let id = JobSetId {
+                run_id,
+                job_ids: job_ids.clone(),
+            };
+            match advance_jobset_admission(inner, &id, Some(key)) {
+                Ok(JobSetAdmissionResult::Blocked) => return,
+                Err(_) => {
+                    cancel_holder(
+                        inner,
+                        &concurrency::Holder::JobSet { run_id, job_ids },
+                        concurrency::cancelled_reason().as_deref(),
+                    );
+                    return;
+                }
+                Ok(JobSetAdmissionResult::Ready) => {}
+            }
+
             let mut to_queue = Vec::new();
-            inner.concurrency_blocked.retain(|j| {
-                if j.run_id == run_id && job_ids.contains(&j.job_id) {
-                    to_queue.push(j.clone());
+            inner.concurrency_blocked.retain(|job| {
+                if job.run_id == run_id && job_ids.contains(&job.job_id) {
+                    to_queue.push(job.clone());
                     false
                 } else {
                     true
                 }
             });
-            // Also check held_runs for JobSet members.
-            if let Some(held) = inner.held_runs.get_mut(&run_id) {
-                let mut rest = Vec::new();
-                for j in held.drain(..) {
-                    if job_ids.contains(&j.job_id) {
-                        to_queue.push(j);
-                    } else {
-                        rest.push(j);
-                    }
-                }
-                *held = rest;
-            }
             for mut job in to_queue {
                 if under_max_parallel(inner, &job) {
                     if let Some(run) = inner.runs.get_mut(&run_id) {
