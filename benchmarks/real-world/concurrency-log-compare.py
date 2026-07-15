@@ -159,7 +159,7 @@ def load_aksh_capture(dir_path: Path) -> SideCapture:
         markers |= extract_markers(lines)
     markers |= extract_markers([strip_noise(l) for l in log.splitlines()])
 
-    raw_jobs = summary.get("jobs") or []
+    raw_jobs = summary.get("jobs_list") or summary.get("jobs") or []
     if isinstance(raw_jobs, dict):
         jobs = {str(job_id): str(status or "") for job_id, status in raw_jobs.items()}
         step_conc = {}
