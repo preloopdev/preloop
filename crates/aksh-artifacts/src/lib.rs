@@ -15,6 +15,49 @@ pub enum ArtifactError {
     /// Artifact was not found.
     #[error("artifact `{0}` was not found")]
     NotFound(Uuid),
+    /// Invalid artifact name.
+    #[error("invalid artifact name: {0}")]
+    InvalidName(String),
+    /// Invalid file name.
+    #[error("invalid file name: {0}")]
+    InvalidFileName(String),
+}
+
+/// Validate an artifact name using the official toolkit's upload contract.
+///
+/// Reference: `actions/toolkit/packages/artifact/src/internal/upload/path-and-artifact-name-validation.ts`.
+pub fn validate_artifact_name(name: &str) -> Result<(), ArtifactError> {
+    if name.is_empty() {
+        return Err(ArtifactError::InvalidName(
+            "artifact name must not be empty".to_owned(),
+        ));
+    }
+    if let Some(character) = name.chars().find(|character| {
+        matches!(
+            character,
+            '"' | ':' | '<' | '>' | '|' | '*' | '?' | '\r' | '\n' | '/' | '\\'
+        )
+    }) {
+        return Err(ArtifactError::InvalidName(format!(
+            "artifact name contains invalid character: {character:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_storage_relative_path(file_name: &str) -> Result<(), ArtifactError> {
+    let path = std::path::Path::new(file_name);
+    if file_name.is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(ArtifactError::InvalidFileName(
+            "artifact file path must be a non-empty relative path without `..`".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Artifact metadata.
@@ -47,6 +90,12 @@ impl ArtifactStore {
     }
 
     /// Save an artifact payload.
+    ///
+    /// Artifact-name validation exactly follows the official toolkit source:
+    /// `actions/toolkit/packages/artifact/src/internal/upload/path-and-artifact-name-validation.ts`.
+    /// File paths are distinct from artifact names and may contain separators;
+    /// this store only rejects absolute or parent-traversal paths to keep the
+    /// file-backed implementation rooted safely.
     pub async fn put(
         &self,
         run_id: RunId,
@@ -54,6 +103,8 @@ impl ArtifactStore {
         file_name: &str,
         bytes: &[u8],
     ) -> Result<Artifact, ArtifactError> {
+        validate_artifact_name(name)?;
+        validate_storage_relative_path(file_name)?;
         let id = Uuid::new_v4();
         let path = self
             .root
@@ -78,18 +129,23 @@ impl ArtifactStore {
         Ok(fs::read(&artifact.path).await?)
     }
 
-    /// List artifacts for a run.
+    /// List all artifact files for a run, including nested paths.
     pub async fn list_run(&self, run_id: RunId) -> Result<Vec<PathBuf>, ArtifactError> {
         let run_root = self.root.join(run_id.to_string());
         if !fs::try_exists(&run_root).await? {
             return Ok(Vec::new());
         }
         let mut paths = Vec::new();
-        let mut artifacts = fs::read_dir(run_root).await?;
-        while let Some(artifact_dir) = artifacts.next_entry().await? {
-            let mut files = fs::read_dir(artifact_dir.path()).await?;
-            while let Some(file) = files.next_entry().await? {
-                paths.push(file.path());
+        let mut pending = vec![run_root];
+        while let Some(directory) = pending.pop() {
+            let mut entries = fs::read_dir(directory).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let path = entry.path();
+                if entry.file_type().await?.is_dir() {
+                    pending.push(path);
+                } else {
+                    paths.push(path);
+                }
             }
         }
         Ok(paths)
@@ -100,6 +156,12 @@ impl ArtifactStore {
 mod tests {
     use super::*;
 
+    fn invalid_name() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just(String::new()),
+            prop::string::string_regex(".*[\"/:?*|<>\\\\\r\n].*").unwrap(),
+        ]
+    }
     #[tokio::test]
     async fn stores_artifact_payloads() {
         let temp = tempfile::tempdir().unwrap();
@@ -114,5 +176,61 @@ mod tests {
 
         assert_eq!(bytes, b"hello");
         assert_eq!(store.list_run(run_id).await.unwrap().len(), 1);
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn test_artifact_roundtrip(
+            ref name in "[a-zA-Z0-9_-]{1,32}",
+            ref file_name in "[a-zA-Z0-9_-]{1,32}",
+            ref payload in prop::collection::vec(0..=255u8, 0..1024)
+        ) {
+            let temp = tempfile::tempdir().unwrap();
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let store = ArtifactStore::new(temp.path()).await.unwrap();
+                let run_id = RunId::new();
+                let artifact = store.put(run_id, name, file_name, payload).await.unwrap();
+                assert_eq!(artifact.run_id, run_id);
+                assert_eq!(artifact.name, *name);
+
+                // Assert path safety: must stay inside root
+                assert!(artifact.path.starts_with(temp.path()));
+
+                let restored = store.get(&artifact).await.unwrap();
+                assert_eq!(restored, *payload);
+
+                let list = store.list_run(run_id).await.unwrap();
+                assert_eq!(list.len(), 1);
+                assert_eq!(list[0], artifact.path);
+            });
+        }
+        #[test]
+        fn test_artifact_invalid_names(
+            ref name in invalid_name(),
+            ref file_name in "[a-zA-Z0-9_-]{1,32}"
+        ) {
+            let temp = tempfile::tempdir().unwrap();
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let store = ArtifactStore::new(temp.path()).await.unwrap();
+                let result = store.put(RunId::new(), name, file_name, b"payload").await;
+                assert!(matches!(result, Err(ArtifactError::InvalidName(_))));
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_unsafe_storage_relative_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ArtifactStore::new(temp.path()).await.unwrap();
+        for file_name in ["../escape", "/absolute"] {
+            let result = store
+                .put(RunId::new(), "valid-name", file_name, b"payload")
+                .await;
+            assert!(matches!(result, Err(ArtifactError::InvalidFileName(_))));
+        }
     }
 }
