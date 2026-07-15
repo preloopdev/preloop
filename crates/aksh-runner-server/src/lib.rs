@@ -11686,12 +11686,12 @@ jobs:
     }
 
     #[tokio::test]
-    async fn empty_concurrency_group_rejected() {
+    async fn empty_workflow_concurrency_group_creates_zero_job_failure() {
         let temp = tempfile::tempdir().unwrap();
         let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let mut events = state.events.subscribe();
         let app = app(state.clone(), CancellationToken::new());
         let response = app
-            .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -11703,7 +11703,7 @@ jobs:
                             "workflow_yaml": r#"
 on: push
 concurrency:
-  group: ""
+  group: ${{ github.event.head_commit.id_missing }}
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -11711,7 +11711,8 @@ jobs:
       - run: echo hi
 "#,
                             "event": "push",
-                            "repository": "owner/repo"
+                            "repository": "owner/repo",
+                            "payload": { "head_commit": {} }
                         })
                         .to_string(),
                     ))
@@ -11721,13 +11722,42 @@ jobs:
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let val: Value = serde_json::from_slice(&bytes).unwrap();
-        let run_id = val["run_id"].as_str().unwrap();
+        let accepted: RunAccepted = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(accepted.queued_jobs, 0);
 
-        // Check that the run status is failure
+        let accepted_event = events.recv().await.unwrap();
+        assert!(matches!(
+            accepted_event,
+            NdjsonEvent::RunAccepted { run_id, queued_jobs }
+                if run_id == accepted.run_id && queued_jobs == 0
+        ));
+        let failed_event = events.recv().await.unwrap();
+        assert!(matches!(
+            failed_event,
+            NdjsonEvent::RunStatus {
+                run_id,
+                status: ExecutionStatus::Failure,
+                reason: Some(reason),
+            } if run_id == accepted.run_id && reason.contains("must not be empty")
+        ));
+
         let inner = state.inner.lock().await;
-        let record = inner.runs.get(&run_id.parse().unwrap()).unwrap();
+        let record = &inner.runs[&accepted.run_id];
         assert_eq!(record.status, ExecutionStatus::Failure);
+        assert!(record.jobs.is_empty());
+        assert!(!inner
+            .job_requests
+            .values()
+            .any(|request| request.run_id == accepted.run_id));
+        assert!(!inner.queue.iter().any(|job| job.run_id == accepted.run_id));
+        assert!(!inner
+            .pending_jobs
+            .iter()
+            .any(|job| job.run_id == accepted.run_id));
+        assert!(!inner
+            .concurrency_blocked
+            .iter()
+            .any(|job| job.run_id == accepted.run_id));
     }
 
     #[tokio::test]
@@ -12902,10 +12932,8 @@ jobs:
         // rejected. The parser catches literal "true" at parse time → 400.
         // Dynamic expressions are caught at evaluation time → also rejected.
         let temp = tempfile::tempdir().unwrap();
-        let app = app(
-            AppState::new(temp.path().to_path_buf()).await.unwrap(),
-            CancellationToken::new(),
-        );
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
 
         let body = json!({
             "workflow_yaml": "on: push\nconcurrency:\n  group: queue-max-cancel-true\n  queue: max\n  cancel-in-progress: ${{ true }}\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
@@ -12918,27 +12946,9 @@ jobs:
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
             .unwrap();
-        let response = app.clone().oneshot(request).await.unwrap();
-
-        // Must be rejected — either 400 (parser) or the run should be terminal.
-        if response.status() == StatusCode::BAD_REQUEST
-            || response.status() == StatusCode::UNPROCESSABLE_ENTITY
-        {
-            // Correct: the combination was rejected before creating a run.
-            return;
-        }
-        // If a 200 was returned, the run must be in a terminal failure state.
-        assert!(response.status().is_success());
-        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let result: Value = serde_json::from_slice(&bytes).unwrap();
-        if let Some(run_id) = result.get("run_id").and_then(|v| v.as_str()) {
-            let run = get_run_json(&app, run_id).await;
-            let status = run["status"].as_str().unwrap_or("unknown");
-            assert!(
-                status == "failure" || status == "cancelled",
-                "queue:max + cancel:${{{{true}}}} should fail, got: {status}"
-            );
-        }
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(state.inner.lock().await.runs.is_empty());
     }
 
     // ── C-07 regression: holder_keys reclamation ──
