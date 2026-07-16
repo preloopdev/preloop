@@ -639,34 +639,41 @@ async fn run_runner_e2e(
         .context("missing run_id")?
         .to_string();
 
-    // Start runner once
-    let runner_status = Command::new(&runner_bin)
-        .arg("--runner-root")
-        .arg(&runner_root)
-        .arg("run")
-        .arg("--once")
-        .status()
-        .await?;
-
-    // Check completion and verdict
+    // Loop runner until the run reaches a terminal status (handles multi-job workflows).
+    let terminal = ["completed", "success", "failed", "cancelled"];
     let run_status_url = format!("http://127.0.0.1:9191/api/v1/runs/{}", run_id);
     let native_api_token =
         std::env::var("AKSH_SYSTEM_TOKEN").unwrap_or_else(|_| "aksh-system-token".to_owned());
     let mut run_status = "unknown".to_string();
-    if let Ok(resp) = client
-        .get(&run_status_url)
-        .bearer_auth(&native_api_token)
-        .send()
-        .await
-    {
-        if let Ok(v) = resp.json::<serde_json::Value>().await {
-            if let Some(status) = v.get("status").and_then(|v| v.as_str()) {
-                run_status = status.to_string();
+    let mut last_runner_status = None::<bool>;
+    for _ in 0..50 {
+        let status = Command::new(&runner_bin)
+            .arg("--runner-root")
+            .arg(&runner_root)
+            .arg("run")
+            .arg("--once")
+            .status()
+            .await?;
+        last_runner_status = Some(status.success());
+        // Poll run status
+        if let Ok(resp) = client
+            .get(&run_status_url)
+            .bearer_auth(&native_api_token)
+            .send()
+            .await
+        {
+            if let Ok(v) = resp.json::<serde_json::Value>().await {
+                if let Some(s) = v.get("status").and_then(|v| v.as_str()) {
+                    run_status = s.to_string();
+                }
             }
+        }
+        if terminal.contains(&run_status.as_str()) {
+            break;
         }
     }
     let run_success =
-        runner_status.success() && matches!(run_status.as_str(), "completed" | "success");
+        last_runner_status.unwrap_or(false) && matches!(run_status.as_str(), "completed" | "success");
 
     let verdict = serde_json::json!({
         "success": run_success,
