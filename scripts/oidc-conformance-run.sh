@@ -68,7 +68,8 @@ t=json.load(sys.stdin)['value'];c=verify_token(t)
 assert c['ref_type']=='tag',f'ref_type={c["ref_type"]}'
 assert ':ref:refs/tags/' in c['sub'],f'sub={c["sub"]}'
 assert c['ref']=='refs/tags/v2.0.1',f'ref={c["ref"]}'
-print(f'PASS: sub={c["sub"]} ref_type={c["ref_type"]} ref={c["ref"]}')
+assert c['aud']=='api://vault',f'aud={c["aud"]}'
+print(f'PASS: sub={c["sub"]} ref_type={c["ref_type"]} ref={c["ref"]} aud={c["aud"]}')
 PYEOF
 
 cat > "$STATE/verify-pr.py" << PYEOF
@@ -77,15 +78,17 @@ t=json.load(sys.stdin)['value'];c=verify_token(t)
 assert c['event_name']=='pull_request',f'event={c["event_name"]}'
 assert c['sub'].endswith(':pull_request'),f'sub={c["sub"]}'
 assert ':ref:' not in c['sub'],f'sub={c["sub"]}'
-print(f'PASS: sub={c["sub"]} event={c["event_name"]}')
+assert c['aud']=='pr-aud',f'aud={c["aud"]}'
+print(f'PASS: sub={c["sub"]} event={c["event_name"]} aud={c["aud"]}')
 PYEOF
 
 cat > "$STATE/verify-deploy.py" << PYEOF
 import sys,json,os; sys.path.insert(0,os.path.dirname(os.path.abspath(__file__))); from aksh_oidc_verify import verify_token
 t=json.load(sys.stdin)['value'];c=verify_token(t)
-assert ':environment:' in c['sub'],f'sub={c["sub"]}'
+assert ':environment:staging:' in c['sub'] or c['sub'].endswith(':environment:staging'),f'sub must contain :environment:staging: got {c["sub"]}'
 assert c['event_name']=='deployment',f'event={c["event_name"]}'
-print(f'PASS: sub={c["sub"]} event={c["event_name"]}')
+assert c['aud']=='vault/hcp',f'aud={c["aud"]}'
+print(f'PASS: sub={c["sub"]} event={c["event_name"]} aud={c["aud"]}')
 PYEOF
 
 # ── Start server ────────────────────────────────────────────────────
