@@ -29,6 +29,7 @@ CLIENT="${CLIENT:-http://127.0.0.1:80}"
 LOG_DIR="$REPO_ROOT/logs/e2e"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 LOG_FILE="$LOG_DIR/e2e-$TIMESTAMP.log"
+SYSTEM_TOKEN="${AKSH_SYSTEM_TOKEN:-aksh-system-token}"
 
 mkdir -p "$LOG_DIR"
 
@@ -174,6 +175,7 @@ submit_workflow() {
     local response
     response=$(curl -s --max-time 10 \
         -X POST "$CLIENT/api/v1/runs" \
+        -H "Authorization: Bearer $SYSTEM_TOKEN" \
         -H "Content-Type: application/json" \
         -d '{
             "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello from aksh\n      - run: whoami\n      - run: date\n",
@@ -202,6 +204,7 @@ run_runner() {
     if [ -n "${RUN_ID:-}" ]; then
         local status
         status=$(curl -sf --max-time 5 "$CLIENT/api/v1/runs/$RUN_ID" 2>/dev/null \
+            -H "Authorization: Bearer $SYSTEM_TOKEN" \
             | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('status','unknown'))" 2>/dev/null || echo "unknown")
         info "Run status: $status"
     fi

@@ -26,6 +26,7 @@ serde_json.workspace = true
 futures.workspace = true
 hmac.workspace = true
 sha2.workspace = true
+sha1.workspace = true
 rand.workspace = true
 reqwest.workspace = true
 thiserror.workspace = true
@@ -44,6 +45,7 @@ cron.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
 
+serde_yaml.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 tower.workspace = true

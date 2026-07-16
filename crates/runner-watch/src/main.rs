@@ -1734,6 +1734,8 @@ async fn replay_flows_to_aksh(
         .unwrap_or(out_dir)
         .join("official-filtered");
     fs::create_dir_all(&baseline_dir)?;
+    let native_token =
+        std::env::var("AKSH_SYSTEM_TOKEN").unwrap_or_else(|_| "aksh-system-token".to_owned());
     materialize_replay_state(golden_dir, scenario_root, aksh_url, &client).await?;
     let mut out = tokio::fs::File::create(out_dir.join("flows.jsonl")).await?;
     let mut baseline = tokio::fs::File::create(baseline_dir.join("flows.jsonl")).await?;
@@ -1796,13 +1798,13 @@ async fn replay_flows_to_aksh(
                 if name.eq_ignore_ascii_case("authorization") {
                     saw_auth = true;
                 }
-                let header_value = rewritten_header_value(name, value, &path);
+                let header_value = rewritten_header_value(name, value, &path, &native_token);
                 req = req.header(name, header_value.as_ref());
             }
         }
         if !saw_auth {
-            if let Some(auth) = synthesized_authorization(&path) {
-                req = req.header("Authorization", auth);
+            if let Some(auth) = synthesized_authorization(&path, &native_token) {
+                req = req.header("Authorization", auth.as_ref());
             }
         }
         if let Some(mut body) = replay_request_body(&flow)? {
@@ -2115,11 +2117,14 @@ async fn materialize_replay_state(
         return Ok(());
     }
 
+    let native_api_token =
+        std::env::var("AKSH_SYSTEM_TOKEN").unwrap_or_else(|_| "aksh-system-token".to_owned());
     let submissions = replay_workflow_submissions(golden_dir, scenario_root)?;
     let mut queued_jobs = 0_u64;
     for submit_body in submissions {
         let accepted = client
             .post(format!("{}/api/v1/runs", aksh_url.trim_end_matches('/')))
+            .bearer_auth(&native_api_token)
             .json(&submit_body)
             .send()
             .await?
@@ -2220,21 +2225,26 @@ fn normalize_replay_wait(mut path: String) -> String {
     path
 }
 
-fn synthesized_authorization(path: &str) -> Option<&'static str> {
+fn synthesized_authorization<'a>(path: &str, bearer: &'a str) -> Option<std::borrow::Cow<'a, str>> {
     if path == "/api/v3/actions/runner-registration" {
-        Some("RemoteAuth replay-token")
+        Some(std::borrow::Cow::Borrowed("RemoteAuth replay-token"))
     } else if path.starts_with("/runner/server/_apis/")
         || path.starts_with("/_apis/")
         || path.starts_with("/twirp/")
         || path.starts_with("/broker/")
     {
-        Some("Bearer aksh-system-token")
+        Some(std::borrow::Cow::Owned(format!("Bearer {bearer}")))
     } else {
         None
     }
 }
 
-fn rewritten_header_value<'a>(name: &str, value: &'a str, path: &str) -> std::borrow::Cow<'a, str> {
+fn rewritten_header_value<'a>(
+    name: &str,
+    value: &'a str,
+    path: &str,
+    bearer: &str,
+) -> std::borrow::Cow<'a, str> {
     if name.eq_ignore_ascii_case("authorization") && value == "***REDACTED***" {
         if path == "/api/v3/actions/runner-registration" {
             return std::borrow::Cow::Borrowed("RemoteAuth replay-token");
@@ -2244,7 +2254,7 @@ fn rewritten_header_value<'a>(name: &str, value: &'a str, path: &str) -> std::bo
             || path.starts_with("/twirp/")
             || path.starts_with("/broker/")
         {
-            return std::borrow::Cow::Borrowed("Bearer aksh-system-token");
+            return std::borrow::Cow::Owned(format!("Bearer {bearer}"));
         }
     }
     std::borrow::Cow::Borrowed(value)

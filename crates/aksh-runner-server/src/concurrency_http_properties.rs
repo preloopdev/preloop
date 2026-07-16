@@ -29,7 +29,8 @@ fn make_app(state: AppState, shutdown: CancellationToken) -> Router {
 
 async fn req(app: &Router, method: Method, uri: &str, body: Value) -> (StatusCode, Value) {
     let mut builder = Request::builder().method(method).uri(uri);
-    if uri.starts_with("/_apis/")
+    if uri.starts_with("/api/v1/")
+        || uri.starts_with("/_apis/")
         || uri.starts_with("/runner/server/_apis/")
         || uri.starts_with("/broker/")
     {
@@ -125,20 +126,29 @@ async fn poll_message(app: &Router, session_id: &str) -> Value {
     val
 }
 
-async fn broker_complete(app: &Router, runner_id: i64, plan_id: &str, job_id: &str) -> StatusCode {
-    let (status, _) = req(
-        app,
-        Method::POST,
-        &format!("/broker/{runner_id}/completejob"),
-        json!({
-            "planId": plan_id,
-            "jobId": job_id,
-            "conclusion": "succeeded",
-            "outputs": {},
-        }),
-    )
-    .await;
-    status
+async fn broker_complete(
+    app: &Router,
+    bearer_token: &str,
+    runner_id: i64,
+    plan_id: &str,
+    job_id: &str,
+) -> StatusCode {
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/broker/{runner_id}/completejob"))
+        .header(header::AUTHORIZATION, format!("Bearer {bearer_token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({
+                "planId": plan_id,
+                "jobId": job_id,
+                "conclusion": "succeeded",
+                "outputs": {},
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    app.clone().oneshot(request).await.unwrap().status()
 }
 
 // ─── Generators ─────────────────────────────────────────────────────────────
@@ -571,6 +581,18 @@ pub(crate) mod http_sequences {
         let msg = poll_message(&app, "sess-broker").await;
         assert!(!msg.is_null(), "A should be dispatchable");
         assert_eq!(get_run(&app, a_id).await["jobs"]["build"], "in_progress");
+        let runner_token = state
+            .local_jwt(json!({
+                "sub": "aksh-runner-listen-1",
+                "scp": "ActionsRuntime.RunnerListen",
+            }))
+            .unwrap();
+        {
+            let mut inner = state.inner.lock().await;
+            inner
+                .broker_session_runners
+                .insert("sess-broker".to_owned(), 1);
+        }
 
         // Complete via broker path.
         // We need to find the agent_job_id and plan_id.
@@ -584,7 +606,8 @@ pub(crate) mod http_sequences {
             (req.plan_id.clone(), req.agent_job_id)
         };
 
-        let status = broker_complete(&app, 1, &plan_id, &agent_job_id.to_string()).await;
+        let status =
+            broker_complete(&app, &runner_token, 1, &plan_id, &agent_job_id.to_string()).await;
         assert!(
             status.is_success() || status == StatusCode::NO_CONTENT,
             "broker complete should succeed: {status}"
