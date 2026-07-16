@@ -1,0 +1,415 @@
+{
+  "$schema": "https://raw.githubusercontent.com/actions/runner/32e89e2afd4549a362dbec337a589b81fd17a0c5/src/Runner.Listener/JobCancelMessage.cs",
+  "schema_version": 1,
+  "runner_pin": "32e89e2afd4549a362dbec337a589b81fd17a0c5",
+  "docs_date": "2026-07-14",
+  "cases": [
+    {
+      "id": "single-replacement-3-arrivals",
+      "invariant": "GH-SINGLE-01",
+      "description": "single queue: 3 arrivals; second is cancelled when third arrives; only first (running) and third (pending) survive",
+      "kind": "control_plane",
+      "group": "test-single-replace",
+      "queue": "single",
+      "cancel_in_progress": false,
+      "arrivals": [
+        {"label": "A", "repo": "org/repo"},
+        {"label": "B", "repo": "org/repo"},
+        {"label": "C", "repo": "org/repo"}
+      ],
+      "expect": {
+        "running_label": "A",
+        "pending_labels": ["C"],
+        "cancelled_labels": ["B"]
+      }
+    },
+    {
+      "id": "max-fifo-depth-0",
+      "invariant": "GH-MAX-01",
+      "description": "max queue with 0 pending: arrival parks, not cancelled",
+      "kind": "control_plane",
+      "group": "test-max-fifo-d0",
+      "queue": "max",
+      "cancel_in_progress": false,
+      "arrivals": [
+        {"label": "A", "repo": "org/repo"},
+        {"label": "B", "repo": "org/repo"}
+      ],
+      "expect": {
+        "running_label": "A",
+        "pending_labels": ["B"],
+        "cancelled_labels": []
+      }
+    },
+    {
+      "id": "max-fifo-depth-99",
+      "invariant": "GH-MAX-01",
+      "description": "max queue with 99 pending holders: 100th arrival parks (total pending becomes 100)",
+      "kind": "control_plane",
+      "group": "test-max-fifo-d99",
+      "queue": "max",
+      "cancel_in_progress": false,
+      "pending_prefill": 99,
+      "arrivals": [
+        {"label": "NEXT", "repo": "org/repo"}
+      ],
+      "expect": {
+        "pending_count": 100,
+        "arrival_cancelled": false
+      }
+    },
+    {
+      "id": "max-fifo-depth-100",
+      "invariant": "GH-MAX-01",
+      "description": "max queue at 100 pending: 101st arrival is cancelled; queue unchanged",
+      "kind": "control_plane",
+      "group": "test-max-fifo-d100",
+      "queue": "max",
+      "cancel_in_progress": false,
+      "pending_prefill": 100,
+      "arrivals": [
+        {"label": "OVERFLOW", "repo": "org/repo"}
+      ],
+      "expect": {
+        "pending_count": 100,
+        "arrival_cancelled": true
+      }
+    },
+    {
+      "id": "max-fifo-depth-101",
+      "invariant": "GH-MAX-01",
+      "description": "max queue already at 101 pending (overflow boundary): new arrival still cancelled",
+      "kind": "control_plane",
+      "group": "test-max-fifo-d101",
+      "queue": "max",
+      "cancel_in_progress": false,
+      "pending_prefill": 101,
+      "arrivals": [
+        {"label": "OVERFLOW2", "repo": "org/repo"}
+      ],
+      "expect": {
+        "pending_count": 101,
+        "arrival_cancelled": true
+      }
+    },
+    {
+      "id": "cancel-expr-true",
+      "invariant": "GH-CANCEL-01",
+      "description": "cancel-in-progress: true — arrival atomically cancels running holder and becomes running itself",
+      "kind": "control_plane",
+      "group": "test-cancel-true",
+      "queue": "single",
+      "cancel_in_progress": true,
+      "arrivals": [
+        {"label": "A", "repo": "org/repo"},
+        {"label": "B", "repo": "org/repo"}
+      ],
+      "expect": {
+        "running_label": "B",
+        "pending_labels": [],
+        "cancelled_labels": ["A"]
+      }
+    },
+    {
+      "id": "cancel-expr-false",
+      "invariant": "GH-SINGLE-01",
+      "description": "cancel-in-progress: false — arrival parks; running holder is never cancelled",
+      "kind": "control_plane",
+      "group": "test-cancel-false",
+      "queue": "single",
+      "cancel_in_progress": false,
+      "arrivals": [
+        {"label": "A", "repo": "org/repo"},
+        {"label": "B", "repo": "org/repo"}
+      ],
+      "expect": {
+        "running_label": "A",
+        "pending_labels": ["B"],
+        "cancelled_labels": []
+      }
+    },
+    {
+      "id": "case-variant-pair",
+      "invariant": "GH-GROUP-01",
+      "description": "case-insensitive group key: 'Deploy' and 'deploy' map to the same group in the same repo",
+      "kind": "control_plane",
+      "group_variants": ["Deploy", "deploy"],
+      "repo": "org/repo",
+      "queue": "single",
+      "cancel_in_progress": false,
+      "expect": {
+        "same_group": true
+      }
+    },
+    {
+      "id": "matrix-max-parallel-shared-group",
+      "invariant": "GH-MATRIX-01",
+      "description": "matrix max-parallel=1 with shared concurrency group: only one sibling runs at a time",
+      "kind": "control_plane",
+      "group": "test-matrix-shared",
+      "queue": "single",
+      "cancel_in_progress": false,
+      "matrix": {"os": ["ubuntu", "macos", "windows"]},
+      "max_parallel": 1,
+      "expect": {
+        "max_concurrent": 1
+      }
+    },
+    {
+      "id": "matrix-max-parallel-different-group",
+      "invariant": "GH-MATRIX-01",
+      "description": "matrix max-parallel=2 with per-cell different group: cells independent, limited by max-parallel",
+      "kind": "control_plane",
+      "group_template": "test-matrix-cell-${{ matrix.os }}",
+      "queue": "single",
+      "cancel_in_progress": false,
+      "matrix": {"os": ["ubuntu", "macos"]},
+      "max_parallel": 2,
+      "expect": {
+        "max_concurrent": 2
+      }
+    },
+    {
+      "id": "needs-output-derived-group",
+      "invariant": "GH-CTX-JOB-01",
+      "description": "job-level group derived from needs.<job>.outputs.key; group resolves after needs completes",
+      "kind": "control_plane",
+      "group_template": "${{ needs.setup.outputs.deploy_env }}",
+      "needs_outputs": {"setup": {"deploy_env": "production"}},
+      "queue": "single",
+      "cancel_in_progress": false,
+      "expect": {
+        "resolved_group": "production"
+      }
+    },
+    {
+      "id": "jobset-caller-only",
+      "invariant": "GH-REUSE-01",
+      "description": "caller-level concurrency on a uses: job; inner jobs cannot dispatch until caller key acquired",
+      "kind": "control_plane",
+      "caller_group": "test-caller-only",
+      "embedded_group": null,
+      "queue": "single",
+      "cancel_in_progress": false,
+      "expect": {
+        "inner_blocked_until_caller_acquired": true
+      }
+    },
+    {
+      "id": "jobset-embedded-only",
+      "invariant": "GH-REUSE-01",
+      "description": "called workflow-level concurrency applies to expanded inner job set",
+      "kind": "control_plane",
+      "caller_group": null,
+      "embedded_group": "test-embedded-only",
+      "queue": "single",
+      "cancel_in_progress": false,
+      "expect": {
+        "inner_blocked_until_embedded_acquired": true
+      }
+    },
+    {
+      "id": "jobset-equal-key",
+      "invariant": "GH-REUSE-01",
+      "description": "caller and called workflow use the same evaluated group key; acquisition is all-or-nothing",
+      "kind": "control_plane",
+      "caller_group": "test-shared-key",
+      "embedded_group": "test-shared-key",
+      "queue": "single",
+      "cancel_in_progress": false,
+      "expect": {
+        "all_or_nothing_acquisition": true
+      }
+    },
+    {
+      "id": "jobset-different-key",
+      "invariant": "GH-REUSE-01",
+      "description": "caller and called workflow use different group keys; both must be acquired before dispatch",
+      "kind": "control_plane",
+      "caller_group": "test-caller-key",
+      "embedded_group": "test-inner-key",
+      "queue": "single",
+      "cancel_in_progress": false,
+      "expect": {
+        "all_or_nothing_acquisition": true
+      }
+    },
+    {
+      "id": "jobset-nested",
+      "invariant": "GH-REUSE-01",
+      "description": "nested reusable workflow calls preserve outer and embedded scope without duplicate inner jobs",
+      "kind": "control_plane",
+      "caller_group": "test-outer",
+      "embedded_group": "test-inner",
+      "nested_embedded_group": "test-nested",
+      "queue": "single",
+      "cancel_in_progress": false,
+      "expect": {
+        "no_duplicate_inner_jobs": true
+      }
+    },
+    {
+      "id": "runner-cancel-wrong-id",
+      "invariant": "RUN-ID-01",
+      "description": "JobCancellation for a job ID not in the active dispatcher map is ignored; active state unchanged",
+      "kind": "runner",
+      "job_id": "11111111-1111-1111-1111-111111111111",
+      "cancel_job_id": "22222222-2222-2222-2222-222222222222",
+      "timeout_secs": 60,
+      "expect": {
+        "effect": "ignore",
+        "active_state_changed": false
+      }
+    },
+    {
+      "id": "runner-cancel-before-start",
+      "invariant": "RUN-ORDER-01",
+      "description": "cancel arriving before job start is ignored; worker receives the job before its cancel message",
+      "kind": "runner",
+      "sequence": ["cancel", "job_arrived"],
+      "job_id": "33333333-3333-3333-3333-333333333333",
+      "timeout_secs": 60,
+      "expect": {
+        "cancel_effect": "ignore"
+      }
+    },
+    {
+      "id": "runner-cancel-during-run",
+      "invariant": "RUN-TIME-01",
+      "description": "cancel during run with timeout=60s; effective=60s; kill fires at 45s",
+      "kind": "runner",
+      "sequence": ["job_arrived", "cancel"],
+      "job_id": "44444444-4444-4444-4444-444444444444",
+      "timeout_secs": 60,
+      "expect": {
+        "effective_timeout_secs": 60,
+        "kill_offset_secs": 45
+      }
+    },
+    {
+      "id": "runner-cancel-after-finish",
+      "invariant": "RUN-ID-01",
+      "description": "cancel arriving after job finishes/dispatcher removed is ignored",
+      "kind": "runner",
+      "sequence": ["job_arrived", "job_finished", "cancel"],
+      "job_id": "55555555-5555-5555-5555-555555555555",
+      "timeout_secs": 60,
+      "expect": {
+        "cancel_effect": "ignore"
+      }
+    },
+    {
+      "id": "runner-cancel-repeated",
+      "invariant": "RUN-IDEMP-01",
+      "description": "repeated matching cancellation: graceful cancel fires once; kill deadline updates to max(new,60)-15",
+      "kind": "runner",
+      "sequence": ["job_arrived", "cancel", "cancel"],
+      "job_id": "66666666-6666-6666-6666-666666666666",
+      "first_timeout_secs": 60,
+      "second_timeout_secs": 120,
+      "expect": {
+        "graceful_cancel_count": 1,
+        "kill_deadline_secs": 105
+      }
+    },
+    {
+      "id": "runner-timeout-0",
+      "invariant": "RUN-TIME-01",
+      "description": "timeout=0 is clamped to 60s effective; kill fires at 45s",
+      "kind": "runner",
+      "timeout_secs": 0,
+      "expect": {
+        "effective_timeout_secs": 60,
+        "kill_offset_secs": 45
+      }
+    },
+    {
+      "id": "runner-timeout-44",
+      "invariant": "RUN-TIME-01",
+      "description": "timeout=44s is clamped to 60s; kill at 45s",
+      "kind": "runner",
+      "timeout_secs": 44,
+      "expect": {
+        "effective_timeout_secs": 60,
+        "kill_offset_secs": 45
+      }
+    },
+    {
+      "id": "runner-timeout-45",
+      "invariant": "RUN-TIME-01",
+      "description": "timeout=45s is clamped to 60s; kill at 45s",
+      "kind": "runner",
+      "timeout_secs": 45,
+      "expect": {
+        "effective_timeout_secs": 60,
+        "kill_offset_secs": 45
+      }
+    },
+    {
+      "id": "runner-timeout-59",
+      "invariant": "RUN-TIME-01",
+      "description": "timeout=59s is clamped to 60s; kill at 45s",
+      "kind": "runner",
+      "timeout_secs": 59,
+      "expect": {
+        "effective_timeout_secs": 60,
+        "kill_offset_secs": 45
+      }
+    },
+    {
+      "id": "runner-timeout-60",
+      "invariant": "RUN-TIME-01",
+      "description": "timeout=60s: effective=60s; kill at 45s",
+      "kind": "runner",
+      "timeout_secs": 60,
+      "expect": {
+        "effective_timeout_secs": 60,
+        "kill_offset_secs": 45
+      }
+    },
+    {
+      "id": "runner-timeout-61",
+      "invariant": "RUN-TIME-01",
+      "description": "timeout=61s: no clamp; effective=61s; kill at 46s",
+      "kind": "runner",
+      "timeout_secs": 61,
+      "expect": {
+        "effective_timeout_secs": 61,
+        "kill_offset_secs": 46
+      }
+    },
+    {
+      "id": "runner-timeout-300",
+      "invariant": "RUN-TIME-01",
+      "description": "timeout=300s; effective=300s; kill at 285s",
+      "kind": "runner",
+      "timeout_secs": 300,
+      "expect": {
+        "effective_timeout_secs": 300,
+        "kill_offset_secs": 285
+      }
+    },
+    {
+      "id": "runner-timeout-multiday-timespan",
+      "invariant": "RUN-MSG-01",
+      "description": "multi-day TimeSpan string '1.00:00:00' (1 day = 86400s); effective=86400; kill at 86385s",
+      "kind": "runner",
+      "timeout_timespan": "1.00:00:00",
+      "expect": {
+        "effective_timeout_secs": 86400,
+        "kill_offset_secs": 86385
+      }
+    },
+    {
+      "id": "runner-overlap-drains-predecessor",
+      "invariant": "RUN-OVERLAP-01",
+      "description": "a second run-service job cancels and drains the prior worker before starting its successor",
+      "kind": "runner",
+      "sequence": ["job_a_arrived", "job_b_arrived"],
+      "expect": {
+        "overlap_events": ["cancel_a", "await_a", "start_b"],
+        "max_active_workers": 1
+      }
+    }
+  ]
+}

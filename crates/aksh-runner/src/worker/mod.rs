@@ -15,7 +15,10 @@ pub mod job_extension;
 pub mod job_runner;
 pub mod live_logs;
 pub mod matchers;
+pub mod official_oracles;
 pub mod server_queue;
+pub mod step_conditions;
+pub mod step_records;
 pub mod steps_runner;
 pub mod template;
 

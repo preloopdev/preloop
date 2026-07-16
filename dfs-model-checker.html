@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>aksh DFS Model Checker — Visual Walkthrough</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#0f172a;--card:#1e293b;--border:#334155;--fg:#e2e8f0;--dim:#94a3b8;--accent:#38bdf8;--green:#4ade80;--orange:#fb923c;--blue:#60a5fa;--pink:#f472b6;--font:'Inter',system-ui,-apple-system,sans-serif}
+body{background:var(--bg);color:var(--fg);font-family:var(--font);line-height:1.6;padding:2rem 1rem;max-width:1100px;margin:0 auto}
+h1{font-size:2rem;font-weight:700;margin-bottom:.25rem;background:linear-gradient(135deg,var(--accent),var(--pink));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.subtitle{color:var(--dim);margin-bottom:2rem;font-size:.95rem;border-bottom:1px solid var(--border);padding-bottom:1rem}
+h2{font-size:1.3rem;font-weight:600;margin:2.5rem 0 .75rem;color:var(--accent)}
+h3{font-size:1.05rem;font-weight:600;margin:1.5rem 0 .5rem;color:var(--fg)}
+p,li{color:var(--dim);margin-bottom:.5rem;font-size:.92rem}
+a{color:var(--accent)}
+.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1.5rem;margin:1.25rem 0}
+.card h3{margin-top:0}
+.mermaid-wrap{overflow-x:auto;padding:.5rem 0;min-height:100px}
+.code{background:#0a0f1e;border:1px solid var(--border);border-radius:8px;padding:1rem;font-family:'JetBrains Mono','Fira Code',monospace;font-size:.82rem;overflow-x:auto;margin:.75rem 0}
+.code .kw{color:#c792ea}.code .ty{color:#ffcb6b}.code .str{color:#89ddff}.code .cm{color:#546e7a}.code .fn{color:#82aaff}.code .op{color:#89ddff}
+.tag{display:inline-block;background:var(--accent);color:#0f172a;font-size:.7rem;font-weight:700;padding:0 .45rem;border-radius:4px;margin-right:.35rem;text-transform:uppercase}
+.tag.model{background:#4ade80;color:#0f172a}.tag.prod{background:#fb923c;color:#0f172a}.tag.check{background:#60a5fa;color:#fff}.tag.bug{background:#f472b6;color:#fff}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:1rem}@media(max-width:720px){.grid2{grid-template-columns:1fr}}
+.badge{display:inline-flex;align-items:center;gap:.35rem;background:var(--card);border:1px solid var(--border);border-radius:999px;padding:.25rem .7rem;font-size:.78rem;color:var(--dim)}
+.badge.green{background:#064e3b;border-color:#4ade80;color:#4ade80}
+.badge.blue{background:#1e3a5f;border-color:#60a5fa;color:#60a5fa}
+.stats{display:flex;gap:.75rem;flex-wrap:wrap;margin:1rem 0}
+.footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--border);color:var(--dim);font-size:.82rem}
+</style>
+</head>
+<body>
+
+<h1>aksh DFS Model Checker</h1>
+<p class="subtitle">Systematic state-space verification of the GitHub Actions concurrency state machine</p>
+
+<!-- ── STATS ── -->
+<div class="stats">
+  <span class="badge green">● 338 unique states</span>
+  <span class="badge blue">● 6 depth bound</span>
+  <span class="badge">● 3 runs × 2 groups</span>
+  <span class="badge">● 2 queue modes</span>
+  <span class="badge">● 4 invariants</span>
+  <span class="badge">● 0 divergences</span>
+</div>
+
+<!-- ── 1. DUAL-STATE ARCHITECTURE ── -->
+<h2>1. Dual-State Architecture</h2>
+<p>Two independent implementations run in parallel at every step: a <span class="tag model">clean-room model</span> and the live <span class="tag prod">production code</span>. Every operation is applied to both, then cross-checked for equivalence.</p>
+
+<div class="card">
+<div class="mermaid-wrap">
+<pre class="mermaid">
+flowchart LR
+    subgraph Input["Input Space"]
+        E[("Submit / Release / Cancel")]
+    end
+
+    subgraph Model["📐 Independent Reference Model"]
+        direction TB
+        M1["Model.acquire()"]
+        M2["Model.release()"]
+        M3["Model.cancel()"]
+        M4["Model.check all invariants()"]
+    end
+
+    subgraph Prod["🏭 Production InnerState"]
+        direction TB
+        P1["try_acquire_concurrency()"]
+        P2["release_concurrency_for_run()"]
+        P3["cancel_run_inner()"]
+        P4["check_production_invariants()"]
+    end
+
+    subgraph Verify["✅ Cross-Check"]
+        S1["Snapshot equivalence<br/>(running, pending) per group"]
+        S2["Invariant agreement<br/>INV-1 / INV-2 / INV-7 / INV-12"]
+        S3["Result agreement<br/>Ok / Err axis"]
+    end
+
+    E -->|"clone &amp; apply"| M1
+    E -->|"clone &amp; apply"| P1
+    M1 --> M4
+    P1 --> P4
+    M4 --> Verify
+    P4 --> Verify
+    Verify -->|"pass → recurse"| E
+    Verify -->|"fail → panic"| X["💥 Assertion failure"]
+</pre>
+</div>
+</div>
+
+<p><strong>Key insight:</strong> The model is pure logic (~250 lines, zero production imports). The prod wrapper calls real <code>InnerState</code> functions verbatim. If they ever disagree on running/pending holders, the test panics with the full op sequence.</p>
+
+<!-- ── 2. REFERENCE MODEL ── -->
+<h2>2. Independent Reference Model</h2>
+<p>The model tracks three data structures to mirror GitHub's concurrency semantics exactly:</p>
+
+<div class="grid2">
+<div class="card">
+<h3>groups</h3>
+<p><code style="color:var(--accent)">BTreeMap&lt;(repo,group), ModelGroup&gt;</code></p>
+<p>Each group has exactly one <code>running</code> slot plus a <code>pending</code> FIFO deque. <span style="color:var(--green)">→ at most one running holder per group</span></p>
+</div>
+<div class="card">
+<h3>holder_state</h3>
+<p><code style="color:var(--accent)">BTreeMap&lt;HolderToken, HolderState&gt;</code></p>
+<p>Every holder token maps to Running / Pending / Cancelled / Terminal. <span style="color:var(--green)">→ single source of truth for lifecycle</span></p>
+</div>
+</div>
+<div class="card">
+<h3>holder_keys</h3>
+<p><code style="color:var(--accent)">BTreeMap&lt;HolderToken, BTreeSet&lt;key&gt;&gt;</code></p>
+<p>Reverse map: for every holder, what groups is it in? Multi-key holders (JobSets) appear in multiple groups. <span style="color:var(--green)">→ prevents ghost keys on cleanup</span></p>
+</div>
+
+<div class="code">
+<span class="cm">// The four invariants checked at every node:</span><br>
+<br>
+<span class="cm">// INV-1: At most one running holder per group</span><br>
+<span class="kw">fn</span> <span class="fn">check_inv1</span>(&self) -> <span class="ty">Result</span>&lt;(), <span class="ty">String</span>&gt; { <span class="op">...</span> }<br>
+<br>
+<span class="cm">// INV-2: Running and pending sets are disjoint</span><br>
+<span class="kw">fn</span> <span class="fn">check_inv2</span>(&self) -> <span class="ty">Result</span>&lt;(), <span class="ty">String</span>&gt; { <span class="op">...</span> }<br>
+<br>
+<span class="cm">// INV-7: Every running/pending holder has exact reverse key</span><br>
+<span class="kw">fn</span> <span class="fn">check_inv7</span>(&self) -> <span class="ty">Result</span>&lt;(), <span class="ty">String</span>&gt; { <span class="op">...</span> }<br>
+<br>
+<span class="cm">// INV-12: Empty groups are immediately removed</span><br>
+<span class="kw">fn</span> <span class="fn">check_inv12</span>(&self) -> <span class="ty">Result</span>&lt;(), <span class="ty">String</span>&gt; { <span class="op">...</span> }
+</div>
+
+<!-- ── 3. DFS SEARCH TREE ── -->
+<h2>3. DFS Search Tree</h2>
+<p>At every node, the explorer enumerates <strong>every</strong> valid next operation — all 24 Submit variants (3 runs × 2 groups × 2 queue modes × 2 CIP), plus Release and Cancel for every running/pending holder. No randomness, no sampling.</p>
+
+<div class="card">
+<div class="mermaid-wrap">
+<pre class="mermaid">
+flowchart TD
+    S0["depth 0<br/>State: empty groups<br/>no holders<br/><span style='color:#4ade80;font-weight:700'>visited = 1</span>"]
+
+    S0 -->|"Submit(run=0, grp-1, Single, CIP=false)"| S1["depth 1<br/>grp-1: running=[run0]<br/><span style='color:#94a3b8;font-weight:700'>visited = 7</span>"]
+    S0 -->|"Submit(run=0, grp-1, Max, CIP=false)"| S2["depth 1<br/>grp-1: running=[run0]<br/><span style='color:#94a3b8;font-weight:700'>visited = 8</span>"]
+    S0 -->|"Submit(run=0, grp-2, Single, CIP=true)"| S3["depth 1<br/>grp-2: running=[run0]<br/><span style='color:#94a3b8;font-weight:700'>visited = 9</span>"]
+    S0 -->|"… 21 more candidates"| SX["<span style='color:#94a3b8'>⋯</span>"]
+
+    S1 -->|"Submit(run=1, grp-1, Single, CIP=false)"| S4["depth 2<br/>grp-1: r=[run0], p=[run1]<br/><span style='color:#94a3b8;font-weight:700'>visited = 15</span>"]
+    S1 -->|"Submit(run=1, grp-2, Single, CIP=false)"| S5["depth 2<br/>grp-1: r=[run0]<br/>grp-2: r=[run1]<br/><span style='color:#94a3b8;font-weight:700'>visited = 16</span>"]
+    S1 -->|"Release(run=0)"| S6["depth 2<br/>empty (run0 promoted,<br/>nothing pending)<br/><span style='color:#60a5fa;font-weight:700'>visited = 17</span>"]
+
+    S4 -->|"Cancel(run=0)"| S7["depth 3<br/>grp-1: r=[run1]<br/>(CIP: run0 cancelled,<br/>run1 promoted)<br/><span style='color:#fb923c;font-weight:700'>visited = 42</span>"]
+    S4 -->|"Release(run=0)"| S8["depth 3<br/>grp-1: r=[run1]<br/>(FIFO: promoted<br/>from pending)<br/><span style='color:#60a5fa;font-weight:700'>visited = 43</span>"]
+
+    style S0 fill:#064e3b,color:#4ade80,stroke:#4ade80
+    style S6 fill:#1e3a5f,color:#60a5fa,stroke:#60a5fa
+    style S8 fill:#1e3a5f,color:#60a5fa,stroke:#60a5fa
+    style S7 fill:#7c2d12,color:#fb923c,stroke:#fb923c
+</pre>
+</div>
+</div>
+
+<p style="margin-top:.25rem;font-size:.85rem;color:var(--dim)">
+<span style="color:#4ade80;">■</span> initial &nbsp;
+<span style="color:#60a5fa;">■</span> terminal/empty &nbsp;
+<span style="color:#fb923c;">■</span> cancellation event
+</p>
+
+<!-- ── 4. EVERY NODE IS VERIFIED ── -->
+<h2>4. What's Verified at Every Node</h2>
+
+<div class="card">
+<div class="mermaid-wrap">
+<pre class="mermaid">
+flowchart LR
+    subgraph ModelState["Model Snapshot"]
+        MR["grp-1: running=run0, pending=[]"]
+        MH["holder_state: {run0 → Running}"]
+    end
+
+    subgraph ProdState["Prod Snapshot"]
+        PR["grp-1: running=run0, pending=[]"]
+        PH["holder_keys: {run0 → {grp-1}}"]
+    end
+
+    subgraph Check["3-Way Cross-Check"]
+        C1["INV-1: ≤1 running per group"]
+        C2["INV-2: running &amp; pending disjoint"]
+        C3["INV-7: reverse keys match"]
+        C4["INV-12: no empty groups"]
+        C5["Snapshot: (running, pending) ≡ model"]
+    end
+
+    MR --> C5
+    PR --> C5
+    C5 -->|"OK → recurse"| GO["⬇ DFS(depth+1)"]
+    C5 -->|"MISMATCH → 💥"| PANIC["panic with full path"]
+</pre>
+</div>
+</div>
+
+<!-- ── 5. CONCRETE TRACE ── -->
+<h2>5. Concrete Trace: 3-Run FIFO Sequence</h2>
+<p>The simplest interesting path — three runs queue on the same group, then release one-by-one. The model and production must agree on who's running and who's pending at every step.</p>
+
+<div class="card">
+<div class="mermaid-wrap">
+<pre class="mermaid">
+sequenceDiagram
+    participant M as Model
+    participant P as ProdState
+    participant V as Verifier
+
+    Note over M,V: State 0: empty, visited=1
+
+    M->>M: acquire(grp-1, run0, !CIP, Single)
+    P->>P: try_acquire_concurrency(grp-1, run0, !CIP, Single)
+    V->>V: ✅ snapshots match → grp-1: running=[run0]
+
+    M->>M: acquire(grp-1, run1, !CIP, Single)
+    P->>P: try_acquire_concurrency(grp-1, run1, !CIP, Single)
+    V->>V: ✅ snapshots match → grp-1: r=[run0], p=[run1]
+
+    M->>M: acquire(grp-1, run2, !CIP, Single)
+    P->>P: try_acquire_concurrency(grp-1, run2, !CIP, Single)
+    V->>V: ✅ snapshots match → grp-1: r=[run0], p=[run1, run2]
+
+    M->>M: release(grp-1, run0)
+    P->>P: release_concurrency_for_run(run0)
+    V->>V: ✅ snapshots match → grp-1: r=[run1], p=[run2]
+
+    M->>M: release(grp-1, run1)
+    P->>P: release_concurrency_for_run(run1)
+    V->>V: ✅ snapshots match → grp-1: r=[run2], p=[]
+
+    M->>M: release(grp-1, run2)
+    P->>P: release_concurrency_for_run(run2)
+    V->>V: ✅ snapshots match → empty (group cleaned)
+</pre>
+</div>
+</div>
+
+<!-- ── 6. WHAT CATCHES A BUG ── -->
+<h2>6. What Catches a Real Bug</h2>
+<p>Here's what happens when production diverges from the model — a simplified version of the self-deadlock bug found in the original promotion state machine:</p>
+
+<div class="card">
+<div class="mermaid-wrap">
+<pre class="mermaid">
+flowchart LR
+    subgraph ModelState["✅ Model"]
+        MR["grp-1: running=run0<br/>pending=[]"]
+        MH["holder_state: {run0 → Running}"]
+    end
+
+    subgraph ProdState["❌ Production (buggy)"]
+        PR["grp-1: running=run0<br/>pending=[run0]"]
+        PH["holder_keys: {run0 → {grp-1}}"]
+    end
+
+    subgraph Check["Snapshot Equivalence"]
+        C1["running: run0 ≡ run0 ✓"]
+        C2["pending: [] ≠ [run0] <span style='color:#f472b6'>✗</span>"]
+    end
+
+    MR --> C1
+    PR --> C1
+    MR --> C2
+    PR --> C2
+
+    C2 -->|"MISMATCH"| PANIC["💥 panic with path dump<br/>→ exact op sequence to reproduce"]
+</pre>
+</div>
+<p style="margin-top:.75rem;color:var(--pink);font-weight:600">The bug: a promotion moves run0 to "pending" while it still holds the running slot. The model's INV-2 (disjoint running/pending) catches this immediately. The production version had the exact same flaw — a job was moved to <code>concurrency_blocked</code> without releasing its <code>holder_keys</code>.</p>
+</div>
+
+<!-- ── 7. STATE-SPACE PRUNING ── -->
+<h2>7. State-Space Pruning</h2>
+<p>Without deduplication, the DFS explodes combinatorially (~50K branches). The <code>visited</code> set compresses multiple execution paths into the same equivalence class by hashing the post-op groups + holder_state.</p>
+
+<div class="card">
+<div class="mermaid-wrap">
+<pre class="mermaid">
+flowchart LR
+    subgraph P1["Path A: Submit run0 → Submit run1 → Cancel run1"]
+        A1["State after 3 ops:<br/>grp-1: r=[run0], p=[]<br/>{run0→Running, run1→Cancelled}"]
+    end
+    subgraph P2["Path B: Submit run1 → Cancel run1 → Submit run0"]
+        B1["State after 3 ops:<br/>grp-1: r=[run0], p=[]<br/>{run0→Running, run1→Cancelled}"]
+    end
+
+    A1 -->|"same hash"| V["visited.insert(key)"]
+    B1 -->|"same hash"| V
+
+    V -->|"key: (grp-1)__run=[0]__p=[]__{0:Running, 1:Cancelled}"| VE["338 unique states<br/>from ~50K raw branches"]
+</pre>
+</div>
+</div>
+
+<!-- ── 8. GENERATION LOOP ── -->
+<h2>8. Generation Loop (Pseudocode)</h2>
+
+<div class="code">
+<span class="kw">fn</span> <span class="fn">dfs</span>(depth, model, prod, path, visited):
+    <span class="cm">// Invariants must hold at every node</span>
+    assert model.check_all_invariants().is_ok()
+    assert check_production_invariants(&prod.inner).is_ok()
+    assert snapshots_equivalent(model, prod)
+
+    <span class="kw">if</span> depth >= 6: <span class="kw">return</span>
+
+    <span class="cm">// Enumerate EVERY valid next op</span>
+    <span class="kw">for</span> run <span class="kw">in</span> [0, 1, 2]:
+        <span class="kw">if</span> run not already holding:
+            <span class="kw">for</span> group <span class="kw">in</span> ["grp-1", "grp-2"]:
+                <span class="kw">for</span> queue <span class="kw">in</span> [Single, Max]:
+                    <span class="kw">for</span> cancel <span class="kw">in</span> [<span class="kw">false</span>, <span class="kw">true</span>]:
+                        ops.push(Submit { run, group, queue, cancel })
+
+    <span class="kw">for</span> group with a running holder:
+        ops.push(Release { group.running })
+
+    <span class="kw">for</span> every Running <span class="kw">or</span> Pending holder:
+        ops.push(Cancel { holder.run })
+
+    <span class="cm">// Branch, check, prune duplicates</span>
+    <span class="kw">for</span> op <span class="kw">in</span> ops:
+        next_model = model.clone()
+        next_prod = prod.clone_concurrency()
+        execute_op(&mut next_model, &mut next_prod, &op)
+
+        <span class="kw">if</span> visited.insert(state_key(next_model)):
+            path.push(op)
+            dfs(depth + 1, next_model, next_prod, path, visited)
+            path.pop()
+</div>
+
+<!-- ── FOOTER ── -->
+<div class="footer">
+<p><strong>Repository:</strong> <code>git@github.com:preloopdev/aksh.git</code> — branch <code>Bnjoroge/concurrency</code></p>
+<p><strong>Source file:</strong> <code>crates/aksh-runner-server/src/concurrency_properties.rs</code> — function <code>test_exhaustive_state_space_model_check</code></p>
+<p><strong>Slug:</strong> <code>aksh-dfs-concurrency-model-checker</code></p>
+</div>
+
+<script>
+mermaid.initialize({
+    startOnLoad: true,
+    theme: 'dark',
+    themeVariables: {
+        primaryColor: '#1e293b',
+        primaryTextColor: '#e2e8f0',
+        primaryBorderColor: '#334155',
+        lineColor: '#38bdf8',
+        secondaryColor: '#0f172a',
+        tertiaryColor: '#1e293b',
+        fontSize: '13px',
+        fontFamily: 'Inter, system-ui, sans-serif'
+    },
+    flowchart: { htmlLabels: true, useMaxWidth: false },
+    sequence: { showSequenceNumbers: false, actorFontSize: 13, noteFontSize: 12, messageFontSize: 12 }
+});
+</script>
+</body>
+</html>

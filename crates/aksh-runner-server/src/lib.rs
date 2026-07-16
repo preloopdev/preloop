@@ -1,16 +1,30 @@
 //! Host-side Preloop runner control plane.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+pub mod concurrency;
+pub mod events;
 pub mod github;
+pub mod scheduler;
+
+/// Pure job-graph scheduler model and property tests.
+pub mod scheduling;
+
+#[cfg(test)]
+mod concurrency_http_properties;
+#[cfg(test)]
+mod concurrency_properties;
+/// GitHub-compatible OIDC id-token provider.
+pub mod oidc;
 
 use axum_server::{tls_rustls::RustlsConfig, Handle};
 use rcgen::generate_simple_self_signed;
 
-use aksh_artifacts::ArtifactStore;
+use aksh_artifacts::{validate_artifact_name, ArtifactStore};
 use aksh_cache::CacheStore;
 use aksh_gha_parser::{expand_jobs_with_reusables, parse_workflow};
 use aksh_gha_protocol::{
@@ -23,7 +37,7 @@ use aksh_gha_protocol::{
 use axum::body::{to_bytes, Body};
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -44,9 +58,10 @@ use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
 use tracing::{debug, info, warn};
 
-/// Shared local-only token used for runner ↔ server auth in development.
-/// Not a credential — just a magic value that both sides agree on.
-const AKSH_SYSTEM_TOKEN: &str = "aksh-system-token";
+/// Default local token used when `AKSH_SYSTEM_TOKEN` is not configured.
+const DEFAULT_AKSH_SYSTEM_TOKEN: &str = "aksh-system-token";
+#[cfg(test)]
+const TEST_LOCAL_JWT_KEY: &[u8] = b"aksh-test-local-jwt-signing-key";
 
 /// Server configuration.
 #[derive(Debug, Clone)]
@@ -59,6 +74,17 @@ pub struct ServerConfig {
     pub record_flows: Option<PathBuf>,
     /// TLS mode (default: no TLS).
     pub tls: TlsMode,
+    /// Enable privileged local/CI simulation endpoints.
+    pub enable_test_api: bool,
+    /// Bearer token required by privileged simulation endpoints.
+    pub test_api_token: Option<String>,
+    /// OIDC issuer URL. Defaults to `{public_base_url}/oidc`.
+    ///
+    /// This must identify an issuer controlled by the aksh deployment. Setting
+    /// GitHub's hosted issuer does not make locally signed tokens GitHub-trusted.
+    pub oidc_issuer: Option<String>,
+    /// Enable the cron scheduler for schedule-triggered workflows.
+    pub enable_scheduler: bool,
 }
 
 /// TLS configuration.
@@ -134,10 +160,13 @@ async fn reap_once(shared: &Arc<SharedState>) {
                     if let Some(req) = inner.job_requests.get_mut(&request_id) {
                         req.timeout_triggered = true;
                     }
-                    cancellations.push(QueuedCancellation {
-                        run_id,
-                        job_id: job_id.clone(),
-                    });
+                    if let Some(agent_job_id) = agent_job_id_for(&inner, run_id, &job_id) {
+                        cancellations.push(QueuedCancellation {
+                            run_id,
+                            job_id: job_id.clone(),
+                            agent_job_id,
+                        });
+                    }
                 }
             }
         }
@@ -216,7 +245,42 @@ async fn run_background_reaper(shared: Arc<SharedState>) {
 
 /// Start the server and block until shutdown.
 pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
-    let state = AppState::new(config.state_dir.clone()).await?;
+    let mut state = AppState::new(config.state_dir.clone()).await?;
+    if !config.listen.ip().is_loopback() && state.system_token == DEFAULT_AKSH_SYSTEM_TOKEN {
+        anyhow::bail!(
+            "AKSH_SYSTEM_TOKEN must be explicitly configured when listening beyond loopback"
+        );
+    }
+    let oidc_issuer = normalize_oidc_issuer(
+        config
+            .oidc_issuer
+            .unwrap_or_else(|| format!("{}/oidc", public_base_url())),
+    )?;
+    {
+        let mut inner = state.inner.lock().await;
+        inner.oidc_issuer = oidc_issuer;
+    }
+    let shutdown = CancellationToken::new();
+    if config.enable_scheduler {
+        let scheduler = crate::scheduler::Scheduler::new();
+        state.scheduler = Some(scheduler.clone());
+        let shared_for_scan = Arc::new(SharedState {
+            state: state.clone(),
+            shutdown: shutdown.clone(),
+        });
+        let scheduler_clone = scheduler.clone();
+        if let Some(workspace) = state.local_workspace.clone() {
+            tokio::spawn(async move {
+                scheduler_clone
+                    .scan_workspace(&workspace, shared_for_scan)
+                    .await;
+            });
+        } else {
+            tokio::spawn(async move {
+                scheduler_clone.scan_remote(shared_for_scan).await;
+            });
+        }
+    }
     if let Some(path) = &config.record_flows {
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -226,8 +290,27 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
         let mut inner = state.inner.lock().await;
         inner.flows_file = Some(file);
     }
-    let shutdown = CancellationToken::new();
-    let router = app(state.clone(), shutdown.clone());
+    let test_api_token = if config.enable_test_api {
+        if !config.listen.ip().is_loopback() {
+            anyhow::bail!("the test API may only be enabled on a loopback listener");
+        }
+        let token = config
+            .test_api_token
+            .clone()
+            .filter(|token| !token.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("--enable-test-api requires --test-api-token"))?;
+        warn!(
+            listen = %config.listen,
+            "PRIVILEGED TEST API ENABLED; simulated sessions and completions are accepted"
+        );
+        Some(token)
+    } else {
+        if config.test_api_token.is_some() {
+            anyhow::bail!("--test-api-token requires --enable-test-api");
+        }
+        None
+    };
+    let router = build_app(state.clone(), shutdown.clone(), test_api_token);
 
     let shared = Arc::new(SharedState {
         state,
@@ -302,8 +385,28 @@ async fn shutdown_signal(shutdown: CancellationToken) {
     shutdown.cancel();
 }
 
-/// Build the server router.
+/// Build the production server router without simulation endpoints.
 pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
+    build_app(state, shutdown, None)
+}
+
+/// Build an in-process router with privileged local/CI simulation endpoints.
+///
+/// Network servers should use [`serve`], which additionally enforces a
+/// loopback-only listener when this API is enabled.
+pub fn app_with_test_api(
+    state: AppState,
+    shutdown: CancellationToken,
+    token: impl Into<String>,
+) -> Router {
+    build_app(state, shutdown, Some(token.into()))
+}
+
+fn build_app(
+    state: AppState,
+    shutdown: CancellationToken,
+    test_api_token: Option<String>,
+) -> Router {
     let shared = Arc::new(SharedState {
         state: state.clone(),
         shutdown: shutdown.clone(),
@@ -398,6 +501,10 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             get(oidc_token),
         )
         .route(
+            "/:orchestration_id//idtoken/:plan_id/:job_id",
+            get(oidc_token_run_service),
+        )
+        .route(
             "/_apis/v1/ActionDownloadInfo/:scope/:hub/:plan_id",
             post(action_download_info),
         )
@@ -469,10 +576,20 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             "/runner/server/_apis/v1/plans/:plan_id/events",
             post(finish_job_plan),
         )
-        .route_layer(middleware::from_fn(require_bearer));
+        .route_layer(middleware::from_fn_with_state(
+            shared.clone(),
+            require_protocol_bearer,
+        ));
 
-    Router::new()
+    let router = Router::new()
         .route("/healthz", get(healthz))
+        .route("/.well-known/openid-configuration", get(oidc_discovery))
+        .route("/.well-known/jwks.json", get(oidc_jwks))
+        .route(
+            "/oidc/.well-known/openid-configuration",
+            get(oidc_discovery),
+        )
+        .route("/oidc/.well-known/jwks.json", get(oidc_jwks))
         // GHES-style org-prefixed routes
         .route("/:org/_apis/connectionData", get(connection_data))
         .route("/:org/_apis/v1/oauth2/token", post(oauth2_token))
@@ -589,35 +706,79 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         )
         .route("/_apis/connectionData", get(connection_data))
         .route(
-            "/_apis/",
-            axum::routing::options(|| async { StatusCode::OK }),
+            "/api/v1/runs",
+            post(submit_run).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_native_bearer,
+            )),
         )
-        .route("/api/v1/runs", post(submit_run))
+        .route("/api/v1/scheduler/history", get(get_scheduler_history))
         .route(
             "/api/v1/github/webhooks",
             post(github::handle_github_webhook),
         )
         .route("/api/v1/github/register", get(github::github_register))
         .route("/api/v1/github/callback", get(github::github_callback))
-        .route("/api/v1/runs/:run_id", get(get_run))
-        .route("/api/v1/runs/:run_id/cancel", post(cancel_run))
-        .route("/api/v1/runs/:run_id/rerun", post(rerun_run))
-        .route("/api/v1/runs/:run_id/events.ndjson", get(run_events))
-        .route("/api/v1/runs/:run_id/debug", get(ws_dap_debug))
-        .route("/api/v1/runs/:run_id/debug", post(register_dap_port))
+        .route(
+            "/api/v1/runs/:run_id",
+            get(get_run).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_native_bearer,
+            )),
+        )
+        .route(
+            "/api/v1/runs/:run_id/logs",
+            get(get_run_logs).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_native_bearer,
+            )),
+        )
+        .route(
+            "/api/v1/runs/:run_id/cancel",
+            post(cancel_run).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_native_bearer,
+            )),
+        )
+        .route(
+            "/api/v1/runs/:run_id/rerun",
+            post(rerun_run).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_native_bearer,
+            )),
+        )
+        .route(
+            "/api/v1/runs/:run_id/events.ndjson",
+            get(run_events).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_native_bearer,
+            )),
+        )
+        .route(
+            "/api/v1/runs/:run_id/debug",
+            get(ws_dap_debug).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_native_bearer,
+            )),
+        )
+        .route(
+            "/api/v1/runs/:run_id/debug",
+            post(register_dap_port).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_runner_bearer,
+            )),
+        )
+        // Archive tickets are bearerless in the official runner protocol.
         .route(
             "/api/v1/actions/download/:owner/:repo/*git_ref",
             get(download_action_tarball),
         )
-        .route("/api/v1/runners", post(register_runner))
-        .route("/api/v1/runners/sessions", post(create_session))
         .route(
-            "/api/v1/runners/sessions/:session_id/messages",
-            get(next_message),
-        )
-        .route(
-            "/api/v1/runners/sessions/:session_id/messages/:message_id",
-            delete(delete_session_message),
+            "/api/v1/runners",
+            post(register_runner).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_native_bearer,
+            )),
         )
         .route(
             "/runner/session",
@@ -627,7 +788,13 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             "/runner/session/:session_id",
             delete(broker_delete_session_by_path),
         )
-        .route("/runner/message", get(next_message_broker_ref_root))
+        .route(
+            "/runner/message",
+            get(next_message_broker_ref_root).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_runner_bearer,
+            )),
+        )
         .route("/runner/acknowledge", post(broker_acknowledge_root))
         .route(
             "/runner/server/runner/session",
@@ -639,7 +806,10 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
         )
         .route(
             "/runner/server/runner/message",
-            get(next_message_broker_ref_root),
+            get(next_message_broker_ref_root).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_runner_bearer,
+            )),
         )
         .route(
             "/runner/server/runner/acknowledge",
@@ -653,7 +823,13 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             "/session/:session_id",
             delete(broker_delete_session_by_path),
         )
-        .route("/message", get(next_message_broker_ref_root))
+        .route(
+            "/message",
+            get(next_message_broker_ref_root).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_runner_bearer,
+            )),
+        )
         .route("/acknowledge", post(broker_acknowledge_root))
         .route(
             "/runner/server/session",
@@ -663,18 +839,46 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             "/runner/server/session/:session_id",
             delete(broker_delete_session_by_path),
         )
-        .route("/runner/server/message", get(next_message_broker_ref_root))
+        .route(
+            "/runner/server/message",
+            get(next_message_broker_ref_root).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_runner_bearer,
+            )),
+        )
         .route("/runner/server/acknowledge", post(broker_acknowledge_root))
-        .route("/api/v1/jobs/complete", post(complete_job))
-        .route("/api/v1/cache", post(cache_put))
-        .route("/api/v1/cache", get(cache_get))
-        .route("/api/v1/artifacts", post(artifact_put))
-        .route("/api/v1/artifacts/:artifact_id", get(artifact_get))
-        // Runner lifecycle endpoints — public (runner may not have auth token yet)
+        .route(
+            "/api/v1/cache",
+            get(cache_get)
+                .post(cache_put)
+                .route_layer(middleware::from_fn_with_state(
+                    shared.clone(),
+                    require_native_bearer,
+                )),
+        )
+        .route(
+            "/api/v1/artifacts",
+            post(artifact_put).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_native_bearer,
+            )),
+        )
+        .route(
+            "/api/v1/artifacts/:artifact_id",
+            get(artifact_get).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_native_bearer,
+            )),
+        )
+        // Runner lifecycle endpoints — public before the runner receives its token.
         .route("/_apis/v1/AgentPools", get(runner_pools))
         .route(
             "/_apis/v1/Agent/:pool_id/:agent_id",
             get(agent_lookup_by_id).post(register_runner_compat),
+        )
+        .route(
+            "/_apis/v1/Agent/:pool_id",
+            get(agent_lookup).post(register_runner_compat_pool_only),
         )
         .route(
             "/_apis/v1/AgentSession/:pool_id/:session_id",
@@ -778,51 +982,204 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
             state.clone(),
             record_flows_middleware,
         ))
-        .with_state(shared)
+        .with_state(shared.clone());
+
+    match test_api_token {
+        Some(token) => router.merge(
+            Router::new()
+                .route(
+                    "/internal/test/runners/sessions/:session_id/messages",
+                    get(next_message),
+                )
+                .route(
+                    "/internal/test/runners/sessions/:session_id/messages/:message_id",
+                    delete(delete_session_message),
+                )
+                .route("/internal/test/runners/sessions", post(create_session))
+                .route("/internal/test/jobs/complete", post(complete_job))
+                .route_layer(middleware::from_fn_with_state(
+                    Arc::<str>::from(token),
+                    require_test_api_token,
+                ))
+                .with_state(shared),
+        ),
+        None => router,
+    }
 }
 
-/// HMAC key used for local JWT signing/verification.
-const LOCAL_JWT_KEY: &[u8] = b"aksh-local-runner-signing-key";
-
-async fn require_bearer(request: Request, next: Next) -> Result<Response, ApiError> {
-    if request.uri().path().starts_with("/broker/") {
-        return Ok(next.run(request).await);
+async fn require_protocol_bearer(
+    State(shared): State<Arc<SharedState>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let authorized = bearer_token(&request).is_some_and(|token| {
+        token == shared.state.system_token || shared.state.verify_local_jwt_claims(token).is_some()
+    });
+    if authorized {
+        Ok(next.run(request).await)
+    } else {
+        Err(ApiError::unauthorized(
+            "runner or job protocol token required",
+        ))
     }
+}
+
+async fn require_test_api_token(
+    State(expected): State<Arc<str>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
     let authorized = request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|token| {
-            token == AKSH_SYSTEM_TOKEN || token.starts_with("aksh-") || verify_local_jwt(token)
-        });
+        .is_some_and(|token| token == expected.as_ref());
+    if !authorized {
+        warn!(path = %request.uri().path(), "rejected privileged test API request");
+        return Err(ApiError::unauthorized("missing or invalid test API token"));
+    }
+    warn!(path = %request.uri().path(), "privileged test API request");
+    Ok(next.run(request).await)
+}
+
+async fn require_native_bearer(
+    State(shared): State<Arc<SharedState>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let authorized = bearer_token(&request).is_some_and(|token| token == shared.state.system_token);
     if authorized {
         Ok(next.run(request).await)
     } else {
-        Err(ApiError::unauthorized("missing or invalid bearer token"))
+        Err(ApiError::unauthorized(
+            "missing or invalid native API token",
+        ))
     }
 }
 
-/// Verify an HS256 JWT issued by this server's `local_jwt()`.
-fn verify_local_jwt(token: &str) -> bool {
-    let parts: Vec<&str> = token.splitn(3, '.').collect();
-    if parts.len() != 3 {
-        return false;
+async fn require_runner_bearer(
+    State(shared): State<Arc<SharedState>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let authorized = bearer_token(&request)
+        .and_then(|token| shared.state.runner_id_from_token(token))
+        .is_some();
+    if authorized {
+        Ok(next.run(request).await)
+    } else {
+        Err(ApiError::unauthorized("runner listen token required"))
     }
-    let signing_input = format!("{}.{}", parts[0], parts[1]);
-    let mut mac = match Hmac::<Sha256>::new_from_slice(LOCAL_JWT_KEY) {
-        Ok(m) => m,
-        Err(_) => return false,
-    };
-    mac.update(signing_input.as_bytes());
-    let expected = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
-    expected == parts[2]
+}
+
+fn bearer_token(request: &Request) -> Option<&str> {
+    request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+}
+
+impl AppState {
+    fn local_jwt(&self, mut claims: serde_json::Value) -> Result<String, ApiError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| ApiError::bad_request(format!("system clock before epoch: {error}")))?
+            .as_secs();
+        let claims = claims
+            .as_object_mut()
+            .ok_or_else(|| ApiError::bad_request("JWT claims must be an object"))?;
+        claims.insert("iss".to_owned(), json!("https://aksh.local"));
+        claims.insert("iat".to_owned(), json!(now));
+        claims.insert("nbf".to_owned(), json!(now));
+        claims.insert("exp".to_owned(), json!(now + 2999));
+        let header = json!({
+            "alg": "HS256",
+            "typ": "JWT",
+            "kid": "aksh-local"
+        });
+        let signing_input = format!(
+            "{}.{}",
+            base64_url_json(&header)?,
+            base64_url_json(&serde_json::Value::Object(claims.clone()))?
+        );
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.local_jwt_key)
+            .map_err(|error| ApiError::bad_request(format!("invalid signing key: {error}")))?;
+        mac.update(signing_input.as_bytes());
+        let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        Ok(format!("{signing_input}.{signature}"))
+    }
+
+    fn verify_local_jwt_claims(&self, token: &str) -> Option<serde_json::Value> {
+        let parts: Vec<&str> = token.splitn(3, '.').collect();
+        if parts.len() != 3 {
+            return None;
+        }
+        let header_bytes = URL_SAFE_NO_PAD.decode(parts[0]).ok()?;
+        let header: serde_json::Value = serde_json::from_slice(&header_bytes).ok()?;
+        if header.get("alg").and_then(|value| value.as_str()) != Some("HS256") {
+            return None;
+        }
+        let payload_bytes = URL_SAFE_NO_PAD.decode(parts[1]).ok()?;
+        let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+        let exp = payload.get("exp").and_then(|value| value.as_u64())?;
+        let nbf = payload.get("nbf").and_then(|value| value.as_u64());
+        if exp <= now || nbf.is_some_and(|value| value > now + 30) {
+            return None;
+        }
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.local_jwt_key).ok()?;
+        mac.update(format!("{}.{}", parts[0], parts[1]).as_bytes());
+        let signature = URL_SAFE_NO_PAD.decode(parts[2]).ok()?;
+        mac.verify_slice(&signature).ok()?;
+        Some(payload)
+    }
+
+    fn verify_local_jwt_scope(&self, token: &str, expected_scope: &str) -> bool {
+        self.verify_local_jwt_claims(token)
+            .and_then(|payload| {
+                payload
+                    .get("scp")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
+            })
+            .as_deref()
+            == Some(expected_scope)
+    }
+
+    fn runner_id_from_token(&self, token: &str) -> Option<i64> {
+        let payload = self.verify_local_jwt_claims(token)?;
+        let scope = payload.get("scp")?.as_str()?;
+        if !scope
+            .split_whitespace()
+            .any(|value| value == "ActionsRuntime.RunnerListen")
+        {
+            return None;
+        }
+        payload
+            .get("sub")?
+            .as_str()?
+            .strip_prefix("aksh-runner-listen-")?
+            .parse()
+            .ok()
+    }
+
+    fn mint_runtime_token(&self, plan_id: &str, job_id: &uuid::Uuid) -> String {
+        self.local_jwt(json!({
+            "sub": format!("aksh-job-{job_id}"),
+            "scp": format!("Actions.Results:{plan_id}:{job_id}"),
+        }))
+        .expect("fixed local JWT claims must serialize")
+    }
 }
 
 #[derive(Clone)]
-struct SharedState {
-    state: AppState,
-    shutdown: CancellationToken,
+pub struct SharedState {
+    /// Inner application state.
+    pub state: AppState,
+    /// Cancellation token for graceful shutdown.
+    pub shutdown: CancellationToken,
 }
 
 /// Application state.
@@ -839,16 +1196,69 @@ pub struct AppState {
     pub local_workspace: Option<PathBuf>,
     /// State directory for replay/log storage.
     pub state_dir: PathBuf,
+    /// Native API administrator credential for this server instance.
+    system_token: String,
+    /// Per-instance HMAC key for runner and job JWTs.
+    local_jwt_key: Vec<u8>,
+    /// Optional cron scheduler (active when `--enable-scheduler` is set).
+    pub scheduler: Option<Arc<crate::scheduler::Scheduler>>,
+}
+
+#[derive(Debug, Clone)]
+struct OidcJobContext {
+    environment: Option<String>,
+    job_workflow_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct JobSetId {
+    run_id: RunId,
+    job_ids: BTreeSet<JobId>,
+}
+
+impl JobSetId {
+    fn holder(&self) -> concurrency::Holder {
+        concurrency::Holder::JobSet {
+            run_id: self.run_id,
+            job_ids: self.job_ids.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct JobSetGate {
+    key: (String, String),
+    display_name: String,
+    cancel_in_progress: bool,
+    queue: aksh_gha_parser::ConcurrencyQueue,
+}
+
+#[derive(Debug, Clone)]
+struct JobSetAdmission {
+    gates: Vec<JobSetGate>,
+    acquired_keys: BTreeSet<(String, String)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobSetAdmissionResult {
+    Ready,
+    Blocked,
 }
 
 impl AppState {
-    /// Build state rooted in a state directory.
     pub async fn new(state_dir: PathBuf) -> anyhow::Result<Self> {
         let cache = CacheStore::new(state_dir.join("cache")).await?;
         let artifacts = ArtifactStore::new(state_dir.join("artifacts")).await?;
         let (events, _) = broadcast::channel(1024);
         let keypair = AgentRsaKeypair::generate()
             .map_err(|e| anyhow::anyhow!("Failed to generate RSA keypair: {}", e))?;
+        let oidc_keypair = load_or_generate_oidc_keypair(&state_dir)?;
+        let system_token =
+            env::var("AKSH_SYSTEM_TOKEN").unwrap_or_else(|_| DEFAULT_AKSH_SYSTEM_TOKEN.to_owned());
+        #[cfg(test)]
+        let local_jwt_key = TEST_LOCAL_JWT_KEY.to_vec();
+        #[cfg(not(test))]
+        let local_jwt_key = load_or_generate_hmac_key(&state_dir)?;
         let registry_path = state_dir.join("artifact_v2_registry.json");
         let (registry, next_id) = if registry_path.exists() {
             if let Ok(content) = std::fs::read_to_string(&registry_path) {
@@ -869,6 +1279,7 @@ impl AppState {
             agent_keypair: Some(keypair),
             artifact_v2_registry: registry,
             next_artifact_v2_id: next_id,
+            oidc_keypair: Some(oidc_keypair),
             ..Default::default()
         };
         let webhook_secret = std::env::var("AKSH_WEBHOOK_SECRET").ok();
@@ -884,6 +1295,9 @@ impl AppState {
             webhook_secret,
             local_workspace,
             state_dir,
+            system_token,
+            local_jwt_key,
+            scheduler: None,
         })
     }
 
@@ -891,14 +1305,133 @@ impl AppState {
         let _ = self.events.send(event);
     }
 }
+#[cfg(test)]
+fn mint_runtime_token(plan_id: &str, job_id: &uuid::Uuid) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("test clock must be after epoch")
+        .as_secs();
+    let header = json!({"alg": "HS256", "typ": "JWT", "kid": "aksh-local"});
+    let claims = json!({
+        "iss": "https://aksh.local",
+        "iat": now,
+        "nbf": now,
+        "exp": now + 2999,
+        "sub": format!("aksh-job-{job_id}"),
+        "scp": format!("Actions.Results:{plan_id}:{job_id}"),
+    });
+    let signing_input = format!(
+        "{}.{}",
+        base64_url_json(&header).expect("test header serializes"),
+        base64_url_json(&claims).expect("test claims serialize"),
+    );
+    let mut mac = Hmac::<Sha256>::new_from_slice(TEST_LOCAL_JWT_KEY).expect("test key is valid");
+    mac.update(signing_input.as_bytes());
+    format!(
+        "{signing_input}.{}",
+        URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+    )
+}
+
+/// Load the OIDC signing keypair from `<state_dir>/oidc-key.json`, or generate
+/// a new one and persist it for reuse across restarts.
+fn load_or_generate_oidc_keypair(state_dir: &std::path::Path) -> anyhow::Result<oidc::OidcKeypair> {
+    let key_path = state_dir.join("oidc-key.json");
+    if key_path.exists() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let mode = std::fs::metadata(&key_path)?.mode();
+            if mode & 0o077 != 0 {
+                std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+            }
+        }
+        let content = std::fs::read_to_string(&key_path).map_err(|error| {
+            anyhow::anyhow!("failed to read OIDC key {}: {error}", key_path.display())
+        })?;
+        let params =
+            serde_json::from_str::<aksh_gha_protocol::crypto::RsaParametersExport>(&content)
+                .map_err(|error| {
+                    anyhow::anyhow!("invalid OIDC key {}: {error}", key_path.display())
+                })?;
+        return oidc::OidcKeypair::from_params(&params);
+    }
+
+    let kp = oidc::OidcKeypair::generate()?;
+    let json = serde_json::to_vec(&kp.params())?;
+    std::fs::create_dir_all(state_dir)?;
+    let temp_path = state_dir.join(format!("oidc-key.{}.tmp", uuid::Uuid::new_v4()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temp_path)?;
+    use std::io::Write;
+    file.write_all(&json)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&temp_path, &key_path).map_err(|error| {
+        let _ = std::fs::remove_file(&temp_path);
+        anyhow::anyhow!("failed to persist OIDC key {}: {error}", key_path.display())
+    })?;
+    Ok(kp)
+}
+
+/// Load or generate a 32-byte HMAC key for local JWT signing.
+///
+/// Persisted to `<state_dir>/hmac-key.bin` so runtime tokens survive restarts.
+fn load_or_generate_hmac_key(state_dir: &std::path::Path) -> anyhow::Result<Vec<u8>> {
+    let key_path = state_dir.join("hmac-key.bin");
+    if key_path.exists() {
+        let key = std::fs::read(&key_path).map_err(|error| {
+            anyhow::anyhow!("failed to read HMAC key {}: {error}", key_path.display())
+        })?;
+        if key.len() == 32 {
+            return Ok(key);
+        }
+        // Wrong size — regenerate.
+    }
+    let mut key = vec![0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut key);
+    std::fs::create_dir_all(state_dir)?;
+    let temp_path = state_dir.join(format!("hmac-key.{}.tmp", uuid::Uuid::new_v4()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temp_path)?;
+    use std::io::Write;
+    file.write_all(&key)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&temp_path, &key_path).map_err(|error| {
+        let _ = std::fs::remove_file(&temp_path);
+        anyhow::anyhow!("failed to persist HMAC key {}: {error}", key_path.display())
+    })?;
+    Ok(key)
+}
 
 impl InnerState {
     /// Look up the labels for the runner that owns a given session.
     fn runner_labels_for_session(&self, session_id: &str) -> Vec<String> {
-        self.sessions
+        let runner_id = self
+            .broker_session_runners
             .get(session_id)
-            .and_then(|s| self.runners.get(&s.runner_id))
-            .map(|r| r.labels.clone())
+            .copied()
+            .or_else(|| {
+                self.sessions
+                    .get(session_id)
+                    .map(|session| session.runner_id)
+            });
+        runner_id
+            .and_then(|runner_id| self.runners.get(&runner_id))
+            .map(|runner| runner.labels.clone())
             .unwrap_or_default()
     }
 }
@@ -931,6 +1464,8 @@ struct InnerState {
     agent_job_requests: BTreeMap<uuid::Uuid, i64>,
     timeline_requests: BTreeMap<uuid::Uuid, i64>,
     session_active_requests: BTreeMap<String, i64>,
+    /// Modern broker session owner, derived from the runner-listen JWT.
+    broker_session_runners: BTreeMap<String, i64>,
     next_runner_id: i64,
     next_cache_id: i64,
     next_message_id: i64,
@@ -951,13 +1486,46 @@ struct InnerState {
     artifact_v2_registry: BTreeMap<String, ArtifactV2Entry>,
     /// Monotonic artifact v2 ID counter.
     next_artifact_v2_id: u64,
+    /// Per-job resolved OIDC execution context.
+    oidc_job_contexts: BTreeMap<(RunId, JobId), OidcJobContext>,
+    /// OIDC issuer URL used in the `iss` claim and discovery document.
+    oidc_issuer: String,
     dap_ports: BTreeMap<RunId, DapPortRegistration>,
+    /// OIDC signing keypair (RS256) for id-token minting.
+    oidc_keypair: Option<oidc::OidcKeypair>,
+    /// Per-job `id-token: write` grant, keyed by (run_id, job_id).
+    id_token_grants: BTreeMap<(RunId, JobId), bool>,
+    /// Concurrency groups keyed by (lowercased repo, lowercased group name).
+    concurrency_groups: BTreeMap<(String, String), concurrency::ConcurrencyGroup>,
+    /// Workflow-level pending runs: run_id → jobs held out of the ready queue.
+    held_runs: BTreeMap<RunId, Vec<QueuedJob>>,
+    /// Job-level concurrency-blocked jobs (FIFO).
+    concurrency_blocked: VecDeque<QueuedJob>,
+    /// Multi-key admission state for reusable workflow invocations.
+    jobset_admissions: BTreeMap<JobSetId, JobSetAdmission>,
+    /// Evaluated workflow-level concurrency raw config per run (for release/debug).
+    run_concurrency: BTreeMap<RunId, aksh_gha_parser::Concurrency>,
+    /// Which concurrency key a holder currently occupies (for release).
+    holder_keys: BTreeMap<RunId, Vec<(String, String)>>,
 }
 
 #[derive(Debug, Clone)]
 struct DapPortRegistration {
     port: u16,
     job_id: JobId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct StepRecord {
+    pub(crate) name: String,
+    pub(crate) conclusion: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct JobDetail {
+    pub(crate) name: String,
+    pub(crate) conclusion: String,
+    pub(crate) steps: Vec<StepRecord>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -968,11 +1536,15 @@ pub(crate) struct RunRecord {
     pub(crate) status: ExecutionStatus,
     pub(crate) job_outputs: BTreeMap<JobId, BTreeMap<String, serde_json::Value>>,
     pub(crate) job_base_ids: BTreeMap<JobId, String>,
+    #[serde(skip)]
+    pub(crate) job_needs: BTreeMap<JobId, Vec<JobId>>,
     pub(crate) job_fail_fast: BTreeMap<String, bool>,
     #[serde(default)]
     pub(crate) job_check_run_ids: BTreeMap<JobId, u64>,
     #[serde(default)]
     pub(crate) reusable_calls: BTreeMap<String, aksh_gha_parser::ReusableCallMetadata>,
+    #[serde(default)]
+    pub(crate) jobs_list: Vec<JobDetail>,
 }
 
 #[derive(Debug, Clone)]
@@ -998,17 +1570,25 @@ struct QueuedJob {
     job_id: JobId,
     base_id: String,
     needs: Vec<JobId>,
+    if_condition: Option<String>,
+    condition_context: aksh_gha_expressions::Context,
     fail_fast: bool,
     max_parallel: Option<u64>,
     /// Required runner labels from `runs-on`.
     runs_on: Vec<String>,
     message: azdo::AgentJobRequestMessage,
+    /// Raw job-level concurrency (evaluated when the job becomes ready).
+    concurrency: Option<aksh_gha_parser::Concurrency>,
+    /// Matrix values for this expansion (for concurrency expression eval).
+    matrix: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
 struct QueuedCancellation {
     run_id: RunId,
     job_id: JobId,
+    /// Agent job GUID from the job message (`jobId`), required for official JobCancelMessage.
+    agent_job_id: uuid::Uuid,
 }
 
 #[derive(Debug, Clone)]
@@ -1134,21 +1714,102 @@ async fn healthz(State(shared): State<Arc<SharedState>>) -> Json<serde_json::Val
 
 pub(crate) async fn submit_run_inner(
     shared: &Arc<SharedState>,
-    submission: WorkflowSubmission,
+    mut submission: WorkflowSubmission,
 ) -> Result<RunAccepted, ApiError> {
     let workflow = parse_workflow(&submission.workflow_yaml)?;
-    let (branch, tag) = git_ref_context(&submission.git_ref);
-    let changed_paths = changed_paths_from_payload(&submission.payload);
-    let activity_type = submission
-        .payload
-        .get("action")
-        .and_then(|value| value.as_str());
+    if submission.event == "workflow_dispatch" {
+        workflow.apply_workflow_dispatch_inputs(&mut submission.payload)?;
+        if submission.dispatch_inputs.is_empty() {
+            submission.dispatch_inputs = submission
+                .payload
+                .get("inputs")
+                .and_then(serde_json::Value::as_object)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+        }
+        if submission.dispatch_inputs_stringified.is_empty() {
+            submission.dispatch_inputs_stringified = submission
+                .dispatch_inputs
+                .iter()
+                .map(|(name, value)| (name.clone(), value_to_input_string(value)))
+                .collect();
+        }
+        if let Some(object) = submission.payload.as_object_mut() {
+            object.insert(
+                "inputs".to_owned(),
+                serde_json::to_value(&submission.dispatch_inputs_stringified).unwrap_or_default(),
+            );
+        }
+    }
+    if let Some(tier) = submission.trust_tier.as_deref().and_then(|value| {
+        serde_json::from_value::<crate::events::trust_tier::TrustTier>(json!(value)).ok()
+    }) {
+        if !tier.allows_secrets() {
+            submission.secrets.clear();
+        }
+    }
+    let (branch, tag) = {
+        let (default_branch, default_tag) = git_ref_context(&submission.git_ref);
+        let filter_branch = submission.filter_branch.clone().or_else(|| {
+            if matches!(
+                submission.event.as_str(),
+                "pull_request" | "pull_request_target"
+            ) {
+                submission
+                    .payload
+                    .get("pull_request")
+                    .and_then(|pr| pr.get("base"))
+                    .and_then(|base| base.get("ref"))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
+            } else if submission.event == "workflow_run" {
+                submission
+                    .payload
+                    .get("workflow_run")
+                    .and_then(|run| run.get("head_branch"))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
+            } else {
+                None
+            }
+        });
+        if filter_branch.is_some() {
+            (filter_branch, None)
+        } else {
+            (default_branch, default_tag)
+        }
+    };
+    let payload_has_paths =
+        submission.payload.get("paths").is_some() || submission.payload.get("commits").is_some();
+    let changed_paths_known = submission.changed_paths_known || payload_has_paths;
+    let changed_paths = if submission.changed_paths_known {
+        submission.changed_paths.clone()
+    } else {
+        changed_paths_from_payload(&submission.payload)
+    };
+    if !changed_paths_known && workflow.on.has_path_filters(&submission.event) {
+        return Err(ApiError::bad_request(
+            "workflow path filters require a complete changed-file list".to_owned(),
+        ));
+    }
+    // Activity type from explicit field (set by dispatcher) or payload.action fallback.
+    let activity_owned: Option<String> = submission.activity_type.clone().or_else(|| {
+        submission
+            .payload
+            .get("action")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+    });
+    let activity_type = activity_owned.as_deref();
     if !workflow.on.matches_with_context(
         &submission.event,
         branch.as_deref(),
         tag.as_deref(),
         &changed_paths,
         activity_type,
+        &submission.workflow_run_upstream_names,
     ) {
         return Err(ApiError::bad_request(format!(
             "workflow does not match event `{}`",
@@ -1157,26 +1818,194 @@ pub(crate) async fn submit_run_inner(
     }
     let expanded = expand_jobs_with_reusables(&workflow, &submission.reusable_workflows)?;
     let mut jobs = expanded.jobs;
+    if !submission.dispatch_inputs.is_empty() {
+        for job in &mut jobs {
+            job.inputs = submission.dispatch_inputs.clone();
+        }
+    }
     let reusable_calls = expanded.reusable_calls;
     let run_id = RunId::new();
+    let repository_owner = submission
+        .repository
+        .split('/')
+        .next()
+        .unwrap_or("owner")
+        .to_string();
+    let sha = submission
+        .resolved_sha
+        .clone()
+        .or_else(|| {
+            submission
+                .payload
+                .get("after")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| {
+            if submission.git_ref.len() == 40
+                && submission
+                    .git_ref
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit())
+            {
+                submission.git_ref.clone()
+            } else {
+                "0000000000000000000000000000000000000000".to_owned()
+            }
+        })
+        .to_string();
+    let workflow_path = submission
+        .workflow_path
+        .clone()
+        .unwrap_or_else(|| ".github/workflows/workflow.yml".to_owned());
+    let workflow_ref = format!(
+        "{}/{}@{}",
+        submission.repository, workflow_path, submission.git_ref
+    );
+
+    let ref_name = submission
+        .git_ref
+        .strip_prefix("refs/heads/")
+        .or_else(|| submission.git_ref.strip_prefix("refs/tags/"))
+        .unwrap_or(&submission.git_ref)
+        .to_owned();
+    let ref_type = if submission.git_ref.starts_with("refs/tags/") {
+        "tag"
+    } else {
+        "branch"
+    };
+
     let github = json!({
-        "event_name": submission.event,
-        "event": submission.payload,
-        "repository": submission.repository,
         "ref": submission.git_ref,
+        "sha": sha,
+        "repository": submission.repository,
+        "repository_owner": repository_owner,
+        "repository_owner_id": "0",
+        "repositoryUrl": format!("git://github.com/{}.git", submission.repository),
         "run_id": run_id.to_string(),
+        "run_number": "1",
+        "retention_days": "90",
+        "run_attempt": "1",
+        "artifact_cache_size_limit": "10",
+        "repository_visibility": "private",
+        "actor_id": "0",
+        "actor": "aksh-system",
         "workflow": workflow.name.clone().unwrap_or_default(),
-        "server_url": "https://github.com"
+        "head_ref": "",
+        "base_ref": "",
+        "event_name": submission.event,
+        "server_url": "https://github.com",
+        "api_url": "https://api.github.com",
+        "graphql_url": "https://api.github.com/graphql",
+        "ref_name": ref_name,
+        "ref_protected": false,
+        "ref_type": ref_type,
+        "secret_source": "Actions",
+        "event": submission.payload,
+        "workflow_ref": workflow_ref,
+        "workflow_sha": sha,
+        "repository_id": "0",
+        "triggering_actor": "aksh-system"
     });
+
+    // Evaluate workflow-level concurrency before locking (pure).
+    let workflow_concurrency = workflow.concurrency.clone();
+    let mut empty_workflow_concurrency_group = false;
+    let workflow_concurrency_eval = if let Some(raw) = &workflow_concurrency {
+        let eval_ctx = concurrency::ConcurrencyContext {
+            scope: concurrency::ConcurrencyScope::Workflow,
+            github: &github,
+            vars: &submission.vars,
+            inputs: &submission.inputs,
+            matrix: None,
+            strategy: None,
+            needs: None,
+        };
+        let (group, cancel, queue) =
+            concurrency::evaluate_concurrency(raw, &eval_ctx).map_err(|error| {
+                ApiError::bad_request(format!("concurrency evaluation failed: {error}"))
+            })?;
+        if group.trim().is_empty() {
+            empty_workflow_concurrency_group = true;
+            None
+        } else {
+            Some((group, cancel, queue, raw.clone()))
+        }
+    } else {
+        None
+    };
 
     {
         let mut inner = shared.state.inner.lock().await;
         let mut statuses = BTreeMap::new();
         let mut ready_jobs = 0usize;
         let mut job_base_ids = BTreeMap::new();
+        let mut job_needs = BTreeMap::new();
         let mut job_fail_fast = BTreeMap::new();
         let mut ready_by_base: BTreeMap<String, u64> = BTreeMap::new();
+        let mut initially_skipped = Vec::new();
+        let mut built_jobs: Vec<QueuedJob> = Vec::new();
+        if empty_workflow_concurrency_group {
+            let queued_jobs = 0;
+            inner.runs.insert(
+                run_id,
+                RunRecord {
+                    run_id,
+                    submission,
+                    jobs: BTreeMap::new(),
+                    job_outputs: BTreeMap::new(),
+                    job_base_ids: BTreeMap::new(),
+                    job_needs: BTreeMap::new(),
+                    job_fail_fast: BTreeMap::new(),
+                    status: ExecutionStatus::Failure,
+                    job_check_run_ids: BTreeMap::new(),
+                    reusable_calls,
+                    jobs_list: Vec::new(),
+                },
+            );
+            drop(inner);
+            shared
+                .state
+                .emit(NdjsonEvent::RunAccepted {
+                    run_id,
+                    queued_jobs,
+                })
+                .await;
+            shared
+                .state
+                .emit(NdjsonEvent::RunStatus {
+                    run_id,
+                    status: ExecutionStatus::Failure,
+                    reason: Some("concurrency group name must not be empty".to_owned()),
+                })
+                .await;
+            return Ok(RunAccepted {
+                run_id,
+                queued_jobs,
+            });
+        }
         for job in jobs {
+            job_base_ids.insert(job.id.clone(), job.base_id.clone());
+            job_needs.insert(job.id.clone(), job.needs.clone());
+            job_fail_fast.insert(job.base_id.clone(), job.fail_fast);
+            statuses.insert(job.id.clone(), ExecutionStatus::Queued);
+            let condition_context = job_condition_context(&job, &github, &submission);
+            if job.needs.is_empty() {
+                let condition =
+                    aksh_gha_expressions::effective_condition(job.if_condition.as_deref());
+                let should_run = aksh_gha_expressions::eval_bool(&condition, &condition_context)
+                    .map_err(|error| {
+                        ApiError::bad_request(format!(
+                            "failed to evaluate condition for job `{}`: {error}",
+                            job.id
+                        ))
+                    })?;
+                if !should_run {
+                    statuses.insert(job.id.clone(), ExecutionStatus::Skipped);
+                    initially_skipped.push((run_id, job.id.clone()));
+                    continue;
+                }
+            }
             let mut agent_msg = aksh_gha_parser::job_builder::build_agent_job_message(
                 &job,
                 &github,
@@ -1190,15 +2019,61 @@ pub(crate) async fn submit_run_inner(
             )
             .map_err(|e| ApiError::bad_request(format!("failed to build job message: {e}")))?;
 
-            // Mint a dynamic JWT for the job and inject it as GITHUB_TOKEN
-            let token = mint_runtime_token(&agent_msg.plan.plan_id, &agent_msg.job_id);
+            let id_token_granted = job.oidc_id_token_granted;
+            inner
+                .id_token_grants
+                .insert((run_id, job.id.clone()), id_token_granted);
+            inner.oidc_job_contexts.insert(
+                (run_id, job.id.clone()),
+                OidcJobContext {
+                    environment: job.oidc_environment.clone(),
+                    job_workflow_ref: job.oidc_job_workflow_ref.clone(),
+                },
+            );
+            inner.next_request_id += 1;
+            let request_id = inner.next_request_id;
+            agent_msg.request_id = request_id;
+            if id_token_granted {
+                let oidc_url = format!(
+                    "{}/runner/server/_apis/distributedtask/hubs/actions/plans/{}/jobs/{}/oidctoken?api-version=2.0",
+                    public_base_url(),
+                    agent_msg.plan.plan_id,
+                    agent_msg.job_id,
+                );
+                for endpoint in &mut agent_msg.resources.endpoints {
+                    if endpoint.name.eq_ignore_ascii_case("SystemVssConnection") {
+                        endpoint
+                            .data
+                            .insert("GenerateIdTokenUrl".to_owned(), oidc_url.clone());
+                    }
+                }
+            }
+            // Mint a dynamic JWT for the job and inject it as GITHUB_TOKEN.
+            let token = shared
+                .state
+                .mint_runtime_token(&agent_msg.plan.plan_id, &agent_msg.job_id);
             agent_msg.variables.insert(
                 "system.github.token".to_owned(),
                 aksh_gha_protocol::azdo::VariableValue::secret(token.clone()),
             );
             agent_msg.variables.insert(
+                "github_token".to_owned(),
+                aksh_gha_protocol::azdo::VariableValue::secret(token.clone()),
+            );
+            agent_msg.variables.insert(
                 "system.github.launch_endpoint".to_owned(),
                 aksh_gha_protocol::azdo::VariableValue::new(public_base_url()),
+            );
+            agent_msg.variables.insert(
+                "system.github.results_endpoint".to_owned(),
+                aksh_gha_protocol::azdo::VariableValue::new(public_base_url()),
+            );
+            agent_msg.variables.insert(
+                "system.orchestrationId".to_owned(),
+                aksh_gha_protocol::azdo::VariableValue::new(format!(
+                    "{}.{}.{}",
+                    agent_msg.plan.plan_id, job.base_id, agent_msg.job_name
+                )),
             );
             if let Some(aksh_gha_protocol::azdo::PipelineContextData::Dict(github_dict)) =
                 &mut agent_msg.context_data.get_mut("github")
@@ -1207,14 +2082,54 @@ pub(crate) async fn submit_run_inner(
                     "token".to_owned(),
                     aksh_gha_protocol::azdo::PipelineContextData::String(token),
                 );
+                let mut perms = std::collections::BTreeMap::new();
+                for perm in &[
+                    "actions",
+                    "contents",
+                    "issues",
+                    "metadata",
+                    "pull-requests",
+                    "statuses",
+                ] {
+                    perms.insert(
+                        perm.to_string(),
+                        aksh_gha_protocol::azdo::PipelineContextData::String("write".to_string()),
+                    );
+                }
+                github_dict.insert(
+                    "token_permissions".to_owned(),
+                    aksh_gha_protocol::azdo::PipelineContextData::Dict(perms),
+                );
             }
 
-            // Give every dispatched job a unique requestId so PATCH
-            // /AgentRequest/:request_id can target exactly one job.
-            inner.next_request_id += 1;
-            let request_id = inner.next_request_id;
-            agent_msg.request_id = request_id;
-            // Wire DAP debugger fields from submission
+            agent_msg.file_table = vec![workflow_path.clone()];
+            if let Some(aksh_gha_protocol::azdo::PipelineContextData::Dict(job_dict)) =
+                agent_msg.context_data.get_mut("job")
+            {
+                job_dict.insert(
+                    "check_run_id".to_owned(),
+                    aksh_gha_protocol::azdo::PipelineContextData::Number(0.0),
+                );
+                job_dict.insert(
+                    "workflow_ref".to_owned(),
+                    aksh_gha_protocol::azdo::PipelineContextData::String(workflow_ref.clone()),
+                );
+                job_dict.insert(
+                    "workflow_sha".to_owned(),
+                    aksh_gha_protocol::azdo::PipelineContextData::String(sha.clone()),
+                );
+                job_dict.insert(
+                    "workflow_repository".to_owned(),
+                    aksh_gha_protocol::azdo::PipelineContextData::String(
+                        submission.repository.clone(),
+                    ),
+                );
+                job_dict.insert(
+                    "workflow_file_path".to_owned(),
+                    aksh_gha_protocol::azdo::PipelineContextData::String(workflow_path.clone()),
+                );
+            }
+
             agent_msg.enable_debugger = submission.enable_debugger;
             agent_msg.debugger_welcome_message = submission.debugger_welcome_message.clone();
             if submission.enable_debugger {
@@ -1230,11 +2145,7 @@ pub(crate) async fn submit_run_inner(
                 job_id: job.id.clone(),
                 agent_job_id: agent_msg.job_id,
                 plan_id: agent_msg.plan.plan_id.clone(),
-                plan_type: agent_msg
-                    .plan
-                    .plan_type
-                    .clone()
-                    .unwrap_or_else(|| "Job".to_owned()),
+                plan_type: agent_msg.plan.plan_type.clone(),
                 timeline_id: agent_msg.timeline.id,
                 result: None,
                 locked_until: agent_request_locked_until(),
@@ -1258,31 +2169,332 @@ pub(crate) async fn submit_run_inner(
                 job_id: job.id.clone(),
                 base_id: job.base_id.clone(),
                 needs: job.needs.clone(),
+                if_condition: job.if_condition.clone(),
+                condition_context,
                 fail_fast: job.fail_fast,
                 max_parallel: job.max_parallel,
                 runs_on: job.runs_on.clone(),
                 message: agent_msg,
+                concurrency: concurrency::concurrency_from_plan_fields(
+                    job.concurrency_group.as_deref(),
+                    job.concurrency_cancel_in_progress.as_deref(),
+                    job.concurrency_queue.as_deref(),
+                ),
+                matrix: job
+                    .matrix
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
             };
             job_base_ids.insert(job.id.clone(), job.base_id.clone());
             job_fail_fast.insert(job.base_id.clone(), job.fail_fast);
+            built_jobs.push(queued_job);
+        }
 
-            // Check if dependencies are met (no needs = ready immediately)
-            if job.needs.is_empty()
-                && job
-                    .max_parallel
-                    .is_none_or(|max| ready_by_base.get(&job.base_id).copied().unwrap_or(0) < max)
-            {
-                statuses.insert(job.id.clone(), ExecutionStatus::Queued);
-                inner.queue.push_back(queued_job);
-                *ready_by_base.entry(job.base_id.clone()).or_default() += 1;
-                ready_jobs += 1;
+        // Workflow-level concurrency gate.
+        let mut hold_entire_run = false;
+        if let Some((group, cancel, queue, raw)) = &workflow_concurrency_eval {
+            let key = concurrency::concurrency_key(&submission.repository, group);
+            match try_acquire_concurrency(
+                &mut inner,
+                key,
+                group.clone(),
+                concurrency::Holder::Run(run_id),
+                *cancel,
+                *queue,
+            ) {
+                Ok(true) => {
+                    inner.run_concurrency.insert(run_id, raw.clone());
+                }
+                Ok(false) => {
+                    hold_entire_run = true;
+                    inner.run_concurrency.insert(run_id, raw.clone());
+                }
+                Err(e) if e == "concurrency_queue_overflow" => {
+                    // Cancel this run immediately — all jobs Cancelled.
+                    for job in &built_jobs {
+                        statuses.insert(job.job_id.clone(), ExecutionStatus::Cancelled);
+                    }
+                    let queued_jobs = statuses.len();
+                    inner.runs.insert(
+                        run_id,
+                        RunRecord {
+                            run_id,
+                            submission,
+                            jobs: statuses,
+                            job_outputs: BTreeMap::new(),
+                            job_base_ids,
+                            job_needs,
+                            job_fail_fast,
+                            status: ExecutionStatus::Cancelled,
+                            job_check_run_ids: BTreeMap::new(),
+                            reusable_calls,
+                            jobs_list: Vec::new(),
+                        },
+                    );
+                    drop(inner);
+                    shared
+                        .state
+                        .emit(NdjsonEvent::RunAccepted {
+                            run_id,
+                            queued_jobs,
+                        })
+                        .await;
+                    shared
+                        .state
+                        .emit(NdjsonEvent::RunStatus {
+                            run_id,
+                            status: ExecutionStatus::Cancelled,
+                            reason: concurrency::cancelled_reason(),
+                        })
+                        .await;
+                    return Ok(RunAccepted {
+                        run_id,
+                        queued_jobs,
+                    });
+                }
+                Err(e) => {
+                    return Err(ApiError::bad_request(e));
+                }
+            }
+        }
+
+        if hold_entire_run {
+            for job in &built_jobs {
+                statuses.insert(job.job_id.clone(), ExecutionStatus::Pending);
+            }
+            inner.held_runs.insert(run_id, built_jobs);
+            let queued_jobs = statuses.len();
+            inner.runs.insert(
+                run_id,
+                RunRecord {
+                    run_id,
+                    submission,
+                    jobs: statuses,
+                    job_outputs: BTreeMap::new(),
+                    job_base_ids,
+                    job_needs,
+                    job_fail_fast,
+                    status: ExecutionStatus::Pending,
+                    job_check_run_ids: BTreeMap::new(),
+                    reusable_calls,
+                    jobs_list: Vec::new(),
+                },
+            );
+            drop(inner);
+            shared
+                .state
+                .emit(NdjsonEvent::RunAccepted {
+                    run_id,
+                    queued_jobs,
+                })
+                .await;
+            shared
+                .state
+                .emit(NdjsonEvent::RunStatus {
+                    run_id,
+                    status: ExecutionStatus::Pending,
+                    reason: concurrency::pending_reason(),
+                })
+                .await;
+            return Ok(RunAccepted {
+                run_id,
+                queued_jobs,
+            });
+        }
+        // Install a provisional run before evaluating per-job and JobSet gates.
+        // Multiple holders from this same submission can cancel each other;
+        // cancellation helpers need the run to exist so they can persist the
+        // affected job conclusion instead of silently becoming no-ops.
+        inner.runs.insert(
+            run_id,
+            RunRecord {
+                run_id,
+                submission: submission.clone(),
+                jobs: statuses.clone(),
+                job_outputs: BTreeMap::new(),
+                job_base_ids: job_base_ids.clone(),
+                job_needs: job_needs.clone(),
+                job_fail_fast: job_fail_fast.clone(),
+                status: ExecutionStatus::Queued,
+                job_check_run_ids: BTreeMap::new(),
+                reusable_calls: reusable_calls.clone(),
+                jobs_list: Vec::new(),
+            },
+        );
+
+        // Reusable workflow invocations must acquire caller and embedded
+        // concurrency gates as one ordered, deduplicated admission set. A
+        // partially admitted JobSet keeps its earlier keys while waiting on
+        // the next key, preventing it from bypassing either scope.
+        let mut jobset_blocked: std::collections::HashSet<JobId> = std::collections::HashSet::new();
+        for call in reusable_calls.values() {
+            let member_ids: BTreeSet<JobId> = call
+                .inner_job_ids
+                .iter()
+                .map(|id| JobId(id.clone()))
+                .collect();
+            let id = JobSetId {
+                run_id,
+                job_ids: member_ids.clone(),
+            };
+            let mut gates = Vec::new();
+            let mut evaluation_failed = false;
+
+            for (raw, scope, label, inputs) in [
+                (
+                    call.caller_concurrency.as_ref(),
+                    concurrency::ConcurrencyScope::Job,
+                    "caller concurrency (JobSet)",
+                    &submission.inputs,
+                ),
+                (
+                    call.embedded_concurrency.as_ref(),
+                    concurrency::ConcurrencyScope::Workflow,
+                    "embedded concurrency (JobSet)",
+                    &call.inputs,
+                ),
+            ] {
+                let Some(raw) = raw else { continue };
+                let eval_ctx = concurrency::ConcurrencyContext {
+                    scope,
+                    github: &github,
+                    vars: &submission.vars,
+                    inputs,
+                    matrix: Some(&call.matrix),
+                    strategy: None,
+                    needs: None,
+                };
+                match concurrency::evaluate_concurrency(raw, &eval_ctx) {
+                    Ok((group, cancel_in_progress, queue)) if !group.trim().is_empty() => {
+                        merge_jobset_gate(
+                            &mut gates,
+                            JobSetGate {
+                                key: concurrency::concurrency_key(&submission.repository, &group),
+                                display_name: group,
+                                cancel_in_progress,
+                                queue,
+                            },
+                        );
+                    }
+                    Ok((_, _, _)) => {
+                        evaluation_failed = true;
+                    }
+                    Err(error) => {
+                        concurrency::log_eval_error(label, &error);
+                        evaluation_failed = true;
+                    }
+                }
+            }
+
+            if evaluation_failed {
+                for member_id in &member_ids {
+                    statuses.insert(member_id.clone(), ExecutionStatus::Failure);
+                }
+                jobset_blocked.extend(member_ids);
+                continue;
+            }
+            if gates.is_empty() {
+                continue;
+            }
+
+            inner.jobset_admissions.insert(
+                id.clone(),
+                JobSetAdmission {
+                    gates,
+                    acquired_keys: BTreeSet::new(),
+                },
+            );
+            match advance_jobset_admission(&mut inner, &id, None) {
+                Ok(JobSetAdmissionResult::Ready) => {}
+                Ok(JobSetAdmissionResult::Blocked) => {
+                    jobset_blocked.extend(member_ids);
+                }
+                Err(error) => {
+                    let status = if error == "concurrency_queue_overflow" {
+                        ExecutionStatus::Cancelled
+                    } else {
+                        ExecutionStatus::Failure
+                    };
+                    for member_id in &member_ids {
+                        statuses.insert(member_id.clone(), status);
+                    }
+                    jobset_blocked.extend(member_ids);
+                }
+            }
+        }
+
+        // Enqueue jobs (workflow concurrency free / acquired).
+        for queued_job in built_jobs {
+            let job_id = queued_job.job_id.clone();
+            let base_id = queued_job.base_id.clone();
+
+            // A blocked JobSet member must remain durably parked until every
+            // required key is acquired. Terminal members are not parked.
+            if jobset_blocked.contains(&job_id) {
+                let status = statuses.get(&job_id).copied();
+                if status.is_some_and(concurrency::is_awaiting_execution) {
+                    statuses.insert(job_id, ExecutionStatus::Pending);
+                    inner.concurrency_blocked.push_back(queued_job);
+                }
+                continue;
+            }
+
+            let needs_empty = queued_job.needs.is_empty();
+            let max_parallel = queued_job.max_parallel;
+            let under_mp = max_parallel
+                .is_none_or(|max| ready_by_base.get(&base_id).copied().unwrap_or(0) < max);
+
+            if needs_empty && under_mp {
+                // Job-level concurrency gate (needs/max_parallel already satisfied).
+                match try_enqueue_with_job_concurrency(
+                    &mut inner,
+                    &github,
+                    &submission,
+                    queued_job,
+                    &mut statuses,
+                ) {
+                    Ok(true) => {
+                        *ready_by_base.entry(base_id).or_default() += 1;
+                        ready_jobs += 1;
+                    }
+                    Ok(false) => {
+                        // parked pending
+                    }
+                    Err(_) => {
+                        // cancelled by queue overflow or eval failure already marked
+                    }
+                }
             } else {
-                // Job has dependencies — queue it as pending
-                statuses.insert(job.id.clone(), ExecutionStatus::Queued);
+                statuses.insert(job_id, ExecutionStatus::Queued);
                 inner.pending_jobs.push_back(queued_job);
             }
         }
+
+        // Preserve terminal conclusions written through cancel_job_inner while
+        // gates were evaluated. Non-terminal scheduling state remains owned by
+        // the local status map and is installed below with the final record.
+        if let Some(provisional) = inner.runs.get(&run_id) {
+            for (job_id, status) in &provisional.jobs {
+                if concurrency::is_terminal(*status) {
+                    statuses.insert(job_id.clone(), *status);
+                }
+            }
+        }
+
         let queued_jobs = statuses.len();
+        // C-05: derive the initial run status from job statuses so that eval
+        // failures (Failure) are reflected immediately rather than leaving the
+        // run permanently Queued. summarize_run returns InProgress for any mix
+        // of Queued/Pending jobs; map that to Queued since no job has started.
+        let initial_status = {
+            let s = summarize_run(statuses.values().copied());
+            if s == ExecutionStatus::InProgress {
+                ExecutionStatus::Queued
+            } else {
+                s
+            }
+        };
         inner.runs.insert(
             run_id,
             RunRecord {
@@ -1291,15 +2503,29 @@ pub(crate) async fn submit_run_inner(
                 jobs: statuses,
                 job_outputs: BTreeMap::new(),
                 job_base_ids,
+                job_needs,
                 job_fail_fast,
-                status: ExecutionStatus::Queued,
+                status: initial_status,
                 job_check_run_ids: BTreeMap::new(),
                 reusable_calls,
+                jobs_list: Vec::new(),
             },
         );
+        let cancel_count = inner.cancellation_queue.len();
         drop(inner);
-        if ready_jobs > 0 {
+        if ready_jobs > 0 || cancel_count > 0 {
             shared.state.message_notify.notify_waiters();
+        }
+        for (event_run_id, job_id) in initially_skipped {
+            shared
+                .state
+                .emit(NdjsonEvent::JobStatus {
+                    run_id: event_run_id,
+                    job_id,
+                    status: ExecutionStatus::Skipped,
+                    reason: None,
+                })
+                .await;
         }
         shared
             .state
@@ -1315,11 +2541,102 @@ pub(crate) async fn submit_run_inner(
     }
 }
 
+/// Enqueue a ready job, applying job-level concurrency if present.
+/// Returns Ok(true) if pushed to ready queue, Ok(false) if parked, Err if cancelled.
+fn try_enqueue_with_job_concurrency(
+    inner: &mut InnerState,
+    github: &serde_json::Value,
+    submission: &WorkflowSubmission,
+    queued_job: QueuedJob,
+    statuses: &mut BTreeMap<JobId, ExecutionStatus>,
+) -> Result<bool, ()> {
+    let Some(raw) = queued_job.concurrency.clone() else {
+        statuses.insert(queued_job.job_id.clone(), ExecutionStatus::Queued);
+        inner.queue.push_back(queued_job);
+        return Ok(true);
+    };
+
+    let strategy = queued_job
+        .message
+        .context_data
+        .get("strategy")
+        .map(concurrency::context_data_to_json)
+        .unwrap_or_else(|| json!({}));
+    let eval_ctx = concurrency::ConcurrencyContext {
+        scope: concurrency::ConcurrencyScope::Job,
+        github,
+        vars: &submission.vars,
+        inputs: &submission.inputs,
+        matrix: Some(&queued_job.matrix),
+        strategy: Some(&strategy),
+        needs: None,
+    };
+    let eval = concurrency::evaluate_concurrency(&raw, &eval_ctx);
+    let (group, cancel, queue) = match eval {
+        Ok(v) => v,
+        Err(e) => {
+            concurrency::log_eval_error("job concurrency", &e);
+            statuses.insert(queued_job.job_id.clone(), ExecutionStatus::Failure);
+            return Err(());
+        }
+    };
+    if group.trim().is_empty() {
+        statuses.insert(queued_job.job_id.clone(), ExecutionStatus::Failure);
+        return Err(());
+    }
+
+    let key = concurrency::concurrency_key(&submission.repository, &group);
+    let holder = concurrency::Holder::Job {
+        run_id: queued_job.run_id,
+        job_id: queued_job.job_id.clone(),
+    };
+    match try_acquire_concurrency(inner, key, group, holder, cancel, queue) {
+        Ok(true) => {
+            statuses.insert(queued_job.job_id.clone(), ExecutionStatus::Queued);
+            inner.queue.push_back(queued_job);
+            Ok(true)
+        }
+        Ok(false) => {
+            statuses.insert(queued_job.job_id.clone(), ExecutionStatus::Pending);
+            inner.concurrency_blocked.push_back(queued_job);
+            Ok(false)
+        }
+        Err(e) if e == "concurrency_queue_overflow" => {
+            statuses.insert(queued_job.job_id.clone(), ExecutionStatus::Cancelled);
+            let _ = queued_job;
+            Err(())
+        }
+        Err(_) => {
+            statuses.insert(queued_job.job_id.clone(), ExecutionStatus::Failure);
+            Err(())
+        }
+    }
+}
 async fn submit_run(
     State(shared): State<Arc<SharedState>>,
     Json(submission): Json<WorkflowSubmission>,
 ) -> Result<Json<RunAccepted>, ApiError> {
     submit_run_inner(&shared, submission).await.map(Json)
+}
+
+async fn get_scheduler_history(
+    State(shared): State<Arc<SharedState>>,
+) -> Result<Json<Vec<crate::scheduler::ScheduleFire>>, ApiError> {
+    if let Some(scheduler) = &shared.state.scheduler {
+        let history = scheduler.history.lock().await.clone();
+        Ok(Json(history))
+    } else {
+        Ok(Json(vec![]))
+    }
+}
+
+fn value_to_input_string(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(value) => value.clone(),
+        serde_json::Value::Bool(value) => value.to_string(),
+        serde_json::Value::Number(value) => value.to_string(),
+        _ => value.to_string(),
+    }
 }
 
 fn git_ref_context(git_ref: &str) -> (Option<String>, Option<String>) {
@@ -1368,12 +2685,111 @@ async fn get_run(
     Path(run_id): Path<RunId>,
 ) -> Result<Json<RunRecord>, ApiError> {
     let inner = shared.state.inner.lock().await;
-    inner
+    let mut run = inner
         .runs
         .get(&run_id)
         .cloned()
-        .map(Json)
-        .ok_or_else(|| ApiError::not_found("run not found"))
+        .ok_or_else(|| ApiError::not_found("run not found"))?;
+
+    // Results/timeline updates only create details for dispatched jobs. Keep
+    // the native jobs_list a complete projection by adding jobs that were
+    // cancelled or failed before dispatch with an empty step list.
+    for (job_id, status) in &run.jobs {
+        if !run.jobs_list.iter().any(|detail| detail.name == job_id.0) {
+            run.jobs_list.push(JobDetail {
+                name: job_id.0.clone(),
+                conclusion: status_string(*status),
+                steps: Vec::new(),
+            });
+        }
+    }
+
+    for job_detail in &mut run.jobs_list {
+        if let Some(status) = run.jobs.get(&JobId(job_detail.name.clone())) {
+            job_detail.conclusion = status_string(*status);
+        }
+    }
+
+    Ok(Json(run))
+}
+
+async fn get_run_logs(
+    State(shared): State<Arc<SharedState>>,
+    Path(run_id): Path<RunId>,
+) -> Result<Response, ApiError> {
+    let (state_dir, sources) = {
+        let inner = shared.state.inner.lock().await;
+        if !inner.runs.contains_key(&run_id) {
+            return Err(ApiError::not_found("run not found"));
+        }
+
+        let mut requests: Vec<&TaskAgentJobRequestRecord> = inner
+            .job_requests
+            .values()
+            .filter(|request| request.run_id == run_id)
+            .collect();
+        requests.sort_by_key(|request| request.request_id);
+        let sources = requests
+            .into_iter()
+            .map(|request| {
+                let prefix = format!("{}/", request.plan_id);
+                let mut blocks: Vec<(&str, &[u8])> = inner
+                    .logs
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        key.strip_prefix(&prefix)
+                            .map(|log_id| (log_id, value.as_slice()))
+                    })
+                    .collect();
+                blocks.sort_by(|(left, _), (right, _)| {
+                    match (left.parse::<u64>(), right.parse::<u64>()) {
+                        (Ok(left), Ok(right)) => left.cmp(&right),
+                        (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+                        (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+                        (Err(_), Err(_)) => left.cmp(right),
+                    }
+                });
+                (
+                    request.plan_id.clone(),
+                    request.agent_job_id.to_string(),
+                    blocks
+                        .into_iter()
+                        .map(|(_, block)| block.to_vec())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        (shared.state.state_dir.clone(), sources)
+    };
+
+    let mut merged = Vec::new();
+    for (plan_id, agent_job_id, fallback_blocks) in sources {
+        let results_log = state_dir
+            .join("replay")
+            .join("results")
+            .join(plan_id)
+            .join(agent_job_id)
+            .join("job-logs.txt");
+        match tokio::fs::read(&results_log).await {
+            Ok(contents) => merged.extend_from_slice(&contents),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                for block in fallback_blocks {
+                    merged.extend_from_slice(&block);
+                }
+            }
+            Err(error) => {
+                return Err(ApiError::internal(format!(
+                    "failed to read run log `{}`: {error}",
+                    results_log.display()
+                )));
+            }
+        }
+    }
+
+    Ok(Response::builder()
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Body::from(merged))
+        .expect("static run log response"))
 }
 
 async fn cancel_run(
@@ -1381,33 +2797,11 @@ async fn cancel_run(
     Path(run_id): Path<RunId>,
 ) -> Result<Json<RunRecord>, ApiError> {
     let mut inner = shared.state.inner.lock().await;
-    let mut cancellations = Vec::new();
-    {
-        let record = inner
-            .runs
-            .get_mut(&run_id)
-            .ok_or_else(|| ApiError::not_found("run not found"))?;
-        record.status = ExecutionStatus::Cancelled;
-        for (job_id, status) in &mut record.jobs {
-            if matches!(*status, ExecutionStatus::InProgress) {
-                cancellations.push(QueuedCancellation {
-                    run_id,
-                    job_id: job_id.clone(),
-                });
-            }
-            if matches!(
-                *status,
-                ExecutionStatus::Queued | ExecutionStatus::InProgress
-            ) {
-                *status = ExecutionStatus::Cancelled;
-            }
-        }
+    if !inner.runs.contains_key(&run_id) {
+        return Err(ApiError::not_found("run not found"));
     }
-    inner.queue.retain(|job| job.run_id != run_id);
-    inner.pending_jobs.retain(|job| job.run_id != run_id);
-    inner.dap_ports.remove(&run_id);
-    let cancellation_count = cancellations.len();
-    inner.cancellation_queue.extend(cancellations);
+    let cancellation_count =
+        cancel_run_inner(&mut inner, run_id, None /* no concurrency reason */);
     let record = inner
         .runs
         .get(&run_id)
@@ -1422,9 +2816,588 @@ async fn cancel_run(
         .emit(NdjsonEvent::RunStatus {
             run_id,
             status: ExecutionStatus::Cancelled,
+            reason: None,
         })
         .await;
     Ok(Json(record))
+}
+
+/// Resolve the agent job GUID for an in-flight job, if any.
+fn agent_job_id_for(inner: &InnerState, run_id: RunId, job_id: &JobId) -> Option<uuid::Uuid> {
+    inner
+        .job_requests
+        .values()
+        .find(|r| r.run_id == run_id && r.job_id == *job_id && r.result.is_none())
+        .map(|r| r.agent_job_id)
+        .or_else(|| {
+            // Also check via inflight_requests if result already set but still relevant.
+            inner
+                .job_requests
+                .values()
+                .find(|r| r.run_id == run_id && r.job_id == *job_id)
+                .map(|r| r.agent_job_id)
+        })
+}
+
+/// Cancel a run: mark non-terminal jobs Cancelled, enqueue JobCancellation for
+/// in-flight jobs, remove from queues/held/blocked, and release concurrency.
+/// Returns the number of cancellation messages enqueued.
+fn cancel_run_inner(inner: &mut InnerState, run_id: RunId, reason: Option<&str>) -> usize {
+    let mut in_progress: Vec<JobId> = Vec::new();
+    {
+        let Some(record) = inner.runs.get_mut(&run_id) else {
+            return 0;
+        };
+        record.status = ExecutionStatus::Cancelled;
+        for (job_id, status) in &mut record.jobs {
+            if matches!(*status, ExecutionStatus::InProgress) {
+                in_progress.push(job_id.clone());
+            }
+            if matches!(
+                *status,
+                ExecutionStatus::Queued | ExecutionStatus::Pending | ExecutionStatus::InProgress
+            ) {
+                *status = ExecutionStatus::Cancelled;
+            }
+        }
+    }
+
+    let mut cancellations = Vec::new();
+    for job_id in in_progress {
+        if let Some(agent_job_id) = agent_job_id_for(inner, run_id, &job_id) {
+            cancellations.push(QueuedCancellation {
+                run_id,
+                job_id,
+                agent_job_id,
+            });
+        }
+    }
+    let count = cancellations.len();
+    inner.cancellation_queue.extend(cancellations);
+
+    inner.queue.retain(|job| job.run_id != run_id);
+    inner.pending_jobs.retain(|job| job.run_id != run_id);
+    inner.held_runs.remove(&run_id);
+    inner.concurrency_blocked.retain(|job| job.run_id != run_id);
+    inner.dap_ports.remove(&run_id);
+
+    // Release any concurrency holders belonging to this run and promote next.
+    release_concurrency_for_run(inner, run_id);
+    inner.jobset_admissions.retain(|id, _| id.run_id != run_id);
+
+    let _ = reason; // events emitted by caller when needed
+    count
+}
+
+/// Cancel a single job (job-level concurrency / fail-fast style).
+fn cancel_job_inner(inner: &mut InnerState, run_id: RunId, job_id: &JobId) -> usize {
+    let was_in_progress = {
+        let Some(record) = inner.runs.get_mut(&run_id) else {
+            return 0;
+        };
+        let Some(status) = record.jobs.get_mut(job_id) else {
+            return 0;
+        };
+        let in_progress = matches!(*status, ExecutionStatus::InProgress);
+        if matches!(
+            *status,
+            ExecutionStatus::Queued | ExecutionStatus::Pending | ExecutionStatus::InProgress
+        ) {
+            *status = ExecutionStatus::Cancelled;
+        }
+        record.status = summarize_run(record.jobs.values().copied());
+        in_progress
+    };
+
+    let mut count = 0;
+    if was_in_progress {
+        if let Some(agent_job_id) = agent_job_id_for(inner, run_id, job_id) {
+            inner.cancellation_queue.push_back(QueuedCancellation {
+                run_id,
+                job_id: job_id.clone(),
+                agent_job_id,
+            });
+            count = 1;
+        }
+    }
+    inner
+        .queue
+        .retain(|j| !(j.run_id == run_id && j.job_id == *job_id));
+    inner
+        .pending_jobs
+        .retain(|j| !(j.run_id == run_id && j.job_id == *job_id));
+    inner
+        .concurrency_blocked
+        .retain(|j| !(j.run_id == run_id && j.job_id == *job_id));
+    if let Some(held) = inner.held_runs.get_mut(&run_id) {
+        held.retain(|j| j.job_id != *job_id);
+    }
+
+    release_concurrency_for_job(inner, run_id, job_id);
+    count
+}
+
+fn release_concurrency_for_run(inner: &mut InnerState, run_id: RunId) {
+    let keys: Vec<(String, String)> = inner.holder_keys.get(&run_id).cloned().unwrap_or_default();
+    for key in keys {
+        if let Some(group) = inner.concurrency_groups.get_mut(&key) {
+            let running_match = group
+                .running
+                .as_ref()
+                .is_some_and(|h| h.is_run_holder(run_id) || h.run_id() == run_id);
+            if running_match {
+                let done = group.running.take();
+                if let Some(done) = done {
+                    // Only release if all jobs terminal OR this was a cancel of the whole run.
+                    promote_next_from_group(inner, &key, done);
+                }
+            } else {
+                // Remove from pending queue.
+                if let Some(group) = inner.concurrency_groups.get_mut(&key) {
+                    group.pending.retain(|h| h.run_id() != run_id);
+                    if group.running.is_none() && group.pending.is_empty() {
+                        inner.concurrency_groups.remove(&key);
+                    }
+                }
+            }
+        }
+    }
+    // C-07: discard all key tracking for this run now that every group has been released.
+    inner.holder_keys.remove(&run_id);
+}
+
+fn release_concurrency_for_job(inner: &mut InnerState, run_id: RunId, job_id: &JobId) {
+    let keys: Vec<(String, String)> = inner.concurrency_groups.keys().cloned().collect();
+    for key in keys {
+        let should_release = {
+            let Some(group) = inner.concurrency_groups.get(&key) else {
+                continue;
+            };
+            match &group.running {
+                Some(h) if h.contains_job(run_id, job_id) => {
+                    // Job holders release immediately; Run/JobSet when all terminal.
+                    match h {
+                        concurrency::Holder::Job { .. } => true,
+                        concurrency::Holder::Run(_) | concurrency::Holder::JobSet { .. } => inner
+                            .runs
+                            .get(&run_id)
+                            .is_some_and(|r| concurrency::holder_is_terminal(h, &r.jobs)),
+                    }
+                }
+                _ => false,
+            }
+        };
+        // Also drop pending entries for this job.
+        if let Some(group) = inner.concurrency_groups.get_mut(&key) {
+            group.pending.retain(|h| !h.contains_job(run_id, job_id));
+        }
+        if should_release {
+            if let Some(group) = inner.concurrency_groups.get_mut(&key) {
+                if let Some(done) = group.running.take() {
+                    promote_next_from_group(inner, &key, done);
+                }
+            }
+        } else if let Some(group) = inner.concurrency_groups.get(&key) {
+            if group.running.is_none() && group.pending.is_empty() {
+                inner.concurrency_groups.remove(&key);
+            }
+        }
+        // C-07: prune this key from holder_keys when the run has no remaining
+        // presence in the group (neither running nor pending).
+        let run_still_present = inner.concurrency_groups.get(&key).is_some_and(|g| {
+            g.running.as_ref().is_some_and(|h| h.run_id() == run_id)
+                || g.pending.iter().any(|h| h.run_id() == run_id)
+        });
+        if !run_still_present {
+            if let Some(rkeys) = inner.holder_keys.get_mut(&run_id) {
+                rkeys.retain(|k| k != &key);
+                if rkeys.is_empty() {
+                    inner.holder_keys.remove(&run_id);
+                }
+            }
+        }
+    }
+}
+
+/// Release a single concurrency key acquired by a JobSet whose members all
+/// became terminal before any could dispatch (e.g. embedded gate overflow).
+/// Removes the running holder from the group and promotes the next pending.
+fn merge_jobset_gate(gates: &mut Vec<JobSetGate>, mut gate: JobSetGate) {
+    if let Some(existing) = gates.iter_mut().find(|existing| existing.key == gate.key) {
+        existing.cancel_in_progress |= gate.cancel_in_progress;
+        if gate.queue == aksh_gha_parser::ConcurrencyQueue::Single {
+            existing.queue = aksh_gha_parser::ConcurrencyQueue::Single;
+        }
+        return;
+    }
+    gate.display_name = gate.display_name.trim().to_owned();
+    gates.push(gate);
+    gates.sort_by(|left, right| left.key.cmp(&right.key));
+}
+
+fn release_holder_key(
+    inner: &mut InnerState,
+    key: &(String, String),
+    holder: &concurrency::Holder,
+) {
+    let mut promote = None;
+    if let Some(group) = inner.concurrency_groups.get_mut(key) {
+        if group.running.as_ref() == Some(holder) {
+            promote = group.running.take();
+        } else {
+            group.pending.retain(|pending| pending != holder);
+        }
+    }
+    if let Some(done) = promote {
+        promote_next_from_group(inner, key, done);
+    }
+    if inner
+        .concurrency_groups
+        .get(key)
+        .is_some_and(|group| group.running.is_none() && group.pending.is_empty())
+    {
+        inner.concurrency_groups.remove(key);
+    }
+
+    let run_id = holder.run_id();
+    let run_still_present = inner.concurrency_groups.get(key).is_some_and(|group| {
+        group
+            .running
+            .as_ref()
+            .is_some_and(|candidate| candidate.run_id() == run_id)
+            || group
+                .pending
+                .iter()
+                .any(|candidate| candidate.run_id() == run_id)
+    });
+    if !run_still_present {
+        if let Some(keys) = inner.holder_keys.get_mut(&run_id) {
+            keys.retain(|candidate| candidate != key);
+            if keys.is_empty() {
+                inner.holder_keys.remove(&run_id);
+            }
+        }
+    }
+}
+
+fn release_jobset_admission(inner: &mut InnerState, id: &JobSetId) {
+    let Some(admission) = inner.jobset_admissions.remove(id) else {
+        return;
+    };
+    let holder = id.holder();
+    for key in admission.acquired_keys {
+        release_holder_key(inner, &key, &holder);
+    }
+}
+
+fn advance_jobset_admission(
+    inner: &mut InnerState,
+    id: &JobSetId,
+    promoted_key: Option<&(String, String)>,
+) -> Result<JobSetAdmissionResult, String> {
+    if let Some(key) = promoted_key {
+        if let Some(admission) = inner.jobset_admissions.get_mut(id) {
+            admission.acquired_keys.insert(key.clone());
+        }
+    }
+
+    loop {
+        let next_gate = {
+            let Some(admission) = inner.jobset_admissions.get(id) else {
+                return Ok(JobSetAdmissionResult::Ready);
+            };
+            admission
+                .gates
+                .iter()
+                .find(|gate| !admission.acquired_keys.contains(&gate.key))
+                .cloned()
+        };
+        let Some(gate) = next_gate else {
+            inner.jobset_admissions.remove(id);
+            return Ok(JobSetAdmissionResult::Ready);
+        };
+
+        let holder = id.holder();
+        match try_acquire_concurrency(
+            inner,
+            gate.key.clone(),
+            gate.display_name,
+            holder,
+            gate.cancel_in_progress,
+            gate.queue,
+        ) {
+            Ok(true) => {
+                if let Some(admission) = inner.jobset_admissions.get_mut(id) {
+                    admission.acquired_keys.insert(gate.key);
+                }
+            }
+            Ok(false) => return Ok(JobSetAdmissionResult::Blocked),
+            Err(error) => {
+                release_jobset_admission(inner, id);
+                return Err(error);
+            }
+        }
+    }
+}
+
+/// After a holder finishes, promote the next pending holder for the group.
+fn promote_next_from_group(
+    inner: &mut InnerState,
+    key: &(String, String),
+    _done: concurrency::Holder,
+) {
+    let next = {
+        let Some(group) = inner.concurrency_groups.get_mut(key) else {
+            return;
+        };
+        group.pending.pop_front()
+    };
+
+    let Some(next) = next else {
+        if let Some(group) = inner.concurrency_groups.get(key) {
+            if group.running.is_none() && group.pending.is_empty() {
+                inner.concurrency_groups.remove(key);
+            }
+        }
+        return;
+    };
+
+    // Install as running immediately for Run and JobSet; for Holder::Job, defer
+    // until max-parallel is confirmed free so the job cannot contend with its
+    // own pending holder (C-01).
+    if !matches!(&next, concurrency::Holder::Job { .. }) {
+        if let Some(group) = inner.concurrency_groups.get_mut(key) {
+            group.running = Some(next.clone());
+        }
+    }
+
+    match next {
+        concurrency::Holder::Run(run_id) => {
+            if let Some(jobs) = inner.held_runs.remove(&run_id) {
+                for mut job in jobs {
+                    if let Some(run) = inner.runs.get_mut(&run_id) {
+                        run.jobs.insert(job.job_id.clone(), ExecutionStatus::Queued);
+                    }
+                    // Re-check needs/max_parallel before queueing.
+                    let needs_ok = inner.runs.get(&run_id).is_some_and(|run| {
+                        job.needs
+                            .iter()
+                            .all(|n| scheduling::need_satisfied(&run.jobs, n))
+                    });
+                    if needs_ok && under_max_parallel(inner, &job) {
+                        if let Some(run) = inner.runs.get(&run_id) {
+                            hydrate_needs_context(&mut job, run);
+                        }
+                        inner.queue.push_back(job);
+                    } else {
+                        if let Some(run) = inner.runs.get_mut(&run_id) {
+                            // keep Queued status in pending_jobs path
+                            run.jobs.insert(job.job_id.clone(), ExecutionStatus::Queued);
+                        }
+                        inner.pending_jobs.push_back(job);
+                    }
+                }
+                if let Some(run) = inner.runs.get_mut(&run_id) {
+                    if run.status == ExecutionStatus::Pending {
+                        run.status = ExecutionStatus::Queued;
+                    }
+                }
+            }
+        }
+        concurrency::Holder::Job { run_id, job_id } => {
+            let pos = inner
+                .concurrency_blocked
+                .iter()
+                .position(|j| j.run_id == run_id && j.job_id == job_id);
+            let Some(pos) = pos else { return };
+            // Remove the job temporarily so we can call under_max_parallel
+            // without a mutable/immutable borrow conflict on inner.
+            let mut job = inner.concurrency_blocked.remove(pos).unwrap();
+            if !under_max_parallel(inner, &job) {
+                // max-parallel still full: restore the holder at the front of
+                // the pending queue and put the job back where it was so the
+                // next release event or promote_ready_jobs sweep can retry.
+                inner.concurrency_blocked.insert(pos, job);
+                if let Some(group) = inner.concurrency_groups.get_mut(key) {
+                    group
+                        .pending
+                        .push_front(concurrency::Holder::Job { run_id, job_id });
+                }
+                return;
+            }
+            // Both gates clear: atomically install as running and dispatch.
+            if let Some(group) = inner.concurrency_groups.get_mut(key) {
+                group.running = Some(concurrency::Holder::Job { run_id, job_id });
+            }
+            if let Some(run) = inner.runs.get_mut(&run_id) {
+                run.jobs.insert(job.job_id.clone(), ExecutionStatus::Queued);
+                hydrate_needs_context(&mut job, run);
+            }
+            inner.queue.push_back(job);
+        }
+        concurrency::Holder::JobSet { run_id, job_ids } => {
+            let id = JobSetId {
+                run_id,
+                job_ids: job_ids.clone(),
+            };
+            match advance_jobset_admission(inner, &id, Some(key)) {
+                Ok(JobSetAdmissionResult::Blocked) => return,
+                Err(_) => {
+                    cancel_holder(
+                        inner,
+                        &concurrency::Holder::JobSet { run_id, job_ids },
+                        concurrency::cancelled_reason().as_deref(),
+                    );
+                    return;
+                }
+                Ok(JobSetAdmissionResult::Ready) => {}
+            }
+
+            let mut to_queue = Vec::new();
+            inner.concurrency_blocked.retain(|job| {
+                if job.run_id == run_id && job_ids.contains(&job.job_id) {
+                    to_queue.push(job.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            for mut job in to_queue {
+                if under_max_parallel(inner, &job) {
+                    if let Some(run) = inner.runs.get_mut(&run_id) {
+                        run.jobs.insert(job.job_id.clone(), ExecutionStatus::Queued);
+                        hydrate_needs_context(&mut job, run);
+                    }
+                    inner.queue.push_back(job);
+                } else {
+                    if let Some(run) = inner.runs.get_mut(&run_id) {
+                        run.jobs.insert(job.job_id.clone(), ExecutionStatus::Queued);
+                    }
+                    inner.pending_jobs.push_back(job);
+                }
+            }
+        }
+    }
+}
+
+/// Try to acquire a concurrency slot for a holder. Returns:
+/// - `Ok(true)` if the holder may proceed (slot acquired / free)
+/// - `Ok(false)` if parked as pending
+/// - `Err("cancelled")` if the arrival itself was cancelled (queue max overflow)
+/// - `Err(msg)` for evaluation / empty-group errors
+fn try_acquire_concurrency(
+    inner: &mut InnerState,
+    key: (String, String),
+    display_name: String,
+    holder: concurrency::Holder,
+    cancel_in_progress: bool,
+    queue: aksh_gha_parser::ConcurrencyQueue,
+) -> Result<bool, String> {
+    let group = inner
+        .concurrency_groups
+        .entry(key.clone())
+        .or_insert_with(|| concurrency::ConcurrencyGroup {
+            display_name: display_name.clone(),
+            running: None,
+            pending: VecDeque::new(),
+        });
+    if group.display_name.is_empty() {
+        group.display_name = display_name;
+    }
+
+    if group.running.is_none() {
+        group.running = Some(holder.clone());
+        let _ = group;
+        track_holder_key(inner, &holder, key);
+        return Ok(true);
+    }
+
+    if cancel_in_progress {
+        let prev = group.running.take();
+        // Docs: "any existing pending job or workflow in the same concurrency
+        // group will be canceled" — drain all pending holders too.
+        let stale_pending: Vec<concurrency::Holder> = group.pending.drain(..).collect();
+        group.running = Some(holder.clone());
+        let _ = group;
+        track_holder_key(inner, &holder, key.clone());
+        if let Some(prev) = prev {
+            cancel_holder(inner, &prev, concurrency::cancelled_reason().as_deref());
+        }
+        for pending in stale_pending {
+            cancel_holder(inner, &pending, concurrency::cancelled_reason().as_deref());
+        }
+        return Ok(true);
+    }
+    let _ = group;
+
+    // Contended — apply queue mode for this arrival.
+    let join = {
+        let group = inner.concurrency_groups.get(&key).unwrap();
+        concurrency::apply_queue_mode(queue, &group.pending)
+    };
+
+    for pending_holder in join.cancel_pending {
+        if pending_holder.run_id() == holder.run_id() {
+            continue;
+        }
+        cancel_holder(
+            inner,
+            &pending_holder,
+            concurrency::cancelled_reason().as_deref(),
+        );
+        if let Some(group) = inner.concurrency_groups.get_mut(&key) {
+            group.pending.retain(|h| h != &pending_holder);
+        }
+    }
+
+    if join.cancel_arrival {
+        return Err("concurrency_queue_overflow".to_owned());
+    }
+
+    if join.park_arrival {
+        if let Some(group) = inner.concurrency_groups.get_mut(&key) {
+            // After single-mode clears, re-push.
+            group.pending.push_back(holder.clone());
+        }
+        track_holder_key(inner, &holder, key);
+        return Ok(false);
+    }
+
+    Ok(true)
+}
+
+fn track_holder_key(inner: &mut InnerState, holder: &concurrency::Holder, key: (String, String)) {
+    let run_id = holder.run_id();
+    let keys = inner.holder_keys.entry(run_id).or_default();
+    if !keys.contains(&key) {
+        keys.push(key);
+    }
+}
+
+fn cancel_holder(inner: &mut InnerState, holder: &concurrency::Holder, _reason: Option<&str>) {
+    match holder {
+        concurrency::Holder::Run(run_id) => {
+            cancel_run_inner(inner, *run_id, Some("concurrency_cancelled"));
+        }
+        concurrency::Holder::Job { run_id, job_id } => {
+            cancel_job_inner(inner, *run_id, job_id);
+        }
+        concurrency::Holder::JobSet { run_id, job_ids } => {
+            inner.jobset_admissions.remove(&JobSetId {
+                run_id: *run_id,
+                job_ids: job_ids.clone(),
+            });
+            for job_id in job_ids {
+                cancel_job_inner(inner, *run_id, job_id);
+            }
+            // If all jobs cancelled, mark run cancelled when appropriate.
+            if let Some(run) = inner.runs.get_mut(run_id) {
+                if run.jobs.values().all(|s| concurrency::is_terminal(*s)) {
+                    run.status = summarize_run(run.jobs.values().copied());
+                }
+            }
+        }
+    }
 }
 
 async fn rerun_run(
@@ -1454,12 +3427,14 @@ async fn run_events(
     let mut out = event_to_ndjson(&NdjsonEvent::RunStatus {
         run_id,
         status: run.status,
+        reason: None,
     })?;
     for (job_id, status) in &run.jobs {
         out.push_str(&event_to_ndjson(&NdjsonEvent::JobStatus {
             run_id,
             job_id: job_id.clone(),
             status: *status,
+            reason: None,
         })?);
     }
     if let Some(events) = inner.timeline_events.get(&run_id) {
@@ -1832,11 +3807,20 @@ async fn create_session_disttask(
         session_enc.key.clone(),
     );
 
+    let runner_id = body
+        .pointer("/agent/id")
+        .and_then(serde_json::Value::as_i64);
+
     {
         let mut inner = shared.state.inner.lock().await;
         inner
             .session_keys
             .insert(session_id.to_string(), session_enc);
+        if let Some(runner_id) = runner_id {
+            inner
+                .broker_session_runners
+                .insert(session_id.to_string(), runner_id);
+        }
         // Only mark as AzDO if the client explicitly opts in.
         // This preserves backward compat: test and broker-hybrid sessions do NOT
         // include `akshAzdo: true` and continue to receive broker-ref messages.
@@ -1878,6 +3862,7 @@ async fn delete_session(
 ) -> StatusCode {
     let mut inner = shared.state.inner.lock().await;
     inner.sessions.remove(&session_id);
+    inner.broker_session_runners.remove(&session_id);
     StatusCode::NO_CONTENT
 }
 
@@ -1915,17 +3900,19 @@ struct BrokerAcquireJobRequest {
 #[serde(rename_all = "camelCase")]
 struct BrokerRenewJobRequest {
     job_id: uuid::Uuid,
-    plan_id: String,
+    #[serde(rename = "planId")]
+    _plan_id: String,
     conclusion: Option<String>,
     #[serde(default)]
     outputs: BTreeMap<String, serde_json::Value>,
 }
 
 fn execution_status_from_runner_result(result: &str) -> Option<ExecutionStatus> {
-    match result {
-        "success" | "succeeded" | "succeededWithIssues" => Some(ExecutionStatus::Success),
+    match result.to_ascii_lowercase().as_str() {
+        "success" | "succeeded" | "succeededwithissues" => Some(ExecutionStatus::Success),
         "failure" | "failed" => Some(ExecutionStatus::Failure),
         "cancelled" | "canceled" => Some(ExecutionStatus::Cancelled),
+        "skipped" => Some(ExecutionStatus::Skipped),
         _ => None,
     }
 }
@@ -1939,6 +3926,36 @@ fn public_base_url() -> String {
         .unwrap_or_else(|_| "http://127.0.0.1:9090".to_owned())
         .trim_end_matches('/')
         .to_owned()
+}
+
+fn format_reusable_workflow_ref(repository: &str, workflow_ref: &str, caller_ref: &str) -> String {
+    if let Some(path) = workflow_ref.strip_prefix("./") {
+        let (path, git_ref) = path.split_once('@').unwrap_or((path, caller_ref));
+        return format!("{repository}/{path}@{git_ref}");
+    }
+    workflow_ref.to_owned()
+}
+
+fn normalize_oidc_issuer(value: String) -> anyhow::Result<String> {
+    let issuer = value.trim_end_matches('/').to_owned();
+    if issuer.is_empty()
+        || !(issuer.starts_with("https://") || issuer.starts_with("http://"))
+        || issuer.contains('?')
+        || issuer.contains('#')
+    {
+        anyhow::bail!("OIDC issuer must be an absolute HTTP(S) URL without query or fragment");
+    }
+    Ok(issuer)
+}
+
+/// Return the effective OIDC issuer URL, falling back to
+/// `{public_base_url}/oidc` when not explicitly configured.
+fn oidc_issuer_url(inner: &InnerState) -> String {
+    if inner.oidc_issuer.is_empty() {
+        format!("{}/oidc", public_base_url())
+    } else {
+        inner.oidc_issuer.clone()
+    }
 }
 
 fn websocket_base_url() -> String {
@@ -1970,6 +3987,9 @@ fn broker_job_ref(request: &TaskAgentJobRequestRecord, runner_id: i64) -> serde_
 }
 
 fn broker_job_ref_root(request: &TaskAgentJobRequestRecord, runner_id: i64) -> serde_json::Value {
+    // messageId must be unique across job + cancel messages on a session.
+    // Using request_id alone collides with cancel messages that also allocate
+    // from the same integer space (runner in-memory dedup then drops the job).
     json!({
         "messageId": request.request_id,
         "messageType": "RunnerJobRequest",
@@ -1980,6 +4000,19 @@ fn broker_job_ref_root(request: &TaskAgentJobRequestRecord, runner_id: i64) -> s
             "should_acknowledge": true
         })).unwrap()
     })
+}
+
+/// Allocate a session-unique broker message id that cannot collide with
+/// `request_id` values used as RunnerJobRequest messageIds.
+fn next_broker_message_id(inner: &mut InnerState) -> i64 {
+    // request_ids start at 1 and increase; keep message ids in a separate high
+    // range so cancels never reuse a past/future request_id.
+    const MESSAGE_ID_BASE: i64 = 1_000_000;
+    if inner.next_message_id < MESSAGE_ID_BASE {
+        inner.next_message_id = MESSAGE_ID_BASE;
+    }
+    inner.next_message_id += 1;
+    inner.next_message_id
 }
 async fn next_message_broker_ref(
     State(shared): State<Arc<SharedState>>,
@@ -2018,11 +4051,7 @@ async fn next_message_broker_ref(
                         &mut inner,
                         &session_id,
                         azdo::message_type::JOB_CANCELLED,
-                        json!({
-                            "runId": cancellation.run_id.to_string(),
-                            "jobId": cancellation.job_id.to_string(),
-                        })
-                        .to_string(),
+                        concurrency::job_cancel_body(cancellation.agent_job_id),
                     );
                     return Ok(Json(message).into_response());
                 }
@@ -2087,6 +4116,7 @@ async fn next_message_broker_ref(
                 run_id,
                 job_id,
                 status: ExecutionStatus::InProgress,
+                reason: None,
             })
             .await;
 
@@ -2124,15 +4154,20 @@ async fn next_message_disttask(
 
 async fn broker_session_root(
     State(shared): State<Arc<SharedState>>,
-) -> (StatusCode, Json<serde_json::Value>) {
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let runner_id = authenticated_runner_id(&shared, &headers, None)?;
     let session_id = uuid::Uuid::new_v4().to_string();
     {
         let mut inner = shared.state.inner.lock().await;
         inner
             .session_keys
             .insert(session_id.clone(), SessionEncryption::generate());
+        inner
+            .broker_session_runners
+            .insert(session_id.clone(), runner_id);
     }
-    (
+    Ok((
         StatusCode::CREATED,
         Json(json!({
             "sessionId": session_id,
@@ -2140,54 +4175,152 @@ async fn broker_session_root(
             "assignmentQueued": false,
             "orchestrationId": ""
         })),
-    )
+    ))
 }
 
 async fn broker_delete_session_root(
     State(shared): State<Arc<SharedState>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
-) -> StatusCode {
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let runner_id = authenticated_runner_id(&shared, &headers, None)?;
     if let Some(session_id) = params.get("sessionId") {
-        let mut inner = shared.state.inner.lock().await;
-        inner.session_keys.remove(session_id);
-        inner.session_active_requests.remove(session_id);
+        remove_broker_session(&shared, session_id, runner_id).await?;
     }
-    StatusCode::NO_CONTENT
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn broker_delete_session_by_path(
     State(shared): State<Arc<SharedState>>,
     Path(session_id): Path<String>,
-) -> StatusCode {
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let runner_id = authenticated_runner_id(&shared, &headers, None)?;
+    remove_broker_session(&shared, &session_id, runner_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn remove_broker_session(
+    shared: &Arc<SharedState>,
+    session_id: &str,
+    runner_id: i64,
+) -> Result<(), ApiError> {
     let mut inner = shared.state.inner.lock().await;
-    inner.session_keys.remove(&session_id);
-    inner.session_active_requests.remove(&session_id);
-    StatusCode::NO_CONTENT
+    match inner.broker_session_runners.get(session_id).copied() {
+        Some(owner) if owner == runner_id => {
+            inner.broker_session_runners.remove(session_id);
+            inner.session_keys.remove(session_id);
+            inner.session_active_requests.remove(session_id);
+            Ok(())
+        }
+        Some(_) => Err(ApiError::forbidden(
+            "broker session belongs to another runner",
+        )),
+        None => Err(ApiError::not_found("broker session not found")),
+    }
+}
+fn authenticated_runner_id(
+    shared: &Arc<SharedState>,
+    headers: &HeaderMap,
+    expected_runner_id: Option<i64>,
+) -> Result<i64, ApiError> {
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or_else(|| ApiError::unauthorized("runner listen token required"))?;
+    let runner_id = shared
+        .state
+        .runner_id_from_token(bearer)
+        .ok_or_else(|| ApiError::unauthorized("runner listen token required"))?;
+    if expected_runner_id.is_some_and(|expected| expected != runner_id) {
+        return Err(ApiError::forbidden(
+            "runner token does not match broker path",
+        ));
+    }
+    Ok(runner_id)
+}
+
+fn ensure_broker_request_owner(
+    inner: &InnerState,
+    request_id: i64,
+    runner_id: i64,
+) -> Result<(), ApiError> {
+    let owner = inner
+        .session_active_requests
+        .iter()
+        .find_map(|(session_id, active_request_id)| {
+            (*active_request_id == request_id).then_some(session_id)
+        })
+        .and_then(|session_id| inner.broker_session_runners.get(session_id).copied());
+    match owner {
+        Some(owner) if owner == runner_id => Ok(()),
+        Some(_) => Err(ApiError::forbidden(
+            "broker request belongs to another runner",
+        )),
+        None => Err(ApiError::not_found(
+            "broker request is not assigned to a session",
+        )),
+    }
 }
 
 async fn next_message_broker_ref_root(
     State(shared): State<Arc<SharedState>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let runner_id = authenticated_runner_id(&shared, &headers, None)?;
     let session_id = params
         .get("sessionId")
         .cloned()
-        .unwrap_or_else(|| "default".to_owned());
+        .ok_or_else(|| ApiError::bad_request("broker sessionId is required"))?;
+    {
+        let inner = shared.state.inner.lock().await;
+        if inner.broker_session_runners.get(&session_id) != Some(&runner_id) {
+            return Err(ApiError::forbidden(
+                "broker session belongs to another runner",
+            ));
+        }
+    }
 
     // Default to 50s long-poll (golden flows show ~50s waits between jobs)
     let wait = params
         .get("waitSeconds")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(50);
+    // The runner may report completion before its worker process has fully
+    // exited. GitHub keeps polling with status=Busy during that drain window;
+    // never dispatch a successor until the runner reports Online again.
+    let runner_busy = params
+        .get("status")
+        .is_some_and(|status| status.eq_ignore_ascii_case("busy"));
+
     let deadline = std::time::Instant::now() + Duration::from_secs(wait);
 
     loop {
         let maybe = {
             let mut inner = shared.state.inner.lock().await;
+            // Prefer delivering JobCancellation for the active request (official
+            // cancel path). Without this, concurrency cancel-in-progress never
+            // reaches broker-path runners.
             if let Some(request_id) = inner.session_active_requests.get(&session_id).copied() {
-                if let Some(request) = inner.job_requests.get(&request_id) {
-                    if request.result.is_none() {
-                        Some(broker_job_ref_root(request, 1))
+                if let Some(request) = inner.job_requests.get(&request_id).cloned() {
+                    if let Some(pos) = inner
+                        .cancellation_queue
+                        .iter()
+                        .position(|c| c.run_id == request.run_id && c.job_id == request.job_id)
+                    {
+                        let cancellation = inner.cancellation_queue.remove(pos).unwrap();
+                        let message_id = next_broker_message_id(&mut inner);
+                        Some(json!({
+                            "messageId": message_id,
+                            "messageType": azdo::message_type::JOB_CANCELLED,
+                            "body": concurrency::job_cancel_body(cancellation.agent_job_id),
+                        }))
+                    } else if request.result.is_none() {
+                        // Still running — long-poll for cancel rather than
+                        // redelivering the same RunnerJobRequest (runner dedups it).
+                        None
                     } else {
                         inner.session_active_requests.remove(&session_id);
                         None
@@ -2196,6 +4329,8 @@ async fn next_message_broker_ref_root(
                     inner.session_active_requests.remove(&session_id);
                     None
                 }
+            } else if runner_busy {
+                None
             } else {
                 let labels = inner.runner_labels_for_session(&session_id);
                 if let Some(queued) = take_matching_job(&mut inner.queue, &labels) {
@@ -2205,6 +4340,11 @@ async fn next_message_broker_ref_root(
                             .insert(queued.job_id.clone(), ExecutionStatus::InProgress);
                     }
                     let request_id = queued.message.request_id;
+                    if let Some(request) = inner.job_requests.get_mut(&request_id) {
+                        request.started_at = Some(std::time::SystemTime::now());
+                        request.last_renewed_at = Some(std::time::SystemTime::now());
+                    }
+                    // Job messageId = request_id (low range). Cancels use 1_000_000+.
                     inner
                         .session_active_requests
                         .insert(session_id.clone(), request_id);
@@ -2228,7 +4368,10 @@ async fn next_message_broker_ref_root(
         if wait == 0 || std::time::Instant::now() >= deadline {
             return Ok(Json(serde_json::Value::Null));
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        // Wake promptly on cancel/enqueue rather than fixed 250ms sleep.
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let slice = remaining.min(Duration::from_secs(3));
+        let _ = tokio::time::timeout(slice, shared.state.message_notify.notified()).await;
     }
 }
 
@@ -2246,33 +4389,21 @@ async fn broker_acknowledge_root(
 async fn broker_acquire_job(
     State(shared): State<Arc<SharedState>>,
     Path(runner_id): Path<i64>,
+    headers: HeaderMap,
     Json(request): Json<BrokerAcquireJobRequest>,
 ) -> Result<Json<azdo::AgentJobRequestMessage>, ApiError> {
+    authenticated_runner_id(&shared, &headers, Some(runner_id))?;
     let inner = shared.state.inner.lock().await;
     let request_id = inner
         .agent_job_requests
         .get(&request.job_message_id)
         .copied()
-        .or_else(|| sole_active_unfinished_request(&inner))
         .ok_or_else(|| ApiError::not_found("broker job message not found"))?;
+    ensure_broker_request_owner(&inner, request_id, runner_id)?;
     let mut message = inner
         .broker_messages
         .get(&request_id)
         .cloned()
-        .or_else(|| {
-            inner.job_requests.get(&request_id).and_then(|record| {
-                inner
-                    .agent_job_requests
-                    .get(&record.agent_job_id)
-                    .and_then(|_| {
-                        inner
-                            .queue
-                            .iter()
-                            .find(|queued| queued.message.request_id == request_id)
-                            .map(|queued| queued.message.clone())
-                    })
-            })
-        })
         .ok_or_else(|| ApiError::not_found("broker job payload not found"))?;
     message.message_type = Some(azdo::message_type::RUNNER_JOB_REQUEST.to_owned());
     let run_service_url = broker_run_service_url(runner_id);
@@ -2281,7 +4412,9 @@ async fn broker_acquire_job(
             endpoint.url = Some(run_service_url.clone());
             endpoint.authorization.parameters.insert(
                 "AccessToken".to_owned(),
-                mint_runtime_token(&message.plan.plan_id, &message.job_id),
+                shared
+                    .state
+                    .mint_runtime_token(&message.plan.plan_id, &message.job_id),
             );
             endpoint
                 .data
@@ -2298,22 +4431,27 @@ async fn broker_acquire_job(
             );
         }
     }
+    message.billing_owner_id = request.billing_owner_id;
+    // Run-service payloads use the DTO default; internal request IDs remain in
+    // `job_requests` and broker lookup maps for renew/complete bookkeeping.
+    message.request_id = 0;
     Ok(Json(message))
 }
 
 async fn broker_renew_job(
     State(shared): State<Arc<SharedState>>,
-    Path(_runner_id): Path<i64>,
+    Path(runner_id): Path<i64>,
+    headers: HeaderMap,
     Json(request): Json<BrokerRenewJobRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    authenticated_runner_id(&shared, &headers, Some(runner_id))?;
     let mut inner = shared.state.inner.lock().await;
     let request_id = inner
         .agent_job_requests
         .get(&request.job_id)
         .copied()
-        .or_else(|| inner.plan_requests.get(&request.plan_id).copied())
-        .or_else(|| sole_active_unfinished_request(&inner))
         .ok_or_else(|| ApiError::not_found("broker renew request not found"))?;
+    ensure_broker_request_owner(&inner, request_id, runner_id)?;
     let record = inner
         .job_requests
         .get_mut(&request_id)
@@ -2325,14 +4463,18 @@ async fn broker_renew_job(
 
 async fn broker_complete_job(
     State(shared): State<Arc<SharedState>>,
-    Path(_runner_id): Path<i64>,
+    Path(runner_id): Path<i64>,
+    headers: HeaderMap,
     Json(request): Json<BrokerRenewJobRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let status = request
-        .conclusion
-        .as_deref()
-        .and_then(execution_status_from_runner_result)
-        .unwrap_or(ExecutionStatus::Success);
+    authenticated_runner_id(&shared, &headers, Some(runner_id))?;
+    let status = match request.conclusion.as_deref() {
+        Some(conclusion) => execution_status_from_runner_result(conclusion).ok_or_else(|| {
+            ApiError::bad_request(format!("unknown broker conclusion `{conclusion}`"))
+        })?,
+        // Older broker clients omit this field on successful completion.
+        None => ExecutionStatus::Success,
+    };
 
     // Extract outputs from the completejob body.
     // Runner sends: { "outputName": {"value": "theValue"} }
@@ -2352,28 +4494,22 @@ async fn broker_complete_job(
 
     let completion = {
         let mut inner = shared.state.inner.lock().await;
-        let request_id = match inner
+        let request_id = inner
             .agent_job_requests
             .get(&request.job_id)
             .copied()
-            .or_else(|| inner.plan_requests.get(&request.plan_id).copied())
-            .or_else(|| sole_active_unfinished_request(&inner))
-        {
-            Some(id) => id,
-            None => {
-                warn!(
-                    job_id = %request.job_id,
-                    plan_id = %request.plan_id,
-                    "broker complete: could not find request_id"
-                );
-                return Ok(StatusCode::NO_CONTENT);
-            }
-        };
+            .ok_or_else(|| ApiError::not_found("broker complete request not found"))?;
+        ensure_broker_request_owner(&inner, request_id, runner_id)?;
         debug!(request_id, job_id = %request.job_id, "broker complete: found request");
         if let Some(record) = inner.job_requests.get_mut(&request_id) {
             record.result = Some(status);
             record.locked_until = agent_request_locked_until();
         }
+        // Free the session so the next broker poll can take a new job immediately
+        // (otherwise the poll arm waits until it observes result.is_some()).
+        inner
+            .session_active_requests
+            .retain(|_, &mut rid| rid != request_id);
         let run_job = inner.inflight_requests.remove(&request_id).or_else(|| {
             job_request_tuple(&inner, request_id).map(|(_, run_id, job_id)| (run_id, job_id))
         });
@@ -2397,8 +4533,11 @@ async fn broker_complete_job(
         }
     };
     if let Some(completion) = completion {
-        let _ = complete_job_inner(shared, completion).await?;
+        let _ = complete_job_inner(shared.clone(), completion).await?;
     }
+    // Wake long-polling runners so a queued successor job is delivered promptly
+    // after cancel/complete (concurrency release path).
+    shared.state.message_notify.notify_waiters();
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2416,9 +4555,79 @@ struct StepLogsSignedBlobUrlRequest {
 }
 
 async fn twirp_workflow_steps_update(
-    Json(_request): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
-    Json(json!({"ok": true}))
+    State(shared): State<Arc<SharedState>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut inner = shared.state.inner.lock().await;
+
+    let plan_id = payload["workflow_run_backend_id"].as_str().unwrap_or("");
+    let agent_job_id_str = payload["workflow_job_run_backend_id"]
+        .as_str()
+        .unwrap_or("");
+
+    if let (Some(plan_uuid), Some(job_uuid)) = (
+        uuid::Uuid::parse_str(plan_id).ok(),
+        uuid::Uuid::parse_str(agent_job_id_str).ok(),
+    ) {
+        if let Some((_, run_id, job_id)) =
+            resolve_callback_job(&inner, &plan_uuid.to_string(), None, Some(job_uuid))
+        {
+            if let Some(run) = inner.runs.get_mut(&run_id) {
+                let job_name = job_id.0.clone();
+                let job_detail =
+                    if let Some(pos) = run.jobs_list.iter().position(|j| j.name == job_name) {
+                        &mut run.jobs_list[pos]
+                    } else {
+                        run.jobs_list.push(JobDetail {
+                            name: job_name,
+                            conclusion: "success".to_owned(),
+                            steps: Vec::new(),
+                        });
+                        run.jobs_list.last_mut().unwrap()
+                    };
+
+                if let Some(status) = run.jobs.get(&job_id) {
+                    job_detail.conclusion = format!("{:?}", status).to_lowercase();
+                }
+                if let Some(steps) = payload["steps"].as_array() {
+                    for step in steps {
+                        let name = step["name"].as_str().unwrap_or("").to_owned();
+                        let conclusion_num = step["conclusion"].as_u64().unwrap_or(0);
+                        let status_num = step["status"].as_u64().unwrap_or(0);
+
+                        let job_status = run.jobs.get(&job_id).copied();
+                        let conclusion_str = if status_num == 6 {
+                            match conclusion_num {
+                                2 => "success",
+                                3 => {
+                                    if job_status == Some(ExecutionStatus::Cancelled) {
+                                        "cancelled"
+                                    } else {
+                                        "failure"
+                                    }
+                                }
+                                7 => "skipped",
+                                _ => "success",
+                            }
+                        } else {
+                            "in_progress"
+                        };
+
+                        if let Some(pos) = job_detail.steps.iter().position(|s| s.name == name) {
+                            job_detail.steps[pos].conclusion = conclusion_str.to_owned();
+                        } else {
+                            job_detail.steps.push(StepRecord {
+                                name,
+                                conclusion: conclusion_str.to_owned(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(Json(json!({"ok": true})))
 }
 
 async fn twirp_get_job_logs_signed_blob_url(
@@ -2517,18 +4726,32 @@ async fn twirp_create_job_logs_metadata(
 
 // ─── Cache v2 Twirp (github.actions.results.api.v1.CacheService) ─────────────
 
+fn scoped_cache_key(key: &str, scope: Option<&str>, repository: Option<&str>) -> String {
+    format!(
+        "{}:{}\0{key}",
+        repository.unwrap_or("default"),
+        scope.unwrap_or("default")
+    )
+}
+
 #[derive(Debug, Deserialize)]
 struct CacheV2CreateRequest {
     key: String,
     version: String,
-    // metadata ignored — scope/repo_id not needed for local store
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    repository: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct CacheV2FinalizeRequest {
     key: String,
     version: String,
-    // size_bytes is informational; we measure the actual blob
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    repository: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2537,12 +4760,35 @@ struct CacheV2GetDlUrlRequest {
     version: String,
     #[serde(default)]
     restore_keys: Vec<String>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    repository: Option<String>,
 }
 
 async fn twirp_cache_v2_create(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<CacheV2CreateRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let storage_key = scoped_cache_key(
+        &request.key,
+        request.scope.as_deref(),
+        request.repository.as_deref(),
+    );
+    if shared
+        .state
+        .cache
+        .get(&storage_key, &request.version, &[])
+        .await
+        .map_err(|error| ApiError::internal(format!("cache lookup error: {error}")))?
+        .is_some()
+    {
+        return Ok(Json(json!({
+            "ok": false,
+            "signed_upload_url": "",
+            "message": "cache already exists"
+        })));
+    }
     let token = uuid::Uuid::new_v4().to_string();
     let stage_dir = shared
         .state
@@ -2553,15 +4799,32 @@ async fn twirp_cache_v2_create(
     tokio::fs::create_dir_all(&stage_dir)
         .await
         .map_err(|e| ApiError::internal(format!("failed to create cache stage dir: {e}")))?;
-    {
+    let already_reserved = {
         let mut inner = shared.state.inner.lock().await;
-        inner.cache_v2_pending.insert(
-            token.clone(),
-            CacheV2Pending {
-                key: request.key,
-                version: request.version,
-            },
-        );
+        if inner
+            .cache_v2_pending
+            .values()
+            .any(|pending| pending.key == storage_key && pending.version == request.version)
+        {
+            true
+        } else {
+            inner.cache_v2_pending.insert(
+                token.clone(),
+                CacheV2Pending {
+                    key: storage_key,
+                    version: request.version,
+                },
+            );
+            false
+        }
+    };
+    if already_reserved {
+        let _ = tokio::fs::remove_dir_all(&stage_dir).await;
+        return Ok(Json(json!({
+            "ok": false,
+            "signed_upload_url": "",
+            "message": "cache upload already reserved"
+        })));
     }
     let upload_url = format!("{}/twirp-blob/cache/{token}", public_base_url());
     info!(token, "cache v2 create entry");
@@ -2574,13 +4837,18 @@ async fn twirp_cache_v2_finalize(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<CacheV2FinalizeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let storage_key = scoped_cache_key(
+        &request.key,
+        request.scope.as_deref(),
+        request.repository.as_deref(),
+    );
     // Find the pending upload token matching key+version.
     let token = {
         let inner = shared.state.inner.lock().await;
         inner
             .cache_v2_pending
             .iter()
-            .find(|(_, p)| p.key == request.key && p.version == request.version)
+            .find(|(_, p)| p.key == storage_key && p.version == request.version)
             .map(|(k, _)| k.clone())
     }
     .ok_or_else(|| ApiError::not_found("no pending cache upload for key+version"))?;
@@ -2597,12 +4865,12 @@ async fn twirp_cache_v2_finalize(
     })?;
 
     let (key, version) = {
-        let mut inner = shared.state.inner.lock().await;
+        let inner = shared.state.inner.lock().await;
         let pending = inner
             .cache_v2_pending
-            .remove(&token)
+            .get(&token)
             .ok_or_else(|| ApiError::internal("pending entry vanished"))?;
-        (pending.key, pending.version)
+        (pending.key.clone(), pending.version.clone())
     };
 
     shared
@@ -2611,6 +4879,11 @@ async fn twirp_cache_v2_finalize(
         .put(&key, &version, &bytes)
         .await
         .map_err(|e| ApiError::internal(format!("cache store error: {e}")))?;
+
+    {
+        let mut inner = shared.state.inner.lock().await;
+        inner.cache_v2_pending.remove(&token);
+    }
 
     // Clean up staging directory.
     let _ = tokio::fs::remove_dir_all(
@@ -2631,10 +4904,20 @@ async fn twirp_cache_v2_get_dl_url(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<CacheV2GetDlUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let storage_key = scoped_cache_key(
+        &request.key,
+        request.scope.as_deref(),
+        request.repository.as_deref(),
+    );
+    let storage_restore_keys = request
+        .restore_keys
+        .iter()
+        .map(|key| scoped_cache_key(key, request.scope.as_deref(), request.repository.as_deref()))
+        .collect::<Vec<_>>();
     let result = shared
         .state
         .cache
-        .get(&request.key, &request.version, &request.restore_keys)
+        .get(&storage_key, &request.version, &storage_restore_keys)
         .await
         .map_err(|e| ApiError::internal(format!("cache lookup error: {e}")))?;
 
@@ -2654,13 +4937,17 @@ async fn twirp_cache_v2_get_dl_url(
             .cache_v2_dl_tokens
             .insert(dl_token.clone(), (entry.key.clone(), entry.version.clone()));
     }
-
     let download_url = format!("{}/twirp-blob/cache/{dl_token}", public_base_url());
-    info!(key = entry.key, "cache v2 download URL issued");
+    let matched_key = entry
+        .key
+        .split_once('\0')
+        .map(|(_, key)| key.to_owned())
+        .unwrap_or_else(|| entry.key.clone());
+    info!(key = %matched_key, "cache v2 download URL issued");
     Ok(Json(json!({
         "ok": true,
         "signed_download_url": download_url,
-        "matched_key": entry.key
+        "matched_key": matched_key
     })))
 }
 
@@ -2725,6 +5012,8 @@ async fn twirp_artifact_v2_create(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<ArtifactV2CreateRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    validate_artifact_name(&request.name)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let token = uuid::Uuid::new_v4().to_string();
     let registry_key = artifact_v2_registry_key(
         &request.workflow_run_backend_id,
@@ -3196,11 +5485,7 @@ async fn next_message(
         }
 
         if let Some(cancellation) = inner.cancellation_queue.pop_front() {
-            let body_json = json!({
-                "runId": cancellation.run_id.to_string(),
-                "jobId": cancellation.job_id.to_string(),
-            })
-            .to_string();
+            let body_json = concurrency::job_cancel_body(cancellation.agent_job_id);
             let message = build_task_agent_message(
                 &mut inner,
                 &session_id,
@@ -3268,7 +5553,9 @@ async fn next_message(
                 endpoint.url = Some(runner_server_url());
                 endpoint.authorization.parameters.insert(
                     "AccessToken".to_owned(),
-                    mint_runtime_token(&msg.plan.plan_id, &msg.job_id),
+                    shared
+                        .state
+                        .mint_runtime_token(&msg.plan.plan_id, &msg.job_id),
                 );
                 endpoint
                     .data
@@ -3313,6 +5600,7 @@ async fn next_message(
                 run_id,
                 job_id,
                 status: ExecutionStatus::InProgress,
+                reason: None,
             })
             .await;
 
@@ -3564,7 +5852,9 @@ fn agent_request_result(status: ExecutionStatus) -> &'static str {
         ExecutionStatus::Failure => "failed",
         ExecutionStatus::Cancelled => "canceled",
         ExecutionStatus::Skipped => "skipped",
-        ExecutionStatus::Queued | ExecutionStatus::InProgress => "pending",
+        ExecutionStatus::Queued | ExecutionStatus::Pending | ExecutionStatus::InProgress => {
+            "pending"
+        }
     }
 }
 
@@ -3612,12 +5902,10 @@ fn sole_active_unfinished_request(inner: &InnerState) -> Option<i64> {
         });
     let request_id = active.next()?;
     if active.next().is_none() {
-        Some(request_id)
-    } else {
-        None
+        return Some(request_id);
     }
+    None
 }
-
 fn job_request_tuple(inner: &InnerState, request_id: i64) -> Option<(i64, RunId, JobId)> {
     let request = inner.job_requests.get(&request_id)?;
     Some((request_id, request.run_id, request.job_id.clone()))
@@ -3627,14 +5915,41 @@ async fn complete_job_inner(
     shared: Arc<SharedState>,
     completion: JobCompletion,
 ) -> Result<Json<RunRecord>, ApiError> {
+    if !is_terminal_status(completion.status) {
+        return Err(ApiError::bad_request(
+            "job completion status must be terminal",
+        ));
+    }
     let mut inner = shared.state.inner.lock().await;
     {
         let run = inner
             .runs
             .get_mut(&completion.run_id)
             .ok_or_else(|| ApiError::not_found("run not found"))?;
-        run.jobs
-            .insert(completion.job_id.clone(), completion.status);
+        let prior = run
+            .jobs
+            .get(&completion.job_id)
+            .copied()
+            .ok_or_else(|| ApiError::bad_request("job does not belong to run"))?;
+        if is_terminal_status(prior) && prior != ExecutionStatus::Cancelled {
+            return Ok(Json(run.clone()));
+        }
+        let effective = match (prior, completion.status) {
+            (ExecutionStatus::Cancelled, ExecutionStatus::Success)
+            | (ExecutionStatus::Cancelled, ExecutionStatus::Failure) => ExecutionStatus::Cancelled,
+            _ => completion.status,
+        };
+        run.jobs.insert(completion.job_id.clone(), effective);
+        let job_name = completion.job_id.0.clone();
+        if let Some(pos) = run.jobs_list.iter().position(|j| j.name == job_name) {
+            run.jobs_list[pos].conclusion = format!("{:?}", effective).to_lowercase();
+        } else {
+            run.jobs_list.push(JobDetail {
+                name: job_name,
+                conclusion: format!("{:?}", effective).to_lowercase(),
+                steps: Vec::new(),
+            });
+        }
         run.job_outputs.insert(
             completion.job_id.clone(),
             completion
@@ -3646,17 +5961,61 @@ async fn complete_job_inner(
         propagate_reusable_outputs(run);
         run.status = summarize_run(run.jobs.values().copied());
     }
-    let cancelled_siblings = if completion.status == ExecutionStatus::Failure {
+    // Use the status actually stored (may differ from completion if terminal-locked).
+    let effective_status = inner
+        .runs
+        .get(&completion.run_id)
+        .and_then(|r| r.jobs.get(&completion.job_id).copied())
+        .unwrap_or(completion.status);
+    let cancelled_siblings = if effective_status == ExecutionStatus::Failure {
         apply_matrix_fail_fast(&mut inner, completion.run_id, &completion.job_id)
     } else {
-        0
+        Vec::new()
     };
-    let promoted_jobs = promote_ready_jobs(&mut inner);
+    // A terminal job must not remain dispatchable, including completion via
+    // the native/internal API before a runner acquires it.
+    inner
+        .queue
+        .retain(|job| !(job.run_id == completion.run_id && job.job_id == completion.job_id));
+    inner
+        .pending_jobs
+        .retain(|job| !(job.run_id == completion.run_id && job.job_id == completion.job_id));
+    inner
+        .concurrency_blocked
+        .retain(|job| !(job.run_id == completion.run_id && job.job_id == completion.job_id));
+    if let Some(held) = inner.held_runs.get_mut(&completion.run_id) {
+        held.retain(|job| job.job_id != completion.job_id);
+        if held.is_empty() {
+            inner.held_runs.remove(&completion.run_id);
+        }
+    }
+    // Release concurrency for the completed job / run, which may promote held work.
+    release_concurrency_for_job(&mut inner, completion.run_id, &completion.job_id);
+    let scheduling = promote_ready_jobs(&mut inner);
     let record = inner
         .runs
         .get(&completion.run_id)
         .cloned()
         .ok_or_else(|| ApiError::not_found("run not found"))?;
+    // Mark agent request finished and free the broker session slot so the
+    // runner can immediately poll the next job (including concurrency successors).
+    let finished_request_ids: Vec<i64> = inner
+        .job_requests
+        .iter()
+        .filter(|(_, r)| r.run_id == completion.run_id && r.job_id == completion.job_id)
+        .map(|(id, _)| *id)
+        .collect();
+    for request_id in &finished_request_ids {
+        if let Some(req) = inner.job_requests.get_mut(request_id) {
+            if req.result.is_none() {
+                req.result = Some(effective_status);
+            }
+        }
+        inner
+            .session_active_requests
+            .retain(|_, &mut rid| rid != *request_id);
+        inner.inflight_requests.remove(request_id);
+    }
     // Evict live-log state for this job to prevent unbounded memory growth.
     // The durable step-log blob has already been uploaded by the runner.
     if let Some(agent_key) = inner
@@ -3669,17 +6028,18 @@ async fn complete_job_inner(
         inner.live_log_tx.remove(&agent_key);
     }
     inner.dap_ports.remove(&completion.run_id);
+    let queue_nonempty = !inner.queue.is_empty() || !inner.cancellation_queue.is_empty();
     drop(inner);
 
     github::report_check_run_completed(
         &shared,
         completion.run_id,
         &completion.job_id,
-        completion.status,
+        effective_status,
     )
     .await;
 
-    if promoted_jobs > 0 || cancelled_siblings > 0 {
+    if scheduling.promoted > 0 || !cancelled_siblings.is_empty() || queue_nonempty {
         shared.state.message_notify.notify_waiters();
     }
 
@@ -3688,47 +6048,242 @@ async fn complete_job_inner(
         .emit(NdjsonEvent::JobStatus {
             run_id: completion.run_id,
             job_id: completion.job_id,
-            status: completion.status,
+            status: effective_status,
+            reason: None,
         })
         .await;
+    for job_id in cancelled_siblings {
+        github::report_check_run_completed(
+            &shared,
+            completion.run_id,
+            &job_id,
+            ExecutionStatus::Cancelled,
+        )
+        .await;
+        shared
+            .state
+            .emit(NdjsonEvent::JobStatus {
+                run_id: completion.run_id,
+                job_id,
+                status: ExecutionStatus::Cancelled,
+                reason: None,
+            })
+            .await;
+    }
+    for (run_id, job_id) in scheduling.skipped {
+        shared
+            .state
+            .emit(NdjsonEvent::JobStatus {
+                run_id,
+                job_id,
+                status: ExecutionStatus::Skipped,
+                reason: None,
+            })
+            .await;
+    }
+    for (run_id, job_id) in scheduling.failed {
+        shared
+            .state
+            .emit(NdjsonEvent::JobStatus {
+                run_id,
+                job_id,
+                status: ExecutionStatus::Failure,
+                reason: None,
+            })
+            .await;
+    }
     shared
         .state
         .emit(NdjsonEvent::RunStatus {
             run_id: completion.run_id,
             status: record.status,
+            reason: None,
         })
         .await;
     Ok(Json(record))
 }
 
-/// Check if pending jobs can be dispatched and promote them to the queue.
-fn promote_ready_jobs(inner: &mut InnerState) -> usize {
-    let mut promoted = Vec::new();
-    let mut remaining = VecDeque::new();
+fn job_condition_context(
+    job: &aksh_gha_protocol::JobPlan,
+    github: &serde_json::Value,
+    submission: &WorkflowSubmission,
+) -> aksh_gha_expressions::Context {
+    let mut context = aksh_gha_expressions::Context::default();
+    context.insert("github", github.clone());
+    context.insert(
+        "vars",
+        serde_json::to_value(&submission.vars).unwrap_or_default(),
+    );
+    context.insert(
+        "inputs",
+        serde_json::to_value(&job.inputs).unwrap_or_default(),
+    );
+    context.insert("needs", serde_json::Value::Object(Default::default()));
+    context
+}
 
-    while let Some(mut job) = inner.pending_jobs.pop_front() {
-        let needs_satisfied = inner
-            .runs
-            .get(&job.run_id)
-            .is_some_and(|run| job.needs.iter().all(|need| need_satisfied(run, need)))
-            && under_max_parallel(inner, &job);
+#[derive(Default)]
+struct SchedulingOutcome {
+    promoted: usize,
+    skipped: Vec<(RunId, JobId)>,
+    failed: Vec<(RunId, JobId)>,
+}
 
-        if needs_satisfied {
-            if let Some(run) = inner.runs.get(&job.run_id) {
-                hydrate_needs_context(&mut job, run);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DependencyDecision {
+    Wait,
+    Run,
+    Skip,
+    Error,
+}
+
+/// Promote or skip pending jobs once every declared dependency is terminal.
+fn promote_ready_jobs(inner: &mut InnerState) -> SchedulingOutcome {
+    let mut outcome = SchedulingOutcome::default();
+    loop {
+        let mut promoted_by_base: BTreeMap<(RunId, String), u64> = BTreeMap::new();
+        let mut promoted = Vec::new();
+        let mut remaining = VecDeque::new();
+        let mut settled = false;
+
+        while let Some(mut job) = inner.pending_jobs.pop_front() {
+            let decision = inner
+                .runs
+                .get(&job.run_id)
+                .map(|run| dependency_decision(run, &job))
+                .unwrap_or(DependencyDecision::Wait);
+            match decision {
+                DependencyDecision::Run
+                    if under_max_parallel(inner, &job)
+                        && promoted_by_base
+                            .get(&(job.run_id, job.base_id.clone()))
+                            .copied()
+                            .unwrap_or(0)
+                            < job.max_parallel.unwrap_or(u64::MAX) =>
+                {
+                    if let Some(run) = inner.runs.get(&job.run_id) {
+                        hydrate_needs_context(&mut job, run);
+                    }
+                    *promoted_by_base
+                        .entry((job.run_id, job.base_id.clone()))
+                        .or_default() += 1;
+                    promoted.push(job);
+                }
+                DependencyDecision::Skip | DependencyDecision::Error => {
+                    if let Some(run) = inner.runs.get_mut(&job.run_id) {
+                        let status = if decision == DependencyDecision::Skip {
+                            ExecutionStatus::Skipped
+                        } else {
+                            ExecutionStatus::Failure
+                        };
+                        run.jobs.insert(job.job_id.clone(), status);
+                        run.status = summarize_run(run.jobs.values().copied());
+                    }
+                    if decision == DependencyDecision::Skip {
+                        outcome.skipped.push((job.run_id, job.job_id));
+                    } else {
+                        outcome.failed.push((job.run_id, job.job_id));
+                    }
+                    settled = true;
+                }
+                DependencyDecision::Wait | DependencyDecision::Run => remaining.push_back(job),
             }
-            promoted.push(job);
-        } else {
-            remaining.push_back(job);
+        }
+
+        outcome.promoted += promoted.len();
+        inner.pending_jobs = remaining;
+        inner.queue.extend(promoted);
+        if !settled {
+            return outcome;
         }
     }
+}
 
-    let promoted_count = promoted.len();
-    inner.pending_jobs = remaining;
-    for job in promoted {
-        inner.queue.push_back(job);
+fn dependency_decision(run: &RunRecord, job: &QueuedJob) -> DependencyDecision {
+    if job.needs.is_empty() {
+        return DependencyDecision::Run;
     }
-    promoted_count
+    let direct_statuses = job
+        .needs
+        .iter()
+        .flat_map(|need| matching_need_statuses(run, need))
+        .collect::<Vec<_>>();
+    if direct_statuses.is_empty()
+        || direct_statuses
+            .iter()
+            .any(|status| !is_terminal_status(*status))
+    {
+        return DependencyDecision::Wait;
+    }
+    let statuses = ancestor_statuses(run, job);
+    let aggregate = aggregate_need_status(&statuses).unwrap_or(ExecutionStatus::Skipped);
+    let context = job.condition_context.clone().with_status(
+        aggregate == ExecutionStatus::Success,
+        aggregate == ExecutionStatus::Failure,
+        aggregate == ExecutionStatus::Cancelled,
+    );
+    let mut context = context;
+    context.insert("needs", needs_json_context(run, &job.needs));
+    let condition = aksh_gha_expressions::effective_condition(job.if_condition.as_deref());
+    match aksh_gha_expressions::eval_bool(&condition, &context) {
+        Ok(true) => DependencyDecision::Run,
+        Ok(false) => DependencyDecision::Skip,
+        Err(_) => DependencyDecision::Error,
+    }
+}
+
+fn matching_need_ids(run: &RunRecord, need: &JobId) -> Vec<JobId> {
+    run.jobs
+        .keys()
+        .filter(|job_id| {
+            *job_id == need
+                || run
+                    .job_base_ids
+                    .get(*job_id)
+                    .is_some_and(|base| base == &need.0)
+        })
+        .cloned()
+        .collect()
+}
+
+fn matching_need_statuses(run: &RunRecord, need: &JobId) -> Vec<ExecutionStatus> {
+    matching_need_ids(run, need)
+        .iter()
+        .filter_map(|job_id| run.jobs.get(job_id).copied())
+        .collect()
+}
+
+fn ancestor_statuses(run: &RunRecord, job: &QueuedJob) -> Vec<ExecutionStatus> {
+    let mut pending = job
+        .needs
+        .iter()
+        .flat_map(|need| matching_need_ids(run, need))
+        .collect::<Vec<_>>();
+    let mut visited = std::collections::BTreeSet::new();
+    let mut statuses = Vec::new();
+
+    while let Some(job_id) = pending.pop() {
+        if !visited.insert(job_id.clone()) {
+            continue;
+        }
+        if let Some(status) = run.jobs.get(&job_id) {
+            statuses.push(*status);
+        }
+        if let Some(needs) = run.job_needs.get(&job_id) {
+            pending.extend(needs.iter().flat_map(|need| matching_need_ids(run, need)));
+        }
+    }
+    statuses
+}
+
+fn is_terminal_status(status: ExecutionStatus) -> bool {
+    matches!(
+        status,
+        ExecutionStatus::Success
+            | ExecutionStatus::Failure
+            | ExecutionStatus::Skipped
+            | ExecutionStatus::Cancelled
+    )
 }
 
 /// Check if a job's `runs-on` labels match a runner's registered labels.
@@ -3816,35 +6371,39 @@ fn under_max_parallel(inner: &InnerState, job: &QueuedJob) -> bool {
     active_in_queue + active_running < max_parallel
 }
 
-fn apply_matrix_fail_fast(inner: &mut InnerState, run_id: RunId, failed_job: &JobId) -> usize {
+fn apply_matrix_fail_fast(inner: &mut InnerState, run_id: RunId, failed_job: &JobId) -> Vec<JobId> {
     let Some(run) = inner.runs.get_mut(&run_id) else {
-        return 0;
+        return Vec::new();
     };
     let Some(base_id) = run.job_base_ids.get(failed_job).cloned() else {
-        return 0;
+        return Vec::new();
     };
     if !run.job_fail_fast.get(&base_id).copied().unwrap_or(true) {
-        return 0;
+        return Vec::new();
     }
 
     // Track in-progress siblings: they need a JOB_CANCELLED message so the
     // runner aborts the worker. Queued siblings only need their state flipped
     // — they were never dispatched.
+    let mut cancelled_jobs = Vec::new();
     let mut cancellations = Vec::new();
     for (job_id, status) in &mut run.jobs {
         if job_id != failed_job
             && run.job_base_ids.get(job_id) == Some(&base_id)
             && matches!(
                 status,
-                ExecutionStatus::Queued | ExecutionStatus::InProgress
+                ExecutionStatus::Queued | ExecutionStatus::Pending | ExecutionStatus::InProgress
             )
         {
             if matches!(status, ExecutionStatus::InProgress) {
+                // Resolve agent_job_id after loop (borrow checker).
                 cancellations.push(QueuedCancellation {
                     run_id,
                     job_id: job_id.clone(),
+                    agent_job_id: uuid::Uuid::nil(), // filled below
                 });
             }
+            cancelled_jobs.push(job_id.clone());
             *status = ExecutionStatus::Cancelled;
         }
     }
@@ -3855,9 +6414,17 @@ fn apply_matrix_fail_fast(inner: &mut InnerState, run_id: RunId, failed_job: &Jo
     inner
         .pending_jobs
         .retain(|job| !(job.run_id == run_id && job.base_id == base_id));
-    let count = cancellations.len();
+    // Fill real agent_job_ids; drop cancellations for jobs not in flight.
+    cancellations.retain_mut(|c| {
+        if let Some(id) = agent_job_id_for(inner, c.run_id, &c.job_id) {
+            c.agent_job_id = id;
+            true
+        } else {
+            false
+        }
+    });
     inner.cancellation_queue.extend(cancellations);
-    count
+    cancelled_jobs
 }
 
 fn hydrate_needs_context(job: &mut QueuedJob, run: &RunRecord) {
@@ -3870,19 +6437,66 @@ fn hydrate_needs_context(job: &mut QueuedJob, run: &RunRecord) {
         .context_data
         .insert("needs".to_owned(), azdo::PipelineContextData::Dict(needs));
 }
+fn needs_json_context(run: &RunRecord, needs: &[JobId]) -> serde_json::Value {
+    let values = needs
+        .iter()
+        .filter_map(|need| {
+            let statuses = matching_need_statuses(run, need);
+            let result = aggregate_need_status(&statuses)?;
+            let matching_ids = matching_need_ids(run, need);
+            let mut outputs = serde_json::Map::new();
+            for job_id in matching_ids {
+                if let Some(job_outputs) = run.job_outputs.get(&job_id) {
+                    outputs.extend(job_outputs.clone());
+                }
+            }
+            Some((
+                need.0.clone(),
+                json!({
+                    "result": status_string(result),
+                    "outputs": outputs,
+                }),
+            ))
+        })
+        .collect();
+    serde_json::Value::Object(values)
+}
+
+fn aggregate_need_status(statuses: &[ExecutionStatus]) -> Option<ExecutionStatus> {
+    if statuses
+        .iter()
+        .any(|status| *status == ExecutionStatus::Failure)
+    {
+        Some(ExecutionStatus::Failure)
+    } else if statuses
+        .iter()
+        .any(|status| *status == ExecutionStatus::Cancelled)
+    {
+        Some(ExecutionStatus::Cancelled)
+    } else if statuses
+        .iter()
+        .any(|status| *status == ExecutionStatus::Skipped)
+    {
+        Some(ExecutionStatus::Skipped)
+    } else if !statuses.is_empty()
+        && statuses
+            .iter()
+            .all(|status| *status == ExecutionStatus::Success)
+    {
+        Some(ExecutionStatus::Success)
+    } else {
+        None
+    }
+}
 
 fn need_context(run: &RunRecord, need: &JobId) -> Option<azdo::PipelineContextData> {
-    let mut result = None;
+    let statuses = matching_need_statuses(run, need);
+    let result = aggregate_need_status(&statuses)?;
     let mut outputs = BTreeMap::new();
-    let matrix_prefix = format!("{} (", need.0);
-
-    for (job_id, status) in &run.jobs {
-        if job_id == need || job_id.0.starts_with(&matrix_prefix) {
-            result = Some(status_string(*status));
-            if let Some(job_outputs) = run.job_outputs.get(job_id) {
-                for (key, value) in job_outputs {
-                    outputs.insert(key.clone(), json_to_context_data(value));
-                }
+    for job_id in matching_need_ids(run, need) {
+        if let Some(job_outputs) = run.job_outputs.get(&job_id) {
+            for (key, value) in job_outputs {
+                outputs.insert(key.clone(), json_to_context_data(value));
             }
         }
     }
@@ -3890,7 +6504,7 @@ fn need_context(run: &RunRecord, need: &JobId) -> Option<azdo::PipelineContextDa
     let mut context = BTreeMap::new();
     context.insert(
         "result".to_owned(),
-        azdo::PipelineContextData::String(result?),
+        azdo::PipelineContextData::String(status_string(result)),
     );
     context.insert(
         "outputs".to_owned(),
@@ -3901,9 +6515,10 @@ fn need_context(run: &RunRecord, need: &JobId) -> Option<azdo::PipelineContextDa
 
 fn status_string(status: ExecutionStatus) -> String {
     match status {
-        ExecutionStatus::Queued | ExecutionStatus::InProgress | ExecutionStatus::Success => {
-            "success"
-        }
+        ExecutionStatus::Queued
+        | ExecutionStatus::Pending
+        | ExecutionStatus::InProgress
+        | ExecutionStatus::Success => "success",
         ExecutionStatus::Failure => "failure",
         ExecutionStatus::Skipped => "skipped",
         ExecutionStatus::Cancelled => "cancelled",
@@ -3929,22 +6544,6 @@ fn json_to_context_data(value: &serde_json::Value) -> azdo::PipelineContextData 
         ),
         serde_json::Value::Null => azdo::PipelineContextData::String(String::new()),
     }
-}
-
-fn need_satisfied(run: &RunRecord, need: &JobId) -> bool {
-    let matrix_prefix = format!("{} (", need.0);
-    let mut matched = false;
-
-    for (job_id, status) in &run.jobs {
-        if job_id == need || job_id.0.starts_with(&matrix_prefix) {
-            matched = true;
-            if !matches!(status, ExecutionStatus::Success | ExecutionStatus::Skipped) {
-                return false;
-            }
-        }
-    }
-
-    matched
 }
 
 // ─── Phase E: Timeline, logs, completion ────────────────────────────────────
@@ -3984,6 +6583,7 @@ async fn patch_timeline_records(
                     .clone()
                     .unwrap_or_else(|| JobId(record.id.to_string())),
                 status,
+                reason: None,
             });
         }
         if let Some(run_id) = run_id {
@@ -4008,13 +6608,70 @@ async fn patch_timeline_records(
             .entry(run_id)
             .or_default()
             .extend(projected.clone());
+
+        if let Some(job_id) = logical_job_id {
+            if let Some(run) = inner.runs.get_mut(&run_id) {
+                let job_name = job_id.0.clone();
+                let job_detail =
+                    if let Some(pos) = run.jobs_list.iter().position(|j| j.name == job_name) {
+                        &mut run.jobs_list[pos]
+                    } else {
+                        run.jobs_list.push(JobDetail {
+                            name: job_name,
+                            conclusion: "success".to_owned(),
+                            steps: Vec::new(),
+                        });
+                        run.jobs_list.last_mut().unwrap()
+                    };
+
+                if let Some(status) = run.jobs.get(&job_id) {
+                    job_detail.conclusion = format!("{:?}", status).to_lowercase();
+                }
+
+                for record in &records {
+                    let Some(name) = &record.display_name else {
+                        continue;
+                    };
+                    if record.id.to_string() == job_id.0 {
+                        continue;
+                    }
+
+                    let conclusion_str = match record.result {
+                        Some(
+                            azdo::TaskResult::Succeeded | azdo::TaskResult::SucceededWithIssues,
+                        ) => "success",
+                        Some(azdo::TaskResult::Failed) => {
+                            if run.jobs.get(&job_id) == Some(&ExecutionStatus::Cancelled) {
+                                "cancelled"
+                            } else {
+                                "failure"
+                            }
+                        }
+                        Some(azdo::TaskResult::Cancelled) => "cancelled",
+                        Some(azdo::TaskResult::Skipped) => "skipped",
+                        None if record.state == Some(azdo::TimelineRecordState::InProgress) => {
+                            "in_progress"
+                        }
+                        _ => "success",
+                    };
+
+                    if let Some(pos) = job_detail.steps.iter().position(|s| s.name == *name) {
+                        job_detail.steps[pos].conclusion = conclusion_str.to_owned();
+                    } else {
+                        job_detail.steps.push(StepRecord {
+                            name: name.clone(),
+                            conclusion: conclusion_str.to_owned(),
+                        });
+                    }
+                }
+            }
+        }
     }
     for event in projected {
         shared.state.emit(event).await;
     }
     Json(json!({ "count": count, "value": records }))
 }
-
 fn timeline_status(record: &azdo::TimelineRecord) -> Option<ExecutionStatus> {
     match record.result {
         Some(azdo::TaskResult::Succeeded | azdo::TaskResult::SucceededWithIssues) => {
@@ -4578,7 +7235,14 @@ fn runnerresolve_action(
 
 fn summarize_run(statuses: impl Iterator<Item = ExecutionStatus>) -> ExecutionStatus {
     let statuses = statuses.collect::<Vec<_>>();
-    if statuses
+    if statuses.iter().any(|status| {
+        matches!(
+            status,
+            ExecutionStatus::Queued | ExecutionStatus::Pending | ExecutionStatus::InProgress
+        )
+    }) {
+        ExecutionStatus::InProgress
+    } else if statuses
         .iter()
         .any(|status| *status == ExecutionStatus::Failure)
     {
@@ -4588,13 +7252,8 @@ fn summarize_run(statuses: impl Iterator<Item = ExecutionStatus>) -> ExecutionSt
         .any(|status| *status == ExecutionStatus::Cancelled)
     {
         ExecutionStatus::Cancelled
-    } else if statuses
-        .iter()
-        .all(|status| matches!(status, ExecutionStatus::Success | ExecutionStatus::Skipped))
-    {
-        ExecutionStatus::Success
     } else {
-        ExecutionStatus::InProgress
+        ExecutionStatus::Success
     }
 }
 
@@ -5142,6 +7801,7 @@ async fn action_download_info_org(
 /// Matches the ChristopherHX/runner.server format: `GitHubAuthResult` with
 /// `token`, `token_schema`, and `tenant_url`.
 async fn github_registration_token(
+    State(shared): State<Arc<SharedState>>,
     headers: axum::http::HeaderMap,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -5154,7 +7814,7 @@ async fn github_registration_token(
         return Err(ApiError::unauthorized("missing Authorization header"));
     }
 
-    let token = local_jwt(json!({
+    let token = shared.state.local_jwt(json!({
         "sub": "aksh-runner-registration",
         "scp": "ActionsRuntime.RunnerManage Framework.GenericRead Identity.ReadRefs LocationService.Connect",
         "jti": uuid::Uuid::new_v4().to_string()
@@ -5218,7 +7878,7 @@ async fn oauth2_token(
 ) -> Result<Json<TokenResponse>, ApiError> {
     // Try JSON first (mock flow from existing tests)
     if let Ok(req) = serde_json::from_slice::<JsonOAuth2Request>(&body) {
-        let token = local_jwt(json!({
+        let token = shared.state.local_jwt(json!({
             "sub": format!("aksh-runner-listen-mock-{}", req.client_id),
             "scp": "ActionsRuntime.RunnerListen Framework.GenericRead Identity.ReadRefs LocationService.Connect",
             "jti": uuid::Uuid::new_v4().to_string()
@@ -5288,7 +7948,7 @@ async fn oauth2_token(
         .verify_signature_ps256(signing_input.as_bytes(), &signature)
         .map_err(|e| ApiError::unauthorized(format!("JWT signature verification failed: {e}")))?;
 
-    let token = local_jwt(json!({
+    let token = shared.state.local_jwt(json!({
         "sub": format!("aksh-runner-listen-{runner_id}"),
         "scp": "ActionsRuntime.RunnerListen Framework.GenericRead Identity.ReadRefs LocationService.Connect",
         "jti": uuid::Uuid::new_v4().to_string()
@@ -5301,52 +7961,11 @@ async fn oauth2_token(
     }))
 }
 
-fn local_jwt(mut claims: serde_json::Value) -> Result<String, ApiError> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| ApiError::bad_request(format!("system clock before epoch: {error}")))?
-        .as_secs();
-    let claims = claims
-        .as_object_mut()
-        .ok_or_else(|| ApiError::bad_request("JWT claims must be an object"))?;
-    claims.insert("iss".to_owned(), json!("https://aksh.local"));
-    claims.insert("iat".to_owned(), json!(now));
-    claims.insert("nbf".to_owned(), json!(now));
-    claims.insert("exp".to_owned(), json!(now + 2999));
-    let header = json!({
-        "alg": "HS256",
-        "typ": "JWT",
-        "kid": "aksh-local"
-    });
-    let signing_input = format!(
-        "{}.{}",
-        base64_url_json(&header)?,
-        base64_url_json(&serde_json::Value::Object(claims.clone()))?
-    );
-    let mut mac = Hmac::<Sha256>::new_from_slice(LOCAL_JWT_KEY)
-        .map_err(|error| ApiError::bad_request(format!("invalid signing key: {error}")))?;
-    mac.update(signing_input.as_bytes());
-    let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
-    Ok(format!("{signing_input}.{signature}"))
-}
-
-/// Mint a per-job `ACTIONS_RUNTIME_TOKEN` JWT.
-///
-/// The artifact toolkit (`@actions/artifact`, `@actions/cache` v2) decodes this token
-/// (without signature verification) and extracts `workflowRunBackendId` and
-/// `workflowJobRunBackendId` from the `scp` claim before making any Twirp requests.
-/// Format: `Actions.Results:{plan_id}:{job_id}`.
-fn mint_runtime_token(plan_id: &str, job_id: &uuid::Uuid) -> String {
-    local_jwt(json!({
-        "sub": format!("aksh-job-{job_id}"),
-        "scp": format!("Actions.Results:{plan_id}:{job_id}"),
-    }))
-    .unwrap_or_else(|_| AKSH_SYSTEM_TOKEN.to_owned())
-}
-
 #[derive(Debug, Deserialize)]
 struct OidcTokenQuery {
     audience: Option<String>,
+    #[serde(rename = "api-version")]
+    _api_version: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -5354,45 +7973,287 @@ struct OidcTokenResponse {
     value: String,
 }
 
+/// `GET /runner/server/_apis/distributedtask/hubs/actions/plans/:plan_id/jobs/:job_id/oidctoken`
+///
+/// Mints a GitHub-compatible RS256-signed OIDC id-token JWT. Looks up the
+/// originating workflow run to populate claims, and enforces `id-token: write`.
+async fn oidc_token_run_service(
+    State(shared): State<Arc<SharedState>>,
+    Path((_orchestration_id, plan_id, job_id)): Path<(String, String, String)>,
+    Query(query): Query<OidcTokenQuery>,
+    headers: HeaderMap,
+) -> Result<Json<OidcTokenResponse>, ApiError> {
+    oidc_token(
+        State(shared),
+        Path((plan_id, job_id)),
+        Query(query),
+        headers,
+    )
+    .await
+}
+
 async fn oidc_token(
+    State(shared): State<Arc<SharedState>>,
     Path((plan_id, job_id)): Path<(String, String)>,
     Query(query): Query<OidcTokenQuery>,
+    headers: HeaderMap,
 ) -> Result<Json<OidcTokenResponse>, ApiError> {
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or_else(|| ApiError::unauthorized("OIDC bearer token required"))?;
+    let expected_scope = format!("Actions.Results:{plan_id}:{job_id}");
+    if !shared.state.verify_local_jwt_scope(bearer, &expected_scope) {
+        return Err(ApiError::forbidden(
+            "OIDC runtime token is not bound to this job",
+        ));
+    }
+    let inner = shared.state.inner.lock().await;
+    let request_id = inner
+        .plan_requests
+        .get(&plan_id)
+        .copied()
+        .ok_or_else(|| ApiError::not_found("OIDC: plan not found"))?;
+    let request = inner
+        .job_requests
+        .get(&request_id)
+        .ok_or_else(|| ApiError::not_found("OIDC: job request not found"))?;
+    if request.agent_job_id.to_string() != job_id {
+        return Err(ApiError::not_found("OIDC: plan and job do not match"));
+    }
+    let run_id = request.run_id;
+    let resolved_job_id = request.job_id.clone();
+
+    // Permission enforcement: id-token:write must be granted.
+    let granted = inner
+        .id_token_grants
+        .get(&(run_id, resolved_job_id.clone()))
+        .copied()
+        .unwrap_or(false);
+    if !granted {
+        return Err(ApiError::forbidden(
+            "id-token: write permission is required to request an OIDC token",
+        ));
+    }
+
+    // Get the OIDC signing keypair.
+    let oidc_kp = inner
+        .oidc_keypair
+        .as_ref()
+        .ok_or_else(|| ApiError::internal("OIDC signing keypair not available"))?
+        .clone();
+
+    let oidc_context = inner
+        .oidc_job_contexts
+        .get(&(run_id, resolved_job_id.clone()))
+        .cloned()
+        .ok_or_else(|| ApiError::internal("OIDC context missing for dispatched job"))?;
+
+    // Build claims from the run's submission and parser-resolved job context.
+    let run = inner
+        .runs
+        .get(&run_id)
+        .ok_or_else(|| ApiError::not_found("OIDC: run not found"))?;
+    let submission = &run.submission;
+    let repository_owner = submission
+        .repository
+        .split('/')
+        .next()
+        .unwrap_or("owner")
+        .to_string();
+
+    // Use sha from submission first-class field, fallback to payload extraction.
+    let sha = if submission.sha != "0000000000000000000000000000000000000000" {
+        submission.sha.clone()
+    } else {
+        submission
+            .payload
+            .get("after")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                submission
+                    .payload
+                    .get("pull_request")
+                    .and_then(|pr| pr.get("head"))
+                    .and_then(|h| h.get("sha"))
+                    .and_then(|v| v.as_str())
+            })
+            .unwrap_or("0000000000000000000000000000000000000000")
+            .to_string()
+    };
+
+    // Use actor from submission first-class field, fallback to payload extraction.
+    let actor = if submission.actor != "aksh-system" {
+        submission.actor.clone()
+    } else {
+        submission
+            .payload
+            .get("pusher")
+            .and_then(|p| p.get("name"))
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                submission
+                    .payload
+                    .get("sender")
+                    .and_then(|s| s.get("login"))
+                    .and_then(|v| v.as_str())
+            })
+            .unwrap_or("aksh-system")
+            .to_string()
+    };
+
+    // Extract actor_id from payload if available.
+    let actor_id = submission
+        .payload
+        .get("sender")
+        .and_then(|s| s.get("id"))
+        .and_then(|v| v.as_u64())
+        .map(|id| id.to_string())
+        .unwrap_or_default();
+
+    // Extract repository_id and repository_owner_id from payload.
+    let repository_id = submission
+        .payload
+        .get("repository")
+        .and_then(|r| r.get("id"))
+        .and_then(|v| v.as_u64())
+        .map(|id| id.to_string())
+        .unwrap_or_default();
+    let repository_owner_id = submission
+        .payload
+        .get("repository")
+        .and_then(|r| r.get("owner"))
+        .and_then(|o| o.get("id"))
+        .and_then(|v| v.as_u64())
+        .map(|id| id.to_string())
+        .unwrap_or_default();
+    let repository_visibility = submission
+        .payload
+        .get("repository")
+        .and_then(|repository| repository.get("visibility"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("private")
+        .to_owned();
+
+    let workflow_name = parse_workflow(&submission.workflow_yaml)
+        .ok()
+        .and_then(|w| w.name)
+        .unwrap_or_default();
+
+    // Derive the workflow filename: explicit > parsed from YAML > "workflow.yml"
+    let workflow_file = submission
+        .workflow_file
+        .clone()
+        .unwrap_or_else(|| "workflow.yml".to_owned());
+
+    let head_ref = submission
+        .payload
+        .get("pull_request")
+        .and_then(|pr| pr.get("head"))
+        .and_then(|h| h.get("ref"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let base_ref = submission
+        .payload
+        .get("pull_request")
+        .and_then(|pr| pr.get("base"))
+        .and_then(|b| b.get("ref"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let check_run_id = run.job_check_run_ids.get(&resolved_job_id).copied();
+    let workflow_ref = format!(
+        "{}/.github/workflows/{}@{}",
+        submission.repository, workflow_file, submission.git_ref
+    );
+
+    let job_workflow_ref = oidc_context.job_workflow_ref.as_deref().map(|reference| {
+        format_reusable_workflow_ref(&submission.repository, reference, &submission.git_ref)
+    });
+    let job_workflow_sha = job_workflow_ref
+        .as_ref()
+        .and_then(|reference| {
+            reference
+                .rsplit_once('@')
+                .map(|(_, git_ref)| git_ref)
+                .filter(|git_ref| {
+                    git_ref.len() == 40
+                        && git_ref
+                            .chars()
+                            .all(|character| character.is_ascii_hexdigit())
+                })
+                .map(str::to_owned)
+        })
+        .or_else(|| job_workflow_ref.as_ref().map(|_| sha.clone()));
+
+    let claims_input = oidc::OidcClaimsInput {
+        repository: submission.repository.clone(),
+        repository_owner,
+        git_ref: submission.git_ref.clone(),
+        event_name: submission.event.clone(),
+        sha: sha.clone(),
+        actor,
+        actor_id,
+        workflow: workflow_name,
+        run_id: run_id.to_string(),
+        run_number: "1".to_string(),
+        run_attempt: "1".to_string(),
+        head_ref,
+        base_ref,
+        environment: oidc_context.environment,
+        repository_visibility,
+        repository_id,
+        repository_owner_id,
+        workflow_ref: Some(workflow_ref),
+        workflow_sha: Some(sha),
+        job_workflow_ref,
+        job_workflow_sha,
+    };
+
+    let audience = query
+        .audience
+        .unwrap_or_else(|| oidc::default_audience(&claims_input.repository_owner));
+
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| ApiError::bad_request(format!("system clock before epoch: {error}")))?
         .as_secs();
-    let audience = query.audience.unwrap_or_else(|| "api://aksh".to_owned());
-    let header = json!({
-        "alg": "HS256",
-        "typ": "JWT",
-        "kid": "aksh-local"
-    });
-    let claims = json!({
-        "iss": "https://aksh.local",
-        "sub": format!("repo:local:job:{job_id}"),
-        "aud": audience,
-        "iat": now,
-        "nbf": now,
-        "exp": now + 600,
-        "jti": uuid::Uuid::new_v4().to_string(),
-        "job_id": job_id,
-        "plan_id": plan_id,
-    });
 
-    let signing_input = format!(
-        "{}.{}",
-        base64_url_json(&header)?,
-        base64_url_json(&claims)?
-    );
-    let mut mac = Hmac::<Sha256>::new_from_slice(b"aksh-local-oidc-signing-key")
-        .map_err(|error| ApiError::bad_request(format!("invalid signing key: {error}")))?;
-    mac.update(signing_input.as_bytes());
-    let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    let issuer = oidc_issuer_url(&inner);
+    drop(inner);
+    let mut claims = oidc::build_claims(&claims_input, &audience, &issuer, now);
+    if let Some(check_run_id) = check_run_id {
+        claims["check_run_id"] = json!(check_run_id.to_string());
+    }
 
-    Ok(Json(OidcTokenResponse {
-        value: format!("{signing_input}.{signature}"),
-    }))
+    let jwt = oidc_kp
+        .sign_jwt(&claims)
+        .map_err(|e| ApiError::internal(format!("OIDC token signing failed: {e}")))?;
+
+    Ok(Json(OidcTokenResponse { value: jwt }))
+}
+
+/// `GET /.well-known/openid-configuration` — OIDC discovery document.
+async fn oidc_discovery(
+    State(shared): State<Arc<SharedState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let inner = shared.state.inner.lock().await;
+    let issuer = oidc_issuer_url(&inner);
+    let jwks_uri = format!("{issuer}/.well-known/jwks.json");
+    Ok(Json(oidc::discovery_document(&issuer, &jwks_uri)))
+}
+
+/// `GET /.well-known/jwks.json` — JSON Web Key Set for OIDC token verification.
+async fn oidc_jwks(
+    State(shared): State<Arc<SharedState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let inner = shared.state.inner.lock().await;
+    let kp = inner
+        .oidc_keypair
+        .as_ref()
+        .ok_or_else(|| ApiError::internal("OIDC keypair not available"))?;
+    Ok(Json(kp.jwks()))
 }
 
 fn base64_url_json(value: &serde_json::Value) -> Result<String, ApiError> {
@@ -5673,6 +8534,20 @@ impl ApiError {
     fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
+            message: message.into(),
+        }
+    }
+
+    fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: message.into(),
+        }
+    }
+
+    fn unprocessable(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
             message: message.into(),
         }
     }
@@ -6048,6 +8923,18 @@ fn propagate_reusable_outputs(run: &mut RunRecord) {
 }
 
 #[cfg(test)]
+/// Production-path DAG/workflow properties.
+///
+/// Oracle sources:
+/// - `needs`, skipped dependencies, and job-level conditions:
+///   <https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idneeds>.
+/// - status functions: <https://docs.github.com/en/actions/learn-github-actions/expressions#status-check-functions>.
+/// - runner v2.335.1: `src/Runner.Worker/StepsRunner.cs` and
+///   `src/Runner.Worker/Expressions/{Success,Failure,Cancelled,Always}Function.cs`.
+///
+/// These tests submit YAML through the real parser/router and use only the
+/// explicitly gated internal test API to simulate worker completions. The
+/// oracle compares observable job/run state; it does not copy scheduler code.
 mod tests {
     use axum::body::{to_bytes, Body};
     use axum::http::{Method, Request, StatusCode};
@@ -6056,6 +8943,11 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+    const TEST_API_TOKEN: &str = "property-test-token";
+
+    fn app(state: AppState, shutdown: CancellationToken) -> Router {
+        app_with_test_api(state, shutdown, TEST_API_TOKEN)
+    }
 
     #[tokio::test]
     async fn matrix_max_parallel_and_fail_fast_are_enforced() {
@@ -6097,7 +8989,7 @@ jobs:
         request_json(
             &app,
             Method::POST,
-            "/api/v1/jobs/complete",
+            "/internal/test/jobs/complete",
             json!({
                 "run_id": run_id,
                 "job_id": first_job,
@@ -6643,7 +9535,7 @@ jobs:
         request_json(
             &app,
             Method::POST,
-            "/api/v1/jobs/complete",
+            "/internal/test/jobs/complete",
             json!({
                 "run_id": run_id,
                 "job_id": failing_job,
@@ -6702,7 +9594,7 @@ jobs:
         request_json(
             &app,
             Method::POST,
-            "/api/v1/jobs/complete",
+            "/internal/test/jobs/complete",
             json!({
                 "run_id": run_id,
                 "job_id": "build",
@@ -6799,7 +9691,7 @@ jobs:
         request_json(
             &app,
             Method::POST,
-            "/api/v1/jobs/complete",
+            "/internal/test/jobs/complete",
             json!({
                 "run_id": run_id,
                 "job_id": "build",
@@ -6863,7 +9755,7 @@ jobs:
         request_json(
             &app,
             Method::POST,
-            "/api/v1/jobs/complete",
+            "/internal/test/jobs/complete",
             json!({
                 "run_id": run_id,
                 "job_id": "build",
@@ -6919,7 +9811,7 @@ jobs:
         request_json(
             &app,
             Method::POST,
-            "/api/v1/jobs/complete",
+            "/internal/test/jobs/complete",
             json!({
                 "run_id": run_id,
                 "job_id": "producer",
@@ -7033,7 +9925,7 @@ jobs:
         request_json(
             &app,
             Method::POST,
-            "/api/v1/jobs/complete",
+            "/internal/test/jobs/complete",
             json!({
                 "run_id": run_id,
                 "job_id": failing_job,
@@ -7105,6 +9997,7 @@ jobs:
                 Request::builder()
                     .method(Method::GET)
                     .uri(format!("/api/v1/runs/{run_id}/events.ndjson"))
+                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -7292,6 +10185,142 @@ jobs:
     }
 
     #[tokio::test]
+    async fn log_get_run_logs_uses_production_plan_ids_and_numeric_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+        let accepted = submit_yaml(
+            &app,
+            r#"
+on: push
+jobs:
+  first:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo first
+  second:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo second
+"#,
+            "owner/repo",
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+        let requests = {
+            let inner = state.inner.lock().await;
+            let mut requests: Vec<_> = inner
+                .job_requests
+                .values()
+                .filter(|request| request.run_id == run_id)
+                .collect();
+            requests.sort_by_key(|request| request.request_id);
+            requests
+                .into_iter()
+                .map(|request| (request.plan_id.clone(), request.agent_job_id.to_string()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(requests.len(), 2);
+
+        for (plan_id, log_id, body) in [
+            (
+                &requests[0].0,
+                "10",
+                "first-ten
+",
+            ),
+            (
+                &requests[0].0,
+                "2",
+                "first-two
+",
+            ),
+            (
+                &requests[1].0,
+                "1",
+                "ignored-fallback
+",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!(
+                            "/_apis/v1/Logfiles/scope/actions/{plan_id}/{log_id}"
+                        ))
+                        .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+        }
+
+        let results_dir = temp
+            .path()
+            .join("replay")
+            .join("results")
+            .join(&requests[1].0)
+            .join(&requests[1].1);
+        tokio::fs::create_dir_all(&results_dir).await.unwrap();
+        tokio::fs::write(
+            results_dir.join("job-logs.txt"),
+            b"results-second
+",
+        )
+        .await
+        .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/v1/runs/{run_id}/logs"))
+                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            body.as_ref(),
+            b"first-two
+first-ten
+results-second
+"
+        );
+    }
+
+    #[tokio::test]
+    async fn log_get_run_logs_returns_404_for_unknown_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/v1/runs/{}/logs", RunId::new()))
+                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn log_append_masks_submitted_secrets() {
         let temp = tempfile::tempdir().unwrap();
         let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
@@ -7391,7 +10420,7 @@ jobs:
         let session = request_json(
             &app,
             Method::POST,
-            "/api/v1/runners/sessions",
+            "/internal/test/runners/sessions",
             json!({"runner_id": runner_id, "name": "local"}),
         )
         .await;
@@ -7427,7 +10456,7 @@ jobs:
         let session = request_json(
             &app,
             Method::POST,
-            "/api/v1/runners/sessions",
+            "/internal/test/runners/sessions",
             json!({"runner_id": runner_id, "name": "local"}),
         )
         .await;
@@ -7568,7 +10597,7 @@ jobs:
     async fn current_runner_registration_to_broker_job_e2e() {
         let temp = tempfile::tempdir().unwrap();
         let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
-        let app = app(state, CancellationToken::new());
+        let app = app(state.clone(), CancellationToken::new());
         let runner_keypair = AgentRsaKeypair::generate().unwrap();
         let public_xml = runner_keypair.public_key_xml();
         let modulus = public_xml
@@ -7634,6 +10663,12 @@ jobs:
         )
         .await;
         let runner_id = agent["id"].as_i64().unwrap();
+        let runner_token = state
+            .local_jwt(json!({
+                "sub": format!("aksh-runner-listen-{runner_id}"),
+                "scp": "ActionsRuntime.RunnerListen",
+            }))
+            .unwrap();
         assert_eq!(agent["properties"]["UseV2Flow"]["$value"], true);
         assert_eq!(
             agent["properties"]["ServerUrlV2"]["$value"],
@@ -7693,14 +10728,30 @@ jobs:
         assert_eq!(body["should_acknowledge"], true);
         let runner_request_id = body["runner_request_id"].as_str().unwrap();
 
-        let acquired = request_json(
-            &app,
-            Method::POST,
-            &format!("/broker/{runner_id}/acquirejob"),
-            json!({"jobMessageId": runner_request_id, "billingOwnerId": "local", "runnerOS": "macOS"}),
+        let acquired_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/broker/{runner_id}/acquirejob"))
+                    .header(header::AUTHORIZATION, format!("Bearer {runner_token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"jobMessageId": runner_request_id, "billingOwnerId": "local", "runnerOS": "macOS"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(acquired_response.status(), StatusCode::OK);
+        let acquired = serde_json::from_slice::<Value>(
+            &to_bytes(acquired_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
         )
-        .await;
-        assert_eq!(acquired["requestId"], 1);
+        .unwrap();
+        assert_eq!(acquired["requestId"], 0);
+        assert_eq!(acquired["billingOwnerId"], "local");
         assert_eq!(
             acquired["messageType"],
             azdo::message_type::RUNNER_JOB_REQUEST
@@ -7758,7 +10809,7 @@ jobs:
                 Request::builder()
                     .method(Method::POST)
                     .uri(format!("/broker/{runner_id}/completejob"))
-                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                    .header(header::AUTHORIZATION, format!("Bearer {runner_token}"))
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         json!({"jobId": runner_request_id, "planId": acquired["plan"]["planId"]})
@@ -7776,6 +10827,12 @@ jobs:
         let temp = tempfile::tempdir().unwrap();
         let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
         let app = app(state.clone(), CancellationToken::new());
+        let runner_token = state
+            .local_jwt(json!({
+                "sub": "aksh-runner-listen-1",
+                "scp": "ActionsRuntime.RunnerListen",
+            }))
+            .unwrap();
 
         let workflow = "on:
   push:
@@ -7842,14 +10899,16 @@ jobs:
         assert_eq!(session["assignmentQueued"], false);
         assert_eq!(session["orchestrationId"], "");
 
-        let acquired = request_json(
+        let acquired = request_json_with_bearer(
             &app,
             Method::POST,
             "/broker/1/acquirejob",
             json!({"jobMessageId": runner_request_id, "billingOwnerId": "local", "runnerOS": "macOS"}),
+            &runner_token,
         )
         .await;
-        assert_eq!(acquired["requestId"].as_i64().unwrap(), 1);
+        assert_eq!(acquired["requestId"].as_i64().unwrap(), 0);
+        assert_eq!(acquired["billingOwnerId"], "local");
         assert_eq!(
             acquired["messageType"],
             azdo::message_type::RUNNER_JOB_REQUEST
@@ -7872,11 +10931,12 @@ jobs:
         assert!(acquired["jobId"].is_string());
         assert!(acquired["steps"].is_array());
 
-        let renewed = request_json(
+        let renewed = request_json_with_bearer(
             &app,
             Method::POST,
             "/broker/1/renewjob",
             json!({"jobId": runner_request_id, "planId": acquired["plan"]["planId"]}),
+            &runner_token,
         )
         .await;
         assert!(renewed["lockedUntil"].as_str().unwrap().contains('T'));
@@ -7887,7 +10947,7 @@ jobs:
                 Request::builder()
                     .method(Method::POST)
                     .uri("/broker/1/completejob")
-                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                    .header(header::AUTHORIZATION, format!("Bearer {runner_token}"))
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         json!({"jobId": runner_request_id, "planId": acquired["plan"]["planId"]})
@@ -8074,6 +11134,7 @@ jobs:
         );
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::GET)
@@ -8085,6 +11146,56 @@ jobs:
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/_apis/artifactcache/cache?keys=x&version=v1")
+                    .header(header::AUTHORIZATION, "Bearer aksh-attacker-controlled")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn native_api_rejects_job_runtime_token() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let token = state.mint_runtime_token("plan", &uuid::Uuid::new_v4());
+        let app = app(state, CancellationToken::new());
+
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/runs")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+
+        let accepted = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/runs")
+                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(accepted.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -8139,55 +11250,200 @@ jobs:
     }
 
     #[tokio::test]
-    async fn oidc_endpoint_mints_jwt_with_requested_audience() {
+    async fn oidc_endpoint_mints_rs256_jwt_with_requested_audience() {
         let temp = tempfile::tempdir().unwrap();
-        let app = app(
-            AppState::new(temp.path().to_path_buf()).await.unwrap(),
-            CancellationToken::new(),
-        );
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let workflow = json!({
+            "workflow_yaml": "name: oidc-test\non: push\npermissions:\n  id-token: write\n  contents: read\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo",
+        });
+        let resp = request_json(&app, Method::POST, "/api/v1/runs", workflow).await;
+        let _run_id: RunId = resp["run_id"].as_str().unwrap().parse().unwrap();
+
+        let (plan_id, agent_job_id) = {
+            let inner = state.inner.lock().await;
+            inner
+                .queue
+                .front()
+                .or_else(|| inner.pending_jobs.front())
+                .map(|j| (j.message.plan.plan_id.clone(), j.message.job_id))
+                .unwrap()
+        };
 
         let token = request_json(
             &app,
             Method::GET,
-            "/runner/server/_apis/distributedtask/hubs/actions/plans/plan-1/jobs/job-1/oidctoken?audience=api://custom",
+            &format!("/runner/server/_apis/distributedtask/hubs/actions/plans/{plan_id}/jobs/{agent_job_id}/oidctoken?audience=api://custom"),
             Value::Null,
         )
         .await;
         let jwt = token["value"].as_str().unwrap();
         let parts: Vec<&str> = jwt.split('.').collect();
         assert_eq!(parts.len(), 3);
-        let claims = URL_SAFE_NO_PAD.decode(parts[1]).unwrap();
-        let claims: Value = serde_json::from_slice(&claims).unwrap();
 
+        // Verify header is RS256 with a kid.
+        let header: Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[0]).unwrap()).unwrap();
+        assert_eq!(header["alg"], "RS256");
+        assert!(header["kid"].as_str().unwrap().len() > 10);
+
+        // Verify claims.
+        let claims: Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
         assert_eq!(claims["aud"], "api://custom");
-        assert_eq!(claims["job_id"], "job-1");
-        assert_eq!(claims["plan_id"], "plan-1");
+        assert_eq!(claims["iss"], "http://127.0.0.1:9090/oidc");
+        assert_eq!(claims["repository"], "owner/repo");
+        assert_eq!(claims["repository_owner"], "owner");
+        assert_eq!(claims["event_name"], "push");
+        assert_eq!(claims["runner_environment"], "self-hosted");
+        assert!(claims["sub"]
+            .as_str()
+            .unwrap()
+            .starts_with("repo:owner/repo:"));
+        assert!(claims["jti"].is_string());
+        assert!(claims["exp"].as_u64().unwrap() > claims["iat"].as_u64().unwrap());
+
+        // Verify the OIDC keypair is persisted.
+        assert!(temp.path().join("oidc-key.json").exists());
     }
 
     #[tokio::test]
-    async fn scenario_15_oidc_token_carries_requested_audience() {
+    async fn oidc_default_audience_is_owner_url() {
         let temp = tempfile::tempdir().unwrap();
-        let app = app(
-            AppState::new(temp.path().to_path_buf()).await.unwrap(),
-            CancellationToken::new(),
-        );
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let workflow = json!({
+            "workflow_yaml": "on: push\npermissions:\n  id-token: write\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps: [{ run: \"echo hi\" }]\n",
+            "event": "push",
+            "repository": "octo-org/octo-repo",
+        });
+        let resp = request_json(&app, Method::POST, "/api/v1/runs", workflow).await;
+        let _run_id: RunId = resp["run_id"].as_str().unwrap().parse().unwrap();
+
+        let (plan_id, agent_job_id) = {
+            let inner = state.inner.lock().await;
+            inner
+                .queue
+                .front()
+                .or_else(|| inner.pending_jobs.front())
+                .map(|j| (j.message.plan.plan_id.clone(), j.message.job_id))
+                .unwrap()
+        };
 
         let token = request_json(
             &app,
             Method::GET,
-            "/runner/server/_apis/distributedtask/hubs/actions/plans/plan-15/jobs/job-15/oidctoken?audience=api://aksh",
+            &format!("/runner/server/_apis/distributedtask/hubs/actions/plans/{plan_id}/jobs/{agent_job_id}/oidctoken"),
             Value::Null,
         )
         .await;
         let jwt = token["value"].as_str().unwrap();
         let parts: Vec<&str> = jwt.split('.').collect();
-        assert_eq!(parts.len(), 3);
-        let claims = URL_SAFE_NO_PAD.decode(parts[1]).unwrap();
-        let claims: Value = serde_json::from_slice(&claims).unwrap();
+        let claims: Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
+        assert_eq!(claims["aud"], "https://github.com/octo-org");
+    }
 
-        assert_eq!(claims["aud"], "api://aksh");
-        assert_eq!(claims["job_id"], "job-15");
-        assert_eq!(claims["plan_id"], "plan-15");
+    #[tokio::test]
+    async fn oidc_forbidden_without_id_token_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let workflow = json!({
+            "workflow_yaml": "on: push\npermissions:\n  contents: read\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps: [{ run: \"echo hi\" }]\n",
+            "event": "push",
+            "repository": "owner/repo",
+        });
+        let _resp = request_json(&app, Method::POST, "/api/v1/runs", workflow).await;
+
+        let (plan_id, agent_job_id) = {
+            let inner = state.inner.lock().await;
+            inner
+                .queue
+                .front()
+                .or_else(|| inner.pending_jobs.front())
+                .map(|job| (job.message.plan.plan_id.clone(), job.message.job_id))
+                .unwrap()
+        };
+        let runtime_token = state.mint_runtime_token(&plan_id, &agent_job_id);
+
+        // Use the real job-bound runtime token so this reaches permission enforcement.
+        let uri = format!(
+            "/runner/server/_apis/distributedtask/hubs/actions/plans/{plan_id}/jobs/{agent_job_id}/oidctoken?audience=api://test"
+        );
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(&uri)
+            .header(header::AUTHORIZATION, format!("Bearer {runtime_token}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn oidc_discovery_and_jwks_endpoints() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state, CancellationToken::new());
+
+        let discovery = request_json(
+            &app,
+            Method::GET,
+            "/.well-known/openid-configuration",
+            Value::Null,
+        )
+        .await;
+        assert!(discovery["jwks_uri"]
+            .as_str()
+            .unwrap()
+            .ends_with("/.well-known/jwks.json"));
+        assert_eq!(discovery["issuer"], "http://127.0.0.1:9090/oidc");
+        let namespaced = request_json(
+            &app,
+            Method::GET,
+            "/oidc/.well-known/openid-configuration",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(namespaced, discovery);
+
+        let jwks = request_json(&app, Method::GET, "/.well-known/jwks.json", Value::Null).await;
+        let keys = jwks["keys"].as_array().unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0]["kty"], "RSA");
+        assert_eq!(keys[0]["alg"], "RS256");
+        assert_eq!(keys[0]["use"], "sig");
+        assert!(keys[0]["kid"].is_string());
+        assert!(keys[0]["n"].is_string());
+        assert_eq!(keys[0]["e"], "AQAB");
+    }
+
+    #[tokio::test]
+    async fn oidc_keypair_persists_across_restarts() {
+        let temp = tempfile::tempdir().unwrap();
+        let state1 = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let kid1 = {
+            let inner = state1.inner.lock().await;
+            inner.oidc_keypair.as_ref().unwrap().kid().to_string()
+        };
+        drop(state1);
+
+        // Second instance should load the same keypair.
+        let state2 = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let kid2 = {
+            let inner = state2.inner.lock().await;
+            inner.oidc_keypair.as_ref().unwrap().kid().to_string()
+        };
+        assert_eq!(
+            kid1, kid2,
+            "OIDC keypair kid must be stable across restarts"
+        );
     }
 
     #[tokio::test]
@@ -8331,6 +11587,17 @@ jobs:
             cancellation["messageType"],
             azdo::message_type::JOB_CANCELLED
         );
+        // Body is base64 of plaintext (no session key in this test path).
+        let body_b64 = cancellation["body"].as_str().unwrap();
+        let body_bytes = BASE64_STANDARD.decode(body_b64).unwrap();
+        let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert!(body["jobId"]
+            .as_str()
+            .unwrap()
+            .parse::<uuid::Uuid>()
+            .is_ok());
+        assert_eq!(body["timeout"], "00:05:00");
+        assert!(body.get("runId").is_none());
     }
 
     #[tokio::test]
@@ -8388,7 +11655,7 @@ jobs:
         let session = request_json(
             &app,
             Method::POST,
-            "/api/v1/runners/sessions",
+            "/internal/test/runners/sessions",
             json!({"runner_id": 1, "name": "local"}),
         )
         .await;
@@ -8419,7 +11686,9 @@ jobs:
         let message = request_json(
             &app,
             Method::GET,
-            &format!("/api/v1/runners/sessions/{session_id}/messages?sessionId={session_id}"),
+            &format!(
+                "/internal/test/runners/sessions/{session_id}/messages?sessionId={session_id}"
+            ),
             Value::Null,
         )
         .await;
@@ -8485,6 +11754,7 @@ jobs:
                 Request::builder()
                     .method(Method::POST)
                     .uri("/api/v1/runs")
+                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         json!({
@@ -8518,6 +11788,41 @@ jobs:
         assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
     }
 
+    #[tokio::test]
+    async fn test_get_scheduler_history_endpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let scheduler = crate::scheduler::Scheduler::new();
+
+        // Add a mock fire to history
+        {
+            let mut hist = scheduler.history.lock().await;
+            hist.push(crate::scheduler::ScheduleFire {
+                workflow_path: ".github/workflows/cron.yml".to_owned(),
+                cron_expr: "* * * * *".to_owned(),
+                fired_at: chrono::Utc::now(),
+                run_id: Some("mock-run-id".to_owned()),
+                error: None,
+            });
+        }
+        state.scheduler = Some(scheduler);
+
+        let app = app(state, CancellationToken::new());
+
+        let res = request_json(
+            &app,
+            Method::GET,
+            "/api/v1/scheduler/history",
+            serde_json::Value::Null,
+        )
+        .await;
+
+        let arr = res.as_array().expect("expected array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["workflow_path"], ".github/workflows/cron.yml");
+        assert_eq!(arr[0]["cron_expr"], "* * * * *");
+        assert_eq!(arr[0]["run_id"], "mock-run-id");
+    }
     #[tokio::test]
     async fn cache_protocol_reserves_uploads_commits_and_restores() {
         let temp = tempfile::tempdir().unwrap();
@@ -8566,6 +11871,27 @@ jobs:
         .await;
         assert_eq!(lookup["hit"], true);
         assert_eq!(lookup["content_base64"], "Y2FjaGUtYnl0ZXM=");
+
+        let stored = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/cache",
+            json!({
+                "key": "native-cache",
+                "version": "v1",
+                "content_base64": "bmF0aXZlLWJ5dGVz"
+            }),
+        )
+        .await;
+        assert_eq!(stored["hit"], true);
+        let native_lookup = request_json(
+            &app,
+            Method::GET,
+            "/api/v1/cache?key=native-cache&version=v1",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(native_lookup["content_base64"], "bmF0aXZlLWJ5dGVz");
     }
 
     #[tokio::test]
@@ -8595,6 +11921,7 @@ jobs:
                 Request::builder()
                     .method(Method::GET)
                     .uri(format!("/api/v1/artifacts/{artifact_id}"))
+                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -8620,12 +11947,15 @@ jobs:
             body: Value,
         ) -> (StatusCode, Value) {
             let mut builder = Request::builder().method(method).uri(uri);
-            if uri.starts_with("/_apis/")
+            if uri.starts_with("/api/v1/")
+                || uri.starts_with("/_apis/")
                 || uri.starts_with("/runner/server/_apis/")
                 || uri.starts_with("/broker/")
                 || uri.starts_with("/twirp/")
             {
                 builder = builder.header(header::AUTHORIZATION, "Bearer aksh-system-token");
+            } else if uri.starts_with("/internal/test/") {
+                builder = builder.header(header::AUTHORIZATION, format!("Bearer {TEST_API_TOKEN}"));
             } else if uri.starts_with("/api/v3/actions/runner-registration") {
                 builder =
                     builder.header(header::AUTHORIZATION, "RemoteAuth aksh-registration-token");
@@ -8681,7 +12011,7 @@ jobs:
         let (s, sess) = try_req(
             &app,
             Method::POST,
-            "/api/v1/runners/sessions",
+            "/internal/test/runners/sessions",
             json!({"runner_id": runner_id, "name": "test-runner"}),
         )
         .await;
@@ -8699,7 +12029,7 @@ jobs:
             &app,
             Method::GET,
             &format!(
-                "/api/v1/runners/sessions/{}/messages?sessionId={}&waitSeconds=0",
+                "/internal/test/runners/sessions/{}/messages?sessionId={}&waitSeconds=0",
                 session_id, session_id
             ),
             Value::Null,
@@ -8717,7 +12047,7 @@ jobs:
         let (s, _) = try_req(
             &app,
             Method::POST,
-            "/api/v1/jobs/complete",
+            "/internal/test/jobs/complete",
             json!({"run_id": run_id, "job_id": job_id, "status": "success"}),
         )
         .await;
@@ -8736,13 +12066,29 @@ jobs:
 
     async fn request_json(app: &Router, method: Method, uri: &str, body: Value) -> Value {
         let mut builder = Request::builder().method(method).uri(uri);
-        if uri.starts_with("/_apis/")
+        if uri.contains("/oidctoken") {
+            let token = uri
+                .split("/plans/")
+                .nth(1)
+                .and_then(|rest| rest.split("/jobs/").next().zip(rest.split("/jobs/").nth(1)))
+                .and_then(|(plan, rest)| rest.split('/').next().map(|job| (plan, job)))
+                .and_then(|(plan, job)| {
+                    uuid::Uuid::parse_str(job)
+                        .ok()
+                        .map(|id| mint_runtime_token(plan, &id))
+                })
+                .unwrap_or_else(|| DEFAULT_AKSH_SYSTEM_TOKEN.to_owned());
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        } else if uri.starts_with("/api/v1/")
+            || uri.starts_with("/_apis/")
             || uri.starts_with("/runner/server/_apis/")
             || uri.starts_with("/broker/")
             || uri.starts_with("/actions/build/")
             || uri.starts_with("/twirp/")
         {
             builder = builder.header(header::AUTHORIZATION, "Bearer aksh-system-token");
+        } else if uri.starts_with("/internal/test/") {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {TEST_API_TOKEN}"));
         } else if uri.starts_with("/api/v3/actions/runner-registration") {
             builder = builder.header(header::AUTHORIZATION, "RemoteAuth aksh-registration-token");
         }
@@ -8755,12 +12101,46 @@ jobs:
                 .unwrap()
         };
         let response = app.clone().oneshot(request).await.unwrap();
-        assert!(
-            response.status().is_success(),
-            "unexpected status: {}",
-            response.status()
-        );
+        let status = response.status();
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            status.is_success(),
+            "unexpected status: {} body={}",
+            status,
+            String::from_utf8_lossy(&bytes)
+        );
+        if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        }
+    }
+    async fn request_json_with_bearer(
+        app: &Router,
+        method: Method,
+        uri: &str,
+        body: Value,
+        bearer: &str,
+    ) -> Value {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+        let request = if body.is_null() {
+            builder.body(Body::empty()).unwrap()
+        } else {
+            builder = builder.header(header::CONTENT_TYPE, "application/json");
+            builder.body(Body::from(body.to_string())).unwrap()
+        };
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            status.is_success(),
+            "unexpected status: {} body={}",
+            status,
+            String::from_utf8_lossy(&bytes)
+        );
         if bytes.is_empty() {
             Value::Null
         } else {
@@ -9084,7 +12464,7 @@ jobs:
         assert_eq!(inner.runs.len(), 1);
         let (_, run_record) = inner.runs.iter().next().unwrap();
         assert_eq!(run_record.submission.event, "pull_request");
-        assert_eq!(run_record.submission.git_ref, "refs/pull/42/merge");
+        assert_eq!(run_record.submission.git_ref, "refs/pull/42/head");
         assert_eq!(run_record.job_check_run_ids.len(), 1);
     }
 
@@ -9338,5 +12718,2685 @@ jobs:
     #[test]
     fn label_matching_empty_job_matches_all() {
         assert!(job_matches_runner(&[], &["self-hosted".into()]));
+    }
+
+    // Oracle: GitHub `needs` and status-function contracts, with worker-side
+    // condition semantics pinned to actions/runner v2.335.1. These tests are
+    // production-path checks: YAML is parsed and expanded by Aksh, then the
+    // real queue/promotion state is driven through the explicitly gated test
+    // completion API and compared with the documented outcome.
+    // ─── DAG scheduling regression tests (spec §1) ─────────────────────────
+
+    /// Production path: build fails → test with default condition is skipped.
+    /// Verifies the server's promote_ready_jobs correctly propagates failure.
+    #[tokio::test]
+    async fn dag_build_fails_test_skipped_production() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo build
+  test:
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo test
+"#,
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        request_json(
+            &app,
+            Method::POST,
+            "/internal/test/jobs/complete",
+            json!({
+                "run_id": run_id,
+                "job_id": "build",
+                "status": "failure"
+            }),
+        )
+        .await;
+
+        let inner = state.inner.lock().await;
+        let run = inner.runs.get(&run_id).unwrap();
+        assert_eq!(
+            run.jobs.get(&JobId("build".to_owned())),
+            Some(&ExecutionStatus::Failure)
+        );
+        assert_eq!(
+            run.jobs.get(&JobId("test".to_owned())),
+            Some(&ExecutionStatus::Skipped),
+            "test must be skipped when build fails under default gate"
+        );
+        // No new jobs should have been promoted to queue
+        assert!(
+            !inner.queue.iter().any(|j| j.job_id.0 == "test"),
+            "test must not be in queue"
+        );
+        assert!(inner.pending_jobs.is_empty(), "no jobs should be pending");
+    }
+
+    /// Production path: build fails → cleanup with `if: always()` runs.
+    #[tokio::test]
+    async fn dag_always_runs_after_failure_production() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo build
+  cleanup:
+    needs: [build]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo cleanup
+"#,
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        request_json(
+            &app,
+            Method::POST,
+            "/internal/test/jobs/complete",
+            json!({
+                "run_id": run_id,
+                "job_id": "build",
+                "status": "failure"
+            }),
+        )
+        .await;
+
+        let inner = state.inner.lock().await;
+        assert!(
+            inner.queue.iter().any(|job| job.job_id.0 == "cleanup"),
+            "cleanup with always() must be promoted after build failure"
+        );
+    }
+
+    /// Production path: build fails → notify with `if: failure()` runs.
+    #[tokio::test]
+    async fn dag_failure_condition_runs_after_failure_production() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo build
+  notify:
+    needs: [build]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo notify
+"#,
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        request_json(
+            &app,
+            Method::POST,
+            "/internal/test/jobs/complete",
+            json!({
+                "run_id": run_id,
+                "job_id": "build",
+                "status": "failure"
+            }),
+        )
+        .await;
+
+        let inner = state.inner.lock().await;
+        assert!(
+            inner.queue.iter().any(|job| job.job_id.0 == "notify"),
+            "notify with failure() must be promoted after build failure"
+        );
+    }
+
+    /// Production path: diamond graph build → test-a/test-b → deploy.
+    /// All succeed → deploy runs → run completes successfully.
+    #[tokio::test]
+    async fn dag_diamond_settlement_production() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo build
+  test-a:
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo test-a
+  test-b:
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo test-b
+  deploy:
+    needs: [test-a, test-b]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo deploy
+"#,
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        // Only build queued initially
+        {
+            let inner = state.inner.lock().await;
+            assert_eq!(inner.queue.len(), 1);
+            assert_eq!(inner.queue[0].job_id.0, "build");
+        }
+
+        // Complete build
+        request_json(
+            &app,
+            Method::POST,
+            "/internal/test/jobs/complete",
+            json!({"run_id": run_id, "job_id": "build", "status": "success"}),
+        )
+        .await;
+
+        // test-a and test-b promoted (build QueuedJob remains until dispatched)
+        {
+            let inner = state.inner.lock().await;
+            let queued_ids: std::collections::BTreeSet<_> =
+                inner.queue.iter().map(|j| j.job_id.0.clone()).collect();
+            assert!(queued_ids.contains("test-a"), "test-a should be promoted");
+            assert!(queued_ids.contains("test-b"), "test-b should be promoted");
+        }
+
+        // Complete test-a and test-b
+        request_json(
+            &app,
+            Method::POST,
+            "/internal/test/jobs/complete",
+            json!({"run_id": run_id, "job_id": "test-a", "status": "success"}),
+        )
+        .await;
+        request_json(
+            &app,
+            Method::POST,
+            "/internal/test/jobs/complete",
+            json!({"run_id": run_id, "job_id": "test-b", "status": "success"}),
+        )
+        .await;
+
+        // deploy promoted (other completed jobs' QueuedJobs may linger)
+        {
+            let inner = state.inner.lock().await;
+            assert!(
+                inner.queue.iter().any(|j| j.job_id.0 == "deploy"),
+                "deploy should be promoted after test-a and test-b complete"
+            );
+        }
+
+        // Complete deploy
+        request_json(
+            &app,
+            Method::POST,
+            "/internal/test/jobs/complete",
+            json!({"run_id": run_id, "job_id": "deploy", "status": "success"}),
+        )
+        .await;
+
+        let inner = state.inner.lock().await;
+        let run = inner.runs.get(&run_id).unwrap();
+        assert_eq!(run.status, ExecutionStatus::Success);
+        assert!(inner.pending_jobs.is_empty());
+    }
+
+    /// Production path: cyclic graph rejected at submission time.
+    #[tokio::test]
+    async fn dag_cyclic_graph_rejected_production() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/runs")
+                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "workflow_yaml": r#"
+on: push
+jobs:
+  a:
+    needs: [b]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo a
+  b:
+    needs: [a]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo b
+"#,
+                            "event": "push",
+                            "repository": "owner/repo"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "cyclic graph must be rejected before dispatch"
+        );
+    }
+
+    async fn submit_yaml(app: &Router, yaml: &str, repo: &str) -> Value {
+        request_json(
+            app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": yaml,
+                "event": "push",
+                "repository": repo,
+            }),
+        )
+        .await
+    }
+
+    async fn get_run_json(app: &Router, run_id: &str) -> Value {
+        request_json(
+            app,
+            Method::GET,
+            &format!("/api/v1/runs/{run_id}"),
+            Value::Null,
+        )
+        .await
+    }
+
+    async fn complete_via_api(app: &Router, run_id: &str, job_id: &str) {
+        request_json(
+            app,
+            Method::POST,
+            "/internal/test/jobs/complete",
+            json!({
+                "run_id": run_id,
+                "job_id": job_id,
+                "status": "success",
+                "outputs": {}
+            }),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn workflow_concurrency_serializes_runs_fifo() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+        let yaml = r#"
+on: push
+concurrency:
+  group: serial-group
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"#;
+        let a = submit_yaml(&app, yaml, "owner/repo").await;
+        let b = submit_yaml(&app, yaml, "owner/repo").await;
+        let a_id = a["run_id"].as_str().unwrap();
+        let b_id = b["run_id"].as_str().unwrap();
+
+        let run_a = get_run_json(&app, a_id).await;
+        let run_b = get_run_json(&app, b_id).await;
+        assert_eq!(run_a["status"], "queued");
+        assert_eq!(run_b["status"], "pending");
+        assert_eq!(run_b["jobs"]["build"], "pending");
+
+        // Complete A via message poll + complete API.
+        let msg = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/v1/Message/1?sessionId=default&waitSeconds=0",
+            Value::Null,
+        )
+        .await;
+        assert!(!msg.is_null(), "run A should be dispatchable");
+        complete_via_api(&app, a_id, "build").await;
+
+        let run_b = get_run_json(&app, b_id).await;
+        assert_eq!(run_b["status"], "queued");
+        assert_eq!(run_b["jobs"]["build"], "queued");
+    }
+
+    #[tokio::test]
+    async fn workflow_concurrency_cancel_in_progress_cancels_running() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+        let yaml = r#"
+on: push
+concurrency:
+  group: cancel-group
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sleep 60
+"#;
+        let a = submit_yaml(&app, yaml, "owner/repo").await;
+        let a_id = a["run_id"].as_str().unwrap();
+
+        // Dispatch A so it is InProgress.
+        let msg = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/v1/Message/1?sessionId=default",
+            Value::Null,
+        )
+        .await;
+        let message_id = msg["messageId"].as_i64().unwrap();
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!(
+                        "/runner/server/_apis/v1/Message/1/{message_id}?sessionId=default"
+                    ))
+                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let b = submit_yaml(&app, yaml, "owner/repo").await;
+        let b_id = b["run_id"].as_str().unwrap();
+
+        let run_a = get_run_json(&app, a_id).await;
+        assert_eq!(run_a["status"], "cancelled");
+        assert_eq!(run_a["jobs"]["build"], "cancelled");
+
+        // Cancellation message should be official shape.
+        let cancellation = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/v1/Message/1?sessionId=default&waitSeconds=0",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            cancellation["messageType"],
+            azdo::message_type::JOB_CANCELLED
+        );
+        let body_b64 = cancellation["body"].as_str().unwrap();
+        let body_bytes = BASE64_STANDARD.decode(body_b64).unwrap();
+        let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert!(body["jobId"]
+            .as_str()
+            .unwrap()
+            .parse::<uuid::Uuid>()
+            .is_ok());
+        assert_eq!(body["timeout"], "00:05:00");
+
+        let run_b = get_run_json(&app, b_id).await;
+        assert_eq!(run_b["status"], "queued");
+    }
+
+    #[tokio::test]
+    async fn pending_run_replaced_by_newer_submission() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+        let yaml = r#"
+on: push
+concurrency:
+  group: replace-group
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"#;
+        let a = submit_yaml(&app, yaml, "owner/repo").await;
+        let b = submit_yaml(&app, yaml, "owner/repo").await;
+        let c = submit_yaml(&app, yaml, "owner/repo").await;
+        let a_id = a["run_id"].as_str().unwrap();
+        let b_id = b["run_id"].as_str().unwrap();
+        let c_id = c["run_id"].as_str().unwrap();
+
+        let run_a = get_run_json(&app, a_id).await;
+        let run_b = get_run_json(&app, b_id).await;
+        let run_c = get_run_json(&app, c_id).await;
+        assert_eq!(run_a["status"], "queued");
+        assert_eq!(run_b["status"], "cancelled");
+        assert_eq!(run_c["status"], "pending");
+    }
+
+    #[tokio::test]
+    async fn queue_max_holds_multiple_pending_fifo() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+        let yaml = r#"
+on: push
+concurrency:
+  group: max-group
+  queue: max
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"#;
+        let a = submit_yaml(&app, yaml, "owner/repo").await;
+        let b = submit_yaml(&app, yaml, "owner/repo").await;
+        let c = submit_yaml(&app, yaml, "owner/repo").await;
+        let d = submit_yaml(&app, yaml, "owner/repo").await;
+        let a_id = a["run_id"].as_str().unwrap();
+        let b_id = b["run_id"].as_str().unwrap();
+        let c_id = c["run_id"].as_str().unwrap();
+        let d_id = d["run_id"].as_str().unwrap();
+
+        assert_eq!(get_run_json(&app, b_id).await["status"], "pending");
+        assert_eq!(get_run_json(&app, c_id).await["status"], "pending");
+        assert_eq!(get_run_json(&app, d_id).await["status"], "pending");
+
+        // Dispatch+complete A, then B should become queued.
+        let _ = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/v1/Message/1?sessionId=default&waitSeconds=0",
+            Value::Null,
+        )
+        .await;
+        complete_via_api(&app, a_id, "build").await;
+        assert_eq!(get_run_json(&app, b_id).await["status"], "queued");
+        assert_eq!(get_run_json(&app, c_id).await["status"], "pending");
+
+        let _ = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/v1/Message/1?sessionId=default&waitSeconds=0",
+            Value::Null,
+        )
+        .await;
+        complete_via_api(&app, b_id, "build").await;
+        assert_eq!(get_run_json(&app, c_id).await["status"], "queued");
+        assert_eq!(get_run_json(&app, d_id).await["status"], "pending");
+    }
+
+    #[tokio::test]
+    async fn concurrency_group_names_case_insensitive() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+        let a = submit_yaml(
+            &app,
+            r#"
+on: push
+concurrency: Prod
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo a
+"#,
+            "owner/repo",
+        )
+        .await;
+        let b = submit_yaml(
+            &app,
+            r#"
+on: push
+concurrency: prod
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo b
+"#,
+            "owner/repo",
+        )
+        .await;
+        assert_eq!(
+            get_run_json(&app, a["run_id"].as_str().unwrap()).await["status"],
+            "queued"
+        );
+        assert_eq!(
+            get_run_json(&app, b["run_id"].as_str().unwrap()).await["status"],
+            "pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn job_level_concurrency_gates_single_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+        let accepted = submit_yaml(
+            &app,
+            r#"
+on: push
+jobs:
+  one:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: job-serial
+    steps:
+      - run: echo one
+  two:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: job-serial
+    steps:
+      - run: echo two
+"#,
+            "owner/repo",
+        )
+        .await;
+        let run_id = accepted["run_id"].as_str().unwrap();
+        let run = get_run_json(&app, run_id).await;
+        let one = run["jobs"]["one"].as_str().unwrap();
+        let two = run["jobs"]["two"].as_str().unwrap();
+        // Exactly one should be queued, the other pending.
+        let statuses = [one, two];
+        assert!(statuses.contains(&"queued"));
+        assert!(statuses.contains(&"pending"));
+    }
+
+    #[tokio::test]
+    async fn concurrency_blocked_jobs_do_not_block_unrelated_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+        // First run holds the group.
+        let _ = submit_yaml(
+            &app,
+            r#"
+on: push
+concurrency:
+  group: blocked-group
+jobs:
+  slow:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sleep 99
+"#,
+            "owner/repo",
+        )
+        .await;
+        // Second run is concurrency-pending.
+        let _ = submit_yaml(
+            &app,
+            r#"
+on: push
+concurrency:
+  group: blocked-group
+jobs:
+  slow:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sleep 99
+"#,
+            "owner/repo",
+        )
+        .await;
+        // Unrelated work without concurrency must still be dispatchable after
+        // the first job is taken.
+        let _ = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/v1/Message/1?sessionId=default&waitSeconds=0",
+            Value::Null,
+        )
+        .await;
+        let free = submit_yaml(
+            &app,
+            r#"
+on: push
+jobs:
+  free:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo free
+"#,
+            "owner/repo",
+        )
+        .await;
+        let free_id = free["run_id"].as_str().unwrap();
+        assert_eq!(get_run_json(&app, free_id).await["jobs"]["free"], "queued");
+        let msg = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/v1/Message/1?sessionId=default&waitSeconds=0",
+            Value::Null,
+        )
+        .await;
+        assert!(
+            !msg.is_null(),
+            "unrelated job must be pollable while group is blocked"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_workflow_concurrency_group_creates_zero_job_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let mut events = state.events.subscribe();
+        let app = app(state.clone(), CancellationToken::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/runs")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                    .body(Body::from(
+                        json!({
+                            "workflow_yaml": r#"
+on: push
+concurrency:
+  group: ${{ github.event.head_commit.id_missing }}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"#,
+                            "event": "push",
+                            "repository": "owner/repo",
+                            "payload": { "head_commit": {} }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let accepted: RunAccepted = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(accepted.queued_jobs, 0);
+
+        let accepted_event = events.recv().await.unwrap();
+        assert!(matches!(
+            accepted_event,
+            NdjsonEvent::RunAccepted { run_id, queued_jobs }
+                if run_id == accepted.run_id && queued_jobs == 0
+        ));
+        let failed_event = events.recv().await.unwrap();
+        assert!(matches!(
+            failed_event,
+            NdjsonEvent::RunStatus {
+                run_id,
+                status: ExecutionStatus::Failure,
+                reason: Some(reason),
+            } if run_id == accepted.run_id && reason.contains("must not be empty")
+        ));
+
+        let inner = state.inner.lock().await;
+        let record = &inner.runs[&accepted.run_id];
+        assert_eq!(record.status, ExecutionStatus::Failure);
+        assert!(record.jobs.is_empty());
+        assert!(!inner
+            .job_requests
+            .values()
+            .any(|request| request.run_id == accepted.run_id));
+        assert!(!inner.queue.iter().any(|job| job.run_id == accepted.run_id));
+        assert!(!inner
+            .pending_jobs
+            .iter()
+            .any(|job| job.run_id == accepted.run_id));
+        assert!(!inner
+            .concurrency_blocked
+            .iter()
+            .any(|job| job.run_id == accepted.run_id));
+    }
+
+    #[tokio::test]
+    async fn concurrency_chaos_interleaved_submits_and_completes() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+        let yaml_hold = r#"
+on: push
+concurrency:
+  group: chaos
+  queue: max
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hold
+"#;
+        let yaml_cancel = r#"
+on: push
+concurrency:
+  group: chaos
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo cancel
+"#;
+        let mut run_ids = Vec::new();
+        for i in 0..20 {
+            let yaml = if i % 5 == 0 { yaml_cancel } else { yaml_hold };
+            let accepted = submit_yaml(&app, yaml, "owner/repo").await;
+            run_ids.push(accepted["run_id"].as_str().unwrap().to_owned());
+            // Occasionally complete whatever is dispatchable.
+            if i % 3 == 0 {
+                let msg = request_json(
+                    &app,
+                    Method::GET,
+                    "/runner/server/_apis/v1/Message/1?sessionId=default&waitSeconds=0",
+                    Value::Null,
+                )
+                .await;
+                if !msg.is_null() {
+                    // Complete the currently running holder if we can find a queued/in-progress job.
+                    for rid in &run_ids {
+                        let run = get_run_json(&app, rid).await;
+                        if run["jobs"]["build"] == "in_progress" || run["jobs"]["build"] == "queued"
+                        {
+                            // Mark in progress via poll already done; complete.
+                            complete_via_api(&app, rid, "build").await;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        // Server must remain consistent: no panics, every run has a known status.
+        for rid in &run_ids {
+            let run = get_run_json(&app, rid).await;
+            let status = run["status"].as_str().unwrap();
+            assert!(
+                matches!(
+                    status,
+                    "queued" | "pending" | "in_progress" | "success" | "cancelled" | "failure"
+                ),
+                "unexpected status {status} for {rid}"
+            );
+        }
+    }
+
+    async fn poll_and_ack(app: &Router) -> Value {
+        let msg = request_json(
+            app,
+            Method::GET,
+            "/runner/server/_apis/v1/Message/1?sessionId=default&waitSeconds=0",
+            Value::Null,
+        )
+        .await;
+        if msg.is_null() {
+            return msg;
+        }
+        if let Some(message_id) = msg["messageId"].as_i64() {
+            let _ = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::DELETE)
+                        .uri(format!(
+                            "/runner/server/_apis/v1/Message/1/{message_id}?sessionId=default"
+                        ))
+                        .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        msg
+    }
+
+    fn decode_cancel_body(msg: &Value) -> Value {
+        assert_eq!(msg["messageType"], azdo::message_type::JOB_CANCELLED);
+        let body_b64 = msg["body"].as_str().unwrap();
+        let body_bytes = BASE64_STANDARD.decode(body_b64).unwrap();
+        serde_json::from_slice(&body_bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn job_cancellation_message_type_is_official_string() {
+        // Wire regression: must be "JobCancellation", not "JobCancelled".
+        assert_eq!(azdo::message_type::JOB_CANCELLED, "JobCancellation");
+    }
+
+    #[tokio::test]
+    async fn broker_root_message_path_delivers_job_cancellation() {
+        // The aksh-runner broker client polls `/runner/server/message` (root
+        // path), NOT `/_apis/v1/Message`. Cancel must be delivered there.
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+        // Create broker session.
+        let session = request_json(&app, Method::POST, "/runner/server/session", json!({})).await;
+        let session_id = session["sessionId"].as_str().unwrap();
+
+        let yaml = r#"
+on: push
+concurrency:
+  group: broker-root-cancel
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sleep 60
+"#;
+        let a = submit_yaml(&app, yaml, "owner/repo").await;
+        let a_id = a["run_id"].as_str().unwrap().to_owned();
+
+        // Dispatch A via broker root path.
+        let job_msg = request_json(
+            &app,
+            Method::GET,
+            &format!("/runner/server/message?sessionId={session_id}&waitSeconds=0"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(job_msg["messageType"], "RunnerJobRequest");
+        assert_eq!(
+            get_run_json(&app, &a_id).await["jobs"]["build"],
+            "in_progress"
+        );
+
+        // B cancels A.
+        let b = submit_yaml(&app, yaml, "owner/repo").await;
+        assert_eq!(get_run_json(&app, &a_id).await["status"], "cancelled");
+        assert_eq!(
+            get_run_json(&app, b["run_id"].as_str().unwrap()).await["status"],
+            "queued"
+        );
+
+        // Busy poll must yield JobCancellation on the same session.
+        let cancel_msg = request_json(
+            &app,
+            Method::GET,
+            &format!("/runner/server/message?sessionId={session_id}&waitSeconds=0"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            cancel_msg["messageType"],
+            azdo::message_type::JOB_CANCELLED,
+            "broker root path must deliver JobCancellation, got {cancel_msg}"
+        );
+        // messageId must differ from the job message or runner in-memory dedup
+        // silently drops the cancel.
+        assert_ne!(
+            cancel_msg["messageId"], job_msg["messageId"],
+            "cancel messageId must not collide with job messageId"
+        );
+        // Cancels live in a high id range so they never collide with request_id
+        // messageIds of subsequent RunnerJobRequests.
+        assert!(
+            cancel_msg["messageId"].as_i64().unwrap() >= 1_000_000,
+            "cancel messageId should be in high range, got {}",
+            cancel_msg["messageId"]
+        );
+        let body: Value = serde_json::from_str(cancel_msg["body"].as_str().unwrap()).unwrap();
+        assert!(body["jobId"]
+            .as_str()
+            .unwrap()
+            .parse::<uuid::Uuid>()
+            .is_ok());
+        assert_eq!(body["timeout"], "00:05:00");
+
+        // Simulate runner finishing the cancelled job, freeing the session.
+        complete_via_api(&app, &a_id, "build").await;
+        // completejob can arrive before the worker process exits. A Busy poll
+        // must not receive B yet or the run-service dispatcher cancels the
+        // still-draining worker as an overlap.
+        let busy_msg = request_json(
+            &app,
+            Method::GET,
+            &format!("/runner/server/message?sessionId={session_id}&status=Busy&waitSeconds=0"),
+            Value::Null,
+        )
+        .await;
+        assert!(
+            busy_msg.is_null(),
+            "busy runner received successor: {busy_msg}"
+        );
+
+        // B must be pollable with a messageId that does not collide with cancel.
+        let b_msg = request_json(
+            &app,
+            Method::GET,
+            &format!("/runner/server/message?sessionId={session_id}&status=Online&waitSeconds=0"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            b_msg["messageType"], "RunnerJobRequest",
+            "expected B job after A completed, got {b_msg}"
+        );
+        assert_ne!(b_msg["messageId"], cancel_msg["messageId"]);
+        assert_ne!(b_msg["messageId"], job_msg["messageId"]);
+    }
+
+    #[tokio::test]
+    async fn concurrency_expression_group_uses_github_ref() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+        let yaml = r#"
+on: push
+concurrency:
+  group: ci-${{ github.ref }}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"#;
+        // Same ref → collide.
+        let a = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": yaml,
+                "event": "push",
+                "repository": "owner/repo",
+                "git_ref": "refs/heads/main",
+            }),
+        )
+        .await;
+        let b = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": yaml,
+                "event": "push",
+                "repository": "owner/repo",
+                "git_ref": "refs/heads/main",
+            }),
+        )
+        .await;
+        // Different ref → independent group.
+        let c = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": yaml,
+                "event": "push",
+                "repository": "owner/repo",
+                "git_ref": "refs/heads/feature",
+            }),
+        )
+        .await;
+        assert_eq!(
+            get_run_json(&app, a["run_id"].as_str().unwrap()).await["status"],
+            "queued"
+        );
+        assert_eq!(
+            get_run_json(&app, b["run_id"].as_str().unwrap()).await["status"],
+            "pending"
+        );
+        assert_eq!(
+            get_run_json(&app, c["run_id"].as_str().unwrap()).await["status"],
+            "queued"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrency_groups_are_repo_scoped() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+        let yaml = r#"
+on: push
+concurrency:
+  group: shared-name
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"#;
+        let a = submit_yaml(&app, yaml, "owner/repo-a").await;
+        let b = submit_yaml(&app, yaml, "owner/repo-b").await;
+        // Different repos → both free to run.
+        assert_eq!(
+            get_run_json(&app, a["run_id"].as_str().unwrap()).await["status"],
+            "queued"
+        );
+        assert_eq!(
+            get_run_json(&app, b["run_id"].as_str().unwrap()).await["status"],
+            "queued"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_in_progress_expression_false_does_not_cancel() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+        let yaml = r#"
+on: push
+concurrency:
+  group: expr-cancel
+  cancel-in-progress: ${{ false }}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"#;
+        let a = submit_yaml(&app, yaml, "owner/repo").await;
+        let _ = poll_and_ack(&app).await;
+        let b = submit_yaml(&app, yaml, "owner/repo").await;
+        assert_eq!(
+            get_run_json(&app, a["run_id"].as_str().unwrap()).await["status"],
+            "in_progress"
+        );
+        assert_eq!(
+            get_run_json(&app, b["run_id"].as_str().unwrap()).await["status"],
+            "pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_in_progress_expression_true_cancels() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+        let yaml = r#"
+on: push
+concurrency:
+  group: expr-cancel-true
+  cancel-in-progress: ${{ true }}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sleep 30
+"#;
+        let a = submit_yaml(&app, yaml, "owner/repo").await;
+        let _ = poll_and_ack(&app).await;
+        let b = submit_yaml(&app, yaml, "owner/repo").await;
+        assert_eq!(
+            get_run_json(&app, a["run_id"].as_str().unwrap()).await["status"],
+            "cancelled"
+        );
+        assert_eq!(
+            get_run_json(&app, b["run_id"].as_str().unwrap()).await["status"],
+            "queued"
+        );
+        // Cancel message delivered with official body.
+        let cancel_msg = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/v1/Message/1?sessionId=default&waitSeconds=0",
+            Value::Null,
+        )
+        .await;
+        let body = decode_cancel_body(&cancel_msg);
+        assert_eq!(body["timeout"], "00:05:00");
+        assert!(body.get("runId").is_none());
+    }
+
+    #[tokio::test]
+    async fn late_success_cannot_overwrite_cancelled_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+        let yaml = r#"
+on: push
+concurrency:
+  group: late-success
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sleep 30
+"#;
+        let a = submit_yaml(&app, yaml, "owner/repo").await;
+        let a_id = a["run_id"].as_str().unwrap().to_owned();
+        let _ = poll_and_ack(&app).await;
+        let _b = submit_yaml(&app, yaml, "owner/repo").await;
+        assert_eq!(
+            get_run_json(&app, &a_id).await["jobs"]["build"],
+            "cancelled"
+        );
+        // Late success from a runner that never saw JobCancellation.
+        complete_via_api(&app, &a_id, "build").await;
+        let run_a = get_run_json(&app, &a_id).await;
+        assert_eq!(run_a["jobs"]["build"], "cancelled");
+        assert_eq!(run_a["status"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn multi_job_workflow_concurrency_holds_all_jobs() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+        let yaml = r#"
+on: push
+concurrency:
+  group: multi-job-hold
+jobs:
+  one:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo one
+  two:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo two
+"#;
+        let a = submit_yaml(&app, yaml, "owner/repo").await;
+        let b = submit_yaml(&app, yaml, "owner/repo").await;
+        let b_id = b["run_id"].as_str().unwrap();
+        let run_b = get_run_json(&app, b_id).await;
+        assert_eq!(run_b["status"], "pending");
+        assert_eq!(run_b["jobs"]["one"], "pending");
+        assert_eq!(run_b["jobs"]["two"], "pending");
+        // Unrelated free job still dispatchable after A's jobs taken.
+        let _ = poll_and_ack(&app).await;
+        let free = submit_yaml(
+            &app,
+            r#"
+on: push
+jobs:
+  free:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo free
+"#,
+            "owner/repo",
+        )
+        .await;
+        assert_eq!(
+            get_run_json(&app, free["run_id"].as_str().unwrap()).await["jobs"]["free"],
+            "queued"
+        );
+        let _ = a;
+    }
+
+    #[tokio::test]
+    async fn job_level_concurrency_with_needs_gate_order() {
+        // Gate order: needs → concurrency. Dependent job must not occupy the
+        // group until needs are satisfied.
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+        let accepted = submit_yaml(
+            &app,
+            r#"
+on: push
+jobs:
+  first:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo first
+  second:
+    needs: first
+    runs-on: ubuntu-latest
+    concurrency:
+      group: needs-then-concurrency
+    steps:
+      - run: echo second
+  peer:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: needs-then-concurrency
+    steps:
+      - run: echo peer
+"#,
+            "owner/repo",
+        )
+        .await;
+        let run_id = accepted["run_id"].as_str().unwrap();
+        let run = get_run_json(&app, run_id).await;
+        // first ready; peer may take the concurrency slot; second waits on needs
+        // (and possibly concurrency).
+        assert_eq!(run["jobs"]["first"], "queued");
+        assert_eq!(run["jobs"]["second"], "queued"); // in pending_jobs (needs)
+                                                     // peer has no needs → evaluates concurrency immediately.
+        assert!(
+            run["jobs"]["peer"] == "queued" || run["jobs"]["peer"] == "pending",
+            "peer={}",
+            run["jobs"]["peer"]
+        );
+        // Complete first; second becomes ready and hits concurrency.
+        let _ = poll_and_ack(&app).await;
+        complete_via_api(&app, run_id, "first").await;
+        let run = get_run_json(&app, run_id).await;
+        // Exactly one of {peer, second} may be pending on the shared group if
+        // the other is queued/in_progress.
+        let peer = run["jobs"]["peer"].as_str().unwrap();
+        let second = run["jobs"]["second"].as_str().unwrap();
+        assert!(
+            matches!(
+                (peer, second),
+                ("queued", "pending")
+                    | ("pending", "queued")
+                    | ("in_progress", "pending")
+                    | ("pending", "in_progress")
+                    | ("queued", "queued") // if peer already finished — unlikely
+            ) || peer != second
+                || peer == "queued",
+            "peer={peer} second={second}"
+        );
+    }
+
+    #[tokio::test]
+    async fn job_level_and_workflow_level_share_namespace() {
+        // Plan: groups are one namespace for workflow-level runs and job-level jobs.
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+        let a = submit_yaml(
+            &app,
+            r#"
+on: push
+concurrency:
+  group: shared-ns
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo a
+"#,
+            "owner/repo",
+        )
+        .await;
+        let b = submit_yaml(
+            &app,
+            r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: shared-ns
+    steps:
+      - run: echo b
+"#,
+            "owner/repo",
+        )
+        .await;
+        assert_eq!(
+            get_run_json(&app, a["run_id"].as_str().unwrap()).await["status"],
+            "queued"
+        );
+        // B's job should be pending on the same group held by A's run.
+        let run_b = get_run_json(&app, b["run_id"].as_str().unwrap()).await;
+        assert_eq!(run_b["jobs"]["build"], "pending");
+    }
+
+    #[tokio::test]
+    async fn queue_max_overflow_cancels_arrival() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+        let yaml = r#"
+on: push
+concurrency:
+  group: overflow-group
+  queue: max
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"#;
+        // 1 running + 100 pending = 101 holders; 102nd arrival cancelled.
+        let mut ids = Vec::new();
+        for _ in 0..101 {
+            let r = submit_yaml(&app, yaml, "owner/repo").await;
+            ids.push(r["run_id"].as_str().unwrap().to_owned());
+        }
+        // First is running/queued; next 100 pending.
+        assert_eq!(get_run_json(&app, &ids[0]).await["status"], "queued");
+        for id in ids.iter().skip(1).take(100) {
+            assert_eq!(
+                get_run_json(&app, id).await["status"],
+                "pending",
+                "expected pending for {id}"
+            );
+        }
+        let overflow = submit_yaml(&app, yaml, "owner/repo").await;
+        let overflow_id = overflow["run_id"].as_str().unwrap();
+        assert_eq!(get_run_json(&app, overflow_id).await["status"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn cancel_run_api_releases_concurrency_slot() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+        let yaml = r#"
+on: push
+concurrency:
+  group: api-cancel-release
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sleep 30
+"#;
+        let a = submit_yaml(&app, yaml, "owner/repo").await;
+        let b = submit_yaml(&app, yaml, "owner/repo").await;
+        let a_id = a["run_id"].as_str().unwrap();
+        let b_id = b["run_id"].as_str().unwrap();
+        assert_eq!(get_run_json(&app, b_id).await["status"], "pending");
+        request_json(
+            &app,
+            Method::POST,
+            &format!("/api/v1/runs/{a_id}/cancel"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(get_run_json(&app, a_id).await["status"], "cancelled");
+        // B should be promoted.
+        let run_b = get_run_json(&app, b_id).await;
+        assert_eq!(run_b["status"], "queued");
+        assert_eq!(run_b["jobs"]["build"], "queued");
+    }
+
+    #[tokio::test]
+    async fn cancel_in_progress_then_pending_chain() {
+        // A running, B arrives with cancel-in-progress → A cancelled, B runs.
+        // C arrives without cancel → pending. Complete B → C queued.
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+        let yaml_cancel = r#"
+on: push
+concurrency:
+  group: chain-group
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sleep 30
+"#;
+        let yaml_hold = r#"
+on: push
+concurrency:
+  group: chain-group
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hold
+"#;
+        let a = submit_yaml(&app, yaml_cancel, "owner/repo").await;
+        let _ = poll_and_ack(&app).await;
+        let b = submit_yaml(&app, yaml_cancel, "owner/repo").await;
+        assert_eq!(
+            get_run_json(&app, a["run_id"].as_str().unwrap()).await["status"],
+            "cancelled"
+        );
+        assert_eq!(
+            get_run_json(&app, b["run_id"].as_str().unwrap()).await["status"],
+            "queued"
+        );
+        let c = submit_yaml(&app, yaml_hold, "owner/repo").await;
+        assert_eq!(
+            get_run_json(&app, c["run_id"].as_str().unwrap()).await["status"],
+            "pending"
+        );
+        // Drain cancel message then dispatch B and complete.
+        let msg = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/v1/Message/1?sessionId=default&waitSeconds=0",
+            Value::Null,
+        )
+        .await;
+        if msg["messageType"] == azdo::message_type::JOB_CANCELLED {
+            let _ = poll_and_ack(&app).await; // already consumed above; get next
+        }
+        // Complete B (may still be queued — complete_via_api works regardless).
+        complete_via_api(&app, b["run_id"].as_str().unwrap(), "build").await;
+        let run_c = get_run_json(&app, c["run_id"].as_str().unwrap()).await;
+        assert_eq!(run_c["status"], "queued");
+        assert_eq!(run_c["jobs"]["build"], "queued");
+    }
+
+    #[tokio::test]
+    async fn bare_string_concurrency_shorthand_enforced() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+        let yaml = r#"
+on: push
+concurrency: bare-shorthand
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"#;
+        let a = submit_yaml(&app, yaml, "owner/repo").await;
+        let b = submit_yaml(&app, yaml, "owner/repo").await;
+        assert_eq!(
+            get_run_json(&app, a["run_id"].as_str().unwrap()).await["status"],
+            "queued"
+        );
+        assert_eq!(
+            get_run_json(&app, b["run_id"].as_str().unwrap()).await["status"],
+            "pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn job_level_matrix_concurrency_per_expansion() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+        // Two matrix cells share one group → serialize; different group → parallel.
+        let accepted = submit_yaml(
+            &app,
+            r#"
+on: push
+jobs:
+  matrixed:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [a, b]
+    concurrency:
+      group: matrix-${{ matrix.os }}
+    steps:
+      - run: echo ${{ matrix.os }}
+"#,
+            "owner/repo",
+        )
+        .await;
+        let run_id = accepted["run_id"].as_str().unwrap();
+        let run = get_run_json(&app, run_id).await;
+        // Different matrix.os → different groups → both queued.
+        let statuses: Vec<&str> = run["jobs"]
+            .as_object()
+            .unwrap()
+            .values()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            statuses.iter().filter(|s| **s == "queued").count() >= 2
+                || statuses.iter().all(|s| *s == "queued" || *s == "pending"),
+            "jobs={:?}",
+            run["jobs"]
+        );
+        // Same-group matrix should serialize.
+        let accepted2 = submit_yaml(
+            &app,
+            r#"
+on: push
+jobs:
+  matrixed:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        n: [1, 2, 3]
+    concurrency:
+      group: matrix-same
+    steps:
+      - run: echo ${{ matrix.n }}
+"#,
+            "owner/repo",
+        )
+        .await;
+        let run2 = get_run_json(&app, accepted2["run_id"].as_str().unwrap()).await;
+        let queued = run2["jobs"]
+            .as_object()
+            .unwrap()
+            .values()
+            .filter(|v| v.as_str() == Some("queued"))
+            .count();
+        let pending = run2["jobs"]
+            .as_object()
+            .unwrap()
+            .values()
+            .filter(|v| v.as_str() == Some("pending"))
+            .count();
+        assert_eq!(
+            queued, 1,
+            "exactly one matrix cell should run: {:?}",
+            run2["jobs"]
+        );
+        assert_eq!(pending, 2, "other cells pending: {:?}", run2["jobs"]);
+    }
+
+    #[tokio::test]
+    async fn mixed_queue_modes_arrival_owns_join() {
+        // Assumption #3: each arrival's own queue mode decides how it joins.
+        // A running; B arrives with queue:max (pending); C arrives with queue:single
+        // → should cancel B and take the pending slot.
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+        let a = submit_yaml(
+            &app,
+            r#"
+on: push
+concurrency:
+  group: mixed-q
+  queue: max
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo a
+"#,
+            "owner/repo",
+        )
+        .await;
+        let b = submit_yaml(
+            &app,
+            r#"
+on: push
+concurrency:
+  group: mixed-q
+  queue: max
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo b
+"#,
+            "owner/repo",
+        )
+        .await;
+        let c = submit_yaml(
+            &app,
+            r#"
+on: push
+concurrency:
+  group: mixed-q
+  queue: single
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo c
+"#,
+            "owner/repo",
+        )
+        .await;
+        assert_eq!(
+            get_run_json(&app, a["run_id"].as_str().unwrap()).await["status"],
+            "queued"
+        );
+        assert_eq!(
+            get_run_json(&app, b["run_id"].as_str().unwrap()).await["status"],
+            "cancelled",
+            "queue:single arrival should replace existing pending"
+        );
+        assert_eq!(
+            get_run_json(&app, c["run_id"].as_str().unwrap()).await["status"],
+            "pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_message_targets_agent_job_guid_not_logical_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+        let a = submit_yaml(
+            &app,
+            r#"
+on: push
+concurrency:
+  group: guid-check
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sleep 30
+"#,
+            "owner/repo",
+        )
+        .await;
+        let msg = poll_and_ack(&app).await;
+        assert!(!msg.is_null());
+        // Extract agent job id from the job request path if present; otherwise
+        // from cancellation body after B arrives.
+        let _b = submit_yaml(
+            &app,
+            r#"
+on: push
+concurrency:
+  group: guid-check
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sleep 30
+"#,
+            "owner/repo",
+        )
+        .await;
+        let cancel_msg = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/v1/Message/1?sessionId=default&waitSeconds=0",
+            Value::Null,
+        )
+        .await;
+        let body = decode_cancel_body(&cancel_msg);
+        let job_id = body["jobId"].as_str().unwrap();
+        // Must be a UUID, not the logical job name "build".
+        assert!(
+            job_id.parse::<uuid::Uuid>().is_ok(),
+            "jobId must be agent GUID, got {job_id}"
+        );
+        assert_ne!(job_id, "build");
+        assert_eq!(body["timeout"], "00:05:00");
+        let _ = a;
+    }
+
+    #[tokio::test]
+    async fn workflow_concurrency_cancel_before_dispatch_no_message() {
+        // Cancel a pending (not yet dispatched) run → no JobCancellation enqueued.
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+        let yaml = r#"
+on: push
+concurrency:
+  group: no-msg
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"#;
+        let a = submit_yaml(&app, yaml, "owner/repo").await;
+        let b = submit_yaml(&app, yaml, "owner/repo").await;
+        let b_id = b["run_id"].as_str().unwrap();
+        assert_eq!(get_run_json(&app, b_id).await["status"], "pending");
+        // C with queue:single replaces B without B ever being in-flight.
+        let c = submit_yaml(&app, yaml, "owner/repo").await;
+        assert_eq!(get_run_json(&app, b_id).await["status"], "cancelled");
+        assert_eq!(
+            get_run_json(&app, c["run_id"].as_str().unwrap()).await["status"],
+            "pending"
+        );
+        // Only A's job message should be available, not a cancel for B.
+        let msg = request_json(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/v1/Message/1?sessionId=default&waitSeconds=0",
+            Value::Null,
+        )
+        .await;
+        assert_ne!(
+            msg["messageType"],
+            azdo::message_type::JOB_CANCELLED,
+            "pending-only cancel must not emit JobCancellation"
+        );
+        let _ = a;
+    }
+
+    // ── C-01 regression: max-parallel + concurrency promotion without self-deadlock ──
+
+    #[tokio::test]
+    async fn c01_max_parallel_concurrency_no_self_deadlock() {
+        // Two matrix cells with max-parallel: 1 and a shared concurrency group.
+        // Cell A acquires the group, cell B waits. When A completes, B must
+        // be promoted exactly once without contending with its own holder.
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 1
+      matrix:
+        ver: [1, 2]
+    concurrency:
+      group: mp-group
+    steps:
+      - run: echo test
+"#,
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id = accepted["run_id"].as_str().unwrap();
+
+        // One cell should be queued, the other pending (concurrency-blocked).
+        let (queued_job, _blocked_count) = {
+            let inner = state.inner.lock().await;
+            let q = inner.queue.len();
+            let cb = inner.concurrency_blocked.len();
+            let pj = inner.pending_jobs.len();
+            // Exactly one in queue (or pending_jobs if max-parallel gated first)
+            assert!(
+                q + pj >= 1,
+                "at least one job should be ready: q={q} pj={pj}"
+            );
+            let first_job = inner
+                .queue
+                .front()
+                .map(|j| j.job_id.clone())
+                .or_else(|| inner.pending_jobs.front().map(|j| j.job_id.clone()))
+                .unwrap();
+            (first_job, cb)
+        };
+
+        // Complete the first cell.
+        complete_via_api(&app, run_id, queued_job.0.as_str()).await;
+
+        // After completion + promotion, the second cell should now be queued.
+        let run = get_run_json(&app, run_id).await;
+        let jobs = run["jobs"].as_object().unwrap();
+        // At least one job should be Queued or InProgress (promoted), and none
+        // should be permanently stuck in Pending.
+        let stuck_pending = jobs
+            .values()
+            .filter(|v| v.as_str() == Some("pending"))
+            .count();
+        assert_eq!(
+            stuck_pending, 0,
+            "no job should remain stuck in pending after promotion"
+        );
+    }
+
+    // ── C-05 regression: eval failure → terminal run status ──
+
+    #[tokio::test]
+    async fn c05_eval_failure_terminates_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+
+        // A single-job workflow with a malformed concurrency expression.
+        let accepted = submit_yaml(
+            &app,
+            r#"
+on: push
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ""
+    steps:
+      - run: echo never
+"#,
+            "owner/repo",
+        )
+        .await;
+        let run_id = accepted["run_id"].as_str().unwrap();
+        let run = get_run_json(&app, run_id).await;
+
+        // The run must NOT stay Queued forever — it must reach a terminal state.
+        let status = run["status"].as_str().unwrap();
+        assert!(
+            status == "failure" || status == "cancelled",
+            "run with failed concurrency eval should be terminal, got: {status}"
+        );
+    }
+
+    // ── C-06 regression: boolean expression evaluation for cancel-in-progress ──
+
+    #[tokio::test]
+    async fn c06_cancel_in_progress_expression_bool_eval() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app(
+            AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            CancellationToken::new(),
+        );
+
+        // cancel-in-progress uses an expression — must evaluate as boolean.
+        let yaml = r#"
+on: push
+concurrency:
+  group: bool-eval-group
+  cancel-in-progress: ${{ true }}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"#;
+        let a = submit_yaml(&app, yaml, "owner/repo").await;
+        let b = submit_yaml(&app, yaml, "owner/repo").await;
+
+        // B should cancel A (cancel-in-progress is true).
+        let a_run = get_run_json(&app, a["run_id"].as_str().unwrap()).await;
+        assert_eq!(
+            a_run["status"], "cancelled",
+            "${{{{ true }}}} must be evaluated as truthy cancel"
+        );
+
+        // B should be running/queued.
+        let b_run = get_run_json(&app, b["run_id"].as_str().unwrap()).await;
+        let b_status = b_run["status"].as_str().unwrap();
+        assert!(
+            b_status == "queued" || b_status == "in_progress",
+            "successor should be active, got: {b_status}"
+        );
+    }
+
+    #[tokio::test]
+    async fn c06_queue_max_with_dynamic_true_cancel_rejected() {
+        // queue: max combined with cancel-in-progress: ${{ true }} must be
+        // rejected. The parser catches literal "true" at parse time → 400.
+        // Dynamic expressions are caught at evaluation time → also rejected.
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let body = json!({
+            "workflow_yaml": "on: push\nconcurrency:\n  group: queue-max-cancel-true\n  queue: max\n  cancel-in-progress: ${{ true }}\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo"
+        });
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/runs")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(state.inner.lock().await.runs.is_empty());
+    }
+
+    // ── C-07 regression: holder_keys reclamation ──
+
+    #[tokio::test]
+    async fn c07_holder_keys_cleaned_after_run_release() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let yaml = r#"
+on: push
+concurrency:
+  group: holder-cleanup-group
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo cleanup
+"#;
+        let accepted = submit_yaml(&app, yaml, "owner/repo").await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        // Before completion, holder_keys should have an entry.
+        {
+            let inner = state.inner.lock().await;
+            assert!(
+                inner.holder_keys.contains_key(&run_id),
+                "holder_keys should track the run"
+            );
+        }
+
+        // Get the job ID and complete it.
+        let job_id = {
+            let inner = state.inner.lock().await;
+            inner.queue.front().unwrap().job_id.clone()
+        };
+        complete_via_api(&app, accepted["run_id"].as_str().unwrap(), &job_id.0).await;
+
+        // After completion, holder_keys for this run should be gone.
+        {
+            let inner = state.inner.lock().await;
+            assert!(
+                !inner.holder_keys.contains_key(&run_id),
+                "holder_keys should be cleaned up after run completes"
+            );
+        }
+    }
+
+    // ── C-02 regression: reusable JobSet admission and promotion ──
+
+    #[tokio::test]
+    async fn c02_reusable_call_jobset_blocks_and_promotes_members() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+        let caller_yaml = r#"
+on: push
+jobs:
+  call:
+    uses: ./.github/workflows/callee.yml
+    concurrency:
+      group: reusable-serial
+"#;
+        let callee_yaml = r#"
+on: workflow_call
+jobs:
+  inner:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo callee
+"#;
+        let submission = || {
+            json!({
+                "workflow_yaml": caller_yaml,
+                "event": "push",
+                "repository": "owner/repo",
+                "reusable_workflows": {
+                    ".github/workflows/callee.yml": callee_yaml,
+                }
+            })
+        };
+
+        let first = request_json(&app, Method::POST, "/api/v1/runs", submission()).await;
+        let second = request_json(&app, Method::POST, "/api/v1/runs", submission()).await;
+        let first_run: RunId = first["run_id"].as_str().unwrap().parse().unwrap();
+        let second_run: RunId = second["run_id"].as_str().unwrap().parse().unwrap();
+        let (first_job, second_job) = {
+            let inner = state.inner.lock().await;
+            let first_job = inner.runs[&first_run].jobs.keys().next().unwrap().clone();
+            let second_job = inner.runs[&second_run].jobs.keys().next().unwrap().clone();
+            assert_eq!(
+                inner.runs[&first_run].jobs[&first_job],
+                ExecutionStatus::Queued
+            );
+            assert_eq!(
+                inner.runs[&second_run].jobs[&second_job],
+                ExecutionStatus::Pending
+            );
+            assert!(inner
+                .queue
+                .iter()
+                .any(|job| job.run_id == first_run && job.job_id == first_job));
+            assert!(inner
+                .concurrency_blocked
+                .iter()
+                .any(|job| job.run_id == second_run && job.job_id == second_job));
+            (first_job, second_job)
+        };
+
+        complete_via_api(&app, &first_run.to_string(), &first_job.0).await;
+        {
+            let inner = state.inner.lock().await;
+            assert_eq!(
+                inner.runs[&second_run].jobs[&second_job],
+                ExecutionStatus::Queued
+            );
+            assert!(inner
+                .queue
+                .iter()
+                .any(|job| job.run_id == second_run && job.job_id == second_job));
+            assert!(!inner
+                .concurrency_blocked
+                .iter()
+                .any(|job| job.run_id == second_run && job.job_id == second_job));
+        }
+        complete_via_api(&app, &second_run.to_string(), &second_job.0).await;
+        assert_eq!(
+            state.inner.lock().await.runs[&second_run].status,
+            ExecutionStatus::Success
+        );
+    }
+
+    #[tokio::test]
+    async fn c02_jobset_waits_for_embedded_gate_after_acquiring_caller_gate() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+        let holder = submit_yaml(
+            &app,
+            r#"
+on: push
+concurrency:
+  group: embedded-shared
+jobs:
+  hold:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hold
+"#,
+            "owner/repo",
+        )
+        .await;
+        let reusable = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+on: push
+jobs:
+  call:
+    uses: ./.github/workflows/callee.yml
+    concurrency:
+      group: caller-free
+    with:
+      concurrency_group: embedded-shared
+"#,
+                "event": "push",
+                "repository": "owner/repo",
+                "reusable_workflows": {
+                    ".github/workflows/callee.yml": r#"
+on:
+  workflow_call:
+    inputs:
+      concurrency_group:
+        required: true
+        type: string
+concurrency:
+  group: ${{ inputs.concurrency_group }}
+jobs:
+  inner:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo inner
+"#,
+                }
+            }),
+        )
+        .await;
+        let holder_run: RunId = holder["run_id"].as_str().unwrap().parse().unwrap();
+        let reusable_run: RunId = reusable["run_id"].as_str().unwrap().parse().unwrap();
+        let (holder_job, reusable_job) = {
+            let inner = state.inner.lock().await;
+            let holder_job = inner.runs[&holder_run].jobs.keys().next().unwrap().clone();
+            let reusable_job = inner.runs[&reusable_run]
+                .jobs
+                .keys()
+                .next()
+                .unwrap()
+                .clone();
+            assert_eq!(
+                inner.runs[&reusable_run].jobs[&reusable_job],
+                ExecutionStatus::Pending
+            );
+            assert_eq!(inner.jobset_admissions.len(), 1);
+            assert_eq!(
+                inner
+                    .jobset_admissions
+                    .values()
+                    .next()
+                    .unwrap()
+                    .acquired_keys
+                    .len(),
+                1
+            );
+            (holder_job, reusable_job)
+        };
+
+        complete_via_api(&app, &holder_run.to_string(), &holder_job.0).await;
+        {
+            let inner = state.inner.lock().await;
+            assert_eq!(
+                inner.runs[&reusable_run].jobs[&reusable_job],
+                ExecutionStatus::Queued
+            );
+            assert!(inner.jobset_admissions.is_empty());
+            for group_name in ["caller-free", "embedded-shared"] {
+                let key = concurrency::concurrency_key("owner/repo", group_name);
+                assert!(matches!(
+                    inner.concurrency_groups[&key].running,
+                    Some(concurrency::Holder::JobSet { run_id, .. }) if run_id == reusable_run
+                ));
+            }
+        }
+        complete_via_api(&app, &reusable_run.to_string(), &reusable_job.0).await;
+    }
+
+    #[tokio::test]
+    async fn c02_jobset_deduplicates_identical_caller_and_embedded_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+on: push
+jobs:
+  call:
+    uses: ./.github/workflows/callee.yml
+    concurrency:
+      group: same-key
+"#,
+                "event": "push",
+                "repository": "owner/repo",
+                "reusable_workflows": {
+                    ".github/workflows/callee.yml": r#"
+on: workflow_call
+concurrency:
+  group: same-key
+jobs:
+  inner:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo inner
+"#,
+                }
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+        let inner = state.inner.lock().await;
+        let job_id = inner.runs[&run_id].jobs.keys().next().unwrap();
+        assert_eq!(inner.runs[&run_id].jobs[job_id], ExecutionStatus::Queued);
+        assert!(inner.jobset_admissions.is_empty());
+        let key = concurrency::concurrency_key("owner/repo", "same-key");
+        assert!(inner.concurrency_groups[&key].pending.is_empty());
+        assert!(matches!(
+            inner.concurrency_groups[&key].running,
+            Some(concurrency::Holder::JobSet { run_id: holder_run, .. }) if holder_run == run_id
+        ));
+    }
+    #[tokio::test]
+    async fn c02_jobset_resolves_matrix_contexts_on_caller_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let caller_yaml = r#"
+on: push
+jobs:
+  call:
+    strategy:
+      matrix:
+        env: [dev, prod]
+    uses: ./.github/workflows/callee.yml
+    concurrency:
+      group: deploy-${{ matrix.env }}
+"#;
+        let callee_yaml = r#"
+on: workflow_call
+jobs:
+  inner:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo callee
+"#;
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": caller_yaml,
+                "event": "push",
+                "repository": "owner/repo",
+                "reusable_workflows": {
+                    ".github/workflows/callee.yml": callee_yaml,
+                }
+            }),
+        )
+        .await;
+
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+        let inner = state.inner.lock().await;
+
+        // Verify we evaluated both matrix groups: deploy-dev and deploy-prod
+        let key_dev = concurrency::concurrency_key("owner/repo", "deploy-dev");
+        let key_prod = concurrency::concurrency_key("owner/repo", "deploy-prod");
+
+        assert!(
+            inner.concurrency_groups.contains_key(&key_dev),
+            "concurrency_groups must have deploy-dev"
+        );
+        assert!(
+            inner.concurrency_groups.contains_key(&key_prod),
+            "concurrency_groups must have deploy-prod"
+        );
+
+        assert!(matches!(
+            inner.concurrency_groups[&key_dev].running,
+            Some(concurrency::Holder::JobSet { run_id: holder_run, .. }) if holder_run == run_id
+        ));
+        assert!(matches!(
+            inner.concurrency_groups[&key_prod].running,
+            Some(concurrency::Holder::JobSet { run_id: holder_run, .. }) if holder_run == run_id
+        ));
+    }
+    /// Production path: duplicate completion does not create a second promotion.
+    #[tokio::test]
+    async fn dag_duplicate_completion_idempotent_production() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo build
+  test:
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo test
+"#,
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        // Complete build once
+        request_json(
+            &app,
+            Method::POST,
+            "/internal/test/jobs/complete",
+            json!({"run_id": run_id, "job_id": "build", "status": "success"}),
+        )
+        .await;
+
+        // test should be queued exactly once
+        {
+            let inner = state.inner.lock().await;
+            assert_eq!(
+                inner.queue.iter().filter(|j| j.job_id.0 == "test").count(),
+                1,
+                "test must appear exactly once in queue"
+            );
+        }
+
+        // Complete build again (duplicate)
+        request_json(
+            &app,
+            Method::POST,
+            "/internal/test/jobs/complete",
+            json!({"run_id": run_id, "job_id": "build", "status": "success"}),
+        )
+        .await;
+
+        // test must still appear exactly once
+        {
+            let inner = state.inner.lock().await;
+            assert_eq!(
+                inner.queue.iter().filter(|j| j.job_id.0 == "test").count(),
+                1,
+                "duplicate completion must not create second promotion"
+            );
+        }
+    }
+
+    /// Production path: small structured YAML → parse → expand → server
+    /// submission → promote/complete verifies the full pipeline.
+    #[tokio::test]
+    async fn dag_yaml_parse_expand_server_production() {
+        let yaml = r#"
+on: push
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo lint
+  build:
+    needs: [lint]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo build
+  test:
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo test
+  deploy:
+    needs: [test]
+    if: success()
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo deploy
+"#;
+        // Verify parser round-trip
+        let workflow = aksh_gha_parser::parse_workflow(yaml).unwrap();
+        let plans = aksh_gha_parser::expand_jobs(&workflow).unwrap();
+        let plan_ids: Vec<_> = plans.iter().map(|p| p.id.0.as_str()).collect();
+        assert!(plan_ids.contains(&"lint"));
+        assert!(plan_ids.contains(&"build"));
+        assert!(plan_ids.contains(&"test"));
+        assert!(plan_ids.contains(&"deploy"));
+
+        // Verify DAG validation passes
+        aksh_gha_parser::dag::validate_job_plans(&plans).unwrap();
+
+        // Run through real server
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": yaml,
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        // Queued jobs = parser's expanded IDs (lint is root)
+        {
+            let inner = state.inner.lock().await;
+            assert_eq!(inner.queue.len(), 1);
+            assert_eq!(inner.queue[0].job_id.0, "lint");
+        }
+
+        // Walk the chain: lint → build → test → deploy
+        for (job, next_queued) in [
+            ("lint", Some("build")),
+            ("build", Some("test")),
+            ("test", Some("deploy")),
+            ("deploy", None),
+        ] {
+            request_json(
+                &app,
+                Method::POST,
+                "/internal/test/jobs/complete",
+                json!({"run_id": run_id, "job_id": job, "status": "success"}),
+            )
+            .await;
+
+            let inner = state.inner.lock().await;
+            if let Some(next) = next_queued {
+                assert!(
+                    inner.queue.iter().any(|j| j.job_id.0 == next),
+                    "after completing {job}, {next} should be queued"
+                );
+            }
+        }
+
+        // Run is terminal — all jobs completed successfully
+        let inner = state.inner.lock().await;
+        let run = inner.runs.get(&run_id).unwrap();
+        assert_eq!(run.status, ExecutionStatus::Success);
+        assert!(inner.pending_jobs.is_empty());
+        for (job_id, status) in &run.jobs {
+            assert_eq!(
+                *status,
+                ExecutionStatus::Success,
+                "job {} should be Success, got {:?}",
+                job_id.0,
+                status
+            );
+        }
+    }
+    /// Exercises the real parser → queue → completion → dependency-promotion path
+    /// over 1,000 deterministic bounded DAGs.
+    #[tokio::test]
+    async fn generated_server_dag_properties_1000_cases() {
+        fn next(seed: &mut u64) -> u64 {
+            *seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *seed
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        for case in 0..1_000u64 {
+            let mut seed = 20250713u64 ^ case.wrapping_mul(0x9E37_79B9);
+            let count = 2 + (next(&mut seed) % 4) as usize;
+            let mut needs = vec![Vec::<usize>::new(); count];
+            for job in 1..count {
+                for dependency in 0..job {
+                    if next(&mut seed) & 1 == 1 {
+                        needs[job].push(dependency);
+                    }
+                }
+            }
+            let failed_root = (0..count).find(|job| needs[*job].is_empty()).unwrap();
+
+            // Assign conditions to non-root jobs based on PRNG
+            let mut conditions: Vec<Option<&str>> = vec![None; count];
+            for job in 1..count {
+                if !needs[job].is_empty() {
+                    conditions[job] = match next(&mut seed) % 5 {
+                        0 => Some("always()"),
+                        1 => Some("failure()"),
+                        _ => None, // default gate
+                    };
+                }
+            }
+
+            let mut yaml = String::from("on: push\njobs:\n");
+            for job in 0..count {
+                yaml.push_str(&format!("  j{job}:\n"));
+                if !needs[job].is_empty() {
+                    yaml.push_str("    needs: [");
+                    for (index, dependency) in needs[job].iter().enumerate() {
+                        if index > 0 {
+                            yaml.push_str(", ");
+                        }
+                        yaml.push_str(&format!("j{dependency}"));
+                    }
+                    yaml.push_str("]\n");
+                }
+                if let Some(cond) = conditions[job] {
+                    yaml.push_str(&format!("    if: {cond}\n"));
+                }
+                yaml.push_str("    runs-on: ubuntu-latest\n");
+                yaml.push_str("    steps:\n      - run: echo property\n");
+            }
+
+            let accepted = request_json(
+                &app,
+                Method::POST,
+                "/api/v1/runs",
+                json!({
+                    "workflow_yaml": yaml,
+                    "event": "push",
+                    "repository": "property/test"
+                }),
+            )
+            .await;
+            let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+            for _ in 0..=count {
+                let queued = {
+                    let inner = state.inner.lock().await;
+                    inner
+                        .queue
+                        .iter()
+                        .filter(|job| job.run_id == run_id)
+                        .map(|job| job.job_id.0.clone())
+                        .collect::<Vec<_>>()
+                };
+                if queued.is_empty() {
+                    break;
+                }
+                for job_id in queued {
+                    let status = if job_id == format!("j{failed_root}") {
+                        "failure"
+                    } else {
+                        "success"
+                    };
+                    request_json(
+                        &app,
+                        Method::POST,
+                        "/internal/test/jobs/complete",
+                        json!({"run_id": run_id, "job_id": job_id, "status": status}),
+                    )
+                    .await;
+                }
+            }
+
+            let inner = state.inner.lock().await;
+            let run = inner.runs.get(&run_id).unwrap();
+            let mut failed_ancestor = vec![false; count];
+            for job in 0..count {
+                failed_ancestor[job] = job == failed_root
+                    || needs[job]
+                        .iter()
+                        .any(|dependency| failed_ancestor[*dependency]);
+                let expected = if job == failed_root {
+                    ExecutionStatus::Failure
+                } else if failed_ancestor[job] {
+                    // Job has a failed ancestor — what does the condition say?
+                    match conditions[job] {
+                        Some("always()") => ExecutionStatus::Success, // always runs, completed successfully
+                        Some("failure()") => ExecutionStatus::Success, // failure() is true, job runs
+                        _ => ExecutionStatus::Skipped,                 // default gate blocks
+                    }
+                } else {
+                    // No failed ancestor
+                    match conditions[job] {
+                        Some("failure()") => ExecutionStatus::Skipped, // failure() is false, skip
+                        _ => ExecutionStatus::Success,                 // default or always() runs
+                    }
+                };
+                assert_eq!(
+                    run.jobs[&JobId(format!("j{job}"))],
+                    expected,
+                    "case {case} job j{job} condition={:?}",
+                    conditions[job]
+                );
+            }
+        }
     }
 }

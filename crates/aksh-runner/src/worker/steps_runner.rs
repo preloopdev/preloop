@@ -116,7 +116,7 @@ pub async fn run_steps(
         setup_lines.push(format!("{ts} Machine name: '{machine_name}'"));
 
         // GITHUB_TOKEN permissions from the job message (available in job context)
-        if let Some(token_perms) = job.github_context_value("token") {
+        if let Some(token_perms) = job.github_context_value("token_permissions") {
             if let Some(perms) = token_perms.as_object() {
                 setup_lines.push(format!("{ts} ##[group]GITHUB_TOKEN Permissions"));
                 for (perm, level) in perms {
@@ -481,11 +481,22 @@ pub async fn run_steps(
         }
 
         // Determine initial outcome and conclusion from step execution.
+        // If the step errored and the cancel channel fired mid-step, treat as
+        // cancelled even when the process surface error is a non-zero exit from
+        // SIGINT/SIGTERM. A successful step (Ok) is always "Success" so that
+        // cleanup steps with `if: cancelled()` or `if: always()` are not
+        // retroactively marked cancelled by a stale channel signal.
+        let cancel_signaled = *cancel_rx.borrow();
         let (mut outcome_str, mut conclusion_str) = match &outcome {
             Ok(()) => ("Success".to_string(), "Success".to_string()),
             Err(e) => {
                 let msg = e.to_string();
-                if msg.contains("cancelled") {
+                if msg.contains("cancelled") || msg.contains("canceled") || cancel_signaled {
+                    // Match GitHub Actions hosted-runner step log wording exactly
+                    // (American spelling "canceled").
+                    step_ctx.log("##[error]The operation was canceled.");
+                    cancelled = true;
+                    step_ctx.job.job_status = JobStatus::Cancelled;
                     ("Cancelled".to_string(), "Cancelled".to_string())
                 } else {
                     step_ctx.log(&format!("##[error]{e:#}"));
@@ -769,83 +780,32 @@ pub async fn run_steps(
 }
 
 fn should_run_step(step: &Step, job: &JobContext) -> Result<bool> {
-    let condition = match &step.condition {
-        Some(c) if !c.is_empty() => c.as_str(),
-        _ => "success()",
-    };
-    let stripped = aksh_gha_expressions::trim_expression_markers(condition);
-    let effective_condition = if contains_status_check_function(stripped) {
-        stripped.to_string()
-    } else {
-        format!("success() && ({stripped})")
-    };
+    use super::step_conditions::{contains_status_check_function, effective_condition};
 
+    let raw = step.condition.as_deref();
+    let effective = effective_condition(raw);
     let ctx = job.build_expression_context();
-    match aksh_gha_expressions::eval_bool(&effective_condition, &ctx) {
+    match aksh_gha_expressions::eval_bool(&effective, &ctx) {
         Ok(result) => Ok(result),
         Err(effective_error) => {
+            // Fallback: retry with untrimmed markers if the strip path failed.
+            let condition = match raw {
+                Some(c) if !c.is_empty() => c,
+                _ => return Err(effective_error.into()),
+            };
+            let stripped = aksh_gha_expressions::trim_expression_markers(condition);
             if stripped == condition {
                 Err(effective_error.into())
             } else {
-                aksh_gha_expressions::eval_bool(
-                    &if contains_status_check_function(condition) {
-                        condition.to_string()
-                    } else {
-                        format!("success() && ({condition})")
-                    },
-                    &ctx,
-                )
-                .map_err(Into::into)
+                let fallback = if contains_status_check_function(condition) {
+                    condition.to_string()
+                } else {
+                    format!("success() && ({condition})")
+                };
+                aksh_gha_expressions::eval_bool(&fallback, &ctx).map_err(Into::into)
             }
         }
     }
-}
-
-fn contains_status_check_function(condition: &str) -> bool {
-    let mut chars = condition.char_indices().peekable();
-    while let Some((_, ch)) = chars.next() {
-        if ch == '\'' || ch == '"' {
-            let quote = ch;
-            while let Some((_, quoted)) = chars.next() {
-                if quoted == '\\' {
-                    let _ = chars.next();
-                } else if quoted == quote {
-                    break;
-                }
-            }
-            continue;
-        }
-
-        if ch == '_' || ch.is_ascii_alphabetic() {
-            let mut ident = String::from(ch);
-            while let Some((_, next)) = chars.peek().copied() {
-                if next == '_' || next.is_ascii_alphanumeric() {
-                    ident.push(next);
-                    let _ = chars.next();
-                } else {
-                    break;
-                }
-            }
-
-            while let Some((_, whitespace)) = chars.peek().copied() {
-                if whitespace.is_whitespace() {
-                    let _ = chars.next();
-                } else {
-                    break;
-                }
-            }
-
-            if matches!(
-                ident.to_ascii_lowercase().as_str(),
-                "success" | "failure" | "cancelled" | "always"
-            ) && chars.peek().is_some_and(|(_, next)| *next == '(')
-            {
-                return true;
-            }
-        }
-    }
-
-    false
 }
 
 /// Execute a single step, threading cancel_rx to the process invoker.
@@ -1086,6 +1046,7 @@ mod tests {
     use super::*;
     use crate::worker::contexts::JobContext;
     use crate::worker::server_queue::ServerQueue;
+    use crate::worker::step_conditions::contains_status_check_function;
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::sync::{watch, Mutex};
