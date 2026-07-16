@@ -26,7 +26,7 @@ on:
 #   4. -D warnings on clippy   — pre-existing missing_docs in azdo DTOs
 #      (repo-level issue, not an aksh gap)
 #
-# See .github/workflows/dogfood.yml for the locally-runnable version without
+# See fixtures/workflows/dogfood.yml for the locally-runnable version without
 # action dependencies.
 # ═══════════════════════════════════════════════════════════════════════════
 

@@ -362,9 +362,9 @@ pub(crate) mod http_sequences {
             .count();
 
         let total_cancels = cancel_count + msg_cancel_count;
-        assert!(
-            total_cancels <= 1,
-            "GH-CANCEL-01: expected at most 1 cancellation message for A, got {total_cancels} \
+        assert_eq!(
+            total_cancels, 1,
+            "GH-CANCEL-01: expected exactly 1 cancellation message for A, got {total_cancels} \
              (queue={cancel_count}, inflight={msg_cancel_count})"
         );
         drop(inner);

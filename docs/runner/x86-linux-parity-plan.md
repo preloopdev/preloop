@@ -60,14 +60,14 @@ Plan for validating aksh-runner on x86_64 Linux hosts (`vm103`: Intel i5-4570 @ 
 | Test | Result |
 |------|--------|
 | `hello-world.yml` (simple echo) | ✅ `{"status":"success","success":true}` |
-| `runner-fidelity-f042-f047.yml` — F042 (SIGINT handling) | ✅ Step succeeded in ~0.8s |
+| `fixtures/fidelity/runner-fidelity-f042-f047.yml` — F042 (SIGINT handling) | ✅ Step succeeded in ~0.8s |
 | `cargo test --workspace --quiet` | ✅ 222/222 passed |
 
 ### Blocked (not runner bugs)
 
 | Test | Blocker |
 |------|---------|
-| `runner-fidelity-f046-remote.yml` | References `preloopdev/aksh@cachingv4` on GitHub; repo doesn't exist at that path. Needs local fixture path. |
+| `fixtures/fidelity/runner-fidelity-f046-remote.yml` | References `preloopdev/aksh@cachingv4` on GitHub; repo doesn't exist at that path. Needs local fixture path. |
 | Docker container jobs | `runner-e2e` doesn't populate the workspace (no `git clone`), so `uses: ./fixtures/...` fails. Need to either: (a) add workspace setup to runner-e2e, or (b) create inline Docker test workflows. |
 | Multi-job workflows | `runner-e2e` runs with `--once` (processes 1 job then exits). Multi-job workflows show `"status":"in_progress"`. |
 

@@ -1,0 +1,12 @@
+﻿{
+  "repositoryName": "preloopdev/aksh-conformance-sample",
+  "pipelineDirectory": "aksh-conformance-sample",
+  "workspaceDirectory": "aksh-conformance-sample/aksh-conformance-sample",
+  "repositories": {
+    "preloopdev/aksh-conformance-sample": {
+      "repositoryPath": "aksh-conformance-sample/aksh-conformance-sample",
+      "lastRunOn": "07/15/2026 17:49:52 +00:00"
+    }
+  },
+  "lastRunOn": "07/15/2026 17:49:52 +00:00"
+}
