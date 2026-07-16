@@ -111,16 +111,6 @@ for event in push pull_request pull_request_target pull_request_review \
   
   payload=$(payload_for "$event")
   
-  response=$(curl -s -w "\n%{http_code}" \
-    -X POST \
-    -H "Authorization: Bearer $TEST_API_TOKEN" \
-    -H "Content-Type: application/json" \
-    -H "X-GitHub-Event: $event" \
-    -d "$payload" \
-    "http://127.0.0.1:9199/runner/server/_apis/pipelines/workflows?api-version=6.0-preview" 2>/dev/null || echo -e "\n000")
-  
-  http_code=$(echo "$response" | tail -1)
-  
   # Also try the native webhook endpoint
   sig=$(compute_sig "$payload")
   wh_response=$(curl -s -w "\n%{http_code}" \
