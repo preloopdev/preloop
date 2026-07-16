@@ -12,7 +12,7 @@ GH_REF="${GH_REF:-main}"
 MITM_PORT="${MITM_PORT:-18081}"
 HOST_WORKSPACE="$PWD"
 VM_WORKSPACE="/workspace"
-RESULTS_ROOT="${RESULTS_ROOT:-$PWD/benchmarks/real-world/results/runner-flow}"
+RESULTS_ROOT="${RESULTS_ROOT:-$PWD/benchmarks/compatibility/runner/protocol}"
 AKSH_RUNNER="/usr/local/bin/aksh-runner"
 OFFICIAL_SRC="/opt/runners/actions-runner"
 MITM_ADDON="/workspace/experiments/mitm/addons/capture.py"
@@ -110,8 +110,8 @@ capture_one() {
       cd '$OFFICIAL_SRC'
       RUNNER_ALLOW_RUNASROOT=1 ./config.sh remove --unattended 2>/dev/null || rm -f .runner
       ./config.sh --unattended --url 'https://github.com/$GH_REPO' --token '$token' \
-        --name '$runner_name' --labels "self-hosted,linux,x64,$wf_label" --work '$root/_work' --replace --ephemeral 2>&1
-      timeout 900 ./run.sh --once 2>&1
+        --name '$runner_name' --labels "self-hosted,linux,x64,$wf_label" --work '$root/_work' --replace 2>&1
+      timeout 900 ./run.sh 2>&1
     " > "$capture_dir/vm-runner.log" 2>&1 &
   fi
   local runner_pid=$!
@@ -124,6 +124,8 @@ capture_one() {
   echo "$run_id" > "$capture_dir/github-run-id.txt"
   log "$kind dispatched $SCENARIO as $run_id"
   wait_for_run "$run_id" || true
+  # Kill runner after workflow completes (it stays alive polling otherwise)
+  kill "$runner_pid" 2>/dev/null || true
   wait "$runner_pid" >/dev/null 2>&1 || true
   stop_mitm "$capture_dir"
   # Copy flows from VM (mount sync unreliable with smolvm)

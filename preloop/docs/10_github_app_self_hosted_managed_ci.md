@@ -20,7 +20,7 @@ GitHub webhook
   -> create check runs
   -> schedule Aksh jobs
   -> lease jobs to workers
-  -> boot libkrun VM per job
+  -> boot a microVM per job (smolvm-KVM or Firecracker)
   -> stream logs/artifacts/results
   -> update check runs
 ```
@@ -84,7 +84,7 @@ preloop-control-plane
 preloop-worker fleet
   |
   +-- accepts job lease
-  +-- creates jailed libkrun VM
+  +-- creates a jailed microVM (smolvm-KVM / Firecracker)
   +-- runs aksh-runner inside VM
   +-- streams logs/events
   +-- exports artifacts
@@ -181,7 +181,7 @@ Before self-hosted beta:
 
 - GitHub App webhook flow works end-to-end.
 - Check run lifecycle is durable.
-- Worker can acquire a job and run it in a libkrun VM.
+- Worker can acquire a job and run it in a smolvm microVM (or Firecracker).
 - Worker cleanup is proven.
 - Trust-tier policy applies to PRs.
 - Logs/artifacts are stored durably.

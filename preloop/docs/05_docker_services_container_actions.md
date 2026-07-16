@@ -14,6 +14,11 @@ Preloop's isolation claim only works if Docker and container workflows run witho
 
 This is a critical product gate, not an enhancement.
 
+smolvm boots OCI images directly as microVMs — no Docker daemon is needed to
+*run* an image. A Docker daemon is only needed when the *workflow itself* invokes
+`docker build`/`docker run`/compose, which requires `dockerd`/buildkitd running
+inside the guest (Path B below).
+
 ## Non-negotiable rule
 
 ```text
@@ -39,7 +44,7 @@ No Docker required.
 For user workflows that invoke Docker:
 
 ```text
-libkrun VM
+smolvm microVM (Firecracker on the scale tier)
   +-- dockerd/buildkitd
   +-- docker CLI
   +-- job process runs docker build/run/compose
@@ -47,9 +52,9 @@ libkrun VM
 
 This is the most faithful approach for user-invoked Docker.
 
-### Path C: OCI-to-libkrun optimization
+### Path C: smolvm-native OCI boot
 
-For container actions and services, later optimize by mapping OCI images directly into microVMs or same-VM rootfs/processes where semantics match.
+For container actions and service containers, prefer mapping OCI images straight into smolvm microVMs (smolvm already runs any OCI image) instead of routing through in-guest Docker, where semantics match.
 
 Do this only after private Docker works, because private Docker is the compatibility baseline.
 
@@ -70,7 +75,7 @@ CONFIG_BINFMT_MISC optional
 fuse-overlayfs optional fallback
 ```
 
-This is the main reason direct libkrun or a custom kernel/rootfs path may be required. If the bundled libkrun/microsandbox kernel lacks required features, do not hack around it indefinitely: switch to the custom runtime path.
+This is why the tier's guest kernel/rootfs must ship these features. If smolvm's bundled libkrunfw kernel lacks a required config for in-guest Docker, resolve it upstream in the tier image (libkrunfw kernel config / rootfs), not by reimplementing the hypervisor. The Firecracker tier bakes an equivalent rootfs+kernel.
 
 ## Service strategies
 
@@ -94,7 +99,7 @@ Support order:
 1. JavaScript actions.
 2. Composite actions.
 3. Docker container actions through private in-guest Docker.
-4. Optimized OCI-to-libkrun path.
+4. smolvm-native OCI boot for container actions/services.
 
 Container action requirements:
 
@@ -117,7 +122,7 @@ Implementation options:
 
 - Use private Docker to run the job container.
 - Run container rootfs directly with namespaces inside the VM.
-- Use OCI-to-libkrun for a VM-per-container model later.
+- Map the OCI image directly into a smolvm microVM (VM-per-container) later.
 
 For fidelity, private Docker is the safest first implementation.
 
@@ -150,7 +155,7 @@ services:
 
 ## Docker gate
 
-Before the Preloop alpha runtime is chosen, run this gate on Apple Silicon and Linux/KVM:
+Run this Docker gate on smolvm (Apple Silicon + Linux/KVM) and on the Firecracker tier:
 
 ```text
 1. VM boots.
@@ -178,7 +183,7 @@ Options:
 - native arm64 images where available,
 - multi-arch OCI resolution,
 - `binfmt_misc` + qemu-user inside the VM,
-- Rosetta-based Linux translation where available and legally/technically viable,
+- smolvm `--rosetta` x86-on-ARM translation (~17% overhead vs QEMU's 5–10×),
 - or fail loudly with a fidelity warning.
 
 Never silently run the wrong architecture.
@@ -190,7 +195,7 @@ Add clear support messages:
 ```text
 This workflow uses services.postgres.
 Preloop can run it with private in-guest Docker.
-Runtime: direct-libkrun-docker-kernel
+Runtime: smolvm-docker
 Network: virtio-net
 Fidelity: high
 ```
@@ -200,5 +205,5 @@ or:
 ```text
 This workflow uses Docker services, but the current runtime profile cannot start dockerd.
 Run: preloop doctor docker
-Suggested runtime: direct-libkrun-docker
+Suggested runtime: smolvm-docker (or firecracker-docker on the scale tier)
 ```

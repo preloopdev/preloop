@@ -1,8 +1,0 @@
-{
-  "backend": "aksh",
-  "scenario": "08-job-outputs-needs",
-  "run_id": "28972487507",
-  "conclusion": "success",
-  "flows_count":       39,
-  "timestamp": "2026-07-08T20-12-18Z"
-}

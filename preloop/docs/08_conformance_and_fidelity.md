@@ -197,7 +197,7 @@ p2-pull-request-target-unsafe
 
 | Release | Gate |
 |---|---|
-| Local alpha | P0 pass inside libkrun VM |
+| Local alpha | P0 pass inside a smolvm microVM |
 | Local beta | P1 pass or documented unsupported features |
 | Self-hosted beta | P1 + GitHub App integration + trust-tier tests |
 | Managed private beta | P2 security-relevant cases + malicious corpus |
