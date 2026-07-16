@@ -364,6 +364,7 @@ impl ProdState {
                 reusable_workflows: BTreeMap::new(),
                 enable_debugger: false,
                 debugger_welcome_message: None,
+                ..Default::default()
             },
             jobs,
             status: ExecutionStatus::Queued,

@@ -116,7 +116,7 @@ pub async fn run_steps(
         setup_lines.push(format!("{ts} Machine name: '{machine_name}'"));
 
         // GITHUB_TOKEN permissions from the job message (available in job context)
-        if let Some(token_perms) = job.github_context_value("token") {
+        if let Some(token_perms) = job.github_context_value("token_permissions") {
             if let Some(perms) = token_perms.as_object() {
                 setup_lines.push(format!("{ts} ##[group]GITHUB_TOKEN Permissions"));
                 for (perm, level) in perms {
