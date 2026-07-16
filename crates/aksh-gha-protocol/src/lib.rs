@@ -143,6 +143,9 @@ pub struct WorkflowSubmission {
     /// Git ref for the run.
     #[serde(default = "default_ref")]
     pub git_ref: String,
+    /// Repository-relative path of the submitted workflow file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_path: Option<String>,
     /// Caller-provided variables.
     #[serde(default)]
     pub vars: BTreeMap<String, String>,
