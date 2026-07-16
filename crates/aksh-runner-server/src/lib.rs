@@ -1462,22 +1462,60 @@ pub(crate) async fn submit_run_inner(
             } else {
                 "0000000000000000000000000000000000000000".to_owned()
             }
-        });
+        })
+        .to_string();
+    let workflow_path = submission
+        .workflow_path
+        .clone()
+        .unwrap_or_else(|| ".github/workflows/workflow.yml".to_owned());
+    let workflow_ref = format!(
+        "{}/{}@{}",
+        submission.repository, workflow_path, submission.git_ref
+    );
+
+    let ref_name = submission
+        .git_ref
+        .strip_prefix("refs/heads/")
+        .or_else(|| submission.git_ref.strip_prefix("refs/tags/"))
+        .unwrap_or(&submission.git_ref)
+        .to_owned();
+    let ref_type = if submission.git_ref.starts_with("refs/tags/") {
+        "tag"
+    } else {
+        "branch"
+    };
+
     let github = json!({
-        "event_name": submission.event,
-        "event": submission.payload,
+        "ref": submission.git_ref,
+        "sha": sha,
         "repository": submission.repository,
         "repository_owner": repository_owner,
-        "ref": submission.git_ref,
+        "repository_owner_id": "0",
+        "repositoryUrl": format!("git://github.com/{}.git", submission.repository),
         "run_id": run_id.to_string(),
         "run_number": "1",
+        "retention_days": "90",
         "run_attempt": "1",
+        "artifact_cache_size_limit": "10",
+        "repository_visibility": "private",
+        "actor_id": "0",
         "actor": "aksh-system",
-        "sha": sha,
         "workflow": workflow.name.clone().unwrap_or_default(),
+        "head_ref": "",
+        "base_ref": "",
+        "event_name": submission.event,
         "server_url": "https://github.com",
         "api_url": "https://api.github.com",
-        "graphql_url": "https://api.github.com/graphql"
+        "graphql_url": "https://api.github.com/graphql",
+        "ref_name": ref_name,
+        "ref_protected": false,
+        "ref_type": ref_type,
+        "secret_source": "Actions",
+        "event": submission.payload,
+        "workflow_ref": workflow_ref,
+        "workflow_sha": sha,
+        "repository_id": "0",
+        "triggering_actor": "aksh-system"
     });
 
     // Evaluate workflow-level concurrency before locking (pure).
@@ -1591,14 +1629,58 @@ pub(crate) async fn submit_run_inner(
             )
             .map_err(|e| ApiError::bad_request(format!("failed to build job message: {e}")))?;
 
+            agent_msg.file_table = vec![workflow_path.clone()];
+            if let Some(aksh_gha_protocol::azdo::PipelineContextData::Dict(job_dict)) =
+                agent_msg.context_data.get_mut("job")
+            {
+                job_dict.insert(
+                    "check_run_id".to_owned(),
+                    aksh_gha_protocol::azdo::PipelineContextData::Number(0.0),
+                );
+                job_dict.insert(
+                    "workflow_ref".to_owned(),
+                    aksh_gha_protocol::azdo::PipelineContextData::String(workflow_ref.clone()),
+                );
+                job_dict.insert(
+                    "workflow_sha".to_owned(),
+                    aksh_gha_protocol::azdo::PipelineContextData::String(sha.clone()),
+                );
+                job_dict.insert(
+                    "workflow_repository".to_owned(),
+                    aksh_gha_protocol::azdo::PipelineContextData::String(
+                        submission.repository.clone(),
+                    ),
+                );
+                job_dict.insert(
+                    "workflow_file_path".to_owned(),
+                    aksh_gha_protocol::azdo::PipelineContextData::String(workflow_path.clone()),
+                );
+            }
+
+            // Mint a dynamic JWT for the job and inject it as GITHUB_TOKEN
             let token = mint_runtime_token(&agent_msg.plan.plan_id, &agent_msg.job_id);
             agent_msg.variables.insert(
                 "system.github.token".to_owned(),
                 aksh_gha_protocol::azdo::VariableValue::secret(token.clone()),
             );
             agent_msg.variables.insert(
+                "github_token".to_owned(),
+                aksh_gha_protocol::azdo::VariableValue::secret(token.clone()),
+            );
+            agent_msg.variables.insert(
                 "system.github.launch_endpoint".to_owned(),
                 aksh_gha_protocol::azdo::VariableValue::new(public_base_url()),
+            );
+            agent_msg.variables.insert(
+                "system.github.results_endpoint".to_owned(),
+                aksh_gha_protocol::azdo::VariableValue::new(public_base_url()),
+            );
+            agent_msg.variables.insert(
+                "system.orchestrationId".to_owned(),
+                aksh_gha_protocol::azdo::VariableValue::new(format!(
+                    "{}.{}.{}",
+                    agent_msg.plan.plan_id, job.base_id, agent_msg.job_name
+                )),
             );
             if let Some(aksh_gha_protocol::azdo::PipelineContextData::Dict(github_dict)) =
                 &mut agent_msg.context_data.get_mut("github")
@@ -1645,11 +1727,7 @@ pub(crate) async fn submit_run_inner(
                 job_id: job.id.clone(),
                 agent_job_id: agent_msg.job_id,
                 plan_id: agent_msg.plan.plan_id.clone(),
-                plan_type: agent_msg
-                    .plan
-                    .plan_type
-                    .clone()
-                    .unwrap_or_else(|| "Job".to_owned()),
+                plan_type: agent_msg.plan.plan_type.clone(),
                 timeline_id: agent_msg.timeline.id,
                 result: None,
                 locked_until: agent_request_locked_until(),
@@ -3825,6 +3903,10 @@ async fn broker_acquire_job(
             );
         }
     }
+    message.billing_owner_id = request.billing_owner_id;
+    // Run-service payloads use the DTO default; internal request IDs remain in
+    // `job_requests` and broker lookup maps for renew/complete bookkeeping.
+    message.request_id = 0;
     Ok(Json(message))
 }
 
@@ -9915,7 +9997,8 @@ jobs:
             json!({"jobMessageId": runner_request_id, "billingOwnerId": "local", "runnerOS": "macOS"}),
         )
         .await;
-        assert_eq!(acquired["requestId"], 1);
+        assert_eq!(acquired["requestId"], 0);
+        assert_eq!(acquired["billingOwnerId"], "local");
         assert_eq!(
             acquired["messageType"],
             azdo::message_type::RUNNER_JOB_REQUEST
@@ -10064,7 +10147,8 @@ jobs:
             json!({"jobMessageId": runner_request_id, "billingOwnerId": "local", "runnerOS": "macOS"}),
         )
         .await;
-        assert_eq!(acquired["requestId"].as_i64().unwrap(), 1);
+        assert_eq!(acquired["requestId"].as_i64().unwrap(), 0);
+        assert_eq!(acquired["billingOwnerId"], "local");
         assert_eq!(
             acquired["messageType"],
             azdo::message_type::RUNNER_JOB_REQUEST
@@ -13960,8 +14044,14 @@ jobs:
         let key_dev = concurrency::concurrency_key("owner/repo", "deploy-dev");
         let key_prod = concurrency::concurrency_key("owner/repo", "deploy-prod");
 
-        assert!(inner.concurrency_groups.contains_key(&key_dev), "concurrency_groups must have deploy-dev");
-        assert!(inner.concurrency_groups.contains_key(&key_prod), "concurrency_groups must have deploy-prod");
+        assert!(
+            inner.concurrency_groups.contains_key(&key_dev),
+            "concurrency_groups must have deploy-dev"
+        );
+        assert!(
+            inner.concurrency_groups.contains_key(&key_prod),
+            "concurrency_groups must have deploy-prod"
+        );
 
         assert!(matches!(
             inner.concurrency_groups[&key_dev].running,
