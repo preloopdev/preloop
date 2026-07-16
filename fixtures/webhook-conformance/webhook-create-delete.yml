@@ -1,0 +1,13 @@
+name: Webhook Create Delete
+on:
+  create:
+  delete:
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log event
+        run: |
+          echo "EVENT: ${{ github.event_name }}"
+          echo "REF_TYPE: ${{ github.event.ref_type }}"
+          echo "REF: ${{ github.event.ref }}"
