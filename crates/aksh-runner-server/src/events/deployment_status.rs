@@ -41,7 +41,14 @@ impl EventAdapter for Adapter {
                     format!("refs/heads/{value}")
                 }
             })
-            .unwrap_or_else(|| "refs/heads/main".to_owned());
+            .unwrap_or_else(|| {
+                let default_branch = payload
+                    .get("repository")
+                    .and_then(|r| r.get("default_branch"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("main");
+                format!("refs/heads/{default_branch}")
+            });
         let sha = deployment
             .and_then(|value| value.get("sha"))
             .and_then(Value::as_str)
