@@ -1,0 +1,13 @@
+on: push
+concurrency:
+  group: dogfood-concurrency-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: self-hosted
+    steps:
+      - name: long-step
+        run: |
+          echo "starting long step"
+          sleep 30
+          echo "done"

@@ -1,0 +1,14 @@
+name: Webhook Release
+on:
+  release:
+    types: [published, created, edited, deleted, prereleased, released]
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log event
+        run: |
+          echo "EVENT: release"
+          echo "ACTION: ${{ github.event.action }}"
+          echo "TAG: ${{ github.ref }}"
+          echo "TAG_NAME: ${{ github.event.release.tag_name }}"

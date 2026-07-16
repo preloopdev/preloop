@@ -49,6 +49,9 @@ enum Command {
         /// Secret in KEY=VALUE form. Values are redacted in JSON output.
         #[arg(long = "secret")]
         secrets: Vec<String>,
+        /// Workflow dispatch input in KEY=VALUE form (value treated as JSON, falling back to string).
+        #[arg(long = "input")]
+        inputs: Vec<String>,
         /// Enable the DAP debugger for this run.
         #[arg(long)]
         debug: bool,
@@ -96,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
             git_ref,
             vars,
             secrets,
+            inputs,
             debug,
             debugger_welcome_message,
         } => {
@@ -112,6 +116,17 @@ async fn main() -> anyhow::Result<()> {
                 }
                 None => serde_json::json!({}),
             };
+            let inputs: BTreeMap<String, Value> = inputs
+                .into_iter()
+                .map(|kv| {
+                    let (k, v) = kv
+                        .split_once('=')
+                        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                        .unwrap_or_else(|| (kv.clone(), String::new()));
+                    let json_val = serde_json::from_str::<Value>(&v).unwrap_or(Value::String(v));
+                    (k, json_val)
+                })
+                .collect();
             let submission = SubmitWire {
                 workflow_yaml,
                 event,
@@ -127,6 +142,7 @@ async fn main() -> anyhow::Result<()> {
                 .await?,
                 enable_debugger: debug,
                 debugger_welcome_message,
+                inputs,
             };
             let response = http
                 .post(cli.server.join("/api/v1/runs")?)
@@ -207,6 +223,8 @@ struct SubmitWire {
     reusable_workflows: BTreeMap<String, String>,
     enable_debugger: bool,
     debugger_welcome_message: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    inputs: BTreeMap<String, Value>,
 }
 
 async fn collect_reusable_workflows(

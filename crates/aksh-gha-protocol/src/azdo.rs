@@ -212,8 +212,11 @@ pub mod message_type {
     pub const RUNNER_JOB_REQUEST: &str = "RunnerJobRequest";
     /// Cancellation signal — runner should abort the current job.
     pub const CANCEL_JOB: &str = "CancelJob";
-    /// Job cancellation (newer API).
-    pub const JOB_CANCELLED: &str = "JobCancelled";
+    /// Job cancellation — official `JobCancelMessage.MessageType`.
+    ///
+    /// Must be exactly `"JobCancellation"` (not `"JobCancelled"`): the
+    /// official runner matches this string in `Runner.cs` / broker dispatch.
+    pub const JOB_CANCELLED: &str = "JobCancellation";
     /// Runner should shut down gracefully.
     pub const RUNNER_SHUTDOWN: &str = "RunnerShutdown";
 }
@@ -255,12 +258,37 @@ pub struct AgentJobRequestMessage {
     #[serde(rename = "timeline")]
     pub timeline: TimelineReference,
 
-    /// The job display name.
-    #[serde(rename = "displayName", skip_serializing_if = "Option::is_none")]
-    pub display_name: Option<String>,
+    /// Human-readable job display name.
+    #[serde(rename = "jobDisplayName", skip_serializing_if = "Option::is_none")]
+    pub job_display_name: Option<String>,
+
+    /// Stable workflow job key used by the runner context.
+    #[serde(rename = "jobName")]
+    pub job_name: String,
+
+    /// Broker lease expiry. GitHub uses the minimum DateTime for newly acquired jobs.
+    #[serde(rename = "lockedUntil")]
+    pub locked_until: String,
+
+    /// Billing owner echoed from the acquire request.
+    #[serde(rename = "billingOwnerId", skip_serializing_if = "Option::is_none")]
+    pub billing_owner_id: Option<String>,
+
+    /// Source workflow files referenced by template-token coordinates.
+    #[serde(rename = "fileTable", default)]
+    pub file_table: Vec<String>,
+
+    /// Workflow/job defaults and environment overlays.
+    #[serde(rename = "defaults", default)]
+    pub defaults: Vec<serde_json::Value>,
+    #[serde(rename = "environmentVariables", default)]
+    pub environment_variables: Vec<serde_json::Value>,
+
+    /// Snapshot token; emitted as null when snapshots are not used.
+    #[serde(rename = "snapshot", default)]
+    pub snapshot: Option<serde_json::Value>,
 
     /// The job's `if` condition expression string.
-    /// The runner evaluates this — do NOT pre-collapse.
     #[serde(rename = "condition", skip_serializing_if = "Option::is_none")]
     pub condition: Option<String>,
 
@@ -269,7 +297,7 @@ pub struct AgentJobRequestMessage {
     pub variables: BTreeMap<String, VariableValue>,
 
     /// Mask hints for secret values — tells the runner what to redact in logs.
-    #[serde(rename = "maskHints", default)]
+    #[serde(rename = "mask", default)]
     pub mask_hints: Vec<MaskHint>,
 
     /// Service endpoints (e.g. SystemVssConnection with OAuth token).
@@ -285,14 +313,6 @@ pub struct AgentJobRequestMessage {
     #[serde(rename = "steps", default)]
     pub steps: Vec<TaskStep>,
 
-    /// Actions download info — maps `uses:` references to download URLs.
-    #[serde(rename = "actionsDownloadInfo", default)]
-    pub actions_download_info: BTreeMap<String, ActionsDownloadInfo>,
-
-    /// The job's `runs-on` labels.
-    #[serde(rename = "jobDisplayName", skip_serializing_if = "Option::is_none")]
-    pub job_display_name: Option<String>,
-
     /// Whether this is a retry attempt.
     #[serde(rename = "retryCount", skip_serializing_if = "Option::is_none")]
     pub retry_count: Option<i32>,
@@ -305,30 +325,16 @@ pub struct AgentJobRequestMessage {
     #[serde(rename = "jobTimeout", skip_serializing_if = "Option::is_none")]
     pub job_timeout: Option<i64>,
 
-    /// Job container spec (`container:`) — TemplateToken-compatible JSON.
-    #[serde(
-        rename = "jobContainer",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
+    /// Job container spec (`container:`) — explicit null when absent.
+    #[serde(rename = "jobContainer", default)]
     pub job_container: Option<serde_json::Value>,
 
-    /// Service container specs (`services:`) — alias → spec mapping.
-    #[serde(
-        rename = "jobServiceContainers",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
+    /// Service container specs (`services:`) — explicit null when absent.
+    #[serde(rename = "jobServiceContainers", default)]
     pub job_service_containers: Option<serde_json::Value>,
 
-    /// Job-level output declarations as a TemplateToken map.
-    /// GitHub sends `{type:2,map:[{Key:{...},Value:{...}}]}` and the runner
-    /// evaluates the expression tokens after step execution.
-    #[serde(
-        rename = "jobOutputs",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
+    /// Job-level output declarations — explicit null when absent.
+    #[serde(rename = "jobOutputs", default)]
     pub job_outputs: Option<serde_json::Value>,
 
     /// Whether the debugger is enabled for this job.
@@ -380,8 +386,14 @@ fn is_false(b: &bool) -> bool {
 pub struct PlanReference {
     #[serde(rename = "planId")]
     pub plan_id: String,
-    #[serde(rename = "planType", skip_serializing_if = "Option::is_none")]
-    pub plan_type: Option<String>,
+    #[serde(rename = "planType")]
+    pub plan_type: String,
+    #[serde(rename = "version")]
+    pub version: i32,
+    #[serde(rename = "artifactUri")]
+    pub artifact_uri: String,
+    #[serde(rename = "artifactLocation")]
+    pub artifact_location: String,
 }
 
 /// Dev Tunnel info for remote debugging.
@@ -435,29 +447,24 @@ impl Serialize for TaskStep {
             inputs.insert("script".to_owned(), script.clone());
         }
 
-        let field_count = 5
-            + usize::from(self.name.is_some())
+        let field_count = 8
             + usize::from(self.context_name.is_some())
-            + usize::from(self.display_name.is_some())
             + usize::from(self.display_name_token.is_some())
             + usize::from(self.condition.is_some())
-            + usize::from(self.continue_on_error.is_some())
-            + usize::from(self.working_directory.is_some())
-            + usize::from(self.timeout_in_minutes.is_some());
+            + usize::from(!self.env.is_empty())
+            + usize::from(self.working_directory.is_some());
         let mut map = serializer.serialize_map(Some(field_count))?;
         map.serialize_entry("type", "action")?;
         map.serialize_entry("reference", &SerializedActionReference { step: self })?;
-        map.serialize_entry("environment", &TemplateStringMap(&self.env))?;
+        if !self.env.is_empty() {
+            map.serialize_entry("environment", &TemplateStringMap(&self.env))?;
+        }
         map.serialize_entry("inputs", &TemplateStringMap(&inputs))?;
         map.serialize_entry("id", &self.id)?;
-        if let Some(name) = &self.name {
-            map.serialize_entry("name", name)?;
-        }
+        let name = self.context_name.as_ref().or(self.name.as_ref());
+        map.serialize_entry("name", &name)?;
         if let Some(context_name) = &self.context_name {
             map.serialize_entry("contextName", context_name)?;
-        }
-        if let Some(display_name) = &self.display_name {
-            map.serialize_entry("displayName", display_name)?;
         }
         if let Some(token) = &self.display_name_token {
             map.serialize_entry("displayNameToken", token)?;
@@ -465,15 +472,11 @@ impl Serialize for TaskStep {
         if let Some(condition) = &self.condition {
             map.serialize_entry("condition", condition)?;
         }
-        if let Some(continue_on_error) = self.continue_on_error {
-            map.serialize_entry("continueOnError", &continue_on_error)?;
-        }
+        map.serialize_entry("continueOnError", &self.continue_on_error)?;
         if let Some(working_directory) = &self.working_directory {
             map.serialize_entry("workingDirectory", working_directory)?;
         }
-        if let Some(timeout_in_minutes) = self.timeout_in_minutes {
-            map.serialize_entry("timeoutInMinutes", &timeout_in_minutes)?;
-        }
+        map.serialize_entry("timeoutInMinutes", &self.timeout_in_minutes)?;
         map.end()
     }
 }
@@ -663,9 +666,15 @@ impl Serialize for TemplateStringMapPair<'_> {
         S: Serializer,
     {
         use serde::ser::SerializeMap;
+        let mut value = template_string_token(self.value);
+        if let Some(token) = value.as_object_mut() {
+            token.insert("file".to_owned(), serde_json::json!(1));
+            token.insert("line".to_owned(), serde_json::json!(0));
+            token.insert("col".to_owned(), serde_json::json!(0));
+        }
         let mut map = serializer.serialize_map(Some(2))?;
         map.serialize_entry("Key", &serde_json::json!({"type": 0, "lit": self.key}))?;
-        map.serialize_entry("Value", &template_string_token(self.value))?;
+        map.serialize_entry("Value", &value)?;
         map.end()
     }
 }
@@ -804,8 +813,10 @@ pub struct MaskHint {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum MaskType {
-    /// A literal string to redact.
+    /// A literal hash value to redact.
     Hash,
+    /// A regular expression applied by the runner's secret masker.
+    Regex,
 }
 
 // ─── Timeline and recording DTOs ──────────────────────────────────────────
@@ -815,6 +826,10 @@ pub enum MaskType {
 pub struct TimelineReference {
     #[serde(rename = "id")]
     pub id: uuid::Uuid,
+    #[serde(rename = "changeId")]
+    pub change_id: i32,
+    #[serde(rename = "location")]
+    pub location: Option<String>,
 }
 
 /// A single timeline record — represents the status of a job or step.
@@ -943,7 +958,11 @@ pub enum IssueType {
 pub struct TaskResources {
     #[serde(rename = "endpoints", default)]
     pub endpoints: Vec<ServiceEndpoint>,
-    #[serde(rename = "repositories", default)]
+    #[serde(
+        rename = "repositories",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub repositories: Vec<RepositoryReference>,
 }
 
@@ -959,7 +978,7 @@ pub struct ServiceEndpoint {
     pub data: BTreeMap<String, String>,
     #[serde(rename = "name")]
     pub name: String,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    #[serde(skip)]
     pub endpoint_type: Option<String>,
     #[serde(rename = "url", skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
@@ -967,7 +986,9 @@ pub struct ServiceEndpoint {
     pub authorization: EndpointAuthorization,
     #[serde(rename = "isShared", skip_serializing_if = "Option::is_none")]
     pub is_shared: Option<bool>,
-    #[serde(rename = "serviceOwner", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "isReady", skip_serializing_if = "Option::is_none")]
+    pub is_ready: Option<bool>,
+    #[serde(skip)]
     pub service_owner: Option<String>,
 }
 
@@ -1011,6 +1032,7 @@ pub struct RepositoryConnector {
 /// Upstream source: `Pipelines.ContextData.PipelineContextData.cs`
 #[derive(Debug, Clone)]
 pub enum PipelineContextData {
+    Null,
     String(String),
     Bool(bool),
     Number(f64),
@@ -1026,44 +1048,39 @@ impl Serialize for PipelineContextData {
         use serde::ser::{SerializeMap, SerializeSeq};
 
         match self {
+            PipelineContextData::Null => serializer.serialize_none(),
             PipelineContextData::String(value) => serializer.serialize_str(value),
             PipelineContextData::Bool(value) => serializer.serialize_bool(*value),
             PipelineContextData::Number(value) => serializer.serialize_f64(*value),
             PipelineContextData::Array(values) => {
-                let mut map =
-                    serializer.serialize_map(Some(if values.is_empty() { 1 } else { 2 }))?;
-                map.serialize_entry("t", &1)?;
-                if !values.is_empty() {
-                    struct ArrayValues<'a>(&'a [PipelineContextData]);
+                struct ArrayValues<'a>(&'a [PipelineContextData]);
 
-                    impl Serialize for ArrayValues<'_> {
-                        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-                        where
-                            S: Serializer,
-                        {
-                            let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
-                            for value in self.0 {
-                                seq.serialize_element(value)?;
-                            }
-                            seq.end()
+                impl Serialize for ArrayValues<'_> {
+                    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+                    where
+                        S: Serializer,
+                    {
+                        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+                        for value in self.0 {
+                            seq.serialize_element(value)?;
                         }
+                        seq.end()
                     }
-
-                    map.serialize_entry("a", &ArrayValues(values))?;
                 }
+
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("t", &1)?;
+                map.serialize_entry("a", &ArrayValues(values))?;
                 map.end()
             }
             PipelineContextData::Dict(values) => {
-                let mut map =
-                    serializer.serialize_map(Some(if values.is_empty() { 1 } else { 2 }))?;
+                let pairs: Vec<PipelineContextDataPair<'_>> = values
+                    .iter()
+                    .map(|(key, value)| PipelineContextDataPair { key, value })
+                    .collect();
+                let mut map = serializer.serialize_map(Some(2))?;
                 map.serialize_entry("t", &2)?;
-                if !values.is_empty() {
-                    let pairs: Vec<PipelineContextDataPair<'_>> = values
-                        .iter()
-                        .map(|(key, value)| PipelineContextDataPair { key, value })
-                        .collect();
-                    map.serialize_entry("d", &pairs)?;
-                }
+                map.serialize_entry("d", &pairs)?;
                 map.end()
             }
         }
@@ -1149,7 +1166,7 @@ fn pipeline_context_from_json(value: serde_json::Value) -> Result<PipelineContex
                 Some(other) => Err(format!("unsupported PipelineContextData type {other}")),
             }
         }
-        serde_json::Value::Null => Ok(PipelineContextData::String(String::new())),
+        serde_json::Value::Null => Ok(PipelineContextData::Null),
     }
 }
 
@@ -1277,14 +1294,18 @@ mod tests {
     }
 
     fn expected_template_token(value: &str) -> Value {
-        if let Some(expression) = value
+        let mut token = if let Some(expression) = value
             .strip_prefix("${{")
             .and_then(|rest| rest.strip_suffix("}}"))
         {
             json!({"type": 3, "expr": expression.trim()})
         } else {
             json!({"type": 0, "lit": value})
-        }
+        };
+        token["file"] = json!(1);
+        token["line"] = json!(0);
+        token["col"] = json!(0);
+        token
     }
 
     fn expected_template_map(values: &BTreeMap<String, String>) -> Value {
@@ -1303,20 +1324,8 @@ mod tests {
             json!({"type": 2, "map": pairs})
         }
     }
-    // Independent AgentJobRequest oracle. These rules follow the official
-    // DataMember contract, not AgentJobRequestMessage's Serialize impl:
-    // MessageType/Plan/Timeline/JobId/JobDisplayName/RequestId are required
-    // members (official source lines 64-116); JobContainer, JobServiceContainers,
-    // and JobOutputs omit null (lines 94-110); Resources is required (lines
-    // 118-122); ContextData is EmitDefaultValue=false (lines 124-136), but
-    // the official constructor initializes it, so the empty map is emitted.
-    // EnableDebugger, DebuggerTunnel, and DebuggerWelcomeMessage omit defaults
-    // (official source lines 219-245). Aksh does not model JobName, LockedUntil,
-    // Workspace, ActionsEnvironment, Snapshot, BillingOwnerId, Defaults,
-    // EnvironmentVariables, ActionsDependencies, or FileTable, so this oracle
-    // intentionally makes no claims about those absent DTO fields.
-    // No local golden AgentJobRequest flow exists; protocol_golden.rs:6-20 is
-    // an unrelated NDJSON event golden and is therefore not used as an oracle.
+    // Independent AgentJobRequest oracle derived from the official v2.335.1
+    // wire contract and the fields modeled by this DTO.
     fn expected_variable_wire(value: &VariableValue) -> Value {
         let mut object = Map::new();
         if let Some(value) = &value.value {
@@ -1332,9 +1341,6 @@ mod tests {
         let mut object = Map::new();
         object.insert("data".to_owned(), json!(endpoint.data));
         object.insert("name".to_owned(), json!(endpoint.name));
-        if let Some(value) = &endpoint.endpoint_type {
-            object.insert("type".to_owned(), json!(value));
-        }
         if let Some(value) = &endpoint.url {
             object.insert("url".to_owned(), json!(value));
         }
@@ -1350,8 +1356,8 @@ mod tests {
         if let Some(value) = endpoint.is_shared {
             object.insert("isShared".to_owned(), json!(value));
         }
-        if let Some(value) = &endpoint.service_owner {
-            object.insert("serviceOwner".to_owned(), json!(value));
+        if let Some(value) = endpoint.is_ready {
+            object.insert("isReady".to_owned(), json!(value));
         }
         Value::Object(object)
     }
@@ -1405,17 +1411,17 @@ mod tests {
         let mut object = Map::new();
         object.insert("type".to_owned(), json!("action"));
         object.insert("reference".to_owned(), reference);
-        object.insert("environment".to_owned(), expected_template_map(&step.env));
+        if !step.env.is_empty() {
+            object.insert("environment".to_owned(), expected_template_map(&step.env));
+        }
         object.insert("inputs".to_owned(), expected_template_map(&inputs));
         object.insert("id".to_owned(), json!(step.id));
-        if let Some(value) = &step.name {
-            object.insert("name".to_owned(), json!(value));
-        }
+        object.insert(
+            "name".to_owned(),
+            json!(step.context_name.as_ref().or(step.name.as_ref())),
+        );
         if let Some(value) = &step.context_name {
             object.insert("contextName".to_owned(), json!(value));
-        }
-        if let Some(value) = &step.display_name {
-            object.insert("displayName".to_owned(), json!(value));
         }
         if let Some(value) = &step.display_name_token {
             object.insert("displayNameToken".to_owned(), value.clone());
@@ -1423,43 +1429,106 @@ mod tests {
         if let Some(value) = &step.condition {
             object.insert("condition".to_owned(), json!(value));
         }
-        if let Some(value) = step.continue_on_error {
-            object.insert("continueOnError".to_owned(), json!(value));
-        }
+        object.insert("continueOnError".to_owned(), json!(step.continue_on_error));
         if let Some(value) = &step.working_directory {
             object.insert("workingDirectory".to_owned(), json!(value));
         }
-        if let Some(value) = step.timeout_in_minutes {
-            object.insert("timeoutInMinutes".to_owned(), json!(value));
-        }
+        object.insert(
+            "timeoutInMinutes".to_owned(),
+            json!(step.timeout_in_minutes),
+        );
         Value::Object(object)
     }
 
     fn expected_job_wire(job: &AgentJobRequestMessage) -> Value {
         let mut object = Map::new();
-        // Official [DataMember] names: AgentJobRequestMessage.cs:64-116.
         if let Some(value) = &job.message_type {
             object.insert("messageType".to_owned(), json!(value));
         }
         object.insert("jobId".to_owned(), json!(job.job_id));
         object.insert("requestId".to_owned(), json!(job.request_id));
-
-        let mut plan = Map::new();
-        plan.insert("planId".to_owned(), json!(job.plan.plan_id));
-        if let Some(value) = &job.plan.plan_type {
-            plan.insert("planType".to_owned(), json!(value));
-        }
-        object.insert("plan".to_owned(), Value::Object(plan));
-        object.insert("timeline".to_owned(), json!({"id": job.timeline.id}));
-        if let Some(value) = &job.display_name {
-            object.insert("displayName".to_owned(), json!(value));
-        }
-        if let Some(value) = &job.condition {
-            object.insert("condition".to_owned(), json!(value));
-        }
+        object.insert(
+            "plan".to_owned(),
+            json!({
+                "planId": job.plan.plan_id,
+                "planType": job.plan.plan_type,
+                "version": job.plan.version,
+                "artifactUri": job.plan.artifact_uri,
+                "artifactLocation": job.plan.artifact_location,
+            }),
+        );
+        object.insert(
+            "timeline".to_owned(),
+            json!({
+                "id": job.timeline.id,
+                "changeId": job.timeline.change_id,
+                "location": job.timeline.location,
+            }),
+        );
         if let Some(value) = &job.job_display_name {
             object.insert("jobDisplayName".to_owned(), json!(value));
         }
+        object.insert("jobName".to_owned(), json!(job.job_name));
+        object.insert("lockedUntil".to_owned(), json!(job.locked_until));
+        if let Some(value) = &job.billing_owner_id {
+            object.insert("billingOwnerId".to_owned(), json!(value));
+        }
+        object.insert("fileTable".to_owned(), json!(job.file_table));
+        object.insert("defaults".to_owned(), json!(job.defaults));
+        object.insert(
+            "environmentVariables".to_owned(),
+            json!(job.environment_variables),
+        );
+        object.insert("snapshot".to_owned(), json!(job.snapshot));
+        if let Some(value) = &job.condition {
+            object.insert("condition".to_owned(), json!(value));
+        }
+        object.insert(
+            "variables".to_owned(),
+            Value::Object(
+                job.variables
+                    .iter()
+                    .map(|(key, value)| (key.clone(), expected_variable_wire(value)))
+                    .collect(),
+            ),
+        );
+        object.insert(
+            "mask".to_owned(),
+            Value::Array(
+                job.mask_hints
+                    .iter()
+                    .map(|hint| json!({"type": hint.hint_type, "value": hint.value}))
+                    .collect(),
+            ),
+        );
+        let mut resources = Map::new();
+        resources.insert(
+            "endpoints".to_owned(),
+            Value::Array(
+                job.resources
+                    .endpoints
+                    .iter()
+                    .map(expected_endpoint_wire)
+                    .collect(),
+            ),
+        );
+        if !job.resources.repositories.is_empty() {
+            resources.insert("repositories".to_owned(), json!(job.resources.repositories));
+        }
+        object.insert("resources".to_owned(), Value::Object(resources));
+        object.insert(
+            "contextData".to_owned(),
+            Value::Object(
+                job.context_data
+                    .iter()
+                    .map(|(key, value)| (key.clone(), expected_context_wire(value)))
+                    .collect(),
+            ),
+        );
+        object.insert(
+            "steps".to_owned(),
+            Value::Array(job.steps.iter().map(expected_step_wire).collect()),
+        );
         if let Some(value) = job.retry_count {
             object.insert("retryCount".to_owned(), json!(value));
         }
@@ -1469,89 +1538,17 @@ mod tests {
         if let Some(value) = job.job_timeout {
             object.insert("jobTimeout".to_owned(), json!(value));
         }
-        // Official JobContainer/JobServiceContainers/JobOutputs are
-        // EmitDefaultValue=false (AgentJobRequestMessage.cs:94-110).
-        if let Some(value) = &job.job_container {
-            object.insert("jobContainer".to_owned(), value.clone());
-        }
-        if let Some(value) = &job.job_service_containers {
-            object.insert("jobServiceContainers".to_owned(), value.clone());
-        }
-        if let Some(value) = &job.job_outputs {
-            object.insert("jobOutputs".to_owned(), value.clone());
-        }
-
-        // Variables/Mask/Steps backing members: AgentJobRequestMessage.cs
-        // lines 193-202 and 303-321. The Aksh wire names are the DTO's
-        // explicit lower-camel serde names.
-        // Resources is the required official member at lines 118-122;
-        // ContextData is EmitDefaultValue=false at lines 124-136, but its
-        // official constructor initializes the dictionary, so `{}` is valid.
-        // ActionsDownloadInfo is an Aksh-modeled field (azdo.rs:289-290), not
-        // an AgentJobRequestMessage DataMember at the pinned official commit;
-        // this rule verifies only the local DTO's explicit wire contract.
-        let variables = job
-            .variables
-            .iter()
-            .map(|(key, value)| (key.clone(), expected_variable_wire(value)))
-            .collect::<Map<String, Value>>();
-        object.insert("variables".to_owned(), Value::Object(variables));
+        object.insert("jobContainer".to_owned(), json!(job.job_container));
         object.insert(
-            "maskHints".to_owned(),
-            Value::Array(
-                job.mask_hints
-                    .iter()
-                    .map(|hint| json!({"type": "hash", "value": hint.value}))
-                    .collect(),
-            ),
+            "jobServiceContainers".to_owned(),
+            json!(job.job_service_containers),
         );
-        let resources = json!({
-            "endpoints": job.resources.endpoints.iter().map(expected_endpoint_wire).collect::<Vec<_>>(),
-            "repositories": job.resources.repositories.iter().map(expected_repository_wire).collect::<Vec<_>>(),
-        });
-        object.insert("resources".to_owned(), resources);
-        let context = job
-            .context_data
-            .iter()
-            .map(|(key, value)| (key.clone(), expected_context_wire(value)))
-            .collect::<Map<String, Value>>();
-        object.insert("contextData".to_owned(), Value::Object(context));
-        object.insert(
-            "steps".to_owned(),
-            Value::Array(job.steps.iter().map(expected_step_wire).collect()),
-        );
-        let actions = job
-            .actions_download_info
-            .iter()
-            .map(|(key, value)| {
-                let mut info = Map::new();
-                if let Some(value) = &value.download_type {
-                    info.insert("type".to_owned(), json!(value));
-                }
-                if let Some(value) = &value.url {
-                    info.insert("url".to_owned(), json!(value));
-                }
-                if let Some(value) = &value.auth {
-                    info.insert("auth".to_owned(), json!(value));
-                }
-                (key.clone(), Value::Object(info))
-            })
-            .collect::<Map<String, Value>>();
-        object.insert("actionsDownloadInfo".to_owned(), Value::Object(actions));
-        // Official debugger members are EmitDefaultValue=false (lines 219-245).
+        object.insert("jobOutputs".to_owned(), json!(job.job_outputs));
         if job.enable_debugger {
             object.insert("enableDebugger".to_owned(), json!(true));
         }
         if let Some(value) = &job.debugger_tunnel {
-            object.insert(
-                "debuggerTunnel".to_owned(),
-                json!({
-                    "tunnelId": value.tunnel_id,
-                    "clusterId": value.cluster_id,
-                    "hostToken": value.host_token,
-                    "port": value.port,
-                }),
-            );
+            object.insert("debuggerTunnel".to_owned(), json!(value));
         }
         if let Some(value) = &job.debugger_welcome_message {
             object.insert("debuggerWelcomeMessage".to_owned(), json!(value));
@@ -1584,6 +1581,7 @@ mod tests {
                                 url,
                                 authorization: EndpointAuthorization { parameters, scheme },
                                 is_shared: Some(false),
+                                is_ready: None,
                                 service_owner,
                             }
                         },
@@ -1615,23 +1613,6 @@ mod tests {
             })
     }
 
-    fn arb_actions_download_info() -> impl Strategy<Value = BTreeMap<String, ActionsDownloadInfo>> {
-        proptest::collection::btree_map(
-            arb_key(),
-            (
-                prop::option::of(arb_text()),
-                prop::option::of(arb_text()),
-                prop::option::of(arb_text()),
-            )
-                .prop_map(|(download_type, url, auth)| ActionsDownloadInfo {
-                    download_type,
-                    url,
-                    auth,
-                }),
-            0..=2,
-        )
-    }
-
     fn arb_job() -> impl Strategy<Value = AgentJobRequestMessage> {
         (
             (
@@ -1639,8 +1620,7 @@ mod tests {
                 proptest::array::uniform16(any::<u8>()),
                 -100_000i64..=100_000,
                 arb_text(),
-                prop::option::of(arb_text()),
-                prop::option::of(arb_text()),
+                arb_text(),
                 prop::option::of(arb_text()),
                 prop::option::of(arb_text()),
                 prop::option::of(-10i32..=10),
@@ -1653,7 +1633,6 @@ mod tests {
                 proptest::collection::vec(arb_literal_step(), 0..=2),
                 proptest::collection::btree_map(arb_key(), arb_context_data(), 0..=2),
                 arb_resources(),
-                arb_actions_download_info(),
                 prop::option::of(arb_text().prop_map(|value| json!({"type": 0, "lit": value}))),
                 prop::option::of(arb_text().prop_map(|value| json!({"type": 2, "lit": value}))),
                 prop::option::of(arb_text().prop_map(|value| json!({"type": 2, "lit": value}))),
@@ -1673,7 +1652,6 @@ mod tests {
                         request_id,
                         plan_id,
                         plan_type,
-                        display_name,
                         condition,
                         job_display_name,
                         retry_count,
@@ -1686,7 +1664,6 @@ mod tests {
                         steps,
                         context_data,
                         resources,
-                        actions_download_info,
                         job_container,
                         job_service_containers,
                         job_outputs,
@@ -1696,19 +1673,32 @@ mod tests {
                     message_type: Some("PipelineAgentJobRequest".to_owned()),
                     job_id: uuid::Uuid::from_bytes(job_id),
                     request_id,
-                    plan: PlanReference { plan_id, plan_type },
+                    plan: PlanReference {
+                        plan_id,
+                        plan_type,
+                        version: 0,
+                        artifact_uri: String::new(),
+                        artifact_location: String::new(),
+                    },
                     timeline: TimelineReference {
                         id: uuid::Uuid::from_bytes(timeline_id),
+                        change_id: 0,
+                        location: None,
                     },
-                    display_name,
+                    job_display_name,
+                    job_name: "__job".to_owned(),
+                    locked_until: "0001-01-01T00:00:00".to_owned(),
+                    billing_owner_id: None,
+                    file_table: Vec::new(),
+                    defaults: Vec::new(),
+                    environment_variables: Vec::new(),
+                    snapshot: None,
                     condition,
                     variables,
                     mask_hints,
                     resources,
                     context_data,
                     steps,
-                    actions_download_info,
-                    job_display_name,
                     retry_count,
                     pre_job_timeout,
                     job_timeout,
@@ -1728,14 +1718,13 @@ mod tests {
                 },
             )
     }
-    // Variables and steps are official backing DataMembers (source lines
-    // 303-321); MaskHints is the official accessor over the Mask backing member
-    // (lines 193-202). ActionsDownloadInfo/actionsDownloadInfo is not present
-    // in this pinned AgentJobRequestMessage.cs; its oracle below is limited to
-    // the Aksh DTO's explicitly modeled local field (azdo.rs:289-290).
+
+    // Variables, steps, and tagged context collections are compared against
+    // independent wire-shape oracles so DTO field renames cannot hide drift.
 
     fn assert_context_semantics(left: &PipelineContextData, right: &PipelineContextData) {
         match (left, right) {
+            (PipelineContextData::Null, PipelineContextData::Null) => {}
             (PipelineContextData::String(a), PipelineContextData::String(b)) => assert_eq!(a, b),
             (PipelineContextData::Bool(a), PipelineContextData::Bool(b)) => assert_eq!(a, b),
             (PipelineContextData::Number(a), PipelineContextData::Number(b)) => {
@@ -1759,36 +1748,33 @@ mod tests {
 
     fn expected_context_wire(value: &PipelineContextData) -> Value {
         match value {
+            PipelineContextData::Null => Value::Null,
             PipelineContextData::String(value) => Value::String(value.clone()),
             PipelineContextData::Bool(value) => Value::Bool(*value),
             PipelineContextData::Number(value) => json!(value),
             PipelineContextData::Array(values) => {
                 let mut object = Map::new();
                 object.insert("t".to_owned(), json!(1));
-                if !values.is_empty() {
-                    object.insert(
-                        "a".to_owned(),
-                        Value::Array(values.iter().map(expected_context_wire).collect()),
-                    );
-                }
+                object.insert(
+                    "a".to_owned(),
+                    Value::Array(values.iter().map(expected_context_wire).collect()),
+                );
                 Value::Object(object)
             }
             PipelineContextData::Dict(values) => {
                 let mut object = Map::new();
                 object.insert("t".to_owned(), json!(2));
-                if !values.is_empty() {
-                    object.insert(
-                        "d".to_owned(),
-                        Value::Array(
-                            values
-                                .iter()
-                                .map(|(key, value)| {
-                                    json!({"k": key, "v": expected_context_wire(value)})
-                                })
-                                .collect(),
-                        ),
-                    );
-                }
+                object.insert(
+                    "d".to_owned(),
+                    Value::Array(
+                        values
+                            .iter()
+                            .map(
+                                |(key, value)| json!({"k": key, "v": expected_context_wire(value)}),
+                            )
+                            .collect(),
+                    ),
+                );
                 Value::Object(object)
             }
         }
@@ -1996,7 +1982,10 @@ mod tests {
 
         assert_eq!(json["type"], "action");
         assert_eq!(json["reference"]["type"], "script");
-        assert_eq!(json["environment"]["type"], 2);
+        assert!(json.get("environment").is_none());
+        assert_eq!(json["name"], Value::Null);
+        assert_eq!(json["continueOnError"], Value::Null);
+        assert_eq!(json["timeoutInMinutes"], Value::Null);
         assert_eq!(json["inputs"]["type"], 2);
         assert_eq!(json["inputs"]["map"][0]["Key"]["type"], 0);
         assert_eq!(json["inputs"]["map"][0]["Key"]["lit"], "script");
@@ -2158,17 +2147,18 @@ mod tests {
             let encoded = serde_json::to_value(&step).unwrap();
             prop_assert_eq!(&encoded["type"], &json!("action"));
             prop_assert_eq!(&encoded["reference"], &json!({"type": "script"}));
-            prop_assert_eq!(&encoded["environment"], &expected_template_map(&step.env));
+            if step.env.is_empty() {
+                prop_assert!(encoded.get("environment").is_none());
+            } else {
+                prop_assert_eq!(&encoded["environment"], &expected_template_map(&step.env));
+            }
             prop_assert_eq!(&encoded["inputs"], &expected_template_map(&expected_inputs));
             prop_assert_eq!(&encoded["id"], &json!(step.id));
             prop_assert_eq!(encoded.get("contextName").is_some(), step.context_name.is_some());
-            prop_assert_eq!(encoded.get("displayName").is_some(), step.display_name.is_some());
+            prop_assert!(encoded.get("displayName").is_none());
             prop_assert_eq!(encoded.get("displayNameToken").is_some(), step.display_name_token.is_some());
             if let Some(context_name) = &step.context_name {
                 prop_assert_eq!(&encoded["contextName"], &json!(context_name));
-            }
-            if let Some(display_name) = &step.display_name {
-                prop_assert_eq!(&encoded["displayName"], &json!(display_name));
             }
             if let Some(display_name_token) = &step.display_name_token {
                 prop_assert_eq!(&encoded["displayNameToken"], display_name_token);
@@ -2176,9 +2166,10 @@ mod tests {
 
             let decoded: TaskStep = serde_json::from_value(encoded.clone()).unwrap();
             prop_assert_eq!(&decoded.id, &step.id);
-            prop_assert_eq!(&decoded.name, &step.name);
+            let expected_name = step.context_name.clone().or_else(|| step.name.clone());
+            prop_assert_eq!(&decoded.name, &expected_name);
             prop_assert_eq!(&decoded.context_name, &step.context_name);
-            prop_assert_eq!(&decoded.display_name, &step.display_name);
+            prop_assert_eq!(&decoded.display_name, &None);
             prop_assert_eq!(&decoded.display_name_token, &step.display_name_token);
             prop_assert_eq!(&decoded.condition, &step.condition);
             prop_assert_eq!(&decoded.script, &step.script);
@@ -2200,7 +2191,7 @@ mod tests {
                 .find(|pair| pair["Key"]["lit"] == "script")
                 .map(|pair| pair["Value"].clone())
                 .unwrap();
-            prop_assert_eq!(&script_token, &json!({"type": 3, "expr": expression.trim()}));
+            prop_assert_eq!(&script_token, &expected_template_token(&format!("${{{{ {expression} }}}}")));
         }
 
         #[test]
@@ -2256,7 +2247,7 @@ mod tests {
                 "empty {field} token must decode as empty env"
             );
             let encoded = serde_json::to_value(&decoded).unwrap();
-            assert_eq!(encoded["environment"], json!({"type": 2}));
+            assert!(encoded.get("environment").is_none());
             assert!(encoded.get("env").is_none());
         }
 
