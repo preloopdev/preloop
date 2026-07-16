@@ -15,13 +15,16 @@
     "secrets_inherit": false,
     "steps": [
       {
+        "continue_on_error": null,
         "env": {},
         "id": null,
         "if_condition": null,
         "name": null,
         "run": "echo hello",
+        "shell": null,
         "uses": null,
-        "with": {}
+        "with": {},
+        "working_directory": null
       }
     ]
   }

@@ -9,7 +9,7 @@ GH_REPO="${GH_REPO:-preloopdev/aksh-conformance-sample}"
 TEMPLATE="${TEMPLATE:-/private/tmp/bench-runner.smolmachine}"
 OFFICIAL_RUNNER_HOST="${OFFICIAL_RUNNER_HOST:-$HOME/cachingv4}"
 AKSH_SERVER_BIN="$REPO_ROOT/target/aarch64-unknown-linux-musl/release/aksh-runner-server"
-RESULTS_BASE="$REPO_ROOT/benchmarks/real-world/results/server-compare"
+RESULTS_BASE="$REPO_ROOT/benchmarks/compatibility/server/behavior"
 
 red()   { printf '\033[1;31m%s\033[0m\n' "$*"; }
 green() { printf '\033[1;32m%s\033[0m\n' "$*"; }
@@ -26,7 +26,9 @@ trap cleanup EXIT
 log "Creating persistent VM: $VM"
 smolvm machine create --name "$VM" --from "$TEMPLATE" \
     --net -v "${OFFICIAL_RUNNER_HOST}:/opt/runners:ro" -v "$REPO_ROOT:/workspace" >/dev/null 2>&1
+smolvm machine update --name "$VM" --rosetta >/dev/null 2>&1
 smolvm machine start --name "$VM" >/dev/null 2>&1
+smolvm machine exec --name "$VM" -- bash -lc 'mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc 2>/dev/null || true; if [ -x /usr/bin/rosetta-wrapper ] && [ -x /mnt/rosetta/rosetta ]; then echo ":rosetta:M::\\x7fELF\\x02\\x01\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x02\\x00\\x3e\\x00:\\xff\\xff\\xff\\xff\\xff\\xfe\\xfe\\x00\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xfe\\xff\\xff\\xff:/usr/bin/rosetta-wrapper:F" > /proc/sys/fs/binfmt_misc/register 2>/dev/null || true; fi' >/dev/null 2>&1 || true
 smolvm machine cp "$AKSH_SERVER_BIN" "$VM:/usr/local/bin/aksh-runner-server" 2>&1 | tail -1
 log "VM ready"
 
@@ -57,7 +59,7 @@ print(json.dumps({
 }))
 " <<< "$MODIFIED_YAML" > "$PAYLOAD_FILE"
 
-    RESULT_BASE_VM="/workspace/benchmarks/real-world/results/server-compare/$scenario/aksh-server"
+    RESULT_BASE_VM="/workspace/benchmarks/compatibility/server/behavior/$scenario/aksh-server"
 
     # Run scenario in the persistent VM (each run: start server, run runners, stop server)
     smolvm machine exec --name "$VM" -- bash -lc "
@@ -71,7 +73,7 @@ print(json.dumps({
         wget -qO- http://127.0.0.1/healthz >/dev/null || { echo 'healthz failed'; kill \$server_pid 2>/dev/null; exit 1; }
         
         # Submit workflow
-        RESULT=\$(wget -qO- --post-file=/workspace/benchmarks/real-world/results/server-compare/payload-${scenario}.json \
+        RESULT=\$(wget -qO- --post-file=/workspace/benchmarks/compatibility/server/behavior/payload-${scenario}.json \\
             --header='Content-Type: application/json' \
             --header='Authorization: Bearer aksh-system-token' \
             http://127.0.0.1/api/v1/runs 2>/dev/null)

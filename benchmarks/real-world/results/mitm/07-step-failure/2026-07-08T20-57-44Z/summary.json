@@ -1,8 +1,0 @@
-{
-  "backend": "aksh",
-  "scenario": "07-step-failure",
-  "run_id": "28975235479",
-  "conclusion": "failure",
-  "flows_count":       43,
-  "timestamp": "2026-07-08T20-57-44Z"
-}

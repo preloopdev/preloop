@@ -15,6 +15,14 @@ def normalize_path(path: str) -> str:
     # Strip '/runner/server' prefix that runner.server prepends to its routes.
     path = re.sub(r"^/runner/server(?=/)", "", path)
 
+    # Strip aksh's '/runner/' prefix for broker endpoints so they match the
+    # official broker.actions.githubusercontent.com paths.
+    path = re.sub(r"^/runner/(session|message|acknowledge)", r"/\1", path)
+
+    # Normalize aksh's /broker/{n}/ run-service prefix to the official
+    # /{n}/ form (run-actions-*.actions.githubusercontent.com/{n}/...).
+    path = re.sub(r"^/broker/(\d+)/", r"/\1/", path)
+
     # Strip a single-segment random base path prefix before /_apis/
     # (e.g. /abc123/_apis/... → /_apis/..., or /my-org/_apis/... → /_apis/...).
     # Must be a single alphanumeric/hyphen segment (never multi-segment like /runner/server/).

@@ -4,6 +4,12 @@
 
 Aksh is the GitHub Actions-compatible brain of Preloop. It should own workflow semantics, runner-compatible protocol behavior, and job execution orchestration, while Preloop owns VM lifecycle, host isolation, policy, cache, artifacts, telemetry, and product UX.
 
+Aksh is runtime-agnostic: it emits standard runner job payloads and rewrites the
+service URLs (cache/results/runtime/log) to point at itself regardless of which
+microVM executor runs the job. The executor is chosen per tier behind the
+`VmProvider` seam (see
+[doc 14](14_runtime_tiers_and_portable_handoff.md)).
+
 Earlier plans treated `ChristopherHX/runner.server` as the local control-plane core. Given the current `runner-rust` branch, the better architecture is:
 
 ```text
@@ -87,13 +93,15 @@ The Aksh control plane should eventually provide:
 
 Maintain explicit protocol boundaries:
 
-| Surface | Purpose | Stability requirement |
-|---|---|---|
-| `_apis/...` AzDO-style protocol | Local Aksh and GHES-like runner compatibility | Golden-tested |
-| Broker/run-service protocol | GitHub.com-style runner compatibility | Golden-tested |
-| `/api/v1/...` native REST | CLI, local tools, agent UI | Versioned |
-| NDJSON event stream | Agents/MCP/TUI | Versioned and documented |
-| GitHub App webhooks/checks | Managed/self-hosted CI | Idempotent and secure |
+
+| Surface                         | Purpose                                       | Stability requirement    |
+| ------------------------------- | --------------------------------------------- | ------------------------ |
+| `_apis/...` AzDO-style protocol | Local Aksh and GHES-like runner compatibility | Golden-tested            |
+| Broker/run-service protocol     | GitHub.com-style runner compatibility         | Golden-tested            |
+| `/api/v1/...` native REST       | CLI, local tools, agent UI                    | Versioned                |
+| NDJSON event stream             | Agents/MCP/TUI                                | Versioned and documented |
+| GitHub App webhooks/checks      | Managed/self-hosted CI                        | Idempotent and secure    |
+
 
 Do not let the native API leak into the runner protocol implementation. Runner-facing behavior should be validated with real runner fixtures.
 
@@ -149,7 +157,7 @@ host: preloopd + aksh-control
         |
         | vsock/proxy/local bridge
         v
-libkrun Linux microVM
+smolvm Linux microVM (Firecracker on the scale tier)
   +-- preloop-guest-agent
   +-- aksh-runner listener/worker
   +-- private Docker/buildkit services
@@ -158,28 +166,21 @@ libkrun Linux microVM
 
 For the first integration milestone, keep Aksh control on the host and run `aksh-runner` inside the VM. Later, selected local-only modes may run both inside the VM, but managed mode should keep trusted control-plane state outside untrusted job VMs.
 
-## Official runner and runner.server usage
+Preloop consumes smolvm as the microVM substrate; it does not reimplement the VM
+layer. The same guest agent and `aksh-runner` run inside whichever executor the
+`VmProvider` seam selects (SmolvmProvider for Local/smolvm-KVM, FirecrackerProvider
+for the scale tier), so control-plane behavior is identical across tiers.
 
-Do not delete official compatibility.
 
-Use these modes:
-
-```text
-preloop run --engine=aksh
-preloop run --engine=official-runner
-preloop diff --against=runner-server
-preloop diff --against=github-hosted
-```
-
-The official runner and `runner.server` provide behavioral truth. Aksh provides product control.
 
 ## Acceptance gates
 
 Before Aksh is the default Preloop engine:
 
 - P0 conformance must pass against the official runner or runner.server oracle.
-- Basic success, failure, matrix, needs, outputs, and logs must work inside a libkrun VM.
+- Basic success, failure, matrix, needs, outputs, and logs must work inside a smolvm microVM (and the Firecracker tier behind the same seam).
 - Cache/artifact behavior must either pass or be clearly marked unsupported.
 - Docker/service gaps must fail loudly, not green silently.
 - Cancellation must kill the full process tree.
 - Secrets must never print raw through Debug, Display, serialized output, logs, or artifact metadata.
+
