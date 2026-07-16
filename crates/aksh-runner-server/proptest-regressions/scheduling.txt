@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 4ff0e5a358b3a703b1dc01862bdd51edd9fe2bef5acdde7905b06defa8d75ed2 # shrinks to needs_count = 4, statuses = [Failure, Cancelled], condition = Some("cancelled()")

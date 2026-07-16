@@ -1,0 +1,29 @@
+{
+  "workflow": "14-jobset-embedded",
+  "run_id": "6623e970-5773-4158-9f0a-109a89ee2fc5",
+  "status": "completed",
+  "conclusion": "success",
+  "jobs": [
+    {
+      "name": "caller-job/inner",
+      "id": "caller-job/inner",
+      "status": "success",
+      "conclusion": "success",
+      "steps": [
+        {
+          "name": "Set up job",
+          "conclusion": "success"
+        },
+        {
+          "name": "run-inner",
+          "conclusion": "success"
+        },
+        {
+          "name": "Complete job",
+          "conclusion": "success"
+        }
+      ]
+    }
+  ],
+  "source": "aksh"
+}

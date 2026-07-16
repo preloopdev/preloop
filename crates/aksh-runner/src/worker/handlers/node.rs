@@ -38,6 +38,7 @@ pub async fn run_node_action(
     }
     let node_version = match runs_using {
         "node24" => "node24",
+        "node22" => "node22",
         _ => "node20", // node12/16 mapped to node20
     };
 
