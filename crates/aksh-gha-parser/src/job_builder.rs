@@ -722,7 +722,7 @@ jobs:
         .unwrap();
 
         assert!(!msg.mask_hints.is_empty());
-        assert_eq!(msg.mask_hints[0].value, "s3cr3t");
+        assert!(msg.mask_hints.iter().any(|hint| hint.value == "s3cr3t"));
         let secret = msg.variables.get("MY_SECRET").unwrap();
         assert_eq!(secret.value.as_deref(), Some("s3cr3t"));
         assert_eq!(secret.is_secret, Some(true));

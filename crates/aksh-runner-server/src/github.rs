@@ -730,6 +730,15 @@ pub(crate) async fn handle_github_webhook(
                 reusable_workflows: BTreeMap::new(),
                 enable_debugger: false,
                 debugger_welcome_message: None,
+                sha: resolved_sha.clone(),
+                actor: payload_val
+                    .get("sender")
+                    .and_then(|s| s.get("login"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("aksh-system")
+                    .to_owned(),
+                environment: None,
+                workflow_file: Some(filename.clone()),
                 inputs: BTreeMap::new(),
                 trust_tier: effective.trust_tier.as_ref().and_then(|tier| {
                     serde_json::to_value(tier)

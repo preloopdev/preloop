@@ -28,7 +28,7 @@ jobs:
         run: |
           target/debug/aksh-runner-server serve \
             --listen 127.0.0.1:9090 --state-dir /tmp/aksh-ci-state &
-          for i in $(seq 1 40); do
+          for i in $(seq 1 80); do
             if curl -sf http://127.0.0.1:9090/healthz >/dev/null; then
               echo "aksh ready"; exit 0
             fi

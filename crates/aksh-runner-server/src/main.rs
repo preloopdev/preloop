@@ -42,6 +42,11 @@ enum Command {
         /// Bearer token for privileged simulation endpoints.
         #[arg(long, requires = "enable_test_api")]
         test_api_token: Option<String>,
+        /// OIDC issuer URL for tokens minted by this aksh server.
+        /// Defaults to `{public_base_url}/oidc`; use an HTTPS URL you control
+        /// and register with the relying cloud provider.
+        #[arg(long)]
+        oidc_issuer: Option<String>,
         /// Enable the cron scheduler for schedule-triggered workflows.
         #[arg(long)]
         enable_scheduler: bool,
@@ -93,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
             tls_self_signed,
             enable_test_api,
             test_api_token,
+            oidc_issuer,
             enable_scheduler,
         } => {
             let tls = match (tls_cert, tls_key, tls_self_signed) {
@@ -108,6 +114,7 @@ async fn main() -> anyhow::Result<()> {
                 tls,
                 enable_test_api,
                 test_api_token,
+                oidc_issuer,
                 enable_scheduler,
             })
             .await?;

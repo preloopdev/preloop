@@ -698,6 +698,9 @@ mod properties {
     /// Recursively verify that PipelineContextData shape matches JSON shape.
     fn assert_shape_matches(data: &azdo::PipelineContextData, json: &Value) {
         match data {
+            azdo::PipelineContextData::Null => {
+                assert_eq!(json, &Value::Null, "Null value mismatch");
+            }
             azdo::PipelineContextData::String(s) => {
                 assert_eq!(json, &Value::String(s.clone()), "String value mismatch");
             }
