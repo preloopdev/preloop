@@ -271,6 +271,9 @@ pub struct ReusableCallMetadata {
     /// Callee workflow-level concurrency (`EmbeddedConcurrency`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedded_concurrency: Option<Concurrency>,
+    /// Caller strategy matrix values.
+    #[serde(default)]
+    pub matrix: BTreeMap<String, Value>,
 }
 
 /// Trigger syntax.
@@ -1247,6 +1250,7 @@ fn expand_jobs_with_reusables_internal(
                         inputs: resolved_inputs.clone(),
                         caller_concurrency: job.concurrency.clone(),
                         embedded_concurrency: called.concurrency.clone(),
+                        matrix: matrix.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
                     },
                 );
 

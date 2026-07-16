@@ -1695,7 +1695,7 @@ pub(crate) async fn submit_run_inner(
                     github: &github,
                     vars: &submission.vars,
                     inputs,
-                    matrix: None,
+                    matrix: Some(&call.matrix),
                     strategy: None,
                     needs: None,
                 };
@@ -13605,6 +13605,66 @@ jobs:
         assert!(inner.concurrency_groups[&key].pending.is_empty());
         assert!(matches!(
             inner.concurrency_groups[&key].running,
+            Some(concurrency::Holder::JobSet { run_id: holder_run, .. }) if holder_run == run_id
+        ));
+    }
+    #[tokio::test]
+    async fn c02_jobset_resolves_matrix_contexts_on_caller_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let caller_yaml = r#"
+on: push
+jobs:
+  call:
+    strategy:
+      matrix:
+        env: [dev, prod]
+    uses: ./.github/workflows/callee.yml
+    concurrency:
+      group: deploy-${{ matrix.env }}
+"#;
+        let callee_yaml = r#"
+on: workflow_call
+jobs:
+  inner:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo callee
+"#;
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": caller_yaml,
+                "event": "push",
+                "repository": "owner/repo",
+                "reusable_workflows": {
+                    ".github/workflows/callee.yml": callee_yaml,
+                }
+            }),
+        )
+        .await;
+
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+        let inner = state.inner.lock().await;
+
+        // Verify we evaluated both matrix groups: deploy-dev and deploy-prod
+        let key_dev = concurrency::concurrency_key("owner/repo", "deploy-dev");
+        let key_prod = concurrency::concurrency_key("owner/repo", "deploy-prod");
+
+        assert!(inner.concurrency_groups.contains_key(&key_dev), "concurrency_groups must have deploy-dev");
+        assert!(inner.concurrency_groups.contains_key(&key_prod), "concurrency_groups must have deploy-prod");
+
+        assert!(matches!(
+            inner.concurrency_groups[&key_dev].running,
+            Some(concurrency::Holder::JobSet { run_id: holder_run, .. }) if holder_run == run_id
+        ));
+        assert!(matches!(
+            inner.concurrency_groups[&key_prod].running,
             Some(concurrency::Holder::JobSet { run_id: holder_run, .. }) if holder_run == run_id
         ));
     }
