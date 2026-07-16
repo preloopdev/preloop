@@ -20,6 +20,7 @@ VM_WORKSPACE="/workspace"
 RESULTS_ROOT="${RESULTS_ROOT:-$PWD/benchmarks/real-world/results/runner-flow}"
 AKSH_RUNNER="${AKSH_RUNNER:-/workspace/target/aarch64-unknown-linux-musl/release/aksh-runner}"
 OFFICIAL_SRC="${OFFICIAL_SRC:-/opt/runners/actions-runner}"
+OFFICIAL_RUNNER_HOST="${OFFICIAL_RUNNER_HOST:-$HOME/cachingv4}"
 MITM_ADDON="/workspace/experiments/mitm/addons/capture.py"
 
 log() { echo "[$(date -u +%H:%M:%S.%3NZ)] $*"; }
@@ -36,7 +37,7 @@ ensure_vms() {
       log "Creating $vm (${VM_CPUS} CPU, ${VM_MEM} MiB)"
       smolvm machine create --name "$vm" --image ubuntu:24.04 --cpus "$VM_CPUS" --mem "$VM_MEM" --storage 20 --net >/dev/null
       smolvm machine update --name "$vm" --volume "$PWD:/workspace" >/dev/null
-      smolvm machine update --name "$vm" --volume "/private/tmp/bench-runners:/opt/runners" >/dev/null || true
+      smolvm machine update --name "$vm" --volume "$OFFICIAL_RUNNER_HOST:/opt/runners" >/dev/null || true
     fi
   done
 }
@@ -141,7 +142,7 @@ start_vm_runner() {
       rm -rf '$root'; mkdir -p '$root'
       RUST_LOG=info '$AKSH_RUNNER' --ca-bundle '$ca_bundle' --runner-root '$root' configure \
         --url 'https://github.com/$GH_REPO' --token '$token' --name '$runner_name' \
-        --unattended --replace --ephemeral --labels self-hosted,linux,x64
+        --unattended --replace --ephemeral --labels self-hosted,linux,x64,mitm
       RUST_LOG=info '$AKSH_RUNNER' --ca-bundle '$ca_bundle' --runner-root '$root' run --once
     " > "$vm_log" 2>&1 &
   else
@@ -155,7 +156,7 @@ start_vm_runner() {
       cd '$root/bin/actions-runner'
       export RUNNER_ALLOW_RUNASROOT=1
       ./config.sh --unattended --url 'https://github.com/$GH_REPO' --token '$token' \
-        --name '$runner_name' --labels self-hosted,linux,x64 --work '$root/_work' --replace --ephemeral
+        --name '$runner_name' --labels self-hosted,linux,x64,mitm --work '$root/_work' --replace --ephemeral
       timeout 900 ./run.sh --once
     " > "$vm_log" 2>&1 &
   fi

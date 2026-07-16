@@ -55,7 +55,7 @@ submit-ci:
     cargo run -p aksh-runner-client -- submit -W .github/workflows/ci.yml
 
 submit-dogfood:
-    cargo run -p aksh-runner-client -- submit -W .github/workflows/dogfood.yml
+    cargo run -p aksh-runner-client -- submit -W fixtures/workflows/dogfood.yml
 
 # ── runner ─────────────────────────────────────────────────────────────────
 

@@ -26,6 +26,7 @@ if [ ! -f "$WORKFLOW_FILE" ]; then
     red "Workflow file not found: $WORKFLOW_FILE"
     exit 1
 fi
+WORKFLOW_FILE="$(cd "$(dirname "$WORKFLOW_FILE")" && pwd)/$(basename "$WORKFLOW_FILE")"
 WORKFLOW_YAML=$(cat "$WORKFLOW_FILE")
 
 # Start server
@@ -83,7 +84,7 @@ LOG_LEVEL="info"
 if [ "$VERBOSE" = "--verbose" ]; then
     LOG_LEVEL="debug"
 fi
-RUST_LOG=$LOG_LEVEL timeout 120 "$RUNNER_BIN" run --once 2>&1
+RUST_LOG=$LOG_LEVEL perl -e 'alarm 120; exec @ARGV' -- "$RUNNER_BIN" run --once 2>&1
 
 # Check result
 FINAL=$(curl -s "$SERVER_URL/api/v1/runs/$RUN_ID" \

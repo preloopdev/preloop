@@ -8,7 +8,7 @@
 # runner can reach it on port 80 (the runner strips non-default HTTP ports
 # from URLs; the redirect makes port 80 work without root on aksh itself).
 #
-# Submits .github/workflows/dogfood.yml and measures wall-clock time from
+# Submits fixtures/workflows/dogfood.yml and measures wall-clock time from
 # submission to the runner's JobCompletedEvent.
 #
 # Emits:
@@ -24,7 +24,7 @@ unset all_proxy ALL_PROXY http_proxy https_proxy HTTP_PROXY HTTPS_PROXY \
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 AKSH_BIN="$SCRIPT_DIR/target/release/aksh-runner-server"
-RUNNER_DIR="$HOME/mitm-proxy/experiments/mitm/.cache/runner-official"
+RUNNER_DIR="${RUNNER_DIR:-$HOME/mitm-proxy/experiments/mitm/.cache/runner-official}"
 AKSH_PORT=9090
 # Clients use port 80 via pfctl redirect (runner strips non-default HTTP ports)
 CLIENT_URL="http://127.0.0.1:80"
@@ -146,7 +146,7 @@ import pathlib
 import urllib.request
 
 repo = pathlib.Path("$SCRIPT_DIR").resolve()
-workflow = repo.joinpath(".github", "workflows", "dogfood.yml").read_text()
+workflow = repo.joinpath("fixtures", "workflows", "dogfood.yml").read_text()
 payload = json.dumps({
     "workflow_yaml": workflow,
     "event": "push",

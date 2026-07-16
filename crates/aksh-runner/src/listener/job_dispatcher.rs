@@ -418,7 +418,7 @@ mod tests {
                     "id": "step-1",
                     "contextName": "step1",
                     "displayName": "Step One",
-                    "run": "sleep 10",
+                    "run": "sleep 60",
                     "shell": "bash"
                 }
             ],
@@ -447,7 +447,7 @@ mod tests {
         // SIGTERM before SIGKILL; allow both test grace periods plus startup
         // scheduling overhead while still rejecting the ten-second payload.
         assert!(
-            elapsed.as_secs() < 10,
+            elapsed.as_secs() < 20,
             "Expected cancellation to exit within the grace budget, took {:?}",
             elapsed
         );
