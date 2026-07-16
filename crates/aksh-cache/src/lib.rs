@@ -167,6 +167,7 @@ impl CacheStore {
         let mut version_hasher = Sha256::new();
         version_hasher.update(version.as_bytes());
         let version_hash = hex(version_hasher.finalize());
+        let version_hash = &version_hash[..16.min(version_hash.len())];
         let mut identity = Sha256::new();
         identity.update(key.as_bytes());
         identity.update(b"\0");
