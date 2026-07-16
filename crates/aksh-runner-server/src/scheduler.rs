@@ -69,10 +69,49 @@ fn adjust_dow(dow: &str) -> String {
 /// Convert a GitHub 5-field cron string to the cron-crate 7-field format.
 ///
 /// GitHub: `"min hour dom month dow"`
-/// cron crate: `"sec min hour dom month dow year"`
 ///
 /// Reference: MC.cs:898-915 (Quartz-style cron from GitHub 5-field).
 /// We adjust the day-of-week indexing since the `cron` crate uses 1-based indexing for DOW.
+
+/// Check whether a cron minute field resolves to fewer than 5-minute intervals.
+/// Handles `*`, `*/N`, ranges (`0-4`), comma lists (`0,1,2`), and single values.
+fn minute_field_too_frequent(minute: &str) -> bool {
+    use std::collections::BTreeSet;
+    let mut values = BTreeSet::new();
+    for part in minute.split(',') {
+        if part == "*" {
+            return true;
+        } else if let Some(step_str) = part.strip_prefix("*/") {
+            if let Ok(step) = step_str.parse::<u8>() {
+                if step < 5 {
+                    return true;
+                }
+                for m in (0..60u8).step_by(step as usize) {
+                    values.insert(m);
+                }
+            }
+        } else if let Some((start, end)) = part.split_once('-') {
+            if let (Ok(s), Ok(e)) = (start.parse::<u8>(), end.parse::<u8>()) {
+                for m in s..=e {
+                    values.insert(m);
+                }
+            }
+        } else if let Ok(m) = part.parse::<u8>() {
+            values.insert(m);
+        }
+    }
+    if values.len() < 2 {
+        return false; // single fixed value is always fine
+    }
+    let sorted: Vec<u8> = values.into_iter().collect();
+    let min_gap = sorted
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .min()
+        .unwrap_or(60);
+    min_gap < 5
+}
+
 pub fn github_to_cron(github_expr: &str) -> Result<Schedule, String> {
     github_to_crons(github_expr)?
         .into_iter()
@@ -93,12 +132,7 @@ fn github_to_crons(github_expr: &str) -> Result<Vec<Schedule>, String> {
         ));
     }
     let (minute, hour, dom, month, dow) = (fields[0], fields[1], fields[2], fields[3], fields[4]);
-    if minute == "*"
-        || minute
-            .strip_prefix("*/")
-            .and_then(|step| step.parse::<u8>().ok())
-            .is_some_and(|step| step < 5)
-    {
+    if minute_field_too_frequent(minute) {
         return Err("GitHub schedules cannot run more frequently than every 5 minutes".to_owned());
     }
     let adjusted_dow = adjust_dow(dow);
