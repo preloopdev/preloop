@@ -494,7 +494,7 @@ impl ProdState {
                 holder_keys: self.inner.holder_keys.clone(),
                 jobset_admissions: self.inner.jobset_admissions.clone(),
                 ..Default::default()
-            }
+            },
         }
     }
 }
@@ -1215,16 +1215,28 @@ pub mod state_machine {
             assert!(model.check_all_invariants().is_ok());
             assert!(check_production_invariants(&prod.inner).is_ok());
 
-            let model_snap: BTreeMap<_, _> = model.groups.iter().map(|(k, g)| {
-                let running = g.running.clone();
-                let pending: Vec<_> = g.pending.iter().cloned().collect();
-                (k.clone(), (running, pending))
-            }).collect();
+            let model_snap: BTreeMap<_, _> = model
+                .groups
+                .iter()
+                .map(|(k, g)| {
+                    let running = g.running.clone();
+                    let pending: Vec<_> = g.pending.iter().cloned().collect();
+                    (k.clone(), (running, pending))
+                })
+                .collect();
             let prod_snap = prod.snapshot();
             for (key, m_group) in &model_snap {
                 if let Some((p_running, p_pending)) = prod_snap.get(key) {
-                    assert_eq!(&m_group.0, p_running, "Running mismatch in path: {:?}", path);
-                    assert_eq!(&m_group.1, p_pending, "Pending mismatch in path: {:?}", path);
+                    assert_eq!(
+                        &m_group.0, p_running,
+                        "Running mismatch in path: {:?}",
+                        path
+                    );
+                    assert_eq!(
+                        &m_group.1, p_pending,
+                        "Pending mismatch in path: {:?}",
+                        path
+                    );
                 }
             }
 
@@ -1288,7 +1300,10 @@ pub mod state_machine {
         }
 
         dfs(0, &mut model, &mut prod, &mut path, &mut visited);
-        println!("Exhaustive state space traversal complete. Visited {} unique states.", visited.len());
+        println!(
+            "Exhaustive state space traversal complete. Visited {} unique states.",
+            visited.len()
+        );
     }
 }
 
