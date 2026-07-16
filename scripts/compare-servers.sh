@@ -11,8 +11,10 @@ GH_REPO="${GH_REPO:-preloopdev/aksh-conformance-sample}"
 TEMPLATE="${TEMPLATE:-/private/tmp/bench-runner.smolmachine}"
 OFFICIAL_RUNNER_HOST="${OFFICIAL_RUNNER_HOST:-$HOME/cachingv4}"
 AKSH_SERVER_BIN="$REPO_ROOT/target/aarch64-unknown-linux-musl/release/aksh-runner-server"
-RESULTS_DIR="$REPO_ROOT/benchmarks/real-world/results/server-compare/${SCENARIO%.yml}"
+RESULTS_DIR="$REPO_ROOT/benchmarks/compatibility/server/behavior/${SCENARIO%.yml}"
+PROTOCOL_DIR="$REPO_ROOT/benchmarks/compatibility/server/protocol/captures/${SCENARIO%.yml}"
 MITM_PORT=18081
+GITHUB_ACTIONS_TOKEN="${AKSH_GITHUB_TOKEN:-}"
 
 red()   { printf '\033[1;31m%s\033[0m\n' "$*"; }
 green() { printf '\033[1;32m%s\033[0m\n' "$*"; }
@@ -26,12 +28,23 @@ cleanup() {
     done
 }
 trap cleanup EXIT
+
+enable_rosetta() {
+    local vm="$1"
+    smolvm machine exec --name "$vm" -- bash -lc '
+        if [ -x /usr/bin/rosetta-wrapper ] && [ -x /mnt/rosetta/rosetta ]; then
+            mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc 2>/dev/null || true
+            echo ":rosetta:M::\\x7fELF\\x02\\x01\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x02\\x00\\x3e\\x00:\\xff\\xff\\xff\\xff\\xff\\xfe\\xfe\\x00\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xfe\\xff\\xff\\xff:/usr/bin/rosetta-wrapper:F" > /proc/sys/fs/binfmt_misc/register 2>/dev/null || true
+        fi
+    ' >/dev/null 2>&1 || true
+}
+
 mkdir -p "$RESULTS_DIR"
 
 # Get workflow YAML and save to temp file
 WF_YAML_FILE=$(mktemp)
 gh api "repos/$GH_REPO/contents/.github/workflows/$SCENARIO" --jq .content 2>/dev/null | base64 -d > "$WF_YAML_FILE"
-JOB_COUNT=$(grep -c "runs-on:" "$WF_YAML_FILE" || echo 1)
+JOB_COUNT="${RUNNER_COUNT:-$(grep -c "runs-on:" "$WF_YAML_FILE" || echo 1)}"
 WF_LABEL=$(grep "runs-on:" "$WF_YAML_FILE" | head -1 | sed "s/.*\[//;s/\].*//" | tr "," "\n" | grep -v self-hosted | head -1 | tr -d " ")
 [ -z "$WF_LABEL" ] && WF_LABEL=mitm
 
@@ -52,7 +65,9 @@ run_github() {
     local vm="cmp-gh-$$"
     smolvm machine create --name "$vm" --from "$TEMPLATE" \
         --net -v "${OFFICIAL_RUNNER_HOST}:/opt/runners:ro" -v "$REPO_ROOT:/workspace:ro" >/dev/null 2>&1
+    smolvm machine update --name "$vm" --rosetta >/dev/null 2>&1
     smolvm machine start --name "$vm" >/dev/null 2>&1
+    enable_rosetta "$vm"
     log "VM $vm started"
 
     # Start N non-ephemeral runners (for multi-job), or 1 ephemeral (single-job)
@@ -72,6 +87,17 @@ run_github() {
         export NODE_EXTRA_CA_CERTS=/tmp/cap/vm-mitm-conf/mitmproxy-ca-cert.pem
         export SSL_CERT_FILE=/tmp/cap/vm-mitm-conf/mitmproxy-ca-cert.pem
         export GITHUB_ACTIONS_RUNNER_TLS_NO_VERIFY=1 RUNNER_ALLOW_RUNASROOT=1
+        case "$SCENARIO" in
+            *container*|*services*|*docker*)
+                echo 'Installing and starting Docker inside guest VM...'
+                apt-get update -qq && apt-get install -y -qq docker.io >/dev/null 2>&1
+                mkdir -p /storage/docker
+                (nohup dockerd --data-root /storage/docker > /tmp/dockerd.log 2>&1 &)
+                for n in \$(seq 1 40); do
+                    docker info >/dev/null 2>&1 && break; sleep 1
+                done
+                ;;
+        esac
 
         JOB_COUNT=$JOB_COUNT
         for i in \$(seq 1 \$JOB_COUNT); do
@@ -108,6 +134,17 @@ run_github() {
         st=$(gh run view "$run_id" -R "$GH_REPO" --json status -q '.status' 2>/dev/null || echo unknown)
         [ "$st" = completed ] && break; sleep 5
     done
+    # The GitHub workflow can complete while the runner listener remains in a
+    # long-poll. Export protocol traffic before waiting for that listener.
+    sleep 5
+    local protocol_cap_dir="$PROTOCOL_DIR/github"
+    mkdir -p "$protocol_cap_dir"
+    smolvm machine exec --name "$vm" -- cat /tmp/cap/vm-mitm/flows.jsonl > "$protocol_cap_dir/flows.jsonl" 2>/dev/null || true
+    smolvm machine exec --name "$vm" -- cat /tmp/cap/vm-mitm.log > "$protocol_cap_dir/mitm.log" 2>/dev/null || true
+    if [ -f "$protocol_cap_dir/flows.jsonl" ]; then
+        wc -l < "$protocol_cap_dir/flows.jsonl" > "$protocol_cap_dir/flow-count"
+    fi
+    kill "$rpid" 2>/dev/null || true
     wait "$rpid" 2>/dev/null || true
 
     # Deregister non-ephemeral runners
@@ -143,7 +180,9 @@ run_aksh() {
     local vm="cmp-aksh-$$"
     smolvm machine create --name "$vm" --from "$TEMPLATE" \
         --net -v "${OFFICIAL_RUNNER_HOST}:/opt/runners:ro" -v "$REPO_ROOT:/workspace" >/dev/null 2>&1
+    smolvm machine update --name "$vm" --rosetta >/dev/null 2>&1
     smolvm machine start --name "$vm" >/dev/null 2>&1
+    enable_rosetta "$vm"
     log "VM $vm started"
 
     smolvm machine cp "$AKSH_SERVER_BIN" "$vm:/usr/local/bin/aksh-runner-server" 2>&1 | tail -1
@@ -154,7 +193,7 @@ run_aksh() {
     sed 's/runs-on:.*$/runs-on: self-hosted/' "$WF_YAML_FILE" > "$modified_yaml"
 
     # Prepare submission JSON on the mounted workspace; /tmp is not persistent across smolVM exec calls.
-    local payload_file="$REPO_ROOT/benchmarks/real-world/results/server-compare/payload-${SCENARIO%.yml}.json"
+    local payload_file="$REPO_ROOT/benchmarks/compatibility/server/behavior/payload-${SCENARIO%.yml}.json"
     python3 -c "
 import json
 yaml_content = open('$modified_yaml').read()
@@ -165,19 +204,39 @@ print(json.dumps({
     'git_ref': 'refs/heads/main'
 }))
 " > "$payload_file"
-    local vm_result_dir="$REPO_ROOT/benchmarks/real-world/results/server-compare/${SCENARIO%.yml}/aksh-server"
+    local vm_result_dir="$REPO_ROOT/benchmarks/compatibility/server/behavior/${SCENARIO%.yml}/aksh-server"
     mkdir -p "$vm_result_dir"
 
-    local result_base="/workspace/benchmarks/real-world/results/server-compare/${SCENARIO%.yml}/aksh-server"
+    local result_base="/workspace/benchmarks/compatibility/server/behavior/${SCENARIO%.yml}/aksh-server"
 
     smolvm machine exec --name "$vm" -- bash -lc "
         set -u
+        mkdir -p /tmp/cap/vm-mitm /tmp/cap/vm-mitm-conf
+        nohup env MITM_CAPTURE_DIR=/tmp/cap/vm-mitm BACKEND_PORT=80 mitmdump \\
+            --listen-host 127.0.0.1 --listen-port $MITM_PORT \\
+            --set confdir=/tmp/cap/vm-mitm-conf \\
+            -s /workspace/experiments/mitm/addons/capture.py \\
+            > /tmp/cap/vm-mitm.log 2>&1 < /dev/null &
+        for n in \$(seq 1 40); do
+            bash -c '</dev/tcp/127.0.0.1/$MITM_PORT' 2>/dev/null && break; sleep .25
+        done
         chmod +x /usr/local/bin/aksh-runner-server
-        RUST_LOG=info AKSH_PUBLIC_URL=http://127.0.0.1 aksh-runner-server serve --listen 0.0.0.0:80 > /tmp/server.log 2>&1 &
+        RUST_LOG=info AKSH_PUBLIC_URL=http://127.0.0.1 AKSH_GITHUB_TOKEN='$GITHUB_ACTIONS_TOKEN' aksh-runner-server serve --listen 0.0.0.0:80 --state-dir /tmp/aksh-state > /tmp/server.log 2>&1 &
         server_pid=\$!
         sleep 2
         wget -qO- http://127.0.0.1/healthz >/dev/null || { echo 'healthz failed'; exit 1; }
-        RESULT=\$(wget -qO- --post-file=/workspace/benchmarks/real-world/results/server-compare/payload-${SCENARIO%.yml}.json \\
+        case "$SCENARIO" in
+            *container*|*services*|*docker*)
+                echo 'Installing and starting Docker inside guest VM...'
+                apt-get update -qq && apt-get install -y -qq docker.io >/dev/null 2>&1
+                mkdir -p /storage/docker
+                (nohup dockerd --data-root /storage/docker > /tmp/dockerd.log 2>&1 &)
+                for n in \$(seq 1 40); do
+                    docker info >/dev/null 2>&1 && break; sleep 1
+                done
+                ;;
+        esac
+        RESULT=\$(wget -qO- --post-file=/workspace/benchmarks/compatibility/server/behavior/payload-${SCENARIO%.yml}.json \\
             --header='Content-Type: application/json' \\
             --header='Authorization: Bearer aksh-system-token' \\
             http://127.0.0.1/api/v1/runs 2>/dev/null)
@@ -185,6 +244,11 @@ print(json.dumps({
         RUN_ID=\$(echo \"\$RESULT\" | python3 -c 'import sys,json; print(next(iter(json.load(sys.stdin).values())))')
 
         export RUNNER_ALLOW_RUNASROOT=1 ACTIONS_RUNNER_DEBUG=true RUNNER_DEBUG=1
+        export HTTP_PROXY='http://127.0.0.1:$MITM_PORT' HTTPS_PROXY='http://127.0.0.1:$MITM_PORT'
+        export http_proxy='http://127.0.0.1:$MITM_PORT' https_proxy='http://127.0.0.1:$MITM_PORT'
+        export NO_PROXY='' no_proxy='' NODE_EXTRA_CA_CERTS=/tmp/cap/vm-mitm-conf/mitmproxy-ca-cert.pem
+        export SSL_CERT_FILE=/tmp/cap/vm-mitm-conf/mitmproxy-ca-cert.pem
+        git config --global http.sslCAInfo /tmp/cap/vm-mitm-conf/mitmproxy-ca-cert.pem
         JOB_COUNT=$JOB_COUNT
         last_rc=0
 
@@ -207,6 +271,17 @@ print(json.dumps({
             (cd \$RUNNER_DIR && timeout 240 ./run.sh > /tmp/runner-\$i.log 2>&1; echo \$? > /tmp/runner-\$i.rc) &
             RUNNER_PIDS=\"\$RUNNER_PIDS \$!\"
         done
+
+        # GitHub's cancellation scenario cancels the in-flight workflow through
+        # GitHub's control plane. Mirror that control-plane event for aksh.
+        if [ "$SCENARIO" = "22-cancel-semantics.yml" ]; then
+            (
+                sleep 5
+                wget -qO /dev/null --post-data='' \
+                    --header='Authorization: Bearer aksh-system-token' \
+                    "http://127.0.0.1/api/v1/runs/\$RUN_ID/cancel"
+            ) &
+        fi
         for pid in \$RUNNER_PIDS; do wait \$pid 2>/dev/null || true; done
 
         for i in \$(seq 1 \$JOB_COUNT); do
@@ -232,11 +307,21 @@ print(json.dumps({
         cp /tmp/runner-1.log $result_base/official-runner.log 2>/dev/null || true
         cp /tmp/server.log $result_base/server.log || true
         cp /tmp/status.json $result_base/status.json || true
+        cp /tmp/status.json $result_base/run.json || true
+        mkdir -p $result_base/replay
+        cp -a /tmp/aksh-state/replay/results $result_base/replay/ 2>/dev/null || true
         echo '---STATUS---'
         cat /tmp/status.json 2>/dev/null || true
         echo '---ENDSTATUS---'
         exit \$last_rc
     " > "$cap_dir/runner.log" 2>&1 || true
+    local protocol_cap_dir="$PROTOCOL_DIR/aksh-server"
+    mkdir -p "$protocol_cap_dir"
+    smolvm machine exec --name "$vm" -- cat /tmp/cap/vm-mitm/flows.jsonl > "$protocol_cap_dir/flows.jsonl" 2>/dev/null || true
+    smolvm machine exec --name "$vm" -- cat /tmp/cap/vm-mitm.log > "$protocol_cap_dir/mitm.log" 2>/dev/null || true
+    if [ -f "$protocol_cap_dir/flows.jsonl" ]; then
+        wc -l < "$protocol_cap_dir/flows.jsonl" > "$protocol_cap_dir/flow-count"
+    fi
 
     # Extract results from the persisted API response, not human runner output.
     local status_file="$vm_result_dir/status.json"

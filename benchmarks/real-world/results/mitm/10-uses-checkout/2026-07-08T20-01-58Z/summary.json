@@ -1,8 +1,0 @@
-{
-  "backend": "aksh",
-  "scenario": "10-uses-checkout",
-  "run_id": "28971869955",
-  "conclusion": "failure",
-  "flows_count":       45,
-  "timestamp": "2026-07-08T20-01-58Z"
-}
