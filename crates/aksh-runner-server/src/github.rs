@@ -615,15 +615,16 @@ pub(crate) async fn handle_github_webhook(
         } else {
             &effective.git_ref
         };
-        let workflows = match fetch_workflows(&shared.state.local_workspace, &repo_full_name, workflow_ref)
-            .await
-        {
-            Ok(w) => w,
-            Err(e) => {
-                error!("Failed to fetch workflows for {}: {:?}", effective.event, e);
-                continue;
-            }
-        };
+        let workflows =
+            match fetch_workflows(&shared.state.local_workspace, &repo_full_name, workflow_ref)
+                .await
+            {
+                Ok(w) => w,
+                Err(e) => {
+                    error!("Failed to fetch workflows for {}: {:?}", effective.event, e);
+                    continue;
+                }
+            };
         let resolved_sha = match &effective.sha {
             Some(sha) => sha.clone(),
             None => match resolve_ref_sha(

@@ -69,7 +69,11 @@ impl EventAdapter for Adapter {
 
     fn project(&self, payload: &Value) -> Vec<EffectiveEvent> {
         // Skip branch-deletion pushes (after = all-zero SHA, no valid commit)
-        if payload.get("deleted").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if payload
+            .get("deleted")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
             return vec![];
         }
         if has_skip_ci(payload) {
