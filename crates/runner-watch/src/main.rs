@@ -1935,6 +1935,8 @@ async fn materialize_replay_state(
         return Ok(());
     }
 
+    let native_api_token =
+        std::env::var("AKSH_SYSTEM_TOKEN").unwrap_or_else(|_| "aksh-system-token".to_owned());
     for n in 0..broker_job_count {
         let submit_body = json!({
             "workflow_yaml": format!("on:\n  push:\njobs:\n  replay_{n}:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo replay {n}\n"),
@@ -1948,6 +1950,7 @@ async fn materialize_replay_state(
         });
         let accepted = client
             .post(format!("{}/api/v1/runs", aksh_url.trim_end_matches('/')))
+            .bearer_auth(&native_api_token)
             .json(&submit_body)
             .send()
             .await?

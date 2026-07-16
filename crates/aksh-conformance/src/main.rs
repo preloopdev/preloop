@@ -650,21 +650,23 @@ async fn run_runner_e2e(
 
     // Check completion and verdict
     let run_status_url = format!("http://127.0.0.1:9191/api/v1/runs/{}", run_id);
-    let mut run_success = false;
+    let native_api_token =
+        std::env::var("AKSH_SYSTEM_TOKEN").unwrap_or_else(|_| "aksh-system-token".to_owned());
     let mut run_status = "unknown".to_string();
-    if let Ok(resp) = client.get(&run_status_url).send().await {
+    if let Ok(resp) = client
+        .get(&run_status_url)
+        .bearer_auth(&native_api_token)
+        .send()
+        .await
+    {
         if let Ok(v) = resp.json::<serde_json::Value>().await {
             if let Some(status) = v.get("status").and_then(|v| v.as_str()) {
                 run_status = status.to_string();
-                if status == "completed" || status == "success" {
-                    run_success = true;
-                }
             }
         }
     }
-    if runner_status.success() {
-        run_success = true;
-    }
+    let run_success =
+        runner_status.success() && matches!(run_status.as_str(), "completed" | "success");
 
     let verdict = serde_json::json!({
         "success": run_success,
