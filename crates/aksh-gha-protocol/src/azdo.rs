@@ -810,12 +810,16 @@ pub struct MaskHint {
 }
 
 /// Type of masking hint.
+///
+/// Upstream source: `MaskType.cs` — `Variable = 1`, `Regex = 2`. The official
+/// worker only acts on `Regex` (`Worker.cs` InitializeSecretMasker); values are
+/// serialized as camelCase strings on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum MaskType {
-    /// A literal hash value to redact.
-    Hash,
-    /// A regular expression applied by the runner's secret masker.
+    /// Mask the value of a named variable.
+    Variable,
+    /// Mask everything matching a regular expression.
     Regex,
 }
 
@@ -1809,7 +1813,7 @@ mod tests {
             values
                 .into_iter()
                 .map(|value| MaskHint {
-                    hint_type: MaskType::Hash,
+                    hint_type: MaskType::Regex,
                     value,
                 })
                 .collect()

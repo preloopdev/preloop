@@ -194,8 +194,8 @@ pub fn build_agent_job_message(
             .values()
             .filter(|v| !v.is_empty())
             .map(|v| MaskHint {
-                hint_type: MaskType::Hash,
-                value: v.clone(),
+                hint_type: MaskType::Regex,
+                value: regex_escape(v),
             }),
     );
 
@@ -359,6 +359,33 @@ fn non_empty_services(services: Option<serde_json::Value>) -> Option<serde_json:
         Some(serde_json::Value::Object(m)) if m.is_empty() => None,
         _ => services,
     }
+}
+
+fn regex_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(
+            ch,
+            '\\' | '.'
+                | '+'
+                | '*'
+                | '?'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '|'
+                | '^'
+                | '$'
+                | '/'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
 }
 
 fn default_mask_hints() -> Vec<MaskHint> {
@@ -710,7 +737,7 @@ jobs:
 
         let mut secrets = BTreeMap::new();
         secrets.insert("MY_SECRET".to_owned(), "s3cr3t".to_owned());
-
+        secrets.insert("SPECIAL_SECRET".to_owned(), "p@$$(word)".to_owned());
         let github = serde_json::json!({"event_name": "push"});
         let msg = build_agent_job_message(
             &plans[0],
@@ -721,11 +748,25 @@ jobs:
         )
         .unwrap();
 
-        assert!(!msg.mask_hints.is_empty());
-        assert!(msg.mask_hints.iter().any(|hint| hint.value == "s3cr3t"));
+        let literal_hint = msg
+            .mask_hints
+            .iter()
+            .find(|hint| hint.value == "s3cr3t")
+            .expect("secret hint");
+        assert_eq!(literal_hint.hint_type, MaskType::Regex);
+        assert_eq!(serde_json::to_value(literal_hint).unwrap()["type"], "regex");
+        let special_hint = msg
+            .mask_hints
+            .iter()
+            .find(|hint| hint.value == r#"p@\$\$\(word\)"#)
+            .expect("escaped secret hint");
+        assert_eq!(special_hint.hint_type, MaskType::Regex);
         let secret = msg.variables.get("MY_SECRET").unwrap();
         assert_eq!(secret.value.as_deref(), Some("s3cr3t"));
         assert_eq!(secret.is_secret, Some(true));
+        let special_secret = msg.variables.get("SPECIAL_SECRET").unwrap();
+        assert_eq!(special_secret.value.as_deref(), Some("p@$$(word)"));
+        assert_eq!(special_secret.is_secret, Some(true));
     }
     #[test]
     fn workflow_dispatch_inputs_are_in_event_context() {
