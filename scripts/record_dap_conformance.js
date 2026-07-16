@@ -47,6 +47,7 @@ async function runScenario(backend) {
             env: {
                 ...process.env,
                 RUST_LOG: "info",
+                AKSH_SYSTEM_TOKEN: SYSTEM_TOKEN,
                 // Official runner needs LAN IP (port 80 redirect via mitm).
                 // Aksh runner connects directly to localhost.
                 AKSH_PUBLIC_URL: backend === "official"
