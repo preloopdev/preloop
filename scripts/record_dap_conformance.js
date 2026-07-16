@@ -9,6 +9,7 @@ const MITMDUMP_BIN = path.resolve(MITM_DIR, ".venv/bin/mitmdump");
 const CAPTURES_DIR = path.resolve(REPO_ROOT, ".runner-watch/dap-captures");
 const OFFICIAL_RUNNER_DIR = path.resolve(MITM_DIR, ".cache/runner-official");
 const AKSH_RUNNER_DIR = path.resolve(REPO_ROOT, "target/release");
+const SYSTEM_TOKEN = process.env.AKSH_SYSTEM_TOKEN || "aksh-system-token";
 
 // Ensure capture directories exist
 fs.mkdirSync(CAPTURES_DIR, { recursive: true });
@@ -231,7 +232,10 @@ jobs:
 `;
     const submitResponse = await fetch("http://127.0.0.1:9090/api/v1/runs", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${SYSTEM_TOKEN}`
+        },
         body: JSON.stringify({
             workflow_yaml: workflowYaml,
             event: "push",
@@ -252,7 +256,7 @@ jobs:
         try {
             ws = new WebSocket(`ws://127.0.0.1:9090/api/v1/runs/${runId}/debug`, {
                 headers: {
-                    "Authorization": "Bearer aksh-system-token"
+                    "Authorization": `Bearer ${SYSTEM_TOKEN}`
                 }
             });
             await new Promise((resolve, reject) => {
