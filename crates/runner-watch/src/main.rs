@@ -7,7 +7,7 @@
 
 mod compare;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1735,6 +1735,7 @@ async fn replay_flows_to_aksh(
     let mut broker_job_ids: HashMap<String, String> = HashMap::new();
     let mut official_broker_job_ids = Vec::new();
     let mut aksh_broker_job_ids = Vec::new();
+    let mut blob_upload_urls: VecDeque<String> = VecDeque::new();
     for line in flows.lines().filter(|l| !l.trim().is_empty()) {
         let flow: Value = serde_json::from_str(line)?;
         let method = flow.get("method").and_then(Value::as_str).unwrap_or("GET");
@@ -1743,6 +1744,12 @@ async fn replay_flows_to_aksh(
             method,
             flow.get("path").and_then(Value::as_str).unwrap_or("/"),
         );
+        if is_external_blob_upload(method, host) {
+            if let Some(upload_url) = blob_upload_urls.pop_front() {
+                replay_blob_upload(&client, &upload_url, &flow).await?;
+            }
+            continue;
+        }
         if should_skip_replay_flow(host, &path, &flow) {
             continue;
         }
@@ -1833,6 +1840,15 @@ async fn replay_flows_to_aksh(
                         &aksh_broker_job_ids,
                         &mut broker_job_ids,
                     );
+                    if is_blob_create_endpoint(&path) {
+                        if let Some(upload_url) = body_json
+                            .get("signed_upload_url")
+                            .and_then(Value::as_str)
+                            .filter(|url| !url.is_empty())
+                        {
+                            blob_upload_urls.push_back(upload_url.to_owned());
+                        }
+                    }
                     captured["response_body_json"] = body_json;
                 } else {
                     captured["response_body"] = json!(text);
@@ -1852,6 +1868,54 @@ async fn replay_flows_to_aksh(
     fs::write(out_dir.join("summary.json"), &summary)?;
     fs::write(baseline_dir.join("summary.json"), &summary)?;
     Ok(baseline_dir)
+}
+
+fn is_external_blob_upload(method: &str, host: &str) -> bool {
+    method.eq_ignore_ascii_case("PUT") && host.contains("blob.core.windows.net")
+}
+
+fn is_blob_create_endpoint(path: &str) -> bool {
+    path.contains("CacheService/CreateCacheEntry")
+        || path.contains("ArtifactService/CreateArtifact")
+}
+
+async fn replay_blob_upload(
+    client: &reqwest::Client,
+    upload_url: &str,
+    flow: &Value,
+) -> anyhow::Result<()> {
+    let mut request = client.put(upload_url);
+    if let Some(headers) = flow.get("request_headers").and_then(Value::as_array) {
+        for pair in headers {
+            let Some(arr) = pair.as_array() else {
+                continue;
+            };
+            if arr.len() != 2 {
+                continue;
+            }
+            let Some(name) = arr[0].as_str() else {
+                continue;
+            };
+            let Some(value) = arr[1].as_str() else {
+                continue;
+            };
+            if matches!(
+                name.to_ascii_lowercase().as_str(),
+                "host" | "content-length" | "connection" | "accept-encoding" | "proxy-connection"
+            ) {
+                continue;
+            }
+            request = request.header(name, value);
+        }
+    }
+    let body = replay_request_body(flow)?.unwrap_or_default();
+    let response = request.body(body).send().await?;
+    ensure!(
+        response.status().is_success(),
+        "replayed blob upload failed with {}",
+        response.status()
+    );
+    Ok(())
 }
 
 fn replay_request_body(flow: &Value) -> anyhow::Result<Option<Vec<u8>>> {
@@ -2817,6 +2881,39 @@ mod tests {
             ),
             "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=s&status=Busy&waitSeconds=0"
         );
+    }
+
+    #[test]
+    fn external_blob_upload_detection_only_matches_azure_puts() {
+        assert!(is_external_blob_upload(
+            "PUT",
+            "productionresultssa16.blob.core.windows.net"
+        ));
+        assert!(is_external_blob_upload(
+            "put",
+            "productionresultssa16.blob.core.windows.net"
+        ));
+        assert!(!is_external_blob_upload(
+            "GET",
+            "productionresultssa16.blob.core.windows.net"
+        ));
+        assert!(!is_external_blob_upload(
+            "PUT",
+            "results-receiver.actions.githubusercontent.com"
+        ));
+    }
+
+    #[test]
+    fn blob_create_endpoint_detection_handles_twirp_service_names() {
+        assert!(is_blob_create_endpoint(
+            "/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry"
+        ));
+        assert!(is_blob_create_endpoint(
+            "/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact"
+        ));
+        assert!(!is_blob_create_endpoint(
+            "/twirp/github.actions.results.api.v1.CacheService/FinalizeCacheEntryUpload"
+        ));
     }
 
     #[test]
