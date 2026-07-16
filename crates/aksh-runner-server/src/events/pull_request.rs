@@ -70,7 +70,7 @@ fn is_fork(payload: &Value) -> bool {
         .and_then(|head| head.get("repo"))
         .and_then(|repo| repo.get("fork"))
         .and_then(|v| v.as_bool())
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 /// Extract the action from the payload.
@@ -221,5 +221,23 @@ mod tests {
             }
         });
         assert!(Adapter.project(&payload).is_empty());
+    }
+
+    #[test]
+    fn pr_with_missing_repo_treated_as_fork() {
+        // When the fork repo is deleted, head.repo is null/missing.
+        // Must fail-closed: treat as untrusted fork, not internal.
+        let payload = serde_json::json!({
+            "action": "opened",
+            "number": 50,
+            "pull_request": {
+                "number": 50,
+                "base": { "ref": "main" },
+                "head": { "ref": "feature/deleted", "sha": "del-sha" }
+            }
+        });
+        let events = Adapter.project(&payload);
+        let pr = events.iter().find(|e| e.event == "pull_request").unwrap();
+        assert_eq!(pr.trust_tier, Some(TrustTier::UntrustedForkPullRequest));
     }
 }
