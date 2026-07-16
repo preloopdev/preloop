@@ -6,6 +6,7 @@ permissions:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    environment: staging
     steps:
       - name: Request deployment OIDC token
         run: |
