@@ -1647,9 +1647,14 @@ async fn conform(config: &Config, args: &ConformArgs) -> anyhow::Result<()> {
             .to_string();
         let replay_dir = report_root.join(&scenario).join("aksh");
         fs::create_dir_all(&replay_dir)?;
-        let baseline_dir = replay_flows_to_aksh(&golden, &replay_dir, &args.aksh_url)
-            .await
-            .with_context(|| format!("replay scenario {scenario}"))?;
+        let baseline_dir = replay_flows_to_aksh(
+            &golden,
+            &replay_dir,
+            &args.aksh_url,
+            &config.general.mitm_dir.join("scenarios"),
+        )
+        .await
+        .with_context(|| format!("replay scenario {scenario}"))?;
         let report = report_root.join(format!("{scenario}.md"));
         run_compare(config, &scenario, &baseline_dir, &replay_dir, &report).await?;
         let text = fs::read_to_string(&report).unwrap_or_default();
@@ -1717,6 +1722,7 @@ async fn replay_flows_to_aksh(
     golden_dir: &Path,
     out_dir: &Path,
     aksh_url: &str,
+    scenario_root: &Path,
 ) -> anyhow::Result<PathBuf> {
     let flows_path = golden_dir.join("flows.jsonl");
     let flows = fs::read_to_string(&flows_path)?;
@@ -1728,7 +1734,7 @@ async fn replay_flows_to_aksh(
         .unwrap_or(out_dir)
         .join("official-filtered");
     fs::create_dir_all(&baseline_dir)?;
-    materialize_replay_state(golden_dir, aksh_url, &client).await?;
+    materialize_replay_state(golden_dir, scenario_root, aksh_url, &client).await?;
     let mut out = tokio::fs::File::create(out_dir.join("flows.jsonl")).await?;
     let mut baseline = tokio::fs::File::create(baseline_dir.join("flows.jsonl")).await?;
     let mut count = 0usize;
@@ -1971,8 +1977,118 @@ fn rewrite_replay_body(body: &mut Vec<u8>, broker_job_ids: &HashMap<String, Stri
     }
 }
 
+fn decode_pipeline_context(value: &Value) -> Value {
+    let Some(object) = value.as_object() else {
+        return value.clone();
+    };
+    match object.get("t").and_then(Value::as_i64) {
+        Some(1) => Value::Array(
+            object
+                .get("a")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(decode_pipeline_context)
+                .collect(),
+        ),
+        Some(2 | 5) => Value::Object(
+            object
+                .get("d")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|pair| {
+                    let key = pair.get("k")?.as_str()?.to_owned();
+                    Some((key, decode_pipeline_context(pair.get("v")?)))
+                })
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+fn captured_github_event(golden_dir: &Path) -> anyhow::Result<Value> {
+    let flows = fs::read_to_string(golden_dir.join("flows.jsonl"))?;
+    for line in flows.lines().filter(|line| !line.trim().is_empty()) {
+        let flow: Value = serde_json::from_str(line)?;
+        if !flow
+            .get("path")
+            .and_then(Value::as_str)
+            .is_some_and(|path| path.ends_with("/acquirejob"))
+        {
+            continue;
+        }
+        let pairs = flow
+            .pointer("/response_body_json/contextData/github/d")
+            .and_then(Value::as_array)
+            .context("official acquirejob response has no github context")?;
+        let event = pairs
+            .iter()
+            .find(|pair| pair.get("k").and_then(Value::as_str) == Some("event"))
+            .and_then(|pair| pair.get("v"))
+            .context("official acquirejob github context has no event")?;
+        return Ok(decode_pipeline_context(event));
+    }
+    bail!("official scenario has no acquirejob response")
+}
+
+fn replay_workflow_submissions(
+    golden_dir: &Path,
+    scenario_root: &Path,
+) -> anyhow::Result<Vec<Value>> {
+    let scenario = golden_dir
+        .file_name()
+        .and_then(OsStr::to_str)
+        .context("golden scenario directory has no file name")?;
+    let scenario_dir = scenario_root.join(scenario);
+    let manifest_path = scenario_dir.join("scenario.toml");
+    let manifest_text = fs::read_to_string(&manifest_path)
+        .with_context(|| format!("read replay scenario manifest {}", manifest_path.display()))?;
+    let manifest: toml::Value = toml::from_str(&manifest_text)
+        .with_context(|| format!("parse replay scenario manifest {}", manifest_path.display()))?;
+    let steps = manifest
+        .get("steps")
+        .and_then(toml::Value::as_array)
+        .context("replay scenario manifest has no steps")?;
+    let mut submissions = Vec::new();
+    let payload = captured_github_event(golden_dir)?;
+    for step in steps {
+        let Some(table) = step.as_table() else {
+            continue;
+        };
+        if table.get("kind").and_then(toml::Value::as_str) != Some("submit_workflow") {
+            continue;
+        }
+        let workflow_path = table
+            .get("path")
+            .and_then(toml::Value::as_str)
+            .context("submit_workflow step has no path")?;
+        let workflow_file = scenario_dir.join(workflow_path);
+        let workflow_yaml = fs::read_to_string(&workflow_file)
+            .with_context(|| format!("read replay workflow {}", workflow_file.display()))?;
+        submissions.push(json!({
+            "workflow_yaml": workflow_yaml,
+            "event": "workflow_dispatch",
+            "payload": payload.clone(),
+            "repository": "preloopdev/aksh-conformance-sample",
+            "git_ref": "refs/heads/main",
+            "workflow_path": format!(".github/workflows/{workflow_path}"),
+            "inputs": {},
+            "secrets": {},
+            "vars": {},
+            "reusable_workflows": {}
+        }));
+    }
+    ensure!(
+        !submissions.is_empty(),
+        "replay scenario {scenario} has no submit_workflow steps"
+    );
+    Ok(submissions)
+}
+
 async fn materialize_replay_state(
     golden_dir: &Path,
+    scenario_root: &Path,
     aksh_url: &str,
     client: &reqwest::Client,
 ) -> anyhow::Result<()> {
@@ -1999,17 +2115,9 @@ async fn materialize_replay_state(
         return Ok(());
     }
 
-    for n in 0..broker_job_count {
-        let submit_body = json!({
-            "workflow_yaml": format!("on:\n  push:\njobs:\n  replay_{n}:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo replay {n}\n"),
-            "event": "push",
-            "payload": {"ref": "refs/heads/replay", "commits": []},
-            "repository": "preloopdev/aksh",
-            "git_ref": "refs/heads/replay",
-            "secrets": {},
-            "vars": {},
-            "reusable_workflows": {}
-        });
+    let submissions = replay_workflow_submissions(golden_dir, scenario_root)?;
+    let mut queued_jobs = 0_u64;
+    for submit_body in submissions {
         let accepted = client
             .post(format!("{}/api/v1/runs", aksh_url.trim_end_matches('/')))
             .json(&submit_body)
@@ -2018,15 +2126,15 @@ async fn materialize_replay_state(
             .error_for_status()?
             .json::<Value>()
             .await?;
-        let queued_jobs = accepted
+        queued_jobs += accepted
             .get("queued_jobs")
             .and_then(Value::as_u64)
             .unwrap_or(0);
-        ensure!(
-            queued_jobs > 0,
-            "replay state materialization queued no jobs"
-        );
     }
+    ensure!(
+        queued_jobs == broker_job_count as u64,
+        "replay scenario queued {queued_jobs} jobs but golden capture delivers {broker_job_count}"
+    );
 
     Ok(())
 }
@@ -2214,18 +2322,24 @@ fn bracketed_statuses(text: &str) -> Option<&str> {
 }
 
 fn schema_mismatch_in_report(text: &str) -> bool {
-    let mut lines = text.lines();
+    let mut lines = text.lines().peekable();
+    let mut current_section = "";
     while let Some(line) = lines.next() {
-        if line.starts_with("**Request body schema diff:**") {
-            if let Some(next_line) = lines.next() {
-                if next_line.trim().is_empty() {
-                    if let Some(content_line) = lines.next() {
-                        if content_line != "_identical_" {
-                            return true;
-                        }
-                    }
-                }
-            }
+        if line.starts_with("### `") {
+            current_section = line;
+            continue;
+        }
+        let is_request = line == "**Request body schema diff:**";
+        let is_acquire_response = line == "**Response body schema diff:**"
+            && current_section.contains("/broker/{n}/acquirejob");
+        if !is_request && !is_acquire_response {
+            continue;
+        }
+        while lines.peek().is_some_and(|line| line.trim().is_empty()) {
+            lines.next();
+        }
+        if lines.next().is_some_and(|line| line != "_identical_") {
+            return true;
         }
     }
     false
@@ -3012,5 +3126,108 @@ mod tests {
         assert!(ids.contains("v2-admin-broker-connection"));
         assert!(ids.contains("dap-debugger-endpoint"));
         assert!(ids.contains("server-enforced-runner-settings"));
+    }
+    #[test]
+    fn replay_workflow_submissions_materializes_scenario_07_workflow() {
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let scenario_root = workspace_root.join("experiments/mitm/scenarios");
+        let golden_root = workspace_root.join(".runner-watch/golden/v2.335.1/07-step-failure");
+        let submissions = replay_workflow_submissions(&golden_root, &scenario_root)
+            .expect("checked-in scenario 07 replay metadata should be readable");
+
+        assert_eq!(
+            submissions.len(),
+            1,
+            "scenario 07 has one submit_workflow step"
+        );
+        let submission = &submissions[0];
+        assert_eq!(submission["event"], "workflow_dispatch");
+        assert_eq!(
+            submission["repository"],
+            "preloopdev/aksh-conformance-sample"
+        );
+        assert_eq!(submission["git_ref"], "refs/heads/main");
+        assert_eq!(submission["payload"]["ref"], "refs/heads/main");
+
+        let workflow = submission["workflow_yaml"]
+            .as_str()
+            .expect("workflow submission must carry YAML text");
+        for expected in [
+            "- run: exit 1",
+            "- run: echo ran-on-failure",
+            "if: success()",
+            "- run: echo never",
+        ] {
+            assert!(
+                workflow.contains(expected),
+                "scenario 07 workflow is missing actual step text: {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn replay_workflow_submissions_errors_for_missing_scenario_metadata() {
+        let missing_root = std::env::temp_dir().join(format!(
+            "runner-watch-missing-scenario-root-{}",
+            std::process::id()
+        ));
+        let error = replay_workflow_submissions(
+            Path::new(".runner-watch/golden/v2.335.1/07-step-failure"),
+            &missing_root,
+        )
+        .expect_err("missing scenario metadata must not fall back to synthetic jobs");
+
+        assert!(
+            error.to_string().contains("read replay scenario manifest"),
+            "unexpected missing-metadata error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn schema_mismatch_detects_acquirejob_response_schema_difference() {
+        let report = concat!(
+            "### `POST /broker/{n}/acquirejob`\n\n",
+            "**Request body diff:**\n\n_identical_\n\n",
+            "**Request body schema diff:**\n\n_identical_\n\n",
+            "**Response body diff:**\n\n```diff\n@@\n-{\"count\": 1}\n+{\"count\": 1, \"items\": []}\n```\n\n",
+            "**Response body schema diff:**\n\n```diff\n@@\n-{\"count\": \"number\"}\n+{\"count\": \"number\", \"items\": []}\n```\n"
+        );
+
+        assert!(schema_mismatch_in_report(report));
+    }
+
+    #[test]
+    fn schema_mismatch_ignores_unrelated_response_schema_difference() {
+        let report = concat!(
+            "### `POST /repos/{n}/dispatches`\n\n",
+            "**Response body diff:**\n\n```diff\n@@\n-{}\n+{\"items\": []}\n```\n\n",
+            "**Response body schema diff:**\n\n```diff\n@@\n-{}\n+{\"items\": []}\n```\n"
+        );
+
+        assert!(!schema_mismatch_in_report(report));
+    }
+
+    #[test]
+    fn schema_mismatch_detects_request_schema_difference_globally() {
+        let report = concat!(
+            "### `POST /repos/{n}/dispatches`\n\n",
+            "**Request body diff:**\n\n```diff\n@@\n-{}\n+{\"ref\": \"main\"}\n```\n\n",
+            "**Request body schema diff:**\n\n```diff\n@@\n-{}\n+{\"ref\": \"string\"}\n```\n"
+        );
+
+        assert!(schema_mismatch_in_report(report));
+    }
+
+    #[test]
+    fn schema_mismatch_accepts_identical_request_and_response_schemas() {
+        let report = concat!(
+            "### `POST /broker/{n}/acquirejob`\n\n",
+            "**Request body diff:**\n\n```diff\n@@\n-{\"count\": 1}\n+{\"count\": 2}\n```\n\n",
+            "**Request body schema diff:**\n\n_identical_\n\n",
+            "**Response body diff:**\n\n```diff\n@@\n-{\"status\": \"queued\"}\n+{\"status\": \"running\"}\n```\n\n",
+            "**Response body schema diff:**\n\n_identical_\n"
+        );
+
+        assert!(!schema_mismatch_in_report(report));
     }
 }
