@@ -672,8 +672,8 @@ async fn run_runner_e2e(
             break;
         }
     }
-    let run_success =
-        last_runner_status.unwrap_or(false) && matches!(run_status.as_str(), "completed" | "success");
+    let run_success = last_runner_status.unwrap_or(false)
+        && matches!(run_status.as_str(), "completed" | "success");
 
     let verdict = serde_json::json!({
         "success": run_success,

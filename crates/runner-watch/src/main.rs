@@ -2067,7 +2067,12 @@ fn synthesized_authorization<'a>(path: &str, bearer: &'a str) -> Option<std::bor
     }
 }
 
-fn rewritten_header_value<'a>(name: &str, value: &'a str, path: &str, bearer: &str) -> std::borrow::Cow<'a, str> {
+fn rewritten_header_value<'a>(
+    name: &str,
+    value: &'a str,
+    path: &str,
+    bearer: &str,
+) -> std::borrow::Cow<'a, str> {
     if name.eq_ignore_ascii_case("authorization") && value == "***REDACTED***" {
         if path == "/api/v3/actions/runner-registration" {
             return std::borrow::Cow::Borrowed("RemoteAuth replay-token");
