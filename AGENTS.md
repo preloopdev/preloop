@@ -79,7 +79,7 @@ Direct Cargo commands used by the repo/workflows:
 cargo fmt --all --check
 cargo clippy --workspace --all-targets
 cargo test --workspace --quiet
-cargo run -p aksh-runner-client -- submit -W .github/workflows/dogfood.yml
+cargo run -p aksh-runner-client -- submit -W fixtures/workflows/dogfood.yml
 ```
 
 E2E helpers:
@@ -133,7 +133,7 @@ sudo ./scripts/e2e-setup.sh
 - `docs/fidelity-gap.md` — current protocol limitations and gaps.
 - `docs/runner-watch-plan.md` — runner-watch pipeline design.
 - `.github/workflows/ci.yml` — GitHub-hosted CI shape and current aksh compatibility notes.
-- `.github/workflows/dogfood.yml` — locally runnable self-hosted validation workflow.
+- `fixtures/workflows/dogfood.yml` — locally runnable self-hosted validation workflow.
 - `crates/aksh-runner-server/src/lib.rs` — core server logic, routes, in-memory state, many tests.
 - `crates/aksh-runner-server/src/main.rs` — server CLI entry point.
 - `crates/runner-watch/src/main.rs` / `compare.rs` — conformance/reporting entry points.
@@ -146,8 +146,8 @@ sudo ./scripts/e2e-setup.sh
 - Required Rust toolchain: **1.86** with `rustfmt` and `clippy`.
 - Runtime stack is Rust/Tokio/Axum; no Node/Bun runtime is required for normal development.
 - Official runner E2E on macOS depends on redirecting **port 80 -> 9090** because the runner strips non-default HTTP ports (`scripts/e2e-setup.sh`).
-- Local dogfood uses injected workflow vars such as `AKSH_REPO_ROOT` (`.github/workflows/dogfood.yml`).
-- `.github/workflows/ci.yml` uses actions like `actions/checkout`; `dogfood.yml` intentionally avoids those for local aksh validation while action-download support is incomplete.
+- Local dogfood uses injected workflow vars such as `AKSH_REPO_ROOT` (`fixtures/workflows/dogfood.yml`).
+- `.github/workflows/ci.yml` uses actions like `actions/checkout`; the fixture intentionally avoids those for local aksh validation while action-download support is incomplete.
 
 ## Testing & QA
 
@@ -166,7 +166,7 @@ cargo test --workspace --quiet
 Use the real local workflow when validating runner compatibility:
 
 ```sh
-.github/workflows/dogfood.yml
+fixtures/workflows/dogfood.yml
 ```
 
 That workflow runs:
@@ -187,7 +187,7 @@ When changing runner-facing routes, payloads, or lease/session logic:
 
 - Many server tests are inline in `crates/aksh-runner-server/src/lib.rs`; targeted filtering is practical.
 - `runner-watch` and conformance docs under `docs/watcher/` record recent protocol investigations.
-- If a workflow passes locally but CI shape differs, compare `.github/workflows/ci.yml` vs `.github/workflows/dogfood.yml` before changing production behavior.
+- If a workflow passes locally but CI shape differs, compare `.github/workflows/ci.yml` vs `fixtures/workflows/dogfood.yml` before changing production behavior.
 
 ## Agent Interaction Preferences
 

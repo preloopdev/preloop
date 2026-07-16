@@ -105,6 +105,26 @@ pub enum ParserError {
         /// The expected type.
         expected_type: String,
     },
+    /// A trigger filter key is not valid for this event.
+    /// GitHub only warns, does not reject, but we flag it.
+    #[error("filter key `{key}` is not valid for `on.{event}` — GitHub ignores it at runtime")]
+    InvalidFilterForKey {
+        /// Event name.
+        event: String,
+        /// The invalid filter key.
+        key: String,
+    },
+    /// Mutually exclusive filters are both present (e.g. branches +
+    /// branches-ignore).
+    #[error("`{a}` and `{b}` are mutually exclusive in `on.{event}`")]
+    ConflictingFilters {
+        /// Event name.
+        event: String,
+        /// First filter.
+        a: String,
+        /// Second filter.
+        b: String,
+    },
 }
 
 /// GitHub Actions workflow.
@@ -159,7 +179,10 @@ impl Workflow {
                         }))
                     } else {
                         let trigger: WorkflowCallTrigger = serde_json::from_value(val.clone())
-                            .map_err(|e| ParserError::InvalidWorkflowCallTrigger(e.to_string()))?;
+                            .map_err(|error| {
+                                ParserError::InvalidWorkflowCallTrigger(error.to_string())
+                            })?;
+                        trigger.validate()?;
                         Ok(Some(trigger))
                     }
                 } else {
@@ -167,6 +190,93 @@ impl Workflow {
                 }
             }
         }
+    }
+
+    /// Apply `workflow_dispatch` defaults and validate declared input values.
+    pub fn apply_workflow_dispatch_inputs(&self, payload: &mut Value) -> Result<(), ParserError> {
+        let Trigger::Map(triggers) = &self.on else {
+            return Ok(());
+        };
+        let Some(config) = triggers.get("workflow_dispatch").and_then(Value::as_object) else {
+            return Ok(());
+        };
+        let Some(definitions) = config.get("inputs").and_then(Value::as_object) else {
+            return Ok(());
+        };
+        let inputs = payload
+            .as_object_mut()
+            .ok_or_else(|| {
+                ParserError::InvalidWorkflowCallTrigger(
+                    "workflow_dispatch payload must be an object".to_owned(),
+                )
+            })?
+            .entry("inputs")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()))
+            .as_object_mut()
+            .ok_or_else(|| {
+                ParserError::InvalidWorkflowCallTrigger(
+                    "workflow_dispatch inputs must be an object".to_owned(),
+                )
+            })?;
+        for (name, definition) in definitions {
+            let definition = definition.as_object().ok_or_else(|| {
+                ParserError::InvalidWorkflowCallTrigger(format!(
+                    "workflow_dispatch input `{name}` must be an object"
+                ))
+            })?;
+            let input_type = definition
+                .get("type")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|error| ParserError::InvalidWorkflowCallTrigger(error.to_string()))?
+                .unwrap_or(InputType::String);
+            let supplied = inputs.remove(name).filter(|value| !value.is_null());
+            let value = match supplied {
+                Some(value) => coerce_value(&value, input_type, name)?,
+                None => {
+                    if let Some(default) = definition.get("default") {
+                        default.clone()
+                    } else if definition
+                        .get("required")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        return Err(ParserError::MissingRequiredInput { name: name.clone() });
+                    } else {
+                        match input_type {
+                            InputType::Boolean => Value::Bool(false),
+                            InputType::Number => Value::Number(0.into()),
+                            InputType::Choice => definition
+                                .get("options")
+                                .and_then(Value::as_array)
+                                .and_then(|options| options.first())
+                                .cloned()
+                                .unwrap_or_else(|| Value::String(String::new())),
+                            InputType::String | InputType::Environment => {
+                                Value::String(String::new())
+                            }
+                        }
+                    }
+                }
+            };
+            if input_type == InputType::Choice {
+                let valid = definition
+                    .get("options")
+                    .and_then(Value::as_array)
+                    .map(|options| options.iter().any(|option| option == &value))
+                    .unwrap_or(false);
+                if !valid {
+                    return Err(ParserError::InvalidInputValue {
+                        name: name.clone(),
+                        value: value.to_string(),
+                        expected_type: "declared choice".to_owned(),
+                    });
+                }
+            }
+            inputs.insert(name.clone(), value);
+        }
+        Ok(())
     }
 }
 
@@ -187,7 +297,8 @@ pub struct WorkflowCallTrigger {
 /// Input definition in `workflow_call`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InputDefinition {
-    /// Type of the input.
+    /// Type of the reusable-workflow input. GitHub permits only boolean,
+    /// number, and string for `workflow_call`.
     #[serde(default = "default_input_type", rename = "type")]
     pub input_type: InputType,
     /// Whether the input is required.
@@ -205,7 +316,8 @@ fn default_input_type() -> InputType {
     InputType::String
 }
 
-/// Allowed input types.
+/// Allowed input types. `Choice` and `Environment` are dispatch-only and are
+/// rejected when a reusable workflow declares them.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum InputType {
@@ -215,6 +327,31 @@ pub enum InputType {
     Number,
     /// Boolean type.
     Boolean,
+    /// Dispatch-only choice type.
+    Choice,
+    /// Dispatch-only environment type.
+    Environment,
+}
+
+impl WorkflowCallTrigger {
+    fn validate(&self) -> Result<(), ParserError> {
+        for (name, definition) in &self.inputs {
+            if matches!(
+                definition.input_type,
+                InputType::Choice | InputType::Environment
+            ) {
+                let kind = if definition.input_type == InputType::Choice {
+                    "choice"
+                } else {
+                    "environment"
+                };
+                return Err(ParserError::InvalidWorkflowCallTrigger(format!(
+                    "input `{name}` uses `{kind}`; workflow_call supports only boolean, number, and string"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Secret definition in `workflow_call`.
@@ -289,6 +426,17 @@ impl Trigger {
         }
     }
 
+    /// Whether the event configuration contains path-based filters.
+    pub fn has_path_filters(&self, event: &str) -> bool {
+        matches!(
+            self,
+            Trigger::Map(values)
+                if values.get(event).and_then(Value::as_object).is_some_and(|config| {
+                    config.contains_key("paths") || config.contains_key("paths-ignore")
+                })
+        )
+    }
+
     /// Returns true when the workflow should run for an event with context.
     /// Supports branch/tag/path filtering.
     pub fn matches_with_context(
@@ -298,6 +446,7 @@ impl Trigger {
         tag: Option<&str>,
         paths: &[String],
         activity_type: Option<&str>,
+        upstream_workflow_paths: &[String],
     ) -> bool {
         match self {
             Trigger::Single(value) => value == event,
@@ -307,12 +456,26 @@ impl Trigger {
                     return false;
                 }
                 // Check branch/tag/path filters
-                if let Some(config) = values.get(event) {
+                let config_val = values.get(event);
+                if let Some(config) = config_val {
                     if let Some(obj) = config.as_object() {
                         // activity types filter
-                        if let Some(types) = obj.get("types") {
+                        let types_val = obj.get("types");
+                        if types_val.is_some() {
+                            let types = types_val.unwrap();
                             if let Some(activity_type) = activity_type {
                                 if !matches_filter(types, activity_type) {
+                                    return false;
+                                }
+                            } else {
+                                return false;
+                            }
+                        } else if event == "pull_request" || event == "pull_request_target" {
+                            // Default types per MessageController.cs:1259-1268
+                            const PR_DEFAULT_TYPES: &[&str] =
+                                &["opened", "synchronize", "synchronized", "reopened"];
+                            if let Some(activity_type) = activity_type {
+                                if !PR_DEFAULT_TYPES.contains(&activity_type) {
                                     return false;
                                 }
                             } else {
@@ -355,19 +518,46 @@ impl Trigger {
                                 }
                             }
                         }
-                        // paths filter
+                        // A `paths` filter requires at least one known changed
+                        // path matching the positive pattern.
                         if let Some(path_filters) = obj.get("paths") {
-                            if !paths.is_empty()
-                                && !paths.iter().any(|p| matches_filter(path_filters, p))
+                            if paths.is_empty()
+                                || !paths.iter().any(|path| matches_filter(path_filters, path))
                             {
                                 return false;
                             }
                         }
-                        // paths-ignore
+                        // `paths-ignore` suppresses only when every changed
+                        // path is ignored. A mixed change set must still run.
                         if let Some(ignore) = obj.get("paths-ignore") {
-                            if paths.iter().any(|p| matches_filter(ignore, p)) {
+                            if !paths.is_empty()
+                                && paths.iter().all(|path| matches_filter(ignore, path))
+                            {
                                 return false;
                             }
+                        }
+                        // `workflow_run.workflows` matches the upstream
+                        // workflow display name, not its file path.
+                        if let Some(wf_filter) = obj.get("workflows") {
+                            if upstream_workflow_paths.is_empty()
+                                || !upstream_workflow_paths
+                                    .iter()
+                                    .any(|name| matches_filter(wf_filter, name))
+                            {
+                                return false;
+                            }
+                        }
+                    } else if event == "pull_request" || event == "pull_request_target" {
+                        // Config exists but is null/empty (e.g. `on:\n  pull_request:`).
+                        // Apply default types per MessageController.cs:1259-1268.
+                        const PR_DEFAULT_TYPES: &[&str] =
+                            &["opened", "synchronize", "synchronized", "reopened"];
+                        if let Some(activity_type) = activity_type {
+                            if !PR_DEFAULT_TYPES.contains(&activity_type) {
+                                return false;
+                            }
+                        } else {
+                            return false;
                         }
                     }
                 }
@@ -375,41 +565,119 @@ impl Trigger {
             }
         }
     }
-}
 
-/// Check if a value matches a filter pattern (string or array of strings with globs).
-fn matches_filter(filter: &Value, value: &str) -> bool {
-    match filter {
-        Value::String(pattern) => glob_match(pattern, value),
-        Value::Array(patterns) => patterns.iter().any(|p| {
-            if let Value::String(pattern) = p {
-                glob_match(pattern, value)
-            } else {
-                false
+    /// Returns the set of valid filter keys for a given event name.
+    /// Mirrors MessageController.cs:994-1020.
+    pub fn valid_filter_keys(event: &str) -> &'static [&'static str] {
+        match event {
+            "push" => &[
+                "branches",
+                "branches-ignore",
+                "tags",
+                "tags-ignore",
+                "paths",
+                "paths-ignore",
+            ],
+            "pull_request" | "pull_request_target" => &[
+                "types",
+                "branches",
+                "branches-ignore",
+                "paths",
+                "paths-ignore",
+            ],
+            "workflow_run" => &["types", "branches", "branches-ignore", "workflows"],
+            "schedule" => &["cron", "timezone"],
+            _ => &["types"],
+        }
+    }
+
+    /// Validate filter keys for an event. Returns Ok(()) or
+    /// ParserError::InvalidFilterForKey (a warning — GitHub only warns,
+    /// does not reject the workflow).
+    pub fn validate_filters(&self, event: &str) -> Result<(), ParserError> {
+        if let Trigger::Map(values) = self {
+            if let Some(config) = values.get(event) {
+                if let Some(obj) = config.as_object() {
+                    let valid = Self::valid_filter_keys(event);
+                    for key in obj.keys() {
+                        if !valid.contains(&key.as_str()) {
+                            return Err(ParserError::InvalidFilterForKey {
+                                event: event.to_owned(),
+                                key: key.clone(),
+                            });
+                        }
+                    }
+                }
             }
-        }),
-        _ => false,
+        }
+        Ok(())
+    }
+
+    /// Check for mutually exclusive filter pairs. Mirrors
+    /// MessageController.cs:1236-1250.
+    pub fn check_conflicting_filters(&self, event: &str) -> Result<(), ParserError> {
+        if let Trigger::Map(values) = self {
+            if let Some(config) = values.get(event) {
+                if let Some(obj) = config.as_object() {
+                    let pairs: &[(&str, &str)] = &[
+                        ("branches", "branches-ignore"),
+                        ("tags", "tags-ignore"),
+                        ("paths", "paths-ignore"),
+                    ];
+                    for &(a, b) in pairs {
+                        if obj.contains_key(a) && obj.contains_key(b) {
+                            return Err(ParserError::ConflictingFilters {
+                                event: event.to_owned(),
+                                a: a.to_owned(),
+                                b: b.to_owned(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
-/// Glob matching for trigger filters.
-///
-/// `*` matches within a single path segment; `**` matches across path
-/// separators. This intentionally keeps matching anchored to the whole value.
+/// Check whether a filter value matches GitHub's ordered pattern semantics.
+fn matches_filter(filter: &Value, value: &str) -> bool {
+    matches_filter_with_default(filter, value, false)
+}
+
+fn matches_filter_with_default(filter: &Value, value: &str, default: bool) -> bool {
+    let patterns: Vec<&str> = match filter {
+        Value::String(pattern) => vec![pattern.as_str()],
+        Value::Array(patterns) => patterns.iter().filter_map(Value::as_str).collect(),
+        _ => return false,
+    };
+    if patterns.is_empty() {
+        return default;
+    }
+    let mut matched = default;
+    for pattern in patterns {
+        let (negative, pattern) = pattern
+            .strip_prefix('!')
+            .map_or((false, pattern), |p| (true, p));
+        if glob_match(pattern, value) {
+            matched = !negative;
+        }
+    }
+    matched
+}
+
+/// GitHub-style glob matching anchored to the whole value.
 fn glob_match(pattern: &str, value: &str) -> bool {
     fn matches(pattern: &[char], value: &[char], pi: usize, vi: usize) -> bool {
         if pi == pattern.len() {
             return vi == value.len();
         }
-
         if pattern[pi] == '*' {
             let double_star = pattern.get(pi + 1) == Some(&'*');
             let next_pi = if double_star { pi + 2 } else { pi + 1 };
-
             if matches(pattern, value, next_pi, vi) {
                 return true;
             }
-
             let mut next_vi = vi;
             while next_vi < value.len() {
                 if !double_star && value[next_vi] == '/' {
@@ -420,16 +688,19 @@ fn glob_match(pattern: &str, value: &str) -> bool {
                     return true;
                 }
             }
-
             return false;
         }
-
+        if pattern[pi] == '?' {
+            return vi < value.len() && value[vi] != '/' && matches(pattern, value, pi + 1, vi + 1);
+        }
         vi < value.len() && pattern[pi] == value[vi] && matches(pattern, value, pi + 1, vi + 1)
     }
-
-    let pattern: Vec<char> = pattern.chars().collect();
-    let value: Vec<char> = value.chars().collect();
-    matches(&pattern, &value, 0, 0)
+    matches(
+        &pattern.chars().collect::<Vec<_>>(),
+        &value.chars().collect::<Vec<_>>(),
+        0,
+        0,
+    )
 }
 
 /// Environment map with scalar values normalized to strings.
@@ -950,6 +1221,14 @@ fn coerce_value(
             Value::String(_) => Ok(val.clone()),
             other => Ok(Value::String(other.to_string())),
         },
+        InputType::Choice => match val {
+            Value::String(_) => Ok(val.clone()),
+            other => Ok(Value::String(other.to_string())),
+        },
+        InputType::Environment => match val {
+            Value::String(_) => Ok(val.clone()),
+            other => Ok(Value::String(other.to_string())),
+        },
     }
 }
 
@@ -1008,6 +1287,9 @@ fn expand_jobs_with_reusables_internal(
                                 InputType::String => Value::String(String::new()),
                                 InputType::Number => Value::Number(0.into()),
                                 InputType::Boolean => Value::Bool(false),
+                                InputType::Choice | InputType::Environment => {
+                                    Value::String(String::new())
+                                }
                             }
                         }
                     }
@@ -1401,12 +1683,22 @@ jobs:
         )
         .unwrap();
 
-        assert!(workflow
-            .on
-            .matches_with_context("pull_request", None, None, &[], Some("opened")));
-        assert!(!workflow
-            .on
-            .matches_with_context("pull_request", None, None, &[], Some("closed")));
+        assert!(workflow.on.matches_with_context(
+            "pull_request",
+            None,
+            None,
+            &[],
+            Some("opened"),
+            &[]
+        ));
+        assert!(!workflow.on.matches_with_context(
+            "pull_request",
+            None,
+            None,
+            &[],
+            Some("closed"),
+            &[]
+        ));
     }
 
     #[test]
