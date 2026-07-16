@@ -727,12 +727,17 @@ fn build_app(
         )
         .route(
             "/api/v1/runs/:run_id/debug",
-            get(ws_dap_debug)
-                .post(register_dap_port)
-                .route_layer(middleware::from_fn_with_state(
-                    shared.clone(),
-                    require_native_bearer,
-                )),
+            get(ws_dap_debug).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_native_bearer,
+            )),
+        )
+        .route(
+            "/api/v1/runs/:run_id/debug",
+            post(register_dap_port).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_runner_bearer,
+            )),
         )
         // Archive tickets are bearerless in the official runner protocol.
         .route(
@@ -2493,6 +2498,7 @@ async fn delete_session(
 ) -> StatusCode {
     let mut inner = shared.state.inner.lock().await;
     inner.sessions.remove(&session_id);
+    inner.broker_session_runners.remove(&session_id);
     StatusCode::NO_CONTENT
 }
 
