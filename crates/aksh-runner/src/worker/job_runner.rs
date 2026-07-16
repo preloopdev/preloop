@@ -1431,6 +1431,11 @@ fn build_completejob_step_results(
     }
 
     // "Complete job" wrapper step
+    let complete_annotations: Vec<serde_json::Value> = job_ctx
+        .job_annotations
+        .iter()
+        .map(|annotation| annotation_to_json(annotation, (ordered_steps.len() + 2) as u32))
+        .collect();
     results.push(serde_json::json!({
         "external_id": job_ctx.complete_step_id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
         "number": ordered_steps.len() + 2,
@@ -1441,7 +1446,7 @@ fn build_completejob_step_results(
         "conclusion": "succeeded",
         "started_at": &now,
         "completed_at": &now,
-        "annotations": [],
+        "annotations": complete_annotations,
     }));
 
     results

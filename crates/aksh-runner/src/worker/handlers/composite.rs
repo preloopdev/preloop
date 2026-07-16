@@ -52,7 +52,9 @@ fn run_composite_action_inner<'a>(
             .as_ref()
             .context("composite action missing runs.steps")?;
 
-        let previous_action_status = ctx.job.github_context_value("action_status");
+        let saved_env = ctx.env.clone();
+        let result = async {
+            let previous_action_status = ctx.job.github_context_value("action_status");
 
         // Set up INPUT_* env from `with` inputs
         let mut input_env = std::collections::HashMap::new();
@@ -376,6 +378,9 @@ fn run_composite_action_inner<'a>(
                     match aksh_gha_expressions::eval_expression(trimmed, &eval_ctx) {
                         Ok(val) => {
                             let val_str = match val {
+                                serde_json::Value::Null => String::new(),
+                                serde_json::Value::Bool(b) => b.to_string(),
+                                serde_json::Value::Number(n) => n.to_string(),
                                 serde_json::Value::String(s) => s,
                                 other => serde_json::to_string(&other).unwrap_or_default(),
                             };
@@ -406,10 +411,14 @@ fn run_composite_action_inner<'a>(
                 }
             }
         }
-        ctx.job
-            .set_github_context_value("action_status", previous_action_status);
+            ctx.job
+                .set_github_context_value("action_status", previous_action_status);
+            Ok(())
+        }
+        .await;
 
-        Ok(())
+        ctx.env = saved_env;
+        result
     }) // end Box::pin
 }
 
@@ -719,5 +728,90 @@ runs:
 
         let output = std::fs::read_to_string(parent_output).unwrap();
         assert!(output.contains("greeting=hello-rust"));
+    }
+
+    #[tokio::test]
+    async fn composite_isolates_env_and_inputs() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let manifest = composite_manifest(vec![serde_json::json!({
+            "run": "echo inner-run",
+            "shell": "bash"
+        })]);
+        let mut job = JobContext::new(
+            "job".into(),
+            "job".into(),
+            serde_json::json!({}),
+            serde_json::json!({"github": {"workspace": workspace.path()}}),
+        );
+        job.workspace = Some(workspace.path().to_string_lossy().to_string());
+        let mut ctx = StepContext::new(&mut job, "composite".into(), "Composite".into());
+        ctx.env
+            .insert("PRE_EXISTING".to_string(), "original".to_string());
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+        run_composite_action(
+            &manifest,
+            workspace.path(),
+            &serde_json::json!({"input_one": "val"}),
+            workspace.path().to_str().unwrap(),
+            &mut ctx,
+            cancel_rx,
+        )
+        .await
+        .unwrap();
+
+        // Verify that pre-existing variables are preserved
+        assert_eq!(
+            ctx.env.get("PRE_EXISTING").map(String::as_str),
+            Some("original")
+        );
+        // Verify that composite action inputs do not leak to the outer context
+        assert!(!ctx.env.contains_key("INPUT_INPUT_ONE"));
+        assert!(!ctx.env.contains_key("GITHUB_ACTION_PATH"));
+    }
+
+    #[tokio::test]
+    async fn composite_handles_missing_outputs_gracefully() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let parent_output = workspace.path().join("parent_output");
+
+        let mut manifest = composite_manifest(vec![serde_json::json!({
+            "run": "echo first",
+            "shell": "bash"
+        })]);
+        manifest.outputs = Some(serde_json::Map::from_iter([(
+            "greeting".to_string(),
+            serde_json::json!({
+                "value": "${{ steps.nonexistent.outputs.val }}"
+            }),
+        )]));
+
+        let mut job = JobContext::new(
+            "job".into(),
+            "job".into(),
+            serde_json::json!({}),
+            serde_json::json!({"github": {"workspace": workspace.path()}}),
+        );
+        job.workspace = Some(workspace.path().to_string_lossy().to_string());
+        let mut ctx = StepContext::new(&mut job, "composite".into(), "Composite".into());
+        ctx.env.insert(
+            "GITHUB_OUTPUT".to_string(),
+            parent_output.to_string_lossy().to_string(),
+        );
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+        run_composite_action(
+            &manifest,
+            workspace.path(),
+            &serde_json::json!({}),
+            workspace.path().to_str().unwrap(),
+            &mut ctx,
+            cancel_rx,
+        )
+        .await
+        .unwrap();
+
+        let output = std::fs::read_to_string(parent_output).unwrap();
+        assert!(output.contains("greeting=\n") || output.contains("greeting=\r\n"));
     }
 }
