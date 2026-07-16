@@ -595,13 +595,13 @@ def main() -> int:
     p.add_argument(
         "--official",
         type=Path,
-        default=Path("benchmarks/real-world/results/conformance/conformance-official.jsonl"),
+        default=Path("benchmarks/compatibility/runner/behavior/conformance-official.jsonl"),
         help="Official runner conformance JSONL",
     )
     p.add_argument(
         "--aksh",
         type=Path,
-        default=Path("benchmarks/real-world/results/conformance/conformance-aksh.jsonl"),
+        default=Path("benchmarks/compatibility/runner/behavior/conformance-aksh.jsonl"),
         help="Aksh runner conformance JSONL",
     )
     p.add_argument(

@@ -38,6 +38,11 @@ Cache writes quarantined or disabled.
 
 Every run should carry a trust tier.
 
+On remote handoff, secrets never travel in the `.smolmachine` pack; the
+destination re-resolves them from its own trusted source and re-applies its
+tier's trust policy (see
+[doc 14](14_runtime_tiers_and_portable_handoff.md)).
+
 ## Policy file
 
 Example `.github/preloop.toml`:
@@ -91,6 +96,13 @@ Preferred model:
 - secret values stored in redaction-safe types,
 - logs/artifacts/repro bundles masked before external display.
 
+smolvm implements this transport: `--secret-env`/`--secret-file` and Smolfile
+`[secrets]` resolve host env/file refs at launch, never persist to the VM record,
+DB, or `.smolmachine`, and untrusted surfaces (HTTP bodies, packs) reject refs.
+Bridge Vault/1Password/AWS through the env/file seam. It is defense-in-depth, not
+zero-knowledge (root in guest can read `/proc/*/environ`), so prefer `--ssh-agent`
+when a secret must never leave the host.
+
 Secret type rule:
 
 ```rust
@@ -115,13 +127,16 @@ Network events should be classified:
 
 Modes:
 
-| Mode | Use |
-|---|---|
-| `off` | untrusted fork, deterministic replay |
-| `allowlist` | agent default |
-| `proxy` | policy, logging, masking |
-| `tsi` | fast local mode only if policy can be enforced |
-| `virtio-net` | private Docker/services |
+| Mode | smolvm mechanism | Use |
+|---|---|---|
+| `off` | default (no `--net`) | untrusted fork, deterministic replay |
+| `allowlist` | `--allow-host` / `--allow-cidr` | agent default |
+| `localhost-only` | `--outbound-localhost-only` | co-located deps only |
+| `proxy` | `-e https_proxy=…` to a Preloop policy proxy | policy, logging, masking |
+| `full` | `--net` | private Docker/services, trusted dev |
+| inbound | `-p HOST:GUEST` | expose a service port to host/runner |
+
+Windows is TSI-only (no virtio-net).
 
 Cloud metadata IPs should be blocked by default.
 
@@ -161,7 +176,7 @@ Controls:
 | Cache poisoning | failed PR writes malicious dependency cache | trust namespaces, quarantine |
 | Disk exhaustion | agent writes huge files | quotas on upper/scratch/cache/logs |
 | Host Docker escape | job controls host daemon | no host Docker socket |
-| VMM-proxy escape | guest abuses proxied resource | host jail, per-VM UID, seccomp, cgroups |
+| VMM-proxy escape | guest abuses proxied resource | tier host jail: smolvm-KVM launcher (per-VM UID, namespaces, cgroups, seccomp) / Firecracker jailer |
 | Secret log leakage | action echoes token | masking pipeline before log/artifact exposure |
 
 ## Security acceptance tests
