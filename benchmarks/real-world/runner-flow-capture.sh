@@ -142,7 +142,7 @@ start_vm_runner() {
       rm -rf '$root'; mkdir -p '$root'
       RUST_LOG=info '$AKSH_RUNNER' --ca-bundle '$ca_bundle' --runner-root '$root' configure \
         --url 'https://github.com/$GH_REPO' --token '$token' --name '$runner_name' \
-        --labels self-hosted,linux,x64,mitm
+        --unattended --replace --ephemeral --labels self-hosted,linux,x64,mitm
       RUST_LOG=info '$AKSH_RUNNER' --ca-bundle '$ca_bundle' --runner-root '$root' run --once
     " > "$vm_log" 2>&1 &
   else

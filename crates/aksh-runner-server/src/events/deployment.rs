@@ -24,13 +24,9 @@ impl EventAdapter for Adapter {
             .map(|value| {
                 if value.starts_with("refs/") {
                     value.to_owned()
-                } else if deployment
-                    .and_then(|item| item.get("ref_type"))
-                    .and_then(Value::as_str)
-                    == Some("tag")
-                {
-                    format!("refs/tags/{value}")
                 } else {
+                    // GitHub deployment.ref is a branch, tag, or SHA.
+                    // Without ref_type metadata, default to refs/heads/ (branch).
                     format!("refs/heads/{value}")
                 }
             })
