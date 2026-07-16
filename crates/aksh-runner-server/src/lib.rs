@@ -1,10 +1,10 @@
 //! Host-side Preloop runner control plane.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-
 pub mod github;
 
 /// Pure job-graph scheduler model and property tests.
@@ -29,7 +29,7 @@ use aksh_gha_protocol::{
 use axum::body::{to_bytes, Body};
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -50,11 +50,13 @@ use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
 use tracing::{debug, info, warn};
 
-/// Shared local-only token used for runner ↔ server auth in development.
-/// Not a credential — just a magic value that both sides agree on.
-const AKSH_SYSTEM_TOKEN: &str = "aksh-system-token";
+/// Default local token used when `AKSH_SYSTEM_TOKEN` is not configured.
+const DEFAULT_AKSH_SYSTEM_TOKEN: &str = "aksh-system-token";
+#[cfg(test)]
+const TEST_LOCAL_JWT_KEY: &[u8] = b"aksh-test-local-jwt-signing-key";
 
 /// Server configuration.
+#[derive(Debug, Clone)]
 pub struct ServerConfig {
     /// Address to bind.
     pub listen: SocketAddr,
@@ -69,7 +71,9 @@ pub struct ServerConfig {
     /// Bearer token required by privileged simulation endpoints.
     pub test_api_token: Option<String>,
     /// OIDC issuer URL. Defaults to `{public_base_url}/oidc`.
-    /// Set to `https://token.actions.githubusercontent.com` to mimic GitHub.
+    ///
+    /// This must identify an issuer controlled by the aksh deployment. Setting
+    /// GitHub's hosted issuer does not make locally signed tokens GitHub-trusted.
     pub oidc_issuer: Option<String>,
 }
 
@@ -234,10 +238,16 @@ async fn run_background_reaper(shared: Arc<SharedState>) {
 /// Start the server and block until shutdown.
 pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     let state = AppState::new(config.state_dir.clone()).await?;
-    // Resolve OIDC issuer: explicit config > default (public_base_url/oidc).
-    let oidc_issuer = config
-        .oidc_issuer
-        .unwrap_or_else(|| format!("{}/oidc", public_base_url()));
+    if !config.listen.ip().is_loopback() && state.system_token == DEFAULT_AKSH_SYSTEM_TOKEN {
+        anyhow::bail!(
+            "AKSH_SYSTEM_TOKEN must be explicitly configured when listening beyond loopback"
+        );
+    }
+    let oidc_issuer = normalize_oidc_issuer(
+        config
+            .oidc_issuer
+            .unwrap_or_else(|| format!("{}/oidc", public_base_url())),
+    )?;
     {
         let mut inner = state.inner.lock().await;
         inner.oidc_issuer = oidc_issuer;
@@ -464,7 +474,7 @@ fn build_app(
         )
         .route(
             "/:orchestration_id//idtoken/:plan_id/:job_id",
-            get(oidc_token),
+            get(oidc_token_run_service),
         )
         .route(
             "/_apis/v1/ActionDownloadInfo/:scope/:hub/:plan_id",
@@ -538,12 +548,20 @@ fn build_app(
             "/runner/server/_apis/v1/plans/:plan_id/events",
             post(finish_job_plan),
         )
-        .route_layer(middleware::from_fn(require_bearer));
+        .route_layer(middleware::from_fn_with_state(
+            shared.clone(),
+            require_protocol_bearer,
+        ));
 
     let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/.well-known/openid-configuration", get(oidc_discovery))
         .route("/.well-known/jwks.json", get(oidc_jwks))
+        .route(
+            "/oidc/.well-known/openid-configuration",
+            get(oidc_discovery),
+        )
+        .route("/oidc/.well-known/jwks.json", get(oidc_jwks))
         // GHES-style org-prefixed routes
         .route("/:org/_apis/connectionData", get(connection_data))
         .route("/:org/_apis/v1/oauth2/token", post(oauth2_token))
@@ -660,28 +678,74 @@ fn build_app(
         )
         .route("/_apis/connectionData", get(connection_data))
         .route(
-            "/_apis/",
-            axum::routing::options(|| async { StatusCode::OK }),
+            "/api/v1/runs",
+            post(submit_run).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_native_bearer,
+            )),
         )
-        .route("/api/v1/runs", post(submit_run))
         .route(
             "/api/v1/github/webhooks",
             post(github::handle_github_webhook),
         )
         .route("/api/v1/github/register", get(github::github_register))
         .route("/api/v1/github/callback", get(github::github_callback))
-        .route("/api/v1/runs/:run_id", get(get_run))
-        .route("/api/v1/runs/:run_id/logs", get(get_run_logs))
-        .route("/api/v1/runs/:run_id/cancel", post(cancel_run))
-        .route("/api/v1/runs/:run_id/rerun", post(rerun_run))
-        .route("/api/v1/runs/:run_id/events.ndjson", get(run_events))
-        .route("/api/v1/runs/:run_id/debug", get(ws_dap_debug))
-        .route("/api/v1/runs/:run_id/debug", post(register_dap_port))
+        .route(
+            "/api/v1/runs/:run_id",
+            get(get_run).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_native_bearer,
+            )),
+        )
+        .route(
+            "/api/v1/runs/:run_id/logs",
+            get(get_run_logs).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_native_bearer,
+            )),
+        )
+        .route(
+            "/api/v1/runs/:run_id/cancel",
+            post(cancel_run).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_native_bearer,
+            )),
+        )
+        .route(
+            "/api/v1/runs/:run_id/rerun",
+            post(rerun_run).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_native_bearer,
+            )),
+        )
+        .route(
+            "/api/v1/runs/:run_id/events.ndjson",
+            get(run_events).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_native_bearer,
+            )),
+        )
+        .route(
+            "/api/v1/runs/:run_id/debug",
+            get(ws_dap_debug)
+                .post(register_dap_port)
+                .route_layer(middleware::from_fn_with_state(
+                    shared.clone(),
+                    require_native_bearer,
+                )),
+        )
+        // Archive tickets are bearerless in the official runner protocol.
         .route(
             "/api/v1/actions/download/:owner/:repo/*git_ref",
             get(download_action_tarball),
         )
-        .route("/api/v1/runners", post(register_runner))
+        .route(
+            "/api/v1/runners",
+            post(register_runner).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_native_bearer,
+            )),
+        )
         .route(
             "/runner/session",
             post(broker_session_root).delete(broker_delete_session_root),
@@ -690,7 +754,13 @@ fn build_app(
             "/runner/session/:session_id",
             delete(broker_delete_session_by_path),
         )
-        .route("/runner/message", get(next_message_broker_ref_root))
+        .route(
+            "/runner/message",
+            get(next_message_broker_ref_root).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_runner_bearer,
+            )),
+        )
         .route("/runner/acknowledge", post(broker_acknowledge_root))
         .route(
             "/runner/server/runner/session",
@@ -702,7 +772,10 @@ fn build_app(
         )
         .route(
             "/runner/server/runner/message",
-            get(next_message_broker_ref_root),
+            get(next_message_broker_ref_root).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_runner_bearer,
+            )),
         )
         .route(
             "/runner/server/runner/acknowledge",
@@ -716,7 +789,13 @@ fn build_app(
             "/session/:session_id",
             delete(broker_delete_session_by_path),
         )
-        .route("/message", get(next_message_broker_ref_root))
+        .route(
+            "/message",
+            get(next_message_broker_ref_root).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_runner_bearer,
+            )),
+        )
         .route("/acknowledge", post(broker_acknowledge_root))
         .route(
             "/runner/server/session",
@@ -726,17 +805,46 @@ fn build_app(
             "/runner/server/session/:session_id",
             delete(broker_delete_session_by_path),
         )
-        .route("/runner/server/message", get(next_message_broker_ref_root))
+        .route(
+            "/runner/server/message",
+            get(next_message_broker_ref_root).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_runner_bearer,
+            )),
+        )
         .route("/runner/server/acknowledge", post(broker_acknowledge_root))
-        .route("/api/v1/cache", post(cache_put))
-        .route("/api/v1/cache", get(cache_get))
-        .route("/api/v1/artifacts", post(artifact_put))
-        .route("/api/v1/artifacts/:artifact_id", get(artifact_get))
-        // Runner lifecycle endpoints — public (runner may not have auth token yet)
+        .route(
+            "/api/v1/cache",
+            get(cache_get)
+                .post(cache_put)
+                .route_layer(middleware::from_fn_with_state(
+                    shared.clone(),
+                    require_native_bearer,
+                )),
+        )
+        .route(
+            "/api/v1/artifacts",
+            post(artifact_put).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_native_bearer,
+            )),
+        )
+        .route(
+            "/api/v1/artifacts/:artifact_id",
+            get(artifact_get).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_native_bearer,
+            )),
+        )
+        // Runner lifecycle endpoints — public before the runner receives its token.
         .route("/_apis/v1/AgentPools", get(runner_pools))
         .route(
             "/_apis/v1/Agent/:pool_id/:agent_id",
             get(agent_lookup_by_id).post(register_runner_compat),
+        )
+        .route(
+            "/_apis/v1/Agent/:pool_id",
+            get(agent_lookup).post(register_runner_compat_pool_only),
         )
         .route(
             "/_apis/v1/AgentSession/:pool_id/:session_id",
@@ -865,6 +973,23 @@ fn build_app(
     }
 }
 
+async fn require_protocol_bearer(
+    State(shared): State<Arc<SharedState>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let authorized = bearer_token(&request).is_some_and(|token| {
+        token == shared.state.system_token || shared.state.verify_local_jwt_claims(token).is_some()
+    });
+    if authorized {
+        Ok(next.run(request).await)
+    } else {
+        Err(ApiError::unauthorized(
+            "runner or job protocol token required",
+        ))
+    }
+}
+
 async fn require_test_api_token(
     State(expected): State<Arc<str>>,
     request: Request,
@@ -884,44 +1009,136 @@ async fn require_test_api_token(
     Ok(next.run(request).await)
 }
 
-/// HMAC key used for local JWT signing/verification.
-const LOCAL_JWT_KEY: &[u8] = b"aksh-local-runner-signing-key";
-
-async fn require_bearer(request: Request, next: Next) -> Result<Response, ApiError> {
-    if request.uri().path().starts_with("/broker/") {
-        return Ok(next.run(request).await);
+async fn require_native_bearer(
+    State(shared): State<Arc<SharedState>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let authorized = bearer_token(&request).is_some_and(|token| token == shared.state.system_token);
+    if authorized {
+        Ok(next.run(request).await)
+    } else {
+        Err(ApiError::unauthorized(
+            "missing or invalid native API token",
+        ))
     }
-    let authorized = request
+}
+
+async fn require_runner_bearer(
+    State(shared): State<Arc<SharedState>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let authorized = bearer_token(&request)
+        .and_then(|token| shared.state.runner_id_from_token(token))
+        .is_some();
+    if authorized {
+        Ok(next.run(request).await)
+    } else {
+        Err(ApiError::unauthorized("runner listen token required"))
+    }
+}
+
+fn bearer_token(request: &Request) -> Option<&str> {
+    request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|token| {
-            token == AKSH_SYSTEM_TOKEN || token.starts_with("aksh-") || verify_local_jwt(token)
+}
+
+impl AppState {
+    fn local_jwt(&self, mut claims: serde_json::Value) -> Result<String, ApiError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| ApiError::bad_request(format!("system clock before epoch: {error}")))?
+            .as_secs();
+        let claims = claims
+            .as_object_mut()
+            .ok_or_else(|| ApiError::bad_request("JWT claims must be an object"))?;
+        claims.insert("iss".to_owned(), json!("https://aksh.local"));
+        claims.insert("iat".to_owned(), json!(now));
+        claims.insert("nbf".to_owned(), json!(now));
+        claims.insert("exp".to_owned(), json!(now + 2999));
+        let header = json!({
+            "alg": "HS256",
+            "typ": "JWT",
+            "kid": "aksh-local"
         });
-    if authorized {
-        Ok(next.run(request).await)
-    } else {
-        Err(ApiError::unauthorized("missing or invalid bearer token"))
+        let signing_input = format!(
+            "{}.{}",
+            base64_url_json(&header)?,
+            base64_url_json(&serde_json::Value::Object(claims.clone()))?
+        );
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.local_jwt_key)
+            .map_err(|error| ApiError::bad_request(format!("invalid signing key: {error}")))?;
+        mac.update(signing_input.as_bytes());
+        let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        Ok(format!("{signing_input}.{signature}"))
+    }
+
+    fn verify_local_jwt_claims(&self, token: &str) -> Option<serde_json::Value> {
+        let parts: Vec<&str> = token.splitn(3, '.').collect();
+        if parts.len() != 3 {
+            return None;
+        }
+        let header_bytes = URL_SAFE_NO_PAD.decode(parts[0]).ok()?;
+        let header: serde_json::Value = serde_json::from_slice(&header_bytes).ok()?;
+        if header.get("alg").and_then(|value| value.as_str()) != Some("HS256") {
+            return None;
+        }
+        let payload_bytes = URL_SAFE_NO_PAD.decode(parts[1]).ok()?;
+        let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+        let exp = payload.get("exp").and_then(|value| value.as_u64())?;
+        let nbf = payload.get("nbf").and_then(|value| value.as_u64());
+        if exp <= now || nbf.is_some_and(|value| value > now + 30) {
+            return None;
+        }
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.local_jwt_key).ok()?;
+        mac.update(format!("{}.{}", parts[0], parts[1]).as_bytes());
+        let signature = URL_SAFE_NO_PAD.decode(parts[2]).ok()?;
+        mac.verify_slice(&signature).ok()?;
+        Some(payload)
+    }
+
+    fn verify_local_jwt_scope(&self, token: &str, expected_scope: &str) -> bool {
+        self.verify_local_jwt_claims(token)
+            .and_then(|payload| {
+                payload
+                    .get("scp")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
+            })
+            .as_deref()
+            == Some(expected_scope)
+    }
+
+    fn runner_id_from_token(&self, token: &str) -> Option<i64> {
+        let payload = self.verify_local_jwt_claims(token)?;
+        let scope = payload.get("scp")?.as_str()?;
+        if !scope
+            .split_whitespace()
+            .any(|value| value == "ActionsRuntime.RunnerListen")
+        {
+            return None;
+        }
+        payload
+            .get("sub")?
+            .as_str()?
+            .strip_prefix("aksh-runner-listen-")?
+            .parse()
+            .ok()
+    }
+
+    fn mint_runtime_token(&self, plan_id: &str, job_id: &uuid::Uuid) -> String {
+        self.local_jwt(json!({
+            "sub": format!("aksh-job-{job_id}"),
+            "scp": format!("Actions.Results:{plan_id}:{job_id}"),
+        }))
+        .expect("fixed local JWT claims must serialize")
     }
 }
-
-/// Verify an HS256 JWT issued by this server's `local_jwt()`.
-fn verify_local_jwt(token: &str) -> bool {
-    let parts: Vec<&str> = token.splitn(3, '.').collect();
-    if parts.len() != 3 {
-        return false;
-    }
-    let signing_input = format!("{}.{}", parts[0], parts[1]);
-    let mut mac = match Hmac::<Sha256>::new_from_slice(LOCAL_JWT_KEY) {
-        Ok(m) => m,
-        Err(_) => return false,
-    };
-    mac.update(signing_input.as_bytes());
-    let expected = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
-    expected == parts[2]
-}
-
 #[derive(Clone)]
 struct SharedState {
     state: AppState,
@@ -942,6 +1159,10 @@ pub struct AppState {
     pub local_workspace: Option<PathBuf>,
     /// State directory for replay/log storage.
     pub state_dir: PathBuf,
+    /// Native API administrator credential for this server instance.
+    system_token: String,
+    /// Per-instance HMAC key for runner and job JWTs.
+    local_jwt_key: Vec<u8>,
 }
 
 impl AppState {
@@ -952,7 +1173,13 @@ impl AppState {
         let (events, _) = broadcast::channel(1024);
         let keypair = AgentRsaKeypair::generate()
             .map_err(|e| anyhow::anyhow!("Failed to generate RSA keypair: {}", e))?;
-        let oidc_keypair = load_or_generate_oidc_keypair(&state_dir);
+        let oidc_keypair = load_or_generate_oidc_keypair(&state_dir)?;
+        let system_token =
+            env::var("AKSH_SYSTEM_TOKEN").unwrap_or_else(|_| DEFAULT_AKSH_SYSTEM_TOKEN.to_owned());
+        #[cfg(test)]
+        let local_jwt_key = TEST_LOCAL_JWT_KEY.to_vec();
+        #[cfg(not(test))]
+        let local_jwt_key = load_or_generate_hmac_key(&state_dir)?;
         let registry_path = state_dir.join("artifact_v2_registry.json");
         let (registry, next_id) = if registry_path.exists() {
             if let Ok(content) = std::fs::read_to_string(&registry_path) {
@@ -973,7 +1200,7 @@ impl AppState {
             agent_keypair: Some(keypair),
             artifact_v2_registry: registry,
             next_artifact_v2_id: next_id,
-            oidc_keypair,
+            oidc_keypair: Some(oidc_keypair),
             ..Default::default()
         };
         let webhook_secret = std::env::var("AKSH_WEBHOOK_SECRET").ok();
@@ -989,6 +1216,8 @@ impl AppState {
             webhook_secret,
             local_workspace,
             state_dir,
+            system_token,
+            local_jwt_key,
         })
     }
 
@@ -996,44 +1225,133 @@ impl AppState {
         let _ = self.events.send(event);
     }
 }
+#[cfg(test)]
+fn mint_runtime_token(plan_id: &str, job_id: &uuid::Uuid) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("test clock must be after epoch")
+        .as_secs();
+    let header = json!({"alg": "HS256", "typ": "JWT", "kid": "aksh-local"});
+    let claims = json!({
+        "iss": "https://aksh.local",
+        "iat": now,
+        "nbf": now,
+        "exp": now + 2999,
+        "sub": format!("aksh-job-{job_id}"),
+        "scp": format!("Actions.Results:{plan_id}:{job_id}"),
+    });
+    let signing_input = format!(
+        "{}.{}",
+        base64_url_json(&header).expect("test header serializes"),
+        base64_url_json(&claims).expect("test claims serialize"),
+    );
+    let mut mac = Hmac::<Sha256>::new_from_slice(TEST_LOCAL_JWT_KEY).expect("test key is valid");
+    mac.update(signing_input.as_bytes());
+    format!(
+        "{signing_input}.{}",
+        URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+    )
+}
 
 /// Load the OIDC signing keypair from `<state_dir>/oidc-key.json`, or generate
 /// a new one and persist it for reuse across restarts.
-fn load_or_generate_oidc_keypair(state_dir: &std::path::Path) -> Option<oidc::OidcKeypair> {
+fn load_or_generate_oidc_keypair(state_dir: &std::path::Path) -> anyhow::Result<oidc::OidcKeypair> {
     let key_path = state_dir.join("oidc-key.json");
     if key_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&key_path) {
-            if let Ok(params) =
-                serde_json::from_str::<aksh_gha_protocol::crypto::RsaParametersExport>(&content)
-            {
-                if let Ok(kp) = oidc::OidcKeypair::from_params(&params) {
-                    return Some(kp);
-                }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let mode = std::fs::metadata(&key_path)?.mode();
+            if mode & 0o077 != 0 {
+                std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
             }
         }
+        let content = std::fs::read_to_string(&key_path).map_err(|error| {
+            anyhow::anyhow!("failed to read OIDC key {}: {error}", key_path.display())
+        })?;
+        let params =
+            serde_json::from_str::<aksh_gha_protocol::crypto::RsaParametersExport>(&content)
+                .map_err(|error| {
+                    anyhow::anyhow!("invalid OIDC key {}: {error}", key_path.display())
+                })?;
+        return oidc::OidcKeypair::from_params(&params);
     }
-    match oidc::OidcKeypair::generate() {
-        Ok(kp) => {
-            let params = kp.params();
-            if let Ok(json) = serde_json::to_string(&params) {
-                let _ = std::fs::write(&key_path, json);
-            }
-            Some(kp)
-        }
-        Err(e) => {
-            warn!("Failed to generate OIDC keypair: {e}");
-            None
-        }
+
+    let kp = oidc::OidcKeypair::generate()?;
+    let json = serde_json::to_vec(&kp.params())?;
+    std::fs::create_dir_all(state_dir)?;
+    let temp_path = state_dir.join(format!("oidc-key.{}.tmp", uuid::Uuid::new_v4()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+    let mut file = options.open(&temp_path)?;
+    use std::io::Write;
+    file.write_all(&json)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&temp_path, &key_path).map_err(|error| {
+        let _ = std::fs::remove_file(&temp_path);
+        anyhow::anyhow!("failed to persist OIDC key {}: {error}", key_path.display())
+    })?;
+    Ok(kp)
+}
+
+/// Load or generate a 32-byte HMAC key for local JWT signing.
+///
+/// Persisted to `<state_dir>/hmac-key.bin` so runtime tokens survive restarts.
+fn load_or_generate_hmac_key(state_dir: &std::path::Path) -> anyhow::Result<Vec<u8>> {
+    let key_path = state_dir.join("hmac-key.bin");
+    if key_path.exists() {
+        let key = std::fs::read(&key_path).map_err(|error| {
+            anyhow::anyhow!("failed to read HMAC key {}: {error}", key_path.display())
+        })?;
+        if key.len() == 32 {
+            return Ok(key);
+        }
+        // Wrong size — regenerate.
+    }
+    let mut key = vec![0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut key);
+    std::fs::create_dir_all(state_dir)?;
+    let temp_path = state_dir.join(format!("hmac-key.{}.tmp", uuid::Uuid::new_v4()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temp_path)?;
+    use std::io::Write;
+    file.write_all(&key)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&temp_path, &key_path).map_err(|error| {
+        let _ = std::fs::remove_file(&temp_path);
+        anyhow::anyhow!("failed to persist HMAC key {}: {error}", key_path.display())
+    })?;
+    Ok(key)
 }
 
 impl InnerState {
     /// Look up the labels for the runner that owns a given session.
     fn runner_labels_for_session(&self, session_id: &str) -> Vec<String> {
-        self.sessions
+        let runner_id = self
+            .broker_session_runners
             .get(session_id)
-            .and_then(|s| self.runners.get(&s.runner_id))
-            .map(|r| r.labels.clone())
+            .copied()
+            .or_else(|| {
+                self.sessions
+                    .get(session_id)
+                    .map(|session| session.runner_id)
+            });
+        runner_id
+            .and_then(|runner_id| self.runners.get(&runner_id))
+            .map(|runner| runner.labels.clone())
             .unwrap_or_default()
     }
 }
@@ -1066,6 +1384,8 @@ struct InnerState {
     agent_job_requests: BTreeMap<uuid::Uuid, i64>,
     timeline_requests: BTreeMap<uuid::Uuid, i64>,
     session_active_requests: BTreeMap<String, i64>,
+    /// Modern broker session owner, derived from the runner-listen JWT.
+    broker_session_runners: BTreeMap<String, i64>,
     next_runner_id: i64,
     next_cache_id: i64,
     next_message_id: i64,
@@ -1086,13 +1406,21 @@ struct InnerState {
     artifact_v2_registry: BTreeMap<String, ArtifactV2Entry>,
     /// Monotonic artifact v2 ID counter.
     next_artifact_v2_id: u64,
+    /// Per-job resolved OIDC execution context.
+    oidc_job_contexts: BTreeMap<(RunId, JobId), OidcJobContext>,
+    /// OIDC issuer URL used in the `iss` claim and discovery document.
+    oidc_issuer: String,
     dap_ports: BTreeMap<RunId, DapPortRegistration>,
     /// OIDC signing keypair (RS256) for id-token minting.
     oidc_keypair: Option<oidc::OidcKeypair>,
     /// Per-job `id-token: write` grant, keyed by (run_id, job_id).
     id_token_grants: BTreeMap<(RunId, JobId), bool>,
-    /// OIDC issuer URL used in the `iss` claim and discovery document.
-    oidc_issuer: String,
+}
+
+#[derive(Debug, Clone)]
+struct OidcJobContext {
+    environment: Option<String>,
+    job_workflow_ref: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1394,8 +1722,10 @@ pub(crate) async fn submit_run_inner(
             )
             .map_err(|e| ApiError::bad_request(format!("failed to build job message: {e}")))?;
 
-            // Mint a dynamic JWT for the job and inject it as GITHUB_TOKEN
-            let token = mint_runtime_token(&agent_msg.plan.plan_id, &agent_msg.job_id);
+            // Mint a dynamic JWT for the job and inject it as GITHUB_TOKEN.
+            let token = shared
+                .state
+                .mint_runtime_token(&agent_msg.plan.plan_id, &agent_msg.job_id);
             agent_msg.variables.insert(
                 "system.github.token".to_owned(),
                 aksh_gha_protocol::azdo::VariableValue::secret(token.clone()),
@@ -1413,17 +1743,24 @@ pub(crate) async fn submit_run_inner(
                 );
             }
 
+            // Persist parser-resolved OIDC identity so token minting does not reparse raw YAML.
+            let id_token_granted = job.oidc_id_token_granted;
+            inner
+                .id_token_grants
+                .insert((run_id, job.id.clone()), id_token_granted);
+            inner.oidc_job_contexts.insert(
+                (run_id, job.id.clone()),
+                OidcJobContext {
+                    environment: job.oidc_environment.clone(),
+                    job_workflow_ref: job.oidc_job_workflow_ref.clone(),
+                },
+            );
+
             // Give every dispatched job a unique requestId so PATCH
             // /AgentRequest/:request_id can target exactly one job.
             inner.next_request_id += 1;
             let request_id = inner.next_request_id;
             agent_msg.request_id = request_id;
-            // Track id-token:write grant for OIDC permission enforcement.
-            let id_token_granted =
-                oidc::parse_id_token_grant(&submission.workflow_yaml, Some(&job.id.0));
-            inner
-                .id_token_grants
-                .insert((run_id, job.id.clone()), id_token_granted);
             // Inject GenerateIdTokenUrl into SystemVssConnection when id-token:write is granted.
             if id_token_granted {
                 let oidc_url = format!(
@@ -2101,11 +2438,20 @@ async fn create_session_disttask(
         session_enc.key.clone(),
     );
 
+    let runner_id = body
+        .pointer("/agent/id")
+        .and_then(serde_json::Value::as_i64);
+
     {
         let mut inner = shared.state.inner.lock().await;
         inner
             .session_keys
             .insert(session_id.to_string(), session_enc);
+        if let Some(runner_id) = runner_id {
+            inner
+                .broker_session_runners
+                .insert(session_id.to_string(), runner_id);
+        }
         // Only mark as AzDO if the client explicitly opts in.
         // This preserves backward compat: test and broker-hybrid sessions do NOT
         // include `akshAzdo: true` and continue to receive broker-ref messages.
@@ -2184,7 +2530,8 @@ struct BrokerAcquireJobRequest {
 #[serde(rename_all = "camelCase")]
 struct BrokerRenewJobRequest {
     job_id: uuid::Uuid,
-    plan_id: String,
+    #[serde(rename = "planId")]
+    _plan_id: String,
     conclusion: Option<String>,
     #[serde(default)]
     outputs: BTreeMap<String, serde_json::Value>,
@@ -2209,6 +2556,26 @@ fn public_base_url() -> String {
         .unwrap_or_else(|_| "http://127.0.0.1:9090".to_owned())
         .trim_end_matches('/')
         .to_owned()
+}
+
+fn format_reusable_workflow_ref(repository: &str, workflow_ref: &str, caller_ref: &str) -> String {
+    if let Some(path) = workflow_ref.strip_prefix("./") {
+        let (path, git_ref) = path.split_once('@').unwrap_or((path, caller_ref));
+        return format!("{repository}/{path}@{git_ref}");
+    }
+    workflow_ref.to_owned()
+}
+
+fn normalize_oidc_issuer(value: String) -> anyhow::Result<String> {
+    let issuer = value.trim_end_matches('/').to_owned();
+    if issuer.is_empty()
+        || !(issuer.starts_with("https://") || issuer.starts_with("http://"))
+        || issuer.contains('?')
+        || issuer.contains('#')
+    {
+        anyhow::bail!("OIDC issuer must be an absolute HTTP(S) URL without query or fragment");
+    }
+    Ok(issuer)
 }
 
 /// Return the effective OIDC issuer URL, falling back to
@@ -2404,15 +2771,20 @@ async fn next_message_disttask(
 
 async fn broker_session_root(
     State(shared): State<Arc<SharedState>>,
-) -> (StatusCode, Json<serde_json::Value>) {
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let runner_id = authenticated_runner_id(&shared, &headers, None)?;
     let session_id = uuid::Uuid::new_v4().to_string();
     {
         let mut inner = shared.state.inner.lock().await;
         inner
             .session_keys
             .insert(session_id.clone(), SessionEncryption::generate());
+        inner
+            .broker_session_runners
+            .insert(session_id.clone(), runner_id);
     }
-    (
+    Ok((
         StatusCode::CREATED,
         Json(json!({
             "sessionId": session_id,
@@ -2420,39 +2792,113 @@ async fn broker_session_root(
             "assignmentQueued": false,
             "orchestrationId": ""
         })),
-    )
+    ))
 }
 
 async fn broker_delete_session_root(
     State(shared): State<Arc<SharedState>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
-) -> StatusCode {
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let runner_id = authenticated_runner_id(&shared, &headers, None)?;
     if let Some(session_id) = params.get("sessionId") {
-        let mut inner = shared.state.inner.lock().await;
-        inner.session_keys.remove(session_id);
-        inner.session_active_requests.remove(session_id);
+        remove_broker_session(&shared, session_id, runner_id).await?;
     }
-    StatusCode::NO_CONTENT
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn broker_delete_session_by_path(
     State(shared): State<Arc<SharedState>>,
     Path(session_id): Path<String>,
-) -> StatusCode {
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let runner_id = authenticated_runner_id(&shared, &headers, None)?;
+    remove_broker_session(&shared, &session_id, runner_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn remove_broker_session(
+    shared: &Arc<SharedState>,
+    session_id: &str,
+    runner_id: i64,
+) -> Result<(), ApiError> {
     let mut inner = shared.state.inner.lock().await;
-    inner.session_keys.remove(&session_id);
-    inner.session_active_requests.remove(&session_id);
-    StatusCode::NO_CONTENT
+    match inner.broker_session_runners.get(session_id).copied() {
+        Some(owner) if owner == runner_id => {
+            inner.broker_session_runners.remove(session_id);
+            inner.session_keys.remove(session_id);
+            inner.session_active_requests.remove(session_id);
+            Ok(())
+        }
+        Some(_) => Err(ApiError::forbidden(
+            "broker session belongs to another runner",
+        )),
+        None => Err(ApiError::not_found("broker session not found")),
+    }
+}
+fn authenticated_runner_id(
+    shared: &Arc<SharedState>,
+    headers: &HeaderMap,
+    expected_runner_id: Option<i64>,
+) -> Result<i64, ApiError> {
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or_else(|| ApiError::unauthorized("runner listen token required"))?;
+    let runner_id = shared
+        .state
+        .runner_id_from_token(bearer)
+        .ok_or_else(|| ApiError::unauthorized("runner listen token required"))?;
+    if expected_runner_id.is_some_and(|expected| expected != runner_id) {
+        return Err(ApiError::forbidden(
+            "runner token does not match broker path",
+        ));
+    }
+    Ok(runner_id)
+}
+
+fn ensure_broker_request_owner(
+    inner: &InnerState,
+    request_id: i64,
+    runner_id: i64,
+) -> Result<(), ApiError> {
+    let owner = inner
+        .session_active_requests
+        .iter()
+        .find_map(|(session_id, active_request_id)| {
+            (*active_request_id == request_id).then(|| session_id)
+        })
+        .and_then(|session_id| inner.broker_session_runners.get(session_id).copied());
+    match owner {
+        Some(owner) if owner == runner_id => Ok(()),
+        Some(_) => Err(ApiError::forbidden(
+            "broker request belongs to another runner",
+        )),
+        None => Err(ApiError::not_found(
+            "broker request is not assigned to a session",
+        )),
+    }
 }
 
 async fn next_message_broker_ref_root(
     State(shared): State<Arc<SharedState>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let runner_id = authenticated_runner_id(&shared, &headers, None)?;
     let session_id = params
         .get("sessionId")
         .cloned()
-        .unwrap_or_else(|| "default".to_owned());
+        .ok_or_else(|| ApiError::bad_request("broker sessionId is required"))?;
+    {
+        let inner = shared.state.inner.lock().await;
+        if inner.broker_session_runners.get(&session_id) != Some(&runner_id) {
+            return Err(ApiError::forbidden(
+                "broker session belongs to another runner",
+            ));
+        }
+    }
 
     // Default to 50s long-poll (golden flows show ~50s waits between jobs)
     let wait = params
@@ -2526,33 +2972,21 @@ async fn broker_acknowledge_root(
 async fn broker_acquire_job(
     State(shared): State<Arc<SharedState>>,
     Path(runner_id): Path<i64>,
+    headers: HeaderMap,
     Json(request): Json<BrokerAcquireJobRequest>,
 ) -> Result<Json<azdo::AgentJobRequestMessage>, ApiError> {
+    authenticated_runner_id(&shared, &headers, Some(runner_id))?;
     let inner = shared.state.inner.lock().await;
     let request_id = inner
         .agent_job_requests
         .get(&request.job_message_id)
         .copied()
-        .or_else(|| sole_active_unfinished_request(&inner))
         .ok_or_else(|| ApiError::not_found("broker job message not found"))?;
+    ensure_broker_request_owner(&inner, request_id, runner_id)?;
     let mut message = inner
         .broker_messages
         .get(&request_id)
         .cloned()
-        .or_else(|| {
-            inner.job_requests.get(&request_id).and_then(|record| {
-                inner
-                    .agent_job_requests
-                    .get(&record.agent_job_id)
-                    .and_then(|_| {
-                        inner
-                            .queue
-                            .iter()
-                            .find(|queued| queued.message.request_id == request_id)
-                            .map(|queued| queued.message.clone())
-                    })
-            })
-        })
         .ok_or_else(|| ApiError::not_found("broker job payload not found"))?;
     message.message_type = Some(azdo::message_type::RUNNER_JOB_REQUEST.to_owned());
     let run_service_url = broker_run_service_url(runner_id);
@@ -2561,7 +2995,9 @@ async fn broker_acquire_job(
             endpoint.url = Some(run_service_url.clone());
             endpoint.authorization.parameters.insert(
                 "AccessToken".to_owned(),
-                mint_runtime_token(&message.plan.plan_id, &message.job_id),
+                shared
+                    .state
+                    .mint_runtime_token(&message.plan.plan_id, &message.job_id),
             );
             endpoint
                 .data
@@ -2583,17 +3019,18 @@ async fn broker_acquire_job(
 
 async fn broker_renew_job(
     State(shared): State<Arc<SharedState>>,
-    Path(_runner_id): Path<i64>,
+    Path(runner_id): Path<i64>,
+    headers: HeaderMap,
     Json(request): Json<BrokerRenewJobRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    authenticated_runner_id(&shared, &headers, Some(runner_id))?;
     let mut inner = shared.state.inner.lock().await;
     let request_id = inner
         .agent_job_requests
         .get(&request.job_id)
         .copied()
-        .or_else(|| inner.plan_requests.get(&request.plan_id).copied())
-        .or_else(|| sole_active_unfinished_request(&inner))
         .ok_or_else(|| ApiError::not_found("broker renew request not found"))?;
+    ensure_broker_request_owner(&inner, request_id, runner_id)?;
     let record = inner
         .job_requests
         .get_mut(&request_id)
@@ -2605,9 +3042,11 @@ async fn broker_renew_job(
 
 async fn broker_complete_job(
     State(shared): State<Arc<SharedState>>,
-    Path(_runner_id): Path<i64>,
+    Path(runner_id): Path<i64>,
+    headers: HeaderMap,
     Json(request): Json<BrokerRenewJobRequest>,
 ) -> Result<StatusCode, ApiError> {
+    authenticated_runner_id(&shared, &headers, Some(runner_id))?;
     let status = match request.conclusion.as_deref() {
         Some(conclusion) => execution_status_from_runner_result(conclusion).ok_or_else(|| {
             ApiError::bad_request(format!("unknown broker conclusion `{conclusion}`"))
@@ -2634,23 +3073,12 @@ async fn broker_complete_job(
 
     let completion = {
         let mut inner = shared.state.inner.lock().await;
-        let request_id = match inner
+        let request_id = inner
             .agent_job_requests
             .get(&request.job_id)
             .copied()
-            .or_else(|| inner.plan_requests.get(&request.plan_id).copied())
-            .or_else(|| sole_active_unfinished_request(&inner))
-        {
-            Some(id) => id,
-            None => {
-                warn!(
-                    job_id = %request.job_id,
-                    plan_id = %request.plan_id,
-                    "broker complete: could not find request_id"
-                );
-                return Ok(StatusCode::NO_CONTENT);
-            }
-        };
+            .ok_or_else(|| ApiError::not_found("broker complete request not found"))?;
+        ensure_broker_request_owner(&inner, request_id, runner_id)?;
         debug!(request_id, job_id = %request.job_id, "broker complete: found request");
         if let Some(record) = inner.job_requests.get_mut(&request_id) {
             record.result = Some(status);
@@ -3573,7 +4001,9 @@ async fn next_message(
                 endpoint.url = Some(runner_server_url());
                 endpoint.authorization.parameters.insert(
                     "AccessToken".to_owned(),
-                    mint_runtime_token(&msg.plan.plan_id, &msg.job_id),
+                    shared
+                        .state
+                        .mint_runtime_token(&msg.plan.plan_id, &msg.job_id),
                 );
                 endpoint
                     .data
@@ -3917,12 +4347,10 @@ fn sole_active_unfinished_request(inner: &InnerState) -> Option<i64> {
         });
     let request_id = active.next()?;
     if active.next().is_none() {
-        Some(request_id)
-    } else {
-        None
+        return Some(request_id);
     }
+    None
 }
-
 fn job_request_tuple(inner: &InnerState, request_id: i64) -> Option<(i64, RunId, JobId)> {
     let request = inner.job_requests.get(&request_id)?;
     Some((request_id, request.run_id, request.job_id.clone()))
@@ -5684,6 +6112,7 @@ async fn action_download_info_org(
 /// Matches the ChristopherHX/runner.server format: `GitHubAuthResult` with
 /// `token`, `token_schema`, and `tenant_url`.
 async fn github_registration_token(
+    State(shared): State<Arc<SharedState>>,
     headers: axum::http::HeaderMap,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -5696,7 +6125,7 @@ async fn github_registration_token(
         return Err(ApiError::unauthorized("missing Authorization header"));
     }
 
-    let token = local_jwt(json!({
+    let token = shared.state.local_jwt(json!({
         "sub": "aksh-runner-registration",
         "scp": "ActionsRuntime.RunnerManage Framework.GenericRead Identity.ReadRefs LocationService.Connect",
         "jti": uuid::Uuid::new_v4().to_string()
@@ -5760,7 +6189,7 @@ async fn oauth2_token(
 ) -> Result<Json<TokenResponse>, ApiError> {
     // Try JSON first (mock flow from existing tests)
     if let Ok(req) = serde_json::from_slice::<JsonOAuth2Request>(&body) {
-        let token = local_jwt(json!({
+        let token = shared.state.local_jwt(json!({
             "sub": format!("aksh-runner-listen-mock-{}", req.client_id),
             "scp": "ActionsRuntime.RunnerListen Framework.GenericRead Identity.ReadRefs LocationService.Connect",
             "jti": uuid::Uuid::new_v4().to_string()
@@ -5830,7 +6259,7 @@ async fn oauth2_token(
         .verify_signature_ps256(signing_input.as_bytes(), &signature)
         .map_err(|e| ApiError::unauthorized(format!("JWT signature verification failed: {e}")))?;
 
-    let token = local_jwt(json!({
+    let token = shared.state.local_jwt(json!({
         "sub": format!("aksh-runner-listen-{runner_id}"),
         "scp": "ActionsRuntime.RunnerListen Framework.GenericRead Identity.ReadRefs LocationService.Connect",
         "jti": uuid::Uuid::new_v4().to_string()
@@ -5843,54 +6272,11 @@ async fn oauth2_token(
     }))
 }
 
-fn local_jwt(mut claims: serde_json::Value) -> Result<String, ApiError> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| ApiError::bad_request(format!("system clock before epoch: {error}")))?
-        .as_secs();
-    let claims = claims
-        .as_object_mut()
-        .ok_or_else(|| ApiError::bad_request("JWT claims must be an object"))?;
-    claims.insert("iss".to_owned(), json!("https://aksh.local"));
-    claims.insert("iat".to_owned(), json!(now));
-    claims.insert("nbf".to_owned(), json!(now));
-    claims.insert("exp".to_owned(), json!(now + 2999));
-    let header = json!({
-        "alg": "HS256",
-        "typ": "JWT",
-        "kid": "aksh-local"
-    });
-    let signing_input = format!(
-        "{}.{}",
-        base64_url_json(&header)?,
-        base64_url_json(&serde_json::Value::Object(claims.clone()))?
-    );
-    let mut mac = Hmac::<Sha256>::new_from_slice(LOCAL_JWT_KEY)
-        .map_err(|error| ApiError::bad_request(format!("invalid signing key: {error}")))?;
-    mac.update(signing_input.as_bytes());
-    let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
-    Ok(format!("{signing_input}.{signature}"))
-}
-
-/// Mint a per-job `ACTIONS_RUNTIME_TOKEN` JWT.
-///
-/// The artifact toolkit (`@actions/artifact`, `@actions/cache` v2) decodes this token
-/// (without signature verification) and extracts `workflowRunBackendId` and
-/// `workflowJobRunBackendId` from the `scp` claim before making any Twirp requests.
-/// Format: `Actions.Results:{plan_id}:{job_id}`.
-fn mint_runtime_token(plan_id: &str, job_id: &uuid::Uuid) -> String {
-    local_jwt(json!({
-        "sub": format!("aksh-job-{job_id}"),
-        "scp": format!("Actions.Results:{plan_id}:{job_id}"),
-    }))
-    .unwrap_or_else(|_| AKSH_SYSTEM_TOKEN.to_owned())
-}
-
 #[derive(Debug, Deserialize)]
 struct OidcTokenQuery {
     audience: Option<String>,
     #[serde(rename = "api-version")]
-    api_version: Option<String>,
+    _api_version: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -5902,21 +6288,53 @@ struct OidcTokenResponse {
 ///
 /// Mints a GitHub-compatible RS256-signed OIDC id-token JWT. Looks up the
 /// originating workflow run to populate claims, and enforces `id-token: write`.
+async fn oidc_token_run_service(
+    State(shared): State<Arc<SharedState>>,
+    Path((_orchestration_id, plan_id, job_id)): Path<(String, String, String)>,
+    Query(query): Query<OidcTokenQuery>,
+    headers: HeaderMap,
+) -> Result<Json<OidcTokenResponse>, ApiError> {
+    oidc_token(
+        State(shared),
+        Path((plan_id, job_id)),
+        Query(query),
+        headers,
+    )
+    .await
+}
+
 async fn oidc_token(
     State(shared): State<Arc<SharedState>>,
     Path((plan_id, job_id)): Path<(String, String)>,
     Query(query): Query<OidcTokenQuery>,
+    headers: HeaderMap,
 ) -> Result<Json<OidcTokenResponse>, ApiError> {
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or_else(|| ApiError::unauthorized("OIDC bearer token required"))?;
+    let expected_scope = format!("Actions.Results:{plan_id}:{job_id}");
+    if !shared.state.verify_local_jwt_scope(bearer, &expected_scope) {
+        return Err(ApiError::forbidden(
+            "OIDC runtime token is not bound to this job",
+        ));
+    }
     let inner = shared.state.inner.lock().await;
-
-    // Resolve plan_id → (run_id, job_id) to look up workflow context.
-    let (_, run_id, resolved_job_id) = resolve_callback_job(&inner, &plan_id, None, None)
-        .or_else(|| {
-            // Fallback: plan_id might itself be a job_id string.
-            let _ = &job_id;
-            None
-        })
-        .ok_or_else(|| ApiError::not_found("OIDC: job not found for plan_id"))?;
+    let request_id = inner
+        .plan_requests
+        .get(&plan_id)
+        .copied()
+        .ok_or_else(|| ApiError::not_found("OIDC: plan not found"))?;
+    let request = inner
+        .job_requests
+        .get(&request_id)
+        .ok_or_else(|| ApiError::not_found("OIDC: job request not found"))?;
+    if request.agent_job_id.to_string() != job_id {
+        return Err(ApiError::not_found("OIDC: plan and job do not match"));
+    }
+    let run_id = request.run_id;
+    let resolved_job_id = request.job_id.clone();
 
     // Permission enforcement: id-token:write must be granted.
     let granted = inner
@@ -5934,9 +6352,16 @@ async fn oidc_token(
     let oidc_kp = inner
         .oidc_keypair
         .as_ref()
-        .ok_or_else(|| ApiError::internal("OIDC signing keypair not available"))?;
+        .ok_or_else(|| ApiError::internal("OIDC signing keypair not available"))?
+        .clone();
 
-    // Build claims from the run's submission.
+    let oidc_context = inner
+        .oidc_job_contexts
+        .get(&(run_id, resolved_job_id.clone()))
+        .cloned()
+        .ok_or_else(|| ApiError::internal("OIDC context missing for dispatched job"))?;
+
+    // Build claims from the run's submission and parser-resolved job context.
     let run = inner
         .runs
         .get(&run_id)
@@ -6014,6 +6439,13 @@ async fn oidc_token(
         .and_then(|v| v.as_u64())
         .map(|id| id.to_string())
         .unwrap_or_default();
+    let repository_visibility = submission
+        .payload
+        .get("repository")
+        .and_then(|repository| repository.get("visibility"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("private")
+        .to_owned();
 
     let workflow_name = parse_workflow(&submission.workflow_yaml)
         .ok()
@@ -6041,10 +6473,30 @@ async fn oidc_token(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
+    let check_run_id = run.job_check_run_ids.get(&resolved_job_id).copied();
     let workflow_ref = format!(
         "{}/.github/workflows/{}@{}",
         submission.repository, workflow_file, submission.git_ref
     );
+
+    let job_workflow_ref = oidc_context.job_workflow_ref.as_deref().map(|reference| {
+        format_reusable_workflow_ref(&submission.repository, reference, &submission.git_ref)
+    });
+    let job_workflow_sha = job_workflow_ref
+        .as_ref()
+        .and_then(|reference| {
+            reference
+                .rsplit_once('@')
+                .map(|(_, git_ref)| git_ref)
+                .filter(|git_ref| {
+                    git_ref.len() == 40
+                        && git_ref
+                            .chars()
+                            .all(|character| character.is_ascii_hexdigit())
+                })
+                .map(str::to_owned)
+        })
+        .or_else(|| job_workflow_ref.as_ref().map(|_| sha.clone()));
 
     let claims_input = oidc::OidcClaimsInput {
         repository: submission.repository.clone(),
@@ -6060,14 +6512,14 @@ async fn oidc_token(
         run_attempt: "1".to_string(),
         head_ref,
         base_ref,
-        environment: submission.environment.clone(),
-        repository_visibility: "private".to_string(),
+        environment: oidc_context.environment,
+        repository_visibility,
         repository_id,
         repository_owner_id,
         workflow_ref: Some(workflow_ref),
         workflow_sha: Some(sha),
-        job_workflow_ref: None,
-        job_workflow_sha: None,
+        job_workflow_ref,
+        job_workflow_sha,
     };
 
     let audience = query
@@ -6080,7 +6532,11 @@ async fn oidc_token(
         .as_secs();
 
     let issuer = oidc_issuer_url(&inner);
-    let claims = oidc::build_claims(&claims_input, &audience, &issuer, now);
+    drop(inner);
+    let mut claims = oidc::build_claims(&claims_input, &audience, &issuer, now);
+    if let Some(check_run_id) = check_run_id {
+        claims["check_run_id"] = json!(check_run_id.to_string());
+    }
 
     let jwt = oidc_kp
         .sign_jwt(&claims)
@@ -6095,7 +6551,7 @@ async fn oidc_discovery(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let inner = shared.state.inner.lock().await;
     let issuer = oidc_issuer_url(&inner);
-    let jwks_uri = format!("{}/.well-known/jwks.json", public_base_url());
+    let jwks_uri = format!("{issuer}/.well-known/jwks.json");
     Ok(Json(oidc::discovery_document(&issuer, &jwks_uri)))
 }
 
@@ -7849,6 +8305,7 @@ jobs:
                 Request::builder()
                     .method(Method::GET)
                     .uri(format!("/api/v1/runs/{run_id}/events.ndjson"))
+                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -8312,7 +8769,7 @@ jobs:
     async fn current_runner_registration_to_broker_job_e2e() {
         let temp = tempfile::tempdir().unwrap();
         let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
-        let app = app(state, CancellationToken::new());
+        let app = app(state.clone(), CancellationToken::new());
         let runner_keypair = AgentRsaKeypair::generate().unwrap();
         let public_xml = runner_keypair.public_key_xml();
         let modulus = public_xml
@@ -8378,6 +8835,12 @@ jobs:
         )
         .await;
         let runner_id = agent["id"].as_i64().unwrap();
+        let runner_token = state
+            .local_jwt(json!({
+                "sub": format!("aksh-runner-listen-{runner_id}"),
+                "scp": "ActionsRuntime.RunnerListen",
+            }))
+            .unwrap();
         assert_eq!(agent["properties"]["UseV2Flow"]["$value"], true);
         assert_eq!(
             agent["properties"]["ServerUrlV2"]["$value"],
@@ -8437,13 +8900,28 @@ jobs:
         assert_eq!(body["should_acknowledge"], true);
         let runner_request_id = body["runner_request_id"].as_str().unwrap();
 
-        let acquired = request_json(
-            &app,
-            Method::POST,
-            &format!("/broker/{runner_id}/acquirejob"),
-            json!({"jobMessageId": runner_request_id, "billingOwnerId": "local", "runnerOS": "macOS"}),
+        let acquired_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/broker/{runner_id}/acquirejob"))
+                    .header(header::AUTHORIZATION, format!("Bearer {runner_token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"jobMessageId": runner_request_id, "billingOwnerId": "local", "runnerOS": "macOS"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(acquired_response.status(), StatusCode::OK);
+        let acquired = serde_json::from_slice::<Value>(
+            &to_bytes(acquired_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
         )
-        .await;
+        .unwrap();
         assert_eq!(acquired["requestId"], 1);
         assert_eq!(
             acquired["messageType"],
@@ -8502,7 +8980,7 @@ jobs:
                 Request::builder()
                     .method(Method::POST)
                     .uri(format!("/broker/{runner_id}/completejob"))
-                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                    .header(header::AUTHORIZATION, format!("Bearer {runner_token}"))
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         json!({"jobId": runner_request_id, "planId": acquired["plan"]["planId"]})
@@ -8520,6 +8998,12 @@ jobs:
         let temp = tempfile::tempdir().unwrap();
         let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
         let app = app(state.clone(), CancellationToken::new());
+        let runner_token = state
+            .local_jwt(json!({
+                "sub": "aksh-runner-listen-1",
+                "scp": "ActionsRuntime.RunnerListen",
+            }))
+            .unwrap();
 
         let workflow = "on:
   push:
@@ -8586,11 +9070,12 @@ jobs:
         assert_eq!(session["assignmentQueued"], false);
         assert_eq!(session["orchestrationId"], "");
 
-        let acquired = request_json(
+        let acquired = request_json_with_bearer(
             &app,
             Method::POST,
             "/broker/1/acquirejob",
             json!({"jobMessageId": runner_request_id, "billingOwnerId": "local", "runnerOS": "macOS"}),
+            &runner_token,
         )
         .await;
         assert_eq!(acquired["requestId"].as_i64().unwrap(), 1);
@@ -8616,11 +9101,12 @@ jobs:
         assert!(acquired["jobId"].is_string());
         assert!(acquired["steps"].is_array());
 
-        let renewed = request_json(
+        let renewed = request_json_with_bearer(
             &app,
             Method::POST,
             "/broker/1/renewjob",
             json!({"jobId": runner_request_id, "planId": acquired["plan"]["planId"]}),
+            &runner_token,
         )
         .await;
         assert!(renewed["lockedUntil"].as_str().unwrap().contains('T'));
@@ -8631,7 +9117,7 @@ jobs:
                 Request::builder()
                     .method(Method::POST)
                     .uri("/broker/1/completejob")
-                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                    .header(header::AUTHORIZATION, format!("Bearer {runner_token}"))
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         json!({"jobId": runner_request_id, "planId": acquired["plan"]["planId"]})
@@ -8818,6 +9304,7 @@ jobs:
         );
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::GET)
@@ -8829,6 +9316,56 @@ jobs:
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/_apis/artifactcache/cache?keys=x&version=v1")
+                    .header(header::AUTHORIZATION, "Bearer aksh-attacker-controlled")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn native_api_rejects_job_runtime_token() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let token = state.mint_runtime_token("plan", &uuid::Uuid::new_v4());
+        let app = app(state, CancellationToken::new());
+
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/runs")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+
+        let accepted = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/runs")
+                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(accepted.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -8896,21 +9433,20 @@ jobs:
         let resp = request_json(&app, Method::POST, "/api/v1/runs", workflow).await;
         let _run_id: RunId = resp["run_id"].as_str().unwrap().parse().unwrap();
 
-        // Get the plan_id from the queued job's message.
-        let plan_id = {
+        let (plan_id, agent_job_id) = {
             let inner = state.inner.lock().await;
             inner
                 .queue
                 .front()
                 .or_else(|| inner.pending_jobs.front())
-                .map(|j| j.message.plan.plan_id.clone())
+                .map(|j| (j.message.plan.plan_id.clone(), j.message.job_id))
                 .unwrap()
         };
 
         let token = request_json(
             &app,
             Method::GET,
-            &format!("/runner/server/_apis/distributedtask/hubs/actions/plans/{plan_id}/jobs/job-1/oidctoken?audience=api://custom"),
+            &format!("/runner/server/_apis/distributedtask/hubs/actions/plans/{plan_id}/jobs/{agent_job_id}/oidctoken?audience=api://custom"),
             Value::Null,
         )
         .await;
@@ -8958,20 +9494,20 @@ jobs:
         let resp = request_json(&app, Method::POST, "/api/v1/runs", workflow).await;
         let _run_id: RunId = resp["run_id"].as_str().unwrap().parse().unwrap();
 
-        let plan_id = {
+        let (plan_id, agent_job_id) = {
             let inner = state.inner.lock().await;
             inner
                 .queue
                 .front()
                 .or_else(|| inner.pending_jobs.front())
-                .map(|j| j.message.plan.plan_id.clone())
+                .map(|j| (j.message.plan.plan_id.clone(), j.message.job_id))
                 .unwrap()
         };
 
         let token = request_json(
             &app,
             Method::GET,
-            &format!("/runner/server/_apis/distributedtask/hubs/actions/plans/{plan_id}/jobs/job-1/oidctoken"),
+            &format!("/runner/server/_apis/distributedtask/hubs/actions/plans/{plan_id}/jobs/{agent_job_id}/oidctoken"),
             Value::Null,
         )
         .await;
@@ -8995,24 +9531,25 @@ jobs:
         });
         let _resp = request_json(&app, Method::POST, "/api/v1/runs", workflow).await;
 
-        let plan_id = {
+        let (plan_id, agent_job_id) = {
             let inner = state.inner.lock().await;
             inner
                 .queue
                 .front()
                 .or_else(|| inner.pending_jobs.front())
-                .map(|j| j.message.plan.plan_id.clone())
+                .map(|job| (job.message.plan.plan_id.clone(), job.message.job_id))
                 .unwrap()
         };
+        let runtime_token = state.mint_runtime_token(&plan_id, &agent_job_id);
 
-        // The OIDC endpoint should return 403 Forbidden.
+        // Use the real job-bound runtime token so this reaches permission enforcement.
         let uri = format!(
-            "/runner/server/_apis/distributedtask/hubs/actions/plans/{plan_id}/jobs/job-1/oidctoken?audience=api://test"
+            "/runner/server/_apis/distributedtask/hubs/actions/plans/{plan_id}/jobs/{agent_job_id}/oidctoken?audience=api://test"
         );
         let request = Request::builder()
             .method(Method::GET)
             .uri(&uri)
-            .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+            .header(header::AUTHORIZATION, format!("Bearer {runtime_token}"))
             .body(Body::empty())
             .unwrap();
         let response = app.clone().oneshot(request).await.unwrap();
@@ -9037,6 +9574,14 @@ jobs:
             .unwrap()
             .ends_with("/.well-known/jwks.json"));
         assert_eq!(discovery["issuer"], "http://127.0.0.1:9090/oidc");
+        let namespaced = request_json(
+            &app,
+            Method::GET,
+            "/oidc/.well-known/openid-configuration",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(namespaced, discovery);
 
         let jwks = request_json(&app, Method::GET, "/.well-known/jwks.json", Value::Null).await;
         let keys = jwks["keys"].as_array().unwrap();
@@ -9368,6 +9913,7 @@ jobs:
                 Request::builder()
                     .method(Method::POST)
                     .uri("/api/v1/runs")
+                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         json!({
@@ -9449,6 +9995,27 @@ jobs:
         .await;
         assert_eq!(lookup["hit"], true);
         assert_eq!(lookup["content_base64"], "Y2FjaGUtYnl0ZXM=");
+
+        let stored = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/cache",
+            json!({
+                "key": "native-cache",
+                "version": "v1",
+                "content_base64": "bmF0aXZlLWJ5dGVz"
+            }),
+        )
+        .await;
+        assert_eq!(stored["hit"], true);
+        let native_lookup = request_json(
+            &app,
+            Method::GET,
+            "/api/v1/cache?key=native-cache&version=v1",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(native_lookup["content_base64"], "bmF0aXZlLWJ5dGVz");
     }
 
     #[tokio::test]
@@ -9478,6 +10045,7 @@ jobs:
                 Request::builder()
                     .method(Method::GET)
                     .uri(format!("/api/v1/artifacts/{artifact_id}"))
+                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -9503,7 +10071,8 @@ jobs:
             body: Value,
         ) -> (StatusCode, Value) {
             let mut builder = Request::builder().method(method).uri(uri);
-            if uri.starts_with("/_apis/")
+            if uri.starts_with("/api/v1/")
+                || uri.starts_with("/_apis/")
                 || uri.starts_with("/runner/server/_apis/")
                 || uri.starts_with("/broker/")
                 || uri.starts_with("/twirp/")
@@ -9621,7 +10190,21 @@ jobs:
 
     async fn request_json(app: &Router, method: Method, uri: &str, body: Value) -> Value {
         let mut builder = Request::builder().method(method).uri(uri);
-        if uri.starts_with("/_apis/")
+        if uri.contains("/oidctoken") {
+            let token = uri
+                .split("/plans/")
+                .nth(1)
+                .and_then(|rest| rest.split("/jobs/").next().zip(rest.split("/jobs/").nth(1)))
+                .and_then(|(plan, rest)| rest.split('/').next().map(|job| (plan, job)))
+                .and_then(|(plan, job)| {
+                    uuid::Uuid::parse_str(job)
+                        .ok()
+                        .map(|id| mint_runtime_token(plan, &id))
+                })
+                .unwrap_or_else(|| DEFAULT_AKSH_SYSTEM_TOKEN.to_owned());
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        } else if uri.starts_with("/api/v1/")
+            || uri.starts_with("/_apis/")
             || uri.starts_with("/runner/server/_apis/")
             || uri.starts_with("/broker/")
             || uri.starts_with("/actions/build/")
@@ -9640,6 +10223,38 @@ jobs:
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))
                 .unwrap()
+        };
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            status.is_success(),
+            "unexpected status: {} body={}",
+            status,
+            String::from_utf8_lossy(&bytes)
+        );
+        if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        }
+    }
+    async fn request_json_with_bearer(
+        app: &Router,
+        method: Method,
+        uri: &str,
+        body: Value,
+        bearer: &str,
+    ) -> Value {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+        let request = if body.is_null() {
+            builder.body(Body::empty()).unwrap()
+        } else {
+            builder = builder.header(header::CONTENT_TYPE, "application/json");
+            builder.body(Body::from(body.to_string())).unwrap()
         };
         let response = app.clone().oneshot(request).await.unwrap();
         let status = response.status();
@@ -10526,6 +11141,7 @@ jobs:
                 Request::builder()
                     .method(Method::POST)
                     .uri("/api/v1/runs")
+                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         json!({
