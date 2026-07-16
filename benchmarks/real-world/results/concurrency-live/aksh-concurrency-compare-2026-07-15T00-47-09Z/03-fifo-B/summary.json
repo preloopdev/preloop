@@ -1,0 +1,29 @@
+{
+  "workflow": "03-fifo-B",
+  "run_id": "b985fc2e-4340-48e2-97ed-49c5cdda5da3",
+  "status": "completed",
+  "conclusion": "success",
+  "jobs": [
+    {
+      "name": "long",
+      "id": "long",
+      "status": "success",
+      "conclusion": "success",
+      "steps": [
+        {
+          "name": "Set up job",
+          "conclusion": "success"
+        },
+        {
+          "name": "sleep-a-bit",
+          "conclusion": "success"
+        },
+        {
+          "name": "Complete job",
+          "conclusion": "success"
+        }
+      ]
+    }
+  ],
+  "source": "aksh"
+}

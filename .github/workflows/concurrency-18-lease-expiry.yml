@@ -1,0 +1,15 @@
+name: concurrency-18-lease-expiry
+on: workflow_dispatch
+jobs:
+  lease-holder:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    concurrency:
+      group: lease-expiry-18
+      cancel-in-progress: false
+    steps:
+      - name: lease-marker
+        run: |
+          echo "SCENARIO=lease-expiry"
+          sleep 125
+          echo "DONE=lease-holder"

@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>aksh Concurrency — Full Trace Walkthrough</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#0f172a;--card:#1e293b;--border:#334155;--fg:#e2e8f0;--dim:#94a3b8;--accent:#38bdf8;--green:#4ade80;--orange:#fb923c;--blue:#60a5fa;--pink:#f472b6;--yellow:#facc15;--font:'Inter',system-ui,-apple-system,sans-serif}
+body{background:var(--bg);color:var(--fg);font-family:var(--font);line-height:1.6;padding:2rem 1rem;max-width:1100px;margin:0 auto}
+h1{font-size:2rem;font-weight:700;margin-bottom:.25rem;background:linear-gradient(135deg,var(--accent),var(--pink));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.subtitle{color:var(--dim);margin-bottom:2rem;font-size:.95rem;border-bottom:1px solid var(--border);padding-bottom:1rem}
+h2{font-size:1.3rem;font-weight:600;margin:2.5rem 0 .75rem;color:var(--accent)}
+h3{font-size:1.05rem;font-weight:600;margin:1.5rem 0 .5rem;color:var(--fg)}
+p,li{color:var(--dim);margin-bottom:.5rem;font-size:.92rem}
+a{color:var(--accent)}
+.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1.5rem;margin:1.25rem 0}
+.card h3{margin-top:0}
+.mermaid-wrap{overflow-x:auto;padding:.5rem 0;min-height:100px}
+.code{background:#0a0f1e;border:1px solid var(--border);border-radius:8px;padding:1rem;font-family:'JetBrains Mono','Fira Code',monospace;font-size:.82rem;overflow-x:auto;margin:.75rem 0}
+.code .kw{color:#c792ea}.code .ty{color:#ffcb6b}.code .str{color:#89ddff}.code .cm{color:#546e7a}.code .fn{color:#82aaff}.code .op{color:#89ddff}.code .num{color:#f78c6c}
+.tag{display:inline-block;background:var(--accent);color:#0f172a;font-size:.7rem;font-weight:700;padding:0 .45rem;border-radius:4px;margin-right:.35rem;text-transform:uppercase}
+.tag.model{background:#4ade80;color:#0f172a}.tag.prod{background:#fb923c;color:#0f172a}.tag.check{background:#60a5fa;color:#fff}.tag.bug{background:#f472b6;color:#fff}.tag.run{background:#38bdf8;color:#0f172a}.tag.job{background:#facc15;color:#0f172a}.tag.js{background:#a78bfa;color:#fff}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:1rem}@media(max-width:720px){.grid2{grid-template-columns:1fr}}
+.badge{display:inline-flex;align-items:center;gap:.35rem;background:var(--card);border:1px solid var(--border);border-radius:999px;padding:.25rem .7rem;font-size:.78rem;color:var(--dim)}
+.badge.green{background:#064e3b;border-color:#4ade80;color:#4ade80}
+.badge.blue{background:#1e3a5f;border-color:#60a5fa;color:#60a5fa}
+.badge.orange{background:#7c2d12;border-color:#fb923c;color:#fb923c}
+.badge.pink{background:#4a1d3a;border-color:#f472b6;color:#f472b6}
+.stats{display:flex;gap:.75rem;flex-wrap:wrap;margin:1rem 0}
+.footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--border);color:var(--dim);font-size:.82rem}
+table{width:100%;border-collapse:collapse;margin:.75rem 0;font-size:.85rem}
+th,td{text-align:left;padding:.4rem .6rem;border-bottom:1px solid var(--border)}
+th{color:var(--accent);font-weight:600}
+tr:last-child td{border-bottom:none}
+em{color:var(--fg);font-style:italic}
+strong{color:#f1f5f9}
+</style>
+</head>
+<body>
+
+<h1>aksh Concurrency State Machine</h1>
+<p class="subtitle">Full lifecycle trace: Submit → Park → Release → Promote → Cancel</p>
+
+<!-- ── HOLDER KINDS ── -->
+<h2>0. What's a holder?</h2>
+<p>A <strong>holder</strong> is whoever claims or waits for a slot in a concurrency group. Three kinds, matching GitHub's three scopes:</p>
+
+<div class="grid2">
+<div class="card">
+<h3><span class="tag run">Run</span> Workflow-level</h3>
+<p>The whole run claims the slot. Every job inside shares it.</p>
+<div class="code" style="margin:.5rem 0 0;font-size:.78rem">
+concurrency: group: deploy-prod
+</div>
+<p style="margin-top:.5rem;font-size:.82rem">All jobs park together, release together.</p>
+</div>
+<div class="card">
+<h3><span class="tag job">Job</span> Job-level</h3>
+<p>Each individual job claims the slot independently.</p>
+<div class="code" style="margin:.5rem 0 0;font-size:.78rem">
+job-a:
+  concurrency: group: deploy-prod
+</div>
+<p style="margin-top:.5rem;font-size:.82rem">Jobs from different runs interleave in the FIFO queue.</p>
+</div>
+</div>
+<div class="card">
+<h3><span class="tag js">JobSet</span> Reusable workflow (multi-gate)</h3>
+<p>A reusable workflow call via <code>uses:</code> that carries its own <code>concurrency:</code> block. Must acquire <strong>all</strong> gates atomically — partial admission would deadlock.</p>
+<div class="code" style="margin:.5rem 0 0;font-size:.78rem">
+call-tests:
+  uses: ./.github/workflows/run-tests.yml
+  concurrency: group: shared-gate
+</div>
+<p style="margin-top:.5rem;font-size:.82rem">Two gates: the caller's group + the embedded group. Both must be free.</p>
+</div>
+
+<!-- ── 1. SUBMIT ── -->
+<h2>1. Submit — the bouncer at the door</h2>
+
+<p>A workflow run arrives. The server calls <code>try_acquire_concurrency(group, holder)</code>. Here's the decision tree:</p>
+
+<div class="card">
+<div class="mermaid-wrap">
+<pre class="mermaid">
+flowchart TD
+    START["try_acquire_concurrency<br/>(key, holder, CIP, queue)"]
+    START --> EMPTY{"group.running<br/>is None?"}
+    EMPTY -->|"Yes — slot free"| GO_IN["Install holder as running<br/>track_holder_key(holder, key)<br/>return Ok(true)"]
+    EMPTY -->|"No — occupied"| CIP{"cancel_in_progress?"}
+
+    CIP -->|"Yes: revolution"| KICK["Take current running → cancel it<br/>Drain all pending → cancel them<br/>Install new holder as running<br/>return Ok(true)"]
+
+    CIP -->|"No: join queue"| QUEUE["apply_queue_mode(queue, pending)"]
+
+    QUEUE -->|"Single"| SINGLE["Cancel ALL existing pending<br/>Park new arrival at back<br/>return Ok(false)"]
+    QUEUE -->|"Max, room"| MAX_OK["Park at back<br/>return Ok(false)"]
+    QUEUE -->|"Max, full"| FULL["Cancel arrival (overflow)<br/>return Err()"]
+
+    style GO_IN fill:#064e3b,color:#4ade80,stroke:#4ade80
+    style KICK fill:#7c2d12,color:#fb923c,stroke:#fb923c
+    style SINGLE fill:#1e3a5f,color:#60a5fa,stroke:#60a5fa
+    style MAX_OK fill:#1e3a5f,color:#60a5fa,stroke:#60a5fa
+    style FULL fill:#4a1d3a,color:#f472b6,stroke:#f472b6
+</pre>
+</div>
+</div>
+
+<h3>Real trace: 3 runs, same group, Single mode, no CIP</h3>
+
+<table>
+<tr><th>Step</th><th>Action</th><th>running</th><th>pending</th><th>holder_keys</th><th>Status</th></tr>
+<tr><td>0</td><td>(empty)</td><td>—</td><td>[]</td><td>{}</td><td></td></tr>
+<tr><td>1</td><td>submit Run(A)</td><td style="color:#4ade80">Run(A)</td><td>[]</td><td><code>A→{deploy}</code></td><td>Ok(true) — running</td></tr>
+<tr><td>2</td><td>submit Run(B)</td><td>Run(A)</td><td style="color:#60a5fa">[B]</td><td><code>A→{deploy}, B→{deploy}</code></td><td>Ok(false) — pending</td></tr>
+<tr><td>3</td><td>submit Run(C)</td><td>Run(A)</td><td style="color:#60a5fa">[C]</td><td><code>A→{deploy}, C→{deploy}</code></td><td>Single mode → B cancelled, C parked</td></tr>
+</table>
+
+<p>At step 3, <code>apply_queue_mode(Single, pending=[B])</code> returns <code>cancel_pending=[B], park_arrival=true</code>. Run(B) is cancelled. Run(C) takes the single waiting slot.</p>
+
+<!-- ── 2. PARKED ── -->
+<h2>2. Parked — what Ok(false) means on the inside</h2>
+
+<p>When <code>try_acquire_concurrency</code> returns <code>Ok(false)</code>, the holder is parked. This ripples through the run:</p>
+
+<div class="card">
+<div class="code">
+<span class="cm">// For a Run holder:</span>
+statuses.insert(job.job_id, <span class="str">"Pending"</span>);
+concurrency_blocked.push_back(job);
+
+<span class="cm">// The run's status becomes Pending, not Queued</span>
+run.status = <span class="fn">summarize_run</span>(run.jobs.values()); <span class="cm">// → Pending</span>
+</div>
+</div>
+
+<p>The jobs sit in <code>concurrency_blocked</code> — they're not in the scheduler queue, no runner will pick them up. They're frozen until the holder gets promoted.</p>
+
+<!-- ── 3. RELEASE ── -->
+<h2>3. Release — leaving the club</h2>
+
+<p>When all jobs in a run finish (or a job finishes for job-level), the server calls <code>release_concurrency_for_run</code> or <code>release_concurrency_for_job</code>.</p>
+
+<div class="card">
+<div class="mermaid-wrap">
+<pre class="mermaid">
+flowchart LR
+    DONE["release_concurrency_for_run(run_id)"]
+    DONE --> KEYS["Look up holder_keys[run_id]<br/>→ all groups this run occupies"]
+
+    KEYS --> EACHKEY["For each key:"]
+    EACHKEY --> MATCH{"Is this holder<br/>the current running?"}
+    MATCH -->|"Yes"| TAKE["group.running = None<br/>promote_next_from_group(key, done)"]
+    MATCH -->|"No — it's in pending"| CLEAN["Remove from pending queue<br/>If group empty → delete it"]
+    TAKE --> NEXTKEY["next key"]
+    CLEAN --> NEXTKEY
+    NEXTKEY --> ALLDONE["holder_keys.remove(run_id)"]
+</pre>
+</div>
+</div>
+
+<!-- ── 4. PROMOTE ── -->
+<h2>4. Promote — letting the next person in</h2>
+
+<p><code>promote_next_from_group</code> is the heart of the FIFO queue. It pops the next pending holder and dispatches it based on kind:</p>
+
+<div class="card">
+<div class="mermaid-wrap">
+<pre class="mermaid">
+sequenceDiagram
+    participant G as ConcurrencyGroup
+    participant P as promote_next_from_group
+    participant H as held_runs / concurrency_blocked
+    participant Q as Scheduler Queue
+
+    G->>P: pop_front() → next holder
+    P->>P: match next.kind
+
+    alt Run holder
+        P->>H: held_runs.remove(run_id) → [jobs]
+        H->>P: for each job: under_max_parallel?
+        P->>Q: push_back(job) ← runners pick it up
+        P->>G: group.running = Run(next)
+
+    else Job holder
+        P->>H: concurrency_blocked.pop(job)
+        P->>P: under_max_parallel(inner, &job)?
+        alt full
+            P->>G: push_front back to pending ← retry later
+        else free
+            P->>Q: push_back(job)
+            P->>G: group.running = Job(next)
+        end
+
+    else JobSet holder
+        P->>P: advance_jobset_admission(id, promoted_key)
+        loop for each unacquired gate
+            P->>G: try_acquire_concurrency(gate.key)
+            alt blocked
+                P->>G: stay pending ← wait
+            else overflow
+                P->>P: release_jobset_admission → clean partial keys
+            end
+        end
+        P->>H: drain concurrency_blocked → queue all jobs
+        P->>Q: push_back(all jobs)
+    end
+</pre>
+</div>
+</div>
+
+<h3>Continuing the trace: Run(A) finishes</h3>
+
+<table>
+<tr><th>Step</th><th>Action</th><th>running</th><th>pending</th><th>holder_keys</th></tr>
+<tr><td>4</td><td>Run(A) completes</td><td style="color:#4ade80">Run(C)</td><td>[]</td><td><code>C→{deploy}</code></td></tr>
+<tr><td>5</td><td>Run(C) completes</td><td>—</td><td>[]</td><td>{}</td></tr>
+</table>
+
+<p>At step 4, <code>promote_next_from_group</code> pops Run(C) from pending, installs it as running (Run holders go straight in), then finds <code>held_runs[Run(C)]</code> and injects all its jobs into the scheduler queue. Runners see them and pick them up.</p>
+
+<p>At step 5, the group is empty. <code>cleanup_group</code> removes it from <code>concurrency_groups</code>.</p>
+
+<!-- ── 5. CANCEL ── -->
+<h2>5. Cancel — cutting the line</h2>
+
+<p>Two things trigger cancellation:</p>
+<ul>
+<li><strong><code>cancel-run</code> API call</strong> — user manually cancels a run</li>
+<li><strong>cancel_in_progress</strong> — a new arrival with CIP=true kicks the current holder</li>
+</ul>
+
+<div class="card">
+<div class="code">
+<span class="kw">fn</span> <span class="fn">cancel_holder</span>(inner, holder, reason) {
+    <span class="kw">match</span> holder {
+        <span class="cm">// Run: cancel every job, mark run Cancelled</span>
+        Holder::Run(run_id) => <span class="fn">cancel_run_inner</span>(inner, run_id),
+
+        <span class="cm">// Job: cancel just that job</span>
+        Holder::Job { run_id, job_id } => <span class="fn">cancel_job_inner</span>(inner, run_id, job_id),
+
+        <span class="cm">// JobSet: cancel all jobs + release all partially-acquired gates</span>
+        Holder::JobSet { run_id, job_ids } => {
+            <span class="fn">release_jobset_admission</span>(inner, id);  <span class="cm">// ← clean up keys!</span>
+            <span class="kw">for</span> job_id <span class="kw">in</span> job_ids {
+                <span class="fn">cancel_job_inner</span>(inner, run_id, job_id);
+            }
+        }
+    }
+}
+</pre>
+</div>
+</div>
+
+<!-- ── 6. JOB-LEVEL vs RUN-LEVEL vs JOBSET ── -->
+<h2>6. Side-by-side comparison</h2>
+
+<div class="grid2">
+<div class="card">
+<h3><span class="tag run">Run</span></h3>
+<p>One holder for the whole run.</p>
+<ul style="font-size:.85rem">
+<li>Jobs submit together, release together</li>
+<li>Simple FIFO: one run at a time</li>
+<li>No interleaving with other runs</li>
+<li>Release: <code>release_concurrency_for_run</code><br>→ look up keys from holder_keys</li>
+</ul>
+</div>
+<div class="card">
+<h3><span class="tag job">Job</span></h3>
+<p>One holder per individual job.</p>
+<ul style="font-size:.85rem">
+<li>Jobs from different runs interleave in FIFO</li>
+<li>Max-parallel check before dispatch</li>
+<li>If max-parallel full → push back to front of pending, retry later</li>
+<li>Release: <code>release_concurrency_for_job</code><br>→ scans all groups for this job</li>
+</ul>
+</div>
+</div>
+<div class="card">
+<h3><span class="tag js">JobSet</span></h3>
+<p>One holder for a reusable workflow call with embedded concurrency.</p>
+<ul style="font-size:.85rem">
+<li>Must acquire N gates atomically (caller + embedded groups)</li>
+<li>Partial admission tracked in <code>jobset_admissions</code></li>
+<li>If any gate blocks → park entire set, keep acquired keys</li>
+<li>If promoted again → resume from last unacquired gate</li>
+<li>If any gate overflows → <code>release_jobset_admission</code> cleans up all partially-acquired keys</li>
+<li>Once all gates ready → all jobs go to scheduler at once</li>
+</ul>
+</div>
+
+<!-- ── 7. FULL LIFECYCLE DIAGRAM ── -->
+<h2>7. The complete machine</h2>
+
+<div class="card">
+<div class="mermaid-wrap">
+<pre class="mermaid">
+flowchart TD
+    subgraph Submit["1. SUBMIT"]
+        A["try_acquire_concurrency"]
+        A --> a1{"running is None?"}
+        a1 -->|Yes| RUN["Install as running<br/>Ok(true) → scheduler"]
+        a1 -->|No| cip{"cancel_in_progress?"}
+        cip -->|Yes| KICK["Cancel running + all pending<br/>Install new holder<br/>Ok(true) → scheduler"]
+        cip -->|No| QMODE["apply_queue_mode"]
+        QMODE -->|Single| SP["Cancel pending queue<br/>Park at back<br/>Ok(false)"]
+        QMODE -->|Max, room| MP["Park at back<br/>Ok(false)"]
+        QMODE -->|Max, full| OVF["Cancel arrival<br/>Err(overflow)"]
+    end
+
+    subgraph Parked["2. PARKED"]
+        P["concurrency_blocked<br/>jobs frozen, no runner"]
+    end
+
+    subgraph Release["3. RELEASE"]
+        R["release_concurrency_for_run/job"]
+        R --> r1{"holder is running?"}
+        r1 -->|Yes| RT["Take slot<br/>promote_next_from_group"]
+        r1 -->|No| RP["Remove from pending<br/>Clean empty group"]
+    end
+
+    subgraph Promote["4. PROMOTE"]
+        PM["promote_next_from_group"]
+        PM --> POP["pop_front pending"]
+        POP -->|Run| PRUN["Install running<br/>Unpark held_jobs"]
+        POP -->|Job| PJOB["Check max-parallel<br/>Free→dispatch, Full→retry"]
+        POP -->|JobSet| PJS["advance_jobset_admission<br/>Loop: try each gate<br/>Blocked→wait, Ready→unpark"]
+    end
+
+    subgraph Cancel["5. CANCEL"]
+        C["cancel_run_inner / cancel_holder"]
+        C -->|JobSet| CJS["release_jobset_admission<br/>clean partial keys"]
+        C -->|other| CS["Mark Cancelled<br/>Remove from group<br/>Promote next if running"]
+    end
+
+    Submit --> Parked
+    Parked --> Release
+    Release --> Promote
+    Submit --> OVF --> Cancel
+    Promote -->|blocked| Parked
+    Promote -->|ready| SCHED["Scheduler Queue<br/>→ runner picks up"]
+</pre>
+</div>
+</div>
+
+<!-- ── 8. HOLDER_KEYS ── -->
+<h2>8. The critical detail: holder_keys</h2>
+
+<p><code>holder_keys: BTreeMap&lt;RunId, Vec&lt;(String, String)&gt;&gt;</code> is the reverse map. For every run, what groups does it occupy?</p>
+
+<p>This is what makes multi-key cleanup reliable:</p>
+
+<div class="code">
+<span class="cm">// When releasing a JobSet that acquired 2 keys:</span>
+holder_keys[Run(F)] = [<span class="str">("repo-a","deploy-prod")</span>, <span class="str">("repo-a","shared-tests")</span>]
+
+<span class="cm">// release_concurrency_for_run iterates holder_keys[Run(F)]:</span>
+<span class="kw">for</span> key <span class="kw">in</span> holder_keys[Run(F)]:
+    promote_next_from_group(inner, &key, done);
+
+<span class="cm">// Without holder_keys, you'd have to scan EVERY group to find where this run is — O(n) per release.</span>
+<span class="cm">// With holder_keys, it's O(k) where k = number of groups this run actually occupies.</span>
+</div>
+
+<p>Without this, a JobSet that got through gate A but blocked on gate B would leave a ghost entry in gate A — the next queued run would never be promoted because the group still thinks the JobSet is running.</p>
+
+<!-- ── FOOTER ── -->
+<div class="footer">
+<p><strong>Repository:</strong> <code>git@github.com:preloopdev/aksh.git</code> — branch <code>Bnjoroge/concurrency</code></p>
+<p><strong>Source files:</strong> <code>crates/aksh-runner-server/src/lib.rs</code> (lines 2211–2683) + <code>crates/aksh-runner-server/src/concurrency.rs</code> (full)</p>
+</div>
+
+<script>
+mermaid.initialize({
+    startOnLoad: true,
+    theme: 'dark',
+    themeVariables: {
+        primaryColor: '#1e293b',
+        primaryTextColor: '#e2e8f0',
+        primaryBorderColor: '#334155',
+        lineColor: '#38bdf8',
+        secondaryColor: '#0f172a',
+        tertiaryColor: '#1e293b',
+        fontSize: '13px',
+        fontFamily: 'Inter, system-ui, sans-serif'
+    },
+    flowchart: { htmlLabels: true, useMaxWidth: false, padding: 12 },
+    sequence: { showSequenceNumbers: false, actorFontSize: 13, noteFontSize: 12, messageFontSize: 12 }
+});
+</script>
+</body>
+</html>

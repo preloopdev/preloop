@@ -47,6 +47,9 @@ enum Command {
         /// and register with the relying cloud provider.
         #[arg(long)]
         oidc_issuer: Option<String>,
+        /// Enable the cron scheduler for schedule-triggered workflows.
+        #[arg(long)]
+        enable_scheduler: bool,
     },
     /// Generate a persistent self-signed TLS certificate (no openssl needed).
     Cert {
@@ -96,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
             enable_test_api,
             test_api_token,
             oidc_issuer,
+            enable_scheduler,
         } => {
             let tls = match (tls_cert, tls_key, tls_self_signed) {
                 (Some(cert), Some(key), false) => TlsMode::PemFiles { cert, key },
@@ -111,6 +115,7 @@ async fn main() -> anyhow::Result<()> {
                 enable_test_api,
                 test_api_token,
                 oidc_issuer,
+                enable_scheduler,
             })
             .await?;
         }
