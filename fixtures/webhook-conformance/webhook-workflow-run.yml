@@ -1,7 +1,7 @@
 name: Webhook Workflow Run
 on:
   workflow_run:
-    workflows: [Webhook Push, Webhook PR]
+    workflows: [Webhook Push, Webhook Pull Request]
     types: [requested, completed]
 jobs:
   trigger:

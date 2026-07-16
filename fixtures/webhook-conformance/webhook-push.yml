@@ -3,8 +3,7 @@ on:
   push:
     branches: [main, 'feature/**']
     tags: ['v*']
-    paths: ['src/**', 'crates/**']
-    paths-ignore: ['docs/**']
+    paths: ['src/**', 'crates/**', '!docs/**']
 jobs:
   trigger:
     runs-on: ubuntu-latest
