@@ -410,6 +410,102 @@ fn generate_random_yaml(seed: u64) -> String {
     yaml
 }
 
+fn copy_workspace_code(dest: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    let items = ["Cargo.toml", "Cargo.lock", "crates", "fixtures"];
+    for item in items {
+        let src = std::path::Path::new(item);
+        if src.exists() {
+            if src.is_dir() {
+                copy_dir_all(src, &dest.join(item))?;
+            } else {
+                std::fs::copy(src, dest.join(item))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &dst.join(entry.file_name()))?;
+        } else {
+            std::fs::copy(entry.path(), dst.join(entry.file_name()))?;
+        }
+    }
+    Ok(())
+}
+
+fn modify_workflow_for_local_run(workflow_path: &std::path::Path) -> anyhow::Result<String> {
+    let file = std::fs::File::open(workflow_path)?;
+    let mut doc: serde_yaml::Value = serde_yaml::from_reader(file)?;
+    if let Some(jobs) = doc.get_mut("jobs").and_then(|j| j.as_mapping_mut()) {
+        for (_job_id, job) in jobs.iter_mut() {
+            if let Some(steps) = job.get_mut("steps").and_then(|s| s.as_sequence_mut()) {
+                steps.retain(|step| {
+                    if let Some(uses) = step.get("uses").and_then(|u| u.as_str()) {
+                        !uses.starts_with("actions/checkout")
+                            && !uses.starts_with("dtolnay/rust-toolchain")
+                    } else {
+                        true
+                    }
+                });
+            }
+        }
+    }
+    let modified = serde_yaml::to_string(&doc)?;
+    Ok(modified)
+}
+
+fn preseed_private_actions(
+    workflow: &std::path::Path,
+    state_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    let content = std::fs::read_to_string(workflow)?;
+    let search_str = "preloopdev/aksh/.github/actions/tier2-property-oracle@";
+    let mut cursor = 0;
+    while let Some(pos) = content[cursor..].find(search_str) {
+        let abs_pos = cursor + pos;
+        let sha_start = abs_pos + search_str.len();
+        let sha_end = content[sha_start..]
+            .find(|c: char| !c.is_ascii_hexdigit())
+            .map(|offset| sha_start + offset)
+            .unwrap_or(content.len());
+        let sha = &content[sha_start..sha_end];
+        if sha.len() >= 7 {
+            let dest_dir = state_dir
+                .join("actions")
+                .join("preloopdev")
+                .join("aksh")
+                .join(sha);
+            std::fs::create_dir_all(&dest_dir)?;
+            let archive_path = dest_dir.join("action.tar.gz");
+            let action_dir = std::path::Path::new(".github/actions/tier2-property-oracle");
+            if action_dir.exists() {
+                let file = std::fs::File::create(&archive_path)?;
+                let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+                let mut tar = tar::Builder::new(enc);
+                tar.append_dir_all(
+                    "archive-root/.github/actions/tier2-property-oracle",
+                    action_dir,
+                )?;
+                tar.finish()?;
+                println!(
+                    "Pre-seeded local action cache for commit {} at {}",
+                    sha,
+                    archive_path.display()
+                );
+            }
+        }
+        cursor = sha_end;
+    }
+    Ok(())
+}
+
 async fn run_runner_e2e(
     runner_bin: PathBuf,
     workflow: PathBuf,
@@ -449,6 +545,9 @@ async fn run_runner_e2e(
     let runner_root = temp_dir.path().join("runner-root");
     std::fs::create_dir_all(&state_dir)?;
     std::fs::create_dir_all(&runner_root)?;
+
+    // Pre-seed any private action references locally before starting the server
+    preseed_private_actions(&workflow, &state_dir)?;
 
     // Start server in background on port 9191
     let mut server_cmd = Command::new(server_bin);
@@ -505,11 +604,26 @@ async fn run_runner_e2e(
         let _ = server.kill().await;
         anyhow::bail!("runner configure failed");
     }
+    // If testing live/CI workflows locally, rewrite them to skip Git clone & toolchain setup
+    let is_live_workflow = workflow
+        .file_name()
+        .and_then(|f| f.to_str())
+        .map(|s| s.contains("live") || s.contains("ci") || s.contains("dogfood"))
+        .unwrap_or(false);
+    let submit_workflow_path = if is_live_workflow {
+        copy_workspace_code(&runner_root.join("_work/default/default"))?;
+        let modified = modify_workflow_for_local_run(&workflow)?;
+        let temp_wf = temp_dir.path().join("local-wf.yml");
+        std::fs::write(&temp_wf, modified)?;
+        temp_wf
+    } else {
+        workflow.clone()
+    };
 
     // Submit workflow
     let submit_output = Command::new(client_bin)
         .args(["--server", "http://127.0.0.1:9191", "submit", "-W"])
-        .arg(&workflow)
+        .arg(&submit_workflow_path)
         .output()
         .await?;
     if !submit_output.status.success() {
@@ -525,32 +639,41 @@ async fn run_runner_e2e(
         .context("missing run_id")?
         .to_string();
 
-    // Start runner once
-    let runner_status = Command::new(&runner_bin)
-        .arg("--runner-root")
-        .arg(&runner_root)
-        .arg("run")
-        .arg("--once")
-        .status()
-        .await?;
-
-    // Check completion and verdict
+    // Loop runner until the run reaches a terminal status (handles multi-job workflows).
+    let terminal = ["completed", "success", "failed", "cancelled"];
     let run_status_url = format!("http://127.0.0.1:9191/api/v1/runs/{}", run_id);
-    let mut run_success = false;
+    let native_api_token =
+        std::env::var("AKSH_SYSTEM_TOKEN").unwrap_or_else(|_| "aksh-system-token".to_owned());
     let mut run_status = "unknown".to_string();
-    if let Ok(resp) = client.get(&run_status_url).send().await {
-        if let Ok(v) = resp.json::<serde_json::Value>().await {
-            if let Some(status) = v.get("status").and_then(|v| v.as_str()) {
-                run_status = status.to_string();
-                if status == "completed" || status == "success" {
-                    run_success = true;
+    let mut last_runner_status = None::<bool>;
+    for _ in 0..50 {
+        let status = Command::new(&runner_bin)
+            .arg("--runner-root")
+            .arg(&runner_root)
+            .arg("run")
+            .arg("--once")
+            .status()
+            .await?;
+        last_runner_status = Some(status.success());
+        // Poll run status
+        if let Ok(resp) = client
+            .get(&run_status_url)
+            .bearer_auth(&native_api_token)
+            .send()
+            .await
+        {
+            if let Ok(v) = resp.json::<serde_json::Value>().await {
+                if let Some(s) = v.get("status").and_then(|v| v.as_str()) {
+                    run_status = s.to_string();
                 }
             }
         }
+        if terminal.contains(&run_status.as_str()) {
+            break;
+        }
     }
-    if runner_status.success() {
-        run_success = true;
-    }
+    let run_success = last_runner_status.unwrap_or(false)
+        && matches!(run_status.as_str(), "completed" | "success");
 
     let verdict = serde_json::json!({
         "success": run_success,

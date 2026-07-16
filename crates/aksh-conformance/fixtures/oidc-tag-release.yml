@@ -1,0 +1,25 @@
+name: oidc-tag-release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Request tag-triggered OIDC token
+        run: |
+          if [ -z "$ACTIONS_ID_TOKEN_REQUEST_URL" ]; then echo "FAIL: URL not set"; exit 1; fi
+          RESP=$(curl -s -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://hashicorp-vault")
+          echo "$RESP" | python3 -c "
+import sys,json,base64
+t=json.load(sys.stdin)['value']
+c=json.loads(base64.urlsafe_b64decode(t.split('.')[1]+'=='))
+assert c['ref_type']=='tag', f'ref_type must be tag: got {c[\"ref_type\"]}'
+assert ':ref:refs/tags/' in c['sub'], f'sub must contain :ref:refs/tags/: {c[\"sub\"]}'
+assert 'refs/tags/' in c['ref'], f'ref must contain refs/tags/: {c[\"ref\"]}'
+print(f'PASS: sub={c[\"sub\"]}, ref={c[\"ref\"]}, ref_type={c[\"ref_type\"]}')
+"

@@ -227,7 +227,7 @@ We evaluated the `aksh-runner` natively inside `smolvm` (ARM64 Ubuntu 24.04, 4 v
 - Config 1 (Official → GitHub): official runner v2.335.1 registered as `bench-official` on `preloopdev/aksh-conformance-sample`, triggered via `gh workflow run`, timed via GitHub API (second resolution)
 - Config 2 (aksh → GitHub): aksh-runner compiled for Linux ARM64 inside smolvm, registered as `bench-aksh`, triggered via `gh workflow run`, timed via runner tracing logs (millisecond resolution)
 - Config 3 (aksh → aksh-server): aksh-runner + aksh-runner-server both running inside smolvm, workflow submitted via aksh-runner-client, timed via runner tracing logs
-- Config 4 (Agent CI): `agent-ci run --workflow .github/workflows/bench-agent-ci.yml`, timed via NDJSON event stream (millisecond resolution)
+- Config 4 (Agent CI): `agent-ci run --workflow fixtures/bench-agent-ci.yml`, timed via NDJSON event stream (millisecond resolution)
 - smolvm VM: `build-runner` (4 vCPU, 8 GB, Apple M4 Max host, ubuntu:24.04, Docker CE 29.6.1)
 - Per-step times from runner logs (`Running step:` → next `Running step:` or `completed:` timestamps)
 
@@ -249,5 +249,5 @@ smolvm machine exec --name build-runner -- /root/aksh-runner-client --server htt
 smolvm machine exec --name build-runner -- /root/aksh-runner --runner-root /root/local-runner-root run --once
 
 # Config 4: agent-ci on host
-agent-ci run --workflow .github/workflows/bench-agent-ci.yml --json --quiet
+agent-ci run --workflow fixtures/bench-agent-ci.yml --json --quiet
 ```
