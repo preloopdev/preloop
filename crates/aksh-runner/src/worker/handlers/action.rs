@@ -30,10 +30,10 @@ pub fn run_action<'a>(
             super::container::run_docker_action(uses, with, workspace, ctx).await
         } else if uses.starts_with("./") || uses.starts_with("../") {
             let action_dir = std::path::Path::new(workspace).join(uses);
-            run_action_from_dir(&action_dir, with, workspace, ctx, cancel_rx).await
+            run_action_from_dir(&action_dir, with, workspace, ctx, cancel_rx, None).await
         } else {
             let action_dir = resolve_remote_action(uses, workspace, ctx)?;
-            run_action_from_dir(&action_dir, with, workspace, ctx, cancel_rx).await
+            run_action_from_dir(&action_dir, with, workspace, ctx, cancel_rx, Some(uses)).await
         }
     })
 }
@@ -45,19 +45,28 @@ async fn run_action_from_dir(
     workspace: &str,
     ctx: &mut StepContext<'_>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
+    action_name: Option<&str>,
 ) -> Result<()> {
     let manifest = super::factory::load_action_manifest(action_dir)?;
 
     match manifest.runs_using.as_str() {
-        "node12" | "node16" | "node20" | "node24" => {
+        "node12" | "node16" | "node20" | "node22" | "node24" => {
             if manifest.runs_using == "node12" || manifest.runs_using == "node16" {
                 ctx.log(&format!(
                     "##[warning]Node.js {} actions are deprecated. Please update to node20 or later.",
                     manifest.runs_using
                 ));
             }
-            super::node::run_node_action(&manifest, action_dir, with, workspace, ctx, cancel_rx)
-                .await
+            super::node::run_node_action(
+                &manifest,
+                action_dir,
+                with,
+                workspace,
+                ctx,
+                cancel_rx,
+                action_name,
+            )
+            .await
         }
         "composite" => {
             super::composite::run_composite_action(
