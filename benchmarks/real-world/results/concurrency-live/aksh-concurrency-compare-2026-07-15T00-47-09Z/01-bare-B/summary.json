@@ -1,0 +1,29 @@
+{
+  "workflow": "01-bare-B",
+  "run_id": "800c2c1e-ce57-4ed8-9440-cf778d9aedf5",
+  "status": "completed",
+  "conclusion": "success",
+  "jobs": [
+    {
+      "name": "build",
+      "id": "build",
+      "status": "success",
+      "conclusion": "success",
+      "steps": [
+        {
+          "name": "Set up job",
+          "conclusion": "success"
+        },
+        {
+          "name": "marker",
+          "conclusion": "success"
+        },
+        {
+          "name": "Complete job",
+          "conclusion": "success"
+        }
+      ]
+    }
+  ],
+  "source": "aksh"
+}

@@ -1,0 +1,12 @@
+on: push
+concurrency:
+  group: dogfood-pending-${{ github.ref }}
+jobs:
+  build:
+    runs-on: self-hosted
+    steps:
+      - name: short-step
+        run: |
+          echo "starting pending probe"
+          sleep 5
+          echo "done"
