@@ -1,0 +1,43 @@
+{
+  "workflow": "12-matrix",
+  "run_id": "250557b9-3fef-4f1f-bf2f-e27717b2e8fd",
+  "status": "completed",
+  "conclusion": "success",
+  "jobs": [
+    {
+      "name": "matrix-job (1)",
+      "id": "matrix-job (1)",
+      "status": "success",
+      "conclusion": "success",
+      "steps": [
+        {
+          "name": "Set up job",
+          "conclusion": "success"
+        },
+        {
+          "name": "run-cell",
+          "conclusion": "success"
+        },
+        {
+          "name": "Complete job",
+          "conclusion": "success"
+        }
+      ]
+    },
+    {
+      "name": "matrix-job (2)",
+      "id": "matrix-job (2)",
+      "status": "success",
+      "conclusion": "success",
+      "steps": []
+    },
+    {
+      "name": "matrix-job (3)",
+      "id": "matrix-job (3)",
+      "status": "success",
+      "conclusion": "success",
+      "steps": []
+    }
+  ],
+  "source": "aksh"
+}
