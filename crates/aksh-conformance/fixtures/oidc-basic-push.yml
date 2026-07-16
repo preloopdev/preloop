@@ -1,0 +1,39 @@
+name: oidc-basic-push
+on:
+  push:
+    branches: ["**"]
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  mint-token:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Request OIDC token
+        run: |
+          # Request the OIDC token from the server
+          if [ -z "$ACTIONS_ID_TOKEN_REQUEST_URL" ]; then
+            echo "FAIL: ACTIONS_ID_TOKEN_REQUEST_URL not set"
+            exit 1
+          fi
+          echo "ID_TOKEN_URL=$ACTIONS_ID_TOKEN_REQUEST_URL"
+          if [ -z "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" ]; then
+            echo "FAIL: ACTIONS_ID_TOKEN_REQUEST_TOKEN not set"
+            exit 1
+          fi
+          RESPONSE=$(curl -s -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com")
+          echo "Received OIDC response"
+          TOKEN=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['value'])")
+          # Decode and verify claims
+          PAYLOAD=$(echo "$TOKEN" | cut -d. -f2 | python3 -c "import sys,base64,json; print(json.dumps(json.loads(base64.urlsafe_b64decode(sys.stdin.read() + '==')), indent=2))")
+          echo "Claims: $PAYLOAD"
+          echo "$PAYLOAD" | python3 -c "
+import sys, json
+c = json.load(sys.stdin)
+assert c['aud'] == 'sts.amazonaws.com', f'aud mismatch: {c[\"aud\"]}'
+assert c['ref_type'] == 'branch', f'ref_type mismatch: {c[\"ref_type\"]}'
+assert 'jti' in c, 'missing jti'
+assert c['exp'] > c['iat'], 'exp must be > iat'
+print(f'PASS: sub={c[\"sub\"]}, aud={c[\"aud\"]}, ref_type={c[\"ref_type\"]}')
+"

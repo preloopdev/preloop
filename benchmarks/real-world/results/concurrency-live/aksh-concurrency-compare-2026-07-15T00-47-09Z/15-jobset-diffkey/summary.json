@@ -1,0 +1,29 @@
+{
+  "workflow": "15-jobset-diffkey",
+  "run_id": "e6287465-8c02-490c-9937-849958caa1ab",
+  "status": "completed",
+  "conclusion": "success",
+  "jobs": [
+    {
+      "name": "caller-job/inner",
+      "id": "caller-job/inner",
+      "status": "success",
+      "conclusion": "success",
+      "steps": [
+        {
+          "name": "Set up job",
+          "conclusion": "success"
+        },
+        {
+          "name": "run-inner",
+          "conclusion": "success"
+        },
+        {
+          "name": "Complete job",
+          "conclusion": "success"
+        }
+      ]
+    }
+  ],
+  "source": "aksh"
+}

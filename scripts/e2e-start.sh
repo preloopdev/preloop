@@ -18,6 +18,7 @@ unset all_proxy ALL_PROXY http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 AKSH_STATE="${AKSH_STATE:-$HOME/mitm-proxy/experiments/mitm/.cache/aksh-state}"
+AKSH_BIN="${AKSH_BIN:-$REPO_ROOT/target/release/aksh-runner-server}"
 RUNNER_DIR="${RUNNER_DIR:-$HOME/mitm-proxy/experiments/mitm/.cache/runner-official}"
 AKSH_PORT="${AKSH_PORT:-9090}"
 # aksh binds 9090, but clients (and the runner) reach it via the port-80 redirect.
@@ -28,6 +29,7 @@ CLIENT="${CLIENT:-http://127.0.0.1:80}"
 LOG_DIR="$REPO_ROOT/logs/e2e"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 LOG_FILE="$LOG_DIR/e2e-$TIMESTAMP.log"
+SYSTEM_TOKEN="${AKSH_SYSTEM_TOKEN:-aksh-system-token}"
 
 mkdir -p "$LOG_DIR"
 
@@ -64,12 +66,11 @@ preflight() {
     info "Preflight checks..."
 
     # Check aksh binary
-    local aksh_bin="$HOME/rust-runner-server/target/release/aksh-runner-server"
-    if [ ! -f "$aksh_bin" ]; then
-        red "aksh binary not found. Build it: cd ~/rust-runner-server && cargo build --release"
+    if [ ! -f "$AKSH_BIN" ]; then
+        red "aksh binary not found: $AKSH_BIN. Build it: cargo build --release -p aksh-runner-server"
         exit 1
     fi
-    dim "  aksh binary: $aksh_bin"
+    dim "  aksh binary: $AKSH_BIN"
 
     # Check runner binary
     if [ ! -f "$RUNNER_DIR/run.sh" ]; then
@@ -104,7 +105,7 @@ start_aksh() {
     info "Starting aksh on 127.0.0.1:$AKSH_PORT..."
     mkdir -p "$AKSH_STATE"
 
-    "$HOME/rust-runner-server/target/release/aksh-runner-server" serve \
+    "$AKSH_BIN" serve \
         --listen "127.0.0.1:$AKSH_PORT" \
         --state-dir "$AKSH_STATE" \
         >> "$LOG_FILE" 2>&1 &
@@ -174,6 +175,7 @@ submit_workflow() {
     local response
     response=$(curl -s --max-time 10 \
         -X POST "$CLIENT/api/v1/runs" \
+        -H "Authorization: Bearer $SYSTEM_TOKEN" \
         -H "Content-Type: application/json" \
         -d '{
             "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello from aksh\n      - run: whoami\n      - run: date\n",
@@ -202,6 +204,7 @@ run_runner() {
     if [ -n "${RUN_ID:-}" ]; then
         local status
         status=$(curl -sf --max-time 5 "$CLIENT/api/v1/runs/$RUN_ID" 2>/dev/null \
+            -H "Authorization: Bearer $SYSTEM_TOKEN" \
             | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('status','unknown'))" 2>/dev/null || echo "unknown")
         info "Run status: $status"
     fi
@@ -237,6 +240,7 @@ Environment:
   AKSH_STATE=~/mitm-proxy/experiments/mitm/.cache/aksh-state
   RUNNER_DIR=~/mitm-proxy/experiments/mitm/.cache/runner-official
   AKSH_PORT=9090
+  AKSH_BIN=target/release/aksh-runner-server
 EOF
         exit 0
         ;;

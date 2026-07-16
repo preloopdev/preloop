@@ -108,13 +108,30 @@ pub fn resolve_json(value: &Value, context: &Context) -> Result<Value, String> {
     }
 }
 
-/// Convert a JSON value to its string representation.
+/// Convert a JSON value to its string representation for template substitution.
+///
+/// GitHub Actions renders whole-number values as integers — `1.0` → `"1"`.
+/// serde_yaml 0.9 may produce `f64(1.0)` for a YAML integer `1`; normalise
+/// before embedding in a step command string.
 fn stringify_value(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
         Value::Null => String::new(),
         Value::Bool(b) => b.to_string(),
-        Value::Number(n) => n.to_string(),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                return i.to_string();
+            }
+            if let Some(u) = n.as_u64() {
+                return u.to_string();
+            }
+            if let Some(f) = n.as_f64() {
+                if f.fract() == 0.0 && f.abs() < 1e15 {
+                    return (f as i64).to_string();
+                }
+            }
+            n.to_string()
+        }
         Value::Array(a) => serde_json::to_string(a).unwrap_or_default(),
         Value::Object(o) => serde_json::to_string(o).unwrap_or_default(),
     }
@@ -265,5 +282,22 @@ mod tests {
     fn unclosed_expression_returns_error() {
         let ctx = make_context();
         assert!(resolve_string("${{ github.event_name", &ctx).is_err());
+    }
+
+    #[test]
+    fn resolve_string_integer_matrix_value_no_decimal_suffix() {
+        // GH-MATRIX-INT: ${{ matrix.val }} where val is f64(1.0) must produce
+        // "1" not "1.0" — serde_yaml 0.9 may deserialise YAML int as f64.
+        let mut ctx = make_context();
+        ctx.insert("matrix", serde_json::json!({"val": 1.0_f64}));
+        assert_eq!(
+            resolve_string("DONE=${{ matrix.val }}", &ctx).unwrap(),
+            "DONE=1",
+        );
+        ctx.insert("matrix", serde_json::json!({"val": 3.0_f64}));
+        assert_eq!(
+            resolve_string("echo ${{ matrix.val }}", &ctx).unwrap(),
+            "echo 3",
+        );
     }
 }

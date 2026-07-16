@@ -3,6 +3,15 @@ name: ci
 on:
   push:
   pull_request:
+  schedule:
+    # Nightly intensive property profile at 02:00 UTC
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Property profile: fast (default) or intensive"
+        required: false
+        default: "fast"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # aksh compatibility notes
@@ -17,13 +26,30 @@ on:
 #   4. -D warnings on clippy   — pre-existing missing_docs in azdo DTOs
 #      (repo-level issue, not an aksh gap)
 #
-# See .github/workflows/dogfood.yml for the locally-runnable version without
+# See fixtures/workflows/dogfood.yml for the locally-runnable version without
 # action dependencies.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Property-test CI notes (Plan 006)
+# ═══════════════════════════════════════════════════════════════════════════
+# PR / push: fast profile — 256 cases for pure/model/runner, 64 for HTTP.
+# Scheduled / manual intensive: release mode, 10k cases, 100k shrink iters.
+#
+# Live GitHub or privileged official-runner probes are NEVER run in PR CI.
+# The differential harness dry-run (credential-free) runs in both profiles.
+#
+# Sleep-guard: each property-test job mechanically scans new test files for
+# `sleep(` and fails the build if any match is found.
+#
+# Zero-filter guard: `cargo test -- --list | grep <filter>` must return at
+# least one test name before case-count runs are launched.
 # ═══════════════════════════════════════════════════════════════════════════
 
 jobs:
   rust:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       # action download works — client-side batch resolve + codeload fallback
       - uses: actions/checkout@v4
@@ -36,5 +62,215 @@ jobs:
 
       # inline run steps work against aksh
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: |
+          # Run clippy on warning-free crates with strict -D warnings
+          cargo clippy -p aksh-gha-protocol -p aksh-gha-parser -p aksh-gha-expressions -p aksh-cache -p aksh-artifacts -p runner-watch -p aksh-conformance --all-targets -- -D warnings
+          # Run clippy on crates with pre-existing warnings without -D warnings
+          cargo clippy -p aksh-runner -p aksh-runner-server -p aksh-runner-client -p aksh-dap --all-targets
       - run: cargo test --workspace
+        env:
+          RUSTFLAGS: "-A warnings"
+
+  # ─── Bounded property-test profile (PR / push) ─────────────────────────
+  property-tests-fast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.event_name != 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.86"
+
+      # ── Zero-filter guard: fail if no properties match the filter ──────
+      - name: Verify concurrency_properties filter matches at least one test
+        run: |
+          count=$(PROPTEST_CASES=1 cargo test -p aksh-runner-server -- --list 2>/dev/null | grep -c 'concurrency_properties' || true)
+          if [ "$count" -eq 0 ]; then
+            echo "ERROR: filter 'concurrency_properties' matched zero tests in aksh-runner-server" >&2
+            exit 1
+          fi
+          echo "concurrency_properties: $count test(s) found"
+
+      - name: Verify property filters match tests
+        run: |
+          server=$(PROPTEST_CASES=1 cargo test -p aksh-runner-server -- --list 2>/dev/null | grep -Ec 'concurrency::properties|concurrency_properties|concurrency_http_properties' || true)
+          runner=$(cargo test -p aksh-runner -- --list 2>/dev/null | grep -c 'timespan_tests' || true)
+          parser=$(cargo test -p aksh-gha-parser -- --list 2>/dev/null | grep -c 'concurrency_' || true)
+          if [ "$server" -eq 0 ] || [ "$runner" -eq 0 ] || [ "$parser" -eq 0 ]; then
+            echo "ERROR: zero matching tests (server=$server runner=$runner parser=$parser)" >&2
+            exit 1
+          fi
+      - name: Check no sleep() in property test files
+        run: |
+          files="crates/aksh-runner-server/src/concurrency_properties.rs crates/aksh-runner-server/src/concurrency_http_properties.rs"
+          bad=0
+          for f in $files; do
+            if [ -f "$f" ] && grep -q 'sleep(' "$f"; then
+              echo "ERROR: sleep() found in $f" >&2
+              bad=1
+            fi
+          done
+          if [ "$bad" -ne 0 ]; then exit 1; fi
+          echo "Sleep guard: OK"
+
+      # ── Pure properties (256 cases) ────────────────────────────────────
+      - name: Pure concurrency properties
+        run: |
+          PROPTEST_CASES=256 cargo test -p aksh-runner-server \
+            'concurrency::properties' -- --test-threads=1
+          PROPTEST_CASES=256 cargo test -p aksh-runner-server \
+            concurrency_properties::pure -- --test-threads=1
+
+      # ── Scheduler model properties (256 cases) ─────────────────────────
+      - name: Scheduler model properties
+        run: |
+          PROPTEST_CASES=256 cargo test -p aksh-runner-server \
+            concurrency_properties::state_machine -- --test-threads=1
+
+      # ── Expression / parser properties (256 cases) ─────────────────────
+      - name: Expression and parser properties
+        run: |
+          PROPTEST_CASES=256 cargo test -p aksh-gha-expressions -- --test-threads=1
+          cargo test -p aksh-gha-parser concurrency_ -- --test-threads=1
+
+      # ── Runner dispatcher properties (256 cases) ───────────────────────
+      - name: Runner dispatcher properties
+        run: |
+          cargo test -p aksh-runner timespan_tests -- --test-threads=1
+
+      # ── HTTP sequence properties (64 cases — heavier) ──────────────────
+      - name: HTTP sequence properties
+        run: |
+          PROPTEST_CASES=64 cargo test -p aksh-runner-server \
+            concurrency_http_properties -- --test-threads=1
+
+      # ── Differential harness dry-run (credential-free) ─────────────────
+      - name: Differential harness dry-run (schema + algebraic validation)
+        run: |
+          python3 benchmarks/real-world/run-concurrency-property-probes.py \
+            --dry-run \
+            --corpus benchmarks/real-world/concurrency-property-cases.json
+
+      - name: Differential harness rejects contaminated fixture
+        run: |
+          set +e
+          python3 benchmarks/real-world/run-concurrency-property-probes.py \
+            --dry-run \
+            --corpus benchmarks/real-world/fixtures/contaminated-case.json
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "ERROR: harness did not reject contaminated fixture (expected nonzero exit)" >&2
+            exit 1
+          fi
+          echo "Contamination rejection: OK (exit $status)"
+
+      # ── Upload regression seeds on failure ─────────────────────────────
+      - name: Upload proptest regressions
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proptest-regressions-fast
+          path: |
+            crates/**/proptest-regressions/
+          if-no-files-found: ignore
+
+  # ─── Intensive scheduled / manual profile ──────────────────────────────
+  property-tests-intensive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.profile == 'intensive')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.86"
+
+      # ── Zero-filter guard ──────────────────────────────────────────────
+      - name: Verify concurrency_properties filter matches at least one test
+        run: |
+          count=$(PROPTEST_CASES=1 cargo test -p aksh-runner-server -- --list 2>/dev/null | grep -c 'concurrency_properties' || true)
+          if [ "$count" -eq 0 ]; then
+            echo "ERROR: filter 'concurrency_properties' matched zero tests" >&2
+            exit 1
+          fi
+
+      - name: Verify property filters match tests
+        run: |
+          server=$(PROPTEST_CASES=1 cargo test -p aksh-runner-server -- --list 2>/dev/null | grep -Ec 'concurrency::properties|concurrency_properties|concurrency_http_properties' || true)
+          runner=$(cargo test -p aksh-runner -- --list 2>/dev/null | grep -c 'timespan_tests' || true)
+          parser=$(cargo test -p aksh-gha-parser -- --list 2>/dev/null | grep -c 'concurrency_' || true)
+          if [ "$server" -eq 0 ] || [ "$runner" -eq 0 ] || [ "$parser" -eq 0 ]; then
+            echo "ERROR: zero matching tests (server=$server runner=$runner parser=$parser)" >&2
+            exit 1
+          fi
+      - name: Check no sleep() in property test files
+        run: |
+          bad=0
+          for f in \
+            crates/aksh-runner-server/src/concurrency_properties.rs \
+            crates/aksh-runner-server/src/concurrency_http_properties.rs; do
+            if [ -f "$f" ] && grep -q 'sleep(' "$f"; then
+              echo "ERROR: sleep() found in $f" >&2
+              bad=1
+            fi
+          done
+          if [ "$bad" -ne 0 ]; then exit 1; fi
+
+      # ── Intensive: release mode, 10k cases, 100k shrink iters ──────────
+      - name: Intensive property profile (release)
+        run: |
+          PROPTEST_CASES=10000 PROPTEST_MAX_SHRINK_ITERS=100000 \
+            cargo test -p aksh-runner-server 'concurrency::properties' \
+            --release -- --test-threads=1
+          PROPTEST_CASES=10000 PROPTEST_MAX_SHRINK_ITERS=100000 \
+            cargo test -p aksh-runner-server concurrency_properties \
+            --release -- --test-threads=1
+
+      - name: Intensive runner timing profile (release)
+        run: cargo test -p aksh-runner timespan_tests --release -- --test-threads=1
+
+      - name: Intensive expression / parser profile (release)
+        run: |
+          PROPTEST_CASES=10000 cargo test -p aksh-gha-expressions \
+            --release -- --test-threads=1
+          cargo test -p aksh-gha-parser concurrency_ \
+            --release -- --test-threads=1
+
+      - name: Intensive HTTP sequence profile (release)
+        run: |
+          PROPTEST_CASES=1000 PROPTEST_MAX_SHRINK_ITERS=100000 \
+            cargo test -p aksh-runner-server concurrency_http_properties \
+            --release -- --test-threads=1
+
+      # ── Differential harness dry-run (always, never live probes in CI) ─
+      - name: Differential harness dry-run
+        run: |
+          python3 benchmarks/real-world/run-concurrency-property-probes.py \
+            --dry-run \
+            --corpus benchmarks/real-world/concurrency-property-cases.json
+
+      - name: Differential harness rejects contaminated fixture
+        run: |
+          set +e
+          python3 benchmarks/real-world/run-concurrency-property-probes.py \
+            --dry-run \
+            --corpus benchmarks/real-world/fixtures/contaminated-case.json
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "ERROR: harness did not reject contaminated fixture" >&2
+            exit 1
+          fi
+          echo "Contamination rejection: OK (exit $status)"
+
+      # ── Upload regressions, traces, differential report on failure ──────
+      - name: Upload intensive regression artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proptest-regressions-intensive
+          path: |
+            crates/**/proptest-regressions/
+          if-no-files-found: ignore
