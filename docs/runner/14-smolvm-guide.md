@@ -2,7 +2,7 @@
 
 ## Overview
 
-smolvm creates lightweight ARM64 Linux VMs on Apple Silicon using libkrun (a VMM built on Apple's Hypervisor.framework). We use it to run the aksh runner with Docker inside a Linux VM for E2E testing against GitHub.
+smolvm 1.5.2 creates lightweight ARM64 Ubuntu Linux VMs on Apple Silicon using libkrun (a VMM built on Apple's Hypervisor.framework). It also supports opt-in Rosetta 2 translation with `--rosetta` for x86_64 binaries and `linux/amd64` images. We use it to run the aksh runner with Docker inside a Linux VM for E2E testing against GitHub.
 
 ## Architecture
 
@@ -25,6 +25,10 @@ Communication between host and guest is over **vsock**, bridged to a Unix domain
 smolvm machine create --name build-runner --image ubuntu:24.04 \
   --cpus 4 --mem 8192 --storage 20 --net \
   -v ~/myrepo:/workspace
+
+# Optional x86_64 translation on Apple Silicon
+smolvm machine create --name x86-runner --image ubuntu:24.04 \
+  --cpus 4 --mem 8192 --storage 20 --net --rosetta
 
 # Lifecycle
 smolvm machine start --name build-runner    # 1.2s boot
@@ -224,23 +228,44 @@ Packed VMs have an internal storage disk mounted at `/workspace`. If you also mo
 The internal mount wins. Use a different path:
 ```sh
 ./my-tool start -v ~/myrepo:/work       # works
-```
-
-Regular `smolvm machine` VMs don't have this problem because the virtio-fs mount takes precedence.
-
 ## x86 Emulation
 
-smolvm VMs are ARM64-only (libkrun doesn't support Rosetta). See `docs/runner/13-x86-emulation-research.md` for details.
+On Apple Silicon, smolvm 1.5.2 supports opt-in Rosetta 2 translation. Pass `--rosetta`
+when creating or running a VM that needs x86_64 binaries:
 
-**QEMU fallback** (slow, 5-10x overhead):
+```sh
+smolvm machine run --net --rosetta --image ubuntu:24.04 -- \
+  sh -lc 'uname -m; ls -l /mnt/rosetta/rosetta'
+```
+
+Rosetta is mounted through virtiofs and registered through the guest binfmt wrapper.
+When `--rosetta` is used with a registry image and no explicit platform override, smolvm
+selects `linux/amd64`; `--oci-platform` can override that selection. The benchmark
+harness passes `--rosetta` to its comparison VMs.
+
+For a VM created from a packed `.smolmachine` artifact, persist the feature before
+starting the VM:
+
+```sh
+smolvm machine create --name packed-runner --from ./runner.smolmachine
+smolvm machine update --name packed-runner --rosetta
+smolvm machine start --name packed-runner
+```
+
+The comparison scripts use this explicit `machine update` step because it makes the
+feature visible to later `machine exec` calls in packed benchmark VMs.
+
+Use ARM64-native images by default. Rosetta is intended for x86-only binaries and
+images; enabling the mount is not a substitute for testing architecture-sensitive
+workflows.
+
+**QEMU fallback** (slower, roughly 5–10x overhead):
 ```sh
 smolvm machine exec --name myvm -- sh -c '
   apt-get install -y qemu-user-static binfmt-support
-  echo ":qemu-x86_64:M::\x7fELF\x02\x01\x01\x00...::/usr/bin/qemu-x86_64-static:FPC" \
+  echo ":qemu-x86_64:M::\\x7fELF\\x02\\x01\\x01\\x00...::/usr/bin/qemu-x86_64-static:FPC" \
     > /proc/sys/fs/binfmt_misc/register
 '
-# Now x86_64 Docker images work (slowly)
-docker run --platform linux/amd64 alpine uname -m  # x86_64
 ```
 
 ## Performance Notes

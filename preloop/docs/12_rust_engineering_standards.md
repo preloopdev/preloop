@@ -19,21 +19,23 @@ aksh-runner-client     CLI
 aksh-cache             cache protocol/store
 aksh-artifacts         artifact protocol/store
 aksh-conformance       differential test harness
-preloop-krun           libkrun FFI/runtime
+preloop-vm             VmProvider seam: SmolvmProvider (smolvm CLI/HTTP/SDK) + FirecrackerProvider
 preloop-guest          static guest agent
 preloop-policy         trust tiers and enforcement
 preloop-worker         self-hosted/managed worker daemon
 preloop-telemetry      NDJSON/OpenTelemetry/tracing
 ```
 
+smolvm is an external dependency, not a Preloop crate; Preloop consumes it via
+CLI/HTTP/SDK behind `preloop-vm` and does not vendor a libkrun-FFI crate.
+
 Avoid god crates. Especially avoid letting the server crate own all domain logic.
 
 ## Unsafe policy
 
-- `unsafe_code = "forbid"` for Aksh/control-plane crates.
-- Unsafe only allowed in `preloop-krun` FFI boundary if needed.
-- Every unsafe block requires a safety comment and a focused review.
-- Prefer existing safe wrappers where they do not hide critical libkrun knobs.
+- `unsafe_code = "forbid"` for Aksh and all Preloop control-plane crates.
+- libkrun FFI and all unsafe live in smolvm/libkrunfw (external), so Preloop needs no unsafe of its own.
+- The only narrow exception is the FirecrackerProvider's syscall/ioctl glue (if any); each such block needs a safety comment and a focused review.
 
 ## Typed IDs and state machines
 
@@ -210,7 +212,7 @@ cargo deny check   # or equivalent dependency audit
 cargo audit        # if adopted
 ```
 
-For libkrun-specific tests, use a separate hardware-gated workflow.
+For VM smoke tests (smolvm and Firecracker), use a separate hardware-gated workflow.
 
 ## Feature flags
 
@@ -221,8 +223,8 @@ Use feature flags sparingly and clearly:
 default = ["local"]
 local = []
 managed = []
-libkrun = []
-microsandbox = []
+smolvm = []
+firecracker = []
 github-app = []
 official-runner-oracle = []
 ```

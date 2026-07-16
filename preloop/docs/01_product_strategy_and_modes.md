@@ -26,6 +26,23 @@ The uploaded master plan frames the wedge around five capabilities:
 
 Keep that wedge. Do not drift into “generic local CI runner” positioning.
 
+## Runtime tiers
+
+The three deployment classes map onto three interchangeable microVM executors
+behind one control plane (aksh). See
+[Runtime Tiers and Portable Handoff](14_runtime_tiers_and_portable_handoff.md).
+
+| Tier | Runtime | Role |
+|---|---|---|
+| Local | **smolvm** (libkrun) on macOS/Linux/Windows | primary local product |
+| Portable / smolvm-KVM | **smolvm** on Linux KVM | "start local, continue remote"; a valid production deployment target |
+| Scale-CI | **Firecracker** | primary production runtime for high-scale managed CI |
+
+Preloop consumes smolvm as its microVM substrate — it does not reimplement a
+hypervisor. Firecracker leads production on density/spot/autoscaling; smolvm-KVM
+is production-capable too and uniquely enables portable `.smolmachine` handoff
+from a developer's laptop to a remote host with warm cache intact.
+
 ## Product modes
 
 ### 1. Local developer CI
@@ -78,7 +95,7 @@ This runs on team-owned machines but executes code that may be untrusted, especi
 Default posture:
 
 - Linux worker preferred for hard host jailing.
-- One fresh libkrun VM per job.
+- One fresh smolvm microVM per job (Firecracker on the scale tier).
 - Durable state for runs, jobs, leases, logs, artifacts, and cache metadata.
 - GitHub App or self-hosted runner integration.
 - Trust-tier policies based on event type and repository relationship.
@@ -106,14 +123,22 @@ Success metric:
 
 ## Strategic architecture choice
 
-Aksh should be the primary Rust-native control plane and runner path. The official GitHub Actions runner and `ChristopherHX/runner.server` should remain:
+Aksh is the primary Rust-native control plane and runner path. The official
+GitHub Actions runner and `ChristopherHX/runner.server` remain conformance
+oracles, compatibility fallback paths, protocol drift detectors, and test
+fixtures.
 
-- conformance oracles,
-- compatibility fallback paths,
-- protocol drift detectors,
-- and useful test fixtures.
+The microVM substrate is **smolvm**, consumed as a dependency (CLI, HTTP API, or
+embedded SDK), not rebuilt. A thin `VmProvider` seam swaps smolvm for Firecracker
+on the scale tier while keeping the aksh runner, guest agent, and conformance
+harness identical across tiers.
 
-This is different from a pure official-runner-first plan. Because Preloop needs managed CI, agent pause/retry, network policy, secret policy, VM lifecycle hooks, and failure forking, owning the runner/control plane is strategically valuable.
+Because Preloop needs managed CI, agent pause/retry, network policy, secret
+policy, VM lifecycle hooks, and failure forking, owning the runner/control plane
+(aksh) is strategically valuable — but owning the hypervisor is not. smolvm
+already provides isolation, snapshots, egress control, and secrets; Preloop's
+leverage is the control plane and the efficiency levers layered on top
+([CI Efficiency Levers](15_ci_efficiency_levers.md)).
 
 ## What not to build first
 
@@ -122,6 +147,7 @@ Avoid these traps:
 - Do not build broad CI-system compatibility before GitHub Actions parity.
 - Do not start with Jenkins, Circle, or GitLab CI abstractions.
 - Do not build a generic VM platform without a GitHub Actions use case driving it.
+- Do not reimplement the microVM/hypervisor layer. smolvm is the substrate; consume it. Build a `preloop-krun`/libkrun-FFI crate or a hypervisor-agnostic runtime abstraction only if smolvm provably cannot expose a knob Preloop needs.
 - Do not optimize boot time before measuring edit-to-verdict.
 - Do not ship managed untrusted PR execution without durable state, trust tiers, and cache isolation.
 
@@ -129,11 +155,11 @@ Avoid these traps:
 
 | Version | Promise |
 |---|---|
-| v0.0 | Proves libkrun execution substrate and Aksh conformance direction. |
-| v0.1 | Useful local CI for macOS/Linux with Aksh inside microVMs. |
+| v0.0 | Proves the smolvm execution substrate and Aksh conformance direction. |
+| v0.1 | Useful local CI for macOS/Linux/Windows with Aksh inside smolvm microVMs. |
 | v0.2 | Real-world workflows: cache, artifacts, services, Docker, strict mode. |
-| v0.3 | Self-hosted worker beta with GitHub App integration. |
-| v0.4 | Hardened managed CI private beta. |
+| v0.3 | Self-hosted worker beta (smolvm-KVM) with GitHub App integration. |
+| v0.4 | Hardened managed CI private beta on Firecracker; portable smolvm handoff. |
 
 ## Positioning sentence
 

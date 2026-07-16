@@ -8,7 +8,7 @@
 set -euo pipefail
 
 BENCH_DIR="$(cd "$(dirname "$0")" && pwd)"
-RESULTS_DIR="$BENCH_DIR/results"
+RESULTS_DIR="$BENCH_DIR/../compatibility/runner/behavior"
 CAPTURE_MODE="${1:-}"
 CAPTURE_RUNNER="${2:-}"
 
@@ -25,15 +25,15 @@ fi
 # ── Step 2: Step-level + outcome comparison ─────────────────────────
 log "Running step-level conformance diff..."
 python3 "$BENCH_DIR/conformance-diff.py" \
-    --official "$RESULTS_DIR/conformance/conformance-official.jsonl" \
-    --aksh "$RESULTS_DIR/conformance/conformance-aksh.jsonl" \
+    --official "$RESULTS_DIR/conformance-official.jsonl" \
+    --aksh "$RESULTS_DIR/conformance-aksh.jsonl" \
     --output "$RESULTS_DIR/CONFORMANCE-REPORT.md"
 
 # ── Step 3: Log content comparison ──────────────────────────────────
 log "Running log content diff..."
 python3 "$BENCH_DIR/log-content-diff.py" \
     --batch \
-    --flows-root "$RESULTS_DIR/runner-flow" \
+    --flows-root "$BENCH_DIR/../compatibility/runner/protocol" \
     --output "$RESULTS_DIR/LOG-CONTENT-REPORT.md"
 
 # ── Step 4: Flow-level diffs for captured scenarios ─────────────────
@@ -43,7 +43,7 @@ echo "# MITM Flow Comparison Report" > "$FLOW_REPORT"
 echo "" >> "$FLOW_REPORT"
 
 flow_count=0
-for scenario_dir in "$RESULTS_DIR/runner-flow"/*/; do
+for scenario_dir in "$BENCH_DIR/../compatibility/runner/protocol"/*/; do
     scenario=$(basename "$scenario_dir")
     off_latest="$scenario_dir/official/latest"
     aksh_latest="$scenario_dir/aksh/latest"

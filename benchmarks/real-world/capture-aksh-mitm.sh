@@ -8,7 +8,7 @@ SCENARIO="${1:?Usage: $0 <scenario-name>}"
 VM="${2:-bench-aksh-4}"
 GH_REPO="preloopdev/aksh-conformance-sample"
 WF_NAME="$SCENARIO.yml"
-RESULTS_DIR="$(cd "$(dirname "$0")/results/mitm" && pwd)"
+RESULTS_DIR="$(cd "$(dirname "$0")/../compatibility/runner/protocol/legacy-mitm-captures" && pwd)"
 MITM_PORT=8080
 
 log() { echo "[$(date +%T.%3N)] $*"; }

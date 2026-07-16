@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 HOME = Path.home()
 WT = [HOME / "macos-runners", HOME / "cachingv4", HOME / "mitm-proxy", HOME / "runner-watcher", HOME / "workflow-support"]
-OUT = Path("benchmarks/real-world/results/CAPTURE-INVENTORY.md")
+OUT = Path("benchmarks/compatibility/INVENTORY.md")
 
 def find_flows(dirs):
     results = []
@@ -19,7 +19,7 @@ def find_flows(dirs):
 
 def extract(fpath):
     s = str(fpath)
-    for pat in [r'runner-flow/(\d{2,3})-[^/]+?/(official|aksh)/',
+    for pat in [r'runner/protocol/(\d{2,3})-[^/]+?/(official|aksh)/',
                 r'/captures/(official|aksh|aksh-runner-aksh|runner-server)/(\d{2,3})-[^/]+?/',
                 r'/golden/[^/]+/(\d{2,3})-[^/]+?/flows\.jsonl']:
         m = re.search(pat, s)
@@ -65,14 +65,14 @@ for f in find_flows(WT):
         if num not in official or c > official[num]: official[num] = c
     elif num not in aksh or c > aksh[num]: aksh[num] = c
 
-diff_root = Path("benchmarks/real-world/results/runner-flow")
+diff_root = Path("benchmarks/compatibility/runner/protocol")
 def find_diff(num, name):
     for df in [diff_root / f"{num}-{name}" / "diff.md", diff_root / num / "diff.md"]:
         if not df.exists(): continue
         t = df.read_text()
-        if m := re.search(r'FAIL: (\d+) contract', t): return f"[{m.group(1)} diffs](runner-flow/{df.parent.name}/diff.md)"
-        if "PASS" in t: return f"[PASS](runner-flow/{df.parent.name}/diff.md)"
-        return f"[empty](runner-flow/{df.parent.name}/diff.md)"
+        if m := re.search(r'FAIL: (\d+) contract', t): return f"[{m.group(1)} diffs](runner/protocol/{df.parent.name}/diff.md)"
+        if "PASS" in t: return f"[PASS](runner/protocol/{df.parent.name}/diff.md)"
+        return f"[empty](runner/protocol/{df.parent.name}/diff.md)"
     return "—"
 
 # ── Conformance outcome data ────────────────────────────────────────
@@ -98,7 +98,7 @@ CONFORMANCE_NAMES = {
 
 off_out = {}; aksh_out = {}
 for fn, store in [("conformance-official.jsonl", off_out), ("conformance-aksh.jsonl", aksh_out)]:
-    p = Path(f"benchmarks/real-world/results/conformance/{fn}")
+    p = Path(f"benchmarks/compatibility/runner/behavior/{fn}")
     if not p.exists(): continue
     for line in open(p):
         d = json.loads(line)
@@ -127,7 +127,7 @@ aksh_n = sum(1 for n in MITM_SCENARIOS if n in aksh)
 both_n = sum(1 for n in MITM_SCENARIOS if n in official and n in aksh)
 
 L.append("## MITM Flow Captures")
-L.append(f"{len(MITM_SCENARIOS)} scenarios — {off_n} official — {aksh_n} aksh — {both_n} both — [diffs](runner-flow/) linked where available")
+L.append(f"{len(MITM_SCENARIOS)} scenarios — {off_n} official — {aksh_n} aksh — {both_n} both — [diffs](runner/protocol/) linked where available")
 L.append("")
 L.append("| # | Scenario | Official | Aksh | Diff |")
 L.append("|---|---:|---:|---|")

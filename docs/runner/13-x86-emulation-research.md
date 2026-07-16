@@ -17,24 +17,24 @@ aksh runs workflows locally in smolvm VMs on Apple Silicon (ARM64). Most GitHub 
     │   libkrun     │       │ Virtualization       │
     │   (≈ QEMU)    │       │  .framework          │
     │               │       │  (Apple's own VMM)   │
-    │  Open-source  │       │                      │
-    │  lightweight  │       │  Rosetta 2 support ✓ │
-    │  No Rosetta ✗ │       │  VirtioFS ✓          │
-    │               │       │  GPU passthrough ✓   │
-    └───────┬──────┘       └───────┬──────────────┘
-            │                      │
-        smolvm                 Docker Desktop
-        krunvm                 UTM, Lima
-        Podman <5              Podman ≥5
+    │  smolvm 1.5   │       │                      │
+    │  Rosetta ✓    │       │  Rosetta 2 support ✓ │
+    │  via virtiofs │       │  VirtioFS ✓          │
+    └───────┬──────┘       │  GPU passthrough ✓   │
+            │              └───────┬──────────────┘
+        smolvm                       │
+        krunvm                    Docker Desktop
+                                  UTM, Lima
+
 ```
 
 **Hypervisor.framework** — CPU virtualization primitive (like KVM). Both libkrun and Virtualization.framework use it underneath.
 
 **Virtualization.framework** — Apple's high-level VM manager. Adds virtual devices, networking, file sharing, and Rosetta 2 for Linux. Docker Desktop uses this.
 
-**libkrun** — Open-source VM manager from Red Hat/containers project. Also uses Hypervisor.framework for CPU, but implements its own device layer. Lighter weight than Virtualization.framework but lacks Rosetta.
+**smolvm 1.5.2** — now exposes Rosetta 2 on Apple Silicon through a virtiofs mount and a guest binfmt wrapper. The runtime is opt-in with `--rosetta`; it is not enabled for every VM by default.
 
-**smolvm uses libkrun** → ARM64-only VMs → no native x86 binary support.
+The benchmark host now has smolvm 1.5.2 installed. The comparison scripts pass `--rosetta` when creating their benchmark VMs.
 
 ## Rosetta 2 for Linux
 
@@ -63,6 +63,30 @@ Key code locations in the reverted PR:
 - `read_rosetta_data()` reads `${HOME}/.krunvm-rosetta`
 - ioctl handler checks `cmd == IOCTL_ROSETTA` (type `0x61`) and returns the data
 
+### smolvm 1.5.2 implementation
+
+smolvm now provides an opt-in implementation without requiring a full
+Virtualization.framework VMM migration. It mounts Apple's Linux Rosetta runtime through
+virtiofs, installs a guest `rosetta-wrapper`, and registers the x86_64 ELF interpreter
+through `binfmt_misc`. The host-side CLI flag is `--rosetta`.
+
+Verified on this workstation after installing smolvm 1.5.2:
+
+```text
+smolvm 1.5.2
+command: smolvm machine run --net --rosetta --image ubuntu:24.04 -- uname -m
+guest uname -m: x86_64
+Rosetta runtime: /mnt/rosetta/rosetta
+guest wrapper: /usr/bin/rosetta-wrapper
+```
+
+The command pulled the amd64 Ubuntu image and returned `x86_64` inside the ARM64
+guest, confirming that the Rosetta runtime and binfmt integration execute an x86_64
+image successfully. This does not prove that every x86 binary or package is compatible.
+
+The old reverted-libkrun analysis remains useful historical context, but it no longer
+describes the current smolvm 1.5.2 path.
+
 ### Performance comparison
 
 | Backend | x86 binary speed | Legal status |
@@ -90,14 +114,26 @@ Key code locations in the reverted PR:
 
 ## Options for aksh
 
-| Path | Speed | Effort | Notes |
+| Path | Speed | Status | Notes |
 |------|-------|--------|-------|
-| ARM64-native only | 1x | Done | Works for ~90% of workflows |
-| QEMU binfmt in smolvm | 0.1-0.2x | Low (apt-get install qemu-user-static) | Too slow for CI |
-| Rosetta via Virtualization.framework | ~0.9x | High (new VM backend) | Best UX, needs Apple's framework |
-| Docker Desktop fallback | ~0.9x | Medium | Delegate x86 jobs to Docker Desktop's VM |
-| Encourage ARM64 workflows | 1x | Documentation | Growing ecosystem support |
+| ARM64-native only | 1x | Default | Works for most workflows; use when images and tools publish ARM64 variants. |
+| QEMU binfmt in smolvm | 0.1–0.2x | Fallback | Broad compatibility but too slow for normal CI. |
+| smolvm 1.5.2 `--rosetta` | Near-native | Available | Opt-in Rosetta 2 runtime via virtiofs and guest binfmt wrapper on Apple Silicon. |
+| Docker Desktop fallback | Near-native | Alternative | Delegate x86 jobs to Docker Desktop's VM when a separate VM boundary is preferred. |
+| Encourage ARM64 workflows | 1x | Recommended where possible | Avoids translation and improves portability. |
 
 ## Current recommendation
 
-Ship ARM64-native. Document which workflow patterns need ARM64-compatible images. Most web development CI (Node/Python/Go/Rust + postgres/redis) works without changes. Monitor libkrun upstream for any future Rosetta re-integration.
+Keep ARM64-native execution as the default. Enable `--rosetta` for smolvm VMs that need
+x86-only binaries or `linux/amd64` images. The benchmark harness now passes `--rosetta`
+to its comparison VMs and was smoke-tested with smolvm 1.5.2 using an Ubuntu image:
+
+```sh
+smolvm machine run --net --rosetta --image ubuntu:24.04 -- \
+  sh -lc 'uname -m; ls -l /mnt/rosetta/rosetta'
+```
+
+This selects an x86_64 image and exposes `/mnt/rosetta/rosetta` inside the guest. A
+follow-up benchmark is still required for workflows that execute x86-only binaries
+inside ARM64 guest/container filesystems; enabling the mount is not itself proof that
+every binary or package is compatible.
