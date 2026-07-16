@@ -104,11 +104,7 @@ fn minute_field_too_frequent(minute: &str) -> bool {
         return false; // single fixed value is always fine
     }
     let sorted: Vec<u8> = values.into_iter().collect();
-    let min_gap = sorted
-        .windows(2)
-        .map(|w| w[1] - w[0])
-        .min()
-        .unwrap_or(60);
+    let min_gap = sorted.windows(2).map(|w| w[1] - w[0]).min().unwrap_or(60);
     min_gap < 5
 }
 
