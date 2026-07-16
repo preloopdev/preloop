@@ -576,11 +576,7 @@ pub(crate) async fn handle_github_webhook(
                 reusable_workflows: BTreeMap::new(),
                 enable_debugger: false,
                 debugger_welcome_message: None,
-                sha: payload_val
-                    .get("after")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("0000000000000000000000000000000000000000")
-                    .to_owned(),
+                sha: sha.clone(),
                 actor: payload_val
                     .get("sender")
                     .and_then(|s| s.get("login"))
