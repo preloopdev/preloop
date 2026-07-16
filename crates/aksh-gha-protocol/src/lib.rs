@@ -158,6 +158,40 @@ pub struct WorkflowSubmission {
     /// Welcome message to show when debugger attaches.
     #[serde(default)]
     pub debugger_welcome_message: Option<String>,
+    /// Trust tier assigned by the webhook dispatcher. The server enforces its
+    /// repository-secret policy before building a job; it does not grant an
+    /// untrusted payload permission to select a more trusted tier.
+    #[serde(default)]
+    pub trust_tier: Option<String>,
+    /// Upstream workflow display names for `on.workflow_run.workflows:` filter
+    /// enforcement. Populated from `workflow_run.name` by the adapter.
+    #[serde(default)]
+    pub workflow_run_upstream_names: Vec<String>,
+    /// Activity type for the event (for example `opened`, `synchronize`, or
+    /// `submitted`). Set by the dispatcher so submission does not reinterpret
+    /// event-specific payload fields.
+    #[serde(default)]
+    pub activity_type: Option<String>,
+    /// Resolved SHA for the run's `github.sha` context. A webhook adapter owns
+    /// this value because it differs from payload `after` for PR-family events.
+    #[serde(default)]
+    pub resolved_sha: Option<String>,
+    /// Explicitly resolved changed paths. An empty list is meaningful only
+    /// when `changed_paths_known` is true.
+    #[serde(default)]
+    pub changed_paths: Vec<String>,
+    /// Whether `changed_paths` represents a complete change set.
+    #[serde(default)]
+    pub changed_paths_known: bool,
+    /// Branch used for trigger filtering, independent of `git_ref`.
+    #[serde(default)]
+    pub filter_branch: Option<String>,
+    /// Typed workflow_dispatch inputs.
+    #[serde(default)]
+    pub dispatch_inputs: BTreeMap<String, serde_json::Value>,
+    /// String-valued workflow_dispatch inputs for `github.event.inputs`.
+    #[serde(default)]
+    pub dispatch_inputs_stringified: BTreeMap<String, String>,
 }
 
 fn default_ref() -> String {

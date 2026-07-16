@@ -322,7 +322,7 @@ Per-milestone gates are listed inline above; the cross-cutting checks:
 - Workspace health after every milestone: `just test-ci` (fmt-check + clippy -D warnings + `cargo test --workspace --quiet`), run from repo root.
 - **Tier-1 truth check (first at M1, then every milestone)**: `cargo run -p aksh-conformance -- runner-diff --scenario <NN> --target github` → report at `.runner-watch/runner-conformance/<NN>.md`, exit 0; plus the live run visible green at the `run_url` in the verdict. Prereqs: `gh` CLI authenticated, `GH_RUNNER_TEST_REPO` set to a repo with self-hosted runners enabled, mitmproxy (goldens used 12.2.3) with its CA cert available for `--ca-bundle`.
 - **Tier-2 local loop (first at M3)**: `cargo build --release --workspace && cargo run -p aksh-conformance -- runner-e2e --runner-bin target/release/aksh-runner --workflow fixtures/golden/simple-echo.yml --json /tmp/verdict.json` → `run_status == "Succeeded"` and step log contains the echoed line. Requires port 9090-free only; official-runner comparison runs additionally need `~/mitm-proxy/experiments/mitm/.cache/runner-official` + port-80 redirect (`sudo ./scripts/e2e-setup.sh`).
-- Dogfood-on-itself (from M5, Tier 2): `runner-e2e --workflow .github/workflows/dogfood.yml` with `vars.AKSH_REPO_ROOT` injected — the Rust runner runs this repo's own fmt/clippy/test job.
+- Dogfood-on-itself (from M5, Tier 2): `runner-e2e --workflow fixtures/workflows/dogfood.yml` with `vars.AKSH_REPO_ROOT` injected — the Rust runner runs this repo's own fmt/clippy/test job.
 - Perf claims come only from `just bench-runner` output (M11); no perf statement ships in docs without a `bench-results.json` behind it.
 
 ## Assumptions & contingencies

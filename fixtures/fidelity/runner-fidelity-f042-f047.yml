@@ -4,7 +4,7 @@ on:
   push:
     branches: [cachingv4, main]
     paths:
-      - '.github/workflows/runner-fidelity-f042-f047.yml'
+      - 'fixtures/fidelity/runner-fidelity-f042-f047.yml'
   workflow_dispatch:
 
 jobs:
