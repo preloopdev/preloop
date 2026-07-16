@@ -5,7 +5,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-RESULTS="$SCRIPT_DIR/results/runner-flow"
+RESULTS="$SCRIPT_DIR/../compatibility/runner/protocol"
 
 # All remaining scenarios from CAPTURE-INVENTORY.md that have "—" for both sides
 SCENARIOS=(

@@ -14,7 +14,7 @@ WF_GLOB="${2:-}"
 
 GH_REPO="preloopdev/aksh-conformance-sample"
 HOST_WORKSPACE="/Users/bnjoroge/macos-runners"
-RESULTS_DIR="$HOST_WORKSPACE/benchmarks/real-world/results/conformance"
+RESULTS_DIR="$HOST_WORKSPACE/benchmarks/compatibility/runner/behavior"
 TMP_DIR="/tmp/batch-conformance-$$"
 BATCH_SIZE=4
 VM_PREFIX="bench-aksh"

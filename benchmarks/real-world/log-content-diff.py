@@ -12,7 +12,7 @@ Usage:
   python3 log-content-diff.py --official-flows path/to/official/latest --aksh-flows path/to/aksh/latest
 
   # Batch compare all scenarios with flow captures
-  python3 log-content-diff.py --batch --flows-root benchmarks/real-world/results/runner-flow
+  python3 log-content-diff.py --batch --flows-root benchmarks/compatibility/runner/protocol
 """
 from __future__ import annotations
 
@@ -460,10 +460,10 @@ def main() -> int:
     p.add_argument("--aksh-flows", type=Path, help="Aksh MITM capture directory")
     p.add_argument("--batch", action="store_true", help="Batch compare all scenarios")
     p.add_argument("--flows-root", type=Path,
-                   default=Path("benchmarks/real-world/results/runner-flow"),
+                   default=Path("benchmarks/compatibility/runner/protocol"),
                    help="Root directory for flow captures")
     p.add_argument("-o", "--output", type=Path,
-                   default=Path("benchmarks/real-world/results/LOG-CONTENT-REPORT.md"))
+                   default=Path("benchmarks/compatibility/runner/protocol/LOG-CONTENT-REPORT.md"))
     args = p.parse_args()
 
     if args.batch:
