@@ -402,22 +402,8 @@ pub fn sign_jwt_rs256(
     claims: &serde_json::Value,
     params: &dyn RsaParamsLike,
 ) -> Result<String, anyhow::Error> {
-    use rsa::pkcs1v15::SigningKey;
-    use rsa::signature::{RandomizedSigner, SignatureEncoding};
-    use sha2::Sha256;
-
     let keypair = AgentRsaKeypair::from_rsaparams(params)?;
-
-    let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_string(header)?.as_bytes());
-    let claims_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_string(claims)?.as_bytes());
-    let signing_input = format!("{header_b64}.{claims_b64}");
-
-    let signing_key = SigningKey::<Sha256>::new(keypair.private_key);
-    let mut rng = rand::thread_rng();
-    let signature = signing_key.sign_with_rng(&mut rng, signing_input.as_bytes());
-    let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
-
-    Ok(format!("{signing_input}.{sig_b64}"))
+    sign_jwt_rs256_with_key(header, claims, &keypair)
 }
 
 /// Sign a JWT with RS256 using an already-imported RSA private keypair.
