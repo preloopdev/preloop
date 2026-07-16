@@ -1,6 +1,7 @@
 //! Preloop runner client binary.
 
 use std::collections::BTreeMap;
+use std::env;
 use std::path::PathBuf;
 
 use aksh_gha_protocol::RunId;
@@ -48,6 +49,9 @@ enum Command {
         /// Secret in KEY=VALUE form. Values are redacted in JSON output.
         #[arg(long = "secret")]
         secrets: Vec<String>,
+        /// Workflow dispatch input in KEY=VALUE form (value treated as JSON, falling back to string).
+        #[arg(long = "input")]
+        inputs: Vec<String>,
         /// Enable the DAP debugger for this run.
         #[arg(long)]
         debug: bool,
@@ -80,6 +84,8 @@ enum Command {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
+    let native_api_token =
+        env::var("AKSH_SYSTEM_TOKEN").unwrap_or_else(|_| "aksh-system-token".to_owned());
     let cli = Cli::parse();
     let http = reqwest::Client::new();
 
@@ -93,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
             git_ref,
             vars,
             secrets,
+            inputs,
             debug,
             debugger_welcome_message,
         } => {
@@ -109,6 +116,17 @@ async fn main() -> anyhow::Result<()> {
                 }
                 None => serde_json::json!({}),
             };
+            let inputs: BTreeMap<String, Value> = inputs
+                .into_iter()
+                .map(|kv| {
+                    let (k, v) = kv
+                        .split_once('=')
+                        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                        .unwrap_or_else(|| (kv.clone(), String::new()));
+                    let json_val = serde_json::from_str::<Value>(&v).unwrap_or(Value::String(v));
+                    (k, json_val)
+                })
+                .collect();
             let submission = SubmitWire {
                 workflow_yaml,
                 event,
@@ -124,9 +142,11 @@ async fn main() -> anyhow::Result<()> {
                 .await?,
                 enable_debugger: debug,
                 debugger_welcome_message,
+                inputs,
             };
             let response = http
                 .post(cli.server.join("/api/v1/runs")?)
+                .bearer_auth(&native_api_token)
                 .json(&submission)
                 .send()
                 .await?
@@ -138,6 +158,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Run { run_id } => {
             print_response(
                 http.get(cli.server.join(&format!("/api/v1/runs/{run_id}"))?)
+                    .bearer_auth(&native_api_token)
                     .send()
                     .await?,
             )
@@ -146,6 +167,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Cancel { run_id } => {
             print_response(
                 http.post(cli.server.join(&format!("/api/v1/runs/{run_id}/cancel"))?)
+                    .bearer_auth(&native_api_token)
                     .send()
                     .await?,
             )
@@ -154,6 +176,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Rerun { run_id } => {
             print_response(
                 http.post(cli.server.join(&format!("/api/v1/runs/{run_id}/rerun"))?)
+                    .bearer_auth(&native_api_token)
                     .send()
                     .await?,
             )
@@ -165,6 +188,7 @@ async fn main() -> anyhow::Result<()> {
                     cli.server
                         .join(&format!("/api/v1/runs/{run_id}/events.ndjson"))?,
                 )
+                .bearer_auth(&native_api_token)
                 .send()
                 .await?,
             )
@@ -199,6 +223,8 @@ struct SubmitWire {
     reusable_workflows: BTreeMap<String, String>,
     enable_debugger: bool,
     debugger_welcome_message: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    inputs: BTreeMap<String, Value>,
 }
 
 async fn collect_reusable_workflows(

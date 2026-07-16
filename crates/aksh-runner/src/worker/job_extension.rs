@@ -602,12 +602,13 @@ pub fn build_step_list_with_lifecycle(
         let StepType::Action { ref uses, ref with } = step.step_type else {
             continue;
         };
+        let is_local_action = uses.starts_with("./") || uses.starts_with("../");
 
         // Resolve the action directory. Prefer the SHA-pinned path discovered
         // during the setup/download phase; fall back to local action paths.
         let action_dir = if let Some(path) = action_paths.get(uses) {
             std::path::PathBuf::from(path)
-        } else if uses.starts_with("./") || uses.starts_with("../") {
+        } else if is_local_action {
             std::path::Path::new(workspace).join(uses)
         } else {
             continue;
@@ -621,30 +622,36 @@ pub fn build_step_list_with_lifecycle(
             continue;
         }
 
-        // Pre step
-        if let Some(pre_main) = &manifest.runs_pre {
-            let pre_if = manifest.runs_pre_if.as_deref().unwrap_or("always()");
-            let pre_context = format!("__pre_{}", step.context_name);
-            let pre_id = format!("__pre_{}", step.id);
-            pre_steps.push(Step {
-                id: pre_id,
-                context_name: pre_context,
-                display_name: format!("Pre {}", step.display_name),
-                step_type: StepType::Action {
-                    uses: uses.clone(),
-                    with: with_internal_entry(with, pre_main),
-                },
-                condition: Some(pre_if.to_string()),
-                continue_on_error: step.continue_on_error,
-                timeout_minutes: step.timeout_minutes,
-                env: step.env.clone(),
-                raw: serde_json::json!({
-                    "__pre": true,
-                    "__pre_main": pre_main,
-                    "uses": uses,
-                }),
-                is_background: false,
-            });
+        // ActionRunner.RunAsync warns that pre is unsupported for local self actions;
+        // post cleanup is still registered. Keep this aligned with the pinned source
+        // (ActionRunner.cs, `RunAsync`, lines 105-110).
+        // https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/ActionRunner.cs#L105-L110
+        if !is_local_action {
+            // Pre step
+            if let Some(pre_main) = &manifest.runs_pre {
+                let pre_if = manifest.runs_pre_if.as_deref().unwrap_or("always()");
+                let pre_context = format!("__pre_{}", step.context_name);
+                let pre_id = format!("__pre_{}", step.id);
+                pre_steps.push(Step {
+                    id: pre_id,
+                    context_name: pre_context,
+                    display_name: format!("Pre {}", step.display_name),
+                    step_type: StepType::Action {
+                        uses: uses.clone(),
+                        with: with_internal_entry(with, pre_main),
+                    },
+                    condition: Some(pre_if.to_string()),
+                    continue_on_error: step.continue_on_error,
+                    timeout_minutes: step.timeout_minutes,
+                    env: step.env.clone(),
+                    raw: serde_json::json!({
+                        "__pre": true,
+                        "__pre_main": pre_main,
+                        "uses": uses,
+                    }),
+                    is_background: false,
+                });
+            }
         }
 
         // Post step (will be reversed into LIFO)
@@ -932,6 +939,7 @@ fn orphan_pids_with_tracking_id(needle: &str) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn inject_github_env_sets_core_vars() {
@@ -1289,6 +1297,73 @@ runs:
     }
 
     #[test]
+    fn lifecycle_local_actions_skip_pre_but_retain_main_and_post() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let workspace = temp.path().join("_work/repo/repo");
+        let local_dir = workspace.join(".github/actions/local");
+        let remote_dir = temp
+            .path()
+            .join("_work/_actions/actions/remote/0123456789abcdef");
+        std::fs::create_dir_all(&local_dir).unwrap();
+        std::fs::create_dir_all(&remote_dir).unwrap();
+        let manifest = "name: lifecycle\nruns:\n  using: node20\n  main: main.js\n  pre: pre.js\n  post: post.js\n";
+        std::fs::write(local_dir.join("action.yml"), manifest).unwrap();
+        std::fs::write(remote_dir.join("action.yml"), manifest).unwrap();
+
+        let action_step = |id: &str, uses: &str| Step {
+            id: id.into(),
+            context_name: id.into(),
+            display_name: id.into(),
+            step_type: StepType::Action {
+                uses: uses.into(),
+                with: serde_json::json!({}),
+            },
+            condition: Some("success()".into()),
+            continue_on_error: false,
+            timeout_minutes: None,
+            env: std::collections::HashMap::new(),
+            raw: serde_json::json!({}),
+            is_background: false,
+        };
+        let main_steps = vec![
+            action_step("local", "./.github/actions/local"),
+            action_step("remote", "actions/remote@v1"),
+        ];
+        let mut action_paths = std::collections::HashMap::new();
+        action_paths.insert(
+            "actions/remote@v1".to_string(),
+            remote_dir.to_string_lossy().to_string(),
+        );
+
+        let ordered =
+            build_step_list_with_lifecycle(main_steps, workspace.to_str().unwrap(), &action_paths);
+
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|step| step.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "__pre_remote",
+                "local",
+                "remote",
+                "__post_remote",
+                "__post_local",
+            ]
+        );
+        assert!(matches!(
+            &ordered[0].step_type,
+            StepType::Action { with, .. }
+                if with.get("__aksh_entry").and_then(|v| v.as_str()) == Some("pre.js")
+        ));
+        assert!(matches!(
+            &ordered[4].step_type,
+            StepType::Action { with, .. }
+                if with.get("__aksh_entry").and_then(|v| v.as_str()) == Some("post.js")
+        ));
+    }
+
+    #[test]
     fn lifecycle_registers_docker_action_pre_and_post() {
         let temp = tempfile::TempDir::new().unwrap();
         let workspace = temp.path().join("_work/repo/repo");
@@ -1349,6 +1424,444 @@ runs:
                 if with.get("__aksh_entry").and_then(|v| v.as_str()) == Some("post-entrypoint.sh")
         ));
         assert_eq!(ordered[2].condition.as_deref(), Some("always()"));
+    }
+
+    #[derive(Clone, Debug)]
+    struct LifecycleSpec {
+        has_pre: bool,
+        has_post: bool,
+        explicit_pre_if: bool,
+        explicit_post_if: bool,
+        supported: bool,
+        manifest_present: bool,
+        local: bool,
+        metadata: String,
+        continue_on_error: bool,
+        timeout_minutes: Option<u64>,
+    }
+
+    fn lifecycle_config() -> ProptestConfig {
+        use proptest::test_runner::{FileFailurePersistence, RngSeed};
+        let mut config =
+            ProptestConfig::with_failure_persistence(FileFailurePersistence::default());
+        config.cases = 1_000;
+        config.rng_seed = RngSeed::Fixed(20260714);
+        config.verbose = 1;
+        config
+    }
+
+    fn arb_lifecycle_specs() -> impl Strategy<Value = Vec<LifecycleSpec>> {
+        proptest::collection::vec(
+            (
+                any::<bool>(),
+                any::<bool>(),
+                any::<bool>(),
+                any::<bool>(),
+                any::<bool>(),
+                any::<bool>(),
+                any::<bool>(),
+                "[a-zA-Z0-9_-]{1,16}",
+                any::<bool>(),
+                prop::option::of(1u64..=30),
+            ),
+            0..=5,
+        )
+        .prop_map(
+            |items: Vec<(
+                bool,
+                bool,
+                bool,
+                bool,
+                bool,
+                bool,
+                bool,
+                String,
+                bool,
+                Option<u64>,
+            )>| {
+                items
+                    .into_iter()
+                    .map(
+                        |(
+                            has_pre,
+                            has_post,
+                            explicit_pre_if,
+                            explicit_post_if,
+                            supported,
+                            manifest_present,
+                            local,
+                            metadata,
+                            continue_on_error,
+                            timeout_minutes,
+                        )| LifecycleSpec {
+                            has_pre,
+                            has_post,
+                            explicit_pre_if,
+                            explicit_post_if,
+                            supported,
+                            manifest_present,
+                            local,
+                            metadata,
+                            continue_on_error,
+                            timeout_minutes,
+                        },
+                    )
+                    .collect()
+            },
+        )
+    }
+
+    fn arb_no_lifecycle_specs() -> impl Strategy<Value = Vec<LifecycleSpec>> {
+        proptest::collection::vec(
+            (
+                any::<bool>(),
+                any::<bool>(),
+                "[a-zA-Z0-9_-]{1,16}",
+                any::<bool>(),
+                prop::option::of(1u64..=30),
+            ),
+            0..=5,
+        )
+        .prop_map(|items: Vec<(bool, bool, String, bool, Option<u64>)>| {
+            items
+                .into_iter()
+                .map(
+                    |(
+                        supported,
+                        manifest_present,
+                        metadata,
+                        continue_on_error,
+                        timeout_minutes,
+                    )| {
+                        LifecycleSpec {
+                            has_pre: false,
+                            has_post: false,
+                            explicit_pre_if: false,
+                            explicit_post_if: false,
+                            supported,
+                            manifest_present,
+                            local: false,
+                            metadata,
+                            continue_on_error,
+                            timeout_minutes,
+                        }
+                    },
+                )
+                .collect()
+        })
+    }
+
+    fn lifecycle_fixture(
+        specs: &[LifecycleSpec],
+    ) -> (
+        tempfile::TempDir,
+        String,
+        std::collections::HashMap<String, String>,
+        Vec<Step>,
+    ) {
+        let temp = tempfile::TempDir::new().unwrap();
+        let workspace = temp.path().join("workspace");
+        let mut action_paths = std::collections::HashMap::new();
+        let mut main_steps = Vec::with_capacity(specs.len());
+
+        for (index, spec) in specs.iter().enumerate() {
+            let uses = if spec.local {
+                format!("./.github/actions/generated-{index}")
+            } else {
+                format!("actions/generated-{index}@v1")
+            };
+            let action_dir = temp.path().join(format!("action-{index}"));
+            if spec.manifest_present {
+                std::fs::create_dir_all(&action_dir).unwrap();
+                let using = if spec.supported { "node20" } else { "node6" };
+                let mut manifest =
+                    format!("name: generated-{index}\nruns:\n  using: {using}\n  main: main.js\n");
+                if spec.has_pre {
+                    manifest.push_str("  pre: pre.js\n");
+                    if spec.explicit_pre_if {
+                        manifest.push_str("  pre-if: failure()\n");
+                    }
+                }
+                if spec.has_post {
+                    manifest.push_str("  post: post.js\n");
+                    if spec.explicit_post_if {
+                        manifest.push_str("  post-if: cancelled()\n");
+                    }
+                }
+                std::fs::write(action_dir.join("action.yml"), manifest).unwrap();
+                action_paths.insert(uses.clone(), action_dir.to_string_lossy().to_string());
+            } else if spec.supported {
+                // An explicit, nonexistent path exercises the missing-manifest branch.
+                action_paths.insert(
+                    uses.clone(),
+                    temp.path()
+                        .join(format!("missing-{index}"))
+                        .to_string_lossy()
+                        .to_string(),
+                );
+            }
+
+            let mut env = std::collections::HashMap::new();
+            env.insert("META".to_string(), spec.metadata.clone());
+            main_steps.push(Step {
+                id: format!("step-{index}"),
+                context_name: format!("context-{index}"),
+                display_name: format!("Generated {index}"),
+                step_type: StepType::Action {
+                    uses,
+                    with: serde_json::json!({"input": spec.metadata}),
+                },
+                condition: Some(if spec.continue_on_error {
+                    "always()".to_string()
+                } else {
+                    "success()".to_string()
+                }),
+                continue_on_error: spec.continue_on_error,
+                timeout_minutes: spec.timeout_minutes,
+                env,
+                raw: serde_json::json!({"generated": index, "metadata": spec.metadata}),
+                is_background: index % 2 == 0,
+            });
+        }
+
+        (
+            temp,
+            workspace.to_string_lossy().to_string(),
+            action_paths,
+            main_steps,
+        )
+    }
+
+    fn lifecycle_is_materialized(spec: &LifecycleSpec) -> bool {
+        spec.manifest_present && spec.supported
+    }
+
+    fn lifecycle_has_pre(spec: &LifecycleSpec) -> bool {
+        lifecycle_is_materialized(spec) && spec.has_pre && !spec.local
+    }
+
+    fn assert_metadata_preserved(source: &Step, generated: &Step, post: bool) {
+        assert_eq!(
+            generated.context_name,
+            format!(
+                "__{}{}",
+                if post { "post_" } else { "pre_" },
+                source.context_name
+            )
+        );
+        assert_eq!(
+            generated.display_name,
+            format!(
+                "{} {}",
+                if post { "Post" } else { "Pre" },
+                source.display_name
+            )
+        );
+        assert_eq!(generated.timeout_minutes, source.timeout_minutes);
+        assert_eq!(generated.env, source.env);
+        assert_eq!(generated.is_background, false);
+        assert_eq!(
+            generated.continue_on_error,
+            if post { true } else { source.continue_on_error }
+        );
+        assert_eq!(
+            generated.raw.get(if post { "__post" } else { "__pre" }),
+            Some(&serde_json::Value::Bool(true))
+        );
+        match (&source.step_type, &generated.step_type) {
+            (
+                StepType::Action {
+                    uses: source_uses,
+                    with: source_with,
+                },
+                StepType::Action {
+                    uses: generated_uses,
+                    with: generated_with,
+                },
+            ) => {
+                assert_eq!(generated_uses, source_uses);
+                assert_eq!(generated_with.get("input"), source_with.get("input"));
+                assert_eq!(
+                    generated_with
+                        .get("__aksh_entry")
+                        .and_then(|value| value.as_str()),
+                    Some(if post { "post.js" } else { "pre.js" })
+                );
+            }
+            _ => panic!("lifecycle step changed action type"),
+        }
+    }
+
+    // Oracle: ActionManager.PrepareActionsRecursiveAsync pre/post registration and stack order
+    // (lines 301-360), plus ActionRunner.RunAsync lifecycle stage registration (lines 79-105).
+    // https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/ActionManager.cs#L301-L360
+    // https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/ActionRunner.cs#L79-L110
+    proptest! {
+        #![proptest_config(lifecycle_config())]
+
+        #[test]
+        fn lifecycle_order_conditions_and_unique_ids(specs in arb_lifecycle_specs()) {
+            let (_temp, workspace, action_paths, main_steps) = lifecycle_fixture(&specs);
+            let result = build_step_list_with_lifecycle(main_steps.clone(), &workspace, &action_paths);
+
+            let expected_pre: Vec<String> = specs
+                .iter()
+                .enumerate()
+                .filter(|(_, spec)| lifecycle_has_pre(spec))
+                .map(|(i, _)| format!("__pre_step-{i}"))
+                .collect();
+            let expected_post: Vec<String> = specs
+                .iter()
+                .enumerate()
+                .filter(|(_, spec)| lifecycle_is_materialized(spec) && spec.has_post)
+                .map(|(i, _)| format!("__post_step-{i}"))
+                .rev()
+                .collect();
+            let pre_count = expected_pre.len();
+            let post_count = expected_post.len();
+            prop_assert_eq!(result.len(), pre_count + main_steps.len() + post_count);
+            prop_assert_eq!(
+                result[..pre_count].iter().map(|step| step.id.clone()).collect::<Vec<_>>(),
+                expected_pre,
+            );
+            prop_assert_eq!(
+                result[pre_count..pre_count + main_steps.len()]
+                    .iter()
+                    .map(|step| step.id.clone())
+                    .collect::<Vec<_>>(),
+                main_steps.iter().map(|step| step.id.clone()).collect::<Vec<_>>(),
+            );
+            prop_assert_eq!(
+                result[pre_count + main_steps.len()..]
+                    .iter()
+                    .map(|step| step.id.clone())
+                    .collect::<Vec<_>>(),
+                expected_post,
+            );
+
+            for (position, step) in result.iter().enumerate() {
+                if let Some(index) = step.id.strip_prefix("__pre_step-").and_then(|s| s.parse::<usize>().ok()) {
+                    let spec = &specs[index];
+                    prop_assert_eq!(step.condition.as_deref(), Some(if spec.explicit_pre_if { "failure()" } else { "always()" }));
+                } else if let Some(index) = step.id.strip_prefix("__post_step-").and_then(|s| s.parse::<usize>().ok()) {
+                    let spec = &specs[index];
+                    prop_assert_eq!(step.condition.as_deref(), Some(if spec.explicit_post_if { "cancelled()" } else { "always()" }));
+                }
+                prop_assert!(result[..position].iter().all(|previous| previous.id != step.id));
+            }
+        }
+    }
+
+    // Oracle: ActionManager.PrepareActionsAsync only tracks resolved actions with lifecycle
+    // definitions (lines 301-360); ActionRunner.RunAsync preserves action-step metadata while
+    // selecting a lifecycle Stage (lines 79-105).
+    // https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/ActionManager.cs#L301-L360
+    // https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/ActionRunner.cs#L79-L110
+    proptest! {
+        #![proptest_config(lifecycle_config())]
+
+        #[test]
+        fn lifecycle_steps_preserve_main_metadata(specs in arb_lifecycle_specs()) {
+            let (_temp, workspace, action_paths, main_steps) = lifecycle_fixture(&specs);
+            let result = build_step_list_with_lifecycle(main_steps.clone(), &workspace, &action_paths);
+            for (index, step) in main_steps.iter().enumerate() {
+                if lifecycle_has_pre(&specs[index]) {
+                    let generated = result.iter().find(|candidate| candidate.id == format!("__pre_step-{index}")).unwrap();
+                    assert_metadata_preserved(step, generated, false);
+                }
+                if lifecycle_is_materialized(&specs[index]) && specs[index].has_post {
+                    let generated = result.iter().find(|candidate| candidate.id == format!("__post_step-{index}")).unwrap();
+                    assert_metadata_preserved(step, generated, true);
+                }
+            }
+        }
+
+        #[test]
+        fn no_lifecycle_is_identity(specs in arb_no_lifecycle_specs()) {
+            let (_temp, workspace, action_paths, main_steps) = lifecycle_fixture(&specs);
+            let result = build_step_list_with_lifecycle(main_steps.clone(), &workspace, &action_paths);
+            prop_assert_eq!(result.len(), main_steps.len());
+            for (actual, expected) in result.iter().zip(main_steps.iter()) {
+                prop_assert_eq!(&actual.id, &expected.id);
+                prop_assert_eq!(&actual.context_name, &expected.context_name);
+                prop_assert_eq!(&actual.display_name, &expected.display_name);
+                prop_assert_eq!(&actual.condition, &expected.condition);
+                prop_assert_eq!(actual.continue_on_error, expected.continue_on_error);
+                prop_assert_eq!(actual.timeout_minutes, expected.timeout_minutes);
+                prop_assert_eq!(&actual.env, &expected.env);
+                prop_assert_eq!(&actual.raw, &expected.raw);
+                match (&actual.step_type, &expected.step_type) {
+                    (StepType::Action { uses: actual_uses, with: actual_with }, StepType::Action { uses: expected_uses, with: expected_with }) => {
+                        prop_assert_eq!(actual_uses, expected_uses);
+                        prop_assert_eq!(actual_with, expected_with);
+                    }
+                    _ => prop_assert!(false, "identity changed action type"),
+                }
+                prop_assert_eq!(actual.is_background, expected.is_background);
+            }
+        }
+    }
+
+    // Oracle: ActionManager.PrepareActionsAsync resolves action manifests before lifecycle
+    // registration and skips actions that cannot provide a definition (lines 301-360).
+    // https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/ActionManager.cs#L301-L360
+    #[test]
+    fn mixed_lifecycle_regression_does_not_invent_steps() {
+        let specs = vec![
+            LifecycleSpec {
+                has_pre: true,
+                has_post: true,
+                explicit_pre_if: false,
+                explicit_post_if: false,
+                supported: true,
+                manifest_present: true,
+                local: false,
+                metadata: "supported".into(),
+                continue_on_error: false,
+                timeout_minutes: Some(7),
+            },
+            LifecycleSpec {
+                has_pre: true,
+                has_post: true,
+                explicit_pre_if: true,
+                explicit_post_if: true,
+                supported: false,
+                manifest_present: true,
+                metadata: "unsupported".into(),
+                local: false,
+                continue_on_error: true,
+                timeout_minutes: None,
+            },
+            LifecycleSpec {
+                has_pre: true,
+                has_post: true,
+                explicit_pre_if: true,
+                explicit_post_if: true,
+                supported: true,
+                manifest_present: false,
+                metadata: "missing".into(),
+                local: false,
+                continue_on_error: false,
+                timeout_minutes: Some(1),
+            },
+        ];
+        let (_temp, workspace, action_paths, main_steps) = lifecycle_fixture(&specs);
+        let result = build_step_list_with_lifecycle(main_steps, &workspace, &action_paths);
+        assert_eq!(
+            result
+                .iter()
+                .map(|step| step.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "__pre_step-0",
+                "step-0",
+                "step-1",
+                "step-2",
+                "__post_step-0",
+            ]
+        );
+        assert_eq!(result[0].condition.as_deref(), Some("always()"));
+        assert_eq!(result[4].condition.as_deref(), Some("always()"));
     }
 
     #[test]

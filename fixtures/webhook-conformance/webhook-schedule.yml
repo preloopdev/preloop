@@ -1,0 +1,12 @@
+name: Webhook Schedule
+on:
+  schedule:
+    - cron: '0 0 * * *'  # daily at midnight, won't actually fire in test
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log event
+        run: |
+          echo "EVENT: schedule"
+          echo "SCHEDULE: ${{ github.event.schedule }}"
