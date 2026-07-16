@@ -6,7 +6,7 @@ This document set breaks the updated Preloop plan into logical areas that can be
 
 1. [Product Strategy and Operating Modes](01_product_strategy_and_modes.md)
 2. [Aksh Runner and Control Plane](02_aksh_runner_control_plane.md)
-3. [MicroVM Isolation and Krun Runtime](03_microvm_isolation_and_krun_runtime.md)
+3. [MicroVM Isolation and the smolvm Runtime](03_microvm_isolation_and_smolvm_runtime.md)
 4. [Guest Agent, Workspace, and Filesystem](04_guest_agent_workspace_filesystem.md)
 5. [Docker, Services, and Container Actions](05_docker_services_container_actions.md)
 6. [Security Policy and Trust Tiers](06_security_policy_trust_tiers.md)
@@ -16,6 +16,9 @@ This document set breaks the updated Preloop plan into logical areas that can be
 10. [GitHub App, Self-Hosted, and Managed CI](10_github_app_self_hosted_managed_ci.md)
 11. [Roadmap, Milestones, and Risk Register](11_roadmap_milestones_and_risks.md)
 12. [Rust Engineering Standards](12_rust_engineering_standards.md)
+13. [Rosetta x86_64 and CI Performance](13_rosetta_x86_64_and_ci_performance.md)
+14. [Runtime Tiers and Portable Handoff](14_runtime_tiers_and_portable_handoff.md)
+15. [CI Efficiency Levers](15_ci_efficiency_levers.md)
 
 ## Source context used
 
@@ -31,11 +34,12 @@ These documents synthesize:
   - `docs/github-app-webhook.md`
   - `.runner-watch/golden/v2.335.1/*`
   - the Rust workspace `Cargo.toml` and crate layout.
-- The updated direction: Aksh should become the Rust-native runner/control-plane core, while official runner and `ChristopherHX/runner.server` remain conformance oracles and optional fallback modes.
+- The updated direction: Aksh is the Rust-native runner/control-plane core; official runner and `ChristopherHX/runner.server` remain conformance oracles and optional fallback modes.
+- [smolvm](https://github.com/preloopdev/smolvm): the libkrun-backed microVM substrate Preloop consumes (not reimplements) for the Local and smolvm-KVM tiers, plus Firecracker for the scale tier.
 
 ## One-sentence architecture
 
-Preloop is a macOS-first, Linux-capable local, self-hosted, and managed CI platform that uses Aksh as a Rust-native GitHub Actions-compatible runner/control plane and libkrun-backed Linux microVMs as the execution boundary for fast, isolated, agent-native jobs.
+Preloop is a macOS-first, Linux-capable local, self-hosted, and managed CI platform that uses Aksh as a Rust-native GitHub Actions-compatible runner/control plane over interchangeable microVM executors — **smolvm** (libkrun) for the local and smolvm-KVM tiers and **Firecracker** for the production scale tier — as the execution boundary for fast, isolated, agent-native jobs.
 
 ## Top-level components
 
@@ -54,17 +58,20 @@ preloopd
   +-- preloop-cache             # actions, OCI, toolchain, package, artifacts
   +-- preloop-github            # GitHub App, webhooks, Checks API
   +-- preloop-conformance       # differential behavior gates
-  +-- preloop-krun              # libkrun runtime, host jail, guest agent
+  +-- preloop-vm                # VmProvider seam over executors:
+  |     +-- SmolvmProvider      #   smolvm CLI/HTTP/SDK (Local + smolvm-KVM tiers)
+  |     +-- FirecrackerProvider #   Firecracker API + jailer (scale tier)
+  +-- preloop-guest             # static guest agent (runtime-agnostic)
 ```
 
 ## Product modes
 
 | Mode | User | Trust model | Runtime default | Main success metric |
 |---|---|---|---|---|
-| Local developer CI | human on macOS/Linux | mostly trusted, but unsafe code can exist | libkrun VM, ergonomic defaults | edit-to-verdict latency |
-| Local agent loop | Codex/Claude/Cursor | agent-generated code is untrusted | stricter network/secrets/cache defaults | safe red/green loop |
-| Self-hosted CI | team-owned worker | untrusted PRs and internal branches | hardened Linux libkrun worker | clean ephemeral job execution |
-| Managed CI | Preloop SaaS | hostile multi-tenant code | jailed libkrun workers, tenant isolation | security, reliability, cost/perf |
+| Local developer CI | human on macOS/Linux/Windows | mostly trusted, but unsafe code can exist | smolvm VM, ergonomic defaults | edit-to-verdict latency |
+| Local agent loop | Codex/Claude/Cursor | agent-generated code is untrusted | smolvm, stricter network/secrets/cache defaults | safe red/green loop |
+| Self-hosted CI | team-owned worker | untrusted PRs and internal branches | smolvm-KVM (jailed) or Firecracker worker | clean ephemeral job execution |
+| Managed CI | Preloop SaaS | hostile multi-tenant code | Firecracker (jailer) primary; smolvm-KVM option | security, reliability, cost/perf |
 
 ## Non-negotiables
 

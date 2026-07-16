@@ -5,7 +5,7 @@
 Do not start by building everything. First prove the four hardest truths:
 
 1. Aksh can conform closely enough to real runner behavior.
-2. libkrun can host the job environment on macOS and Linux.
+2. smolvm can host the job environment across tiers (macOS, Linux/KVM), and Firecracker can host the scale tier.
 3. private Docker/services work inside the chosen VM profile.
 4. untrusted code policies are enforceable in self-hosted/managed mode.
 
@@ -75,48 +75,48 @@ cache/artifact roundtrip passes
 cancellation mid-step kills process tree
 ```
 
-## Phase 3 — libkrun substrate, 2 weeks
+## Phase 3 — smolvm integration, 2 weeks
 
-Goal: prove VM control independent of Actions.
+Goal: drive the smolvm substrate from Preloop; prove VM control independent of Actions.
 
 Tasks:
 
-- Implement DirectLibkrunRuntime smoke path.
-- Boot Linux guest on Apple Silicon.
-- Boot Linux guest on Linux/KVM.
-- Build static guest agent.
-- Implement exec, PTY shell, health check.
-- Implement read-only workspace mount.
-- Implement overlay setup.
-- Implement cleanup/reaper.
+- Implement the `VmProvider` seam and `SmolvmProvider` (smolvm CLI/HTTP API/SDK).
+- Boot from OCI image and `.smolmachine` on Apple Silicon and Linux/KVM.
+- Wire exec, PTY shell (`machine shell`), health check, and `machine cp`.
+- Working-tree delta sync onto the ext4 storage disk (uncommitted changes).
+- Snapshot/fork: `pack create --from-vm`, `machine create --from`, `machine fork`.
+- Cleanup/reaper: no zombie VMM, no leaked disk images.
 
 Exit criteria:
 
 ```text
-preloop vm exec -- echo hello
-preloop vm shell <vm>
-preloop vm mount-ro . /host_ro
-preloop vm overlay --mode hybrid
-preloop vm reap reports clean shutdown
+smolvm boot + exec via VmProvider prints hello
+preloop shell attaches over vsock
+machine cp delta sync round-trips
+pack create --from-vm && machine create --from boots warm
+reap reports clean shutdown
 ```
 
-## Phase 4 — Docker substrate gate, 1 week
+## Phase 4 — Docker-in-smolvm gate + Firecracker bringup, 1–2 weeks
 
-Goal: choose the runtime path honestly.
+Goal: validate container workloads on smolvm and stand up the scale tier behind the same seam.
 
 Tasks:
 
-- Test microsandbox with private Docker.
-- Test direct libkrun with custom rootfs/kernel.
-- Test dockerd, BuildKit, docker build, docker run, Postgres service.
-- Measure boot-to-Docker-ready and cleanup reliability.
+- Test dockerd/BuildKit/docker build/docker run/Postgres service inside smolvm (macOS + Linux/KVM).
+- Confirm smolvm libkrunfw kernel/rootfs has the required configs; escalate gaps upstream to the tier image.
+- Implement `FirecrackerProvider` behind `VmProvider`; boot/exec/stream/reap under the jailer; pass P0.
+- Validate portable handoff: local `pack create --from-vm` → resume on a smolvm-KVM host with warm cache.
+- Measure boot-to-Docker-ready and cleanup reliability per tier.
 
 Exit criteria:
 
 ```text
-chosen local alpha runtime
-chosen self-hosted/managed runtime
-Docker gate memo committed
+Docker gate passes on smolvm (both hosts) or emits classified unsupported
+FirecrackerProvider passes P0 behind the seam
+pack handoff resumes remotely with cache intact
+Docker + tier gate memo committed
 ```
 
 ## Phase 5 — Aksh inside microVM, 2 weeks
@@ -137,7 +137,7 @@ Exit criteria:
 
 ```text
 preloop run .github/workflows/ci.yml --engine aksh
-P0 conformance passes inside libkrun VM
+P0 conformance passes inside a smolvm microVM
 preloop shell attaches after failure
 preloop retry --job works
 ```
@@ -207,6 +207,7 @@ Tasks:
 - Ephemeral VM per job.
 - Worker health and cleanup proof.
 - Labels/resources/scheduling.
+- Portable handoff: `pack create --from-vm` → resume on a remote smolvm-KVM worker (see doc 14).
 
 Exit criteria:
 
@@ -226,6 +227,7 @@ Tasks:
 
 - Tenant isolation.
 - Worker pool design.
+- Firecracker jailer worker fleet (primary scale runtime); smolvm-KVM option.
 - Host recycling.
 - Cache/artifact isolation.
 - Object storage policies.
@@ -251,11 +253,11 @@ security review completed
 | Risk | Severity | Mitigation |
 |---|---:|---|
 | Aksh drifts from GitHub semantics | Very high | Conformance against GitHub, official runner, and runner.server |
-| Private Docker fails in chosen guest | Very high | Week-one Docker gate; direct libkrun/custom kernel escape hatch |
+| Private Docker fails in guest | Very high | Docker-in-smolvm gate; fix libkrunfw kernel config in the tier image; Firecracker tier as alternate |
 | Managed CI security underestimated | Very high | Hardened Linux jail, tenant isolation, malicious corpus, security review |
 | Container/service support remains partial | Very high | Make services/container actions release gates |
 | Local shortcuts leak into production | High | Separate local/self-hosted/managed configs and stores |
-| libkrun host-resource exposure | High | Host jail, no host home, path allowlists, seccomp/cgroups |
+| VMM host-resource exposure | High | tier host jail (smolvm-KVM launcher / Firecracker jailer), no host home, path allowlists, seccomp/cgroups |
 | Cache poisoning | High | Trust-tier namespaces, quarantine, write-on-success |
 | Secrets leak through logs/artifacts | High | redaction-safe types, masking pipeline, tests |
 | Network exfiltration | High | off/allowlist/proxy, audit, metadata block |
@@ -268,8 +270,8 @@ security review completed
 1. Generate Aksh feature truth table.
 2. Finish conformance harness P0.
 3. Wire or hard-fail container/service support.
-4. Implement direct libkrun smoke test.
-5. Run Docker gate.
+4. Wire the `VmProvider` seam over smolvm (boot/exec/shell/cp/snapshot/fork).
+5. Run the Docker-in-smolvm gate and stand up the Firecracker provider.
 6. Expand NDJSON events.
 7. Start trust-tier policy engine.
 8. Create malicious workflow corpus.

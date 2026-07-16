@@ -63,20 +63,29 @@ Classify failures so agents do not waste loops:
 | Retry | Meaning | Fidelity | Speed | Use |
 |---|---|---:|---:|---|
 | `retry-step` | re-run failed step in same live VM after edits | medium | fastest | default local agent loop |
-| `retry-from-checkpoint` | restore disk checkpoint and run from step boundary | high | fast | state drift suspected |
-| `retry-job` | re-run whole job with warm image/cache | high | medium | before wider confidence |
+| `retry-from-checkpoint` | restore a `machine fork`/snapshot and run from the step boundary | high | fast | state drift suspected |
+| `retry-job` | re-run the whole job from a warm `.smolmachine` (cache intact) | high | medium | before wider confidence |
 | `retry-clean` | new VM, clean overlay, strict policy | highest | slowest | final verification |
-| `fork-from-failure` | N CoW clones from checkpoint trying fixes in parallel | high | fast-ish | speculative agents |
+| `fork-from-failure` | N `machine fork` CoW clones from the failed VM, trying fixes in parallel | high | fast-ish | speculative agents |
 
 ## Fork-from-failure semantics
 
-Do not describe fork as live-memory fork unless libkrun actually supports it. In Preloop terms:
+smolvm provides real snapshot/fork primitives, so this is more than "re-exec from
+a step boundary." In Preloop terms:
 
 ```text
-fork-from-failure = disk CoW checkpoint + re-exec from step boundary
+fork-from-failure = smolvm `machine fork` (CoW clone, macOS/Linux) from the failed VM,
+                    or resume from a `pack create --from-vm` .smolmachine snapshot
 ```
 
-This is still useful because each branch starts from the same on-disk state, cache state, and workflow progress.
+Each branch starts from the same warm on-disk state, cache, and workflow
+progress. This is on-disk state, not live process RAM; Windows has no
+fork/snapshot, so fall back to rebuilding from the warm image.
+
+The same failure checkpoint can be handed off remotely: pack the failed VM and
+resume the agent loop on a smolvm-KVM host (see
+[doc 14](14_runtime_tiers_and_portable_handoff.md)). Secrets are re-resolved
+remotely and never travel in the pack.
 
 ## Agent event stream
 
@@ -138,7 +147,7 @@ The agent should receive a compact bundle, not raw megabytes of logs:
 
 ## Shell attach
 
-Debug shell should use vsock/console, not SSH.
+Debug shell uses smolvm `machine shell` (vsock PTY, auto-starts the VM), not SSH.
 
 ```text
 preloop shell <run-id> --job test

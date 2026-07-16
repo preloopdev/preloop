@@ -13,13 +13,16 @@
     "secrets_inherit": false,
     "steps": [
       {
+        "continue_on_error": null,
         "env": {},
         "id": null,
         "if_condition": null,
         "name": null,
         "run": "echo build",
+        "shell": null,
         "uses": null,
-        "with": {}
+        "with": {},
+        "working_directory": null
       }
     ]
   },
@@ -37,13 +40,16 @@
     "secrets_inherit": false,
     "steps": [
       {
+        "continue_on_error": null,
         "env": {},
         "id": null,
         "if_condition": null,
         "name": null,
         "run": "echo test",
+        "shell": null,
         "uses": null,
-        "with": {}
+        "with": {},
+        "working_directory": null
       }
     ]
   },
@@ -61,13 +67,16 @@
     "secrets_inherit": false,
     "steps": [
       {
+        "continue_on_error": null,
         "env": {},
         "id": null,
         "if_condition": null,
         "name": null,
         "run": "echo deploy",
+        "shell": null,
         "uses": null,
-        "with": {}
+        "with": {},
+        "working_directory": null
       }
     ]
   }
