@@ -5,7 +5,9 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+pub mod events;
 pub mod github;
+pub mod scheduler;
 
 /// Pure job-graph scheduler model and property tests.
 pub mod scheduling;
@@ -13,7 +15,7 @@ pub mod scheduling;
 use axum_server::{tls_rustls::RustlsConfig, Handle};
 use rcgen::generate_simple_self_signed;
 
-use aksh_artifacts::ArtifactStore;
+use aksh_artifacts::{validate_artifact_name, ArtifactStore};
 use aksh_cache::CacheStore;
 use aksh_gha_parser::{expand_jobs_with_reusables, parse_workflow};
 use aksh_gha_protocol::{
@@ -66,6 +68,8 @@ pub struct ServerConfig {
     pub enable_test_api: bool,
     /// Bearer token required by privileged simulation endpoints.
     pub test_api_token: Option<String>,
+    /// Enable the cron scheduler for schedule-triggered workflows.
+    pub enable_scheduler: bool,
 }
 
 /// TLS configuration.
@@ -228,7 +232,28 @@ async fn run_background_reaper(shared: Arc<SharedState>) {
 
 /// Start the server and block until shutdown.
 pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
-    let state = AppState::new(config.state_dir.clone()).await?;
+    let mut state = AppState::new(config.state_dir.clone()).await?;
+    let shutdown = CancellationToken::new();
+    if config.enable_scheduler {
+        let scheduler = crate::scheduler::Scheduler::new();
+        state.scheduler = Some(scheduler.clone());
+        let shared_for_scan = Arc::new(SharedState {
+            state: state.clone(),
+            shutdown: shutdown.clone(),
+        });
+        let scheduler_clone = scheduler.clone();
+        if let Some(workspace) = state.local_workspace.clone() {
+            tokio::spawn(async move {
+                scheduler_clone
+                    .scan_workspace(&workspace, shared_for_scan)
+                    .await;
+            });
+        } else {
+            tokio::spawn(async move {
+                scheduler_clone.scan_remote(shared_for_scan).await;
+            });
+        }
+    }
     if let Some(path) = &config.record_flows {
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -238,7 +263,6 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
         let mut inner = state.inner.lock().await;
         inner.flows_file = Some(file);
     }
-    let shutdown = CancellationToken::new();
     let test_api_token = if config.enable_test_api {
         if !config.listen.ip().is_loopback() {
             anyhow::bail!("the test API may only be enabled on a loopback listener");
@@ -645,6 +669,7 @@ fn build_app(
             axum::routing::options(|| async { StatusCode::OK }),
         )
         .route("/api/v1/runs", post(submit_run))
+        .route("/api/v1/scheduler/history", get(get_scheduler_history))
         .route(
             "/api/v1/github/webhooks",
             post(github::handle_github_webhook),
@@ -903,10 +928,13 @@ fn verify_local_jwt(token: &str) -> bool {
     expected == parts[2]
 }
 
+/// Shared application state wrapper.
 #[derive(Clone)]
-struct SharedState {
-    state: AppState,
-    shutdown: CancellationToken,
+pub struct SharedState {
+    /// Inner application state.
+    pub state: AppState,
+    /// Cancellation token for graceful shutdown.
+    pub shutdown: CancellationToken,
 }
 
 /// Application state.
@@ -923,6 +951,8 @@ pub struct AppState {
     pub local_workspace: Option<PathBuf>,
     /// State directory for replay/log storage.
     pub state_dir: PathBuf,
+    /// Optional cron scheduler (active when `--enable-scheduler` is set).
+    pub scheduler: Option<Arc<crate::scheduler::Scheduler>>,
 }
 
 impl AppState {
@@ -968,6 +998,7 @@ impl AppState {
             webhook_secret,
             local_workspace,
             state_dir,
+            scheduler: None,
         })
     }
 
@@ -1222,21 +1253,102 @@ async fn healthz(State(shared): State<Arc<SharedState>>) -> Json<serde_json::Val
 
 pub(crate) async fn submit_run_inner(
     shared: &Arc<SharedState>,
-    submission: WorkflowSubmission,
+    mut submission: WorkflowSubmission,
 ) -> Result<RunAccepted, ApiError> {
     let workflow = parse_workflow(&submission.workflow_yaml)?;
-    let (branch, tag) = git_ref_context(&submission.git_ref);
-    let changed_paths = changed_paths_from_payload(&submission.payload);
-    let activity_type = submission
-        .payload
-        .get("action")
-        .and_then(|value| value.as_str());
+    if submission.event == "workflow_dispatch" {
+        workflow.apply_workflow_dispatch_inputs(&mut submission.payload)?;
+        if submission.dispatch_inputs.is_empty() {
+            submission.dispatch_inputs = submission
+                .payload
+                .get("inputs")
+                .and_then(serde_json::Value::as_object)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+        }
+        if submission.dispatch_inputs_stringified.is_empty() {
+            submission.dispatch_inputs_stringified = submission
+                .dispatch_inputs
+                .iter()
+                .map(|(name, value)| (name.clone(), value_to_input_string(value)))
+                .collect();
+        }
+        if let Some(object) = submission.payload.as_object_mut() {
+            object.insert(
+                "inputs".to_owned(),
+                serde_json::to_value(&submission.dispatch_inputs_stringified).unwrap_or_default(),
+            );
+        }
+    }
+    if let Some(tier) = submission.trust_tier.as_deref().and_then(|value| {
+        serde_json::from_value::<crate::events::trust_tier::TrustTier>(json!(value)).ok()
+    }) {
+        if !tier.allows_secrets() {
+            submission.secrets.clear();
+        }
+    }
+    let (branch, tag) = {
+        let (default_branch, default_tag) = git_ref_context(&submission.git_ref);
+        let filter_branch = submission.filter_branch.clone().or_else(|| {
+            if matches!(
+                submission.event.as_str(),
+                "pull_request" | "pull_request_target"
+            ) {
+                submission
+                    .payload
+                    .get("pull_request")
+                    .and_then(|pr| pr.get("base"))
+                    .and_then(|base| base.get("ref"))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
+            } else if submission.event == "workflow_run" {
+                submission
+                    .payload
+                    .get("workflow_run")
+                    .and_then(|run| run.get("head_branch"))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
+            } else {
+                None
+            }
+        });
+        if filter_branch.is_some() {
+            (filter_branch, None)
+        } else {
+            (default_branch, default_tag)
+        }
+    };
+    let payload_has_paths =
+        submission.payload.get("paths").is_some() || submission.payload.get("commits").is_some();
+    let changed_paths_known = submission.changed_paths_known || payload_has_paths;
+    let changed_paths = if submission.changed_paths_known {
+        submission.changed_paths.clone()
+    } else {
+        changed_paths_from_payload(&submission.payload)
+    };
+    if !changed_paths_known && workflow.on.has_path_filters(&submission.event) {
+        return Err(ApiError::bad_request(
+            "workflow path filters require a complete changed-file list".to_owned(),
+        ));
+    }
+    // Activity type from explicit field (set by dispatcher) or payload.action fallback.
+    let activity_owned: Option<String> = submission.activity_type.clone().or_else(|| {
+        submission
+            .payload
+            .get("action")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+    });
+    let activity_type = activity_owned.as_deref();
     if !workflow.on.matches_with_context(
         &submission.event,
         branch.as_deref(),
         tag.as_deref(),
         &changed_paths,
         activity_type,
+        &submission.workflow_run_upstream_names,
     ) {
         return Err(ApiError::bad_request(format!(
             "workflow does not match event `{}`",
@@ -1244,7 +1356,12 @@ pub(crate) async fn submit_run_inner(
         )));
     }
     let expanded = expand_jobs_with_reusables(&workflow, &submission.reusable_workflows)?;
-    let jobs = expanded.jobs;
+    let mut jobs = expanded.jobs;
+    if !submission.dispatch_inputs.is_empty() {
+        for job in &mut jobs {
+            job.inputs = submission.dispatch_inputs.clone();
+        }
+    }
     let reusable_calls = expanded.reusable_calls;
     let run_id = RunId::new();
     let repository_owner = submission
@@ -1254,27 +1371,27 @@ pub(crate) async fn submit_run_inner(
         .unwrap_or("owner")
         .to_string();
     let sha = submission
-        .payload
-        .get("after")
-        .and_then(|v| v.as_str())
+        .resolved_sha
+        .clone()
         .or_else(|| {
             submission
                 .payload
-                .get("pull_request")
-                .and_then(|pr| pr.get("head"))
-                .and_then(|h| h.get("sha"))
-                .and_then(|v| v.as_str())
+                .get("after")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
         })
         .unwrap_or_else(|| {
             if submission.git_ref.len() == 40
-                && submission.git_ref.chars().all(|c| c.is_ascii_hexdigit())
+                && submission
+                    .git_ref
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit())
             {
-                &submission.git_ref
+                submission.git_ref.clone()
             } else {
-                "0000000000000000000000000000000000000000"
+                "0000000000000000000000000000000000000000".to_owned()
             }
-        })
-        .to_string();
+        });
 
     let github = json!({
         "event_name": submission.event,
@@ -1353,6 +1470,24 @@ pub(crate) async fn submit_run_inner(
                 github_dict.insert(
                     "token".to_owned(),
                     aksh_gha_protocol::azdo::PipelineContextData::String(token),
+                );
+                let mut perms = std::collections::BTreeMap::new();
+                for perm in &[
+                    "actions",
+                    "contents",
+                    "issues",
+                    "metadata",
+                    "pull-requests",
+                    "statuses",
+                ] {
+                    perms.insert(
+                        perm.to_string(),
+                        aksh_gha_protocol::azdo::PipelineContextData::String("write".to_string()),
+                    );
+                }
+                github_dict.insert(
+                    "token_permissions".to_owned(),
+                    aksh_gha_protocol::azdo::PipelineContextData::Dict(perms),
                 );
             }
 
@@ -1478,12 +1613,31 @@ pub(crate) async fn submit_run_inner(
         })
     }
 }
-
 async fn submit_run(
     State(shared): State<Arc<SharedState>>,
     Json(submission): Json<WorkflowSubmission>,
 ) -> Result<Json<RunAccepted>, ApiError> {
     submit_run_inner(&shared, submission).await.map(Json)
+}
+
+async fn get_scheduler_history(
+    State(shared): State<Arc<SharedState>>,
+) -> Result<Json<Vec<crate::scheduler::ScheduleFire>>, ApiError> {
+    if let Some(scheduler) = &shared.state.scheduler {
+        let history = scheduler.history.lock().await.clone();
+        Ok(Json(history))
+    } else {
+        Ok(Json(vec![]))
+    }
+}
+
+fn value_to_input_string(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(value) => value.clone(),
+        serde_json::Value::Bool(value) => value.to_string(),
+        serde_json::Value::Number(value) => value.to_string(),
+        _ => value.to_string(),
+    }
 }
 
 fn git_ref_context(git_ref: &str) -> (Option<String>, Option<String>) {
@@ -2733,18 +2887,32 @@ async fn twirp_create_job_logs_metadata(
 
 // ─── Cache v2 Twirp (github.actions.results.api.v1.CacheService) ─────────────
 
+fn scoped_cache_key(key: &str, scope: Option<&str>, repository: Option<&str>) -> String {
+    format!(
+        "{}:{}\0{key}",
+        repository.unwrap_or("default"),
+        scope.unwrap_or("default")
+    )
+}
+
 #[derive(Debug, Deserialize)]
 struct CacheV2CreateRequest {
     key: String,
     version: String,
-    // metadata ignored — scope/repo_id not needed for local store
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    repository: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct CacheV2FinalizeRequest {
     key: String,
     version: String,
-    // size_bytes is informational; we measure the actual blob
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    repository: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2753,12 +2921,35 @@ struct CacheV2GetDlUrlRequest {
     version: String,
     #[serde(default)]
     restore_keys: Vec<String>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    repository: Option<String>,
 }
 
 async fn twirp_cache_v2_create(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<CacheV2CreateRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let storage_key = scoped_cache_key(
+        &request.key,
+        request.scope.as_deref(),
+        request.repository.as_deref(),
+    );
+    if shared
+        .state
+        .cache
+        .get(&storage_key, &request.version, &[])
+        .await
+        .map_err(|error| ApiError::internal(format!("cache lookup error: {error}")))?
+        .is_some()
+    {
+        return Ok(Json(json!({
+            "ok": false,
+            "signed_upload_url": "",
+            "message": "cache already exists"
+        })));
+    }
     let token = uuid::Uuid::new_v4().to_string();
     let stage_dir = shared
         .state
@@ -2769,15 +2960,32 @@ async fn twirp_cache_v2_create(
     tokio::fs::create_dir_all(&stage_dir)
         .await
         .map_err(|e| ApiError::internal(format!("failed to create cache stage dir: {e}")))?;
-    {
+    let already_reserved = {
         let mut inner = shared.state.inner.lock().await;
-        inner.cache_v2_pending.insert(
-            token.clone(),
-            CacheV2Pending {
-                key: request.key,
-                version: request.version,
-            },
-        );
+        if inner
+            .cache_v2_pending
+            .values()
+            .any(|pending| pending.key == storage_key && pending.version == request.version)
+        {
+            true
+        } else {
+            inner.cache_v2_pending.insert(
+                token.clone(),
+                CacheV2Pending {
+                    key: storage_key,
+                    version: request.version,
+                },
+            );
+            false
+        }
+    };
+    if already_reserved {
+        let _ = tokio::fs::remove_dir_all(&stage_dir).await;
+        return Ok(Json(json!({
+            "ok": false,
+            "signed_upload_url": "",
+            "message": "cache upload already reserved"
+        })));
     }
     let upload_url = format!("{}/twirp-blob/cache/{token}", public_base_url());
     info!(token, "cache v2 create entry");
@@ -2790,13 +2998,18 @@ async fn twirp_cache_v2_finalize(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<CacheV2FinalizeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let storage_key = scoped_cache_key(
+        &request.key,
+        request.scope.as_deref(),
+        request.repository.as_deref(),
+    );
     // Find the pending upload token matching key+version.
     let token = {
         let inner = shared.state.inner.lock().await;
         inner
             .cache_v2_pending
             .iter()
-            .find(|(_, p)| p.key == request.key && p.version == request.version)
+            .find(|(_, p)| p.key == storage_key && p.version == request.version)
             .map(|(k, _)| k.clone())
     }
     .ok_or_else(|| ApiError::not_found("no pending cache upload for key+version"))?;
@@ -2813,12 +3026,12 @@ async fn twirp_cache_v2_finalize(
     })?;
 
     let (key, version) = {
-        let mut inner = shared.state.inner.lock().await;
+        let inner = shared.state.inner.lock().await;
         let pending = inner
             .cache_v2_pending
-            .remove(&token)
+            .get(&token)
             .ok_or_else(|| ApiError::internal("pending entry vanished"))?;
-        (pending.key, pending.version)
+        (pending.key.clone(), pending.version.clone())
     };
 
     shared
@@ -2827,6 +3040,11 @@ async fn twirp_cache_v2_finalize(
         .put(&key, &version, &bytes)
         .await
         .map_err(|e| ApiError::internal(format!("cache store error: {e}")))?;
+
+    {
+        let mut inner = shared.state.inner.lock().await;
+        inner.cache_v2_pending.remove(&token);
+    }
 
     // Clean up staging directory.
     let _ = tokio::fs::remove_dir_all(
@@ -2847,10 +3065,20 @@ async fn twirp_cache_v2_get_dl_url(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<CacheV2GetDlUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let storage_key = scoped_cache_key(
+        &request.key,
+        request.scope.as_deref(),
+        request.repository.as_deref(),
+    );
+    let storage_restore_keys = request
+        .restore_keys
+        .iter()
+        .map(|key| scoped_cache_key(key, request.scope.as_deref(), request.repository.as_deref()))
+        .collect::<Vec<_>>();
     let result = shared
         .state
         .cache
-        .get(&request.key, &request.version, &request.restore_keys)
+        .get(&storage_key, &request.version, &storage_restore_keys)
         .await
         .map_err(|e| ApiError::internal(format!("cache lookup error: {e}")))?;
 
@@ -2870,13 +3098,17 @@ async fn twirp_cache_v2_get_dl_url(
             .cache_v2_dl_tokens
             .insert(dl_token.clone(), (entry.key.clone(), entry.version.clone()));
     }
-
     let download_url = format!("{}/twirp-blob/cache/{dl_token}", public_base_url());
-    info!(key = entry.key, "cache v2 download URL issued");
+    let matched_key = entry
+        .key
+        .split_once('\0')
+        .map(|(_, key)| key.to_owned())
+        .unwrap_or_else(|| entry.key.clone());
+    info!(key = %matched_key, "cache v2 download URL issued");
     Ok(Json(json!({
         "ok": true,
         "signed_download_url": download_url,
-        "matched_key": entry.key
+        "matched_key": matched_key
     })))
 }
 
@@ -2941,6 +3173,8 @@ async fn twirp_artifact_v2_create(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<ArtifactV2CreateRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    validate_artifact_name(&request.name)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let token = uuid::Uuid::new_v4().to_string();
     let registry_key = artifact_v2_registry_key(
         &request.workflow_run_backend_id,
@@ -8995,6 +9229,41 @@ jobs:
     }
 
     #[tokio::test]
+    async fn test_get_scheduler_history_endpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let scheduler = crate::scheduler::Scheduler::new();
+
+        // Add a mock fire to history
+        {
+            let mut hist = scheduler.history.lock().await;
+            hist.push(crate::scheduler::ScheduleFire {
+                workflow_path: ".github/workflows/cron.yml".to_owned(),
+                cron_expr: "* * * * *".to_owned(),
+                fired_at: chrono::Utc::now(),
+                run_id: Some("mock-run-id".to_owned()),
+                error: None,
+            });
+        }
+        state.scheduler = Some(scheduler);
+
+        let app = app(state, CancellationToken::new());
+
+        let res = request_json(
+            &app,
+            Method::GET,
+            "/api/v1/scheduler/history",
+            serde_json::Value::Null,
+        )
+        .await;
+
+        let arr = res.as_array().expect("expected array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["workflow_path"], ".github/workflows/cron.yml");
+        assert_eq!(arr[0]["cron_expr"], "* * * * *");
+        assert_eq!(arr[0]["run_id"], "mock-run-id");
+    }
+    #[tokio::test]
     async fn cache_protocol_reserves_uploads_commits_and_restores() {
         let temp = tempfile::tempdir().unwrap();
         let app = app(
@@ -9566,7 +9835,7 @@ jobs:
         assert_eq!(inner.runs.len(), 1);
         let (_, run_record) = inner.runs.iter().next().unwrap();
         assert_eq!(run_record.submission.event, "pull_request");
-        assert_eq!(run_record.submission.git_ref, "refs/pull/42/merge");
+        assert_eq!(run_record.submission.git_ref, "refs/pull/42/head");
         assert_eq!(run_record.job_check_run_ids.len(), 1);
     }
 

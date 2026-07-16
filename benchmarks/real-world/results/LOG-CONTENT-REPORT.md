@@ -1,5 +1,166 @@
 # Log Content Comparison Report
 
+### Log Content Comparison: 07-step-failure
+
+| Metric | Official | Aksh |
+|---|---|---|
+| Lines | 26 | 12 |
+| Steps | 4 | 4 |
+| Timestamps | ✓ | ✓ |
+| Groups | ✓ | ✗ |
+| Annotations | ✓ | ✓ |
+| Secret masking | ✗ | ✗ |
+
+**Issues:**
+
+- 🔴 Aksh log significantly smaller: 12 vs 26 lines (ratio=0.46)
+- 🔴 Aksh logs missing ##[group] markers
+- 🔴 Aksh logs missing ##[endgroup] markers
+- 🟡 Command ##[endgroup] used 3x in official, 0x in aksh
+- 🟡 Command ##[group] used 3x in official, 0x in aksh
+- 🟡 Step 'Run echo ran-on-failure': aksh has 1 lines vs official 5 (ratio=0.20)
+- 🟡 ##[error] count: official=1, aksh=2
+
+### Log Content Comparison: 10-uses-checkout
+
+| Metric | Official | Aksh |
+|---|---|---|
+| Lines | 55 | 39 |
+| Steps | 5 | 4 |
+| Timestamps | ✓ | ✓ |
+| Groups | ✓ | ✗ |
+| Annotations | ✓ | ✗ |
+| Secret masking | ✓ | ✗ |
+
+**Issues:**
+
+- 🟡 Step count: official=5, aksh=4
+- 🟡 Step only in official: 'Post Run actions/checkout@v4'
+- 🔴 Aksh logs missing ##[group] markers
+- 🔴 Aksh logs missing ##[endgroup] markers
+- 🔴 Aksh logs missing secret masking (***) 
+- 🟡 Aksh logs missing annotations
+- 🟡 Command ##[endgroup] used 4x in official, 0x in aksh
+- 🟡 Command ##[group] used 4x in official, 0x in aksh
+- 🟡 Command ##[warning] used 1x in official, 0x in aksh
+- 🟡 Step 'Run echo checked-out': aksh has 1 lines vs official 5 (ratio=0.20)
+- 🟡 ##[warning] count: official=1, aksh=0
+
+### Log Content Comparison: 11-cache-roundtrip
+
+| Metric | Official | Aksh |
+|---|---|---|
+| Lines | 49 | 66 |
+| Steps | 6 | 5 |
+| Timestamps | ✓ | ✓ |
+| Groups | ✓ | ✗ |
+| Annotations | ✓ | ✓ |
+| Secret masking | ✗ | ✗ |
+
+**Issues:**
+
+- 🟡 Step count: official=6, aksh=5
+- 🟡 Step only in official: 'Run mkdir -p .cache-dir && date > .cache-dir/stamp'
+- 🔴 Aksh logs missing ##[group] markers
+- 🔴 Aksh logs missing ##[endgroup] markers
+- 🟡 Command ##[endgroup] used 4x in official, 0x in aksh
+- 🟡 Command ##[group] used 4x in official, 0x in aksh
+- 🟡 Step 'Run cat .cache-dir/stamp': aksh has 1 lines vs official 5 (ratio=0.20)
+- 🟡 ##[warning] count: official=1, aksh=2
+
+### Log Content Comparison: 12-artifact
+
+| Metric | Official | Aksh |
+|---|---|---|
+| Lines | 74 | 83 |
+| Steps | 6 | 5 |
+| Timestamps | ✓ | ✓ |
+| Groups | ✓ | ✗ |
+| Annotations | ✓ | ✗ |
+| Secret masking | ✗ | ✗ |
+
+**Issues:**
+
+- 🟡 Step count: official=6, aksh=5
+- 🟡 Step only in official: 'Run echo hi > out.txt'
+- 🔴 Aksh logs missing ##[group] markers
+- 🔴 Aksh logs missing ##[endgroup] markers
+- 🟡 Aksh logs missing annotations
+- 🟡 Command ##[endgroup] used 5x in official, 0x in aksh
+- 🟡 Command ##[group] used 5x in official, 0x in aksh
+- 🟡 Command ##[warning] used 1x in official, 0x in aksh
+- 🟡 Step 'Run cat dl/out.txt': aksh has 1 lines vs official 5 (ratio=0.20)
+- 🟡 ##[warning] count: official=1, aksh=0
+
+### Log Content Comparison: 13-composite-action
+
+| Metric | Official | Aksh |
+|---|---|---|
+| Lines | 60 | 39 |
+| Steps | 5 | 4 |
+| Timestamps | ✓ | ✓ |
+| Groups | ✓ | ✗ |
+| Annotations | ✓ | ✗ |
+| Secret masking | ✓ | ✗ |
+
+**Issues:**
+
+- 🟡 Step count: official=5, aksh=4
+- 🟡 Step only in official: 'Post Run actions/checkout@v4'
+- 🔴 Aksh logs missing ##[group] markers
+- 🔴 Aksh logs missing ##[endgroup] markers
+- 🔴 Aksh logs missing secret masking (***) 
+- 🟡 Aksh logs missing annotations
+- 🟡 Command ##[endgroup] used 5x in official, 0x in aksh
+- 🟡 Command ##[group] used 5x in official, 0x in aksh
+- 🟡 Command ##[warning] used 1x in official, 0x in aksh
+- 🟡 Step 'Run ./.github/actions/greet': aksh has 1 lines vs official 10 (ratio=0.10)
+- 🟡 ##[warning] count: official=1, aksh=0
+
+### Log Content Comparison: 14-annotations
+
+| Metric | Official | Aksh |
+|---|---|---|
+| Lines | 25 | 13 |
+| Steps | 3 | 3 |
+| Timestamps | ✓ | ✓ |
+| Groups | ✓ | ✗ |
+| Annotations | ✓ | ✓ |
+| Secret masking | ✗ | ✗ |
+
+**Issues:**
+
+- 🔴 Aksh log significantly smaller: 13 vs 25 lines (ratio=0.52)
+- 🔴 Aksh logs missing ##[group] markers
+- 🔴 Aksh logs missing ##[endgroup] markers
+- 🟡 Command ##[endgroup] used 2x in official, 0x in aksh
+- 🟡 Command ##[group] used 2x in official, 0x in aksh
+- 🟡 Command ##[warning] used 1x in official, 0x in aksh
+- 🟡 ##[warning] count: official=1, aksh=0
+
+### Log Content Comparison: 15-oidc-id-token
+
+| Metric | Official | Aksh |
+|---|---|---|
+| Lines | 22 | 12 |
+| Steps | 3 | 3 |
+| Timestamps | ✓ | ✓ |
+| Groups | ✓ | ✗ |
+| Annotations | ✓ | ✓ |
+| Secret masking | ✓ | ✗ |
+
+**Issues:**
+
+- 🔴 Aksh log significantly smaller: 12 vs 22 lines (ratio=0.55)
+- 🟡 Step only in official: 'Run curl -sS -H "Authorization: ***" \'
+- 🔵 Step only in aksh: 'Run curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \'
+- 🔴 Aksh logs missing ##[group] markers
+- 🔴 Aksh logs missing ##[endgroup] markers
+- 🔴 Aksh logs missing secret masking (***) 
+- 🟡 Command ##[endgroup] used 2x in official, 0x in aksh
+- 🟡 Command ##[group] used 2x in official, 0x in aksh
+- 🟡 ##[error] count: official=1, aksh=2
+
 ### Log Content Comparison: 91-large-output
 
 | Metric | Official | Aksh |
@@ -83,4 +244,4 @@
 - 🔵 Step only in aksh: 'Run if [[ "$EXPLICIT_EMPTY" == "" ]]; then'
 
 ---
-**Total**: 3 scenarios compared, 41 issues found
+**Total**: 27 scenarios compared, 104 issues found

@@ -1,0 +1,10 @@
+name: Webhook Push Simple
+on: push
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log event
+        run: |
+          echo "EVENT: push"
+          echo "REF: ${{ github.ref }}"
