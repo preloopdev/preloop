@@ -706,6 +706,7 @@ async fn cron_loop(
             reusable_workflows: Default::default(),
             enable_debugger: false,
             debugger_welcome_message: None,
+            inputs: Default::default(),
             trust_tier: Some("schedule".to_owned()),
             workflow_run_upstream_names: vec![],
             activity_type: Some("schedule".to_owned()),
