@@ -302,6 +302,7 @@ pub fn needs_json_from_context_data(needs: &BTreeMap<String, azdo::PipelineConte
 /// Convert runner protocol context data into expression JSON recursively.
 pub fn context_data_to_json(data: &azdo::PipelineContextData) -> Value {
     match data {
+        azdo::PipelineContextData::Null => Value::Null,
         azdo::PipelineContextData::String(s) => Value::String(s.clone()),
         azdo::PipelineContextData::Bool(b) => Value::Bool(*b),
         azdo::PipelineContextData::Number(n) => json!(n),

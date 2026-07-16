@@ -254,6 +254,7 @@ pub fn to_schema_value(val: &Value) -> Value {
                     unique_schemas.push(item_schema);
                 }
             }
+            unique_schemas.sort_by_key(|schema| serde_json::to_string(schema).unwrap_or_default());
             Value::Array(unique_schemas)
         }
         Value::Object(map) => {
@@ -751,5 +752,33 @@ mod tests {
         ];
         let s = statuses_sorted(&flows);
         assert_eq!(s, vec!["200", "None", "None"]);
+    }
+    #[test]
+    fn schema_arrays_union_heterogeneous_context_pairs_order_insensitively() {
+        let boolean_pair = serde_json::json!({
+            "key": "enabled",
+            "value": true,
+        });
+        let object_pair = serde_json::json!({
+            "key": "metadata",
+            "value": {"source": "runner"},
+        });
+
+        let first_order =
+            serde_json::json!([boolean_pair.clone(), object_pair.clone(), boolean_pair,]);
+        let reverse_order = serde_json::json!([
+            object_pair,
+            serde_json::json!({"key": "enabled", "value": false}),
+        ]);
+
+        let normalized = to_schema_value(&first_order);
+        assert_eq!(normalized, to_schema_value(&reverse_order));
+        assert_eq!(
+            normalized,
+            serde_json::json!([
+                {"key": "string", "value": "boolean"},
+                {"key": "string", "value": {"source": "string"}},
+            ])
+        );
     }
 }
