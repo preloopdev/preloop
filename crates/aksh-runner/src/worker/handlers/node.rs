@@ -16,6 +16,7 @@ pub async fn run_node_action(
     workspace: &str,
     ctx: &mut StepContext<'_>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
+    action_name: Option<&str>,
 ) -> Result<()> {
     let main = with
         .get("__aksh_entry")
@@ -28,7 +29,7 @@ pub async fn run_node_action(
         anyhow::bail!("action entry point not found: {}", entry_point.display());
     }
 
-    // Resolve node binary; warn on deprecated node versions
+    // Resolve node binary and apply the runner's Node 20 migration policy.
     let runs_using = manifest.runs_using.as_str();
     if runs_using == "node12" || runs_using == "node16" {
         tracing::warn!(
@@ -36,40 +37,41 @@ pub async fn run_node_action(
             &runs_using[4..]
         );
     }
-    let node_version = match runs_using {
-        "node24" => "node24",
-        "node22" => "node22",
-        _ => "node20", // node12/16 mapped to node20
-    };
 
-    let mut runner_root = Path::new(workspace).to_path_buf();
-    while !runner_root.join("externals").exists() {
-        if let Some(parent) = runner_root.parent() {
-            runner_root = parent.to_path_buf();
-        } else {
-            // Fallback if we hit root without finding it
-            runner_root = Path::new(workspace)
-                .parent()
-                .and_then(|p| p.parent())
-                .unwrap_or(Path::new("."))
-                .to_path_buf();
-            break;
-        }
-    }
-    let node_bin = runner_root
-        .join("externals")
-        .join(node_version)
-        .join("bin")
-        .join("node");
-    let node_path = if node_bin.exists() {
-        node_bin.to_string_lossy().to_string()
-    } else {
-        // Fallback to PATH
-        "node".to_string()
-    };
-
-    // Build environment with INPUT_* variables, evaluating any ${{ }} expressions
+    // Build environment with INPUT_* variables, evaluating any ${{ }} expressions.
     let mut env = ctx.build_env();
+    let use_node24_by_default = ctx
+        .job
+        .get_variable_bool("actions.runner.usenode24bydefault");
+    let require_node24 = ctx.job.get_variable_bool("actions.runner.requirenode24");
+    let force_node24 = env
+        .get("FORCE_JAVASCRIPT_ACTIONS_TO_NODE24")
+        .is_some_and(|v| v.eq_ignore_ascii_case("true") || v == "1");
+    let allow_unsecure_node20 = env
+        .get("ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION")
+        .is_some_and(|v| v.eq_ignore_ascii_case("true") || v == "1");
+
+    let node_version = if runs_using == "node20" {
+        let use_node24 = require_node24
+            || (use_node24_by_default && !allow_unsecure_node20)
+            || (!use_node24_by_default && force_node24);
+        let selected = if use_node24 { "node24" } else { "node20" };
+        if let Some(name) = action_name {
+            if use_node24 {
+                ctx.job.record_upgraded_node24_action(name);
+            } else if ctx.job.get_variable_bool("actions.runner.warnonnode20") {
+                ctx.job.record_deprecated_node20_action(name);
+            }
+        }
+        selected
+    } else if runs_using == "node24" {
+        "node24"
+    } else if runs_using == "node22" {
+        "node22"
+    } else {
+        "node20" // node12/node16 are mapped to node20
+    };
+
     let expr_ctx_for_inputs = ctx.job.build_expression_context();
     if let Some(inputs) = with.as_object() {
         for (key, value) in inputs {
@@ -118,6 +120,30 @@ pub async fn run_node_action(
             }
         }
     }
+
+    let mut runner_root = Path::new(workspace).to_path_buf();
+    while !runner_root.join("externals").exists() {
+        if let Some(parent) = runner_root.parent() {
+            runner_root = parent.to_path_buf();
+        } else {
+            runner_root = Path::new(workspace)
+                .parent()
+                .and_then(|p| p.parent())
+                .unwrap_or(Path::new("."))
+                .to_path_buf();
+            break;
+        }
+    }
+    let node_bin = runner_root
+        .join("externals")
+        .join(node_version)
+        .join("bin")
+        .join("node");
+    let node_path = if node_bin.exists() {
+        node_bin.to_string_lossy().to_string()
+    } else {
+        "node".to_string()
+    };
 
     // Set GITHUB_ACTION_PATH
     env.insert(
@@ -194,6 +220,7 @@ mod tests {
             dir.path().to_str().unwrap(),
             &mut ctx,
             cancel_rx,
+            None,
         )
         .await
         .unwrap_err();
@@ -222,6 +249,7 @@ mod tests {
             dir.path().to_str().unwrap(),
             &mut ctx,
             cancel_rx,
+            None,
         )
         .await
         .unwrap_err();
