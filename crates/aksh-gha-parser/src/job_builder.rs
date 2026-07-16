@@ -178,11 +178,6 @@ pub fn build_agent_job_message(
         variables.insert(k.clone(), VariableValue::secret(v));
     }
 
-    // System variables
-    variables.insert(
-        "system.pullRequestTargetBranch".to_owned(),
-        VariableValue::new(""),
-    );
     if let Some(wf_file) = &plan.workflow_file {
         variables.insert(
             "system.workflowFileFullPath".to_owned(),
@@ -190,21 +185,30 @@ pub fn build_agent_job_message(
         );
     }
 
-    // Mask hints for secrets
-    let mask_hints: Vec<MaskHint> = resolved_secrets
-        .values()
-        .filter(|v| !v.is_empty())
-        .map(|v| MaskHint {
-            hint_type: MaskType::Hash,
-            value: v.clone(),
-        })
-        .collect();
+    populate_runner_variables(&mut variables, plan);
+
+    // GitHub supplies baseline regexes in addition to value-derived secret masks.
+    let mut mask_hints = default_mask_hints();
+    mask_hints.extend(
+        resolved_secrets
+            .values()
+            .filter(|v| !v.is_empty())
+            .map(|v| MaskHint {
+                hint_type: MaskType::Hash,
+                value: v.clone(),
+            }),
+    );
 
     // Service endpoints (SystemVssConnection)
     let endpoints = vec![ServiceEndpoint {
-        data: BTreeMap::new(),
+        data: BTreeMap::from([
+            ("ConnectivityChecks".to_owned(), "{}".to_owned()),
+            ("GenerateIdTokenUrl".to_owned(), String::new()),
+            ("ServerId".to_owned(), job_id.to_string()),
+            ("ServerName".to_owned(), "aksh".to_owned()),
+        ]),
         name: "SystemVssConnection".to_owned(),
-        endpoint_type: Some("azdoserver".to_owned()),
+        endpoint_type: None,
         url: Some("http://localhost".to_owned()),
         authorization: EndpointAuthorization {
             parameters: BTreeMap::from([(
@@ -214,7 +218,8 @@ pub fn build_agent_job_message(
             scheme: Some("OAuth".to_owned()),
         },
         is_shared: Some(false),
-        service_owner: Some("github".to_owned()),
+        is_ready: Some(true),
+        service_owner: None,
     }];
 
     let resources = TaskResources {
@@ -222,41 +227,17 @@ pub fn build_agent_job_message(
         repositories: Vec::new(),
     };
 
-    // System context — runner needs these for job tracking
-    let mut system_ctx = BTreeMap::new();
-    system_ctx.insert(
-        "jobId".to_owned(),
-        PipelineContextData::String(job_id.to_string()),
-    );
-    system_ctx.insert(
-        "timelineId".to_owned(),
-        PipelineContextData::String(timeline_id.to_string()),
-    );
-    system_ctx.insert(
-        "planId".to_owned(),
-        PipelineContextData::String(job_id.to_string()),
-    );
-    system_ctx.insert(
-        "jobDisplayName".to_owned(),
-        PipelineContextData::String(plan.name.clone()),
-    );
-    system_ctx.insert(
-        "orchestrationId".to_owned(),
-        PipelineContextData::String(job_id.to_string()),
-    );
-
-    // Context data
+    // Context data follows the AgentJobRequestMessage contract. Workflow-level
+    // metadata is enriched by the server, which owns the submission path/ref.
     let mut context_data = BTreeMap::new();
-    context_data.insert("system".to_owned(), PipelineContextData::Dict(system_ctx));
     context_data.insert("github".to_owned(), to_context_data(github));
-    if !plan.inputs.is_empty() {
-        let inputs_ctx = plan
-            .inputs
-            .iter()
-            .map(|(k, v)| (k.clone(), to_context_data(v)))
-            .collect();
-        context_data.insert("inputs".to_owned(), PipelineContextData::Dict(inputs_ctx));
-    }
+    let inputs_ctx = plan
+        .inputs
+        .iter()
+        .map(|(k, v)| (k.clone(), to_context_data(v)))
+        .collect();
+    context_data.insert("inputs".to_owned(), PipelineContextData::Dict(inputs_ctx));
+
     let mut job_ctx = BTreeMap::new();
     if let Some(wref) = &plan.workflow_ref {
         job_ctx.insert(
@@ -276,45 +257,47 @@ pub fn build_agent_job_message(
             PipelineContextData::String(wrepo.clone()),
         );
     }
-    if !job_ctx.is_empty() {
-        context_data.insert("job".to_owned(), PipelineContextData::Dict(job_ctx));
+    if let Some(path) = &plan.workflow_file {
+        job_ctx.insert(
+            "workflow_file_path".to_owned(),
+            PipelineContextData::String(path.clone()),
+        );
     }
+    context_data.insert("job".to_owned(), PipelineContextData::Dict(job_ctx));
 
-    let env_ctx: Map<String, Value> = plan
-        .env
-        .iter()
-        .map(|(k, v)| (k.clone(), Value::String(v.clone())))
-        .collect();
-    context_data.insert(
-        "env".to_owned(),
-        PipelineContextData::Dict(
-            env_ctx
-                .into_iter()
-                .map(|(k, v)| (k, to_context_data(&v)))
-                .collect(),
-        ),
-    );
-
-    let matrix_ctx: Map<String, Value> = plan
-        .matrix
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    context_data.insert(
-        "matrix".to_owned(),
-        PipelineContextData::Dict(
-            matrix_ctx
-                .into_iter()
-                .map(|(k, v)| (k, to_context_data(&v)))
-                .collect(),
-        ),
-    );
-
+    if plan.matrix.is_empty() {
+        context_data.insert("matrix".to_owned(), PipelineContextData::Null);
+    } else {
+        context_data.insert(
+            "matrix".to_owned(),
+            PipelineContextData::Dict(
+                plan.matrix
+                    .iter()
+                    .map(|(k, v)| (k.clone(), to_context_data(v)))
+                    .collect(),
+            ),
+        );
+    }
     context_data.insert(
         "needs".to_owned(),
         PipelineContextData::Dict(BTreeMap::new()),
     );
-    context_data.insert("strategy".to_owned(), to_context_data(&strategy_value));
+    let strategy_ctx = BTreeMap::from([
+        (
+            "fail-fast".to_owned(),
+            PipelineContextData::Bool(plan.fail_fast),
+        ),
+        ("job-index".to_owned(), PipelineContextData::Number(0.0)),
+        ("job-total".to_owned(), PipelineContextData::Number(1.0)),
+        (
+            "max-parallel".to_owned(),
+            PipelineContextData::Number(plan.max_parallel.unwrap_or(1) as f64),
+        ),
+    ]);
+    context_data.insert(
+        "strategy".to_owned(),
+        PipelineContextData::Dict(strategy_ctx),
+    );
     context_data.insert(
         "vars".to_owned(),
         PipelineContextData::Dict(
@@ -324,9 +307,6 @@ pub fn build_agent_job_message(
         ),
     );
 
-    // Actions download info
-    let actions_download_info = BTreeMap::new();
-
     let request_id: i64 = 1;
 
     Ok(AgentJobRequestMessage {
@@ -335,18 +315,30 @@ pub fn build_agent_job_message(
         request_id,
         plan: PlanReference {
             plan_id: job_id.to_string(),
-            plan_type: Some("Job".to_owned()),
+            plan_type: "actions".to_owned(),
+            version: 0,
+            artifact_uri: String::new(),
+            artifact_location: String::new(),
         },
-        timeline: TimelineReference { id: timeline_id },
-        display_name: Some(plan.name.clone()),
+        timeline: TimelineReference {
+            id: timeline_id,
+            change_id: 0,
+            location: None,
+        },
+        job_display_name: Some(plan.name.clone()),
+        job_name: "__default".to_owned(),
+        locked_until: "0001-01-01T00:00:00".to_owned(),
+        billing_owner_id: None,
+        file_table: Vec::new(),
+        defaults: Vec::new(),
+        environment_variables: Vec::new(),
+        snapshot: None,
         condition: plan.if_condition.clone(),
         variables,
         mask_hints,
         resources,
         context_data,
         steps,
-        actions_download_info,
-        job_display_name: Some(plan.name.clone()),
         retry_count: None,
         pre_job_timeout: None,
         job_timeout: None,
@@ -367,6 +359,117 @@ fn non_empty_services(services: Option<serde_json::Value>) -> Option<serde_json:
         Some(serde_json::Value::Object(m)) if m.is_empty() => None,
         _ => services,
     }
+}
+
+fn default_mask_hints() -> Vec<MaskHint> {
+    const REGEXES: &[&str] = &[
+        r#"\b(?:eyJ0eXAiOi|eyJhbGciOi|eyJ4NXQiOi|eyJraWQiOi)[^\s'";]+"#,
+        r#"\bBearer\s+[^\s'";]+"#,
+        r#"\b(?i:Password|Pwd)=(?:[^\s'";]+|"[^"]+")"#,
+        r#"\s+-(?i:Password|Pwd)\s+(?:[^\s'";]+|"[^"]+")"#,
+        r#"\bv1\.[0-9A-Fa-f]{40}\b"#,
+        r#"\bgh[pousr]{1}_[A-Za-z0-9]{36}\b"#,
+        r#"\bgithub_pat_[0-9][A-Za-z0-9]{21}_[A-Za-z0-9]{59}\b"#,
+        r#"(?:[a-zA-Z][a-zA-Z\d+-.]*):\/\/([a-zA-Z\d\-._~\!$&'()*+,;=%]+):([a-zA-Z\d\-._~\!$&'()*+,;=:%]*)@"#,
+        r#"\b[0-9A-Za-z-_~.]{3}7Q~[0-9A-Za-z-_~.]{31}\b|\b[0-9A-Za-z-_~.]{3}8Q~[0-9A-Za-z-_~.]{34}\b"#,
+        r#"(?:^|[^0-9A-Za-z+/])[0-9A-Za-z+/]{76}(APIM|ACDb|\+(ABa|AMC|ASt))[0-9A-Za-z+/]{5}[AQgw]=="#,
+        r#"(?:^|[^0-9A-Za-z+/])[0-9A-Za-z+/]{33}(AIoT|\+(ASb|AEh|ARm))[A-P][0-9A-Za-z+/]{5}="#,
+        r#"\b[0-9A-Za-z_\-]{44}AzFu[0-9A-Za-z\-_]{5}[AQgw]=="#,
+        r#"\b[0-9A-Za-z]{42}AzSe[A-D][0-9A-Za-z]{5}\b"#,
+        r#"\b[0-9A-Za-z+/]{42}\+ACR[A-D][0-9A-Za-z+/]{5}\b"#,
+        r#"\b[0-9A-Za-z]{33}AzCa[A-P][0-9A-Za-z]{5}="#,
+        r#"\boy2[a-p][0-9a-z]{15}[aq][0-9a-z]{11}[eu][bdfhjlnprtvxz357][a-p][0-9a-z]{11}[aeimquy4]\b"#,
+        r#"\bnpm_[0-9A-Za-z]{36}\b"#,
+        r#"\bx-ghcr-signature=[^&]+"#,
+    ];
+    REGEXES
+        .iter()
+        .map(|value| MaskHint {
+            hint_type: MaskType::Regex,
+            value: (*value).to_owned(),
+        })
+        .collect()
+}
+
+fn populate_runner_variables(variables: &mut BTreeMap<String, VariableValue>, plan: &JobPlan) {
+    const TRUE_FLAGS: &[&str] = &[
+        "Actions.EnableHttpRedirects",
+        "DistributedTask.AddWarningToNode12Action",
+        "DistributedTask.AddWarningToNode16Action",
+        "DistributedTask.AllowRunnerContainerHooks",
+        "DistributedTask.DeprecateStepOutputCommands",
+        "DistributedTask.DetailUntarFailure",
+        "DistributedTask.EnableCompositeActions",
+        "DistributedTask.EnableJobServerQueueTelemetry",
+        "DistributedTask.EnhancedAnnotations",
+        "DistributedTask.ForceGithubJavascriptActionsToNode16",
+        "DistributedTask.ForceGithubJavascriptActionsToNode20",
+        "DistributedTask.LogTemplateErrorsAsDebugMessages",
+        "DistributedTask.MarkJobAsFailedOnWorkerCrash",
+        "DistributedTask.NewActionMetadata",
+        "DistributedTask.UploadStepSummary",
+        "DistributedTask.UseActionArchiveCache",
+        "DistributedTask.UseWhich2",
+        "RunService.FixEmbeddedIssues",
+        "actions.runner.usenode24bydefault",
+        "actions.runner.warnonnode20",
+        "actions_add_check_run_id_to_job_context",
+        "actions_container_action_runner_temp",
+        "actions_display_helpful_actions_download_errors",
+        "actions_runner_deprecate_linux_arm32",
+        "actions_service_container_command",
+        "actions_set_orchestration_id_env_for_actions",
+        "actions_skip_retry_complete_job_upon_known_errors",
+        "actions_uses_cache_service_v2",
+    ];
+    const FALSE_FLAGS: &[&str] = &[
+        "actions.runner.requirenode24",
+        "actions_batch_action_resolution",
+        "actions_runner_compare_workflow_parser",
+        "actions_runner_emit_composite_markers",
+        "actions_runner_kill_linux_arm32",
+        "actions_snapshot_preflight_hosted_runner_check",
+        "actions_snapshot_preflight_image_gen_pool_check",
+        "actions_use_bearer_token_for_codeload",
+    ];
+    for key in TRUE_FLAGS {
+        variables
+            .entry((*key).to_owned())
+            .or_insert_with(|| VariableValue::new("true"));
+    }
+    for key in FALSE_FLAGS {
+        variables
+            .entry((*key).to_owned())
+            .or_insert_with(|| VariableValue::new("false"));
+    }
+    for (key, value) in [
+        ("actions_runner_node20_removal_date", ""),
+        ("actions_runner_node24_default_date", "June 16th, 2026"),
+        ("system.from_run_service", "true"),
+        ("system.github.job", plan.base_id.as_str()),
+        ("system.github.launch_endpoint", ""),
+        ("system.github.results_endpoint", ""),
+        ("system.github.results_upload_with_sdk", "true"),
+        (
+            "system.github.token.permissions",
+            r#"{"Contents":"read","Metadata":"read","Packages":"read"}"#,
+        ),
+        ("system.orchestrationId", ""),
+        ("system.phaseDisplayName", plan.name.as_str()),
+        ("system.runner.lowdiskspacethreshold", "100"),
+        ("system.runnerEnvironment", "self-hosted"),
+        ("system.runnerGroupName", "Default"),
+    ] {
+        variables
+            .entry(key.to_owned())
+            .or_insert_with(|| VariableValue::new(value));
+    }
+    variables
+        .entry("github_token".to_owned())
+        .or_insert_with(|| VariableValue::secret(String::new()));
+    variables
+        .entry("system.github.token".to_owned())
+        .or_insert_with(|| VariableValue::secret(String::new()));
 }
 
 /// Build a `TaskStep` from a `StepPlan`.
@@ -475,11 +578,9 @@ fn to_context_data(value: &Value) -> PipelineContextData {
                 .map(|(k, v)| (k.clone(), to_context_data(v)))
                 .collect(),
         ),
-        Value::Null => PipelineContextData::String(String::new()),
+        Value::Null => PipelineContextData::Null,
     }
 }
-
-use serde_json::Map;
 
 #[cfg(test)]
 mod tests {
@@ -621,7 +722,7 @@ jobs:
         .unwrap();
 
         assert!(!msg.mask_hints.is_empty());
-        assert_eq!(msg.mask_hints[0].value, "s3cr3t");
+        assert!(msg.mask_hints.iter().any(|hint| hint.value == "s3cr3t"));
         let secret = msg.variables.get("MY_SECRET").unwrap();
         assert_eq!(secret.value.as_deref(), Some("s3cr3t"));
         assert_eq!(secret.is_secret, Some(true));

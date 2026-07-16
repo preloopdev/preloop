@@ -372,6 +372,55 @@ Paths are in this repo. Updated 2026-06-29 after the v2.335.1 56-flow runner-wat
   - ⚠️ Replay mapper still needs better service-location/path mapping for DistributedTask
     pool discovery and agent registration before those rows can be judged as aksh gaps.
 
+### 3a. Concurrency & cancellation audit (2026-07-13)
+
+Findings from a source audit of aksh vs official runner v2.335.1 sources (local mirror:
+`~/mitm-proxy/experiments/mitm/.cache/runner.server/src`, upstream paths cited as
+`src/Runner.Listener/...`). Implementation plan: `docs/concurrency-plan.md`.
+
+- ❌ **GitHub `concurrency:` unsupported end-to-end.** Not parsed (`Workflow` at
+  `aksh-gha-parser/src/lib.rs:86-160` and `Job` at `:465-511` have no field; the key is
+  silently dropped), no protocol DTO, no server-side group enforcement. GitHub semantics to
+  implement: case-insensitive group names; expressions (`github`/`inputs`/`vars`, plus
+  `needs`/`strategy`/`matrix` at job level); at most one running holder per group;
+  `queue: single` (default, new pending cancels prior pending) / `queue: max` (up to 100
+  pending, overflow cancelled; invalid combined with `cancel-in-progress: true`);
+  `cancel-in-progress` as bool or expression; FIFO by wait-start time. Reusable workflows
+  carry both the caller's `concurrency:` on the `uses:` job and the callee's workflow-level
+  `concurrency:` (`EmbeddedConcurrency`), both enforced.
+- ❌ **`JobCancellation` wire shape breaks cancellation for the unmodified official runner.**
+  aksh sends `{"runId": "...", "jobId": "<workflow job-id string>"}`
+  (`aksh-runner-server/src/lib.rs:2021-2024` broker path, `:3199-3202` AzDO path), where
+  `jobId` is the `JobId(pub String)` workflow id. Official wire type is
+  `JobCancelMessage { JobId: Guid, Timeout: TimeSpan }`
+  (`src/Sdk/DTWebApi/WebApi/JobCancelMessage.cs:18-36`); the runner deserializes it at
+  `src/Runner.Listener/Runner.cs:732-735` and matches `JobId` against the
+  `AgentJobRequestMessage.jobId` GUID key in `_jobInfos`
+  (`src/Runner.Listener/JobDispatcher.cs:141-159`). aksh's job messages do send a GUID there
+  (`aksh-gha-protocol/src/azdo.rs:219-220`), so the official runner cannot match the string
+  id → cancellation is silently ignored. The `timeout` field is also missing (GitHub sends
+  e.g. `00:05:00`).
+- ⚠️ **aksh-runner cancel handling diverges from `JobDispatcher`.** On `JobCancellation` the
+  listener hardcodes a 300 s grace and `await`s worker exit inline, blocking the poll loop
+  (`aksh-runner/src/listener/broker_listener.rs:295-321`). Official behavior:
+  `JobDispatcher.Cancel` is fire-and-forget — cancel token fires immediately, timeout is
+  clamped to ≥60 s, hard-kill token is scheduled at `timeout − 15 s`
+  (`src/Runner.Listener/JobDispatcher.cs:1282-1305`), and the listener keeps polling
+  (`src/Runner.Listener/Runner.cs:496-511`). aksh also ignores the message body entirely
+  (no jobId match, no timeout).
+- ⚠️ **Busy-runner new-job handling diverges.** aksh ignores a job message that arrives while
+  a job is active (`broker_listener.rs:264-267`, `:284-287`). Official
+  `EnsureDispatchFinished` (`src/Runner.Listener/JobDispatcher.cs:239-318`) queries the
+  server-side request status: if the previous request already has a result, it cancels the
+  zombie worker, waits ≤45 s, and dispatches the new job; otherwise it treats the situation
+  as a fatal server error.
+- ⚠️ **Step/timeline updates flush only at job end.** aksh queues cumulative
+  `WorkflowStepsUpdate` bodies but flushes once at job completion
+  (`aksh-runner/src/worker/job_runner.rs:458`); official runner drains timeline updates every
+  500 ms and results uploads every 1000 ms in background dequeue tasks
+  (`src/Runner.Common/JobServerQueue.cs:31-36`, `:173-184`), so mid-job step status is live.
+  (Live console lines already match: 250 ms aggressive → 500 ms.)
+
 ---
 ## 4. Pluggable backends &amp; deployment modes
 
