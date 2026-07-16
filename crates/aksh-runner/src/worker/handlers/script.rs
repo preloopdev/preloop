@@ -41,10 +41,36 @@ pub async fn run_script(
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
     }
+    let shell_desc = if let Some(custom) = shell {
+        custom.to_string()
+    } else {
+        let mut desc_args = args.clone();
+        if let Some(last) = desc_args.last_mut() {
+            if last == &script_path.to_string_lossy().to_string() {
+                *last = "{0}".to_string();
+            }
+        }
+        let p_path = if program == "bash" {
+            if Path::new("/usr/bin/bash").exists() {
+                "/usr/bin/bash"
+            } else {
+                "/bin/bash"
+            }
+        } else if program == "sh" {
+            if Path::new("/bin/sh").exists() {
+                "/bin/sh"
+            } else {
+                "/usr/bin/sh"
+            }
+        } else {
+            &program
+        };
+        format!("{} {}", p_path, desc_args.join(" "))
+    };
+    log_command_echo(script, &shell_desc, ctx);
 
     ctx.debug(&format!("Shell resolved: {}", program));
     ctx.debug(&format!("Command line: {} {:?}", program, args));
-
     // Build environment
     let env = ctx.build_env();
     let ctx_ref = &*ctx;
@@ -153,6 +179,31 @@ pub async fn run_script_in_container(
     env.insert("HOME".to_string(), "/github/home".to_string());
 
     let container_args_ref: Vec<&str> = container_args.iter().map(|s| s.as_str()).collect();
+    let shell_desc = if let Some(custom) = container_shell {
+        custom.to_string()
+    } else {
+        let mut desc_args = container_args.clone();
+        if let Some(last) = desc_args.last_mut() {
+            if last
+                == &crate::worker::container_ops::translate_to_container_path(
+                    &script_path.to_string_lossy(),
+                    &host_work,
+                )
+            {
+                *last = "{0}".to_string();
+            }
+        }
+        let p_path = if container_program == "bash" {
+            "/usr/bin/bash"
+        } else if container_program == "sh" {
+            "/bin/sh"
+        } else {
+            &container_program
+        };
+        format!("{} {}", p_path, desc_args.join(" "))
+    };
+    log_command_echo(script, &shell_desc, ctx);
+
     ctx.debug(&format!("Shell resolved: {}", container_program));
     ctx.debug(&format!(
         "Command line: docker exec -i {container_id} {container_program} {container_args_ref:?}"
@@ -324,4 +375,14 @@ mod tests {
         assert!(path.to_string_lossy().ends_with(".ps1"));
         assert!(args.contains(&"-command".to_string()));
     }
+}
+
+fn log_command_echo(script: &str, shell_desc: &str, ctx: &mut StepContext<'_>) {
+    let first_line = script.lines().next().unwrap_or("").trim();
+    ctx.log_raw(&format!("##[group]Run {}", first_line));
+    for line in script.lines() {
+        ctx.log_raw(&format!("\x1b[36;1m{}\x1b[0m", line));
+    }
+    ctx.log_raw(&format!("shell: {}", shell_desc));
+    ctx.log_raw("##[endgroup]");
 }

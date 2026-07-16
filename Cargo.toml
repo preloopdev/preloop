@@ -63,6 +63,9 @@ walkdir = "2.5"
 toml = "0.8"
 regex = "1.10"
 similar = "2.5"
+cron = "0.12"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 
 command-group = { version = "5", features = ["with-tokio"] }
 flate2 = "1"

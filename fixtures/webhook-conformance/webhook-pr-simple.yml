@@ -1,0 +1,12 @@
+name: Webhook PR Simple
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log event
+        run: |
+          echo "EVENT: ${{ github.event_name }}"
+          echo "ACTION: ${{ github.event.action }}"
