@@ -1,20 +1,14 @@
 //! Host-side Preloop runner control plane.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub mod concurrency;
 pub mod github;
 
 /// Pure job-graph scheduler model and property tests.
 pub mod scheduling;
-
-#[cfg(test)]
-mod concurrency_http_properties;
-#[cfg(test)]
-mod concurrency_properties;
 
 use axum_server::{tls_rustls::RustlsConfig, Handle};
 use rcgen::generate_simple_self_signed;
@@ -54,7 +48,7 @@ use tower_http::trace::TraceLayer;
 use tracing::{debug, info, warn};
 
 /// Shared local-only token used for runner ↔ server auth in development.
-/// Not a credential, just a magic value that both sides agree on.
+/// Not a credential — just a magic value that both sides agree on.
 const AKSH_SYSTEM_TOKEN: &str = "aksh-system-token";
 
 /// Server configuration.
@@ -82,7 +76,12 @@ pub enum TlsMode {
     /// Generate an ephemeral self-signed cert at startup.
     SelfSigned,
     /// Load cert and key from PEM files.
-    PemFiles { cert: PathBuf, key: PathBuf },
+    PemFiles {
+        /// Path to the TLS certificate file (PEM format).
+        cert: PathBuf,
+        /// Path to the private key file (PEM format).
+        key: PathBuf,
+    },
 }
 
 /// A self-signed TLS certificate + private key in PEM format.
@@ -147,13 +146,10 @@ async fn reap_once(shared: &Arc<SharedState>) {
                     if let Some(req) = inner.job_requests.get_mut(&request_id) {
                         req.timeout_triggered = true;
                     }
-                    if let Some(agent_job_id) = agent_job_id_for(&inner, run_id, &job_id) {
-                        cancellations.push(QueuedCancellation {
-                            run_id,
-                            job_id: job_id.clone(),
-                            agent_job_id,
-                        });
-                    }
+                    cancellations.push(QueuedCancellation {
+                        run_id,
+                        job_id: job_id.clone(),
+                    });
                 }
             }
         }
@@ -656,10 +652,10 @@ fn build_app(
         .route("/api/v1/github/register", get(github::github_register))
         .route("/api/v1/github/callback", get(github::github_callback))
         .route("/api/v1/runs/:run_id", get(get_run))
+        .route("/api/v1/runs/:run_id/logs", get(get_run_logs))
         .route("/api/v1/runs/:run_id/cancel", post(cancel_run))
         .route("/api/v1/runs/:run_id/rerun", post(rerun_run))
         .route("/api/v1/runs/:run_id/events.ndjson", get(run_events))
-        .route("/api/v1/runs/:run_id/logs", get(get_run_logs))
         .route("/api/v1/runs/:run_id/debug", get(ws_dap_debug))
         .route("/api/v1/runs/:run_id/debug", post(register_dap_port))
         .route(
@@ -929,42 +925,8 @@ pub struct AppState {
     pub state_dir: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct JobSetId {
-    run_id: RunId,
-    job_ids: BTreeSet<JobId>,
-}
-
-impl JobSetId {
-    fn holder(&self) -> concurrency::Holder {
-        concurrency::Holder::JobSet {
-            run_id: self.run_id,
-            job_ids: self.job_ids.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct JobSetGate {
-    key: (String, String),
-    display_name: String,
-    cancel_in_progress: bool,
-    queue: aksh_gha_parser::ConcurrencyQueue,
-}
-
-#[derive(Debug, Clone)]
-struct JobSetAdmission {
-    gates: Vec<JobSetGate>,
-    acquired_keys: BTreeSet<(String, String)>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum JobSetAdmissionResult {
-    Ready,
-    Blocked,
-}
-
 impl AppState {
+    /// Build state rooted in a state directory.
     pub async fn new(state_dir: PathBuf) -> anyhow::Result<Self> {
         let cache = CacheStore::new(state_dir.join("cache")).await?;
         let artifacts = ArtifactStore::new(state_dir.join("artifacts")).await?;
@@ -1074,18 +1036,6 @@ struct InnerState {
     /// Monotonic artifact v2 ID counter.
     next_artifact_v2_id: u64,
     dap_ports: BTreeMap<RunId, DapPortRegistration>,
-    /// Concurrency groups keyed by (lowercased repo, lowercased group name).
-    concurrency_groups: BTreeMap<(String, String), concurrency::ConcurrencyGroup>,
-    /// Workflow-level pending runs: run_id → jobs held out of the ready queue.
-    held_runs: BTreeMap<RunId, Vec<QueuedJob>>,
-    /// Job-level concurrency-blocked jobs (FIFO).
-    concurrency_blocked: VecDeque<QueuedJob>,
-    /// Multi-key admission state for reusable workflow invocations.
-    jobset_admissions: BTreeMap<JobSetId, JobSetAdmission>,
-    /// Evaluated workflow-level concurrency raw config per run (for release/debug).
-    run_concurrency: BTreeMap<RunId, aksh_gha_parser::Concurrency>,
-    /// Which concurrency key a holder currently occupies (for release).
-    holder_keys: BTreeMap<RunId, Vec<(String, String)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1106,7 +1056,6 @@ pub(crate) struct JobDetail {
     pub(crate) conclusion: String,
     pub(crate) steps: Vec<StepRecord>,
 }
-
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct RunRecord {
     pub(crate) run_id: RunId,
@@ -1156,18 +1105,12 @@ struct QueuedJob {
     /// Required runner labels from `runs-on`.
     runs_on: Vec<String>,
     message: azdo::AgentJobRequestMessage,
-    /// Raw job-level concurrency (evaluated when the job becomes ready).
-    concurrency: Option<aksh_gha_parser::Concurrency>,
-    /// Matrix values for this expansion (for concurrency expression eval).
-    matrix: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
 struct QueuedCancellation {
     run_id: RunId,
     job_id: JobId,
-    /// Agent job GUID from the job message (`jobId`), required for official JobCancelMessage.
-    agent_job_id: uuid::Uuid,
 }
 
 #[derive(Debug, Clone)]
@@ -1318,42 +1261,51 @@ pub(crate) async fn submit_run_inner(
     let jobs = expanded.jobs;
     let reusable_calls = expanded.reusable_calls;
     let run_id = RunId::new();
+    let repository_owner = submission
+        .repository
+        .split('/')
+        .next()
+        .unwrap_or("owner")
+        .to_string();
+    let sha = submission
+        .payload
+        .get("after")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            submission
+                .payload
+                .get("pull_request")
+                .and_then(|pr| pr.get("head"))
+                .and_then(|h| h.get("sha"))
+                .and_then(|v| v.as_str())
+        })
+        .unwrap_or_else(|| {
+            if submission.git_ref.len() == 40
+                && submission.git_ref.chars().all(|c| c.is_ascii_hexdigit())
+            {
+                &submission.git_ref
+            } else {
+                "0000000000000000000000000000000000000000"
+            }
+        })
+        .to_string();
+
     let github = json!({
         "event_name": submission.event,
         "event": submission.payload,
         "repository": submission.repository,
+        "repository_owner": repository_owner,
         "ref": submission.git_ref,
         "run_id": run_id.to_string(),
+        "run_number": "1",
+        "run_attempt": "1",
+        "actor": "aksh-system",
+        "sha": sha,
         "workflow": workflow.name.clone().unwrap_or_default(),
-        "server_url": "https://github.com"
+        "server_url": "https://github.com",
+        "api_url": "https://api.github.com",
+        "graphql_url": "https://api.github.com/graphql"
     });
-
-    // Evaluate workflow-level concurrency before locking (pure).
-    let workflow_concurrency = workflow.concurrency.clone();
-    let mut empty_workflow_concurrency_group = false;
-    let workflow_concurrency_eval = if let Some(raw) = &workflow_concurrency {
-        let eval_ctx = concurrency::ConcurrencyContext {
-            scope: concurrency::ConcurrencyScope::Workflow,
-            github: &github,
-            vars: &submission.vars,
-            inputs: &submission.inputs,
-            matrix: None,
-            strategy: None,
-            needs: None,
-        };
-        let (group, cancel, queue) =
-            concurrency::evaluate_concurrency(raw, &eval_ctx).map_err(|error| {
-                ApiError::bad_request(format!("concurrency evaluation failed: {error}"))
-            })?;
-        if group.trim().is_empty() {
-            empty_workflow_concurrency_group = true;
-            None
-        } else {
-            Some((group, cancel, queue, raw.clone()))
-        }
-    } else {
-        None
-    };
 
     {
         let mut inner = shared.state.inner.lock().await;
@@ -1364,46 +1316,6 @@ pub(crate) async fn submit_run_inner(
         let mut job_fail_fast = BTreeMap::new();
         let mut ready_by_base: BTreeMap<String, u64> = BTreeMap::new();
         let mut initially_skipped = Vec::new();
-        let mut built_jobs: Vec<QueuedJob> = Vec::new();
-        if empty_workflow_concurrency_group {
-            let queued_jobs = 0;
-            inner.runs.insert(
-                run_id,
-                RunRecord {
-                    run_id,
-                    submission,
-                    jobs: BTreeMap::new(),
-                    job_outputs: BTreeMap::new(),
-                    job_base_ids: BTreeMap::new(),
-                    job_needs: BTreeMap::new(),
-                    job_fail_fast: BTreeMap::new(),
-                    status: ExecutionStatus::Failure,
-                    job_check_run_ids: BTreeMap::new(),
-                    reusable_calls,
-                    jobs_list: Vec::new(),
-                },
-            );
-            drop(inner);
-            shared
-                .state
-                .emit(NdjsonEvent::RunAccepted {
-                    run_id,
-                    queued_jobs,
-                })
-                .await;
-            shared
-                .state
-                .emit(NdjsonEvent::RunStatus {
-                    run_id,
-                    status: ExecutionStatus::Failure,
-                    reason: Some("concurrency group name must not be empty".to_owned()),
-                })
-                .await;
-            return Ok(RunAccepted {
-                run_id,
-                queued_jobs,
-            });
-        }
         for job in jobs {
             job_base_ids.insert(job.id.clone(), job.base_id.clone());
             job_needs.insert(job.id.clone(), job.needs.clone());
@@ -1439,6 +1351,7 @@ pub(crate) async fn submit_run_inner(
             )
             .map_err(|e| ApiError::bad_request(format!("failed to build job message: {e}")))?;
 
+            // Mint a dynamic JWT for the job and inject it as GITHUB_TOKEN
             let token = mint_runtime_token(&agent_msg.plan.plan_id, &agent_msg.job_id);
             agent_msg.variables.insert(
                 "system.github.token".to_owned(),
@@ -1457,9 +1370,12 @@ pub(crate) async fn submit_run_inner(
                 );
             }
 
+            // Give every dispatched job a unique requestId so PATCH
+            // /AgentRequest/:request_id can target exactly one job.
             inner.next_request_id += 1;
             let request_id = inner.next_request_id;
             agent_msg.request_id = request_id;
+            // Wire DAP debugger fields from submission
             agent_msg.enable_debugger = submission.enable_debugger;
             agent_msg.debugger_welcome_message = submission.debugger_welcome_message.clone();
             if submission.enable_debugger {
@@ -1509,325 +1425,27 @@ pub(crate) async fn submit_run_inner(
                 max_parallel: job.max_parallel,
                 runs_on: job.runs_on.clone(),
                 message: agent_msg,
-                concurrency: concurrency::concurrency_from_plan_fields(
-                    job.concurrency_group.as_deref(),
-                    job.concurrency_cancel_in_progress.as_deref(),
-                    job.concurrency_queue.as_deref(),
-                ),
-                matrix: job
-                    .matrix
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
             };
-            job_base_ids.insert(job.id.clone(), job.base_id.clone());
-            job_fail_fast.insert(job.base_id.clone(), job.fail_fast);
-            built_jobs.push(queued_job);
-        }
 
-        // Workflow-level concurrency gate.
-        let mut hold_entire_run = false;
-        if let Some((group, cancel, queue, raw)) = &workflow_concurrency_eval {
-            let key = concurrency::concurrency_key(&submission.repository, group);
-            match try_acquire_concurrency(
-                &mut inner,
-                key,
-                group.clone(),
-                concurrency::Holder::Run(run_id),
-                *cancel,
-                *queue,
-            ) {
-                Ok(true) => {
-                    inner.run_concurrency.insert(run_id, raw.clone());
-                }
-                Ok(false) => {
-                    hold_entire_run = true;
-                    inner.run_concurrency.insert(run_id, raw.clone());
-                }
-                Err(e) if e == "concurrency_queue_overflow" => {
-                    // Cancel this run immediately — all jobs Cancelled.
-                    for job in &built_jobs {
-                        statuses.insert(job.job_id.clone(), ExecutionStatus::Cancelled);
-                    }
-                    let queued_jobs = statuses.len();
-                    inner.runs.insert(
-                        run_id,
-                        RunRecord {
-                            run_id,
-                            submission,
-                            jobs: statuses,
-                            job_outputs: BTreeMap::new(),
-                            job_base_ids,
-                            job_needs,
-                            job_fail_fast,
-                            status: ExecutionStatus::Cancelled,
-                            job_check_run_ids: BTreeMap::new(),
-                            reusable_calls,
-                            jobs_list: Vec::new(),
-                        },
-                    );
-                    drop(inner);
-                    shared
-                        .state
-                        .emit(NdjsonEvent::RunAccepted {
-                            run_id,
-                            queued_jobs,
-                        })
-                        .await;
-                    shared
-                        .state
-                        .emit(NdjsonEvent::RunStatus {
-                            run_id,
-                            status: ExecutionStatus::Cancelled,
-                            reason: concurrency::cancelled_reason(),
-                        })
-                        .await;
-                    return Ok(RunAccepted {
-                        run_id,
-                        queued_jobs,
-                    });
-                }
-                Err(e) => {
-                    return Err(ApiError::bad_request(e));
-                }
-            }
-        }
-
-        if hold_entire_run {
-            for job in &built_jobs {
-                statuses.insert(job.job_id.clone(), ExecutionStatus::Pending);
-            }
-            inner.held_runs.insert(run_id, built_jobs);
-            let queued_jobs = statuses.len();
-            inner.runs.insert(
-                run_id,
-                RunRecord {
-                    run_id,
-                    submission,
-                    jobs: statuses,
-                    job_outputs: BTreeMap::new(),
-                    job_base_ids,
-                    job_needs,
-                    job_fail_fast,
-                    status: ExecutionStatus::Pending,
-                    job_check_run_ids: BTreeMap::new(),
-                    reusable_calls,
-                    jobs_list: Vec::new(),
-                },
-            );
-            drop(inner);
-            shared
-                .state
-                .emit(NdjsonEvent::RunAccepted {
-                    run_id,
-                    queued_jobs,
-                })
-                .await;
-            shared
-                .state
-                .emit(NdjsonEvent::RunStatus {
-                    run_id,
-                    status: ExecutionStatus::Pending,
-                    reason: concurrency::pending_reason(),
-                })
-                .await;
-            return Ok(RunAccepted {
-                run_id,
-                queued_jobs,
-            });
-        }
-        // Install a provisional run before evaluating per-job and JobSet gates.
-        // Multiple holders from this same submission can cancel each other;
-        // cancellation helpers need the run to exist so they can persist the
-        // affected job conclusion instead of silently becoming no-ops.
-        inner.runs.insert(
-            run_id,
-            RunRecord {
-                run_id,
-                submission: submission.clone(),
-                jobs: statuses.clone(),
-                job_outputs: BTreeMap::new(),
-                job_base_ids: job_base_ids.clone(),
-                job_needs: job_needs.clone(),
-                job_fail_fast: job_fail_fast.clone(),
-                status: ExecutionStatus::Queued,
-                job_check_run_ids: BTreeMap::new(),
-                reusable_calls: reusable_calls.clone(),
-                jobs_list: Vec::new(),
-            },
-        );
-
-        // Reusable workflow invocations must acquire caller and embedded
-        // concurrency gates as one ordered, deduplicated admission set. A
-        // partially admitted JobSet keeps its earlier keys while waiting on
-        // the next key, preventing it from bypassing either scope.
-        let mut jobset_blocked: std::collections::HashSet<JobId> = std::collections::HashSet::new();
-        for call in reusable_calls.values() {
-            let member_ids: BTreeSet<JobId> = call
-                .inner_job_ids
-                .iter()
-                .map(|id| JobId(id.clone()))
-                .collect();
-            let id = JobSetId {
-                run_id,
-                job_ids: member_ids.clone(),
-            };
-            let mut gates = Vec::new();
-            let mut evaluation_failed = false;
-
-            for (raw, scope, label, inputs) in [
-                (
-                    call.caller_concurrency.as_ref(),
-                    concurrency::ConcurrencyScope::Job,
-                    "caller concurrency (JobSet)",
-                    &submission.inputs,
-                ),
-                (
-                    call.embedded_concurrency.as_ref(),
-                    concurrency::ConcurrencyScope::Workflow,
-                    "embedded concurrency (JobSet)",
-                    &call.inputs,
-                ),
-            ] {
-                let Some(raw) = raw else { continue };
-                let eval_ctx = concurrency::ConcurrencyContext {
-                    scope,
-                    github: &github,
-                    vars: &submission.vars,
-                    inputs,
-                    matrix: None,
-                    strategy: None,
-                    needs: None,
-                };
-                match concurrency::evaluate_concurrency(raw, &eval_ctx) {
-                    Ok((group, cancel_in_progress, queue)) if !group.trim().is_empty() => {
-                        merge_jobset_gate(
-                            &mut gates,
-                            JobSetGate {
-                                key: concurrency::concurrency_key(&submission.repository, &group),
-                                display_name: group,
-                                cancel_in_progress,
-                                queue,
-                            },
-                        );
-                    }
-                    Ok((_, _, _)) => {
-                        evaluation_failed = true;
-                    }
-                    Err(error) => {
-                        concurrency::log_eval_error(label, &error);
-                        evaluation_failed = true;
-                    }
-                }
-            }
-
-            if evaluation_failed {
-                for member_id in &member_ids {
-                    statuses.insert(member_id.clone(), ExecutionStatus::Failure);
-                }
-                jobset_blocked.extend(member_ids);
-                continue;
-            }
-            if gates.is_empty() {
-                continue;
-            }
-
-            inner.jobset_admissions.insert(
-                id.clone(),
-                JobSetAdmission {
-                    gates,
-                    acquired_keys: BTreeSet::new(),
-                },
-            );
-            match advance_jobset_admission(&mut inner, &id, None) {
-                Ok(JobSetAdmissionResult::Ready) => {}
-                Ok(JobSetAdmissionResult::Blocked) => {
-                    jobset_blocked.extend(member_ids);
-                }
-                Err(error) => {
-                    let status = if error == "concurrency_queue_overflow" {
-                        ExecutionStatus::Cancelled
-                    } else {
-                        ExecutionStatus::Failure
-                    };
-                    for member_id in &member_ids {
-                        statuses.insert(member_id.clone(), status);
-                    }
-                    jobset_blocked.extend(member_ids);
-                }
-            }
-        }
-
-        // Enqueue jobs (workflow concurrency free / acquired).
-        for queued_job in built_jobs {
-            let job_id = queued_job.job_id.clone();
-            let base_id = queued_job.base_id.clone();
-
-            // A blocked JobSet member must remain durably parked until every
-            // required key is acquired. Terminal members are not parked.
-            if jobset_blocked.contains(&job_id) {
-                let status = statuses.get(&job_id).copied();
-                if status.is_some_and(concurrency::is_awaiting_execution) {
-                    statuses.insert(job_id, ExecutionStatus::Pending);
-                    inner.concurrency_blocked.push_back(queued_job);
-                }
-                continue;
-            }
-
-            let needs_empty = queued_job.needs.is_empty();
-            let max_parallel = queued_job.max_parallel;
-            let under_mp = max_parallel
-                .is_none_or(|max| ready_by_base.get(&base_id).copied().unwrap_or(0) < max);
-
-            if needs_empty && under_mp {
-                // Job-level concurrency gate (needs/max_parallel already satisfied).
-                match try_enqueue_with_job_concurrency(
-                    &mut inner,
-                    &github,
-                    &submission,
-                    queued_job,
-                    &mut statuses,
-                ) {
-                    Ok(true) => {
-                        *ready_by_base.entry(base_id).or_default() += 1;
-                        ready_jobs += 1;
-                    }
-                    Ok(false) => {
-                        // parked pending
-                    }
-                    Err(_) => {
-                        // cancelled by queue overflow or eval failure already marked
-                    }
-                }
+            // Check if dependencies are met (no needs = ready immediately)
+            if job.needs.is_empty()
+                && job
+                    .max_parallel
+                    .is_none_or(|max| ready_by_base.get(&job.base_id).copied().unwrap_or(0) < max)
+            {
+                inner.queue.push_back(queued_job);
+                *ready_by_base.entry(job.base_id.clone()).or_default() += 1;
+                ready_jobs += 1;
             } else {
-                statuses.insert(job_id, ExecutionStatus::Queued);
+                // Job has dependencies — queue it as pending
                 inner.pending_jobs.push_back(queued_job);
             }
         }
-
-        // Preserve terminal conclusions written through cancel_job_inner while
-        // gates were evaluated. Non-terminal scheduling state remains owned by
-        // the local status map and is installed below with the final record.
-        if let Some(provisional) = inner.runs.get(&run_id) {
-            for (job_id, status) in &provisional.jobs {
-                if concurrency::is_terminal(*status) {
-                    statuses.insert(job_id.clone(), *status);
-                }
-            }
-        }
-
         let queued_jobs = statuses.len();
-        // C-05: derive the initial run status from job statuses so that eval
-        // failures (Failure) are reflected immediately rather than leaving the
-        // run permanently Queued. summarize_run returns InProgress for any mix
-        // of Queued/Pending jobs; map that to Queued since no job has started.
-        let initial_status = {
-            let s = summarize_run(statuses.values().copied());
-            if s == ExecutionStatus::InProgress {
-                ExecutionStatus::Queued
-            } else {
-                s
-            }
+        let initial_status = if statuses.values().copied().all(is_terminal_status) {
+            summarize_run(statuses.values().copied())
+        } else {
+            ExecutionStatus::Queued
         };
         inner.runs.insert(
             run_id,
@@ -1845,9 +1463,11 @@ pub(crate) async fn submit_run_inner(
                 jobs_list: Vec::new(),
             },
         );
-        let cancel_count = inner.cancellation_queue.len();
+        let scheduling = promote_ready_jobs(&mut inner);
+        ready_jobs += scheduling.promoted;
+        initially_skipped.extend(scheduling.skipped);
         drop(inner);
-        if ready_jobs > 0 || cancel_count > 0 {
+        if ready_jobs > 0 {
             shared.state.message_notify.notify_waiters();
         }
         for (event_run_id, job_id) in initially_skipped {
@@ -1872,78 +1492,6 @@ pub(crate) async fn submit_run_inner(
             run_id,
             queued_jobs,
         })
-    }
-}
-
-/// Enqueue a ready job, applying job-level concurrency if present.
-/// Returns Ok(true) if pushed to ready queue, Ok(false) if parked, Err if cancelled.
-fn try_enqueue_with_job_concurrency(
-    inner: &mut InnerState,
-    github: &serde_json::Value,
-    submission: &WorkflowSubmission,
-    queued_job: QueuedJob,
-    statuses: &mut BTreeMap<JobId, ExecutionStatus>,
-) -> Result<bool, ()> {
-    let Some(raw) = queued_job.concurrency.clone() else {
-        statuses.insert(queued_job.job_id.clone(), ExecutionStatus::Queued);
-        inner.queue.push_back(queued_job);
-        return Ok(true);
-    };
-
-    let strategy = queued_job
-        .message
-        .context_data
-        .get("strategy")
-        .map(concurrency::context_data_to_json)
-        .unwrap_or_else(|| json!({}));
-    let eval_ctx = concurrency::ConcurrencyContext {
-        scope: concurrency::ConcurrencyScope::Job,
-        github,
-        vars: &submission.vars,
-        inputs: &submission.inputs,
-        matrix: Some(&queued_job.matrix),
-        strategy: Some(&strategy),
-        needs: None,
-    };
-    let eval = concurrency::evaluate_concurrency(&raw, &eval_ctx);
-    let (group, cancel, queue) = match eval {
-        Ok(v) => v,
-        Err(e) => {
-            concurrency::log_eval_error("job concurrency", &e);
-            statuses.insert(queued_job.job_id.clone(), ExecutionStatus::Failure);
-            return Err(());
-        }
-    };
-    if group.trim().is_empty() {
-        statuses.insert(queued_job.job_id.clone(), ExecutionStatus::Failure);
-        return Err(());
-    }
-
-    let key = concurrency::concurrency_key(&submission.repository, &group);
-    let holder = concurrency::Holder::Job {
-        run_id: queued_job.run_id,
-        job_id: queued_job.job_id.clone(),
-    };
-    match try_acquire_concurrency(inner, key, group, holder, cancel, queue) {
-        Ok(true) => {
-            statuses.insert(queued_job.job_id.clone(), ExecutionStatus::Queued);
-            inner.queue.push_back(queued_job);
-            Ok(true)
-        }
-        Ok(false) => {
-            statuses.insert(queued_job.job_id.clone(), ExecutionStatus::Pending);
-            inner.concurrency_blocked.push_back(queued_job);
-            Ok(false)
-        }
-        Err(e) if e == "concurrency_queue_overflow" => {
-            statuses.insert(queued_job.job_id.clone(), ExecutionStatus::Cancelled);
-            let _ = queued_job;
-            Err(())
-        }
-        Err(_) => {
-            statuses.insert(queued_job.job_id.clone(), ExecutionStatus::Failure);
-            Err(())
-        }
     }
 }
 
@@ -2000,111 +1548,26 @@ async fn get_run(
     Path(run_id): Path<RunId>,
 ) -> Result<Json<RunRecord>, ApiError> {
     let inner = shared.state.inner.lock().await;
-    let mut run = inner
+    inner
         .runs
         .get(&run_id)
         .cloned()
-        .ok_or_else(|| ApiError::not_found("run not found"))?;
-
-    // Results/timeline updates only create details for dispatched jobs. Keep
-    // the native jobs_list a complete projection by adding jobs that were
-    // cancelled or failed before dispatch with an empty step list.
-    for (job_id, status) in &run.jobs {
-        if !run.jobs_list.iter().any(|detail| detail.name == job_id.0) {
-            run.jobs_list.push(JobDetail {
-                name: job_id.0.clone(),
-                conclusion: status_string(*status),
-                steps: Vec::new(),
-            });
-        }
-    }
-
-    for job_detail in &mut run.jobs_list {
-        if let Some(status) = run.jobs.get(&JobId(job_detail.name.clone())) {
-            job_detail.conclusion = status_string(*status);
-        }
-    }
-
-    Ok(Json(run))
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found("run not found"))
 }
 
 async fn get_run_logs(
     State(shared): State<Arc<SharedState>>,
-    Path(run_id): Path<RunId>,
-) -> Result<Response, ApiError> {
-    let (state_dir, sources) = {
-        let inner = shared.state.inner.lock().await;
-        if !inner.runs.contains_key(&run_id) {
-            return Err(ApiError::not_found("run not found"));
-        }
-
-        let mut requests: Vec<&TaskAgentJobRequestRecord> = inner
-            .job_requests
-            .values()
-            .filter(|request| request.run_id == run_id)
-            .collect();
-        requests.sort_by_key(|request| request.request_id);
-        let sources = requests
-            .into_iter()
-            .map(|request| {
-                let prefix = format!("{}/", request.plan_id);
-                let mut blocks: Vec<(&str, &[u8])> = inner
-                    .logs
-                    .iter()
-                    .filter_map(|(key, value)| {
-                        key.strip_prefix(&prefix)
-                            .map(|log_id| (log_id, value.as_slice()))
-                    })
-                    .collect();
-                blocks.sort_by(|(left, _), (right, _)| {
-                    match (left.parse::<u64>(), right.parse::<u64>()) {
-                        (Ok(left), Ok(right)) => left.cmp(&right),
-                        (Ok(_), Err(_)) => std::cmp::Ordering::Less,
-                        (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
-                        (Err(_), Err(_)) => left.cmp(right),
-                    }
-                });
-                (
-                    request.plan_id.clone(),
-                    request.agent_job_id.to_string(),
-                    blocks
-                        .into_iter()
-                        .map(|(_, block)| block.to_vec())
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .collect::<Vec<_>>();
-        (shared.state.state_dir.clone(), sources)
-    };
-
-    let mut merged = Vec::new();
-    for (plan_id, agent_job_id, fallback_blocks) in sources {
-        let results_log = state_dir
-            .join("replay")
-            .join("results")
-            .join(plan_id)
-            .join(agent_job_id)
-            .join("job-logs.txt");
-        match tokio::fs::read(&results_log).await {
-            Ok(contents) => merged.extend_from_slice(&contents),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                for block in fallback_blocks {
-                    merged.extend_from_slice(&block);
-                }
-            }
-            Err(error) => {
-                return Err(ApiError::internal(format!(
-                    "failed to read run log `{}`: {error}",
-                    results_log.display()
-                )));
-            }
-        }
+    Path(_run_id): Path<String>,
+) -> Result<String, ApiError> {
+    let inner = shared.state.inner.lock().await;
+    let mut out = String::new();
+    for (key, bytes) in &inner.logs {
+        out.push_str(&format!("--- Log: {key} ---\n"));
+        out.push_str(&String::from_utf8_lossy(bytes));
+        out.push_str("\n");
     }
-
-    Ok(Response::builder()
-        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .body(Body::from(merged))
-        .expect("static run log response"))
+    Ok(out)
 }
 
 async fn cancel_run(
@@ -2112,11 +1575,43 @@ async fn cancel_run(
     Path(run_id): Path<RunId>,
 ) -> Result<Json<RunRecord>, ApiError> {
     let mut inner = shared.state.inner.lock().await;
-    if !inner.runs.contains_key(&run_id) {
-        return Err(ApiError::not_found("run not found"));
+    let mut cancellations = Vec::new();
+    let changed;
+    {
+        let record = inner
+            .runs
+            .get_mut(&run_id)
+            .ok_or_else(|| ApiError::not_found("run not found"))?;
+        let was_active = record.jobs.values().any(|status| {
+            matches!(
+                status,
+                ExecutionStatus::Queued | ExecutionStatus::InProgress
+            )
+        });
+        changed = was_active;
+        if was_active {
+            record.status = ExecutionStatus::Cancelled;
+        }
+        for (job_id, status) in &mut record.jobs {
+            if matches!(*status, ExecutionStatus::InProgress) {
+                cancellations.push(QueuedCancellation {
+                    run_id,
+                    job_id: job_id.clone(),
+                });
+            }
+            if matches!(
+                *status,
+                ExecutionStatus::Queued | ExecutionStatus::InProgress
+            ) {
+                *status = ExecutionStatus::Cancelled;
+            }
+        }
     }
-    let cancellation_count =
-        cancel_run_inner(&mut inner, run_id, None /* no concurrency reason */);
+    inner.queue.retain(|job| job.run_id != run_id);
+    inner.pending_jobs.retain(|job| job.run_id != run_id);
+    inner.dap_ports.remove(&run_id);
+    let cancellation_count = cancellations.len();
+    inner.cancellation_queue.extend(cancellations);
     let record = inner
         .runs
         .get(&run_id)
@@ -2126,590 +1621,17 @@ async fn cancel_run(
     if cancellation_count > 0 {
         shared.state.message_notify.notify_waiters();
     }
-    shared
-        .state
-        .emit(NdjsonEvent::RunStatus {
-            run_id,
-            status: ExecutionStatus::Cancelled,
-            reason: None,
-        })
-        .await;
+    if changed {
+        shared
+            .state
+            .emit(NdjsonEvent::RunStatus {
+                run_id,
+                status: record.status,
+                reason: None,
+            })
+            .await;
+    }
     Ok(Json(record))
-}
-
-/// Resolve the agent job GUID for an in-flight job, if any.
-fn agent_job_id_for(inner: &InnerState, run_id: RunId, job_id: &JobId) -> Option<uuid::Uuid> {
-    inner
-        .job_requests
-        .values()
-        .find(|r| r.run_id == run_id && r.job_id == *job_id && r.result.is_none())
-        .map(|r| r.agent_job_id)
-        .or_else(|| {
-            // Also check via inflight_requests if result already set but still relevant.
-            inner
-                .job_requests
-                .values()
-                .find(|r| r.run_id == run_id && r.job_id == *job_id)
-                .map(|r| r.agent_job_id)
-        })
-}
-
-/// Cancel a run: mark non-terminal jobs Cancelled, enqueue JobCancellation for
-/// in-flight jobs, remove from queues/held/blocked, and release concurrency.
-/// Returns the number of cancellation messages enqueued.
-fn cancel_run_inner(inner: &mut InnerState, run_id: RunId, reason: Option<&str>) -> usize {
-    let mut in_progress: Vec<JobId> = Vec::new();
-    {
-        let Some(record) = inner.runs.get_mut(&run_id) else {
-            return 0;
-        };
-        record.status = ExecutionStatus::Cancelled;
-        for (job_id, status) in &mut record.jobs {
-            if matches!(*status, ExecutionStatus::InProgress) {
-                in_progress.push(job_id.clone());
-            }
-            if matches!(
-                *status,
-                ExecutionStatus::Queued | ExecutionStatus::Pending | ExecutionStatus::InProgress
-            ) {
-                *status = ExecutionStatus::Cancelled;
-            }
-        }
-    }
-
-    let mut cancellations = Vec::new();
-    for job_id in in_progress {
-        if let Some(agent_job_id) = agent_job_id_for(inner, run_id, &job_id) {
-            cancellations.push(QueuedCancellation {
-                run_id,
-                job_id,
-                agent_job_id,
-            });
-        }
-    }
-    let count = cancellations.len();
-    inner.cancellation_queue.extend(cancellations);
-
-    inner.queue.retain(|job| job.run_id != run_id);
-    inner.pending_jobs.retain(|job| job.run_id != run_id);
-    inner.held_runs.remove(&run_id);
-    inner.concurrency_blocked.retain(|job| job.run_id != run_id);
-    inner.dap_ports.remove(&run_id);
-
-    // Release any concurrency holders belonging to this run and promote next.
-    release_concurrency_for_run(inner, run_id);
-    inner.jobset_admissions.retain(|id, _| id.run_id != run_id);
-
-    let _ = reason; // events emitted by caller when needed
-    count
-}
-
-/// Cancel a single job (job-level concurrency / fail-fast style).
-fn cancel_job_inner(inner: &mut InnerState, run_id: RunId, job_id: &JobId) -> usize {
-    let was_in_progress = {
-        let Some(record) = inner.runs.get_mut(&run_id) else {
-            return 0;
-        };
-        let Some(status) = record.jobs.get_mut(job_id) else {
-            return 0;
-        };
-        let in_progress = matches!(*status, ExecutionStatus::InProgress);
-        if matches!(
-            *status,
-            ExecutionStatus::Queued | ExecutionStatus::Pending | ExecutionStatus::InProgress
-        ) {
-            *status = ExecutionStatus::Cancelled;
-        }
-        record.status = summarize_run(record.jobs.values().copied());
-        in_progress
-    };
-
-    let mut count = 0;
-    if was_in_progress {
-        if let Some(agent_job_id) = agent_job_id_for(inner, run_id, job_id) {
-            inner.cancellation_queue.push_back(QueuedCancellation {
-                run_id,
-                job_id: job_id.clone(),
-                agent_job_id,
-            });
-            count = 1;
-        }
-    }
-    inner
-        .queue
-        .retain(|j| !(j.run_id == run_id && j.job_id == *job_id));
-    inner
-        .pending_jobs
-        .retain(|j| !(j.run_id == run_id && j.job_id == *job_id));
-    inner
-        .concurrency_blocked
-        .retain(|j| !(j.run_id == run_id && j.job_id == *job_id));
-    if let Some(held) = inner.held_runs.get_mut(&run_id) {
-        held.retain(|j| j.job_id != *job_id);
-    }
-
-    release_concurrency_for_job(inner, run_id, job_id);
-    count
-}
-
-fn release_concurrency_for_run(inner: &mut InnerState, run_id: RunId) {
-    let keys: Vec<(String, String)> = inner.holder_keys.get(&run_id).cloned().unwrap_or_default();
-    for key in keys {
-        if let Some(group) = inner.concurrency_groups.get_mut(&key) {
-            let running_match = group
-                .running
-                .as_ref()
-                .is_some_and(|h| h.is_run_holder(run_id) || h.run_id() == run_id);
-            if running_match {
-                let done = group.running.take();
-                if let Some(done) = done {
-                    // Only release if all jobs terminal OR this was a cancel of the whole run.
-                    promote_next_from_group(inner, &key, done);
-                }
-            } else {
-                // Remove from pending queue.
-                if let Some(group) = inner.concurrency_groups.get_mut(&key) {
-                    group.pending.retain(|h| h.run_id() != run_id);
-                    if group.running.is_none() && group.pending.is_empty() {
-                        inner.concurrency_groups.remove(&key);
-                    }
-                }
-            }
-        }
-    }
-    // C-07: discard all key tracking for this run now that every group has been released.
-    inner.holder_keys.remove(&run_id);
-}
-
-fn release_concurrency_for_job(inner: &mut InnerState, run_id: RunId, job_id: &JobId) {
-    let keys: Vec<(String, String)> = inner.concurrency_groups.keys().cloned().collect();
-    for key in keys {
-        let should_release = {
-            let Some(group) = inner.concurrency_groups.get(&key) else {
-                continue;
-            };
-            match &group.running {
-                Some(h) if h.contains_job(run_id, job_id) => {
-                    // Job holders release immediately; Run/JobSet when all terminal.
-                    match h {
-                        concurrency::Holder::Job { .. } => true,
-                        concurrency::Holder::Run(_) | concurrency::Holder::JobSet { .. } => inner
-                            .runs
-                            .get(&run_id)
-                            .is_some_and(|r| concurrency::holder_is_terminal(h, &r.jobs)),
-                    }
-                }
-                _ => false,
-            }
-        };
-        // Also drop pending entries for this job.
-        if let Some(group) = inner.concurrency_groups.get_mut(&key) {
-            group.pending.retain(|h| !h.contains_job(run_id, job_id));
-        }
-        if should_release {
-            if let Some(group) = inner.concurrency_groups.get_mut(&key) {
-                if let Some(done) = group.running.take() {
-                    promote_next_from_group(inner, &key, done);
-                }
-            }
-        } else if let Some(group) = inner.concurrency_groups.get(&key) {
-            if group.running.is_none() && group.pending.is_empty() {
-                inner.concurrency_groups.remove(&key);
-            }
-        }
-        // C-07: prune this key from holder_keys when the run has no remaining
-        // presence in the group (neither running nor pending).
-        let run_still_present = inner.concurrency_groups.get(&key).is_some_and(|g| {
-            g.running.as_ref().is_some_and(|h| h.run_id() == run_id)
-                || g.pending.iter().any(|h| h.run_id() == run_id)
-        });
-        if !run_still_present {
-            if let Some(rkeys) = inner.holder_keys.get_mut(&run_id) {
-                rkeys.retain(|k| k != &key);
-                if rkeys.is_empty() {
-                    inner.holder_keys.remove(&run_id);
-                }
-            }
-        }
-    }
-}
-
-/// Release a single concurrency key acquired by a JobSet whose members all
-/// became terminal before any could dispatch (e.g. embedded gate overflow).
-/// Removes the running holder from the group and promotes the next pending.
-fn merge_jobset_gate(gates: &mut Vec<JobSetGate>, mut gate: JobSetGate) {
-    if let Some(existing) = gates.iter_mut().find(|existing| existing.key == gate.key) {
-        existing.cancel_in_progress |= gate.cancel_in_progress;
-        if gate.queue == aksh_gha_parser::ConcurrencyQueue::Single {
-            existing.queue = aksh_gha_parser::ConcurrencyQueue::Single;
-        }
-        return;
-    }
-    gate.display_name = gate.display_name.trim().to_owned();
-    gates.push(gate);
-    gates.sort_by(|left, right| left.key.cmp(&right.key));
-}
-
-fn release_holder_key(
-    inner: &mut InnerState,
-    key: &(String, String),
-    holder: &concurrency::Holder,
-) {
-    let mut promote = None;
-    if let Some(group) = inner.concurrency_groups.get_mut(key) {
-        if group.running.as_ref() == Some(holder) {
-            promote = group.running.take();
-        } else {
-            group.pending.retain(|pending| pending != holder);
-        }
-    }
-    if let Some(done) = promote {
-        promote_next_from_group(inner, key, done);
-    }
-    if inner
-        .concurrency_groups
-        .get(key)
-        .is_some_and(|group| group.running.is_none() && group.pending.is_empty())
-    {
-        inner.concurrency_groups.remove(key);
-    }
-
-    let run_id = holder.run_id();
-    let run_still_present = inner.concurrency_groups.get(key).is_some_and(|group| {
-        group
-            .running
-            .as_ref()
-            .is_some_and(|candidate| candidate.run_id() == run_id)
-            || group
-                .pending
-                .iter()
-                .any(|candidate| candidate.run_id() == run_id)
-    });
-    if !run_still_present {
-        if let Some(keys) = inner.holder_keys.get_mut(&run_id) {
-            keys.retain(|candidate| candidate != key);
-            if keys.is_empty() {
-                inner.holder_keys.remove(&run_id);
-            }
-        }
-    }
-}
-
-fn release_jobset_admission(inner: &mut InnerState, id: &JobSetId) {
-    let Some(admission) = inner.jobset_admissions.remove(id) else {
-        return;
-    };
-    let holder = id.holder();
-    for key in admission.acquired_keys {
-        release_holder_key(inner, &key, &holder);
-    }
-}
-
-fn advance_jobset_admission(
-    inner: &mut InnerState,
-    id: &JobSetId,
-    promoted_key: Option<&(String, String)>,
-) -> Result<JobSetAdmissionResult, String> {
-    if let Some(key) = promoted_key {
-        if let Some(admission) = inner.jobset_admissions.get_mut(id) {
-            admission.acquired_keys.insert(key.clone());
-        }
-    }
-
-    loop {
-        let next_gate = {
-            let Some(admission) = inner.jobset_admissions.get(id) else {
-                return Ok(JobSetAdmissionResult::Ready);
-            };
-            admission
-                .gates
-                .iter()
-                .find(|gate| !admission.acquired_keys.contains(&gate.key))
-                .cloned()
-        };
-        let Some(gate) = next_gate else {
-            inner.jobset_admissions.remove(id);
-            return Ok(JobSetAdmissionResult::Ready);
-        };
-
-        let holder = id.holder();
-        match try_acquire_concurrency(
-            inner,
-            gate.key.clone(),
-            gate.display_name,
-            holder,
-            gate.cancel_in_progress,
-            gate.queue,
-        ) {
-            Ok(true) => {
-                if let Some(admission) = inner.jobset_admissions.get_mut(id) {
-                    admission.acquired_keys.insert(gate.key);
-                }
-            }
-            Ok(false) => return Ok(JobSetAdmissionResult::Blocked),
-            Err(error) => {
-                release_jobset_admission(inner, id);
-                return Err(error);
-            }
-        }
-    }
-}
-
-/// After a holder finishes, promote the next pending holder for the group.
-fn promote_next_from_group(
-    inner: &mut InnerState,
-    key: &(String, String),
-    _done: concurrency::Holder,
-) {
-    let next = {
-        let Some(group) = inner.concurrency_groups.get_mut(key) else {
-            return;
-        };
-        group.pending.pop_front()
-    };
-
-    let Some(next) = next else {
-        if let Some(group) = inner.concurrency_groups.get(key) {
-            if group.running.is_none() && group.pending.is_empty() {
-                inner.concurrency_groups.remove(key);
-            }
-        }
-        return;
-    };
-
-    // Install as running immediately for Run and JobSet; for Holder::Job, defer
-    // until max-parallel is confirmed free so the job cannot contend with its
-    // own pending holder (C-01).
-    if !matches!(&next, concurrency::Holder::Job { .. }) {
-        if let Some(group) = inner.concurrency_groups.get_mut(key) {
-            group.running = Some(next.clone());
-        }
-    }
-
-    match next {
-        concurrency::Holder::Run(run_id) => {
-            if let Some(jobs) = inner.held_runs.remove(&run_id) {
-                for mut job in jobs {
-                    if let Some(run) = inner.runs.get_mut(&run_id) {
-                        run.jobs.insert(job.job_id.clone(), ExecutionStatus::Queued);
-                    }
-                    // Re-check needs/max_parallel before queueing.
-                    let needs_ok = inner.runs.get(&run_id).is_some_and(|run| {
-                        job.needs
-                            .iter()
-                            .all(|n| scheduling::need_satisfied(&run.jobs, n))
-                    });
-                    if needs_ok && under_max_parallel(inner, &job) {
-                        if let Some(run) = inner.runs.get(&run_id) {
-                            hydrate_needs_context(&mut job, run);
-                        }
-                        inner.queue.push_back(job);
-                    } else {
-                        if let Some(run) = inner.runs.get_mut(&run_id) {
-                            // keep Queued status in pending_jobs path
-                            run.jobs.insert(job.job_id.clone(), ExecutionStatus::Queued);
-                        }
-                        inner.pending_jobs.push_back(job);
-                    }
-                }
-                if let Some(run) = inner.runs.get_mut(&run_id) {
-                    if run.status == ExecutionStatus::Pending {
-                        run.status = ExecutionStatus::Queued;
-                    }
-                }
-            }
-        }
-        concurrency::Holder::Job { run_id, job_id } => {
-            let pos = inner
-                .concurrency_blocked
-                .iter()
-                .position(|j| j.run_id == run_id && j.job_id == job_id);
-            let Some(pos) = pos else { return };
-            // Remove the job temporarily so we can call under_max_parallel
-            // without a mutable/immutable borrow conflict on inner.
-            let mut job = inner.concurrency_blocked.remove(pos).unwrap();
-            if !under_max_parallel(inner, &job) {
-                // max-parallel still full: restore the holder at the front of
-                // the pending queue and put the job back where it was so the
-                // next release event or promote_ready_jobs sweep can retry.
-                inner.concurrency_blocked.insert(pos, job);
-                if let Some(group) = inner.concurrency_groups.get_mut(key) {
-                    group
-                        .pending
-                        .push_front(concurrency::Holder::Job { run_id, job_id });
-                }
-                return;
-            }
-            // Both gates clear: atomically install as running and dispatch.
-            if let Some(group) = inner.concurrency_groups.get_mut(key) {
-                group.running = Some(concurrency::Holder::Job { run_id, job_id });
-            }
-            if let Some(run) = inner.runs.get_mut(&run_id) {
-                run.jobs.insert(job.job_id.clone(), ExecutionStatus::Queued);
-                hydrate_needs_context(&mut job, run);
-            }
-            inner.queue.push_back(job);
-        }
-        concurrency::Holder::JobSet { run_id, job_ids } => {
-            let id = JobSetId {
-                run_id,
-                job_ids: job_ids.clone(),
-            };
-            match advance_jobset_admission(inner, &id, Some(key)) {
-                Ok(JobSetAdmissionResult::Blocked) => return,
-                Err(_) => {
-                    cancel_holder(
-                        inner,
-                        &concurrency::Holder::JobSet { run_id, job_ids },
-                        concurrency::cancelled_reason().as_deref(),
-                    );
-                    return;
-                }
-                Ok(JobSetAdmissionResult::Ready) => {}
-            }
-
-            let mut to_queue = Vec::new();
-            inner.concurrency_blocked.retain(|job| {
-                if job.run_id == run_id && job_ids.contains(&job.job_id) {
-                    to_queue.push(job.clone());
-                    false
-                } else {
-                    true
-                }
-            });
-            for mut job in to_queue {
-                if under_max_parallel(inner, &job) {
-                    if let Some(run) = inner.runs.get_mut(&run_id) {
-                        run.jobs.insert(job.job_id.clone(), ExecutionStatus::Queued);
-                        hydrate_needs_context(&mut job, run);
-                    }
-                    inner.queue.push_back(job);
-                } else {
-                    if let Some(run) = inner.runs.get_mut(&run_id) {
-                        run.jobs.insert(job.job_id.clone(), ExecutionStatus::Queued);
-                    }
-                    inner.pending_jobs.push_back(job);
-                }
-            }
-        }
-    }
-}
-
-/// Try to acquire a concurrency slot for a holder. Returns:
-/// - `Ok(true)` if the holder may proceed (slot acquired / free)
-/// - `Ok(false)` if parked as pending
-/// - `Err("cancelled")` if the arrival itself was cancelled (queue max overflow)
-/// - `Err(msg)` for evaluation / empty-group errors
-fn try_acquire_concurrency(
-    inner: &mut InnerState,
-    key: (String, String),
-    display_name: String,
-    holder: concurrency::Holder,
-    cancel_in_progress: bool,
-    queue: aksh_gha_parser::ConcurrencyQueue,
-) -> Result<bool, String> {
-    let group = inner
-        .concurrency_groups
-        .entry(key.clone())
-        .or_insert_with(|| concurrency::ConcurrencyGroup {
-            display_name: display_name.clone(),
-            running: None,
-            pending: VecDeque::new(),
-        });
-    if group.display_name.is_empty() {
-        group.display_name = display_name;
-    }
-
-    if group.running.is_none() {
-        group.running = Some(holder.clone());
-        let _ = group;
-        track_holder_key(inner, &holder, key);
-        return Ok(true);
-    }
-
-    if cancel_in_progress {
-        let prev = group.running.take();
-        // Docs: "any existing pending job or workflow in the same concurrency
-        // group will be canceled" — drain all pending holders too.
-        let stale_pending: Vec<concurrency::Holder> = group.pending.drain(..).collect();
-        group.running = Some(holder.clone());
-        let _ = group;
-        track_holder_key(inner, &holder, key.clone());
-        if let Some(prev) = prev {
-            cancel_holder(inner, &prev, concurrency::cancelled_reason().as_deref());
-        }
-        for pending in stale_pending {
-            cancel_holder(inner, &pending, concurrency::cancelled_reason().as_deref());
-        }
-        return Ok(true);
-    }
-    let _ = group;
-
-    // Contended — apply queue mode for this arrival.
-    let join = {
-        let group = inner.concurrency_groups.get(&key).unwrap();
-        concurrency::apply_queue_mode(queue, &group.pending)
-    };
-
-    for pending_holder in join.cancel_pending {
-        cancel_holder(
-            inner,
-            &pending_holder,
-            concurrency::cancelled_reason().as_deref(),
-        );
-        if let Some(group) = inner.concurrency_groups.get_mut(&key) {
-            group.pending.retain(|h| h != &pending_holder);
-        }
-    }
-
-    if join.cancel_arrival {
-        return Err("concurrency_queue_overflow".to_owned());
-    }
-
-    if join.park_arrival {
-        if let Some(group) = inner.concurrency_groups.get_mut(&key) {
-            // After single-mode clears, re-push.
-            group.pending.push_back(holder.clone());
-        }
-        track_holder_key(inner, &holder, key);
-        return Ok(false);
-    }
-
-    Ok(true)
-}
-
-fn track_holder_key(inner: &mut InnerState, holder: &concurrency::Holder, key: (String, String)) {
-    let run_id = holder.run_id();
-    let keys = inner.holder_keys.entry(run_id).or_default();
-    if !keys.contains(&key) {
-        keys.push(key);
-    }
-}
-
-fn cancel_holder(inner: &mut InnerState, holder: &concurrency::Holder, _reason: Option<&str>) {
-    match holder {
-        concurrency::Holder::Run(run_id) => {
-            cancel_run_inner(inner, *run_id, Some("concurrency_cancelled"));
-        }
-        concurrency::Holder::Job { run_id, job_id } => {
-            cancel_job_inner(inner, *run_id, job_id);
-        }
-        concurrency::Holder::JobSet { run_id, job_ids } => {
-            inner.jobset_admissions.remove(&JobSetId {
-                run_id: *run_id,
-                job_ids: job_ids.clone(),
-            });
-            for job_id in job_ids {
-                cancel_job_inner(inner, *run_id, job_id);
-            }
-            // If all jobs cancelled, mark run cancelled when appropriate.
-            if let Some(run) = inner.runs.get_mut(run_id) {
-                if run.jobs.values().all(|s| concurrency::is_terminal(*s)) {
-                    run.status = summarize_run(run.jobs.values().copied());
-                }
-            }
-        }
-    }
 }
 
 async fn rerun_run(
@@ -3258,9 +2180,6 @@ fn broker_job_ref(request: &TaskAgentJobRequestRecord, runner_id: i64) -> serde_
 }
 
 fn broker_job_ref_root(request: &TaskAgentJobRequestRecord, runner_id: i64) -> serde_json::Value {
-    // messageId must be unique across job + cancel messages on a session.
-    // Using request_id alone collides with cancel messages that also allocate
-    // from the same integer space (runner in-memory dedup then drops the job).
     json!({
         "messageId": request.request_id,
         "messageType": "RunnerJobRequest",
@@ -3271,19 +2190,6 @@ fn broker_job_ref_root(request: &TaskAgentJobRequestRecord, runner_id: i64) -> s
             "should_acknowledge": true
         })).unwrap()
     })
-}
-
-/// Allocate a session-unique broker message id that cannot collide with
-/// `request_id` values used as RunnerJobRequest messageIds.
-fn next_broker_message_id(inner: &mut InnerState) -> i64 {
-    // request_ids start at 1 and increase; keep message ids in a separate high
-    // range so cancels never reuse a past/future request_id.
-    const MESSAGE_ID_BASE: i64 = 1_000_000;
-    if inner.next_message_id < MESSAGE_ID_BASE {
-        inner.next_message_id = MESSAGE_ID_BASE;
-    }
-    inner.next_message_id += 1;
-    inner.next_message_id
 }
 async fn next_message_broker_ref(
     State(shared): State<Arc<SharedState>>,
@@ -3322,7 +2228,11 @@ async fn next_message_broker_ref(
                         &mut inner,
                         &session_id,
                         azdo::message_type::JOB_CANCELLED,
-                        concurrency::job_cancel_body(cancellation.agent_job_id),
+                        json!({
+                            "runId": cancellation.run_id.to_string(),
+                            "jobId": cancellation.job_id.to_string(),
+                        })
+                        .to_string(),
                     );
                     return Ok(Json(message).into_response());
                 }
@@ -3480,39 +2390,15 @@ async fn next_message_broker_ref_root(
         .get("waitSeconds")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(50);
-    // The runner may report completion before its worker process has fully
-    // exited. GitHub keeps polling with status=Busy during that drain window;
-    // never dispatch a successor until the runner reports Online again.
-    let runner_busy = params
-        .get("status")
-        .is_some_and(|status| status.eq_ignore_ascii_case("busy"));
-
     let deadline = std::time::Instant::now() + Duration::from_secs(wait);
 
     loop {
         let maybe = {
             let mut inner = shared.state.inner.lock().await;
-            // Prefer delivering JobCancellation for the active request (official
-            // cancel path). Without this, concurrency cancel-in-progress never
-            // reaches broker-path runners.
             if let Some(request_id) = inner.session_active_requests.get(&session_id).copied() {
-                if let Some(request) = inner.job_requests.get(&request_id).cloned() {
-                    if let Some(pos) = inner
-                        .cancellation_queue
-                        .iter()
-                        .position(|c| c.run_id == request.run_id && c.job_id == request.job_id)
-                    {
-                        let cancellation = inner.cancellation_queue.remove(pos).unwrap();
-                        let message_id = next_broker_message_id(&mut inner);
-                        Some(json!({
-                            "messageId": message_id,
-                            "messageType": azdo::message_type::JOB_CANCELLED,
-                            "body": concurrency::job_cancel_body(cancellation.agent_job_id),
-                        }))
-                    } else if request.result.is_none() {
-                        // Still running — long-poll for cancel rather than
-                        // redelivering the same RunnerJobRequest (runner dedups it).
-                        None
+                if let Some(request) = inner.job_requests.get(&request_id) {
+                    if request.result.is_none() {
+                        Some(broker_job_ref_root(request, 1))
                     } else {
                         inner.session_active_requests.remove(&session_id);
                         None
@@ -3521,8 +2407,6 @@ async fn next_message_broker_ref_root(
                     inner.session_active_requests.remove(&session_id);
                     None
                 }
-            } else if runner_busy {
-                None
             } else {
                 let labels = inner.runner_labels_for_session(&session_id);
                 if let Some(queued) = take_matching_job(&mut inner.queue, &labels) {
@@ -3532,11 +2416,6 @@ async fn next_message_broker_ref_root(
                             .insert(queued.job_id.clone(), ExecutionStatus::InProgress);
                     }
                     let request_id = queued.message.request_id;
-                    if let Some(request) = inner.job_requests.get_mut(&request_id) {
-                        request.started_at = Some(std::time::SystemTime::now());
-                        request.last_renewed_at = Some(std::time::SystemTime::now());
-                    }
-                    // Job messageId = request_id (low range). Cancels use 1_000_000+.
                     inner
                         .session_active_requests
                         .insert(session_id.clone(), request_id);
@@ -3560,10 +2439,7 @@ async fn next_message_broker_ref_root(
         if wait == 0 || std::time::Instant::now() >= deadline {
             return Ok(Json(serde_json::Value::Null));
         }
-        // Wake promptly on cancel/enqueue rather than fixed 250ms sleep.
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        let slice = remaining.min(Duration::from_secs(3));
-        let _ = tokio::time::timeout(slice, shared.state.message_notify.notified()).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
 
@@ -3711,11 +2587,6 @@ async fn broker_complete_job(
             record.result = Some(status);
             record.locked_until = agent_request_locked_until();
         }
-        // Free the session so the next broker poll can take a new job immediately
-        // (otherwise the poll arm waits until it observes result.is_some()).
-        inner
-            .session_active_requests
-            .retain(|_, &mut rid| rid != request_id);
         let run_job = inner.inflight_requests.remove(&request_id).or_else(|| {
             job_request_tuple(&inner, request_id).map(|(_, run_id, job_id)| (run_id, job_id))
         });
@@ -3739,11 +2610,8 @@ async fn broker_complete_job(
         }
     };
     if let Some(completion) = completion {
-        let _ = complete_job_inner(shared.clone(), completion).await?;
+        let _ = complete_job_inner(shared, completion).await?;
     }
-    // Wake long-polling runners so a queued successor job is delivered promptly
-    // after cancel/complete (concurrency release path).
-    shared.state.message_notify.notify_waiters();
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3760,80 +2628,90 @@ struct StepLogsSignedBlobUrlRequest {
     workflow_run_backend_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct WorkflowStepUpdateRequest {
+    external_id: String,
+    number: u32,
+    name: String,
+    status: u32,
+    #[serde(default)]
+    started_at: Option<String>,
+    #[serde(default)]
+    completed_at: Option<String>,
+    conclusion: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct WorkflowStepsUpdateRequest {
+    steps: Vec<WorkflowStepUpdateRequest>,
+    change_order: u64,
+    workflow_job_run_backend_id: String,
+    workflow_run_backend_id: String,
+}
+
 async fn twirp_workflow_steps_update(
     State(shared): State<Arc<SharedState>>,
-    Json(payload): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+    Json(request): Json<WorkflowStepsUpdateRequest>,
+) -> Json<serde_json::Value> {
     let mut inner = shared.state.inner.lock().await;
 
-    let plan_id = payload["workflow_run_backend_id"].as_str().unwrap_or("");
-    let agent_job_id_str = payload["workflow_job_run_backend_id"]
-        .as_str()
-        .unwrap_or("");
-
-    if let (Some(plan_uuid), Some(job_uuid)) = (
-        uuid::Uuid::parse_str(plan_id).ok(),
-        uuid::Uuid::parse_str(agent_job_id_str).ok(),
+    if let Some((_, run_id, job_id)) = resolve_callback_job(
+        &inner,
+        &request.workflow_run_backend_id,
+        None,
+        uuid::Uuid::parse_str(&request.workflow_job_run_backend_id).ok(),
     ) {
-        if let Some((_, run_id, job_id)) =
-            resolve_callback_job(&inner, &plan_uuid.to_string(), None, Some(job_uuid))
-        {
-            if let Some(run) = inner.runs.get_mut(&run_id) {
-                let job_name = job_id.0.clone();
-                let job_detail =
-                    if let Some(pos) = run.jobs_list.iter().position(|j| j.name == job_name) {
-                        &mut run.jobs_list[pos]
-                    } else {
-                        run.jobs_list.push(JobDetail {
-                            name: job_name,
-                            conclusion: "success".to_owned(),
-                            steps: Vec::new(),
-                        });
-                        run.jobs_list.last_mut().unwrap()
-                    };
+        if let Some(run) = inner.runs.get_mut(&run_id) {
+            let job_name = job_id.0.clone();
+            let job_detail =
+                if let Some(pos) = run.jobs_list.iter().position(|j| j.name == job_name) {
+                    &mut run.jobs_list[pos]
+                } else {
+                    run.jobs_list.push(JobDetail {
+                        name: job_name,
+                        conclusion: "success".to_owned(),
+                        steps: Vec::new(),
+                    });
+                    run.jobs_list.last_mut().unwrap()
+                };
 
-                if let Some(status) = run.jobs.get(&job_id) {
-                    job_detail.conclusion = format!("{:?}", status).to_lowercase();
-                }
-                if let Some(steps) = payload["steps"].as_array() {
-                    for step in steps {
-                        let name = step["name"].as_str().unwrap_or("").to_owned();
-                        let conclusion_num = step["conclusion"].as_u64().unwrap_or(0);
-                        let status_num = step["status"].as_u64().unwrap_or(0);
-
-                        let job_status = run.jobs.get(&job_id).copied();
-                        let conclusion_str = if status_num == 6 {
-                            match conclusion_num {
-                                2 => "success",
-                                3 => {
-                                    if job_status == Some(ExecutionStatus::Cancelled) {
-                                        "cancelled"
-                                    } else {
-                                        "failure"
-                                    }
-                                }
-                                7 => "skipped",
-                                _ => "success",
+            if let Some(status) = run.jobs.get(&job_id) {
+                job_detail.conclusion = status_string(*status);
+            }
+            for step in &request.steps {
+                let job_status = run.jobs.get(&job_id).copied();
+                let conclusion_str = if step.status == 6 {
+                    match step.conclusion {
+                        2 => "success",
+                        3 => {
+                            if job_status == Some(ExecutionStatus::Cancelled) {
+                                "cancelled"
+                            } else {
+                                "failure"
                             }
-                        } else {
-                            "in_progress"
-                        };
-
-                        if let Some(pos) = job_detail.steps.iter().position(|s| s.name == name) {
-                            job_detail.steps[pos].conclusion = conclusion_str.to_owned();
-                        } else {
-                            job_detail.steps.push(StepRecord {
-                                name,
-                                conclusion: conclusion_str.to_owned(),
-                            });
                         }
+                        7 => "skipped",
+                        _ => "success",
                     }
+                } else {
+                    "in_progress"
+                };
+
+                if let Some(pos) = job_detail.steps.iter().position(|s| s.name == step.name) {
+                    job_detail.steps[pos].conclusion = conclusion_str.to_owned();
+                } else {
+                    job_detail.steps.push(StepRecord {
+                        name: step.name.clone(),
+                        conclusion: conclusion_str.to_owned(),
+                    });
                 }
             }
         }
     }
 
-    Ok(Json(json!({"ok": true})))
+    Json(json!({"ok": true}))
 }
 
 async fn twirp_get_job_logs_signed_blob_url(
@@ -4611,7 +3489,11 @@ async fn next_message(
         }
 
         if let Some(cancellation) = inner.cancellation_queue.pop_front() {
-            let body_json = concurrency::job_cancel_body(cancellation.agent_job_id);
+            let body_json = json!({
+                "runId": cancellation.run_id.to_string(),
+                "jobId": cancellation.job_id.to_string(),
+            })
+            .to_string();
             let message = build_task_agent_message(
                 &mut inner,
                 &session_id,
@@ -4976,7 +3858,7 @@ fn agent_request_result(status: ExecutionStatus) -> &'static str {
         ExecutionStatus::Failure => "failed",
         ExecutionStatus::Cancelled => "canceled",
         ExecutionStatus::Skipped => "skipped",
-        ExecutionStatus::Queued | ExecutionStatus::Pending | ExecutionStatus::InProgress => {
+        ExecutionStatus::Pending | ExecutionStatus::Queued | ExecutionStatus::InProgress => {
             "pending"
         }
     }
@@ -5052,30 +3934,16 @@ async fn complete_job_inner(
             .runs
             .get_mut(&completion.run_id)
             .ok_or_else(|| ApiError::not_found("run not found"))?;
-        let prior = run
+        let current = run
             .jobs
             .get(&completion.job_id)
             .copied()
             .ok_or_else(|| ApiError::bad_request("job does not belong to run"))?;
-        if is_terminal_status(prior) && prior != ExecutionStatus::Cancelled {
+        if is_terminal_status(current) {
             return Ok(Json(run.clone()));
         }
-        let effective = match (prior, completion.status) {
-            (ExecutionStatus::Cancelled, ExecutionStatus::Success)
-            | (ExecutionStatus::Cancelled, ExecutionStatus::Failure) => ExecutionStatus::Cancelled,
-            _ => completion.status,
-        };
-        run.jobs.insert(completion.job_id.clone(), effective);
-        let job_name = completion.job_id.0.clone();
-        if let Some(pos) = run.jobs_list.iter().position(|j| j.name == job_name) {
-            run.jobs_list[pos].conclusion = format!("{:?}", effective).to_lowercase();
-        } else {
-            run.jobs_list.push(JobDetail {
-                name: job_name,
-                conclusion: format!("{:?}", effective).to_lowercase(),
-                steps: Vec::new(),
-            });
-        }
+        run.jobs
+            .insert(completion.job_id.clone(), completion.status);
         run.job_outputs.insert(
             completion.job_id.clone(),
             completion
@@ -5087,61 +3955,17 @@ async fn complete_job_inner(
         propagate_reusable_outputs(run);
         run.status = summarize_run(run.jobs.values().copied());
     }
-    // Use the status actually stored (may differ from completion if terminal-locked).
-    let effective_status = inner
-        .runs
-        .get(&completion.run_id)
-        .and_then(|r| r.jobs.get(&completion.job_id).copied())
-        .unwrap_or(completion.status);
-    let cancelled_siblings = if effective_status == ExecutionStatus::Failure {
+    let cancelled_siblings = if completion.status == ExecutionStatus::Failure {
         apply_matrix_fail_fast(&mut inner, completion.run_id, &completion.job_id)
     } else {
         Vec::new()
     };
-    // A terminal job must not remain dispatchable, including completion via
-    // the native/internal API before a runner acquires it.
-    inner
-        .queue
-        .retain(|job| !(job.run_id == completion.run_id && job.job_id == completion.job_id));
-    inner
-        .pending_jobs
-        .retain(|job| !(job.run_id == completion.run_id && job.job_id == completion.job_id));
-    inner
-        .concurrency_blocked
-        .retain(|job| !(job.run_id == completion.run_id && job.job_id == completion.job_id));
-    if let Some(held) = inner.held_runs.get_mut(&completion.run_id) {
-        held.retain(|job| job.job_id != completion.job_id);
-        if held.is_empty() {
-            inner.held_runs.remove(&completion.run_id);
-        }
-    }
-    // Release concurrency for the completed job / run, which may promote held work.
-    release_concurrency_for_job(&mut inner, completion.run_id, &completion.job_id);
     let scheduling = promote_ready_jobs(&mut inner);
     let record = inner
         .runs
         .get(&completion.run_id)
         .cloned()
         .ok_or_else(|| ApiError::not_found("run not found"))?;
-    // Mark agent request finished and free the broker session slot so the
-    // runner can immediately poll the next job (including concurrency successors).
-    let finished_request_ids: Vec<i64> = inner
-        .job_requests
-        .iter()
-        .filter(|(_, r)| r.run_id == completion.run_id && r.job_id == completion.job_id)
-        .map(|(id, _)| *id)
-        .collect();
-    for request_id in &finished_request_ids {
-        if let Some(req) = inner.job_requests.get_mut(request_id) {
-            if req.result.is_none() {
-                req.result = Some(effective_status);
-            }
-        }
-        inner
-            .session_active_requests
-            .retain(|_, &mut rid| rid != *request_id);
-        inner.inflight_requests.remove(request_id);
-    }
     // Evict live-log state for this job to prevent unbounded memory growth.
     // The durable step-log blob has already been uploaded by the runner.
     if let Some(agent_key) = inner
@@ -5154,18 +3978,17 @@ async fn complete_job_inner(
         inner.live_log_tx.remove(&agent_key);
     }
     inner.dap_ports.remove(&completion.run_id);
-    let queue_nonempty = !inner.queue.is_empty() || !inner.cancellation_queue.is_empty();
     drop(inner);
 
     github::report_check_run_completed(
         &shared,
         completion.run_id,
         &completion.job_id,
-        effective_status,
+        completion.status,
     )
     .await;
 
-    if scheduling.promoted > 0 || !cancelled_siblings.is_empty() || queue_nonempty {
+    if scheduling.promoted > 0 || !cancelled_siblings.is_empty() {
         shared.state.message_notify.notify_waiters();
     }
 
@@ -5174,7 +3997,7 @@ async fn complete_job_inner(
         .emit(NdjsonEvent::JobStatus {
             run_id: completion.run_id,
             job_id: completion.job_id,
-            status: effective_status,
+            status: completion.status,
             reason: None,
         })
         .await;
@@ -5518,15 +4341,13 @@ fn apply_matrix_fail_fast(inner: &mut InnerState, run_id: RunId, failed_job: &Jo
             && run.job_base_ids.get(job_id) == Some(&base_id)
             && matches!(
                 status,
-                ExecutionStatus::Queued | ExecutionStatus::Pending | ExecutionStatus::InProgress
+                ExecutionStatus::Queued | ExecutionStatus::InProgress
             )
         {
             if matches!(status, ExecutionStatus::InProgress) {
-                // Resolve agent_job_id after loop (borrow checker).
                 cancellations.push(QueuedCancellation {
                     run_id,
                     job_id: job_id.clone(),
-                    agent_job_id: uuid::Uuid::nil(), // filled below
                 });
             }
             cancelled_jobs.push(job_id.clone());
@@ -5540,15 +4361,6 @@ fn apply_matrix_fail_fast(inner: &mut InnerState, run_id: RunId, failed_job: &Jo
     inner
         .pending_jobs
         .retain(|job| !(job.run_id == run_id && job.base_id == base_id));
-    // Fill real agent_job_ids; drop cancellations for jobs not in flight.
-    cancellations.retain_mut(|c| {
-        if let Some(id) = agent_job_id_for(inner, c.run_id, &c.job_id) {
-            c.agent_job_id = id;
-            true
-        } else {
-            false
-        }
-    });
     inner.cancellation_queue.extend(cancellations);
     cancelled_jobs
 }
@@ -5734,70 +4546,13 @@ async fn patch_timeline_records(
             .entry(run_id)
             .or_default()
             .extend(projected.clone());
-
-        if let Some(job_id) = logical_job_id {
-            if let Some(run) = inner.runs.get_mut(&run_id) {
-                let job_name = job_id.0.clone();
-                let job_detail =
-                    if let Some(pos) = run.jobs_list.iter().position(|j| j.name == job_name) {
-                        &mut run.jobs_list[pos]
-                    } else {
-                        run.jobs_list.push(JobDetail {
-                            name: job_name,
-                            conclusion: "success".to_owned(),
-                            steps: Vec::new(),
-                        });
-                        run.jobs_list.last_mut().unwrap()
-                    };
-
-                if let Some(status) = run.jobs.get(&job_id) {
-                    job_detail.conclusion = format!("{:?}", status).to_lowercase();
-                }
-
-                for record in &records {
-                    let Some(name) = &record.display_name else {
-                        continue;
-                    };
-                    if record.id.to_string() == job_id.0 {
-                        continue;
-                    }
-
-                    let conclusion_str = match record.result {
-                        Some(
-                            azdo::TaskResult::Succeeded | azdo::TaskResult::SucceededWithIssues,
-                        ) => "success",
-                        Some(azdo::TaskResult::Failed) => {
-                            if run.jobs.get(&job_id) == Some(&ExecutionStatus::Cancelled) {
-                                "cancelled"
-                            } else {
-                                "failure"
-                            }
-                        }
-                        Some(azdo::TaskResult::Cancelled) => "cancelled",
-                        Some(azdo::TaskResult::Skipped) => "skipped",
-                        None if record.state == Some(azdo::TimelineRecordState::InProgress) => {
-                            "in_progress"
-                        }
-                        _ => "success",
-                    };
-
-                    if let Some(pos) = job_detail.steps.iter().position(|s| s.name == *name) {
-                        job_detail.steps[pos].conclusion = conclusion_str.to_owned();
-                    } else {
-                        job_detail.steps.push(StepRecord {
-                            name: name.clone(),
-                            conclusion: conclusion_str.to_owned(),
-                        });
-                    }
-                }
-            }
-        }
     }
     for event in projected {
         shared.state.emit(event).await;
     }
     Json(json!({ "count": count, "value": records }))
 }
+
 fn timeline_status(record: &azdo::TimelineRecord) -> Option<ExecutionStatus> {
     match record.result {
         Some(azdo::TaskResult::Succeeded | azdo::TaskResult::SucceededWithIssues) => {
@@ -7462,13 +6217,6 @@ impl ApiError {
         }
     }
 
-    fn unprocessable(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::UNPROCESSABLE_ENTITY,
-            message: message.into(),
-        }
-    }
-
     fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -7643,6 +6391,7 @@ fn server_iso_now() -> String {
     format!("{y:04}-{m:02}-{d:02}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z")
 }
 
+#[allow(dead_code)]
 /// Fetch a remote reusable workflow YAML from GitHub.
 /// `uses` format: `owner/repo/path/.github/workflows/workflow.yml@ref`
 async fn fetch_remote_workflow(uses: &str) -> Result<String, anyhow::Error> {
@@ -7668,6 +6417,7 @@ async fn fetch_remote_workflow(uses: &str) -> Result<String, anyhow::Error> {
     Ok(resp.text().await?)
 }
 
+#[allow(dead_code)]
 /// Resolve a git ref (branch/tag) to a commit SHA via the GitHub API.
 async fn resolve_remote_sha(owner: &str, repo: &str, git_ref: &str) -> Option<String> {
     let url = format!(
@@ -7709,7 +6459,7 @@ async fn resolve_remote_sha(owner: &str, repo: &str, git_ref: &str) -> Option<St
         .and_then(|s| s.as_str())
         .map(String::from)
 }
-
+#[allow(dead_code)]
 async fn resolve_all_reusable_workflows(
     workflow: &aksh_gha_parser::Workflow,
     reusable_workflows: &mut BTreeMap<String, String>,
@@ -7855,6 +6605,8 @@ fn propagate_reusable_outputs(run: &mut RunRecord) {
 mod tests {
     use axum::body::{to_bytes, Body};
     use axum::http::{Method, Request, StatusCode};
+    use proptest::prelude::*;
+    use proptest::test_runner::{FileFailurePersistence, RngSeed};
     use serde_json::Value;
     use tokio_util::sync::CancellationToken;
     use tower::ServiceExt;
@@ -9101,140 +7853,6 @@ jobs:
     }
 
     #[tokio::test]
-    async fn log_get_run_logs_uses_production_plan_ids_and_numeric_order() {
-        let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
-        let app = app(state.clone(), CancellationToken::new());
-        let accepted = submit_yaml(
-            &app,
-            r#"
-on: push
-jobs:
-  first:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo first
-  second:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo second
-"#,
-            "owner/repo",
-        )
-        .await;
-        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
-        let requests = {
-            let inner = state.inner.lock().await;
-            let mut requests: Vec<_> = inner
-                .job_requests
-                .values()
-                .filter(|request| request.run_id == run_id)
-                .collect();
-            requests.sort_by_key(|request| request.request_id);
-            requests
-                .into_iter()
-                .map(|request| (request.plan_id.clone(), request.agent_job_id.to_string()))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(requests.len(), 2);
-
-        for (plan_id, log_id, body) in [
-            (
-                &requests[0].0,
-                "10",
-                "first-ten
-",
-            ),
-            (
-                &requests[0].0,
-                "2",
-                "first-two
-",
-            ),
-            (
-                &requests[1].0,
-                "1",
-                "ignored-fallback
-",
-            ),
-        ] {
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method(Method::POST)
-                        .uri(format!(
-                            "/_apis/v1/Logfiles/scope/actions/{plan_id}/{log_id}"
-                        ))
-                        .header(header::AUTHORIZATION, "Bearer aksh-system-token")
-                        .body(Body::from(body))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::ACCEPTED);
-        }
-
-        let results_dir = temp
-            .path()
-            .join("replay")
-            .join("results")
-            .join(&requests[1].0)
-            .join(&requests[1].1);
-        tokio::fs::create_dir_all(&results_dir).await.unwrap();
-        tokio::fs::write(
-            results_dir.join("job-logs.txt"),
-            b"results-second
-",
-        )
-        .await
-        .unwrap();
-
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri(format!("/api/v1/runs/{run_id}/logs"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers()[header::CONTENT_TYPE],
-            "text/plain; charset=utf-8"
-        );
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(
-            body.as_ref(),
-            b"first-two
-first-ten
-results-second
-"
-        );
-    }
-
-    #[tokio::test]
-    async fn log_get_run_logs_returns_404_for_unknown_run() {
-        let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
-        let app = app(state.clone(), CancellationToken::new());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri(format!("/api/v1/runs/{}/logs", RunId::new()))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
     async fn log_append_masks_submitted_secrets() {
         let temp = tempfile::tempdir().unwrap();
         let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
@@ -10274,17 +8892,6 @@ jobs:
             cancellation["messageType"],
             azdo::message_type::JOB_CANCELLED
         );
-        // Body is base64 of plaintext (no session key in this test path).
-        let body_b64 = cancellation["body"].as_str().unwrap();
-        let body_bytes = BASE64_STANDARD.decode(body_b64).unwrap();
-        let body: Value = serde_json::from_slice(&body_bytes).unwrap();
-        assert!(body["jobId"]
-            .as_str()
-            .unwrap()
-            .parse::<uuid::Uuid>()
-            .is_ok());
-        assert_eq!(body["timeout"], "00:05:00");
-        assert!(body.get("runId").is_none());
     }
 
     #[tokio::test]
@@ -11595,7 +10202,6 @@ jobs:
         );
 
         let response = app
-            .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -11634,1977 +10240,6 @@ jobs:
         );
     }
 
-    async fn submit_yaml(app: &Router, yaml: &str, repo: &str) -> Value {
-        request_json(
-            app,
-            Method::POST,
-            "/api/v1/runs",
-            json!({
-                "workflow_yaml": yaml,
-                "event": "push",
-                "repository": repo,
-            }),
-        )
-        .await
-    }
-
-    async fn get_run_json(app: &Router, run_id: &str) -> Value {
-        request_json(
-            app,
-            Method::GET,
-            &format!("/api/v1/runs/{run_id}"),
-            Value::Null,
-        )
-        .await
-    }
-
-    async fn complete_via_api(app: &Router, run_id: &str, job_id: &str) {
-        request_json(
-            app,
-            Method::POST,
-            "/internal/test/jobs/complete",
-            json!({
-                "run_id": run_id,
-                "job_id": job_id,
-                "status": "success",
-                "outputs": {}
-            }),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn workflow_concurrency_serializes_runs_fifo() {
-        let temp = tempfile::tempdir().unwrap();
-        let app = app(
-            AppState::new(temp.path().to_path_buf()).await.unwrap(),
-            CancellationToken::new(),
-        );
-        let yaml = r#"
-on: push
-concurrency:
-  group: serial-group
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo hi
-"#;
-        let a = submit_yaml(&app, yaml, "owner/repo").await;
-        let b = submit_yaml(&app, yaml, "owner/repo").await;
-        let a_id = a["run_id"].as_str().unwrap();
-        let b_id = b["run_id"].as_str().unwrap();
-
-        let run_a = get_run_json(&app, a_id).await;
-        let run_b = get_run_json(&app, b_id).await;
-        assert_eq!(run_a["status"], "queued");
-        assert_eq!(run_b["status"], "pending");
-        assert_eq!(run_b["jobs"]["build"], "pending");
-
-        // Complete A via message poll + complete API.
-        let msg = request_json(
-            &app,
-            Method::GET,
-            "/runner/server/_apis/v1/Message/1?sessionId=default&waitSeconds=0",
-            Value::Null,
-        )
-        .await;
-        assert!(!msg.is_null(), "run A should be dispatchable");
-        complete_via_api(&app, a_id, "build").await;
-
-        let run_b = get_run_json(&app, b_id).await;
-        assert_eq!(run_b["status"], "queued");
-        assert_eq!(run_b["jobs"]["build"], "queued");
-    }
-
-    #[tokio::test]
-    async fn workflow_concurrency_cancel_in_progress_cancels_running() {
-        let temp = tempfile::tempdir().unwrap();
-        let app = app(
-            AppState::new(temp.path().to_path_buf()).await.unwrap(),
-            CancellationToken::new(),
-        );
-        let yaml = r#"
-on: push
-concurrency:
-  group: cancel-group
-  cancel-in-progress: true
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - run: sleep 60
-"#;
-        let a = submit_yaml(&app, yaml, "owner/repo").await;
-        let a_id = a["run_id"].as_str().unwrap();
-
-        // Dispatch A so it is InProgress.
-        let msg = request_json(
-            &app,
-            Method::GET,
-            "/runner/server/_apis/v1/Message/1?sessionId=default",
-            Value::Null,
-        )
-        .await;
-        let message_id = msg["messageId"].as_i64().unwrap();
-        let _ = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(Method::DELETE)
-                    .uri(format!(
-                        "/runner/server/_apis/v1/Message/1/{message_id}?sessionId=default"
-                    ))
-                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        let b = submit_yaml(&app, yaml, "owner/repo").await;
-        let b_id = b["run_id"].as_str().unwrap();
-
-        let run_a = get_run_json(&app, a_id).await;
-        assert_eq!(run_a["status"], "cancelled");
-        assert_eq!(run_a["jobs"]["build"], "cancelled");
-
-        // Cancellation message should be official shape.
-        let cancellation = request_json(
-            &app,
-            Method::GET,
-            "/runner/server/_apis/v1/Message/1?sessionId=default&waitSeconds=0",
-            Value::Null,
-        )
-        .await;
-        assert_eq!(
-            cancellation["messageType"],
-            azdo::message_type::JOB_CANCELLED
-        );
-        let body_b64 = cancellation["body"].as_str().unwrap();
-        let body_bytes = BASE64_STANDARD.decode(body_b64).unwrap();
-        let body: Value = serde_json::from_slice(&body_bytes).unwrap();
-        assert!(body["jobId"]
-            .as_str()
-            .unwrap()
-            .parse::<uuid::Uuid>()
-            .is_ok());
-        assert_eq!(body["timeout"], "00:05:00");
-
-        let run_b = get_run_json(&app, b_id).await;
-        assert_eq!(run_b["status"], "queued");
-    }
-
-    #[tokio::test]
-    async fn pending_run_replaced_by_newer_submission() {
-        let temp = tempfile::tempdir().unwrap();
-        let app = app(
-            AppState::new(temp.path().to_path_buf()).await.unwrap(),
-            CancellationToken::new(),
-        );
-        let yaml = r#"
-on: push
-concurrency:
-  group: replace-group
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo hi
-"#;
-        let a = submit_yaml(&app, yaml, "owner/repo").await;
-        let b = submit_yaml(&app, yaml, "owner/repo").await;
-        let c = submit_yaml(&app, yaml, "owner/repo").await;
-        let a_id = a["run_id"].as_str().unwrap();
-        let b_id = b["run_id"].as_str().unwrap();
-        let c_id = c["run_id"].as_str().unwrap();
-
-        let run_a = get_run_json(&app, a_id).await;
-        let run_b = get_run_json(&app, b_id).await;
-        let run_c = get_run_json(&app, c_id).await;
-        assert_eq!(run_a["status"], "queued");
-        assert_eq!(run_b["status"], "cancelled");
-        assert_eq!(run_c["status"], "pending");
-    }
-
-    #[tokio::test]
-    async fn queue_max_holds_multiple_pending_fifo() {
-        let temp = tempfile::tempdir().unwrap();
-        let app = app(
-            AppState::new(temp.path().to_path_buf()).await.unwrap(),
-            CancellationToken::new(),
-        );
-        let yaml = r#"
-on: push
-concurrency:
-  group: max-group
-  queue: max
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo hi
-"#;
-        let a = submit_yaml(&app, yaml, "owner/repo").await;
-        let b = submit_yaml(&app, yaml, "owner/repo").await;
-        let c = submit_yaml(&app, yaml, "owner/repo").await;
-        let d = submit_yaml(&app, yaml, "owner/repo").await;
-        let a_id = a["run_id"].as_str().unwrap();
-        let b_id = b["run_id"].as_str().unwrap();
-        let c_id = c["run_id"].as_str().unwrap();
-        let d_id = d["run_id"].as_str().unwrap();
-
-        assert_eq!(get_run_json(&app, b_id).await["status"], "pending");
-        assert_eq!(get_run_json(&app, c_id).await["status"], "pending");
-        assert_eq!(get_run_json(&app, d_id).await["status"], "pending");
-
-        // Dispatch+complete A, then B should become queued.
-        let _ = request_json(
-            &app,
-            Method::GET,
-            "/runner/server/_apis/v1/Message/1?sessionId=default&waitSeconds=0",
-            Value::Null,
-        )
-        .await;
-        complete_via_api(&app, a_id, "build").await;
-        assert_eq!(get_run_json(&app, b_id).await["status"], "queued");
-        assert_eq!(get_run_json(&app, c_id).await["status"], "pending");
-
-        let _ = request_json(
-            &app,
-            Method::GET,
-            "/runner/server/_apis/v1/Message/1?sessionId=default&waitSeconds=0",
-            Value::Null,
-        )
-        .await;
-        complete_via_api(&app, b_id, "build").await;
-        assert_eq!(get_run_json(&app, c_id).await["status"], "queued");
-        assert_eq!(get_run_json(&app, d_id).await["status"], "pending");
-    }
-
-    #[tokio::test]
-    async fn concurrency_group_names_case_insensitive() {
-        let temp = tempfile::tempdir().unwrap();
-        let app = app(
-            AppState::new(temp.path().to_path_buf()).await.unwrap(),
-            CancellationToken::new(),
-        );
-        let a = submit_yaml(
-            &app,
-            r#"
-on: push
-concurrency: Prod
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo a
-"#,
-            "owner/repo",
-        )
-        .await;
-        let b = submit_yaml(
-            &app,
-            r#"
-on: push
-concurrency: prod
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo b
-"#,
-            "owner/repo",
-        )
-        .await;
-        assert_eq!(
-            get_run_json(&app, a["run_id"].as_str().unwrap()).await["status"],
-            "queued"
-        );
-        assert_eq!(
-            get_run_json(&app, b["run_id"].as_str().unwrap()).await["status"],
-            "pending"
-        );
-    }
-
-    #[tokio::test]
-    async fn job_level_concurrency_gates_single_job() {
-        let temp = tempfile::tempdir().unwrap();
-        let app = app(
-            AppState::new(temp.path().to_path_buf()).await.unwrap(),
-            CancellationToken::new(),
-        );
-        let accepted = submit_yaml(
-            &app,
-            r#"
-on: push
-jobs:
-  one:
-    runs-on: ubuntu-latest
-    concurrency:
-      group: job-serial
-    steps:
-      - run: echo one
-  two:
-    runs-on: ubuntu-latest
-    concurrency:
-      group: job-serial
-    steps:
-      - run: echo two
-"#,
-            "owner/repo",
-        )
-        .await;
-        let run_id = accepted["run_id"].as_str().unwrap();
-        let run = get_run_json(&app, run_id).await;
-        let one = run["jobs"]["one"].as_str().unwrap();
-        let two = run["jobs"]["two"].as_str().unwrap();
-        // Exactly one should be queued, the other pending.
-        let statuses = [one, two];
-        assert!(statuses.contains(&"queued"));
-        assert!(statuses.contains(&"pending"));
-    }
-
-    #[tokio::test]
-    async fn concurrency_blocked_jobs_do_not_block_unrelated_work() {
-        let temp = tempfile::tempdir().unwrap();
-        let app = app(
-            AppState::new(temp.path().to_path_buf()).await.unwrap(),
-            CancellationToken::new(),
-        );
-        // First run holds the group.
-        let _ = submit_yaml(
-            &app,
-            r#"
-on: push
-concurrency:
-  group: blocked-group
-jobs:
-  slow:
-    runs-on: ubuntu-latest
-    steps:
-      - run: sleep 99
-"#,
-            "owner/repo",
-        )
-        .await;
-        // Second run is concurrency-pending.
-        let _ = submit_yaml(
-            &app,
-            r#"
-on: push
-concurrency:
-  group: blocked-group
-jobs:
-  slow:
-    runs-on: ubuntu-latest
-    steps:
-      - run: sleep 99
-"#,
-            "owner/repo",
-        )
-        .await;
-        // Unrelated work without concurrency must still be dispatchable after
-        // the first job is taken.
-        let _ = request_json(
-            &app,
-            Method::GET,
-            "/runner/server/_apis/v1/Message/1?sessionId=default&waitSeconds=0",
-            Value::Null,
-        )
-        .await;
-        let free = submit_yaml(
-            &app,
-            r#"
-on: push
-jobs:
-  free:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo free
-"#,
-            "owner/repo",
-        )
-        .await;
-        let free_id = free["run_id"].as_str().unwrap();
-        assert_eq!(get_run_json(&app, free_id).await["jobs"]["free"], "queued");
-        let msg = request_json(
-            &app,
-            Method::GET,
-            "/runner/server/_apis/v1/Message/1?sessionId=default&waitSeconds=0",
-            Value::Null,
-        )
-        .await;
-        assert!(
-            !msg.is_null(),
-            "unrelated job must be pollable while group is blocked"
-        );
-    }
-
-    #[tokio::test]
-    async fn empty_workflow_concurrency_group_creates_zero_job_failure() {
-        let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
-        let mut events = state.events.subscribe();
-        let app = app(state.clone(), CancellationToken::new());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/api/v1/runs")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
-                    .body(Body::from(
-                        json!({
-                            "workflow_yaml": r#"
-on: push
-concurrency:
-  group: ${{ github.event.head_commit.id_missing }}
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo hi
-"#,
-                            "event": "push",
-                            "repository": "owner/repo",
-                            "payload": { "head_commit": {} }
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let accepted: RunAccepted = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(accepted.queued_jobs, 0);
-
-        let accepted_event = events.recv().await.unwrap();
-        assert!(matches!(
-            accepted_event,
-            NdjsonEvent::RunAccepted { run_id, queued_jobs }
-                if run_id == accepted.run_id && queued_jobs == 0
-        ));
-        let failed_event = events.recv().await.unwrap();
-        assert!(matches!(
-            failed_event,
-            NdjsonEvent::RunStatus {
-                run_id,
-                status: ExecutionStatus::Failure,
-                reason: Some(reason),
-            } if run_id == accepted.run_id && reason.contains("must not be empty")
-        ));
-
-        let inner = state.inner.lock().await;
-        let record = &inner.runs[&accepted.run_id];
-        assert_eq!(record.status, ExecutionStatus::Failure);
-        assert!(record.jobs.is_empty());
-        assert!(!inner
-            .job_requests
-            .values()
-            .any(|request| request.run_id == accepted.run_id));
-        assert!(!inner.queue.iter().any(|job| job.run_id == accepted.run_id));
-        assert!(!inner
-            .pending_jobs
-            .iter()
-            .any(|job| job.run_id == accepted.run_id));
-        assert!(!inner
-            .concurrency_blocked
-            .iter()
-            .any(|job| job.run_id == accepted.run_id));
-    }
-
-    #[tokio::test]
-    async fn concurrency_chaos_interleaved_submits_and_completes() {
-        let temp = tempfile::tempdir().unwrap();
-        let app = app(
-            AppState::new(temp.path().to_path_buf()).await.unwrap(),
-            CancellationToken::new(),
-        );
-        let yaml_hold = r#"
-on: push
-concurrency:
-  group: chaos
-  queue: max
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo hold
-"#;
-        let yaml_cancel = r#"
-on: push
-concurrency:
-  group: chaos
-  cancel-in-progress: true
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo cancel
-"#;
-        let mut run_ids = Vec::new();
-        for i in 0..20 {
-            let yaml = if i % 5 == 0 { yaml_cancel } else { yaml_hold };
-            let accepted = submit_yaml(&app, yaml, "owner/repo").await;
-            run_ids.push(accepted["run_id"].as_str().unwrap().to_owned());
-            // Occasionally complete whatever is dispatchable.
-            if i % 3 == 0 {
-                let msg = request_json(
-                    &app,
-                    Method::GET,
-                    "/runner/server/_apis/v1/Message/1?sessionId=default&waitSeconds=0",
-                    Value::Null,
-                )
-                .await;
-                if !msg.is_null() {
-                    // Complete the currently running holder if we can find a queued/in-progress job.
-                    for rid in &run_ids {
-                        let run = get_run_json(&app, rid).await;
-                        if run["jobs"]["build"] == "in_progress" || run["jobs"]["build"] == "queued"
-                        {
-                            // Mark in progress via poll already done; complete.
-                            complete_via_api(&app, rid, "build").await;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        // Server must remain consistent: no panics, every run has a known status.
-        for rid in &run_ids {
-            let run = get_run_json(&app, rid).await;
-            let status = run["status"].as_str().unwrap();
-            assert!(
-                matches!(
-                    status,
-                    "queued" | "pending" | "in_progress" | "success" | "cancelled" | "failure"
-                ),
-                "unexpected status {status} for {rid}"
-            );
-        }
-    }
-
-    async fn poll_and_ack(app: &Router) -> Value {
-        let msg = request_json(
-            app,
-            Method::GET,
-            "/runner/server/_apis/v1/Message/1?sessionId=default&waitSeconds=0",
-            Value::Null,
-        )
-        .await;
-        if msg.is_null() {
-            return msg;
-        }
-        if let Some(message_id) = msg["messageId"].as_i64() {
-            let _ = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method(Method::DELETE)
-                        .uri(format!(
-                            "/runner/server/_apis/v1/Message/1/{message_id}?sessionId=default"
-                        ))
-                        .header(header::AUTHORIZATION, "Bearer aksh-system-token")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-        }
-        msg
-    }
-
-    fn decode_cancel_body(msg: &Value) -> Value {
-        assert_eq!(msg["messageType"], azdo::message_type::JOB_CANCELLED);
-        let body_b64 = msg["body"].as_str().unwrap();
-        let body_bytes = BASE64_STANDARD.decode(body_b64).unwrap();
-        serde_json::from_slice(&body_bytes).unwrap()
-    }
-
-    #[tokio::test]
-    async fn job_cancellation_message_type_is_official_string() {
-        // Wire regression: must be "JobCancellation", not "JobCancelled".
-        assert_eq!(azdo::message_type::JOB_CANCELLED, "JobCancellation");
-    }
-
-    #[tokio::test]
-    async fn broker_root_message_path_delivers_job_cancellation() {
-        // The aksh-runner broker client polls `/runner/server/message` (root
-        // path), NOT `/_apis/v1/Message`. Cancel must be delivered there.
-        let temp = tempfile::tempdir().unwrap();
-        let app = app(
-            AppState::new(temp.path().to_path_buf()).await.unwrap(),
-            CancellationToken::new(),
-        );
-        // Create broker session.
-        let session = request_json(&app, Method::POST, "/runner/server/session", json!({})).await;
-        let session_id = session["sessionId"].as_str().unwrap();
-
-        let yaml = r#"
-on: push
-concurrency:
-  group: broker-root-cancel
-  cancel-in-progress: true
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - run: sleep 60
-"#;
-        let a = submit_yaml(&app, yaml, "owner/repo").await;
-        let a_id = a["run_id"].as_str().unwrap().to_owned();
-
-        // Dispatch A via broker root path.
-        let job_msg = request_json(
-            &app,
-            Method::GET,
-            &format!("/runner/server/message?sessionId={session_id}&waitSeconds=0"),
-            Value::Null,
-        )
-        .await;
-        assert_eq!(job_msg["messageType"], "RunnerJobRequest");
-        assert_eq!(
-            get_run_json(&app, &a_id).await["jobs"]["build"],
-            "in_progress"
-        );
-
-        // B cancels A.
-        let b = submit_yaml(&app, yaml, "owner/repo").await;
-        assert_eq!(get_run_json(&app, &a_id).await["status"], "cancelled");
-        assert_eq!(
-            get_run_json(&app, b["run_id"].as_str().unwrap()).await["status"],
-            "queued"
-        );
-
-        // Busy poll must yield JobCancellation on the same session.
-        let cancel_msg = request_json(
-            &app,
-            Method::GET,
-            &format!("/runner/server/message?sessionId={session_id}&waitSeconds=0"),
-            Value::Null,
-        )
-        .await;
-        assert_eq!(
-            cancel_msg["messageType"],
-            azdo::message_type::JOB_CANCELLED,
-            "broker root path must deliver JobCancellation, got {cancel_msg}"
-        );
-        // messageId must differ from the job message or runner in-memory dedup
-        // silently drops the cancel.
-        assert_ne!(
-            cancel_msg["messageId"], job_msg["messageId"],
-            "cancel messageId must not collide with job messageId"
-        );
-        // Cancels live in a high id range so they never collide with request_id
-        // messageIds of subsequent RunnerJobRequests.
-        assert!(
-            cancel_msg["messageId"].as_i64().unwrap() >= 1_000_000,
-            "cancel messageId should be in high range, got {}",
-            cancel_msg["messageId"]
-        );
-        let body: Value = serde_json::from_str(cancel_msg["body"].as_str().unwrap()).unwrap();
-        assert!(body["jobId"]
-            .as_str()
-            .unwrap()
-            .parse::<uuid::Uuid>()
-            .is_ok());
-        assert_eq!(body["timeout"], "00:05:00");
-
-        // Simulate runner finishing the cancelled job, freeing the session.
-        complete_via_api(&app, &a_id, "build").await;
-        // completejob can arrive before the worker process exits. A Busy poll
-        // must not receive B yet or the run-service dispatcher cancels the
-        // still-draining worker as an overlap.
-        let busy_msg = request_json(
-            &app,
-            Method::GET,
-            &format!("/runner/server/message?sessionId={session_id}&status=Busy&waitSeconds=0"),
-            Value::Null,
-        )
-        .await;
-        assert!(
-            busy_msg.is_null(),
-            "busy runner received successor: {busy_msg}"
-        );
-
-        // B must be pollable with a messageId that does not collide with cancel.
-        let b_msg = request_json(
-            &app,
-            Method::GET,
-            &format!("/runner/server/message?sessionId={session_id}&status=Online&waitSeconds=0"),
-            Value::Null,
-        )
-        .await;
-        assert_eq!(
-            b_msg["messageType"], "RunnerJobRequest",
-            "expected B job after A completed, got {b_msg}"
-        );
-        assert_ne!(b_msg["messageId"], cancel_msg["messageId"]);
-        assert_ne!(b_msg["messageId"], job_msg["messageId"]);
-    }
-
-    #[tokio::test]
-    async fn concurrency_expression_group_uses_github_ref() {
-        let temp = tempfile::tempdir().unwrap();
-        let app = app(
-            AppState::new(temp.path().to_path_buf()).await.unwrap(),
-            CancellationToken::new(),
-        );
-        let yaml = r#"
-on: push
-concurrency:
-  group: ci-${{ github.ref }}
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo hi
-"#;
-        // Same ref → collide.
-        let a = request_json(
-            &app,
-            Method::POST,
-            "/api/v1/runs",
-            json!({
-                "workflow_yaml": yaml,
-                "event": "push",
-                "repository": "owner/repo",
-                "git_ref": "refs/heads/main",
-            }),
-        )
-        .await;
-        let b = request_json(
-            &app,
-            Method::POST,
-            "/api/v1/runs",
-            json!({
-                "workflow_yaml": yaml,
-                "event": "push",
-                "repository": "owner/repo",
-                "git_ref": "refs/heads/main",
-            }),
-        )
-        .await;
-        // Different ref → independent group.
-        let c = request_json(
-            &app,
-            Method::POST,
-            "/api/v1/runs",
-            json!({
-                "workflow_yaml": yaml,
-                "event": "push",
-                "repository": "owner/repo",
-                "git_ref": "refs/heads/feature",
-            }),
-        )
-        .await;
-        assert_eq!(
-            get_run_json(&app, a["run_id"].as_str().unwrap()).await["status"],
-            "queued"
-        );
-        assert_eq!(
-            get_run_json(&app, b["run_id"].as_str().unwrap()).await["status"],
-            "pending"
-        );
-        assert_eq!(
-            get_run_json(&app, c["run_id"].as_str().unwrap()).await["status"],
-            "queued"
-        );
-    }
-
-    #[tokio::test]
-    async fn concurrency_groups_are_repo_scoped() {
-        let temp = tempfile::tempdir().unwrap();
-        let app = app(
-            AppState::new(temp.path().to_path_buf()).await.unwrap(),
-            CancellationToken::new(),
-        );
-        let yaml = r#"
-on: push
-concurrency:
-  group: shared-name
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo hi
-"#;
-        let a = submit_yaml(&app, yaml, "owner/repo-a").await;
-        let b = submit_yaml(&app, yaml, "owner/repo-b").await;
-        // Different repos → both free to run.
-        assert_eq!(
-            get_run_json(&app, a["run_id"].as_str().unwrap()).await["status"],
-            "queued"
-        );
-        assert_eq!(
-            get_run_json(&app, b["run_id"].as_str().unwrap()).await["status"],
-            "queued"
-        );
-    }
-
-    #[tokio::test]
-    async fn cancel_in_progress_expression_false_does_not_cancel() {
-        let temp = tempfile::tempdir().unwrap();
-        let app = app(
-            AppState::new(temp.path().to_path_buf()).await.unwrap(),
-            CancellationToken::new(),
-        );
-        let yaml = r#"
-on: push
-concurrency:
-  group: expr-cancel
-  cancel-in-progress: ${{ false }}
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo hi
-"#;
-        let a = submit_yaml(&app, yaml, "owner/repo").await;
-        let _ = poll_and_ack(&app).await;
-        let b = submit_yaml(&app, yaml, "owner/repo").await;
-        assert_eq!(
-            get_run_json(&app, a["run_id"].as_str().unwrap()).await["status"],
-            "in_progress"
-        );
-        assert_eq!(
-            get_run_json(&app, b["run_id"].as_str().unwrap()).await["status"],
-            "pending"
-        );
-    }
-
-    #[tokio::test]
-    async fn cancel_in_progress_expression_true_cancels() {
-        let temp = tempfile::tempdir().unwrap();
-        let app = app(
-            AppState::new(temp.path().to_path_buf()).await.unwrap(),
-            CancellationToken::new(),
-        );
-        let yaml = r#"
-on: push
-concurrency:
-  group: expr-cancel-true
-  cancel-in-progress: ${{ true }}
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - run: sleep 30
-"#;
-        let a = submit_yaml(&app, yaml, "owner/repo").await;
-        let _ = poll_and_ack(&app).await;
-        let b = submit_yaml(&app, yaml, "owner/repo").await;
-        assert_eq!(
-            get_run_json(&app, a["run_id"].as_str().unwrap()).await["status"],
-            "cancelled"
-        );
-        assert_eq!(
-            get_run_json(&app, b["run_id"].as_str().unwrap()).await["status"],
-            "queued"
-        );
-        // Cancel message delivered with official body.
-        let cancel_msg = request_json(
-            &app,
-            Method::GET,
-            "/runner/server/_apis/v1/Message/1?sessionId=default&waitSeconds=0",
-            Value::Null,
-        )
-        .await;
-        let body = decode_cancel_body(&cancel_msg);
-        assert_eq!(body["timeout"], "00:05:00");
-        assert!(body.get("runId").is_none());
-    }
-
-    #[tokio::test]
-    async fn late_success_cannot_overwrite_cancelled_job() {
-        let temp = tempfile::tempdir().unwrap();
-        let app = app(
-            AppState::new(temp.path().to_path_buf()).await.unwrap(),
-            CancellationToken::new(),
-        );
-        let yaml = r#"
-on: push
-concurrency:
-  group: late-success
-  cancel-in-progress: true
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - run: sleep 30
-"#;
-        let a = submit_yaml(&app, yaml, "owner/repo").await;
-        let a_id = a["run_id"].as_str().unwrap().to_owned();
-        let _ = poll_and_ack(&app).await;
-        let _b = submit_yaml(&app, yaml, "owner/repo").await;
-        assert_eq!(
-            get_run_json(&app, &a_id).await["jobs"]["build"],
-            "cancelled"
-        );
-        // Late success from a runner that never saw JobCancellation.
-        complete_via_api(&app, &a_id, "build").await;
-        let run_a = get_run_json(&app, &a_id).await;
-        assert_eq!(run_a["jobs"]["build"], "cancelled");
-        assert_eq!(run_a["status"], "cancelled");
-    }
-
-    #[tokio::test]
-    async fn multi_job_workflow_concurrency_holds_all_jobs() {
-        let temp = tempfile::tempdir().unwrap();
-        let app = app(
-            AppState::new(temp.path().to_path_buf()).await.unwrap(),
-            CancellationToken::new(),
-        );
-        let yaml = r#"
-on: push
-concurrency:
-  group: multi-job-hold
-jobs:
-  one:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo one
-  two:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo two
-"#;
-        let a = submit_yaml(&app, yaml, "owner/repo").await;
-        let b = submit_yaml(&app, yaml, "owner/repo").await;
-        let b_id = b["run_id"].as_str().unwrap();
-        let run_b = get_run_json(&app, b_id).await;
-        assert_eq!(run_b["status"], "pending");
-        assert_eq!(run_b["jobs"]["one"], "pending");
-        assert_eq!(run_b["jobs"]["two"], "pending");
-        // Unrelated free job still dispatchable after A's jobs taken.
-        let _ = poll_and_ack(&app).await;
-        let free = submit_yaml(
-            &app,
-            r#"
-on: push
-jobs:
-  free:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo free
-"#,
-            "owner/repo",
-        )
-        .await;
-        assert_eq!(
-            get_run_json(&app, free["run_id"].as_str().unwrap()).await["jobs"]["free"],
-            "queued"
-        );
-        let _ = a;
-    }
-
-    #[tokio::test]
-    async fn job_level_concurrency_with_needs_gate_order() {
-        // Gate order: needs → concurrency. Dependent job must not occupy the
-        // group until needs are satisfied.
-        let temp = tempfile::tempdir().unwrap();
-        let app = app(
-            AppState::new(temp.path().to_path_buf()).await.unwrap(),
-            CancellationToken::new(),
-        );
-        let accepted = submit_yaml(
-            &app,
-            r#"
-on: push
-jobs:
-  first:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo first
-  second:
-    needs: first
-    runs-on: ubuntu-latest
-    concurrency:
-      group: needs-then-concurrency
-    steps:
-      - run: echo second
-  peer:
-    runs-on: ubuntu-latest
-    concurrency:
-      group: needs-then-concurrency
-    steps:
-      - run: echo peer
-"#,
-            "owner/repo",
-        )
-        .await;
-        let run_id = accepted["run_id"].as_str().unwrap();
-        let run = get_run_json(&app, run_id).await;
-        // first ready; peer may take the concurrency slot; second waits on needs
-        // (and possibly concurrency).
-        assert_eq!(run["jobs"]["first"], "queued");
-        assert_eq!(run["jobs"]["second"], "queued"); // in pending_jobs (needs)
-                                                     // peer has no needs → evaluates concurrency immediately.
-        assert!(
-            run["jobs"]["peer"] == "queued" || run["jobs"]["peer"] == "pending",
-            "peer={}",
-            run["jobs"]["peer"]
-        );
-        // Complete first; second becomes ready and hits concurrency.
-        let _ = poll_and_ack(&app).await;
-        complete_via_api(&app, run_id, "first").await;
-        let run = get_run_json(&app, run_id).await;
-        // Exactly one of {peer, second} may be pending on the shared group if
-        // the other is queued/in_progress.
-        let peer = run["jobs"]["peer"].as_str().unwrap();
-        let second = run["jobs"]["second"].as_str().unwrap();
-        assert!(
-            matches!(
-                (peer, second),
-                ("queued", "pending")
-                    | ("pending", "queued")
-                    | ("in_progress", "pending")
-                    | ("pending", "in_progress")
-                    | ("queued", "queued") // if peer already finished — unlikely
-            ) || peer != second
-                || peer == "queued",
-            "peer={peer} second={second}"
-        );
-    }
-
-    #[tokio::test]
-    async fn job_level_and_workflow_level_share_namespace() {
-        // Plan: groups are one namespace for workflow-level runs and job-level jobs.
-        let temp = tempfile::tempdir().unwrap();
-        let app = app(
-            AppState::new(temp.path().to_path_buf()).await.unwrap(),
-            CancellationToken::new(),
-        );
-        let a = submit_yaml(
-            &app,
-            r#"
-on: push
-concurrency:
-  group: shared-ns
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo a
-"#,
-            "owner/repo",
-        )
-        .await;
-        let b = submit_yaml(
-            &app,
-            r#"
-on: push
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    concurrency:
-      group: shared-ns
-    steps:
-      - run: echo b
-"#,
-            "owner/repo",
-        )
-        .await;
-        assert_eq!(
-            get_run_json(&app, a["run_id"].as_str().unwrap()).await["status"],
-            "queued"
-        );
-        // B's job should be pending on the same group held by A's run.
-        let run_b = get_run_json(&app, b["run_id"].as_str().unwrap()).await;
-        assert_eq!(run_b["jobs"]["build"], "pending");
-    }
-
-    #[tokio::test]
-    async fn queue_max_overflow_cancels_arrival() {
-        let temp = tempfile::tempdir().unwrap();
-        let app = app(
-            AppState::new(temp.path().to_path_buf()).await.unwrap(),
-            CancellationToken::new(),
-        );
-        let yaml = r#"
-on: push
-concurrency:
-  group: overflow-group
-  queue: max
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo hi
-"#;
-        // 1 running + 100 pending = 101 holders; 102nd arrival cancelled.
-        let mut ids = Vec::new();
-        for _ in 0..101 {
-            let r = submit_yaml(&app, yaml, "owner/repo").await;
-            ids.push(r["run_id"].as_str().unwrap().to_owned());
-        }
-        // First is running/queued; next 100 pending.
-        assert_eq!(get_run_json(&app, &ids[0]).await["status"], "queued");
-        for id in ids.iter().skip(1).take(100) {
-            assert_eq!(
-                get_run_json(&app, id).await["status"],
-                "pending",
-                "expected pending for {id}"
-            );
-        }
-        let overflow = submit_yaml(&app, yaml, "owner/repo").await;
-        let overflow_id = overflow["run_id"].as_str().unwrap();
-        assert_eq!(get_run_json(&app, overflow_id).await["status"], "cancelled");
-    }
-
-    #[tokio::test]
-    async fn cancel_run_api_releases_concurrency_slot() {
-        let temp = tempfile::tempdir().unwrap();
-        let app = app(
-            AppState::new(temp.path().to_path_buf()).await.unwrap(),
-            CancellationToken::new(),
-        );
-        let yaml = r#"
-on: push
-concurrency:
-  group: api-cancel-release
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - run: sleep 30
-"#;
-        let a = submit_yaml(&app, yaml, "owner/repo").await;
-        let b = submit_yaml(&app, yaml, "owner/repo").await;
-        let a_id = a["run_id"].as_str().unwrap();
-        let b_id = b["run_id"].as_str().unwrap();
-        assert_eq!(get_run_json(&app, b_id).await["status"], "pending");
-        request_json(
-            &app,
-            Method::POST,
-            &format!("/api/v1/runs/{a_id}/cancel"),
-            Value::Null,
-        )
-        .await;
-        assert_eq!(get_run_json(&app, a_id).await["status"], "cancelled");
-        // B should be promoted.
-        let run_b = get_run_json(&app, b_id).await;
-        assert_eq!(run_b["status"], "queued");
-        assert_eq!(run_b["jobs"]["build"], "queued");
-    }
-
-    #[tokio::test]
-    async fn cancel_in_progress_then_pending_chain() {
-        // A running, B arrives with cancel-in-progress → A cancelled, B runs.
-        // C arrives without cancel → pending. Complete B → C queued.
-        let temp = tempfile::tempdir().unwrap();
-        let app = app(
-            AppState::new(temp.path().to_path_buf()).await.unwrap(),
-            CancellationToken::new(),
-        );
-        let yaml_cancel = r#"
-on: push
-concurrency:
-  group: chain-group
-  cancel-in-progress: true
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - run: sleep 30
-"#;
-        let yaml_hold = r#"
-on: push
-concurrency:
-  group: chain-group
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo hold
-"#;
-        let a = submit_yaml(&app, yaml_cancel, "owner/repo").await;
-        let _ = poll_and_ack(&app).await;
-        let b = submit_yaml(&app, yaml_cancel, "owner/repo").await;
-        assert_eq!(
-            get_run_json(&app, a["run_id"].as_str().unwrap()).await["status"],
-            "cancelled"
-        );
-        assert_eq!(
-            get_run_json(&app, b["run_id"].as_str().unwrap()).await["status"],
-            "queued"
-        );
-        let c = submit_yaml(&app, yaml_hold, "owner/repo").await;
-        assert_eq!(
-            get_run_json(&app, c["run_id"].as_str().unwrap()).await["status"],
-            "pending"
-        );
-        // Drain cancel message then dispatch B and complete.
-        let msg = request_json(
-            &app,
-            Method::GET,
-            "/runner/server/_apis/v1/Message/1?sessionId=default&waitSeconds=0",
-            Value::Null,
-        )
-        .await;
-        if msg["messageType"] == azdo::message_type::JOB_CANCELLED {
-            let _ = poll_and_ack(&app).await; // already consumed above; get next
-        }
-        // Complete B (may still be queued — complete_via_api works regardless).
-        complete_via_api(&app, b["run_id"].as_str().unwrap(), "build").await;
-        let run_c = get_run_json(&app, c["run_id"].as_str().unwrap()).await;
-        assert_eq!(run_c["status"], "queued");
-        assert_eq!(run_c["jobs"]["build"], "queued");
-    }
-
-    #[tokio::test]
-    async fn bare_string_concurrency_shorthand_enforced() {
-        let temp = tempfile::tempdir().unwrap();
-        let app = app(
-            AppState::new(temp.path().to_path_buf()).await.unwrap(),
-            CancellationToken::new(),
-        );
-        let yaml = r#"
-on: push
-concurrency: bare-shorthand
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo hi
-"#;
-        let a = submit_yaml(&app, yaml, "owner/repo").await;
-        let b = submit_yaml(&app, yaml, "owner/repo").await;
-        assert_eq!(
-            get_run_json(&app, a["run_id"].as_str().unwrap()).await["status"],
-            "queued"
-        );
-        assert_eq!(
-            get_run_json(&app, b["run_id"].as_str().unwrap()).await["status"],
-            "pending"
-        );
-    }
-
-    #[tokio::test]
-    async fn job_level_matrix_concurrency_per_expansion() {
-        let temp = tempfile::tempdir().unwrap();
-        let app = app(
-            AppState::new(temp.path().to_path_buf()).await.unwrap(),
-            CancellationToken::new(),
-        );
-        // Two matrix cells share one group → serialize; different group → parallel.
-        let accepted = submit_yaml(
-            &app,
-            r#"
-on: push
-jobs:
-  matrixed:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        os: [a, b]
-    concurrency:
-      group: matrix-${{ matrix.os }}
-    steps:
-      - run: echo ${{ matrix.os }}
-"#,
-            "owner/repo",
-        )
-        .await;
-        let run_id = accepted["run_id"].as_str().unwrap();
-        let run = get_run_json(&app, run_id).await;
-        // Different matrix.os → different groups → both queued.
-        let statuses: Vec<&str> = run["jobs"]
-            .as_object()
-            .unwrap()
-            .values()
-            .filter_map(|v| v.as_str())
-            .collect();
-        assert!(
-            statuses.iter().filter(|s| **s == "queued").count() >= 2
-                || statuses.iter().all(|s| *s == "queued" || *s == "pending"),
-            "jobs={:?}",
-            run["jobs"]
-        );
-        // Same-group matrix should serialize.
-        let accepted2 = submit_yaml(
-            &app,
-            r#"
-on: push
-jobs:
-  matrixed:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        n: [1, 2, 3]
-    concurrency:
-      group: matrix-same
-    steps:
-      - run: echo ${{ matrix.n }}
-"#,
-            "owner/repo",
-        )
-        .await;
-        let run2 = get_run_json(&app, accepted2["run_id"].as_str().unwrap()).await;
-        let queued = run2["jobs"]
-            .as_object()
-            .unwrap()
-            .values()
-            .filter(|v| v.as_str() == Some("queued"))
-            .count();
-        let pending = run2["jobs"]
-            .as_object()
-            .unwrap()
-            .values()
-            .filter(|v| v.as_str() == Some("pending"))
-            .count();
-        assert_eq!(
-            queued, 1,
-            "exactly one matrix cell should run: {:?}",
-            run2["jobs"]
-        );
-        assert_eq!(pending, 2, "other cells pending: {:?}", run2["jobs"]);
-    }
-
-    #[tokio::test]
-    async fn mixed_queue_modes_arrival_owns_join() {
-        // Assumption #3: each arrival's own queue mode decides how it joins.
-        // A running; B arrives with queue:max (pending); C arrives with queue:single
-        // → should cancel B and take the pending slot.
-        let temp = tempfile::tempdir().unwrap();
-        let app = app(
-            AppState::new(temp.path().to_path_buf()).await.unwrap(),
-            CancellationToken::new(),
-        );
-        let a = submit_yaml(
-            &app,
-            r#"
-on: push
-concurrency:
-  group: mixed-q
-  queue: max
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo a
-"#,
-            "owner/repo",
-        )
-        .await;
-        let b = submit_yaml(
-            &app,
-            r#"
-on: push
-concurrency:
-  group: mixed-q
-  queue: max
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo b
-"#,
-            "owner/repo",
-        )
-        .await;
-        let c = submit_yaml(
-            &app,
-            r#"
-on: push
-concurrency:
-  group: mixed-q
-  queue: single
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo c
-"#,
-            "owner/repo",
-        )
-        .await;
-        assert_eq!(
-            get_run_json(&app, a["run_id"].as_str().unwrap()).await["status"],
-            "queued"
-        );
-        assert_eq!(
-            get_run_json(&app, b["run_id"].as_str().unwrap()).await["status"],
-            "cancelled",
-            "queue:single arrival should replace existing pending"
-        );
-        assert_eq!(
-            get_run_json(&app, c["run_id"].as_str().unwrap()).await["status"],
-            "pending"
-        );
-    }
-
-    #[tokio::test]
-    async fn cancel_message_targets_agent_job_guid_not_logical_id() {
-        let temp = tempfile::tempdir().unwrap();
-        let app = app(
-            AppState::new(temp.path().to_path_buf()).await.unwrap(),
-            CancellationToken::new(),
-        );
-        let a = submit_yaml(
-            &app,
-            r#"
-on: push
-concurrency:
-  group: guid-check
-  cancel-in-progress: true
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - run: sleep 30
-"#,
-            "owner/repo",
-        )
-        .await;
-        let msg = poll_and_ack(&app).await;
-        assert!(!msg.is_null());
-        // Extract agent job id from the job request path if present; otherwise
-        // from cancellation body after B arrives.
-        let _b = submit_yaml(
-            &app,
-            r#"
-on: push
-concurrency:
-  group: guid-check
-  cancel-in-progress: true
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - run: sleep 30
-"#,
-            "owner/repo",
-        )
-        .await;
-        let cancel_msg = request_json(
-            &app,
-            Method::GET,
-            "/runner/server/_apis/v1/Message/1?sessionId=default&waitSeconds=0",
-            Value::Null,
-        )
-        .await;
-        let body = decode_cancel_body(&cancel_msg);
-        let job_id = body["jobId"].as_str().unwrap();
-        // Must be a UUID, not the logical job name "build".
-        assert!(
-            job_id.parse::<uuid::Uuid>().is_ok(),
-            "jobId must be agent GUID, got {job_id}"
-        );
-        assert_ne!(job_id, "build");
-        assert_eq!(body["timeout"], "00:05:00");
-        let _ = a;
-    }
-
-    #[tokio::test]
-    async fn workflow_concurrency_cancel_before_dispatch_no_message() {
-        // Cancel a pending (not yet dispatched) run → no JobCancellation enqueued.
-        let temp = tempfile::tempdir().unwrap();
-        let app = app(
-            AppState::new(temp.path().to_path_buf()).await.unwrap(),
-            CancellationToken::new(),
-        );
-        let yaml = r#"
-on: push
-concurrency:
-  group: no-msg
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo hi
-"#;
-        let a = submit_yaml(&app, yaml, "owner/repo").await;
-        let b = submit_yaml(&app, yaml, "owner/repo").await;
-        let b_id = b["run_id"].as_str().unwrap();
-        assert_eq!(get_run_json(&app, b_id).await["status"], "pending");
-        // C with queue:single replaces B without B ever being in-flight.
-        let c = submit_yaml(&app, yaml, "owner/repo").await;
-        assert_eq!(get_run_json(&app, b_id).await["status"], "cancelled");
-        assert_eq!(
-            get_run_json(&app, c["run_id"].as_str().unwrap()).await["status"],
-            "pending"
-        );
-        // Only A's job message should be available, not a cancel for B.
-        let msg = request_json(
-            &app,
-            Method::GET,
-            "/runner/server/_apis/v1/Message/1?sessionId=default&waitSeconds=0",
-            Value::Null,
-        )
-        .await;
-        assert_ne!(
-            msg["messageType"],
-            azdo::message_type::JOB_CANCELLED,
-            "pending-only cancel must not emit JobCancellation"
-        );
-        let _ = a;
-    }
-
-    // ── C-01 regression: max-parallel + concurrency promotion without self-deadlock ──
-
-    #[tokio::test]
-    async fn c01_max_parallel_concurrency_no_self_deadlock() {
-        // Two matrix cells with max-parallel: 1 and a shared concurrency group.
-        // Cell A acquires the group, cell B waits. When A completes, B must
-        // be promoted exactly once without contending with its own holder.
-        let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
-        let app = app(state.clone(), CancellationToken::new());
-
-        let accepted = request_json(
-            &app,
-            Method::POST,
-            "/api/v1/runs",
-            json!({
-                "workflow_yaml": r#"
-on: push
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    strategy:
-      max-parallel: 1
-      matrix:
-        ver: [1, 2]
-    concurrency:
-      group: mp-group
-    steps:
-      - run: echo test
-"#,
-                "event": "push",
-                "repository": "owner/repo"
-            }),
-        )
-        .await;
-        let run_id = accepted["run_id"].as_str().unwrap();
-
-        // One cell should be queued, the other pending (concurrency-blocked).
-        let (queued_job, _blocked_count) = {
-            let inner = state.inner.lock().await;
-            let q = inner.queue.len();
-            let cb = inner.concurrency_blocked.len();
-            let pj = inner.pending_jobs.len();
-            // Exactly one in queue (or pending_jobs if max-parallel gated first)
-            assert!(
-                q + pj >= 1,
-                "at least one job should be ready: q={q} pj={pj}"
-            );
-            let first_job = inner
-                .queue
-                .front()
-                .map(|j| j.job_id.clone())
-                .or_else(|| inner.pending_jobs.front().map(|j| j.job_id.clone()))
-                .unwrap();
-            (first_job, cb)
-        };
-
-        // Complete the first cell.
-        complete_via_api(&app, run_id, queued_job.0.as_str()).await;
-
-        // After completion + promotion, the second cell should now be queued.
-        let run = get_run_json(&app, run_id).await;
-        let jobs = run["jobs"].as_object().unwrap();
-        // At least one job should be Queued or InProgress (promoted), and none
-        // should be permanently stuck in Pending.
-        let stuck_pending = jobs
-            .values()
-            .filter(|v| v.as_str() == Some("pending"))
-            .count();
-        assert_eq!(
-            stuck_pending, 0,
-            "no job should remain stuck in pending after promotion"
-        );
-    }
-
-    // ── C-05 regression: eval failure → terminal run status ──
-
-    #[tokio::test]
-    async fn c05_eval_failure_terminates_run() {
-        let temp = tempfile::tempdir().unwrap();
-        let app = app(
-            AppState::new(temp.path().to_path_buf()).await.unwrap(),
-            CancellationToken::new(),
-        );
-
-        // A single-job workflow with a malformed concurrency expression.
-        let accepted = submit_yaml(
-            &app,
-            r#"
-on: push
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    concurrency:
-      group: ""
-    steps:
-      - run: echo never
-"#,
-            "owner/repo",
-        )
-        .await;
-        let run_id = accepted["run_id"].as_str().unwrap();
-        let run = get_run_json(&app, run_id).await;
-
-        // The run must NOT stay Queued forever — it must reach a terminal state.
-        let status = run["status"].as_str().unwrap();
-        assert!(
-            status == "failure" || status == "cancelled",
-            "run with failed concurrency eval should be terminal, got: {status}"
-        );
-    }
-
-    // ── C-06 regression: boolean expression evaluation for cancel-in-progress ──
-
-    #[tokio::test]
-    async fn c06_cancel_in_progress_expression_bool_eval() {
-        let temp = tempfile::tempdir().unwrap();
-        let app = app(
-            AppState::new(temp.path().to_path_buf()).await.unwrap(),
-            CancellationToken::new(),
-        );
-
-        // cancel-in-progress uses an expression — must evaluate as boolean.
-        let yaml = r#"
-on: push
-concurrency:
-  group: bool-eval-group
-  cancel-in-progress: ${{ true }}
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo hi
-"#;
-        let a = submit_yaml(&app, yaml, "owner/repo").await;
-        let b = submit_yaml(&app, yaml, "owner/repo").await;
-
-        // B should cancel A (cancel-in-progress is true).
-        let a_run = get_run_json(&app, a["run_id"].as_str().unwrap()).await;
-        assert_eq!(
-            a_run["status"], "cancelled",
-            "${{{{ true }}}} must be evaluated as truthy cancel"
-        );
-
-        // B should be running/queued.
-        let b_run = get_run_json(&app, b["run_id"].as_str().unwrap()).await;
-        let b_status = b_run["status"].as_str().unwrap();
-        assert!(
-            b_status == "queued" || b_status == "in_progress",
-            "successor should be active, got: {b_status}"
-        );
-    }
-
-    #[tokio::test]
-    async fn c06_queue_max_with_dynamic_true_cancel_rejected() {
-        // queue: max combined with cancel-in-progress: ${{ true }} must be
-        // rejected. The parser catches literal "true" at parse time → 400.
-        // Dynamic expressions are caught at evaluation time → also rejected.
-        let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
-        let app = app(state.clone(), CancellationToken::new());
-
-        let body = json!({
-            "workflow_yaml": "on: push\nconcurrency:\n  group: queue-max-cancel-true\n  queue: max\n  cancel-in-progress: ${{ true }}\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
-            "event": "push",
-            "repository": "owner/repo"
-        });
-        let request = Request::builder()
-            .method(Method::POST)
-            .uri("/api/v1/runs")
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap();
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(state.inner.lock().await.runs.is_empty());
-    }
-
-    // ── C-07 regression: holder_keys reclamation ──
-
-    #[tokio::test]
-    async fn c07_holder_keys_cleaned_after_run_release() {
-        let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
-        let app = app(state.clone(), CancellationToken::new());
-
-        let yaml = r#"
-on: push
-concurrency:
-  group: holder-cleanup-group
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo cleanup
-"#;
-        let accepted = submit_yaml(&app, yaml, "owner/repo").await;
-        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
-
-        // Before completion, holder_keys should have an entry.
-        {
-            let inner = state.inner.lock().await;
-            assert!(
-                inner.holder_keys.contains_key(&run_id),
-                "holder_keys should track the run"
-            );
-        }
-
-        // Get the job ID and complete it.
-        let job_id = {
-            let inner = state.inner.lock().await;
-            inner.queue.front().unwrap().job_id.clone()
-        };
-        complete_via_api(&app, accepted["run_id"].as_str().unwrap(), &job_id.0).await;
-
-        // After completion, holder_keys for this run should be gone.
-        {
-            let inner = state.inner.lock().await;
-            assert!(
-                !inner.holder_keys.contains_key(&run_id),
-                "holder_keys should be cleaned up after run completes"
-            );
-        }
-    }
-
-    // ── C-02 regression: reusable JobSet admission and promotion ──
-
-    #[tokio::test]
-    async fn c02_reusable_call_jobset_blocks_and_promotes_members() {
-        let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
-        let app = app(state.clone(), CancellationToken::new());
-        let caller_yaml = r#"
-on: push
-jobs:
-  call:
-    uses: ./.github/workflows/callee.yml
-    concurrency:
-      group: reusable-serial
-"#;
-        let callee_yaml = r#"
-on: workflow_call
-jobs:
-  inner:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo callee
-"#;
-        let submission = || {
-            json!({
-                "workflow_yaml": caller_yaml,
-                "event": "push",
-                "repository": "owner/repo",
-                "reusable_workflows": {
-                    ".github/workflows/callee.yml": callee_yaml,
-                }
-            })
-        };
-
-        let first = request_json(&app, Method::POST, "/api/v1/runs", submission()).await;
-        let second = request_json(&app, Method::POST, "/api/v1/runs", submission()).await;
-        let first_run: RunId = first["run_id"].as_str().unwrap().parse().unwrap();
-        let second_run: RunId = second["run_id"].as_str().unwrap().parse().unwrap();
-        let (first_job, second_job) = {
-            let inner = state.inner.lock().await;
-            let first_job = inner.runs[&first_run].jobs.keys().next().unwrap().clone();
-            let second_job = inner.runs[&second_run].jobs.keys().next().unwrap().clone();
-            assert_eq!(
-                inner.runs[&first_run].jobs[&first_job],
-                ExecutionStatus::Queued
-            );
-            assert_eq!(
-                inner.runs[&second_run].jobs[&second_job],
-                ExecutionStatus::Pending
-            );
-            assert!(inner
-                .queue
-                .iter()
-                .any(|job| job.run_id == first_run && job.job_id == first_job));
-            assert!(inner
-                .concurrency_blocked
-                .iter()
-                .any(|job| job.run_id == second_run && job.job_id == second_job));
-            (first_job, second_job)
-        };
-
-        complete_via_api(&app, &first_run.to_string(), &first_job.0).await;
-        {
-            let inner = state.inner.lock().await;
-            assert_eq!(
-                inner.runs[&second_run].jobs[&second_job],
-                ExecutionStatus::Queued
-            );
-            assert!(inner
-                .queue
-                .iter()
-                .any(|job| job.run_id == second_run && job.job_id == second_job));
-            assert!(!inner
-                .concurrency_blocked
-                .iter()
-                .any(|job| job.run_id == second_run && job.job_id == second_job));
-        }
-        complete_via_api(&app, &second_run.to_string(), &second_job.0).await;
-        assert_eq!(
-            state.inner.lock().await.runs[&second_run].status,
-            ExecutionStatus::Success
-        );
-    }
-
-    #[tokio::test]
-    async fn c02_jobset_waits_for_embedded_gate_after_acquiring_caller_gate() {
-        let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
-        let app = app(state.clone(), CancellationToken::new());
-        let holder = submit_yaml(
-            &app,
-            r#"
-on: push
-concurrency:
-  group: embedded-shared
-jobs:
-  hold:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo hold
-"#,
-            "owner/repo",
-        )
-        .await;
-        let reusable = request_json(
-            &app,
-            Method::POST,
-            "/api/v1/runs",
-            json!({
-                "workflow_yaml": r#"
-on: push
-jobs:
-  call:
-    uses: ./.github/workflows/callee.yml
-    concurrency:
-      group: caller-free
-    with:
-      concurrency_group: embedded-shared
-"#,
-                "event": "push",
-                "repository": "owner/repo",
-                "reusable_workflows": {
-                    ".github/workflows/callee.yml": r#"
-on:
-  workflow_call:
-    inputs:
-      concurrency_group:
-        required: true
-        type: string
-concurrency:
-  group: ${{ inputs.concurrency_group }}
-jobs:
-  inner:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo inner
-"#,
-                }
-            }),
-        )
-        .await;
-        let holder_run: RunId = holder["run_id"].as_str().unwrap().parse().unwrap();
-        let reusable_run: RunId = reusable["run_id"].as_str().unwrap().parse().unwrap();
-        let (holder_job, reusable_job) = {
-            let inner = state.inner.lock().await;
-            let holder_job = inner.runs[&holder_run].jobs.keys().next().unwrap().clone();
-            let reusable_job = inner.runs[&reusable_run]
-                .jobs
-                .keys()
-                .next()
-                .unwrap()
-                .clone();
-            assert_eq!(
-                inner.runs[&reusable_run].jobs[&reusable_job],
-                ExecutionStatus::Pending
-            );
-            assert_eq!(inner.jobset_admissions.len(), 1);
-            assert_eq!(
-                inner
-                    .jobset_admissions
-                    .values()
-                    .next()
-                    .unwrap()
-                    .acquired_keys
-                    .len(),
-                1
-            );
-            (holder_job, reusable_job)
-        };
-
-        complete_via_api(&app, &holder_run.to_string(), &holder_job.0).await;
-        {
-            let inner = state.inner.lock().await;
-            assert_eq!(
-                inner.runs[&reusable_run].jobs[&reusable_job],
-                ExecutionStatus::Queued
-            );
-            assert!(inner.jobset_admissions.is_empty());
-            for group_name in ["caller-free", "embedded-shared"] {
-                let key = concurrency::concurrency_key("owner/repo", group_name);
-                assert!(matches!(
-                    inner.concurrency_groups[&key].running,
-                    Some(concurrency::Holder::JobSet { run_id, .. }) if run_id == reusable_run
-                ));
-            }
-        }
-        complete_via_api(&app, &reusable_run.to_string(), &reusable_job.0).await;
-    }
-
-    #[tokio::test]
-    async fn c02_jobset_deduplicates_identical_caller_and_embedded_keys() {
-        let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
-        let app = app(state.clone(), CancellationToken::new());
-        let accepted = request_json(
-            &app,
-            Method::POST,
-            "/api/v1/runs",
-            json!({
-                "workflow_yaml": r#"
-on: push
-jobs:
-  call:
-    uses: ./.github/workflows/callee.yml
-    concurrency:
-      group: same-key
-"#,
-                "event": "push",
-                "repository": "owner/repo",
-                "reusable_workflows": {
-                    ".github/workflows/callee.yml": r#"
-on: workflow_call
-concurrency:
-  group: same-key
-jobs:
-  inner:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo inner
-"#,
-                }
-            }),
-        )
-        .await;
-        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
-        let inner = state.inner.lock().await;
-        let job_id = inner.runs[&run_id].jobs.keys().next().unwrap();
-        assert_eq!(inner.runs[&run_id].jobs[job_id], ExecutionStatus::Queued);
-        assert!(inner.jobset_admissions.is_empty());
-        let key = concurrency::concurrency_key("owner/repo", "same-key");
-        assert!(inner.concurrency_groups[&key].pending.is_empty());
-        assert!(matches!(
-            inner.concurrency_groups[&key].running,
-            Some(concurrency::Holder::JobSet { run_id: holder_run, .. }) if holder_run == run_id
-        ));
-    }
     /// Production path: duplicate completion does not create a second promotion.
     #[tokio::test]
     async fn dag_duplicate_completion_idempotent_production() {
@@ -13912,6 +10547,239 @@ jobs:
                     conditions[job]
                 );
             }
+        }
+    }
+    /// Oracle sources for this production-path group:
+    /// * GitHub Actions workflow step syntax (the public contract for ordered
+    ///   steps): <https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#jobsjob_idsteps>.
+    /// * actions/runner v2.335.1 `RunServiceHttpClient.GetJobMessageAsync`,
+    ///   `RenewJobAsync`, and `CompleteJobAsync` (POST request shape and IDs):
+    ///   <https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Sdk/RSWebApi/RunServiceHttpClient.cs#L25-L166>.
+    /// * The captured v2.335.1 golden exchange records the observable
+    ///   `POST /twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate`
+    ///   at `.runner-watch/golden/v2.335.1/06-multi-step/flows.jsonl` (flow 40).
+    ///
+    /// This oracle deliberately asserts only the public JSON contract and the
+    /// response accepted by the router; it does not claim private service
+    /// implementation semantics.
+    fn arb_production_step_update(
+    ) -> impl Strategy<Value = aksh_runner::worker::server_queue::StepUpdate> {
+        use aksh_runner::worker::server_queue::{step_conclusion, step_status, StepUpdate};
+
+        (
+            0u8..4,
+            1u32..8,
+            "[a-z]{1,8}",
+            prop_oneof![Just(step_status::IN_PROGRESS), Just(step_status::COMPLETED)],
+            prop::option::of("2026-07-[0-9]{2}T00:00:00Z"),
+            prop::option::of("2026-07-[0-9]{2}T00:00:01Z"),
+            prop_oneof![
+                Just(0u32),
+                Just(step_conclusion::SUCCEEDED),
+                Just(step_conclusion::FAILED),
+                Just(step_conclusion::SKIPPED),
+            ],
+        )
+            .prop_map(
+                |(id, number, name, status, started_at, completed_at, conclusion)| StepUpdate {
+                    external_id: format!("step-{id}"),
+                    number,
+                    name,
+                    status,
+                    started_at,
+                    completed_at,
+                    conclusion,
+                },
+            )
+    }
+
+    fn oracle_status_rank(status: u32) -> u8 {
+        match status {
+            2 => 1,
+            6 => 2,
+            _ => 0,
+        }
+    }
+
+    fn oracle_merge_step(
+        store: &mut std::collections::BTreeMap<
+            String,
+            aksh_runner::worker::server_queue::StepUpdate,
+        >,
+        incoming: aksh_runner::worker::server_queue::StepUpdate,
+    ) {
+        use aksh_runner::worker::server_queue::StepUpdate;
+
+        let merged = if let Some(previous) = store.get(&incoming.external_id) {
+            let mut next = incoming.clone();
+            // The public wire identity is external_id; numbers and names are
+            // payload fields, while status follows the lifecycle order.
+            next.status =
+                if oracle_status_rank(incoming.status) >= oracle_status_rank(previous.status) {
+                    incoming.status
+                } else {
+                    previous.status
+                };
+            // Cumulative reports keep the first start timestamp when present.
+            next.started_at = previous.started_at.clone().or(incoming.started_at.clone());
+            next.completed_at = incoming
+                .completed_at
+                .clone()
+                .or(previous.completed_at.clone());
+            // A zero/unset conclusion cannot erase a concrete conclusion.
+            next.conclusion = if incoming.conclusion != 0 || previous.conclusion == 0 {
+                incoming.conclusion
+            } else {
+                previous.conclusion
+            };
+            next
+        } else {
+            incoming
+        };
+        let id = merged.external_id.clone();
+        store.insert(id, merged);
+        let _ = StepUpdate {
+            external_id: String::new(),
+            number: 0,
+            name: String::new(),
+            status: 0,
+            started_at: None,
+            completed_at: None,
+            conclusion: 0,
+        };
+    }
+
+    async fn post_typed_workflow_steps_update(app: Router, body: Value) -> (StatusCode, Value) {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate")
+            .header("authorization", "Bearer aksh-system-token")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        (status, value)
+    }
+
+    fn workflow_steps_update_config() -> ProptestConfig {
+        let mut config = ProptestConfig::with_failure_persistence(
+            FileFailurePersistence::SourceParallel("proptest-regressions"),
+        );
+        config.cases = 1_000;
+        config.rng_seed = RngSeed::Fixed(0x57E0_2026);
+        config.verbose = 1;
+        config
+    }
+
+    static WORKFLOW_STEPS_TEST_APP: std::sync::LazyLock<Router> = std::sync::LazyLock::new(|| {
+        std::thread::spawn(|| {
+            let state_dir = tempfile::tempdir().unwrap().keep();
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let state = runtime.block_on(AppState::new(state_dir)).unwrap();
+            app(state, CancellationToken::new())
+        })
+        .join()
+        .expect("step-update test router initializer panicked")
+    });
+
+    proptest! {
+        #![proptest_config(workflow_steps_update_config())]
+
+        /// 1,000 bounded queue → merge → body → JSON → real Twirp router cases.
+        /// This catches cumulative snapshots, change_order, IDs, duplicate and
+        /// out-of-order updates, and omitted timestamps without asserting internals.
+        #[test]
+        fn workflow_steps_update_production_path_1000_cases(
+        updates in prop::collection::vec(arb_production_step_update(), 1..9)
+    ) {
+        let app = WORKFLOW_STEPS_TEST_APP.clone();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut queue = aksh_runner::worker::server_queue::ServerQueue::new(
+                "job-prop".into(),
+                "plan-prop".into(),
+            );
+            let mut oracle = std::collections::BTreeMap::new();
+
+            for (index, update) in updates.into_iter().enumerate() {
+                queue.queue_update(update.clone());
+                oracle_merge_step(&mut oracle, update);
+                let body = queue.take_steps_update_body().expect("queued update has a body");
+                assert_eq!(body.change_order, (index + 1) as u64);
+                assert_eq!(body.workflow_job_run_backend_id, "job-prop");
+                assert_eq!(body.workflow_run_backend_id, "plan-prop");
+                let actual: std::collections::BTreeMap<_, _> = body
+                    .steps
+                    .iter()
+                    .map(|step| (step.external_id.clone(), step.clone()))
+                    .collect();
+                assert_eq!(actual, oracle, "snapshot {index}");
+
+                let (status, response) = post_typed_workflow_steps_update(
+                    app.clone(),
+                    serde_json::to_value(&body).unwrap(),
+                ).await;
+                assert_eq!(status, StatusCode::OK, "snapshot {index}");
+                assert_eq!(response, json!({"ok": true}));
+            }
+        });
+    }
+    }
+
+    /// The typed Twirp DTO rejects malformed field types at the HTTP boundary.
+    /// Source: pinned `RunServiceHttpClient` JSON request construction above;
+    /// endpoint and response shape are captured in the golden flow cited above.
+    #[tokio::test]
+    async fn workflow_steps_update_rejects_invalid_types() {
+        let app = WORKFLOW_STEPS_TEST_APP.clone();
+        let valid_step = json!({
+            "external_id": "step-1",
+            "number": 1,
+            "name": "build",
+            "status": 2,
+            "started_at": "2026-07-14T00:00:00Z",
+            "completed_at": null,
+            "conclusion": 0
+        });
+        let cases = [
+            (
+                "steps",
+                json!({"steps": "not-an-array", "change_order": 1, "workflow_job_run_backend_id": "j", "workflow_run_backend_id": "p"}),
+            ),
+            (
+                "status",
+                json!({"steps": [{"external_id": "step-1", "number": 1, "name": "build", "status": "in-progress", "conclusion": 0}], "change_order": 1, "workflow_job_run_backend_id": "j", "workflow_run_backend_id": "p"}),
+            ),
+            (
+                "change_order",
+                json!({"steps": [valid_step.clone()], "change_order": "1", "workflow_job_run_backend_id": "j", "workflow_run_backend_id": "p"}),
+            ),
+            (
+                "timestamp",
+                json!({"steps": [{"external_id": "step-1", "number": 1, "name": "build", "status": 2, "started_at": 7, "conclusion": 0}], "change_order": 1, "workflow_job_run_backend_id": "j", "workflow_run_backend_id": "p"}),
+            ),
+        ];
+        for (name, body) in cases {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate")
+                .header("authorization", "Bearer aksh-system-token")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert!(
+                response.status().is_client_error(),
+                "case {name} unexpectedly returned {}",
+                response.status()
+            );
         }
     }
 }
