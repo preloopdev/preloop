@@ -37,7 +37,6 @@ impl EventAdapter for Adapter {
             .and_then(|b| b.get("sha"))
             .and_then(|v| v.as_str());
 
-
         let base_ref = payload
             .get("pull_request")
             .and_then(|pr| pr.get("base"))
@@ -53,9 +52,7 @@ impl EventAdapter for Adapter {
         vec![EffectiveEvent {
             event: "pull_request_target".to_owned(),
             git_ref: format!("refs/heads/{base_ref}"),
-            sha: base_sha
-                .or(head_sha)
-                .map(|s| s.to_owned()),
+            sha: base_sha.or(head_sha).map(|s| s.to_owned()),
             status_check_sha: head_sha.map(|s| s.to_owned()),
             activity_type,
             trust_tier: Some(TrustTier::PullRequestTarget),

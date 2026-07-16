@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc 0b671d075a78aa62297b6a9564a1a7e4b542f329a015853623e2897247a99a8f # shrinks to ref expr = "* * * * 0"
 cc 59cbe52b229608d36bcb60ffe4429ba3c467c3949f5c02073787ffb0114870b9 # shrinks to ref expr = "* * 31 4,9 *"
+cc 07a4fcfb3586bb755848572b7df665a0776016a6b92874a5957db0a19d963d4b # shrinks to ref expr = "*/7 * * * *"

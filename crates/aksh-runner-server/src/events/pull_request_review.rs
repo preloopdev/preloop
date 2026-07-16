@@ -113,7 +113,10 @@ mod tests {
             "review": { "state": "approved" }
         });
         let events = Adapter.project(&payload);
-        assert_eq!(events[0].trust_tier, Some(TrustTier::UntrustedForkPullRequest));
+        assert_eq!(
+            events[0].trust_tier,
+            Some(TrustTier::UntrustedForkPullRequest)
+        );
     }
 
     #[test]
@@ -127,6 +130,9 @@ mod tests {
             "review": { "state": "approved" }
         });
         let events = Adapter.project(&payload);
-        assert_eq!(events[0].trust_tier, Some(TrustTier::UntrustedForkPullRequest));
+        assert_eq!(
+            events[0].trust_tier,
+            Some(TrustTier::UntrustedForkPullRequest)
+        );
     }
 }
