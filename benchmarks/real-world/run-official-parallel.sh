@@ -3,7 +3,7 @@
 set -euo pipefail
 
 GH_REPO="preloopdev/aksh-conformance-sample"
-RESULTS_DIR="$HOME/macos-runners/benchmarks/real-world/results/conformance"
+RESULTS_DIR="$HOME/macos-runners/benchmarks/compatibility/runner/behavior"
 mkdir -p "$RESULTS_DIR"
 
 log() { echo "[$(date +%T.%3N)] $*"; }

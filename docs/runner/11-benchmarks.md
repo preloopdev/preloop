@@ -92,6 +92,10 @@ Host bare metal (warm)           0.2s       2s     25s      27s     27s
 - **Docker**: Docker CE 29.6.1 (for container job benchmarks)
 - **Workspace**: host directory mounted via virtio-fs at `/workspace`
 - **VM boot time**: 1.2s from stopped state
+
+The historical figures above used smolvm v1.4.1. The current 2026-07-12 compatibility
+sweep uses smolvm v1.5.2 with `--rosetta` enabled for its comparison VMs; those results
+are documented in `benchmarks/compatibility/server/behavior/COMPARISON-REPORT.md`.
 ## 3. Container Job Benchmarks
 
 Workload: Docker container lifecycle — pull image, create network, start container, execute steps inside, health checks, cleanup.

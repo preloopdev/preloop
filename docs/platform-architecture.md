@@ -231,9 +231,11 @@ no Firecracker equivalent). Must use physical Mac minis — 1 job per device.
 Cleanup via ephemeral user accounts (not VM destroy). 30–60s reboot between
 jobs.
 
-Apple Silicon (M4) mandatory by 2026 — Intel Macs losing macOS support.
-x86 emulation via Rosetta does not work for Docker containers or VMs.
-
+Apple Silicon (M4) is the local target. smolvm 1.5.2 now supports opt-in Rosetta 2
+translation for x86_64 Linux binaries inside Linux guests; it does not provide macOS
+guest virtualization or make every Docker image architecture-independent. Use
+`smolvm ... --rosetta` for x86-only workloads and keep ARM64-native execution as the
+default.
 Cost: ~$0.08/min. Slowest and most expensive tier. No meaningful way to
 improve density beyond what GitHub already does.
 

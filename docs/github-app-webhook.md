@@ -109,27 +109,46 @@ Push a commit or open a pull request. `aksh` will:
 
 ---
 
-## 7. Automated One-Click App Registration (Manifest Flow)
+## 7. GitHub App Registration and Installation
 
-To simplify local development and testing, `aksh` supports the official **GitHub App Manifest** flow:
+`aksh` supports the official **GitHub App Manifest** flow to create an App. Creating the App and installing it are separate GitHub operations.
 
-1. **Open the Registration page**:
-   Start `aksh-runner-server` and navigate to:
-   `http://localhost:9090/api/v1/github/register`
+1. **Expose aksh at its final public HTTPS URL**:
+   Start `aksh-runner-server` behind a publicly reachable HTTPS address, then open:
+   ```text
+   https://aksh.example.com/api/v1/github/register
+   ```
+   `localhost` is suitable for viewing the form, but GitHub cannot deliver webhook events or callback redirects to it. The manifest only includes webhook settings for non-local hosts.
 
-2. **Click "Register App on GitHub"**:
-   You will be redirected to GitHub to register the app under your personal account or organization with all required permissions and webhook events pre-configured.
+2. **Create the App from the manifest**:
+   Click **Register App on GitHub**. GitHub opens its App-creation flow with aksh's redirect URL, webhook URL, default events, and default permissions pre-filled.
 
-3. **Callback Conversion**:
-   After clicking "Create", GitHub redirects back to:
-   `http://localhost:9090/api/v1/github/callback?code=...`
-   
-   `aksh` exchanges the temporary code for your new App ID, Webhook Secret, and Private Key PEM, displaying them directly on-screen and logging them to the terminal.
+3. **Capture the callback credentials**:
+   After GitHub creates the App, it redirects to:
+   ```text
+   https://aksh.example.com/api/v1/github/callback?code=...
+   ```
+   aksh exchanges the one-time code for an App ID, webhook secret, and private-key PEM, then displays them. Treat the PEM and webhook secret as credentials: store them in a secret manager and do not commit them.
 
-4. **Save and Restart**:
-   Copy the displayed credentials into your local environment:
+4. **Install the App**:
+   In GitHub's App settings, install the newly created App on the target account or repository. Copy the installation ID from its installation settings URL, for example:
+   ```text
+   https://github.com/settings/installations/INSTALLATION_ID
+   ```
+   The App cannot mint an installation access token until this step is complete.
+
+5. **Configure aksh and restart it**:
    ```sh
    export AKSH_WEBHOOK_SECRET="your-new-webhook-secret"
    export AKSH_GITHUB_APP_ID="your-new-app-id"
+   export AKSH_GITHUB_APP_INSTALLATION_ID="your-installation-id"
+   export AKSH_GITHUB_APP_PRIVATE_KEY='-----BEGIN PRIVATE KEY-----
+   ...
+   -----END PRIVATE KEY-----'
+   # Or: export AKSH_GITHUB_APP_PRIVATE_KEY_PATH=/secure/path/aksh-app.pem
    ```
-   And restart `aksh`!
+
+   When these values are set, aksh signs a GitHub App JWT, exchanges it for a per-job installation access token, and applies each workflow/job `permissions:` declaration to the token supplied to the official runner. If no App configuration is present, `AKSH_GITHUB_TOKEN` remains the job-token fallback.
+
+6. **Confirm delivery and job credential use**:
+   Push a commit or open a pull request. aksh verifies the webhook and queues matching jobs. The installed App's scoped token is supplied to the runner job. Remote workflow retrieval and GitHub Check Run reporting currently continue to use `AKSH_GITHUB_TOKEN`; configure `AKSH_LOCAL_WORKSPACE` for offline workflow loading, or provide that token for those server-side GitHub API calls.

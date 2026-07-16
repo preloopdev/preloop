@@ -15,7 +15,7 @@ GH_REPO="${GH_REPO:-preloopdev/aksh-conformance-sample}"
 GH_REF="${GH_REF:-main}"
 MITM_PORT="${MITM_PORT:-18081}"
 HOST_WORKSPACE="$PWD"
-RESULTS_ROOT="${RESULTS_ROOT:-$PWD/benchmarks/real-world/results/runner-flow}"
+RESULTS_ROOT="${RESULTS_ROOT:-$PWD/benchmarks/compatibility/runner/protocol}"
 AKSH_RUNNER="/usr/local/bin/aksh-runner"
 # Host path to the official runner install (mounted read-only into each VM)
 OFFICIAL_RUNNER_HOST="${OFFICIAL_RUNNER_HOST:-/Users/bnjoroge/cachingv4}"

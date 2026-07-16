@@ -2,6 +2,8 @@
 
 aksh treats compatibility as a test artifact, not an assertion in prose.
 
+The complete evidence index is [`benchmarks/compatibility/README.md`](../benchmarks/compatibility/README.md). It separates server fidelity (official runner against GitHub versus aksh) from runner fidelity (official runner versus aksh-runner against GitHub), and labels live behavior, MITM protocol captures, and replay gates separately.
+
 ## Current State (2026-07-10)
 
 The official `actions/runner` v2.335.1 completes the broker lifecycle against aksh:
