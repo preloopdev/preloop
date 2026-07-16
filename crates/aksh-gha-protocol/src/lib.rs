@@ -129,7 +129,7 @@ impl<'de> Deserialize<'de> for SecretString {
 pub type SecretMap = BTreeMap<String, SecretString>;
 
 /// Incoming workflow submission.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WorkflowSubmission {
     /// YAML workflow contents.
     pub workflow_yaml: String,
@@ -146,6 +146,9 @@ pub struct WorkflowSubmission {
     /// Caller-provided variables.
     #[serde(default)]
     pub vars: BTreeMap<String, String>,
+    /// Workflow dispatch or call inputs.
+    #[serde(default)]
+    pub inputs: BTreeMap<String, serde_json::Value>,
     /// Caller-provided secrets.
     #[serde(default)]
     pub secrets: SecretMap,
@@ -213,6 +216,8 @@ pub struct RunAccepted {
 pub enum ExecutionStatus {
     /// Object exists but has not started.
     Queued,
+    /// Object is waiting on a concurrency group (not runnable yet).
+    Pending,
     /// Object is currently running.
     InProgress,
     /// Object completed successfully.
@@ -288,6 +293,15 @@ pub struct JobPlan {
     /// The runner evaluates these after step execution and includes results in completejob.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub job_outputs: BTreeMap<String, String>,
+    /// Raw job-level concurrency group expression/string (server-evaluated).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency_group: Option<String>,
+    /// Raw job-level `cancel-in-progress` value: "true"/"false"/expression.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency_cancel_in_progress: Option<String>,
+    /// Job-level concurrency queue mode: `"single"` or `"max"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency_queue: Option<String>,
 }
 
 fn default_fail_fast() -> bool {
@@ -447,6 +461,9 @@ pub enum NdjsonEvent {
         job_id: JobId,
         /// New status.
         status: ExecutionStatus,
+        /// Optional status reason (`concurrency_pending`, `concurrency_cancelled`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     /// Log line was appended.
     Log {
@@ -478,6 +495,9 @@ pub enum NdjsonEvent {
         run_id: RunId,
         /// New status.
         status: ExecutionStatus,
+        /// Optional status reason (`concurrency_pending`, `concurrency_cancelled`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     /// Job completed with result and outputs.
     JobCompleted {

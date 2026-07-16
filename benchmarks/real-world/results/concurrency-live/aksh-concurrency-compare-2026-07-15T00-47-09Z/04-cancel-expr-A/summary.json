@@ -1,0 +1,29 @@
+{
+  "workflow": "04-cancel-expr-A",
+  "run_id": "25f90d50-66ba-4346-b5e2-1f1ebe0f1227",
+  "status": "completed",
+  "conclusion": "cancelled",
+  "jobs": [
+    {
+      "name": "long",
+      "id": "long",
+      "status": "cancelled",
+      "conclusion": "cancelled",
+      "steps": [
+        {
+          "name": "Set up job",
+          "conclusion": "success"
+        },
+        {
+          "name": "sleep-long",
+          "conclusion": "cancelled"
+        },
+        {
+          "name": "Complete job",
+          "conclusion": "success"
+        }
+      ]
+    }
+  ],
+  "source": "aksh"
+}

@@ -10,6 +10,7 @@ fn ndjson_event_shape_is_stable() {
         run_id,
         job_id: JobId("test[os=ubuntu-latest]".to_owned()),
         status: ExecutionStatus::Success,
+        reason: None,
     })
     .unwrap();
 

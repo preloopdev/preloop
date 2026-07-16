@@ -729,6 +729,7 @@ pub(crate) async fn handle_github_webhook(
                 reusable_workflows: BTreeMap::new(),
                 enable_debugger: false,
                 debugger_welcome_message: None,
+                inputs: BTreeMap::new(),
                 trust_tier: effective.trust_tier.as_ref().and_then(|tier| {
                     serde_json::to_value(tier)
                         .ok()
