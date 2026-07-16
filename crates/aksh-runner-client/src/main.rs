@@ -1,6 +1,7 @@
 //! Preloop runner client binary.
 
 use std::collections::BTreeMap;
+use std::env;
 use std::path::PathBuf;
 
 use aksh_gha_protocol::RunId;
@@ -83,6 +84,8 @@ enum Command {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
+    let native_api_token =
+        env::var("AKSH_SYSTEM_TOKEN").unwrap_or_else(|_| "aksh-system-token".to_owned());
     let cli = Cli::parse();
     let http = reqwest::Client::new();
 
@@ -143,6 +146,7 @@ async fn main() -> anyhow::Result<()> {
             };
             let response = http
                 .post(cli.server.join("/api/v1/runs")?)
+                .bearer_auth(&native_api_token)
                 .json(&submission)
                 .send()
                 .await?
@@ -154,6 +158,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Run { run_id } => {
             print_response(
                 http.get(cli.server.join(&format!("/api/v1/runs/{run_id}"))?)
+                    .bearer_auth(&native_api_token)
                     .send()
                     .await?,
             )
@@ -162,6 +167,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Cancel { run_id } => {
             print_response(
                 http.post(cli.server.join(&format!("/api/v1/runs/{run_id}/cancel"))?)
+                    .bearer_auth(&native_api_token)
                     .send()
                     .await?,
             )
@@ -170,6 +176,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Rerun { run_id } => {
             print_response(
                 http.post(cli.server.join(&format!("/api/v1/runs/{run_id}/rerun"))?)
+                    .bearer_auth(&native_api_token)
                     .send()
                     .await?,
             )
@@ -181,6 +188,7 @@ async fn main() -> anyhow::Result<()> {
                     cli.server
                         .join(&format!("/api/v1/runs/{run_id}/events.ndjson"))?,
                 )
+                .bearer_auth(&native_api_token)
                 .send()
                 .await?,
             )

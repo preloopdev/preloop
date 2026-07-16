@@ -142,6 +142,9 @@ pub struct Workflow {
     /// Global environment.
     #[serde(default)]
     pub env: Env,
+    /// Workflow-level permissions.
+    #[serde(default)]
+    pub permissions: Option<Value>,
     /// Workflow-level concurrency group.
     #[serde(default)]
     pub concurrency: Option<Concurrency>,
@@ -789,12 +792,19 @@ pub struct Job {
     /// Strategy block.
     #[serde(default)]
     pub strategy: Strategy,
+    /// Job environment variables.
     /// Job-level concurrency group.
     #[serde(default)]
     pub concurrency: Option<Concurrency>,
     /// Job environment.
     #[serde(default)]
     pub env: Env,
+    /// Deployment environment, scalar or `{ name, url }` mapping.
+    #[serde(default)]
+    pub environment: Option<Value>,
+    /// Job-level permissions.
+    #[serde(default)]
+    pub permissions: Option<Value>,
     /// Steps.
     #[serde(default)]
     pub steps: Vec<Step>,
@@ -1207,16 +1217,71 @@ fn non_empty_services(services: Option<serde_json::Value>) -> Option<serde_json:
     }
 }
 
+fn id_token_granted(permissions: Option<&Value>) -> bool {
+    match permissions {
+        Some(Value::String(value)) => value == "write-all",
+        Some(Value::Object(values)) => values
+            .get("id-token")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value == "write"),
+        _ => false,
+    }
+}
+
+fn resolved_environment(
+    environment: Option<&Value>,
+    matrix: &indexmap::IndexMap<String, Value>,
+) -> Option<String> {
+    let value = match environment? {
+        Value::String(value) => value,
+        Value::Object(values) => values.get("name")?.as_str()?,
+        _ => return None,
+    };
+    let trimmed = value.trim();
+    let expression = trimmed.strip_prefix("${{")?.strip_suffix("}}")?.trim();
+    let key = expression.strip_prefix("matrix.")?;
+    matrix.get(key).and_then(|value| match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        _ => None,
+    })
+}
+
+fn oidc_environment(
+    environment: Option<&Value>,
+    matrix: &indexmap::IndexMap<String, Value>,
+) -> Option<String> {
+    match environment? {
+        Value::String(value) if !value.trim().starts_with("${{") => Some(value.clone()),
+        Value::Object(values) => match values.get("name")?.as_str()? {
+            value if !value.trim().starts_with("${{") => Some(value.to_owned()),
+            _ => resolved_environment(environment, matrix),
+        },
+        Value::String(_) => resolved_environment(environment, matrix),
+        _ => None,
+    }
+}
+
 /// Expand all jobs for a workflow.
 pub fn expand_jobs(workflow: &Workflow) -> Result<Vec<JobPlan>, ParserError> {
     let mut plans = Vec::new();
     let global_env = workflow.env.clone().into_strings();
     for (job_id, job) in &workflow.jobs {
         for matrix in expand_matrix(job_id, job.strategy.matrix.as_ref())? {
+            let oidc_environment = oidc_environment(job.environment.as_ref(), &matrix);
             let expanded_id = expanded_job_id(job_id, &matrix);
             let mut env = global_env.clone();
             env.extend(job.env.clone().into_strings());
-            plans.push(job_plan_from_job(job_id, job, expanded_id, matrix, env));
+            plans.push(job_plan_from_job(
+                job_id,
+                job,
+                expanded_id,
+                matrix,
+                env,
+                oidc_environment,
+                workflow.permissions.as_ref(),
+            ));
         }
     }
     dag::validate_job_plans(&plans)?;
@@ -1229,6 +1294,8 @@ fn job_plan_from_job(
     expanded_id: String,
     matrix: IndexMap<String, Value>,
     env: BTreeMap<String, String>,
+    oidc_environment: Option<String>,
+    workflow_permissions: Option<&Value>,
 ) -> JobPlan {
     let (concurrency_group, concurrency_cancel_in_progress, concurrency_queue) =
         concurrency_fields(job.concurrency.as_ref());
@@ -1263,6 +1330,9 @@ fn job_plan_from_job(
             .iter()
             .map(|(k, v)| (k.clone(), v.as_str().unwrap_or(&v.to_string()).to_string()))
             .collect(),
+        oidc_id_token_granted: id_token_granted(job.permissions.as_ref().or(workflow_permissions)),
+        oidc_environment,
+        oidc_job_workflow_ref: None,
         concurrency_group,
         concurrency_cancel_in_progress,
         concurrency_queue,
@@ -1520,6 +1590,10 @@ fn expand_jobs_with_reusables_internal(
                     called_plan.secrets_map.extend(secrets_map.clone());
                     called_plan.workflow_file = Some(path.clone());
                     called_plan.workflow_ref = Some(uses.clone());
+                    called_plan.oidc_id_token_granted &= id_token_granted(
+                        job.permissions.as_ref().or(workflow.permissions.as_ref()),
+                    );
+                    called_plan.oidc_job_workflow_ref = Some(uses.clone());
                     called_plan.matrix.extend(matrix.clone());
                 }
 
@@ -1542,10 +1616,19 @@ fn expand_jobs_with_reusables_internal(
         }
 
         for matrix in expand_matrix(job_id, job.strategy.matrix.as_ref())? {
+            let oidc_environment = oidc_environment(job.environment.as_ref(), &matrix);
             let expanded_id = expanded_job_id(job_id, &matrix);
             let mut env = global_env.clone();
             env.extend(job.env.clone().into_strings());
-            plans.push(job_plan_from_job(job_id, job, expanded_id, matrix, env));
+            plans.push(job_plan_from_job(
+                job_id,
+                job,
+                expanded_id,
+                matrix,
+                env,
+                oidc_environment,
+                workflow.permissions.as_ref(),
+            ));
         }
     }
     Ok(plans)
@@ -1921,6 +2004,72 @@ jobs:
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].id.0, "call/test");
         assert_eq!(jobs[0].runs_on, vec!["ubuntu-latest"]);
+    }
+
+    #[test]
+    fn records_oidc_permission_and_matrix_environment() {
+        let workflow = parse_workflow(
+            r#"
+on: push
+permissions:
+  id-token: write
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ matrix.environment }}
+    strategy:
+      matrix:
+        environment: [staging, production]
+    steps:
+      - run: echo deploy
+"#,
+        )
+        .unwrap();
+
+        let jobs = expand_jobs(&workflow).unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert!(jobs.iter().all(|job| job.oidc_id_token_granted));
+        assert_eq!(jobs[0].oidc_environment.as_deref(), Some("staging"));
+        assert_eq!(jobs[1].oidc_environment.as_deref(), Some("production"));
+    }
+
+    #[test]
+    fn reusable_oidc_permission_requires_caller_grant() {
+        let caller = parse_workflow(
+            r#"
+on: push
+jobs:
+  call:
+    uses: ./.github/workflows/reusable.yml
+"#,
+        )
+        .unwrap();
+        let mut reusable = BTreeMap::new();
+        reusable.insert(
+            ".github/workflows/reusable.yml".to_owned(),
+            r#"
+on:
+  workflow_call:
+permissions:
+  id-token: write
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - run: echo deploy
+"#
+            .to_owned(),
+        );
+
+        let jobs = expand_jobs_with_reusables(&caller, &reusable).unwrap().jobs;
+        assert_eq!(jobs.len(), 1);
+        assert!(!jobs[0].oidc_id_token_granted);
+        assert_eq!(jobs[0].oidc_environment.as_deref(), Some("production"));
+        assert_eq!(
+            jobs[0].oidc_job_workflow_ref.as_deref(),
+            Some("./.github/workflows/reusable.yml")
+        );
     }
 
     #[test]
