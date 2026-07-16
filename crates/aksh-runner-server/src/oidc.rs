@@ -10,40 +10,35 @@
 //! environment. The toolkit's `OidcClient.getIDToken()` hits this endpoint
 //! and reads `{"value":"<jwt>"}`.
 
-use aksh_gha_protocol::crypto::{sign_jwt_rs256, AgentRsaKeypair, RsaParametersExport};
+use aksh_gha_protocol::crypto::{sign_jwt_rs256_with_key, AgentRsaKeypair, RsaParametersExport};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
-/// The issuer URL that real GitHub OIDC tokens carry.
+/// The issuer URL used by GitHub's hosted OIDC provider for compatibility tests.
 pub const GITHUB_OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
 
-/// Token validity window in seconds (GitHub uses up to 3600; we use 600).
-const TOKEN_TTL_SECS: u64 = 600;
+/// Token validity window in seconds.
+const TOKEN_TTL_SECS: u64 = 300;
 
 // ---------------------------------------------------------------------------
 // Key management
 // ---------------------------------------------------------------------------
-
 /// An RSA keypair dedicated to OIDC token signing, with a precomputed `kid`
 /// (RFC 7638 JWK thumbprint).
 #[derive(Clone)]
 pub struct OidcKeypair {
     keypair: AgentRsaKeypair,
     kid: String,
-    /// X.509 SHA-1 thumbprint (base64url). GitHub includes this in the JWT header.
-    x5t: String,
 }
 
 impl OidcKeypair {
-    /// Generate a fresh 2048-bit RSA keypair and compute its `kid` and `x5t`.
+    /// Generate a fresh 2048-bit RSA keypair and compute its `kid`.
     pub fn generate() -> Result<Self, anyhow::Error> {
         let keypair = AgentRsaKeypair::generate()
             .map_err(|e| anyhow::anyhow!("OIDC keypair generation failed: {e}"))?;
         let kid = compute_kid(&keypair);
-        let x5t = compute_x5t(&keypair);
-        Ok(Self { keypair, kid, x5t })
+        Ok(Self { keypair, kid })
     }
 
     /// Reconstruct from persisted `RsaParametersExport` (C# RSAParameters JSON).
@@ -51,8 +46,7 @@ impl OidcKeypair {
         let keypair = AgentRsaKeypair::from_rsaparams(params)
             .map_err(|e| anyhow::anyhow!("OIDC keypair import failed: {e}"))?;
         let kid = compute_kid(&keypair);
-        let x5t = compute_x5t(&keypair);
-        Ok(Self { keypair, kid, x5t })
+        Ok(Self { keypair, kid })
     }
 
     /// Export for persistence.
@@ -80,16 +74,14 @@ impl OidcKeypair {
         })
     }
 
-    /// Sign a JWT with RS256 using this keypair. Includes `x5t` in header
-    /// to match GitHub's OIDC token format.
+    /// Sign a JWT with RS256 using this keypair.
     pub fn sign_jwt(&self, claims: &serde_json::Value) -> Result<String, anyhow::Error> {
         let header = serde_json::json!({
             "alg": "RS256",
             "typ": "JWT",
             "kid": self.kid,
-            "x5t": self.x5t,
         });
-        sign_jwt_rs256(&header, claims, &self.params())
+        sign_jwt_rs256_with_key(&header, claims, &self.keypair)
     }
 }
 
@@ -99,15 +91,6 @@ fn compute_kid(keypair: &AgentRsaKeypair) -> String {
     // RFC 7638 §3.1: the canonical JSON is {"e":"…","kty":"RSA","n":"…"} (lexicographic key order).
     let canonical = format!(r#"{{"e":"{e}","kty":"RSA","n":"{n}"}}"#);
     let hash = Sha256::digest(canonical.as_bytes());
-    URL_SAFE_NO_PAD.encode(hash)
-}
-
-/// Compute the X.509 SHA-1 thumbprint (base64url(SHA-1 of the canonical JWK)).
-/// GitHub includes this as `x5t` in the JWT header.
-fn compute_x5t(keypair: &AgentRsaKeypair) -> String {
-    let (n, e) = keypair.jwk_components();
-    let canonical = format!(r#"{{"e":"{e}","kty":"RSA","n":"{n}"}}"#);
-    let hash = Sha1::digest(canonical.as_bytes());
     URL_SAFE_NO_PAD.encode(hash)
 }
 
@@ -124,7 +107,7 @@ pub fn discovery_document(issuer: &str, jwks_uri: &str) -> serde_json::Value {
         "response_types_supported": ["id_token"],
         "subject_types_supported": ["public"],
         "claims_supported": [
-            "sub", "aud", "iss", "exp", "iat", "nbf", "jti",
+            "sub", "aud", "iss", "exp", "iat", "nbf", "jti", "check_run_id",
             "actor", "actor_id",
             "repository", "repository_id", "repository_owner", "repository_owner_id",
             "repository_visibility",
@@ -310,6 +293,10 @@ pub fn build_claims(
     claims
 }
 
+/// Parse whether a workflow/job grants `id-token: write`.
+///
+/// Job-level permissions replace workflow-level permissions. `write-all` grants
+/// the permission; boolean permission values are not treated as write grants.
 pub fn parse_id_token_grant(workflow_yaml: &str, job_id: Option<&str>) -> bool {
     let Ok(parsed) = serde_yaml::from_str::<serde_yaml::Value>(workflow_yaml) else {
         return false;
@@ -318,36 +305,31 @@ pub fn parse_id_token_grant(workflow_yaml: &str, job_id: Option<&str>) -> bool {
         return false;
     };
 
-    // Helper: "write" (string) or true (bool) means granted.
-    fn permission_is_write(v: &serde_yaml::Value) -> bool {
-        v.as_bool().unwrap_or(false) || v.as_str() == Some("write")
-    }
-
-    // Workflow-level permissions.
-    let wf_grant = parsed
-        .get("permissions")
-        .and_then(|p| p.get("id-token"))
-        .map(permission_is_write)
-        .unwrap_or(false);
-    if wf_grant {
-        return true;
-    }
-
-    // Job-level permissions (if a specific job is requested).
-    if let Some(jid) = job_id {
-        if let Some(job) = jobs.get(jid) {
-            let job_grant = job
-                .get("permissions")
-                .and_then(|p| p.get("id-token"))
-                .map(permission_is_write)
-                .unwrap_or(false);
-            if job_grant {
-                return true;
-            }
+    fn permission_is_write(value: &serde_yaml::Value) -> bool {
+        match value {
+            serde_yaml::Value::String(value) => value == "write",
+            serde_yaml::Value::Mapping(value) => value
+                .get(serde_yaml::Value::String("id-token".to_owned()))
+                .is_some_and(permission_is_write),
+            _ => false,
         }
     }
 
-    false
+    fn permissions_grant(value: &serde_yaml::Value) -> bool {
+        match value {
+            serde_yaml::Value::String(value) => value == "write-all",
+            serde_yaml::Value::Mapping(_) => permission_is_write(value),
+            _ => false,
+        }
+    }
+
+    if let Some(job_id) = job_id {
+        if let Some(job_permissions) = jobs.get(job_id).and_then(|job| job.get("permissions")) {
+            return permissions_grant(job_permissions);
+        }
+    }
+
+    parsed.get("permissions").is_some_and(permissions_grant)
 }
 
 // ---------------------------------------------------------------------------
@@ -503,7 +485,7 @@ mod tests {
     }
 
     #[test]
-    fn claims_exp_is_iat_plus_600() {
+    fn claims_exp_is_iat_plus_300() {
         let input = test_input("refs/heads/main", "push", None);
         let now = 1_700_000_000u64;
         let claims = build_claims(&input, "test", GITHUB_OIDC_ISSUER, now);
@@ -1161,34 +1143,23 @@ mod lie_github_tests {
     }
 
     #[test]
-    fn x5t_in_header_matches_sha1_of_jwk() {
+    fn jwt_header_omits_unbacked_x5t() {
         let kp = OidcKeypair::generate().unwrap();
         let input = test_input("refs/heads/main", "push", None);
         let claims = build_claims(&input, "test", GITHUB_OIDC_ISSUER, 100);
         let jwt = kp.sign_jwt(&claims).unwrap();
         let parts: Vec<&str> = jwt.split('.').collect();
-        assert_eq!(parts.len(), 3);
-
         let header: serde_json::Value =
             serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[0]).unwrap()).unwrap();
-        assert!(header["x5t"].is_string(), "JWT header must contain x5t");
-
-        // Verify x5t is the base64url(SHA-1(canonical JWK)).
-        let (n, e) = kp.keypair.jwk_components();
-        let canonical = format!(r#"{{"e":"{e}","kty":"RSA","n":"{n}"}}"#);
-        let expected_x5t = URL_SAFE_NO_PAD.encode(Sha1::digest(canonical.as_bytes()));
-        assert_eq!(header["x5t"].as_str().unwrap(), expected_x5t);
+        assert!(header.get("x5t").is_none());
+        assert_eq!(header["kid"], kp.kid());
     }
 
     #[test]
-    fn keypair_roundtrip_preserves_x5t() {
+    fn keypair_roundtrip_preserves_kid() {
         let kp1 = OidcKeypair::generate().unwrap();
         let params = kp1.params();
         let kp2 = OidcKeypair::from_params(&params).unwrap();
         assert_eq!(kp1.kid(), kp2.kid());
-        assert_eq!(
-            kp1.x5t, kp2.x5t,
-            "x5t must be stable across serialize/deserialize"
-        );
     }
 }
