@@ -1970,7 +1970,7 @@ async fn get_run_logs(
     for (key, bytes) in &inner.logs {
         out.push_str(&format!("--- Log: {key} ---\n"));
         out.push_str(&String::from_utf8_lossy(bytes));
-        out.push_str("\n");
+        out.push('\n');
     }
     Ok(out)
 }
@@ -2873,7 +2873,7 @@ fn ensure_broker_request_owner(
         .session_active_requests
         .iter()
         .find_map(|(session_id, active_request_id)| {
-            (*active_request_id == request_id).then(|| session_id)
+            (*active_request_id == request_id).then_some(session_id)
         })
         .and_then(|session_id| inner.broker_session_runners.get(session_id).copied());
     match owner {
