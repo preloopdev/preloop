@@ -39,6 +39,8 @@ SCENARIO_WORKFLOWS = {
     "13-jobset-caller-only": "concurrency-13-jobset-caller-only.yml",
     "14-jobset-embedded-only": "concurrency-14-jobset-embedded-only.yml",
     "15-jobset-different-key": "concurrency-15-jobset-different-key.yml",
+    "16-multi-jobset-same-gate": "concurrency-16-multi-jobset-same-gate.yml",
+    "17-jobset-overlap-gates": "concurrency-17-jobset-overlap-gates.yml",
 }
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
