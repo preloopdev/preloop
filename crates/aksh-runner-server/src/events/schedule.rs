@@ -4,7 +4,6 @@
 //! Reference: MessageController.cs:882-927 (registration) and line 123 (firing).
 //! ref = default branch, sha = head of default branch.
 
-use crate::events::trust_tier::TrustTier;
 use crate::events::{EffectiveEvent, EventAdapter};
 use serde_json::Value;
 

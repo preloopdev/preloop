@@ -36,7 +36,7 @@ if [ -z "$event" ]; then
     echo ""
     echo "Environment:"
     echo "  AKSH_URL           server URL (default: http://127.0.0.1:8080)"
-    echo "  WEBHOOK_SECRET     webhook secret (default: dev-secret)"
+    echo "  AKSH_WEBHOOK_SECRET  webhook secret (default: dev-secret)"
     echo "  PAYLOADS_DIR       captured payloads dir (default: experiments/mitm/scenarios)"
     exit 1
 fi
