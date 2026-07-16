@@ -56,6 +56,10 @@ pub struct JobContext {
     pub dap_debugger: Option<Arc<dyn aksh_dap::IDapDebugger>>,
     /// Debugger connection telemetry entries for completejob.
     pub debugger_telemetry: Vec<String>,
+    /// Actions upgraded from node20 to node24 by migration policy.
+    pub upgraded_node24_actions: Vec<String>,
+    /// Actions still using deprecated node20 (for warning).
+    pub deprecated_node20_actions: Vec<String>,
 }
 
 impl std::fmt::Debug for JobContext {
@@ -149,6 +153,22 @@ impl JobContext {
             complete_step_id: None,
             dap_debugger: None,
             debugger_telemetry: Vec::new(),
+            upgraded_node24_actions: Vec::new(),
+            deprecated_node20_actions: Vec::new(),
+        }
+    }
+
+    /// Record an action that was upgraded from node20 to node24 by migration policy.
+    pub fn record_upgraded_node24_action(&mut self, name: &str) {
+        if !self.upgraded_node24_actions.iter().any(|n| n == name) {
+            self.upgraded_node24_actions.push(name.to_string());
+        }
+    }
+
+    /// Record an action still using deprecated node20.
+    pub fn record_deprecated_node20_action(&mut self, name: &str) {
+        if !self.deprecated_node20_actions.iter().any(|n| n == name) {
+            self.deprecated_node20_actions.push(name.to_string());
         }
     }
 
