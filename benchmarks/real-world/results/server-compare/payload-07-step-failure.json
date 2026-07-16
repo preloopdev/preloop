@@ -1,0 +1,1 @@
+{"workflow_yaml": "name: mitm step failure\non: workflow_dispatch\njobs:\n  build:\n    runs-on: self-hosted\n    steps:\n      - run: exit 1\n      - run: echo ran-on-failure\n        if: failure()\n      - run: echo never\n        if: success()\n", "event": "workflow_dispatch", "repository": "preloopdev/aksh-conformance-sample", "git_ref": "refs/heads/main"}

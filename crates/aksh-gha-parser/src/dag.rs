@@ -290,6 +290,9 @@ mod tests {
             oidc_id_token_granted: false,
             oidc_environment: None,
             oidc_job_workflow_ref: None,
+            concurrency_group: None,
+            concurrency_cancel_in_progress: None,
+            concurrency_queue: None,
         }
     }
 

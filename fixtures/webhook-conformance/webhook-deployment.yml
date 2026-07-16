@@ -1,0 +1,12 @@
+name: Webhook Deployment
+on:
+  deployment:
+  deployment_status:
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log event
+        run: |
+          echo "EVENT: ${{ github.event_name }}"
+          echo "ACTION: ${{ github.event.action }}"
