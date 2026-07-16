@@ -1,0 +1,42 @@
+name: Webhook Dispatch
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        description: 'Name to greet'
+        required: false
+        type: string
+        default: 'world'
+      count:
+        description: 'Number'
+        required: false
+        type: number
+        default: 1
+      enable:
+        description: 'Enable feature'
+        required: false
+        type: boolean
+        default: false
+      env:
+        description: 'Environment'
+        required: false
+        type: environment
+      flavor:
+        description: 'Pick a flavor'
+        required: false
+        type: choice
+        options:
+          - vanilla
+          - chocolate
+          - strawberry
+  repository_dispatch:
+    types: [test-trigger, deploy]
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log event
+        run: |
+          echo "EVENT: ${{ github.event_name }}"
+          echo "ACTION: ${{ github.event.action }}"
+          echo "NAME: ${{ github.event.inputs.name }}"
