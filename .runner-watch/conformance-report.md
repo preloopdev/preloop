@@ -1,6 +1,6 @@
 # runner-watch conformance report
 
-❌ 2 of 11 scenario(s) diverged.
+❌ 1 of 11 scenario(s) diverged.
 
 - [01-register-and-idle](.runner-watch/conformance/v2.335.1/01-register-and-idle.md)
 - [06-multi-step](.runner-watch/conformance/v2.335.1/06-multi-step.md)

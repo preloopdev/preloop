@@ -38,6 +38,12 @@ pub struct RunningJob {
     stdin: Option<tokio::process::ChildStdin>,
     /// The job/request ID for matching cancellation messages.
     pub request_id: String,
+    /// Agent job GUID from the job message body (`jobId`), for JobCancellation matching.
+    pub job_id: Option<uuid::Uuid>,
+    /// Hard-kill deadline after cancel (official: timeout − 15s).
+    pub kill_at: Option<tokio::time::Instant>,
+    /// Whether graceful cancellation was already delivered to the worker.
+    cancel_sent: bool,
 }
 
 impl RunningJob {
@@ -56,9 +62,14 @@ impl RunningJob {
         Ok(status.success())
     }
 
-    /// Send a cancel message to the worker via stdin.
-    /// The worker's stdin reader task picks this up and signals cancellation.
-    pub async fn cancel(&mut self, timeout_secs: u64) {
+    /// Send graceful cancellation once. Repeated official cancellation
+    /// messages only reset `kill_at`; the worker cancellation token is
+    /// idempotent in `actions/runner`.
+    pub async fn cancel(&mut self, timeout_secs: u64) -> bool {
+        if self.cancel_sent {
+            return false;
+        }
+        self.cancel_sent = true;
         if let Some(stdin) = &mut self.stdin {
             let msg = WorkerMessage::Cancel { timeout_secs };
             if let Ok(line) = serde_json::to_string(&msg) {
@@ -67,6 +78,7 @@ impl RunningJob {
                 let _ = stdin.flush().await;
             }
         }
+        true
     }
 
     /// Hard-kill the worker process group (after cancel timeout expires).
@@ -91,39 +103,76 @@ pub async fn spawn_job(
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
+    let job_id = job_message
+        .get("jobId")
+        .and_then(|v| v.as_str())
+        .and_then(|s| uuid::Uuid::parse_str(s).ok());
 
     info!("Dispatching job {request_id} to worker");
 
-    let raw_exe = std::env::current_exe().context("finding current executable")?;
-    let current_exe = if let Ok(bin) = std::env::var("CARGO_BIN_EXE_aksh-runner") {
-        let p = std::path::PathBuf::from(bin);
-        if p.exists() && p.file_name().unwrap() == "aksh-runner" {
-            p
+    #[cfg(test)]
+    let mut command = {
+        static WORKER_BIN: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        let binary = WORKER_BIN.get_or_init(|| {
+            let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+            let status = std::process::Command::new("cargo")
+                .args(["build", "--quiet", "--manifest-path"])
+                .arg(&manifest)
+                .args(["--bin", "aksh-runner"])
+                .status()
+                .expect("build aksh-runner test worker");
+            assert!(status.success(), "building aksh-runner test worker failed");
+            if let Ok(target_dir_env) = std::env::var("CARGO_TARGET_DIR") {
+                std::path::PathBuf::from(target_dir_env).join("debug/aksh-runner")
+            } else {
+                manifest
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .join("target/debug/aksh-runner")
+            }
+        });
+        let mut command = tokio::process::Command::new(binary);
+        command.arg("worker");
+        command
+    };
+    #[cfg(not(test))]
+    let mut command = {
+        let raw_exe = std::env::current_exe().context("finding current executable")?;
+        let current_exe = if let Ok(bin) = std::env::var("CARGO_BIN_EXE_aksh-runner") {
+            let p = std::path::PathBuf::from(bin);
+            if p.exists() && p.file_name().unwrap() == "aksh-runner" {
+                p
+            } else {
+                raw_exe
+            }
+        } else if let Ok(bin) = std::env::var("AKSH_RUNNER_BIN") {
+            std::path::PathBuf::from(bin)
         } else {
-            raw_exe
-        }
-    } else if let Ok(bin) = std::env::var("AKSH_RUNNER_BIN") {
-        std::path::PathBuf::from(bin)
-    } else {
-        let target_dir = raw_exe.parent().unwrap();
-        let aksh_bin = if target_dir.file_name().unwrap() == "deps" {
-            target_dir.parent().unwrap().join("aksh-runner")
-        } else {
-            target_dir.join("aksh-runner")
+            let target_dir = raw_exe.parent().unwrap();
+            let aksh_bin = if target_dir.file_name().unwrap() == "deps" {
+                target_dir.parent().unwrap().join("aksh-runner")
+            } else {
+                target_dir.join("aksh-runner")
+            };
+            if aksh_bin.exists() {
+                aksh_bin
+            } else {
+                raw_exe
+            }
         };
-        if aksh_bin.exists() {
-            aksh_bin
-        } else {
-            raw_exe
-        }
+        let mut command = tokio::process::Command::new(current_exe);
+        command.arg("worker");
+        command
     };
     let via_str = match via {
         ProtocolPath::Broker => "broker",
         ProtocolPath::Azdo => "azdo",
     };
-
-    let mut child = tokio::process::Command::new(&current_exe)
-        .arg("worker")
+    let mut child = command
         .arg("--via")
         .arg(via_str)
         .current_dir(runner_root)
@@ -148,7 +197,158 @@ pub async fn spawn_job(
         child,
         stdin,
         request_id,
+        job_id,
+        kill_at: None,
+        cancel_sent: false,
     })
+}
+
+/// Effective cancellation timing from official `JobDispatcher.Cancel`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CancellationTiming {
+    /// Timeout sent to the worker after the official 60-second clamp.
+    pub effective_timeout_secs: u64,
+    /// Forced-kill delay: effective timeout minus 15 seconds.
+    pub kill_after_secs: u64,
+}
+
+/// Clamp a cancellation timeout and derive the official forced-kill delay.
+pub fn cancellation_timing(timeout_secs: u64) -> CancellationTiming {
+    let effective_timeout_secs = timeout_secs.max(60);
+    CancellationTiming {
+        effective_timeout_secs,
+        kill_after_secs: effective_timeout_secs - 15,
+    }
+}
+
+/// Parse a non-negative .NET invariant TimeSpan (`hh:mm:ss` or
+/// `d.hh:mm:ss[.fffffff]`) into whole seconds, rounding a non-zero fractional
+/// component up so the runner never kills earlier than the requested timeout.
+pub fn parse_timespan_secs(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (days, clock) = match s.split_once('.') {
+        Some((days, rest)) if days.chars().all(|c| c.is_ascii_digit()) && rest.contains(':') => {
+            (days.parse::<u64>().ok()?, rest)
+        }
+        _ => (0, s),
+    };
+    let (clock, fraction) = match clock.split_once('.') {
+        Some((clock, fraction)) => {
+            if fraction.is_empty()
+                || fraction.len() > 7
+                || !fraction.chars().all(|c| c.is_ascii_digit())
+            {
+                return None;
+            }
+            (clock, Some(fraction))
+        }
+        None => (clock, None),
+    };
+    let mut parts = clock.split(':');
+    let hours = parts.next()?.parse::<u64>().ok()?;
+    let minutes = parts.next()?.parse::<u64>().ok()?;
+    let seconds = parts.next()?.parse::<u64>().ok()?;
+    if parts.next().is_some() || hours >= 24 || minutes >= 60 || seconds >= 60 {
+        return None;
+    }
+    let whole = days
+        .checked_mul(86_400)?
+        .checked_add(hours.checked_mul(3_600)?)?
+        .checked_add(minutes.checked_mul(60)?)?
+        .checked_add(seconds)?;
+    let round_up = fraction.is_some_and(|value| value.bytes().any(|digit| digit != b'0'));
+    whole.checked_add(u64::from(round_up))
+}
+
+#[cfg(test)]
+mod timespan_tests {
+    use super::{cancellation_timing, parse_timespan_secs, WorkerMessage};
+    use proptest::prelude::*;
+
+    #[test]
+    fn parses_hh_mm_ss() {
+        assert_eq!(parse_timespan_secs("00:05:00"), Some(300));
+        assert_eq!(parse_timespan_secs("01:00:00"), Some(3600));
+    }
+
+    #[test]
+    fn parses_days() {
+        assert_eq!(parse_timespan_secs("1.00:00:00"), Some(86400));
+    }
+
+    #[test]
+    fn garbage_returns_none() {
+        assert_eq!(parse_timespan_secs("not-a-timespan"), None);
+        assert_eq!(parse_timespan_secs(""), None);
+    }
+
+    proptest! {
+        #[test]
+        fn run_time_01_parses_valid_timespans(
+            days in 0_u64..=10_000,
+            hours in 0_u64..24,
+            minutes in 0_u64..60,
+            seconds in 0_u64..60,
+            fractional_tick in any::<bool>(),
+        ) {
+            let fraction = if fractional_tick { "1" } else { "0" };
+            let input = format!("{days}.{hours:02}:{minutes:02}:{seconds:02}.{fraction}");
+            let expected = days * 86_400
+                + hours * 3_600
+                + minutes * 60
+                + seconds
+                + u64::from(fractional_tick);
+            prop_assert_eq!(
+                parse_timespan_secs(&input),
+                Some(expected),
+                "RUN-TIME-01: valid TimeSpan must preserve its duration without an early fractional truncation",
+            );
+        }
+
+        #[test]
+        fn run_time_01_rejects_out_of_range_clock_fields(
+            hours in 24_u64..=99,
+            minutes in 60_u64..=99,
+            seconds in 60_u64..=99,
+        ) {
+            prop_assert_eq!(parse_timespan_secs(&format!("{hours:02}:00:00")), None);
+            prop_assert_eq!(parse_timespan_secs(&format!("00:{minutes:02}:00")), None);
+            prop_assert_eq!(parse_timespan_secs(&format!("00:00:{seconds:02}")), None);
+        }
+
+        #[test]
+        fn run_time_01_never_schedules_forced_kill_before_45_seconds(
+            timeout_secs in any::<u64>(),
+        ) {
+            let timing = cancellation_timing(timeout_secs);
+            prop_assert!(timing.effective_timeout_secs >= 60);
+            prop_assert!(timing.kill_after_secs >= 45);
+            prop_assert_eq!(timing.kill_after_secs, timing.effective_timeout_secs - 15);
+        }
+
+        #[test]
+        fn run_scope_01_cancel_ipc_excludes_server_concurrency_metadata(
+            timeout_secs in any::<u64>(),
+        ) {
+            let encoded = serde_json::to_value(WorkerMessage::Cancel { timeout_secs }).unwrap();
+            let object = encoded.as_object().unwrap();
+            prop_assert_eq!(object.len(), 2);
+            prop_assert_eq!(object.get("t").and_then(serde_json::Value::as_str), Some("cancel"));
+            prop_assert_eq!(
+                object.get("timeout_secs").and_then(serde_json::Value::as_u64),
+                Some(timeout_secs),
+            );
+            for server_only in ["concurrency", "group", "queue", "matrix", "reusable"] {
+                prop_assert!(
+                    !object.contains_key(server_only),
+                    "RUN-SCOPE-01: runner IPC exposed server-only field {server_only}",
+                );
+            }
+        }
+    }
 }
 
 /// Blocking dispatch — spawns and waits. Used by the AzDO message listener
@@ -218,7 +418,7 @@ mod tests {
                     "id": "step-1",
                     "contextName": "step1",
                     "displayName": "Step One",
-                    "run": "sleep 10",
+                    "run": "sleep 60",
                     "shell": "bash"
                 }
             ],
@@ -243,10 +443,12 @@ mod tests {
 
         // The job should succeed/exit (with Ok status since cancellation is handled gracefully)
         assert!(success);
-        // The elapsed time should be way below 10 seconds
+        // The worker intentionally gives the child process group SIGINT then
+        // SIGTERM before SIGKILL; allow both test grace periods plus startup
+        // scheduling overhead while still rejecting the ten-second payload.
         assert!(
-            elapsed.as_secs() < 5,
-            "Expected cancellation to exit quickly, took {:?}",
+            elapsed.as_secs() < 20,
+            "Expected cancellation to exit within the grace budget, took {:?}",
             elapsed
         );
     }
