@@ -16,23 +16,12 @@ impl EventAdapter for Adapter {
         "schedule"
     }
 
-    fn project(&self, payload: &Value) -> Vec<EffectiveEvent> {
-        let default_branch = payload
-            .get("repository")
-            .and_then(|r| r.get("default_branch"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("main");
-
-        vec![EffectiveEvent {
-            event: "schedule".to_owned(),
-            git_ref: format!("refs/heads/{default_branch}"),
-            sha: None,
-            status_check_sha: None,
-            activity_type: Some("schedule".to_owned()),
-            trust_tier: Some(TrustTier::Schedule),
-            skip: false,
-            payload: payload.clone(),
-            upstream_workflow_names: vec![],
-        }]
+    fn project(&self, _payload: &Value) -> Vec<EffectiveEvent> {
+        // The internal cron executor (scheduler.rs) builds EffectiveEvent
+        // directly and never goes through this adapter. If we reach here,
+        // it's an external webhook claiming to be a schedule event — reject it
+        // to prevent untrusted sources from getting Schedule trust tier.
+        tracing::warn!("Ignoring external schedule webhook (schedule events are internal-only)");
+        vec![]
     }
 }
