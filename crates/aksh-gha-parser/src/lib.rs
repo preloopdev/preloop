@@ -571,7 +571,6 @@ impl Trigger {
     pub fn valid_filter_keys(event: &str) -> &'static [&'static str] {
         match event {
             "push" => &[
-                "types",
                 "branches",
                 "branches-ignore",
                 "tags",
@@ -583,8 +582,6 @@ impl Trigger {
                 "types",
                 "branches",
                 "branches-ignore",
-                "tags",
-                "tags-ignore",
                 "paths",
                 "paths-ignore",
             ],

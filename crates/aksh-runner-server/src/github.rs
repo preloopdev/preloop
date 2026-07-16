@@ -615,29 +615,34 @@ pub(crate) async fn handle_github_webhook(
         } else {
             &effective.git_ref
         };
-        let workflows =
-            fetch_workflows(&shared.state.local_workspace, &repo_full_name, workflow_ref)
-                .await
-                .map_err(|e| {
-                    error!("Failed to fetch workflows: {:?}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?;
+        let workflows = match fetch_workflows(&shared.state.local_workspace, &repo_full_name, workflow_ref)
+            .await
+        {
+            Ok(w) => w,
+            Err(e) => {
+                error!("Failed to fetch workflows for {}: {:?}", effective.event, e);
+                continue;
+            }
+        };
         let resolved_sha = match &effective.sha {
             Some(sha) => sha.clone(),
-            None => resolve_ref_sha(
+            None => match resolve_ref_sha(
                 &shared.state.local_workspace,
                 &repo_full_name,
                 &effective.git_ref,
             )
             .await
-            .map_err(|error| {
-                error!(?error, "failed to resolve webhook ref SHA");
-                StatusCode::BAD_GATEWAY
-            })?
-            .ok_or_else(|| {
-                error!(ref_name = %effective.git_ref, "webhook ref has no resolvable commit SHA");
-                StatusCode::BAD_GATEWAY
-            })?,
+            {
+                Ok(Some(sha)) => sha,
+                Ok(None) => {
+                    error!(ref_name = %effective.git_ref, "webhook ref has no resolvable commit SHA");
+                    continue;
+                }
+                Err(error) => {
+                    error!(?error, "failed to resolve webhook ref SHA");
+                    continue;
+                }
+            },
         };
         if effective.event == "push" && effective.git_ref == ref_default {
             if let Some(scheduler) = &shared.state.scheduler {
