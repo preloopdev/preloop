@@ -274,6 +274,15 @@ pub struct JobPlan {
     /// The runner evaluates these after step execution and includes results in completejob.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub job_outputs: BTreeMap<String, String>,
+    /// Effective `id-token: write` permission after reusable-workflow reduction.
+    #[serde(default)]
+    pub oidc_id_token_granted: bool,
+    /// Resolved deployment environment used for OIDC claims.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oidc_environment: Option<String>,
+    /// Executing reusable workflow reference, when this job came from one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oidc_job_workflow_ref: Option<String>,
 }
 
 fn default_fail_fast() -> bool {
