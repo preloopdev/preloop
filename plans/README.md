@@ -44,7 +44,7 @@ each phase, follow the dependency notes.
 | 004 | Handle `ForceTokenRefresh`/`RunnerShutdown`/`RunnerRefresh(Config)` broker messages | P2 | S | LOW | — | DONE (official wire constants; forced token replacement; shutdown/refresh dispatch; 368 runner tests pass) |
 | 005 | Diagnostic-logs route (`GetJobDiagLogsSignedBlobURL`) + **authenticate all `/twirp` job-token routes** | P1 | M | HIGH | — | DONE (official route/`diag_logs_url`; signed UUID blob; Results-scope JWT middleware; all 16 APIs reject unauthenticated calls) |
 | 007 | Add 400-character concurrency group-length validation (`queue: max` is confirmed official ✅) | P2 | S | LOW | — | DONE (official UTF-16 length/empty rejection; 6 boundary regressions; integration returns HTTP 400) |
-| 008 | Node20→24 migration: flag source precedence, conflict warning, Linux ARM32 fallback | P2 | M | MED | — | TODO (NEW) |
+| 008 | Node20→24 migration: flag source precedence, conflict warning, Linux ARM32 fallback | P2 | M | MED | — | DONE (official NodeUtil policy/warnings; workflow-over-system precedence; ARM32 fallback; 381 runner tests pass) |
 | 009 | Valid RFC3339 timestamps for cancellation step records (currently literal `"cancelled"`) | P2 | S | MED | — | TODO (NEW) |
 | 010 | OIDC discovery/JWKS path + JWT header (`x5t`, `jwks` path, `scopes_supported`, `pairwise`) | P3 | S | MED | — | TODO (NEW) |
 | 011 | Push skip-CI across the commit batch + `PlanReference.scopeIdentifier` | P3 | S | MED | — | DONE (scan all commits for skip markers; add scopeIdentifier to PlanReference) |
