@@ -221,7 +221,11 @@ pub(crate) async fn delete_pool_message(
     ack_message(shared, session_id, message_id).await
 }
 
-pub(crate) async fn ack_message(shared: Arc<SharedState>, session_id: &str, message_id: i64) -> StatusCode {
+pub(crate) async fn ack_message(
+    shared: Arc<SharedState>,
+    session_id: &str,
+    message_id: i64,
+) -> StatusCode {
     let mut inner = shared.state.inner.lock().await;
     if let Some(messages) = inner.inflight_messages.get_mut(session_id) {
         messages.remove(&message_id);
@@ -280,7 +284,9 @@ pub(crate) async fn agent_request_get(
 }
 
 /// POST /_apis/v1/AgentRequest/:pool_id/:request_id — best-effort request ack.
-pub(crate) async fn agent_request_ack(Path((_pool_id, _request_id)): Path<(i64, i64)>) -> StatusCode {
+pub(crate) async fn agent_request_ack(
+    Path((_pool_id, _request_id)): Path<(i64, i64)>,
+) -> StatusCode {
     StatusCode::OK
 }
 
@@ -373,7 +379,10 @@ pub(crate) async fn agent_request_response(
         })
 }
 
-pub(crate) fn agent_request_json(pool_id: i64, request: &TaskAgentJobRequestRecord) -> serde_json::Value {
+pub(crate) fn agent_request_json(
+    pool_id: i64,
+    request: &TaskAgentJobRequestRecord,
+) -> serde_json::Value {
     json!({
         "requestId": request.request_id,
         "poolId": pool_id,
@@ -446,7 +455,10 @@ pub(crate) fn sole_active_unfinished_request(inner: &InnerState) -> Option<i64> 
     }
     None
 }
-pub(crate) fn job_request_tuple(inner: &InnerState, request_id: i64) -> Option<(i64, RunId, JobId)> {
+pub(crate) fn job_request_tuple(
+    inner: &InnerState,
+    request_id: i64,
+) -> Option<(i64, RunId, JobId)> {
     let request = inner.job_requests.get(&request_id)?;
     Some((request_id, request.run_id, request.job_id.clone()))
 }
