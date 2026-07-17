@@ -72,7 +72,11 @@ pub(crate) fn try_enqueue_with_job_concurrency(
     }
 }
 /// Resolve the agent job GUID for an in-flight job, if any.
-pub(crate) fn agent_job_id_for(inner: &InnerState, run_id: RunId, job_id: &JobId) -> Option<uuid::Uuid> {
+pub(crate) fn agent_job_id_for(
+    inner: &InnerState,
+    run_id: RunId,
+    job_id: &JobId,
+) -> Option<uuid::Uuid> {
     inner
         .job_requests
         .values()
@@ -91,7 +95,11 @@ pub(crate) fn agent_job_id_for(inner: &InnerState, run_id: RunId, job_id: &JobId
 /// Cancel a run: mark non-terminal jobs Cancelled, enqueue JobCancellation for
 /// in-flight jobs, remove from queues/held/blocked, and release concurrency.
 /// Returns the number of cancellation messages enqueued.
-pub(crate) fn cancel_run_inner(inner: &mut InnerState, run_id: RunId, reason: Option<&str>) -> usize {
+pub(crate) fn cancel_run_inner(
+    inner: &mut InnerState,
+    run_id: RunId,
+    reason: Option<&str>,
+) -> usize {
     let mut in_progress: Vec<JobId> = Vec::new();
     {
         let Some(record) = inner.runs.get_mut(&run_id) else {
@@ -615,7 +623,11 @@ pub(crate) fn try_acquire_concurrency(
     Ok(true)
 }
 
-pub(crate) fn track_holder_key(inner: &mut InnerState, holder: &concurrency::Holder, key: (String, String)) {
+pub(crate) fn track_holder_key(
+    inner: &mut InnerState,
+    holder: &concurrency::Holder,
+    key: (String, String),
+) {
     let run_id = holder.run_id();
     let keys = inner.holder_keys.entry(run_id).or_default();
     if !keys.contains(&key) {
@@ -623,7 +635,11 @@ pub(crate) fn track_holder_key(inner: &mut InnerState, holder: &concurrency::Hol
     }
 }
 
-pub(crate) fn cancel_holder(inner: &mut InnerState, holder: &concurrency::Holder, _reason: Option<&str>) {
+pub(crate) fn cancel_holder(
+    inner: &mut InnerState,
+    holder: &concurrency::Holder,
+    _reason: Option<&str>,
+) {
     match holder {
         concurrency::Holder::Run(run_id) => {
             cancel_run_inner(inner, *run_id, Some("concurrency_cancelled"));
@@ -898,7 +914,11 @@ pub(crate) fn under_max_parallel(inner: &InnerState, job: &QueuedJob) -> bool {
     active_in_queue + active_running < max_parallel
 }
 
-pub(crate) fn apply_matrix_fail_fast(inner: &mut InnerState, run_id: RunId, failed_job: &JobId) -> Vec<JobId> {
+pub(crate) fn apply_matrix_fail_fast(
+    inner: &mut InnerState,
+    run_id: RunId,
+    failed_job: &JobId,
+) -> Vec<JobId> {
     let Some(run) = inner.runs.get_mut(&run_id) else {
         return Vec::new();
     };

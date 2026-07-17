@@ -254,7 +254,9 @@ pub(crate) fn mint_runtime_token(plan_id: &str, job_id: &uuid::Uuid) -> String {
 
 /// Load the OIDC signing keypair from `<state_dir>/oidc-key.json`, or generate
 /// a new one and persist it for reuse across restarts.
-pub(crate) fn load_or_generate_oidc_keypair(state_dir: &std::path::Path) -> anyhow::Result<oidc::OidcKeypair> {
+pub(crate) fn load_or_generate_oidc_keypair(
+    state_dir: &std::path::Path,
+) -> anyhow::Result<oidc::OidcKeypair> {
     let key_path = state_dir.join("oidc-key.json");
     if key_path.exists() {
         #[cfg(unix)]
@@ -375,7 +377,8 @@ pub(crate) struct InnerState {
     pub(crate) artifacts: BTreeMap<String, ArtifactRecord>,
     pub(crate) logs: BTreeMap<String, Vec<u8>>,
     pub(crate) timeline_events: BTreeMap<RunId, Vec<NdjsonEvent>>,
-    pub(crate) live_log_lines: BTreeMap<String, Arc<tokio::sync::Mutex<Vec<LiveLogFeedLinesWrapper>>>>,
+    pub(crate) live_log_lines:
+        BTreeMap<String, Arc<tokio::sync::Mutex<Vec<LiveLogFeedLinesWrapper>>>>,
     pub(crate) live_log_tx: BTreeMap<String, broadcast::Sender<LiveLogFeedLinesWrapper>>,
     pub(crate) inflight_requests: BTreeMap<i64, (RunId, JobId)>,
     pub(crate) job_requests: BTreeMap<i64, TaskAgentJobRequestRecord>,
