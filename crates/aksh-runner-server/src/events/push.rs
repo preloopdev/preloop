@@ -15,38 +15,45 @@ use serde_json::Value;
 pub struct Adapter;
 
 /// [skip ci] labels that suppress CI runs.
+/// Source: Runner.Server/Controllers/MessageController.cs:6258-6259,6283-6285.
 const SKIP_CI_LABELS: &[&str] = &[
     "[skip ci]",
     "[ci skip]",
     "[no ci]",
     "[skip actions]",
     "[actions skip]",
+    "***NO_CI***",
 ];
 
-/// Check whether the head commit message contains a skip-CI label.
+fn has_skip_label(message: &str) -> bool {
+    SKIP_CI_LABELS.iter().any(|label| message.contains(label))
+}
+
+/// Check whether any commit in the push batch carries a skip-CI label.
 ///
-/// GitHub skips CI when the **head commit** of a push contains a skip label,
-/// not when any commit in the batch does.  Reference:
-/// <https://docs.github.com/en/actions/managing-workflow-runs/skipping-workflow-runs>
+/// GitHub skips the run when *any* commit in the push carries a skip label,
+/// not just the head commit. Reference: `MessageController.cs:6258-6285`
+/// (`Any(...)` across the commit batch).
 fn has_skip_ci(payload: &Value) -> bool {
-    // Prefer the explicit head_commit field (always the tip of the push).
-    let head_message = payload
+    // Check every commit in the batch.
+    if let Some(commits) = payload.get("commits").and_then(|v| v.as_array()) {
+        if !commits.is_empty() {
+            return commits.iter().any(|commit| {
+                commit
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .is_some_and(has_skip_label)
+            });
+        }
+    }
+
+    // Fall back to head_commit when commits[] is absent or empty
+    // (lightweight webhooks may omit commits).
+    payload
         .get("head_commit")
         .and_then(|hc| hc.get("message"))
-        .and_then(|m| m.as_str());
-
-    // Fall back to the last element of commits[] (same commit, different
-    // representation — lightweight webhooks may omit head_commit).
-    let message = head_message.or_else(|| {
-        payload
-            .get("commits")
-            .and_then(|v| v.as_array())
-            .and_then(|commits| commits.last())
-            .and_then(|commit| commit.get("message"))
-            .and_then(|m| m.as_str())
-    });
-
-    message.is_some_and(|msg| SKIP_CI_LABELS.iter().any(|label| msg.contains(label)))
+        .and_then(|m| m.as_str())
+        .is_some_and(has_skip_label)
 }
 
 /// Determine whether this is a push to the default branch.
@@ -184,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn skip_ci_only_in_early_commit_does_not_skip() {
+    fn skip_ci_in_early_commit_skips() {
         let payload = serde_json::json!({
             "ref": "refs/heads/main",
             "after": "abc123",
@@ -195,10 +202,9 @@ mod tests {
             ]
         });
         let events = Adapter.project(&payload);
-        assert_eq!(
-            events.len(),
-            1,
-            "skip-ci in a non-head commit must not suppress the push"
+        assert!(
+            events.is_empty(),
+            "skip-ci in any commit must suppress the push"
         );
     }
 
@@ -217,6 +223,72 @@ mod tests {
         assert!(
             events.is_empty(),
             "skip-ci in the head (last) commit must suppress the push"
+        );
+    }
+
+    #[test]
+    fn skip_ci_in_middle_commit_skips() {
+        let payload = serde_json::json!({
+            "ref": "refs/heads/main",
+            "after": "abc123",
+            "repository": { "default_branch": "main" },
+            "commits": [
+                {"message": "first: clean"},
+                {"message": "second: [ci skip] tweak"},
+                {"message": "third: clean"}
+            ]
+        });
+        let events = Adapter.project(&payload);
+        assert!(
+            events.is_empty(),
+            "skip-ci in a middle commit must suppress the push"
+        );
+    }
+
+    #[test]
+    fn skip_ci_no_skip_in_multi_commit_push() {
+        let payload = serde_json::json!({
+            "ref": "refs/heads/main",
+            "after": "abc123",
+            "repository": { "default_branch": "main" },
+            "commits": [
+                {"message": "first: clean"},
+                {"message": "second: also clean"},
+                {"message": "third: clean too"}
+            ]
+        });
+        let events = Adapter.project(&payload);
+        assert_eq!(events.len(), 1, "no skip label must start a run");
+    }
+
+    #[test]
+    fn skip_ci_head_commit_fallback_when_commits_empty() {
+        let payload = serde_json::json!({
+            "ref": "refs/heads/main",
+            "after": "abc123",
+            "repository": { "default_branch": "main" },
+            "commits": [],
+            "head_commit": {"message": "bump [skip actions]"}
+        });
+        let events = Adapter.project(&payload);
+        assert!(
+            events.is_empty(),
+            "head_commit fallback must suppress when commits is empty"
+        );
+    }
+
+    #[test]
+    fn skip_ci_head_commit_fallback_when_commits_missing() {
+        let payload = serde_json::json!({
+            "ref": "refs/heads/main",
+            "after": "abc123",
+            "repository": { "default_branch": "main" },
+            "head_commit": {"message": "release [actions skip]"}
+        });
+        let events = Adapter.project(&payload);
+        assert!(
+            events.is_empty(),
+            "head_commit fallback must suppress when commits field is absent"
         );
     }
 }
