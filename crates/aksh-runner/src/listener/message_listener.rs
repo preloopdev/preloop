@@ -108,7 +108,7 @@ pub async fn run_message_loop(
                                     let patch = serde_json::json!({
                                         "requestId": request_id,
                                         "agentId": config.settings.agent_id,
-                                        "startTime": crate::worker::job_runner::iso_now(),
+                                        "startTime": crate::worker::helpers::iso_now(),
                                     });
                                     match client.patch_agent_request(token, request_id, &patch).await {
                                         Ok(_) => info!("Patched agent request {request_id} (started)"),
@@ -127,7 +127,7 @@ pub async fn run_message_loop(
                                     let patch = serde_json::json!({
                                         "requestId": request_id,
                                         "agentId": config.settings.agent_id,
-                                        "finishTime": crate::worker::job_runner::iso_now(),
+                                        "finishTime": crate::worker::helpers::iso_now(),
                                     });
                                     match client.patch_agent_request(token, request_id, &patch).await {
                                         Ok(_) => info!("Patched agent request {request_id} (completed)"),
