@@ -475,7 +475,6 @@ pub(crate) async fn submit_run_inner(
                 needs: job.needs.clone(),
                 if_condition: job.if_condition.clone(),
                 condition_context,
-                fail_fast: job.fail_fast,
                 max_parallel: job.max_parallel,
                 runs_on: job.runs_on.clone(),
                 message: agent_msg,

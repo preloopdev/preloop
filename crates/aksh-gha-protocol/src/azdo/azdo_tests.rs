@@ -3,6 +3,7 @@ use base64::Engine;
 use proptest::prelude::*;
 use proptest::test_runner::{FileFailurePersistence, RngSeed};
 use serde_json::{json, Map, Value};
+use std::collections::BTreeMap;
 
 fn codec_config() -> ProptestConfig {
     let mut config = ProptestConfig::with_failure_persistence(

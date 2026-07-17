@@ -4,8 +4,10 @@ use super::*;
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BrokerAcquireJobRequest {
     pub(crate) job_message_id: uuid::Uuid,
+    // serde: accepted from the runner but not needed by acquisition logic.
     #[allow(dead_code)]
     pub(crate) billing_owner_id: Option<String>,
+    // serde: accepted from the runner but not needed by acquisition logic.
     #[allow(dead_code)]
     pub(crate) runner_os: Option<String>,
 }
