@@ -1,0 +1,15 @@
+id: no-inline-masking
+message: |
+  Inline secret masking is banned. Use `aksh_gha_protocol::masking::mask_secrets` instead.
+  This ensures consistent longest-first ordering and DAP keyword exclusions.
+severity: error
+language: rust
+rule:
+  kind: call_expression
+  pattern: $OBJ.replace($SECRET, "****")
+  not:
+    inside:
+      kind: function_item
+      has:
+        field: name
+        regex: "^mask_secrets$"
