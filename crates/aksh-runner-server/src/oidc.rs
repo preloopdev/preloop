@@ -21,9 +21,6 @@ pub const GITHUB_OIDC_ISSUER: &str = "https://token.actions.githubusercontent.co
 /// Token validity window in seconds.
 const TOKEN_TTL_SECS: u64 = 300;
 
-// ---------------------------------------------------------------------------
-// Key management
-// ---------------------------------------------------------------------------
 /// An RSA keypair dedicated to OIDC token signing, with a precomputed `kid`
 /// (RFC 7638 JWK thumbprint).
 #[derive(Clone)]
@@ -94,10 +91,6 @@ fn compute_kid(keypair: &AgentRsaKeypair) -> String {
     URL_SAFE_NO_PAD.encode(hash)
 }
 
-// ---------------------------------------------------------------------------
-// Discovery document
-// ---------------------------------------------------------------------------
-
 /// Build the OpenID Connect discovery document.
 pub fn discovery_document(issuer: &str, jwks_uri: &str) -> serde_json::Value {
     serde_json::json!({
@@ -105,7 +98,8 @@ pub fn discovery_document(issuer: &str, jwks_uri: &str) -> serde_json::Value {
         "jwks_uri": jwks_uri,
         "id_token_signing_alg_values_supported": ["RS256"],
         "response_types_supported": ["id_token"],
-        "subject_types_supported": ["public"],
+        "subject_types_supported": ["public", "pairwise"],
+        "scopes_supported": ["openid"],
         "claims_supported": [
             "sub", "aud", "iss", "exp", "iat", "nbf", "jti", "check_run_id",
             "actor", "actor_id",
@@ -123,10 +117,6 @@ pub fn discovery_document(issuer: &str, jwks_uri: &str) -> serde_json::Value {
         ],
     })
 }
-
-// ---------------------------------------------------------------------------
-// Claims input and building
-// ---------------------------------------------------------------------------
 
 /// All data needed to build a GitHub-compatible OIDC token's claims.
 ///
