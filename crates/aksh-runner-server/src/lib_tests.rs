@@ -4943,12 +4943,24 @@ async fn broker_root_message_path_delivers_job_cancellation() {
     // The aksh-runner broker client polls `/runner/server/message` (root
     // path), NOT `/_apis/v1/Message`. Cancel must be delivered there.
     let temp = tempfile::tempdir().unwrap();
-    let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
-        CancellationToken::new(),
-    );
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    // Mint a runner listen token for broker auth.
+    let runner_token = state
+        .local_jwt(json!({
+            "sub": "aksh-runner-listen-1",
+            "scp": "ActionsRuntime.RunnerListen",
+        }))
+        .unwrap();
     // Create broker session.
-    let session = request_json(&app, Method::POST, "/runner/server/session", json!({})).await;
+    let session = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/runner/server/session",
+        json!({}),
+        &runner_token,
+    )
+    .await;
     let session_id = session["sessionId"].as_str().unwrap();
 
     let yaml = r#"
@@ -4966,11 +4978,12 @@ jobs:
     let a_id = a["run_id"].as_str().unwrap().to_owned();
 
     // Dispatch A via broker root path.
-    let job_msg = request_json(
+    let job_msg = request_json_with_bearer(
         &app,
         Method::GET,
         &format!("/runner/server/message?sessionId={session_id}&waitSeconds=0"),
         Value::Null,
+        &runner_token,
     )
     .await;
     assert_eq!(job_msg["messageType"], "RunnerJobRequest");
@@ -4988,11 +5001,12 @@ jobs:
     );
 
     // Busy poll must yield JobCancellation on the same session.
-    let cancel_msg = request_json(
+    let cancel_msg = request_json_with_bearer(
         &app,
         Method::GET,
         &format!("/runner/server/message?sessionId={session_id}&waitSeconds=0"),
         Value::Null,
+        &runner_token,
     )
     .await;
     assert_eq!(
@@ -5026,11 +5040,12 @@ jobs:
     // completejob can arrive before the worker process exits. A Busy poll
     // must not receive B yet or the run-service dispatcher cancels the
     // still-draining worker as an overlap.
-    let busy_msg = request_json(
+    let busy_msg = request_json_with_bearer(
         &app,
         Method::GET,
         &format!("/runner/server/message?sessionId={session_id}&status=Busy&waitSeconds=0"),
         Value::Null,
+        &runner_token,
     )
     .await;
     assert!(
@@ -5039,11 +5054,12 @@ jobs:
     );
 
     // B must be pollable with a messageId that does not collide with cancel.
-    let b_msg = request_json(
+    let b_msg = request_json_with_bearer(
         &app,
         Method::GET,
         &format!("/runner/server/message?sessionId={session_id}&status=Online&waitSeconds=0"),
         Value::Null,
+        &runner_token,
     )
     .await;
     assert_eq!(
@@ -6022,6 +6038,7 @@ async fn c06_queue_max_with_dynamic_true_cancel_rejected() {
     let request = Request::builder()
         .method(Method::POST)
         .uri("/api/v1/runs")
+        .header(header::AUTHORIZATION, "Bearer aksh-system-token")
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();
