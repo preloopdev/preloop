@@ -451,6 +451,8 @@ fn populate_runner_variables(variables: &mut BTreeMap<String, VariableValue>, pl
         "actions_uses_cache_service_v2",
     ];
     const FALSE_FLAGS: &[&str] = &[
+        "DistributedTask.ActionsNode20ForceUseNode20",
+        "DistributedTask.ForceGithubToken",
         "actions.runner.requirenode24",
         "actions_batch_action_resolution",
         "actions_runner_compare_workflow_parser",
@@ -473,6 +475,7 @@ fn populate_runner_variables(variables: &mut BTreeMap<String, VariableValue>, pl
     for (key, value) in [
         ("actions_runner_node20_removal_date", ""),
         ("actions_runner_node24_default_date", "June 16th, 2026"),
+        ("actions.runner.lowdiskspacethreshold", "100"),
         ("system.from_run_service", "true"),
         ("system.github.job", plan.base_id.as_str()),
         ("system.github.launch_endpoint", ""),
@@ -487,6 +490,7 @@ fn populate_runner_variables(variables: &mut BTreeMap<String, VariableValue>, pl
         ("system.runner.lowdiskspacethreshold", "100"),
         ("system.runnerEnvironment", "self-hosted"),
         ("system.runnerGroupName", "Default"),
+        ("system.workflow.workspace", "/_work"),
     ] {
         variables
             .entry(key.to_owned())
