@@ -566,7 +566,11 @@ async fn run_runner_e2e(
     let mut server = server_cmd.spawn()?;
 
     // Wait for server to listen
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent("aksh-conformance")
+        .build()
+        .expect("HTTP client");
     let mut ready = false;
     for _ in 0..30 {
         if client.get("http://127.0.0.1:9191/").send().await.is_ok() {
