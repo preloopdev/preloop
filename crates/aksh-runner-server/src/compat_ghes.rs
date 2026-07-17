@@ -98,15 +98,6 @@ pub(crate) async fn agent_request_ack_org(
     agent_request_ack(Path((pool_id, request_id))).await
 }
 
-#[allow(dead_code)]
-pub(crate) async fn complete_job_compat_org(
-    State(shared): State<Arc<SharedState>>,
-    Path((_org, run_id, job_id)): Path<(String, RunId, String)>,
-    Json(body): Json<serde_json::Value>,
-) -> Result<Json<RunRecord>, ApiError> {
-    complete_job_compat(State(shared), Path((run_id, job_id)), Json(body)).await
-}
-
 pub(crate) async fn agent_request_patch_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, pool_id, request_id)): Path<(String, i64, i64)>,

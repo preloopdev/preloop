@@ -3,8 +3,7 @@
 use anyhow::Result;
 use tracing::{info, warn};
 
-use super::contexts::JobContext;
-use super::execution_types::{Annotation, AnnotationLevel};
+use super::execution_types::Annotation;
 use super::helpers::{extract_service_endpoint, iso_now};
 use super::job_runner::ReportingContext;
 use super::steps_runner::{Step, StepType};
