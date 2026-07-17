@@ -42,7 +42,11 @@ pub(crate) fn live_log_sse_event(wrapper: &LiveLogFeedLinesWrapper) -> Event {
     Event::default().event("live-log").data(data)
 }
 
-pub(crate) fn live_log_key_for_job(inner: &InnerState, run_id: RunId, job_id: &str) -> Option<String> {
+pub(crate) fn live_log_key_for_job(
+    inner: &InnerState,
+    run_id: RunId,
+    job_id: &str,
+) -> Option<String> {
     inner.runs.get(&run_id)?;
     inner
         .job_requests
@@ -77,7 +81,11 @@ pub(crate) async fn ws_live_logs(
     ws.on_upgrade(move |socket| handle_live_log_socket(socket, job_id, shared))
 }
 
-pub(crate) async fn handle_live_log_socket(mut socket: WebSocket, job_id: String, shared: Arc<SharedState>) {
+pub(crate) async fn handle_live_log_socket(
+    mut socket: WebSocket,
+    job_id: String,
+    shared: Arc<SharedState>,
+) {
     const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
     loop {
         let message = match tokio::time::timeout(IDLE_TIMEOUT, socket.next()).await {
