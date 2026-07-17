@@ -41,7 +41,7 @@ each phase, follow the dependency notes.
 | 001 | Emit official MaskHint wire shape (drop `MaskType::Hash`) | P1 | S | LOW | — | DONE (official SDK + worker source; parser/protocol tests pass) |
 | 002 | Conform expression evaluation to `Sdk/Expressions` semantics | P1 | M | MED | — | DONE (official C# parity: coercion/truthiness/functions/errors; 31 expression tests pass) |
 | 003 | Conform job-lease renewal (runner ignores `lockedUntil`; server 120s reaper vs 2099 advert) | P1 | M | HIGH | — | DONE (shared 600s lease; RFC3339 deadline/grace; typed 404 loss; 367 runner tests pass) |
-| 004 | Handle `ForceTokenRefresh`/`HostedRunnerShutdown`/`RunnerRefresh(Config)` broker messages | P2 | S | LOW | — | TODO (OPEN) |
+| 004 | Handle `ForceTokenRefresh`/`RunnerShutdown`/`RunnerRefresh(Config)` broker messages | P2 | S | LOW | — | DONE (official wire constants; forced token replacement; shutdown/refresh dispatch; 368 runner tests pass) |
 | 005 | Diagnostic-logs route (`GetJobDiagLogsSignedBlobURL`) + **authenticate all `/twirp` job-token routes** | P1 | M | HIGH | — | TODO (OPEN; auth gap now confirmed, remote-deploy blocker) |
 | 007 | Add 400-char concurrency group-length validation (`queue: max` is confirmed official ✅) | P2 | S | LOW | — | TODO (NEW) |
 | 008 | Node20→24 migration: flag source precedence, conflict warning, Linux ARM32 fallback | P2 | M | MED | — | TODO (NEW) |
