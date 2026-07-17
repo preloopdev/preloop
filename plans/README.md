@@ -39,7 +39,7 @@ each phase, follow the dependency notes.
 | Plan | Title | Priority | Effort | Risk | Depends on | Status |
 |------|-------|----------|--------|------|------------|--------|
 | 001 | Emit official MaskHint wire shape (drop `MaskType::Hash`) | P1 | S | LOW | — | DONE (official SDK + worker source; parser/protocol tests pass) |
-| 002 | Conform expression evaluation to `Sdk/Expressions` semantics | P1 | M | MED | — | TODO (OPEN) |
+| 002 | Conform expression evaluation to `Sdk/Expressions` semantics | P1 | M | MED | — | DONE (official C# parity: coercion/truthiness/functions/errors; 31 expression tests pass) |
 | 003 | Conform job-lease renewal (runner ignores `lockedUntil`; server 120s reaper vs 2099 advert) | P1 | M | HIGH | — | TODO (OPEN) |
 | 004 | Handle `ForceTokenRefresh`/`HostedRunnerShutdown`/`RunnerRefresh(Config)` broker messages | P2 | S | LOW | — | TODO (OPEN) |
 | 005 | Diagnostic-logs route (`GetJobDiagLogsSignedBlobURL`) + **authenticate all `/twirp` job-token routes** | P1 | M | HIGH | — | TODO (OPEN; auth gap now confirmed, remote-deploy blocker) |
