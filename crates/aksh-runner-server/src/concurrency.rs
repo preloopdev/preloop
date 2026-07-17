@@ -105,6 +105,8 @@ pub struct ConcurrencyContext<'a> {
     pub needs: Option<&'a Value>,
 }
 
+const MAX_CONCURRENCY_GROUP_UTF16_LENGTH: usize = 400;
+
 /// Evaluate a raw concurrency config against a typed scope-aware context.
 ///
 /// Returns `(group_name, cancel_in_progress, queue_mode)` or an error string.
@@ -116,6 +118,15 @@ pub fn evaluate_concurrency(
 ) -> Result<(String, bool, ConcurrencyQueue), String> {
     let expr_ctx = build_eval_context(ctx);
     let group = resolve_string(&raw.group, &expr_ctx)?;
+    if group.is_empty() {
+        return Err("concurrency group name must not be empty".to_owned());
+    }
+    let group_length = group.encode_utf16().count();
+    if group_length > MAX_CONCURRENCY_GROUP_UTF16_LENGTH {
+        return Err(format!(
+            "concurrency group name is too long ({group_length} UTF-16 code units, maximum {MAX_CONCURRENCY_GROUP_UTF16_LENGTH})"
+        ));
+    }
     let cancel = match &raw.cancel_in_progress {
         None => false,
         Some(expr) => eval_bool(expr, &expr_ctx).map_err(|e| format!("{e}"))?,
