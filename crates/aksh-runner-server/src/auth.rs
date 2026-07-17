@@ -17,6 +17,33 @@ pub(crate) async fn require_protocol_bearer(
     }
 }
 
+pub(crate) async fn require_results_bearer(
+    State(shared): State<Arc<SharedState>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    if !request.uri().path().starts_with("/twirp/") {
+        return Ok(next.run(request).await);
+    }
+    let authorized = bearer_token(&request).is_some_and(|token| {
+        token == shared.state.system_token
+            || shared
+                .state
+                .verify_local_jwt_claims(token)
+                .is_some_and(|claims| {
+                    claims
+                        .get("scp")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|scope| scope.starts_with("Actions.Results:"))
+                })
+    });
+    if authorized {
+        Ok(next.run(request).await)
+    } else {
+        Err(ApiError::unauthorized("results-service job token required"))
+    }
+}
+
 pub(crate) async fn require_test_api_token(
     State(expected): State<Arc<str>>,
     request: Request,
