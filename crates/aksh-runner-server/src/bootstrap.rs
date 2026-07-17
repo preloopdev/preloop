@@ -54,7 +54,7 @@ pub fn generate_self_signed_cert() -> anyhow::Result<SelfSignedCert> {
     })
 }
 
-async fn reap_once(shared: &Arc<SharedState>) {
+pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
     let mut inner = shared.state.inner.lock().await;
     let now = SystemTime::now();
     let mut cancellations = Vec::new();
