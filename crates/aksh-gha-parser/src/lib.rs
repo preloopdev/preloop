@@ -13,6 +13,8 @@ pub mod eval;
 
 /// Build `AgentJobRequestMessage` from parsed workflow data.
 pub mod job_builder;
+
+mod matrix_expand;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -1270,7 +1272,7 @@ pub fn expand_jobs(workflow: &Workflow) -> Result<Vec<JobPlan>, ParserError> {
     for (job_id, job) in &workflow.jobs {
         for matrix in expand_matrix(job_id, job.strategy.matrix.as_ref())? {
             let oidc_environment = oidc_environment(job.environment.as_ref(), &matrix);
-            let expanded_id = expanded_job_id(job_id, &matrix);
+            let expanded_id = matrix_expand::expanded_job_id(job_id, &matrix);
             let mut env = global_env.clone();
             env.extend(job.env.clone().into_strings());
             plans.push(job_plan_from_job(
@@ -1557,7 +1559,7 @@ fn expand_jobs_with_reusables_internal(
 
             let matrices = expand_matrix(job_id, job.strategy.matrix.as_ref())?;
             for matrix in matrices {
-                let expanded_job_id = expanded_job_id(job_id, &matrix);
+                let expanded_job_id = matrix_expand::expanded_job_id(job_id, &matrix);
                 let mut called_plans = expand_jobs_with_reusables_internal(
                     &called,
                     reusable_workflows,
@@ -1617,7 +1619,7 @@ fn expand_jobs_with_reusables_internal(
 
         for matrix in expand_matrix(job_id, job.strategy.matrix.as_ref())? {
             let oidc_environment = oidc_environment(job.environment.as_ref(), &matrix);
-            let expanded_id = expanded_job_id(job_id, &matrix);
+            let expanded_id = matrix_expand::expanded_job_id(job_id, &matrix);
             let mut env = global_env.clone();
             env.extend(job.env.clone().into_strings());
             plans.push(job_plan_from_job(
@@ -1720,22 +1722,6 @@ fn step_plan(step: Step, defaults: &Option<JobDefaults>) -> StepPlan {
     }
 }
 
-fn expanded_job_id(base: &str, matrix: &IndexMap<String, Value>) -> String {
-    if matrix.is_empty() {
-        return base.to_owned();
-    }
-    // GitHub format: "name (v1, v2)" with values in declaration order
-    let values: Vec<String> = matrix.values().map(value_key).collect();
-    format!("{base} ({})", values.join(", "))
-}
-
-fn value_key(value: &Value) -> String {
-    match value {
-        Value::String(value) => value.clone(),
-        other => other.to_string(),
-    }
-}
-
 fn expand_matrix(
     job_id: &str,
     matrix: Option<&Matrix>,
@@ -1744,104 +1730,11 @@ fn expand_matrix(
         return Ok(vec![IndexMap::new()]);
     };
 
-    // Use IndexMap to preserve declaration order
-    let mut combinations: Vec<IndexMap<String, Value>> = vec![IndexMap::new()];
-    for (axis, values) in &matrix.axes {
-        let axis_values = match values {
-            Value::Array(values) => values.clone(),
-            value => vec![value.clone()],
-        };
-        combinations = combinations
-            .into_iter()
-            .flat_map(|existing| {
-                axis_values.iter().cloned().map(move |value| {
-                    let mut next = existing.clone();
-                    next.insert(axis.clone(), value);
-                    next
-                })
-            })
-            .collect();
-    }
-
-    for excluded in &matrix.exclude {
-        let excluded = object_entry_indexed(job_id, "exclude", excluded)?;
-        combinations.retain(|candidate| !matches_partial(candidate, &excluded));
-    }
-
-    for included in &matrix.include {
-        let included = object_entry_indexed(job_id, "include", included)?;
-        if let Some(existing) = combinations
-            .iter_mut()
-            .find(|candidate| can_merge_include_indexed(candidate, &included))
-        {
-            existing.extend(included);
-        } else {
-            combinations.push(included);
-        }
-    }
-
-    if combinations.is_empty() {
-        combinations.push(IndexMap::new());
-    }
-
-    Ok(combinations)
-}
-
-fn object_entry_indexed(
-    job_id: &str,
-    field: &'static str,
-    value: &Value,
-) -> Result<IndexMap<String, Value>, ParserError> {
-    let Value::Object(map) = value else {
-        return Err(ParserError::InvalidMatrixEntry {
-            job_id: job_id.to_owned(),
-            field,
-        });
-    };
-    Ok(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-}
-
-fn can_merge_include_indexed(
-    candidate: &IndexMap<String, Value>,
-    include: &IndexMap<String, Value>,
-) -> bool {
-    include
-        .iter()
-        .all(|(key, value)| candidate.get(key).is_none_or(|existing| existing == value))
-}
-
-fn _object_entry(
-    job_id: &str,
-    field: &'static str,
-    value: &Value,
-) -> Result<BTreeMap<String, Value>, ParserError> {
-    let Value::Object(map) = value else {
-        return Err(ParserError::InvalidMatrixEntry {
-            job_id: job_id.to_owned(),
-            field,
-        });
-    };
-    Ok(map
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
+    let spec = matrix_expand::matrix_to_spec(job_id, matrix)?;
+    Ok(matrix_expand::expand_matrix_spec(&spec)
+        .into_iter()
+        .map(|combination| combination.values)
         .collect())
-}
-
-fn matches_partial(candidate: &IndexMap<String, Value>, partial: &IndexMap<String, Value>) -> bool {
-    partial.iter().all(|(key, value)| {
-        candidate
-            .get(key)
-            .is_some_and(|candidate| candidate == value)
-    })
-}
-
-fn _can_merge_include(
-    candidate: &IndexMap<String, Value>,
-    include: &IndexMap<String, Value>,
-) -> bool {
-    include
-        .iter()
-        .all(|(key, value)| candidate.get(key).is_none_or(|existing| existing == value))
 }
 
 #[cfg(test)]
