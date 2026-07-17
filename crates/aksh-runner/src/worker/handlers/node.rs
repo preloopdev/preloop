@@ -8,6 +8,112 @@ use super::factory::ActionManifest;
 use crate::process;
 use crate::worker::execution_context::StepContext;
 
+const FORCE_NODE24: &str = "FORCE_JAVASCRIPT_ACTIONS_TO_NODE24";
+const ALLOW_UNSECURE_NODE: &str = "ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION";
+
+#[derive(Debug, PartialEq, Eq)]
+struct NodeSelection {
+    version: &'static str,
+    warnings: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+struct MigrationFlag {
+    is_true: bool,
+    from_workflow: bool,
+    from_system: bool,
+}
+
+fn node_bool(value: &str) -> bool {
+    value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("$true")
+}
+
+fn migration_flag(
+    name: &str,
+    workflow_env: &std::collections::HashMap<String, String>,
+    system_value: Option<&str>,
+) -> MigrationFlag {
+    let workflow_value = workflow_env.get(name);
+    MigrationFlag {
+        is_true: workflow_value
+            .map(|value| node_bool(value))
+            .unwrap_or_else(|| system_value.is_some_and(node_bool)),
+        from_workflow: workflow_value.is_some(),
+        from_system: system_value.is_some_and(|value| !value.is_empty()),
+    }
+}
+
+fn resolve_node_version(
+    runs_using: &str,
+    workflow_env: &std::collections::HashMap<String, String>,
+    system_force_node24: Option<&str>,
+    system_allow_unsecure_node: Option<&str>,
+    use_node24_by_default: bool,
+    require_node24: bool,
+    target_os: &str,
+    target_arch: &str,
+) -> NodeSelection {
+    let mut warnings = Vec::new();
+    let mut version = match runs_using {
+        "node20" if require_node24 => "node24",
+        "node20" => {
+            let force_node24 = migration_flag(FORCE_NODE24, workflow_env, system_force_node24);
+            let allow_unsecure = migration_flag(
+                ALLOW_UNSECURE_NODE,
+                workflow_env,
+                system_allow_unsecure_node,
+            );
+            let both_from_workflow = force_node24.is_true
+                && allow_unsecure.is_true
+                && force_node24.from_workflow
+                && allow_unsecure.from_workflow;
+            let both_from_system = force_node24.is_true
+                && allow_unsecure.is_true
+                && force_node24.from_system
+                && allow_unsecure.from_system;
+            if both_from_workflow || both_from_system {
+                let source = if both_from_workflow {
+                    "workflow"
+                } else {
+                    "system"
+                };
+                let default_version = if use_node24_by_default {
+                    "node24"
+                } else {
+                    "node20"
+                };
+                warnings.push(format!(
+                    "Both {FORCE_NODE24} and {ALLOW_UNSECURE_NODE} environment variables are set to true in the {source} environment. This is likely a configuration error. Using the default Node version: {default_version}."
+                ));
+                default_version
+            } else if use_node24_by_default {
+                if allow_unsecure.is_true {
+                    "node20"
+                } else {
+                    "node24"
+                }
+            } else if force_node24.is_true {
+                "node24"
+            } else {
+                "node20"
+            }
+        }
+        "node24" => "node24",
+        "node22" => "node22",
+        _ => "node20",
+    };
+
+    if version == "node24" && target_os == "linux" && target_arch == "arm" {
+        version = "node20";
+        warnings.push(
+            "Node 24 is not supported on Linux ARM32 platforms. Falling back to Node 20."
+                .to_owned(),
+        );
+    }
+
+    NodeSelection { version, warnings }
+}
+
 /// Run a Node.js action.
 pub async fn run_node_action(
     manifest: &ActionManifest,
@@ -44,33 +150,32 @@ pub async fn run_node_action(
         .job
         .get_variable_bool("actions.runner.usenode24bydefault");
     let require_node24 = ctx.job.get_variable_bool("actions.runner.requirenode24");
-    let force_node24 = env
-        .get("FORCE_JAVASCRIPT_ACTIONS_TO_NODE24")
-        .is_some_and(|v| v.eq_ignore_ascii_case("true") || v == "1");
-    let allow_unsecure_node20 = env
-        .get("ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION")
-        .is_some_and(|v| v.eq_ignore_ascii_case("true") || v == "1");
-
-    let node_version = if runs_using == "node20" {
-        let use_node24 = require_node24
-            || (use_node24_by_default && !allow_unsecure_node20)
-            || (!use_node24_by_default && force_node24);
-        let selected = if use_node24 { "node24" } else { "node20" };
+    let system_force_node24 = std::env::var(FORCE_NODE24).ok();
+    let system_allow_unsecure_node = std::env::var(ALLOW_UNSECURE_NODE).ok();
+    let selection = resolve_node_version(
+        runs_using,
+        &env,
+        system_force_node24.as_deref(),
+        system_allow_unsecure_node.as_deref(),
+        use_node24_by_default,
+        require_node24,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    );
+    for warning in &selection.warnings {
+        tracing::warn!("{warning}");
+        ctx.log(&format!("::warning::{warning}"));
+    }
+    let node_version = selection.version;
+    if runs_using == "node20" {
         if let Some(name) = action_name {
-            if use_node24 {
+            if node_version == "node24" {
                 ctx.job.record_upgraded_node24_action(name);
             } else if ctx.job.get_variable_bool("actions.runner.warnonnode20") {
                 ctx.job.record_deprecated_node20_action(name);
             }
         }
-        selected
-    } else if runs_using == "node24" {
-        "node24"
-    } else if runs_using == "node22" {
-        "node22"
-    } else {
-        "node20" // node12/node16 are mapped to node20
-    };
+    }
 
     let expr_ctx_for_inputs = ctx.job.build_expression_context();
     if let Some(inputs) = with.as_object() {
@@ -198,6 +303,237 @@ mod tests {
             inputs: None,
             outputs: None,
         }
+    }
+    fn resolve(
+        runs_using: &str,
+        workflow: &[(&str, &str)],
+        system_force_node24: Option<&str>,
+        system_allow_unsecure_node: Option<&str>,
+        use_node24_by_default: bool,
+        require_node24: bool,
+        target_os: &str,
+        target_arch: &str,
+    ) -> NodeSelection {
+        let workflow_env = workflow
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
+        resolve_node_version(
+            runs_using,
+            &workflow_env,
+            system_force_node24,
+            system_allow_unsecure_node,
+            use_node24_by_default,
+            require_node24,
+            target_os,
+            target_arch,
+        )
+    }
+
+    #[test]
+    fn system_only_force_node24_selects_node24() {
+        let selection = resolve(
+            "node20",
+            &[],
+            Some("true"),
+            None,
+            false,
+            false,
+            "linux",
+            "x64",
+        );
+
+        assert_eq!(selection.version, "node24");
+        assert!(selection.warnings.is_empty());
+    }
+
+    #[test]
+    fn workflow_false_overrides_system_true() {
+        let selection = resolve(
+            "node20",
+            &[(FORCE_NODE24, "false")],
+            Some("true"),
+            None,
+            false,
+            false,
+            "linux",
+            "x64",
+        );
+
+        assert_eq!(selection.version, "node20");
+        assert!(selection.warnings.is_empty());
+    }
+
+    #[test]
+    fn workflow_true_overrides_system_false() {
+        let selection = resolve(
+            "node20",
+            &[(FORCE_NODE24, "true")],
+            Some("false"),
+            None,
+            false,
+            false,
+            "linux",
+            "x64",
+        );
+
+        assert_eq!(selection.version, "node24");
+        assert!(selection.warnings.is_empty());
+    }
+
+    #[test]
+    fn both_workflow_flags_true_use_configured_default_and_warning() {
+        for (use_node24_by_default, expected_version) in [(false, "node20"), (true, "node24")] {
+            let selection = resolve(
+                "node20",
+                &[(FORCE_NODE24, "true"), (ALLOW_UNSECURE_NODE, "true")],
+                None,
+                None,
+                use_node24_by_default,
+                false,
+                "linux",
+                "x64",
+            );
+
+            assert_eq!(selection.version, expected_version);
+            assert_eq!(
+                selection.warnings,
+                vec![format!(
+                    "Both {FORCE_NODE24} and {ALLOW_UNSECURE_NODE} environment variables are set to true in the workflow environment. This is likely a configuration error. Using the default Node version: {expected_version}."
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn both_system_flags_true_use_configured_default_and_warning() {
+        for (use_node24_by_default, expected_version) in [(false, "node20"), (true, "node24")] {
+            let selection = resolve(
+                "node20",
+                &[],
+                Some("true"),
+                Some("true"),
+                use_node24_by_default,
+                false,
+                "linux",
+                "x64",
+            );
+
+            assert_eq!(selection.version, expected_version);
+            assert_eq!(
+                selection.warnings,
+                vec![format!(
+                    "Both {FORCE_NODE24} and {ALLOW_UNSECURE_NODE} environment variables are set to true in the system environment. This is likely a configuration error. Using the default Node version: {expected_version}."
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn flags_from_different_sources_do_not_trigger_conflict_warning() {
+        let selection = resolve(
+            "node20",
+            &[(FORCE_NODE24, "true")],
+            None,
+            Some("true"),
+            false,
+            false,
+            "linux",
+            "x64",
+        );
+
+        assert_eq!(selection.version, "node24");
+        assert!(selection.warnings.is_empty());
+    }
+
+    #[test]
+    fn require_node24_overrides_conflicting_flags_without_warning() {
+        let selection = resolve(
+            "node20",
+            &[(FORCE_NODE24, "true"), (ALLOW_UNSECURE_NODE, "true")],
+            Some("true"),
+            Some("true"),
+            false,
+            true,
+            "linux",
+            "x64",
+        );
+
+        assert_eq!(selection.version, "node24");
+        assert!(selection.warnings.is_empty());
+    }
+
+    #[test]
+    fn dollar_true_is_accepted_for_force_node24() {
+        let selection = resolve(
+            "node20",
+            &[(FORCE_NODE24, "$true")],
+            None,
+            None,
+            false,
+            false,
+            "linux",
+            "x64",
+        );
+
+        assert_eq!(selection.version, "node24");
+        assert!(selection.warnings.is_empty());
+    }
+
+    #[test]
+    fn linux_arm32_downgrades_selected_and_direct_node24() {
+        let cases = [
+            ("selected node24", "node20", &[(FORCE_NODE24, "true")][..]),
+            ("direct node24", "node24", &[][..]),
+        ];
+        for (case, runs_using, workflow) in cases {
+            let selection = resolve(
+                runs_using, workflow, None, None, false, false, "linux", "arm",
+            );
+
+            assert_eq!(selection.version, "node20", "{case}");
+            assert_eq!(
+                selection.warnings,
+                vec![
+                    "Node 24 is not supported on Linux ARM32 platforms. Falling back to Node 20."
+                        .to_owned()
+                ],
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn node24_is_preserved_on_linux_aarch64_and_non_linux_arm() {
+        for (target_os, target_arch) in [("linux", "aarch64"), ("darwin", "arm")] {
+            let selection = resolve(
+                "node24",
+                &[],
+                None,
+                None,
+                false,
+                false,
+                target_os,
+                target_arch,
+            );
+
+            assert_eq!(selection.version, "node24");
+            assert!(selection.warnings.is_empty());
+        }
+    }
+
+    #[test]
+    fn legacy_node_versions_migrate_to_node20_and_node22_is_preserved() {
+        for runs_using in ["node12", "node16"] {
+            let selection = resolve(runs_using, &[], None, None, false, false, "linux", "x64");
+
+            assert_eq!(selection.version, "node20", "{runs_using}");
+            assert!(selection.warnings.is_empty(), "{runs_using}");
+        }
+
+        let selection = resolve("node22", &[], None, None, false, false, "linux", "x64");
+        assert_eq!(selection.version, "node22");
+        assert!(selection.warnings.is_empty());
     }
 
     #[tokio::test]
