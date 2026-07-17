@@ -2560,7 +2560,7 @@ fn try_enqueue_with_job_concurrency(
         .message
         .context_data
         .get("strategy")
-        .map(concurrency::context_data_to_json)
+        .map(azdo::PipelineContextData::to_json)
         .unwrap_or_else(|| json!({}));
     let eval_ctx = concurrency::ConcurrencyContext {
         scope: concurrency::ConcurrencyScope::Job,
@@ -6496,7 +6496,7 @@ fn need_context(run: &RunRecord, need: &JobId) -> Option<azdo::PipelineContextDa
     for job_id in matching_need_ids(run, need) {
         if let Some(job_outputs) = run.job_outputs.get(&job_id) {
             for (key, value) in job_outputs {
-                outputs.insert(key.clone(), json_to_context_data(value));
+                outputs.insert(key.clone(), azdo::PipelineContextData::from_json(value));
             }
         }
     }
@@ -6524,26 +6524,6 @@ fn status_string(status: ExecutionStatus) -> String {
         ExecutionStatus::Cancelled => "cancelled",
     }
     .to_owned()
-}
-
-fn json_to_context_data(value: &serde_json::Value) -> azdo::PipelineContextData {
-    match value {
-        serde_json::Value::String(value) => azdo::PipelineContextData::String(value.clone()),
-        serde_json::Value::Bool(value) => azdo::PipelineContextData::Bool(*value),
-        serde_json::Value::Number(value) => {
-            azdo::PipelineContextData::Number(value.as_f64().unwrap_or_default())
-        }
-        serde_json::Value::Array(values) => {
-            azdo::PipelineContextData::Array(values.iter().map(json_to_context_data).collect())
-        }
-        serde_json::Value::Object(values) => azdo::PipelineContextData::Dict(
-            values
-                .iter()
-                .map(|(key, value)| (key.clone(), json_to_context_data(value)))
-                .collect(),
-        ),
-        serde_json::Value::Null => azdo::PipelineContextData::String(String::new()),
-    }
 }
 
 // ─── Phase E: Timeline, logs, completion ────────────────────────────────────
