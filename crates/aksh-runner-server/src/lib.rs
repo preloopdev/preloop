@@ -10,6 +10,8 @@ pub mod concurrency;
 pub mod events;
 pub mod github;
 pub mod scheduler;
+mod errors;
+pub use errors::ApiError;
 
 /// Pure job-graph scheduler model and property tests.
 pub mod scheduling;
@@ -8480,98 +8482,6 @@ fn decode_base64(value: &str) -> Result<Vec<u8>, ApiError> {
         .map_err(|error| ApiError::bad_request(format!("invalid base64 content: {error}")))
 }
 
-/// API error.
-#[derive(Debug)]
-pub struct ApiError {
-    status: StatusCode,
-    message: String,
-}
-
-impl ApiError {
-    fn bad_request(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            message: message.into(),
-        }
-    }
-
-    fn unauthorized(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::UNAUTHORIZED,
-            message: message.into(),
-        }
-    }
-
-    fn not_found(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::NOT_FOUND,
-            message: message.into(),
-        }
-    }
-
-    fn forbidden(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::FORBIDDEN,
-            message: message.into(),
-        }
-    }
-
-    fn unprocessable(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::UNPROCESSABLE_ENTITY,
-            message: message.into(),
-        }
-    }
-
-    fn internal(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: message.into(),
-        }
-    }
-}
-
-impl From<aksh_gha_parser::ParserError> for ApiError {
-    fn from(value: aksh_gha_parser::ParserError) -> Self {
-        Self::bad_request(value.to_string())
-    }
-}
-
-impl From<aksh_gha_protocol::ProtocolError> for ApiError {
-    fn from(value: aksh_gha_protocol::ProtocolError) -> Self {
-        Self::bad_request(value.to_string())
-    }
-}
-
-impl From<aksh_gha_protocol::crypto::CryptoError> for ApiError {
-    fn from(value: aksh_gha_protocol::crypto::CryptoError) -> Self {
-        Self::bad_request(value.to_string())
-    }
-}
-
-impl From<aksh_cache::CacheError> for ApiError {
-    fn from(value: aksh_cache::CacheError) -> Self {
-        Self::bad_request(value.to_string())
-    }
-}
-
-impl From<aksh_artifacts::ArtifactError> for ApiError {
-    fn from(value: aksh_artifacts::ArtifactError) -> Self {
-        Self::bad_request(value.to_string())
-    }
-}
-
-impl From<std::io::Error> for ApiError {
-    fn from(value: std::io::Error) -> Self {
-        Self::bad_request(value.to_string())
-    }
-}
-
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        (self.status, Json(json!({ "error": self.message }))).into_response()
-    }
-}
 async fn record_flows_middleware(
     State(state): State<AppState>,
     request: Request,
