@@ -26,6 +26,7 @@ use rcgen::generate_simple_self_signed;
 
 use aksh_artifacts::{validate_artifact_name, ArtifactStore};
 use aksh_cache::CacheStore;
+use aksh_gha_parser::eval::build_context;
 use aksh_gha_parser::{expand_jobs_with_reusables, parse_workflow};
 use aksh_gha_protocol::{
     azdo,
@@ -1989,7 +1990,15 @@ pub(crate) async fn submit_run_inner(
             job_needs.insert(job.id.clone(), job.needs.clone());
             job_fail_fast.insert(job.base_id.clone(), job.fail_fast);
             statuses.insert(job.id.clone(), ExecutionStatus::Queued);
-            let condition_context = job_condition_context(&job, &github, &submission);
+            let condition_context = build_context(
+                &github,
+                &BTreeMap::new(),
+                &submission.vars,
+                &indexmap::IndexMap::new(),
+                &serde_json::json!({}),
+                &BTreeMap::new(),
+                &job.inputs,
+            );
             if job.needs.is_empty() {
                 let condition =
                     aksh_gha_expressions::effective_condition(job.if_condition.as_deref());
@@ -6101,25 +6110,6 @@ async fn complete_job_inner(
         })
         .await;
     Ok(Json(record))
-}
-
-fn job_condition_context(
-    job: &aksh_gha_protocol::JobPlan,
-    github: &serde_json::Value,
-    submission: &WorkflowSubmission,
-) -> aksh_gha_expressions::Context {
-    let mut context = aksh_gha_expressions::Context::default();
-    context.insert("github", github.clone());
-    context.insert(
-        "vars",
-        serde_json::to_value(&submission.vars).unwrap_or_default(),
-    );
-    context.insert(
-        "inputs",
-        serde_json::to_value(&job.inputs).unwrap_or_default(),
-    );
-    context.insert("needs", serde_json::Value::Object(Default::default()));
-    context
 }
 
 #[derive(Default)]
