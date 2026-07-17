@@ -1,6 +1,7 @@
 use axum::body::{to_bytes, Body};
 use axum::http::{Method, Request, StatusCode};
 use serde_json::Value;
+use sha1::{Digest, Sha1};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
@@ -2519,6 +2520,24 @@ async fn oidc_endpoint_mints_rs256_jwt_with_requested_audience() {
     assert_eq!(header["alg"], "RS256");
     assert!(!header["kid"].as_str().unwrap_or_default().is_empty());
 
+    // The JWT thumbprint must identify the same certificate published by JWKS.
+    let jwt_x5t = header["x5t"].as_str().unwrap_or_default();
+    assert!(!jwt_x5t.is_empty(), "JWT header must contain x5t");
+    let jwks = request_json(&app, Method::GET, "/.well-known/jwks", Value::Null).await;
+    let jwks_key = &jwks["keys"][0];
+    let jwks_x5t = jwks_key["x5t"].as_str().unwrap_or_default();
+    assert!(!jwks_x5t.is_empty(), "JWKS key must contain x5t");
+    assert_eq!(jwt_x5t, jwks_x5t);
+
+    let certificate_der = std::fs::read(temp.path().join("oidc-cert.der")).unwrap();
+    assert!(
+        !certificate_der.is_empty(),
+        "OIDC certificate DER must be nonempty"
+    );
+    let expected_x5t = URL_SAFE_NO_PAD.encode(Sha1::digest(&certificate_der));
+    assert_eq!(jwt_x5t, expected_x5t);
+    assert_eq!(jwks_x5t, expected_x5t);
+
     // Verify claims.
     let claims: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
     assert_eq!(claims["aud"], "api://custom");
@@ -2676,21 +2695,60 @@ async fn oidc_discovery_and_jwks_endpoints() {
 async fn oidc_keypair_persists_across_restarts() {
     let temp = tempfile::tempdir().unwrap();
     let state1 = AppState::new(temp.path().to_path_buf()).await.unwrap();
-    let kid1 = {
+    let (kid1, x5t1, certificate_der1) = {
         let inner = state1.inner.lock().await;
-        inner.oidc_keypair.as_ref().unwrap().kid().to_string()
+        let keypair = inner.oidc_keypair.as_ref().unwrap();
+        (
+            keypair.kid().to_string(),
+            keypair.x5t().to_string(),
+            keypair.certificate_der().to_vec(),
+        )
     };
+    let certificate_path = temp.path().join("oidc-cert.der");
+    assert!(certificate_path.exists());
+    assert!(!certificate_der1.is_empty());
+    assert_eq!(certificate_der1, std::fs::read(&certificate_path).unwrap());
+    let expected_x5t1 = URL_SAFE_NO_PAD.encode(Sha1::digest(&certificate_der1));
+    assert_eq!(x5t1, expected_x5t1);
     drop(state1);
-
-    // Second instance should load the same keypair.
+    // Second instance should load the same keypair and certificate.
     let state2 = AppState::new(temp.path().to_path_buf()).await.unwrap();
-    let kid2 = {
+
+    let (kid2, x5t2, certificate_der2) = {
         let inner = state2.inner.lock().await;
-        inner.oidc_keypair.as_ref().unwrap().kid().to_string()
+        let keypair = inner.oidc_keypair.as_ref().unwrap();
+        (
+            keypair.kid().to_string(),
+            keypair.x5t().to_string(),
+            keypair.certificate_der().to_vec(),
+        )
     };
     assert_eq!(
         kid1, kid2,
         "OIDC keypair kid must be stable across restarts"
+    );
+    assert_eq!(
+        x5t1, x5t2,
+        "OIDC certificate x5t must be stable across restarts"
+    );
+    assert_eq!(certificate_der1, certificate_der2);
+    assert_eq!(certificate_der1, std::fs::read(&certificate_path).unwrap());
+    assert_eq!(
+        x5t2,
+        URL_SAFE_NO_PAD.encode(Sha1::digest(&certificate_der2))
+    );
+}
+
+#[tokio::test]
+async fn oidc_malformed_certificate_sidecar_rejects_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    drop(state);
+
+    std::fs::write(temp.path().join("oidc-cert.der"), b"not a DER certificate").unwrap();
+    assert!(
+        AppState::new(temp.path().to_path_buf()).await.is_err(),
+        "startup must reject a malformed persisted OIDC certificate"
     );
 }
 

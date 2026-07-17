@@ -15,7 +15,7 @@ use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvI
 use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use rsa::pkcs1::DecodeRsaPublicKey;
-use rsa::pkcs8::DecodePublicKey;
+use rsa::pkcs8::{DecodePublicKey, EncodePrivateKey, EncodePublicKey};
 use rsa::traits::PublicKeyParts;
 use rsa::{BigUint, Oaep};
 use sha1::Sha1;
@@ -240,6 +240,22 @@ impl AgentRsaKeypair {
         let n = URL_SAFE_NO_PAD.encode(self.public_key.n().to_bytes_be());
         let e = URL_SAFE_NO_PAD.encode(self.public_key.e().to_bytes_be());
         (n, e)
+    }
+
+    /// Export this keypair's private key as unencrypted PKCS#8 DER.
+    pub fn private_key_pkcs8_der(&self) -> Result<Vec<u8>, CryptoError> {
+        self.private_key
+            .to_pkcs8_der()
+            .map(|document| document.as_bytes().to_vec())
+            .map_err(|error| CryptoError::ExportKey(error.to_string()))
+    }
+
+    /// Export this keypair's public key as DER SubjectPublicKeyInfo.
+    pub fn public_key_spki_der(&self) -> Result<Vec<u8>, CryptoError> {
+        self.public_key
+            .to_public_key_der()
+            .map(|document| document.as_bytes().to_vec())
+            .map_err(|error| CryptoError::ExportKey(error.to_string()))
     }
 }
 
@@ -491,6 +507,9 @@ pub enum CryptoError {
     /// RSA public-key parsing failed.
     #[error("RSA public key parse failed: {0}")]
     ParseKey(String),
+    /// RSA key export failed.
+    #[error("RSA key export failed: {0}")]
+    ExportKey(String),
     /// AES decryption failed.
     #[error("AES decryption failed: {0}")]
     Decrypt(String),
