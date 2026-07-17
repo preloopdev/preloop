@@ -194,6 +194,7 @@ fn expected_job_wire(job: &AgentJobRequestMessage) -> Value {
     object.insert(
         "plan".to_owned(),
         json!({
+            "scopeIdentifier": job.plan.scope_identifier,
             "planId": job.plan.plan_id,
             "planType": job.plan.plan_type,
             "version": job.plan.version,
@@ -416,6 +417,7 @@ fn arb_job() -> impl Strategy<Value = AgentJobRequestMessage> {
                 job_id: uuid::Uuid::from_bytes(job_id),
                 request_id,
                 plan: PlanReference {
+                    scope_identifier: plan_id.clone(),
                     plan_id,
                     plan_type,
                     version: 0,
