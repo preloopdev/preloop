@@ -18,7 +18,7 @@ resolver = "2"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/preloop/preloop"
-rust-version = "1.86"
+rust-version = "1.97"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
