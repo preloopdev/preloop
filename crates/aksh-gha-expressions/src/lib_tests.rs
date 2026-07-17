@@ -424,3 +424,137 @@ fn matrix_genuine_float_preserved() {
     };
     assert!(s.contains('.'), "1.5 must retain decimal: got {s}");
 }
+
+mod official_semantics {
+    use super::*;
+
+    fn assert_bool(expression: &str, expected: bool) {
+        let actual = eval_expression(expression, &Context::default())
+            .unwrap_or_else(|error| panic!("{expression:?} should evaluate: {error}"));
+        assert_eq!(actual, Value::Bool(expected), "expression: {expression}");
+    }
+
+    #[test]
+    fn starts_with_and_ends_with_are_case_insensitive() {
+        assert_bool("startsWith('Hello world', 'HELLO')", true);
+        assert_bool("endsWith('Hello world', 'WORLD')", true);
+        assert_bool("startsWith('Hello world', 'WORLD')", false);
+        assert_bool("endsWith('Hello world', 'HELLO')", false);
+    }
+
+    #[test]
+    fn same_kind_string_equality_is_case_insensitive() {
+        assert_bool("'Alpha-Beta' == 'aLPHA-bETA'", true);
+        assert_bool("'Alpha-Beta' != 'aLPHA-bETA'", false);
+        assert_bool("'Alpha-Beta' == 'Alpha-Gamma'", false);
+    }
+
+    #[test]
+    fn mixed_kind_coercion_uses_official_numeric_rules() {
+        let cases = [
+            ("0 == ''", true),
+            ("null == 0", true),
+            ("true == 1", true),
+            ("false == 0", true),
+            ("'1' == 1.0", true),
+            ("null == ''", true),
+            ("'  1  ' == 1", true),
+            ("'0x10' == 16", true),
+            ("'0o10' == 8", true),
+            ("'Infinity' == 1", false),
+            ("'Infinity' > 1", true),
+            ("'-Infinity' < 0", true),
+            ("'abc' == 0", false),
+            ("'NaN' == 0", false),
+            ("'NaN' != 0", true),
+            ("'inf' != 0", true),
+        ];
+
+        for (expression, expected) in cases {
+            assert_bool(expression, expected);
+        }
+    }
+
+    #[test]
+    fn arrays_and_objects_are_truthy_even_when_empty() {
+        let cases = [
+            ("fromJSON('[]')", true),
+            ("fromJSON('[1]')", true),
+            ("fromJSON('{}')", true),
+            ("fromJSON('{\"key\":\"value\"}')", true),
+        ];
+
+        for (expression, expected) in cases {
+            assert_eq!(
+                eval_bool(expression, &Context::default()).unwrap(),
+                expected,
+                "expression: {expression}"
+            );
+        }
+    }
+
+    #[test]
+    fn contains_array_uses_abstract_equality() {
+        let cases = [
+            ("contains(fromJSON('[1, 2]'), '1')", true),
+            ("contains(fromJSON('[null]'), '')", true),
+            ("contains(fromJSON('[true]'), '1')", true),
+            ("contains(fromJSON('[1, 2]'), '3')", false),
+        ];
+
+        for (expression, expected) in cases {
+            assert_bool(expression, expected);
+        }
+    }
+
+    #[test]
+    fn format_escaped_braces_are_preserved() {
+        let result = eval_expression("format('{{literal}}')", &Context::default()).unwrap();
+        assert_eq!(result, Value::String("{literal}".to_owned()));
+    }
+
+    #[test]
+    fn format_malformed_template_errors() {
+        for expression in [
+            "format('{', 'value')",
+            "format('value}', 'value')",
+            "format('{x}', 'value')",
+        ] {
+            assert!(
+                eval_expression(expression, &Context::default()).is_err(),
+                "malformed template should fail: {expression}"
+            );
+        }
+    }
+
+    #[test]
+    fn format_missing_index_argument_errors() {
+        for expression in ["format('{1}', 'value')", "format('{256}', 'value')"] {
+            assert!(
+                eval_expression(expression, &Context::default()).is_err(),
+                "invalid argument index should fail: {expression}"
+            );
+        }
+    }
+
+    #[test]
+    fn format_invalid_specifier_errors() {
+        assert!(
+            eval_expression("format('{0:bogus}', 'value')", &Context::default()).is_err(),
+            "unsupported format specifier should fail"
+        );
+    }
+
+    #[test]
+    fn hash_files_unknown_leading_flag_errors() {
+        let workspace = std::env::temp_dir().join("aksh-official-semantics-hashfiles");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("x"), b"x").unwrap();
+
+        let context = Context::default().with_workspace(workspace.to_string_lossy().into_owned());
+        let result = eval_expression("hashFiles('--bogus-flag', 'x')", &context);
+
+        let _ = std::fs::remove_dir_all(&workspace);
+        assert!(result.is_err(), "unknown hashFiles flags must fail");
+    }
+}
