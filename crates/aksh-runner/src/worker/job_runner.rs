@@ -1129,6 +1129,12 @@ async fn upload_job_log(rpt: &ReportingContext, content: &str) {
 /// - Collects log files from the runner's _diag/ directory
 /// - Creates a zip archive with metadata
 /// - Uploads via the results service
+fn diagnostic_logs_url(response: &serde_json::Value) -> Option<&str> {
+    response
+        .get("diag_logs_url")
+        .and_then(|value| value.as_str())
+}
+
 async fn upload_diagnostic_logs(
     rpt: &ReportingContext,
     runner_root: &std::path::Path,
@@ -1224,13 +1230,7 @@ async fn upload_diagnostic_logs(
         .get_diagnostic_logs_signed_url(&rpt.access_token, &body)
         .await
     {
-        Ok(resp) => resp
-            .get("blob_url")
-            .or_else(|| resp.get("url"))
-            .or_else(|| resp.get("logs_url"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
+        Ok(response) => diagnostic_logs_url(&response).unwrap_or("").to_owned(),
         Err(e) => {
             debug!("Diagnostic log signed URL request failed (non-fatal): {e:#}");
             return;
