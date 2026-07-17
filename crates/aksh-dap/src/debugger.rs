@@ -554,6 +554,21 @@ async fn next_seq(core: &Arc<DebuggerCore>) -> i64 {
     v
 }
 
+/// Build a masking closure from the current mask set, using the shared
+/// protocol masker with DAP keyword exclusions.
+fn dap_mask_closure(
+    masks: &std::collections::HashSet<String>,
+) -> Box<dyn Fn(&str) -> String + Send + Sync> {
+    let masks = masks.clone();
+    Box::new(move |input: &str| {
+        aksh_gha_protocol::masking::mask_secrets(
+            input,
+            masks.iter().map(String::as_str),
+            crate::DAP_PROTOCOL_KEYWORDS,
+        )
+    })
+}
+
 async fn read_headers<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> Result<usize, DapError> {
     let mut header = Vec::with_capacity(256);
     let mut byte = [0u8; 1];
@@ -624,16 +639,7 @@ async fn dispatch_one(core: &Arc<DebuggerCore>, req: &Request, seq: i64) -> Resp
         }
         "scopes" => {
             let masks = core.masks.lock().clone();
-            let mask_secret = Box::new(move |input: &str| {
-                let mut result = input.to_string();
-                let mut sorted_masks: Vec<&String> =
-                    masks.iter().filter(|s| !s.is_empty()).collect();
-                sorted_masks.sort_by_key(|b| std::cmp::Reverse(b.len()));
-                for secret in sorted_masks {
-                    result = result.replace(secret.as_str(), "***");
-                }
-                result
-            });
+            let mask_secret = dap_mask_closure(&masks);
             let provider = DapVariableProvider::new(mask_secret);
             Response::success(seq, req.header.seq, "scopes")
                 .with_body(json!({ "scopes": provider.scopes() }))
@@ -646,16 +652,7 @@ async fn dispatch_one(core: &Arc<DebuggerCore>, req: &Request, seq: i64) -> Resp
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
             let masks = core.masks.lock().clone();
-            let mask_secret = Box::new(move |input: &str| {
-                let mut result = input.to_string();
-                let mut sorted_masks: Vec<&String> =
-                    masks.iter().filter(|s| !s.is_empty()).collect();
-                sorted_masks.sort_by_key(|b| std::cmp::Reverse(b.len()));
-                for secret in sorted_masks {
-                    result = result.replace(secret.as_str(), "***");
-                }
-                result
-            });
+            let mask_secret = dap_mask_closure(&masks);
             let provider = DapVariableProvider::new(mask_secret);
             let ctx = core.context.lock().clone();
             let vars = provider.variables(reference, &ctx);
@@ -701,16 +698,7 @@ async fn dispatch_one(core: &Arc<DebuggerCore>, req: &Request, seq: i64) -> Resp
             };
             if let Some(parsed) = parsed {
                 let masks = core.masks.lock().clone();
-                let mask_secret = Box::new(move |input: &str| {
-                    let mut result = input.to_string();
-                    let mut sorted_masks: Vec<&String> =
-                        masks.iter().filter(|s| !s.is_empty()).collect();
-                    sorted_masks.sort_by_key(|b| std::cmp::Reverse(b.len()));
-                    for secret in sorted_masks {
-                        result = result.replace(secret.as_str(), "***");
-                    }
-                    result
-                });
+                let mask_secret = dap_mask_closure(&masks);
                 let executor = DapReplExecutor::with_masker(mask_secret);
                 let output = executor.execute(&parsed);
                 Response::success(seq, req.header.seq, "evaluate")
@@ -732,14 +720,7 @@ async fn dispatch_one(core: &Arc<DebuggerCore>, req: &Request, seq: i64) -> Resp
                             other => other.to_string(),
                         };
                         let masks = core.masks.lock().clone();
-                        let mut result_masked = result_raw;
-                        let mut sorted_masks: Vec<&String> =
-                            masks.iter().filter(|s| !s.is_empty()).collect();
-                        sorted_masks.sort_by_key(|b| std::cmp::Reverse(b.len()));
-                        for secret in sorted_masks {
-                            result_masked = result_masked.replace(secret.as_str(), "***");
-                        }
-                        result_masked
+                        dap_mask_closure(&masks)(&result_raw)
                     }
                     Err(e) => format!("error: {e}"),
                 };
