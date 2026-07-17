@@ -10,9 +10,6 @@
 //! - `GitHub.DistributedTask.WebApi` NuGet package (shared DTOs)
 #![allow(missing_docs)]
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::collections::BTreeMap;
-
 mod completion;
 mod context_data;
 mod job;
@@ -25,7 +22,6 @@ mod variables;
 pub use completion::*;
 pub use context_data::*;
 pub use job::*;
-pub(crate) use job::{find_expression_end, template_string_token};
 pub use lifecycle::*;
 pub use messages::message_type;
 pub use messages::*;

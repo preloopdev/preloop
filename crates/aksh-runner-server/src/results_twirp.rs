@@ -145,12 +145,21 @@ pub(crate) async fn twirp_get_step_summary_signed_blob_url(
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub(crate) struct StepSummaryMetadataRequest {
+    // serde: metadata is accepted for protocol compatibility; field is not inspected.
+    #[allow(dead_code)]
     pub(crate) step_backend_id: String,
+    // serde: metadata is accepted for protocol compatibility; field is not inspected.
+    #[allow(dead_code)]
     pub(crate) workflow_job_run_backend_id: String,
+    // serde: metadata is accepted for protocol compatibility; field is not inspected.
+    #[allow(dead_code)]
     pub(crate) workflow_run_backend_id: String,
+    // serde: metadata is accepted for protocol compatibility; field is not inspected.
+    #[allow(dead_code)]
     pub(crate) size: Option<u64>,
+    // serde: metadata is accepted for protocol compatibility; field is not inspected.
+    #[allow(dead_code)]
     pub(crate) uploaded_at: Option<String>,
 }
 
@@ -161,12 +170,21 @@ pub(crate) async fn twirp_create_step_summary_metadata(
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub(crate) struct StepLogsMetadataRequest {
+    // serde: metadata is accepted for protocol compatibility; field is not inspected.
+    #[allow(dead_code)]
     pub(crate) step_backend_id: Option<String>,
+    // serde: metadata is accepted for protocol compatibility; field is not inspected.
+    #[allow(dead_code)]
     pub(crate) workflow_job_run_backend_id: Option<String>,
+    // serde: metadata is accepted for protocol compatibility; field is not inspected.
+    #[allow(dead_code)]
     pub(crate) workflow_run_backend_id: Option<String>,
+    // serde: metadata is accepted for protocol compatibility; field is not inspected.
+    #[allow(dead_code)]
     pub(crate) upload_url: Option<String>,
+    // serde: metadata is accepted for protocol compatibility; field is not inspected.
+    #[allow(dead_code)]
     pub(crate) line_count: Option<u64>,
 }
 
@@ -178,11 +196,18 @@ pub(crate) async fn twirp_create_step_logs_metadata(
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub(crate) struct JobLogsMetadataRequest {
+    // serde: metadata is accepted for protocol compatibility; field is not inspected.
+    #[allow(dead_code)]
     pub(crate) workflow_job_run_backend_id: Option<String>,
+    // serde: metadata is accepted for protocol compatibility; field is not inspected.
+    #[allow(dead_code)]
     pub(crate) workflow_run_backend_id: Option<String>,
+    // serde: metadata is accepted for protocol compatibility; field is not inspected.
+    #[allow(dead_code)]
     pub(crate) upload_url: Option<String>,
+    // serde: metadata is accepted for protocol compatibility; field is not inspected.
+    #[allow(dead_code)]
     pub(crate) line_count: Option<u64>,
 }
 

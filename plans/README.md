@@ -60,7 +60,7 @@ each phase, follow the dependency notes.
 | 015 | Decompose `aksh-runner-server/src/lib.rs` (15K→modules), staged pure moves | P2 | L | MED→HIGH | 012, 014 | DONE (139-line module root; protocol/state/bootstrap modules; 267-test baseline preserved; pre-existing strict-clippy debt remains under 018) |
 | 016 | Decompose the worker engine (`job_runner`/`steps_runner`/`job_extension`) + dedupe action inputs | P2 | L | HIGH | 012, 014 | DONE (job_runner 1914→699; Annotation/AnnotationLevel to execution_types.rs; reporting/completion/action_preparation/helpers extracted; dead code removed; action input dedup deferred—handlers have deliberate per-type differences; steps_runner 1046 and job_extension 941 within bounds after Plan 012 test extraction; 381 runner tests pass) |
 | 017 | Split `azdo.rs`/parser `lib.rs`/expressions `lib.rs` behind facades | P3 | L | HIGH | 012, 013, 014 | DONE (azdo.rs→azdo/ with 8 submodules; parser lib.rs→models/trigger/yaml/expand; expressions lib.rs→context/conditions/ast/evaluator/lexer/expr_parser; all facades re-export public API; baselines 48+84+31 preserved) |
-| 018 | Hygiene: one HTTP client, typed error mapping, dead-code/deps, module map + CONTRIBUTING | P3 | M | LOW→MED | 015 (part B) | TODO (NEW) |
+| 018 | Hygiene: one HTTP client, typed error mapping, dead-code/deps, module map + CONTRIBUTING | P3 | M | LOW→MED | 015 (part B) | DONE (B: io::Error→500; C: dead code removed, allows narrowed; D: thiserror removed; E: CONTRIBUTING.md + module map in architecture.md; toolchain 1.97; README/AGENTS/fidelity docs synced. A: HTTP client dedup deferred—structural, low risk) |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (reason) | REJECTED (rationale).
 
