@@ -20,7 +20,7 @@ use super::step_conditions::{evaluate_step_condition, StatusFlags};
 /// so **unset (null) is Success**.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OfficialJobStatus {
-    /// `JobContext.Status == null` — treated as Success by official runner.
+    /// `JobContext.Status == null` is treated as Success by official runner.
     Unset,
     Success,
     Failure,

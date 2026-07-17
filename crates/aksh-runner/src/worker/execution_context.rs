@@ -9,6 +9,7 @@ use std::io::{BufWriter, Write};
 use std::sync::Arc;
 
 use super::contexts::JobContext;
+pub use super::execution_types::{Annotation, AnnotationLevel};
 use super::live_logs::LiveLogQueue;
 pub struct StepContext<'a> {
     pub job: &'a mut JobContext,
@@ -42,26 +43,6 @@ pub struct StepContext<'a> {
     pub live_logs: Option<Arc<LiveLogQueue>>,
     /// Monotonic line counter for live log feed (per step).
     live_line_counter: std::sync::atomic::AtomicU64,
-}
-/// A workflow annotation (error/warning/notice).
-#[derive(Debug, Clone)]
-pub struct Annotation {
-    pub level: AnnotationLevel,
-    pub message: String,
-    pub title: Option<String>,
-    pub file: Option<String>,
-    pub line: Option<u32>,
-    pub end_line: Option<u32>,
-    pub col: Option<u32>,
-    pub end_column: Option<u32>,
-}
-
-/// Annotation severity level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AnnotationLevel {
-    Notice,
-    Warning,
-    Error,
 }
 
 impl<'a> StepContext<'a> {
@@ -121,7 +102,7 @@ impl<'a> StepContext<'a> {
             let line = String::from_utf8_lossy(&line_bytes[..line_bytes.len() - 1]);
 
             let masked = self.job.mask_secrets(&line);
-            let ts = crate::worker::job_runner::iso_now();
+            let ts = crate::worker::helpers::iso_now();
             let fmt = format!("{ts} {masked}");
             {
                 let mut lock = self.log_file.lock();
@@ -146,7 +127,7 @@ impl<'a> StepContext<'a> {
         }
         let line = String::from_utf8_lossy(&buf);
         let masked = self.job.mask_secrets(&line);
-        let ts = crate::worker::job_runner::iso_now();
+        let ts = crate::worker::helpers::iso_now();
         let fmt = format!("{ts} {masked}");
         {
             let mut lock = self.log_file.lock();
@@ -172,7 +153,7 @@ impl<'a> StepContext<'a> {
             }
             // All commands suspended — just log the line
             let masked = self.job.mask_secrets(line);
-            let ts = crate::worker::job_runner::iso_now();
+            let ts = crate::worker::helpers::iso_now();
             let fmt = format!("{ts} {masked}");
             {
                 let mut lock = self.log_file.lock();
@@ -278,10 +259,10 @@ impl<'a> StepContext<'a> {
                 self.annotate(ann);
             }
 
-            let ts = crate::worker::job_runner::iso_now();
+            let ts = crate::worker::helpers::iso_now();
             format!("{ts} {prefix}{masked}")
         } else {
-            let ts = crate::worker::job_runner::iso_now();
+            let ts = crate::worker::helpers::iso_now();
             format!("{ts} {masked}")
         };
 
