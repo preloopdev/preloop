@@ -23,6 +23,8 @@ use recording::*;
 mod state;
 pub use state::{AppState, SharedState};
 use state::*;
+mod models;
+use models::*;
 mod bootstrap;
 pub use bootstrap::{generate_self_signed_cert, serve, SelfSignedCert, ServerConfig, TlsMode};
 #[cfg(test)]
@@ -779,133 +781,6 @@ fn bearer_token(request: &Request) -> Option<&str> {
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-}
-
-#[derive(Debug, Clone)]
-struct DapPortRegistration {
-    port: u16,
-    job_id: JobId,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct StepRecord {
-    pub(crate) name: String,
-    pub(crate) conclusion: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct JobDetail {
-    pub(crate) name: String,
-    pub(crate) conclusion: String,
-    pub(crate) steps: Vec<StepRecord>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct RunRecord {
-    pub(crate) run_id: RunId,
-    pub(crate) submission: WorkflowSubmission,
-    pub(crate) jobs: BTreeMap<JobId, ExecutionStatus>,
-    pub(crate) status: ExecutionStatus,
-    pub(crate) job_outputs: BTreeMap<JobId, BTreeMap<String, serde_json::Value>>,
-    pub(crate) job_base_ids: BTreeMap<JobId, String>,
-    #[serde(skip)]
-    pub(crate) job_needs: BTreeMap<JobId, Vec<JobId>>,
-    pub(crate) job_fail_fast: BTreeMap<String, bool>,
-    #[serde(default)]
-    pub(crate) job_check_run_ids: BTreeMap<JobId, u64>,
-    #[serde(default)]
-    pub(crate) reusable_calls: BTreeMap<String, aksh_gha_parser::ReusableCallMetadata>,
-    #[serde(default)]
-    pub(crate) jobs_list: Vec<JobDetail>,
-}
-
-#[derive(Debug, Clone)]
-struct TaskAgentJobRequestRecord {
-    request_id: i64,
-    run_id: RunId,
-    job_id: JobId,
-    agent_job_id: uuid::Uuid,
-    plan_id: String,
-    plan_type: String,
-    timeline_id: uuid::Uuid,
-    result: Option<ExecutionStatus>,
-    locked_until: String,
-    started_at: Option<std::time::SystemTime>,
-    last_renewed_at: Option<std::time::SystemTime>,
-    timeout_triggered: bool,
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct QueuedJob {
-    run_id: RunId,
-    job_id: JobId,
-    base_id: String,
-    needs: Vec<JobId>,
-    if_condition: Option<String>,
-    condition_context: aksh_gha_expressions::Context,
-    fail_fast: bool,
-    max_parallel: Option<u64>,
-    /// Required runner labels from `runs-on`.
-    runs_on: Vec<String>,
-    message: azdo::AgentJobRequestMessage,
-    /// Raw job-level concurrency (evaluated when the job becomes ready).
-    concurrency: Option<aksh_gha_parser::Concurrency>,
-    /// Matrix values for this expansion (for concurrency expression eval).
-    matrix: BTreeMap<String, serde_json::Value>,
-}
-
-#[derive(Debug, Clone)]
-struct QueuedCancellation {
-    run_id: RunId,
-    job_id: JobId,
-    /// Agent job GUID from the job message (`jobId`), required for official JobCancelMessage.
-    agent_job_id: uuid::Uuid,
-}
-
-#[derive(Debug, Clone)]
-struct PendingCache {
-    key: String,
-    version: String,
-    bytes: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ArtifactRecord {
-    id: String,
-    run_id: RunId,
-    name: String,
-    file_name: String,
-    path: String,
-    size: u64,
-}
-
-/// Pending cache v2 upload (Twirp CacheService).
-#[derive(Debug)]
-struct CacheV2Pending {
-    key: String,
-    version: String,
-}
-
-/// Pending artifact v2 upload (Twirp ArtifactService).
-#[derive(Debug)]
-struct ArtifactV2Pending {
-    /// Registry key = "{run_backend_id}/{job_backend_id}/{name}".
-    registry_key: String,
-}
-
-/// Finalized artifact v2 entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ArtifactV2Entry {
-    id: u64,
-    workflow_run_backend_id: String,
-    workflow_job_run_backend_id: String,
-    name: String,
-    size: u64,
-    created_at: String,
-    digest: Option<String>,
-    /// Upload token used to find the assembled blob on disk.
-    blob_token: String,
 }
 
 // Re-export from protocol crate — shared wire type with the runner.
