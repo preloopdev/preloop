@@ -111,8 +111,7 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
         // 2. Check Lease Expiration / Disconnect Reaper
         if let Some(last_renewed_at) = last_renewed_at {
             let elapsed = now.duration_since(last_renewed_at).unwrap_or_default();
-            // 120 seconds disconnect threshold
-            if elapsed >= Duration::from_secs(120) {
+            if elapsed >= Duration::from_secs(JOB_LEASE_SECONDS) {
                 info!(
                     %run_id,
                     %job_id,
