@@ -28,7 +28,7 @@ pub struct ServiceEndpoint {
     pub data: BTreeMap<String, String>,
     #[serde(rename = "name")]
     pub name: String,
-    #[serde(skip)]
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub endpoint_type: Option<String>,
     #[serde(rename = "url", skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
@@ -38,7 +38,7 @@ pub struct ServiceEndpoint {
     pub is_shared: Option<bool>,
     #[serde(rename = "isReady", skip_serializing_if = "Option::is_none")]
     pub is_ready: Option<bool>,
-    #[serde(skip)]
+    #[serde(rename = "serviceOwner", skip_serializing_if = "Option::is_none")]
     pub service_owner: Option<String>,
 }
 
