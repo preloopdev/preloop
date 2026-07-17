@@ -370,7 +370,7 @@ impl Scheduler {
             warn!("scheduler: remote startup scan requires AKSH_GITHUB_REPOSITORY and AKSH_GITHUB_TOKEN");
             return;
         };
-        let client = reqwest::Client::new();
+        let client = crate::shared_http::CLIENT.clone();
         let metadata = match client
             .get(format!("https://api.github.com/repos/{repository}"))
             .header("User-Agent", "aksh")

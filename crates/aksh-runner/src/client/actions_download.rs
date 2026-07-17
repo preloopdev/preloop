@@ -192,7 +192,9 @@ impl ActionsDownloadClient {
     /// Download an action tarball.
     pub async fn download_tarball(&self, url: &str, token: Option<&str>) -> Result<bytes::Bytes> {
         if let Some(t) = token {
-            let resp = reqwest::Client::new()
+            let resp = self
+                .http
+                .inner_client()
                 .get(url)
                 .header("Authorization", format!("Bearer {t}"))
                 .send()
