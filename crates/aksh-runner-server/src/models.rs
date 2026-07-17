@@ -55,7 +55,6 @@ pub(crate) struct TaskAgentJobRequestRecord {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct QueuedJob {
     pub(crate) run_id: RunId,
     pub(crate) job_id: JobId,
@@ -63,7 +62,6 @@ pub(crate) struct QueuedJob {
     pub(crate) needs: Vec<JobId>,
     pub(crate) if_condition: Option<String>,
     pub(crate) condition_context: aksh_gha_expressions::Context,
-    pub(crate) fail_fast: bool,
     pub(crate) max_parallel: Option<u64>,
     /// Required runner labels from `runs-on`.
     pub(crate) runs_on: Vec<String>,

@@ -29,7 +29,6 @@ sha2.workspace = true
 sha1.workspace = true
 rand.workspace = true
 reqwest.workspace = true
-thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tower-http.workspace = true

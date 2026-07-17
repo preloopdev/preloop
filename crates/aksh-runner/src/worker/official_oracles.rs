@@ -11,7 +11,7 @@
 //! - `src/Sdk/WorkflowParser/Conversion/MatrixBuilder.cs` documented examples
 //! - Live GitHub run for `p0-failure-conditions.yml` (docs/test-coverage.md)
 
-use super::step_conditions::{evaluate_step_condition, StatusFlags};
+use super::step_conditions::StatusFlags;
 
 /// Official `ActionResult` / `JobContext.Status` values.
 ///
@@ -124,6 +124,7 @@ pub fn official_effective_condition(raw: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worker::step_conditions::evaluate_step_condition;
     use proptest::prelude::*;
 
     /// ConditionFunctionsL0 — exact table, no generation.

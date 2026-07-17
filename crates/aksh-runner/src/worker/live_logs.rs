@@ -6,7 +6,6 @@
 
 use futures::SinkExt;
 use rand::Rng;
-use serde::Serialize;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};

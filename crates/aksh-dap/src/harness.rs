@@ -27,13 +27,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 use thiserror::Error;
-use tokio::io::AsyncReadExt;
-use tokio::net::TcpStream;
 
-use crate::framing::{read_message, write_message};
-use crate::messages::{Event, ProtocolMessage, Request, Response};
+use crate::messages::Request;
 use crate::view::{PredictedPostStep, SourceEntry};
 
 /// A captured/framed DAP message plus its direction.
