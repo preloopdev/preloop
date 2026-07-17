@@ -140,6 +140,12 @@ pub enum ExpressionError {
     /// Unknown function.
     #[error("unknown function `{0}`")]
     UnknownFunction(String),
+    /// Invalid `format()` template or argument reference.
+    #[error("invalid format string: {0}")]
+    InvalidFormat(String),
+    /// Invalid leading option passed to `hashFiles()`.
+    #[error("invalid hashFiles option `{0}`")]
+    InvalidHashFilesOption(String),
 }
 
 /// Parse an expression without evaluating it.
@@ -244,10 +250,9 @@ pub fn is_truthy(value: &Value) -> bool {
     match value {
         Value::Null => false,
         Value::Bool(value) => *value,
-        Value::Number(number) => number.as_f64().is_some_and(|n| n != 0.0),
+        Value::Number(number) => number.as_f64().is_some_and(|n| n != 0.0 && !n.is_nan()),
         Value::String(value) => !value.is_empty(),
-        Value::Array(values) => !values.is_empty(),
-        Value::Object(values) => !values.is_empty(),
+        Value::Array(_) | Value::Object(_) => true,
     }
 }
 
@@ -339,11 +344,11 @@ fn eval(expr: &Expr, context: &Context) -> Result<Value, ExpressionError> {
                     Ok(left)
                 }
             }
-            BinaryOp::Eq => Ok(Value::Bool(values_equal(
+            BinaryOp::Eq => Ok(Value::Bool(abstract_equal(
                 &eval(left, context)?,
                 &eval(right, context)?,
             ))),
-            BinaryOp::Ne => Ok(Value::Bool(!values_equal(
+            BinaryOp::Ne => Ok(Value::Bool(!abstract_equal(
                 &eval(left, context)?,
                 &eval(right, context)?,
             ))),
@@ -376,10 +381,22 @@ fn eval(expr: &Expr, context: &Context) -> Result<Value, ExpressionError> {
     }
 }
 
-fn values_equal(left: &Value, right: &Value) -> bool {
+fn abstract_equal(left: &Value, right: &Value) -> bool {
     match (left, right) {
+        (Value::Null, Value::Null) => true,
+        (Value::Bool(left), Value::Bool(right)) => left == right,
+        (Value::Number(left), Value::Number(right)) => left.as_f64() == right.as_f64(),
         (Value::String(left), Value::String(right)) => left.eq_ignore_ascii_case(right),
-        _ => left == right,
+        (Value::Array(_), Value::Array(_)) | (Value::Object(_), Value::Object(_)) => {
+            std::ptr::eq(left, right)
+        }
+        (Value::Array(_) | Value::Object(_), _) | (_, Value::Array(_) | Value::Object(_)) => false,
+        _ => {
+            let left = numeric_value(left);
+            let right = numeric_value(right);
+            left.zip(right)
+                .is_some_and(|(left, right)| !left.is_nan() && !right.is_nan() && left == right)
+        }
     }
 }
 
@@ -397,11 +414,73 @@ fn compare_values(
 fn numeric_value(value: &Value) -> Option<f64> {
     match value {
         Value::Number(value) => value.as_f64(),
-        Value::String(value) => value.parse().ok(),
+        Value::String(value) => Some(parse_number(value)),
         Value::Bool(true) => Some(1.0),
         Value::Bool(false) | Value::Null => Some(0.0),
         _ => None,
     }
+}
+
+fn parse_number(value: &str) -> f64 {
+    let value = value.trim();
+    if value.is_empty() {
+        return 0.0;
+    }
+    if value == "Infinity" {
+        return f64::INFINITY;
+    }
+    if value == "-Infinity" {
+        return f64::NEG_INFINITY;
+    }
+    if let Some(hex) = value.strip_prefix("0x") {
+        return i32::from_str_radix(hex, 16)
+            .map(f64::from)
+            .unwrap_or(f64::NAN);
+    }
+    if let Some(octal) = value.strip_prefix("0o") {
+        return i32::from_str_radix(octal, 8)
+            .map(f64::from)
+            .unwrap_or(f64::NAN);
+    }
+    if is_decimal_number(value) {
+        value.parse().unwrap_or(f64::NAN)
+    } else {
+        f64::NAN
+    }
+}
+
+fn is_decimal_number(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
+    let mut digits = 0;
+    while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+        index += 1;
+        digits += 1;
+    }
+    if bytes.get(index) == Some(&b'.') {
+        index += 1;
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+            digits += 1;
+        }
+    }
+    if digits == 0 {
+        return false;
+    }
+    if matches!(bytes.get(index), Some(b'e' | b'E')) {
+        index += 1;
+        if matches!(bytes.get(index), Some(b'+' | b'-')) {
+            index += 1;
+        }
+        let exponent_start = index;
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+        if index == exponent_start {
+            return false;
+        }
+    }
+    index == bytes.len()
 }
 
 fn eval_call(name: &str, args: &[Expr], context: &Context) -> Result<Value, ExpressionError> {
@@ -422,18 +501,22 @@ fn eval_call(name: &str, args: &[Expr], context: &Context) -> Result<Value, Expr
             )))
         }
         "startswith" => Ok(Value::Bool(
-            string_arg(&values, 0).starts_with(&string_arg(&values, 1)),
+            string_arg(&values, 0)
+                .to_ascii_lowercase()
+                .starts_with(&string_arg(&values, 1).to_ascii_lowercase()),
         )),
         "endswith" => Ok(Value::Bool(
-            string_arg(&values, 0).ends_with(&string_arg(&values, 1)),
+            string_arg(&values, 0)
+                .to_ascii_lowercase()
+                .ends_with(&string_arg(&values, 1).to_ascii_lowercase()),
         )),
-        "format" => Ok(Value::String(format_args(&values))),
+        "format" => format_args(&values).map(Value::String),
         "fromjson" => Ok(values
             .first()
             .and_then(|value| serde_json::from_str(&string_value(value)).ok())
             .unwrap_or(Value::Null)),
         "join" => Ok(Value::String(join_args(&values))),
-        "hashfiles" => Ok(Value::String(hash_files(&values, context))),
+        "hashfiles" => hash_files(&values, context).map(Value::String),
         "tojson" => Ok(Value::String(
             serde_json::to_string(values.first().unwrap_or(&Value::Null)).unwrap_or_default(),
         )),
@@ -446,7 +529,7 @@ fn contains(haystack: &Value, needle: &Value) -> bool {
         Value::String(value) => value
             .to_ascii_lowercase()
             .contains(&string_value(needle).to_ascii_lowercase()),
-        Value::Array(values) => values.iter().any(|value| values_equal(value, needle)),
+        Value::Array(values) => values.iter().any(|value| abstract_equal(value, needle)),
         _ => false,
     }
 }
@@ -482,15 +565,64 @@ fn string_value(value: &Value) -> String {
     }
 }
 
-fn format_args(values: &[Value]) -> String {
-    let mut out = string_arg(values, 0);
-    for (index, value) in values.iter().enumerate().skip(1) {
-        out = out.replace(&format!("{{{}}}", index - 1), &string_value(value));
+fn format_args(values: &[Value]) -> Result<String, ExpressionError> {
+    let format = string_arg(values, 0);
+    let bytes = format.as_bytes();
+    let mut output = String::with_capacity(format.len());
+    let mut segment_start = 0;
+    let mut index = 0;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'{' => {
+                output.push_str(&format[segment_start..index]);
+                if bytes.get(index + 1) == Some(&b'{') {
+                    output.push('{');
+                    index += 2;
+                    segment_start = index;
+                    continue;
+                }
+
+                let digit_start = index + 1;
+                let mut cursor = digit_start;
+                while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+                    cursor += 1;
+                }
+                if cursor == digit_start {
+                    return Err(ExpressionError::InvalidFormat(format));
+                }
+                let argument_index = format[digit_start..cursor]
+                    .parse::<u8>()
+                    .map_err(|_| ExpressionError::InvalidFormat(format.clone()))?
+                    as usize;
+                match bytes.get(cursor) {
+                    Some(b'}') => {}
+                    Some(b':') => {
+                        return Err(ExpressionError::InvalidFormat(format));
+                    }
+                    _ => return Err(ExpressionError::InvalidFormat(format)),
+                }
+                let value = values
+                    .get(argument_index + 1)
+                    .ok_or_else(|| ExpressionError::InvalidFormat(format.clone()))?;
+                output.push_str(&string_value(value));
+                index = cursor + 1;
+                segment_start = index;
+            }
+            b'}' => {
+                output.push_str(&format[segment_start..index]);
+                if bytes.get(index + 1) != Some(&b'}') {
+                    return Err(ExpressionError::InvalidFormat(format));
+                }
+                output.push('}');
+                index += 2;
+                segment_start = index;
+            }
+            _ => index += 1,
+        }
     }
-    // Handle escaped braces: {{ → { and }} → }
-    // (matches C#'s String.Format / GitHub Actions format() behavior)
-    out = out.replace("{{", "{").replace("}}", "}");
-    out
+    output.push_str(&format[segment_start..]);
+    Ok(output)
 }
 
 fn join_args(values: &[Value]) -> String {
@@ -515,12 +647,12 @@ fn join_args(values: &[Value]) -> String {
 /// F055: Supports `--follow-symbolic-links` as an optional first argument.
 /// When set, symbolic links are followed during file enumeration.
 /// Matches official `HashFilesFunction.cs:44-51`.
-fn hash_files(values: &[Value], context: &Context) -> String {
+fn hash_files(values: &[Value], context: &Context) -> Result<String, ExpressionError> {
     use sha2::{Digest, Sha256};
 
     let workspace = match &context.workspace_dir {
         Some(dir) => dir.as_str(),
-        None => return String::new(),
+        None => return Ok(String::new()),
     };
 
     // F055: Parse optional flags from the first argument.
@@ -540,10 +672,7 @@ fn hash_files(values: &[Value], context: &Context) -> String {
                     follow_symlinks = true;
                     continue;
                 }
-                // Official throws on unknown flags; we silently skip to avoid
-                // breaking expressions, but the pattern won't match anything
-                // useful either way.
-                continue;
+                return Err(ExpressionError::InvalidHashFilesOption(s));
             }
         }
         patterns.push(s);
@@ -586,7 +715,7 @@ fn hash_files(values: &[Value], context: &Context) -> String {
     }
 
     if all_paths.is_empty() {
-        return String::new();
+        return Ok(String::new());
     }
 
     all_paths.sort();
@@ -606,12 +735,12 @@ fn hash_files(values: &[Value], context: &Context) -> String {
     }
 
     if combined.is_empty() {
-        return String::new();
+        return Ok(String::new());
     }
 
     // Hash the concatenated binary digests
     let final_hash = Sha256::digest(&combined);
-    format!("{final_hash:x}")
+    Ok(format!("{final_hash:x}"))
 }
 
 #[derive(Debug, Clone, PartialEq)]
