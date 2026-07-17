@@ -4703,11 +4703,10 @@ jobs:
 }
 
 #[tokio::test]
-async fn empty_workflow_concurrency_group_creates_zero_job_failure() {
+async fn empty_workflow_concurrency_group_is_rejected() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
-    let mut events = state.events.subscribe();
-    let app = app(state.clone(), CancellationToken::new());
+    let app = app(state, CancellationToken::new());
     let response = app
         .oneshot(
             Request::builder()
@@ -4737,44 +4736,14 @@ jobs:
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    let accepted: RunAccepted = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(accepted.queued_jobs, 0);
-
-    let accepted_event = events.recv().await.unwrap();
-    assert!(matches!(
-        accepted_event,
-        NdjsonEvent::RunAccepted { run_id, queued_jobs }
-            if run_id == accepted.run_id && queued_jobs == 0
-    ));
-    let failed_event = events.recv().await.unwrap();
-    assert!(matches!(
-        failed_event,
-        NdjsonEvent::RunStatus {
-            run_id,
-            status: ExecutionStatus::Failure,
-            reason: Some(reason),
-        } if run_id == accepted.run_id && reason.contains("must not be empty")
-    ));
-
-    let inner = state.inner.lock().await;
-    let record = &inner.runs[&accepted.run_id];
-    assert_eq!(record.status, ExecutionStatus::Failure);
-    assert!(record.jobs.is_empty());
-    assert!(!inner
-        .job_requests
-        .values()
-        .any(|request| request.run_id == accepted.run_id));
-    assert!(!inner.queue.iter().any(|job| job.run_id == accepted.run_id));
-    assert!(!inner
-        .pending_jobs
-        .iter()
-        .any(|job| job.run_id == accepted.run_id));
-    assert!(!inner
-        .concurrency_blocked
-        .iter()
-        .any(|job| job.run_id == accepted.run_id));
+    let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        error["error"],
+        "concurrency evaluation failed: concurrency group name must not be empty"
+    );
 }
 
 #[tokio::test]
