@@ -55,7 +55,7 @@ each phase, follow the dependency notes.
 | Plan | Title | Priority | Effort | Risk | Depends on | Status |
 |------|-------|----------|--------|------|------------|--------|
 | 012 | Move oversized inline test suites out of production modules (**do first**) | P1 | M | LOW→MED | — | DONE (nine sibling test modules; exact bodies preserved) |
-| 013 | Unify matrix expansion on one implementation (orphan `matrix_expand.rs` vs live copy) | P1 | M | HIGH | 012 (soft) | TODO (NEW; also a correctness fix) |
+| 013 | Unify matrix expansion on one implementation (orphan `matrix_expand.rs` vs live copy) | P1 | M | HIGH | 012 (soft) | DONE (official MatrixBuilder include/exclude semantics; one compiled implementation; 84 parser tests) |
 | 014 | Consolidate duplicated core logic: `PipelineContextData` conv (fixes null bug), expr-context builder, secret masker | P1/P2 | M | MED | 012 | DONE (A: canonical from_json/to_json, null bug fixed; B: job_condition_context→build_context; C: shared masker, server longest-first bug fixed) |
 | 015 | Decompose `aksh-runner-server/src/lib.rs` (15K→modules), staged pure moves | P2 | L | MED→HIGH | 012, 014 | TODO (NEW) |
 | 016 | Decompose the worker engine (`job_runner`/`steps_runner`/`job_extension`) + dedupe action inputs | P2 | L | HIGH | 012, 014 | TODO (NEW) |
