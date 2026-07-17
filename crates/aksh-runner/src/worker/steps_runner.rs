@@ -74,7 +74,7 @@ pub async fn run_steps(
     let has_containers = container_spec.is_some() || !service_specs.is_empty();
     let mut any_failed = false;
     let mut cancelled = false;
-    let now = crate::worker::job_runner::iso_now();
+    let now = crate::worker::helpers::iso_now();
 
     // F019: Queue initial "Set up job" step as completed (number 1, official convention)
     let setup_step_id = uuid::Uuid::new_v4().to_string();
@@ -104,7 +104,7 @@ pub async fn run_steps(
             .ok()
             .and_then(|h| h.into_string().ok())
             .unwrap_or_else(|| "unknown".to_string());
-        let ts = crate::worker::job_runner::iso_now();
+        let ts = crate::worker::helpers::iso_now();
 
         let mut setup_lines = Vec::new();
         setup_lines.push(format!(
@@ -139,13 +139,13 @@ pub async fn run_steps(
             q.record_step_logs(&setup_step_id, &setup_content);
         }
         if let Some(rpt) = reporting {
-            crate::worker::job_runner::upload_step_log(rpt, &setup_step_id, &setup_content).await;
+            crate::worker::reporting::upload_step_log(rpt, &setup_step_id, &setup_content).await;
         }
     }
 
     // Phase 2: Initialize containers step (step 2 when containers present)
     let step_offset: u32 = if has_containers {
-        let init_start = crate::worker::job_runner::iso_now();
+        let init_start = crate::worker::helpers::iso_now();
         let init_step_id = uuid::Uuid::new_v4().to_string();
         {
             let mut q = queue.lock().await;
@@ -169,7 +169,7 @@ pub async fn run_steps(
             Err(_) => Vec::new(),
         };
 
-        let init_end = crate::worker::job_runner::iso_now();
+        let init_end = crate::worker::helpers::iso_now();
         let init_conclusion = if init_result.is_ok() {
             step_conclusion::SUCCEEDED
         } else {
@@ -197,7 +197,7 @@ pub async fn run_steps(
             // Upload init container logs
             if !init_logs.is_empty() {
                 let content = init_logs.join("\n");
-                crate::worker::job_runner::upload_step_log(rpt, &init_step_id, &content).await;
+                crate::worker::reporting::upload_step_log(rpt, &init_step_id, &content).await;
             }
         }
 
@@ -270,7 +270,7 @@ pub async fn run_steps(
                     },
                 );
                 // F019: Queue skipped step
-                let ts = crate::worker::job_runner::iso_now();
+                let ts = crate::worker::helpers::iso_now();
                 {
                     let mut q = queue.lock().await;
                     q.queue_update(StepUpdate {
@@ -300,7 +300,7 @@ pub async fn run_steps(
                         outputs: std::collections::HashMap::new(),
                     },
                 );
-                let ts = crate::worker::job_runner::iso_now();
+                let ts = crate::worker::helpers::iso_now();
                 {
                     let mut q = queue.lock().await;
                     q.queue_update(StepUpdate {
@@ -318,7 +318,7 @@ pub async fn run_steps(
         }
 
         info!("Running step: {}", resolved_display_name);
-        let step_start = crate::worker::job_runner::iso_now();
+        let step_start = crate::worker::helpers::iso_now();
 
         // F019: Queue InProgress update
         {
@@ -579,7 +579,7 @@ pub async fn run_steps(
             }
         }
 
-        let step_end = crate::worker::job_runner::iso_now();
+        let step_end = crate::worker::helpers::iso_now();
         let conclusion_proto = ServerQueue::conclusion_to_proto(&conclusion_str);
         // F035: Read and scrub step summary content before cleanup deletes the file.
         let summary_content = if let Ok(metadata) =
@@ -658,18 +658,18 @@ pub async fn run_steps(
         // so GitHub's UI shows the failure before post/always steps run.
         if (conclusion_str == "Failure" || conclusion_str == "Cancelled") && reporting.is_some() {
             if let Some(rpt) = reporting {
-                crate::worker::job_runner::flush_step_updates(rpt, &queue).await;
+                crate::worker::reporting::flush_step_updates(rpt, &queue).await;
             }
         }
 
         // F020: Upload step log immediately after completion
         if let Some(rpt) = reporting {
             if !log_content.is_empty() {
-                crate::worker::job_runner::upload_step_log(rpt, &step.id, &log_content).await;
+                crate::worker::reporting::upload_step_log(rpt, &step.id, &log_content).await;
             }
             // F035: Upload step summary if non-empty
             if !summary_content.is_empty() {
-                crate::worker::job_runner::upload_step_summary(rpt, &step.id, &summary_content)
+                crate::worker::reporting::upload_step_summary(rpt, &step.id, &summary_content)
                     .await;
             }
         }
@@ -679,7 +679,7 @@ pub async fn run_steps(
     let mut extra_steps = 0u32;
     if has_containers {
         extra_steps += 1;
-        let stop_start = crate::worker::job_runner::iso_now();
+        let stop_start = crate::worker::helpers::iso_now();
         let stop_step_number = step_offset + steps.len() as u32;
         let stop_step_id = uuid::Uuid::new_v4().to_string();
         {
@@ -707,7 +707,7 @@ pub async fn run_steps(
             }
         }
 
-        let stop_end = crate::worker::job_runner::iso_now();
+        let stop_end = crate::worker::helpers::iso_now();
         {
             let mut q = queue.lock().await;
             q.queue_update(StepUpdate {
@@ -728,13 +728,13 @@ pub async fn run_steps(
             // Upload cleanup logs
             if !cleanup_log.is_empty() {
                 let content = cleanup_log.join("\n");
-                crate::worker::job_runner::upload_step_log(rpt, &stop_step_id, &content).await;
+                crate::worker::reporting::upload_step_log(rpt, &stop_step_id, &content).await;
             }
         }
     }
 
     // F019: Queue "Complete job" step
-    let ts = crate::worker::job_runner::iso_now();
+    let ts = crate::worker::helpers::iso_now();
     // Step number: step_offset + user_steps + extra_steps (stop containers) + 1
     let complete_step_number = step_offset + steps.len() as u32 + extra_steps;
     let final_conclusion = if cancelled || any_failed {
@@ -765,7 +765,7 @@ pub async fn run_steps(
             q.record_step_logs(&complete_step_id, &complete_content);
         }
         if let Some(rpt) = reporting {
-            crate::worker::job_runner::upload_step_log(rpt, &complete_step_id, &complete_content)
+            crate::worker::reporting::upload_step_log(rpt, &complete_step_id, &complete_content)
                 .await;
         }
     }
