@@ -521,8 +521,7 @@ pub(crate) fn build_app(
         // P1.10: Accept blob uploads at the signed-URL paths minted by the Twirp handlers.
         // The runner PUTs logs/summaries here; we store them in the state directory.
         .route("/replay/results/*path", put(replay_results_put))
-        // Twirp results-service routes — outside require_bearer so the runner's
-        // job token (which uses a different signing key) is accepted.
+        // Twirp APIs accept only the system token or a locally signed Actions.Results job token.
         .route(
             "/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate",
             post(twirp_workflow_steps_update),
@@ -551,9 +550,12 @@ pub(crate) fn build_app(
             "/twirp/results.services.receiver.Receiver/CreateJobLogsMetadata",
             post(twirp_create_job_logs_metadata),
         )
+        .route(
+            "/twirp/results.services.receiver.Receiver/GetJobDiagLogsSignedBlobURL",
+            post(twirp_get_job_diag_logs_signed_blob_url),
+        )
         // Cache v2 Twirp (CacheService) — used by actions/cache@v4 when ACTIONS_CACHE_SERVICE_V2=true.
-        // Auth: bearer from job runtime token (verified by having correct scp in the JWT).
-        // These routes are outside require_bearer because the job JWT uses its own signing context.
+        // The shared Twirp middleware below validates the job token before body extraction.
         .route(
             "/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry",
             post(twirp_cache_v2_create),
@@ -591,6 +593,10 @@ pub(crate) fn build_app(
         // Cache: /twirp-blob/cache/{token}
         // Artifact: /twirp-blob/artifact/{token}  (download URL appends .zip for content-type detection)
         .route("/twirp-blob/:kind/:token", put(blob_put).get(blob_get))
+        .route_layer(middleware::from_fn_with_state(
+            shared.clone(),
+            require_results_bearer,
+        ))
         .merge(protected_apis)
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
