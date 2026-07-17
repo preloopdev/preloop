@@ -127,7 +127,7 @@ async fn send_github_check_request(
     path: &str,
     body: Value,
 ) -> anyhow::Result<Value> {
-    let client = reqwest::Client::new();
+    let client = crate::shared_http::CLIENT.clone();
     let url = format!("https://api.github.com/repos/{}/{}", repo, path);
     let res = client
         .request(method, &url)
@@ -362,7 +362,7 @@ async fn fetch_remote_workflows(
     repo: &str,
     git_ref: &str,
 ) -> anyhow::Result<BTreeMap<String, String>> {
-    let client = reqwest::Client::new();
+    let client = crate::shared_http::CLIENT.clone();
     let url = format!(
         "https://api.github.com/repos/{}/contents/.github/workflows?ref={}",
         repo, git_ref
@@ -440,7 +440,8 @@ async fn resolve_ref_sha(
         .strip_prefix("refs/heads/")
         .or_else(|| git_ref.strip_prefix("refs/tags/"))
         .unwrap_or(git_ref);
-    let response = reqwest::Client::new()
+    let response = crate::shared_http::CLIENT
+        .clone()
         .get(format!(
             "https://api.github.com/repos/{repository}/commits/{commit_ref}"
         ))
@@ -461,7 +462,7 @@ async fn get_pr_changed_files(
     repo: &str,
     pr_number: u64,
 ) -> anyhow::Result<Vec<String>> {
-    let client = reqwest::Client::new();
+    let client = crate::shared_http::CLIENT.clone();
     let mut page = 1;
     let mut all_files = Vec::new();
 
@@ -862,7 +863,7 @@ pub(crate) async fn github_callback(
     State(shared): State<Arc<SharedState>>,
     Query(params): Query<CallbackQuery>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let client = reqwest::Client::new();
+    let client = crate::shared_http::CLIENT.clone();
     let api_base = std::env::var("AKSH_GITHUB_API_URL")
         .unwrap_or_else(|_| "https://api.github.com".to_owned());
     let url = format!("{}/app-manifests/{}/conversions", api_base, params.code);
