@@ -2234,6 +2234,164 @@ async fn protected_apis_require_bearer_token() {
 }
 
 #[tokio::test]
+async fn all_twirp_api_routes_reject_missing_bearer_before_body_validation() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = app(
+        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        CancellationToken::new(),
+    );
+
+    // The malformed body proves auth runs before any route-specific JSON extractor.
+    let routes = [
+        "/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate",
+        "/twirp/results.services.receiver.Receiver/GetJobLogsSignedBlobURL",
+        "/twirp/results.services.receiver.Receiver/GetJobDiagLogsSignedBlobURL",
+        "/twirp/results.services.receiver.Receiver/GetStepLogsSignedBlobURL",
+        "/twirp/results.services.receiver.Receiver/GetStepSummarySignedBlobURL",
+        "/twirp/results.services.receiver.Receiver/CreateStepSummaryMetadata",
+        "/twirp/results.services.receiver.Receiver/CreateStepLogsMetadata",
+        "/twirp/results.services.receiver.Receiver/CreateJobLogsMetadata",
+        "/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry",
+        "/twirp/github.actions.results.api.v1.CacheService/FinalizeCacheEntryUpload",
+        "/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL",
+        "/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact",
+        "/twirp/github.actions.results.api.v1.ArtifactService/FinalizeArtifact",
+        "/twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts",
+        "/twirp/github.actions.results.api.v1.ArtifactService/GetSignedArtifactURL",
+        "/twirp/github.actions.results.api.v1.ArtifactService/DeleteArtifact",
+    ];
+
+    for route in routes {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(route)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{route}");
+    }
+}
+
+#[tokio::test]
+async fn twirp_diag_route_rejects_runner_listen_scope() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let plan_id = uuid::Uuid::new_v4().to_string();
+    let job_id = uuid::Uuid::new_v4();
+    let runner_listen_token = state
+        .local_jwt(json!({
+            "sub": "aksh-runner-listen-1",
+            "scp": "ActionsRuntime.RunnerListen",
+        }))
+        .unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/twirp/results.services.receiver.Receiver/GetJobDiagLogsSignedBlobURL")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {runner_listen_token}"),
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "workflow_run_backend_id": plan_id,
+                        "workflow_job_run_backend_id": job_id.to_string(),
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn twirp_diag_route_issues_random_blob_url_and_accepts_bearerless_upload() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let plan_id = uuid::Uuid::new_v4().to_string();
+    let job_id = uuid::Uuid::new_v4();
+    let runtime_token = state.mint_runtime_token(&plan_id, &job_id);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/twirp/results.services.receiver.Receiver/GetJobDiagLogsSignedBlobURL")
+                .header(header::AUTHORIZATION, format!("Bearer {runtime_token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "workflow_run_backend_id": plan_id,
+                        "workflow_job_run_backend_id": job_id.to_string(),
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(payload["blob_storage_type"], "BLOB_STORAGE_TYPE_AZURE");
+
+    let diag_url = payload["diag_logs_url"].as_str().unwrap();
+    assert!(!diag_url.is_empty());
+    let (_, blob_token) = diag_url
+        .split_once("/twirp-blob/diag/")
+        .expect("diagnostic URL must use the bearerless diag blob endpoint");
+    let blob_uuid = uuid::Uuid::parse_str(blob_token).expect("diagnostic token must be a UUID");
+    assert_eq!(blob_uuid.as_bytes()[6] >> 4, 4, "token must be UUIDv4");
+    assert_eq!(
+        blob_uuid.as_bytes()[8] & 0xc0,
+        0x80,
+        "token must use RFC 4122 variant"
+    );
+
+    let bytes = b"diagnostic log bytes";
+    let upload = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(diag_url)
+                .body(Body::from(bytes.as_slice()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(upload.status(), StatusCode::CREATED);
+
+    let downloaded = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(diag_url)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(downloaded.status(), StatusCode::OK);
+    let downloaded_bytes = to_bytes(downloaded.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(downloaded_bytes.as_ref(), bytes);
+}
+
+#[tokio::test]
 async fn native_api_rejects_job_runtime_token() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();

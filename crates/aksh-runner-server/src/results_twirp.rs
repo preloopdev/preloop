@@ -101,6 +101,16 @@ pub(crate) async fn twirp_get_job_logs_signed_blob_url(
     }))
 }
 
+pub(crate) async fn twirp_get_job_diag_logs_signed_blob_url(
+    Json(_request): Json<JobLogsSignedBlobUrlRequest>,
+) -> Json<serde_json::Value> {
+    let token = uuid::Uuid::new_v4();
+    Json(json!({
+        "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
+        "diag_logs_url": format!("{}/twirp-blob/diag/{token}", public_base_url()),
+    }))
+}
+
 pub(crate) async fn twirp_get_step_logs_signed_blob_url(
     Json(request): Json<StepLogsSignedBlobUrlRequest>,
 ) -> Json<serde_json::Value> {
