@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 5f1b561495aa9ed75bb22c55de8f706c3470516b4422551c333cb98c58a24a9a # shrinks to job = AgentJobRequestMessage { message_type: Some("PipelineAgentJobRequest"), job_id: 00000000-0000-0000-0000-000000000000, request_id: 0, plan: PlanReference { scope_identifier: "", plan_id: "", plan_type: "", version: 0, artifact_uri: "", artifact_location: "" }, timeline: TimelineReference { id: 00000000-0000-0000-0000-000000000000, change_id: 0, location: None }, job_display_name: None, job_name: "__job", locked_until: "0001-01-01T00:00:00", billing_owner_id: None, file_table: [], defaults: [], environment_variables: [], snapshot: None, condition: None, variables: {}, mask_hints: [], resources: TaskResources { endpoints: [], repositories: [] }, context_data: {}, steps: [], retry_count: None, pre_job_timeout: None, job_timeout: None, job_container: None, job_service_containers: None, job_outputs: None, enable_debugger: false, debugger_tunnel: None, debugger_welcome_message: None, aksh_debug_run_id: None, aksh_debug_transport: None }

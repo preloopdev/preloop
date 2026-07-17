@@ -13,14 +13,11 @@
 //! This module wires `ServerQueue`, `ResultsClient`, and `RunServiceClient` to
 //! implement the full reporting lifecycle.
 
-use super::action_preparation::{parse_remote_uses, prepare_remote_actions};
+use super::action_preparation::prepare_remote_actions;
 use super::completion::{make_hook_step, report_completion};
 use super::helpers::{extract_results_url, extract_service_endpoint, iso_now};
-use super::reporting::{
-    diagnostic_logs_url, flush_step_updates, upload_diagnostic_logs, upload_job_log,
-};
+use super::reporting::{flush_step_updates, upload_diagnostic_logs, upload_job_log};
 use super::server_queue::ServerQueue;
-use super::steps_runner::Step;
 use crate::cli::ProtocolPath;
 use crate::client::azdo::AzdoClient;
 use crate::client::http::{HttpClient, HttpError};
@@ -32,7 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{watch, Mutex};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 /// AzDO-specific reporting state threaded into [`ReportingContext`] when
 /// `--via azdo` is active.  Contains only what the timeline and log endpoints

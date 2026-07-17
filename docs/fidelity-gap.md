@@ -148,6 +148,7 @@ validated end-to-end.
 | AgentRequest acknowledgement | endpoint exists and now returns `200` like official v2.335.1 | ✅ good |
 | Broker acquire/renew/complete | queue-backed routes pass targeted E2E; runner-watch now materializes replay state and rewrites captured broker IDs so acquire/renew/complete statuses match official | ✅ good for status/protocol flow |
 | Results-service Twirp logs/update | 5 Twirp routes registered outside `require_bearer` (runner job token uses different signing key); handlers return real data with signed blob URLs | ✅ good |
+| OIDC id-token provider | RS256-signed JWTs with certificate-backed x5t; persisted X.509 cert; JWKS/discovery endpoints match GitHub wire shape | ✅ good |
 | Timeline / logs / web-console feed | AzDO timeline/log routes exist; current service path now includes Twirp results surfaces, but the response payloads are not yet faithful | ⚠️ partial |
 | Job/step completion events + annotations | AgentRequest PATCH and broker complete paths exist; annotation/body fidelity remains partial | ⚠️ partial |
 | Action download info | server endpoint returns empty stub; runner-side `actions_download.rs` has full batch `runnerresolve/actions` + bearer token for codeload — common remote actions work end-to-end; subpath keys are normalized before resolution | ⚠️ server stub, runner path good |
@@ -157,7 +158,7 @@ validated end-to-end.
 | DAP debugger integration | fully implemented: 4,527 LOC, 67 tests, WebSocket DAP server with breakpoints/stepping/variable inspection | ✅ good |
 | Runner config refresh | not exercised in this replay; support remains incomplete/untested | ⚠️ unknown/partial |
 | Server-enforced runner settings | not implemented | ❌ missing |
-| Node 20→24 migration/deprecation warnings | not implemented/surfaced | ❌ missing |
+| Node 20→24 migration/deprecation warnings | implemented: flag source precedence, conflict warning, ARM32 fallback (Plan 008) | ✅ good |
 
 ---
 
@@ -239,7 +240,7 @@ finding. Keep these tracked, but do not confuse them with observed replay failur
 | P2 | `SendJobLevelAnnotations` in timeline | v2.323.0 | ❌ missing/untested in idle replay |
 | P2 | `BatchActionResolution` for action downloads | v2.328.0 | ✅ implemented (client-side in `actions_download.rs`); server stub returns empty, runner falls back to GitHub API; passes scenarios 10, 83, 94 |
 | P2 | `UseBearerTokenForCodeload` for action tarballs | v2.328.0 | ✅ implemented (client-side in `manager.rs`); bearer auth on codeload.github.com downloads |
-| P3 | Node 20 deprecation warning annotation | v2.328.0 | ❌ missing/untested in idle replay |
+| P3 | Node 20→24 migration: flag precedence, conflict warning, ARM32 fallback | v2.328.0 | ✅ implemented (Plan 008); workflow-over-system precedence, ARM32 fallback, conflict warning |
 | P3 | `DisableStdoutMultilineLogPrefixing` env var | v2.335.0 | ❌ missing/runner-side unless aksh injects env |
 | P3 | Server-enforced runner settings | v2.323.0 | ❌ missing |
 

@@ -14,15 +14,15 @@ independently usable — anyone can `cargo install aksh` and point their own run
 
 ## Crates
 
-- `aksh-server`: host-side HTTP service, runner-compatible APIs, run queue, cancellation,
-  reruns, NDJSON event stream.
+- `aksh-runner-server`: host-side HTTP service, runner-compatible APIs, run queue,
+  cancellation, reruns, NDJSON event stream.
 - `aksh-runner-client`: CLI equivalent to `Runner.Client` for submitting workflows and
   inspecting runs.
-- `aksh-parser`: typed GitHub Actions workflow parsing, trigger matching, job graph
+- `aksh-gha-parser`: typed GitHub Actions workflow parsing, trigger matching, job graph
   construction, matrix expansion.
 - `aksh-gha-expressions`: expression parser/evaluator for `${{ }}` in workflows, matrices,
   `if`, contexts, and outputs.
-- `aksh-protocol`: versioned domain and wire models (AzDO wire DTOs, `SecretString`,
+- `aksh-gha-protocol`: versioned domain and wire models (AzDO wire DTOs, `SecretString`,
   runner session DTOs, NDJSON events).
 - `aksh-cache`: local cache service compatible with the runner cache protocol shape.
 - `aksh-artifacts`: local artifact/container service compatible with runner
@@ -31,7 +31,8 @@ independently usable — anyone can `cargo install aksh` and point their own run
   `runner.server`.
 - `aksh-runner`: Rust reimplementation of the GitHub Actions runner (Listener + Worker),
   faithful to `actions/runner` v2.335.1. Registers, polls, executes workflows, and reports results.
-  See [`crates/aksh-runner/README.md`](crates/aksh-runner/README.md) for architecture benefits and why we rewrote the runner in Rust.
+  See [`crates/aksh-runner/README.md`](crates/aksh-runner/README.md) for details.
+- `aksh-dap`: Debug Adapter Protocol bridge for step-level workflow debugging.
 
 ## Why aksh Exists
 
@@ -62,14 +63,14 @@ Workspace tests pass via `cargo test --workspace`. runner-watch records protocol
 
 ## Toolchain
 
-The workspace targets Rust 1.86 or newer and uses `tokio`, `axum`, `serde_yaml`, `tracing`,
-`thiserror`, `anyhow`, and `clap`.
+The workspace targets Rust 1.97 or newer and uses `tokio`, `axum`, `serde_yaml`, `tracing`,
+`anyhow`, and `clap`.
 
 ```sh
 cargo fmt --all
 cargo test --workspace
-cargo run -p aksh-server -- serve --listen 127.0.0.1:8080
-cargo run -p aksh-runner-client -- submit --workflow .github/workflows/ci.yml --event push
+cargo run -p aksh-runner-server -- serve --listen 127.0.0.1:9090
+cargo run -p aksh-runner-client -- submit -W .github/workflows/ci.yml
 ```
 
 ## Upstream Reference

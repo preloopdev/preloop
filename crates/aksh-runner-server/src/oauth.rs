@@ -43,18 +43,24 @@ pub(crate) struct TokenResponse {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub(crate) struct FormOAuth2Request {
+    // serde: accepted from the runner's form payload but not inspected.
+    #[allow(dead_code)]
     pub(crate) client_assertion_type: Option<String>,
     pub(crate) client_assertion: Option<String>,
+    // serde: accepted from the runner's form payload but not inspected.
+    #[allow(dead_code)]
     pub(crate) grant_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub(crate) struct JsonOAuth2Request {
+    // serde: accepted from the runner's JSON payload but not inspected.
+    #[allow(dead_code)]
     pub(crate) grant_type: String,
     pub(crate) client_id: String,
+    // serde: accepted from the runner's JSON payload but not inspected.
+    #[allow(dead_code)]
     pub(crate) client_secret: String,
 }
 
