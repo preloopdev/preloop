@@ -99,9 +99,11 @@ pub(crate) async fn record_flows_middleware(
 }
 
 pub(crate) fn server_iso_now() -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
+    server_iso_at(SystemTime::now())
+}
+
+pub(crate) fn server_iso_at(time: SystemTime) -> String {
+    let now = time.duration_since(UNIX_EPOCH).unwrap_or_default();
     let secs = now.as_secs();
     let millis = now.subsec_millis();
 

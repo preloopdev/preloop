@@ -307,7 +307,7 @@ pub(crate) async fn agent_request_patch(
             None => {
                 info!(request_id, %result, "unknown agent_request_patch result; skipping completion");
                 return Json(
-                    json!({ "requestId": request_id, "lockedUntil": "2099-12-31T23:59:59Z" }),
+                    json!({ "requestId": request_id, "lockedUntil": agent_request_locked_until() }),
                 );
             }
         };
@@ -407,8 +407,10 @@ pub(crate) fn agent_request_result(status: ExecutionStatus) -> &'static str {
     }
 }
 
+pub(crate) const JOB_LEASE_SECONDS: u64 = 600;
+
 pub(crate) fn agent_request_locked_until() -> String {
-    "2099-12-31T23:59:59Z".to_owned()
+    server_iso_at(SystemTime::now() + Duration::from_secs(JOB_LEASE_SECONDS))
 }
 
 pub(crate) fn task_result_status(result: azdo::TaskResult) -> ExecutionStatus {
