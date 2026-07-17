@@ -382,8 +382,13 @@ fn is_false(b: &bool) -> bool {
 }
 
 /// Plan reference — identifies the orchestration plan.
+///
+/// 1:1 port of `Sdk/DTWebApi/WebApi/TaskOrchestrationPlanReference.cs`
+/// in `actions/runner` v2.335.1.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanReference {
+    #[serde(rename = "scopeIdentifier")]
+    pub scope_identifier: String,
     #[serde(rename = "planId")]
     pub plan_id: String,
     #[serde(rename = "planType")]
