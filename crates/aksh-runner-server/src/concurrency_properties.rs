@@ -1324,6 +1324,87 @@ pub mod pure {
             ..ProptestConfig::default()
         }
     }
+    fn evaluate_group(group: String) -> Result<(String, bool, ConcurrencyQueue), String> {
+        let github = serde_json::json!({});
+        let inputs = BTreeMap::from([("group".to_owned(), serde_json::Value::String(group))]);
+        let vars = BTreeMap::new();
+        let raw = aksh_gha_parser::Concurrency {
+            group: "${{ inputs.group }}".to_owned(),
+            cancel_in_progress: None,
+            queue: ConcurrencyQueue::Single,
+        };
+        let ctx = concurrency::ConcurrencyContext {
+            scope: concurrency::ConcurrencyScope::Workflow,
+            github: &github,
+            inputs: &inputs,
+            vars: &vars,
+            matrix: None,
+            strategy: None,
+            needs: None,
+        };
+        concurrency::evaluate_concurrency(&raw, &ctx)
+    }
+
+    /// GH-VALIDATE-02: the evaluated ASCII group boundary is inclusive.
+    #[test]
+    fn evaluated_ascii_group_length_400_is_accepted() {
+        let group = "a".repeat(400);
+        let result = evaluate_group(group.clone()).expect("400 ASCII characters must be accepted");
+        assert_eq!(result, (group, false, ConcurrencyQueue::Single));
+    }
+
+    /// GH-VALIDATE-03: an evaluated ASCII group over the limit reports its
+    /// UTF-16 length and the official maximum.
+    #[test]
+    fn evaluated_ascii_group_length_401_is_rejected() {
+        let error =
+            evaluate_group("a".repeat(401)).expect_err("401 ASCII characters must be rejected");
+        assert_eq!(
+            error,
+            "concurrency group name is too long (401 UTF-16 code units, maximum 400)"
+        );
+    }
+
+    /// GH-VALIDATE-04: validation applies after expression resolution, so an
+    /// expression that evaluates to an empty group is rejected.
+    #[test]
+    fn evaluated_empty_group_is_rejected() {
+        let error =
+            evaluate_group(String::new()).expect_err("an evaluated empty group must be rejected");
+        assert_eq!(error, "concurrency group name must not be empty");
+    }
+
+    /// GH-VALIDATE-05: C# `string.Length` counts each astral character as two
+    /// UTF-16 code units; 200 astral characters therefore fit exactly.
+    #[test]
+    fn evaluated_astral_group_length_400_utf16_units_is_accepted() {
+        let group = "😀".repeat(200);
+        let result = evaluate_group(group.clone())
+            .expect("200 astral characters (400 UTF-16 code units) must be accepted");
+        assert_eq!(result, (group, false, ConcurrencyQueue::Single));
+    }
+
+    /// GH-VALIDATE-06: 201 astral characters produce 402 UTF-16 code units
+    /// and must be rejected using that evaluated length.
+    #[test]
+    fn evaluated_astral_group_length_402_utf16_units_is_rejected() {
+        let error = evaluate_group("😀".repeat(201))
+            .expect_err("201 astral characters (402 UTF-16 code units) must be rejected");
+        assert_eq!(
+            error,
+            "concurrency group name is too long (402 UTF-16 code units, maximum 400)"
+        );
+    }
+
+    /// GH-VALIDATE-07: BMP characters occupy one UTF-16 code unit each even
+    /// when they occupy multiple bytes in UTF-8.
+    #[test]
+    fn evaluated_bmp_group_length_400_utf16_units_is_accepted() {
+        let group = "é".repeat(400);
+        let result = evaluate_group(group.clone())
+            .expect("400 BMP characters (400 UTF-16 code units) must be accepted");
+        assert_eq!(result, (group, false, ConcurrencyQueue::Single));
+    }
 
     proptest! {
         #![proptest_config(config())]
