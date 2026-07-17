@@ -1021,3 +1021,63 @@ fn tier2_codec_task_step_environment_aliases() {
         assert!(encoded.get("env").is_none());
     }
 }
+
+#[test]
+fn context_data_from_json_null_round_trips() {
+    let null_json = serde_json::Value::Null;
+    let ctx = PipelineContextData::from_json(&null_json);
+    assert!(matches!(ctx, PipelineContextData::Null));
+    let back = ctx.to_json();
+    assert_eq!(back, serde_json::Value::Null);
+}
+
+#[test]
+fn context_data_from_json_string_round_trips() {
+    let json = serde_json::json!("hello");
+    let ctx = PipelineContextData::from_json(&json);
+    assert!(matches!(&ctx, PipelineContextData::String(s) if s == "hello"));
+    assert_eq!(ctx.to_json(), json);
+}
+
+#[test]
+fn context_data_from_json_bool_round_trips() {
+    let json = serde_json::json!(true);
+    let ctx = PipelineContextData::from_json(&json);
+    assert!(matches!(ctx, PipelineContextData::Bool(true)));
+    assert_eq!(ctx.to_json(), json);
+}
+
+#[test]
+fn context_data_from_json_number_round_trips() {
+    let json = serde_json::json!(42.5);
+    let ctx = PipelineContextData::from_json(&json);
+    assert!(matches!(ctx, PipelineContextData::Number(n) if (n - 42.5).abs() < f64::EPSILON));
+    assert_eq!(ctx.to_json(), json);
+}
+
+#[test]
+fn context_data_from_json_nested_round_trips() {
+    let json = serde_json::json!({
+        "key": "value",
+        "nested": {
+            "arr": [1.0, null, true, "s"],
+            "empty": null
+        }
+    });
+    let ctx = PipelineContextData::from_json(&json);
+    let back = ctx.to_json();
+    assert_eq!(back, json, "nested structure must round-trip exactly");
+}
+
+#[test]
+fn context_data_from_json_empty_array_and_dict() {
+    let arr_json = serde_json::json!([]);
+    let ctx = PipelineContextData::from_json(&arr_json);
+    assert!(matches!(&ctx, PipelineContextData::Array(v) if v.is_empty()));
+    assert_eq!(ctx.to_json(), arr_json);
+
+    let dict_json = serde_json::json!({});
+    let ctx = PipelineContextData::from_json(&dict_json);
+    assert!(matches!(&ctx, PipelineContextData::Dict(m) if m.is_empty()));
+    assert_eq!(ctx.to_json(), dict_json);
+}
