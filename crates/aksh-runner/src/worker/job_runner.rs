@@ -14,7 +14,10 @@
 //! implement the full reporting lifecycle.
 
 use anyhow::Result;
+use chrono::{DateTime, TimeDelta, Utc};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{watch, Mutex};
 use tracing::{debug, error, info, warn};
 
@@ -23,7 +26,7 @@ use super::server_queue::ServerQueue;
 use super::steps_runner::{Step, StepType};
 use crate::cli::ProtocolPath;
 use crate::client::azdo::AzdoClient;
-use crate::client::http::HttpClient;
+use crate::client::http::{HttpClient, HttpError};
 use crate::client::results::ResultsClient;
 use crate::client::run_service::RunServiceClient;
 
@@ -323,11 +326,6 @@ pub async fn run_job(
         }
     }
 
-    // F018: Spawn renew loop
-    let renew_handle = reporting
-        .as_ref()
-        .map(|rpt| spawn_renew_loop(rpt.clone(), cancel_rx.clone()));
-
     let live_logs = if let Some(feed_url) = super::live_logs::extract_feed_stream_url(&job_message)
     {
         let token = reporting
@@ -372,6 +370,15 @@ pub async fn run_job(
     // process group, then run_steps unwinds through normal cancel semantics.
     let (job_cancel_tx, job_cancel_rx) = watch::channel(false);
     let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let lease_lost = Arc::new(AtomicBool::new(false));
+    let renew_handle = reporting.as_ref().map(|rpt| {
+        spawn_renew_loop(
+            rpt.clone(),
+            cancel_rx.clone(),
+            job_cancel_tx.clone(),
+            lease_lost.clone(),
+        )
+    });
 
     // Forward parent cancel → job cancel
     let fwd_tx = job_cancel_tx.clone();
@@ -467,6 +474,11 @@ pub async fn run_job(
         .map_err(|e| anyhow::anyhow!("{e}"))
     };
 
+    // Once execution has finished, completion wins over a concurrent renewal failure.
+    if let Some(handle) = renew_handle {
+        handle.abort();
+    }
+
     if let (Some(queue), Some(handle)) = (live_logs.as_ref(), live_log_handle) {
         queue.shutdown_and_wait(handle).await;
     }
@@ -477,10 +489,10 @@ pub async fn run_job(
         super::job_extension::kill_orphan_processes(&tracking_id);
     }
 
-    // Check if we timed out (must check before aborting the timer)
-    let was_timeout = timed_out.load(std::sync::atomic::Ordering::SeqCst);
+    // Check terminal causes before stopping their supporting tasks.
+    let was_timeout = timed_out.load(Ordering::SeqCst);
+    let was_lease_lost = lease_lost.load(Ordering::SeqCst);
 
-    // Clean up timer/forward tasks
     timeout_handle.abort();
     forward_handle.abort();
 
@@ -504,12 +516,23 @@ pub async fn run_job(
         });
     }
 
-    // F018: Stop renew loop
-    if let Some(handle) = renew_handle {
-        handle.abort();
+    if was_lease_lost && !was_timeout {
+        let msg = "Runner lost the server job lease".to_owned();
+        error!("{msg}");
+        job_ctx.job_status = super::contexts::JobStatus::Failure;
+        job_ctx.add_job_annotation(super::execution_context::Annotation {
+            level: super::execution_context::AnnotationLevel::Error,
+            message: msg,
+            title: None,
+            file: None,
+            line: None,
+            end_line: None,
+            col: None,
+            end_column: None,
+        });
     }
 
-    let (result_str, conclusion) = if was_timeout {
+    let (result_str, conclusion) = if was_timeout || was_lease_lost {
         ("Failed".to_string(), "Failed".to_string())
     } else {
         match &job_result {
@@ -595,18 +618,20 @@ pub async fn run_job(
 
 // ── Renew loop (F018) ────────────────────────────────────────────────
 
-/// Spawn a background task that renews the job lock.
-///
-/// Golden 10 renews immediately after acquire and then continues before the
-/// lease expires. We renew once immediately for parity, then every 60 seconds as
-/// the fallback interval until `lockedUntil` parsing is made exact.
+/// Renew immediately, then every 60 seconds after success. Transient failures
+/// back off until the advertised lease plus the official five-minute grace;
+/// a missing job is terminal and cancels local execution.
 fn spawn_renew_loop(
     rpt: Arc<ReportingContext>,
     cancel_rx: watch::Receiver<bool>,
+    job_cancel_tx: watch::Sender<bool>,
+    lease_lost: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut cancel_rx = cancel_rx;
         let mut first_renew = true;
+        let mut lease_deadline = None;
+        let mut failures = 0;
         loop {
             if *cancel_rx.borrow() {
                 info!("Renew loop: job cancelled, stopping");
@@ -618,18 +643,38 @@ fn spawn_renew_loop(
                 "jobId": rpt.job_id,
             });
 
-            match rpt.run_service.renew_job(&rpt.access_token, &body).await {
+            let delay = match rpt.run_service.renew_job(&rpt.access_token, &body).await {
                 Ok(resp) => {
-                    let locked_until = resp
+                    lease_deadline = resp
                         .get("lockedUntil")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown");
-                    info!("Job lock renewed, lockedUntil={locked_until}");
+                        .and_then(|value| value.as_str())
+                        .and_then(parse_lease_deadline)
+                        .or(lease_deadline);
+                    failures = 0;
+                    info!(locked_until = ?lease_deadline, "Job lock renewed");
+                    Duration::from_secs(60)
                 }
-                Err(e) => {
-                    warn!("renewjob failed: {e:#}");
+                Err(error) if is_job_not_found(&error) => {
+                    error!("Job lease lost (404); stopping renewal");
+                    lease_lost.store(true, Ordering::SeqCst);
+                    let _ = job_cancel_tx.send(true);
+                    break;
                 }
-            }
+                Err(error) => {
+                    failures += 1;
+                    warn!(failures, "renewjob failed: {error:#}");
+                    let exhausted = lease_deadline
+                        .is_some_and(|deadline| lease_expired(deadline, Utc::now()))
+                        || (lease_deadline.is_none() && failures >= 5);
+                    if exhausted {
+                        error!("Job lease renewal retry window exhausted");
+                        lease_lost.store(true, Ordering::SeqCst);
+                        let _ = job_cancel_tx.send(true);
+                        break;
+                    }
+                    renew_backoff(failures)
+                }
+            };
 
             // Official runner probes service health after the first renewjob
             if first_renew {
@@ -677,7 +722,7 @@ fn spawn_renew_loop(
             }
 
             tokio::select! {
-                _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+                _ = tokio::time::sleep(delay) => {}
                 changed = cancel_rx.changed() => {
                     if changed.is_err() || *cancel_rx.borrow() {
                         info!("Renew loop: cancellation channel closed/signaled, stopping");
@@ -687,6 +732,29 @@ fn spawn_renew_loop(
             }
         }
     })
+}
+
+fn renew_backoff(attempt: u32) -> Duration {
+    const DELAYS: [u64; 4] = [5, 10, 20, 30];
+    let index = attempt.saturating_sub(1).min(DELAYS.len() as u32 - 1) as usize;
+    Duration::from_secs(DELAYS[index])
+}
+
+fn parse_lease_deadline(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|deadline| deadline.with_timezone(&Utc))
+}
+
+fn lease_expired(locked_until: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    now > locked_until + TimeDelta::minutes(5)
+}
+
+fn is_job_not_found(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<HttpError>(),
+        Some(HttpError::Status { status, .. }) if *status == reqwest::StatusCode::NOT_FOUND
+    )
 }
 
 /// Flush queued step-status updates to the server.
