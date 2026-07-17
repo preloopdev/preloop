@@ -86,6 +86,12 @@ fn expected_endpoint_wire(endpoint: &ServiceEndpoint) -> Value {
     let mut object = Map::new();
     object.insert("data".to_owned(), json!(endpoint.data));
     object.insert("name".to_owned(), json!(endpoint.name));
+    if let Some(value) = &endpoint.endpoint_type {
+        object.insert("type".to_owned(), json!(value));
+    }
+    if let Some(value) = &endpoint.service_owner {
+        object.insert("serviceOwner".to_owned(), json!(value));
+    }
     if let Some(value) = &endpoint.url {
         object.insert("url".to_owned(), json!(value));
     }
