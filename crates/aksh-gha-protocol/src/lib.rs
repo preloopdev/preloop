@@ -15,6 +15,9 @@ pub use azdo::DebuggerTunnelInfo;
 /// RSA/AES session encryption for the runner protocol.
 pub mod crypto;
 
+/// Shared secret-masking logic (longest-first, exclusion-aware).
+pub mod masking;
+
 /// Protocol version exposed by this crate's runner-compatible DTOs.
 pub const PROTOCOL_VERSION: &str = "2026-06-25.aksh.v1";
 
