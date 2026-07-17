@@ -47,7 +47,7 @@ each phase, follow the dependency notes.
 | 008 | Node20→24 migration: flag source precedence, conflict warning, Linux ARM32 fallback | P2 | M | MED | — | TODO (NEW) |
 | 009 | Valid RFC3339 timestamps for cancellation step records (currently literal `"cancelled"`) | P2 | S | MED | — | TODO (NEW) |
 | 010 | OIDC discovery/JWKS path + JWT header (`x5t`, `jwks` path, `scopes_supported`, `pairwise`) | P3 | S | MED | — | TODO (NEW) |
-| 011 | Push skip-CI across the commit batch + `PlanReference.scopeIdentifier` | P3 | S | MED | — | TODO (NEW) |
+| 011 | Push skip-CI across the commit batch + `PlanReference.scopeIdentifier` | P3 | S | MED | — | DONE (scan all commits for skip markers; add scopeIdentifier to PlanReference) |
 | 006 | Concurrency model-based property testing + live differential gate | P1 | L | HIGH | 007 | BLOCKED (live differential prerequisites; coordinate with 007) |
 
 ### Phase B — Refactor (Step 2: maintainability, no behavior change)
