@@ -294,29 +294,9 @@ pub fn needs_json_from_context_data(needs: &BTreeMap<String, azdo::PipelineConte
     // Best-effort: expose result/outputs as JSON for expression evaluation.
     let mut map = serde_json::Map::new();
     for (k, v) in needs {
-        map.insert(k.clone(), context_data_to_json(v));
+        map.insert(k.clone(), v.to_json());
     }
     Value::Object(map)
-}
-
-/// Convert runner protocol context data into expression JSON recursively.
-pub fn context_data_to_json(data: &azdo::PipelineContextData) -> Value {
-    match data {
-        azdo::PipelineContextData::Null => Value::Null,
-        azdo::PipelineContextData::String(s) => Value::String(s.clone()),
-        azdo::PipelineContextData::Bool(b) => Value::Bool(*b),
-        azdo::PipelineContextData::Number(n) => json!(n),
-        azdo::PipelineContextData::Array(items) => {
-            Value::Array(items.iter().map(context_data_to_json).collect())
-        }
-        azdo::PipelineContextData::Dict(map) => {
-            let mut obj = serde_json::Map::new();
-            for (k, v) in map {
-                obj.insert(k.clone(), context_data_to_json(v));
-            }
-            Value::Object(obj)
-        }
-    }
 }
 
 /// Log and ignore evaluation failures (job-level marks failure at call site).
@@ -630,31 +610,31 @@ mod properties {
                 "A JobSet with a missing member must be non-terminal");
         }
 
-        /// context_data_to_json preserves shape: scalar/list/dict structure
+        /// PipelineContextData::to_json preserves shape: scalar/list/dict structure
         /// round-trips through the conversion with the correct JSON type.
         #[test]
         fn context_data_shape_preserved(data in arb_context_data(3)) {
-            let json = context_data_to_json(&data);
+            let json = data.to_json();
             assert_shape_matches(&data, &json);
         }
 
-        /// context_data_to_json: String values are preserved exactly.
+        /// PipelineContextData::to_json: String values are preserved exactly.
         #[test]
         fn context_data_string_exact(s in "[a-zA-Z0-9 _-]{0,32}") {
             let data = azdo::PipelineContextData::String(s.clone());
-            let json = context_data_to_json(&data);
+            let json = data.to_json();
             prop_assert_eq!(json, Value::String(s));
         }
 
-        /// context_data_to_json: Bool values are preserved.
+        /// PipelineContextData::to_json: Bool values are preserved.
         #[test]
         fn context_data_bool_exact(b in any::<bool>()) {
             let data = azdo::PipelineContextData::Bool(b);
-            let json = context_data_to_json(&data);
+            let json = data.to_json();
             prop_assert_eq!(json, Value::Bool(b));
         }
 
-        /// context_data_to_json: Dict key set is preserved — every key in the
+        /// PipelineContextData::to_json: Dict key set is preserved — every key in the
         /// input appears in the output object and vice versa.
         #[test]
         fn context_data_dict_keys_preserved(
@@ -665,7 +645,7 @@ mod properties {
             )
         ) {
             let data = azdo::PipelineContextData::Dict(map.clone());
-            let json = context_data_to_json(&data);
+            let json = data.to_json();
             if let Value::Object(obj) = json {
                 let input_keys: BTreeSet<&String> = map.keys().collect();
                 let output_keys: BTreeSet<&String> = obj.keys().collect();
@@ -676,7 +656,7 @@ mod properties {
             }
         }
 
-        /// context_data_to_json: Array length is preserved.
+        /// PipelineContextData::to_json: Array length is preserved.
         #[test]
         fn context_data_array_len_preserved(
             items in pvec(
@@ -685,7 +665,7 @@ mod properties {
             )
         ) {
             let data = azdo::PipelineContextData::Array(items.clone());
-            let json = context_data_to_json(&data);
+            let json = data.to_json();
             if let Value::Array(arr) = json {
                 prop_assert_eq!(arr.len(), items.len(),
                     "Array length must be preserved");
