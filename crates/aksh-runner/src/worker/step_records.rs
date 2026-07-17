@@ -177,6 +177,7 @@ pub struct DispatchedTask {
 pub fn reconcile_cancelled_steps(
     dispatched: &[DispatchedTask],
     received: &BTreeMap<String, StepUpdate>,
+    completed_at: &str,
 ) -> Vec<StepUpdate> {
     let mut out: BTreeMap<String, StepUpdate> = BTreeMap::new();
 
@@ -202,7 +203,7 @@ pub fn reconcile_cancelled_steps(
                 cancelled.number
             };
             if cancelled.completed_at.is_none() {
-                cancelled.completed_at = Some("cancelled".into());
+                cancelled.completed_at = Some(completed_at.to_owned());
             }
             out.insert(task.external_id.clone(), cancelled);
         } else {
@@ -215,7 +216,7 @@ pub fn reconcile_cancelled_steps(
                     name: task.name.clone(),
                     status: step_status::COMPLETED,
                     started_at: None,
-                    completed_at: Some("cancelled".into()),
+                    completed_at: Some(completed_at.to_owned()),
                     conclusion: step_conclusion::FAILED,
                 },
             );
@@ -238,7 +239,25 @@ pub fn count_cancelled(records: &[StepUpdate]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::DateTime;
     use proptest::prelude::*;
+
+    const CANCEL_COMPLETED_AT: &str = "2024-01-02T03:04:05Z";
+    const ORIGINAL_COMPLETED_AT: &str = "2024-01-01T00:00:00Z";
+
+    fn assert_synthesized_cancelled(record: &StepUpdate, supplied_completed_at: &str) {
+        assert_eq!(record.status, step_status::COMPLETED);
+        assert_eq!(record.conclusion, step_conclusion::FAILED);
+        let completed_at = record
+            .completed_at
+            .as_deref()
+            .expect("synthesized cancellation must have completion time");
+        assert_eq!(completed_at, supplied_completed_at);
+        assert_ne!(record.completed_at.as_deref(), Some("cancelled"));
+        let parsed = DateTime::parse_from_rfc3339(completed_at)
+            .expect("synthesized completion time must be RFC3339");
+        assert_eq!(parsed.offset().local_minus_utc(), 0);
+    }
 
     fn full(id: &str, number: u32, name: &str, status: u32, conclusion: u32) -> StepUpdate {
         StepUpdate {
@@ -354,28 +373,30 @@ mod tests {
             },
         ];
         let mut received = BTreeMap::new();
-        received.insert(
-            "setup".into(),
-            full(
-                "setup",
-                1,
-                "Set up job",
-                step_status::COMPLETED,
-                step_conclusion::SUCCEEDED,
-            ),
+        let mut setup_record = full(
+            "setup",
+            1,
+            "Set up job",
+            step_status::COMPLETED,
+            step_conclusion::SUCCEEDED,
         );
+        setup_record.completed_at = Some(ORIGINAL_COMPLETED_AT.into());
+        received.insert("setup".into(), setup_record);
         received.insert(
             "s1".into(),
             full("s1", 2, "Run", step_status::IN_PROGRESS, 0),
         );
         // s2 never reported
 
-        let out = reconcile_cancelled_steps(&dispatched, &received);
+        let out = reconcile_cancelled_steps(&dispatched, &received, CANCEL_COMPLETED_AT);
         assert_eq!(out.len(), 3);
         assert_eq!(out[0].conclusion, step_conclusion::SUCCEEDED);
+        assert_eq!(out[0].completed_at.as_deref(), Some(ORIGINAL_COMPLETED_AT));
         assert_eq!(out[1].status, step_status::COMPLETED);
         assert_eq!(out[1].conclusion, step_conclusion::FAILED);
+        assert_synthesized_cancelled(&out[1], CANCEL_COMPLETED_AT);
         assert_eq!(out[2].conclusion, step_conclusion::FAILED);
+        assert_synthesized_cancelled(&out[2], CANCEL_COMPLETED_AT);
         // Exactly one cancelled record per interrupted task (s1, s2); setup untouched.
         assert_eq!(
             out.iter()
@@ -559,7 +580,7 @@ mod tests {
                     );
                 }
             }
-            let out = reconcile_cancelled_steps(&dispatched, &received);
+            let out = reconcile_cancelled_steps(&dispatched, &received, CANCEL_COMPLETED_AT);
             prop_assert_eq!(out.len(), n);
             // Order by number.
             for w in out.windows(2) {
@@ -573,9 +594,17 @@ mod tests {
                     } else {
                         prop_assert_eq!(rec.status, step_status::COMPLETED);
                         prop_assert_eq!(rec.conclusion, step_conclusion::FAILED);
+                        prop_assert_eq!(rec.completed_at.as_deref(), Some(CANCEL_COMPLETED_AT));
+                        prop_assert!(DateTime::parse_from_rfc3339(
+                            rec.completed_at.as_deref().unwrap()
+                        ).is_ok());
                     }
                 } else {
                     prop_assert_eq!(rec.conclusion, step_conclusion::FAILED);
+                    prop_assert_eq!(rec.completed_at.as_deref(), Some(CANCEL_COMPLETED_AT));
+                    prop_assert!(DateTime::parse_from_rfc3339(
+                        rec.completed_at.as_deref().unwrap()
+                    ).is_ok());
                 }
             }
             // No duplicates.
@@ -631,7 +660,7 @@ mod tests {
                 step_conclusion::SUCCEEDED,
             ),
         );
-        let out = reconcile_cancelled_steps(&dispatched, &received);
+        let out = reconcile_cancelled_steps(&dispatched, &received, CANCEL_COMPLETED_AT);
         // With empty dispatched, no tasks to reconcile — output should be empty
         // (unknown records are not in scope of dispatched reconciliation)
         assert_eq!(out.len(), 0);
