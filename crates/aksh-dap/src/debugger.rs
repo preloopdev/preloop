@@ -43,7 +43,7 @@ use tracing::{debug, error, warn};
 use crate::config::{DebuggerConfig, DebuggerTransportMode, DebuggerTunnelInfo};
 use crate::messages::{
     Capabilities, Event, Request, Response, EVENT_CONTINUED, EVENT_EXITED, EVENT_INITIALIZED,
-    EVENT_OUTPUT, EVENT_STOPPED, EVENT_TERMINATED, EVENT_THREAD,
+    EVENT_OUTPUT, EVENT_STOPPED, EVENT_TERMINATED,
 };
 use crate::repl::{DapReplExecutor, DapReplParser, ParseError};
 use crate::variables::DapVariableProvider;

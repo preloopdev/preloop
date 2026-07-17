@@ -24,6 +24,8 @@ async fn serve_diagnostic_signed_url() -> (String, oneshot::Receiver<String>) {
     (format!("http://{addr}"), request_rx)
 }
 
+use super::super::action_preparation::parse_remote_uses;
+use super::super::reporting::diagnostic_logs_url;
 use super::*;
 use tempfile::TempDir;
 use tokio::sync::watch;

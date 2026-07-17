@@ -10,7 +10,7 @@
 //! is replaced with a constant redaction marker.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 /// A DAP `Scope` — a named bag of variables, identified by a
 /// `variablesReference` integer that the client uses to fetch the
