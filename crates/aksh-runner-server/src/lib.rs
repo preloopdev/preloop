@@ -6702,29 +6702,30 @@ fn log_key(plan_id: &str, log_id: &str) -> String {
 }
 
 fn mask_log_bytes(inner: &InnerState, plan_id: &str, body: &[u8]) -> Vec<u8> {
-    let mut text = String::from_utf8_lossy(body).into_owned();
+    let text = String::from_utf8_lossy(body);
     let resolved_run_id = resolve_callback_job(inner, plan_id, None, None)
         .map(|(_, run_id, _)| run_id)
         .or_else(|| plan_id.parse::<RunId>().ok());
-    let run_secrets = resolved_run_id
+    let run_secrets: Vec<String> = resolved_run_id
         .and_then(|run_id| inner.runs.get(&run_id))
-        .map(|run| run.submission.secrets.values().collect::<Vec<_>>())
+        .map(|run| {
+            run.submission
+                .secrets
+                .values()
+                .map(|s| s.expose().to_owned())
+                .collect()
+        })
         .unwrap_or_else(|| {
             inner
                 .runs
                 .values()
                 .flat_map(|run| run.submission.secrets.values())
+                .map(|s| s.expose().to_owned())
                 .collect()
         });
 
-    for secret in run_secrets {
-        let exposed = secret.expose();
-        if !exposed.is_empty() {
-            text = text.replace(exposed, "***");
-        }
-    }
-
-    text.into_bytes()
+    aksh_gha_protocol::masking::mask_secrets(&text, run_secrets.iter().map(String::as_str), &[])
+        .into_bytes()
 }
 
 /// POST console log — runner streams live console output.
