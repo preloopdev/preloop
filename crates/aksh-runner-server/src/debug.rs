@@ -50,7 +50,11 @@ pub(crate) async fn ws_dap_debug(
     ws.on_upgrade(move |socket| handle_dap_debug_socket(socket, run_id, shared))
 }
 
-pub(crate) async fn handle_dap_debug_socket(socket: WebSocket, run_id: RunId, shared: Arc<SharedState>) {
+pub(crate) async fn handle_dap_debug_socket(
+    socket: WebSocket,
+    run_id: RunId,
+    shared: Arc<SharedState>,
+) {
     let registration = {
         let inner = shared.state.inner.lock().await;
         inner.dap_ports.get(&run_id).cloned()
@@ -69,7 +73,10 @@ pub(crate) async fn handle_dap_debug_socket(socket: WebSocket, run_id: RunId, sh
     }
 }
 
-pub(crate) async fn pump_axum_ws_to_dap(ws: WebSocket, target_port: u16) -> Result<(), anyhow::Error> {
+pub(crate) async fn pump_axum_ws_to_dap(
+    ws: WebSocket,
+    target_port: u16,
+) -> Result<(), anyhow::Error> {
     use futures::{SinkExt, StreamExt};
 
     let url = format!("ws://127.0.0.1:{target_port}");

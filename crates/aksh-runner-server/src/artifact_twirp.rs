@@ -48,7 +48,9 @@ pub(crate) fn artifact_v2_registry_key(run_id: &str, job_id: &str, name: &str) -
     format!("{run_id}/{job_id}/{name}")
 }
 
-pub(crate) async fn save_artifact_v2_registry(shared: &Arc<SharedState>) -> Result<(), std::io::Error> {
+pub(crate) async fn save_artifact_v2_registry(
+    shared: &Arc<SharedState>,
+) -> Result<(), std::io::Error> {
     let registry_path = shared.state.state_dir.join("artifact_v2_registry.json");
     let serialized = {
         let inner = shared.state.inner.lock().await;
