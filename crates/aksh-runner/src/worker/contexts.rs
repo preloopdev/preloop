@@ -229,19 +229,16 @@ impl JobContext {
 
     /// Mask secret values in a string (longest secrets first to prevent partial matches).
     pub fn mask_secrets(&self, input: &str) -> String {
-        let mut result = input.to_string();
-        // Sort by length descending so longer secrets are replaced before
-        // shorter ones that might be a subset (e.g. trimmed variant).
-        let mut secrets: Vec<&String> = self.masks.iter().filter(|s| !s.is_empty()).collect();
-        // If the DAP debugger is active, preserve standard protocol keywords.
-        if self.dap_debugger.is_some() {
-            secrets.retain(|s| !aksh_dap::DAP_PROTOCOL_KEYWORDS.contains(&s.as_str()));
-        }
-        secrets.sort_by_key(|b| std::cmp::Reverse(b.len()));
-        for secret in secrets {
-            result = result.replace(secret.as_str(), "***");
-        }
-        result
+        let exclude: &[&str] = if self.dap_debugger.is_some() {
+            aksh_dap::DAP_PROTOCOL_KEYWORDS
+        } else {
+            &[]
+        };
+        aksh_gha_protocol::masking::mask_secrets(
+            input,
+            self.masks.iter().map(String::as_str),
+            exclude,
+        )
     }
 
     /// Read one key from the mutable GitHub context.
