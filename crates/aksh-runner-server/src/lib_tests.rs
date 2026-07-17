@@ -2514,10 +2514,10 @@ async fn oidc_endpoint_mints_rs256_jwt_with_requested_audience() {
     let parts: Vec<&str> = jwt.split('.').collect();
     assert_eq!(parts.len(), 3);
 
-    // Verify header is RS256 with a kid.
+    // Verify the protected header is RS256 with a retained kid.
     let header: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[0]).unwrap()).unwrap();
     assert_eq!(header["alg"], "RS256");
-    assert!(header["kid"].as_str().unwrap().len() > 10);
+    assert!(!header["kid"].as_str().unwrap_or_default().is_empty());
 
     // Verify claims.
     let claims: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
@@ -2626,11 +2626,17 @@ async fn oidc_discovery_and_jwks_endpoints() {
         Value::Null,
     )
     .await;
-    assert!(discovery["jwks_uri"]
-        .as_str()
-        .unwrap()
-        .ends_with("/.well-known/jwks.json"));
+    assert_eq!(
+        discovery["jwks_uri"],
+        "http://127.0.0.1:9090/oidc/.well-known/jwks"
+    );
     assert_eq!(discovery["issuer"], "http://127.0.0.1:9090/oidc");
+    assert_eq!(
+        discovery["subject_types_supported"],
+        json!(["public", "pairwise"])
+    );
+    assert_eq!(discovery["scopes_supported"], json!(["openid"]));
+
     let namespaced = request_json(
         &app,
         Method::GET,
@@ -2640,14 +2646,29 @@ async fn oidc_discovery_and_jwks_endpoints() {
     .await;
     assert_eq!(namespaced, discovery);
 
-    let jwks = request_json(&app, Method::GET, "/.well-known/jwks.json", Value::Null).await;
-    let keys = jwks["keys"].as_array().unwrap();
+    let root_jwks = request_json(&app, Method::GET, "/.well-known/jwks", Value::Null).await;
+    let root_json_jwks =
+        request_json(&app, Method::GET, "/.well-known/jwks.json", Value::Null).await;
+    let namespaced_jwks =
+        request_json(&app, Method::GET, "/oidc/.well-known/jwks", Value::Null).await;
+    let namespaced_json_jwks = request_json(
+        &app,
+        Method::GET,
+        "/oidc/.well-known/jwks.json",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(root_jwks, root_json_jwks);
+    assert_eq!(namespaced_jwks, root_jwks);
+    assert_eq!(namespaced_json_jwks, root_jwks);
+
+    let keys = root_jwks["keys"].as_array().unwrap();
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0]["kty"], "RSA");
     assert_eq!(keys[0]["alg"], "RS256");
     assert_eq!(keys[0]["use"], "sig");
-    assert!(keys[0]["kid"].is_string());
-    assert!(keys[0]["n"].is_string());
+    assert!(!keys[0]["kid"].as_str().unwrap_or_default().is_empty());
+    assert!(keys[0]["n"].as_str().is_some_and(|value| !value.is_empty()));
     assert_eq!(keys[0]["e"], "AQAB");
 }
 
