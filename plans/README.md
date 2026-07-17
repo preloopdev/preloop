@@ -48,7 +48,7 @@ each phase, follow the dependency notes.
 | 009 | Valid RFC3339 timestamps for cancellation step records (currently literal `"cancelled"`) | P2 | S | MED | — | TODO (NEW) |
 | 010 | OIDC discovery/JWKS path + JWT header (`x5t`, `jwks` path, `scopes_supported`, `pairwise`) | P3 | S | MED | — | TODO (NEW) |
 | 011 | Push skip-CI across the commit batch + `PlanReference.scopeIdentifier` | P3 | S | MED | — | DONE (scan all commits for skip markers; add scopeIdentifier to PlanReference) |
-| 006 | Concurrency model-based property testing + live differential gate | P1 | L | HIGH | 007 | BLOCKED (live differential prerequisites; coordinate with 007) |
+| 006 | Concurrency model-based property testing + live differential gate | P1 | L | HIGH | 007 | BLOCKED (30-case dry corpus + 64-case HTTP properties pass; contamination rejected; no `GH_TOKEN`/`GH_REPO`/`AKSH_SERVER` or pinned official runner installed) |
 
 ### Phase B — Refactor (Step 2: maintainability, no behavior change)
 
