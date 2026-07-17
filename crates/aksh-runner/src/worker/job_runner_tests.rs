@@ -1,3 +1,29 @@
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::sync::oneshot;
+
+async fn serve_diagnostic_signed_url() -> (String, oneshot::Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (request_tx, request_rx) = oneshot::channel();
+    let body = r#"{"diag_logs_url":"https://blob.example/diagnostics.zip"}"#;
+
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0_u8; 8192];
+        let n = socket.read(&mut buf).await.unwrap();
+        let request = String::from_utf8_lossy(&buf[..n]).to_string();
+        let _ = request_tx.send(request);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+    });
+
+    (format!("http://{addr}"), request_rx)
+}
+
 use super::*;
 use tempfile::TempDir;
 use tokio::sync::watch;
@@ -209,4 +235,76 @@ fn only_typed_http_404_is_classified_as_job_not_found() {
     assert!(is_job_not_found(&not_found));
     assert!(!is_job_not_found(&conflict));
     assert!(!is_job_not_found(&text_only));
+}
+
+#[test]
+fn diagnostic_signed_url_reads_only_official_response_field() {
+    let cases = [
+        (
+            "official diag_logs_url",
+            serde_json::json!({"diag_logs_url": "https://blob.example/diagnostics.zip"}),
+            Some("https://blob.example/diagnostics.zip"),
+        ),
+        (
+            "legacy blob_url is ignored",
+            serde_json::json!({"blob_url": "https://blob.example/legacy.zip"}),
+            None,
+        ),
+        (
+            "legacy url is ignored",
+            serde_json::json!({"url": "https://blob.example/legacy.zip"}),
+            None,
+        ),
+        (
+            "legacy logs_url is ignored",
+            serde_json::json!({"logs_url": "https://blob.example/legacy.zip"}),
+            None,
+        ),
+        (
+            "official field wins over legacy aliases",
+            serde_json::json!({
+                "diag_logs_url": "https://blob.example/diagnostics.zip",
+                "blob_url": "https://blob.example/legacy-blob.zip",
+                "url": "https://blob.example/legacy-url.zip",
+                "logs_url": "https://blob.example/legacy-logs.zip"
+            }),
+            Some("https://blob.example/diagnostics.zip"),
+        ),
+        (
+            "non-string official field is rejected",
+            serde_json::json!({"diag_logs_url": 42}),
+            None,
+        ),
+    ];
+
+    for (name, response, expected) in cases {
+        assert_eq!(diagnostic_logs_url(&response), expected, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn diagnostic_signed_url_uses_official_receiver_endpoint() {
+    let (base_url, request_rx) = serve_diagnostic_signed_url().await;
+    let http = crate::client::http::HttpClient::new(None).unwrap();
+    let client = crate::client::results::ResultsClient::new(http, base_url);
+
+    let response = client
+        .get_diagnostic_logs_signed_url(
+            "test-token",
+            &serde_json::json!({
+                "workflow_run_backend_id": "plan-1",
+                "workflow_job_run_backend_id": "job-1"
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        diagnostic_logs_url(&response),
+        Some("https://blob.example/diagnostics.zip")
+    );
+    let request = request_rx.await.unwrap();
+    assert!(request.starts_with(
+        "POST /twirp/results.services.receiver.Receiver/GetJobDiagLogsSignedBlobURL HTTP/1.1"
+    ));
 }
