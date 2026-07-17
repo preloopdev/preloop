@@ -199,11 +199,13 @@ pub(crate) fn build_app(
     let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/.well-known/openid-configuration", get(oidc_discovery))
+        .route("/.well-known/jwks", get(oidc_jwks))
         .route("/.well-known/jwks.json", get(oidc_jwks))
         .route(
             "/oidc/.well-known/openid-configuration",
             get(oidc_discovery),
         )
+        .route("/oidc/.well-known/jwks", get(oidc_jwks))
         .route("/oidc/.well-known/jwks.json", get(oidc_jwks))
         // GHES-style org-prefixed routes
         .route("/:org/_apis/connectionData", get(connection_data))
