@@ -111,7 +111,7 @@ impl ResultsClient {
         body: &serde_json::Value,
     ) -> Result<serde_json::Value> {
         let url = format!(
-            "{}/twirp/results.services.receiver.Receiver/CreateResultsDiagnosticLogsSignedBlobURL",
+            "{}/twirp/results.services.receiver.Receiver/GetJobDiagLogsSignedBlobURL",
             self.base_url
         );
         self.http
@@ -206,15 +206,15 @@ mod tests {
             client.base_url
         );
         let diagnostics = format!(
-            "{}/twirp/results.services.receiver.Receiver/CreateResultsDiagnosticLogsSignedBlobURL",
+            "{}/twirp/results.services.receiver.Receiver/GetJobDiagLogsSignedBlobURL",
             client.base_url
         );
 
         assert!(step.ends_with("results.services.receiver.Receiver/GetStepLogsSignedBlobURL"));
         assert!(job.ends_with("results.services.receiver.Receiver/GetJobLogsSignedBlobURL"));
         assert!(summary.ends_with("results.services.receiver.Receiver/GetStepSummarySignedBlobURL"));
-        assert!(diagnostics.ends_with(
-            "results.services.receiver.Receiver/CreateResultsDiagnosticLogsSignedBlobURL"
-        ));
+        assert!(
+            diagnostics.ends_with("results.services.receiver.Receiver/GetJobDiagLogsSignedBlobURL")
+        );
     }
 }
