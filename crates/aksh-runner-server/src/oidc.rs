@@ -13,7 +13,10 @@
 use aksh_gha_protocol::crypto::{sign_jwt_rs256_with_key, AgentRsaKeypair, RsaParametersExport};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use rcgen::{CertificateParams, DnType, KeyPair, KeyUsagePurpose};
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
+use x509_parser::prelude::FromDer;
 
 /// The issuer URL used by GitHub's hosted OIDC provider for compatibility tests.
 pub const GITHUB_OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
@@ -21,29 +24,41 @@ pub const GITHUB_OIDC_ISSUER: &str = "https://token.actions.githubusercontent.co
 /// Token validity window in seconds.
 const TOKEN_TTL_SECS: u64 = 300;
 
-/// An RSA keypair dedicated to OIDC token signing, with a precomputed `kid`
-/// (RFC 7638 JWK thumbprint).
+/// An RSA keypair dedicated to OIDC token signing, with a persisted X.509
+/// certificate and its identifiers.
 #[derive(Clone)]
 pub struct OidcKeypair {
     keypair: AgentRsaKeypair,
     kid: String,
+    certificate_der: Vec<u8>,
+    x5t: String,
 }
 
 impl OidcKeypair {
-    /// Generate a fresh 2048-bit RSA keypair and compute its `kid`.
+    /// Generate a fresh RSA keypair and a self-signed certificate for it.
     pub fn generate() -> Result<Self, anyhow::Error> {
         let keypair = AgentRsaKeypair::generate()
             .map_err(|e| anyhow::anyhow!("OIDC keypair generation failed: {e}"))?;
-        let kid = compute_kid(&keypair);
-        Ok(Self { keypair, kid })
+        let certificate_der = generate_certificate(&keypair)?;
+        Self::from_keypair_and_certificate(keypair, certificate_der)
     }
 
-    /// Reconstruct from persisted `RsaParametersExport` (C# RSAParameters JSON).
+    /// Reconstruct from persisted RSA parameters and generate a certificate.
     pub fn from_params(params: &RsaParametersExport) -> Result<Self, anyhow::Error> {
         let keypair = AgentRsaKeypair::from_rsaparams(params)
             .map_err(|e| anyhow::anyhow!("OIDC keypair import failed: {e}"))?;
-        let kid = compute_kid(&keypair);
-        Ok(Self { keypair, kid })
+        let certificate_der = generate_certificate(&keypair)?;
+        Self::from_keypair_and_certificate(keypair, certificate_der)
+    }
+
+    /// Reconstruct from persisted RSA parameters and certificate DER.
+    pub fn from_params_and_certificate(
+        params: &RsaParametersExport,
+        certificate_der: &[u8],
+    ) -> Result<Self, anyhow::Error> {
+        let keypair = AgentRsaKeypair::from_rsaparams(params)
+            .map_err(|e| anyhow::anyhow!("OIDC keypair import failed: {e}"))?;
+        Self::from_keypair_and_certificate(keypair, certificate_der.to_vec())
     }
 
     /// Export for persistence.
@@ -56,6 +71,16 @@ impl OidcKeypair {
         &self.kid
     }
 
+    /// The DER-encoded signing certificate.
+    pub fn certificate_der(&self) -> &[u8] {
+        &self.certificate_der
+    }
+
+    /// The Base64URL SHA-1 thumbprint of the signing certificate.
+    pub fn x5t(&self) -> &str {
+        &self.x5t
+    }
+
     /// Build the JWKS document (`{"keys":[…]}`).
     pub fn jwks(&self) -> serde_json::Value {
         let (n, e) = self.keypair.jwk_components();
@@ -63,6 +88,7 @@ impl OidcKeypair {
             "keys": [{
                 "kty": "RSA",
                 "kid": self.kid,
+                "x5t": self.x5t,
                 "alg": "RS256",
                 "use": "sig",
                 "n": n,
@@ -77,9 +103,52 @@ impl OidcKeypair {
             "alg": "RS256",
             "typ": "JWT",
             "kid": self.kid,
+            "x5t": self.x5t,
         });
         sign_jwt_rs256_with_key(&header, claims, &self.keypair)
     }
+
+    fn from_keypair_and_certificate(
+        keypair: AgentRsaKeypair,
+        certificate_der: Vec<u8>,
+    ) -> Result<Self, anyhow::Error> {
+        let (_, certificate) =
+            x509_parser::certificate::X509Certificate::from_der(&certificate_der)
+                .map_err(|error| anyhow::anyhow!("OIDC certificate parse failed: {error}"))?;
+        let expected_spki = keypair
+            .public_key_spki_der()
+            .map_err(|error| anyhow::anyhow!("OIDC public key export failed: {error}"))?;
+        if certificate.public_key().raw != expected_spki.as_slice() {
+            return Err(anyhow::anyhow!(
+                "OIDC certificate public key does not match signing key"
+            ));
+        }
+        let kid = compute_kid(&keypair);
+        let x5t = URL_SAFE_NO_PAD.encode(Sha1::digest(&certificate_der));
+        Ok(Self {
+            keypair,
+            kid,
+            certificate_der,
+            x5t,
+        })
+    }
+}
+
+fn generate_certificate(keypair: &AgentRsaKeypair) -> Result<Vec<u8>, anyhow::Error> {
+    let private_key_der = keypair
+        .private_key_pkcs8_der()
+        .map_err(|error| anyhow::anyhow!("OIDC private key export failed: {error}"))?;
+    let signing_key = KeyPair::try_from(private_key_der.as_slice())
+        .map_err(|error| anyhow::anyhow!("OIDC certificate key import failed: {error}"))?;
+    let mut params = CertificateParams::default();
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "aksh OIDC");
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    let certificate = params
+        .self_signed(&signing_key)
+        .map_err(|error| anyhow::anyhow!("OIDC certificate generation failed: {error}"))?;
+    Ok(certificate.der().to_vec())
 }
 
 /// Compute the RFC 7638 JWK thumbprint (base64url(SHA-256 of the canonical JWK)).
@@ -1133,7 +1202,7 @@ mod lie_github_tests {
     }
 
     #[test]
-    fn jwt_header_omits_unbacked_x5t() {
+    fn jwt_header_includes_certificate_x5t() {
         let kp = OidcKeypair::generate().unwrap();
         let input = test_input("refs/heads/main", "push", None);
         let claims = build_claims(&input, "test", GITHUB_OIDC_ISSUER, 100);
@@ -1141,7 +1210,11 @@ mod lie_github_tests {
         let parts: Vec<&str> = jwt.split('.').collect();
         let header: serde_json::Value =
             serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[0]).unwrap()).unwrap();
-        assert!(header.get("x5t").is_none());
+        assert_eq!(header["x5t"], kp.x5t());
+        assert_eq!(
+            header["x5t"],
+            URL_SAFE_NO_PAD.encode(Sha1::digest(kp.certificate_der()))
+        );
         assert_eq!(header["kid"], kp.kid());
     }
 
