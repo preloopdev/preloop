@@ -314,6 +314,7 @@ pub fn build_agent_job_message(
         job_id,
         request_id,
         plan: PlanReference {
+            scope_identifier: job_id.to_string(),
             plan_id: job_id.to_string(),
             plan_type: "actions".to_owned(),
             version: 0,
