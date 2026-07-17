@@ -13,6 +13,35 @@ use crate::client::http::HttpClient;
 use crate::listener::job_dispatcher::{self, cancellation_timing, parse_timespan_secs, RunningJob};
 use crate::settings::RunnerConfig;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrokerMessageKind {
+    RunnerJobRequest,
+    PipelineAgentJobRequest,
+    JobCancellation,
+    AgentRefresh,
+    BrokerMigration,
+    ForceTokenRefresh,
+    RunnerShutdown,
+    RunnerRefresh,
+    RunnerRefreshConfig,
+    Unknown,
+}
+
+fn classify_message(message_type: &str) -> BrokerMessageKind {
+    match message_type {
+        "RunnerJobRequest" => BrokerMessageKind::RunnerJobRequest,
+        "PipelineAgentJobRequest" => BrokerMessageKind::PipelineAgentJobRequest,
+        "JobCancellation" => BrokerMessageKind::JobCancellation,
+        "AgentRefresh" => BrokerMessageKind::AgentRefresh,
+        "BrokerMigration" => BrokerMessageKind::BrokerMigration,
+        "ForceTokenRefresh" => BrokerMessageKind::ForceTokenRefresh,
+        "RunnerShutdown" => BrokerMessageKind::RunnerShutdown,
+        "RunnerRefresh" => BrokerMessageKind::RunnerRefresh,
+        "RunnerRefreshConfig" => BrokerMessageKind::RunnerRefreshConfig,
+        _ => BrokerMessageKind::Unknown,
+    }
+}
+
 /// Run the broker message polling loop.
 pub async fn run_broker_loop(
     http: &HttpClient,
@@ -269,8 +298,8 @@ pub async fn run_broker_loop(
                             let _ = client.acknowledge(&token, &session_id, &runner_request_id).await;
                         }
 
-                        match message_type.as_str() {
-                            "RunnerJobRequest" => {
+                        match classify_message(&message_type) {
+                            BrokerMessageKind::RunnerJobRequest => {
                                 if let Some(mut prev) = active_job.take() {
                                     // C-04: Official run-service dispatcher cancels
                                     // the previous worker immediately on overlap
@@ -312,7 +341,7 @@ pub async fn run_broker_loop(
                                     active_job = Some(running);
                                 }
                             }
-                            "PipelineAgentJobRequest" => {
+                            BrokerMessageKind::PipelineAgentJobRequest => {
                                 if let Some(mut prev) = active_job.take() {
                                     // Same cancel-immediately pattern for AzDO path
                                     info!(
@@ -342,7 +371,7 @@ pub async fn run_broker_loop(
                                 ).await?;
                                 active_job = Some(running);
                             }
-                            "JobCancellation" => {
+                            BrokerMessageKind::JobCancellation => {
                                 // Official shape: { jobId: Guid, timeout: TimeSpan }
                                 let cancel_job_id = body
                                     .get("jobId")
@@ -388,10 +417,35 @@ pub async fn run_broker_loop(
                                     debug!("Received cancellation but no active job");
                                 }
                             }
-                            "AgentRefresh" => {
+                            BrokerMessageKind::AgentRefresh => {
                                 info!("Self-update requested; aksh-runner does not self-update");
                             }
-                            "BrokerMigration" => {
+                            BrokerMessageKind::ForceTokenRefresh => {
+                                info!("Received ForceTokenRefresh; refreshing listener token");
+                                match crate::listener::oauth::get_oauth_token(http, config).await {
+                                    Ok((new_token, new_expires)) => {
+                                        token = new_token;
+                                        token_expires_at = new_expires;
+                                        consecutive_errors = 0;
+                                    }
+                                    Err(error) => warn!("Forced OAuth token refresh failed: {error:#}"),
+                                }
+                            }
+                            BrokerMessageKind::RunnerShutdown => {
+                                let reason = body
+                                    .get("reason")
+                                    .and_then(|value| value.as_str())
+                                    .unwrap_or("unspecified");
+                                info!(%reason, "Service requested runner shutdown");
+                                return Ok(());
+                            }
+                            BrokerMessageKind::RunnerRefresh => {
+                                info!("Self-update requested (RunnerRefresh); aksh-runner does not self-update");
+                            }
+                            BrokerMessageKind::RunnerRefreshConfig => {
+                                info!("Runner configuration refresh requested; dynamic config updates are not supported");
+                            }
+                            BrokerMessageKind::BrokerMigration => {
                                 info!("Broker migration requested — re-resolving broker URL...");
                                 if !session_id.is_empty() {
                                     let _ = client.delete_session(&token, &session_id).await;
@@ -403,8 +457,8 @@ pub async fn run_broker_loop(
                                     client = BrokerClient::new(http.clone(), new_url.trim_end_matches('/').to_string());
                                 }
                             }
-                            other => {
-                                warn!("Unknown broker message type: {other}");
+                            BrokerMessageKind::Unknown => {
+                                warn!(%message_type, "unhandled broker message type");
                             }
                         }
                     }
@@ -603,6 +657,39 @@ mod tests {
     use super::*;
 
     // --- P1 broker listener gap coverage ---
+
+    #[test]
+    fn classify_message_maps_official_broker_types() {
+        let cases = [
+            ("RunnerJobRequest", BrokerMessageKind::RunnerJobRequest),
+            (
+                "PipelineAgentJobRequest",
+                BrokerMessageKind::PipelineAgentJobRequest,
+            ),
+            ("JobCancellation", BrokerMessageKind::JobCancellation),
+            ("AgentRefresh", BrokerMessageKind::AgentRefresh),
+            ("BrokerMigration", BrokerMessageKind::BrokerMigration),
+            ("ForceTokenRefresh", BrokerMessageKind::ForceTokenRefresh),
+            ("RunnerShutdown", BrokerMessageKind::RunnerShutdown),
+            ("RunnerRefresh", BrokerMessageKind::RunnerRefresh),
+            (
+                "RunnerRefreshConfig",
+                BrokerMessageKind::RunnerRefreshConfig,
+            ),
+            // The official SDK wire constant is RunnerShutdown; this legacy
+            // name must remain unknown rather than being accepted as an alias.
+            ("HostedRunnerShutdown", BrokerMessageKind::Unknown),
+            ("FutureBrokerMessage", BrokerMessageKind::Unknown),
+        ];
+
+        for (wire_type, expected) in cases {
+            assert_eq!(
+                classify_message(wire_type),
+                expected,
+                "unexpected classification for broker type {wire_type}"
+            );
+        }
+    }
 
     #[test]
     fn is_unauthorized_detects_401() {
