@@ -11,6 +11,7 @@ mod errors;
 pub mod events;
 pub mod github;
 pub mod scheduler;
+mod shared_http;
 pub use errors::ApiError;
 mod actions;
 use actions::*;

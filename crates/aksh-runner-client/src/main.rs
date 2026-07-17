@@ -87,7 +87,10 @@ async fn main() -> anyhow::Result<()> {
     let native_api_token =
         env::var("AKSH_SYSTEM_TOKEN").unwrap_or_else(|_| "aksh-system-token".to_owned());
     let cli = Cli::parse();
-    let http = reqwest::Client::new();
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent("aksh-runner-client")
+        .build()?;
 
     match cli.command {
         Command::Submit {
