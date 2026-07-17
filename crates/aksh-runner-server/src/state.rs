@@ -252,21 +252,17 @@ pub(crate) fn mint_runtime_token(plan_id: &str, job_id: &uuid::Uuid) -> String {
     )
 }
 
-/// Load the OIDC signing keypair from `<state_dir>/oidc-key.json`, or generate
-/// a new one and persist it for reuse across restarts.
+/// Load the OIDC signing keypair from `<state_dir>/oidc-key.json` and its
+/// certificate from `<state_dir>/oidc-cert.der`, generating missing material.
 pub(crate) fn load_or_generate_oidc_keypair(
     state_dir: &std::path::Path,
 ) -> anyhow::Result<oidc::OidcKeypair> {
     let key_path = state_dir.join("oidc-key.json");
+    let certificate_path = state_dir.join("oidc-cert.der");
+    std::fs::create_dir_all(state_dir)?;
+
     if key_path.exists() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
-            let mode = std::fs::metadata(&key_path)?.mode();
-            if mode & 0o077 != 0 {
-                std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
-            }
-        }
+        set_private_file_permissions(&key_path)?;
         let content = std::fs::read_to_string(&key_path).map_err(|error| {
             anyhow::anyhow!("failed to read OIDC key {}: {error}", key_path.display())
         })?;
@@ -275,13 +271,32 @@ pub(crate) fn load_or_generate_oidc_keypair(
                 .map_err(|error| {
                     anyhow::anyhow!("invalid OIDC key {}: {error}", key_path.display())
                 })?;
-        return oidc::OidcKeypair::from_params(&params);
+        let kp = if certificate_path.exists() {
+            set_private_file_permissions(&certificate_path)?;
+            let certificate_der = std::fs::read(&certificate_path).map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to read OIDC certificate {}: {error}",
+                    certificate_path.display()
+                )
+            })?;
+            oidc::OidcKeypair::from_params_and_certificate(&params, &certificate_der)?
+        } else {
+            let kp = oidc::OidcKeypair::from_params(&params)?;
+            persist_private_file(&certificate_path, kp.certificate_der())?;
+            kp
+        };
+        return Ok(kp);
     }
 
     let kp = oidc::OidcKeypair::generate()?;
     let json = serde_json::to_vec(&kp.params())?;
-    std::fs::create_dir_all(state_dir)?;
-    let temp_path = state_dir.join(format!("oidc-key.{}.tmp", uuid::Uuid::new_v4()));
+    persist_private_file(&key_path, &json)?;
+    persist_private_file(&certificate_path, kp.certificate_der())?;
+    Ok(kp)
+}
+
+fn persist_private_file(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let temp_path = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -289,16 +304,31 @@ pub(crate) fn load_or_generate_oidc_keypair(
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(&temp_path)?;
-    use std::io::Write;
-    file.write_all(&json)?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::rename(&temp_path, &key_path).map_err(|error| {
+    let result = (|| -> anyhow::Result<()> {
+        use std::io::Write;
+        let mut file = options.open(&temp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp_path, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
         let _ = std::fs::remove_file(&temp_path);
-        anyhow::anyhow!("failed to persist OIDC key {}: {error}", key_path.display())
-    })?;
-    Ok(kp)
+    }
+    result
+}
+
+fn set_private_file_permissions(path: &std::path::Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mode = std::fs::metadata(path)?.mode();
+        if mode & 0o077 != 0 {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(())
 }
 
 /// Load or generate a 32-byte HMAC key for local JWT signing.
