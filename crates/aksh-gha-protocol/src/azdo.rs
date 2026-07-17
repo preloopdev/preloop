@@ -1044,6 +1044,58 @@ pub enum PipelineContextData {
     Dict(BTreeMap<String, PipelineContextData>),
 }
 
+impl PipelineContextData {
+    /// Convert a plain `serde_json::Value` (expression-context JSON) into
+    /// `PipelineContextData`.
+    ///
+    /// This is **not** the wire codec (which handles the tagged `{"t":…}` format
+    /// used by `Serialize`/`Deserialize`). This converts the simple JSON shape
+    /// used in expression evaluation, job-message context data, and concurrency
+    /// group resolution.
+    ///
+    /// `Value::Null` maps to `PipelineContextData::Null` — preserving null
+    /// semantics throughout the parser→server→runner pipeline.
+    pub fn from_json(value: &serde_json::Value) -> Self {
+        match value {
+            serde_json::Value::String(s) => PipelineContextData::String(s.clone()),
+            serde_json::Value::Bool(b) => PipelineContextData::Bool(*b),
+            serde_json::Value::Number(n) => PipelineContextData::Number(n.as_f64().unwrap_or(0.0)),
+            serde_json::Value::Array(arr) => {
+                PipelineContextData::Array(arr.iter().map(PipelineContextData::from_json).collect())
+            }
+            serde_json::Value::Object(map) => PipelineContextData::Dict(
+                map.iter()
+                    .map(|(k, v)| (k.clone(), PipelineContextData::from_json(v)))
+                    .collect(),
+            ),
+            serde_json::Value::Null => PipelineContextData::Null,
+        }
+    }
+
+    /// Convert `PipelineContextData` back to a plain `serde_json::Value`.
+    ///
+    /// Inverse of [`from_json`](Self::from_json). `Null` round-trips as
+    /// `Value::Null`.
+    pub fn to_json(&self) -> serde_json::Value {
+        match self {
+            PipelineContextData::Null => serde_json::Value::Null,
+            PipelineContextData::String(s) => serde_json::Value::String(s.clone()),
+            PipelineContextData::Bool(b) => serde_json::Value::Bool(*b),
+            PipelineContextData::Number(n) => serde_json::json!(n),
+            PipelineContextData::Array(items) => {
+                serde_json::Value::Array(items.iter().map(PipelineContextData::to_json).collect())
+            }
+            PipelineContextData::Dict(map) => {
+                let mut obj = serde_json::Map::new();
+                for (k, v) in map {
+                    obj.insert(k.clone(), v.to_json());
+                }
+                serde_json::Value::Object(obj)
+            }
+        }
+    }
+}
+
 impl Serialize for PipelineContextData {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
