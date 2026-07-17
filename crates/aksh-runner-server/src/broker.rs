@@ -42,7 +42,11 @@ pub(crate) fn public_base_url() -> String {
         .to_owned()
 }
 
-pub(crate) fn format_reusable_workflow_ref(repository: &str, workflow_ref: &str, caller_ref: &str) -> String {
+pub(crate) fn format_reusable_workflow_ref(
+    repository: &str,
+    workflow_ref: &str,
+    caller_ref: &str,
+) -> String {
     if let Some(path) = workflow_ref.strip_prefix("./") {
         let (path, git_ref) = path.split_once('@').unwrap_or((path, caller_ref));
         return format!("{repository}/{path}@{git_ref}");
@@ -87,7 +91,10 @@ pub(crate) fn runner_server_url() -> String {
     format!("{}/runner/server", public_base_url())
 }
 
-pub(crate) fn broker_job_ref(request: &TaskAgentJobRequestRecord, runner_id: i64) -> serde_json::Value {
+pub(crate) fn broker_job_ref(
+    request: &TaskAgentJobRequestRecord,
+    runner_id: i64,
+) -> serde_json::Value {
     json!({
         "messageId": request.agent_job_id.to_string(),
         "messageType": "RunnerJobRequest",
@@ -100,7 +107,10 @@ pub(crate) fn broker_job_ref(request: &TaskAgentJobRequestRecord, runner_id: i64
     })
 }
 
-pub(crate) fn broker_job_ref_root(request: &TaskAgentJobRequestRecord, runner_id: i64) -> serde_json::Value {
+pub(crate) fn broker_job_ref_root(
+    request: &TaskAgentJobRequestRecord,
+    runner_id: i64,
+) -> serde_json::Value {
     // messageId must be unique across job + cancel messages on a session.
     // Using request_id alone collides with cancel messages that also allocate
     // from the same integer space (runner in-memory dedup then drops the job).
