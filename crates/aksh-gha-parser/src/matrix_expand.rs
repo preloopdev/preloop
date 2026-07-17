@@ -1,15 +1,14 @@
 //! Pure matrix expansion matching GitHub Actions semantics.
 //!
-//! Official order (docs.github.com + runner.server):
-//! 1. Cartesian product of axis values (declaration order).
-//! 2. Drop combinations that partially match any `exclude` object.
-//! 3. For each `include` object: merge into the first compatible combination,
-//!    else append as include-only.
-//! 4. If the result is empty, emit a single empty combination (no matrix context).
+//! Official order (`MatrixBuilder.cs` in the GitHub workflow parser):
+//! 1. Build the Cartesian product of declared axes.
+//! 2. Drop rows that match an `exclude` filter.
+//! 3. Match every `include` against each surviving original row using only
+//!    declared axis keys; merge non-axis extras, with later extras winning.
+//! 4. Append each include that matched no original row as an independent row.
 //!
-//! Deferred matrices (`fromJSON(needs.*.outputs.*)`) are modeled explicitly so
-//! property tests can assert unresolved display identity when a producer fails
-//! (property-testing-plan scenario 63).
+//! An explicitly empty or fully excluded matrix produces no rows. A job with
+//! no matrix is handled separately and produces one empty matrix context.
 
 use indexmap::IndexMap;
 use serde_json::Value;
@@ -34,40 +33,15 @@ pub struct MatrixCombination {
     pub include_only: bool,
 }
 
-/// Deferred matrix axis that cannot be expanded until a producer job finishes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeferredMatrixAxis {
-    /// Axis name in the consumer job.
-    pub name: String,
-    /// Raw expression, e.g. `fromJSON(needs.producer.outputs.matrix)`.
-    pub expression: String,
-}
-
-/// Result of attempting expansion when some axes are deferred.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ExpandOutcome {
-    /// Fully concrete expansion.
-    Concrete(Vec<MatrixCombination>),
-    /// Producer failed or outputs missing: keep unresolved display placeholders.
-    Unresolved {
-        /// Base job id.
-        base_id: String,
-        /// Display name template that must retain `${{ matrix.* }}` placeholders.
-        display_template: String,
-        /// Deferred axes that never resolved.
-        deferred: Vec<DeferredMatrixAxis>,
-    },
-}
-
-/// Expand a concrete matrix. Never panics; invalid empty axis lists yield no
-/// cartesian rows (then include-only / empty fallback apply).
+/// Expand a concrete matrix according to GitHub's `MatrixBuilder` semantics.
 pub fn expand_matrix_spec(spec: &MatrixSpec) -> Vec<MatrixCombination> {
-    let mut combinations: Vec<IndexMap<String, Value>> = vec![IndexMap::new()];
+    let mut combinations = Vec::with_capacity(cartesian_count(spec));
+    if !spec.axes.is_empty() && spec.axes.values().all(|values| !values.is_empty()) {
+        combinations.push(IndexMap::new());
+    }
 
     for (axis, values) in &spec.axes {
         if values.is_empty() {
-            // Empty axis annihilates the product (GitHub rejects this in practice;
-            // we model it as zero cartesian rows before include).
             combinations.clear();
             break;
         }
@@ -90,53 +64,59 @@ pub fn expand_matrix_spec(spec: &MatrixSpec) -> Vec<MatrixCombination> {
         combinations.retain(|candidate| !matches_partial(candidate, excluded));
     }
 
-    let mut tagged: Vec<MatrixCombination> = combinations
-        .into_iter()
-        .map(|values| MatrixCombination {
-            values,
-            include_only: false,
-        })
-        .collect();
+    // MatrixBuilder evaluates every include against the original cross-product
+    // row, not against a row already mutated by earlier includes. Only declared
+    // axis keys are filters; all other keys are extras. Later matching includes
+    // overwrite earlier extras with the same key.
+    let mut include_matched = vec![false; spec.include.len()];
+    let mut expanded = Vec::with_capacity(combinations.len() + spec.include.len());
+    for mut values in combinations {
+        let mut extras = IndexMap::new();
+        for (index, included) in spec.include.iter().enumerate() {
+            let matches = included
+                .iter()
+                .all(|(key, value)| !spec.axes.contains_key(key) || values.get(key) == Some(value));
+            if !matches {
+                continue;
+            }
 
-    // Official MatrixBuilder.MatrixInclude.Match: each include filter is applied
-    // against *every* cross-product vector (not just the first match). Unmatched
-    // include rows are appended as include-only configurations.
-    // Source: actions/runner MatrixBuilder.cs (via runner.server Sdk/WorkflowParser).
-    for included in &spec.include {
-        let mut matched_any = false;
-        for candidate in &mut tagged {
-            if can_merge_include(&candidate.values, included) {
-                candidate.values.extend(included.clone());
-                matched_any = true;
+            include_matched[index] = true;
+            for (key, value) in included {
+                if !spec.axes.contains_key(key) {
+                    extras.insert(key.clone(), value.clone());
+                }
             }
         }
-        if !matched_any {
-            tagged.push(MatrixCombination {
+        values.extend(extras);
+        expanded.push(MatrixCombination {
+            values,
+            include_only: false,
+        });
+    }
+
+    for (included, matched) in spec.include.iter().zip(include_matched) {
+        if !matched {
+            expanded.push(MatrixCombination {
                 values: included.clone(),
                 include_only: true,
             });
         }
     }
 
-    // Official MatrixBuilder yields zero configs when the product is empty and
-    // no include-only rows remain (all-excluded matrix → no jobs). Do not invent
-    // a synthetic empty combination here.
-    tagged
+    expanded
 }
 
 /// Cartesian product size before exclude/include (0 if any axis is empty).
 pub fn cartesian_count(spec: &MatrixSpec) -> usize {
     if spec.axes.is_empty() {
-        return 1;
+        return 0;
     }
-    let mut n = 1usize;
-    for values in spec.axes.values() {
-        if values.is_empty() {
-            return 0;
-        }
-        n = n.saturating_mul(values.len());
-    }
-    n
+    spec.axes
+        .values()
+        .try_fold(1usize, |count, values| {
+            (!values.is_empty()).then(|| count.saturating_mul(values.len()))
+        })
+        .unwrap_or(0)
 }
 
 /// Build the official expanded job id: `base (v1, v2)` in declaration order.
@@ -146,35 +126,6 @@ pub fn expanded_job_id(base: &str, matrix: &IndexMap<String, Value>) -> String {
     }
     let values: Vec<String> = matrix.values().map(value_key).collect();
     format!("{base} ({})", values.join(", "))
-}
-
-/// When deferred axes cannot resolve, the display identity must keep the
-/// template form rather than collapsing to the bare base id (scenario 63).
-pub fn unresolved_display_identity(base_id: &str, display_template: &str) -> String {
-    if display_template.contains("${{") {
-        display_template.to_owned()
-    } else {
-        // No template — still must not invent matrix values.
-        base_id.to_owned()
-    }
-}
-
-/// Expand or record unresolved deferred identity.
-pub fn expand_with_deferred(
-    base_id: &str,
-    display_template: &str,
-    concrete: &MatrixSpec,
-    deferred: &[DeferredMatrixAxis],
-    producer_ok: bool,
-) -> ExpandOutcome {
-    if !deferred.is_empty() && !producer_ok {
-        return ExpandOutcome::Unresolved {
-            base_id: base_id.to_owned(),
-            display_template: unresolved_display_identity(base_id, display_template),
-            deferred: deferred.to_vec(),
-        };
-    }
-    ExpandOutcome::Concrete(expand_matrix_spec(concrete))
 }
 
 fn value_key(value: &Value) -> String {
@@ -192,17 +143,11 @@ fn matches_partial(candidate: &IndexMap<String, Value>, partial: &IndexMap<Strin
     })
 }
 
-fn can_merge_include(
-    candidate: &IndexMap<String, Value>,
-    include: &IndexMap<String, Value>,
-) -> bool {
-    include
-        .iter()
-        .all(|(key, value)| candidate.get(key).is_none_or(|existing| existing == value))
-}
-
-/// Convert parser `Matrix` wire type into a pure `MatrixSpec`.
-pub fn matrix_to_spec(matrix: &crate::Matrix) -> MatrixSpec {
+/// Convert the parser's matrix type into a validated expansion specification.
+pub fn matrix_to_spec(
+    job_id: &str,
+    matrix: &crate::Matrix,
+) -> Result<MatrixSpec, crate::ParserError> {
     let mut axes = IndexMap::new();
     for (axis, values) in &matrix.axes {
         let axis_values = match values {
@@ -211,21 +156,34 @@ pub fn matrix_to_spec(matrix: &crate::Matrix) -> MatrixSpec {
         };
         axes.insert(axis.clone(), axis_values);
     }
+
     let exclude = matrix
         .exclude
         .iter()
-        .filter_map(|v| value_object_indexed(v))
-        .collect();
+        .map(|value| matrix_entry(job_id, "exclude", value))
+        .collect::<Result<_, _>>()?;
     let include = matrix
         .include
         .iter()
-        .filter_map(|v| value_object_indexed(v))
-        .collect();
-    MatrixSpec {
+        .map(|value| matrix_entry(job_id, "include", value))
+        .collect::<Result<_, _>>()?;
+
+    Ok(MatrixSpec {
         axes,
         exclude,
         include,
-    }
+    })
+}
+
+fn matrix_entry(
+    job_id: &str,
+    field: &'static str,
+    value: &Value,
+) -> Result<IndexMap<String, Value>, crate::ParserError> {
+    value_object_indexed(value).ok_or_else(|| crate::ParserError::InvalidMatrixEntry {
+        job_id: job_id.to_owned(),
+        field,
+    })
 }
 
 fn value_object_indexed(value: &Value) -> Option<IndexMap<String, Value>> {
@@ -274,33 +232,6 @@ mod tests {
             c.values.get("os") == Some(&json!("macos-latest"))
                 && c.values.get("node") == Some(&json!(20))
         }));
-    }
-
-    #[test]
-    fn scenario_63_unresolved_keeps_template() {
-        let deferred = vec![DeferredMatrixAxis {
-            name: "case".into(),
-            expression: "fromJSON(needs.producer.outputs.matrix)".into(),
-        }];
-        let outcome = expand_with_deferred(
-            "matrix-build",
-            "matrix-build-${{ matrix.case }}-${{ matrix.mode }}",
-            &MatrixSpec::default(),
-            &deferred,
-            false,
-        );
-        match outcome {
-            ExpandOutcome::Unresolved {
-                display_template, ..
-            } => {
-                assert_eq!(
-                    display_template,
-                    "matrix-build-${{ matrix.case }}-${{ matrix.mode }}"
-                );
-                assert_ne!(display_template, "matrix-build");
-            }
-            other => panic!("expected unresolved, got {other:?}"),
-        }
     }
 
     fn arb_scalar() -> impl Strategy<Value = Value> {
@@ -454,50 +385,6 @@ mod tests {
             }
         }
 
-        /// Deferred failure preserves template identity (scenario 63 family).
-        #[test]
-        fn deferred_failure_preserves_placeholders(
-            case_name in "[a-z]{1,5}",
-            mode_name in "[a-z]{1,5}"
-        ) {
-            let template = format!(
-                "matrix-build-${{{{ matrix.{case_name} }}}}-${{{{ matrix.{mode_name} }}}}"
-            );
-            let deferred = vec![
-                DeferredMatrixAxis {
-                    name: case_name,
-                    expression: "fromJSON(needs.p.outputs.m)".into(),
-                },
-                DeferredMatrixAxis {
-                    name: mode_name,
-                    expression: "fromJSON(needs.p.outputs.m2)".into(),
-                },
-            ];
-            let outcome = expand_with_deferred(
-                "matrix-build",
-                &template,
-                &MatrixSpec::default(),
-                &deferred,
-                false,
-            );
-            match outcome {
-                ExpandOutcome::Unresolved {
-                    display_template, ..
-                } => {
-                    prop_assert!(display_template.contains("${{"));
-                    prop_assert_ne!(display_template, "matrix-build");
-                }
-                ExpandOutcome::Concrete(_) => prop_assert!(false, "should be unresolved"),
-            }
-        }
-
-        /// When producer succeeds with no deferred axes, concrete expansion runs.
-        #[test]
-        fn deferred_ok_without_axes_is_concrete(spec in arb_matrix_spec()) {
-            let outcome =
-                expand_with_deferred("job", "job", &spec, &[], true);
-            prop_assert!(matches!(outcome, ExpandOutcome::Concrete(_)));
-        }
     }
 
     /// Include-only rows are tagged and do not invent axis declaration order.
@@ -591,7 +478,13 @@ mod tests {
             .unwrap();
         assert_eq!(x64_linux.values.get("publish"), Some(&json!(true)));
         // Other rows must not get publish.
-        assert!(combos.iter().filter(|c| c.values.get("publish").is_some()).count() == 1);
+        assert!(
+            combos
+                .iter()
+                .filter(|c| c.values.get("publish").is_some())
+                .count()
+                == 1
+        );
     }
 
     /// Include with only an axis key that matches multiple product rows applies
@@ -615,7 +508,9 @@ mod tests {
             .collect();
         // Both x64/linux and x64/windows get publish:true.
         assert_eq!(published.len(), 2);
-        assert!(published.iter().all(|c| c.values.get("arch") == Some(&json!("x64"))));
+        assert!(published
+            .iter()
+            .all(|c| c.values.get("arch") == Some(&json!("x64"))));
     }
 
     /// Official: all-excluded product with no include-only → zero configurations.
@@ -631,6 +526,112 @@ mod tests {
             include: vec![],
         });
         assert!(combos.is_empty());
+    }
+
+    /// GitHub's documented include example: include filters compare only axis
+    /// keys against original cartesian rows; later extras overwrite earlier
+    /// extras, and unmatched include rows remain independent.
+    #[test]
+    fn official_sequential_includes_use_original_axes() {
+        let mut axes = IndexMap::new();
+        axes.insert("fruit".into(), vec![json!("apple"), json!("pear")]);
+        axes.insert("animal".into(), vec![json!("cat"), json!("dog")]);
+
+        let includes = [
+            json!({"color": "green"}),
+            json!({"color": "pink", "animal": "cat"}),
+            json!({"fruit": "apple", "shape": "circle"}),
+            json!({"fruit": "banana"}),
+            json!({"fruit": "banana", "animal": "cat"}),
+        ]
+        .into_iter()
+        .map(|value| value_object_indexed(&value).unwrap())
+        .collect();
+
+        let combos = expand_matrix_spec(&MatrixSpec {
+            axes,
+            exclude: vec![],
+            include: includes,
+        });
+        let values: Vec<Value> = combos
+            .into_iter()
+            .map(|combo| serde_json::to_value(combo.values).unwrap())
+            .collect();
+
+        assert_eq!(
+            values,
+            vec![
+                json!({
+                    "fruit": "apple", "animal": "cat", "color": "pink", "shape": "circle"
+                }),
+                json!({
+                    "fruit": "apple", "animal": "dog", "color": "green", "shape": "circle"
+                }),
+                json!({"fruit": "pear", "animal": "cat", "color": "pink"}),
+                json!({"fruit": "pear", "animal": "dog", "color": "green"}),
+                json!({"fruit": "banana"}),
+                json!({"fruit": "banana", "animal": "cat"}),
+            ]
+        );
+    }
+
+    #[test]
+    fn expand_jobs_all_excluded_yields_no_jobs() {
+        let workflow = crate::parse_workflow(
+            r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [linux]
+        exclude:
+          - os: linux
+    steps:
+      - run: echo test
+"#,
+        )
+        .unwrap();
+
+        assert!(crate::expand_jobs(&workflow).unwrap().is_empty());
+    }
+
+    #[test]
+    fn expand_jobs_explicit_empty_matrix_yields_no_jobs() {
+        let workflow = crate::parse_workflow(
+            r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: {}
+    steps:
+      - run: echo test
+"#,
+        )
+        .unwrap();
+
+        assert!(crate::expand_jobs(&workflow).unwrap().is_empty());
+    }
+
+    #[test]
+    fn matrix_conversion_rejects_non_object_include_and_exclude_rows() {
+        for (field, matrix) in [
+            ("include", json!({"include": ["not-an-object"]})),
+            ("exclude", json!({"exclude": [42]})),
+        ] {
+            let matrix: crate::Matrix = serde_json::from_value(matrix).unwrap();
+            let error = matrix_to_spec("build", &matrix).unwrap_err();
+            assert!(matches!(
+                error,
+                crate::ParserError::InvalidMatrixEntry {
+                    ref job_id,
+                    field: actual_field,
+                } if job_id == "build" && actual_field == field
+            ));
+        }
     }
 
     /// Golden fixture fixtures/golden/matrix-expand.yml expansion ids.
@@ -651,8 +652,9 @@ mod tests {
         );
     }
 
-    /// Size limit: cartesian count stays bounded for generated specs.
-    /// Oracle: docs/property-tests.md §2.14 — size limits enforced before expansion.
+    // Size limit: cartesian count stays bounded for generated specs.
+    // Oracle: docs/property-tests.md §2.14 — size limits enforced before expansion.
+
     proptest! {
         #![proptest_config(ProptestConfig { cases: 1_000, ..ProptestConfig::default() })]
 
@@ -662,8 +664,8 @@ mod tests {
             sizes in proptest::collection::vec(0usize..=6, 0..=4),
         ) {
             let mut axes = IndexMap::new();
-            for i in 0..axis_count.min(sizes.len()) {
-                let vals: Vec<Value> = (0..sizes[i]).map(|v| json!(v)).collect();
+            for (i, size) in sizes.iter().copied().take(axis_count).enumerate() {
+                let vals: Vec<Value> = (0..size).map(|v| json!(v)).collect();
                 if !vals.is_empty() {
                     axes.insert(format!("a{i}"), vals);
                 }
@@ -688,20 +690,28 @@ mod tests {
         axes_ba.insert("node".into(), vec![json!(18), json!(20)]);
         axes_ba.insert("os".into(), vec![json!("linux"), json!("mac")]);
 
-        let combos_ab = expand_matrix_spec(&MatrixSpec { axes: axes_ab, exclude: vec![], include: vec![] });
-        let combos_ba = expand_matrix_spec(&MatrixSpec { axes: axes_ba, exclude: vec![], include: vec![] });
+        let combos_ab = expand_matrix_spec(&MatrixSpec {
+            axes: axes_ab,
+            exclude: vec![],
+            include: vec![],
+        });
+        let combos_ba = expand_matrix_spec(&MatrixSpec {
+            axes: axes_ba,
+            exclude: vec![],
+            include: vec![],
+        });
         assert_eq!(combos_ab.len(), combos_ba.len());
-        // Same value sets (order may differ by declaration order, which is correct)
-        let set_ab: std::collections::BTreeSet<_> = combos_ab.iter().map(|c| {
-            let mut sorted: Vec<_> = c.values.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-            sorted.sort_by(|a, b| a.0.cmp(&b.0));
-            sorted
-        }).collect();
-        let set_ba: std::collections::BTreeSet<_> = combos_ba.iter().map(|c| {
-            let mut sorted: Vec<_> = c.values.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-            sorted.sort_by(|a, b| a.0.cmp(&b.0));
-            sorted
-        }).collect();
+        // Compare logical key/value sets; declaration order intentionally differs.
+        let normalize = |combination: &MatrixCombination| {
+            let sorted: std::collections::BTreeMap<_, _> = combination
+                .values
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            serde_json::to_string(&sorted).unwrap()
+        };
+        let set_ab: std::collections::BTreeSet<_> = combos_ab.iter().map(normalize).collect();
+        let set_ba: std::collections::BTreeSet<_> = combos_ba.iter().map(normalize).collect();
         assert_eq!(set_ab, set_ba);
     }
 
@@ -716,10 +726,16 @@ mod tests {
             let mut axes = IndexMap::new();
             axes.insert("x".into(), vals);
             if case % 3 == 0 {
-                let vals2: Vec<Value> = (0..((case % 2 + 1) as usize)).map(|v| json!(format!("w{v}"))).collect();
+                let vals2: Vec<Value> = (0..((case % 2 + 1) as usize))
+                    .map(|v| json!(format!("w{v}")))
+                    .collect();
                 axes.insert("y".into(), vals2);
             }
-            let spec = MatrixSpec { axes: axes.clone(), exclude: vec![], include: vec![] };
+            let spec = MatrixSpec {
+                axes: axes.clone(),
+                exclude: vec![],
+                include: vec![],
+            };
             let model_count = expand_matrix_spec(&spec).len();
 
             // Render as YAML
@@ -727,7 +743,9 @@ mod tests {
             for (name, values) in &axes {
                 yaml.push_str(&format!("        {name}: ["));
                 for (i, v) in values.iter().enumerate() {
-                    if i > 0 { yaml.push_str(", "); }
+                    if i > 0 {
+                        yaml.push_str(", ");
+                    }
                     yaml.push_str(v.as_str().unwrap_or("0"));
                 }
                 yaml.push_str("]\n");
@@ -737,7 +755,8 @@ mod tests {
             let workflow = crate::parse_workflow(&yaml).unwrap();
             let jobs = crate::expand_jobs(&workflow).unwrap();
             assert_eq!(
-                jobs.len(), model_count,
+                jobs.len(),
+                model_count,
                 "case {case}: production {}, model {model_count}",
                 jobs.len()
             );
