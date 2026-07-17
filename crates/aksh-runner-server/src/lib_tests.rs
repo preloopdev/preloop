@@ -2001,7 +2001,17 @@ jobs:
         &runner_token,
     )
     .await;
-    assert!(renewed["lockedUntil"].as_str().unwrap().contains('T'));
+    let locked_until = renewed["lockedUntil"]
+        .as_str()
+        .expect("renewjob must advertise lockedUntil");
+    let locked_until = chrono::DateTime::parse_from_rfc3339(locked_until)
+        .expect("renewed lockedUntil must be RFC3339")
+        .with_timezone(&chrono::Utc);
+    let seconds_until = (locked_until - chrono::Utc::now()).num_seconds();
+    assert!(
+        (seconds_until - JOB_LEASE_SECONDS as i64).abs() <= 5,
+        "renewed lease should be approximately {JOB_LEASE_SECONDS}s, got {seconds_until}s"
+    );
 
     let response = app
         .clone()
@@ -3297,14 +3307,37 @@ async fn runner_lease_expiration_disconnect_reaper() {
         *inner.job_requests.keys().next().unwrap()
     };
 
-    // 3. Override last_renewed_at to be in the past (beyond 120s threshold)
+    // 3. Exercise the just-before-boundary case without sleeping.
     {
         let mut inner = state.inner.lock().await;
         let request = inner.job_requests.get_mut(&request_id).unwrap();
-        request.last_renewed_at = Some(SystemTime::now() - Duration::from_secs(130));
+        request.last_renewed_at =
+            Some(SystemTime::now() - Duration::from_secs(JOB_LEASE_SECONDS - 1));
     }
 
-    // 4. Run reaper tick
+    reap_once(&shared).await;
+    {
+        let inner = state.inner.lock().await;
+        let request = inner.job_requests.get(&request_id).unwrap();
+        assert_eq!(
+            request.result, None,
+            "lease must survive just before expiry"
+        );
+        assert!(inner.inflight_requests.contains_key(&request_id));
+        assert_eq!(
+            inner.runs.get(&run_id).unwrap().status,
+            ExecutionStatus::InProgress
+        );
+    }
+
+    // 4. Move just beyond the same production lease boundary and reap.
+    {
+        let mut inner = state.inner.lock().await;
+        let request = inner.job_requests.get_mut(&request_id).unwrap();
+        request.last_renewed_at =
+            Some(SystemTime::now() - Duration::from_secs(JOB_LEASE_SECONDS + 1));
+    }
+
     reap_once(&shared).await;
 
     // 5. Verify the job was marked failed and run completes as failed
