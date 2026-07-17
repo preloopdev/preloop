@@ -331,6 +331,7 @@ fn set_private_file_permissions(path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(not(test))]
 /// Load or generate a 32-byte HMAC key for local JWT signing.
 ///
 /// Persisted to `<state_dir>/hmac-key.bin` so runtime tokens survive restarts.
@@ -388,7 +389,6 @@ impl InnerState {
 }
 
 #[derive(Default)]
-#[allow(dead_code)]
 pub(crate) struct InnerState {
     pub(crate) runs: BTreeMap<RunId, RunRecord>,
     pub(crate) queue: VecDeque<QueuedJob>,
@@ -396,6 +396,8 @@ pub(crate) struct InnerState {
     pub(crate) runners: BTreeMap<i64, RegisteredRunner>,
     pub(crate) sessions: BTreeMap<String, RunnerSession>,
     pub(crate) session_keys: BTreeMap<String, SessionEncryption>,
+    // test-only: retained for session encryption integration coverage.
+    #[allow(dead_code)]
     pub(crate) agent_keypair: Option<AgentRsaKeypair>,
     pub(crate) runner_public_keys: BTreeMap<i64, String>,
     pub(crate) runner_rsa_public_keys: BTreeMap<i64, AgentRsaPublicKey>,

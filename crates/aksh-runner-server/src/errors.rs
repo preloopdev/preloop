@@ -36,13 +36,6 @@ impl ApiError {
         }
     }
 
-    pub(crate) fn unprocessable(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::UNPROCESSABLE_ENTITY,
-            message: message.into(),
-        }
-    }
-
     pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -83,7 +76,7 @@ impl From<aksh_artifacts::ArtifactError> for ApiError {
 
 impl From<std::io::Error> for ApiError {
     fn from(value: std::io::Error) -> Self {
-        Self::bad_request(value.to_string())
+        Self::internal(value.to_string())
     }
 }
 
