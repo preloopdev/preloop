@@ -230,11 +230,11 @@ pub fn build_agent_job_message(
     // Context data follows the AgentJobRequestMessage contract. Workflow-level
     // metadata is enriched by the server, which owns the submission path/ref.
     let mut context_data = BTreeMap::new();
-    context_data.insert("github".to_owned(), to_context_data(github));
+    context_data.insert("github".to_owned(), PipelineContextData::from_json(github));
     let inputs_ctx = plan
         .inputs
         .iter()
-        .map(|(k, v)| (k.clone(), to_context_data(v)))
+        .map(|(k, v)| (k.clone(), PipelineContextData::from_json(v)))
         .collect();
     context_data.insert("inputs".to_owned(), PipelineContextData::Dict(inputs_ctx));
 
@@ -273,7 +273,7 @@ pub fn build_agent_job_message(
             PipelineContextData::Dict(
                 plan.matrix
                     .iter()
-                    .map(|(k, v)| (k.clone(), to_context_data(v)))
+                    .map(|(k, v)| (k.clone(), PipelineContextData::from_json(v)))
                     .collect(),
             ),
         );
@@ -590,22 +590,6 @@ fn step_input_to_string(value: &Value) -> String {
     match value {
         Value::String(value) => value.clone(),
         other => other.to_string(),
-    }
-}
-
-/// Convert a `serde_json::Value` to `PipelineContextData`.
-fn to_context_data(value: &Value) -> PipelineContextData {
-    match value {
-        Value::String(s) => PipelineContextData::String(s.clone()),
-        Value::Bool(b) => PipelineContextData::Bool(*b),
-        Value::Number(n) => PipelineContextData::Number(n.as_f64().unwrap_or(0.0)),
-        Value::Array(arr) => PipelineContextData::Array(arr.iter().map(to_context_data).collect()),
-        Value::Object(map) => PipelineContextData::Dict(
-            map.iter()
-                .map(|(k, v)| (k.clone(), to_context_data(v)))
-                .collect(),
-        ),
-        Value::Null => PipelineContextData::Null,
     }
 }
 
