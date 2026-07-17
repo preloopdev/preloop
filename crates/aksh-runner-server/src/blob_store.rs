@@ -117,6 +117,10 @@ pub(crate) async fn blob_put(
         }
         _ => {
             // Single-shot upload.
+            if let Err(e) = tokio::fs::create_dir_all(&blob_root).await {
+                warn!(kind, token, "failed to create blob dir: {e}");
+                return StatusCode::INTERNAL_SERVER_ERROR;
+            }
             let data_path = blob_root.join("data");
             match tokio::fs::write(&data_path, &body).await {
                 Ok(()) => {
