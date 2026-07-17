@@ -4,7 +4,7 @@ use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
-use crate::worker::execution_context::Annotation;
+use crate::worker::execution_types::Annotation;
 use crate::worker::matchers::MatcherRegistry;
 
 /// The top-level job context holding all sub-contexts and accumulated state.

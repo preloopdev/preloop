@@ -4,18 +4,23 @@
 //! concurrently reading stdin for cancel messages. This mirrors Worker.cs:
 //! the listener can send `{"t":"cancel"}` at any time during execution.
 
+pub mod action_preparation;
 pub mod actions;
 pub mod commands;
+pub mod completion;
 pub mod container_ops;
 pub mod contexts;
 pub mod execution_context;
+pub mod execution_types;
 pub mod file_commands;
 pub mod handlers;
+pub mod helpers;
 pub mod job_extension;
 pub mod job_runner;
 pub mod live_logs;
 pub mod matchers;
 pub mod official_oracles;
+pub mod reporting;
 pub mod server_queue;
 pub mod step_conditions;
 pub mod step_records;

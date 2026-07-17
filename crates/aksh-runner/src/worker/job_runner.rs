@@ -13,6 +13,19 @@
 //! This module wires `ServerQueue`, `ResultsClient`, and `RunServiceClient` to
 //! implement the full reporting lifecycle.
 
+use super::action_preparation::{parse_remote_uses, prepare_remote_actions};
+use super::completion::{make_hook_step, report_completion};
+use super::helpers::{extract_results_url, extract_service_endpoint, iso_now};
+use super::reporting::{
+    diagnostic_logs_url, flush_step_updates, upload_diagnostic_logs, upload_job_log,
+};
+use super::server_queue::ServerQueue;
+use super::steps_runner::Step;
+use crate::cli::ProtocolPath;
+use crate::client::azdo::AzdoClient;
+use crate::client::http::{HttpClient, HttpError};
+use crate::client::results::ResultsClient;
+use crate::client::run_service::RunServiceClient;
 use anyhow::Result;
 use chrono::{DateTime, TimeDelta, Utc};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,15 +33,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{watch, Mutex};
 use tracing::{debug, error, info, warn};
-
-use super::execution_context::Annotation;
-use super::server_queue::ServerQueue;
-use super::steps_runner::{Step, StepType};
-use crate::cli::ProtocolPath;
-use crate::client::azdo::AzdoClient;
-use crate::client::http::{HttpClient, HttpError};
-use crate::client::results::ResultsClient;
-use crate::client::run_service::RunServiceClient;
 
 /// AzDO-specific reporting state threaded into [`ReportingContext`] when
 /// `--via azdo` is active.  Contains only what the timeline and log endpoints
@@ -64,41 +68,29 @@ pub async fn run_job(
         .get("jobDisplayName")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
-
     info!("Starting job: {job_name} ({job_id})");
-
     let steps = job_message
         .get("steps")
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-
     let variables = job_message
         .get("variables")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
-
     let context_data = job_message
         .get("contextData")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
-
-    // Build execution context
     let mut job_ctx = super::contexts::JobContext::new(
         job_id.to_string(),
         job_name.to_string(),
         variables,
         context_data,
     );
-
-    // Initialize workspace
     let workspace = super::job_extension::setup_workspace(&job_message)?;
     job_ctx.workspace = Some(workspace.clone());
-
-    // Inject GITHUB_* environment variables
     super::job_extension::inject_github_env(&mut job_ctx, &job_message);
-
-    // Phase 2: Parse container/service specs from job message
     let raw_container = job_message.get("jobContainer");
     let raw_services = job_message.get("jobServiceContainers");
     info!(
@@ -110,12 +102,10 @@ pub async fn run_job(
             .map(|v| v.to_string())
             .unwrap_or_else(|| "absent".to_string()),
     );
-
     let job_container_spec = raw_container.and_then(super::container_ops::parse_container_spec);
     let service_specs = raw_services
         .map(super::container_ops::parse_service_specs)
         .unwrap_or_default();
-
     let has_containers = job_container_spec.is_some() || !service_specs.is_empty();
     if has_containers {
         info!(
@@ -124,31 +114,18 @@ pub async fn run_job(
             service_specs.len()
         );
     }
-
-    // Extract plan ID
     let plan_id = job_message
         .get("plan")
         .and_then(|p| p.get("planId"))
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-
     let main_steps = super::job_extension::build_step_list(&steps, &job_message);
-
-    // F022/F023: download remote actions before lifecycle discovery so pre/post
-    // manifests are available and action execution uses SHA-pinned directories.
     let action_paths =
         prepare_remote_actions(&job_message, &workspace, &main_steps, &plan_id).await?;
     job_ctx.action_paths = action_paths.clone();
-
-    // Build step list (F023: includes pre/post from downloaded manifests)
     let mut ordered_steps =
         super::job_extension::build_step_list_with_lifecycle(main_steps, &workspace, &action_paths);
-
-    // ACTIONS_RUNNER_HOOK_JOB_STARTED / ACTIONS_RUNNER_HOOK_JOB_COMPLETED:
-    // The official runner reads these from the host OS environment and injects
-    // them as synthetic script steps before and after user steps respectively.
-    // Providers use them for workspace pre-warming, VM snapshotting, metrics, etc.
     if let Ok(hook) = std::env::var("ACTIONS_RUNNER_HOOK_JOB_STARTED") {
         if !hook.is_empty() {
             info!("Injecting ACTIONS_RUNNER_HOOK_JOB_STARTED: {hook}");
@@ -168,10 +145,6 @@ pub async fn run_job(
             ));
         }
     }
-
-    // ── DAP debugger (parity with GlobalContext.Debugger) ────────
-    // Mirrors `ExecutionContext.cs` populating `Global.Debugger` from
-    // `message.EnableDebugger` + `message.DebuggerTunnel`.
     {
         let enable_debugger = job_message
             .get("enableDebugger")
@@ -223,8 +196,6 @@ pub async fn run_job(
             }
         }
     }
-
-    // DAP: OnJobStepsInitialized — send step list to debugger view.
     if let Some(dbg) = job_ctx.dap_debugger.as_ref() {
         let entries: Vec<aksh_dap::SourceEntry> = ordered_steps
             .iter()
@@ -258,14 +229,11 @@ pub async fn run_job(
         dbg.on_job_steps_initialized(&entries, &post, &predicted)
             .await;
     }
-    // Set up reporting context (F018/F019/F020/F030)
     let reporting = if let Some((service_url, access_token)) =
         extract_service_endpoint(&job_message)
     {
         let http = HttpClient::new(None)?;
         let results_url = extract_results_url(&job_message).unwrap_or_else(|| service_url.clone());
-
-        // F030: build AzDO-specific context when running via the legacy protocol path.
         let azdo = if via == ProtocolPath::Azdo {
             let timeline_id = job_message
                 .get("timeline")
@@ -285,7 +253,6 @@ pub async fn run_job(
         } else {
             None
         };
-
         Some(Arc::new(ReportingContext {
             results: ResultsClient::new(http.clone(), results_url),
             run_service: RunServiceClient::new(http, service_url),
@@ -298,9 +265,6 @@ pub async fn run_job(
         warn!("No SystemVssConnection endpoint — reporting disabled");
         None
     };
-
-    // F030: mark the job record InProgress on the AzDO timeline so GitHub shows
-    // the job as running (mirrors JobRunner.cs InitializeJob → QueueTimelineRecordUpdate).
     if let Some(rpt) = &reporting {
         if let Some(azdo) = &rpt.azdo {
             let job_record = serde_json::json!({
@@ -325,7 +289,6 @@ pub async fn run_job(
             }
         }
     }
-
     let live_logs = if let Some(feed_url) = super::live_logs::extract_feed_stream_url(&job_message)
     {
         let token = reporting
@@ -338,18 +301,10 @@ pub async fn run_job(
     };
     let live_log_handle = live_logs.as_ref().map(|queue| queue.spawn_drain());
     job_ctx.live_logs = live_logs.clone();
-
-    // Create the server queue for step status tracking
     let queue = Arc::new(Mutex::new(ServerQueue::new(
         job_id.to_string(),
         plan_id.clone(),
     )));
-
-    // F031/P1.5: Job-level timeout enforcement.
-    // For self-hosted runners on github.com, the server enforces `timeout-minutes`
-    // and sends a cancellation message. The local timer is a safety net matching
-    // the official runner's 360-minute default. If the job message ever carries
-    // the timeout (e.g. `jobTimeout` or `plan.jobTimeoutInMinutes`), we'll use it.
     let job_timeout_minutes: u64 = job_message
         .get("jobTimeout")
         .and_then(|v| v.as_u64())
@@ -360,14 +315,7 @@ pub async fn run_job(
                 .and_then(|v| v.as_u64())
         })
         .unwrap_or(360);
-
     info!("Job timeout: {job_timeout_minutes} minutes");
-
-    // Instead of wrapping run_steps in tokio::time::timeout (which would drop
-    // the future and orphan child processes — the bug F015 fixed), we create a
-    // derived cancel channel that merges the parent cancel with a timeout timer.
-    // When the timer fires, cancel_tx trips and process::invoke kills the
-    // process group, then run_steps unwinds through normal cancel semantics.
     let (job_cancel_tx, job_cancel_rx) = watch::channel(false);
     let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let lease_lost = Arc::new(AtomicBool::new(false));
@@ -379,8 +327,6 @@ pub async fn run_job(
             lease_lost.clone(),
         )
     });
-
-    // Forward parent cancel → job cancel
     let fwd_tx = job_cancel_tx.clone();
     let mut fwd_rx = cancel_rx.clone();
     let forward_handle = tokio::spawn(async move {
@@ -615,12 +561,6 @@ pub async fn run_job(
     info!("Job {job_name} finished with result: {conclusion}");
     Ok(())
 }
-
-// ── Renew loop (F018) ────────────────────────────────────────────────
-
-/// Renew immediately, then every 60 seconds after success. Transient failures
-/// back off until the advertised lease plus the official five-minute grace;
-/// a missing job is terminal and cancels local execution.
 fn spawn_renew_loop(
     rpt: Arc<ReportingContext>,
     cancel_rx: watch::Receiver<bool>,
@@ -755,1159 +695,6 @@ fn is_job_not_found(error: &anyhow::Error) -> bool {
         error.downcast_ref::<HttpError>(),
         Some(HttpError::Status { status, .. }) if *status == reqwest::StatusCode::NOT_FOUND
     )
-}
-
-/// Flush queued step-status updates to the server.
-///
-/// Broker path: WorkflowStepsUpdate Twirp call.
-/// AzDO path (F030): PATCH timeline records via `update_timeline`.
-pub async fn flush_step_updates(rpt: &ReportingContext, queue: &Arc<Mutex<ServerQueue>>) {
-    let body = {
-        let mut q = queue.lock().await;
-        q.take_steps_update_body()
-    };
-
-    let Some(body) = body else { return };
-
-    if let Some(azdo) = &rpt.azdo {
-        // F030: translate StepUpdate → AzDO TimelineRecord and PATCH.
-        let records: Vec<serde_json::Value> = body
-            .steps
-            .iter()
-            .map(azdo_timeline_record_from_step_update)
-            .collect();
-        let count = records.len();
-        let payload = serde_json::json!({ "count": count, "value": records });
-        match azdo
-            .client
-            .update_timeline(&rpt.access_token, &rpt.plan_id, &azdo.timeline_id, &payload)
-            .await
-        {
-            Ok(_) => info!(
-                "AzDO timeline updated ({} steps, change_order={})",
-                body.steps.len(),
-                body.change_order
-            ),
-            Err(e) => warn!("AzDO timeline update failed (non-fatal): {e:#}"),
-        }
-    } else {
-        let body_json = serde_json::to_value(&body).unwrap_or_default();
-        match rpt
-            .results
-            .update_workflow_steps(&rpt.access_token, &body_json)
-            .await
-        {
-            Ok(_) => info!(
-                "WorkflowStepsUpdate sent ({} steps, change_order={})",
-                body.steps.len(),
-                body.change_order
-            ),
-            Err(e) => warn!("WorkflowStepsUpdate failed (non-fatal): {e:#}"),
-        }
-    }
-}
-
-/// Convert a [`StepUpdate`] (Twirp-oriented) to an AzDO timeline record JSON value.
-///
-/// AzDO `TimelineRecordState`: 0=Pending, 1=InProgress, 2=Completed.
-/// AzDO `TaskResult`:          0=Succeeded, 1=SucceededWithIssues, 2=Failed,
-///                             3=Canceled, 4=Skipped, 5=Abandoned.
-fn azdo_timeline_record_from_step_update(s: &super::server_queue::StepUpdate) -> serde_json::Value {
-    use super::server_queue::{step_conclusion, step_status};
-
-    // AzDO TimelineRecordState strings (TimelineRecordState.cs): "pending", "inProgress", "completed"
-    let state_str = if s.status == step_status::COMPLETED {
-        "completed"
-    } else {
-        "inProgress"
-    };
-
-    let mut record = serde_json::json!({
-        "id":    s.external_id,
-        "name":  s.name,
-        "type":  "step",
-        "order": s.number,
-        "state": state_str,
-        "percentComplete": if s.status == step_status::COMPLETED { 100_u32 } else { 0_u32 },
-    });
-
-    if let Some(ts) = &s.started_at {
-        record["startTime"] = serde_json::json!(ts);
-    }
-
-    if s.status == step_status::COMPLETED {
-        // AzDO TaskResult strings (TaskResult.cs): "succeeded", "succeededWithIssues",
-        // "failed", "canceled", "skipped", "abandoned".
-        let result_str = match s.conclusion {
-            c if c == step_conclusion::SUCCEEDED => "succeeded",
-            c if c == step_conclusion::FAILED => "failed",
-            c if c == step_conclusion::SKIPPED => "skipped",
-            _ => "failed",
-        };
-        record["result"] = serde_json::json!(result_str);
-        if let Some(ts) = &s.completed_at {
-            record["finishTime"] = serde_json::json!(ts);
-        }
-    }
-
-    record
-}
-
-// ── Log upload (F020) ────────────────────────────────────────────────
-
-/// Upload a single step's log content.
-///
-/// Broker path (F020): POST GetStepLogsSignedBlobURL → PUT blob.
-/// AzDO path  (F030): POST create_log → PUT append_log → PATCH timeline log ref.
-pub async fn upload_step_log(rpt: &ReportingContext, step_id: &str, content: &str) {
-    if content.is_empty() {
-        return;
-    }
-
-    if let Some(azdo) = &rpt.azdo {
-        // AzDO: create a log entry, append content, then set the log ref on the
-        // timeline record so GitHub can link the step record to its log.
-        let log_body = serde_json::json!({
-            "path": format!("logs/{step_id}"),
-            "lineCount": content.lines().count(),
-        });
-        let log_id = match azdo
-            .client
-            .create_log(&rpt.access_token, &rpt.plan_id, &log_body)
-            .await
-        {
-            Ok(resp) => match resp.get("id").and_then(|v| v.as_i64()) {
-                Some(id) => id,
-                None => {
-                    warn!("AzDO create_log response missing id for step {step_id}");
-                    return;
-                }
-            },
-            Err(e) => {
-                warn!("AzDO create_log failed for step {step_id}: {e:#}");
-                return;
-            }
-        };
-
-        match azdo
-            .client
-            .append_log(
-                &rpt.access_token,
-                &rpt.plan_id,
-                log_id,
-                content.as_bytes().to_vec(),
-            )
-            .await
-        {
-            Ok(()) => info!(
-                "AzDO: uploaded log for step {step_id} (log_id={log_id}, {} bytes)",
-                content.len()
-            ),
-            Err(e) => warn!("AzDO append_log failed for step {step_id}: {e:#}"),
-        }
-
-        // Patch the timeline record to attach the log reference.
-        let log_ref_patch = serde_json::json!({
-            "count": 1,
-            "value": [{ "id": step_id, "log": { "id": log_id } }]
-        });
-        match azdo
-            .client
-            .update_timeline(
-                &rpt.access_token,
-                &rpt.plan_id,
-                &azdo.timeline_id,
-                &log_ref_patch,
-            )
-            .await
-        {
-            Ok(_) => {}
-            Err(e) => warn!("AzDO timeline log-ref patch failed for step {step_id}: {e:#}"),
-        }
-        return;
-    }
-
-    // Broker path: signed-URL blob upload.
-    let body = serde_json::json!({
-        "workflow_job_run_backend_id": rpt.job_id,
-        "workflow_run_backend_id": rpt.plan_id,
-        "step_backend_id": step_id,
-    });
-
-    let signed_url = match rpt
-        .results
-        .get_step_logs_signed_url(&rpt.access_token, &body)
-        .await
-    {
-        Ok(resp) => resp
-            .get("logs_url")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        Err(e) => {
-            warn!("GetStepLogsSignedBlobURL failed for step {step_id}: {e:#}");
-            return;
-        }
-    };
-
-    if signed_url.is_empty() {
-        warn!("Empty signed URL for step {step_id}");
-        return;
-    }
-
-    match rpt
-        .results
-        .upload_log_blob(&signed_url, content.as_bytes().to_vec())
-        .await
-    {
-        Ok(()) => {
-            info!("Uploaded log for step {step_id} ({} bytes)", content.len());
-            // Official runner calls CreateStepLogsMetadata after each step log upload
-            let metadata = serde_json::json!({
-                "workflow_run_backend_id": rpt.plan_id,
-                "workflow_job_run_backend_id": rpt.job_id,
-                "step_backend_id": step_id,
-                "uploaded_at": iso_now(),
-                "line_count": content.lines().count(),
-            });
-            match rpt
-                .results
-                .create_step_logs_metadata(&rpt.access_token, &metadata)
-                .await
-            {
-                Ok(_) => info!("CreateStepLogsMetadata succeeded for step {step_id}"),
-                Err(e) => warn!("CreateStepLogsMetadata failed for step {step_id}: {e:#}"),
-            }
-        }
-        Err(e) => warn!("Log upload failed for step {step_id}: {e:#}"),
-    }
-}
-
-/// F035: Upload step summary content to the results service.
-///
-/// AzDO path: no-op — the AzDO protocol has no step summary equivalent.
-/// Broker path: GetStepSummarySignedBlobURL → PUT blob → CreateStepSummaryMetadata.
-pub async fn upload_step_summary(rpt: &ReportingContext, step_id: &str, content: &str) {
-    if content.is_empty() {
-        return;
-    }
-
-    if rpt.azdo.is_some() {
-        debug!("AzDO path: step summaries not supported, skipping for step {step_id}");
-        return;
-    }
-
-    if content.len() > 1_048_576 {
-        warn!("Step summary exceeds 1MiB limit for step {step_id}, skipping upload");
-        return;
-    }
-
-    let body = serde_json::json!({
-        "workflow_job_run_backend_id": rpt.job_id,
-        "workflow_run_backend_id": rpt.plan_id,
-        "step_backend_id": step_id,
-    });
-
-    let signed_url = match rpt
-        .results
-        .get_step_summary_signed_url(&rpt.access_token, &body)
-        .await
-    {
-        Ok(resp) => resp
-            .get("summary_url")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        Err(e) => {
-            warn!("GetStepSummarySignedBlobURL failed for step {step_id}: {e:#}");
-            return;
-        }
-    };
-
-    if signed_url.is_empty() {
-        warn!("Empty signed URL for step summary {step_id}");
-        return;
-    }
-
-    let byte_count = content.len();
-    match rpt
-        .results
-        .upload_log_blob(&signed_url, content.as_bytes().to_vec())
-        .await
-    {
-        Ok(()) => info!("Uploaded summary for step {step_id} ({byte_count} bytes)"),
-        Err(e) => {
-            warn!("Summary upload failed for step {step_id}: {e:#}");
-            return;
-        }
-    }
-
-    let metadata = serde_json::json!({
-        "workflow_job_run_backend_id": rpt.job_id,
-        "workflow_run_backend_id": rpt.plan_id,
-        "step_backend_id": step_id,
-        "size": byte_count,
-        "uploaded_at": iso_now(),
-    });
-    match rpt
-        .results
-        .create_step_summary_metadata(&rpt.access_token, &metadata)
-        .await
-    {
-        Ok(_) => info!("CreateStepSummaryMetadata succeeded for step {step_id}"),
-        Err(e) => warn!("CreateStepSummaryMetadata failed for step {step_id}: {e:#}"),
-    }
-}
-
-/// Upload the full job log (concatenation of all step logs).
-///
-/// AzDO path: no-op — individual step logs are already uploaded via
-/// `upload_step_log`; there is no separate job-log endpoint in the AzDO path.
-/// Broker path (F020): POST GetJobLogsSignedBlobURL → PUT blob.
-async fn upload_job_log(rpt: &ReportingContext, content: &str) {
-    if rpt.azdo.is_some() {
-        debug!("AzDO path: skipping job log upload (step logs already uploaded individually)");
-        return;
-    }
-
-    let body = serde_json::json!({
-        "workflow_job_run_backend_id": rpt.job_id,
-        "workflow_run_backend_id": rpt.plan_id,
-    });
-
-    let signed_url = match rpt
-        .results
-        .get_job_logs_signed_url(&rpt.access_token, &body)
-        .await
-    {
-        Ok(resp) => resp
-            .get("logs_url")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        Err(e) => {
-            warn!("GetJobLogsSignedBlobURL failed: {e:#}");
-            return;
-        }
-    };
-
-    if signed_url.is_empty() {
-        warn!("Empty signed URL for job log");
-        return;
-    }
-
-    match rpt
-        .results
-        .upload_log_blob(&signed_url, content.as_bytes().to_vec())
-        .await
-    {
-        Ok(()) => {
-            info!("Uploaded job log ({} bytes)", content.len());
-            // Official runner calls CreateJobLogsMetadata after job log upload
-            let metadata = serde_json::json!({
-                "workflow_run_backend_id": rpt.plan_id,
-                "workflow_job_run_backend_id": rpt.job_id,
-                "uploaded_at": iso_now(),
-                "line_count": content.lines().count(),
-            });
-            match rpt
-                .results
-                .create_job_logs_metadata(&rpt.access_token, &metadata)
-                .await
-            {
-                Ok(_) => info!("CreateJobLogsMetadata succeeded"),
-                Err(e) => warn!("CreateJobLogsMetadata failed: {e:#}"),
-            }
-        }
-        Err(e) => warn!("Job log upload failed: {e:#}"),
-    }
-}
-
-/// F054: Upload diagnostic logs from the _diag/ directory (if present).
-///
-/// Matches official `DiagnosticLogManager.UploadDiagnosticLogs()`:
-/// - Collects log files from the runner's _diag/ directory
-/// - Creates a zip archive with metadata
-/// - Uploads via the results service
-fn diagnostic_logs_url(response: &serde_json::Value) -> Option<&str> {
-    response
-        .get("diag_logs_url")
-        .and_then(|value| value.as_str())
-}
-
-async fn upload_diagnostic_logs(
-    rpt: &ReportingContext,
-    runner_root: &std::path::Path,
-    job_name: &str,
-    plan_id: &str,
-    job_id: &str,
-) {
-    let diag_dir = runner_root.join("_diag");
-    if !diag_dir.is_dir() {
-        debug!(
-            "No _diag/ directory found at {} — skipping diagnostic log upload",
-            diag_dir.display()
-        );
-        return;
-    }
-
-    // Collect log files
-    let log_files: Vec<_> = match std::fs::read_dir(&diag_dir) {
-        Ok(entries) => entries
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .is_some_and(|ext| ext == "log" || ext == "txt")
-            })
-            .collect(),
-        Err(e) => {
-            debug!("Failed to read _diag/ directory: {e}");
-            return;
-        }
-    };
-
-    if log_files.is_empty() {
-        debug!("No log files in _diag/ — skipping diagnostic upload");
-        return;
-    }
-
-    // Create a simple zip of all log files
-    let zip_path = runner_root
-        .join("_work")
-        .join("_temp")
-        .join(format!("{job_name}-diagnostics.zip"));
-    if let Some(parent) = zip_path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-
-    let zip_result = (|| -> Result<Vec<u8>> {
-        use std::io::Write;
-        let mut buf = Vec::new();
-        {
-            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-            let options = zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Deflated);
-
-            for entry in &log_files {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if let Ok(content) = std::fs::read(&entry.path()) {
-                    zip.start_file(&name, options)?;
-                    zip.write_all(&content)?;
-                }
-            }
-
-            // Add metadata JSON
-            let metadata = serde_json::json!({
-                "jobName": job_name,
-                "planId": plan_id,
-                "jobId": job_id,
-                "fileCount": log_files.len(),
-            });
-            zip.start_file("diagnostics-metadata.json", options)?;
-            zip.write_all(serde_json::to_string_pretty(&metadata)?.as_bytes())?;
-            zip.finish()?;
-        }
-        Ok(buf)
-    })();
-
-    let zip_content = match zip_result {
-        Ok(content) => content,
-        Err(e) => {
-            warn!("Failed to create diagnostic zip: {e:#}");
-            return;
-        }
-    };
-
-    // Upload via results service
-    let body = serde_json::json!({
-        "workflow_run_backend_id": plan_id,
-        "workflow_job_run_backend_id": job_id,
-    });
-
-    let signed_url = match rpt
-        .results
-        .get_diagnostic_logs_signed_url(&rpt.access_token, &body)
-        .await
-    {
-        Ok(response) => diagnostic_logs_url(&response).unwrap_or("").to_owned(),
-        Err(e) => {
-            debug!("Diagnostic log signed URL request failed (non-fatal): {e:#}");
-            return;
-        }
-    };
-
-    if signed_url.is_empty() {
-        debug!("Empty signed URL for diagnostic logs — server may not support this feature");
-        return;
-    }
-
-    match rpt.results.upload_log_blob(&signed_url, zip_content).await {
-        Ok(()) => info!(
-            "Uploaded diagnostic logs ({} files, {} bytes)",
-            log_files.len(),
-            zip_path.display()
-        ),
-        Err(e) => warn!("Diagnostic log upload failed: {e:#}"),
-    }
-}
-
-async fn prepare_remote_actions(
-    job_message: &serde_json::Value,
-    workspace: &str,
-    steps: &[Step],
-    plan_id: &str,
-) -> Result<std::collections::HashMap<String, String>> {
-    let mut refs = Vec::new();
-    for step in steps {
-        let StepType::Action { uses, .. } = &step.step_type else {
-            continue;
-        };
-        if uses.starts_with("./") || uses.starts_with("../") || uses.starts_with("docker://") {
-            continue;
-        }
-        if let Some(parsed) = parse_remote_uses(uses) {
-            refs.push((uses.clone(), parsed));
-        } else {
-            warn!("Cannot parse remote action ref (missing @version?): {uses:?}");
-        }
-    }
-
-    if refs.is_empty() {
-        return Ok(std::collections::HashMap::new());
-    }
-
-    let job_id = job_message
-        .get("jobId")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let access_token = extract_service_endpoint(job_message)
-        .map(|(_, token)| token)
-        .unwrap_or_default();
-    let launch_url =
-        message_variable(job_message, "system.github.launch_endpoint").map(str::to_string);
-
-    let http = HttpClient::new(None)?;
-    let resolver = crate::client::actions_download::ActionsResolveClient::new(http, launch_url);
-    let action_pairs: Vec<(String, String)> = refs
-        .iter()
-        .map(|(_, parsed)| (parsed.action_name.clone(), parsed.git_ref.clone()))
-        .collect();
-    let action_pair_refs: Vec<(&str, &str)> = action_pairs
-        .iter()
-        .map(|(action, version)| (action.as_str(), version.as_str()))
-        .collect();
-    let resolved = if !access_token.is_empty() {
-        resolver
-            .resolve_batch(&access_token, plan_id, job_id, &action_pair_refs)
-            .await?
-    } else {
-        std::collections::HashMap::new()
-    };
-
-    let actions_dir = std::path::Path::new(workspace)
-        .parent()
-        .unwrap_or(std::path::Path::new("."))
-        .join("_actions");
-    let mut action_paths = std::collections::HashMap::new();
-
-    for (uses, parsed) in refs {
-        let key = format!("{}@{}", parsed.action_name, parsed.git_ref);
-        let meta = resolved.get(&key);
-        let dir_ref = meta
-            .map(|m| m.resolved_sha.as_str())
-            .filter(|sha| !sha.is_empty())
-            .unwrap_or(parsed.git_ref.as_str());
-        let download_url = meta
-            .map(|m| m.tar_url.as_str())
-            .filter(|url| !url.is_empty());
-        let auth_token = meta.and_then(|m| m.auth_token.as_deref());
-
-        let action_root = super::actions::manager::download_action(
-            &parsed.owner,
-            &parsed.repo,
-            dir_ref,
-            &actions_dir,
-            download_url,
-            auth_token,
-        )
-        .await?;
-
-        let action_dir = if parsed.subpath.is_empty() {
-            action_root
-        } else {
-            action_root.join(&parsed.subpath)
-        };
-        action_paths.insert(uses, action_dir.to_string_lossy().to_string());
-    }
-
-    Ok(action_paths)
-}
-
-struct ParsedUses {
-    owner: String,
-    repo: String,
-    subpath: String,
-    git_ref: String,
-    action_name: String,
-}
-
-fn parse_remote_uses(uses: &str) -> Option<ParsedUses> {
-    let (repo_part, git_ref) = uses.split_once('@')?;
-    let mut parts = repo_part.split('/');
-    let owner = parts.next()?.to_string();
-    let repo = parts.next()?.to_string();
-    let rest: Vec<&str> = parts.collect();
-    let subpath = rest.join("/");
-    Some(ParsedUses {
-        owner: owner.clone(),
-        repo: repo.clone(),
-        subpath,
-        git_ref: git_ref.to_string(),
-        action_name: format!("{owner}/{repo}"),
-    })
-}
-
-fn message_variable<'a>(job_message: &'a serde_json::Value, key: &str) -> Option<&'a str> {
-    job_message
-        .get("variables")
-        .and_then(|v| v.get(key))
-        .and_then(|v| v.get("value"))
-        .and_then(|v| v.as_str())
-}
-
-// ── Helpers ──────────────────────────────────────────────────────────
-
-/// Extract the run-service base URL and access token from the job message.
-///
-/// The job message's `resources.endpoints` contains a `SystemVssConnection`
-/// endpoint with the URL and OAuth AccessToken for the run-service.
-fn extract_service_endpoint(job_message: &serde_json::Value) -> Option<(String, String)> {
-    let endpoints = job_message
-        .get("resources")
-        .and_then(|r| r.get("endpoints"))
-        .and_then(|e| e.as_array())?;
-
-    for ep in endpoints {
-        let name = ep.get("name").and_then(|v| v.as_str()).unwrap_or("");
-        if name == "SystemVssConnection" {
-            let url = ep.get("url").and_then(|v| v.as_str())?.to_string();
-            let token = ep
-                .get("authorization")
-                .and_then(|a| a.get("parameters"))
-                .and_then(|p| p.get("AccessToken"))
-                .and_then(|v| v.as_str())?
-                .to_string();
-            return Some((url.trim_end_matches('/').to_string(), token));
-        }
-    }
-    None
-}
-
-/// Extract the results service URL from endpoint data or job message variables.
-///
-/// Golden 06: `system.github.results_endpoint` = `https://results-receiver.actions.githubusercontent.com/`.
-/// Current acquire payloads can also carry `resources.endpoints[].data.ResultsServiceUrl`.
-fn extract_results_url(job_message: &serde_json::Value) -> Option<String> {
-    if let Some(endpoints) = job_message
-        .get("resources")
-        .and_then(|r| r.get("endpoints"))
-        .and_then(|e| e.as_array())
-    {
-        for ep in endpoints {
-            let name = ep.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            if name.eq_ignore_ascii_case("SystemVssConnection") {
-                if let Some(url) = ep
-                    .get("data")
-                    .and_then(|d| d.get("ResultsServiceUrl"))
-                    .and_then(|v| v.as_str())
-                    .filter(|url| !url.is_empty())
-                {
-                    return Some(url.trim_end_matches('/').to_string());
-                }
-            }
-        }
-    }
-
-    let vars = job_message.get("variables")?.as_object()?;
-    let url = vars
-        .get("system.github.results_endpoint")
-        .and_then(|v| v.get("value"))
-        .and_then(|v| v.as_str())?;
-    Some(url.trim_end_matches('/').to_string())
-}
-
-/// Build step results for the completejob body, including annotations (F025).
-///
-/// Golden 06 flow 41: each stepResult has `{external_id, number, name,
-/// action_name, type, status, conclusion, started_at, completed_at, annotations}`.
-/// Golden 14: annotations array has `{level, message, title, startLine, endLine, stepNumber}`.
-fn build_completejob_step_results(
-    ordered_steps: &[Step],
-    job_ctx: &super::contexts::JobContext,
-    step_annotations: &std::collections::HashMap<String, Vec<Annotation>>,
-) -> Vec<serde_json::Value> {
-    let now = chrono_now();
-    let mut results = Vec::with_capacity(ordered_steps.len() + 2);
-
-    // "Set up job" wrapper step
-    results.push(serde_json::json!({
-        "external_id": job_ctx.setup_step_id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-        "number": 1,
-        "name": "Set up job",
-        "action_name": "setup_job",
-        "type": "runner",
-        "status": "completed",
-        "conclusion": "succeeded",
-        "started_at": &now,
-        "completed_at": &now,
-        "annotations": [],
-    }));
-
-    for (idx, step) in ordered_steps.iter().enumerate() {
-        let conclusion = job_ctx
-            .steps
-            .get(&step.context_name)
-            .map(|result| runner_conclusion(&result.conclusion))
-            .unwrap_or("skipped");
-
-        let (step_type, action_name) = completejob_type_and_action(step);
-
-        // F025: Include annotations for this step
-        let step_number = (idx + 2) as u32;
-        let annotations: Vec<serde_json::Value> = step_annotations
-            .get(&step.context_name)
-            .map(|anns| {
-                anns.iter()
-                    .map(|a| annotation_to_json(a, step_number))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        results.push(serde_json::json!({
-            "external_id": step.id,
-            "number": step_number,
-            "name": step.display_name,
-            "action_name": action_name,
-            "type": step_type,
-            "status": "completed",
-            "conclusion": conclusion,
-            "started_at": &now,
-            "completed_at": &now,
-            "annotations": annotations,
-        }));
-    }
-
-    // "Complete job" wrapper step
-    let complete_annotations: Vec<serde_json::Value> = job_ctx
-        .job_annotations
-        .iter()
-        .map(|annotation| annotation_to_json(annotation, (ordered_steps.len() + 2) as u32))
-        .collect();
-    results.push(serde_json::json!({
-        "external_id": job_ctx.complete_step_id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-        "number": ordered_steps.len() + 2,
-        "name": "Complete job",
-        "action_name": "complete_job",
-        "type": "runner",
-        "status": "completed",
-        "conclusion": "succeeded",
-        "started_at": &now,
-        "completed_at": &now,
-        "annotations": complete_annotations,
-    }));
-
-    results
-}
-
-/// Convert an Annotation to the golden 14 JSON shape.
-fn annotation_to_json(ann: &Annotation, step_number: u32) -> serde_json::Value {
-    use super::execution_context::AnnotationLevel;
-    let level = match ann.level {
-        AnnotationLevel::Notice => "notice",
-        AnnotationLevel::Warning => "warning",
-        AnnotationLevel::Error => "failure",
-    };
-
-    // Golden 14 always includes startLine/endLine; default to 1 when the
-    // annotation carries no source-file line info.
-    let start_line = ann.line.unwrap_or(1);
-    let end_line = ann.end_line.unwrap_or(start_line);
-
-    let mut obj = serde_json::json!({
-        "level": level,
-        "message": ann.message,
-        "stepNumber": step_number,
-        "startLine": start_line,
-        "endLine": end_line,
-    });
-
-    if let Some(title) = &ann.title {
-        obj["title"] = serde_json::json!(title);
-    }
-    if let Some(col) = ann.col {
-        obj["startColumn"] = serde_json::json!(col);
-    }
-    if let Some(end_col) = ann.end_column {
-        obj["endColumn"] = serde_json::json!(end_col);
-    }
-
-    obj
-}
-
-fn completejob_type_and_action(step: &Step) -> (&'static str, String) {
-    match &step.step_type {
-        StepType::Script { shell, .. } => (
-            "run",
-            shell
-                .as_deref()
-                .and_then(|shell| shell.split_whitespace().next())
-                .and_then(|shell| std::path::Path::new(shell).file_stem())
-                .and_then(|stem| stem.to_str())
-                .unwrap_or("sh")
-                .to_string(),
-        ),
-        StepType::Action { uses, .. } => ("action", uses.clone()),
-    }
-}
-
-fn runner_conclusion(conclusion: &str) -> &'static str {
-    match conclusion.to_ascii_lowercase().as_str() {
-        "success" | "succeeded" => "succeeded",
-        "failure" | "failed" => "failed",
-        "cancelled" | "canceled" => "canceled",
-        "skipped" => "skipped",
-        _ => "failed",
-    }
-}
-
-fn job_status_conclusion(status: super::contexts::JobStatus) -> &'static str {
-    match status {
-        super::contexts::JobStatus::Success => "succeeded",
-        super::contexts::JobStatus::Failure => "failed",
-        super::contexts::JobStatus::Cancelled => "canceled",
-    }
-}
-
-/// ISO 8601 timestamp for step timing (public so steps_runner can call it).
-pub fn iso_now() -> String {
-    use std::time::SystemTime;
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = now.as_secs();
-    let millis = now.subsec_millis();
-    time_to_iso8601(secs, millis)
-}
-
-/// ISO 8601 timestamp for step timing (private alias kept for local callers).
-fn chrono_now() -> String {
-    iso_now()
-}
-
-/// Convert unix timestamp to ISO 8601 string (UTC).
-fn time_to_iso8601(secs: u64, millis: u32) -> String {
-    // Simple UTC ISO 8601 formatter without chrono dependency
-    let days = secs / 86400;
-    let time_secs = secs % 86400;
-    let hours = time_secs / 3600;
-    let minutes = (time_secs % 3600) / 60;
-    let seconds = time_secs % 60;
-
-    // Days since epoch to y/m/d (civil_from_days algorithm)
-    let (y, m, d) = civil_from_days(days as i64);
-
-    format!("{y:04}-{m:02}-{d:02}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z")
-}
-
-/// Convert days since Unix epoch to (year, month, day).
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
-}
-
-/// Report job completion to the server.
-///
-/// F013: Full completejob body matching golden flow 25/41:
-/// `{planId, jobId, conclusion, outputs, stepResults, annotations, telemetry, billingOwnerId}`
-async fn report_completion(
-    job_message: &serde_json::Value,
-    result: &str,
-    job_ctx: &super::contexts::JobContext,
-    ordered_steps: &[Step],
-    via: ProtocolPath,
-    reporting: Option<&ReportingContext>,
-) -> Result<()> {
-    let plan_id = job_message
-        .get("plan")
-        .and_then(|p| p.get("planId"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let job_id = job_message
-        .get("jobId")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let billing_owner_id = job_message
-        .get("billingOwnerId")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    // Collect annotations from step contexts stored in the job context
-    let step_annotations = job_ctx.step_annotations.clone();
-
-    let step_results = build_completejob_step_results(ordered_steps, job_ctx, &step_annotations);
-
-    // Evaluate job-level output expressions (e.g. `outputs: z: ${{ steps.step1.outputs.out1 }}`)
-    // and include them in the completejob body so the server can propagate
-    // them to downstream jobs and reusable workflow callers.
-    let outputs = {
-        let mut map = serde_json::Map::new();
-        if let Some(output_decls) = job_message.get("jobOutputs") {
-            let expr_ctx = job_ctx.build_expression_context();
-            if let Some(obj) = output_decls.as_object() {
-                if obj.contains_key("type") {
-                    // Format 2: TemplateToken mapping
-                    if let Some(map_arr) = obj.get("map").and_then(|m| m.as_array()) {
-                        for item in map_arr {
-                            if let Some(item_obj) = item.as_object() {
-                                let key_lit = item_obj
-                                    .get("Key")
-                                    .and_then(|k| k.get("lit"))
-                                    .and_then(|l| l.as_str());
-                                let val_expr = item_obj
-                                    .get("Value")
-                                    .and_then(|v| v.get("expr"))
-                                    .and_then(|e| e.as_str());
-                                let val_lit = item_obj
-                                    .get("Value")
-                                    .and_then(|v| v.get("lit"))
-                                    .and_then(|l| l.as_str());
-
-                                if let Some(name) = key_lit {
-                                    if let Some(expr) = val_expr {
-                                        let expr_wrapped = format!("${{{{ {expr} }}}}");
-                                        match crate::worker::template::evaluate_template(
-                                            &expr_wrapped,
-                                            &expr_ctx,
-                                        ) {
-                                            Ok(val) => {
-                                                map.insert(
-                                                    name.to_string(),
-                                                    serde_json::json!({ "value": val }),
-                                                );
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    "job output '{name}' expression failed: {e}"
-                                                );
-                                            }
-                                        }
-                                    } else if let Some(lit) = val_lit {
-                                        map.insert(
-                                            name.to_string(),
-                                            serde_json::json!({ "value": lit }),
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    // Format 1: Simple JSON map (string -> string)
-                    for (name, expr_val) in obj {
-                        if let Some(expr) = expr_val.as_str() {
-                            match crate::worker::template::evaluate_template(expr, &expr_ctx) {
-                                Ok(val) => {
-                                    map.insert(name.clone(), serde_json::json!({ "value": val }));
-                                }
-                                Err(e) => {
-                                    tracing::warn!("job output '{name}' expression failed: {e}");
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        map
-    };
-
-    // F048: Collect job-level annotations for completejob body.
-    // These are infrastructure-level issues (container failures, action download errors)
-    // not tied to a specific step. Step annotations are already in stepResults (F025).
-    let job_annotations: Vec<serde_json::Value> = job_ctx
-        .job_annotations
-        .iter()
-        .map(|a| annotation_to_json(a, 0))
-        .collect();
-
-    let mut telemetry = vec![serde_json::json!({
-        "type": "task",
-        "message": format!("{{\"ClassType\":\"StepsRunner\",\"FinishResult\":\"{}\"}}", result.to_lowercase()),
-    })];
-    telemetry.extend(job_ctx.debugger_telemetry.iter().map(|dbg_result| {
-        serde_json::json!({
-            "type": "task",
-            "message": format!("{{\"ClassType\":\"DapDebugger\",\"DebuggerConnectionResult\":\"{}\"}}", dbg_result),
-        })
-    }));
-
-    let completion_body = serde_json::json!({
-        "planId": plan_id,
-        "jobId": job_id,
-        "conclusion": result.to_lowercase(),
-        "outputs": outputs,
-        "stepResults": step_results,
-        "annotations": job_annotations,
-        "telemetry": telemetry,
-        "billingOwnerId": billing_owner_id,
-    });
-
-    // Use reporting context if available, otherwise fall back to creating a new client
-    if let Some(rpt) = reporting {
-        match via {
-            ProtocolPath::Broker => {
-                let url = format!("{}/completejob", rpt.run_service.base_url());
-                info!("Reporting completion to {url}");
-                match rpt
-                    .results
-                    .http()
-                    .post_json_bearer::<serde_json::Value>(
-                        &url,
-                        &completion_body,
-                        &rpt.access_token,
-                    )
-                    .await
-                {
-                    Ok(_) => info!("Job completion reported successfully"),
-                    Err(e) => warn!("completejob POST failed (non-fatal): {e:#}"),
-                }
-            }
-            ProtocolPath::Azdo => {
-                // F030: mark the job timeline record as Completed before posting the event.
-                if let Some(azdo) = &rpt.azdo {
-                    let azdo_result_str = match result.to_ascii_lowercase().as_str() {
-                        "success" | "succeeded" => "succeeded",
-                        "cancelled" | "canceled" => "canceled",
-                        _ => "failed",
-                    };
-                    let job_record = serde_json::json!({
-                        "count": 1,
-                        "value": [{
-                            "id": job_id,
-                            "type": "job",
-                            "state": "completed",
-                            "result": azdo_result_str,
-                            "finishTime": iso_now(),
-                            "percentComplete": 100_u32,
-                        }]
-                    });
-                    match azdo
-                        .client
-                        .update_timeline(&rpt.access_token, plan_id, &azdo.timeline_id, &job_record)
-                        .await
-                    {
-                        Ok(_) => info!("AzDO: job timeline record set to Completed"),
-                        Err(e) => warn!("AzDO: job timeline Completed failed (non-fatal): {e:#}"),
-                    }
-                }
-
-                let url = format!(
-                    "{}/_apis/v1/plans/{plan_id}/events",
-                    rpt.run_service.base_url()
-                );
-                let event = serde_json::json!({
-                    "name": "JobCompleted",
-                    "jobId": job_id,
-                    "requestId": job_message.get("requestId").and_then(|v| v.as_i64()).unwrap_or(0),
-                    "result": result.to_lowercase(),
-                    "outputs": outputs,
-                });
-                info!("Reporting completion to {url}");
-                match rpt
-                    .results
-                    .http()
-                    .post_json_bearer::<serde_json::Value>(&url, &event, &rpt.access_token)
-                    .await
-                {
-                    Ok(_) => info!("Job completion reported successfully"),
-                    Err(e) => warn!("FinishJob POST failed (non-fatal): {e:#}"),
-                }
-            }
-        }
-    } else if let Some((service_url, access_token)) = extract_service_endpoint(job_message) {
-        let http = HttpClient::new(None)?;
-        match via {
-            ProtocolPath::Broker => {
-                let url = format!("{service_url}/completejob");
-                info!("Reporting completion to {url}");
-                match http
-                    .post_json_bearer::<serde_json::Value>(&url, &completion_body, &access_token)
-                    .await
-                {
-                    Ok(_) => info!("Job completion reported successfully"),
-                    Err(e) => warn!("completejob POST failed (non-fatal): {e:#}"),
-                }
-            }
-            ProtocolPath::Azdo => {
-                let url = format!("{service_url}/_apis/v1/plans/{plan_id}/events");
-                let event = serde_json::json!({
-                    "name": "JobCompleted",
-                    "jobId": job_id,
-                    "requestId": job_message.get("requestId").and_then(|v| v.as_i64()).unwrap_or(0),
-                    "result": result.to_lowercase(),
-                    "outputs": outputs,
-                });
-                info!("Reporting completion to {url}");
-                match http
-                    .post_json_bearer::<serde_json::Value>(&url, &event, &access_token)
-                    .await
-                {
-                    Ok(_) => info!("Job completion reported successfully"),
-                    Err(e) => warn!("FinishJob POST failed (non-fatal): {e:#}"),
-                }
-            }
-        }
-    } else {
-        warn!("No SystemVssConnection endpoint — cannot report completion");
-        info!(
-            "Job completion (unreported): planId={plan_id}, jobId={job_id}, result={result}, steps={}",
-            step_results.len()
-        );
-    }
-
-    Ok(())
-}
-
-/// Build a synthetic script Step for a job hook (ACTIONS_RUNNER_HOOK_JOB_STARTED
-/// / ACTIONS_RUNNER_HOOK_JOB_COMPLETED). The hook path is a shell script on the
-/// runner host, executed with the default shell exactly like a `run:` step.
-fn make_hook_step(id: &str, context_name: &str, script_path: &str) -> super::steps_runner::Step {
-    super::steps_runner::Step {
-        id: id.to_string(),
-        context_name: context_name.to_string(),
-        display_name: context_name.replace('_', " ").trim().to_string(),
-        step_type: super::steps_runner::StepType::Script {
-            script: script_path.to_string(),
-            shell: None,
-            working_directory: None,
-        },
-        condition: Some("always()".to_string()),
-        continue_on_error: true,
-        timeout_minutes: Some(10),
-        env: std::collections::HashMap::new(),
-        raw: serde_json::json!({}),
-        is_background: false,
-    }
 }
 #[cfg(test)]
 #[path = "job_runner_tests.rs"]
