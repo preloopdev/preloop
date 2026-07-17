@@ -1,0 +1,14 @@
+id: no-expose-in-loop
+message: |
+  Calling .expose() inside a loop or iterator is a red flag — secret values
+  should be resolved once and passed to the masker, not re-exposed per iteration.
+  If you need the plaintext value for masking, collect it once before the loop.
+severity: warning
+language: rust
+rule:
+  any:
+    - pattern: $SECRET.expose()
+    - pattern: $SECRET.expose().to_owned()
+    - pattern: $SECRET.expose().to_string()
+inside:
+  kind: for_expression

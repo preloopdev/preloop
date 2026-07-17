@@ -28,6 +28,14 @@ test:
 test-ci: fmt-check clippy test
     @echo CI: all checks passed
 
+# ── lint (ast-grep structural rules) ─────────────────────────────────────
+
+sg-scan:
+    sg scan
+
+sg-scan-strict:
+    sg scan --error
+
 # ── dogfood (e2e against aksh with real runner) ────────────────────────────
 
 dogfood: build
