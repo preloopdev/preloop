@@ -279,11 +279,11 @@ pub(crate) async fn oidc_discovery(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let inner = shared.state.inner.lock().await;
     let issuer = oidc_issuer_url(&inner);
-    let jwks_uri = format!("{issuer}/.well-known/jwks.json");
+    let jwks_uri = format!("{issuer}/.well-known/jwks");
     Ok(Json(oidc::discovery_document(&issuer, &jwks_uri)))
 }
 
-/// `GET /.well-known/jwks.json` — JSON Web Key Set for OIDC token verification.
+/// `GET /.well-known/jwks` — JSON Web Key Set for OIDC token verification.
 pub(crate) async fn oidc_jwks(
     State(shared): State<Arc<SharedState>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
