@@ -369,16 +369,11 @@ pub fn process_line_callback(
     let live_masks = live_masks.clone();
     let next_line = Arc::new(std::sync::atomic::AtomicU64::new(1));
     Some(Box::new(move |line: &str| {
-        let mut masked = line.to_string();
-        if let Ok(masks) = live_masks.read() {
-            // Sort by length descending so longer secrets are replaced first,
-            // matching the durable-log masking order in JobContext::mask_secrets.
-            let mut secrets: Vec<&String> = masks.iter().filter(|s| !s.is_empty()).collect();
-            secrets.sort_by_key(|b| std::cmp::Reverse(b.len()));
-            for secret in secrets {
-                masked = masked.replace(secret.as_str(), "***");
-            }
-        }
+        let masked = if let Ok(masks) = live_masks.read() {
+            aksh_gha_protocol::masking::mask_secrets(line, masks.iter().map(String::as_str), &[])
+        } else {
+            line.to_string()
+        };
         let line_number = next_line.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         live_logs.enqueue(&step_id, &masked, line_number);
     }))
