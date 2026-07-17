@@ -164,3 +164,49 @@ fn action_resolution_key_excludes_subpath() {
     assert_eq!(parsed.subpath, "restore");
     assert_eq!(parsed.git_ref, "v4");
 }
+
+#[test]
+fn renew_backoff_caps_at_thirty_seconds() {
+    let expected = [5, 10, 20, 30, 30];
+    for (attempt, expected_seconds) in expected.into_iter().enumerate() {
+        let attempt = attempt as u32 + 1;
+        assert_eq!(
+            renew_backoff(attempt),
+            std::time::Duration::from_secs(expected_seconds),
+            "unexpected retry delay for attempt {attempt}"
+        );
+    }
+}
+
+#[test]
+fn lease_deadline_parser_accepts_rfc3339_and_rejects_garbage() {
+    assert!(parse_lease_deadline("2026-07-13T12:00:00Z").is_some());
+    assert!(parse_lease_deadline("not-a-timestamp").is_none());
+}
+
+#[test]
+fn lease_deadline_gives_up_only_after_five_minute_grace() {
+    let locked_until = parse_lease_deadline("2026-07-13T12:00:00Z").unwrap();
+    let grace_boundary = parse_lease_deadline("2026-07-13T12:05:00Z").unwrap();
+    let after_grace = parse_lease_deadline("2026-07-13T12:05:01Z").unwrap();
+
+    assert!(!lease_expired(locked_until, grace_boundary));
+    assert!(lease_expired(locked_until, after_grace));
+}
+
+#[test]
+fn only_typed_http_404_is_classified_as_job_not_found() {
+    let not_found = anyhow::Error::new(crate::client::http::HttpError::Status {
+        status: reqwest::StatusCode::NOT_FOUND,
+        body: "missing lease".to_owned(),
+    });
+    let conflict = anyhow::Error::new(crate::client::http::HttpError::Status {
+        status: reqwest::StatusCode::CONFLICT,
+        body: "temporary failure".to_owned(),
+    });
+    let text_only = anyhow::anyhow!("HTTP status 404: missing lease");
+
+    assert!(is_job_not_found(&not_found));
+    assert!(!is_job_not_found(&conflict));
+    assert!(!is_job_not_found(&text_only));
+}
