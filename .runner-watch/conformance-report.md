@@ -1,8 +1,8 @@
 # runner-watch conformance report
 
-✅ All 1 scenario(s) matched recorded baseline responses (see replay caveats below).
+❌ 1 of 1 scenario(s) diverged.
 
-- [07-step-failure](.runner-watch/conformance/v2.335.1/07-step-failure.md)
+- [01-register-and-idle](.runner-watch/conformance/v2.335.1/01-register-and-idle.md)
 
 ## Replay methodology and known gaps
 
