@@ -230,10 +230,7 @@ pub(crate) fn build_app(
         .route("/:org/_apis/connectionData", get(connection_data))
         .route("/:org/_apis/v1/oauth2/token", post(oauth2_token))
         .route("/:org/_apis/v1/AgentPools", get(runner_pools))
-        .route(
-            "/:org/_apis/v1/settings/runner",
-            get(runner_settings),
-        )
+        .route("/:org/_apis/v1/settings/runner", get(runner_settings))
         .route(
             "/:org/_apis/v1/Agent/:pool_id/:agent_id",
             get(agent_lookup_by_id_org).post(register_runner_compat_org_2),

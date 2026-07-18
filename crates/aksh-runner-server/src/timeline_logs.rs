@@ -83,10 +83,7 @@ pub(crate) async fn patch_timeline_records(
 
     let new_change_id = {
         let mut inner = shared.state.inner.lock().await;
-        let current = inner
-            .timeline_change_ids
-            .entry(timeline_key)
-            .or_insert(0);
+        let current = inner.timeline_change_ids.entry(timeline_key).or_insert(0);
         *current += 1;
         let new_id = *current;
 

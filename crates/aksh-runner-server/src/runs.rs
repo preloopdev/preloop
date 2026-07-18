@@ -20,7 +20,10 @@ fn evaluate_run_name(
 ) -> String {
     let mut context = aksh_gha_expressions::Context::default();
     context.insert("github", github.clone());
-    context.insert("inputs", serde_json::Value::Object(inputs.clone().into_iter().collect()));
+    context.insert(
+        "inputs",
+        serde_json::Value::Object(inputs.clone().into_iter().collect()),
+    );
     context.insert(
         "vars",
         serde_json::Value::Object(

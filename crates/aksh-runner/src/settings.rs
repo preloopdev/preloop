@@ -151,12 +151,14 @@ fn save_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let json = serde_json::to_string_pretty(value)?;
     let temp = path.with_file_name(format!(
         ".{}.tmp-{}",
-        path.file_name().and_then(|name| name.to_str()).unwrap_or("runner"),
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("runner"),
         std::process::id()
     ));
     std::fs::write(&temp, json).with_context(|| format!("writing {}", temp.display()))?;
-    let result = std::fs::rename(&temp, path)
-        .with_context(|| format!("replacing {}", path.display()));
+    let result =
+        std::fs::rename(&temp, path).with_context(|| format!("replacing {}", path.display()));
     if result.is_err() {
         let _ = std::fs::remove_file(&temp);
     }
@@ -175,11 +177,8 @@ fn decode_refresh_payload(payload: &serde_json::Value) -> Result<serde_json::Val
     if let Ok(json) = serde_json::from_str(encoded) {
         return Ok(json);
     }
-    let bytes = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        encoded,
-    )
-    .context("decoding refreshed runner settings")?;
+    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
+        .context("decoding refreshed runner settings")?;
     let text = String::from_utf8(bytes).context("refreshed runner settings are not UTF-8")?;
     serde_json::from_str(&text).context("parsing refreshed runner settings JSON")
 }
@@ -268,9 +267,21 @@ impl RunnerConfig {
         }
 
         const SUPPORTED_FIELDS: &[&str] = &[
-            "poolId", "poolName", "serverUrl", "gitHubUrl", "workFolder", "isHosted",
-            "runnerGroupId", "runnerGroupName", "ephemeral", "isHostedServer", "useV2Flow",
-            "serverUrlV2", "disableUpdate", "skipSessionRecover", "monitorSocketAddress",
+            "poolId",
+            "poolName",
+            "serverUrl",
+            "gitHubUrl",
+            "workFolder",
+            "isHosted",
+            "runnerGroupId",
+            "runnerGroupName",
+            "ephemeral",
+            "isHostedServer",
+            "useV2Flow",
+            "serverUrlV2",
+            "disableUpdate",
+            "skipSessionRecover",
+            "monitorSocketAddress",
             "useRunnerAdminFlow",
         ];
         let mut merged = serde_json::to_value(&self.settings)?;
@@ -290,8 +301,8 @@ impl RunnerConfig {
             return Ok(false);
         }
 
-        let refreshed: RunnerSettings = serde_json::from_value(merged)
-            .context("parsing refreshed runner settings")?;
+        let refreshed: RunnerSettings =
+            serde_json::from_value(merged).context("parsing refreshed runner settings")?;
         self.settings = refreshed;
         self.save_settings_atomic(root)?;
         Ok(true)
@@ -766,7 +777,10 @@ mod tests {
         let persisted: RunnerSettings = load_json(&dir.path().join(RUNNER_FILE)).unwrap();
         assert!(persisted.disable_update);
         assert!(persisted.skip_session_recover);
-        assert_eq!(persisted.server_url_v2.as_deref(), Some("https://new-broker.example.com"));
+        assert_eq!(
+            persisted.server_url_v2.as_deref(),
+            Some("https://new-broker.example.com")
+        );
         assert_eq!(persisted.agent_id, 42);
     }
 
