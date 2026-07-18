@@ -426,19 +426,24 @@ Comprehensive source review of official `actions/runner` v2.335.1 and
 | Periodic step-status drain | Background tokio task spawned in `run_job` with 500 ms interval (`MissedTickBehavior::Skip`); flushes `WorkflowStepsUpdate` via `flush_step_updates`; exits on job cancel; aborted before final flush |
 | Server-enforced runner settings | `RunnerServerSettings` DTO in `aksh-gha-protocol::azdo::lifecycle`; `GET /_apis/v1/settings/runner` (+ GHES prefix) returns defaults; broker acquire injects `runnerSettings` in response |
 
+
+#### Resolved P2 gaps (2026-07-18)
+
+| Gap | Resolution | Commit |
+| --- | --- | --- |
+| Runner groups server-side | `runs-on: { group: ... }` is parsed into `JobPlan.runner_group`; runner registration stores group ID/name; broker and legacy message acquisition match both labels and group; default runners remain in group 1 | `eaf9e21c` |
+| `RunnerVersionDeprecated` | Opt-in `AKSH_RUNNER_VERSION_DEPRECATED=true|1|yes` makes message polling return HTTP 403 with official `AccessDeniedException`/`errorCode: 1`; the runner recognizes the signal, deletes its session, and stops retrying | `1f4b1bda` |
+| `SendJobLevelAnnotations` | Feature-gated aggregation via `actions_send_job_level_annotations`; job annotations are projected into completejob, AzDO timeline issues, and NDJSON while step annotations remain intact | `bed9f86f` |
+| `RunnerRefreshConfig` | Parses official refresh metadata, posts the base64 `.runner` payload to `configRefreshURL`, validates runner identity, atomically persists supported settings, and handles malformed/unknown payloads non-fatally | `c4b4688b`, `f0f991d` |
+| AzDO error envelopes | Runner-facing `/_apis`, `/broker`, and `/twirp` errors now use path-specific official-compatible envelopes; native `/api/v1` errors remain unchanged | `d0b4cb51` |
+
 #### Remaining gaps
 
 | Priority | Gap | Detail | Severity |
 | --- | --- | --- | --- |
-| P2 | Runner self-update | `AgentRefresh` / `RunnerRefresh` messages logged but no update mechanism — intentional for aksh-runner but means the server cannot force runner version upgrades | ❌ intentional |
-| P2 | `RunnerRefreshConfig` | Message acknowledged; dynamic config updates not implemented | ❌ missing |
-| P2 | Runner groups server-side | `runner_group_id`/`runner_group_name` stored client-side but aksh server has no group routing — jobs cannot be restricted to specific runner groups | ⚠️ partial |
-| P2 | `RunnerVersionDeprecated` feature flag | Not implemented; official server can warn runners on old versions | ❌ missing |
-| P2 | `SendJobLevelAnnotations` | Timeline feature for job-level annotation aggregation not implemented | ❌ missing |
-| P2 | AzDO error envelope shape | aksh returns JSON errors but may not match the exact AzDO `$type`/`typeName`/`typeKey`/`message` envelope the runner expects for error handling | ⚠️ unverified |
 | P3 | `DisableStdoutMultilineLogPrefixing` | Runner-side env var for log formatting not implemented | ❌ runner-side |
 | P3 | `EnsureDispatchFinished` zombie detection | Official `JobDispatcher` queries server-side request status when a new job arrives while busy; aksh handles overlap but may not query request status | ⚠️ partial |
-| P3 | Session reconnection backoff | Official runner has specific exponential backoff with jitter for session recreation on auth failure; aksh reconnection strategy unverified | ⚠️ unverified |
+| P3 | Session reconnection backoff | Official runner has specific exponential backoff with jitter for session recreation on auth failure; aksh behavior remains unverified | ⚠️ unverified |
 | P3 | FIPS encryption mode | RSA-OAEP-SHA256 required when `UseFipsEncryption` is enabled; aksh implements SHA-1 OAEP only | ⚠️ edge case |
 
 ---
