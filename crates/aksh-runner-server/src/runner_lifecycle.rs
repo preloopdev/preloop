@@ -368,6 +368,6 @@ pub(crate) async fn next_message_compat(
     State(shared): State<Arc<SharedState>>,
     Path(_pool_id): Path<i64>,
     Query(params): Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<Option<azdo::TaskAgentMessage>>, ApiError> {
+) -> (StatusCode, Json<Option<azdo::TaskAgentMessage>>) {
     next_message(State(shared), Query(params)).await
 }
