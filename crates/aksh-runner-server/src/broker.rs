@@ -193,7 +193,7 @@ pub(crate) async fn next_message_broker_ref(
         let Some(queued) = take_matching_job(&mut inner.queue, &runner_labels) else {
             drop(inner);
             if wait_seconds == 0 {
-                return Ok((StatusCode::ACCEPTED, Json(json!({}))).into_response());
+                return Ok((StatusCode::OK, Json(json!({}))).into_response());
             }
             if tokio::time::timeout(
                 Duration::from_secs(wait_seconds),
@@ -202,7 +202,7 @@ pub(crate) async fn next_message_broker_ref(
             .await
             .is_err()
             {
-                return Ok((StatusCode::ACCEPTED, Json(json!({}))).into_response());
+                return Ok((StatusCode::OK, Json(json!({}))).into_response());
             }
             continue;
         };
