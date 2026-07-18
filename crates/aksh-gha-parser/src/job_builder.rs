@@ -341,15 +341,17 @@ pub fn build_agent_job_message(
     ]);
     context_data.insert("job".to_owned(), PipelineContextData::Dict(job_ctx));
 
-    context_data.insert(
-        "matrix".to_owned(),
+    let matrix_ctx = if plan.matrix.is_empty() {
+        PipelineContextData::Null
+    } else {
         PipelineContextData::Dict(
             plan.matrix
                 .iter()
                 .map(|(k, v)| (k.clone(), PipelineContextData::from_json(v)))
                 .collect(),
-        ),
-    );
+        )
+    };
+    context_data.insert("matrix".to_owned(), matrix_ctx);
     context_data.insert(
         "needs".to_owned(),
         PipelineContextData::Dict(BTreeMap::new()),
@@ -386,7 +388,7 @@ pub fn build_agent_job_message(
         job_id,
         request_id,
         plan: PlanReference {
-            scope_identifier: job_id.to_string(),
+            scope_identifier: String::new(),
             plan_id: job_id.to_string(),
             plan_type: "actions".to_owned(),
             version: 0,
@@ -398,8 +400,8 @@ pub fn build_agent_job_message(
             change_id: 0,
             location: None,
         },
-        job_display_name: None,
-        job_name: "__default".to_owned(),
+        job_display_name: Some(plan.name.clone()),
+        job_name: plan.name.clone(),
         locked_until: "0001-01-01T00:00:00".to_owned(),
         billing_owner_id: None,
         file_table: Vec::new(),
@@ -523,8 +525,6 @@ fn populate_runner_variables(variables: &mut BTreeMap<String, VariableValue>, pl
         "actions_uses_cache_service_v2",
     ];
     const FALSE_FLAGS: &[&str] = &[
-        "DistributedTask.ActionsNode20ForceUseNode20",
-        "DistributedTask.ForceGithubToken",
         "actions.runner.requirenode24",
         "actions_batch_action_resolution",
         "actions_runner_compare_workflow_parser",
@@ -547,7 +547,6 @@ fn populate_runner_variables(variables: &mut BTreeMap<String, VariableValue>, pl
     for (key, value) in [
         ("actions_runner_node20_removal_date", ""),
         ("actions_runner_node24_default_date", "June 16th, 2026"),
-        ("actions.runner.lowdiskspacethreshold", "100"),
         ("system.from_run_service", "true"),
         ("system.github.job", plan.base_id.as_str()),
         ("system.github.launch_endpoint", ""),
@@ -559,10 +558,9 @@ fn populate_runner_variables(variables: &mut BTreeMap<String, VariableValue>, pl
         ),
         ("system.orchestrationId", ""),
         ("system.phaseDisplayName", plan.name.as_str()),
-        ("system.runner.lowdiskspacethreshold", "100"),
         ("system.runnerEnvironment", "self-hosted"),
         ("system.runnerGroupName", "Default"),
-        ("system.workflow.workspace", "/_work"),
+        ("system.runner.lowdiskspacethreshold", "100"),
     ] {
         variables
             .entry(key.to_owned())
