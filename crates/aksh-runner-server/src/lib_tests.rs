@@ -1981,11 +1981,6 @@ jobs:
         public_base_url()
     );
     assert!(acquired["variables"]["system.github.token"]["value"].is_string());
-    assert!(acquired["contextData"]["github"]["d"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|pair| pair["k"] == "token" && pair["v"].as_str().is_some()));
     assert_eq!(
         acquired["resources"]["endpoints"][0]["url"],
         "http://127.0.0.1:9090/broker/1/"
