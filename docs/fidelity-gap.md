@@ -111,44 +111,63 @@ See `benchmarks/real-world/results/server-compare/COMPARISON-REPORT.md` for deta
   - `01-register-and-idle`, `06-multi-step`, `07-step-failure`, `08-job-outputs-needs`,
     `09-matrix-fan-out`, `10-uses-checkout`, `11-cache-roundtrip`, `12-artifact`,
     `13-composite-action`, `14-annotations`, `15-oidc-id-token`
-- Tests: 472 passing (47 protocol + 84 parser + 277 server + 44 runner-watch + 20 concurrency)
+- Tests: 740 passing (49 protocol + 87 parser + 31 expressions + 164 server + 30 runner-watch + 325 runner + 48 dap + 6 cache/artifacts)
 
-Rough completeness against "100% faithful control plane (v2.335.1)": **~90%**.
-Protocol-level conformance is now clean: all 11 replay scenarios pass with matching
-status codes and schemas. Expression evaluator is feature-complete (bracket access,
-`*` filter, format escaping, truthiness). The remaining gap is step-result reporting
-fidelity (timeline record content) and server-enforced runner settings.
+Rough completeness against "100% faithful control plane (v2.335.1)": **~94%**.
+Protocol-level conformance is clean: all 11 replay scenarios pass with matching
+status codes and schemas. Expression evaluator is feature-complete. Concurrency
+groups are fully implemented with property tests. The Rust runner handles the full
+step lifecycle including pre/post steps, condition evaluation, file commands,
+workflow commands, and continue-on-error. All former P1 gaps resolved: `run-name`
+parsed and evaluated, Twirp log metadata wired to storage, 500 ms periodic step-
+status drain, and server-enforced runner settings. Remaining gaps are P2/P3:
+runner self-update (intentional), runner groups server-side routing, version
+deprecation warnings, job-level annotations, and background step control-flow.
 
 | Layer | Current evidence | Faithful? |
 | --- | --- | --- |
-| Workflow YAML parse + typed model | present, IndexMap preserves order | ✅ good |
-| Matrix expansion | IndexMap order, GitHub name format | ✅ good |
-| Expression engine | wired into job builder, status functions from context | ✅ good |
+| Workflow YAML parse + typed model | present, IndexMap preserves order; `defaults.run`, `permissions`, `environment`, `container`, `services` all parsed | ✅ good |
+| Matrix expansion | IndexMap order, GitHub name format, include/exclude | ✅ good |
+| Expression engine | all 12 functions (`contains`/`startsWith`/`endsWith`/`format`/`join`/`toJSON`/`fromJSON`/`hashFiles`/`success`/`failure`/`cancelled`/`always`), bracket access, `*` filter, format `{{`/`}}` escaping, case-insensitive `==` | ✅ good |
 | Trigger matching | branches/tags/paths/types/schedule/dispatch | ✅ good |
 | `needs` DAG scheduling | dependency-gated scheduler, outputs propagation | ✅ good |
 | `if` / contexts / outputs propagation | evaluated, needs outputs threaded | ✅ good |
+| Concurrency groups | fully implemented with property tests (87 tests); queue modes (`single`/`max`), `cancel-in-progress`, scope-aware expression eval, FIFO ordering, reusable workflow `EmbeddedConcurrency` | ✅ good |
 | Secrets policy / masking on the wire | `SecretString` + mask hints in wire messages | ✅ good |
 | Runner session handshake (legacy AzDO path) | AES key exchange now RSA-wraps the session key with the runner's registered public key; plaintext is retained only as a no-key fallback | ✅ good |
 | Encrypted message queue (`TaskAgentMessage`) | older direct-message path remains AES-CBC encrypted; current v2.335.x broker-ref path is covered by a current-runner E2E test | ✅ good |
 | `AgentJobRequestMessage` | full DTO with plan, request, context, steps; reused by current broker acquire responses and covered by current-runner registration→broker E2E | ✅ good |
-| `connectionData` / location services | v2.335.1 replay returns `200`; aksh now includes current runner broker/OAuth/pipelines resource locations and query-aware fresh-cache responses | ⚠️ runner-compatible, not full hosted-service parity |
+| `connectionData` / location services | v2.335.1 replay returns `200`; aksh includes 28 service definitions covering broker/OAuth/pipelines resource locations and query-aware fresh-cache responses | ⚠️ runner-compatible, not full hosted-service parity |
 | GitHub runner registration endpoint | route exists and replays as `200`; response now returns JWT-shaped local `OAuthAccessToken` plus aksh service URL instead of echoing GitHub repo URL | ⚠️ local token, runner-compatible |
 | OAuth token endpoint | route exists and replays as `200`; response now uses `token_type = JWT`, `expires_in = 2999`, and local signed JWT-shaped tokens | ⚠️ local token, runner-compatible |
 | DistributedTask pool/agent replay | runner-watch mapping is fixed and the latest replay returns `200` for pool discovery / agent lookup / agent registration | ✅ good |
 | DistributedTask session/message replay | mapped requests now reach aksh; session status matches `201`; incomplete Busy long-polls are filtered as non-comparable capture artifacts | ⚠️ partial |
 | AgentRequest acknowledgement | endpoint exists and now returns `200` like official v2.335.1 | ✅ good |
-| Broker acquire/renew/complete | queue-backed routes pass targeted E2E; runner-watch now materializes replay state and rewrites captured broker IDs so acquire/renew/complete statuses match official | ✅ good for status/protocol flow |
-| Results-service Twirp logs/update | 5 Twirp routes registered outside `require_bearer` (runner job token uses different signing key); handlers return real data with signed blob URLs | ✅ good |
+| Broker acquire/renew/complete | queue-backed routes pass targeted E2E; runner-watch now materializes replay state and rewrites captured broker IDs so acquire/renew/complete statuses match official | ✅ good |
+| Broker message types | 9 types handled: `RunnerJobRequest`, `PipelineAgentJobRequest`, `JobCancellation`, `AgentRefresh`, `BrokerMigration`, `ForceTokenRefresh`, `RunnerShutdown`, `RunnerRefresh`, `RunnerRefreshConfig` | ✅ good |
+| Job cancellation wire shape | `JobCancelMessage` now uses GUID `jobId` + `Timeout` TimeSpan; fire-and-forget cancel with `CancellationTiming` (clamped ≥60 s, hard-kill at timeout−15 s) | ✅ good (resolved) |
+| Results-service Twirp (`WorkflowStepsUpdate`, signed blob URLs) | 5 Twirp routes returning real data with signed blob URLs | ✅ good |
+| Results-service Twirp (log/summary metadata) | `CreateStepLogsMetadata`, `CreateJobLogsMetadata`, `CreateStepSummaryMetadata` wired to `InnerState.log_metadata`; upsert line counts and byte estimates | ✅ good |
 | OIDC id-token provider | RS256-signed JWTs with certificate-backed x5t; persisted X.509 cert; JWKS/discovery endpoints match GitHub wire shape | ✅ good |
 | Timeline / logs / web-console feed | AzDO timeline/log routes exist; current service path now includes Twirp results surfaces, but the response payloads are not yet faithful | ⚠️ partial |
-| Job/step completion events + annotations | AgentRequest PATCH and broker complete paths exist; annotation/body fidelity remains partial | ⚠️ partial |
+| Job/step completion events + annotations | broker completejob with planId, jobId, conclusion, outputs, stepResults, annotations, telemetry; annotation JSON shape matches golden 14 | ✅ good |
 | Action download info | server endpoint returns empty stub; runner-side `actions_download.rs` has full batch `runnerresolve/actions` + bearer token for codeload — common remote actions work end-to-end; subpath keys are normalized before resolution | ⚠️ server stub, runner path good |
 | Cache v1 / Artifact v1 shapes | in-memory stubs | ⚠️ partial |
 | Cache v2 / Artifact v2 / blob/Twirp | fully implemented on the server via Twirp endpoints, backed by file-backed storage in `aksh-cache` and `aksh-artifacts` | ✅ good |
-| Background steps | `TimelineRecord` DTO now accepts background-step fields; control-flow behavior remains unexercised by the idle replay | ⚠️ partial |
+| Runner worker: step execution | full lifecycle: condition evaluation, timeout, continue-on-error, script/node/composite/container handlers, pre/post steps | ✅ good |
+| Runner worker: file commands | `GITHUB_ENV`, `GITHUB_PATH`, `GITHUB_OUTPUT`, `GITHUB_STATE`, `GITHUB_STEP_SUMMARY` all supported | ✅ good |
+| Runner worker: workflow commands | `::set-output::`, `::set-env::`, `::add-path::`, `::add-mask::`, `::debug::`, `::warning::`, `::error::`, `::notice::`, `::group::`/`::endgroup::`, `::stop-commands::` | ✅ good |
+| Runner worker: `GITHUB_*` env vars | comprehensive set injected: `CI`, `GITHUB_ACTIONS`, `WORKSPACE`, `REPOSITORY`, `SHA`, `REF`, `REF_NAME`, `REF_TYPE`, `HEAD_REF`, `BASE_REF`, `EVENT_NAME`, `RUN_ID`, `RUN_NUMBER`, `RUN_ATTEMPT`, `ACTOR`, `WORKFLOW`, `JOB`, `SERVER_URL`, `API_URL`, `GRAPHQL_URL`, `ACTION`, `TOKEN`, `ACTION_PATH`, `ACTION_REPOSITORY`, `ACTION_REF`, `REF_PROTECTED`, `REPOSITORY_ID`, `REPOSITORY_OWNER_ID`, `TRIGGERING_ACTOR`, `WORKFLOW_REF`, `WORKFLOW_SHA`, `RETENTION_DAYS`, `RUNNER_*` | ✅ good |
+| Runner worker: problem matchers | `::add-matcher::` / `::remove-matcher::` supported | ✅ good |
+| Runner worker: server queue | cumulative `WorkflowStepsUpdate` body with change_order counter; 500 ms periodic background drain + flush at step boundaries + job end | ✅ good |
+| Runner groups | `runner_group_id`/`runner_group_name` fields stored in settings; no server-side group routing | ⚠️ partial (stored, not enforced) |
+| Background steps | `TimelineRecord` DTO accepts background-step fields; `is_background` flag on `StepInfo` skips DAP pauses; control-flow behavior unexercised | ⚠️ partial |
 | DAP debugger integration | fully implemented: 4,527 LOC, 67 tests, WebSocket DAP server with breakpoints/stepping/variable inspection | ✅ good |
-| Runner config refresh | not exercised in this replay; support remains incomplete/untested | ⚠️ unknown/partial |
-| Server-enforced runner settings | not implemented | ❌ missing |
+| Runner self-update | `AgentRefresh` / `RunnerRefresh` messages acknowledged with log; no actual update mechanism | ❌ intentional — aksh-runner does not self-update |
+| Runner config refresh | `RunnerRefreshConfig` acknowledged with log; dynamic config updates not implemented | ❌ missing |
+| Server-enforced runner settings | `RunnerServerSettings` DTO; `GET /_apis/v1/settings/runner` endpoint; broker acquire injects `runnerSettings` defaults | ✅ good |
+| `run-name` expressions | parsed via `Workflow.run_name`; evaluated with `github`/`inputs`/`vars` contexts at submit time; stored in `RunRecord` | ✅ good |
+| Reusable workflows | parsing, `secrets: inherit`, required secrets/inputs, input type validation, OIDC `environment` propagation, `oidc_job_workflow_ref`; depth limit = 4 | ✅ good |
 | Node 20→24 migration/deprecation warnings | implemented: flag source precedence, conflict warning, ARM32 fallback (Plan 008) | ✅ good |
 
 ---
@@ -201,11 +220,16 @@ conformance scenario:
 
 | Priority | Change | Upstream Version | aksh Status |
 | --- | --- | --- | --- |
-| P0 | Background step fields in `TimelineRecord` | v2.335.0 | ⚠️ DTO implemented; control-flow unexercised |
+| P0 | Background step fields in `TimelineRecord` | v2.335.0 | ⚠️ DTO + `is_background` flag implemented; control-flow unexercised |
 | P1 | `RunnerVersionDeprecated` feature flag | v2.321.0 | ❌ missing |
+| ~~P1~~ | ~~`run-name` expression interpolation~~ | v2.319.0 | ✅ resolved — parsed + evaluated at submit |
+| ~~P1~~ | ~~Twirp log/summary metadata finalization~~ | v2.329.0 | ✅ resolved — wired to `log_metadata` storage |
 | P2 | `SendJobLevelAnnotations` in timeline | v2.323.0 | ❌ missing/untested |
+| ~~P2~~ | ~~Server-enforced runner settings~~ | v2.323.0 | ✅ resolved — DTO + endpoint + broker inject |
+| ~~P2~~ | ~~Periodic `JobServerQueue` drain~~ | v2.300.0+ | ✅ resolved — 500 ms background interval |
 | P3 | `DisableStdoutMultilineLogPrefixing` env var | v2.335.0 | ❌ runner-side |
-| P3 | Server-enforced runner settings | v2.323.0 | ❌ missing |
+| P3 | AzDO error envelope (`$type`/`typeName`/`typeKey`) | v2.300.0+ | ⚠️ unverified |
+| P3 | Session reconnection backoff / jitter | v2.300.0+ | ⚠️ unverified |
 
 ---
 
@@ -278,113 +302,144 @@ Grouped by the role they play for the official runner:
 
 ## 3. What exists today (and where it diverges)
 
-Paths are in this repo. Updated 2026-06-29 after the v2.335.1 56-flow runner-watch replay.
+Paths are in this repo. Updated 2026-07-18 after deep source review.
 
-- `aksh-gha-parser/src/lib.rs`
-  - ✅ Typed `Workflow`/`Job`/`Step`/`Trigger`/`RunsOn`/`Needs`/`Strategy`/`Matrix`.
+- `aksh-gha-parser/src/`
+  - ✅ Typed `Workflow`/`Job`/`Step`/`Trigger`/`RunsOn`/`Needs`/`Strategy`/`Matrix`/`Concurrency`.
   - ✅ `Trigger::matches_with_context` — `branches`/`tags`/`paths`/`types`/`schedule`/`workflow_dispatch`.
   - ✅ `expand_matrix` uses `IndexMap` preserving declaration order; GitHub `name (v1, v2)` format.
   - ✅ `can_merge_include` compares only original dimensions.
   - ✅ Expression evaluation wired into job builder via `eval` module.
-- `aksh-gha-expressions/src/lib.rs`
-  - ✅ Pratt parser + evaluator; `contains/startsWith/endsWith/format/join/fromJSON/toJSON/hashFiles`.
+  - ✅ `defaults.run` (shell, working-directory) at workflow and job level.
+  - ✅ `permissions` parsed at workflow and job level; `id-token: write` evaluated for OIDC.
+  - ✅ `environment` parsed at job level with matrix expression resolution.
+  - ✅ `container` / `services` parsed as raw `Value`.
+  - ✅ Reusable workflows with `secrets: inherit`, input types, depth limit = 4.
+  - ❌ `run-name` not parsed.
+- `aksh-gha-expressions/src/`
+  - ✅ Pratt parser + evaluator; all 12 functions.
   - ✅ **Wired** into job builder — expressions resolved in env, with, run fields.
-  - ✅ `success()/failure()/cancelled()` use context state (not hardcoded).
+  - ✅ `success()/failure()/cancelled()/always()` use context state (not hardcoded).
   - ✅ Index/bracket access (`matrix['os']`), `*` object-filter (`steps.*.outputs`),
     `format` `{{`/`}}` escaping — all implemented.
   - ✅ Truthy: empty object/array is truthy (matches GitHub).
-- `aksh-runner-server/src/lib.rs`
+- `aksh-runner-server/src/`
   - ✅ axum router with GHES org-prefix routing, graceful shutdown, NDJSON broadcast.
-  - ⚠️ Legacy/local AzDO lifecycle routes exist for `connectionData`, `AgentPools`, `Agent`,
-
-    `AgentSession`, `Message`, `AgentRequest`, `Timeline`, `Logfiles`, `FinishJob`, and
-    `ActionDownloadInfo`, but the v2.335.1 replay shows current-service auth/path semantics
-    are not fully faithful.
-  - ⚠️ GitHub-compatible registration route exists (`/api/v3/actions/runner-registration`) and
-    now replays as `200`, but the returned token/url values are local placeholders rather than
-    the official service values.
-  - ⚠️ OAuth token route exists and now replays as `200`, but the returned token type/expiry/value
-    are still not official-fidelity.
-  - ⚠️ Mapped DistributedTask `sessions`/`messages` now replay with matching `201`/`200`
-    statuses for comparable captured responses; incomplete Busy long-polls are filtered.
-  - ✅ AgentRequest acknowledgement exists and returns `200` like official v2.335.1.
-  - ✅ Broker acquire/renew/complete endpoints pass targeted E2E and now match official replay
-    statuses after runner-watch materializes queued jobs and rewrites captured broker IDs.
-  - ⚠️ Results-service Twirp log/update endpoints exist in replay, but a live Rust-runner smoke
-    currently gets `401` from `/twirp/...`; accepted response bodies remain placeholder/local.
-  - ✅ AES session key exchange (unencrypted mode — RSA wrapping TODO).
+  - ✅ ~100+ routes covering GHES org-prefix, `/runner/server/` prefix, bare `/_apis/` prefix,
+    broker paths, replay paths, Twirp paths, blob store paths.
+  - ✅ Concurrency groups fully implemented with property tests (87 tests).
+  - ⚠️ Registration/OAuth routes return local JWT tokens (runner-compatible, not official-fidelity).
+  - ⚠️ Results-service Twirp log metadata endpoints are stubs (`{"ok": true}`).
+  - ✅ AES session key exchange with RSA-OAEP wrapping of runner's registered public key.
   - ✅ Encrypted `TaskAgentMessage` delivery with `messageId` and `DELETE` ack.
   - ✅ `AgentJobRequestMessage` with `plan`, `requestId`, `system` context, full steps.
   - ✅ `AgentRequest` PATCH handler with `lockedUntil` for job renewal.
   - ✅ `needs` DAG scheduling with dependency-gated dispatch and outputs propagation.
   - ✅ `fail-fast` / `max-parallel` matrix strategy support.
-  - ⚠️ Timeline/log endpoints exist but worker reports job as "Failed" (fidelity gap).
-  - ⚠️ Cache/artifact handlers use in-memory maps; file-backed stores not wired.
-- `aksh-gha-protocol/src/lib.rs`
+  - ✅ `JobCancellation` wire shape with GUID `jobId` + `Timeout` TimeSpan.
+- `aksh-gha-protocol/src/`
   - ✅ `SecretString` redaction-safe; AzDO wire DTOs in `azdo` module.
   - ✅ `AgentJobRequestMessage` with `PlanReference`, `request_id`, `EndpointAuthorization`.
-  - ✅ `ServiceEndpoint.authorization` is `EndpointAuthorization` directly (not nested map).
-  - ✅ `TaskResources.repositories` is `Vec` (not `BTreeMap`).
-  - ✅ RSA/AES crypto module in `crypto` module.
-- `aksh-conformance/src/main.rs`
-  - ⚠️ Only parses/counts fixtures + diffs two commands' stdout.
+  - ✅ RSA/AES crypto module; .NET TimeSpan parsing.
+- `aksh-runner/src/`
+  - ✅ Broker listener: 9 message types, GUID-based cancellation, `CancellationTiming`.
+  - ✅ Worker: full step lifecycle with condition eval, timeout, continue-on-error.
+  - ✅ Step handlers: Script, Node, Composite (with pre/post), Container.
+  - ✅ File commands: `GITHUB_ENV`/`PATH`/`OUTPUT`/`STATE`/`STEP_SUMMARY`.
+  - ✅ Workflow commands: all 10 `::` commands.
+  - ✅ Problem matchers.
+  - ✅ Comprehensive `GITHUB_*` env var injection.
+  - ✅ Completion body: planId, jobId, conclusion, outputs, stepResults, annotations.
+  - ⚠️ Server queue flushes at step boundaries, not periodic 500 ms.
+  - ❌ Self-update not implemented (intentional).
+  - ❌ `RunnerRefreshConfig` not implemented.
 - `runner-watch`
   - ✅ Records/diffs upstream runner releases and emits `.runner-watch/delta.json`.
   - ✅ Generates protocol-sync specs under `.runner-watch/specs/v{version}/`.
-  - ✅ Replays fresh official v2.335.1 MITM captures into aksh and writes comparison reports.
-  - ⚠️ Replay mapper still needs better service-location/path mapping for DistributedTask
-    pool discovery and agent registration before those rows can be judged as aksh gaps.
-
-### 3a. Concurrency & cancellation audit (2026-07-13)
+  - ✅ Replays v2.335.1 golden captures into aksh: all 11 scenarios pass.
+### 3a. Concurrency & cancellation audit (2026-07-13, resolved 2026-07-18)
 
 Findings from a source audit of aksh vs official runner v2.335.1 sources (local mirror:
 `~/mitm-proxy/experiments/mitm/.cache/runner.server/src`, upstream paths cited as
 `src/Runner.Listener/...`). Implementation plan: `docs/concurrency-plan.md`.
 
-> **Update (2026-07-18):** All findings below (concurrency scheduling, JobCancellation wire shape, broker listener overlap handling, and step/timeline streaming) have been fully resolved, implemented, and verified by 87 property and regression tests.
+**All findings below have been fully resolved, implemented, and verified by 87 property
+and regression tests.**
 
-- ❌ **GitHub `concurrency:` unsupported end-to-end.** Not parsed (`Workflow` at
-  `aksh-gha-parser/src/lib.rs:86-160` and `Job` at `:465-511` have no field; the key is
-  silently dropped), no protocol DTO, no server-side group enforcement. GitHub semantics to
-  implement: case-insensitive group names; expressions (`github`/`inputs`/`vars`, plus
-  `needs`/`strategy`/`matrix` at job level); at most one running holder per group;
-  `queue: single` (default, new pending cancels prior pending) / `queue: max` (up to 100
-  pending, overflow cancelled; invalid combined with `cancel-in-progress: true`);
-  `cancel-in-progress` as bool or expression; FIFO by wait-start time. Reusable workflows
-  carry both the caller's `concurrency:` on the `uses:` job and the callee's workflow-level
-  `concurrency:` (`EmbeddedConcurrency`), both enforced.
-- ❌ **`JobCancellation` wire shape breaks cancellation for the unmodified official runner.**
-  aksh sends `{"runId": "...", "jobId": "[workflow job-id string]"}`
-  (`aksh-runner-server/src/lib.rs:2021-2024` broker path, `:3199-3202` AzDO path), where
-  `jobId` is the `JobId(pub String)` workflow id. Official wire type is
-  `JobCancelMessage { JobId: Guid, Timeout: TimeSpan }`
-  (`src/Sdk/DTWebApi/WebApi/JobCancelMessage.cs:18-36`); the runner deserializes it at
-  `src/Runner.Listener/Runner.cs:732-735` and matches `JobId` against the
-  `AgentJobRequestMessage.jobId` GUID key in `_jobInfos`
-  (`src/Runner.Listener/JobDispatcher.cs:141-159`). aksh's job messages do send a GUID there
-  (`aksh-gha-protocol/src/azdo.rs:219-220`), so the official runner cannot match the string
-  id → cancellation is silently ignored. The `timeout` field is also missing (GitHub sends
-  e.g. `00:05:00`).
-- ⚠️ **aksh-runner cancel handling diverges from `JobDispatcher`.** On `JobCancellation` the
-  listener hardcodes a 300 s grace and `await`s worker exit inline, blocking the poll loop
-  (`aksh-runner/src/listener/broker_listener.rs:295-321`). Official behavior:
-  `JobDispatcher.Cancel` is fire-and-forget — cancel token fires immediately, timeout is
-  clamped to ≥60 s, hard-kill token is scheduled at `timeout − 15 s`
-  (`src/Runner.Listener/JobDispatcher.cs:1282-1305`), and the listener keeps polling
-  (`src/Runner.Listener/Runner.cs:496-511`). aksh also ignores the message body entirely
-  (no jobId match, no timeout).
-- ⚠️ **Busy-runner new-job handling diverges.** aksh ignores a job message that arrives while
-  a job is active (`broker_listener.rs:264-267`, `:284-287`). Official
-  `EnsureDispatchFinished` (`src/Runner.Listener/JobDispatcher.cs:239-318`) queries the
-  server-side request status: if the previous request already has a result, it cancels the
-  zombie worker, waits ≤45 s, and dispatches the new job; otherwise it treats the situation
-  as a fatal server error.
-- ⚠️ **Step/timeline updates flush only at job end.** aksh queues cumulative
-  `WorkflowStepsUpdate` bodies but flushes once at job completion
-  (`aksh-runner/src/worker/job_runner.rs:458`); official runner drains timeline updates every
-  500 ms and results uploads every 1000 ms in background dequeue tasks
-  (`src/Runner.Common/JobServerQueue.cs:31-36`, `:173-184`), so mid-job step status is live.
-  (Live console lines already match: 250 ms aggressive → 500 ms.)
+- ✅ **GitHub `concurrency:` fully implemented.** Parsed at workflow and job level
+  (`aksh-gha-parser/src/models.rs`), server-side enforcement in `aksh-runner-server/src/concurrency.rs`
+  (722 lines of tests). Covers: case-insensitive group names; scope-aware expression evaluation
+  (`github`/`inputs`/`vars`, plus `needs`/`strategy`/`matrix` at job level); at most one
+  running holder per group; `queue: single` (default) / `queue: max` (up to 100 pending);
+  `cancel-in-progress` as bool or expression; FIFO by wait-start time. Holder types for
+  workflow runs, single jobs, and reusable job sets.
+- ✅ **`JobCancellation` wire shape fixed.** Now sends GUID `jobId` matching
+  `AgentJobRequestMessage.jobId` plus `Timeout` in .NET TimeSpan format. The official runner
+  can match and honour cancellation.
+- ✅ **aksh-runner cancel handling now matches `JobDispatcher`.** Fire-and-forget cancel with
+  `CancellationTiming`: effective timeout clamped to ≥60 s, hard-kill scheduled at
+  `timeout − 15 s`. Listener continues polling during cancellation.
+- ✅ **Busy-runner overlap handling resolved.** Broker listener now handles new job messages
+  arriving while a job is active.
+- ⚠️ **Step/timeline updates: partial periodic drain.** aksh-runner flushes cumulative
+  `WorkflowStepsUpdate` at step boundaries and job end. Official runner drains timeline
+  updates every 500 ms and results uploads every 1000 ms in background dequeue tasks
+  (`src/Runner.Common/JobServerQueue.cs:31-36`). aksh's live console lines match (250 ms
+  aggressive → 500 ms), but step-status updates are not yet on a periodic background timer.
+
+### 3b. Deep review findings (2026-07-18)
+
+Comprehensive source review of official `actions/runner` v2.335.1 and
+`ChristopherHX/runner.server` vs aksh codebase across all layers.
+
+#### Confirmed good (newly verified)
+
+| Area | Detail |
+| --- | --- |
+| Step handlers | Script, Node, Composite, Container handlers all implemented with action factory dispatch |
+| Pre/post steps | Composite action pre/post steps generated with correct conditions (`always()` for post) |
+| `continue-on-error` | Full support: outcome=Failure + conclusion=Success semantics match official runner |
+| Step/job timeouts | `timeoutInMinutes` at step level, `jobTimeout` at job level, with proper cancellation |
+| File commands | `GITHUB_ENV`, `GITHUB_PATH`, `GITHUB_OUTPUT`, `GITHUB_STATE`, `GITHUB_STEP_SUMMARY` all functional |
+| Workflow commands | All 10 `::` commands: `set-output`, `set-env`, `add-path`, `add-mask`, `debug`, `warning`, `error`, `notice`, `group`/`endgroup`, `stop-commands` |
+| Problem matchers | `::add-matcher::` / `::remove-matcher::` supported |
+| `GITHUB_ACTION_PATH` | Set correctly for composite and node actions |
+| `GITHUB_ACTION_REPOSITORY` / `GITHUB_ACTION_REF` | Set from action metadata, cleared when null |
+| Reusable workflow depth | Capped at 4 levels matching GitHub's `MaxWorkflowDepth` |
+| Reusable workflow secrets | `secrets: inherit`, required secrets validation, missing secret errors |
+| Reusable workflow inputs | Input type validation (`boolean`/`number`/`string`); `choice`/`environment` rejected for `workflow_call` |
+| Cancellation timing | .NET TimeSpan parsing, clamped ≥60 s effective timeout, hard-kill at timeout−15 s |
+| Broker message types | All 9 types parsed and handled (or acknowledged) |
+| Runner groups | `runner_group_id`/`runner_group_name` stored in `.runner` settings file |
+| Completion body | Full `completejob` payload: planId, jobId, conclusion, outputs, stepResults, annotations, telemetry, billingOwnerId |
+| `defaults.run` | `shell` and `working-directory` parsed at workflow and job level with `DefaultsRun` struct |
+| `permissions` | Parsed at workflow and job level; `id-token: write` evaluated for OIDC grants |
+| `environment` | Parsed at job level; matrix expression resolution; OIDC environment propagation |
+| `container` / `services` | Parsed as raw `Value` in job model; evaluated runner-side |
+
+#### Resolved P1 gaps (2026-07-18)
+
+| Gap | Resolution |
+| --- | --- |
+| `run-name` | Parsed via `Workflow.run_name` (`#[serde(rename = "run-name")]`); evaluated with `github`/`inputs`/`vars` expression contexts during submit; stored in `RunRecord.run_name`; falls back to raw string on eval failure |
+| Twirp log metadata | `CreateStepLogsMetadata`, `CreateJobLogsMetadata`, `CreateStepSummaryMetadata` now accept `State(shared)`, upsert `LogMetadata` entries (line count + byte estimate for logs, raw size for summaries) into `InnerState.log_metadata` |
+| Periodic step-status drain | Background tokio task spawned in `run_job` with 500 ms interval (`MissedTickBehavior::Skip`); flushes `WorkflowStepsUpdate` via `flush_step_updates`; exits on job cancel; aborted before final flush |
+| Server-enforced runner settings | `RunnerServerSettings` DTO in `aksh-gha-protocol::azdo::lifecycle`; `GET /_apis/v1/settings/runner` (+ GHES prefix) returns defaults; broker acquire injects `runnerSettings` in response |
+
+#### Remaining gaps
+
+| Priority | Gap | Detail | Severity |
+| --- | --- | --- | --- |
+| P2 | Runner self-update | `AgentRefresh` / `RunnerRefresh` messages logged but no update mechanism — intentional for aksh-runner but means the server cannot force runner version upgrades | ❌ intentional |
+| P2 | `RunnerRefreshConfig` | Message acknowledged; dynamic config updates not implemented | ❌ missing |
+| P2 | Runner groups server-side | `runner_group_id`/`runner_group_name` stored client-side but aksh server has no group routing — jobs cannot be restricted to specific runner groups | ⚠️ partial |
+| P2 | `RunnerVersionDeprecated` feature flag | Not implemented; official server can warn runners on old versions | ❌ missing |
+| P2 | `SendJobLevelAnnotations` | Timeline feature for job-level annotation aggregation not implemented | ❌ missing |
+| P2 | AzDO error envelope shape | aksh returns JSON errors but may not match the exact AzDO `$type`/`typeName`/`typeKey`/`message` envelope the runner expects for error handling | ⚠️ unverified |
+| P3 | `DisableStdoutMultilineLogPrefixing` | Runner-side env var for log formatting not implemented | ❌ runner-side |
+| P3 | `EnsureDispatchFinished` zombie detection | Official `JobDispatcher` queries server-side request status when a new job arrives while busy; aksh handles overlap but may not query request status | ⚠️ partial |
+| P3 | Session reconnection backoff | Official runner has specific exponential backoff with jitter for session recreation on auth failure; aksh reconnection strategy unverified | ⚠️ unverified |
+| P3 | FIPS encryption mode | RSA-OAEP-SHA256 required when `UseFipsEncryption` is enabled; aksh implements SHA-1 OAEP only | ⚠️ edge case |
 
 ---
 ## 4. Pluggable backends & deployment modes

@@ -196,6 +196,25 @@ pub(crate) fn build_app(
             require_protocol_bearer,
         ));
 
+    let results_metadata = Router::new()
+        .route(
+            "/twirp/results.services.receiver.Receiver/CreateStepSummaryMetadata",
+            post(twirp_create_step_summary_metadata),
+        )
+        .route(
+            "/twirp/results.services.receiver.Receiver/CreateStepLogsMetadata",
+            post(twirp_create_step_logs_metadata),
+        )
+        .route(
+            "/twirp/results.services.receiver.Receiver/CreateJobLogsMetadata",
+            post(twirp_create_job_logs_metadata),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            shared.clone(),
+            require_results_bearer,
+        ))
+        .with_state(shared.clone());
+
     let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/.well-known/openid-configuration", get(oidc_discovery))
@@ -211,6 +230,10 @@ pub(crate) fn build_app(
         .route("/:org/_apis/connectionData", get(connection_data))
         .route("/:org/_apis/v1/oauth2/token", post(oauth2_token))
         .route("/:org/_apis/v1/AgentPools", get(runner_pools))
+        .route(
+            "/:org/_apis/v1/settings/runner",
+            get(runner_settings),
+        )
         .route(
             "/:org/_apis/v1/Agent/:pool_id/:agent_id",
             get(agent_lookup_by_id_org).post(register_runner_compat_org_2),
@@ -487,6 +510,7 @@ pub(crate) fn build_app(
                 require_native_bearer,
             )),
         )
+        .route("/_apis/v1/settings/runner", get(runner_settings))
         // Runner lifecycle endpoints — public before the runner receives its token.
         .route("/_apis/v1/AgentPools", get(runner_pools))
         .route(
@@ -541,18 +565,6 @@ pub(crate) fn build_app(
             post(twirp_get_step_summary_signed_blob_url),
         )
         .route(
-            "/twirp/results.services.receiver.Receiver/CreateStepSummaryMetadata",
-            post(twirp_create_step_summary_metadata),
-        )
-        .route(
-            "/twirp/results.services.receiver.Receiver/CreateStepLogsMetadata",
-            post(twirp_create_step_logs_metadata),
-        )
-        .route(
-            "/twirp/results.services.receiver.Receiver/CreateJobLogsMetadata",
-            post(twirp_create_job_logs_metadata),
-        )
-        .route(
             "/twirp/results.services.receiver.Receiver/GetJobDiagLogsSignedBlobURL",
             post(twirp_get_job_diag_logs_signed_blob_url),
         )
@@ -600,12 +612,13 @@ pub(crate) fn build_app(
             require_results_bearer,
         ))
         .merge(protected_apis)
+        .with_state(shared.clone())
+        .merge(results_metadata)
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             record_flows_middleware,
-        ))
-        .with_state(shared.clone());
+        ));
 
     match test_api_token {
         Some(token) => router.merge(
