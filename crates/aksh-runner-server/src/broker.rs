@@ -574,9 +574,13 @@ pub(crate) async fn broker_acquire_job(
             );
             endpoint.data.insert("ServerId".to_owned(), String::new());
             endpoint.data.insert("ServerName".to_owned(), String::new());
-            endpoint
-                .data
-                .insert("GenerateIdTokenUrl".to_owned(), String::new());
+            endpoint.data.insert(
+                "GenerateIdTokenUrl".to_owned(),
+                format!(
+                    "{}/_apis/distributedtask/hubs/actions/plans/{}/jobs/{}/oidctoken",
+                    run_service_url, message.plan.plan_id, message.job_id
+                ),
+            );
         }
     }
     message.billing_owner_id = request.billing_owner_id;
