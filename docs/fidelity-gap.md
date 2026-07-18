@@ -437,14 +437,14 @@ Comprehensive source review of official `actions/runner` v2.335.1 and
 | `RunnerRefreshConfig` | Parses official refresh metadata, posts the base64 `.runner` payload to `configRefreshURL`, validates runner identity, atomically persists supported settings, and handles malformed/unknown payloads non-fatally | `c4b4688b`, `f0f991d` |
 | AzDO error envelopes | Runner-facing `/_apis`, `/broker`, and `/twirp` errors now use path-specific official-compatible envelopes; native `/api/v1` errors remain unchanged | `d0b4cb51` |
 
-#### Remaining gaps
+#### Resolved P3 gaps (2026-07-18)
 
 | Priority | Gap | Detail | Severity |
 | --- | --- | --- | --- |
-| P3 | `DisableStdoutMultilineLogPrefixing` | Runner-side env var for log formatting not implemented | ❌ runner-side |
-| P3 | `EnsureDispatchFinished` zombie detection | Official `JobDispatcher` queries server-side request status when a new job arrives while busy; aksh handles overlap but may not query request status | ⚠️ partial |
-| P3 | Session reconnection backoff | Official runner has specific exponential backoff with jitter for session recreation on auth failure; aksh behavior remains unverified | ⚠️ unverified |
-| P3 | FIPS encryption mode | RSA-OAEP-SHA256 required when `UseFipsEncryption` is enabled; aksh implements SHA-1 OAEP only | ⚠️ edge case |
+| P3 | `DisableStdoutMultilineLogPrefixing` | `ACTIONS_RUNNER_DISABLE_STDOUT_MULTILINE_LOG_PREFIXING` now matches official boolean parsing and suppresses continuation-line prefixes | ✅ `457280bf` |
+| P3 | `EnsureDispatchFinished` zombie detection | Busy dispatches query `AgentRequest`; terminal requests cancel/drain the worker, active overlap is fatal, and status failures cancel/drain before rethrowing | ✅ `8d275862` |
+| P3 | Session reconnection backoff | Session conflicts are bounded to four minutes; poll/session failures use cancellable `[15,30)`/`[30,60)` jitter and reset after success | ✅ `67ad4447` |
+| P3 | FIPS encryption mode | Session responses select RSA-OAEP-SHA256 when `useFipsEncryption` is true; legacy/default sessions remain OAEP-SHA1, and FIPS paths reject plaintext fallback | ✅ `0673a741`, `c44a570`, `e2e1a8e` |
 
 ---
 ## 4. Pluggable backends & deployment modes
