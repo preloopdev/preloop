@@ -270,9 +270,8 @@ pub(crate) async fn next_message_disttask(
         inner.azdo_sessions.contains(&session_id)
     };
     if is_azdo {
-        next_message_compat(State(shared), Path(pool_id), Query(params))
-            .await
-            .map(|r| r.into_response())
+        let (status, body) = next_message_compat(State(shared), Path(pool_id), Query(params)).await;
+        Ok((status, body).into_response())
     } else {
         next_message_broker_ref(State(shared), Path(pool_id), Query(params)).await
     }

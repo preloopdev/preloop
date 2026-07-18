@@ -3,7 +3,7 @@ use super::*;
 pub(crate) async fn next_message(
     State(shared): State<Arc<SharedState>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<Option<azdo::TaskAgentMessage>>, ApiError> {
+) -> (StatusCode, Json<Option<azdo::TaskAgentMessage>>) {
     let session_id = params
         .get("sessionId")
         .cloned()
@@ -21,18 +21,20 @@ pub(crate) async fn next_message(
             .get(&session_id)
             .and_then(|messages| messages.values().next().cloned())
         {
-            return Ok(Json(Some(message)));
+            return (StatusCode::OK, Json(Some(message)));
         }
 
         if let Some(cancellation) = inner.cancellation_queue.pop_front() {
             let body_json = concurrency::job_cancel_body(cancellation.agent_job_id);
-            let message = build_task_agent_message(
+            match build_task_agent_message(
                 &mut inner,
                 &session_id,
                 azdo::message_type::JOB_CANCELLED,
                 body_json,
-            )?;
-            return Ok(Json(Some(message)));
+            ) {
+                Ok(message) => return (StatusCode::OK, Json(Some(message))),
+                Err(_) => return (StatusCode::ACCEPTED, Json(None)),
+            }
         }
 
         if let Some(request_id) = inner.session_active_requests.get(&session_id).copied() {
@@ -45,7 +47,7 @@ pub(crate) async fn next_message(
             } else {
                 drop(inner);
                 if wait_seconds == 0 {
-                    return Ok(Json(None));
+                    return (StatusCode::ACCEPTED, Json(None));
                 }
                 if tokio::time::timeout(
                     Duration::from_secs(wait_seconds),
@@ -54,7 +56,7 @@ pub(crate) async fn next_message(
                 .await
                 .is_err()
                 {
-                    return Ok(Json(None));
+                    return (StatusCode::ACCEPTED, Json(None));
                 }
                 continue;
             }
@@ -64,7 +66,7 @@ pub(crate) async fn next_message(
         let Some(queued) = take_matching_job(&mut inner.queue, &runner_labels) else {
             drop(inner);
             if wait_seconds == 0 {
-                return Ok(Json(None));
+                return (StatusCode::ACCEPTED, Json(None));
             }
             if tokio::time::timeout(
                 Duration::from_secs(wait_seconds),
@@ -73,7 +75,7 @@ pub(crate) async fn next_message(
             .await
             .is_err()
             {
-                return Ok(Json(None));
+                return (StatusCode::ACCEPTED, Json(None));
             }
             continue;
         };
@@ -113,7 +115,11 @@ pub(crate) async fn next_message(
             "F030: injected SystemVssConnection into AzDO job message"
         );
         let body_json = serde_json::to_string(&msg)
-            .map_err(|e| ApiError::bad_request(format!("failed to serialize job message: {e}")))?;
+            .map_err(|e| ApiError::bad_request(format!("failed to serialize job message: {e}")));
+        let body_json = match body_json {
+            Ok(b) => b,
+            Err(_) => return (StatusCode::ACCEPTED, Json(None)),
+        };
         let request_id = queued.message.request_id;
         inner
             .session_active_requests
@@ -126,7 +132,12 @@ pub(crate) async fn next_message(
             &session_id,
             azdo::message_type::PIPELINE_AGENT_JOB_REQUEST,
             body_json,
-        )?;
+        );
+
+        let message = match message {
+            Ok(m) => m,
+            Err(_) => return (StatusCode::ACCEPTED, Json(None)),
+        };
 
         let run_id = queued.run_id;
         let job_id = queued.job_id.clone();
@@ -144,7 +155,7 @@ pub(crate) async fn next_message(
             })
             .await;
 
-        return Ok(Json(Some(message)));
+        return (StatusCode::OK, Json(Some(message)));
     }
 }
 
