@@ -98,7 +98,7 @@ pub(crate) fn broker_job_ref(
     runner_id: i64,
 ) -> serde_json::Value {
     json!({
-        "messageId": request.agent_job_id.to_string(),
+        "messageId": request.request_id,
         "messageType": "RunnerJobRequest",
         "body": serde_json::to_string(&json!({
             "runner_request_id": request.agent_job_id.to_string(),
