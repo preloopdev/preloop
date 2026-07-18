@@ -8,7 +8,7 @@ use base64::Engine;
 use tracing::{debug, error, info, warn};
 
 use crate::client::azdo::AzdoClient;
-use crate::client::http::HttpClient;
+use crate::client::http::{HttpClient, SessionBackoff};
 use crate::listener::job_dispatcher;
 use crate::settings::RunnerConfig;
 
@@ -39,9 +39,13 @@ pub async fn run_message_loop(
         "akshAzdo": true,
     });
 
+    let shutdown = tokio::signal::ctrl_c();
+    tokio::pin!(shutdown);
+
     // Retry session creation on 409 conflict: a prior runner instance may still
     // hold an active session.  GitHub typically frees it within ~30 s after the
     // TCP connection drops.  Mirrors MessageListener.cs behaviour.
+    let mut conflict_retries = 0u32;
     let (session_resp, session_id) = loop {
         match client.create_session(token, &session_body).await {
             Ok(resp) => {
@@ -52,9 +56,23 @@ pub async fn run_message_loop(
                     .to_string();
                 break (resp, id);
             }
-            Err(e) if e.to_string().contains("409") || e.to_string().contains("session") => {
+            Err(e) if is_session_conflict(&e) => {
+                conflict_retries += 1;
+                if conflict_retries > 8 {
+                    return Err(e.context("session conflict retry limit exceeded (4 minutes)"));
+                }
                 warn!("Session conflict (409) — waiting 30 s before retry");
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                tokio::select! {
+                    _ = &mut shutdown => return Ok(()),
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+                }
+            }
+            Err(e) if is_transient_session_error(&e) => {
+                warn!("Transient session creation failure: {e:#}; retrying in 30 s");
+                tokio::select! {
+                    _ = &mut shutdown => return Ok(()),
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+                }
             }
             Err(e) => return Err(e.context("creating session")),
         }
@@ -72,11 +90,9 @@ pub async fn run_message_loop(
 
     info!("Session created: {session_id}");
 
-    let shutdown = tokio::signal::ctrl_c();
-    tokio::pin!(shutdown);
-
     let mut last_message_id: Option<i64> = None;
     let mut consecutive_errors: u32 = 0;
+    let mut retry_backoff = SessionBackoff::default();
 
     loop {
         tokio::select! {
@@ -89,6 +105,7 @@ pub async fn run_message_loop(
                 match result {
                     Ok(Some(msg)) => {
                         consecutive_errors = 0;
+                        retry_backoff.reset();
                         let message_id = msg.get("messageId").and_then(|v| v.as_i64()).unwrap_or(0);
                         last_message_id = Some(message_id);
 
@@ -173,17 +190,40 @@ pub async fn run_message_loop(
                     }
                     Ok(None) => {
                         consecutive_errors = 0;
+                        retry_backoff.reset();
                         info!("Polling: no message received (long-poll timeout)");
                     }
                     Err(e) => {
                         consecutive_errors += 1;
-                        let delay = std::cmp::min(consecutive_errors * 5, 60);
-                        warn!("Message poll error ({consecutive_errors}): {e:#}. Retrying in {delay}s");
-                        tokio::time::sleep(std::time::Duration::from_secs(delay as u64)).await;
+                        let delay = retry_backoff.next_delay();
+                        warn!("Message poll error ({consecutive_errors}): {e:#}. Retrying in {delay:?}");
+                        tokio::select! {
+                            _ = &mut shutdown => return Ok(()),
+                            _ = tokio::time::sleep(delay) => {}
+                        }
                     }
                 }
             }
         }
+    }
+}
+
+fn status_of(err: &anyhow::Error) -> Option<reqwest::StatusCode> {
+    err.chain().find_map(|cause| {
+        cause.downcast_ref::<crate::client::http::HttpError>().map(|e| match e {
+            crate::client::http::HttpError::Status { status, .. } => *status,
+        })
+    })
+}
+
+fn is_session_conflict(err: &anyhow::Error) -> bool {
+    status_of(err) == Some(reqwest::StatusCode::CONFLICT)
+}
+
+fn is_transient_session_error(err: &anyhow::Error) -> bool {
+    match status_of(err) {
+        Some(status) => status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error(),
+        None => true,
     }
 }
 

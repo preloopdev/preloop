@@ -10,7 +10,7 @@ use tracing::{debug, info, warn};
 
 use crate::client::azdo::AzdoClient;
 use crate::client::broker::BrokerClient;
-use crate::client::http::HttpClient;
+use crate::client::http::{HttpClient, SessionBackoff};
 use crate::listener::job_dispatcher::{self, cancellation_timing, parse_timespan_secs, RunningJob};
 use crate::settings::RunnerConfig;
 
@@ -83,6 +83,7 @@ pub async fn run_broker_loop(
     let mut processed_message_ids: std::collections::HashSet<i64> =
         std::collections::HashSet::new();
     let mut consecutive_errors: u32 = 0;
+    let mut retry_backoff = SessionBackoff::default();
     let mut active_job: Option<RunningJob> = None;
 
     // We start in a "need session" state.
@@ -169,6 +170,7 @@ pub async fn run_broker_loop(
                         info!("Broker session created: {session_id}");
                         need_session = false;
                         consecutive_errors = 0;
+                        retry_backoff.reset();
                         // Scope dedup set to this session — old IDs from a previous
                         // session must not block re-delivered messages on the new one.
                         processed_message_ids.clear();
@@ -176,8 +178,11 @@ pub async fn run_broker_loop(
                     } else {
                         warn!("Session response missing sessionId");
                         consecutive_errors += 1;
-                        let delay = std::cmp::min(consecutive_errors * 5, 60);
-                        tokio::time::sleep(std::time::Duration::from_secs(delay as u64)).await;
+                        let delay = retry_backoff.next_delay();
+                        tokio::select! {
+                            _ = &mut shutdown => return Ok(()),
+                            _ = tokio::time::sleep(delay) => {}
+                        }
                     }
                 }
                 Err(e) => {
@@ -199,9 +204,12 @@ pub async fn run_broker_loop(
                         }
                     } else {
                         consecutive_errors += 1;
-                        let delay = std::cmp::min(consecutive_errors * 5, 60);
-                        warn!("Failed to create broker session: {e:#}. Retrying in {delay}s");
-                        tokio::time::sleep(std::time::Duration::from_secs(delay as u64)).await;
+                        let delay = retry_backoff.next_delay();
+                        warn!("Failed to create broker session: {e:#}. Retrying in {delay:?}");
+                        tokio::select! {
+                            _ = &mut shutdown => return Ok(()),
+                            _ = tokio::time::sleep(delay) => {}
+                        }
                     }
                     continue;
                 }
@@ -266,6 +274,7 @@ pub async fn run_broker_loop(
                 match result {
                     Ok(Some(msg)) => {
                         consecutive_errors = 0;
+                        retry_backoff.reset();
                         let message_id = msg.get("messageId").and_then(|v| v.as_i64()).unwrap_or(0);
 
                         // In-memory dedup: skip already-processed messages
@@ -519,6 +528,7 @@ pub async fn run_broker_loop(
                     }
                     Ok(None) => {
                         consecutive_errors = 0;
+                        retry_backoff.reset();
                         debug!("Broker poll returned no message");
                     }
                     Err(e) => {
@@ -554,9 +564,12 @@ pub async fn run_broker_loop(
                             need_session = true;
                         } else {
                             consecutive_errors += 1;
-                            let delay = std::cmp::min(consecutive_errors * 5, 60);
-                            warn!("Broker poll error ({consecutive_errors}): {e:#}. Retrying in {delay}s");
-                            tokio::time::sleep(std::time::Duration::from_secs(delay as u64)).await;
+                            let delay = retry_backoff.next_delay();
+                            warn!("Broker poll error ({consecutive_errors}): {e:#}. Retrying in {delay:?}");
+                            tokio::select! {
+                                _ = &mut shutdown => return Ok(()),
+                                _ = tokio::time::sleep(delay) => {}
+                            }
                         }
                     }
                 }

@@ -1,6 +1,7 @@
 //! Shared HTTP client with CA bundle and proxy support.
 
 use anyhow::{Context, Result};
+use rand::Rng;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use std::path::Path;
 use std::time::Duration;
@@ -12,6 +13,39 @@ pub enum HttpError {
         status: reqwest::StatusCode,
         body: String,
     },
+}
+
+/// Runner.Listener reconnect jitter from MessageListener.cs v2.335.1.
+/// Consecutive failures use [15, 30) seconds for the first five retries and
+/// [30, 60) seconds afterwards; a successful poll resets the counter.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct SessionBackoff {
+    consecutive_errors: u32,
+}
+
+impl SessionBackoff {
+    pub(crate) fn next_delay(&mut self) -> Duration {
+        self.consecutive_errors = self.consecutive_errors.saturating_add(1);
+        let (min, max) = if self.consecutive_errors <= 5 {
+            (15_000, 30_000)
+        } else {
+            (30_000, 60_000)
+        };
+        Duration::from_millis(rand::thread_rng().gen_range(min..max))
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.consecutive_errors = 0;
+    }
+
+    #[cfg(test)]
+    fn consecutive_errors(&self) -> u32 {
+        self.consecutive_errors
+    }
+}
+
+fn is_transient_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
 /// Shared HTTP client wrapping reqwest with CA bundle, proxy, and auth.
@@ -172,7 +206,7 @@ impl HttpClient {
                 }
             };
             let status = resp.status();
-            if status.is_server_error() {
+            if is_transient_status(status) {
                 let body_text = resp.text().await.unwrap_or_default();
                 last_err = Some(anyhow::anyhow!("POST {url} returned {status}: {body_text}"));
                 continue;
@@ -324,7 +358,7 @@ impl HttpClient {
                 }
             };
             let status = resp.status();
-            if status.is_server_error() {
+            if is_transient_status(status) {
                 let body = resp.text().await.unwrap_or_default();
                 last_err = Some(anyhow::anyhow!("PUT {url} returned {status}: {body}"));
                 continue;
@@ -372,7 +406,7 @@ impl HttpClient {
                 }
             };
             let status = resp.status();
-            if status.is_server_error() {
+            if is_transient_status(status) {
                 let body = resp.text().await.unwrap_or_default();
                 last_err = Some(anyhow::anyhow!("PUT {url} returned {status}: {body}"));
                 continue;
@@ -441,6 +475,27 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
+
+    #[test]
+    fn session_backoff_uses_official_bounded_windows_and_resets() {
+        let mut backoff = SessionBackoff::default();
+        for _ in 0..5 {
+            let delay = backoff.next_delay();
+            assert!(delay >= Duration::from_secs(15));
+            assert!(delay < Duration::from_secs(30));
+        }
+        for _ in 0..3 {
+            let delay = backoff.next_delay();
+            assert!(delay >= Duration::from_secs(30));
+            assert!(delay < Duration::from_secs(60));
+        }
+        assert_eq!(backoff.consecutive_errors(), 8);
+        backoff.reset();
+        assert_eq!(backoff.consecutive_errors(), 0);
+        let delay = backoff.next_delay();
+        assert!(delay >= Duration::from_secs(15));
+        assert!(delay < Duration::from_secs(30));
+    }
 
     async fn serve_once(status: &str, body: &str) -> (String, oneshot::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
