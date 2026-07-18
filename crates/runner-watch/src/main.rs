@@ -2852,7 +2852,7 @@ fn update_fidelity_gap(version: &str, spec_dir: &Path) -> anyhow::Result<()> {
         return Ok(());
     }
     let mut text = fs::read_to_string(&path)?;
-    let marker = "<!-- runner-watch-sync -->";
+    let marker = "[//]: # (runner-watch-sync)";
     let generated = render_fidelity_update(version, spec_dir)?;
     if let Some(pos) = text.find(marker) {
         text.truncate(pos);
