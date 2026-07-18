@@ -53,20 +53,33 @@ fn expected_template_token(value: &str) -> Value {
     token
 }
 
-fn expected_template_map(values: &BTreeMap<String, String>) -> Value {
+fn expected_template_map(values: &BTreeMap<String, String>, with_loc: bool) -> Value {
     let pairs: Vec<Value> = values
         .iter()
         .map(|(key, value)| {
+            let key_token = if with_loc {
+                json!({"type": 0, "lit": key, "col": 0, "file": 1, "line": 0})
+            } else {
+                json!({"type": 0, "lit": key})
+            };
             json!({
-                "Key": {"type": 0, "lit": key},
+                "Key": key_token,
                 "Value": expected_template_token(value),
             })
         })
         .collect();
     if pairs.is_empty() {
-        json!({"type": 2})
+        if with_loc {
+            json!({"type": 2, "col": 0, "file": 1, "line": 0})
+        } else {
+            json!({"type": 2})
+        }
     } else {
-        json!({"type": 2, "map": pairs})
+        if with_loc {
+            json!({"type": 2, "col": 0, "file": 1, "line": 0, "map": pairs})
+        } else {
+            json!({"type": 2, "map": pairs})
+        }
     }
 }
 // Independent AgentJobRequest oracle derived from the official v2.335.1
@@ -163,9 +176,12 @@ fn expected_step_wire(step: &TaskStep) -> Value {
     object.insert("type".to_owned(), json!("action"));
     object.insert("reference".to_owned(), reference);
     if !step.env.is_empty() {
-        object.insert("environment".to_owned(), expected_template_map(&step.env));
+        object.insert("environment".to_owned(), expected_template_map(&step.env, true));
     }
-    object.insert("inputs".to_owned(), expected_template_map(&inputs));
+    if !inputs.is_empty() {
+        let inputs_with_loc = step.reference.as_ref().map_or(false, |r| r.reference_type.as_deref() != Some("script"));
+        object.insert("inputs".to_owned(), expected_template_map(&inputs, inputs_with_loc));
+    }
     object.insert("id".to_owned(), json!(step.id));
     object.insert(
         "name".to_owned(),
@@ -898,9 +914,14 @@ proptest! {
         if step.env.is_empty() {
             prop_assert!(encoded.get("environment").is_none());
         } else {
-            prop_assert_eq!(&encoded["environment"], &expected_template_map(&step.env));
+            prop_assert_eq!(&encoded["environment"], &expected_template_map(&step.env, true));
         }
-        prop_assert_eq!(&encoded["inputs"], &expected_template_map(&expected_inputs));
+        if expected_inputs.is_empty() {
+            prop_assert!(encoded.get("inputs").is_none());
+        } else {
+            let inputs_with_loc = step.reference.as_ref().map_or(false, |r| r.reference_type.as_deref() != Some("script"));
+            prop_assert_eq!(&encoded["inputs"], &expected_template_map(&expected_inputs, inputs_with_loc));
+        }
         prop_assert_eq!(&encoded["id"], &json!(step.id));
         prop_assert_eq!(encoded.get("contextName").is_some(), step.context_name.is_some());
         prop_assert!(encoded.get("displayName").is_none());
@@ -1026,7 +1047,7 @@ fn tier2_codec_task_step_environment_aliases() {
             ])
         );
         let encoded = serde_json::to_value(&decoded).unwrap();
-        assert_eq!(encoded["environment"], expected_template_map(&decoded.env));
+        assert_eq!(encoded["environment"], expected_template_map(&decoded.env, true));
         assert!(encoded.get("env").is_none());
     }
 }
