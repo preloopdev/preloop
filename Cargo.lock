@@ -2074,6 +2074,7 @@ dependencies = [
 name = "runner-watch"
 version = "0.1.0"
 dependencies = [
+ "aksh-gha-protocol",
  "anyhow",
  "base64",
  "clap",
