@@ -243,7 +243,14 @@ impl Serialize for TaskStep {
         map.serialize_entry("type", "action")?;
         map.serialize_entry("reference", &SerializedActionReference { step: self })?;
         if !self.env.is_empty() {
-            map.serialize_entry("environment", &TemplateStringMap(&self.env))?;
+            let mut env_val = serde_json::to_value(TemplateStringMap(&self.env))
+                .unwrap_or(serde_json::json!({"type": 2}));
+            if let Some(obj) = env_val.as_object_mut() {
+                obj.insert("col".to_owned(), serde_json::json!(0));
+                obj.insert("file".to_owned(), serde_json::json!(1));
+                obj.insert("line".to_owned(), serde_json::json!(0));
+            }
+            map.serialize_entry("environment", &env_val)?;
         }
         map.serialize_entry("inputs", &TemplateStringMap(&inputs))?;
         map.serialize_entry("id", &self.id)?;
