@@ -523,6 +523,9 @@ pub enum NdjsonEvent {
         file: Option<String>,
         /// Optional line number.
         line: Option<u64>,
+        /// Optional step/record ID.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        step_id: Option<String>,
     },
     /// Run-level status changed.
     RunStatus {
