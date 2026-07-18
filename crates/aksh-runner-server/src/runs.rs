@@ -8,6 +8,64 @@ pub(crate) async fn healthz(State(shared): State<Arc<SharedState>>) -> Json<serd
     }))
 }
 
+/// Interpolate `${{ ... }}` expressions in a workflow run name.
+///
+/// A malformed expression is left untouched, matching GitHub's behavior of
+/// retaining the configured run-name rather than rejecting the run.
+fn evaluate_run_name(
+    raw: &str,
+    github: &serde_json::Value,
+    inputs: &BTreeMap<String, serde_json::Value>,
+    vars: &BTreeMap<String, String>,
+) -> String {
+    let mut context = aksh_gha_expressions::Context::default();
+    context.insert("github", github.clone());
+    context.insert("inputs", serde_json::Value::Object(inputs.clone().into_iter().collect()));
+    context.insert(
+        "vars",
+        serde_json::Value::Object(
+            vars.iter()
+                .map(|(name, value)| (name.clone(), serde_json::Value::String(value.clone())))
+                .collect(),
+        ),
+    );
+
+    let Some(_) = raw.find("${{") else {
+        return raw.to_owned();
+    };
+    let mut result = String::with_capacity(raw.len());
+    let mut cursor = 0;
+    loop {
+        let Some(relative_start) = raw[cursor..].find("${{") else {
+            result.push_str(&raw[cursor..]);
+            break;
+        };
+        let start = cursor + relative_start;
+        result.push_str(&raw[cursor..start]);
+        let expression_start = start + 3;
+        let Some(relative_end) = raw[expression_start..].find("}}") else {
+            return raw.to_owned();
+        };
+        let expression_end = expression_start + relative_end;
+        let value = match aksh_gha_expressions::eval_expression(
+            &raw[expression_start..expression_end],
+            &context,
+        ) {
+            Ok(value) => value,
+            Err(_) => return raw.to_owned(),
+        };
+        match value {
+            serde_json::Value::String(value) => result.push_str(&value),
+            serde_json::Value::Null => {}
+            serde_json::Value::Bool(value) => result.push_str(if value { "true" } else { "false" }),
+            serde_json::Value::Number(value) => result.push_str(&value.to_string()),
+            value => result.push_str(&serde_json::to_string(&value).unwrap_or_default()),
+        }
+        cursor = expression_end + 2;
+    }
+    result
+}
+
 pub(crate) async fn submit_run_inner(
     shared: &Arc<SharedState>,
     mut submission: WorkflowSubmission,
@@ -206,6 +264,15 @@ pub(crate) async fn submit_run_inner(
         "triggering_actor": "aksh-system"
     });
 
+    let run_name = workflow.run_name.as_deref().map(|raw| {
+        let inputs = if submission.dispatch_inputs.is_empty() {
+            &submission.inputs
+        } else {
+            &submission.dispatch_inputs
+        };
+        evaluate_run_name(raw, &github, inputs, &submission.vars)
+    });
+
     // Evaluate workflow-level concurrency before locking (pure).
     let workflow_concurrency = workflow.concurrency.clone();
     let mut empty_workflow_concurrency_group = false;
@@ -249,6 +316,7 @@ pub(crate) async fn submit_run_inner(
                 run_id,
                 RunRecord {
                     run_id,
+                    run_name,
                     submission,
                     jobs: BTreeMap::new(),
                     job_outputs: BTreeMap::new(),
@@ -499,6 +567,7 @@ pub(crate) async fn submit_run_inner(
                         run_id,
                         RunRecord {
                             run_id,
+                            run_name,
                             submission,
                             jobs: statuses,
                             job_outputs: BTreeMap::new(),
@@ -548,6 +617,7 @@ pub(crate) async fn submit_run_inner(
                 run_id,
                 RunRecord {
                     run_id,
+                    run_name,
                     submission,
                     jobs: statuses,
                     job_outputs: BTreeMap::new(),
@@ -589,6 +659,7 @@ pub(crate) async fn submit_run_inner(
             run_id,
             RunRecord {
                 run_id,
+                run_name: run_name.clone(),
                 submission: submission.clone(),
                 jobs: statuses.clone(),
                 job_outputs: BTreeMap::new(),
@@ -778,6 +849,7 @@ pub(crate) async fn submit_run_inner(
             run_id,
             RunRecord {
                 run_id,
+                run_name,
                 submission,
                 jobs: statuses,
                 job_outputs: BTreeMap::new(),
