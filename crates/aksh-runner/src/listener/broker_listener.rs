@@ -8,7 +8,6 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use tracing::{debug, info, warn};
 
-use crate::client::azdo::AzdoClient;
 use crate::client::broker::BrokerClient;
 use crate::client::http::{HttpClient, SessionBackoff};
 use crate::listener::job_dispatcher::{self, cancellation_timing, parse_timespan_secs, RunningJob};
@@ -66,16 +65,12 @@ pub async fn run_broker_loop(
         .trim_end_matches('/')
         .to_string();
     let mut client = BrokerClient::new(http.clone(), broker_url);
-    let status_client = AzdoClient::new(
-        http.clone(),
-        config.settings.server_url.clone(),
-        config.settings.pool_id,
-    );
 
     let mut token = initial_token.to_string();
     let mut token_expires_at: Option<std::time::Instant> = initial_expires_at;
     let mut session_id = String::new();
     let mut session_key: Option<Vec<u8>> = None;
+    let mut use_fips_encryption = false;
 
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
@@ -159,14 +154,22 @@ pub async fn run_broker_loop(
                     "status": 0,
                     "provisioningState": serde_json::Value::Null,
                 },
-                "useFipsEncryption": false,
+                "useFipsEncryption": require_fips_cryptography(&config),
             });
 
             match client.create_session(&token, &session_body).await {
                 Ok(session_resp) => {
                     if let Some(sid) = session_resp.get("sessionId").and_then(|v| v.as_str()) {
                         session_id = sid.to_string();
-                        session_key = extract_session_key_if_present(&session_resp, &config);
+                        use_fips_encryption = session_resp
+                            .get("useFipsEncryption")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false);
+                        session_key = extract_session_key_if_present(
+                            &session_resp,
+                            &config,
+                            use_fips_encryption,
+                        );
                         info!("Broker session created: {session_id}");
                         need_session = false;
                         consecutive_errors = 0;
@@ -197,9 +200,11 @@ pub async fn run_broker_loop(
                             Err(oe) => {
                                 warn!("Failed to re-acquire OAuth token: {oe:#}");
                                 consecutive_errors += 1;
-                                let delay = std::cmp::min(consecutive_errors * 5, 60);
-                                tokio::time::sleep(std::time::Duration::from_secs(delay as u64))
-                                    .await;
+                                let delay = retry_backoff.next_delay();
+                                tokio::select! {
+                                    _ = &mut shutdown => return Ok(()),
+                                    _ = tokio::time::sleep(delay) => {}
+                                }
                             }
                         }
                     } else {
@@ -292,7 +297,11 @@ pub async fn run_broker_loop(
                         info!("Received broker message {message_id}: {message_type}");
 
                         // Parse body — decrypt if key present, else plaintext (F011)
-                        let body = match parse_message_body(&msg, session_key.as_deref()) {
+                        let body = match parse_message_body(
+                            &msg,
+                            session_key.as_deref(),
+                            use_fips_encryption,
+                        ) {
                             Ok(b) => b,
                             Err(e) => {
                                 warn!("Failed to parse message body: {e:#}");
@@ -359,28 +368,21 @@ pub async fn run_broker_loop(
                             }
                             BrokerMessageKind::PipelineAgentJobRequest => {
                                 if let Some(mut prev) = active_job.take() {
+                                    // Same cancel-immediately pattern for AzDO path
                                     info!(
-                                        "PipelineAgentJobRequest while busy — checking previous job {} status",
+                                        "PipelineAgentJobRequest while busy — cancelling previous job {}",
                                         prev.request_id
                                     );
-                                    // EnsureDispatchFinished queries the server before
-                                    // deciding whether this is a zombie worker or an
-                                    // active-overlap protocol violation. A terminal
-                                    // request is cancelled/drained; an active request
-                                    // is fatal instead of silently dropping job B.
-                                    if prev.agent_request_id.is_some() {
-                                        job_dispatcher::ensure_dispatch_finished(
-                                            &mut prev,
-                                            &token,
-                                            config.settings.pool_id,
-                                            &status_client,
-                                        )
-                                        .await?;
-                                    } else {
-                                        // A malformed legacy payload has no status key;
-                                        // retain the previous cancellation behavior.
-                                        prev.cancel(60).await;
-                                        let _ = prev.wait().await;
+                                    let timing = cancellation_timing(60);
+                                    prev.cancel(timing.effective_timeout_secs).await;
+                                    if tokio::time::timeout(
+                                        std::time::Duration::from_secs(timing.kill_after_secs),
+                                        prev.wait(),
+                                    )
+                                    .await
+                                    .is_err()
+                                    {
+                                        prev.kill().await;
                                     }
                                     if once || config.settings.ephemeral {
                                         let _ = client.delete_session(&token, &session_id).await;
@@ -603,10 +605,21 @@ fn is_session_expired(err: &anyhow::Error) -> bool {
     }
 }
 
+/// Read `requireFipsCryptography` from the runner's `.credentials` data.
+fn require_fips_cryptography(config: &RunnerConfig) -> bool {
+    config
+        .credentials
+        .data
+        .get("requireFipsCryptography")
+        .and_then(|v| v.as_str())
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+}
+
 /// F011: Extract session key only if present.
 fn extract_session_key_if_present(
     session: &serde_json::Value,
     config: &RunnerConfig,
+    use_fips_encryption: bool,
 ) -> Option<Vec<u8>> {
     let enc_key = session.get("encryptionKey")?;
     let value = enc_key.get("value").and_then(|v| v.as_str())?;
@@ -623,7 +636,14 @@ fn extract_session_key_if_present(
     if encrypted {
         let keypair =
             aksh_gha_protocol::crypto::AgentRsaKeypair::from_rsaparams(&config.rsa_params).ok()?;
-        keypair.unwrap_key(&key_bytes).ok()
+        let hash = if use_fips_encryption {
+            aksh_gha_protocol::crypto::RsaOaepHash::Sha256
+        } else {
+            aksh_gha_protocol::crypto::RsaOaepHash::Sha1
+        };
+        keypair.unwrap_key_with_hash(&key_bytes, hash).ok()
+    } else if use_fips_encryption {
+        None
     } else {
         Some(key_bytes)
     }
@@ -633,12 +653,16 @@ fn extract_session_key_if_present(
 fn parse_message_body(
     msg: &serde_json::Value,
     session_key: Option<&[u8]>,
+    use_fips_encryption: bool,
 ) -> Result<serde_json::Value> {
     let body_val = msg.get("body");
 
     // If body is already a JSON object (plaintext broker path), return directly
     if let Some(body) = body_val {
         if body.is_object() || body.is_array() {
+            if use_fips_encryption {
+                anyhow::bail!("FIPS broker message must be encrypted");
+            }
             return Ok(body.clone());
         }
     }
@@ -662,6 +686,10 @@ fn parse_message_body(
             return serde_json::from_str(&String::from_utf8(plain)?)
                 .context("parsing decrypted body");
         }
+    }
+
+    if use_fips_encryption {
+        anyhow::bail!("FIPS broker message is missing its decrypted AES key or IV");
     }
 
     serde_json::from_str(body_str).context("parsing plaintext body")
@@ -896,7 +924,7 @@ mod tests {
         let msg = serde_json::json!({
             "body": {"runner_request_id": "abc-123", "run_service_url": "https://example.com"}
         });
-        let body = parse_message_body(&msg, None).unwrap();
+        let body = parse_message_body(&msg, None, false).unwrap();
         assert_eq!(
             body.get("runner_request_id").unwrap().as_str().unwrap(),
             "abc-123"
@@ -908,7 +936,7 @@ mod tests {
         let msg = serde_json::json!({
             "body": "{\"key\": \"value\"}"
         });
-        let body = parse_message_body(&msg, None).unwrap();
+        let body = parse_message_body(&msg, None, false).unwrap();
         assert_eq!(body.get("key").unwrap().as_str().unwrap(), "value");
     }
 
@@ -916,13 +944,13 @@ mod tests {
     fn parse_message_body_empty_is_error() {
         let msg = serde_json::json!({"body": ""});
         // Empty string is not valid JSON — parse_message_body should fail
-        assert!(parse_message_body(&msg, None).is_err());
+        assert!(parse_message_body(&msg, None, false).is_err());
     }
 
     #[test]
     fn parse_message_body_no_body_field() {
         let msg = serde_json::json!({"messageType": "unknown"});
-        let body = parse_message_body(&msg, None).unwrap();
+        let body = parse_message_body(&msg, None, false).unwrap();
         assert!(body.is_object() || body.is_null());
     }
 
@@ -930,7 +958,7 @@ mod tests {
     fn extract_session_key_no_encryption_key() {
         let session = serde_json::json!({"sessionId": "abc"});
         let config = test_config();
-        assert!(extract_session_key_if_present(&session, &config).is_none());
+        assert!(extract_session_key_if_present(&session, &config, false).is_none());
     }
 
     #[test]
@@ -940,7 +968,7 @@ mod tests {
             "encryptionKey": {"value": "", "encrypted": false}
         });
         let config = test_config();
-        assert!(extract_session_key_if_present(&session, &config).is_none());
+        assert!(extract_session_key_if_present(&session, &config, false).is_none());
     }
 
     #[test]
@@ -953,7 +981,7 @@ mod tests {
             "encryptionKey": {"value": b64, "encrypted": false}
         });
         let config = test_config();
-        let key = extract_session_key_if_present(&session, &config).unwrap();
+        let key = extract_session_key_if_present(&session, &config, false).unwrap();
         assert_eq!(key, raw_key);
     }
 
