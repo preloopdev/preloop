@@ -22,3 +22,4 @@ walkdir.workspace = true
 toml.workspace = true
 regex.workspace = true
 similar.workspace = true
+aksh-gha-protocol = { path = "../aksh-gha-protocol" }
