@@ -482,6 +482,7 @@ pub enum HarnessError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use crate::config::{DebuggerConfig, DebuggerTunnelInfo};
     use crate::debugger::DapDebugger;
     use std::sync::Arc;
