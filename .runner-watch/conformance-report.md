@@ -1,6 +1,6 @@
 # runner-watch conformance report
 
-❌ 1 of 1 scenario(s) diverged.
+✅ All 1 scenario(s) matched recorded baseline responses (see replay caveats below).
 
 - [15-oidc-id-token](.runner-watch/conformance/v2.335.1/15-oidc-id-token.md)
 

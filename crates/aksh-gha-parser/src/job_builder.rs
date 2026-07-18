@@ -588,26 +588,19 @@ fn build_task_step(step: &crate::StepPlan, context: &Context) -> TaskStep {
     // `with` inputs are still resolved because action handlers need resolved values
     // to locate and configure the action before step execution.
     let env = step.env.clone();
-    let mut with: BTreeMap<String, String> = step
+    let with: BTreeMap<String, String> = step
         .with
         .iter()
         .map(|(k, v)| {
             let input = step_input_to_string(v);
-            let resolved = resolve_string(&input, context).unwrap_or(input);
-            (k.clone(), resolved)
+            // Don't resolve expressions — preserve ${{ }} so the protocol
+            // layer serializes them as TemplateToken expression type=3.
+            (k.clone(), input)
         })
         .collect();
 
     // Run script: pass as-is; the runner evaluates ${{ }} at step execution time.
     let run = step.run.clone();
-
-    // For script steps, include the shell as an input so the runner's
-    // ScriptHandler picks the correct invocation (e.g. bash --noprofile
-    // --norc -e -o pipefail vs sh -e). GitHub's server always sends this.
-    if run.is_some() {
-        let shell = step.shell.clone().unwrap_or_else(|| "bash".to_owned());
-        with.insert("shell".to_owned(), shell);
-    }
 
     // The runner always evaluates a step condition. Omitted conditions are
     // the same as GitHub's default `success()`.
@@ -638,16 +631,28 @@ fn build_task_step(step: &crate::StepPlan, context: &Context) -> TaskStep {
         condition,
         script: run,
         reference: step.uses.as_ref().map(|uses| {
-            let (name, version) = if let Some((n, v)) = uses.split_once('@') {
-                (n.to_owned(), Some(v.to_owned()))
+            let is_local = uses.starts_with("./") || uses.starts_with(".\\");
+            if is_local {
+                aksh_gha_protocol::azdo::TaskReference {
+                    id: None,
+                    name: None,
+                    path: Some(uses.clone()),
+                    version: None,
+                    reference_type: Some("repository".to_owned()),
+                }
             } else {
-                (uses.clone(), None)
-            };
-            aksh_gha_protocol::azdo::TaskReference {
-                id: None,
-                name: Some(name),
-                version,
-                reference_type: None,
+                let (name, version) = if let Some((n, v)) = uses.split_once('@') {
+                    (n.to_owned(), Some(v.to_owned()))
+                } else {
+                    (uses.clone(), None)
+                };
+                aksh_gha_protocol::azdo::TaskReference {
+                    id: None,
+                    name: Some(name),
+                    path: None,
+                    version,
+                    reference_type: None,
+                }
             }
         }),
         inputs: with,
