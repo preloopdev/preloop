@@ -1895,13 +1895,27 @@ async fn replay_flows_to_aksh(
         }
         // Rewrite OIDC plan/job IDs to match local replay state
         if path.contains("/oidctoken") {
-            if let Some(rest) = path.strip_prefix("/runner/server/_apis/distributedtask/hubs/actions/plans/") {
+            if let Some(rest) =
+                path.strip_prefix("/runner/server/_apis/distributedtask/hubs/actions/plans/")
+            {
                 let parts: Vec<&str> = rest.splitn(3, '/').collect();
                 if parts.len() >= 3 {
                     let official_plan = parts[0];
-                    let official_job = parts[2].split('/').next().unwrap_or(parts[2]).split('?').next().unwrap_or("");
-                    if let Some((local_plan, local_job)) = plan_job_ids.get(&(official_plan.to_owned(), official_job.to_owned())) {
-                        let query = if let Some(q) = path.split_once('?') { format!("?{}", q.1) } else { String::new() };
+                    let official_job = parts[2]
+                        .split('/')
+                        .next()
+                        .unwrap_or(parts[2])
+                        .split('?')
+                        .next()
+                        .unwrap_or("");
+                    if let Some((local_plan, local_job)) =
+                        plan_job_ids.get(&(official_plan.to_owned(), official_job.to_owned()))
+                    {
+                        let query = if let Some(q) = path.split_once('?') {
+                            format!("?{}", q.1)
+                        } else {
+                            String::new()
+                        };
                         path = format!(
                             "/runner/server/_apis/distributedtask/hubs/actions/plans/{}/jobs/{}/oidctoken{}",
                             local_plan, local_job, query
@@ -2011,9 +2025,17 @@ async fn replay_flows_to_aksh(
                     if path.contains("/acquirejob") {
                         let official_resp = flow.get("response_body_json").unwrap_or(&Value::Null);
                         if let (Some(op), Some(oj), Some(lp), Some(lj)) = (
-                            official_resp.get("plan").and_then(|p| p.get("planId")).and_then(Value::as_str).or_else(|| official_resp.get("planId").and_then(Value::as_str)),
+                            official_resp
+                                .get("plan")
+                                .and_then(|p| p.get("planId"))
+                                .and_then(Value::as_str)
+                                .or_else(|| official_resp.get("planId").and_then(Value::as_str)),
                             official_resp.get("jobId").and_then(Value::as_str),
-                            body_json.get("plan").and_then(|p| p.get("planId")).and_then(Value::as_str).or_else(|| body_json.get("planId").and_then(Value::as_str)),
+                            body_json
+                                .get("plan")
+                                .and_then(|p| p.get("planId"))
+                                .and_then(Value::as_str)
+                                .or_else(|| body_json.get("planId").and_then(Value::as_str)),
                             body_json.get("jobId").and_then(Value::as_str),
                         ) {
                             plan_job_ids

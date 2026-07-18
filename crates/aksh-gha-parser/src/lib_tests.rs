@@ -66,7 +66,10 @@ jobs:
     )
     .unwrap();
 
-    assert_eq!(workflow.run_name.as_deref(), Some("Deploy ${{ github.ref }}"));
+    assert_eq!(
+        workflow.run_name.as_deref(),
+        Some("Deploy ${{ github.ref }}")
+    );
 }
 
 #[test]

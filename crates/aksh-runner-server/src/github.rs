@@ -293,7 +293,11 @@ pub(crate) async fn report_check_run_completed(
                                 "message": message,
                             }));
                         } else {
-                            global_issues.push(format!("**{}**: {}", level_str.to_uppercase(), message));
+                            global_issues.push(format!(
+                                "**{}**: {}",
+                                level_str.to_uppercase(),
+                                message
+                            ));
                         }
                     }
                 }
@@ -363,7 +367,6 @@ pub(crate) async fn report_check_run_completed(
         );
     }
 }
-
 
 /// Fetch workflows helper.
 pub(crate) async fn fetch_workflows(
