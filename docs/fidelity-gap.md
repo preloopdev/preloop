@@ -1,4 +1,4 @@
-# aksh — GitHub Actions Control Plane Fidelity Gap &amp; Roadmap
+# aksh — GitHub Actions Control Plane Fidelity Gap & Roadmap
 
 **aksh** is a faithful Rust reimplementation of the GitHub Actions control plane
 
@@ -423,7 +423,7 @@ Findings from a source audit of aksh vs official runner v2.335.1 sources (local 
   (Live console lines already match: 250 ms aggressive → 500 ms.)
 
 ---
-## 4. Pluggable backends &amp; deployment modes
+## 4. Pluggable backends & deployment modes
 
 The official runner protocol already decouples execution from the control plane: the runner
 
