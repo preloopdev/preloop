@@ -614,7 +614,9 @@ pub(crate) fn build_app(
         .merge(protected_apis)
         .with_state(shared.clone())
         .merge(results_metadata)
+        .fallback(errors::protocol_not_found)
         .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn(errors::protocol_error_envelope))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             record_flows_middleware,
