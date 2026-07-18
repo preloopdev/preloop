@@ -198,17 +198,16 @@ fn expected_job_wire(job: &AgentJobRequestMessage) -> Value {
     }
     object.insert("jobId".to_owned(), json!(job.job_id));
     object.insert("requestId".to_owned(), json!(job.request_id));
-    object.insert(
-        "plan".to_owned(),
-        json!({
-            "scopeIdentifier": job.plan.scope_identifier,
-            "planId": job.plan.plan_id,
-            "planType": job.plan.plan_type,
-            "version": job.plan.version,
-            "artifactUri": job.plan.artifact_uri,
-            "artifactLocation": job.plan.artifact_location,
-        }),
-    );
+    let mut plan = serde_json::Map::new();
+    if !job.plan.scope_identifier.is_empty() {
+        plan.insert("scopeIdentifier".to_owned(), json!(job.plan.scope_identifier));
+    }
+    plan.insert("planId".to_owned(), json!(job.plan.plan_id));
+    plan.insert("planType".to_owned(), json!(job.plan.plan_type));
+    plan.insert("version".to_owned(), json!(job.plan.version));
+    plan.insert("artifactUri".to_owned(), json!(job.plan.artifact_uri));
+    plan.insert("artifactLocation".to_owned(), json!(job.plan.artifact_location));
+    object.insert("plan".to_owned(), Value::Object(plan));
     object.insert(
         "timeline".to_owned(),
         json!({
