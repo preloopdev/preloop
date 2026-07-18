@@ -266,6 +266,7 @@ mod tests {
             id: aksh_gha_protocol::JobId(id.to_owned()),
             base_id: base.to_owned(),
             name: id.to_owned(),
+            runner_group: None,
             runs_on: vec!["ubuntu-latest".to_owned()],
             needs: needs
                 .iter()

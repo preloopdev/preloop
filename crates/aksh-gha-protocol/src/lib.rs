@@ -265,6 +265,9 @@ pub struct JobPlan {
     pub base_id: String,
     /// Display name.
     pub name: String,
+    /// Display name of the required runner group from object-valued `runs-on`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_group: Option<String>,
     /// Required runner labels.
     pub runs_on: Vec<String>,
     /// Dependency job ids.
@@ -424,6 +427,12 @@ pub struct RunnerRegistrationRequest {
     /// Runner RSA public key material (XML/JWK/PEM depending on client).
     #[serde(default)]
     pub public_key: Option<String>,
+    /// Numeric runner group identifier. Missing means the default group.
+    #[serde(default, alias = "runnerGroupId", skip_serializing_if = "Option::is_none")]
+    pub runner_group_id: Option<i64>,
+    /// Runner group display name. Missing means the default group.
+    #[serde(default, alias = "runnerGroupName", skip_serializing_if = "Option::is_none")]
+    pub runner_group_name: Option<String>,
 }
 
 /// Registered runner state.
@@ -440,6 +449,12 @@ pub struct RegisteredRunner {
     /// Runner RSA public key material, if supplied at registration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_key: Option<String>,
+    /// Numeric runner group identifier. Missing means the default group.
+    #[serde(default, alias = "runnerGroupId", skip_serializing_if = "Option::is_none")]
+    pub runner_group_id: Option<i64>,
+    /// Runner group display name. Missing means the default group.
+    #[serde(default, alias = "runnerGroupName", skip_serializing_if = "Option::is_none")]
+    pub runner_group_name: Option<String>,
 }
 
 /// Runner session creation request.

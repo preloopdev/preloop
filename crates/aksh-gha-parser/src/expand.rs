@@ -106,6 +106,7 @@ fn job_plan_from_job(
         id: JobId(expanded_id),
         base_id: job_id.to_owned(),
         name: job.name.clone().unwrap_or_else(|| job_id.to_owned()),
+        runner_group: job.runs_on.group(),
         runs_on: job.runs_on.labels(),
         needs: job.needs.ids(),
         matrix,

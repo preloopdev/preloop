@@ -833,14 +833,12 @@ pub(crate) fn is_terminal_status(status: ExecutionStatus) -> bool {
 ///
 /// A job matches when every label in the job's `runs-on` is present in the
 /// runner's label set (case-insensitive). GitHub-hosted runner labels like
-/// `ubuntu-latest` are treated as aliases for common self-hosted labels.
+/// Match required labels against a runner's labels.
 pub(crate) fn job_matches_runner(job_labels: &[String], runner_labels: &[String]) -> bool {
-    // Empty runs-on matches any runner (shouldn't happen, but be safe)
     if job_labels.is_empty() {
         return true;
     }
-    // Unknown runner (no session→runner mapping) matches any job.
-    // This preserves backward compat for tests and legacy session paths.
+    // Unknown runner (no session→runner mapping) matches any job labels.
     if runner_labels.is_empty() {
         return true;
     }
@@ -848,13 +846,9 @@ pub(crate) fn job_matches_runner(job_labels: &[String], runner_labels: &[String]
         runner_labels.iter().map(|l| l.to_lowercase()).collect();
     job_labels.iter().all(|required| {
         let req = required.to_lowercase();
-        // Direct match
         if runner_set.contains(&req) {
             return true;
         }
-        // GitHub-hosted aliases: treat `ubuntu-latest`, `ubuntu-24.04`, etc.
-        // as matching a runner with "linux" label; `macos-latest` matches "macos";
-        // `windows-latest` matches "windows".
         if req.starts_with("ubuntu") && runner_set.contains("linux") {
             return true;
         }
@@ -864,27 +858,56 @@ pub(crate) fn job_matches_runner(job_labels: &[String], runner_labels: &[String]
         if req.starts_with("windows") && runner_set.contains("windows") {
             return true;
         }
-        // Broad fallback: if the runner has "self-hosted" and the job only
-        // specifies a GitHub-hosted label (e.g. "ubuntu-latest"), match it.
-        // This lets single-runner local setups work without label gymnastics.
-        if runner_set.contains("self-hosted")
-            && (req.starts_with("ubuntu") || req.starts_with("macos") || req.starts_with("windows"))
-        {
-            return true;
-        }
-        false
+        runner_set.contains("self-hosted")
+            && (req.starts_with("ubuntu")
+                || req.starts_with("macos")
+                || req.starts_with("windows"))
     })
 }
 
-/// Find and remove the first job in the queue that matches the given runner's labels.
-/// Returns `None` if no matching job is found.
+/// Match an explicit job group against a registered runner's group.
+/// Group is separate from labels; missing metadata on a known runner is the
+/// default group (id 1, name `Default`).
+pub(crate) fn job_matches_runner_group(
+    required_group: Option<&str>,
+    runner: &RunnerCapabilities,
+) -> bool {
+    let Some(required) = required_group.map(str::trim).filter(|v| !v.is_empty()) else {
+        return true;
+    };
+    if !runner.known {
+        return false;
+    }
+    if let Ok(required_id) = required.parse::<i64>() {
+        return match runner.runner_group_id {
+            Some(actual_id) => actual_id == required_id,
+            None => runner.runner_group_name.is_none() && required_id == 1,
+        };
+    }
+    match (&runner.runner_group_id, &runner.runner_group_name) {
+        (Some(id), Some(name)) if *id != 1 => name.eq_ignore_ascii_case(required),
+        (_, Some(name)) => name.eq_ignore_ascii_case(required),
+        (None, None) | (Some(1), None) => "Default".eq_ignore_ascii_case(required),
+        (Some(_), None) => false,
+    }
+}
+
+pub(crate) fn job_matches_runner_capabilities(
+    job: &QueuedJob,
+    runner: &RunnerCapabilities,
+) -> bool {
+    job_matches_runner(&job.runs_on, &runner.labels)
+        && job_matches_runner_group(job.runner_group.as_deref(), runner)
+}
+
+/// Find and remove the first job matching the given runner's labels and group.
 pub(crate) fn take_matching_job(
     queue: &mut VecDeque<QueuedJob>,
-    runner_labels: &[String],
+    runner: &RunnerCapabilities,
 ) -> Option<QueuedJob> {
     let pos = queue
         .iter()
-        .position(|job| job_matches_runner(&job.runs_on, runner_labels))?;
+        .position(|job| job_matches_runner_capabilities(job, runner))?;
     queue.remove(pos)
 }
 
@@ -1094,5 +1117,52 @@ pub(crate) fn summarize_run(statuses: impl Iterator<Item = ExecutionStatus>) -> 
         ExecutionStatus::Cancelled
     } else {
         ExecutionStatus::Success
+    }
+}
+
+#[cfg(test)]
+mod runner_group_tests {
+    use super::*;
+
+    fn runner(group_id: Option<i64>, group_name: Option<&str>) -> RunnerCapabilities {
+        RunnerCapabilities {
+            known: true,
+            labels: vec!["self-hosted".to_owned(), "linux".to_owned()],
+            runner_group_id: group_id,
+            runner_group_name: group_name.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn restricted_group_rejects_wrong_runner() {
+        assert!(!job_matches_runner_group(
+            Some("release"),
+            &runner(Some(2), Some("build")),
+        ));
+        assert!(job_matches_runner_group(
+            Some("release"),
+            &runner(Some(2), Some("Release")),
+        ));
+    }
+
+    #[test]
+    fn group_is_not_treated_as_a_label() {
+        let mut capabilities = runner(Some(2), Some("build"));
+        capabilities.labels.push("release".to_owned());
+        assert!(!job_matches_runner_group(Some("deploy"), &capabilities));
+    }
+
+    #[test]
+    fn missing_group_metadata_uses_default_group() {
+        let default_runner = runner(None, None);
+        assert!(job_matches_runner_group(Some("Default"), &default_runner));
+        let custom_name_only = runner(None, Some("private"));
+        assert!(!job_matches_runner_group(Some("1"), &custom_name_only));
+        assert!(job_matches_runner_group(Some("1"), &default_runner));
+        assert!(job_matches_runner_group(None, &default_runner));
+        assert!(!job_matches_runner_group(
+            Some("private"),
+            &RunnerCapabilities::default(),
+        ));
     }
 }

@@ -62,8 +62,8 @@ pub(crate) async fn next_message(
             }
         }
 
-        let runner_labels = inner.runner_labels_for_session(&session_id);
-        let Some(queued) = take_matching_job(&mut inner.queue, &runner_labels) else {
+        let runner = inner.runner_capabilities_for_session(&session_id);
+        let Some(queued) = take_matching_job(&mut inner.queue, &runner) else {
             drop(inner);
             if wait_seconds == 0 {
                 return (StatusCode::OK, Json(None));
