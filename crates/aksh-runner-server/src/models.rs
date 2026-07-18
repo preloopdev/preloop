@@ -19,6 +19,15 @@ pub(crate) struct JobDetail {
     pub(crate) steps: Vec<StepRecord>,
 }
 
+/// Metadata tracked per log file for results-service Twirp retrieval.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct LogMetadata {
+    /// Total bytes appended so far.
+    pub(crate) byte_count: usize,
+    /// Total lines appended so far.
+    pub(crate) line_count: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct RunRecord {
     pub(crate) run_id: RunId,

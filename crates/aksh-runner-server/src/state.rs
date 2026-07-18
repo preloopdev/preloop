@@ -408,6 +408,7 @@ pub(crate) struct InnerState {
     pub(crate) pending_caches: BTreeMap<i64, PendingCache>,
     pub(crate) artifacts: BTreeMap<String, ArtifactRecord>,
     pub(crate) logs: BTreeMap<String, Vec<u8>>,
+    pub(crate) log_metadata: BTreeMap<String, LogMetadata>,
     pub(crate) timeline_events: BTreeMap<RunId, Vec<NdjsonEvent>>,
     /// Per-timeline changeId counter for timeline PATCH versioning.
     pub(crate) timeline_change_ids: BTreeMap<String, i32>,
