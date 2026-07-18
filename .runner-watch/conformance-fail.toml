@@ -1,6 +1,0 @@
-[[failures]]
-endpoint = "scenario:11-cache-roundtrip"
-expected_status = 0
-actual_status = 0
-diff = "See .runner-watch/conformance/v2.335.1/11-cache-roundtrip.md"
-
