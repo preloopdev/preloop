@@ -314,6 +314,28 @@ pub async fn run_job(
         .unwrap_or(360);
     info!("Job timeout: {job_timeout_minutes} minutes");
     let (job_cancel_tx, job_cancel_rx) = watch::channel(false);
+    // Spawn periodic step-status drain (matches official runner's 500ms JobServerQueue interval)
+    let drain_handle = reporting.as_ref().map(|rpt| {
+        let drain_rpt = rpt.clone();
+        let drain_queue = queue.clone();
+        let mut drain_cancel = job_cancel_rx.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(500));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        flush_step_updates(&drain_rpt, &drain_queue).await;
+                    }
+                    changed = drain_cancel.changed() => {
+                        if changed.is_err() || *drain_cancel.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+    });
     let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let lease_lost = Arc::new(AtomicBool::new(false));
     let renew_handle = reporting.as_ref().map(|rpt| {
@@ -501,6 +523,9 @@ pub async fn run_job(
             }
         }
     };
+    if let Some(handle) = drain_handle {
+        handle.abort();
+    }
 
     // F019: Flush any final WorkflowStepsUpdate entries.
     if let Some(ref rpt) = reporting {

@@ -872,6 +872,30 @@ fn issue_roundtrip() {
     let back: Issue = serde_json::from_str(&json).unwrap();
     assert_eq!(back.issue_type, IssueType::Error);
 }
+
+#[test]
+fn runner_server_settings_serialization_roundtrip() {
+    let settings = RunnerServerSettings {
+        is_hosted_server: true,
+        agent_download_urls: Some(json!({"linux": "https://example.invalid/runner.tar.gz"})),
+    };
+    let encoded = serde_json::to_value(&settings).unwrap();
+    assert_eq!(
+        encoded,
+        json!({
+            "isHostedServer": true,
+            "agentDownloadUrls": {"linux": "https://example.invalid/runner.tar.gz"}
+        })
+    );
+
+    let decoded: RunnerServerSettings = serde_json::from_value(encoded).unwrap();
+    assert_eq!(decoded.is_hosted_server, settings.is_hosted_server);
+    assert_eq!(decoded.agent_download_urls, settings.agent_download_urls);
+
+    let defaults: RunnerServerSettings = serde_json::from_value(json!({})).unwrap();
+    assert!(!defaults.is_hosted_server);
+    assert!(defaults.agent_download_urls.is_none());
+}
 // Tier 2 authority (actions/runner v2.335.1, commit 7d737449ef346f6524f75688d0c9c95fa10ba10a):
 // VariableValue: https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Sdk/DTWebApi/WebApi/VariableValue.cs#L8-L38
 // ActionStep/JobStep wire fields: https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Sdk/DTPipelines/Pipelines/ActionStep.cs#L9-L46

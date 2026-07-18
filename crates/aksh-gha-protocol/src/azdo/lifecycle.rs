@@ -1,6 +1,21 @@
 use serde::{Deserialize, Serialize};
 
 // ─── Runner lifecycle DTOs ────────────────────────────────────────────────
+/// Server-enforced runner feature settings.
+///
+/// The runner may retrieve these defaults from the settings endpoint while it
+/// establishes its connection. Unknown settings are intentionally represented
+/// by `agent_download_urls` as JSON so the server can evolve that payload
+/// without requiring a protocol crate release for every shape change.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunnerServerSettings {
+    #[serde(default)]
+    pub is_hosted_server: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_download_urls: Option<serde_json::Value>,
+}
+
 
 /// Service location data returned by `GET _apis/connectionData`.
 ///

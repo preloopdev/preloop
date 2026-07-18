@@ -2275,6 +2275,67 @@ async fn all_twirp_api_routes_reject_missing_bearer_before_body_validation() {
 }
 
 #[tokio::test]
+async fn twirp_metadata_routes_persist_log_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let requests = [
+        (
+            "/twirp/results.services.receiver.Receiver/CreateStepSummaryMetadata",
+            json!({
+                "step_backend_id": "step-summary",
+                "workflow_job_run_backend_id": "job-1",
+                "workflow_run_backend_id": "run-1",
+                "size": 321,
+            }),
+            "summary:step-summary",
+        ),
+        (
+            "/twirp/results.services.receiver.Receiver/CreateStepLogsMetadata",
+            json!({"step_backend_id": "step-logs", "line_count": 7}),
+            "step:step-logs",
+        ),
+        (
+            "/twirp/results.services.receiver.Receiver/CreateJobLogsMetadata",
+            json!({"workflow_job_run_backend_id": "job-logs", "line_count": 9}),
+            "job:job-logs",
+        ),
+    ];
+
+    for (uri, body, _) in requests {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(uri)
+                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let payload: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(payload["ok"], true, "{uri}");
+    }
+
+    let inner = state.inner.lock().await;
+    let summary = inner.log_metadata.get("summary:step-summary").unwrap();
+    assert_eq!(summary.byte_count, 321);
+    assert_eq!(summary.line_count, 0);
+    let step = inner.log_metadata.get("step:step-logs").unwrap();
+    assert_eq!(step.byte_count, 560);
+    assert_eq!(step.line_count, 7);
+    let job = inner.log_metadata.get("job:job-logs").unwrap();
+    assert_eq!(job.byte_count, 720);
+    assert_eq!(job.line_count, 9);
+}
+
+#[tokio::test]
 async fn twirp_diag_route_rejects_runner_listen_scope() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
