@@ -326,7 +326,7 @@ pub(crate) async fn finish_job(
         );
     }
 
-    Json(json!({ "ok": true }))
+    Json(serde_json::Value::Null)
 }
 
 // ── F030: standard AzDO `/_apis/v1/plans/` route handlers ────────────────────
@@ -438,5 +438,5 @@ pub(crate) async fn finish_job_plan(
     if let Some(c) = completion {
         let _ = complete_job_inner(shared, c).await;
     }
-    Json(json!({ "ok": true }))
+    Json(serde_json::Value::Null)
 }
