@@ -509,7 +509,13 @@ pub async fn run_broker_loop(
                         debug!("Broker poll returned no message");
                     }
                     Err(e) => {
-                        if is_unauthorized(&e) {
+                        if crate::client::broker::is_runner_version_deprecated(&e) {
+                            warn!("Runner version is deprecated and cannot receive messages; stopping");
+                            if !session_id.is_empty() {
+                                let _ = client.delete_session(&token, &session_id).await;
+                            }
+                            return Err(e);
+                        } else if is_unauthorized(&e) {
                             info!("OAuth token expired during message poll. Re-acquiring token...");
                             match crate::listener::oauth::get_oauth_token(http, &config).await {
                                 Ok((new_token, new_expires)) => {
