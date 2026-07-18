@@ -113,12 +113,11 @@ See `benchmarks/real-world/results/server-compare/COMPARISON-REPORT.md` for deta
     `13-composite-action`, `14-annotations`, `15-oidc-id-token`
 - Tests: 472 passing (47 protocol + 84 parser + 277 server + 44 runner-watch + 20 concurrency)
 
-Rough completeness against "100% faithful control plane (v2.335.1)": **~85–90%**.
+Rough completeness against "100% faithful control plane (v2.335.1)": **~90%**.
 Protocol-level conformance is now clean: all 11 replay scenarios pass with matching
-status codes and schemas. The remaining gap is step-result reporting fidelity (timeline
-record content), expression evaluator edge cases (nested bracket access), and shell
-wrapper behavior. These affect live E2E step-level match (6/12) but not protocol-level
-conformance.
+status codes and schemas. Expression evaluator is feature-complete (bracket access,
+`*` filter, format escaping, truthiness). The remaining gap is step-result reporting
+fidelity (timeline record content) and server-enforced runner settings.
 
 | Layer | Current evidence | Faithful? |
 | --- | --- | --- |
@@ -288,13 +287,12 @@ Paths are in this repo. Updated 2026-06-29 after the v2.335.1 56-flow runner-wat
   - ✅ `can_merge_include` compares only original dimensions.
   - ✅ Expression evaluation wired into job builder via `eval` module.
 - `aksh-gha-expressions/src/lib.rs`
-  - ✅ Pratt parser + evaluator; `contains/startsWith/endsWith/format/join/fromJSON/toJSON`.
+  - ✅ Pratt parser + evaluator; `contains/startsWith/endsWith/format/join/fromJSON/toJSON/hashFiles`.
   - ✅ **Wired** into job builder — expressions resolved in env, with, run fields.
   - ✅ `success()/failure()/cancelled()` use context state (not hardcoded).
-  - ⚠️ No index/bracket access (`matrix['os']`), no `*` object-filter (`steps.*.outputs`),
-  
-    no `format` `{{`/`}}` escaping.
-  - ⚠️ Empty object/array is falsey; GitHub treats non-null object/array as truthy.
+  - ✅ Index/bracket access (`matrix['os']`), `*` object-filter (`steps.*.outputs`),
+    `format` `{{`/`}}` escaping — all implemented.
+  - ✅ Truthy: empty object/array is truthy (matches GitHub).
 - `aksh-runner-server/src/lib.rs`
   - ✅ axum router with GHES org-prefix routing, graceful shutdown, NDJSON broadcast.
   - ⚠️ Legacy/local AzDO lifecycle routes exist for `connectionData`, `AgentPools`, `Agent`,
