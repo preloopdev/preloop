@@ -145,10 +145,55 @@ fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     serde_json::from_str(clean).with_context(|| format!("parsing {}", path.display()))
 }
 
-/// Save a JSON file (no BOM — we write clean UTF-8).
+/// Save a JSON file atomically (the official runner may replace settings while
+/// the listener is polling; never leave a truncated `.runner` behind).
+fn save_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let json = serde_json::to_string_pretty(value)?;
+    let temp = path.with_file_name(format!(
+        ".{}.tmp-{}",
+        path.file_name().and_then(|name| name.to_str()).unwrap_or("runner"),
+        std::process::id()
+    ));
+    std::fs::write(&temp, json).with_context(|| format!("writing {}", temp.display()))?;
+    let result = std::fs::rename(&temp, path)
+        .with_context(|| format!("replacing {}", path.display()));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
 fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let json = serde_json::to_string_pretty(value)?;
     std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))
+}
+
+fn decode_refresh_payload(payload: &serde_json::Value) -> Result<serde_json::Value> {
+    let Some(encoded) = payload.as_str() else {
+        return Ok(payload.clone());
+    };
+    if let Ok(json) = serde_json::from_str(encoded) {
+        return Ok(json);
+    }
+    let bytes = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        encoded,
+    )
+    .context("decoding refreshed runner settings")?;
+    let text = String::from_utf8(bytes).context("refreshed runner settings are not UTF-8")?;
+    serde_json::from_str(&text).context("parsing refreshed runner settings JSON")
+}
+
+fn refresh_settings_object(
+    payload: &serde_json::Value,
+) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    let object = payload.as_object()?;
+    for wrapper in ["settings", "runnerSettings", "runnerConfig"] {
+        if let Some(inner) = object.get(wrapper) {
+            return inner.as_object();
+        }
+    }
+    Some(object)
 }
 
 /// Restrict a file to owner-read/write only (0600) on Unix.
@@ -185,6 +230,71 @@ impl RunnerConfig {
             credentials: load_json(&root.join(CREDENTIALS_FILE))?,
             rsa_params: load_json(&root.join(RSA_PARAMS_FILE))?,
         })
+    }
+
+    /// Persist only `.runner` using an atomic replacement.
+    pub fn save_settings_atomic(&self, root: &Path) -> Result<()> {
+        let runner_path = root.join(RUNNER_FILE);
+        save_json_atomic(&runner_path, &self.settings)?;
+        restrict_permissions(&runner_path)
+    }
+
+    /// Apply a server-supplied runner settings refresh.
+    ///
+    /// The official `RunnerRefreshConfig` response is a base64-encoded JSON
+    /// `.runner` document. Local servers also commonly return the JSON object
+    /// directly, so both forms are accepted. Unknown keys are ignored and the
+    /// runner identity is immutable; malformed or mismatched payloads leave
+    /// the current settings untouched.
+    pub fn apply_runner_settings_refresh(
+        &mut self,
+        payload: &serde_json::Value,
+        root: &Path,
+    ) -> Result<bool> {
+        let payload = decode_refresh_payload(payload)?;
+        let Some(object) = refresh_settings_object(&payload) else {
+            return Ok(false);
+        };
+
+        if let Some(agent_id) = object.get("agentId") {
+            if agent_id.as_i64() != Some(self.settings.agent_id) {
+                return Ok(false);
+            }
+        }
+        if let Some(agent_name) = object.get("agentName") {
+            if agent_name.as_str() != Some(self.settings.agent_name.as_str()) {
+                return Ok(false);
+            }
+        }
+
+        const SUPPORTED_FIELDS: &[&str] = &[
+            "poolId", "poolName", "serverUrl", "gitHubUrl", "workFolder", "isHosted",
+            "runnerGroupId", "runnerGroupName", "ephemeral", "isHostedServer", "useV2Flow",
+            "serverUrlV2", "disableUpdate", "skipSessionRecover", "monitorSocketAddress",
+            "useRunnerAdminFlow",
+        ];
+        let mut merged = serde_json::to_value(&self.settings)?;
+        let merged_object = merged
+            .as_object_mut()
+            .expect("RunnerSettings serializes as an object");
+        let mut changed = false;
+        for field in SUPPORTED_FIELDS {
+            if let Some(value) = object.get(*field) {
+                if merged_object.get(*field) != Some(value) {
+                    merged_object.insert((*field).to_string(), value.clone());
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            return Ok(false);
+        }
+
+        let refreshed: RunnerSettings = serde_json::from_value(merged)
+            .context("parsing refreshed runner settings")?;
+        self.settings = refreshed;
+        self.save_settings_atomic(root)?;
+        Ok(true)
     }
 
     /// Persist runner configuration to the given root directory.
@@ -594,5 +704,109 @@ mod tests {
             loaded.settings.server_url_v2.as_deref(),
             Some("https://broker.example.com/")
         );
+    }
+    fn refresh_test_config() -> RunnerConfig {
+        RunnerConfig {
+            settings: RunnerSettings {
+                agent_id: 42,
+                agent_name: "refresh-runner".to_string(),
+                pool_id: 1,
+                pool_name: "Default".to_string(),
+                server_url: "https://pipelines.example.com".to_string(),
+                git_hub_url: "https://github.com/org/repo".to_string(),
+                work_folder: "_work".to_string(),
+                is_hosted: false,
+                runner_group_id: None,
+                runner_group_name: None,
+                ephemeral: false,
+                is_hosted_server: false,
+                use_v2_flow: true,
+                server_url_v2: Some("https://broker.example.com".to_string()),
+                disable_update: false,
+                skip_session_recover: false,
+                monitor_socket_address: None,
+                use_runner_admin_flow: false,
+            },
+            credentials: CredentialData {
+                scheme: "OAuth".to_string(),
+                data: serde_json::Map::new(),
+            },
+            rsa_params: RsaParameters {
+                d: "d".to_string(),
+                dp: "dp".to_string(),
+                dq: "dq".to_string(),
+                exponent: "AQAB".to_string(),
+                inverse_q: "iq".to_string(),
+                modulus: "mod".to_string(),
+                p: "p".to_string(),
+                q: "q".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn refresh_updates_supported_fields_atomically() {
+        let dir = TempDir::new().unwrap();
+        let mut config = refresh_test_config();
+        config.save(dir.path()).unwrap();
+        let changed = config
+            .apply_runner_settings_refresh(
+                &serde_json::json!({
+                    "agentId": 42,
+                    "agentName": "refresh-runner",
+                    "disableUpdate": true,
+                    "skipSessionRecover": true,
+                    "serverUrlV2": "https://new-broker.example.com",
+                    "futureSetting": "ignored"
+                }),
+                dir.path(),
+            )
+            .unwrap();
+        assert!(changed);
+        let persisted: RunnerSettings = load_json(&dir.path().join(RUNNER_FILE)).unwrap();
+        assert!(persisted.disable_update);
+        assert!(persisted.skip_session_recover);
+        assert_eq!(persisted.server_url_v2.as_deref(), Some("https://new-broker.example.com"));
+        assert_eq!(persisted.agent_id, 42);
+    }
+
+    #[test]
+    fn refresh_accepts_official_base64_and_rejects_identity_change() {
+        use base64::Engine;
+        let dir = TempDir::new().unwrap();
+        let mut config = refresh_test_config();
+        config.save(dir.path()).unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "agentId": 42,
+                "agentName": "refresh-runner",
+                "ephemeral": true
+            }))
+            .unwrap(),
+        );
+        assert!(config
+            .apply_runner_settings_refresh(&serde_json::json!(encoded), dir.path())
+            .unwrap());
+        assert!(config.settings.ephemeral);
+        assert!(!config
+            .apply_runner_settings_refresh(
+                &serde_json::json!({"agentId": 999, "disableUpdate": false}),
+                dir.path(),
+            )
+            .unwrap());
+        assert!(config.settings.disable_update == false);
+        let _: serde_json::Value = load_json(&dir.path().join(RUNNER_FILE)).unwrap();
+    }
+
+    #[test]
+    fn malformed_refresh_is_non_mutating() {
+        let dir = TempDir::new().unwrap();
+        let mut config = refresh_test_config();
+        config.save(dir.path()).unwrap();
+        assert!(config
+            .apply_runner_settings_refresh(&serde_json::json!("not-base64"), dir.path())
+            .is_err());
+        let persisted: RunnerSettings = load_json(&dir.path().join(RUNNER_FILE)).unwrap();
+        assert!(!persisted.disable_update);
     }
 }
