@@ -520,9 +520,23 @@ pub enum NdjsonEvent {
         /// Message.
         message: String,
         /// Optional file path.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         file: Option<String>,
-        /// Optional line number.
+        /// Optional start line number.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         line: Option<u64>,
+        /// Optional end line number.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        end_line: Option<u64>,
+        /// Optional start column number.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        col: Option<u64>,
+        /// Optional end column number.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        end_column: Option<u64>,
+        /// Optional annotation title.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
         /// Optional step/record ID.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         step_id: Option<String>,
@@ -605,5 +619,30 @@ mod tests {
         assert_eq!(secret.to_string(), "<redacted>");
         assert_eq!(serde_json::to_string(&secret).unwrap(), "\"<redacted>\"");
         assert_eq!(secret.expose(), "super-secret");
+    }
+    #[test]
+    fn annotation_event_serializes_optional_source_fields() {
+        let event = NdjsonEvent::Annotation {
+            run_id: RunId(uuid::Uuid::nil()),
+            job_id: JobId("job".into()),
+            level: AnnotationLevel::Warning,
+            message: "warning".into(),
+            file: Some("src/lib.rs".into()),
+            line: Some(7),
+            end_line: Some(8),
+            col: Some(3),
+            end_column: Some(9),
+            title: Some("Compiler".into()),
+            step_id: None,
+        };
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["type"], "annotation");
+        assert_eq!(value["file"], "src/lib.rs");
+        assert_eq!(value["line"], 7);
+        assert_eq!(value["end_line"], 8);
+        assert_eq!(value["col"], 3);
+        assert_eq!(value["end_column"], 9);
+        assert_eq!(value["title"], "Compiler");
+        assert!(value.get("step_id").is_none());
     }
 }

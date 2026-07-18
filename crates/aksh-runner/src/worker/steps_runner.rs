@@ -622,6 +622,7 @@ pub async fn run_steps(
 
         // F025: Store annotations in job context
         if !annotations.is_empty() {
+            step_ctx.job.add_step_annotations_to_job(&annotations);
             step_ctx
                 .job
                 .step_annotations
