@@ -241,16 +241,26 @@ pub(crate) fn mask_log_bytes(inner: &InnerState, plan_id: &str, body: &[u8]) -> 
 
 /// POST console log — runner streams live console output.
 pub(crate) async fn console_log(
-    State(_shared): State<Arc<SharedState>>,
-    Path((_scope, _hub, _plan_id, _timeline_id, _record_id)): Path<(
+    State(shared): State<Arc<SharedState>>,
+    Path((_scope, _hub, plan_id, _timeline_id, _record_id)): Path<(
         String,
         String,
         String,
         String,
         String,
     )>,
-    _body: Bytes,
+    body: Bytes,
 ) -> StatusCode {
+    // Parse the body as a LiveLogFeedLinesWrapper and store/broadcast it.
+    if let Ok(wrapper) = serde_json::from_slice::<LiveLogFeedLinesWrapper>(&body) {
+        let job_id = {
+            let inner = shared.state.inner.lock().await;
+            resolve_callback_job(&inner, &plan_id, None, None)
+                .map(|(_, _, job_id)| job_id.0.clone())
+                .unwrap_or_else(|| plan_id.clone())
+        };
+        record_live_log_wrapper(&shared, &job_id, wrapper).await;
+    }
     StatusCode::OK
 }
 
