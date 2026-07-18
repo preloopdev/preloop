@@ -233,7 +233,8 @@ impl Serialize for TaskStep {
             inputs.insert("script".to_owned(), script.clone());
         }
 
-        let field_count = 8
+        let field_count = 7
+            + usize::from(!inputs.is_empty())
             + usize::from(self.context_name.is_some())
             + usize::from(self.display_name_token.is_some())
             + usize::from(self.condition.is_some())
@@ -243,16 +244,12 @@ impl Serialize for TaskStep {
         map.serialize_entry("type", "action")?;
         map.serialize_entry("reference", &SerializedActionReference { step: self })?;
         if !self.env.is_empty() {
-            let mut env_val = serde_json::to_value(TemplateStringMap(&self.env))
-                .unwrap_or(serde_json::json!({"type": 2}));
-            if let Some(obj) = env_val.as_object_mut() {
-                obj.insert("col".to_owned(), serde_json::json!(0));
-                obj.insert("file".to_owned(), serde_json::json!(1));
-                obj.insert("line".to_owned(), serde_json::json!(0));
-            }
-            map.serialize_entry("environment", &env_val)?;
+            map.serialize_entry("environment", &TemplateStringMap(&self.env, true))?;
         }
-        map.serialize_entry("inputs", &TemplateStringMap(&inputs))?;
+        if !inputs.is_empty() {
+            let inputs_with_loc = self.reference.as_ref().map_or(false, |r| r.reference_type.as_deref() != Some("script"));
+            map.serialize_entry("inputs", &TemplateStringMap(&inputs, inputs_with_loc))?;
+        }
         map.serialize_entry("id", &self.id)?;
         let name = self.context_name.as_ref().or(self.name.as_ref());
         map.serialize_entry("name", &name)?;
@@ -425,7 +422,7 @@ impl Serialize for SerializedActionReference<'_> {
     }
 }
 
-struct TemplateStringMap<'a>(&'a BTreeMap<String, String>);
+struct TemplateStringMap<'a>(&'a BTreeMap<String, String>, bool);
 
 impl Serialize for TemplateStringMap<'_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -434,13 +431,20 @@ impl Serialize for TemplateStringMap<'_> {
     {
         use serde::ser::SerializeMap;
 
-        let mut map = serializer.serialize_map(Some(if self.0.is_empty() { 1 } else { 2 }))?;
+        let with_loc = self.1;
+        let extra = usize::from(with_loc) * 3;
+        let mut map = serializer.serialize_map(Some(if self.0.is_empty() { 1 + extra } else { 2 + extra }))?;
         map.serialize_entry("type", &2)?;
+        if with_loc {
+            map.serialize_entry("col", &0)?;
+            map.serialize_entry("file", &1)?;
+            map.serialize_entry("line", &0)?;
+        }
         if !self.0.is_empty() {
             let pairs: Vec<TemplateStringMapPair<'_>> = self
                 .0
                 .iter()
-                .map(|(key, value)| TemplateStringMapPair { key, value })
+                .map(|(key, value)| TemplateStringMapPair { key, value, with_loc })
                 .collect();
             map.serialize_entry("map", &pairs)?;
         }
@@ -451,6 +455,7 @@ impl Serialize for TemplateStringMap<'_> {
 struct TemplateStringMapPair<'a> {
     key: &'a str,
     value: &'a str,
+    with_loc: bool,
 }
 
 impl Serialize for TemplateStringMapPair<'_> {
@@ -465,8 +470,13 @@ impl Serialize for TemplateStringMapPair<'_> {
             token.insert("line".to_owned(), serde_json::json!(0));
             token.insert("col".to_owned(), serde_json::json!(0));
         }
+        let key_token = if self.with_loc {
+            serde_json::json!({"type": 0, "lit": self.key, "col": 0, "file": 1, "line": 0})
+        } else {
+            serde_json::json!({"type": 0, "lit": self.key})
+        };
         let mut map = serializer.serialize_map(Some(2))?;
-        map.serialize_entry("Key", &serde_json::json!({"type": 0, "lit": self.key}))?;
+        map.serialize_entry("Key", &key_token)?;
         map.serialize_entry("Value", &value)?;
         map.end()
     }
