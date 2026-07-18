@@ -1875,6 +1875,7 @@ async fn replay_flows_to_aksh(
     let mut baseline = tokio::fs::File::create(baseline_dir.join("flows.jsonl")).await?;
     let mut count = 0usize;
     let mut broker_job_ids: HashMap<String, String> = HashMap::new();
+    let mut plan_job_ids: HashMap<(String, String), (String, String)> = HashMap::new();
     let mut official_broker_job_ids = Vec::new();
     let mut aksh_broker_job_ids = Vec::new();
     let mut blob_upload_urls: VecDeque<String> = VecDeque::new();
@@ -1890,6 +1891,23 @@ async fn replay_flows_to_aksh(
         if let Some(rest) = path.strip_prefix("/broker/") {
             if let Some(slash_pos) = rest.find('/') {
                 path = format!("/broker/{}{}", replay_runner_id, &rest[slash_pos..]);
+            }
+        }
+        // Rewrite OIDC plan/job IDs to match local replay state
+        if path.contains("/oidctoken") {
+            if let Some(rest) = path.strip_prefix("/runner/server/_apis/distributedtask/hubs/actions/plans/") {
+                let parts: Vec<&str> = rest.splitn(3, '/').collect();
+                if parts.len() >= 3 {
+                    let official_plan = parts[0];
+                    let official_job = parts[2].split('/').next().unwrap_or(parts[2]).split('?').next().unwrap_or("");
+                    if let Some((local_plan, local_job)) = plan_job_ids.get(&(official_plan.to_owned(), official_job.to_owned())) {
+                        let query = if let Some(q) = path.split_once('?') { format!("?{}", q.1) } else { String::new() };
+                        path = format!(
+                            "/runner/server/_apis/distributedtask/hubs/actions/plans/{}/jobs/{}/oidctoken{}",
+                            local_plan, local_job, query
+                        );
+                    }
+                }
             }
         }
         if is_external_blob_upload(method, host) {
@@ -1989,6 +2007,20 @@ async fn replay_flows_to_aksh(
                         &aksh_broker_job_ids,
                         &mut broker_job_ids,
                     );
+                    // Extract plan/job IDs from acquirejob responses for OIDC path mapping
+                    if path.contains("/acquirejob") {
+                        let official_resp = flow.get("response_body_json").unwrap_or(&Value::Null);
+                        if let (Some(op), Some(oj), Some(lp), Some(lj)) = (
+                            official_resp.get("plan").and_then(|p| p.get("planId")).and_then(Value::as_str).or_else(|| official_resp.get("planId").and_then(Value::as_str)),
+                            official_resp.get("jobId").and_then(Value::as_str),
+                            body_json.get("plan").and_then(|p| p.get("planId")).and_then(Value::as_str).or_else(|| body_json.get("planId").and_then(Value::as_str)),
+                            body_json.get("jobId").and_then(Value::as_str),
+                        ) {
+                            plan_job_ids
+                                .entry((op.to_owned(), oj.to_owned()))
+                                .or_insert_with(|| (lp.to_owned(), lj.to_owned()));
+                        }
+                    }
                     if is_blob_create_endpoint(&path) {
                         if let Some(upload_url) = body_json
                             .get("signed_upload_url")
