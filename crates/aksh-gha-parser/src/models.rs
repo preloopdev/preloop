@@ -581,7 +581,30 @@ impl RunsOn {
             Self::Single(value) => vec![value.clone()],
             Self::Many(values) => values.clone(),
             Self::Dynamic(Value::String(value)) => vec![value.clone()],
+            Self::Dynamic(Value::Object(object)) => object
+                .get("labels")
+                .map(|labels| match labels {
+                    Value::String(value) => vec![value.clone()],
+                    Value::Array(values) => values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect(),
+                    _ => Vec::new(),
+                })
+                .unwrap_or_default(),
             Self::Dynamic(_) => Vec::new(),
+        }
+    }
+
+    /// Return the explicit runner group from object-valued `runs-on`.
+    pub(crate) fn group(&self) -> Option<String> {
+        match self {
+            Self::Dynamic(Value::Object(object)) => object
+                .get("group")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            _ => None,
         }
     }
 }
