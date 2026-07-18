@@ -659,3 +659,43 @@ fn secrets_context_resolves_in_expressions() {
         Some("s3cr3t")
     );
 }
+
+#[test]
+fn job_annotation_aggregation_is_feature_gated_and_preserves_fields() {
+    let mut job = JobContext::new(
+        "job1".into(),
+        "Test".into(),
+        serde_json::json!({
+            "actions_send_job_level_annotations": {"value": "true"}
+        }),
+        serde_json::json!({}),
+    );
+    let annotation = Annotation {
+        level: crate::worker::execution_context::AnnotationLevel::Warning,
+        message: "warning".into(),
+        title: Some("Compiler".into()),
+        file: Some("src/lib.rs".into()),
+        line: Some(7),
+        end_line: Some(8),
+        col: Some(3),
+        end_column: Some(9),
+    };
+
+    job.add_step_annotations_to_job(std::slice::from_ref(&annotation));
+    assert_eq!(job.job_annotations.len(), 1);
+    assert_eq!(job.job_annotations[0].file.as_deref(), Some("src/lib.rs"));
+    assert_eq!(job.job_annotations[0].line, Some(7));
+    assert_eq!(job.job_annotations[0].end_line, Some(8));
+    assert_eq!(job.job_annotations[0].col, Some(3));
+    assert_eq!(job.job_annotations[0].end_column, Some(9));
+    assert_eq!(job.job_annotations[0].title.as_deref(), Some("Compiler"));
+
+    let mut disabled = JobContext::new(
+        "job2".into(),
+        "Test".into(),
+        serde_json::json!({}),
+        serde_json::json!({}),
+    );
+    disabled.add_step_annotations_to_job(std::slice::from_ref(&annotation));
+    assert!(disabled.job_annotations.is_empty());
+}
