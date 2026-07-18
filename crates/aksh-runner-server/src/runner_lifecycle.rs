@@ -233,7 +233,19 @@ pub(crate) async fn agent_lookup_by_id(
 pub(crate) async fn runner_pools() -> Json<serde_json::Value> {
     Json(json!({
         "count": 1,
-        "value": [{"id": 1, "name": "Default", "isHosted": false, "poolType": 1}]
+        "value": [{
+            "id": 1,
+            "name": "Default",
+            "isHosted": false,
+            "poolType": 1,
+            "agentCloudId": null,
+            "autoSize": true,
+            "createdOn": "2026-01-01T00:00:00Z",
+            "isInternal": true,
+            "scope": "00000000-0000-0000-0000-000000000000",
+            "size": 0,
+            "targetSize": null
+        }]
     }))
 }
 
@@ -309,6 +321,7 @@ pub(crate) async fn register_runner_compat(
         "queueName": format!("taskagent-{}", result.0.id),
         "runnerGroupId": 1,
         "runnerGroupName": null,
+        "createdOn": "2026-01-01T00:00:00Z",
         "labels": result.0.labels.iter().map(|l| json!({"name": l, "type": "user"})).collect::<Vec<_>>(),
         "authorization": {
             "authorizationUrl": format!("{}/_apis/v1/oauth2/token", runner_server_url()),
