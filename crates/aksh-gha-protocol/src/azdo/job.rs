@@ -400,23 +400,32 @@ impl Serialize for SerializedActionReference<'_> {
             return map.end();
         };
 
+        let is_self = reference.path.is_some();
         let field_count = 1
-            + usize::from(reference.name.is_some())
+            + usize::from(reference.name.is_some() || is_self)
             + usize::from(reference.version.is_some())
-            + usize::from(reference.reference_type.is_some());
+            + usize::from(reference.reference_type.is_some())
+            + usize::from(is_self);
         let mut map = serializer.serialize_map(Some(field_count))?;
         map.serialize_entry(
             "type",
             reference.reference_type.as_deref().unwrap_or("repository"),
         )?;
-        if let Some(name) = &reference.name {
-            map.serialize_entry("name", name)?;
-        }
-        if let Some(version) = &reference.version {
-            map.serialize_entry("ref", version)?;
-        }
-        if reference.reference_type.is_none() {
-            map.serialize_entry("repositoryType", "GitHub")?;
+        if is_self {
+            map.serialize_entry("repositoryType", "self")?;
+            if let Some(path) = &reference.path {
+                map.serialize_entry("path", path)?;
+            }
+        } else {
+            if let Some(name) = &reference.name {
+                map.serialize_entry("name", name)?;
+            }
+            if let Some(version) = &reference.version {
+                map.serialize_entry("ref", version)?;
+            }
+            if reference.reference_type.is_none() {
+                map.serialize_entry("repositoryType", "GitHub")?;
+            }
         }
         map.end()
     }
@@ -549,6 +558,8 @@ pub struct TaskReference {
     pub id: Option<uuid::Uuid>,
     #[serde(rename = "name", skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(rename = "path", skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     #[serde(rename = "version", skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
