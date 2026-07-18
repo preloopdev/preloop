@@ -1737,6 +1737,140 @@ async fn replay_flows_to_aksh(
     let native_token =
         std::env::var("AKSH_SYSTEM_TOKEN").unwrap_or_else(|_| "aksh-system-token".to_owned());
     materialize_replay_state(golden_dir, scenario_root, aksh_url, &client).await?;
+    // Pre-flight: register a replay runner with an RSA keypair, then exchange a
+    // signed client_assertion for a runner-listen token.  Broker endpoints require
+    // a JWT whose sub is "aksh-runner-listen-{numeric_id}" — the system token
+    // alone does not satisfy authenticated_runner_id().
+    let (broker_token, replay_runner_id) = {
+        use aksh_gha_protocol::crypto::{sign_jwt_ps256, AgentRsaKeypair};
+        // Step 1: generate an ephemeral RSA keypair
+        let keypair = match AgentRsaKeypair::generate() {
+            Ok(kp) => kp,
+            Err(error) => {
+                eprintln!("runner-watch: RSA keygen failed: {error}, broker replay may 401");
+                return Err(error.into());
+            }
+        };
+        let params = keypair.to_rsaparams();
+        let modulus = params.modulus.clone();
+        let exponent = params.exponent.clone();
+        // Step 2: register the runner with the public key
+        let register_resp = client
+            .post(format!(
+                "{}/_apis/v1/Agent/1",
+                aksh_url.trim_end_matches('/')
+            ))
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {native_token}"))
+            .json(&json!({
+                "name": "runner-watch-replay",
+                "version": "2.335.1",
+                "osDescription": "runner-watch",
+                "authorization": {
+                    "publicKey": {
+                        "modulus": modulus,
+                        "exponent": exponent
+                    }
+                }
+            }))
+            .send()
+            .await;
+        let (runner_id, client_id) = match register_resp {
+            Ok(resp) if resp.status().is_success() => {
+                let body: Value = resp.json().await.unwrap_or_default();
+                let id = body.get("id").and_then(Value::as_i64).unwrap_or(1);
+                let cid = body
+                    .get("authorization")
+                    .and_then(|a| a.get("clientId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("replay")
+                    .to_owned();
+                eprintln!("runner-watch: registered replay runner id={id} client_id={cid}");
+                (id, cid)
+            }
+            Ok(resp) => {
+                eprintln!(
+                    "runner-watch: runner registration returned {}, using fallback",
+                    resp.status()
+                );
+                (1_i64, "replay".to_owned())
+            }
+            Err(error) => {
+                eprintln!("runner-watch: runner registration failed: {error}, using fallback");
+                (1_i64, "replay".to_owned())
+            }
+        };
+        // Step 3: sign a client_assertion JWT (PS256) and exchange for a token
+        let assertion_header = json!({"typ": "JWT", "alg": "PS256"});
+        let assertion_claims = json!({
+            "sub": client_id,
+            "iss": client_id,
+            "jti": format!("replay-{}", std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()),
+            "iat": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        });
+        let assertion = match sign_jwt_ps256(&assertion_header, &assertion_claims, &params) {
+            Ok(jwt) => jwt,
+            Err(error) => {
+                eprintln!(
+                    "runner-watch: client_assertion signing failed: {error}, broker replay may 401"
+                );
+                String::new()
+            }
+        };
+        if assertion.is_empty() {
+            (String::new(), runner_id)
+        } else {
+            let form_body = format!(
+                "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer&client_assertion={assertion}&grant_type=client_credentials"
+            );
+            let token_resp = client
+                .post(format!(
+                    "{}/_apis/v1/oauth2/token",
+                    aksh_url.trim_end_matches('/')
+                ))
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .header("Authorization", format!("Bearer {native_token}"))
+                .body(form_body)
+                .send()
+                .await;
+            match token_resp {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body_text = resp.text().await.unwrap_or_default();
+                    let tok = serde_json::from_str::<Value>(&body_text)
+                        .ok()
+                        .and_then(|body| {
+                            body.get("access_token")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                        })
+                        .unwrap_or_default();
+                    if tok.is_empty() {
+                        eprintln!("runner-watch: OAuth pre-flight status={status}, no access_token, broker replay may 401");
+                        eprintln!("runner-watch: pre-flight body: {body_text}");
+                    } else {
+                        eprintln!(
+                            "runner-watch: OAuth pre-flight status={status} token_len={}",
+                            tok.len()
+                        );
+                    }
+                    (tok, runner_id)
+                }
+                Err(error) => {
+                    eprintln!(
+                        "runner-watch: OAuth pre-flight failed: {error}, broker replay may 401"
+                    );
+                    (String::new(), runner_id)
+                }
+            }
+        }
+    };
     let mut out = tokio::fs::File::create(out_dir.join("flows.jsonl")).await?;
     let mut baseline = tokio::fs::File::create(baseline_dir.join("flows.jsonl")).await?;
     let mut count = 0usize;
@@ -1748,10 +1882,16 @@ async fn replay_flows_to_aksh(
         let flow: Value = serde_json::from_str(line)?;
         let method = flow.get("method").and_then(Value::as_str).unwrap_or("GET");
         let host = flow.get("host").and_then(Value::as_str).unwrap_or("");
-        let path = normalize_request_path(
+        let mut path = normalize_request_path(
             method,
             flow.get("path").and_then(Value::as_str).unwrap_or("/"),
         );
+        // Rewrite broker path runner_id to match the registered replay runner
+        if let Some(rest) = path.strip_prefix("/broker/") {
+            if let Some(slash_pos) = rest.find('/') {
+                path = format!("/broker/{}{}", replay_runner_id, &rest[slash_pos..]);
+            }
+        }
         if is_external_blob_upload(method, host) {
             if let Some(upload_url) = blob_upload_urls.pop_front() {
                 replay_blob_upload(&client, &upload_url, &flow).await?;
@@ -1798,17 +1938,18 @@ async fn replay_flows_to_aksh(
                 if name.eq_ignore_ascii_case("authorization") {
                     saw_auth = true;
                 }
-                let header_value = rewritten_header_value(name, value, &path, &native_token);
+                let header_value =
+                    rewritten_header_value(name, value, &path, &native_token, &broker_token);
                 req = req.header(name, header_value.as_ref());
             }
         }
         if !saw_auth {
-            if let Some(auth) = synthesized_authorization(&path, &native_token) {
+            if let Some(auth) = synthesized_authorization(&path, &native_token, &broker_token) {
                 req = req.header("Authorization", auth.as_ref());
             }
         }
         if let Some(mut body) = replay_request_body(&flow)? {
-            rewrite_replay_body(&mut body, &broker_job_ids);
+            rewrite_replay_body(&mut body, &broker_job_ids, replay_runner_id);
             req = req.body(body);
         }
         let official_runner_request_id = extract_runner_request_id_from_message(
@@ -1961,7 +2102,11 @@ fn sync_broker_job_id_map(
     }
 }
 
-fn rewrite_replay_body(body: &mut Vec<u8>, broker_job_ids: &HashMap<String, String>) {
+fn rewrite_replay_body(
+    body: &mut Vec<u8>,
+    broker_job_ids: &HashMap<String, String>,
+    replay_runner_id: i64,
+) {
     let Ok(mut json_body) = serde_json::from_slice::<Value>(body) else {
         return;
     };
@@ -1973,6 +2118,12 @@ fn rewrite_replay_body(body: &mut Vec<u8>, broker_job_ids: &HashMap<String, Stri
             continue;
         };
         json_body[key] = json!(rewritten);
+    }
+    // Rewrite agent.id in session creation to match the registered replay runner
+    if let Some(agent) = json_body.get_mut("agent") {
+        if agent.get("id").is_some() {
+            agent["id"] = json!(replay_runner_id);
+        }
     }
     if let Ok(rewritten) = serde_json::to_vec(&json_body) {
         *body = rewritten;
@@ -2225,13 +2376,23 @@ fn normalize_replay_wait(mut path: String) -> String {
     path
 }
 
-fn synthesized_authorization<'a>(path: &str, bearer: &'a str) -> Option<std::borrow::Cow<'a, str>> {
+fn synthesized_authorization<'a>(
+    path: &str,
+    bearer: &'a str,
+    broker_token: &'a str,
+) -> Option<std::borrow::Cow<'a, str>> {
     if path == "/api/v3/actions/runner-registration" {
         Some(std::borrow::Cow::Borrowed("RemoteAuth replay-token"))
+    } else if path.starts_with("/broker/") {
+        let token = if broker_token.is_empty() {
+            bearer
+        } else {
+            broker_token
+        };
+        Some(std::borrow::Cow::Owned(format!("Bearer {token}")))
     } else if path.starts_with("/runner/server/_apis/")
         || path.starts_with("/_apis/")
         || path.starts_with("/twirp/")
-        || path.starts_with("/broker/")
     {
         Some(std::borrow::Cow::Owned(format!("Bearer {bearer}")))
     } else {
@@ -2244,22 +2405,29 @@ fn rewritten_header_value<'a>(
     value: &'a str,
     path: &str,
     bearer: &str,
+    broker_token: &str,
 ) -> std::borrow::Cow<'a, str> {
     if name.eq_ignore_ascii_case("authorization") && value == "***REDACTED***" {
         if path == "/api/v3/actions/runner-registration" {
             return std::borrow::Cow::Borrowed("RemoteAuth replay-token");
         }
+        if path.starts_with("/broker/") {
+            let token = if broker_token.is_empty() {
+                bearer
+            } else {
+                broker_token
+            };
+            return std::borrow::Cow::Owned(format!("Bearer {token}"));
+        }
         if path.starts_with("/runner/server/_apis/")
             || path.starts_with("/_apis/")
             || path.starts_with("/twirp/")
-            || path.starts_with("/broker/")
         {
             return std::borrow::Cow::Owned(format!("Bearer {bearer}"));
         }
     }
     std::borrow::Cow::Borrowed(value)
 }
-
 fn should_skip_replay_path(host: &str, path: &str) -> bool {
     host.contains("blob.core.windows.net")
         || path == "/health"
@@ -2274,6 +2442,14 @@ fn should_skip_replay_path(host: &str, path: &str) -> bool {
 
 fn should_skip_replay_flow(host: &str, path: &str, flow: &Value) -> bool {
     if should_skip_replay_path(host, path) {
+        return true;
+    }
+    // Skip OAuth token requests: the golden contains GitHub's client_assertion JWTs
+    // with GitHub-specific client IDs that aksh cannot validate. The pre-flight token
+    // exchange in replay_flows_to_aksh already obtains a valid runner-listen token.
+    if path.starts_with("/_apis/v1/oauth2/token")
+        || path.starts_with("/runner/server/_apis/v1/oauth2/token")
+    {
         return true;
     }
     // Skip any flow that has no captured response status. These are capture artifacts
@@ -3046,7 +3222,7 @@ mod tests {
         ids.insert("official-job".to_string(), "aksh-job".to_string());
         let mut body = br#"{"jobMessageId":"official-job","jobId":"official-job","runnerRequestId":"official-job","other":"kept"}"#.to_vec();
 
-        rewrite_replay_body(&mut body, &ids);
+        rewrite_replay_body(&mut body, &ids, 1);
 
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["jobMessageId"], "aksh-job");
