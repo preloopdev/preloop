@@ -2230,6 +2230,116 @@ async fn protected_apis_require_bearer_token() {
 }
 
 #[tokio::test]
+async fn runner_protocol_errors_use_official_envelopes_without_changing_native_api() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = app(
+        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        CancellationToken::new(),
+    );
+
+    // Auth middleware failures on _apis routes must be VSS/AzDO JSON, not the
+    // native {"error": ...} response used by local APIs.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/_apis/artifactcache/cache?keys=x&version=v1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "application/json; charset=utf-8"
+    );
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["$type"], "Microsoft.VisualStudio.Services.Common.VssException, Microsoft.VisualStudio.Services.Common");
+    assert_eq!(body["message"], "runner or job protocol token required");
+    assert_eq!(body["typeKey"], "UnauthorizedRequestException");
+    assert!(body["typeName"].as_str().is_some());
+
+    // Router-level 404s on the runner-facing surface use the same envelope.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/_apis/does-not-exist")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["typeKey"], "ResourceNotFoundException");
+    assert_eq!(body["message"], "Not Found");
+
+    // JSON extractor failures on a protected _apis route are 400 VSS errors.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/runner/server/_apis/distributedtask/pools/1/sessions")
+                .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["typeKey"], "VssInvalidRequestException");
+    assert!(body["message"].as_str().unwrap().contains("JSON"));
+
+    // Twirp has its own canonical error envelope rather than the VSS object.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate")
+                .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["code"], "invalid_argument");
+    assert!(body["msg"].as_str().is_some());
+
+    // Native callers keep the existing local API error contract.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/runs/00000000-0000-0000-0000-000000000000")
+                .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"], "run not found");
+    assert!(body.get("typeName").is_none());
+}
+
+#[tokio::test]
 async fn all_twirp_api_routes_reject_missing_bearer_before_body_validation() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
