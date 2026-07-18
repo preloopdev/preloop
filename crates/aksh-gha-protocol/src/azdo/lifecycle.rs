@@ -16,7 +16,6 @@ pub struct RunnerServerSettings {
     pub agent_download_urls: Option<serde_json::Value>,
 }
 
-
 /// Service location data returned by `GET _apis/connectionData`.
 ///
 /// The runner calls this first to discover which service GUIDs map to
