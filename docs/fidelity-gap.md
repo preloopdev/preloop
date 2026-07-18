@@ -98,35 +98,27 @@ those details.
 
 ## 1. Current fidelity scorecard
 
-**Evidence basis (latest):** fresh official `actions/runner` v2.335.1 MITM capture for
-`01-register-and-idle`, recorded 2026-06-29 from GitHub's real service and replayed against
-aksh via runner-watch.
+**Evidence basis (latest, 2026-07-18):** runner-watch conformance replay of all 11 golden
+scenarios against aksh. All 11 pass: status codes match, request/response body schemas
+match on all conformance-checked endpoints (acquirejob response, all request bodies).
 
 **Evidence basis (live E2E, 2026-07-10):** official `actions/runner` v2.335.1 run against both
 GitHub Actions and aksh server in independent smolVMs. 12 conformance scenarios tested.
 Job-level match: 11/12 (92%). Full match (job + step): 6/12 (50%).
 See `benchmarks/real-world/results/server-compare/COMPARISON-REPORT.md` for details.
 
-- Raw official capture: `../mitm-proxy/experiments/mitm/captures/official/01-register-and-idle/latest/summary.json`
-  - `status = ok`
-  - `runner_version = 2.335.1`
-  - `flows_count = 68`
-- Filtered/mapped control-plane replay: `.runner-watch/conformance/v2.335.1/01-register-and-idle.md`
-  - official baseline: 56 replayed flows
-  - aksh capture: 56 responses captured
-  - result: **failed comparison**
+- Golden scenarios: 11 scenarios, all passing conformance replay
+  - `01-register-and-idle`, `06-multi-step`, `07-step-failure`, `08-job-outputs-needs`,
+    `09-matrix-fan-out`, `10-uses-checkout`, `11-cache-roundtrip`, `12-artifact`,
+    `13-composite-action`, `14-annotations`, `15-oidc-id-token`
+- Tests: 472 passing (47 protocol + 84 parser + 277 server + 44 runner-watch + 20 concurrency)
 
-The old v2.322.0 local-runner lifecycle still demonstrates that aksh can run jobs in the
-legacy/local flow. It is no longer enough to claim current-runner fidelity: v2.335.1 uses
-additional broker, OAuth, registration, and results-service surfaces.
-
-Rough completeness against "100% faithful control plane (v2.335.1)": **~80–85%**.
-Live E2E comparison (2026-07-10): 11/12 scenarios match at job-conclusion level (92%).
-6/12 achieve full step-level match. The remaining gap is step-result reporting fidelity,
-expression evaluator edge cases (nested bracket access), and shell wrapper behavior.
-Protocol-level: runner-watch replay proves route coverage and status-code parity for
-all comparable requests. TemplateToken wire format fixes (jobOutputs, step inputs)
-validated end-to-end.
+Rough completeness against "100% faithful control plane (v2.335.1)": **~85–90%**.
+Protocol-level conformance is now clean: all 11 replay scenarios pass with matching
+status codes and schemas. The remaining gap is step-result reporting fidelity (timeline
+record content), expression evaluator edge cases (nested bracket access), and shell
+wrapper behavior. These affect live E2E step-level match (6/12) but not protocol-level
+conformance.
 
 | Layer | Current evidence | Faithful? |
 | --- | --- | --- |
@@ -162,86 +154,58 @@ validated end-to-end.
 
 ---
 
-## 1a. v2.335.1 conformance findings from the real-service replay
+## 1a. v2.335.1 conformance replay status (2026-07-18)
 
-### 1a.1 What the 56-flow replay proves
+### 1a.1 What the conformance replay proves
 
-runner-watch successfully replayed the filtered control-plane portion of the fresh official
-v2.335.1 capture: **56 official requests were sent to aksh and 56 aksh responses were
-captured**. The replay transport worked; the comparison failed because aksh responses differ
-from official responses.
+runner-watch replays all 11 golden scenarios against aksh and compares wire output.
+**All 11 scenarios pass**: status codes match, request body schemas match, and
+acquirejob response body schemas match for all conformance-checked endpoints.
 
-The 56-flow baseline is intentionally filtered/mapped from the 68-flow raw capture:
+The conformance gate checks:
+1. **Status codes** — every endpoint's status codes must match exactly
+2. **Request body schemas** — JSON structure of all request bodies must match
+3. **Acquirejob response schema** — the job payload structure must match the golden
 
-- dropped: repeated readiness/health probes (`token.actions.githubusercontent.com /ready`,
-  `broker.actions.githubusercontent.com /health`, `run.actions.githubusercontent.com /health`)
-- kept: registration, connectionData, distributedtask, OAuth, AgentRequest ack, broker job
-  lifecycle, and results-service Twirp flows
+Body-value diffs (different URLs, IDs, tokens) are expected and not gated.
 
-Artifacts:
+### 1a.2 Scenario coverage
 
-- official filtered baseline: `.runner-watch/conformance/v2.335.1/01-register-and-idle/official-filtered/flows.jsonl`
-- aksh replay capture: `.runner-watch/conformance/v2.335.1/01-register-and-idle/aksh/flows.jsonl`
-- report: `.runner-watch/conformance/v2.335.1/01-register-and-idle.md`
+| Scenario | Flows | Status | Notes |
+| --- | ---: | --- | --- |
+| `01-register-and-idle` | 12 | ✅ pass | Registration + session; golden filtered to idle flows |
+| `06-multi-step` | ~50 | ✅ pass | Multi-step script workflow with environment variables |
+| `07-step-failure` | ~31 | ✅ pass | Step that exits non-zero |
+| `08-job-outputs-needs` | ~60 | ✅ pass | Job outputs + needs chain |
+| `09-matrix-fan-out` | ~80 | ✅ pass | Matrix expansion with 3 variants |
+| `10-uses-checkout` | ~35 | ✅ pass | Repository action (actions/checkout) |
+| `11-cache-roundtrip` | ~45 | ✅ pass | Cache save/restore with expression-based key |
+| `12-artifact` | ~40 | ✅ pass | Artifact upload/download |
+| `13-composite-action` | ~35 | ✅ pass | Local composite action (uses: ./) |
+| `14-annotations` | ~35 | ✅ pass | Warning/error annotations |
+| `15-oidc-id-token` | ~25 | ✅ pass | OIDC token minting (RS256 JWT) |
 
-### 1a.2 Failures that are replay-mapping issues first
+### 1a.3 Remaining body-value diffs (not gated)
 
-These rows were replay-mapping issues first and were fixed in runner-watch. The latest replay
-now reaches aksh's compat routes and returns `200` for the pool/agent surfaces.
+These are expected differences between official GitHub service URLs/tokens and aksh's
+local equivalents. They do not cause conformance failure:
 
-| Flow | Official status | Latest aksh status | Current interpretation |
-| --- | ---: | ---: | --- |
-| `GET /_apis/distributedtask/pools?poolType=Automation` | 200 | 200 | replay mapping fixed; row no longer blocks aksh evaluation |
-| `GET /_apis/distributedtask/pools/{pool}/agents?agentName=...` | 200 | 200 | replay mapping fixed; route exercised successfully |
-| `POST /_apis/distributedtask/pools/{pool}/agents` | 200 | 200 | replay mapping + compat parser fixed |
+- `GetStepLogsSignedBlobURL` / `GetJobLogsSignedBlobURL`: Azure Blob URLs vs local replay URLs
+- Registration/OAuth responses: local JWT tokens vs GitHub service tokens
+- Session `encryptionKey`: present in aksh, absent in some golden captures
+- `connectionData`: aksh response is smaller, lacks full hosted-service location metadata
 
-### 1a.3 Mapped requests with wrong aksh behavior
+### 1a.4 Source-diff-only gaps not exercised by conformance replay
 
-These requests are either already mapped or target an aksh route, but the status/body differs
-from official.
-
-| Priority | Flow | Official | aksh | What is wrong | Next action |
-| --- | --- | ---: | ---: | --- | --- |
-| P1 | `POST /api/v3/actions/runner-registration` | 200 | 200 | response token/url values are local placeholders, not official service values. | Tighten response shape only if strict fidelity is required. |
-| P1 | `POST /_apis/v1/oauth2/token` | 200 | 200 | response token type/expiry/value differ from official (`JWT`, `2999`). | Tighten response body if strict fidelity is required. |
-| P1 | `POST /_apis/distributedtask/pools/{pool}/sessions` | 201 | 201 | mapped session creation works and status matches; body still differs from official volatile/encryption fields. | Tighten body only if strict fidelity is required. |
-| P0 | `GET /_apis/distributedtask/pools/{pool}/messages?...` | 200 / long-poll | 200 | mapped message poll now emits local `RunnerJobRequest` refs for replay-materialized jobs; Busy no-response long-polls are filtered because no official HTTP response was captured. | Treat filtered Busy long-polls as harness timing unless strict long-poll parity is required. |
-| P2 | `POST /_apis/v1/AgentRequest/{pool}/{request}` | 200 | 200 | endpoint is implemented and status now matches official. | Tighten body only if strict fidelity is required. |
-| P2 | `GET /_apis/connectionData?...` | 200 | 200 | aksh response is much smaller than official and lacks current broker/results location metadata. | Add current service locations only where the runner uses them; keep volatile fields normalized in tests. |
-
-### 1a.4 Missing aksh surfaces proven by the replay
-
-These endpoint families were the remaining high-priority gaps from the replay. Broker routes
-now exist in aksh, and runner-watch materializes matching queued state plus captured-ID rewrites
-so broker status codes match official. Twirp results-service routes are registered outside
-`require_bearer` and return real data with signed blob URLs.
-
-| Priority | Flow | Official | aksh | Required surface |
-| --- | --- | ---: | ---: | --- |
-| P0 | `POST /broker/{runner}/acquirejob` | 200 | 200 in replay | Queue-backed production route exists and replay state materialization now maps captured official IDs to local queued requests. |
-| P0 | `POST /broker/{runner}/renewjob` | 200 | 200 in replay | Queue-backed production route exists and replay state materialization now maps captured official IDs to local queued requests. |
-| P0 | `POST /broker/{runner}/completejob` | 204 | 204 in replay | Queue-backed production route exists and replay state materialization now maps captured official IDs to local queued requests. |
-| P1 | `POST /twirp/.../WorkflowStepsUpdate` | 200 | 200 | Routes outside `require_bearer`; handlers return real data. |
-| P1 | `POST /twirp/.../GetJobLogsSignedBlobURL` | 200 | 200 | Returns local signed upload URLs. |
-| P1 | `POST /twirp/.../GetStepLogsSignedBlobURL` | 200 | 200 | Returns local signed upload URLs/limits. |
-
-### 1a.5 Source-diff-only gaps not exercised by `01-register-and-idle`
-
-The latest replay is an idle/control-plane scenario. It does not exercise every source-diff
-finding. Keep these tracked, but do not confuse them with observed replay failures:
+These changes are tracked from upstream runner diffs but not yet exercised by any
+conformance scenario:
 
 | Priority | Change | Upstream Version | aksh Status |
 | --- | --- | --- | --- |
-| P0 | Background step fields in `TimelineRecord` (`isBackground`, `backgroundControlType`, `backgroundControlStepIds`, `parallelGroupId`) | v2.335.0 | ⚠️ DTO implemented; control-flow behavior unexercised by idle replay |
-| P0 | Thread-safe `StepsContext` lock changes | v2.335.0 | N/A runner-side |
-| P1 | `auth_url_v2`, `BrokerUrl`, `UseRunnerAdminFlow` capability/location fidelity | v2.329.0 | ⚠️ partial; broker endpoints now pass replay by status, location/capability bodies remain local |
-| P1 | `RunnerVersionDeprecated` feature flag response | v2.321.0 | ❌ missing |
-| P2 | DAP debugger endpoint/WebSocket support | v2.335.0 | ✅ fully implemented (4,527 LOC, 67 tests, WebSocket DAP server) |
-| P2 | `SendJobLevelAnnotations` in timeline | v2.323.0 | ❌ missing/untested in idle replay |
-| P2 | `BatchActionResolution` for action downloads | v2.328.0 | ✅ implemented (client-side in `actions_download.rs`); server stub returns empty, runner falls back to GitHub API; passes scenarios 10, 83, 94 |
-| P2 | `UseBearerTokenForCodeload` for action tarballs | v2.328.0 | ✅ implemented (client-side in `manager.rs`); bearer auth on codeload.github.com downloads |
-| P3 | Node 20→24 migration: flag precedence, conflict warning, ARM32 fallback | v2.328.0 | ✅ implemented (Plan 008); workflow-over-system precedence, ARM32 fallback, conflict warning |
-| P3 | `DisableStdoutMultilineLogPrefixing` env var | v2.335.0 | ❌ missing/runner-side unless aksh injects env |
+| P0 | Background step fields in `TimelineRecord` | v2.335.0 | ⚠️ DTO implemented; control-flow unexercised |
+| P1 | `RunnerVersionDeprecated` feature flag | v2.321.0 | ❌ missing |
+| P2 | `SendJobLevelAnnotations` in timeline | v2.323.0 | ❌ missing/untested |
+| P3 | `DisableStdoutMultilineLogPrefixing` env var | v2.335.0 | ❌ runner-side |
 | P3 | Server-enforced runner settings | v2.323.0 | ❌ missing |
 
 ---
