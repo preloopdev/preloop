@@ -181,7 +181,8 @@ pub(crate) async fn create_log(
     inner.next_log_id = next_id.wrapping_add(1);
     log.id = next_id as i64;
     let key = format!("{}/{}", plan_id, next_id);
-    inner.logs.entry(key).or_default();
+    inner.logs.entry(key.clone()).or_default();
+    inner.log_metadata.entry(key).or_default();
     Json(serde_json::to_value(&log).unwrap_or(json!({ "ok": true })))
 }
 
@@ -194,11 +195,16 @@ pub(crate) async fn append_log(
     let key = log_key(&plan_id, &log_id);
     let mut inner = shared.state.inner.lock().await;
     let masked = mask_log_bytes(&inner, &plan_id, &body);
+    let byte_count = masked.len();
+    let line_count = masked.iter().filter(|&&b| b == b'\n').count();
     inner
         .logs
-        .entry(key)
+        .entry(key.clone())
         .or_default()
         .extend_from_slice(&masked);
+    let meta = inner.log_metadata.entry(key).or_default();
+    meta.byte_count += byte_count;
+    meta.line_count += line_count;
     StatusCode::ACCEPTED
 }
 
