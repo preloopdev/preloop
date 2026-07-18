@@ -638,6 +638,7 @@ fn variable_value_secret_roundtrip() {
 fn timeline_record_state_serialization() {
     let record = TimelineRecord {
         id: uuid::Uuid::nil(),
+        change_id: None,
         parent_id: None,
         name: None,
         display_name: None,
