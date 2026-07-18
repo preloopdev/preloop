@@ -647,6 +647,41 @@ fn parse_message_body(
 ///   `runner_request_id`, `run_service_url`, `billing_owner_id`, `should_acknowledge`
 /// Golden flow 15: POST /{id}/acquirejob returns the full camelCase job payload.
 async fn acquire_job_from_ref(
+    job_ref: &serde_json::Value,
+    http: &HttpClient,
+    token: &str,
+) -> Result<Option<serde_json::Value>> {
+    // Snake_case per golden flow 12; fall back to camelCase for compatibility
+    let run_service_url = job_ref
+        .get("run_service_url")
+        .or_else(|| job_ref.get("runServiceUrl"))
+        .and_then(|v| v.as_str());
+
+    let runner_request_id = job_ref
+        .get("runner_request_id")
+        .or_else(|| job_ref.get("runnerRequestId"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+
+    if let Some(rs_url) = run_service_url {
+        let rs_client =
+            crate::client::run_service::RunServiceClient::new(http.clone(), rs_url.to_string());
+        let acquire_body = serde_json::json!({
+            "jobMessageId": runner_request_id,
+            "runnerOS": if cfg!(target_os = "macos") { "macOS" } else { "Linux" },
+            "billingOwnerId": job_ref.get("billing_owner_id")
+                .or_else(|| job_ref.get("billingOwnerId")),
+        });
+        let job = rs_client.acquire_job(token, &acquire_body).await?;
+        info!("Job acquired via run-service");
+        Ok(Some(job))
+    } else {
+        // No run-service URL → this must be the full payload already (e.g. local aksh)
+        info!("Job message is full payload (no run-service URL)");
+        Ok(Some(job_ref.clone()))
+    }
+}
+
 /// Apply the official RunnerRefreshConfig protocol. The message identifies a
 /// config refresh operation; the refreshed runner settings are returned by the
 /// service as a base64-encoded `.runner` JSON document.
@@ -672,8 +707,6 @@ async fn apply_runner_refresh_config(
         .and_then(|value| value.as_str())
         .unwrap_or_default();
     if !config_type.eq_ignore_ascii_case("runner") {
-        // Credentials and future config types are acknowledged but deliberately
-        // left untouched; this runner cannot safely rotate its auth files here.
         return Ok(false);
     }
 
@@ -723,40 +756,6 @@ async fn apply_runner_refresh_config(
     config.apply_runner_settings_refresh(&refreshed, runner_root)
 }
 
-    job_ref: &serde_json::Value,
-    http: &HttpClient,
-    token: &str,
-) -> Result<Option<serde_json::Value>> {
-    // Snake_case per golden flow 12; fall back to camelCase for compatibility
-    let run_service_url = job_ref
-        .get("run_service_url")
-        .or_else(|| job_ref.get("runServiceUrl"))
-        .and_then(|v| v.as_str());
-
-    let runner_request_id = job_ref
-        .get("runner_request_id")
-        .or_else(|| job_ref.get("runnerRequestId"))
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-
-    if let Some(rs_url) = run_service_url {
-        let rs_client =
-            crate::client::run_service::RunServiceClient::new(http.clone(), rs_url.to_string());
-        let acquire_body = serde_json::json!({
-            "jobMessageId": runner_request_id,
-            "runnerOS": if cfg!(target_os = "macos") { "macOS" } else { "Linux" },
-            "billingOwnerId": job_ref.get("billing_owner_id")
-                .or_else(|| job_ref.get("billingOwnerId")),
-        });
-        let job = rs_client.acquire_job(token, &acquire_body).await?;
-        info!("Job acquired via run-service");
-        Ok(Some(job))
-    } else {
-        // No run-service URL → this must be the full payload already (e.g. local aksh)
-        info!("Job message is full payload (no run-service URL)");
-        Ok(Some(job_ref.clone()))
-    }
-}
 async fn re_resolve_broker_url(http: &HttpClient, server_url: &str) -> Option<String> {
     let url = format!("{}/_apis/connectionData?connectOptions=1", server_url);
     if let Ok(resp) = http.get_json::<serde_json::Value>(&url).await {
