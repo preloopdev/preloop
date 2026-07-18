@@ -59,11 +59,28 @@ pub(crate) async fn patch_timeline_records(
                     message: issue.message.clone().unwrap_or_default(),
                     file: issue.data.get("file").cloned(),
                     line: issue.data.get("line").and_then(|line| line.parse().ok()),
+                    end_line: issue
+                        .data
+                        .get("endLine")
+                        .or_else(|| issue.data.get("endline"))
+                        .and_then(|line| line.parse().ok()),
+                    col: issue
+                        .data
+                        .get("col")
+                        .or_else(|| issue.data.get("startColumn"))
+                        .and_then(|column| column.parse().ok()),
+                    end_column: issue
+                        .data
+                        .get("endColumn")
+                        .or_else(|| issue.data.get("endcolumn"))
+                        .and_then(|column| column.parse().ok()),
+                    title: issue.data.get("title").cloned(),
                     step_id,
                 });
             }
         }
     }
+
     let new_change_id = {
         let mut inner = shared.state.inner.lock().await;
         let current = inner
