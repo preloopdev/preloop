@@ -2232,10 +2232,8 @@ fn replay_workflow_submissions(
             "reusable_workflows": {}
         }));
     }
-    ensure!(
-        !submissions.is_empty(),
-        "replay scenario {scenario} has no submit_workflow steps"
-    );
+    // Idle scenarios (like 01-register-and-idle) have no submit_workflow steps.
+    // Return empty submissions — materialize_replay_state will skip job creation.
     Ok(submissions)
 }
 
@@ -2271,6 +2269,11 @@ async fn materialize_replay_state(
     let native_api_token =
         std::env::var("AKSH_SYSTEM_TOKEN").unwrap_or_else(|_| "aksh-system-token".to_owned());
     let submissions = replay_workflow_submissions(golden_dir, scenario_root)?;
+    // Idle scenarios have no submit_workflow steps — skip job creation.
+    // The replay will use the golden capture's message responses directly.
+    if submissions.is_empty() {
+        return Ok(());
+    }
     let mut queued_jobs = 0_u64;
     for submit_body in submissions {
         let accepted = client
