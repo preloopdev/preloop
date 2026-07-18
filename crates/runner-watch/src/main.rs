@@ -1999,6 +1999,10 @@ async fn replay_flows_to_aksh(
                         }
                     }
                     captured["response_body_json"] = body_json;
+                } else if text.trim().is_empty() {
+                    // Empty body (e.g. 204 No Content) — store as null so
+                    // comparison tool sees null instead of substituting {}.
+                    captured["response_body_json"] = Value::Null;
                 } else {
                     captured["response_body"] = json!(text);
                 }
