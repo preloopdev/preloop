@@ -75,11 +75,22 @@ pub(crate) struct QueuedJob {
     pub(crate) max_parallel: Option<u64>,
     /// Required runner labels from `runs-on`.
     pub(crate) runs_on: Vec<String>,
+    /// Explicit runner group from object-valued `runs-on`.
+    pub(crate) runner_group: Option<String>,
     pub(crate) message: azdo::AgentJobRequestMessage,
     /// Raw job-level concurrency (evaluated when the job becomes ready).
     pub(crate) concurrency: Option<aksh_gha_parser::Concurrency>,
     /// Matrix values for this expansion (for concurrency expression eval).
     pub(crate) matrix: BTreeMap<String, serde_json::Value>,
+}
+
+/// Runner metadata used by dispatch matching.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RunnerCapabilities {
+    pub(crate) known: bool,
+    pub(crate) labels: Vec<String>,
+    pub(crate) runner_group_id: Option<i64>,
+    pub(crate) runner_group_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]

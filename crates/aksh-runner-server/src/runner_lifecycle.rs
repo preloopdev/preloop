@@ -20,6 +20,8 @@ pub(crate) async fn register_runner(
         labels: request.labels,
         ephemeral: request.ephemeral,
         public_key,
+        runner_group_id: request.runner_group_id,
+        runner_group_name: request.runner_group_name,
     };
     if let Some(public_key) = &runner.public_key {
         inner
@@ -219,8 +221,8 @@ pub(crate) async fn agent_lookup(
                 "isVirtual": false,
                 "provisioningState": "Provisioned",
                 "queueName": format!("taskagent-{}", runner.id),
-                "runnerGroupId": 1,
-                "runnerGroupName": null,
+                "runnerGroupId": runner.runner_group_id.unwrap_or(1),
+                "runnerGroupName": runner.runner_group_name.clone(),
                 "owningTenant": null,
                 "createdOn": "2026-01-01T00:00:00Z",
                 "lastConnectedOn": "2026-01-01T00:00:00",
@@ -306,6 +308,15 @@ pub(crate) async fn register_runner_compat(
         .get("ephemeral")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let runner_group_id = request
+        .get("runnerGroupId")
+        .or_else(|| request.get("runner_group_id"))
+        .and_then(serde_json::Value::as_i64);
+    let runner_group_name = request
+        .get("runnerGroupName")
+        .or_else(|| request.get("runner_group_name"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
     let public_key_xml = task_agent_public_key(&request);
     let public_key_object = request
         .get("authorization")
@@ -323,6 +334,8 @@ pub(crate) async fn register_runner_compat(
         labels,
         ephemeral,
         public_key: public_key_xml,
+        runner_group_id,
+        runner_group_name,
     };
     let result = register_runner(State(shared.clone()), Json(reg_request)).await?;
     let client_id = uuid::Uuid::new_v4().to_string();
@@ -347,8 +360,8 @@ pub(crate) async fn register_runner_compat(
         "isVirtual": false,
         "provisioningState": "Provisioned",
         "queueName": format!("taskagent-{}", result.0.id),
-        "runnerGroupId": 1,
-        "runnerGroupName": null,
+        "runnerGroupId": result.0.runner_group_id.unwrap_or(1),
+        "runnerGroupName": result.0.runner_group_name,
         "owningTenant": null,
         "createdOn": "2026-01-01T00:00:00Z",
         "labels": result.0.labels.iter().enumerate().map(|(i, l)| json!({"id": i + 1, "name": l, "type": "user"})).collect::<Vec<_>>(),
