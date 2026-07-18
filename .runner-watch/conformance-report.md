@@ -2,7 +2,7 @@
 
 ❌ 1 of 1 scenario(s) diverged.
 
-- [15-oidc-id-token](.runner-watch/conformance/v2.335.1/15-oidc-id-token.md)
+- [07-step-failure](.runner-watch/conformance/v2.335.1/07-step-failure.md)
 
 ## Replay methodology and known gaps
 
