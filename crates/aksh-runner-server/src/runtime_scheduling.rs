@@ -859,9 +859,7 @@ pub(crate) fn job_matches_runner(job_labels: &[String], runner_labels: &[String]
             return true;
         }
         runner_set.contains("self-hosted")
-            && (req.starts_with("ubuntu")
-                || req.starts_with("macos")
-                || req.starts_with("windows"))
+            && (req.starts_with("ubuntu") || req.starts_with("macos") || req.starts_with("windows"))
     })
 }
 
