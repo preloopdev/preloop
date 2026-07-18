@@ -428,10 +428,18 @@ pub struct RunnerRegistrationRequest {
     #[serde(default)]
     pub public_key: Option<String>,
     /// Numeric runner group identifier. Missing means the default group.
-    #[serde(default, alias = "runnerGroupId", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "runnerGroupId",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub runner_group_id: Option<i64>,
     /// Runner group display name. Missing means the default group.
-    #[serde(default, alias = "runnerGroupName", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "runnerGroupName",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub runner_group_name: Option<String>,
 }
 
@@ -450,10 +458,18 @@ pub struct RegisteredRunner {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_key: Option<String>,
     /// Numeric runner group identifier. Missing means the default group.
-    #[serde(default, alias = "runnerGroupId", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "runnerGroupId",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub runner_group_id: Option<i64>,
     /// Runner group display name. Missing means the default group.
-    #[serde(default, alias = "runnerGroupName", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "runnerGroupName",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub runner_group_name: Option<String>,
 }
 
