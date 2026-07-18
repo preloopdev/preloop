@@ -976,7 +976,7 @@ Phases A–E are the critical path to "a real runner runs one job." F–H reach
 semantics." Provider integration and GitHub App/checks integration (steps 10–12)
 close the loop for Preloop and self-hosted control-plane use.
 
-<!-- runner-watch-sync -->
+[//]: # (runner-watch-sync)
 ## runner-watch generated scorecard for v2.335.1
 
 This section is generated from the latest runner-watch artifacts and hand-normalized from the
