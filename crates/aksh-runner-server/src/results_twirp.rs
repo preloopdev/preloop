@@ -344,8 +344,22 @@ pub(crate) async fn twirp_cache_v2_finalize(
             .iter()
             .find(|(_, p)| p.key == storage_key && p.version == request.version)
             .map(|(k, _)| k.clone())
-    }
-    .ok_or_else(|| ApiError::not_found("no pending cache upload for key+version"))?;
+    };
+    let Some(token) = token else {
+        // If no pending upload exists, check if the cache entry already exists.
+        // This happens when CreateCacheEntry returned "cache already exists".
+        if shared
+            .state
+            .cache
+            .get(&storage_key, &request.version, &[])
+            .await
+            .map_err(|error| ApiError::internal(format!("cache lookup error: {error}")))?
+            .is_some()
+        {
+            return Ok(Json(json!({ "ok": true, "entry_id": "1", "message": "" })));
+        }
+        return Err(ApiError::not_found("no pending cache upload for key+version"));
+    };
 
     let blob_path = shared
         .state
