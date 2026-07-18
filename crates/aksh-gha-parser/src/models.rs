@@ -128,6 +128,9 @@ pub struct Workflow {
     /// Workflow name.
     #[serde(default)]
     pub name: Option<String>,
+    /// Custom run name with expression interpolation (`run-name:`).
+    #[serde(default, rename = "run-name")]
+    pub run_name: Option<String>,
     /// Trigger block.
     #[serde(default, rename = "on", alias = "true")]
     pub on: Trigger,
