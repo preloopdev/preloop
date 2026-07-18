@@ -33,10 +33,12 @@ pub(crate) async fn submit_run_inner(
                 .collect();
         }
         if let Some(object) = submission.payload.as_object_mut() {
-            object.insert(
-                "inputs".to_owned(),
-                serde_json::to_value(&submission.dispatch_inputs_stringified).unwrap_or_default(),
-            );
+            let inputs_value = if submission.dispatch_inputs_stringified.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::to_value(&submission.dispatch_inputs_stringified).unwrap_or_default()
+            };
+            object.insert("inputs".to_owned(), inputs_value);
         }
     }
     if let Some(tier) = submission.trust_tier.as_deref().and_then(|value| {
@@ -379,32 +381,6 @@ pub(crate) async fn submit_run_inner(
                     agent_msg.plan.plan_id, job.base_id, agent_msg.job_name
                 )),
             );
-            if let Some(aksh_gha_protocol::azdo::PipelineContextData::Dict(github_dict)) =
-                &mut agent_msg.context_data.get_mut("github")
-            {
-                github_dict.insert(
-                    "token".to_owned(),
-                    aksh_gha_protocol::azdo::PipelineContextData::String(token),
-                );
-                let mut perms = std::collections::BTreeMap::new();
-                for perm in &[
-                    "actions",
-                    "contents",
-                    "issues",
-                    "metadata",
-                    "pull-requests",
-                    "statuses",
-                ] {
-                    perms.insert(
-                        perm.to_string(),
-                        aksh_gha_protocol::azdo::PipelineContextData::String("write".to_string()),
-                    );
-                }
-                github_dict.insert(
-                    "token_permissions".to_owned(),
-                    aksh_gha_protocol::azdo::PipelineContextData::Dict(perms),
-                );
-            }
 
             agent_msg.file_table = vec![workflow_path.clone()];
             if let Some(aksh_gha_protocol::azdo::PipelineContextData::Dict(job_dict)) =
