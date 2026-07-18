@@ -1,5 +1,12 @@
 use super::*;
 
+/// Stable deployment ID — generated once per server lifetime via lazy_static pattern.
+/// The official service returns a fixed deployment GUID; we do the same.
+const DEPLOYMENT_ID: &str = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
+
+/// Stable instance ID — same reasoning as deployment ID.
+const INSTANCE_ID: &str = "bc944321-3dbc-431b-8cf2-8afa3e25e359";
+
 pub(crate) async fn connection_data(
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> axum::response::Response {
@@ -9,14 +16,15 @@ pub(crate) async fn connection_data(
             .is_some_and(|last_change_id| last_change_id != "-1")
     {
         return axum::response::Json(json!({
-            "deploymentId": "00000000-0000-0000-0000-000000000000",
+            "deploymentId": DEPLOYMENT_ID,
             "deploymentType": "hosted",
-            "instanceId": uuid::Uuid::new_v4().to_string(),
+            "instanceId": INSTANCE_ID,
             "locationServiceData": {
                 "clientCacheFresh": true,
                 "defaultAccessMappingMoniker": "ScaleUnitMapping",
                 "lastChangeId": 1,
-                "lastChangeId64": 1
+                "lastChangeId64": 1,
+                "serviceOwner": "0000005a-0000-8888-8000-000000000000"
             }
         }))
         .into_response();
@@ -25,9 +33,9 @@ pub(crate) async fn connection_data(
     let service_root = public_base_url();
     let runner_root = runner_server_url();
     let body = serde_json::json!({
-        "deploymentId": "00000000-0000-0000-0000-000000000000",
+        "deploymentId": DEPLOYMENT_ID,
         "deploymentType": "hosted",
-        "instanceId": uuid::Uuid::new_v4().to_string(),
+        "instanceId": INSTANCE_ID,
         "serverUrlV2": runner_root,
         "brokerUrl": public_base_url(),
         "resultsServiceUrl": runner_root,
@@ -35,7 +43,7 @@ pub(crate) async fn connection_data(
             "lastChangeId": 1,
             "lastChangeId64": 1,
             "clientCacheFresh": true,
-            "serviceOwner": "00000000-0000-0000-0000-000000000000",
+            "serviceOwner": "0000005a-0000-8888-8000-000000000000",
             "serviceDefinitions": [
                 area_svc("Location Service", "9f1fe989-7d0d-4a9b-a9bf-11330ab257c1", "LocationService2", "Framework", &service_root),
                 area_svc("distributedtask", "a85b8835-c1a1-4aac-ae97-1c3d0ba72dbd", "LocationService2", "Framework", &runner_root),
@@ -73,24 +81,27 @@ pub(crate) async fn connection_data(
                     "moniker": "PublicAccessMapping",
                     "displayName": "Public Access Mapping",
                     "accessPoint": service_root,
-                    "serviceOwner": "00000000-0000-0000-0000-000000000000",
+                    "serviceOwner": "0000005a-0000-8888-8000-000000000000",
                     "virtualDirectory": ""
                 },
                 {
                     "moniker": "ScaleUnitMapping",
                     "displayName": "Scale Unit Access Mapping",
                     "accessPoint": runner_root,
-                    "serviceOwner": "00000000-0000-0000-0000-000000000000",
+                    "serviceOwner": "0000005a-0000-8888-8000-000000000000",
                     "virtualDirectory": ""
                 }
             ],
             "defaultAccessMappingMoniker": "ScaleUnitMapping",
             "clientCacheFresh": true,
-            "serviceOwner": "00000000-0000-0000-0000-000000000000"
+            "serviceOwner": "0000005a-0000-8888-8000-000000000000"
         }
     });
     axum::response::Json(body).into_response()
 }
+
+
+const SVC_OWNER: &str = "0000005a-0000-8888-8000-000000000000";
 
 fn area_svc(
     display_name: &str,
@@ -110,7 +121,7 @@ fn area_svc(
             {"accessMappingMoniker": "PublicAccessMapping", "location": location},
             {"accessMappingMoniker": "ScaleUnitMapping", "location": location}
         ],
-        "serviceOwner": "00000000-0000-0000-0000-000000000000",
+        "serviceOwner": SVC_OWNER,
         "properties": {}
     })
 }
@@ -123,8 +134,11 @@ fn resource_svc(name: &str, id: &str, area: &str, location: &str) -> serde_json:
         "relativePath": location,
         "description": name,
         "toolId": area,
-        "locationMappings": [],
-        "serviceOwner": "00000000-0000-0000-0000-000000000000",
+        "locationMappings": [
+            {"accessMappingMoniker": "ScaleUnitMapping", "location": runner_server_url()},
+            {"accessMappingMoniker": "PublicAccessMapping", "location": public_base_url()}
+        ],
+        "serviceOwner": SVC_OWNER,
         "resourceVersion": 1,
         "minVersion": "1.0",
         "maxVersion": "6.0",
@@ -147,7 +161,7 @@ fn svc(name: &str, id: &str, location: &str) -> serde_json::Value {
             {"accessMappingMoniker": "ScaleUnitMapping", "location": runner_server_url()},
             {"accessMappingMoniker": "PublicAccessMapping", "location": public_base_url()}
         ],
-        "serviceOwner": "00000000-0000-0000-0000-000000000000",
+        "serviceOwner": SVC_OWNER,
         "resourceVersion": 6,
         "minVersion": "1.0",
         "maxVersion": "12.0",
