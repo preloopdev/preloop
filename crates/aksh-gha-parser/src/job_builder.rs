@@ -56,6 +56,85 @@ fn job_outputs_token(outputs: &BTreeMap<String, String>) -> Option<Value> {
         "map": map,
     }))
 }
+fn normalized_github_context(github: &Value) -> Value {
+    let mut object = match github {
+        Value::Object(value) => value.clone(),
+        _ => serde_json::Map::new(),
+    };
+
+    let repository = object
+        .get("repository")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let repository_owner = repository.split('/').next().unwrap_or_default().to_owned();
+    let git_ref = object
+        .get("ref")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let ref_name = git_ref
+        .strip_prefix("refs/heads/")
+        .or_else(|| git_ref.strip_prefix("refs/tags/"))
+        .unwrap_or(&git_ref)
+        .to_owned();
+    let ref_type = if git_ref.starts_with("refs/tags/") {
+        "tag"
+    } else {
+        "branch"
+    };
+
+    // These values are part of the runner's stable github context, rather than
+    // event-payload fields. Keep server-supplied run/actor metadata intact while
+    // deriving the ref and repository fields from the submission context.
+    object.insert("server_url".to_owned(), json!("https://github.com"));
+    object.insert("api_url".to_owned(), json!("https://api.github.com"));
+    object.insert(
+        "graphql_url".to_owned(),
+        json!("https://api.github.com/graphql"),
+    );
+    object.insert("ref_name".to_owned(), json!(ref_name));
+    object.insert("ref_protected".to_owned(), json!(false));
+    object.insert("ref_type".to_owned(), json!(ref_type));
+    object.insert("secret_source".to_owned(), json!("Actions"));
+    object
+        .entry("retention_days".to_owned())
+        .or_insert_with(|| json!("90"));
+    object
+        .entry("artifact_cache_size_limit".to_owned())
+        .or_insert_with(|| json!("10"));
+    object.insert("repository_owner".to_owned(), json!(repository_owner));
+    object
+        .entry("repository_owner_id".to_owned())
+        .or_insert_with(|| json!("0"));
+    object.insert(
+        "repositoryUrl".to_owned(),
+        json!(format!("git://github.com/{repository}.git")),
+    );
+
+    for key in [
+        "ref",
+        "sha",
+        "repository",
+        "run_id",
+        "run_number",
+        "run_attempt",
+        "repository_visibility",
+        "actor_id",
+        "actor",
+        "workflow",
+        "head_ref",
+        "base_ref",
+        "event_name",
+    ] {
+        object.entry(key.to_owned()).or_insert_with(|| json!(""));
+    }
+    if !object.get("event").is_some_and(Value::is_object) {
+        object.insert("event".to_owned(), json!({}));
+    }
+
+    Value::Object(object)
+}
 /// Build a full `AgentJobRequestMessage` from a job plan and context.
 ///
 /// This resolves `${{ }}` in env/with/run fields, builds contextData,
@@ -70,6 +149,7 @@ pub fn build_agent_job_message(
 ) -> Result<AgentJobRequestMessage, String> {
     let timeline_id = uuid::Uuid::new_v4();
     let job_id = uuid::Uuid::new_v4();
+    let github_context = normalized_github_context(github);
 
     // Build expression evaluation context
     let strategy = plan
@@ -85,7 +165,7 @@ pub fn build_agent_job_message(
     );
 
     let expr_context = build_context(
-        github,
+        &github_context,
         &plan.env,
         vars,
         &plan.matrix,
@@ -105,7 +185,7 @@ pub fn build_agent_job_message(
     }
 
     let job_expr_context = build_context(
-        github,
+        &github_context,
         &plan.env,
         vars,
         &plan.matrix,
@@ -184,7 +264,6 @@ pub fn build_agent_job_message(
             VariableValue::new(wf_file),
         );
     }
-
     populate_runner_variables(&mut variables, plan);
 
     // GitHub supplies baseline regexes in addition to value-derived secret masks.
@@ -204,8 +283,8 @@ pub fn build_agent_job_message(
         data: BTreeMap::from([
             ("ConnectivityChecks".to_owned(), "{}".to_owned()),
             ("GenerateIdTokenUrl".to_owned(), String::new()),
-            ("ServerId".to_owned(), job_id.to_string()),
-            ("ServerName".to_owned(), "aksh".to_owned()),
+            ("ServerId".to_owned(), String::new()),
+            ("ServerName".to_owned(), String::new()),
         ]),
         name: "SystemVssConnection".to_owned(),
         endpoint_type: None,
@@ -230,7 +309,10 @@ pub fn build_agent_job_message(
     // Context data follows the AgentJobRequestMessage contract. Workflow-level
     // metadata is enriched by the server, which owns the submission path/ref.
     let mut context_data = BTreeMap::new();
-    context_data.insert("github".to_owned(), PipelineContextData::from_json(github));
+    context_data.insert(
+        "github".to_owned(),
+        PipelineContextData::from_json(&github_context),
+    );
     let inputs_ctx = plan
         .inputs
         .iter()
@@ -238,46 +320,36 @@ pub fn build_agent_job_message(
         .collect();
     context_data.insert("inputs".to_owned(), PipelineContextData::Dict(inputs_ctx));
 
-    let mut job_ctx = BTreeMap::new();
-    if let Some(wref) = &plan.workflow_ref {
-        job_ctx.insert(
+    let job_ctx = BTreeMap::from([
+        ("check_run_id".to_owned(), PipelineContextData::Number(0.0)),
+        (
             "workflow_ref".to_owned(),
-            PipelineContextData::String(wref.clone()),
-        );
-    }
-    if let Some(wsha) = &plan.workflow_sha {
-        job_ctx.insert(
+            PipelineContextData::String(plan.workflow_ref.clone().unwrap_or_default()),
+        ),
+        (
             "workflow_sha".to_owned(),
-            PipelineContextData::String(wsha.clone()),
-        );
-    }
-    if let Some(wrepo) = &plan.workflow_repository {
-        job_ctx.insert(
+            PipelineContextData::String(plan.workflow_sha.clone().unwrap_or_default()),
+        ),
+        (
             "workflow_repository".to_owned(),
-            PipelineContextData::String(wrepo.clone()),
-        );
-    }
-    if let Some(path) = &plan.workflow_file {
-        job_ctx.insert(
+            PipelineContextData::String(plan.workflow_repository.clone().unwrap_or_default()),
+        ),
+        (
             "workflow_file_path".to_owned(),
-            PipelineContextData::String(path.clone()),
-        );
-    }
+            PipelineContextData::String(plan.workflow_file.clone().unwrap_or_default()),
+        ),
+    ]);
     context_data.insert("job".to_owned(), PipelineContextData::Dict(job_ctx));
 
-    if plan.matrix.is_empty() {
-        context_data.insert("matrix".to_owned(), PipelineContextData::Null);
-    } else {
-        context_data.insert(
-            "matrix".to_owned(),
-            PipelineContextData::Dict(
-                plan.matrix
-                    .iter()
-                    .map(|(k, v)| (k.clone(), PipelineContextData::from_json(v)))
-                    .collect(),
-            ),
-        );
-    }
+    context_data.insert(
+        "matrix".to_owned(),
+        PipelineContextData::Dict(
+            plan.matrix
+                .iter()
+                .map(|(k, v)| (k.clone(), PipelineContextData::from_json(v)))
+                .collect(),
+        ),
+    );
     context_data.insert(
         "needs".to_owned(),
         PipelineContextData::Dict(BTreeMap::new()),
@@ -326,7 +398,7 @@ pub fn build_agent_job_message(
             change_id: 0,
             location: None,
         },
-        job_display_name: Some(plan.name.clone()),
+        job_display_name: None,
         job_name: "__default".to_owned(),
         locked_until: "0001-01-01T00:00:00".to_owned(),
         billing_owner_id: None,

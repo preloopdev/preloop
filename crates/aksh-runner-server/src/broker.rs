@@ -557,24 +557,13 @@ pub(crate) async fn broker_acquire_job(
             );
             endpoint.data.insert(
                 "ConnectivityChecks".to_owned(),
-                format!("{}/check", public_base_url()),
+                serde_json::json!([format!("{}/check", public_base_url())]).to_string(),
             );
-            endpoint.data.insert(
-                "ServerId".to_owned(),
-                "4e7fae75-3a76-4a43-9d3a-8b063c8517c4".to_owned(),
-            );
+            endpoint.data.insert("ServerId".to_owned(), String::new());
+            endpoint.data.insert("ServerName".to_owned(), String::new());
             endpoint
                 .data
-                .insert("ServerName".to_owned(), "aksh".to_owned());
-            endpoint.data.insert(
-                "GenerateIdTokenUrl".to_owned(),
-                format!(
-                    "{}/runner/server/_apis/distributedtask/hubs/actions/plans/{}/jobs/{}/oidctoken",
-                    runner_server_url(),
-                    message.plan.plan_id,
-                    message.job_id
-                ),
-            );
+                .insert("GenerateIdTokenUrl".to_owned(), String::new());
         }
     }
     message.billing_owner_id = request.billing_owner_id;
