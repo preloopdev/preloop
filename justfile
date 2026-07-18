@@ -1,3 +1,5 @@
+server := "http://127.0.0.1:9090"
+
 # ── build ──────────────────────────────────────────────────────────────────
 
 build:
@@ -60,10 +62,10 @@ serve:
 # ── submit ──────────────────────────────────────────────────────────────────
 
 submit-ci:
-    cargo run -p aksh-runner-client -- submit -W .github/workflows/ci.yml
+    cargo run -p aksh-runner-client -- --server {{server}} submit -W .github/workflows/ci.yml
 
 submit-dogfood:
-    cargo run -p aksh-runner-client -- submit -W fixtures/workflows/dogfood.yml
+    cargo run -p aksh-runner-client -- --server {{server}} submit -W fixtures/workflows/dogfood.yml
 
 # ── runner ─────────────────────────────────────────────────────────────────
 

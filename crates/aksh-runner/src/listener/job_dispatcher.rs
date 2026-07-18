@@ -7,14 +7,14 @@
 //! so JobCancellation can arrive mid-job and be forwarded to the worker.
 
 use anyhow::{Context, Result};
-use futures::future::BoxFuture;
 use std::path::Path;
-use std::process::Stdio;
 use std::time::Duration;
+use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Child;
 use tracing::{error, info, warn};
 
+use futures::future::BoxFuture;
 use crate::cli::ProtocolPath;
 
 /// IPC message types sent from listener to worker via stdin.
@@ -40,14 +40,14 @@ pub struct RunningJob {
     stdin: Option<tokio::process::ChildStdin>,
     /// The job/request ID for matching cancellation messages.
     pub request_id: String,
-    /// Numeric distributed-task request ID used by EnsureDispatchFinished.
-    pub agent_request_id: Option<i64>,
     /// Agent job GUID from the job message body (`jobId`), for JobCancellation matching.
     pub job_id: Option<uuid::Uuid>,
     /// Hard-kill deadline after cancel (official: timeout − 15s).
     pub kill_at: Option<tokio::time::Instant>,
     /// Whether graceful cancellation was already delivered to the worker.
     cancel_sent: bool,
+    /// Numeric agent request ID for status queries, if available.
+    pub agent_request_id: Option<i64>,
 }
 
 /// Server-side job request status provider used to resolve a busy-runner overlap.
@@ -84,12 +84,16 @@ pub async fn ensure_dispatch_finished<P: AgentRequestStatusProvider>(
     }
 
     let request = match provider
-        .get_agent_request(token, pool_id, job.agent_request_id.ok_or_else(|| {
-            anyhow::anyhow!(
-                "cannot query status for job request {} without a numeric request ID",
-                job.request_id
-            )
-        })?)
+        .get_agent_request(
+            token,
+            pool_id,
+            job.agent_request_id.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cannot query status for job request {} without a numeric request ID",
+                    job.request_id
+                )
+            })?,
+        )
         .await
     {
         Ok(request) => request,
@@ -122,7 +126,6 @@ pub async fn ensure_dispatch_finished<P: AgentRequestStatusProvider>(
         ),
     }
 }
-
 impl RunningJob {
     /// Check if the worker has finished (non-blocking).
     pub fn try_wait(&mut self) -> Result<Option<bool>> {
@@ -180,13 +183,13 @@ pub async fn spawn_job(
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
-    let agent_request_id = job_message
-        .get("requestId")
-        .and_then(|value| value.as_i64());
     let job_id = job_message
         .get("jobId")
         .and_then(|v| v.as_str())
         .and_then(|s| uuid::Uuid::parse_str(s).ok());
+    let agent_request_id = job_message
+        .get("requestId")
+        .and_then(|v| v.as_i64());
 
     info!("Dispatching job {request_id} to worker");
 
@@ -277,10 +280,10 @@ pub async fn spawn_job(
         child,
         stdin,
         request_id,
-        agent_request_id,
         job_id,
         kill_at: None,
         cancel_sent: false,
+        agent_request_id,
     })
 }
 
@@ -456,10 +459,14 @@ pub async fn dispatch_job(
 mod tests {
     use super::*;
     use futures::future::BoxFuture;
-    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
     use std::time::Instant;
     use tempfile::TempDir;
 
+    /// Fake status provider for testing ensure_dispatch_finished.
     struct FakeStatusProvider {
         response: serde_json::Value,
         calls: Arc<AtomicUsize>,
@@ -472,8 +479,8 @@ mod tests {
             _pool_id: i64,
             _request_id: i64,
         ) -> BoxFuture<'a, Result<serde_json::Value>> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Box::pin(std::future::ready(Ok(self.response.clone())))
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { Ok(self.response.clone()) })
         }
     }
 
@@ -651,7 +658,9 @@ mod tests {
             "steps": [{"run": "sleep 60", "shell": "bash"}],
             "fileTable": {"workDirectory": dir.path().join("work").to_str().unwrap()}
         });
-        let mut previous = spawn_job(payload, dir.path(), ProtocolPath::Azdo).await.unwrap();
+        let mut previous = spawn_job(payload, dir.path(), ProtocolPath::Azdo)
+            .await
+            .unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let provider = FakeStatusProvider {
             response: serde_json::json!({"requestId": 41, "result": "succeeded"}),
@@ -667,7 +676,9 @@ mod tests {
             "steps": [{"run": "echo next", "shell": "bash"}],
             "fileTable": {"workDirectory": dir.path().join("next").to_str().unwrap()}
         });
-        let mut next = spawn_job(next, dir.path(), ProtocolPath::Azdo).await.unwrap();
+        let mut next = spawn_job(next, dir.path(), ProtocolPath::Azdo)
+            .await
+            .unwrap();
         assert!(next.wait().await.unwrap());
     }
 
@@ -680,7 +691,9 @@ mod tests {
             "steps": [{"run": "sleep 60", "shell": "bash"}],
             "fileTable": {"workDirectory": dir.path().join("work").to_str().unwrap()}
         });
-        let mut previous = spawn_job(payload, dir.path(), ProtocolPath::Azdo).await.unwrap();
+        let mut previous = spawn_job(payload, dir.path(), ProtocolPath::Azdo)
+            .await
+            .unwrap();
         let provider = FakeStatusProvider {
             response: serde_json::json!({"requestId": 42, "result": null}),
             calls: Arc::new(AtomicUsize::new(0)),
@@ -701,7 +714,9 @@ mod tests {
             "steps": [{"run": "echo normal", "shell": "bash"}],
             "fileTable": {"workDirectory": dir.path().join("work").to_str().unwrap()}
         });
-        let mut previous = spawn_job(payload, dir.path(), ProtocolPath::Azdo).await.unwrap();
+        let mut previous = spawn_job(payload, dir.path(), ProtocolPath::Azdo)
+            .await
+            .unwrap();
         assert!(previous.wait().await.unwrap());
         let calls = Arc::new(AtomicUsize::new(0));
         let provider = FakeStatusProvider {

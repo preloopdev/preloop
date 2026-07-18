@@ -8,7 +8,6 @@
 //! Timeline and log endpoints (`_apis/v1/plans/…`) also require the header.
 
 use anyhow::{Context, Result};
-use futures::future::BoxFuture;
 use std::time::Duration;
 
 use super::http::HttpClient;
@@ -116,32 +115,6 @@ impl AzdoClient {
             .context("patching agent request")
     }
 
-    /// Query an agent request's current lease and terminal result.
-    ///
-    /// The compatibility service exposes this resource at
-    /// `/_apis/v1/AgentRequest/{pool}/{request}` for the official
-    /// `JobDispatcher.EnsureDispatchFinished` overlap probe.
-    pub async fn get_agent_request(
-        &self,
-        token: &str,
-        request_id: i64,
-    ) -> Result<serde_json::Value> {
-        let url = self.agent_request_status_url(request_id);
-        self.http
-            .get_json_with_auth(&url, &format!("Bearer {token}"))
-            .await
-            .context("getting agent request")
-    }
-
-    fn agent_request_status_url(&self, request_id: i64) -> String {
-        format!(
-            "{}/_apis/v1/AgentRequest/{}/{}",
-            self.base_url.trim_end_matches('/'),
-            self.pool_id,
-            request_id,
-        )
-    }
-
     /// PATCH timeline records.
     pub async fn update_timeline(
         &self,
@@ -233,35 +206,5 @@ impl AzdoClient {
             .await
             .context("finishing job")?;
         Ok(())
-    }
-}
-
-impl crate::listener::job_dispatcher::AgentRequestStatusProvider for AzdoClient {
-    fn get_agent_request<'a>(
-        &'a self,
-        token: &'a str,
-        _pool_id: i64,
-        request_id: i64,
-    ) -> BoxFuture<'a, Result<serde_json::Value>> {
-        Box::pin(async move { self.get_agent_request(token, request_id).await })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn agent_request_status_wire_shape_is_stable() {
-        let http = HttpClient::new(None).unwrap();
-        let client = AzdoClient::new(
-            http,
-            "https://pipelines.example.test/runner/server/".to_string(),
-            7,
-        );
-        assert_eq!(
-            client.agent_request_status_url(42),
-            "https://pipelines.example.test/runner/server/_apis/v1/AgentRequest/7/42"
-        );
     }
 }

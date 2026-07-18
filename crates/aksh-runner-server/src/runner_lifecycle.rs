@@ -77,6 +77,8 @@ pub(crate) async fn create_session(
     })))
 }
 
+use aksh_gha_protocol::crypto::RsaOaepHash;
+
 pub(crate) async fn create_session_disttask(
     State(shared): State<Arc<SharedState>>,
     Path(_pool_id): Path<i64>,
@@ -87,14 +89,15 @@ pub(crate) async fn create_session_disttask(
     // use the runner's from_rsaparams may not reconstruct the keypair correctly.
     let session_id = uuid::Uuid::new_v4();
     let session_enc = SessionEncryption::generate();
-    let key_b64 = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        session_enc.key.clone(),
-    );
 
     let runner_id = body
         .pointer("/agent/id")
         .and_then(serde_json::Value::as_i64);
+
+    let use_fips_encryption = body
+        .get("useFipsEncryption")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
 
     let runner_public_key = {
         let inner = shared.state.inner.lock().await;
