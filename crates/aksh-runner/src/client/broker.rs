@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use std::time::Duration;
 
-use super::http::HttpClient;
+use super::http::{HttpClient, HttpError};
 
 /// Client for the broker endpoints (GitHub-current path).
 pub struct BrokerClient {
@@ -99,6 +99,48 @@ impl BrokerClient {
             .await
             .context("acknowledging broker message")?;
         Ok(())
+    }
+}
+
+/// Detect the official runner-version deprecation response.
+///
+/// Runner.Listener receives this as `AccessDeniedException` with
+/// `errorCode: 1` from the message endpoint. Keep the check narrow so normal
+/// authorization failures continue through the retry/reconnect path.
+pub fn is_runner_version_deprecated(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let Some(HttpError::Status { status, body }) = cause.downcast_ref::<HttpError>() else {
+            return false;
+        };
+        *status == reqwest::StatusCode::FORBIDDEN
+            && serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .and_then(|value| value.get("errorCode").and_then(serde_json::Value::as_i64))
+                == Some(1)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_access_denied_error_code_one() {
+        let error = anyhow::Error::new(HttpError::Status {
+            status: reqwest::StatusCode::FORBIDDEN,
+            body: r#"{"typeKey":"AccessDeniedException","errorCode":1}"#.to_owned(),
+        })
+        .context("polling broker message");
+        assert!(is_runner_version_deprecated(&error));
+    }
+
+    #[test]
+    fn does_not_classify_other_forbidden_responses() {
+        let error = anyhow::Error::new(HttpError::Status {
+            status: reqwest::StatusCode::FORBIDDEN,
+            body: r#"{"typeKey":"AccessDeniedException","errorCode":0}"#.to_owned(),
+        });
+        assert!(!is_runner_version_deprecated(&error));
     }
 }
 
