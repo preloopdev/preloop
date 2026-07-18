@@ -19,9 +19,22 @@ use rsa::pkcs8::{DecodePublicKey, EncodePrivateKey, EncodePublicKey};
 use rsa::traits::PublicKeyParts;
 use rsa::{BigUint, Oaep};
 use sha1::Sha1;
+use sha2::Sha256;
 
 type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
 type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
+
+/// RSA-OAEP hash used to wrap a session's AES key.
+///
+/// The official runner uses OAEP-SHA1 by default and OAEP-SHA256 when the
+/// session response's `UseFipsEncryption` flag is true.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RsaOaepHash {
+    /// Official default wire algorithm.
+    Sha1,
+    /// FIPS session-key wrapping algorithm.
+    Sha256,
+}
 
 /// An RSA keypair used for session key wrapping.
 ///
@@ -223,8 +236,21 @@ impl AgentRsaKeypair {
     /// The runner decrypts this with its copy of the private key.
     /// Returns the wrapped key bytes.
     pub fn wrap_key(&self, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        self.wrap_key_with_hash(plaintext, RsaOaepHash::Sha1)
+    }
+
+    /// Wrap a symmetric key using the selected RSA-OAEP hash.
+    pub fn wrap_key_with_hash(
+        &self,
+        plaintext: &[u8],
+        hash: RsaOaepHash,
+    ) -> Result<Vec<u8>, CryptoError> {
+        let padding = match hash {
+            RsaOaepHash::Sha1 => Oaep::new::<Sha1>(),
+            RsaOaepHash::Sha256 => Oaep::new::<Sha256>(),
+        };
         self.public_key
-            .encrypt(&mut rand::thread_rng(), Oaep::new::<Sha1>(), plaintext)
+            .encrypt(&mut rand::thread_rng(), padding, plaintext)
             .map_err(|e| CryptoError::Wrap(e.to_string()))
     }
 
@@ -564,6 +590,30 @@ mod tests {
         let wrapped = kp.wrap_key(&symmetric_key).unwrap();
         let unwrapped = kp.unwrap_key(&wrapped).unwrap();
         assert_eq!(symmetric_key, unwrapped);
+    }
+
+    #[test]
+    fn rsa_sha256_wrap_unwrap_roundtrip() {
+        let kp = AgentRsaKeypair::generate().unwrap();
+        let symmetric_key = vec![42u8; 32];
+        let wrapped = kp
+            .wrap_key_with_hash(&symmetric_key, RsaOaepHash::Sha256)
+            .unwrap();
+        let unwrapped = kp
+            .unwrap_key_with_hash(&wrapped, RsaOaepHash::Sha256)
+            .unwrap();
+        assert_eq!(symmetric_key, unwrapped);
+    }
+
+    #[test]
+    fn rsa_wrong_oaep_hash_fails() {
+        let kp = AgentRsaKeypair::generate().unwrap();
+        let wrapped = kp
+            .wrap_key_with_hash(b"fips session key", RsaOaepHash::Sha256)
+            .unwrap();
+        assert!(kp
+            .unwrap_key_with_hash(&wrapped, RsaOaepHash::Sha1)
+            .is_err());
     }
 
     #[test]
