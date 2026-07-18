@@ -7,8 +7,10 @@
 //! so JobCancellation can arrive mid-job and be forwarded to the worker.
 
 use anyhow::{Context, Result};
+use futures::future::BoxFuture;
 use std::path::Path;
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Child;
 use tracing::{error, info, warn};
@@ -38,12 +40,87 @@ pub struct RunningJob {
     stdin: Option<tokio::process::ChildStdin>,
     /// The job/request ID for matching cancellation messages.
     pub request_id: String,
+    /// Numeric distributed-task request ID used by EnsureDispatchFinished.
+    pub agent_request_id: Option<i64>,
     /// Agent job GUID from the job message body (`jobId`), for JobCancellation matching.
     pub job_id: Option<uuid::Uuid>,
     /// Hard-kill deadline after cancel (official: timeout − 15s).
     pub kill_at: Option<tokio::time::Instant>,
     /// Whether graceful cancellation was already delivered to the worker.
     cancel_sent: bool,
+}
+
+/// Server-side job request status provider used to resolve a busy-runner overlap.
+///
+/// The official runner asks the distributed-task service whether the previous
+/// request has a terminal `result` before deciding whether to accept another
+/// job. Keeping this as a tiny async provider makes that decision deterministic
+/// in tests without coupling worker lifecycle code to HTTP.
+pub trait AgentRequestStatusProvider: Send + Sync {
+    fn get_agent_request<'a>(
+        &'a self,
+        token: &'a str,
+        pool_id: i64,
+        request_id: i64,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+}
+
+/// Apply the official EnsureDispatchFinished overlap decision to a worker.
+///
+/// A completed worker needs no server query. Otherwise a terminal server
+/// result identifies a zombie worker: cancel it and wait up to the official
+/// 45-second grace period. A null/missing result is an active overlap and is a
+/// fatal protocol error; the caller must stop rather than silently dropping the
+/// new job. Status-query failures cancel and drain the worker before returning
+/// the original error, matching the official cleanup guarantee.
+pub async fn ensure_dispatch_finished<P: AgentRequestStatusProvider>(
+    job: &mut RunningJob,
+    token: &str,
+    pool_id: i64,
+    provider: &P,
+) -> Result<()> {
+    if job.try_wait()?.is_some() {
+        return Ok(());
+    }
+
+    let request = match provider
+        .get_agent_request(token, pool_id, job.agent_request_id.ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot query status for job request {} without a numeric request ID",
+                job.request_id
+            )
+        })?)
+        .await
+    {
+        Ok(request) => request,
+        Err(error) => {
+            job.cancel(60).await;
+            let _ = job.wait().await;
+            return Err(error).context("querying previous agent request status");
+        }
+    };
+
+    let terminal = request
+        .get("result")
+        .is_some_and(|result| !result.is_null());
+    if !terminal {
+        anyhow::bail!(
+            "server sent a new job request while previous job request {} hasn't finished",
+            job.request_id
+        );
+    }
+
+    job.cancel(60).await;
+    match tokio::time::timeout(Duration::from_secs(45), job.wait()).await {
+        Ok(result) => {
+            result?;
+            Ok(())
+        }
+        Err(_) => anyhow::bail!(
+            "job dispatch process for {} was not cancelled within 45 seconds",
+            job.request_id
+        ),
+    }
 }
 
 impl RunningJob {
@@ -103,6 +180,9 @@ pub async fn spawn_job(
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
+    let agent_request_id = job_message
+        .get("requestId")
+        .and_then(|value| value.as_i64());
     let job_id = job_message
         .get("jobId")
         .and_then(|v| v.as_str())
@@ -197,6 +277,7 @@ pub async fn spawn_job(
         child,
         stdin,
         request_id,
+        agent_request_id,
         job_id,
         kill_at: None,
         cancel_sent: false,
@@ -374,8 +455,27 @@ pub async fn dispatch_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::future::BoxFuture;
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
     use std::time::Instant;
     use tempfile::TempDir;
+
+    struct FakeStatusProvider {
+        response: serde_json::Value,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl AgentRequestStatusProvider for FakeStatusProvider {
+        fn get_agent_request<'a>(
+            &'a self,
+            _token: &'a str,
+            _pool_id: i64,
+            _request_id: i64,
+        ) -> BoxFuture<'a, Result<serde_json::Value>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::ready(Ok(self.response.clone())))
+        }
+    }
 
     #[tokio::test]
     async fn test_worker_dispatch_run_new_job() {
@@ -540,5 +640,77 @@ mod tests {
             .unwrap();
         assert_eq!(running.request_id, "fallback-id");
         running.kill().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_zombie_is_cancelled_before_next_dispatch() {
+        let dir = TempDir::new().unwrap();
+        let payload = serde_json::json!({
+            "jobId": "zombie-job",
+            "requestId": 41,
+            "steps": [{"run": "sleep 60", "shell": "bash"}],
+            "fileTable": {"workDirectory": dir.path().join("work").to_str().unwrap()}
+        });
+        let mut previous = spawn_job(payload, dir.path(), ProtocolPath::Azdo).await.unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = FakeStatusProvider {
+            response: serde_json::json!({"requestId": 41, "result": "succeeded"}),
+            calls: calls.clone(),
+        };
+        ensure_dispatch_finished(&mut previous, "token", 1, &provider)
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let next = serde_json::json!({
+            "jobId": "next-job",
+            "steps": [{"run": "echo next", "shell": "bash"}],
+            "fileTable": {"workDirectory": dir.path().join("next").to_str().unwrap()}
+        });
+        let mut next = spawn_job(next, dir.path(), ProtocolPath::Azdo).await.unwrap();
+        assert!(next.wait().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn active_overlap_is_fatal_and_does_not_drop_job_silently() {
+        let dir = TempDir::new().unwrap();
+        let payload = serde_json::json!({
+            "jobId": "active-job",
+            "requestId": 42,
+            "steps": [{"run": "sleep 60", "shell": "bash"}],
+            "fileTable": {"workDirectory": dir.path().join("work").to_str().unwrap()}
+        });
+        let mut previous = spawn_job(payload, dir.path(), ProtocolPath::Azdo).await.unwrap();
+        let provider = FakeStatusProvider {
+            response: serde_json::json!({"requestId": 42, "result": null}),
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let error = ensure_dispatch_finished(&mut previous, "token", 1, &provider)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("hasn't finished"));
+        previous.kill().await;
+    }
+
+    #[tokio::test]
+    async fn completed_worker_dispatches_normally_without_status_probe() {
+        let dir = TempDir::new().unwrap();
+        let payload = serde_json::json!({
+            "jobId": "normal-job",
+            "requestId": 43,
+            "steps": [{"run": "echo normal", "shell": "bash"}],
+            "fileTable": {"workDirectory": dir.path().join("work").to_str().unwrap()}
+        });
+        let mut previous = spawn_job(payload, dir.path(), ProtocolPath::Azdo).await.unwrap();
+        assert!(previous.wait().await.unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = FakeStatusProvider {
+            response: serde_json::json!({"result": null}),
+            calls: calls.clone(),
+        };
+        ensure_dispatch_finished(&mut previous, "token", 1, &provider)
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }
