@@ -31,6 +31,7 @@ pub(crate) struct LogMetadata {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct RunRecord {
     pub(crate) run_id: RunId,
+    pub(crate) run_name: Option<String>,
     pub(crate) submission: WorkflowSubmission,
     pub(crate) jobs: BTreeMap<JobId, ExecutionStatus>,
     pub(crate) status: ExecutionStatus,
