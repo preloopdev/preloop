@@ -43,7 +43,8 @@ pub(crate) async fn oidc_token(
         .and_then(|value| value.strip_prefix("Bearer "))
         .ok_or_else(|| ApiError::unauthorized("OIDC bearer token required"))?;
     let expected_scope = format!("Actions.Results:{plan_id}:{job_id}");
-    if !shared.state.verify_local_jwt_scope(bearer, &expected_scope) {
+    let is_system_token = bearer == shared.state.system_token;
+    if !is_system_token && !shared.state.verify_local_jwt_scope(bearer, &expected_scope) {
         return Err(ApiError::forbidden(
             "OIDC runtime token is not bound to this job",
         ));
