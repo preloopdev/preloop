@@ -115,6 +115,10 @@ pub(crate) fn annotation_to_json(ann: &Annotation, step_number: u32) -> serde_js
         "endLine": end_line,
     });
 
+    if let Some(file) = &ann.file {
+        obj["file"] = serde_json::json!(file);
+    }
+
     if let Some(title) = &ann.title {
         obj["title"] = serde_json::json!(title);
     }
@@ -126,6 +130,46 @@ pub(crate) fn annotation_to_json(ann: &Annotation, step_number: u32) -> serde_js
     }
 
     obj
+}
+
+/// Convert a job annotation to an AzDO timeline issue payload.
+fn annotation_to_timeline_issue(annotation: &Annotation) -> serde_json::Value {
+    use super::execution_context::AnnotationLevel;
+    let issue_type = match annotation.level {
+        AnnotationLevel::Notice => "info",
+        AnnotationLevel::Warning => "warning",
+        AnnotationLevel::Error => "error",
+    };
+    let mut data = serde_json::Map::new();
+    if let Some(file) = &annotation.file {
+        data.insert("file".to_owned(), serde_json::json!(file));
+    }
+    if let Some(line) = annotation.line {
+        data.insert("line".to_owned(), serde_json::json!(line.to_string()));
+    }
+    if let Some(end_line) = annotation.end_line {
+        data.insert(
+            "endLine".to_owned(),
+            serde_json::json!(end_line.to_string()),
+        );
+    }
+    if let Some(col) = annotation.col {
+        data.insert("col".to_owned(), serde_json::json!(col.to_string()));
+    }
+    if let Some(end_column) = annotation.end_column {
+        data.insert(
+            "endColumn".to_owned(),
+            serde_json::json!(end_column.to_string()),
+        );
+    }
+    if let Some(title) = &annotation.title {
+        data.insert("title".to_owned(), serde_json::json!(title));
+    }
+    serde_json::json!({
+        "type": issue_type,
+        "message": annotation.message,
+        "data": data,
+    })
 }
 
 pub(crate) fn completejob_type_and_action(step: &Step) -> (&'static str, String) {
@@ -318,6 +362,11 @@ pub(crate) async fn report_completion(
                         "cancelled" | "canceled" => "canceled",
                         _ => "failed",
                     };
+                    let issues: Vec<serde_json::Value> = job_ctx
+                        .job_annotations
+                        .iter()
+                        .map(annotation_to_timeline_issue)
+                        .collect();
                     let job_record = serde_json::json!({
                         "count": 1,
                         "value": [{
@@ -327,6 +376,7 @@ pub(crate) async fn report_completion(
                             "result": azdo_result_str,
                             "finishTime": iso_now(),
                             "percentComplete": 100_u32,
+                            "issues": issues,
                         }]
                     });
                     match azdo
@@ -429,5 +479,44 @@ pub(crate) fn make_hook_step(
         env: std::collections::HashMap::new(),
         raw: serde_json::json!({}),
         is_background: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worker::execution_context::AnnotationLevel;
+
+    #[test]
+    fn annotation_serialization_preserves_job_fields() {
+        let annotation = Annotation {
+            level: AnnotationLevel::Error,
+            message: "failed".into(),
+            title: Some("Build".into()),
+            file: Some("src/main.rs".into()),
+            line: Some(11),
+            end_line: Some(12),
+            col: Some(2),
+            end_column: Some(8),
+        };
+
+        let json = annotation_to_json(&annotation, 0);
+        assert_eq!(json["level"], "failure");
+        assert_eq!(json["file"], "src/main.rs");
+        assert_eq!(json["startLine"], 11);
+        assert_eq!(json["endLine"], 12);
+        assert_eq!(json["startColumn"], 2);
+        assert_eq!(json["endColumn"], 8);
+        assert_eq!(json["title"], "Build");
+        assert_eq!(json["stepNumber"], 0);
+
+        let timeline = annotation_to_timeline_issue(&annotation);
+        assert_eq!(timeline["type"], "error");
+        assert_eq!(timeline["data"]["file"], "src/main.rs");
+        assert_eq!(timeline["data"]["line"], "11");
+        assert_eq!(timeline["data"]["endLine"], "12");
+        assert_eq!(timeline["data"]["col"], "2");
+        assert_eq!(timeline["data"]["endColumn"], "8");
+        assert_eq!(timeline["data"]["title"], "Build");
     }
 }
