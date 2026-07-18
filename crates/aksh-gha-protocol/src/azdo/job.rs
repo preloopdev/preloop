@@ -243,7 +243,14 @@ impl Serialize for TaskStep {
         map.serialize_entry("type", "action")?;
         map.serialize_entry("reference", &SerializedActionReference { step: self })?;
         if !self.env.is_empty() {
-            map.serialize_entry("environment", &TemplateStringMap(&self.env))?;
+            let mut env_val = serde_json::to_value(TemplateStringMap(&self.env))
+                .unwrap_or(serde_json::json!({"type": 2}));
+            if let Some(obj) = env_val.as_object_mut() {
+                obj.insert("col".to_owned(), serde_json::json!(0));
+                obj.insert("file".to_owned(), serde_json::json!(1));
+                obj.insert("line".to_owned(), serde_json::json!(0));
+            }
+            map.serialize_entry("environment", &env_val)?;
         }
         map.serialize_entry("inputs", &TemplateStringMap(&inputs))?;
         map.serialize_entry("id", &self.id)?;
@@ -427,12 +434,8 @@ impl Serialize for TemplateStringMap<'_> {
     {
         use serde::ser::SerializeMap;
 
-        let field_count = if self.0.is_empty() { 4 } else { 5 };
-        let mut map = serializer.serialize_map(Some(field_count))?;
+        let mut map = serializer.serialize_map(Some(if self.0.is_empty() { 1 } else { 2 }))?;
         map.serialize_entry("type", &2)?;
-        map.serialize_entry("col", &0)?;
-        map.serialize_entry("file", &1)?;
-        map.serialize_entry("line", &0)?;
         if !self.0.is_empty() {
             let pairs: Vec<TemplateStringMapPair<'_>> = self
                 .0
@@ -463,7 +466,7 @@ impl Serialize for TemplateStringMapPair<'_> {
             token.insert("col".to_owned(), serde_json::json!(0));
         }
         let mut map = serializer.serialize_map(Some(2))?;
-        map.serialize_entry("Key", &serde_json::json!({"type": 0, "lit": self.key, "file": 1, "line": 0, "col": 0}))?;
+        map.serialize_entry("Key", &serde_json::json!({"type": 0, "lit": self.key}))?;
         map.serialize_entry("Value", &value)?;
         map.end()
     }
@@ -471,7 +474,7 @@ impl Serialize for TemplateStringMapPair<'_> {
 
 pub(crate) fn template_string_token(value: &str) -> serde_json::Value {
     let Some(first) = value.find("${{") else {
-        return serde_json::json!({"type": 0, "lit": value, "col": 0, "file": 1, "line": 0});
+        return serde_json::json!({"type": 0, "lit": value});
     };
     let mut literal = String::new();
     let mut expressions = Vec::new();
@@ -483,20 +486,19 @@ pub(crate) fn template_string_token(value: &str) -> serde_json::Value {
         };
         literal.push_str(&rest[..start]);
         let after = &rest[start + 3..];
-        // Find the closing }} that isn't inside a string literal.
         let Some(end) = find_expression_end(after) else {
-            return serde_json::json!({"type": 0, "lit": value, "col": 0, "file": 1, "line": 0});
+            return serde_json::json!({"type": 0, "lit": value});
         };
         expressions.push(after[..end].trim().to_owned());
         literal.push_str(&format!("{{{}}}", expressions.len() - 1));
         rest = &after[end + 2..];
     }
     if first == 0 && literal == "{0}" && expressions.len() == 1 {
-        return serde_json::json!({"type": 3, "expr": expressions[0], "col": 0, "file": 1, "line": 0});
+        return serde_json::json!({"type": 3, "expr": expressions[0]});
     }
     let escaped = literal.replace('\'', "''");
     let expr = format!("format('{}', {})", escaped, expressions.join(", "));
-    serde_json::json!({"type": 3, "expr": expr, "col": 0, "file": 1, "line": 0})
+    serde_json::json!({"type": 3, "expr": expr})
 }
 
 /// Find the position of `}}` that closes a `${{ ... }}` expression,
