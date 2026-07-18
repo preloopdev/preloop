@@ -51,6 +51,7 @@ pub async fn run_broker_loop(
     once: bool,
     runner_root: &std::path::Path,
 ) -> Result<()> {
+    let mut config = config.clone();
     // P1.1: Derive broker URL from settings.server_url_v2 (extracted from agent
     // response properties.ServerUrlV2 at configure time). This is
     // "https://broker.actions.githubusercontent.com/" for github.com, and the
@@ -87,7 +88,7 @@ pub async fn run_broker_loop(
         if let Some(exp) = token_expires_at {
             if std::time::Instant::now() >= exp {
                 info!("OAuth token expiring soon, proactively refreshing...");
-                match crate::listener::oauth::get_oauth_token(http, config).await {
+                match crate::listener::oauth::get_oauth_token(http, &config).await {
                     Ok((t, ea)) => {
                         token = t;
                         token_expires_at = ea;
@@ -158,7 +159,7 @@ pub async fn run_broker_loop(
                 Ok(session_resp) => {
                     if let Some(sid) = session_resp.get("sessionId").and_then(|v| v.as_str()) {
                         session_id = sid.to_string();
-                        session_key = extract_session_key_if_present(&session_resp, config);
+                        session_key = extract_session_key_if_present(&session_resp, &config);
                         info!("Broker session created: {session_id}");
                         need_session = false;
                         consecutive_errors = 0;
@@ -176,7 +177,7 @@ pub async fn run_broker_loop(
                 Err(e) => {
                     if is_unauthorized(&e) {
                         info!("OAuth token expired during session creation. Re-acquiring token...");
-                        match crate::listener::oauth::get_oauth_token(http, config).await {
+                        match crate::listener::oauth::get_oauth_token(http, &config).await {
                             Ok((new_token, new_expires)) => {
                                 token = new_token;
                                 token_expires_at = new_expires;
@@ -327,7 +328,7 @@ pub async fn run_broker_loop(
                                         return Ok(());
                                     }
                                 }
-                                match crate::listener::oauth::get_oauth_token(http, config).await {
+                                match crate::listener::oauth::get_oauth_token(http, &config).await {
                                     Ok((new_token, new_expires)) => { token = new_token; token_expires_at = new_expires; }
                                     Err(e) => warn!("OAuth token renewal before job failed: {e:#}"),
                                 }
@@ -422,7 +423,7 @@ pub async fn run_broker_loop(
                             }
                             BrokerMessageKind::ForceTokenRefresh => {
                                 info!("Received ForceTokenRefresh; refreshing listener token");
-                                match crate::listener::oauth::get_oauth_token(http, config).await {
+                                match crate::listener::oauth::get_oauth_token(http, &config).await {
                                     Ok((new_token, new_expires)) => {
                                         token = new_token;
                                         token_expires_at = new_expires;
@@ -443,7 +444,48 @@ pub async fn run_broker_loop(
                                 info!("Self-update requested (RunnerRefresh); aksh-runner does not self-update");
                             }
                             BrokerMessageKind::RunnerRefreshConfig => {
-                                info!("Runner configuration refresh requested; dynamic config updates are not supported");
+                                let old_broker_url = config
+                                    .settings
+                                    .server_url_v2
+                                    .clone()
+                                    .unwrap_or_else(|| config.settings.server_url.clone())
+                                    .trim_end_matches('/')
+                                    .to_string();
+                                match apply_runner_refresh_config(
+                                    http,
+                                    &mut config,
+                                    runner_root,
+                                    &body,
+                                    &token,
+                                )
+                                .await
+                                {
+                                    Ok(true) => {
+                                        info!("Runner configuration refresh applied");
+                                        let new_broker_url = config
+                                            .settings
+                                            .server_url_v2
+                                            .clone()
+                                            .unwrap_or_else(|| config.settings.server_url.clone())
+                                            .trim_end_matches('/')
+                                            .to_string();
+                                        if new_broker_url != old_broker_url {
+                                            if !session_id.is_empty() {
+                                                let _ = client.delete_session(&token, &session_id).await;
+                                                session_id.clear();
+                                            }
+                                            session_key = None;
+                                            need_session = true;
+                                            client = BrokerClient::new(http.clone(), new_broker_url);
+                                        }
+                                    }
+                                    Ok(false) => {
+                                        info!("Runner configuration refresh acknowledged without supported changes");
+                                    }
+                                    Err(error) => {
+                                        warn!("Runner configuration refresh failed (non-fatal): {error:#}");
+                                    }
+                                }
                             }
                             BrokerMessageKind::BrokerMigration => {
                                 info!("Broker migration requested — re-resolving broker URL...");
@@ -469,7 +511,7 @@ pub async fn run_broker_loop(
                     Err(e) => {
                         if is_unauthorized(&e) {
                             info!("OAuth token expired during message poll. Re-acquiring token...");
-                            match crate::listener::oauth::get_oauth_token(http, config).await {
+                            match crate::listener::oauth::get_oauth_token(http, &config).await {
                                 Ok((new_token, new_expires)) => {
                                     token = new_token;
                                     token_expires_at = new_expires;
@@ -599,6 +641,82 @@ fn parse_message_body(
 ///   `runner_request_id`, `run_service_url`, `billing_owner_id`, `should_acknowledge`
 /// Golden flow 15: POST /{id}/acquirejob returns the full camelCase job payload.
 async fn acquire_job_from_ref(
+/// Apply the official RunnerRefreshConfig protocol. The message identifies a
+/// config refresh operation; the refreshed runner settings are returned by the
+/// service as a base64-encoded `.runner` JSON document.
+async fn apply_runner_refresh_config(
+    http: &HttpClient,
+    config: &mut RunnerConfig,
+    runner_root: &std::path::Path,
+    body: &serde_json::Value,
+    token: &str,
+) -> Result<bool> {
+    // Local servers may include the settings object directly. Try this first,
+    // while still enforcing the immutable runner identity in settings.rs.
+    if config.apply_runner_settings_refresh(body, runner_root)? {
+        return Ok(true);
+    }
+
+    let Some(object) = body.as_object() else {
+        return Ok(false);
+    };
+    let config_type = object
+        .get("configType")
+        .or_else(|| object.get("config_type"))
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    if !config_type.eq_ignore_ascii_case("runner") {
+        // Credentials and future config types are acknowledged but deliberately
+        // left untouched; this runner cannot safely rotate its auth files here.
+        return Ok(false);
+    }
+
+    if let Some(qualified_id) = object
+        .get("runnerQualifiedId")
+        .or_else(|| object.get("runner_qualified_id"))
+        .and_then(|value| value.as_str())
+    {
+        let parts: Vec<_> = qualified_id
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect();
+        if parts.len() != 4 || parts[3] != config.settings.agent_id.to_string() {
+            return Ok(false);
+        }
+    }
+
+    let service_type = object
+        .get("serviceType")
+        .or_else(|| object.get("service_type"))
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    if !service_type.eq_ignore_ascii_case("pipelines") {
+        return Ok(false);
+    }
+    let refresh_url = object
+        .get("configRefreshURL")
+        .or_else(|| object.get("configRefreshUrl"))
+        .or_else(|| object.get("config_refresh_url"))
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty());
+    let Some(refresh_url) = refresh_url else {
+        return Ok(false);
+    };
+
+    let runner_file = runner_root.join(".runner");
+    let current = std::fs::read(&runner_file)
+        .with_context(|| format!("reading {} for refresh", runner_file.display()))?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(current);
+    let refreshed: serde_json::Value = http
+        .post_json_bearer(refresh_url, &serde_json::json!(encoded), token)
+        .await
+        .context("refreshing runner settings")?;
+    if refreshed.is_null() || refreshed.as_str().is_some_and(str::is_empty) {
+        return Ok(false);
+    }
+    config.apply_runner_settings_refresh(&refreshed, runner_root)
+}
+
     job_ref: &serde_json::Value,
     http: &HttpClient,
     token: &str,
