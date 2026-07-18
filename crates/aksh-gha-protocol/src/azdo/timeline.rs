@@ -25,6 +25,8 @@ pub struct TimelineReference {
 pub struct TimelineRecord {
     #[serde(rename = "id")]
     pub id: uuid::Uuid,
+    #[serde(rename = "changeId", skip_serializing_if = "Option::is_none")]
+    pub change_id: Option<i32>,
     /// Parent record ID (job → step relationship).
     #[serde(rename = "parentId", skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<uuid::Uuid>,
