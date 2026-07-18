@@ -157,6 +157,26 @@ jobs:
 }
 
 #[test]
+fn parses_object_runs_on_group_and_labels() {
+    let workflow = parse_workflow(
+        r#"
+on: push
+jobs:
+  deploy:
+    runs-on:
+      group: release-runners
+      labels: [self-hosted, linux]
+    steps:
+      - run: echo deploy
+"#,
+    )
+    .unwrap();
+    let jobs = expand_jobs(&workflow).unwrap();
+    assert_eq!(jobs[0].runner_group.as_deref(), Some("release-runners"));
+    assert_eq!(jobs[0].runs_on, vec!["self-hosted", "linux"]);
+}
+
+#[test]
 fn parses_local_action_metadata() {
     let action = parse_action_metadata(
         r#"
