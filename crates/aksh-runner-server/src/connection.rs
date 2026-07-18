@@ -100,7 +100,6 @@ pub(crate) async fn connection_data(
     axum::response::Json(body).into_response()
 }
 
-
 const SVC_OWNER: &str = "0000005a-0000-8888-8000-000000000000";
 
 fn area_svc(

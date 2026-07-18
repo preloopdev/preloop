@@ -102,7 +102,6 @@ pub(crate) async fn runner_settings() -> Json<azdo::RunnerServerSettings> {
     Json(azdo::RunnerServerSettings::default())
 }
 
-
 pub(crate) fn broker_job_ref(
     request: &TaskAgentJobRequestRecord,
     runner_id: i64,
@@ -578,7 +577,7 @@ pub(crate) async fn broker_acquire_job(
     Path(runner_id): Path<i64>,
     headers: HeaderMap,
     Json(request): Json<BrokerAcquireJobRequest>,
-)-> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     authenticated_runner_id(&shared, &headers, Some(runner_id))?;
     let inner = shared.state.inner.lock().await;
     let request_id = inner
@@ -774,7 +773,10 @@ mod tests {
         let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
         let app = crate::app(state, CancellationToken::new());
 
-        for path in ["/_apis/v1/settings/runner", "/acme/_apis/v1/settings/runner"] {
+        for path in [
+            "/_apis/v1/settings/runner",
+            "/acme/_apis/v1/settings/runner",
+        ] {
             let response = app
                 .clone()
                 .oneshot(
@@ -787,10 +789,9 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK, "path={path}");
-            let wire: serde_json::Value = serde_json::from_slice(
-                &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
-            )
-            .unwrap();
+            let wire: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
             assert_eq!(wire["isHostedServer"], false, "path={path}");
             assert!(wire.get("agentDownloadUrls").is_none(), "path={path}");
         }
@@ -814,10 +815,9 @@ mod tests {
         shared.state.runner_version_deprecated = true;
         let response = runner_version_deprecated_response(&shared, &params).unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        let wire: serde_json::Value = serde_json::from_slice(
-            &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
-        )
-        .unwrap();
+        let wire: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
         assert_eq!(wire["typeKey"], "AccessDeniedException");
         assert_eq!(wire["errorCode"], 1);
         assert_eq!(
@@ -825,5 +825,4 @@ mod tests {
             "Runner version 2.330.1 is deprecated and cannot receive messages."
         );
     }
-
 }

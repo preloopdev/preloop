@@ -168,7 +168,11 @@ fn is_false(b: &bool) -> bool {
 /// in `actions/runner` v2.335.1.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanReference {
-    #[serde(rename = "scopeIdentifier", default, skip_serializing_if = "String::is_empty")]
+    #[serde(
+        rename = "scopeIdentifier",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
     pub scope_identifier: String,
     #[serde(rename = "planId")]
     pub plan_id: String,
@@ -247,7 +251,10 @@ impl Serialize for TaskStep {
             map.serialize_entry("environment", &TemplateStringMap(&self.env, true))?;
         }
         if !inputs.is_empty() {
-            let inputs_with_loc = self.reference.as_ref().map_or(false, |r| r.reference_type.as_deref() != Some("script"));
+            let inputs_with_loc = self
+                .reference
+                .as_ref()
+                .map_or(false, |r| r.reference_type.as_deref() != Some("script"));
             map.serialize_entry("inputs", &TemplateStringMap(&inputs, inputs_with_loc))?;
         }
         map.serialize_entry("id", &self.id)?;
@@ -442,7 +449,11 @@ impl Serialize for TemplateStringMap<'_> {
 
         let with_loc = self.1;
         let extra = usize::from(with_loc) * 3;
-        let mut map = serializer.serialize_map(Some(if self.0.is_empty() { 1 + extra } else { 2 + extra }))?;
+        let mut map = serializer.serialize_map(Some(if self.0.is_empty() {
+            1 + extra
+        } else {
+            2 + extra
+        }))?;
         map.serialize_entry("type", &2)?;
         if with_loc {
             map.serialize_entry("col", &0)?;
@@ -453,7 +464,11 @@ impl Serialize for TemplateStringMap<'_> {
             let pairs: Vec<TemplateStringMapPair<'_>> = self
                 .0
                 .iter()
-                .map(|(key, value)| TemplateStringMapPair { key, value, with_loc })
+                .map(|(key, value)| TemplateStringMapPair {
+                    key,
+                    value,
+                    with_loc,
+                })
                 .collect();
             map.serialize_entry("map", &pairs)?;
         }

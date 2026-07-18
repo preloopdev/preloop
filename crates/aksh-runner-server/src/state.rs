@@ -210,7 +210,12 @@ impl AppState {
             .map(PathBuf::from);
         let runner_version_deprecated = std::env::var("AKSH_RUNNER_VERSION_DEPRECATED")
             .ok()
-            .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes"
+                )
+            })
             .unwrap_or(false);
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
@@ -384,7 +389,11 @@ impl InnerState {
             .broker_session_runners
             .get(session_id)
             .copied()
-            .or_else(|| self.sessions.get(session_id).map(|session| session.runner_id));
+            .or_else(|| {
+                self.sessions
+                    .get(session_id)
+                    .map(|session| session.runner_id)
+            });
         runner_id
             .and_then(|runner_id| self.runners.get(&runner_id))
             .map(|runner| RunnerCapabilities {
@@ -395,7 +404,6 @@ impl InnerState {
             })
             .unwrap_or_default()
     }
-
 }
 
 #[derive(Default)]
