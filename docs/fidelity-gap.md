@@ -293,7 +293,7 @@ Grouped by the role they play for the official runner:
 - `TimeLineWebConsoleLogController` — live console `feed` lines.
 - `FinishJobController` — `JobCompleted` event with **job outputs** + final result.
 
-  This is where `needs.<job>.outputs` originate.
+  This is where `needs.[job].outputs` originate.
 
 ### 2.3 Asset services
 
@@ -390,7 +390,7 @@ Findings from a source audit of aksh vs official runner v2.335.1 sources (local 
   carry both the caller's `concurrency:` on the `uses:` job and the callee's workflow-level
   `concurrency:` (`EmbeddedConcurrency`), both enforced.
 - ❌ **`JobCancellation` wire shape breaks cancellation for the unmodified official runner.**
-  aksh sends `{"runId": "...", "jobId": "<workflow job-id string>"}`
+  aksh sends `{"runId": "...", "jobId": "[workflow job-id string]"}`
   (`aksh-runner-server/src/lib.rs:2021-2024` broker path, `:3199-3202` AzDO path), where
   `jobId` is the `JobId(pub String)` workflow id. Official wire type is
   `JobCancelMessage { JobId: Guid, Timeout: TimeSpan }`
@@ -523,7 +523,7 @@ matching semantics.
 
 All three are traits; default impls cover local use.
 
-`**RunStore**` — run/job state persistence.
+**`RunStore`** — run/job state persistence.
 
 
 | Implementation              | Use case                                          |
@@ -532,7 +532,7 @@ All three are traits; default impls cover local use.
 | `sqlx` (SQLite or Postgres) | Server: durable, idempotent restart, multi-tenant |
 
 
-`**AuthProvider` / tenancy** — who can talk to aksh.
+**`AuthProvider` / tenancy** — who can talk to aksh.
 
 
 | Mode                              | Use case                                              |
@@ -541,7 +541,7 @@ All three are traits; default impls cover local use.
 | OAuth + mTLS + per-tenant scoping | Server: namespaced tenants, per-tenant queues/secrets |
 
 
-`**SecretStore**` — where secret values come from.
+**`SecretStore`** — where secret values come from.
 
 
 | Mode                         | Use case                                                   |
@@ -709,7 +709,7 @@ Steps:
    persist per-agent.
 2. `POST .../pools/{id}/sessions`: generate a random AES key, **RSA-OAEP wrap** it with the
 
-   runner's pubkey, return `TaskAgentSession { encryptionKey: { value: <wrapped>, ... } }`.
+   runner's pubkey, return `TaskAgentSession { encryptionKey: { value: [wrapped], ... } }`.
 3. Keep the AES key server-side keyed by `sessionId`.
 4. **Crypto isolation:** all RSA/AES lives in one reviewed module (`protocol::crypto`);
 
@@ -816,7 +816,7 @@ Steps:
    all `needs` complete; compute its `if` against real job-status functions
 
    (`success()/failure()/cancelled()/always()`), which now reflect dependency results.
-2. Thread `needs.<job>.outputs` + `needs.<job>.result` into the dependent job's `contextData`.
+2. Thread `needs.[job].outputs` + `needs.[job].result` into the dependent job's `contextData`.
 3. `fail-fast` / `max-parallel` honoring; skipped vs failed vs cancelled propagation per
 
    GitHub's `NeedsTaskResult` rules (see upstream `MessageController` enum).
@@ -889,7 +889,7 @@ Build `aksh-conformance` into a real differential tester:
 
 - `record` — drive upstream `runner.server` (+ optionally a runner) over each fixture,
 
-  capturing wire traffic and final state to `fixtures/wire/<case>/`.
+  capturing wire traffic and final state to `fixtures/wire/[case]/`.
 - `expand` — our parser/evaluator over each fixture → expanded jobs + `contextData`.
 - `compare` — assert our expansion/messages/timeline/cache/artifact responses match the
 
@@ -922,7 +922,7 @@ A run is faithful when, with the **unmodified official `actions/runner`**:
 4. Steps run; timeline records, logs, live console, and annotations stream back; secrets are
 
    masked (Phase E).
-5. `JobCompleted` delivers outputs; downstream `needs` jobs see `needs.<job>.outputs` and
+5. `JobCompleted` delivers outputs; downstream `needs` jobs see `needs.[job].outputs` and
 
    evaluate their `if` correctly (Phases E–F).
 6. `actions/checkout`/`cache`/`upload-artifact` work via action-download + cache/artifact
