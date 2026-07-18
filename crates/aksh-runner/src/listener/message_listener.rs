@@ -21,7 +21,7 @@ pub async fn run_message_loop(
     runner_root: &std::path::Path,
 ) -> Result<()> {
     let mut config = config.clone();
-    let mut client = AzdoClient::new(
+    let client = AzdoClient::new(
         http.clone(),
         config.settings.server_url.clone(),
         config.settings.pool_id,
@@ -33,7 +33,7 @@ pub async fn run_message_loop(
             "id": config.settings.agent_id,
             "name": config.settings.agent_name,
         },
-        "useFipsEncryption": false,
+        "useFipsEncryption": require_fips_cryptography(&config),
         // F030: opt in to full AzDO message format (PipelineAgentJobRequest) with
         // encryption. AKSH-specific field; ignored by real GHES/GitHub servers.
         "akshAzdo": true,
@@ -81,7 +81,12 @@ pub async fn run_message_loop(
     // Extract session key if present (optional — not all servers send one)
     let keypair =
         aksh_gha_protocol::crypto::AgentRsaKeypair::from_rsaparams(&config.rsa_params).ok();
-    let session_key = extract_session_key_optional(&session_resp, keypair.as_ref());
+    let use_fips_encryption = session_resp
+        .get("useFipsEncryption")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let session_key =
+        extract_session_key_optional(&session_resp, keypair.as_ref(), use_fips_encryption);
     if session_key.is_some() {
         debug!("Session encryption key present");
     } else {
@@ -114,7 +119,11 @@ pub async fn run_message_loop(
                             .and_then(|value| value.as_str())
                             .is_some_and(|value| value == "RunnerRefreshConfig")
                         {
-                            match parse_refresh_body(&msg, session_key.as_deref()) {
+                            match parse_refresh_body_with_fips(
+                                &msg,
+                                session_key.as_deref(),
+                                use_fips_encryption,
+                            ) {
                                 Ok(payload) => match config
                                     .apply_runner_settings_refresh(&payload, runner_root)
                                 {
@@ -132,7 +141,11 @@ pub async fn run_message_loop(
                             }
                         }
 
-                        let dispatch = process_message(&msg, session_key.as_deref());
+                        let dispatch = process_message_with_fips(
+                            &msg,
+                            session_key.as_deref(),
+                            use_fips_encryption,
+                        );
 
                         // Acknowledge
                         let _ = client.delete_message(token, &session_id, message_id).await;
@@ -210,9 +223,11 @@ pub async fn run_message_loop(
 
 fn status_of(err: &anyhow::Error) -> Option<reqwest::StatusCode> {
     err.chain().find_map(|cause| {
-        cause.downcast_ref::<crate::client::http::HttpError>().map(|e| match e {
-            crate::client::http::HttpError::Status { status, .. } => *status,
-        })
+        cause
+            .downcast_ref::<crate::client::http::HttpError>()
+            .map(|e| match e {
+                crate::client::http::HttpError::Status { status, .. } => *status,
+            })
     })
 }
 
@@ -222,7 +237,9 @@ fn is_session_conflict(err: &anyhow::Error) -> bool {
 
 fn is_transient_session_error(err: &anyhow::Error) -> bool {
     match status_of(err) {
-        Some(status) => status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error(),
+        Some(status) => {
+            status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+        }
         None => true,
     }
 }
@@ -231,6 +248,7 @@ fn is_transient_session_error(err: &anyhow::Error) -> bool {
 fn extract_session_key_optional(
     session: &serde_json::Value,
     keypair: Option<&aksh_gha_protocol::crypto::AgentRsaKeypair>,
+    use_fips_encryption: bool,
 ) -> Option<Vec<u8>> {
     let enc_key = session.get("encryptionKey")?;
     let value = enc_key.get("value").and_then(|v| v.as_str())?;
@@ -245,23 +263,38 @@ fn extract_session_key_optional(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     if encrypted {
-        keypair?.unwrap_key(&key_bytes).ok()
+        let hash = if use_fips_encryption {
+            aksh_gha_protocol::crypto::RsaOaepHash::Sha256
+        } else {
+            aksh_gha_protocol::crypto::RsaOaepHash::Sha1
+        };
+        keypair?.unwrap_key_with_hash(&key_bytes, hash).ok()
+    } else if use_fips_encryption {
+        None
     } else {
         Some(key_bytes)
     }
 }
 
 /// Parse and dispatch a message. Returns Some(job) for job messages, None for others.
+#[cfg(test)]
 fn process_message(
     msg: &serde_json::Value,
     session_key: Option<&[u8]>,
+) -> Result<Option<serde_json::Value>> {
+    process_message_with_fips(msg, session_key, false)
+}
+
+fn process_message_with_fips(
+    msg: &serde_json::Value,
+    session_key: Option<&[u8]>,
+    use_fips_encryption: bool,
 ) -> Result<Option<serde_json::Value>> {
     let message_type = msg
         .get("messageType")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
 
- /// Parse and dispatch a message. Returns Some(job) for job messages, None for others.
     let body_str = msg.get("body").and_then(|v| v.as_str()).unwrap_or("");
     let iv_str = msg.get("iv").and_then(|v| v.as_str());
 
@@ -279,6 +312,8 @@ fn process_message(
             } else {
                 body_str.to_string()
             }
+        } else if use_fips_encryption {
+            anyhow::bail!("FIPS session message is missing its decrypted AES key or IV")
         } else {
             body_str.to_string()
         }
@@ -312,12 +347,25 @@ fn process_message(
     }
 }
 
+/// Parse and dispatch a message. Returns Some(job) for job messages, None for others.
+#[cfg(test)]
 fn parse_refresh_body(
     msg: &serde_json::Value,
     session_key: Option<&[u8]>,
 ) -> Result<serde_json::Value> {
+    parse_refresh_body_with_fips(msg, session_key, false)
+}
+
+fn parse_refresh_body_with_fips(
+    msg: &serde_json::Value,
+    session_key: Option<&[u8]>,
+    use_fips_encryption: bool,
+) -> Result<serde_json::Value> {
     let body = msg.get("body").unwrap_or(&serde_json::Value::Null);
     if body.is_object() || body.is_array() {
+        if use_fips_encryption {
+            anyhow::bail!("FIPS refresh message must be encrypted")
+        }
         return Ok(body.clone());
     }
     let body_str = body.as_str().unwrap_or("");
@@ -334,10 +382,26 @@ fn parse_refresh_body(
         } else {
             body_str.to_owned()
         }
+    } else if use_fips_encryption {
+        anyhow::bail!("FIPS refresh message is missing its decrypted AES key or IV")
     } else {
         body_str.to_owned()
     };
     serde_json::from_str(&decrypted).context("parsing refresh config body")
+}
+
+/// Read `requireFipsCryptography` from the runner's `.credentials` data.
+///
+/// The official runner stores this as a string `"True"` / `"False"` in the
+/// credential data map, sourced from the agent response properties during
+/// configuration. We parse it with the same case-insensitive boolean logic.
+fn require_fips_cryptography(config: &RunnerConfig) -> bool {
+    config
+        .credentials
+        .data
+        .get("requireFipsCryptography")
+        .and_then(|v| v.as_str())
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"))
 }
 
 #[cfg(test)]
@@ -395,7 +459,10 @@ mod tests {
             "body": {"disableUpdate": true}
         });
         let body = parse_refresh_body(&msg, None).unwrap();
-        assert_eq!(body.get("disableUpdate").and_then(|value| value.as_bool()), Some(true));
+        assert_eq!(
+            body.get("disableUpdate").and_then(|value| value.as_bool()),
+            Some(true)
+        );
     }
 
     #[test]
@@ -427,7 +494,7 @@ mod tests {
     #[test]
     fn extract_session_key_optional_no_key() {
         let session = serde_json::json!({"sessionId": "test"});
-        assert!(extract_session_key_optional(&session, None).is_none());
+        assert!(extract_session_key_optional(&session, None, false).is_none());
     }
 
     #[test]
@@ -435,7 +502,7 @@ mod tests {
         let session = serde_json::json!({
             "encryptionKey": {"value": "", "encrypted": false}
         });
-        assert!(extract_session_key_optional(&session, None).is_none());
+        assert!(extract_session_key_optional(&session, None, false).is_none());
     }
 
     #[test]
@@ -446,7 +513,7 @@ mod tests {
         let session = serde_json::json!({
             "encryptionKey": {"value": b64, "encrypted": false}
         });
-        let result = extract_session_key_optional(&session, None).unwrap();
+        let result = extract_session_key_optional(&session, None, false).unwrap();
         assert_eq!(result, key_bytes);
     }
 
@@ -459,6 +526,6 @@ mod tests {
             "encryptionKey": {"value": b64, "encrypted": true}
         });
         // No keypair → cannot decrypt → None
-        assert!(extract_session_key_optional(&session, None).is_none());
+        assert!(extract_session_key_optional(&session, None, false).is_none());
     }
 }

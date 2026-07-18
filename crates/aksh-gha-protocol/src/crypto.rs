@@ -65,9 +65,26 @@ impl AgentRsaPublicKey {
 
     /// Wrap (encrypt) a symmetric key with this runner's public key.
     pub fn wrap_key(&self, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        self.public_key
-            .encrypt(&mut rand::thread_rng(), Oaep::new::<Sha1>(), plaintext)
-            .map_err(|e| CryptoError::Wrap(e.to_string()))
+        self.wrap_key_with_hash(plaintext, RsaOaepHash::Sha1)
+    }
+
+    /// Wrap a symmetric key using the selected RSA-OAEP hash.
+    pub fn wrap_key_with_hash(
+        &self,
+        plaintext: &[u8],
+        hash: RsaOaepHash,
+    ) -> Result<Vec<u8>, CryptoError> {
+        let result = match hash {
+            RsaOaepHash::Sha1 => {
+                self.public_key
+                    .encrypt(&mut rand::thread_rng(), Oaep::new::<Sha1>(), plaintext)
+            }
+            RsaOaepHash::Sha256 => {
+                self.public_key
+                    .encrypt(&mut rand::thread_rng(), Oaep::new::<Sha256>(), plaintext)
+            }
+        };
+        result.map_err(|e| CryptoError::Wrap(e.to_string()))
     }
 
     /// Verify a signature signed with PS256 (RSA-PSS SHA-256).
@@ -213,9 +230,20 @@ impl AgentRsaKeypair {
 
     /// Unwrap (decrypt) a symmetric key with RSA-OAEP.
     pub fn unwrap_key(&self, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        self.private_key
-            .decrypt(Oaep::new::<Sha1>(), ciphertext)
-            .map_err(|e| CryptoError::Unwrap(e.to_string()))
+        self.unwrap_key_with_hash(ciphertext, RsaOaepHash::Sha1)
+    }
+
+    /// Unwrap a symmetric key using the selected RSA-OAEP hash.
+    pub fn unwrap_key_with_hash(
+        &self,
+        ciphertext: &[u8],
+        hash: RsaOaepHash,
+    ) -> Result<Vec<u8>, CryptoError> {
+        let result = match hash {
+            RsaOaepHash::Sha1 => self.private_key.decrypt(Oaep::new::<Sha1>(), ciphertext),
+            RsaOaepHash::Sha256 => self.private_key.decrypt(Oaep::new::<Sha256>(), ciphertext),
+        };
+        result.map_err(|e| CryptoError::Unwrap(e.to_string()))
     }
 
     /// Borrow this keypair's public key.
