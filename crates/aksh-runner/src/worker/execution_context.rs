@@ -22,12 +22,8 @@ const DISABLE_STDOUT_MULTILINE_LOG_PREFIXING: &str =
 /// values are `1`, `true`, and `$true` (case-insensitive). Invalid and unset
 /// values retain the default of false.
 fn disable_stdout_multiline_log_prefixing() -> bool {
-    std::env::var(DISABLE_STDOUT_MULTILINE_LOG_PREFIXING).is_ok_and(|value| {
-        matches!(
-            value.to_ascii_lowercase().as_str(),
-            "1" | "true" | "$true"
-        )
-    })
+    std::env::var(DISABLE_STDOUT_MULTILINE_LOG_PREFIXING)
+        .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "$true"))
 }
 
 /// Format one line from a stdout trace message.
@@ -453,9 +449,7 @@ mod tests {
         }
         let result = test();
         match previous {
-            Some(previous) => {
-                std::env::set_var(DISABLE_STDOUT_MULTILINE_LOG_PREFIXING, previous)
-            }
+            Some(previous) => std::env::set_var(DISABLE_STDOUT_MULTILINE_LOG_PREFIXING, previous),
             None => std::env::remove_var(DISABLE_STDOUT_MULTILINE_LOG_PREFIXING),
         }
         result
@@ -731,8 +725,16 @@ mod tests {
                 ctx.write_chunk(b"first\nsecond\n");
                 let lines: Vec<_> = ctx.log_content().lines().map(str::to_string).collect();
                 assert_eq!(lines.len(), 2);
-                assert!(lines[0].ends_with(" first"), "unexpected first line: {}", lines[0]);
-                assert!(lines[1].ends_with(" second"), "unexpected second line: {}", lines[1]);
+                assert!(
+                    lines[0].ends_with(" first"),
+                    "unexpected first line: {}",
+                    lines[0]
+                );
+                assert!(
+                    lines[1].ends_with(" second"),
+                    "unexpected second line: {}",
+                    lines[1]
+                );
             });
         }
     }
@@ -745,7 +747,11 @@ mod tests {
             ctx.write_chunk(b"first\nsecond\n");
             let lines: Vec<_> = ctx.log_content().lines().map(str::to_string).collect();
             assert_eq!(lines.len(), 2);
-            assert!(lines[0].ends_with(" first"), "unexpected first line: {}", lines[0]);
+            assert!(
+                lines[0].ends_with(" first"),
+                "unexpected first line: {}",
+                lines[0]
+            );
             assert_eq!(lines[1], "second");
         });
     }

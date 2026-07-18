@@ -203,9 +203,7 @@ pub(crate) async fn twirp_create_step_logs_metadata(
     if let Some(step_backend_id) = request.step_backend_id {
         let line_count = request.line_count.unwrap_or_default();
         let line_count_usize = line_count.min(usize::MAX as u64) as usize;
-        let byte_count = line_count
-            .saturating_mul(80)
-            .min(usize::MAX as u64) as usize;
+        let byte_count = line_count.saturating_mul(80).min(usize::MAX as u64) as usize;
         let mut inner = shared.state.inner.lock().await;
         inner.log_metadata.insert(
             format!("step:{step_backend_id}"),
@@ -241,9 +239,7 @@ pub(crate) async fn twirp_create_job_logs_metadata(
     if let Some(workflow_job_run_backend_id) = request.workflow_job_run_backend_id {
         let line_count = request.line_count.unwrap_or_default();
         let line_count_usize = line_count.min(usize::MAX as u64) as usize;
-        let byte_count = line_count
-            .saturating_mul(80)
-            .min(usize::MAX as u64) as usize;
+        let byte_count = line_count.saturating_mul(80).min(usize::MAX as u64) as usize;
         let mut inner = shared.state.inner.lock().await;
         inner.log_metadata.insert(
             format!("job:{workflow_job_run_backend_id}"),
@@ -256,7 +252,6 @@ pub(crate) async fn twirp_create_job_logs_metadata(
 
     Json(json!({"ok": true}))
 }
-
 
 // ─── Cache v2 Twirp (github.actions.results.api.v1.CacheService) ─────────────
 
@@ -398,7 +393,9 @@ pub(crate) async fn twirp_cache_v2_finalize(
         {
             return Ok(Json(json!({ "ok": true, "entry_id": "1", "message": "" })));
         }
-        return Err(ApiError::not_found("no pending cache upload for key+version"));
+        return Err(ApiError::not_found(
+            "no pending cache upload for key+version",
+        ));
     };
 
     let blob_path = shared

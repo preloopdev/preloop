@@ -176,11 +176,20 @@ fn expected_step_wire(step: &TaskStep) -> Value {
     object.insert("type".to_owned(), json!("action"));
     object.insert("reference".to_owned(), reference);
     if !step.env.is_empty() {
-        object.insert("environment".to_owned(), expected_template_map(&step.env, true));
+        object.insert(
+            "environment".to_owned(),
+            expected_template_map(&step.env, true),
+        );
     }
     if !inputs.is_empty() {
-        let inputs_with_loc = step.reference.as_ref().map_or(false, |r| r.reference_type.as_deref() != Some("script"));
-        object.insert("inputs".to_owned(), expected_template_map(&inputs, inputs_with_loc));
+        let inputs_with_loc = step
+            .reference
+            .as_ref()
+            .map_or(false, |r| r.reference_type.as_deref() != Some("script"));
+        object.insert(
+            "inputs".to_owned(),
+            expected_template_map(&inputs, inputs_with_loc),
+        );
     }
     object.insert("id".to_owned(), json!(step.id));
     object.insert(
@@ -216,13 +225,19 @@ fn expected_job_wire(job: &AgentJobRequestMessage) -> Value {
     object.insert("requestId".to_owned(), json!(job.request_id));
     let mut plan = serde_json::Map::new();
     if !job.plan.scope_identifier.is_empty() {
-        plan.insert("scopeIdentifier".to_owned(), json!(job.plan.scope_identifier));
+        plan.insert(
+            "scopeIdentifier".to_owned(),
+            json!(job.plan.scope_identifier),
+        );
     }
     plan.insert("planId".to_owned(), json!(job.plan.plan_id));
     plan.insert("planType".to_owned(), json!(job.plan.plan_type));
     plan.insert("version".to_owned(), json!(job.plan.version));
     plan.insert("artifactUri".to_owned(), json!(job.plan.artifact_uri));
-    plan.insert("artifactLocation".to_owned(), json!(job.plan.artifact_location));
+    plan.insert(
+        "artifactLocation".to_owned(),
+        json!(job.plan.artifact_location),
+    );
     object.insert("plan".to_owned(), Value::Object(plan));
     object.insert(
         "timeline".to_owned(),
@@ -1071,7 +1086,10 @@ fn tier2_codec_task_step_environment_aliases() {
             ])
         );
         let encoded = serde_json::to_value(&decoded).unwrap();
-        assert_eq!(encoded["environment"], expected_template_map(&decoded.env, true));
+        assert_eq!(
+            encoded["environment"],
+            expected_template_map(&decoded.env, true)
+        );
         assert!(encoded.get("env").is_none());
     }
 }
