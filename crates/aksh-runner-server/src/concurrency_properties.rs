@@ -352,6 +352,7 @@ impl ProdState {
         }
         let record = RunRecord {
             run_id,
+            run_name: None,
             submission: WorkflowSubmission {
                 workflow_yaml: String::new(),
                 event: "push".to_owned(),

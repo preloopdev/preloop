@@ -1,3 +1,4 @@
+use super::super::server_queue::StepUpdate;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -54,6 +55,80 @@ async fn test_run_job_executes_successfully() {
     let (_tx, cancel_rx) = watch::channel(false);
     let res = run_job(payload, ProtocolPath::Broker, cancel_rx).await;
     assert!(res.is_ok(), "Expected run_job to succeed, got: {:?}", res);
+}
+
+#[tokio::test]
+async fn periodic_drain_flushes_queued_step_updates() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (request_tx, request_rx) = oneshot::channel::<String>();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0_u8; 8192];
+        let n = socket.read(&mut buf).await.unwrap();
+        let _ = request_tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{}")
+            .await
+            .unwrap();
+    });
+
+    let http = crate::client::http::HttpClient::new(None).unwrap();
+    let base_url = format!("http://{addr}");
+    let reporting = Arc::new(ReportingContext {
+        results: crate::client::results::ResultsClient::new(http.clone(), base_url.clone()),
+        run_service: crate::client::run_service::RunServiceClient::new(http, base_url),
+        access_token: "test-token".to_string(),
+        plan_id: "plan-1".to_string(),
+        job_id: "job-1".to_string(),
+        azdo: None,
+    });
+    let queue = Arc::new(Mutex::new(ServerQueue::new(
+        "job-1".to_string(),
+        "plan-1".to_string(),
+    )));
+    queue.lock().await.queue_update(StepUpdate {
+        external_id: "step-1".to_string(),
+        number: 1,
+        name: "Step One".to_string(),
+        status: super::super::server_queue::step_status::IN_PROGRESS,
+        started_at: Some("2026-01-01T00:00:00Z".to_string()),
+        completed_at: None,
+        conclusion: 0,
+    });
+
+    let (cancel_tx, mut cancel_rx) = watch::channel(false);
+    let drain_rpt = reporting.clone();
+    let drain_queue = queue.clone();
+    let drain_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(500));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    flush_step_updates(&drain_rpt, &drain_queue).await;
+                }
+                changed = cancel_rx.changed() => {
+                    if changed.is_err() || *cancel_rx.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let request = tokio::time::timeout(Duration::from_secs(1), request_rx)
+        .await
+        .expect("periodic drain did not flush within one second")
+        .expect("periodic drain request sender dropped");
+    assert!(request.contains("WorkflowStepsUpdate"));
+    assert!(request.contains("step-1"));
+
+    cancel_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), drain_handle)
+        .await
+        .expect("periodic drain did not stop after cancellation")
+        .expect("periodic drain task panicked");
 }
 
 #[test]

@@ -93,6 +93,16 @@ pub(crate) fn runner_server_url() -> String {
     format!("{}/runner/server", public_base_url())
 }
 
+/// Return server-enforced runner settings.
+///
+/// The official runner treats these settings as optional and applies its own
+/// defaults when the endpoint is unavailable. Returning an explicit default
+/// response keeps that negotiation deterministic for self-hosted deployments.
+pub(crate) async fn runner_settings() -> Json<azdo::RunnerServerSettings> {
+    Json(azdo::RunnerServerSettings::default())
+}
+
+
 pub(crate) fn broker_job_ref(
     request: &TaskAgentJobRequestRecord,
     runner_id: i64,
@@ -530,7 +540,7 @@ pub(crate) async fn broker_acquire_job(
     Path(runner_id): Path<i64>,
     headers: HeaderMap,
     Json(request): Json<BrokerAcquireJobRequest>,
-) -> Result<Json<azdo::AgentJobRequestMessage>, ApiError> {
+)-> Result<Json<serde_json::Value>, ApiError> {
     authenticated_runner_id(&shared, &headers, Some(runner_id))?;
     let inner = shared.state.inner.lock().await;
     let request_id = inner
@@ -587,7 +597,18 @@ pub(crate) async fn broker_acquire_job(
     // Run-service payloads use the DTO default; internal request IDs remain in
     // `job_requests` and broker lookup maps for renew/complete bookkeeping.
     message.request_id = 0;
-    Ok(Json(message))
+    let mut payload = serde_json::to_value(&message)
+        .map_err(|error| ApiError::internal(format!("serialize broker job payload: {error}")))?;
+    let object = payload
+        .as_object_mut()
+        .ok_or_else(|| ApiError::internal("broker job payload must serialize as an object"))?;
+    object.insert(
+        "runnerSettings".to_owned(),
+        serde_json::to_value(azdo::RunnerServerSettings::default()).map_err(|error| {
+            ApiError::internal(format!("serialize runner server settings: {error}"))
+        })?,
+    );
+    Ok(Json(payload))
 }
 
 pub(crate) async fn broker_renew_job(
@@ -691,4 +712,49 @@ pub(crate) async fn broker_complete_job(
     // after cancel/complete (concurrency release path).
     shared.state.message_notify.notify_waiters();
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn runner_settings_returns_default_wire_shape() {
+        let Json(settings) = runner_settings().await;
+        let wire = serde_json::to_value(settings).unwrap();
+        assert_eq!(wire, json!({"isHostedServer": false}));
+    }
+
+    #[tokio::test]
+    async fn settings_routes_serve_default_json() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{Method, Request, StatusCode};
+        use tokio_util::sync::CancellationToken;
+        use tower::ServiceExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = crate::app(state, CancellationToken::new());
+
+        for path in ["/_apis/v1/settings/runner", "/acme/_apis/v1/settings/runner"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "path={path}");
+            let wire: serde_json::Value = serde_json::from_slice(
+                &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+            )
+            .unwrap();
+            assert_eq!(wire["isHostedServer"], false, "path={path}");
+            assert!(wire.get("agentDownloadUrls").is_none(), "path={path}");
+        }
+    }
 }
