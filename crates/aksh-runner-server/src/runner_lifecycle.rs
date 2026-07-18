@@ -96,6 +96,24 @@ pub(crate) async fn create_session_disttask(
         .pointer("/agent/id")
         .and_then(serde_json::Value::as_i64);
 
+    let runner_public_key = {
+        let inner = shared.state.inner.lock().await;
+        runner_id.and_then(|id| inner.runner_rsa_public_keys.get(&id).cloned())
+    };
+    let (key_bytes, encrypted) = if use_fips_encryption {
+        let Some(public_key) = runner_public_key else {
+            return Err(ApiError::bad_request(
+                "FIPS session encryption requires a registered RSA public key",
+            ));
+        };
+        (
+            public_key.wrap_key_with_hash(&session_enc.key, RsaOaepHash::Sha256)?,
+            true,
+        )
+    } else {
+        (session_enc.key.clone(), false)
+    };
+    let key_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key_bytes);
     {
         let mut inner = shared.state.inner.lock().await;
         inner
