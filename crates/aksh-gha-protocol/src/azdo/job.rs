@@ -168,7 +168,7 @@ fn is_false(b: &bool) -> bool {
 /// in `actions/runner` v2.335.1.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanReference {
-    #[serde(rename = "scopeIdentifier")]
+    #[serde(rename = "scopeIdentifier", skip_serializing_if = "String::is_empty")]
     pub scope_identifier: String,
     #[serde(rename = "planId")]
     pub plan_id: String,
