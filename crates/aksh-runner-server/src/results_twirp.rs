@@ -146,8 +146,7 @@ pub(crate) async fn twirp_get_step_summary_signed_blob_url(
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct StepSummaryMetadataRequest {
-    // serde: metadata is accepted for protocol compatibility; field is not inspected.
-    #[allow(dead_code)]
+    // serde: metadata is accepted for protocol compatibility; this identifies the summary.
     pub(crate) step_backend_id: String,
     // serde: metadata is accepted for protocol compatibility; field is not inspected.
     #[allow(dead_code)]
@@ -155,8 +154,7 @@ pub(crate) struct StepSummaryMetadataRequest {
     // serde: metadata is accepted for protocol compatibility; field is not inspected.
     #[allow(dead_code)]
     pub(crate) workflow_run_backend_id: String,
-    // serde: metadata is accepted for protocol compatibility; field is not inspected.
-    #[allow(dead_code)]
+    // serde: metadata is accepted for protocol compatibility; this records the summary size.
     pub(crate) size: Option<u64>,
     // serde: metadata is accepted for protocol compatibility; field is not inspected.
     #[allow(dead_code)]
@@ -164,15 +162,25 @@ pub(crate) struct StepSummaryMetadataRequest {
 }
 
 pub(crate) async fn twirp_create_step_summary_metadata(
-    Json(_request): Json<StepSummaryMetadataRequest>,
+    State(shared): State<Arc<SharedState>>,
+    Json(request): Json<StepSummaryMetadataRequest>,
 ) -> Json<serde_json::Value> {
+    let byte_count = request.size.unwrap_or_default().min(usize::MAX as u64) as usize;
+    let mut inner = shared.state.inner.lock().await;
+    inner.log_metadata.insert(
+        format!("summary:{}", request.step_backend_id),
+        LogMetadata {
+            byte_count,
+            line_count: 0,
+        },
+    );
+
     Json(json!({"ok": true}))
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct StepLogsMetadataRequest {
-    // serde: metadata is accepted for protocol compatibility; field is not inspected.
-    #[allow(dead_code)]
+    // serde: metadata is accepted for protocol compatibility; this identifies the step.
     pub(crate) step_backend_id: Option<String>,
     // serde: metadata is accepted for protocol compatibility; field is not inspected.
     #[allow(dead_code)]
@@ -183,22 +191,37 @@ pub(crate) struct StepLogsMetadataRequest {
     // serde: metadata is accepted for protocol compatibility; field is not inspected.
     #[allow(dead_code)]
     pub(crate) upload_url: Option<String>,
-    // serde: metadata is accepted for protocol compatibility; field is not inspected.
-    #[allow(dead_code)]
+    // serde: metadata is accepted for protocol compatibility; this records the line count.
     pub(crate) line_count: Option<u64>,
 }
 
 /// POST CreateStepLogsMetadata — runner calls this after uploading step logs.
 pub(crate) async fn twirp_create_step_logs_metadata(
-    Json(_request): Json<StepLogsMetadataRequest>,
+    State(shared): State<Arc<SharedState>>,
+    Json(request): Json<StepLogsMetadataRequest>,
 ) -> Json<serde_json::Value> {
+    if let Some(step_backend_id) = request.step_backend_id {
+        let line_count = request.line_count.unwrap_or_default();
+        let line_count_usize = line_count.min(usize::MAX as u64) as usize;
+        let byte_count = line_count
+            .saturating_mul(80)
+            .min(usize::MAX as u64) as usize;
+        let mut inner = shared.state.inner.lock().await;
+        inner.log_metadata.insert(
+            format!("step:{step_backend_id}"),
+            LogMetadata {
+                byte_count,
+                line_count: line_count_usize,
+            },
+        );
+    }
+
     Json(json!({"ok": true}))
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct JobLogsMetadataRequest {
-    // serde: metadata is accepted for protocol compatibility; field is not inspected.
-    #[allow(dead_code)]
+    // serde: metadata is accepted for protocol compatibility; this identifies the job.
     pub(crate) workflow_job_run_backend_id: Option<String>,
     // serde: metadata is accepted for protocol compatibility; field is not inspected.
     #[allow(dead_code)]
@@ -206,17 +229,34 @@ pub(crate) struct JobLogsMetadataRequest {
     // serde: metadata is accepted for protocol compatibility; field is not inspected.
     #[allow(dead_code)]
     pub(crate) upload_url: Option<String>,
-    // serde: metadata is accepted for protocol compatibility; field is not inspected.
-    #[allow(dead_code)]
+    // serde: metadata is accepted for protocol compatibility; this records the line count.
     pub(crate) line_count: Option<u64>,
 }
 
 /// POST CreateJobLogsMetadata — runner calls this after uploading job logs.
 pub(crate) async fn twirp_create_job_logs_metadata(
-    Json(_request): Json<JobLogsMetadataRequest>,
+    State(shared): State<Arc<SharedState>>,
+    Json(request): Json<JobLogsMetadataRequest>,
 ) -> Json<serde_json::Value> {
+    if let Some(workflow_job_run_backend_id) = request.workflow_job_run_backend_id {
+        let line_count = request.line_count.unwrap_or_default();
+        let line_count_usize = line_count.min(usize::MAX as u64) as usize;
+        let byte_count = line_count
+            .saturating_mul(80)
+            .min(usize::MAX as u64) as usize;
+        let mut inner = shared.state.inner.lock().await;
+        inner.log_metadata.insert(
+            format!("job:{workflow_job_run_backend_id}"),
+            LogMetadata {
+                byte_count,
+                line_count: line_count_usize,
+            },
+        );
+    }
+
     Json(json!({"ok": true}))
 }
+
 
 // ─── Cache v2 Twirp (github.actions.results.api.v1.CacheService) ─────────────
 

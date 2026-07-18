@@ -15,6 +15,61 @@ fn glob_match_handles_multiple_wildcards() {
 }
 
 #[test]
+fn parses_workflow_run_name() {
+    let workflow = parse_workflow(
+        r#"
+name: deploy
+run-name: Deploy production
+on: push
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo deploy
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(workflow.run_name.as_deref(), Some("Deploy production"));
+}
+
+#[test]
+fn workflow_run_name_defaults_to_none() {
+    let workflow = parse_workflow(
+        r#"
+name: ci
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo test
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(workflow.run_name, None);
+}
+
+#[test]
+fn preserves_run_name_expression_source() {
+    let workflow = parse_workflow(
+        r#"
+run-name: "Deploy ${{ github.ref }}"
+on: push
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo deploy
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(workflow.run_name.as_deref(), Some("Deploy ${{ github.ref }}"));
+}
+
+#[test]
 fn trigger_context_matches_activity_types() {
     let workflow = parse_workflow(
         r#"
