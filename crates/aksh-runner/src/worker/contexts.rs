@@ -289,6 +289,20 @@ impl JobContext {
     pub fn add_job_annotation(&mut self, annotation: Annotation) {
         self.job_annotations.push(annotation);
     }
+    /// Whether the runner should mirror step issues onto the job annotation list.
+    ///
+    /// This is the v2.335.1 `actions_send_job_level_annotations` feature flag.
+    pub fn send_job_level_annotations_enabled(&self) -> bool {
+        self.get_variable_bool("actions_send_job_level_annotations")
+    }
+
+    /// Aggregate annotations emitted while executing a step into the job projection.
+    /// Step annotations remain stored in `step_annotations` as well.
+    pub fn add_step_annotations_to_job(&mut self, annotations: &[Annotation]) {
+        if self.send_job_level_annotations_enabled() {
+            self.job_annotations.extend(annotations.iter().cloned());
+        }
+    }
 
     /// Build the expression evaluation context for condition evaluation.
     pub fn build_expression_context(&self) -> aksh_gha_expressions::Context {
