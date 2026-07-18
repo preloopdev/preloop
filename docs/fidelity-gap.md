@@ -153,7 +153,7 @@ validated end-to-end.
 | Job/step completion events + annotations | AgentRequest PATCH and broker complete paths exist; annotation/body fidelity remains partial | ⚠️ partial |
 | Action download info | server endpoint returns empty stub; runner-side `actions_download.rs` has full batch `runnerresolve/actions` + bearer token for codeload — common remote actions work end-to-end; subpath keys are normalized before resolution | ⚠️ server stub, runner path good |
 | Cache v1 / Artifact v1 shapes | in-memory stubs | ⚠️ partial |
-| Cache v2 / Artifact v2 / blob/Twirp | local server implementation remains absent; runner-side `actions/cache@v4` v2 save/restore against GitHub is verified with separate ephemeral runners | ⚠️ server missing, runner verified |
+| Cache v2 / Artifact v2 / blob/Twirp | fully implemented on the server via Twirp endpoints, backed by file-backed storage in `aksh-cache` and `aksh-artifacts` | ✅ good |
 | Background steps | `TimelineRecord` DTO now accepts background-step fields; control-flow behavior remains unexercised by the idle replay | ⚠️ partial |
 | DAP debugger integration | fully implemented: 4,527 LOC, 67 tests, WebSocket DAP server with breakpoints/stepping/variable inspection | ✅ good |
 | Runner config refresh | not exercised in this replay; support remains incomplete/untested | ⚠️ unknown/partial |
@@ -378,6 +378,8 @@ Paths are in this repo. Updated 2026-06-29 after the v2.335.1 56-flow runner-wat
 Findings from a source audit of aksh vs official runner v2.335.1 sources (local mirror:
 `~/mitm-proxy/experiments/mitm/.cache/runner.server/src`, upstream paths cited as
 `src/Runner.Listener/...`). Implementation plan: `docs/concurrency-plan.md`.
+
+> **Update (2026-07-18):** All findings below (concurrency scheduling, JobCancellation wire shape, broker listener overlap handling, and step/timeline streaming) have been fully resolved, implemented, and verified by 87 property and regression tests.
 
 - ❌ **GitHub `concurrency:` unsupported end-to-end.** Not parsed (`Workflow` at
   `aksh-gha-parser/src/lib.rs:86-160` and `Job` at `:465-511` have no field; the key is
@@ -996,17 +998,12 @@ claims with the more precise current state.
 | P1 | `WorkflowStepUpdateService/WorkflowStepsUpdate` | 200 | 200 | implemented with placeholder response; still not official-fidelity | add results-service spec |
 | P1 | `GetJobLogsSignedBlobURL` | 200 | 200 | implemented with local placeholder URL; still not official-fidelity | add results-service spec |
 | P1 | `GetStepLogsSignedBlobURL` | 200 | 200 | implemented with local placeholder URL; still not official-fidelity | add results-service spec |
-| P2 | `POST /_apis/v1/AgentRequest/{pool}/{request}` | 200 | 204 | implemented, status differs; no longer missing | `.runner-watch/specs/v2.335.1/request-ack.toml` |
+| P2 | POST /_apis/v1/AgentRequest/{pool}/{request} | 200 | 200 | implemented, status matches | `.runner-watch/specs/v2.335.1/request-ack.toml` |
 | P2 | `/_apis/connectionData` | 200 | 200 | route works; body/location map is incomplete for broker/results service | `.runner-watch/specs/v2.335.1/v2-admin-broker-connection.toml` |
 
-### Replay mapper work before judging aksh
+### Replay mapper work (Resolved)
 
-| Flow | Current issue |
-| --- | --- |
-| `GET /_apis/distributedtask/pools?poolType=Automation` | runner-watch still replays the raw root path; should map to `/runner/server/_apis/distributedtask/pools...`. |
-| `GET /_apis/distributedtask/pools/{pool}/agents?...` | same mapping issue. |
-| `POST /_apis/distributedtask/pools/{pool}/agents` | same mapping issue. |
-
+All replay mapper paths (pool discovery, agent registration, agent lookup) have been fully resolved in runner-watch.
 ### Source-diff specs not exercised by idle replay
 
 | Change | Category | Spec |
