@@ -21,7 +21,7 @@ pub(crate) async fn next_message(
             .get(&session_id)
             .and_then(|messages| messages.values().next().cloned())
         {
-            return (StatusCode::OK, Json(Some(message)));
+            return (StatusCode::ACCEPTED, Json(Some(message)));
         }
 
         if let Some(cancellation) = inner.cancellation_queue.pop_front() {
@@ -47,7 +47,7 @@ pub(crate) async fn next_message(
             } else {
                 drop(inner);
                 if wait_seconds == 0 {
-                    return (StatusCode::ACCEPTED, Json(None));
+                    return (StatusCode::OK, Json(None));
                 }
                 if tokio::time::timeout(
                     Duration::from_secs(wait_seconds),
@@ -56,7 +56,7 @@ pub(crate) async fn next_message(
                 .await
                 .is_err()
                 {
-                    return (StatusCode::ACCEPTED, Json(None));
+                    return (StatusCode::OK, Json(None));
                 }
                 continue;
             }
@@ -66,7 +66,7 @@ pub(crate) async fn next_message(
         let Some(queued) = take_matching_job(&mut inner.queue, &runner_labels) else {
             drop(inner);
             if wait_seconds == 0 {
-                return (StatusCode::ACCEPTED, Json(None));
+                return (StatusCode::OK, Json(None));
             }
             if tokio::time::timeout(
                 Duration::from_secs(wait_seconds),
@@ -75,7 +75,7 @@ pub(crate) async fn next_message(
             .await
             .is_err()
             {
-                return (StatusCode::ACCEPTED, Json(None));
+                return (StatusCode::OK, Json(None));
             }
             continue;
         };
@@ -155,7 +155,7 @@ pub(crate) async fn next_message(
             })
             .await;
 
-        return (StatusCode::OK, Json(Some(message)));
+        return (StatusCode::ACCEPTED, Json(Some(message)));
     }
 }
 
