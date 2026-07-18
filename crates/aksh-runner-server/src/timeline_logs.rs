@@ -42,6 +42,13 @@ pub(crate) async fn patch_timeline_records(
         }
         if let Some(run_id) = run_id {
             for issue in &record.issues {
+                let step_id = if record.record_type == Some(azdo::TimelineRecordType::Step)
+                    || record.parent_id.is_some()
+                {
+                    Some(record.id.to_string())
+                } else {
+                    None
+                };
                 projected.push(NdjsonEvent::Annotation {
                     run_id,
                     job_id: logical_job_id
@@ -51,6 +58,7 @@ pub(crate) async fn patch_timeline_records(
                     message: issue.message.clone().unwrap_or_default(),
                     file: issue.data.get("file").cloned(),
                     line: issue.data.get("line").and_then(|line| line.parse().ok()),
+                    step_id,
                 });
             }
         }
