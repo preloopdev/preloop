@@ -181,6 +181,7 @@ fn runner_version_deprecated_response(
             .into_response(),
     )
 }
+
 pub(crate) async fn next_message_broker_ref(
     State(shared): State<Arc<SharedState>>,
     Path(pool_id): Path<i64>,
@@ -233,8 +234,8 @@ pub(crate) async fn next_message_broker_ref(
             inner.session_active_requests.remove(&session_id);
         }
 
-        let runner_labels = inner.runner_labels_for_session(&session_id);
-        let Some(queued) = take_matching_job(&mut inner.queue, &runner_labels) else {
+        let runner = inner.runner_capabilities_for_session(&session_id);
+        let Some(queued) = take_matching_job(&mut inner.queue, &runner) else {
             drop(inner);
             if wait_seconds == 0 {
                 return Ok((StatusCode::OK, Json(json!({}))).into_response());
@@ -518,8 +519,8 @@ pub(crate) async fn next_message_broker_ref_root(
             } else if runner_busy {
                 None
             } else {
-                let labels = inner.runner_labels_for_session(&session_id);
-                if let Some(queued) = take_matching_job(&mut inner.queue, &labels) {
+                let runner = inner.runner_capabilities_for_session(&session_id);
+                if let Some(queued) = take_matching_job(&mut inner.queue, &runner) {
                     if let Some(run) = inner.runs.get_mut(&queued.run_id) {
                         run.status = ExecutionStatus::InProgress;
                         run.jobs
