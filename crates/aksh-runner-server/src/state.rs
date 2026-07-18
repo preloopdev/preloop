@@ -378,22 +378,24 @@ pub(crate) fn load_or_generate_hmac_key(state_dir: &std::path::Path) -> anyhow::
 }
 
 impl InnerState {
-    /// Look up the labels for the runner that owns a given session.
-    pub(crate) fn runner_labels_for_session(&self, session_id: &str) -> Vec<String> {
+    /// Look up dispatch metadata for the runner that owns a given session.
+    pub(crate) fn runner_capabilities_for_session(&self, session_id: &str) -> RunnerCapabilities {
         let runner_id = self
             .broker_session_runners
             .get(session_id)
             .copied()
-            .or_else(|| {
-                self.sessions
-                    .get(session_id)
-                    .map(|session| session.runner_id)
-            });
+            .or_else(|| self.sessions.get(session_id).map(|session| session.runner_id));
         runner_id
             .and_then(|runner_id| self.runners.get(&runner_id))
-            .map(|runner| runner.labels.clone())
+            .map(|runner| RunnerCapabilities {
+                known: true,
+                labels: runner.labels.clone(),
+                runner_group_id: runner.runner_group_id,
+                runner_group_name: runner.runner_group_name.clone(),
+            })
             .unwrap_or_default()
     }
+
 }
 
 #[derive(Default)]
