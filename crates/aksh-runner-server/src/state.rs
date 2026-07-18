@@ -409,6 +409,8 @@ pub(crate) struct InnerState {
     pub(crate) artifacts: BTreeMap<String, ArtifactRecord>,
     pub(crate) logs: BTreeMap<String, Vec<u8>>,
     pub(crate) timeline_events: BTreeMap<RunId, Vec<NdjsonEvent>>,
+    /// Per-timeline changeId counter for timeline PATCH versioning.
+    pub(crate) timeline_change_ids: BTreeMap<String, i32>,
     pub(crate) live_log_lines:
         BTreeMap<String, Arc<tokio::sync::Mutex<Vec<LiveLogFeedLinesWrapper>>>>,
     pub(crate) live_log_tx: BTreeMap<String, broadcast::Sender<LiveLogFeedLinesWrapper>>,

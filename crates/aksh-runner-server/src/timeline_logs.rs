@@ -8,8 +8,9 @@ pub(crate) async fn patch_timeline_records(
     Path((_scope, _hub, plan_id, timeline_id)): Path<(String, String, String, String)>,
     Json(wrapper): Json<azdo::VssJsonCollectionWrapper<azdo::TimelineRecord>>,
 ) -> Json<serde_json::Value> {
-    let records = wrapper.value;
+    let mut records = wrapper.value;
     let count = records.len();
+    let timeline_key = format!("{}/{}", plan_id, timeline_id);
     let callback_job = {
         let inner = shared.state.inner.lock().await;
         resolve_callback_job(&inner, &plan_id, timeline_id.parse().ok(), None)
@@ -63,15 +64,22 @@ pub(crate) async fn patch_timeline_records(
             }
         }
     }
-    if let Some(run_id) = run_id {
+    let new_change_id = {
         let mut inner = shared.state.inner.lock().await;
+        let current = inner
+            .timeline_change_ids
+            .entry(timeline_key)
+            .or_insert(0);
+        *current += 1;
+        let new_id = *current;
+
         inner
             .timeline_events
-            .entry(run_id)
+            .entry(run_id.unwrap_or_else(|| RunId(uuid::Uuid::nil())))
             .or_default()
             .extend(projected.clone());
 
-        if let Some(job_id) = logical_job_id {
+        if let (Some(run_id), Some(job_id)) = (run_id, &logical_job_id) {
             if let Some(run) = inner.runs.get_mut(&run_id) {
                 let job_name = job_id.0.clone();
                 let job_detail =
@@ -86,7 +94,7 @@ pub(crate) async fn patch_timeline_records(
                         run.jobs_list.last_mut().unwrap()
                     };
 
-                if let Some(status) = run.jobs.get(&job_id) {
+                if let Some(status) = run.jobs.get(job_id) {
                     job_detail.conclusion = format!("{:?}", status).to_lowercase();
                 }
 
@@ -103,7 +111,7 @@ pub(crate) async fn patch_timeline_records(
                             azdo::TaskResult::Succeeded | azdo::TaskResult::SucceededWithIssues,
                         ) => "success",
                         Some(azdo::TaskResult::Failed) => {
-                            if run.jobs.get(&job_id) == Some(&ExecutionStatus::Cancelled) {
+                            if run.jobs.get(job_id) == Some(&ExecutionStatus::Cancelled) {
                                 "cancelled"
                             } else {
                                 "failure"
@@ -128,9 +136,14 @@ pub(crate) async fn patch_timeline_records(
                 }
             }
         }
-    }
+        new_id
+    };
     for event in projected {
         shared.state.emit(event).await;
+    }
+    // Stamp each record with the server's current changeId.
+    for record in &mut records {
+        record.change_id = Some(new_change_id);
     }
     Json(json!({ "count": count, "value": records }))
 }
