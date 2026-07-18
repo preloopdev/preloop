@@ -20,7 +20,8 @@ pub async fn run_message_loop(
     once: bool,
     runner_root: &std::path::Path,
 ) -> Result<()> {
-    let client = AzdoClient::new(
+    let mut config = config.clone();
+    let mut client = AzdoClient::new(
         http.clone(),
         config.settings.server_url.clone(),
         config.settings.pool_id,
@@ -91,6 +92,29 @@ pub async fn run_message_loop(
                         let message_id = msg.get("messageId").and_then(|v| v.as_i64()).unwrap_or(0);
                         last_message_id = Some(message_id);
 
+                        if msg
+                            .get("messageType")
+                            .and_then(|value| value.as_str())
+                            .is_some_and(|value| value == "RunnerRefreshConfig")
+                        {
+                            match parse_refresh_body(&msg, session_key.as_deref()) {
+                                Ok(payload) => match config
+                                    .apply_runner_settings_refresh(&payload, runner_root)
+                                {
+                                    Ok(true) => info!("Runner configuration refresh applied"),
+                                    Ok(false) => info!(
+                                        "Runner configuration refresh acknowledged without supported changes"
+                                    ),
+                                    Err(error) => warn!(
+                                        "Runner configuration refresh failed (non-fatal): {error:#}"
+                                    ),
+                                },
+                                Err(error) => warn!(
+                                    "Runner configuration refresh payload malformed (non-fatal): {error:#}"
+                                ),
+                            }
+                        }
+
                         let dispatch = process_message(&msg, session_key.as_deref());
 
                         // Acknowledge
@@ -135,7 +159,7 @@ pub async fn run_message_loop(
                                     }
                                 }
 
-                                if once {
+                                if once || config.settings.ephemeral {
                                     info!("--once: exiting after first job");
                                     let _ = client.delete_session(token, &session_id).await;
                                     return Ok(());
@@ -196,6 +220,8 @@ fn process_message(
         .get("messageType")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
+
+ /// Parse and dispatch a message. Returns Some(job) for job messages, None for others.
     let body_str = msg.get("body").and_then(|v| v.as_str()).unwrap_or("");
     let iv_str = msg.get("iv").and_then(|v| v.as_str());
 
@@ -231,6 +257,10 @@ fn process_message(
             info!("Received job cancellation");
             Ok(None)
         }
+        "RunnerRefreshConfig" => {
+            info!("Runner configuration refresh requested");
+            Ok(None)
+        }
         "AgentRefresh" => {
             info!("Self-update requested by server; aksh-runner does not self-update");
             Ok(None)
@@ -240,6 +270,34 @@ fn process_message(
             Ok(None)
         }
     }
+}
+
+fn parse_refresh_body(
+    msg: &serde_json::Value,
+    session_key: Option<&[u8]>,
+) -> Result<serde_json::Value> {
+    let body = msg.get("body").unwrap_or(&serde_json::Value::Null);
+    if body.is_object() || body.is_array() {
+        return Ok(body.clone());
+    }
+    let body_str = body.as_str().unwrap_or("");
+    let iv_str = msg.get("iv").and_then(|value| value.as_str());
+    let decrypted = if let (Some(key), Some(iv)) = (session_key, iv_str) {
+        if !iv.is_empty() {
+            let body_bytes = base64::engine::general_purpose::STANDARD.decode(body_str)?;
+            let iv_bytes = base64::engine::general_purpose::STANDARD.decode(iv)?;
+            let enc = aksh_gha_protocol::crypto::SessionEncryption::from_key(key.to_vec());
+            String::from_utf8(
+                enc.decrypt(&body_bytes, &iv_bytes)
+                    .map_err(|error| anyhow::anyhow!("decrypting refresh body: {error}"))?,
+            )?
+        } else {
+            body_str.to_owned()
+        }
+    } else {
+        body_str.to_owned()
+    };
+    serde_json::from_str(&decrypted).context("parsing refresh config body")
 }
 
 #[cfg(test)]
@@ -288,6 +346,25 @@ mod tests {
         });
         let result = process_message(&msg, None).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_refresh_body_accepts_plain_object() {
+        let msg = serde_json::json!({
+            "messageType": "RunnerRefreshConfig",
+            "body": {"disableUpdate": true}
+        });
+        let body = parse_refresh_body(&msg, None).unwrap();
+        assert_eq!(body.get("disableUpdate").and_then(|value| value.as_bool()), Some(true));
+    }
+
+    #[test]
+    fn parse_refresh_body_rejects_malformed_json() {
+        let msg = serde_json::json!({
+            "messageType": "RunnerRefreshConfig",
+            "body": "not-json"
+        });
+        assert!(parse_refresh_body(&msg, None).is_err());
     }
 
     #[test]
