@@ -207,11 +207,28 @@ pub(crate) async fn agent_lookup(
             return Json(json!({"count": 1, "value": [{
                 "id": runner.id,
                 "name": runner.name,
-                "version": "2.322.0",
+                "version": "2.335.1",
                 "osDescription": "Linux",
                 "enabled": true,
                 "status": "online",
-                "labels": runner.labels.iter().map(|l| json!({"name": l, "type": "user"})).collect::<Vec<_>>()
+                "ephemeral": runner.ephemeral,
+                "maxParallelism": 1,
+                "currentParallelism": 0,
+                "disableUpdate": false,
+                "isElastic": false,
+                "isVirtual": false,
+                "provisioningState": "Provisioned",
+                "queueName": format!("taskagent-{}", runner.id),
+                "runnerGroupId": 1,
+                "runnerGroupName": null,
+                "owningTenant": null,
+                "createdOn": "2026-01-01T00:00:00Z",
+                "lastConnectedOn": "2026-01-01T00:00:00",
+                "labels": runner.labels.iter().enumerate().map(|(i, l)| json!({"id": i + 1, "name": l, "type": "user"})).collect::<Vec<_>>(),
+                "authorization": {
+                    "clientId": "",
+                    "publicKey": {"exponent": "AQAB", "modulus": ""}
+                }
             }]}));
         }
     }
@@ -231,20 +248,31 @@ pub(crate) async fn agent_lookup_by_id(
 }
 
 pub(crate) async fn runner_pools() -> Json<serde_json::Value> {
+    let instance_id = crate::connection::INSTANCE_ID;
     Json(json!({
-        "count": 1,
+        "count": 2,
         "value": [{
             "id": 1,
             "name": "Default",
             "isHosted": false,
-            "poolType": 1,
             "agentCloudId": null,
             "autoSize": true,
             "createdOn": "2026-01-01T00:00:00Z",
             "isInternal": true,
-            "scope": "00000000-0000-0000-0000-000000000000",
-            "size": 0,
+            "scope": instance_id,
+            "size": 1,
             "targetSize": null
+        }, {
+            "id": 2,
+            "name": "GitHub Actions",
+            "isHosted": true,
+            "agentCloudId": 1,
+            "autoSize": true,
+            "createdOn": "2026-01-01T00:00:00Z",
+            "isInternal": false,
+            "scope": instance_id,
+            "size": 1,
+            "targetSize": 1
         }]
     }))
 }
@@ -321,8 +349,9 @@ pub(crate) async fn register_runner_compat(
         "queueName": format!("taskagent-{}", result.0.id),
         "runnerGroupId": 1,
         "runnerGroupName": null,
+        "owningTenant": null,
         "createdOn": "2026-01-01T00:00:00Z",
-        "labels": result.0.labels.iter().map(|l| json!({"name": l, "type": "user"})).collect::<Vec<_>>(),
+        "labels": result.0.labels.iter().enumerate().map(|(i, l)| json!({"id": i + 1, "name": l, "type": "user"})).collect::<Vec<_>>(),
         "authorization": {
             "authorizationUrl": format!("{}/_apis/v1/oauth2/token", runner_server_url()),
             "clientId": client_id,
