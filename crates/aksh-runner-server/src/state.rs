@@ -119,6 +119,9 @@ pub struct AppState {
     pub(crate) system_token: String,
     /// Per-instance HMAC key for runner and job JWTs.
     pub(crate) local_jwt_key: Vec<u8>,
+    /// When enabled, message polling returns the official AccessDenied/ErrorCode=1
+    /// runner-version deprecation response. Disabled by default for local runners.
+    pub runner_version_deprecated: bool,
     /// Optional cron scheduler (active when `--enable-scheduler` is set).
     pub scheduler: Option<Arc<crate::scheduler::Scheduler>>,
 }
@@ -205,6 +208,10 @@ impl AppState {
         let local_workspace = std::env::var("AKSH_LOCAL_WORKSPACE")
             .ok()
             .map(PathBuf::from);
+        let runner_version_deprecated = std::env::var("AKSH_RUNNER_VERSION_DEPRECATED")
+            .ok()
+            .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
             events,
@@ -216,6 +223,7 @@ impl AppState {
             state_dir,
             system_token,
             local_jwt_key,
+            runner_version_deprecated,
             scheduler: None,
         })
     }

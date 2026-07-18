@@ -150,11 +150,45 @@ pub(crate) fn next_broker_message_id(inner: &mut InnerState) -> i64 {
     inner.next_message_id += 1;
     inner.next_message_id
 }
+
+/// Return the runner-compatible deprecation response used by the official
+/// message endpoint. `AccessDeniedException` with `errorCode: 1` is mapped by
+/// Runner.Listener to its `RunnerVersionDeprecated` exit code (7) when the
+/// corresponding feature flag is enabled there.
+fn runner_version_deprecated_response(
+    shared: &SharedState,
+    params: &std::collections::HashMap<String, String>,
+) -> Option<Response> {
+    if !shared.state.runner_version_deprecated {
+        return None;
+    }
+
+    let version = params
+        .get("runnerVersion")
+        .map(String::as_str)
+        .unwrap_or("unknown");
+    Some(
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "typeKey": "AccessDeniedException",
+                "errorCode": 1,
+                "message": format!(
+                    "Runner version {version} is deprecated and cannot receive messages."
+                ),
+            })),
+        )
+            .into_response(),
+    )
+}
 pub(crate) async fn next_message_broker_ref(
     State(shared): State<Arc<SharedState>>,
     Path(pool_id): Path<i64>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
+    if let Some(response) = runner_version_deprecated_response(&shared, &params) {
+        return Ok(response);
+    }
     let session_id = params
         .get("sessionId")
         .cloned()
@@ -417,8 +451,11 @@ pub(crate) async fn next_message_broker_ref_root(
     State(shared): State<Arc<SharedState>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<Response, ApiError> {
     let runner_id = authenticated_runner_id(&shared, &headers, None)?;
+    if let Some(response) = runner_version_deprecated_response(&shared, &params) {
+        return Ok(response);
+    }
     let session_id = params
         .get("sessionId")
         .cloned()
@@ -512,10 +549,10 @@ pub(crate) async fn next_message_broker_ref_root(
         };
 
         if let Some(message) = maybe {
-            return Ok(Json(message));
+            return Ok(Json(message).into_response());
         }
         if wait == 0 || std::time::Instant::now() >= deadline {
-            return Ok(Json(serde_json::Value::Null));
+            return Ok(Json(serde_json::Value::Null).into_response());
         }
         // Wake promptly on cancel/enqueue rather than fixed 250ms sleep.
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -757,4 +794,35 @@ mod tests {
             assert!(wire.get("agentDownloadUrls").is_none(), "path={path}");
         }
     }
+
+    #[tokio::test]
+    async fn runner_version_deprecation_response_is_opt_in_and_runner_compatible() {
+        use axum::body::to_bytes;
+        use std::collections::HashMap;
+        use tokio_util::sync::CancellationToken;
+
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let mut shared = SharedState {
+            state,
+            shutdown: CancellationToken::new(),
+        };
+        let params = HashMap::from([(String::from("runnerVersion"), String::from("2.330.1"))]);
+        assert!(runner_version_deprecated_response(&shared, &params).is_none());
+
+        shared.state.runner_version_deprecated = true;
+        let response = runner_version_deprecated_response(&shared, &params).unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let wire: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(wire["typeKey"], "AccessDeniedException");
+        assert_eq!(wire["errorCode"], 1);
+        assert_eq!(
+            wire["message"],
+            "Runner version 2.330.1 is deprecated and cannot receive messages."
+        );
+    }
+
 }
