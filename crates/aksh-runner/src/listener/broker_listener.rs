@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use tracing::{debug, info, warn};
 
+use crate::client::azdo::AzdoClient;
 use crate::client::broker::BrokerClient;
 use crate::client::http::HttpClient;
 use crate::listener::job_dispatcher::{self, cancellation_timing, parse_timespan_secs, RunningJob};
@@ -65,6 +66,11 @@ pub async fn run_broker_loop(
         .trim_end_matches('/')
         .to_string();
     let mut client = BrokerClient::new(http.clone(), broker_url);
+    let status_client = AzdoClient::new(
+        http.clone(),
+        config.settings.server_url.clone(),
+        config.settings.pool_id,
+    );
 
     let mut token = initial_token.to_string();
     let mut token_expires_at: Option<std::time::Instant> = initial_expires_at;
@@ -344,21 +350,28 @@ pub async fn run_broker_loop(
                             }
                             BrokerMessageKind::PipelineAgentJobRequest => {
                                 if let Some(mut prev) = active_job.take() {
-                                    // Same cancel-immediately pattern for AzDO path
                                     info!(
-                                        "PipelineAgentJobRequest while busy — cancelling previous job {}",
+                                        "PipelineAgentJobRequest while busy — checking previous job {} status",
                                         prev.request_id
                                     );
-                                    let timing = cancellation_timing(60);
-                                    prev.cancel(timing.effective_timeout_secs).await;
-                                    if tokio::time::timeout(
-                                        std::time::Duration::from_secs(timing.kill_after_secs),
-                                        prev.wait(),
-                                    )
-                                    .await
-                                    .is_err()
-                                    {
-                                        prev.kill().await;
+                                    // EnsureDispatchFinished queries the server before
+                                    // deciding whether this is a zombie worker or an
+                                    // active-overlap protocol violation. A terminal
+                                    // request is cancelled/drained; an active request
+                                    // is fatal instead of silently dropping job B.
+                                    if prev.agent_request_id.is_some() {
+                                        job_dispatcher::ensure_dispatch_finished(
+                                            &mut prev,
+                                            &token,
+                                            config.settings.pool_id,
+                                            &status_client,
+                                        )
+                                        .await?;
+                                    } else {
+                                        // A malformed legacy payload has no status key;
+                                        // retain the previous cancellation behavior.
+                                        prev.cancel(60).await;
+                                        let _ = prev.wait().await;
                                     }
                                     if once || config.settings.ephemeral {
                                         let _ = client.delete_session(&token, &session_id).await;
