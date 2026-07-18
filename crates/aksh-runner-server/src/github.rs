@@ -16,7 +16,7 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use crate::{changed_paths_from_payload, submit_run_inner, ExecutionStatus, SharedState};
-use aksh_gha_protocol::{JobId, RunId, WorkflowSubmission};
+use aksh_gha_protocol::{AnnotationLevel, JobId, NdjsonEvent, RunId, WorkflowSubmission};
 
 /// Webhook push event payload.
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -251,7 +251,7 @@ pub(crate) async fn report_check_run_completed(
     job_id: &JobId,
     status: ExecutionStatus,
 ) {
-    let (repo, check_run_id) = {
+    let (repo, check_run_id, annotations, global_issues) = {
         let inner = shared.state.inner.lock().await;
         let run = match inner.runs.get(&run_id) {
             Some(r) => r,
@@ -262,7 +262,49 @@ pub(crate) async fn report_check_run_completed(
             Some(id) => id,
             None => return,
         };
-        (repo, check_run_id)
+
+        let mut annotations = Vec::new();
+        let mut global_issues = Vec::new();
+
+        if let Some(events) = inner.timeline_events.get(&run_id) {
+            for event in events {
+                if let NdjsonEvent::Annotation {
+                    job_id: event_job_id,
+                    level,
+                    message,
+                    file,
+                    line,
+                    ..
+                } = event
+                {
+                    if event_job_id == job_id {
+                        let level_str = match level {
+                            AnnotationLevel::Notice => "notice",
+                            AnnotationLevel::Warning => "warning",
+                            AnnotationLevel::Error => "failure",
+                        };
+                        if let Some(file_path) = file {
+                            let line_num = line.unwrap_or(1);
+                            annotations.push(serde_json::json!({
+                                "path": file_path,
+                                "start_line": line_num,
+                                "end_line": line_num,
+                                "annotation_level": level_str,
+                                "message": message,
+                            }));
+                        } else {
+                            global_issues.push(format!("**{}**: {}", level_str.to_uppercase(), message));
+                        }
+                    }
+                }
+            }
+        }
+
+        if annotations.len() > 50 {
+            annotations.truncate(50);
+        }
+
+        (repo, check_run_id, annotations, global_issues)
     };
 
     let conclusion = match status {
@@ -274,10 +316,28 @@ pub(crate) async fn report_check_run_completed(
 
     let token = std::env::var("AKSH_GITHUB_TOKEN").ok();
     if let Some(token) = &token {
-        let body = serde_json::json!({
+        let summary = if global_issues.is_empty() {
+            format!("Job completed with status: {}", conclusion)
+        } else {
+            format!(
+                "Job completed with status: {}\n\n### Global/Job-Level Issues:\n{}",
+                conclusion,
+                global_issues.join("\n")
+            )
+        };
+
+        let mut body = serde_json::json!({
             "status": "completed",
             "conclusion": conclusion,
         });
+
+        if !annotations.is_empty() || !global_issues.is_empty() {
+            body["output"] = serde_json::json!({
+                "title": format!("Job: {}", job_id.0),
+                "summary": summary,
+                "annotations": annotations,
+            });
+        }
 
         let path = format!("check-runs/{}", check_run_id);
         if let Err(e) =
@@ -297,10 +357,13 @@ pub(crate) async fn report_check_run_completed(
             %job_id,
             check_run_id,
             conclusion,
+            annotations_count = annotations.len(),
+            global_issues_count = global_issues.len(),
             "Mock updated check run to completed"
         );
     }
 }
+
 
 /// Fetch workflows helper.
 pub(crate) async fn fetch_workflows(
