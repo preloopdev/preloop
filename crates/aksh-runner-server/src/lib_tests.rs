@@ -1,7 +1,12 @@
+use aksh_gha_protocol::azdo::AgentJobRequestMessage;
 use axum::body::{to_bytes, Body};
 use axum::http::{Method, Request, StatusCode};
 use serde_json::Value;
 use sha1::{Digest, Sha1};
+use std::fs;
+use std::io::Write;
+use std::path::Path as FsPath;
+use std::process::{Command, Stdio};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
@@ -4093,7 +4098,7 @@ async fn runner_oauth2_token_client_assertion_verification() {
     let client_assertion = sign_jwt_ps256(&header, &claims, &rsa_params).unwrap();
 
     // 4. Request OAuth token using urlencoded body
-    let form_body = serde_urlencoded::to_string(&[
+    let form_body = serde_urlencoded::to_string([
         (
             "client_assertion_type",
             "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
@@ -4128,7 +4133,7 @@ async fn runner_oauth2_token_client_assertion_verification() {
     let wrong_rsa_params = wrong_keypair.to_rsaparams();
     let bad_assertion = sign_jwt_ps256(&header, &claims, &wrong_rsa_params).unwrap();
 
-    let bad_form_body = serde_urlencoded::to_string(&[
+    let bad_form_body = serde_urlencoded::to_string([
         (
             "client_assertion_type",
             "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
@@ -6740,6 +6745,7 @@ jobs:
 /// Exercises the real parser → queue → completion → dependency-promotion path
 /// over 1,000 deterministic bounded DAGs.
 #[tokio::test]
+#[allow(clippy::needless_range_loop)]
 async fn generated_server_dag_properties_1000_cases() {
     fn next(seed: &mut u64) -> u64 {
         *seed = seed
@@ -6870,4 +6876,539 @@ async fn generated_server_dag_properties_1000_cases() {
             );
         }
     }
+}
+
+fn git_fixture_command(worktree: &FsPath, args: &[&str]) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn git_fixture_output(worktree: &FsPath, args: &[&str]) -> Vec<u8> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+fn git_fixture_output_allow_failure(worktree: &FsPath, args: &[&str]) -> (bool, Vec<u8>) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(args)
+        .output()
+        .unwrap();
+    (output.status.success(), output.stdout)
+}
+
+fn create_snapshot_fixture(root: &FsPath) -> (std::path::PathBuf, std::path::PathBuf) {
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    git_fixture_command(&workspace, &["init", "-b", "main"]);
+    git_fixture_command(&workspace, &["config", "user.name", "Snapshot Test"]);
+    git_fixture_command(
+        &workspace,
+        &["config", "user.email", "snapshot@example.test"],
+    );
+
+    fs::write(workspace.join(".gitignore"), "*.ignored\nignored-dir/\n").unwrap();
+    fs::write(workspace.join("tracked.txt"), "tracked base\n").unwrap();
+    fs::write(workspace.join("deleted.txt"), "will disappear\n").unwrap();
+    fs::write(workspace.join("staged.txt"), "staged base\n").unwrap();
+    fs::write(workspace.join("tracked.ignored"), "tracked ignored base\n").unwrap();
+    git_fixture_command(
+        &workspace,
+        &[
+            "add",
+            ".gitignore",
+            "tracked.txt",
+            "deleted.txt",
+            "staged.txt",
+        ],
+    );
+    git_fixture_command(&workspace, &["add", "-f", "tracked.ignored"]);
+    git_fixture_command(&workspace, &["commit", "-m", "base"]);
+
+    fs::write(workspace.join("tracked.txt"), "tracked unstaged change\n").unwrap();
+    fs::write(workspace.join("staged.txt"), "staged index change\n").unwrap();
+    git_fixture_command(&workspace, &["add", "staged.txt"]);
+    fs::remove_file(workspace.join("deleted.txt")).unwrap();
+    fs::write(workspace.join("untracked.txt"), "new nonignored file\n").unwrap();
+    fs::write(
+        workspace.join("ignored.ignored"),
+        "must not enter snapshot\n",
+    )
+    .unwrap();
+    fs::create_dir_all(workspace.join("ignored-dir")).unwrap();
+    fs::write(
+        workspace.join("ignored-dir/hidden.txt"),
+        "must not enter snapshot\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("tracked.ignored"),
+        "tracked ignored modification\n",
+    )
+    .unwrap();
+
+    (root.join("state"), workspace)
+}
+
+#[tokio::test]
+async fn workspace_snapshot_captures_git_state_without_mutating_source() {
+    let temp = tempfile::tempdir().unwrap();
+    let (state_dir, workspace) = create_snapshot_fixture(temp.path());
+    fs::create_dir_all(&state_dir).unwrap();
+    let run_id: RunId = "11111111-1111-4111-8111-111111111111".parse().unwrap();
+
+    let status_before = git_fixture_output(&workspace, &["status", "--porcelain=v1"]);
+    let index_path = FsPath::new(
+        String::from_utf8(git_fixture_output(
+            &workspace,
+            &["rev-parse", "--git-path", "index"],
+        ))
+        .unwrap()
+        .trim(),
+    )
+    .to_path_buf();
+    let index_path = if index_path.is_absolute() {
+        index_path
+    } else {
+        workspace.join(index_path)
+    };
+    let index_before = fs::read(&index_path).unwrap();
+
+    let snapshot = create_workspace_snapshot(&state_dir, &workspace, run_id)
+        .await
+        .expect("snapshot creation should succeed");
+
+    assert_eq!(snapshot.repository, format!("snapshots/{run_id}"));
+    assert_eq!(snapshot.commit_sha.len(), 40);
+    assert!(snapshot
+        .commit_sha
+        .bytes()
+        .all(|byte| byte.is_ascii_hexdigit()));
+    assert_eq!(
+        git_fixture_output(&workspace, &["status", "--porcelain=v1"]),
+        status_before,
+        "snapshot creation must not alter source status"
+    );
+    assert_eq!(fs::read(&index_path).unwrap(), index_before);
+
+    let repository = state_dir.join(&snapshot.repository);
+    assert!(repository.join("objects").is_dir());
+    assert!(!repository.join("objects/info/alternates").exists());
+    let commit = snapshot.commit_sha.as_str();
+    assert!(
+        git_fixture_output_allow_failure(
+            &repository,
+            &["cat-file", "-e", &format!("{commit}^{{commit}}")]
+        )
+        .0
+    );
+    assert_eq!(
+        git_fixture_output(&repository, &["show", &format!("{commit}:tracked.txt")]),
+        b"tracked unstaged change\n"
+    );
+    assert_eq!(
+        git_fixture_output(&repository, &["show", &format!("{commit}:staged.txt")]),
+        b"staged index change\n"
+    );
+    assert_eq!(
+        git_fixture_output(&repository, &["show", &format!("{commit}:tracked.ignored")]),
+        b"tracked ignored modification\n"
+    );
+    assert_eq!(
+        git_fixture_output(&repository, &["show", &format!("{commit}:untracked.txt")]),
+        b"new nonignored file\n"
+    );
+    assert!(
+        !git_fixture_output_allow_failure(
+            &repository,
+            &["cat-file", "-e", &format!("{commit}:deleted.txt")]
+        )
+        .0
+    );
+    assert!(
+        !git_fixture_output_allow_failure(
+            &repository,
+            &["cat-file", "-e", &format!("{commit}:ignored.ignored")]
+        )
+        .0
+    );
+    assert!(
+        !git_fixture_output_allow_failure(
+            &repository,
+            &[
+                "cat-file",
+                "-e",
+                &format!("{commit}:ignored-dir/hidden.txt")
+            ]
+        )
+        .0
+    );
+}
+
+fn checkout_test_message(steps: Value) -> AgentJobRequestMessage {
+    serde_json::from_value(json!({
+        "jobId": "00000000-0000-0000-0000-000000000001",
+        "requestId": 1,
+        "plan": {
+            "planId": "plan",
+            "planType": "build",
+            "version": 1,
+            "artifactUri": "",
+            "artifactLocation": ""
+        },
+        "timeline": {
+            "id": "00000000-0000-0000-0000-000000000002",
+            "changeId": 0,
+            "location": null
+        },
+        "jobName": "build",
+        "lockedUntil": "",
+        "resources": {"endpoints": []},
+        "steps": steps,
+        "snapshot": null
+    }))
+    .unwrap()
+}
+
+#[test]
+fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
+    let mut message = checkout_test_message(json!([
+        {
+            "id": "00000000-0000-0000-0000-000000000010",
+            "name": "checkout",
+            "reference": {"name": "Actions/Checkout", "version": "v4", "type": "repository"},
+            "inputs": {"path": "source", "fetch-depth": "0"},
+            "continueOnError": false,
+            "timeoutInMinutes": null
+        },
+        {
+            "id": "00000000-0000-0000-0000-000000000011",
+            "name": "explicit checkout",
+            "reference": {"name": "actions/checkout", "version": "v4", "type": "repository"},
+            "inputs": {
+                "repository": "octo/other",
+                "ref": "refs/heads/release",
+                "token": "secret-token",
+                "github-server-url": "https://github.example",
+                "path": "other"
+            },
+            "continueOnError": false,
+            "timeoutInMinutes": null
+        },
+        {
+            "id": "00000000-0000-0000-0000-000000000012",
+            "name": "run",
+            "reference": {"name": "actions/setup-node", "version": "v4", "type": "repository"},
+            "inputs": {"node-version": "22"},
+            "continueOnError": false,
+            "timeoutInMinutes": null
+        }
+    ]));
+    let original_explicit = message.steps[1].inputs.clone();
+    let original_non_checkout = message.steps[2].inputs.clone();
+    assert!(message.snapshot.is_none());
+
+    let redirected = redirect_primary_checkout(
+        &mut message,
+        &WorkspaceSnapshot {
+            commit_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            repository: "snapshots/11111111-1111-4111-8111-111111111111".to_owned(),
+        },
+        "http://127.0.0.1:9090",
+    );
+
+    assert_eq!(redirected, 1);
+    let primary = &message.steps[0].inputs;
+    assert_eq!(
+        primary.get("repository"),
+        Some(&"snapshots/11111111-1111-4111-8111-111111111111".to_owned())
+    );
+    assert_eq!(
+        primary.get("ref"),
+        Some(&"0123456789abcdef0123456789abcdef01234567".to_owned())
+    );
+    assert_eq!(
+        primary.get("github-server-url"),
+        Some(&"http://127.0.0.1:9090".to_owned())
+    );
+    assert_eq!(primary.get("path"), Some(&"source".to_owned()));
+    assert_eq!(primary.get("fetch-depth"), Some(&"0".to_owned()));
+    assert_eq!(message.steps[1].inputs, original_explicit);
+    assert_eq!(message.steps[2].inputs, original_non_checkout);
+    assert!(
+        message.snapshot.is_none(),
+        "snapshot wire field must remain untouched"
+    );
+}
+
+#[tokio::test]
+async fn local_workspace_checkout_acquires_synthetic_repository_and_serves_git_http() {
+    let temp = tempfile::tempdir().unwrap();
+    let (state_dir, workspace) = create_snapshot_fixture(temp.path());
+    let mut state = AppState::new(state_dir.clone()).await.unwrap();
+    state.local_workspace = Some(workspace.clone());
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = submit_yaml(
+        &app,
+        r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+"#,
+        "owner/repo",
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    let session = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/distributedtask/pools/1/sessions",
+        json!({
+            "agent": {"id": 1, "name": "snapshot-runner"},
+            "ownerName": "snapshot test",
+            "sessionId": "00000000-0000-0000-0000-000000000000",
+            "useFipsEncryption": false
+        }),
+    )
+    .await;
+    let session_id = session["sessionId"].as_str().unwrap();
+    let broker_message = request_json(
+        &app,
+        Method::GET,
+        &format!(
+            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId={session_id}&waitSeconds=0"
+        ),
+        Value::Null,
+    )
+    .await;
+    let broker_body: Value = serde_json::from_str(broker_message["body"].as_str().unwrap())
+        .expect("broker message body should be JSON");
+    let runner_request_id = broker_body["runner_request_id"]
+        .as_str()
+        .expect("broker message should identify the queued request");
+    let runner_token = state
+        .local_jwt(json!({
+            "sub": "aksh-runner-listen-1",
+            "scp": "ActionsRuntime.RunnerListen",
+        }))
+        .unwrap();
+    let acquired = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/broker/1/acquirejob",
+        json!({
+            "jobMessageId": runner_request_id,
+            "billingOwnerId": "local",
+            "runnerOS": "linux"
+        }),
+        &runner_token,
+    )
+    .await;
+
+    let checkout = acquired["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["reference"]["name"].as_str() == Some("actions/checkout"))
+        .expect("the acquired job should contain the checkout step");
+    fn checkout_input<'a>(step: &'a Value, name: &str) -> Option<&'a str> {
+        step["inputs"]
+            .get(name)
+            .and_then(Value::as_str)
+            .or_else(|| {
+                step["inputs"]["map"]
+                    .as_array()?
+                    .iter()
+                    .find(|entry| {
+                        entry
+                            .get("Key")
+                            .or_else(|| entry.get("key"))
+                            .and_then(|key| key.get("lit"))
+                            .and_then(Value::as_str)
+                            == Some(name)
+                    })
+                    .and_then(|entry| entry.get("Value").or_else(|| entry.get("value")))
+                    .and_then(|value| value.get("lit"))
+                    .and_then(Value::as_str)
+            })
+    }
+    let repository = checkout_input(checkout, "repository")
+        .unwrap_or_else(|| panic!("checkout repository should be rewritten: {checkout}"));
+    let commit = checkout_input(checkout, "ref").expect("checkout ref should be rewritten");
+    let server_url = checkout_input(checkout, "github-server-url")
+        .expect("checkout server URL should be rewritten");
+    assert_eq!(repository, format!("snapshots/{run_id}"));
+    assert_eq!(server_url, public_base_url());
+    assert_eq!(commit.len(), 40);
+    assert!(commit.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_eq!(acquired["snapshot"], Value::Null);
+
+    let runtime_token = acquired["variables"]["system.github.token"]["value"]
+        .as_str()
+        .expect("acquired job should expose its runtime token");
+    let unauthenticated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/snapshots/{run_id}/info/refs?service=git-upload-pack"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+    let wrong_run = "22222222-2222-4222-8222-222222222222";
+    let wrong_binding = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/snapshots/{wrong_run}/info/refs?service=git-upload-pack"
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {runtime_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wrong_binding.status(), StatusCode::FORBIDDEN);
+
+    let advertisement = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/snapshots/{run_id}/info/refs?service=git-upload-pack"
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {runtime_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(advertisement.status(), StatusCode::OK);
+    let advertisement_body = to_bytes(advertisement.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(advertisement_body
+        .windows(commit.len())
+        .any(|window| window == commit.as_bytes()));
+
+    fn pkt_line(payload: &[u8]) -> Vec<u8> {
+        let mut line = format!("{:04x}", payload.len() + 4).into_bytes();
+        line.extend_from_slice(payload);
+        line
+    }
+    let want = format!("want {commit} multi_ack_detailed side-band-64k thin-pack ofs-delta\n");
+    let mut upload_request = pkt_line(want.as_bytes());
+    upload_request.extend_from_slice(b"0000");
+    upload_request.extend_from_slice(&pkt_line(b"done\n"));
+    let upload = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/snapshots/{run_id}/git-upload-pack"))
+                .header(header::AUTHORIZATION, format!("Bearer {runtime_token}"))
+                .header(
+                    header::CONTENT_TYPE,
+                    "application/x-git-upload-pack-request",
+                )
+                .body(Body::from(upload_request))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(upload.status(), StatusCode::OK);
+    let upload_body = to_bytes(upload.into_body(), usize::MAX).await.unwrap();
+
+    // Decode side-band channel 1 from the actual git-http-backend response,
+    // then let Git validate the fetched pack's checksum and object framing.
+    let mut pack = Vec::new();
+    let mut offset = 0;
+    while offset + 4 <= upload_body.len() {
+        let length = usize::from_str_radix(
+            std::str::from_utf8(&upload_body[offset..offset + 4]).unwrap(),
+            16,
+        )
+        .unwrap();
+        offset += 4;
+        if length == 0 {
+            continue;
+        }
+        let payload_len = length - 4;
+        assert!(offset + payload_len <= upload_body.len());
+        let payload = &upload_body[offset..offset + payload_len];
+        if payload.first() == Some(&1) {
+            pack.extend_from_slice(&payload[1..]);
+        } else if payload.starts_with(b"PACK") {
+            pack.extend_from_slice(payload);
+        }
+        offset += payload_len;
+    }
+    assert!(
+        pack.starts_with(b"PACK"),
+        "upload-pack response should contain a pack"
+    );
+    let mut index_pack = Command::new("git")
+        .args(["index-pack", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    index_pack.stdin.take().unwrap().write_all(&pack).unwrap();
+    let index_result = index_pack.wait_with_output().unwrap();
+    assert!(
+        index_result.status.success(),
+        "Git rejected the route's fetched pack: {}",
+        String::from_utf8_lossy(&index_result.stderr)
+    );
+
+    let bare_repository = state_dir.join(repository);
+    assert!(
+        git_fixture_output_allow_failure(
+            &bare_repository,
+            &["cat-file", "-e", &format!("{commit}^{{commit}}")]
+        )
+        .0
+    );
+    assert_eq!(
+        git_fixture_output(
+            &bare_repository,
+            &["show", &format!("{commit}:tracked.txt")]
+        ),
+        b"tracked unstaged change\n"
+    );
 }
