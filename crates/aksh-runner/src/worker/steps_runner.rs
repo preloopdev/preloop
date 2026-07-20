@@ -72,6 +72,7 @@ pub async fn run_steps(
     container_spec: Option<&super::container_ops::ContainerSpec>,
     service_specs: &[super::container_ops::ServiceSpec],
 ) -> Result<String> {
+    let mut steps = steps.to_vec();
     let has_containers = container_spec.is_some() || !service_specs.is_empty();
     let mut any_failed = false;
     let mut cancelled = false;
@@ -116,8 +117,14 @@ pub async fn run_steps(
         setup_lines.push(format!("{ts} Runner group name: 'Default'"));
         setup_lines.push(format!("{ts} Machine name: '{machine_name}'"));
 
-        // GITHUB_TOKEN permissions from the job message (available in job context)
-        if let Some(token_perms) = job.github_context_value("token_permissions") {
+        // GITHUB_TOKEN permissions are present in the GitHub context on local
+        // submissions, while the GitHub control plane supplies the same data
+        // through system.github.token.permissions.
+        let token_permissions = job.github_context_value("token_permissions").or_else(|| {
+            job.get_variable("system.github.token.permissions")
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        });
+        if let Some(token_perms) = token_permissions {
             if let Some(perms) = token_perms.as_object() {
                 setup_lines.push(format!("{ts} ##[group]GITHUB_TOKEN Permissions"));
                 for (perm, level) in perms {
@@ -130,6 +137,18 @@ pub async fn run_steps(
         }
 
         setup_lines.push(format!("{ts} Secret source: Actions"));
+        // The official runner records configured HTTP proxies in the setup
+        // step. Reqwest reads these same environment variables for transport.
+        for (scheme, names) in [
+            ("HTTP", ["HTTP_PROXY", "http_proxy"]),
+            ("HTTPS", ["HTTPS_PROXY", "https_proxy"]),
+        ] {
+            if let Some(proxy) = names.iter().find_map(|name| std::env::var(name).ok()) {
+                setup_lines.push(format!(
+                    "{ts} Runner is running behind proxy server '{proxy}' for all {scheme} requests."
+                ));
+            }
+        }
         setup_lines.push(format!("{ts} Prepare workflow directory"));
         setup_lines.push(format!("{ts} Prepare all required actions"));
         setup_lines.push(format!("{ts} Complete job name: {}", job.job_name));
@@ -213,11 +232,11 @@ pub async fn run_steps(
         2
     };
 
-    for (idx, step) in steps.iter().enumerate() {
+    for (idx, step) in steps.iter_mut().enumerate() {
         let step_number = (idx as u32) + step_offset;
 
         let expr_ctx = job.build_expression_context();
-        let resolved_display_name = {
+        let mut resolved_display_name = {
             let evaluated =
                 crate::worker::template::evaluate_template(&step.display_name, &expr_ctx)
                     .unwrap_or_else(|_| step.display_name.clone());
@@ -465,6 +484,30 @@ pub async fn run_steps(
 
         let mut outcome =
             execute_step(&step.step_type, &mut step_ctx, workspace, exec_cancel_rx).await;
+        if resolved_display_name.contains("${{ format(") {
+            if let Some(group_line) = step_ctx
+                .log_content()
+                .lines()
+                .find_map(|line| line.split_once("##[group]Run ").map(|(_, name)| name))
+            {
+                resolved_display_name = format!("Run {group_line}");
+            } else if let StepType::Script { script, .. } = &step.step_type {
+                let expr_ctx = step_ctx.job.build_expression_context();
+                if let Ok(evaluated_script) =
+                    crate::worker::template::evaluate_template(script, &expr_ctx)
+                {
+                    resolved_display_name = crate::worker::job_extension::display_name_for_step(
+                        &step.id,
+                        &StepType::Script {
+                            script: evaluated_script,
+                            shell: None,
+                            working_directory: None,
+                        },
+                    );
+                }
+            }
+        }
+        step.display_name = resolved_display_name.clone();
         if let Some(handle) = timeout_handle {
             handle.abort();
         }
@@ -500,7 +543,13 @@ pub async fn run_steps(
                     step_ctx.job.job_status = JobStatus::Cancelled;
                     ("Cancelled".to_string(), "Cancelled".to_string())
                 } else {
-                    step_ctx.log(&format!("##[error]{e:#}"));
+                    // Script/container handlers already emit the official
+                    // process-failure command before returning their error.
+                    // Do not mirror that same `process exit code` as a second
+                    // ##[error] line from the generic step wrapper.
+                    if !msg.contains("process exit code") {
+                        step_ctx.log(&format!("##[error]{e:#}"));
+                    }
                     if step.continue_on_error {
                         warn!(
                             "Step '{}' failed but continue-on-error is set: {e:#}",
@@ -739,11 +788,11 @@ pub async fn run_steps(
     let ts = crate::worker::helpers::iso_now();
     // Step number: step_offset + user_steps + extra_steps (stop containers) + 1
     let complete_step_number = step_offset + steps.len() as u32 + extra_steps;
-    let final_conclusion = if cancelled || any_failed {
-        step_conclusion::FAILED
-    } else {
-        step_conclusion::SUCCEEDED
-    };
+    // "Complete job" is runner bookkeeping, not a workflow step. The
+    // official runner reports it successful even when the job result is
+    // failure or cancellation; the job result is carried separately in
+    // completejob.
+    let final_conclusion = step_conclusion::SUCCEEDED;
     let complete_step_id = uuid::Uuid::new_v4().to_string();
     job.complete_step_id = Some(complete_step_id.clone());
     {

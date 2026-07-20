@@ -657,6 +657,9 @@ pub fn build_step_list_with_lifecycle(
 
         // Post step (will be reversed into LIFO)
         if let Some(post_main) = &manifest.runs_post {
+            // The official runner keys post registration by Action.Id. Each
+            // workflow step is therefore a distinct invocation, including
+            // repeated `uses:` references with separate saved state.
             let post_if = manifest.runs_post_if.as_deref().unwrap_or("always()");
             let post_context = format!("__post_{}", step.context_name);
             let post_id = format!("__post_{}", step.id);
