@@ -126,6 +126,7 @@ fn expected_endpoint_wire(endpoint: &ServiceEndpoint) -> Value {
     Value::Object(object)
 }
 
+#[allow(dead_code)]
 fn expected_repository_wire(repository: &RepositoryReference) -> Value {
     let mut object = Map::new();
     if let Some(value) = &repository.repository {
@@ -185,7 +186,7 @@ fn expected_step_wire(step: &TaskStep) -> Value {
         let inputs_with_loc = step
             .reference
             .as_ref()
-            .map_or(false, |r| r.reference_type.as_deref() != Some("script"));
+            .is_some_and(|r| r.reference_type.as_deref() != Some("script"));
         object.insert(
             "inputs".to_owned(),
             expected_template_map(&inputs, inputs_with_loc),
@@ -958,7 +959,7 @@ proptest! {
         if expected_inputs.is_empty() {
             prop_assert!(encoded.get("inputs").is_none());
         } else {
-            let inputs_with_loc = step.reference.as_ref().map_or(false, |r| r.reference_type.as_deref() != Some("script"));
+            let inputs_with_loc = step.reference.as_ref().is_some_and(|r| r.reference_type.as_deref() != Some("script"));
             prop_assert_eq!(&encoded["inputs"], &expected_template_map(&expected_inputs, inputs_with_loc));
         }
         prop_assert_eq!(&encoded["id"], &json!(step.id));

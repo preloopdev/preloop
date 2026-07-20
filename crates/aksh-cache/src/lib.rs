@@ -329,7 +329,7 @@ mod tests {
                 let key2 = format!("{}{}", key_prefix, key_suffix2);
                 store.put(&key1, version, payload1).await.unwrap();
                 store.put(&key2, version, payload2).await.unwrap();
-                let restored = store.get("non-existent-key", version, &[key_prefix.to_string()]).await.unwrap();
+                let restored = store.get("non-existent-key", version, std::slice::from_ref(key_prefix)).await.unwrap();
                 let (entry, bytes) = restored.expect("prefix cache must resolve");
                 assert_eq!(entry.key, key2);
                 assert_eq!(bytes, *payload2);
@@ -347,7 +347,7 @@ mod tests {
                 let res_get = store.get(key, version, &[]).await;
                 assert!(matches!(res_get, Err(CacheError::InvalidKey(_))));
 
-                let res_get_rk = store.get("valid-key", version, &[key.to_string()]).await;
+                let res_get_rk = store.get("valid-key", version, std::slice::from_ref(key)).await;
                 assert!(matches!(res_get_rk, Err(CacheError::InvalidKey(_))));
             });
         }
