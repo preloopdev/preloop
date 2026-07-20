@@ -12,7 +12,7 @@ set -euo pipefail
 RUNNER_TYPE="${1:?Usage: $0 <aksh|official|both> [workflow-glob]}"
 WF_GLOB="${2:-}"
 
-GH_REPO="preloopdev/aksh-conformance-sample"
+GH_REPO="${GH_REPO:-Bnjoroge1/aksh-conformance}"
 HOST_WORKSPACE="/Users/bnjoroge/macos-runners"
 RESULTS_DIR="$HOST_WORKSPACE/benchmarks/compatibility/runner/behavior"
 TMP_DIR="/tmp/batch-conformance-$$"
@@ -30,7 +30,7 @@ log() { echo "[$(date +%T.%3N)] $*" | tee -a "$TMP_DIR/batch.log"; }
 log "Fetching workflow list from $GH_REPO..."
 ALL_WFS=$(gh api "repos/$GH_REPO/contents/.github/workflows" --jq '.[].name' | sort)
 
-# Filter to new conformance gap workflows (80-100)
+# Filter to conformance gap workflows (80-110)
 if [ -n "$WF_GLOB" ]; then
   WORKFLOWS=()
   while IFS= read -r wf; do
@@ -42,7 +42,7 @@ else
   while IFS= read -r wf; do
     case "$wf" in
       82-reusable-callee*) ;; # workflow_call only, not dispatchable
-      8[0-9]-*|9[0-9]-*|100-*) WORKFLOWS+=("$wf") ;;
+      8[0-9]-*|9[0-9]-*|10[0-9]-*|110-*) WORKFLOWS+=("$wf") ;;
     esac
   done <<< "$ALL_WFS"
 fi

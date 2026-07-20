@@ -48,6 +48,16 @@ WORKFLOW_NAME_MAP = {
     "99-workspace-defaults": "99",
     "100-tool-cache": "100",
     "94-action-pinning": "94",
+    "101-dynamic-matrix-dataflow": "101",
+    "102-failure-needs-conditions": "102",
+    "103-cancellation-background-post": "103",
+    "104-nested-lifecycle": "104",
+    "105-command-logs-annotations": "105",
+    "106-cache-artifact-pipeline": "106",
+    "107-remote-action-resolution": "107",
+    "108-environment-shell-filesystem": "108",
+    "109-dag-matrix-scheduler": "109",
+    "110-synthetic-workspace-checkout": "110",
 }
 
 WORKFLOW_DESCRIPTIONS = {
@@ -72,6 +82,16 @@ WORKFLOW_DESCRIPTIONS = {
     "98": "Outcome vs Conclusion",
     "99": "Workspace Defaults",
     "100": "Tool Cache",
+    "101": "Dynamic Matrix Dataflow",
+    "102": "Failure and Needs Conditions",
+    "103": "Cancellation and Background Process",
+    "104": "Nested Lifecycle",
+    "105": "Command Logs and Annotations",
+    "106": "Cache Artifact Pipeline",
+    "107": "Remote Action Resolution",
+    "108": "Environment Shell Filesystem",
+    "109": "DAG Matrix Scheduler",
+    "110": "Synthetic Workspace Checkout",
 }
 
 
