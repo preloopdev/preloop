@@ -45,6 +45,13 @@ const CHUNK_CHANNEL_CAPACITY: usize = 1024;
 /// Size of the read buffer for raw byte chunks from stdout/stderr.
 const READ_BUF_SIZE: usize = 65536; // 64 KB
 
+// ProcessInvoker.cs v2.335.1 waits five seconds for redirected streams after
+// the parent exits, then kills the remaining process tree.
+#[cfg(not(test))]
+const STREAM_DRAIN_GRACE: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const STREAM_DRAIN_GRACE: Duration = Duration::from_millis(350);
+
 /// Result of a process invocation.
 #[derive(Debug)]
 pub struct ProcessOutput {
@@ -109,13 +116,23 @@ pub async fn invoke<'a>(
     // Wait for process, racing against cancellation while draining chunks.
     let mut status_opt: Option<std::process::ExitStatus> = None;
     let mut cancel_requested = false;
+    let mut stream_deadline: Option<tokio::time::Instant> = None;
+    let mut forced_stream_close = false;
 
     loop {
-        if let Some(status) = child
-            .try_wait()
-            .with_context(|| format!("checking status for {program}"))?
-        {
-            status_opt = Some(status);
+        if status_opt.is_none() {
+            let status = child
+                .try_wait()
+                .with_context(|| format!("checking status for {program}"))?;
+            if status.is_some() && !chunk_rx.is_closed() {
+                stream_deadline = Some(tokio::time::Instant::now() + STREAM_DRAIN_GRACE);
+            }
+            status_opt = status;
+        }
+        // Runner.Worker keeps the process invocation active until redirected
+        // stdout/stderr reach EOF. This also keeps cancellation live after the
+        // shell exits while a background descendant retains either pipe.
+        if status_opt.is_some() && chunk_rx.is_closed() {
             break;
         }
 
@@ -132,6 +149,14 @@ pub async fn invoke<'a>(
                         break;
                     }
                 }
+                _ = tokio::time::sleep_until(stream_deadline.unwrap_or_else(tokio::time::Instant::now)), if stream_deadline.is_some() => {
+                    tracing::info!("Killing process group for {program} after redirected streams remained open for {:?}", STREAM_DRAIN_GRACE);
+                    if let Err(error) = child.kill().await {
+                        tracing::warn!("Failed to kill process group after stream drain timeout: {error}");
+                    }
+                    forced_stream_close = true;
+                    break;
+                }
                 () = tokio::time::sleep(Duration::from_millis(100)) => {}
             }
         } else {
@@ -140,6 +165,14 @@ pub async fn invoke<'a>(
                     Some(bytes) => push_chunk(bytes, &mut lines, &mut on_chunk, keep_lines),
                     None => continue,
                 },
+                _ = tokio::time::sleep_until(stream_deadline.unwrap_or_else(tokio::time::Instant::now)), if stream_deadline.is_some() => {
+                    tracing::info!("Killing process group for {program} after redirected streams remained open for {:?}", STREAM_DRAIN_GRACE);
+                    if let Err(error) = child.kill().await {
+                        tracing::warn!("Failed to kill process group after stream drain timeout: {error}");
+                    }
+                    forced_stream_close = true;
+                    break;
+                }
                 () = tokio::time::sleep(Duration::from_millis(100)) => {}
             }
         }
@@ -154,6 +187,7 @@ pub async fn invoke<'a>(
             &mut lines,
             &mut on_chunk,
             keep_lines,
+            false,
         )
         .await;
         return Err(anyhow::anyhow!("process cancelled"));
@@ -162,7 +196,8 @@ pub async fn invoke<'a>(
     let status = status_opt.context("process did not exit")?;
     let exit_code = status.code().unwrap_or(-1);
 
-    // Drain remaining chunks after process exit.
+    // A forced stream cutoff is a successful parent-process completion, but
+    // its escaped readers must be aborted rather than awaited indefinitely.
     drain_chunks(
         stdout_handle,
         stderr_handle,
@@ -170,6 +205,7 @@ pub async fn invoke<'a>(
         &mut lines,
         &mut on_chunk,
         keep_lines,
+        !forced_stream_close,
     )
     .await;
 
@@ -251,21 +287,42 @@ fn push_chunk(
 
 /// Drain remaining chunks after the process has exited or been cancelled.
 async fn drain_chunks(
-    stdout_handle: Option<JoinHandle<()>>,
-    stderr_handle: Option<JoinHandle<()>>,
+    mut stdout_handle: Option<JoinHandle<()>>,
+    mut stderr_handle: Option<JoinHandle<()>>,
     chunk_rx: &mut mpsc::Receiver<Bytes>,
     lines: &mut Vec<String>,
     on_chunk: &mut Option<ChunkCallback<'_>>,
     keep_lines: bool,
+    wait_for_eof: bool,
 ) {
-    if let Some(h) = stdout_handle {
-        let _ = h.await;
-    }
-    if let Some(h) = stderr_handle {
-        let _ = h.await;
+    if wait_for_eof {
+        // Runner.Worker does not complete a normally exited process until its
+        // redirected stdout/stderr streams reach EOF. A background descendant
+        // that inherited either pipe therefore keeps the step active and
+        // remains cancellable through the process group.
+        while let Some(bytes) = chunk_rx.recv().await {
+            push_chunk(bytes, lines, on_chunk, keep_lines);
+        }
+        if let Some(handle) = stdout_handle.take() {
+            let _ = handle.await;
+        }
+        if let Some(handle) = stderr_handle.take() {
+            let _ = handle.await;
+        }
+        return;
     }
 
-    while let Some(bytes) = chunk_rx.recv().await {
+    // Cancellation/forced termination must not hang on a descendant that
+    // escaped the process group while retaining a pipe.
+    const DRAIN_GRACE: Duration = Duration::from_millis(250);
+    tokio::time::sleep(DRAIN_GRACE).await;
+    if let Some(handle) = stdout_handle.take() {
+        handle.abort();
+    }
+    if let Some(handle) = stderr_handle.take() {
+        handle.abort();
+    }
+    while let Ok(bytes) = chunk_rx.try_recv() {
         push_chunk(bytes, lines, on_chunk, keep_lines);
     }
 }
@@ -465,6 +522,94 @@ mod tests {
 
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.lines, vec!["out-1", "err-1", "out-2", "err-2"]);
+    }
+
+    #[tokio::test]
+    async fn invoke_waits_for_background_child_to_close_inherited_output_pipe() {
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            invoke(
+                "sh",
+                &["-c", "(sleep 0.15) & echo marker"],
+                Path::new("."),
+                &HashMap::new(),
+                None,
+                None,
+                true,
+            ),
+        )
+        .await
+        .expect("invoke did not observe inherited-pipe EOF")
+        .expect("invoke failed");
+
+        assert_eq!(result.exit_code, 0);
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "invoke returned before the background child closed stdout"
+        );
+        assert!(
+            result.lines.iter().any(|line| line == "marker"),
+            "expected marker in captured output, got {:?}",
+            result.lines
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_background_child_after_shell_exit() {
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let cancel_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let _ = cancel_tx.send(true);
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            invoke(
+                "sh",
+                &[
+                    "-c",
+                    "(trap '' TERM; while :; do sleep 1; done) & echo ready",
+                ],
+                Path::new("."),
+                &HashMap::new(),
+                None,
+                Some(cancel_rx),
+                true,
+            ),
+        )
+        .await
+        .expect("background child cancellation timed out");
+        let _ = cancel_task.await;
+
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("process cancelled"));
+    }
+
+    #[tokio::test]
+    async fn invoke_forces_stream_close_after_official_grace_window() {
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            invoke(
+                "sh",
+                &["-c", "(sleep 5) & echo marker"],
+                Path::new("."),
+                &HashMap::new(),
+                None,
+                None,
+                true,
+            ),
+        )
+        .await
+        .expect("stream cutoff did not terminate the inherited-pipe process")
+        .expect("invoke failed");
+
+        assert_eq!(result.exit_code, 0);
+        assert!(started.elapsed() >= STREAM_DRAIN_GRACE);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[tokio::test]
