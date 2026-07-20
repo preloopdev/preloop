@@ -258,7 +258,7 @@ pub async fn run_node_action(
     );
 
     info!("Running node action: {node_path} {}", entry_point.display());
-    let ctx_ref = &*ctx;
+    let ctx_ref = &mut *ctx;
     let on_chunk = Box::new(move |chunk: &[u8]| {
         ctx_ref.write_chunk(chunk);
     });

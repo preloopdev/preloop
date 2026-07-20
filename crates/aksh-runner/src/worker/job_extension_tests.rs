@@ -357,6 +357,53 @@ runs:
 }
 
 #[test]
+fn lifecycle_registers_post_for_each_repeated_action_invocation() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let workspace = temp.path().join("_work/repo/repo");
+    let action_dir = temp.path().join("_work/_actions/actions/example/sha");
+    std::fs::create_dir_all(&action_dir).unwrap();
+    std::fs::write(
+        action_dir.join("action.yml"),
+        "name: example\nruns:\n  using: node20\n  main: main.js\n  post: cleanup.js\n",
+    )
+    .unwrap();
+    let action_step = |id: &str| Step {
+        id: id.to_owned(),
+        context_name: id.to_owned(),
+        display_name: id.to_owned(),
+        step_type: StepType::Action {
+            uses: "actions/example@v1".to_owned(),
+            with: serde_json::json!({}),
+        },
+        condition: Some("success()".to_owned()),
+        continue_on_error: false,
+        timeout_minutes: None,
+        env: std::collections::HashMap::new(),
+        raw: serde_json::json!({}),
+        is_background: false,
+    };
+    let mut action_paths = std::collections::HashMap::new();
+    action_paths.insert(
+        "actions/example@v1".to_owned(),
+        action_dir.to_string_lossy().into_owned(),
+    );
+
+    let ordered = build_step_list_with_lifecycle(
+        vec![action_step("first"), action_step("second")],
+        workspace.to_str().unwrap(),
+        &action_paths,
+    );
+
+    assert_eq!(
+        ordered
+            .iter()
+            .map(|step| step.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["first", "second", "__post_second", "__post_first"]
+    );
+}
+
+#[test]
 fn lifecycle_local_actions_skip_pre_but_retain_main_and_post() {
     let temp = tempfile::TempDir::new().unwrap();
     let workspace = temp.path().join("_work/repo/repo");

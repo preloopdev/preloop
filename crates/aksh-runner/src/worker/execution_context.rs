@@ -26,14 +26,7 @@ fn disable_stdout_multiline_log_prefixing() -> bool {
         .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "$true"))
 }
 
-/// Format one line from a stdout trace message.
-///
-/// The official listener writes a header before every line by default. With
-/// multiline prefixing disabled, only the first line gets that header and
-/// continuation lines are written verbatim. The timestamp is the local
-/// equivalent of that listener header; preserving the line itself is
-/// important because workflow-command prefixes (for example `##[error]`) are
-/// unrelated to the trace header and must not be altered.
+#[cfg(test)]
 fn format_stdout_line(timestamp: &str, line: &str, prefix: bool) -> String {
     if prefix {
         format!("{timestamp} {line}")
@@ -56,6 +49,7 @@ pub struct StepContext<'a> {
     pub echo: bool,
     /// Log lines collected during step execution.
     pub log_lines: Vec<String>,
+    stdout_prefix_override: Option<bool>,
     /// Whether the step was cancelled.
     pub cancelled: bool,
     /// stop-commands token: when set, all commands are suspended until `::{token}::` is seen.
@@ -107,6 +101,7 @@ impl<'a> StepContext<'a> {
             debug,
             echo: false,
             log_lines: Vec::new(),
+            stdout_prefix_override: None,
             cancelled: false,
             stop_commands_token: None,
             translate_container_path,
@@ -126,76 +121,68 @@ impl<'a> StepContext<'a> {
     /// Buffers partial lines and processes each complete line with a UTC
     /// timestamp prefix and secret masking, matching the official runner's
     /// per-line log formatting.
-    pub fn write_chunk(&self, chunk: &[u8]) {
+    pub fn write_chunk(&mut self, chunk: &[u8]) {
         let mut buf = self.line_buffer.lock();
         buf.extend_from_slice(chunk);
-        let mut prefix = true;
-        self.stdout_partial_is_continuation
-            .store(false, std::sync::atomic::Ordering::Relaxed);
 
         // Process all complete lines (ending with \n)
+        let mut complete_lines = Vec::new();
         while let Some(newline_pos) = buf.iter().position(|&b| b == b'\n') {
             // Extract the line (without the newline)
             let line_bytes: Vec<u8> = buf.drain(..=newline_pos).collect();
             let line = String::from_utf8_lossy(&line_bytes[..line_bytes.len() - 1]);
+            complete_lines.push(line.into_owned());
+        }
 
-            let masked = self.job.mask_secrets(&line);
-            let ts = crate::worker::helpers::iso_now();
-            let fmt = format_stdout_line(
-                &ts,
-                &masked,
-                prefix || !self.disable_stdout_multiline_log_prefixing,
+        if !complete_lines.is_empty() {
+            self.stdout_partial_is_continuation.store(
+                self.disable_stdout_multiline_log_prefixing && !buf.is_empty(),
+                std::sync::atomic::Ordering::Relaxed,
             );
-            prefix = false;
-            {
-                let mut lock = self.log_file.lock();
-                let _ = writeln!(lock, "{}", fmt);
-            }
-            // Feed to live log WebSocket (best-effort, matching official runner
-            // OutputManager per-line callback behavior).
-            if let Some(ref live) = self.live_logs {
+        } else if buf.is_empty() {
+            self.stdout_partial_is_continuation
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        drop(buf);
+
+        for (index, line) in complete_lines.into_iter().enumerate() {
+            let masked = self.job.mask_secrets(&line);
+            self.stdout_prefix_override =
+                Some(index == 0 || !self.disable_stdout_multiline_log_prefixing);
+            self.log(&line);
+            self.stdout_prefix_override = None;
+            if let Some(live) = &self.live_logs {
                 let line_num = self
                     .live_line_counter
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 live.enqueue(&self.step_id, &masked, line_num);
             }
         }
-
-        self.stdout_partial_is_continuation.store(
-            self.disable_stdout_multiline_log_prefixing && !prefix && !buf.is_empty(),
-            std::sync::atomic::Ordering::Relaxed,
-        );
     }
 
     /// Flush any remaining partial line in the buffer (call at step end).
-    pub fn flush_line_buffer(&self) {
+    pub fn flush_line_buffer(&mut self) {
         let mut buf = self.line_buffer.lock();
         if buf.is_empty() {
             return;
         }
-        let line = String::from_utf8_lossy(&buf);
+        let line = String::from_utf8_lossy(&buf).into_owned();
         let masked = self.job.mask_secrets(&line);
-        let ts = crate::worker::helpers::iso_now();
-        let continuation = self
+        let is_continuation = self
             .stdout_partial_is_continuation
             .swap(false, std::sync::atomic::Ordering::Relaxed);
-        let fmt = format_stdout_line(
-            &ts,
-            &masked,
-            !self.disable_stdout_multiline_log_prefixing || !continuation,
-        );
-        {
-            let mut lock = self.log_file.lock();
-            let _ = writeln!(lock, "{}", fmt);
-        }
-        // Feed final partial line to live log WebSocket.
+        buf.clear();
+        drop(buf);
+        self.stdout_prefix_override =
+            Some(!self.disable_stdout_multiline_log_prefixing || !is_continuation);
+        self.log(&line);
+        self.stdout_prefix_override = None;
         if let Some(ref live) = self.live_logs {
             let line_num = self
                 .live_line_counter
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             live.enqueue(&self.step_id, &masked, line_num);
         }
-        buf.clear();
     }
 
     /// Add a log line: parse workflow commands, apply masking, feed problem matchers.
@@ -209,7 +196,11 @@ impl<'a> StepContext<'a> {
             // All commands suspended — just log the line
             let masked = self.job.mask_secrets(line);
             let ts = crate::worker::helpers::iso_now();
-            let fmt = format!("{ts} {masked}");
+            let fmt = if self.stdout_prefix_override == Some(false) {
+                masked.clone()
+            } else {
+                format!("{ts} {masked}")
+            };
             {
                 let mut lock = self.log_file.lock();
                 let _ = writeln!(lock, "{}", fmt);
@@ -318,7 +309,11 @@ impl<'a> StepContext<'a> {
             format!("{ts} {prefix}{masked}")
         } else {
             let ts = crate::worker::helpers::iso_now();
-            format!("{ts} {masked}")
+            if self.stdout_prefix_override == Some(false) {
+                masked
+            } else {
+                format!("{ts} {masked}")
+            }
         };
 
         {
@@ -717,7 +712,7 @@ mod tests {
         for value in [None, Some("false")] {
             with_stdout_toggle(value, || {
                 let mut job = make_job();
-                let ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+                let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
                 ctx.write_chunk(b"first\nsecond\n");
                 let lines: Vec<_> = ctx.log_content().lines().map(str::to_string).collect();
                 assert_eq!(lines.len(), 2);
@@ -739,7 +734,7 @@ mod tests {
     fn write_chunk_multiline_stdout_suppresses_true_continuation_prefix() {
         with_stdout_toggle(Some("true"), || {
             let mut job = make_job();
-            let ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+            let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
             ctx.write_chunk(b"first\nsecond\n");
             let lines: Vec<_> = ctx.log_content().lines().map(str::to_string).collect();
             assert_eq!(lines.len(), 2);
@@ -756,7 +751,7 @@ mod tests {
     fn write_chunk_flushes_true_partial_continuation_without_prefix() {
         with_stdout_toggle(Some("true"), || {
             let mut job = make_job();
-            let ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+            let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
             ctx.write_chunk(b"first\nsecond");
             ctx.flush_line_buffer();
             let lines: Vec<_> = ctx.log_content().lines().map(str::to_string).collect();
@@ -767,10 +762,41 @@ mod tests {
     }
 
     #[test]
+    fn write_chunk_flushes_standalone_partial_line_with_prefix() {
+        with_stdout_toggle(Some("true"), || {
+            let mut job = make_job();
+            let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+            ctx.write_chunk(b"standalone");
+            ctx.flush_line_buffer();
+            let content = ctx.log_content();
+            let lines: Vec<_> = content.lines().collect();
+            assert_eq!(lines.len(), 1);
+            assert!(lines[0].ends_with(" standalone"));
+            assert_ne!(lines[0], "standalone");
+        });
+    }
+
+    #[test]
+    fn write_chunk_preserves_continuation_state_across_chunks() {
+        with_stdout_toggle(Some("true"), || {
+            let mut job = make_job();
+            let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+            ctx.write_chunk(b"first\nsec");
+            ctx.write_chunk(b"ond");
+            ctx.flush_line_buffer();
+            let content = ctx.log_content();
+            let lines: Vec<_> = content.lines().collect();
+            assert_eq!(lines.len(), 2);
+            assert!(lines[0].ends_with(" first"));
+            assert_eq!(lines[1], "second");
+        });
+    }
+
+    #[test]
     fn write_chunk_multiline_stdout_preserves_unrelated_command_prefixes() {
         with_stdout_toggle(Some("true"), || {
             let mut job = make_job();
-            let ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+            let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
             ctx.write_chunk(b"##[error]first\n##[warning]second\n");
             let lines: Vec<_> = ctx.log_content().lines().map(str::to_string).collect();
             assert_eq!(lines.len(), 2);
