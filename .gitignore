@@ -1,4 +1,5 @@
 /target/
+/target-arm/
 /.preloop/
 /.runner-watch/repos/
 /.runner-watch/**/*.pid
@@ -22,6 +23,8 @@ __pycache__/
 .env
 *.pem
 *.key
+*.p12
+*.cer
 /_work/
 /_runner_work/
 /externals/
@@ -42,10 +45,8 @@ libs/*.so*
 benchmarks/real-world/aksh-runner
 benchmarks/real-world/aksh-runner-new
 benchmarks/real-world/official-runner.tar.gz
-benchmarks/compatibility/runner/protocol/**/flows.jsonl
-benchmarks/compatibility/runner/protocol/**/flows.mitm
-benchmarks/compatibility/runner/protocol/**/flow.*.bin
-benchmarks/compatibility/runner/protocol/**/*.pid
+/benchmarks/compatibility/runner/protocol/
+/benchmarks/compatibility/runner/protocol-local/
 benchmarks/compatibility/server/protocol/captures/**/flow.*.bin
 
 # Disposable official-runner installations used by smolVM comparisons.

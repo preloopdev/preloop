@@ -1,7 +1,7 @@
 server := "http://127.0.0.1:9090"
 repo := "preloopdev/aksh"
 
-# ── build ──────────────────────────────────────────────────────────────────
+
 
 build:
     cargo build --release -p aksh-runner-server
@@ -9,7 +9,6 @@ build:
 build-all:
     cargo build --release --workspace
 
-# ── check ──────────────────────────────────────────────────────────────────
 
 check:
     cargo check --workspace
@@ -23,7 +22,6 @@ fmt-check:
 clippy:
     cargo clippy --workspace --all-targets -- -D warnings
 
-# ── test ───────────────────────────────────────────────────────────────────
 
 test:
     cargo test --workspace --quiet
@@ -31,7 +29,7 @@ test:
 test-ci: fmt-check clippy test
     @echo CI: all checks passed
 
-# ── lint (ast-grep structural rules) ─────────────────────────────────────
+#lint (ast-grep structural rules)
 
 sg-scan:
     sg scan
@@ -39,12 +37,12 @@ sg-scan:
 sg-scan-strict:
     sg scan --error
 
-# ── dogfood (e2e against aksh with real runner) ────────────────────────────
+#dogfood (e2e against aksh with real runner) 
 
 dogfood: build
     ./autoresearch.sh
 
-# ── e2e redirect (one-time setup) ──────────────────────────────────────────
+# e2e redirect (one-time setup) 
 
 e2e-setup:
     sudo ./scripts/e2e-setup.sh
@@ -55,12 +53,12 @@ e2e-status:
 e2e-teardown:
     sudo ./scripts/e2e-setup.sh --teardown
 
-# ── serve ──────────────────────────────────────────────────────────────────
+#serve
 
 serve:
     AKSH_LOCAL_WORKSPACE="${AKSH_LOCAL_WORKSPACE:-$PWD}" cargo run --release -p aksh-runner-server -- serve --listen 127.0.0.1:9090
 
-# ── submit ──────────────────────────────────────────────────────────────────
+#submit 
 
 submit-ci:
     cargo run -p aksh-runner-client -- --server {{server}} submit -W .github/workflows/ci.yml --repository {{repo}}
@@ -68,7 +66,7 @@ submit-ci:
 submit-dogfood:
     cargo run -p aksh-runner-client -- --server {{server}} submit -W fixtures/workflows/dogfood.yml
 
-# ── runner ─────────────────────────────────────────────────────────────────
+#runner 
 
 build-runner:
     cargo build --release -p aksh-runner
