@@ -91,6 +91,8 @@ pub struct ServerQueue {
     /// Accumulated log content temp file (used for job log).
     job_log_file: std::io::BufWriter<std::fs::File>,
     change_order: u64,
+    steps_generation: u64,
+    published_generation: u64,
     job_id: String,
     plan_id: String,
     /// All updates ever queued — populated only in test builds.
@@ -109,6 +111,8 @@ impl ServerQueue {
                 tempfile::tempfile().expect("failed to create job log temp file"),
             ),
             change_order: 0,
+            steps_generation: 0,
+            published_generation: 0,
             job_id,
             plan_id,
             #[cfg(test)]
@@ -135,7 +139,10 @@ impl ServerQueue {
         let partial = crate::worker::step_records::PartialStepUpdate::from_full(&update);
         let merged =
             crate::worker::step_records::merge_step_update(self.all_steps.get(&key), &partial);
-        self.all_steps.insert(key, merged);
+        if self.all_steps.get(&key) != Some(&merged) {
+            self.steps_generation = self.steps_generation.wrapping_add(1);
+            self.all_steps.insert(key, merged);
+        }
     }
 
     /// Queue log lines for a step.
@@ -148,20 +155,29 @@ impl ServerQueue {
     ///
     /// Returns ALL steps with their latest status (cumulative), matching
     /// the official runner's behavior. Increments change_order.
-    pub fn take_steps_update_body(&mut self) -> Option<WorkflowStepsUpdateBody> {
-        if self.all_steps.is_empty() {
+    pub fn take_steps_update_body(&mut self) -> Option<(WorkflowStepsUpdateBody, u64)> {
+        if self.steps_generation == self.published_generation {
             return None;
         }
         self.change_order += 1;
         // Collect all steps sorted by number (matching official runner ordering)
         let mut steps: Vec<StepUpdate> = self.all_steps.values().cloned().collect();
         steps.sort_by_key(|s| s.number);
-        Some(WorkflowStepsUpdateBody {
-            steps,
-            change_order: self.change_order,
-            workflow_job_run_backend_id: self.job_id.clone(),
-            workflow_run_backend_id: self.plan_id.clone(),
-        })
+        Some((
+            WorkflowStepsUpdateBody {
+                steps,
+                change_order: self.change_order,
+                workflow_job_run_backend_id: self.job_id.clone(),
+                workflow_run_backend_id: self.plan_id.clone(),
+            },
+            self.steps_generation,
+        ))
+    }
+
+    /// Mark the captured generation as published. Updates queued while the
+    /// request was in flight retain a newer generation and remain pending.
+    pub fn mark_steps_published(&mut self, generation: u64) {
+        self.published_generation = self.published_generation.max(generation);
     }
 
     /// Take all pending logs (drains the queue).
@@ -171,7 +187,12 @@ impl ServerQueue {
 
     /// Check if there are any pending items.
     pub fn has_pending(&self) -> bool {
-        !self.all_steps.is_empty() || !self.pending_logs.is_empty()
+        self.has_step_updates() || !self.pending_logs.is_empty()
+    }
+
+    /// Whether a step state newer than the last successful publication exists.
+    pub fn has_step_updates(&self) -> bool {
+        self.steps_generation != self.published_generation
     }
 
     /// Map a conclusion string to the proto enum value.
@@ -238,7 +259,7 @@ mod tests {
         });
         assert!(q.has_pending());
 
-        let body = q.take_steps_update_body().unwrap();
+        let (body, generation) = q.take_steps_update_body().unwrap();
         assert_eq!(body.steps.len(), 1);
         assert_eq!(body.steps[0].external_id, "step-uuid-1");
         assert_eq!(body.steps[0].status, 6);
@@ -246,8 +267,10 @@ mod tests {
         assert_eq!(body.change_order, 1);
         assert_eq!(body.workflow_job_run_backend_id, "job-1");
         assert_eq!(body.workflow_run_backend_id, "plan-1");
-        // all_steps is cumulative — has_pending stays true until steps are taken
+        // A snapshot remains pending until the transport confirms publication.
         assert!(q.has_pending());
+        q.mark_steps_published(generation);
+        assert!(!q.has_pending());
 
         // Serializes correctly
         let json = serde_json::to_value(&body).unwrap();
@@ -281,11 +304,12 @@ mod tests {
             conclusion: 0,
         });
 
-        let body = q.take_steps_update_body().unwrap();
+        let (body, generation) = q.take_steps_update_body().unwrap();
         // Both steps should be in the update
         assert_eq!(body.steps.len(), 2);
         assert_eq!(body.steps[0].external_id, "step-1");
         assert_eq!(body.steps[1].external_id, "step-2");
+        q.mark_steps_published(generation);
 
         // Step 2 completes, step 3 starts
         q.queue_update(StepUpdate {
@@ -307,7 +331,7 @@ mod tests {
             conclusion: step_conclusion::SUCCEEDED,
         });
 
-        let body2 = q.take_steps_update_body().unwrap();
+        let (body2, _) = q.take_steps_update_body().unwrap();
         // All 3 steps should be in the update (cumulative)
         assert_eq!(body2.steps.len(), 3);
         assert_eq!(body2.steps[0].external_id, "step-1");
@@ -351,8 +375,9 @@ mod tests {
             completed_at: None,
             conclusion: step_conclusion::SUCCEEDED,
         });
-        let b1 = q.take_steps_update_body().unwrap();
+        let (b1, generation) = q.take_steps_update_body().unwrap();
         assert_eq!(b1.change_order, 1);
+        q.mark_steps_published(generation);
 
         q.queue_update(StepUpdate {
             external_id: "b".into(),
@@ -363,8 +388,38 @@ mod tests {
             completed_at: None,
             conclusion: step_conclusion::FAILED,
         });
-        let b2 = q.take_steps_update_body().unwrap();
+        let (b2, _) = q.take_steps_update_body().unwrap();
         assert_eq!(b2.change_order, 2);
+    }
+
+    #[test]
+    fn publication_keeps_updates_queued_while_request_is_in_flight() {
+        let mut q = ServerQueue::new("j".into(), "p".into());
+        q.queue_update(StepUpdate {
+            external_id: "a".into(),
+            number: 1,
+            name: "first".into(),
+            status: step_status::IN_PROGRESS,
+            started_at: None,
+            completed_at: None,
+            conclusion: 0,
+        });
+        let (_, in_flight_generation) = q.take_steps_update_body().unwrap();
+        q.queue_update(StepUpdate {
+            external_id: "a".into(),
+            number: 1,
+            name: "first".into(),
+            status: step_status::COMPLETED,
+            started_at: None,
+            completed_at: None,
+            conclusion: step_conclusion::SUCCEEDED,
+        });
+
+        q.mark_steps_published(in_flight_generation);
+
+        assert!(q.has_step_updates());
+        let (body, _) = q.take_steps_update_body().unwrap();
+        assert_eq!(body.steps[0].status, step_status::COMPLETED);
     }
 
     #[test]

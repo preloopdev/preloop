@@ -357,10 +357,15 @@ impl JobContext {
         let mut steps_map = serde_json::Map::new();
         for (id, result) in &self.steps {
             let mut step_val = serde_json::Map::new();
-            step_val.insert("outcome".to_string(), serde_json::json!(result.outcome));
+            // GitHub exposes these context fields as lowercase strings even
+            // though the runner's internal result model uses title case.
+            step_val.insert(
+                "outcome".to_string(),
+                serde_json::json!(result.outcome.to_ascii_lowercase()),
+            );
             step_val.insert(
                 "conclusion".to_string(),
-                serde_json::json!(result.conclusion),
+                serde_json::json!(result.conclusion.to_ascii_lowercase()),
             );
             let mut outputs_map = serde_json::Map::new();
             for (k, v) in &result.outputs {
