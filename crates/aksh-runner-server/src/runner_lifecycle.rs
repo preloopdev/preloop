@@ -392,7 +392,7 @@ pub(crate) async fn register_runner_compat(
             "publicKey": public_key_object
         },
         "properties": {
-            "RequireFipsCryptography": {"$type": "System.Boolean", "$value": true},
+            "RequireFipsCryptography": {"$type": "System.Boolean", "$value": false},
             "ServerUrl": {"$type": "System.String", "$value": runner_server_url()},
             "ServerUrlV2": {"$type": "System.String", "$value": runner_server_url()},
             "UseV2Flow": {"$type": "System.Boolean", "$value": true}
