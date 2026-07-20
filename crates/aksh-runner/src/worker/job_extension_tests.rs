@@ -526,6 +526,7 @@ fn arb_lifecycle_specs() -> impl Strategy<Value = Vec<LifecycleSpec>> {
         0..=5,
     )
     .prop_map(
+        #[allow(clippy::type_complexity)]
         |items: Vec<(
             bool,
             bool,
@@ -712,7 +713,7 @@ fn assert_metadata_preserved(source: &Step, generated: &Step, post: bool) {
     );
     assert_eq!(generated.timeout_minutes, source.timeout_minutes);
     assert_eq!(generated.env, source.env);
-    assert_eq!(generated.is_background, false);
+    assert!(!generated.is_background);
     assert_eq!(
         generated.continue_on_error,
         if post { true } else { source.continue_on_error }

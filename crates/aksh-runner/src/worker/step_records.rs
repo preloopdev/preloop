@@ -105,18 +105,16 @@ pub fn merge_step_update(
         // Prefer first non-empty started_at; do not clear once set.
         if merged.started_at.is_none() {
             merged.started_at = incoming.started_at.clone();
-        } else if incoming.started_at.is_some() && merged.started_at.is_none() {
-            merged.started_at = incoming.started_at.clone();
         }
     }
 
-    if incoming.has_completed_at {
-        if incoming.completed_at.is_some() || merged.completed_at.is_none() {
-            // Allow setting completed_at; do not clear a set value with None
-            // unless we are explicitly completing again with a timestamp.
-            if let Some(ref ts) = incoming.completed_at {
-                merged.completed_at = Some(ts.clone());
-            }
+    if incoming.has_completed_at
+        && (incoming.completed_at.is_some() || merged.completed_at.is_none())
+    {
+        // Allow setting completed_at; do not clear a set value with None
+        // unless we are explicitly completing again with a timestamp.
+        if let Some(ref ts) = incoming.completed_at {
+            merged.completed_at = Some(ts.clone());
         }
     }
 
@@ -677,8 +675,8 @@ mod tests {
         assert_eq!(step_status::COMPLETED, 6);
     }
 
-    /// Generated merges produce valid field types.
-    /// Oracle: docs/property-tests.md §4.12 — valid field types.
+    // Generated merges produce valid field types.
+    // Oracle: docs/property-tests.md §4.12 — valid field types.
     proptest! {
         #![proptest_config(ProptestConfig { cases: 1_000, ..ProptestConfig::default() })]
 

@@ -520,10 +520,11 @@ pub fn build_step_list(steps: &[serde_json::Value], job_message: &serde_json::Va
                         } else {
                             format!("{name}/{path}")
                         };
-                        if full_name.contains('@') || action_ref.is_none() {
-                            full_name
-                        } else {
-                            format!("{full_name}@{}", action_ref.unwrap())
+                        match action_ref {
+                            Some(version) if !full_name.contains('@') => {
+                                format!("{full_name}@{version}")
+                            }
+                            _ => full_name,
                         }
                     };
                     let with =
@@ -921,12 +922,7 @@ fn orphan_pids_with_tracking_id(needle: &str) -> Vec<u32> {
             let stdout = String::from_utf8_lossy(&out.stdout);
             for line in stdout.lines() {
                 if line.contains(needle) {
-                    if let Some(pid) = line
-                        .trim()
-                        .split_whitespace()
-                        .next()
-                        .and_then(|s| s.parse().ok())
-                    {
+                    if let Some(pid) = line.split_whitespace().next().and_then(|s| s.parse().ok()) {
                         pids.push(pid);
                     }
                 }
