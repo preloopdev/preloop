@@ -16,6 +16,7 @@ use evaluator::{eval, validate_function_calls};
 use expr_parser::Parser;
 use lexer::Lexer;
 
+/// Errors encountered when parsing or evaluating `${{ }}` expressions.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ExpressionError {
     /// Unexpected end of input.

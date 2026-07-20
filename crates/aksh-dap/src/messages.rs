@@ -36,6 +36,7 @@ pub enum DapCommand {
 impl DapCommand {
     /// Parse a DAP `command` string into the enum, returning `None`
     /// for commands that the REPL does not handle.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "continue" => Some(Self::Continue),

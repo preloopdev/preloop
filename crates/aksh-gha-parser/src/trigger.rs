@@ -48,9 +48,7 @@ impl Trigger {
                 if let Some(config) = config_val {
                     if let Some(obj) = config.as_object() {
                         // activity types filter
-                        let types_val = obj.get("types");
-                        if types_val.is_some() {
-                            let types = types_val.unwrap();
+                        if let Some(types) = obj.get("types") {
                             if let Some(activity_type) = activity_type {
                                 if !matches_filter(types, activity_type) {
                                     return false;
