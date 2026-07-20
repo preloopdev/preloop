@@ -8,6 +8,11 @@ use std::time::Duration;
 
 use super::http::{HttpClient, HttpError};
 
+// Runner.Listener uses the broker's normal 50-second long poll for both
+// Online and Busy status. A status transition cancels the in-flight request;
+// shortening Busy polls creates a request storm while a job is running.
+const MESSAGE_POLL_TIMEOUT: Duration = Duration::from_secs(50);
+
 /// Client for the broker endpoints (GitHub-current path).
 pub struct BrokerClient {
     http: HttpClient,
@@ -35,9 +40,9 @@ impl BrokerClient {
 
     /// Delete a broker session.
     pub async fn delete_session(&self, token: &str, session_id: &str) -> Result<()> {
-        let url = format!("{}/session?sessionId={session_id}", self.base_url);
+        let url = format!("{}/session", self.base_url);
         self.http
-            .delete_with_token(&url, token)
+            .delete_with_token_header(&url, token, "X-Actions-Session", session_id)
             .await
             .context("deleting broker session")
     }
@@ -61,15 +66,8 @@ impl BrokerClient {
             os_label(),
             arch_label(),
         );
-        // Official runner polls every ~3s when busy (for cancellation detection),
-        // and uses a long ~50s poll when idle (waiting for a job).
-        let timeout = if busy {
-            Duration::from_secs(3)
-        } else {
-            Duration::from_secs(50)
-        };
         self.http
-            .get_long_poll(&url, &format!("Bearer {token}"), timeout)
+            .get_long_poll(&url, &format!("Bearer {token}"), MESSAGE_POLL_TIMEOUT)
             .await
             .context("polling broker message")
     }
@@ -157,5 +155,10 @@ mod tests {
             body: r#"{"typeKey":"AccessDeniedException","errorCode":0}"#.to_owned(),
         });
         assert!(!is_runner_version_deprecated(&error));
+    }
+
+    #[test]
+    fn busy_and_online_messages_use_the_official_long_poll_window() {
+        assert_eq!(MESSAGE_POLL_TIMEOUT, Duration::from_secs(50));
     }
 }
