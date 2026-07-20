@@ -49,6 +49,51 @@ pub struct ReportingContext {
     /// Populated when running via the AzDO (legacy) protocol path.
     /// `None` on the broker path.
     pub azdo: Option<AzdoReportingContext>,
+    /// Connectivity checks performed after the first lease renewal. The
+    /// official runner includes these in completejob telemetry.
+    pub connectivity_telemetry: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+fn create_reporting_context(
+    job_message: &serde_json::Value,
+    via: ProtocolPath,
+    plan_id: &str,
+    job_id: &str,
+) -> Result<Option<Arc<ReportingContext>>> {
+    let Some((service_url, access_token)) = extract_service_endpoint(job_message) else {
+        warn!("No SystemVssConnection endpoint — reporting disabled");
+        return Ok(None);
+    };
+    let http = HttpClient::new(None)?;
+    let results_url = extract_results_url(job_message).unwrap_or_else(|| service_url.clone());
+    let azdo = if via == ProtocolPath::Azdo {
+        let timeline_id = job_message
+            .get("timeline")
+            .and_then(|timeline| timeline.get("id"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_owned();
+        if timeline_id.is_empty() {
+            warn!("No timeline.id in AzDO job message — timeline reporting disabled");
+            None
+        } else {
+            Some(AzdoReportingContext {
+                client: AzdoClient::new(http.clone(), service_url.clone(), 0),
+                timeline_id,
+            })
+        }
+    } else {
+        None
+    };
+    Ok(Some(Arc::new(ReportingContext {
+        results: ResultsClient::new(http.clone(), results_url),
+        run_service: RunServiceClient::new(http, service_url),
+        access_token,
+        plan_id: plan_id.to_owned(),
+        job_id: job_id.to_owned(),
+        azdo,
+        connectivity_telemetry: Arc::new(Mutex::new(Vec::new())),
+    })))
 }
 
 /// Execute a job from the deserialized message.
@@ -117,9 +162,26 @@ pub async fn run_job(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    let reporting = create_reporting_context(&job_message, via, &plan_id, job_id)?;
     let main_steps = super::job_extension::build_step_list(&steps, &job_message);
     let action_paths =
-        prepare_remote_actions(&job_message, &workspace, &main_steps, &plan_id).await?;
+        match prepare_remote_actions(&job_message, &workspace, &main_steps, &plan_id).await {
+            Ok(paths) => paths,
+            Err(error) => {
+                error!("Set up job failed while preparing actions: {error:#}");
+                job_ctx.job_status = super::contexts::JobStatus::Failure;
+                report_completion(
+                    &job_message,
+                    "Failure",
+                    &job_ctx,
+                    &[],
+                    via,
+                    reporting.as_deref(),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
     job_ctx.action_paths = action_paths.clone();
     let mut ordered_steps =
         super::job_extension::build_step_list_with_lifecycle(main_steps, &workspace, &action_paths);
@@ -226,42 +288,6 @@ pub async fn run_job(
         dbg.on_job_steps_initialized(&entries, &post, &predicted)
             .await;
     }
-    let reporting = if let Some((service_url, access_token)) =
-        extract_service_endpoint(&job_message)
-    {
-        let http = HttpClient::new(None)?;
-        let results_url = extract_results_url(&job_message).unwrap_or_else(|| service_url.clone());
-        let azdo = if via == ProtocolPath::Azdo {
-            let timeline_id = job_message
-                .get("timeline")
-                .and_then(|t| t.get("id"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if timeline_id.is_empty() {
-                warn!("No timeline.id in AzDO job message — timeline reporting disabled");
-                None
-            } else {
-                Some(AzdoReportingContext {
-                    client: AzdoClient::new(http.clone(), service_url.clone(), 0),
-                    timeline_id,
-                })
-            }
-        } else {
-            None
-        };
-        Some(Arc::new(ReportingContext {
-            results: ResultsClient::new(http.clone(), results_url),
-            run_service: RunServiceClient::new(http, service_url),
-            access_token,
-            plan_id: plan_id.clone(),
-            job_id: job_id.to_string(),
-            azdo,
-        }))
-    } else {
-        warn!("No SystemVssConnection endpoint — reporting disabled");
-        None
-    };
     if let Some(rpt) = &reporting {
         if let Some(azdo) = &rpt.azdo {
             let job_record = serde_json::json!({
@@ -325,7 +351,10 @@ pub async fn run_job(
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        flush_step_updates(&drain_rpt, &drain_queue).await;
+                        let should_flush = drain_queue.lock().await.has_step_updates();
+                        if should_flush {
+                            flush_step_updates(&drain_rpt, &drain_queue).await;
+                        }
                     }
                     changed = drain_cancel.changed() => {
                         if changed.is_err() || *drain_cancel.borrow() {
@@ -650,15 +679,13 @@ fn spawn_renew_loop(
                     "https://results-receiver.actions.githubusercontent.com/_ws/ingest.sock"
                         .to_string();
                 let token_ready = "https://token.actions.githubusercontent.com/ready".to_string();
-                // Probe in parallel, non-blocking
+                // Probe in parallel, non-blocking. The resulting status text
+                // is also sent in completejob telemetry by the official
+                // runner (the probes themselves are not step output).
                 let inner = http.inner_client();
-                let _ = tokio::join!(
-                    async {
-                        let _ = http.get_json::<serde_json::Value>(&broker_health).await;
-                    },
-                    async {
-                        let _ = http.get_json::<serde_json::Value>(&run_health).await;
-                    },
+                let (broker_result, run_result, ws_result, token_result) = tokio::join!(
+                    async { inner.get(&broker_health).send().await },
+                    async { inner.get(&run_health).send().await },
                     async {
                         // WebSocket upgrade probe — matching official runner headers exactly.
                         // Official sends: Authorization, Connection: Upgrade, Upgrade: websocket,
@@ -667,7 +694,7 @@ fn spawn_renew_loop(
                         let mut nonce = [0u8; 16];
                         rand::Rng::fill(&mut rand::thread_rng(), &mut nonce);
                         let ws_key = base64::engine::general_purpose::STANDARD.encode(nonce);
-                        let _ = inner
+                        inner
                             .get(&results_ws)
                             .header("Authorization", format!("Bearer {}", rpt.access_token))
                             .header("Connection", "Upgrade")
@@ -675,12 +702,34 @@ fn spawn_renew_loop(
                             .header("Sec-WebSocket-Version", "13")
                             .header("Sec-WebSocket-Key", ws_key)
                             .send()
-                            .await;
+                            .await
                     },
-                    async {
-                        let _ = http.get_json::<serde_json::Value>(&token_ready).await;
-                    },
+                    async { inner.get(&token_ready).send().await },
                 );
+                let status_text = |result: &Result<reqwest::Response, reqwest::Error>| match result
+                {
+                    Ok(response) if response.status().as_u16() == 204 => "NoContent".to_owned(),
+                    Ok(response) if response.status().is_success() => "OK".to_owned(),
+                    Ok(response) => response.status().to_string(),
+                    Err(_) => "Error".to_owned(),
+                };
+                let mut telemetry = rpt.connectivity_telemetry.lock().await;
+                telemetry.extend([
+                    serde_json::json!({
+                        "type": "ConnectivityCheck",
+                        "message": format!("{broker_health}: {}", status_text(&broker_result)),
+                    }),
+                    serde_json::json!({
+                        "type": "ConnectivityCheck",
+                        "message": format!("{token_ready}: {}", status_text(&token_result)),
+                    }),
+                    serde_json::json!({
+                        "type": "ConnectivityCheck",
+                        "message": format!("{run_health}: {}", status_text(&run_result)),
+                    }),
+                ]);
+                drop(telemetry);
+                let _ = ws_result;
                 info!("Service health probes completed");
             }
 
