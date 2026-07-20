@@ -42,6 +42,23 @@ fn classify_message(message_type: &str) -> BrokerMessageKind {
     }
 }
 
+async fn delete_broker_session(client: &BrokerClient, token: &str, session_id: &mut String) {
+    if session_id.is_empty() {
+        return;
+    }
+    let id = std::mem::take(session_id);
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        client.delete_session(token, &id),
+    )
+    .await
+    {
+        Ok(Ok(())) => info!(session_id = %id, "Broker session deleted"),
+        Ok(Err(error)) => warn!(session_id = %id, "Broker session deletion failed: {error:#}"),
+        Err(_) => warn!(session_id = %id, "Broker session deletion timed out"),
+    }
+}
+
 /// Run the broker message polling loop.
 pub async fn run_broker_loop(
     http: &HttpClient,
@@ -84,6 +101,7 @@ pub async fn run_broker_loop(
     // We start in a "need session" state.
     let mut need_session = true;
 
+    let result = async {
     loop {
         // Proactive OAuth token refresh — renew 5 minutes before expiry so the
         // next poll cycle always uses a live token (RLIS-02).
@@ -119,9 +137,6 @@ pub async fn run_broker_loop(
                             info!("exiting after first job (--once)");
                         } else {
                             info!("exiting after first job (--ephemeral)");
-                        }
-                        if !session_id.is_empty() {
-                            let _ = client.delete_session(&token, &session_id).await;
                         }
                         return Ok(());
                     }
@@ -231,9 +246,6 @@ pub async fn run_broker_loop(
                     info!("Killing active worker");
                     job.kill().await;
                 }
-                if !session_id.is_empty() {
-                    let _ = client.delete_session(&token, &session_id).await;
-                }
                 return Ok(());
             }
             // When a job is active, race between job completion and broker
@@ -257,9 +269,6 @@ pub async fn run_broker_loop(
                         info!("exiting after first job (--once)");
                     } else {
                         info!("exiting after first job (--ephemeral)");
-                    }
-                    if !session_id.is_empty() {
-                        let _ = client.delete_session(&token, &session_id).await;
                     }
                     return Ok(());
                 }
@@ -348,7 +357,6 @@ pub async fn run_broker_loop(
                                     // Check once/ephemeral AFTER the old job drains
                                     if once || config.settings.ephemeral {
                                         info!("exiting after first job finished during overlap (run-service)");
-                                        let _ = client.delete_session(&token, &session_id).await;
                                         return Ok(());
                                     }
                                 }
@@ -385,7 +393,6 @@ pub async fn run_broker_loop(
                                         prev.kill().await;
                                     }
                                     if once || config.settings.ephemeral {
-                                        let _ = client.delete_session(&token, &session_id).await;
                                         return Ok(());
                                     }
                                 }
@@ -494,10 +501,7 @@ pub async fn run_broker_loop(
                                             .trim_end_matches('/')
                                             .to_string();
                                         if new_broker_url != old_broker_url {
-                                            if !session_id.is_empty() {
-                                                let _ = client.delete_session(&token, &session_id).await;
-                                                session_id.clear();
-                                            }
+                                            delete_broker_session(&client, &token, &mut session_id).await;
                                             session_key = None;
                                             need_session = true;
                                             client = BrokerClient::new(http.clone(), new_broker_url);
@@ -513,10 +517,7 @@ pub async fn run_broker_loop(
                             }
                             BrokerMessageKind::BrokerMigration => {
                                 info!("Broker migration requested — re-resolving broker URL...");
-                                if !session_id.is_empty() {
-                                    let _ = client.delete_session(&token, &session_id).await;
-                                    session_id = String::new();
-                                }
+                                delete_broker_session(&client, &token, &mut session_id).await;
                                 need_session = true;
                                 if let Some(new_url) = re_resolve_broker_url(http, &config.settings.server_url).await {
                                     info!("New broker URL after migration: {new_url}");
@@ -536,9 +537,6 @@ pub async fn run_broker_loop(
                     Err(e) => {
                         if crate::client::broker::is_runner_version_deprecated(&e) {
                             warn!("Runner version is deprecated and cannot receive messages; stopping");
-                            if !session_id.is_empty() {
-                                let _ = client.delete_session(&token, &session_id).await;
-                            }
                             return Err(e);
                         } else if is_unauthorized(&e) {
                             info!("OAuth token expired during message poll. Re-acquiring token...");
@@ -578,6 +576,10 @@ pub async fn run_broker_loop(
             }
         }
     }
+    }.await;
+
+    delete_broker_session(&client, &token, &mut session_id).await;
+    result
 }
 
 fn is_unauthorized(err: &anyhow::Error) -> bool {
@@ -832,6 +834,8 @@ async fn re_resolve_broker_url(http: &HttpClient, server_url: &str) -> Option<St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     // --- P1 broker listener gap coverage ---
 
@@ -866,6 +870,33 @@ mod tests {
                 "unexpected classification for broker type {wire_type}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn delete_broker_session_sends_once_and_clears_owned_id() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let request_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 4096];
+            let count = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&request[..count]).into_owned()
+        });
+        let client = BrokerClient::new(HttpClient::new(None).unwrap(), format!("http://{address}"));
+        let mut session_id = "session-123".to_owned();
+
+        delete_broker_session(&client, "token", &mut session_id).await;
+
+        assert!(session_id.is_empty());
+        let request = request_task.await.unwrap();
+        assert!(request.starts_with("DELETE /session HTTP/1.1"));
+        assert!(request.contains("x-actions-session: session-123"));
     }
 
     #[test]

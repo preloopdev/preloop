@@ -329,6 +329,30 @@ impl HttpClient {
         Ok(())
     }
 
+    /// DELETE with bearer auth and one protocol-specific header.
+    pub async fn delete_with_token_header(
+        &self,
+        url: &str,
+        token: &str,
+        header_name: &str,
+        header_value: &str,
+    ) -> Result<()> {
+        let resp = self
+            .inner
+            .delete(url)
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .header(header_name, header_value)
+            .send()
+            .await
+            .with_context(|| format!("DELETE {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow::Error::new(HttpError::Status { status, body }));
+        }
+        Ok(())
+    }
+
     /// PUT raw bytes with content type.
     /// P1.7: Retries up to 3 times on transient 5xx or network errors.
     pub async fn put_bytes(&self, url: &str, data: Vec<u8>, content_type: &str) -> Result<()> {
