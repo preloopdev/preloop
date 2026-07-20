@@ -808,7 +808,7 @@ mod tests {
                 dir.path(),
             )
             .unwrap());
-        assert!(config.settings.disable_update == false);
+        assert!(!config.settings.disable_update);
         let _: serde_json::Value = load_json(&dir.path().join(RUNNER_FILE)).unwrap();
     }
 

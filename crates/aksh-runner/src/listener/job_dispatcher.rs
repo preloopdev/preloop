@@ -8,14 +8,14 @@
 
 use anyhow::{Context, Result};
 use std::path::Path;
-use std::time::Duration;
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Child;
 use tracing::{error, info, warn};
 
-use futures::future::BoxFuture;
 use crate::cli::ProtocolPath;
+use futures::future::BoxFuture;
 
 /// IPC message types sent from listener to worker via stdin.
 #[derive(Debug, serde::Serialize)]
@@ -29,6 +29,7 @@ enum WorkerMessage {
     Cancel { timeout_secs: u64 },
     /// Shut down the worker process.
     #[serde(rename = "shutdown")]
+    #[allow(dead_code)]
     Shutdown,
 }
 
@@ -187,9 +188,7 @@ pub async fn spawn_job(
         .get("jobId")
         .and_then(|v| v.as_str())
         .and_then(|s| uuid::Uuid::parse_str(s).ok());
-    let agent_request_id = job_message
-        .get("requestId")
-        .and_then(|v| v.as_i64());
+    let agent_request_id = job_message.get("requestId").and_then(|v| v.as_i64());
 
     info!("Dispatching job {request_id} to worker");
 
