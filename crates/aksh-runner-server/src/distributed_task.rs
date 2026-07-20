@@ -499,10 +499,20 @@ pub(crate) async fn complete_job_inner(
         if is_terminal_status(prior) && prior != ExecutionStatus::Cancelled {
             return Ok(Json(run.clone()));
         }
-        let effective = match (prior, completion.status) {
+        let tolerated = run
+            .job_continue_on_error
+            .get(&completion.job_id.to_string())
+            .copied()
+            .unwrap_or(false);
+        let reported_status = if tolerated && completion.status == ExecutionStatus::Failure {
+            ExecutionStatus::Success
+        } else {
+            completion.status
+        };
+        let effective = match (prior, reported_status) {
             (ExecutionStatus::Cancelled, ExecutionStatus::Success)
             | (ExecutionStatus::Cancelled, ExecutionStatus::Failure) => ExecutionStatus::Cancelled,
-            _ => completion.status,
+            _ => reported_status,
         };
         run.jobs.insert(completion.job_id.clone(), effective);
         let job_name = completion.job_id.0.clone();
