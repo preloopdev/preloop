@@ -371,7 +371,7 @@ pub async fn run_job(
     let mut debugger_result = Ok(());
     if let Some(dbg) = job_ctx.dap_debugger.clone() {
         info!("Starting debugger…");
-        if let Err(e) = dbg.start(&job_id, &[]).await {
+        if let Err(e) = dbg.start(job_id, &[]).await {
             error!("DAP debugger failed to start: {e}");
             job_ctx.debugger_telemetry.push("Failed".to_string());
             debugger_result = Err(anyhow::anyhow!(
@@ -643,12 +643,13 @@ fn spawn_renew_loop(
                 first_renew = false;
                 let http = rpt.results.http();
                 // Fire-and-forget health probes — matching official runner lifecycle
-                let broker_health = format!("https://broker.actions.githubusercontent.com/health");
-                let run_health = format!("https://run.actions.githubusercontent.com/health");
-                let results_ws = format!(
+                let broker_health =
+                    "https://broker.actions.githubusercontent.com/health".to_string();
+                let run_health = "https://run.actions.githubusercontent.com/health".to_string();
+                let results_ws =
                     "https://results-receiver.actions.githubusercontent.com/_ws/ingest.sock"
-                );
-                let token_ready = format!("https://token.actions.githubusercontent.com/ready");
+                        .to_string();
+                let token_ready = "https://token.actions.githubusercontent.com/ready".to_string();
                 // Probe in parallel, non-blocking
                 let inner = http.inner_client();
                 let _ = tokio::join!(
