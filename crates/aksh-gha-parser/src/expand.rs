@@ -3,14 +3,68 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use aksh_gha_expressions::{eval_expression, Context};
 use aksh_gha_protocol::{JobId, JobPlan, StepPlan};
 use indexmap::IndexMap;
 use serde_json::Value;
 
 use crate::{
     dag, matrix_expand, parse_workflow, Concurrency, ConcurrencyQueue, ExpandedWorkflows,
-    InputType, Job, JobDefaults, Matrix, ParserError, ReusableCallMetadata, Step, Workflow,
+    InputType, Job, JobContinueOnError, JobDefaults, Matrix, ParserError, ReusableCallMetadata,
+    Step, Workflow,
 };
+
+fn resolved_continue_on_error(
+    job_id: &str,
+    value: Option<&JobContinueOnError>,
+    matrix: &IndexMap<String, Value>,
+) -> Result<bool, ParserError> {
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    match value {
+        JobContinueOnError::Bool(value) => Ok(*value),
+        JobContinueOnError::Expression(value) => {
+            let trimmed = value.trim();
+            if trimmed.eq_ignore_ascii_case("true") {
+                return Ok(true);
+            }
+            if trimmed.eq_ignore_ascii_case("false") {
+                return Ok(false);
+            }
+            let expression = trimmed
+                .strip_prefix("${{")
+                .and_then(|value| value.strip_suffix("}}"))
+                .map(str::trim)
+                .ok_or_else(|| ParserError::InvalidContinueOnError {
+                    job_id: job_id.to_owned(),
+                    message: "expected a boolean or `${{ }}` expression".to_owned(),
+                })?;
+            let mut context = Context::default();
+            context.insert(
+                "matrix",
+                Value::Object(
+                    matrix
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect(),
+                ),
+            );
+            let result = eval_expression(expression, &context).map_err(|error| {
+                ParserError::InvalidContinueOnError {
+                    job_id: job_id.to_owned(),
+                    message: error.to_string(),
+                }
+            })?;
+            result
+                .as_bool()
+                .ok_or_else(|| ParserError::InvalidContinueOnError {
+                    job_id: job_id.to_owned(),
+                    message: format!("expression returned {result}, expected a boolean"),
+                })
+        }
+    }
+}
 
 /// Omit empty `services: {}` to match `EmitDefaultValue=false` behavior.
 fn non_empty_services(services: Option<serde_json::Value>) -> Option<serde_json::Value> {
@@ -84,7 +138,7 @@ pub fn expand_jobs(workflow: &Workflow) -> Result<Vec<JobPlan>, ParserError> {
                 env,
                 oidc_environment,
                 workflow.permissions.as_ref(),
-            ));
+            )?);
         }
     }
     dag::validate_job_plans(&plans)?;
@@ -99,10 +153,12 @@ fn job_plan_from_job(
     env: BTreeMap<String, String>,
     oidc_environment: Option<String>,
     workflow_permissions: Option<&Value>,
-) -> JobPlan {
+) -> Result<JobPlan, ParserError> {
     let (concurrency_group, concurrency_cancel_in_progress, concurrency_queue) =
         concurrency_fields(job.concurrency.as_ref());
-    JobPlan {
+    let continue_on_error =
+        resolved_continue_on_error(job_id, job.continue_on_error.as_ref(), &matrix)?;
+    Ok(JobPlan {
         id: JobId(expanded_id),
         base_id: job_id.to_owned(),
         name: job.name.clone().unwrap_or_else(|| job_id.to_owned()),
@@ -118,6 +174,7 @@ fn job_plan_from_job(
             .map(|s| step_plan(s, &job.defaults))
             .collect(),
         if_condition: job.if_condition.clone(),
+        continue_on_error,
         fail_fast: job.strategy.fail_fast.unwrap_or(true),
         max_parallel: job.strategy.max_parallel,
         secrets_inherit: false,
@@ -140,7 +197,7 @@ fn job_plan_from_job(
         concurrency_group,
         concurrency_cancel_in_progress,
         concurrency_queue,
-    }
+    })
 }
 
 fn concurrency_fields(
@@ -432,7 +489,7 @@ fn expand_jobs_with_reusables_internal(
                 env,
                 oidc_environment,
                 workflow.permissions.as_ref(),
-            ));
+            )?);
         }
     }
     Ok(plans)
