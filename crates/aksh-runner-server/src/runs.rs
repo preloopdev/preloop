@@ -260,6 +260,14 @@ pub(crate) async fn submit_run_inner(
         "ref_protected": false,
         "ref_type": ref_type,
         "secret_source": "Actions",
+        // Public-repository workflow_dispatch defaults observed from the
+        // official runner setup log. The worker uses this context to emit the
+        // same GITHUB_TOKEN Permissions group before user steps.
+        "token_permissions": {
+            "contents": "read",
+            "metadata": "read",
+            "packages": "read"
+        },
         "event": submission.payload,
         "workflow_ref": workflow_ref,
         "workflow_sha": sha,
@@ -324,6 +332,7 @@ pub(crate) async fn submit_run_inner(
         let mut job_base_ids = BTreeMap::new();
         let mut job_needs = BTreeMap::new();
         let mut job_fail_fast = BTreeMap::new();
+        let mut job_continue_on_error = BTreeMap::new();
         let mut ready_by_base: BTreeMap<String, u64> = BTreeMap::new();
         let mut initially_skipped = Vec::new();
         let mut built_jobs: Vec<QueuedJob> = Vec::new();
@@ -340,6 +349,7 @@ pub(crate) async fn submit_run_inner(
                     job_base_ids: BTreeMap::new(),
                     job_needs: BTreeMap::new(),
                     job_fail_fast: BTreeMap::new(),
+                    job_continue_on_error: BTreeMap::new(),
                     status: ExecutionStatus::Failure,
                     job_check_run_ids: BTreeMap::new(),
                     reusable_calls,
@@ -371,6 +381,7 @@ pub(crate) async fn submit_run_inner(
             job_base_ids.insert(job.id.clone(), job.base_id.clone());
             job_needs.insert(job.id.clone(), job.needs.clone());
             job_fail_fast.insert(job.base_id.clone(), job.fail_fast);
+            job_continue_on_error.insert(job.id.to_string(), job.continue_on_error);
             statuses.insert(job.id.clone(), ExecutionStatus::Queued);
             let condition_context = build_context(
                 &github,
@@ -606,6 +617,7 @@ pub(crate) async fn submit_run_inner(
                             job_base_ids,
                             job_needs,
                             job_fail_fast,
+                            job_continue_on_error,
                             status: ExecutionStatus::Cancelled,
                             job_check_run_ids: BTreeMap::new(),
                             reusable_calls,
@@ -656,6 +668,7 @@ pub(crate) async fn submit_run_inner(
                     job_base_ids,
                     job_needs,
                     job_fail_fast,
+                    job_continue_on_error,
                     status: ExecutionStatus::Pending,
                     job_check_run_ids: BTreeMap::new(),
                     reusable_calls,
@@ -698,6 +711,7 @@ pub(crate) async fn submit_run_inner(
                 job_base_ids: job_base_ids.clone(),
                 job_needs: job_needs.clone(),
                 job_fail_fast: job_fail_fast.clone(),
+                job_continue_on_error: job_continue_on_error.clone(),
                 status: ExecutionStatus::Queued,
                 job_check_run_ids: BTreeMap::new(),
                 reusable_calls: reusable_calls.clone(),
@@ -888,6 +902,7 @@ pub(crate) async fn submit_run_inner(
                 job_base_ids,
                 job_needs,
                 job_fail_fast,
+                job_continue_on_error,
                 status: initial_status,
                 job_check_run_ids: BTreeMap::new(),
                 reusable_calls,
