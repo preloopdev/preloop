@@ -120,6 +120,22 @@ pub fn is_runner_version_deprecated(error: &anyhow::Error) -> bool {
     })
 }
 
+fn os_label() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "macOS"
+    } else {
+        "Linux"
+    }
+}
+
+fn arch_label() -> &'static str {
+    if cfg!(target_arch = "aarch64") {
+        "ARM64"
+    } else {
+        "X64"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,21 +157,5 @@ mod tests {
             body: r#"{"typeKey":"AccessDeniedException","errorCode":0}"#.to_owned(),
         });
         assert!(!is_runner_version_deprecated(&error));
-    }
-}
-
-fn os_label() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "macOS"
-    } else {
-        "Linux"
-    }
-}
-
-fn arch_label() -> &'static str {
-    if cfg!(target_arch = "aarch64") {
-        "ARM64"
-    } else {
-        "X64"
     }
 }

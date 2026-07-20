@@ -448,7 +448,7 @@ impl HttpClient {
                     Ok(None)
                 } else {
                     let body = r.text().await.unwrap_or_default();
-                    return Err(anyhow::Error::new(HttpError::Status { status, body }));
+                    Err(anyhow::Error::new(HttpError::Status { status, body }))
                 }
             }
             Err(e) if e.is_timeout() => Ok(None),

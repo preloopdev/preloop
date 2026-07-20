@@ -356,13 +356,11 @@ impl MatcherRegistry {
                         }
                     }
 
-                    if !Path::new(&resolved).is_absolute() {
-                        if !workspace.is_empty() {
-                            resolved = Path::new(workspace)
-                                .join(&resolved)
-                                .to_string_lossy()
-                                .to_string();
-                        }
+                    if !Path::new(&resolved).is_absolute() && !workspace.is_empty() {
+                        resolved = Path::new(workspace)
+                            .join(&resolved)
+                            .to_string_lossy()
+                            .to_string();
                     }
 
                     let mut resolved = normalize_path(Path::new(&resolved))

@@ -291,7 +291,7 @@ fn run_composite_action_inner<'a>(
             // Apply GITHUB_ENV and GITHUB_PATH from this composite step
             // so subsequent steps see the env changes (e.g. dtolnay/rust-toolchain
             // sets CARGO_HOME via GITHUB_ENV and adds to PATH via GITHUB_PATH)
-            crate::worker::file_commands::apply_file_commands_to_job(&file_commands, &mut ctx.job);
+            crate::worker::file_commands::apply_file_commands_to_job(&file_commands, ctx.job);
 
             let step_outputs =
                 crate::worker::file_commands::parse_kv_file(&file_commands.output_file)

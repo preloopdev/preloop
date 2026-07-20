@@ -270,8 +270,11 @@ pub async fn run_remove(args: RemoveArgs, global: &GlobalArgs) -> Result<()> {
 struct RegistrationResult {
     oauth_token: String,
     service_url: String,
+    #[allow(dead_code)]
     token_url: Option<String>,
+    #[allow(dead_code)]
     client_id: Option<String>,
+    #[allow(dead_code)]
     pool_id: Option<i64>,
 }
 
