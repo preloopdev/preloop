@@ -13,25 +13,9 @@ on:
         required: false
         default: "fast"
 
-# ═══════════════════════════════════════════════════════════════════════════
-# aksh compatibility notes
-# ═══════════════════════════════════════════════════════════════════════════
-# This workflow runs on GitHub-hosted runners today. To run against aksh
-# locally, a harness injects vars (AKSH_REPO_ROOT, etc.) at submission time.
-#
-# Conflicts with aksh (see docs/fidelity-gap.md § Phase H):
-#   1. actions/checkout@v4    — ✅ works (client-side batch resolve + codeload download)
-#   2. dtolnay/rust-toolchain — ✅ works (same mechanism)
-#   3. runs-on: ubuntu-latest  — label matching is lenient (not enforced yet)
-#   4. -D warnings on clippy   — pre-existing missing_docs in azdo DTOs
-#      (repo-level issue, not an aksh gap)
-#
-# See fixtures/workflows/dogfood.yml for the locally-runnable version without
-# action dependencies.
-# ═══════════════════════════════════════════════════════════════════════════
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Property-test CI notes (Plan 006)
+# Property-test CI notes
 # ═══════════════════════════════════════════════════════════════════════════
 # PR / push: fast profile — 256 cases for pure/model/runner, 64 for HTTP.
 # Scheduled / manual intensive: release mode, 10k cases, 100k shrink iters.
@@ -71,7 +55,7 @@ jobs:
         env:
           RUSTFLAGS: "-A warnings"
 
-  # ─── Bounded property-test profile (PR / push) ─────────────────────────
+  # Bounded property-test profile
   property-tests-fast:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -82,7 +66,7 @@ jobs:
         with:
           toolchain: "1.86"
 
-      # ── Zero-filter guard: fail if no properties match the filter ──────
+      # Zero-filter guard so just fail if no properties match the filter
       - name: Verify concurrency_properties filter matches at least one test
         run: |
           count=$(PROPTEST_CASES=1 cargo test -p aksh-runner-server -- --list 2>/dev/null | grep -c 'concurrency_properties' || true)
@@ -114,7 +98,7 @@ jobs:
           if [ "$bad" -ne 0 ]; then exit 1; fi
           echo "Sleep guard: OK"
 
-      # ── Pure properties (256 cases) ────────────────────────────────────
+      # Pure properties (256 cases)
       - name: Pure concurrency properties
         run: |
           PROPTEST_CASES=256 cargo test -p aksh-runner-server \
@@ -122,30 +106,30 @@ jobs:
           PROPTEST_CASES=256 cargo test -p aksh-runner-server \
             concurrency_properties::pure -- --test-threads=1
 
-      # ── Scheduler model properties (256 cases) ─────────────────────────
+      # Scheduler model properties (256 cases)
       - name: Scheduler model properties
         run: |
           PROPTEST_CASES=256 cargo test -p aksh-runner-server \
             concurrency_properties::state_machine -- --test-threads=1
 
-      # ── Expression / parser properties (256 cases) ─────────────────────
+      # Expression / parser properties (256 cases)
       - name: Expression and parser properties
         run: |
           PROPTEST_CASES=256 cargo test -p aksh-gha-expressions -- --test-threads=1
           cargo test -p aksh-gha-parser concurrency_ -- --test-threads=1
 
-      # ── Runner dispatcher properties (256 cases) ───────────────────────
+      # Runner dispatcher properties (256 cases)
       - name: Runner dispatcher properties
         run: |
           cargo test -p aksh-runner timespan_tests -- --test-threads=1
 
-      # ── HTTP sequence properties (64 cases — heavier) ──────────────────
+      # HTTP sequence properties (64 cases — heavier)
       - name: HTTP sequence properties
         run: |
           PROPTEST_CASES=64 cargo test -p aksh-runner-server \
             concurrency_http_properties -- --test-threads=1
 
-      # ── Differential harness dry-run (credential-free) ─────────────────
+      # Differential harness dry-run (credential-free)
       - name: Differential harness dry-run (schema + algebraic validation)
         run: |
           python3 benchmarks/real-world/run-concurrency-property-probes.py \
@@ -166,7 +150,7 @@ jobs:
           fi
           echo "Contamination rejection: OK (exit $status)"
 
-      # ── Upload regression seeds on failure ─────────────────────────────
+      # Upload regression seeds on failure
       - name: Upload proptest regressions
         if: failure()
         uses: actions/upload-artifact@v4
@@ -176,7 +160,7 @@ jobs:
             crates/**/proptest-regressions/
           if-no-files-found: ignore
 
-  # ─── Intensive scheduled / manual profile ──────────────────────────────
+  # Intensive scheduled / manual profile
   property-tests-intensive:
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -187,7 +171,7 @@ jobs:
         with:
           toolchain: "1.86"
 
-      # ── Zero-filter guard ──────────────────────────────────────────────
+      # Zero-filter guard
       - name: Verify concurrency_properties filter matches at least one test
         run: |
           count=$(PROPTEST_CASES=1 cargo test -p aksh-runner-server -- --list 2>/dev/null | grep -c 'concurrency_properties' || true)
@@ -218,7 +202,7 @@ jobs:
           done
           if [ "$bad" -ne 0 ]; then exit 1; fi
 
-      # ── Intensive: release mode, 10k cases, 100k shrink iters ──────────
+      # Intensive: release mode, 10k cases, 100k shrink iters
       - name: Intensive property profile (release)
         run: |
           PROPTEST_CASES=10000 PROPTEST_MAX_SHRINK_ITERS=100000 \
@@ -265,7 +249,7 @@ jobs:
           fi
           echo "Contamination rejection: OK (exit $status)"
 
-      # ── Upload regressions, traces, differential report on failure ──────
+      #Upload regressions, traces, differential report on failure
       - name: Upload intensive regression artifacts
         if: failure()
         uses: actions/upload-artifact@v4
