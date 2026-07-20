@@ -79,13 +79,42 @@ impl ActionsResolveClient {
             base.trim_end_matches('/')
         );
 
-        let response: serde_json::Value = match self
+        // runnerresolve can return HTTP 422 together with usable entries in
+        // `actions` and per-action errors. Other non-success statuses are
+        // ordinary protocol failures and must not be treated as partial data.
+        let response = match self
             .http
-            .post_json_bearer(&url, &body, token)
+            .inner_client()
+            .post(&url)
+            .bearer_auth(token)
+            .header("Accept", "application/json")
+            .json(&body)
+            .send()
             .await
             .context("runnerresolve/actions batch POST")
         {
-            Ok(r) => r,
+            Ok(resp) => {
+                let status = resp.status();
+                if !status.is_success() && status != reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+                    return Err(anyhow::anyhow!(
+                        "runnerresolve/actions batch returned HTTP {status}"
+                    ));
+                }
+                match resp.json::<serde_json::Value>().await {
+                    Ok(value) => {
+                        if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+                            tracing::warn!(
+                                "runnerresolve batch returned {status}; using partial action resolutions"
+                            );
+                        }
+                        value
+                    }
+                    Err(e) if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY => {
+                        return Err(e).context("parsing partial runnerresolve response");
+                    }
+                    Err(e) => return Err(e).context("parsing runnerresolve response"),
+                }
+            }
             Err(e) => {
                 tracing::warn!(
                     "runnerresolve batch failed (will use api.github.com fallback): {e:#}"
@@ -209,5 +238,67 @@ impl ActionsDownloadClient {
         } else {
             self.http.get_bytes(url).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn serve_once(status: &str, body: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let status = status.to_owned();
+        let body = body.to_owned();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 8192];
+            let _ = socket.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn resolve_batch_accepts_partial_entries_only_for_422() {
+        let body = serde_json::json!({
+            "actions": {
+                "actions/checkout@v4": {
+                    "name": "actions/checkout",
+                    "version": "v4",
+                    "resolved_sha": "abc123",
+                    "tar_url": "https://example.invalid/checkout.tar.gz"
+                }
+            }
+        })
+        .to_string();
+        let base = serve_once("422 Unprocessable Entity", &body).await;
+        let client = ActionsResolveClient::new(HttpClient::new(None).unwrap(), Some(base));
+
+        let result = client
+            .resolve_batch("token", "plan", "job", &[("actions/checkout", "v4")])
+            .await
+            .unwrap();
+
+        assert_eq!(result["actions/checkout@v4"].resolved_sha, "abc123");
+    }
+
+    #[tokio::test]
+    async fn resolve_batch_rejects_json_from_other_error_statuses() {
+        let base = serve_once("401 Unauthorized", r#"{"actions":{}}"#).await;
+        let client = ActionsResolveClient::new(HttpClient::new(None).unwrap(), Some(base));
+
+        let error = client
+            .resolve_batch("bad-token", "plan", "job", &[("actions/checkout", "v4")])
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("HTTP 401 Unauthorized"));
     }
 }
