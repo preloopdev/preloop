@@ -31,7 +31,7 @@ The system is configured using the following environment variables:
 | Variable | Description | Example |
 |---|---|---|
 | `AKSH_WEBHOOK_SECRET` | Secret key configured on the GitHub App to verify payload signatures. | `my-secure-webhook-secret` |
-| `AKSH_LOCAL_WORKSPACE` | Path to a local clone of the repository to fetch workflows from offline. | `/path/to/my-repo` |
+| `AKSH_LOCAL_WORKSPACE` | Path to a local Git worktree used for offline workflow loading and immutable local-source checkouts. | `/path/to/my-repo` |
 | `AKSH_GITHUB_TOKEN` | GitHub Personal Access Token or App Installation Token to fetch workflows and update check runs. | `ghp_...` or `ghs_...` |
 
 ### Security Best Practices
@@ -59,7 +59,14 @@ The system is configured using the following environment variables:
 
 When a push or PR webhook is received, `aksh` retrieves the workflow definitions:
 1. **Local Filesystem (Offline/Dev Mode)**:
-   If `AKSH_LOCAL_WORKSPACE` is configured, `aksh` reads the `.github/workflows/` directory directly from that local path.
+   If `AKSH_LOCAL_WORKSPACE` is configured, `aksh` reads the `.github/workflows/`
+   directory directly from that local path. For a default
+   `uses: actions/checkout@v4` step, submission also captures the worktree as an
+   immutable synthetic Git commit and redirects the compiled checkout inputs to
+   aksh's authenticated smart-HTTP endpoint. Tracked modifications, deletions,
+   and untracked non-ignored files are included without modifying the user's
+   index or workflow YAML. Explicit repository/ref/token/server checkout inputs
+   retain their original remote behavior.
 2. **GitHub API (Remote/Production Mode)**:
    If `AKSH_LOCAL_WORKSPACE` is not configured, but `AKSH_GITHUB_TOKEN` is set, `aksh` queries:
    `GET /repos/{owner}/{repo}/contents/.github/workflows?ref={git_ref}`

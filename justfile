@@ -1,4 +1,5 @@
 server := "http://127.0.0.1:9090"
+repo := "preloopdev/aksh"
 
 # ── build ──────────────────────────────────────────────────────────────────
 
@@ -57,12 +58,12 @@ e2e-teardown:
 # ── serve ──────────────────────────────────────────────────────────────────
 
 serve:
-    cargo run --release -p aksh-runner-server -- serve --listen 127.0.0.1:9090
+    AKSH_LOCAL_WORKSPACE="${AKSH_LOCAL_WORKSPACE:-$PWD}" cargo run --release -p aksh-runner-server -- serve --listen 127.0.0.1:9090
 
 # ── submit ──────────────────────────────────────────────────────────────────
 
 submit-ci:
-    cargo run -p aksh-runner-client -- --server {{server}} submit -W .github/workflows/ci.yml
+    cargo run -p aksh-runner-client -- --server {{server}} submit -W .github/workflows/ci.yml --repository {{repo}}
 
 submit-dogfood:
     cargo run -p aksh-runner-client -- --server {{server}} submit -W fixtures/workflows/dogfood.yml
