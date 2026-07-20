@@ -398,16 +398,22 @@ pub(crate) fn authenticated_runner_id(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .ok_or_else(|| ApiError::unauthorized("runner listen token required"))?;
-    let runner_id = shared
-        .state
-        .runner_id_from_token(bearer)
-        .ok_or_else(|| ApiError::unauthorized("runner listen token required"))?;
-    if expected_runner_id.is_some_and(|expected| expected != runner_id) {
-        return Err(ApiError::forbidden(
-            "runner token does not match broker path",
-        ));
+    // Accept runner listen tokens (normal path) or job runtime tokens
+    // (worker uses the SystemVssConnection AccessToken for renewjob/completejob).
+    if let Some(runner_id) = shared.state.runner_id_from_token(bearer) {
+        if expected_runner_id.is_some_and(|expected| expected != runner_id) {
+            return Err(ApiError::forbidden(
+                "runner token does not match broker path",
+            ));
+        }
+        return Ok(runner_id);
     }
-    Ok(runner_id)
+    // Fall back: accept runtime tokens (Actions.Results scope). These don't
+    // carry a runner_id, so we trust the path parameter.
+    if shared.state.verify_local_jwt_claims(bearer).is_some() {
+        return expected_runner_id.ok_or_else(|| ApiError::unauthorized("runner id required"));
+    }
+    Err(ApiError::unauthorized("runner listen token required"))
 }
 
 pub(crate) fn ensure_broker_request_owner(

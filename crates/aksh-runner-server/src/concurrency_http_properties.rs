@@ -773,14 +773,14 @@ pub(crate) mod http_sequences {
                 // INV-1: GH-SLOT-01 — at most one running holder per group.
                 for (key, group) in &inner.concurrency_groups {
                     assert!(
-                        group.running.as_ref().map_or(true, |_| true),
+                        group.running.as_ref().is_none_or(|_| true),
                         "op {op_idx}: group {key:?} has multiple running holders"
                     );
                     // The running field is Option<Holder>, so it's at most one.
                 }
 
                 // INV-2: Pending runs (held_runs) must not have jobs in queue.
-                for (held_run_id, _held_jobs) in &inner.held_runs {
+                for held_run_id in inner.held_runs.keys() {
                     let in_queue = inner.queue.iter().any(|j| j.run_id == *held_run_id);
                     assert!(
                         !in_queue,

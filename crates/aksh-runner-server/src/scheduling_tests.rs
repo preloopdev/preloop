@@ -1,3 +1,5 @@
+#![allow(clippy::needless_range_loop, clippy::if_same_then_else)]
+
 use super::*;
 use proptest::prelude::*;
 use proptest::test_runner::RngSeed;
@@ -854,20 +856,11 @@ fn terminal_job_never_reverts() {
 /// A dependency set is summarized to one result: failure wins over
 /// cancellation, then skipped, then success.
 fn oracle_should_run(ancestor_statuses: &[ExecutionStatus], if_condition: Option<&str>) -> bool {
-    let aggregate = if ancestor_statuses
-        .iter()
-        .any(|s| *s == ExecutionStatus::Failure)
-    {
+    let aggregate = if ancestor_statuses.contains(&ExecutionStatus::Failure) {
         ExecutionStatus::Failure
-    } else if ancestor_statuses
-        .iter()
-        .any(|s| *s == ExecutionStatus::Cancelled)
-    {
+    } else if ancestor_statuses.contains(&ExecutionStatus::Cancelled) {
         ExecutionStatus::Cancelled
-    } else if ancestor_statuses
-        .iter()
-        .any(|s| *s == ExecutionStatus::Skipped)
-    {
+    } else if ancestor_statuses.contains(&ExecutionStatus::Skipped) {
         ExecutionStatus::Skipped
     } else {
         ExecutionStatus::Success
