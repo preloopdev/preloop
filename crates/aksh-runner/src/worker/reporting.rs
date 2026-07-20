@@ -14,14 +14,16 @@ use crate::worker::helpers::iso_now;
 /// Broker path: WorkflowStepsUpdate Twirp call.
 /// AzDO path (F030): PATCH timeline records via `update_timeline`.
 pub async fn flush_step_updates(rpt: &ReportingContext, queue: &Arc<Mutex<ServerQueue>>) {
-    let body = {
+    let pending = {
         let mut q = queue.lock().await;
         q.take_steps_update_body()
     };
 
-    let Some(body) = body else { return };
+    let Some((body, generation)) = pending else {
+        return;
+    };
 
-    if let Some(azdo) = &rpt.azdo {
+    let published = if let Some(azdo) = &rpt.azdo {
         // F030: translate StepUpdate → AzDO TimelineRecord and PATCH.
         let records: Vec<serde_json::Value> = body
             .steps
@@ -35,12 +37,18 @@ pub async fn flush_step_updates(rpt: &ReportingContext, queue: &Arc<Mutex<Server
             .update_timeline(&rpt.access_token, &rpt.plan_id, &azdo.timeline_id, &payload)
             .await
         {
-            Ok(_) => info!(
-                "AzDO timeline updated ({} steps, change_order={})",
-                body.steps.len(),
-                body.change_order
-            ),
-            Err(e) => warn!("AzDO timeline update failed (non-fatal): {e:#}"),
+            Ok(_) => {
+                info!(
+                    "AzDO timeline updated ({} steps, change_order={})",
+                    body.steps.len(),
+                    body.change_order
+                );
+                true
+            }
+            Err(e) => {
+                warn!("AzDO timeline update failed (non-fatal): {e:#}");
+                false
+            }
         }
     } else {
         let body_json = serde_json::to_value(&body).unwrap_or_default();
@@ -49,13 +57,23 @@ pub async fn flush_step_updates(rpt: &ReportingContext, queue: &Arc<Mutex<Server
             .update_workflow_steps(&rpt.access_token, &body_json)
             .await
         {
-            Ok(_) => info!(
-                "WorkflowStepsUpdate sent ({} steps, change_order={})",
-                body.steps.len(),
-                body.change_order
-            ),
-            Err(e) => warn!("WorkflowStepsUpdate failed (non-fatal): {e:#}"),
+            Ok(_) => {
+                info!(
+                    "WorkflowStepsUpdate sent ({} steps, change_order={})",
+                    body.steps.len(),
+                    body.change_order
+                );
+                true
+            }
+            Err(e) => {
+                warn!("WorkflowStepsUpdate failed (non-fatal): {e:#}");
+                false
+            }
         }
+    };
+
+    if published {
+        queue.lock().await.mark_steps_published(generation);
     }
 }
 
