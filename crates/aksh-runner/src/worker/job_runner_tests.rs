@@ -82,6 +82,7 @@ async fn periodic_drain_flushes_queued_step_updates() {
         plan_id: "plan-1".to_string(),
         job_id: "job-1".to_string(),
         azdo: None,
+        connectivity_telemetry: Arc::new(Mutex::new(Vec::new())),
     });
     let queue = Arc::new(Mutex::new(ServerQueue::new(
         "job-1".to_string(),
