@@ -353,7 +353,11 @@ pub(crate) async fn broker_delete_session_root(
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     let runner_id = authenticated_runner_id(&shared, &headers, None)?;
-    if let Some(session_id) = params.get("sessionId") {
+    let header_session = headers
+        .get("x-actions-session")
+        .and_then(|value| value.to_str().ok());
+    if let Some(session_id) = header_session.or_else(|| params.get("sessionId").map(String::as_str))
+    {
         remove_broker_session(&shared, session_id, runner_id).await?;
     }
     Ok(StatusCode::NO_CONTENT)

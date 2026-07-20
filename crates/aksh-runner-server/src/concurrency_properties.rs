@@ -373,6 +373,7 @@ impl ProdState {
             job_base_ids,
             job_needs: BTreeMap::new(),
             job_fail_fast: BTreeMap::new(),
+            job_continue_on_error: BTreeMap::new(),
             job_check_run_ids: BTreeMap::new(),
             reusable_calls: BTreeMap::new(),
             jobs_list: Vec::new(),

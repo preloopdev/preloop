@@ -41,6 +41,8 @@ pub(crate) struct RunRecord {
     pub(crate) job_needs: BTreeMap<JobId, Vec<JobId>>,
     pub(crate) job_fail_fast: BTreeMap<String, bool>,
     #[serde(default)]
+    pub(crate) job_continue_on_error: BTreeMap<String, bool>,
+    #[serde(default)]
     pub(crate) job_check_run_ids: BTreeMap<JobId, u64>,
     #[serde(default)]
     pub(crate) reusable_calls: BTreeMap<String, aksh_gha_parser::ReusableCallMetadata>,

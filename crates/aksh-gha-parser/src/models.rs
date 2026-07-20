@@ -39,6 +39,14 @@ pub enum ParserError {
         /// Expression parser error.
         message: String,
     },
+    /// A job-level continue-on-error value is invalid or non-boolean.
+    #[error("invalid continue-on-error for job `{job_id}`: {message}")]
+    InvalidContinueOnError {
+        /// Expanded job id.
+        job_id: String,
+        /// Expression or type error.
+        message: String,
+    },
 
     /// Matrix include/exclude entries must be objects.
     #[error("matrix entry for `{job_id}` in `{field}` must be an object")]
@@ -470,6 +478,17 @@ pub enum EnvValue {
     Null,
 }
 
+/// Job-level failure tolerance, either a literal or an expression evaluated
+/// for each expanded matrix job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum JobContinueOnError {
+    /// Literal failure tolerance.
+    Bool(bool),
+    /// Expression-valued failure tolerance.
+    Expression(String),
+}
+
 impl EnvValue {
     pub(crate) fn into_string(self) -> String {
         match self {
@@ -496,6 +515,9 @@ pub struct Job {
     /// Optional if condition.
     #[serde(default, rename = "if")]
     pub if_condition: Option<String>,
+    /// Job-level failure tolerance.
+    #[serde(default, rename = "continue-on-error")]
+    pub continue_on_error: Option<JobContinueOnError>,
     /// Strategy block.
     #[serde(default)]
     pub strategy: Strategy,
