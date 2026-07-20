@@ -1031,20 +1031,11 @@ pub(crate) fn needs_json_context(run: &RunRecord, needs: &[JobId]) -> serde_json
 }
 
 pub(crate) fn aggregate_need_status(statuses: &[ExecutionStatus]) -> Option<ExecutionStatus> {
-    if statuses
-        .iter()
-        .any(|status| *status == ExecutionStatus::Failure)
-    {
+    if statuses.contains(&ExecutionStatus::Failure) {
         Some(ExecutionStatus::Failure)
-    } else if statuses
-        .iter()
-        .any(|status| *status == ExecutionStatus::Cancelled)
-    {
+    } else if statuses.contains(&ExecutionStatus::Cancelled) {
         Some(ExecutionStatus::Cancelled)
-    } else if statuses
-        .iter()
-        .any(|status| *status == ExecutionStatus::Skipped)
-    {
+    } else if statuses.contains(&ExecutionStatus::Skipped) {
         Some(ExecutionStatus::Skipped)
     } else if !statuses.is_empty()
         && statuses
@@ -1103,15 +1094,9 @@ pub(crate) fn summarize_run(statuses: impl Iterator<Item = ExecutionStatus>) -> 
         )
     }) {
         ExecutionStatus::InProgress
-    } else if statuses
-        .iter()
-        .any(|status| *status == ExecutionStatus::Failure)
-    {
+    } else if statuses.contains(&ExecutionStatus::Failure) {
         ExecutionStatus::Failure
-    } else if statuses
-        .iter()
-        .any(|status| *status == ExecutionStatus::Cancelled)
-    {
+    } else if statuses.contains(&ExecutionStatus::Cancelled) {
         ExecutionStatus::Cancelled
     } else {
         ExecutionStatus::Success
