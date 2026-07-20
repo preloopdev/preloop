@@ -38,13 +38,10 @@ pub(crate) fn build_completejob_step_results(
     }));
 
     for (idx, step) in ordered_steps.iter().enumerate() {
-        let conclusion = job_ctx
-            .steps
-            .get(&step.context_name)
+        let execution_result = job_ctx.steps.get(&step.context_name);
+        let conclusion = execution_result
             .map(|result| runner_conclusion(&result.conclusion))
             .unwrap_or("skipped");
-
-        let (step_type, action_name) = completejob_type_and_action(step);
 
         // F025: Include annotations for this step
         let step_number = (idx + 2) as u32;
@@ -57,18 +54,26 @@ pub(crate) fn build_completejob_step_results(
             })
             .unwrap_or_default();
 
-        results.push(serde_json::json!({
+        let mut result = serde_json::json!({
             "external_id": step.id,
             "number": step_number,
             "name": step.display_name,
-            "action_name": action_name,
-            "type": step_type,
             "status": "completed",
             "conclusion": conclusion,
             "started_at": &now,
             "completed_at": &now,
             "annotations": annotations,
-        }));
+        });
+        // Official Runner.Worker adds action_name/type only for execution
+        // contexts that became Task records. Unexecuted/skipped steps retain
+        // the timeline identity and conclusion without invented task fields.
+        if execution_result.is_some_and(|result| runner_conclusion(&result.conclusion) != "skipped")
+        {
+            let (step_type, action_name) = completejob_type_and_action(step);
+            result["action_name"] = serde_json::json!(action_name);
+            result["type"] = serde_json::json!(step_type);
+        }
+        results.push(result);
     }
 
     // "Complete job" wrapper step
@@ -312,21 +317,21 @@ pub(crate) async fn report_completion(
         .map(|a| annotation_to_json(a, 0))
         .collect();
 
-    let mut telemetry = vec![serde_json::json!({
-        "type": "task",
-        "message": format!("{{\"ClassType\":\"StepsRunner\",\"FinishResult\":\"{}\"}}", result.to_lowercase()),
-    })];
+    let mut telemetry = Vec::new();
     telemetry.extend(job_ctx.debugger_telemetry.iter().map(|dbg_result| {
         serde_json::json!({
             "type": "task",
             "message": format!("{{\"ClassType\":\"DapDebugger\",\"DebuggerConnectionResult\":\"{}\"}}", dbg_result),
         })
     }));
+    if let Some(rpt) = reporting {
+        telemetry.extend(rpt.connectivity_telemetry.lock().await.iter().cloned());
+    }
 
     let completion_body = serde_json::json!({
         "planId": plan_id,
         "jobId": job_id,
-        "conclusion": result.to_lowercase(),
+        "conclusion": runner_conclusion(result),
         "outputs": outputs,
         "stepResults": step_results,
         "annotations": job_annotations,
@@ -518,5 +523,52 @@ mod tests {
         assert_eq!(timeline["data"]["col"], "2");
         assert_eq!(timeline["data"]["endColumn"], "8");
         assert_eq!(timeline["data"]["title"], "Build");
+    }
+
+    #[test]
+    fn runner_conclusion_uses_service_spelling_for_cancellation() {
+        assert_eq!(runner_conclusion("Cancelled"), "canceled");
+        assert_eq!(runner_conclusion("canceled"), "canceled");
+    }
+
+    #[test]
+    fn skipped_step_result_omits_task_only_fields() {
+        let step = Step {
+            id: "step-id".into(),
+            context_name: "skipped".into(),
+            display_name: "Skipped step".into(),
+            step_type: StepType::Script {
+                script: "echo skipped".into(),
+                shell: Some("bash".into()),
+                working_directory: None,
+            },
+            condition: Some("false".into()),
+            continue_on_error: false,
+            timeout_minutes: None,
+            env: std::collections::HashMap::new(),
+            raw: serde_json::json!({}),
+            is_background: false,
+        };
+        let mut job = super::super::contexts::JobContext::new(
+            "job".into(),
+            "job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        job.steps.insert(
+            "skipped".into(),
+            super::super::contexts::StepResult {
+                outcome: "Skipped".into(),
+                conclusion: "Skipped".into(),
+                outputs: std::collections::HashMap::new(),
+            },
+        );
+
+        let results =
+            build_completejob_step_results(&[step], &job, &std::collections::HashMap::new());
+        let skipped = &results[1];
+        assert_eq!(skipped["conclusion"], "skipped");
+        assert!(skipped.get("action_name").is_none());
+        assert!(skipped.get("type").is_none());
     }
 }
