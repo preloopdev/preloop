@@ -72,7 +72,6 @@ fn adjust_dow(dow: &str) -> String {
 ///
 /// Reference: MC.cs:898-915 (Quartz-style cron from GitHub 5-field).
 /// We adjust the day-of-week indexing since the `cron` crate uses 1-based indexing for DOW.
-
 /// Check whether a cron minute field resolves to fewer than 5-minute intervals.
 /// Handles `*`, `*/N`, ranges (`0-4`), comma lists (`0,1,2`), and single values.
 fn minute_field_too_frequent(minute: &str) -> bool {

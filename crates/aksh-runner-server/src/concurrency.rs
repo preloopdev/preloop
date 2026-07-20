@@ -444,7 +444,7 @@ mod properties {
             let key_a = concurrency_key(&repo_a, &group);
             let key_b = concurrency_key(&repo_b, &group);
             // Keys equal iff repos are equal after lowering.
-            let repos_equal = repo_a.to_ascii_lowercase() == repo_b.to_ascii_lowercase();
+            let repos_equal = repo_a.eq_ignore_ascii_case(&repo_b);
             prop_assert_eq!(key_a == key_b, repos_equal,
                 "GH-GROUP-01: keys must differ iff repos differ (case-insensitive)");
         }
@@ -581,7 +581,7 @@ mod properties {
                 job_ids: member_ids.clone(),
             };
             let jobset_expected = member_ids.iter().all(|id| {
-                jobs.get(id).copied().is_some_and(|s| is_terminal(s))
+                jobs.get(id).copied().is_some_and(is_terminal)
             });
             prop_assert_eq!(
                 holder_is_terminal(&jobset_holder, &jobs),
