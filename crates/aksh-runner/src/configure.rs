@@ -22,6 +22,8 @@ const DISTTASK_AGENT_CONTENT_TYPE: &str =
 pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<()> {
     let root = global.runner_root();
     info!("Configuring runner in {}", root.display());
+    std::fs::create_dir_all(&root)
+        .with_context(|| format!("creating runner root {}", root.display()))?;
 
     // Check for existing configuration
     if RunnerConfig::is_configured(&root) && !args.replace {
@@ -40,14 +42,51 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
         registration.service_url
     );
 
-    // Step 2: Fetch connection data
-    let _conn_data = http
-        .get_json::<serde_json::Value>(&format!(
+    // Step 2: Fetch connection data. The official runner sends the full
+    // connectOptions=1 response with cached location-service change IDs on
+    // later configurations, matching the official runner's warm path.
+    let cache_path = root.join(".connectionData");
+    let cached_ids = std::fs::read_to_string(&cache_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|value| {
+            Some((
+                value.get("lastChangeId")?.as_i64()?,
+                value.get("lastChangeId64")?.as_i64()?,
+            ))
+        });
+    let connection_url = if let Some((last_change_id, last_change_id64)) = cached_ids {
+        format!(
+            "{}/_apis/connectionData?connectOptions=1&lastChangeId={last_change_id}&lastChangeId64={last_change_id64}",
+            registration.service_url
+        )
+    } else {
+        format!(
             "{}/_apis/connectionData?connectOptions=1",
             registration.service_url
-        ))
+        )
+    };
+    let conn_data = http
+        .get_json::<serde_json::Value>(&connection_url)
         .await
         .context("fetching connectionData")?;
+    if let Some(location) = conn_data.get("locationServiceData") {
+        if let (Some(last_change_id), Some(last_change_id64)) = (
+            location
+                .get("lastChangeId")
+                .and_then(serde_json::Value::as_i64),
+            location
+                .get("lastChangeId64")
+                .and_then(serde_json::Value::as_i64),
+        ) {
+            let cache = serde_json::json!({
+                "lastChangeId": last_change_id,
+                "lastChangeId64": last_change_id64,
+            });
+            std::fs::write(&cache_path, serde_json::to_vec_pretty(&cache)?)
+                .with_context(|| format!("writing {}", cache_path.display()))?;
+        }
+    }
 
     // Step 3: Generate RSA keypair
     let keypair = aksh_gha_protocol::crypto::AgentRsaKeypair::generate()
