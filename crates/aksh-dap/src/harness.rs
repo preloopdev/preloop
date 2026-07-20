@@ -479,6 +479,13 @@ pub enum HarnessError {
     Json(#[from] serde_json::Error),
 }
 
+// Capture surface helpers kept around for when we add a
+// `live_record_against_runner` integration test. Not exercised in
+// unit tests because the harness is async-IO and we want to keep
+// the crate pure-rust for now.
+#[allow(dead_code)]
+fn _record_surface() {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -617,10 +624,3 @@ mod tests {
         assert_eq!(trace.frames[1].direction, "a2c");
     }
 }
-
-// Capture surface helpers kept around for when we add a
-// `live_record_against_runner` integration test. Not exercised in
-// unit tests because the harness is async-IO and we want to keep
-// the crate pure-rust for now.
-#[allow(dead_code)]
-fn _record_surface() {}

@@ -1,3 +1,5 @@
+#![allow(missing_docs, clippy::type_complexity)]
+
 //! aksh-dap — Debug Adapter Protocol implementation for the aksh runner.
 //!
 //! This crate is a 1:1 Rust port of the DAP subsystem added to
