@@ -49,5 +49,5 @@ just dogfood    # E2E with real runner
 
 - **Be critical.** Push back with evidence when a plan hides risk or a claim is wrong.
 - **Composability is the goal.** Any runner should work with any server. Never introduce protocol divergences.
--  **Drop-in** workflows. Users should be able to 
-
+- **Local CI is mandatory.** After every large chunk of work or task, run `just test-ci` to validate the changes and dogfood the workflow.
+- **Drop-in workflows.** Users should be able to run their workflows in local CI unmodified.
