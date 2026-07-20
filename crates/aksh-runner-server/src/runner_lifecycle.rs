@@ -103,7 +103,7 @@ pub(crate) async fn create_session_disttask(
         let inner = shared.state.inner.lock().await;
         runner_id.and_then(|id| inner.runner_rsa_public_keys.get(&id).cloned())
     };
-    let (key_bytes, encrypted) = if use_fips_encryption {
+    let (key_bytes, _encrypted) = if use_fips_encryption {
         let Some(public_key) = runner_public_key else {
             return Err(ApiError::bad_request(
                 "FIPS session encryption requires a registered RSA public key",

@@ -7,7 +7,6 @@ use serde_json::Value;
 /// Native `/api/v1` endpoints intentionally retain [`ApiError`]'s historical
 /// `{ "error": ... }` shape; this middleware is path-scoped to the protocol
 /// surfaces only.
-
 /// Explicit fallback keeps unmatched runner paths inside the middleware stack.
 pub(crate) async fn protocol_not_found() -> Response {
     StatusCode::NOT_FOUND.into_response()

@@ -109,7 +109,7 @@ pub(crate) fn verify_signature(secret: &str, payload: &[u8], signature_header: &
 }
 
 fn decode_hex(hex: &str) -> Result<Vec<u8>, &'static str> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return Err("Odd length");
     }
     let mut bytes = Vec::with_capacity(hex.len() / 2);

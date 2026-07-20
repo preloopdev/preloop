@@ -452,12 +452,8 @@ impl ProdState {
             .concurrency_groups
             .iter()
             .map(|(key, group)| {
-                let running = group.running.as_ref().map(|h| Self::holder_to_token(h));
-                let pending: Vec<_> = group
-                    .pending
-                    .iter()
-                    .map(|h| Self::holder_to_token(h))
-                    .collect();
+                let running = group.running.as_ref().map(Self::holder_to_token);
+                let pending: Vec<_> = group.pending.iter().map(Self::holder_to_token).collect();
                 (key.clone(), (running, pending))
             })
             .collect()
@@ -568,7 +564,7 @@ mod generators {
 
 fn check_production_invariants(inner: &InnerState) -> Result<(), String> {
     // INV-1: At most one running holder per group.
-    for (_key, group) in &inner.concurrency_groups {
+    for group in inner.concurrency_groups.values() {
         if group.running.is_some() {
             // No pending should be running simultaneously
             // (this is structural — pending is a separate queue)
@@ -810,11 +806,7 @@ pub mod state_machine {
                     model.release(&key, &token);
                 }
                 // If token had no keys, just mark terminal
-                if model
-                    .holder_keys
-                    .get(&token)
-                    .map_or(true, |ks| ks.is_empty())
-                {
+                if model.holder_keys.get(&token).is_none_or(|ks| ks.is_empty()) {
                     model
                         .holder_state
                         .insert(token.clone(), HolderState::Terminal);
@@ -1271,7 +1263,7 @@ pub mod state_machine {
                 }
             }
 
-            for (_key, group) in &model.groups {
+            for group in model.groups.values() {
                 if let Some(running) = &group.running {
                     ops.push(Op::Release {
                         run: running.run,

@@ -1,3 +1,5 @@
+#![allow(missing_docs, dead_code, clippy::too_many_arguments)]
+
 //! Host-side Preloop runner control plane.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -50,6 +52,8 @@ mod compat_ghes;
 use compat_ghes::*;
 mod cache_artifacts;
 use cache_artifacts::*;
+mod snapshots;
+use snapshots::*;
 mod recording;
 use recording::*;
 mod state;
