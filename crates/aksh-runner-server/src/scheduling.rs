@@ -130,20 +130,11 @@ fn ancestor_statuses(state: &SchedulerState, job: &SchedJob) -> Vec<ExecutionSta
 }
 
 fn aggregate_status(statuses: &[ExecutionStatus]) -> ExecutionStatus {
-    if statuses
-        .iter()
-        .any(|status| *status == ExecutionStatus::Failure)
-    {
+    if statuses.contains(&ExecutionStatus::Failure) {
         ExecutionStatus::Failure
-    } else if statuses
-        .iter()
-        .any(|status| *status == ExecutionStatus::Cancelled)
-    {
+    } else if statuses.contains(&ExecutionStatus::Cancelled) {
         ExecutionStatus::Cancelled
-    } else if statuses
-        .iter()
-        .any(|status| *status == ExecutionStatus::Skipped)
-    {
+    } else if statuses.contains(&ExecutionStatus::Skipped) {
         ExecutionStatus::Skipped
     } else {
         ExecutionStatus::Success
