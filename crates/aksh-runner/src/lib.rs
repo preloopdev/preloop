@@ -1,3 +1,5 @@
+#![allow(missing_docs)]
+
 //! Rust reimplementation of the GitHub Actions runner.
 //!
 //! This crate implements the runner protocol client (Runner.Listener + Runner.Worker)

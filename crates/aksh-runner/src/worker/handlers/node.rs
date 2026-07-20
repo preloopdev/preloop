@@ -43,6 +43,7 @@ fn migration_flag(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_node_version(
     runs_using: &str,
     workflow_env: &std::collections::HashMap<String, String>,
@@ -304,6 +305,7 @@ mod tests {
             outputs: None,
         }
     }
+    #[allow(clippy::too_many_arguments)]
     fn resolve(
         runs_using: &str,
         workflow: &[(&str, &str)],

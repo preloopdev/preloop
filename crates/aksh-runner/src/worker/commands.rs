@@ -443,7 +443,7 @@ mod tests {
             prop_assert_eq!(ctx.annotations.len(), 1);
             let annotation = &ctx.annotations[0];
             prop_assert_eq!(annotation.level, crate::worker::execution_context::AnnotationLevel::Error);
-            prop_assert_eq!(&annotation.message, &format!("failed: ***"));
+            prop_assert_eq!(&annotation.message, &"failed: ***".to_string());
             prop_assert_eq!(annotation.file.as_deref(), Some("src/main.rs"));
             prop_assert_eq!(annotation.line, Some(line));
             prop_assert_eq!(annotation.end_line, Some(line));

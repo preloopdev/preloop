@@ -61,6 +61,7 @@ pub enum StepType {
 ///
 /// F019: Queues WorkflowStepsUpdate for each step transition (InProgress + Completed).
 /// F020: Uploads step logs right after each step completes.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_steps(
     steps: &[Step],
     job: &mut JobContext,

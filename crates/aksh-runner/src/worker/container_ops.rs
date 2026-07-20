@@ -325,6 +325,7 @@ pub async fn pull_image(
 /// Start the job container (long-running with `tail -f /dev/null` entrypoint).
 ///
 /// Returns the full container ID.
+#[allow(clippy::too_many_arguments)]
 pub async fn start_job_container(
     spec: &ContainerSpec,
     container_name: &str,

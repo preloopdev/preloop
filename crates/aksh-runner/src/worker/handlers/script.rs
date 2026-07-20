@@ -310,6 +310,16 @@ fn resolve_shell(
     }
 }
 
+fn log_command_echo(script: &str, shell_desc: &str, ctx: &mut StepContext<'_>) {
+    let first_line = script.lines().next().unwrap_or("").trim();
+    ctx.log_raw(&format!("##[group]Run {}", first_line));
+    for line in script.lines() {
+        ctx.log_raw(&format!("\x1b[36;1m{}\x1b[0m", line));
+    }
+    ctx.log_raw(&format!("shell: {}", shell_desc));
+    ctx.log_raw("##[endgroup]");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,14 +385,4 @@ mod tests {
         assert!(path.to_string_lossy().ends_with(".ps1"));
         assert!(args.contains(&"-command".to_string()));
     }
-}
-
-fn log_command_echo(script: &str, shell_desc: &str, ctx: &mut StepContext<'_>) {
-    let first_line = script.lines().next().unwrap_or("").trim();
-    ctx.log_raw(&format!("##[group]Run {}", first_line));
-    for line in script.lines() {
-        ctx.log_raw(&format!("\x1b[36;1m{}\x1b[0m", line));
-    }
-    ctx.log_raw(&format!("shell: {}", shell_desc));
-    ctx.log_raw("##[endgroup]");
 }
