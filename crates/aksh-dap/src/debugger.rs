@@ -872,7 +872,7 @@ impl IDapDebugger for DapDebugger {
 
     fn on_post_step_registered(&self, step: &SourceEntry) {
         if let Some(view) = self.core.view.lock().as_ref() {
-            view.add_post_steps(&[step.clone()]);
+            view.add_post_steps(std::slice::from_ref(step));
         }
     }
 

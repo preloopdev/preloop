@@ -254,7 +254,7 @@ impl Serialize for TaskStep {
             let inputs_with_loc = self
                 .reference
                 .as_ref()
-                .map_or(false, |r| r.reference_type.as_deref() != Some("script"));
+                .is_some_and(|r| r.reference_type.as_deref() != Some("script"));
             map.serialize_entry("inputs", &TemplateStringMap(&inputs, inputs_with_loc))?;
         }
         map.serialize_entry("id", &self.id)?;

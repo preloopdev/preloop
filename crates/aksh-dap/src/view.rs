@@ -99,15 +99,14 @@ impl JobExecutionView {
         } else {
             sanitize_path(job_id)
         };
-        let mut line_by_step = Vec::new();
         // "Set up job" occupies line 1; it is the synthetic pre step.
-        line_by_step.push(StepLine {
+        let line_by_step = vec![StepLine {
             line: 1,
             frame_id: 1,
             display_name: "Set up job".into(),
             is_pre: true,
             is_post: false,
-        });
+        }];
         let view = Self {
             job_id,
             pre_entries: Mutex::new(vec![SourceEntry {
