@@ -160,6 +160,32 @@ jobs:
 }
 
 #[test]
+fn evaluates_job_continue_on_error_for_each_matrix_cell() {
+    let workflow = parse_workflow(
+        r#"
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.expected == 'failure' }}
+    strategy:
+      matrix:
+        expected: [success, failure]
+    steps:
+      - run: echo test
+"#,
+    )
+    .unwrap();
+
+    let jobs = expand_jobs(&workflow).unwrap();
+    assert_eq!(jobs.len(), 2);
+    for job in jobs {
+        let expected = job.matrix.get("expected").and_then(Value::as_str).unwrap();
+        assert_eq!(job.continue_on_error, expected == "failure");
+    }
+}
+
+#[test]
 fn parses_object_runs_on_group_and_labels() {
     let workflow = parse_workflow(
         r#"
