@@ -303,6 +303,20 @@ pub(crate) async fn submit_run_inner(
         None
     };
 
+    // Capture the workspace once per run, before any job is queued. Every
+    // redirected checkout then fetches the same immutable local tree.
+    let workspace_snapshot = if let Some(workspace) = shared.state.local_workspace.as_deref() {
+        match create_workspace_snapshot(&shared.state.state_dir, workspace, run_id).await {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => {
+                warn!(%run_id, error = ?error, "Failed to create workspace snapshot — falling back to normal checkout");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     {
         let mut inner = shared.state.inner.lock().await;
         let mut statuses = BTreeMap::new();
@@ -395,6 +409,20 @@ pub(crate) async fn submit_run_inner(
                 &submission.vars,
             )
             .map_err(|e| ApiError::bad_request(format!("failed to build job message: {e}")))?;
+
+            if let Some(snapshot) = workspace_snapshot.as_ref() {
+                let redirected =
+                    redirect_primary_checkout(&mut agent_msg, snapshot, &public_base_url());
+                if redirected > 0 {
+                    info!(
+                        %run_id,
+                        job = %job.id,
+                        %redirected,
+                        commit = %snapshot.commit_sha,
+                        "Redirected primary checkout to local workspace snapshot"
+                    );
+                }
+            }
 
             let id_token_granted = job.oidc_id_token_granted;
             inner
