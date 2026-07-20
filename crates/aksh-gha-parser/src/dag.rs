@@ -276,6 +276,7 @@ mod tests {
             env: Default::default(),
             steps: vec![],
             if_condition: None,
+            continue_on_error: false,
             fail_fast: true,
             max_parallel: None,
             secrets_inherit: false,
