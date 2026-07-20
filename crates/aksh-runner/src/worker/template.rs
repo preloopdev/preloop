@@ -70,7 +70,7 @@ pub fn evaluate_condition(condition: &str, ctx: &aksh_gha_expressions::Context) 
         && trimmed != "0"
         && trimmed.to_lowercase() != "false"
         && trimmed != "null"
-        && trimmed != "")
+        && !trimmed.is_empty())
 }
 
 /// Find the closing `}}` of a `${{ ... }}` expression, respecting string literals.
@@ -106,11 +106,11 @@ fn find_expression_end(s: &str) -> Option<usize> {
             ')' if !in_single_quote && paren_depth > 0 => {
                 paren_depth -= 1;
             }
-            '}' if !in_single_quote && paren_depth == 0 => {
+            '}' if !in_single_quote && paren_depth == 0
                 // Check for }}
-                if iter.peek().map(|&(_, c)| c) == Some('}') {
-                    return Some(byte_pos);
-                }
+                && iter.peek().map(|&(_, c)| c) == Some('}') =>
+            {
+                return Some(byte_pos);
             }
             _ => {}
         }
