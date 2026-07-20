@@ -19,12 +19,13 @@ from pathlib import Path
 from typing import Any
 
 VOLATILE_KEY_RE = re.compile(
-    r"(^|_)(id|guid|token|session|signature|timestamp|time|date|url|uri|nonce|etag|sha|hash|expires|created|updated|started|completed|finish|worker|runner|agent|request|job|plan)(_|$)",
+    r"(^|_)(id|guid|token|session|signature|timestamp|time|date|url|uri|nonce|etag|sha|hash|expires|created|updated|started|completed|finish|worker|runner|agent|owner|request|job|plan|run)(_|$)",
     re.IGNORECASE,
 )
 GUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 LONG_TOKEN_RE = re.compile(r"[A-Za-z0-9_\-]{24,}")
 ISO_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?")
+PEM_RE = re.compile(r"-----BEGIN [^-]+-----.*?-----END [^-]+-----", re.DOTALL)
 DIGIT_SEG_RE = re.compile(r"(?<=/)\d+(?=/|\?|$)")
 QUERY_VOL_RE = re.compile(r"([?&][^=]*(?:id|token|signature|expires|time|date|session|request|plan|job|agent|name)[^=]*=)[^&]+", re.I)
 RUN_ACTIONS_HOST_RE = re.compile(r"^run-actions-\d+-")
@@ -32,6 +33,10 @@ RESULTS_BLOB_HOST_RE = re.compile(r"^productionresultssa\d+\.blob\.core\.windows
 
 IGNORED_HOSTS = {
     "api.github.com",  # gh CLI dispatch/status if captured outside runner should be excluded by scripts, but guard anyway.
+    # Node.js runtime provisioning is an intentional runner-environment choice,
+    # not a control-plane protocol disparity. The aksh VM may install a
+    # runtime that is already present in the official runner image.
+    "nodejs.org",
 }
 
 
@@ -111,11 +116,21 @@ def scrub(v: Any, key: str = "") -> Any:
     if VOLATILE_KEY_RE.search(key):
         return "{volatile}"
     if isinstance(v, dict):
+        # GitHub's acquire-job variables and regex masks are commonly encoded
+        # as {"k": "run_id", "v": "..."}. The value key itself is not
+        # volatile, but its sibling key identifies the semantic field.
+        pair_key = v.get("k")
+        if isinstance(pair_key, str) and VOLATILE_KEY_RE.search(pair_key):
+            return {
+                k: ("{volatile}" if k == "v" else scrub(value, k))
+                for k, value in sorted(v.items())
+            }
         return {k: scrub(val, k) for k, val in sorted(v.items())}
     if isinstance(v, list):
         return [scrub(x, key) for x in v]
     if isinstance(v, str):
         s = ISO_RE.sub("{time}", v)
+        s = PEM_RE.sub("{pem}", s)
         s = GUID_RE.sub("{guid}", s)
         s = LONG_TOKEN_RE.sub(lambda m: "{token}" if len(set(m.group(0))) > 8 else m.group(0), s)
         return s
@@ -168,8 +183,7 @@ def compare(left_dir: Path, right_dir: Path, scenario: str, out: Path) -> int:
 
     lseq = [endpoint(f) for f in left]
     rseq = [endpoint(f) for f in right]
-    if lseq != rseq:
-        issues.append(("endpoint-sequence", "normalized endpoint sequence differs"))
+    sequence_differs = lseq != rseq
     lcnt, rcnt = Counter(lseq), Counter(rseq)
     lines.append("## Endpoint counts")
     lines.append("")
@@ -182,6 +196,7 @@ def compare(left_dir: Path, right_dir: Path, scenario: str, out: Path) -> int:
     lines.append("")
 
     if lseq != rseq:
+        issues.append(("endpoint-sequence", f"official={len(lseq)} aksh={len(rseq)}"))
         lines.append("## Endpoint sequence diff")
         lines.append("")
         lines.append("```diff")
@@ -224,8 +239,12 @@ def compare(left_dir: Path, right_dir: Path, scenario: str, out: Path) -> int:
                     local.append(compact_diff(aval, bval))
                     local.append("```")
                 elif akind == "binary" and aval != bval:
+                    # Until the payload can be decoded and volatile protobuf
+                    # fields redacted explicitly, a byte mismatch is a real
+                    # compatibility difference. Silently accepting it can hide
+                    # truncated or structurally invalid Twirp messages.
                     issues.append((f"{field}-binary", f"{ep} #{idx}"))
-                    local.append(f"- {field} binary body differs")
+                    local.append(f"- {field} opaque binary differs")
                     local.append("```diff")
                     local.append(compact_diff(aval, bval))
                     local.append("```")
