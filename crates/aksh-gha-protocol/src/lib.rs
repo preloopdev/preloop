@@ -288,6 +288,9 @@ pub struct JobPlan {
     /// Whether sibling matrix jobs should be cancelled after a failure.
     #[serde(default = "default_fail_fast")]
     pub fail_fast: bool,
+    /// Whether a failed job is allowed to complete as success.
+    #[serde(default)]
+    pub continue_on_error: bool,
     /// Maximum concurrent matrix jobs for this base job.
     #[serde(default)]
     pub max_parallel: Option<u64>,
