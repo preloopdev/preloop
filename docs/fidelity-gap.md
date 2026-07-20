@@ -349,8 +349,10 @@ Paths are in this repo. Updated 2026-07-18 after deep source review.
   - ✅ Workflow commands: all 10 `::` commands.
   - ✅ Problem matchers.
   - ✅ Comprehensive `GITHUB_*` env var injection.
-  - ✅ Completion body: planId, jobId, conclusion, outputs, stepResults, annotations.
-  - ⚠️ Server queue flushes at step boundaries, not periodic 500 ms.
+  - ✅ Completion body: planId, jobId, service-spelled conclusion, outputs, stepResults,
+    annotations; skipped steps omit task-only `action_name`/`type` fields.
+  - ⚠️ Server queue drains every 500 ms, but still sends cumulative step state rather than
+    the official runner's merged delta batches.
   - ❌ Self-update not implemented (intentional).
   - ❌ `RunnerRefreshConfig` not implemented.
 - `runner-watch`
@@ -381,11 +383,15 @@ and regression tests.**
   `timeout − 15 s`. Listener continues polling during cancellation.
 - ✅ **Busy-runner overlap handling resolved.** Broker listener now handles new job messages
   arriving while a job is active.
+- ✅ **Broker polling/session lifecycle fixed.** Online and Busy states both use the official
+  50-second long-poll window; status transitions cancel the in-flight request, and every
+  listener exit path attempts the broker session `DELETE` exactly once.
 - ⚠️ **Step/timeline updates: partial periodic drain.** aksh-runner flushes cumulative
-  `WorkflowStepsUpdate` at step boundaries and job end. Official runner drains timeline
-  updates every 500 ms and results uploads every 1000 ms in background dequeue tasks
-  (`src/Runner.Common/JobServerQueue.cs:31-36`). aksh's live console lines match (250 ms
-  aggressive → 500 ms), but step-status updates are not yet on a periodic background timer.
+  `WorkflowStepsUpdate` every 500 ms and at job end. Official runner drains at the same
+  interval but merges only records dequeued in that batch
+  (`src/Runner.Common/JobServerQueue.cs:627-705`); capture 103 currently emits 10 Aksh
+  updates versus 5 official updates. Log metadata, signed-URL, blob-upload, and complete-job
+  counts match in that capture.
 
 ### 3b. Deep review findings (2026-07-18)
 
