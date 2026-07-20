@@ -150,22 +150,36 @@ Key details:
 
 ### Phase 3: Workspace population (actions/checkout parity)
 
-The local server needs to provide workspace content to the runner. Three approaches, pick one:
+The local server provides workspace content as an immutable synthetic Git
+repository. Earlier alternatives are retained below for context.
 
 **Option A: virtio-fs mount (current approach)**
 Mount the host repo directory into the VM. Steps see the repo at `/workspace`. This is what `dogfood.yml` does with `vars.AKSH_REPO_ROOT`. Pros: instant, no copy. Cons: not ephemeral (runner can modify host files), doesn't simulate `actions/checkout`.
 
-**Option B: Git clone inside the VM**
-The aksh server provides a git URL in the job payload. The runner's `actions/checkout` implementation clones it. Pros: matches GitHub behavior. Cons: requires a local git server or access to the remote repo.
+**Option B: Synthetic Git repository served by aksh** *(implemented)*
+When `AKSH_LOCAL_WORKSPACE` is configured, submission captures the exact working
+tree in a synthetic root commit. The capture includes tracked modifications,
+tracked deletions, and untracked non-ignored files while preserving the user's
+index and refs. Aksh serves the resulting self-contained bare repository over
+authenticated Git smart HTTP and injects supported `actions/checkout` inputs
+into the compiled job message. The workflow YAML is unchanged, and both the
+official runner and `aksh-runner` execute the normal checkout action against the
+local server rather than GitHub.
 
-**Option C: Tarball injection** *(recommended for local CI)*
-`aksh-runner-server` tarballs the workspace directory on submission, serves it at a URL the runner can download, and the runner extracts it to `$GITHUB_WORKSPACE` during the "Set up job" phase. Pros: ephemeral (each job gets a snapshot), fast (local HTTP), matches the isolation model. Cons: requires implementation.
+**Option C: Tarball injection** *(rejected)*
+Extracting a tarball before `actions/checkout` does not preserve local changes:
+checkout deletes a non-repository destination and resets existing repositories.
+It would also require a custom runner extension, violating the requirement that
+an unmodified official runner work with the server.
 
 ### Phase 4: Action resolution for local actions
 
 For `uses: ./path/to/action` to work, the workspace must contain the action files. This is solved by Phase 3 — once the workspace is populated, relative action paths resolve naturally.
 
-For `uses: actions/checkout@v4` and other remote actions, the runner already implements F022 (action resolution + codeload download). This works when the VM has network access (`--net`).
+For `uses: actions/checkout@v4`, the action package is resolved normally and the
+primary default checkout fetches the synthetic repository from aksh. Other
+remote actions and explicit secondary repository checkouts still require
+network access unless they are cached or mirrored locally.
 
 ### Phase 5: Docker-in-VM validation
 
