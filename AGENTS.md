@@ -2,21 +2,23 @@
 
 ## Overview
 
-`aksh` reimplements the GitHub Actions control plane in Rust. The unmodified `actions/runner` registers, polls, executes, and reports against it. Also contains `runner-watch` for protocol conformance testing.
+`aksh` reimplements the GitHub Actions control plane and official `actions/runner` in Rust. The unmodified runner registers, polls, executes, and reports against it. Also contains `runner-watch` for protocol conformance testing.
 
 ## Crates
 
-| Crate | Role |
-|-------|------|
-| `aksh-runner-server` | HTTP control plane: `/_apis/…` (runner protocol) + `/api/v1/…` (native REST) + `/broker/…` |
-| `aksh-gha-parser` | Workflow YAML → typed model → job DAG/matrix expansion |
-| `aksh-gha-expressions` | `${{ }}` parser/evaluator |
-| `aksh-gha-protocol` | Wire DTOs, session crypto, secret wrappers, NDJSON events |
-| `aksh-runner` | Rust runner: Listener + Worker (faithful to `actions/runner` v2.335.1) |
-| `aksh-runner-client` | CLI for submitting workflows |
-| `aksh-cache` / `aksh-artifacts` | File-backed protocol storage |
-| `aksh-dap` | Debug Adapter Protocol bridge |
-| `aksh-conformance` / `runner-watch` | Conformance harnesses and protocol-diff tooling |
+
+| Crate                               | Role                                                                                       |
+| ----------------------------------- | ------------------------------------------------------------------------------------------ |
+| `aksh-runner-server`                | HTTP control plane: `/_apis/…` (runner protocol) + `/api/v1/…` (native REST) + `/broker/…` |
+| `aksh-gha-parser`                   | Workflow YAML → typed model → job DAG/matrix expansion                                     |
+| `aksh-gha-expressions`              | `${{ }}` parser/evaluator                                                                  |
+| `aksh-gha-protocol`                 | Wire DTOs, session crypto, secret wrappers, NDJSON events                                  |
+| `aksh-runner`                       | Rust runner: Listener + Worker (faithful to `actions/runner` v2.335.1)                     |
+| `aksh-runner-client`                | CLI for submitting workflows                                                               |
+| `aksh-cache` / `aksh-artifacts`     | File-backed protocol storage                                                               |
+| `aksh-dap`                          | Debug Adapter Protocol bridge                                                              |
+| `aksh-conformance` / `runner-watch` | Conformance harnesses and protocol-diff tooling                                            |
+
 
 ## Commands
 
@@ -33,7 +35,7 @@ just dogfood    # E2E with real runner
 - **State**: in-memory behind `Arc<Mutex<…>>` + `Notify`/broadcast. Secrets use `SecretString` — call `expose()` only at protocol boundaries.
 - **Wire compatibility**: `/_apis/…` is the source of truth. Validate protocol changes against the **official runner**, not only unit tests.
 - **Broker path only**: all work targets the modern broker + Twirp results-service protocol (v2.329.0+).
-- **ARM64 local target**: smolvm on Apple Silicon; x86 emulation blocked on libkrun.
+- **ARM64 local target**: smolvm on Apple Silicon.
 
 ## Important Files
 
@@ -47,3 +49,5 @@ just dogfood    # E2E with real runner
 
 - **Be critical.** Push back with evidence when a plan hides risk or a claim is wrong.
 - **Composability is the goal.** Any runner should work with any server. Never introduce protocol divergences.
+-  **Drop-in** workflows. Users should be able to 
+
