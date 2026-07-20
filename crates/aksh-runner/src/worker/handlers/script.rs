@@ -73,7 +73,7 @@ pub async fn run_script(
     ctx.debug(&format!("Command line: {} {:?}", program, args));
     // Build environment
     let env = ctx.build_env();
-    let ctx_ref = &*ctx;
+    let ctx_ref = &mut *ctx;
     let on_chunk = Box::new(move |chunk: &[u8]| {
         ctx_ref.write_chunk(chunk);
     });
@@ -208,7 +208,7 @@ pub async fn run_script_in_container(
     ctx.debug(&format!(
         "Command line: docker exec -i {container_id} {container_program} {container_args_ref:?}"
     ));
-    let ctx_ref = &*ctx;
+    let ctx_ref = &mut *ctx;
     let on_chunk = Box::new(move |chunk: &[u8]| {
         ctx_ref.write_chunk(chunk);
     });
