@@ -171,8 +171,8 @@ pub fn build_context(
     ctx.insert("needs", Value::Object(Map::new()));
 
     let secrets_value: Map<String, Value> = secrets
-        .iter()
-        .map(|(k, _)| (k.clone(), Value::String("***".to_owned())))
+        .keys()
+        .map(|k| (k.clone(), Value::String("***".to_owned())))
         .collect();
     ctx.insert("secrets", Value::Object(secrets_value));
 
