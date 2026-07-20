@@ -374,7 +374,7 @@ mod tests {
             let _ = cancel_tx.send(true);
         });
 
-        let result = invoke(
+        let _result = invoke(
             "sh",
             &[
                 "-c",
@@ -415,7 +415,7 @@ mod tests {
             let _ = cancel_tx.send(true);
         });
 
-        let result = invoke(
+        let _result = invoke(
             "sh",
             &[
                 "-c",
@@ -470,7 +470,7 @@ mod tests {
     #[tokio::test]
     async fn invoke_streams_chunks_to_callback_before_exit() {
         let (chunk_tx, chunk_rx) = std_mpsc::channel();
-        let chunk_tx2 = chunk_tx.clone();
+        let _chunk_tx2 = chunk_tx.clone();
 
         let result = invoke(
             "sh",

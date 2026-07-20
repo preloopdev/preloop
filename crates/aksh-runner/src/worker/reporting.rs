@@ -443,7 +443,7 @@ pub(crate) async fn upload_diagnostic_logs(
 
             for entry in &log_files {
                 let name = entry.file_name().to_string_lossy().to_string();
-                if let Ok(content) = std::fs::read(&entry.path()) {
+                if let Ok(content) = std::fs::read(entry.path()) {
                     zip.start_file(&name, options)?;
                     zip.write_all(&content)?;
                 }

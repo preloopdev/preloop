@@ -134,11 +134,7 @@ impl<'a> StepContext<'a> {
             .store(false, std::sync::atomic::Ordering::Relaxed);
 
         // Process all complete lines (ending with \n)
-        loop {
-            let newline_pos = match buf.iter().position(|&b| b == b'\n') {
-                Some(pos) => pos,
-                None => break,
-            };
+        while let Some(newline_pos) = buf.iter().position(|&b| b == b'\n') {
             // Extract the line (without the newline)
             let line_bytes: Vec<u8> = buf.drain(..=newline_pos).collect();
             let line = String::from_utf8_lossy(&line_bytes[..line_bytes.len() - 1]);
@@ -531,7 +527,7 @@ mod tests {
         let lines: Vec<&str> = ctx
             .log_lines
             .iter()
-            .map(|l| l.splitn(2, ' ').nth(1).unwrap_or(""))
+            .map(|l| l.split_once(' ').map(|x| x.1).unwrap_or(""))
             .collect();
         assert_eq!(lines, vec!["line1", "line2"]);
     }
