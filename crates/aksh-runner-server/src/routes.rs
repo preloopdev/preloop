@@ -410,6 +410,11 @@ pub(crate) fn build_app(
             "/api/v1/actions/download/:owner/:repo/*git_ref",
             get(download_action_tarball),
         )
+        // Read-only Git smart HTTP for immutable local-workspace snapshots.
+        .route(
+            "/snapshots/:run_id/*path",
+            get(snapshot_git_http).post(snapshot_git_http),
+        )
         .route(
             "/api/v1/runners",
             post(register_runner).route_layer(middleware::from_fn_with_state(
