@@ -66,6 +66,11 @@ pub async fn download_action(
     };
 
     // Extract tarball, stripping top-level directory (standard GitHub tarball layout)
+    // v2.336.0 (#4509): Log archive size for telemetry
+    info!(
+        "Action archive {owner}/{repo}@{git_ref}: {} bytes",
+        bytes.len()
+    );
     extract_tarball(&bytes, &dest)?;
 
     info!("Extracted action to {}", dest.display());
