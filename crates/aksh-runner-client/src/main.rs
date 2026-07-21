@@ -80,6 +80,15 @@ enum Command {
         /// Run id.
         run_id: RunId,
     },
+    /// Lint and dry-run workflow parsing and job expansion without running it.
+    Lint {
+        /// Workflow YAML path.
+        #[arg(short = 'W', long)]
+        workflow: PathBuf,
+        /// Repository workspace root used to collect local reusable workflows.
+        #[arg(long)]
+        workspace_root: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -197,6 +206,32 @@ async fn main() -> anyhow::Result<()> {
                 .await?,
             )
             .await?;
+        }
+        Command::Lint {
+            workflow,
+            workspace_root,
+        } => {
+            let workflow_yaml = tokio::fs::read_to_string(&workflow)
+                .await
+                .with_context(|| format!("read workflow {}", workflow.display()))?;
+            let parsed = aksh_gha_parser::parse_workflow(&workflow_yaml)
+                .with_context(|| format!("parse workflow {}", workflow.display()))?;
+            let reusable_workflows =
+                collect_reusable_workflows(workspace_root.as_deref(), &workflow).await?;
+            let expanded =
+                aksh_gha_parser::expand_jobs_with_reusables(&parsed, &reusable_workflows)
+                    .with_context(|| format!("expand workflow {}", workflow.display()))?;
+
+            let step_count: usize = expanded.jobs.iter().map(|j| j.steps.len()).sum();
+            println!(
+                "✓ Workflow {} is valid: parsed {} job plan(s) and {} total step(s).",
+                workflow.display(),
+                expanded.jobs.len(),
+                step_count
+            );
+            for job in &expanded.jobs {
+                println!("  - Job: {} ({})", job.id.0, job.name);
+            }
         }
     }
 
