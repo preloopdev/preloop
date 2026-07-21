@@ -60,6 +60,9 @@ pub struct JobContext {
     pub upgraded_node24_actions: Vec<String>,
     /// Actions still using deprecated node20 (for warning).
     pub deprecated_node20_actions: Vec<String>,
+    /// v2.336.0 (#4527): Job-scoped artifact subjects from $GITHUB_ARTIFACTS.
+    /// Keyed by canonical subject name; value is (digest, kind).
+    pub artifact_subjects: IndexMap<String, ArtifactSubject>,
 }
 
 impl std::fmt::Debug for JobContext {
@@ -71,6 +74,14 @@ impl std::fmt::Debug for JobContext {
             .field("dap_debugger", &self.dap_debugger.is_some())
             .finish_non_exhaustive()
     }
+}
+
+/// v2.336.0 (#4527): Artifact subject declared via $GITHUB_ARTIFACTS.
+#[derive(Debug, Clone)]
+pub struct ArtifactSubject {
+    pub name: String,
+    pub digest: String,
+    pub kind: String,
 }
 
 /// Result of a completed step.
@@ -155,6 +166,7 @@ impl JobContext {
             debugger_telemetry: Vec::new(),
             upgraded_node24_actions: Vec::new(),
             deprecated_node20_actions: Vec::new(),
+            artifact_subjects: IndexMap::new(),
         }
     }
 
