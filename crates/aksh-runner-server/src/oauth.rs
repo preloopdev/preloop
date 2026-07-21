@@ -116,7 +116,7 @@ pub(crate) async fn oauth2_token(
         ));
     }
 
-    let _header_val = decode_jwt_segment(parts[0])
+    let header_val = decode_jwt_segment(parts[0])
         .ok_or_else(|| ApiError::bad_request("failed to decode JWT header"))?;
     let _claims_val = decode_jwt_segment(parts[1])
         .ok_or_else(|| ApiError::bad_request("failed to decode JWT claims"))?;
@@ -154,9 +154,35 @@ pub(crate) async fn oauth2_token(
     };
 
     // Verify signature
-    pubkey
-        .verify_signature_ps256(signing_input.as_bytes(), &signature)
-        .map_err(|e| ApiError::unauthorized(format!("JWT signature verification failed: {e}")))?;
+    let alg = header_val
+        .get("alg")
+        .and_then(|v| v.as_str())
+        .unwrap_or("RS256");
+    match alg {
+        "RS256" => {
+            pubkey
+                .verify_signature_rs256(signing_input.as_bytes(), &signature)
+                .map_err(|e| {
+                    ApiError::unauthorized(format!(
+                        "JWT signature verification failed (RS256): {e}"
+                    ))
+                })?;
+        }
+        "PS256" => {
+            pubkey
+                .verify_signature_ps256(signing_input.as_bytes(), &signature)
+                .map_err(|e| {
+                    ApiError::unauthorized(format!(
+                        "JWT signature verification failed (PS256): {e}"
+                    ))
+                })?;
+        }
+        other => {
+            return Err(ApiError::unauthorized(format!(
+                "unsupported JWT algorithm: {other}"
+            )));
+        }
+    }
 
     let token = shared.state.local_jwt(json!({
         "sub": format!("aksh-runner-listen-{runner_id}"),
