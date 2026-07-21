@@ -31,6 +31,26 @@ pub(crate) async fn twirp_workflow_steps_update(
         if let Some((_, run_id, job_id)) =
             resolve_callback_job(&inner, &plan_uuid.to_string(), None, Some(job_uuid))
         {
+            // Find the step names by external_id and clone them to release the borrow on inner
+            let request_id = inner.agent_job_requests.get(&job_uuid).copied();
+            let step_names: std::collections::HashMap<uuid::Uuid, String> = request_id
+                .and_then(|id| inner.broker_messages.get(&id))
+                .map(|msg| {
+                    msg.steps
+                        .iter()
+                        .map(|s| {
+                            (
+                                s.id,
+                                s.display_name
+                                    .clone()
+                                    .or_else(|| s.name.clone())
+                                    .unwrap_or_default(),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
             if let Some(run) = inner.runs.get_mut(&run_id) {
                 let job_name = job_id.0.clone();
                 let job_detail =
@@ -50,7 +70,14 @@ pub(crate) async fn twirp_workflow_steps_update(
                 }
                 if let Some(steps) = payload["steps"].as_array() {
                     for step in steps {
-                        let name = step["name"].as_str().unwrap_or("").to_owned();
+                        let external_id_str = step["external_id"].as_str().unwrap_or("");
+                        let step_uuid = uuid::Uuid::parse_str(external_id_str).ok();
+
+                        // Find the step name using step_uuid from our cloned map
+                        let name = step_uuid
+                            .and_then(|suuid| step_names.get(&suuid).cloned())
+                            .unwrap_or_else(|| step["name"].as_str().unwrap_or("").to_owned());
+
                         let conclusion_num = step["conclusion"].as_u64().unwrap_or(0);
                         let status_num = step["status"].as_u64().unwrap_or(0);
 
@@ -95,7 +122,7 @@ pub(crate) async fn twirp_get_job_logs_signed_blob_url(
     Json(json!({
         "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
         "logs_url": format!(
-            "{}/replay/results/{}/{}/job-logs.txt",
+            "{}/replay/results/{}/{}/job-logs.txt?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig=dummy",
             public_base_url(), request.workflow_run_backend_id, request.workflow_job_run_backend_id
         )
     }))
@@ -107,7 +134,7 @@ pub(crate) async fn twirp_get_job_diag_logs_signed_blob_url(
     let token = uuid::Uuid::new_v4();
     Json(json!({
         "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
-        "diag_logs_url": format!("{}/twirp-blob/diag/{token}", public_base_url()),
+        "diag_logs_url": format!("{}/twirp-blob/diag/{token}?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig=dummy", public_base_url()),
     }))
 }
 
@@ -117,7 +144,7 @@ pub(crate) async fn twirp_get_step_logs_signed_blob_url(
     Json(json!({
         "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
         "logs_url": format!(
-            "{}/replay/results/{}/{}/step-{}.txt",
+            "{}/replay/results/{}/{}/step-{}.txt?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig=dummy",
             public_base_url(), request.workflow_run_backend_id, request.workflow_job_run_backend_id, request.step_backend_id
         ),
         "soft_size_limit": "1048576"
@@ -137,7 +164,7 @@ pub(crate) async fn twirp_get_step_summary_signed_blob_url(
     Json(json!({
         "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
         "summary_url": format!(
-            "{}/replay/results/{}/{}/step-{}-summary.md",
+            "{}/replay/results/{}/{}/step-{}-summary.md?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig=dummy",
             public_base_url(), request.workflow_run_backend_id, request.workflow_job_run_backend_id, request.step_backend_id
         ),
         "soft_size_limit": "1048576"
