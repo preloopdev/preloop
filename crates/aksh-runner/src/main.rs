@@ -32,6 +32,8 @@ async fn main() -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("parse workflow {}: {e}", args.workflow.display()))?;
             let reusable_workflows =
                 collect_reusable_workflows(args.workspace_root.as_deref(), &args.workflow).await?;
+            let reusable_workflows =
+                resolve_remote_workflows(reusable_workflows, &workflow_yaml).await?;
             let expanded =
                 aksh_gha_parser::expand_jobs_with_reusables(&parsed, &reusable_workflows).map_err(
                     |e| anyhow::anyhow!("expand workflow {}: {e}", args.workflow.display()),
@@ -101,4 +103,57 @@ fn same_file_path(left: &std::path::Path, right: &std::path::Path) -> bool {
         (Ok(left), Ok(right)) => left == right,
         _ => left == right,
     }
+}
+
+async fn resolve_remote_workflows(
+    mut workflows: BTreeMap<String, String>,
+    root_yaml: &str,
+) -> Result<BTreeMap<String, String>> {
+    let client = reqwest::Client::builder()
+        .user_agent("aksh-runner")
+        .build()?;
+    let token = std::env::var("AKSH_GITHUB_TOKEN").ok();
+    let mut queue = vec![root_yaml.to_owned()];
+    let mut visited = std::collections::BTreeSet::new();
+    while let Some(yaml) = queue.pop() {
+        let workflow = aksh_gha_parser::parse_workflow(&yaml)?;
+        for job in workflow.jobs.values() {
+            let Some(reference) = job.uses.as_deref() else {
+                continue;
+            };
+            if reference.starts_with("./") || workflows.contains_key(reference) {
+                continue;
+            }
+            let Some((owner, repo, path, git_ref)) = parse_remote_reference(reference) else {
+                anyhow::bail!("unsupported reusable workflow reference `{reference}`");
+            };
+            if !visited.insert(reference.to_owned()) {
+                continue;
+            }
+            let mut request = client
+                .get(format!(
+                    "https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={git_ref}"
+                ))
+                .header(reqwest::header::ACCEPT, "application/vnd.github.raw+json");
+            if let Some(token) = token.as_deref() {
+                request = request.bearer_auth(token);
+            }
+            let contents = request.send().await?.error_for_status()?.text().await?;
+            workflows.insert(reference.to_owned(), contents.clone());
+            queue.push(contents);
+        }
+    }
+    Ok(workflows)
+}
+
+fn parse_remote_reference(reference: &str) -> Option<(&str, &str, &str, &str)> {
+    let (repository_path, git_ref) = reference.rsplit_once('@')?;
+    let mut parts = repository_path.splitn(3, '/');
+    let owner = parts.next()?;
+    let repo = parts.next()?;
+    let path = parts.next()?;
+    if owner.is_empty() || repo.is_empty() || !path.starts_with(".github/workflows/") {
+        return None;
+    }
+    Some((owner, repo, path, git_ref))
 }

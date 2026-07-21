@@ -74,6 +74,7 @@ pub(crate) async fn submit_run_inner(
     mut submission: WorkflowSubmission,
 ) -> Result<RunAccepted, ApiError> {
     let workflow = parse_workflow(&submission.workflow_yaml)?;
+    crate::remote_workflows::resolve_remote_workflows(&mut submission).await?;
     if submission.event == "workflow_dispatch" {
         workflow.apply_workflow_dispatch_inputs(&mut submission.payload)?;
         if submission.dispatch_inputs.is_empty() {
