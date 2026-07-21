@@ -14,6 +14,9 @@ pub enum ParserError {
     /// YAML deserialization failed.
     #[error("workflow yaml error: {0}")]
     Yaml(#[from] serde_yaml::Error),
+    /// Expression syntax or function error.
+    #[error("invalid expression in workflow: {0}")]
+    InvalidExpression(String),
     /// Workflow did not define jobs.
     #[error("workflow does not define any jobs")]
     EmptyJobs,
