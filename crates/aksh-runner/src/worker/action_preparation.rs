@@ -21,6 +21,59 @@ pub(crate) async fn prepare_remote_actions(
         if uses.starts_with("./") || uses.starts_with("../") || uses.starts_with("docker://") {
             continue;
         }
+        // v2.336.0 ActionManager.ResolveSelfRepositoryReferences — gated by
+        // `actions_self_repository` (Constants.Runner.Features.SelfRepository).
+        if uses.starts_with("$/") {
+            if !self_repository_enabled(job_message) {
+                warn!(
+                    "Self-repository reference '{uses}' requires actions_self_repository; leaving unresolved"
+                );
+                continue;
+            }
+            let subpath = uses
+                .strip_prefix("$/")
+                .unwrap_or("")
+                .trim_start_matches('/');
+            if subpath.is_empty() {
+                warn!("Bare $/ without subpath is not valid: {uses:?}");
+                continue;
+            }
+            let workflow_repo =
+                message_variable(job_message, "system.github.repository").or_else(|| {
+                    job_message
+                        .get("contextData")
+                        .and_then(|cd| cd.get("github"))
+                        .and_then(|g| g.get("repository"))
+                        .and_then(|v| v.as_str())
+                });
+            let workflow_sha = message_variable(job_message, "system.github.sha").or_else(|| {
+                job_message
+                    .get("contextData")
+                    .and_then(|cd| cd.get("github"))
+                    .and_then(|g| g.get("sha"))
+                    .and_then(|v| v.as_str())
+            });
+            if let (Some(repo), Some(sha)) = (workflow_repo, workflow_sha) {
+                let parts: Vec<&str> = repo.splitn(2, '/').collect();
+                if parts.len() == 2 {
+                    refs.push((
+                        uses.clone(),
+                        ParsedUses {
+                            owner: parts[0].to_string(),
+                            repo: parts[1].to_string(),
+                            subpath: subpath.to_string(),
+                            git_ref: sha.to_string(),
+                            action_name: repo.to_string(),
+                        },
+                    ));
+                } else {
+                    warn!("Cannot parse workflow repository for $/ resolution: {repo}");
+                }
+            } else {
+                warn!("Cannot resolve $/ ref: workflow repo/sha not in job message");
+            }
+            continue;
+        }
         if let Some(parsed) = parse_remote_uses(uses) {
             refs.push((uses.clone(), parsed));
         } else {
@@ -52,10 +105,20 @@ pub(crate) async fn prepare_remote_actions(
         .iter()
         .map(|(action, version)| (action.as_str(), version.as_str()))
         .collect();
+    use tracing::info;
+
     let resolved = if !access_token.is_empty() {
-        resolver
+        // v2.336.0 (#4536): Log action resolution telemetry
+        let start = std::time::Instant::now();
+        let result = resolver
             .resolve_batch(&access_token, plan_id, job_id, &action_pair_refs)
-            .await?
+            .await?;
+        let elapsed = start.elapsed();
+        info!(
+            "Action resolution: {} actions resolved in {elapsed:?}",
+            result.len()
+        );
+        result
     } else {
         std::collections::HashMap::new()
     };
@@ -132,4 +195,14 @@ pub(crate) fn message_variable<'a>(
         .and_then(|v| v.get(key))
         .and_then(|v| v.get("value"))
         .and_then(|v| v.as_str())
+}
+
+/// Official `Constants.Runner.Features.SelfRepository` = `actions_self_repository`.
+fn self_repository_enabled(job_message: &serde_json::Value) -> bool {
+    message_variable(job_message, "actions_self_repository").is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "t" | "y" | "yes" | "on"
+        )
+    })
 }
