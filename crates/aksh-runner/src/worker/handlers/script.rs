@@ -166,6 +166,8 @@ pub async fn run_script_in_container(
         "GITHUB_OUTPUT",
         "GITHUB_STATE",
         "GITHUB_STEP_SUMMARY",
+        "GITHUB_ARTIFACTS",
+        "GITHUB_ARTIFACTS_LIST",
         "RUNNER_TEMP",
         "RUNNER_TOOL_CACHE",
     ] {
