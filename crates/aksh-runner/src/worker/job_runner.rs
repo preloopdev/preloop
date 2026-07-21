@@ -133,6 +133,15 @@ pub async fn run_job(
     let workspace = super::job_extension::setup_workspace(&job_message)?;
     job_ctx.workspace = Some(workspace.clone());
     super::job_extension::inject_github_env(&mut job_ctx, &job_message);
+    // v2.336.0 (#4546/#4550): Announce locked dependencies in Setup Job log
+    if let Some(deps) = job_message
+        .get("actionsDependencies")
+        .and_then(|v| v.as_array())
+    {
+        if !deps.is_empty() {
+            info!("Using locked actions versions from the workflow's lockfile");
+        }
+    }
     let raw_container = job_message.get("jobContainer");
     let raw_services = job_message.get("jobServiceContainers");
     info!(
@@ -339,6 +348,12 @@ pub async fn run_job(
         })
         .unwrap_or(360);
     info!("Job timeout: {job_timeout_minutes} minutes");
+    // v2.336.0 (#4538): log effective cache mode when present
+    if let Some(cache_mode) = job_ctx.env.get("ACTIONS_CACHE_MODE") {
+        if !cache_mode.is_empty() {
+            info!("Effective cache mode: {cache_mode}");
+        }
+    }
     let (job_cancel_tx, job_cancel_rx) = watch::channel(false);
     // Spawn periodic step-status drain (matches official runner's 500ms JobServerQueue interval)
     let drain_handle = reporting.as_ref().map(|rpt| {
