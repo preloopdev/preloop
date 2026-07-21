@@ -376,7 +376,9 @@ pub async fn run_steps(
                 .parent()
                 .unwrap_or(std::path::Path::new("."))
                 .join("_temp");
-            let paths = super::file_commands::create_file_commands(&temp_dir)?;
+            // Official FileCommandManager.InitializeFiles + ArtifactsList PopulateInitialContents.
+            let paths =
+                super::file_commands::create_file_commands_with_job(&temp_dir, Some(step_ctx.job))?;
             for (k, v) in super::file_commands::file_command_env(&paths) {
                 step_ctx.env.insert(k, v);
             }
@@ -678,10 +680,17 @@ pub async fn run_steps(
                 .insert(step.context_name.clone(), annotations);
         }
 
+        // Official StepsRunner only folds Failed from the main loop into the job
+        // result. Background steps run off-loop and are aggregated later; Cancelled
+        // from a background step must not flip the job to Cancelled on its own
+        // (#4482: only Failed from bg steps merges; explicit-cancel Canceled is
+        // excluded). Without a BackgroundStepCoordinator, treat is_background
+        // Cancelled as non-influencing (job cancel already sets `cancelled` via
+        // cancel_rx). Failures always count.
         if conclusion_str == "Failure" {
             any_failed = true;
             step_ctx.job.job_status = JobStatus::Failure;
-        } else if conclusion_str == "Cancelled" {
+        } else if conclusion_str == "Cancelled" && !step.is_background {
             cancelled = true;
             step_ctx.job.job_status = JobStatus::Cancelled;
         }
@@ -701,14 +710,6 @@ pub async fn run_steps(
             // Record logs for job log assembly
             if !log_content.is_empty() {
                 q.record_step_logs(&step.id, &log_content);
-            }
-        }
-
-        // Official runner flushes step updates immediately when a step fails,
-        // so GitHub's UI shows the failure before post/always steps run.
-        if (conclusion_str == "Failure" || conclusion_str == "Cancelled") && reporting.is_some() {
-            if let Some(rpt) = reporting {
-                crate::worker::reporting::flush_step_updates(rpt, &queue).await;
             }
         }
 
