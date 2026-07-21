@@ -19,6 +19,15 @@ pub struct BrokerClient {
     base_url: String,
 }
 
+/// Result from acknowledging a broker message.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AcknowledgeResult {
+    /// Acknowledge succeeded normally.
+    Ok,
+    /// Broker returned 404 with `AcknowledgeJobNotFound` — the job no longer exists.
+    JobNotFound,
+}
+
 impl BrokerClient {
     /// Create a new broker client.
     pub fn new(http: HttpClient, base_url: String) -> Self {
@@ -82,7 +91,7 @@ impl BrokerClient {
         token: &str,
         session_id: &str,
         runner_request_id: &str,
-    ) -> Result<()> {
+    ) -> Result<AcknowledgeResult> {
         let url = format!(
             "{}/acknowledge?sessionId={session_id}&status=Online&runnerVersion={}&os={}&architecture={}",
             self.base_url,
@@ -91,12 +100,29 @@ impl BrokerClient {
             arch_label(),
         );
         let body = serde_json::json!({"runnerRequestId": runner_request_id});
-        let _: serde_json::Value = self
+        match self
             .http
-            .post_json_bearer(&url, &body, token)
+            .post_json_bearer::<serde_json::Value>(&url, &body, token)
             .await
-            .context("acknowledging broker message")?;
-        Ok(())
+        {
+            Ok(_) => Ok(AcknowledgeResult::Ok),
+            Err(e) => {
+                // v2.336.0 (#4540): 404 with AcknowledgeJobNotFound means the job
+                // no longer exists. Ephemeral runners should exit cleanly.
+                if let Some(HttpError::Status { status, body }) = e.downcast_ref::<HttpError>() {
+                    if *status == reqwest::StatusCode::NOT_FOUND {
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
+                            if json.get("errorKind").and_then(|v| v.as_str())
+                                == Some("AcknowledgeJobNotFound")
+                            {
+                                return Ok(AcknowledgeResult::JobNotFound);
+                            }
+                        }
+                    }
+                }
+                Err(e).context("acknowledging broker message")
+            }
+        }
     }
 }
 
