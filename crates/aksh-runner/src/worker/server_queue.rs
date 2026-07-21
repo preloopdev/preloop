@@ -16,8 +16,10 @@ use std::collections::HashMap;
 use tracing::debug;
 
 pub mod step_status {
+    /// Step is pending / not started.
+    pub const PENDING: u32 = 5;
     /// Step is in progress.
-    pub const IN_PROGRESS: u32 = 2;
+    pub const IN_PROGRESS: u32 = 3;
     /// Step has completed.
     pub const COMPLETED: u32 = 6;
 }
@@ -56,7 +58,7 @@ pub struct StepUpdate {
 /// The full WorkflowStepsUpdate request body.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WorkflowStepsUpdateBody {
-    /// Step updates — cumulative: includes ALL steps with their latest status.
+    /// Step updates  delta: includes only steps that changed since the last update.
     pub steps: Vec<StepUpdate>,
     /// Monotonically increasing change counter.
     pub change_order: u64,
@@ -84,6 +86,8 @@ pub struct ServerQueue {
     /// Cumulative step state — tracks the latest status for every step seen.
     /// Sent in full on each WorkflowStepsUpdate (matching official runner behavior).
     all_steps: HashMap<String, StepUpdate>,
+    /// Keys of steps modified since the last published update.
+    dirty_keys: std::collections::HashSet<String>,
     /// Ordered keys matching insertion order (BTreeMap would work but
     /// HashMap + sorting by number at flush time is simpler).
     pending_keys: Vec<String>,
@@ -105,6 +109,7 @@ impl ServerQueue {
     pub fn new(job_id: String, plan_id: String) -> Self {
         Self {
             all_steps: HashMap::new(),
+            dirty_keys: std::collections::HashSet::new(),
             pending_keys: Vec::new(),
             pending_logs: HashMap::new(),
             job_log_file: std::io::BufWriter::new(
@@ -140,6 +145,7 @@ impl ServerQueue {
         let merged =
             crate::worker::step_records::merge_step_update(self.all_steps.get(&key), &partial);
         if self.all_steps.get(&key) != Some(&merged) {
+            self.dirty_keys.insert(key.clone());
             self.steps_generation = self.steps_generation.wrapping_add(1);
             self.all_steps.insert(key, merged);
         }
@@ -160,9 +166,14 @@ impl ServerQueue {
             return None;
         }
         self.change_order += 1;
-        // Collect all steps sorted by number (matching official runner ordering)
-        let mut steps: Vec<StepUpdate> = self.all_steps.values().cloned().collect();
+        // Collect dirty steps sorted by number (matching official runner ordering)
+        let mut steps: Vec<StepUpdate> = self
+            .dirty_keys
+            .iter()
+            .filter_map(|key| self.all_steps.get(key).cloned())
+            .collect();
         steps.sort_by_key(|s| s.number);
+        self.dirty_keys.clear();
         Some((
             WorkflowStepsUpdateBody {
                 steps,
@@ -280,7 +291,7 @@ mod tests {
     }
 
     #[test]
-    fn cumulative_updates_include_all_steps() {
+    fn delta_updates_include_only_changed_steps() {
         let mut q = ServerQueue::new("job-1".into(), "plan-1".into());
 
         // Step 1 completes
@@ -332,11 +343,10 @@ mod tests {
         });
 
         let (body2, _) = q.take_steps_update_body().unwrap();
-        // All 3 steps should be in the update (cumulative)
-        assert_eq!(body2.steps.len(), 3);
-        assert_eq!(body2.steps[0].external_id, "step-1");
-        assert_eq!(body2.steps[1].external_id, "step-2");
-        assert_eq!(body2.steps[2].external_id, "step-3");
+        // Only steps 2 and 3 changed since the last published update
+        assert_eq!(body2.steps.len(), 2);
+        assert_eq!(body2.steps[0].external_id, "step-2");
+        assert_eq!(body2.steps[1].external_id, "step-3");
         // Step 2 should have updated status
         assert_eq!(body2.steps[1].status, step_status::COMPLETED);
     }
