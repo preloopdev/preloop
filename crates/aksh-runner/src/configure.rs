@@ -57,12 +57,12 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
         });
     let connection_url = if let Some((last_change_id, last_change_id64)) = cached_ids {
         format!(
-            "{}/_apis/connectionData?connectOptions=1&lastChangeId={last_change_id}&lastChangeId64={last_change_id64}",
+            "{}/_apis/connectionData?connectOptions=0&lastChangeId={last_change_id}&lastChangeId64={last_change_id64}",
             registration.service_url
         )
     } else {
         format!(
-            "{}/_apis/connectionData?connectOptions=1",
+            "{}/_apis/connectionData?connectOptions=0",
             registration.service_url
         )
     };
