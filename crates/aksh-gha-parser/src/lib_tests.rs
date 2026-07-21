@@ -805,6 +805,140 @@ fn preserves_job_output_expressions() {
         Some("${{ steps.gen.outputs.value }}")
     );
 }
+
+#[test]
+fn job_outputs_reject_unknown_function_expression() {
+    let result = parse_workflow(
+        r#"on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      value: ${{ notARealFunction() }}
+    steps:
+      - run: echo ok
+"#,
+    );
+
+    match result {
+        Err(ParserError::InvalidExpression(message)) => {
+            assert!(
+                message.contains("output `value`"),
+                "output field context missing from error: {message}"
+            );
+        }
+        other => panic!("expected invalid output expression, got {other:?}"),
+    }
+}
+
+#[test]
+fn job_outputs_accept_steps_context_expression() {
+    let workflow = parse_workflow(
+        r#"on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      value: ${{ steps.build.outputs.value }}
+    steps:
+      - id: build
+        run: echo ok
+"#,
+    )
+    .expect("steps context is allowed in job outputs");
+
+    assert_eq!(
+        workflow.jobs["build"].outputs["value"]
+            .as_str()
+            .expect("job output expression should remain a string"),
+        "${{ steps.build.outputs.value }}"
+    );
+}
+
+#[test]
+fn job_container_rejects_secrets_context_expression() {
+    let result = parse_workflow(
+        r#"on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: ${{ secrets.IMAGE }}
+    steps:
+      - run: echo ok
+"#,
+    );
+
+    match result {
+        Err(ParserError::InvalidExpression(message)) => {
+            assert!(
+                message.contains("container"),
+                "container field context missing from error: {message}"
+            );
+            assert!(
+                message.contains("secrets"),
+                "forbidden context missing from error: {message}"
+            );
+        }
+        other => panic!("expected invalid container expression, got {other:?}"),
+    }
+}
+
+#[test]
+fn job_defaults_run_working_directory_rejects_secrets_and_accepts_matrix() {
+    let invalid = parse_workflow(
+        r#"on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ secrets.WORKING_DIR }}
+    steps:
+      - run: echo ok
+"#,
+    );
+
+    match invalid {
+        Err(ParserError::InvalidExpression(message)) => {
+            assert!(
+                message.contains("working-directory"),
+                "working-directory field context missing from error: {message}"
+            );
+            assert!(
+                message.contains("secrets"),
+                "forbidden context missing from error: {message}"
+            );
+        }
+        other => panic!("expected invalid defaults expression, got {other:?}"),
+    }
+
+    let workflow = parse_workflow(
+        r#"on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        directory: [workspace]
+    defaults:
+      run:
+        working-directory: ${{ matrix.directory }}
+    steps:
+      - run: echo ok
+"#,
+    )
+    .expect("matrix context is allowed in job defaults.run.working-directory");
+
+    assert_eq!(
+        workflow.jobs["build"]
+            .defaults
+            .as_ref()
+            .and_then(|defaults| defaults.run.as_ref())
+            .and_then(|run| run.working_directory.as_deref()),
+        Some("${{ matrix.directory }}")
+    );
+}
+
 #[test]
 fn concurrency_bare_string_shorthand() {
     let wf = parse_workflow(
