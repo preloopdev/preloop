@@ -16,6 +16,23 @@ use crate::worker::execution_context::StepContext;
 /// Maximum nesting depth for composite actions.
 const MAX_COMPOSITE_DEPTH: u32 = 10;
 
+/// Resolve `_actions/{owner}/{repo}/{sha}` root from an extracted action path.
+///
+/// Official composite nested `$/` refs resolve against the parent action's
+/// repository (already on disk under `_actions/`).
+fn actions_tarball_root(action_dir: &Path) -> Option<std::path::PathBuf> {
+    let s = action_dir.to_str()?;
+    let marker = "_actions/";
+    let pos = s.find(marker)?;
+    let after = &s[pos + marker.len()..];
+    let parts: Vec<&str> = after.split('/').collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    let base = &s[..pos + marker.len()];
+    Some(Path::new(base).join(parts[0]).join(parts[1]).join(parts[2]))
+}
+
 /// Run a composite action.
 pub async fn run_composite_action(
     manifest: &ActionManifest,
@@ -253,7 +270,48 @@ fn run_composite_action_inner<'a>(
                     .unwrap_or_else(|| serde_json::json!({}));
 
                 // Recursively run nested composite actions with depth tracking
-                if uses.starts_with("./") || uses.starts_with("../") {
+                if uses.starts_with("$/") {
+                    // Official ResolveSelfRepositoryReferences at composite depth:
+                    // $/path → parent action repo root + path (already extracted).
+                    let subpath = uses.strip_prefix("$/").unwrap_or("").trim_start_matches('/');
+                    let inner_action_dir = match actions_tarball_root(action_dir) {
+                        Some(root) => root.join(subpath),
+                        None => {
+                            return Err(anyhow::anyhow!(
+                                "Unable to resolve self-reference '$/{subpath}'. Parent action directory is not under _actions/."
+                            ));
+                        }
+                    };
+                    match super::factory::load_action_manifest(&inner_action_dir) {
+                        Ok(inner_manifest) if inner_manifest.runs_using == "composite" => {
+                            run_composite_action_inner(
+                                &inner_manifest,
+                                &inner_action_dir,
+                                &inner_with,
+                                workspace,
+                                ctx,
+                                depth + 1,
+                                cancel_rx.clone(),
+                            )
+                            .await
+                            .map(|_| "Success".to_string())
+                        }
+                        Ok(_) => super::action::run_action_from_dir(
+                            &inner_action_dir,
+                            &inner_with,
+                            workspace,
+                            ctx,
+                            cancel_rx.clone(),
+                            Some(uses),
+                        )
+                        .await
+                        .map(|_| "Success".to_string()),
+                        Err(e) => Err(e).context(format!(
+                            "loading self-repository action at {}",
+                            inner_action_dir.display()
+                        )),
+                    }
+                } else if uses.starts_with("./") || uses.starts_with("../") {
                     let inner_action_dir = action_dir.join(uses);
                     match super::factory::load_action_manifest(&inner_action_dir) {
                         Ok(inner_manifest) if inner_manifest.runs_using == "composite" => {
