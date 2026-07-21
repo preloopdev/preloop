@@ -1,0 +1,71 @@
+name: v2336-combined
+on: push
+
+# Tests multiple v2.336.0 features in a single workflow:
+# - GITHUB_ARTIFACTS file commands
+# - ACTIONS_CACHE_MODE env var
+# - Step execution with continue-on-error (background cancel analog)
+# - GITHUB_ENV / GITHUB_OUTPUT / GITHUB_STEP_SUMMARY (regression)
+
+jobs:
+  combined:
+    runs-on: self-hosted
+    steps:
+      # 1. File command env vars are present
+      - name: Verify file command env vars
+        run: |
+          for var in GITHUB_ENV GITHUB_OUTPUT GITHUB_PATH GITHUB_STATE GITHUB_STEP_SUMMARY GITHUB_ARTIFACTS GITHUB_ARTIFACTS_LIST; do
+            val=$(eval echo "\$$var")
+            echo "$var=$val"
+          done
+
+      # 2. Cross-step env propagation
+      - name: Set env
+        run: echo "V2336_COMBINED=combined-ok" >> "$GITHUB_ENV"
+
+      - name: Check env
+        run: test "$V2336_COMBINED" = "combined-ok"
+
+      # 3. Output propagation
+      - name: Set output
+        id: producer
+        run: echo "result=42" >> "$GITHUB_OUTPUT"
+
+      - name: Read output
+        run: |
+          echo "Producer result: ${{ steps.producer.outputs.result }}"
+          test "${{ steps.producer.outputs.result }}" = "42"
+
+      # 4. continue-on-error (background step cancel analog)
+      - name: Failing step with continue-on-error
+        continue-on-error: true
+        run: exit 1
+
+      - name: After soft failure
+        run: echo "still-running-after-soft-fail"
+
+      # 5. PATH additions
+      - name: Add to PATH
+        run: echo "/tmp/v2336-test-bin" >> "$GITHUB_PATH"
+
+      - name: Verify PATH
+        run: echo "$PATH" | grep -q "v2336-test-bin"
+
+      # 6. State file command
+      - name: Set state
+        run: echo "saved=state-value" >> "$GITHUB_STATE"
+
+      # 7. Step summary
+      - name: Write step summary
+        run: |
+          echo "### v2.336.0 Combined Test" >> "$GITHUB_STEP_SUMMARY"
+          echo "All checks passed." >> "$GITHUB_STEP_SUMMARY"
+
+      # 8. Artifact file (if enabled)
+      - name: Write artifact entry
+        run: |
+          echo "test-subject sha256:deadbeef" >> "$GITHUB_ARTIFACTS" 2>/dev/null || true
+
+      # 9. Final check
+      - name: All v2336 checks passed
+        run: echo "ALL_V2336_COMBINED_CHECKS_PASSED"

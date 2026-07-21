@@ -1,0 +1,26 @@
+name: v2336-background-cancel
+on: push
+jobs:
+  bg-cancel:
+    runs-on: self-hosted
+    steps:
+      # Normal step succeeds
+      - name: Normal step
+        run: echo "normal-step-ok"
+
+      # Step with continue-on-error simulates a background step that is "canceled"
+      # by the job flow. The key invariant from #4482: a canceled background step
+      # should NOT make the job fail.
+      - name: Soft cancel step
+        continue-on-error: true
+        run: |
+          echo "this-step-will-fail-but-job-continues"
+          exit 1
+
+      # Verify job is still succeeding
+      - name: After cancel
+        run: echo "job-still-running"
+
+      # Final marker
+      - name: Job conclusion check
+        run: echo "JOB_CONCLUSION_SHOULD_BE_SUCCESS"

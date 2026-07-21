@@ -1,0 +1,25 @@
+name: v2336-cache-mode
+on: push
+jobs:
+  cache-mode:
+    runs-on: self-hosted
+    steps:
+      # 1. Check if ACTIONS_CACHE_MODE is set (depends on server-side variable)
+      - name: Check cache mode env
+        run: |
+          echo "ACTIONS_CACHE_MODE=${ACTIONS_CACHE_MODE:-unset}"
+          echo "ACTIONS_CACHE_SERVICE_V2=${ACTIONS_CACHE_SERVICE_V2:-unset}"
+          echo "ACTIONS_CACHE_URL=${ACTIONS_CACHE_URL:-unset}"
+
+      # 2. GITHUB_OUTPUT still works
+      - name: Produce output
+        id: out
+        run: echo "val=cache-mode-check-ok" >> "$GITHUB_OUTPUT"
+
+      # 3. Step summary
+      - name: Write summary
+        run: echo "### Cache Mode Test OK" >> "$GITHUB_STEP_SUMMARY"
+
+      # 4. Final verification
+      - name: Done
+        run: echo "V2336_CACHE_MODE_TEST_PASSED"
