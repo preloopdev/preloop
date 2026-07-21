@@ -10,6 +10,7 @@ pub fn parse_workflow(input: &str) -> Result<Workflow, ParserError> {
     if workflow.jobs.is_empty() {
         return Err(ParserError::EmptyJobs);
     }
+    crate::eval::validate_workflow_expressions(&workflow)?;
     Ok(workflow)
 }
 
