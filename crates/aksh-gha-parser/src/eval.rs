@@ -253,6 +253,12 @@ const CTX_JOB_ENV: &[&str] = &[
     "github", "inputs", "vars", "needs", "strategy", "matrix", "secrets", "env",
 ];
 const CTX_JOB_CONCURRENCY: &[&str] = &["github", "inputs", "vars", "needs", "strategy", "matrix"];
+const CTX_JOB_DEFAULTS_RUN: &[&str] = &["github", "strategy", "matrix", "needs", "env", "vars"];
+const CTX_JOB_CONTAINER: &[&str] = &["github", "needs", "strategy", "matrix", "vars"];
+const CTX_CONTAINER_CREDENTIALS: &[&str] = &["secrets", "env", "github", "vars"];
+const CTX_RUNNER: &[&str] = &[
+    "github", "needs", "strategy", "matrix", "secrets", "steps", "job", "runner", "env", "vars",
+];
 const CTX_STEP_IF: &[&str] = &[
     "github",
     "inputs",
@@ -289,6 +295,25 @@ const CTX_STEP_WITH: &[&str] = CTX_STEP_ENV;
 const CTX_STEP_RUN: &[&str] = CTX_STEP_ENV;
 const CTX_STEP_NAME: &[&str] = CTX_STEP_ENV;
 const CTX_STEP_WORKING_DIR: &[&str] = CTX_STEP_ENV;
+
+/// Validate a job container or service value. Container images/options inherit
+/// the job-container context, while `credentials` and `env` have their own
+/// narrower schema-defined contexts.
+fn validate_container_expressions(value: &Value) -> Result<(), String> {
+    let Value::Object(map) = value else {
+        return validate_value_expressions(value, Some(CTX_JOB_CONTAINER));
+    };
+
+    for (key, value) in map {
+        let allowed = match key.as_str() {
+            "credentials" => CTX_CONTAINER_CREDENTIALS,
+            "env" => CTX_RUNNER,
+            _ => CTX_JOB_CONTAINER,
+        };
+        validate_value_expressions(value, Some(allowed))?;
+    }
+    Ok(())
+}
 
 /// Validate all `${{ }}` expressions in a workflow.
 pub fn validate_workflow_expressions(workflow: &Workflow) -> Result<(), ParserError> {
@@ -358,6 +383,58 @@ pub fn validate_workflow_expressions(workflow: &Workflow) -> Result<(), ParserEr
         if let Some(JobContinueOnError::Expression(expr)) = &job.continue_on_error {
             validate_expressions_in_string(expr, false, Some(CTX_JOB_RUNS_ON)).map_err(|e| {
                 ParserError::InvalidExpression(format!("job `{job_id}` continue-on-error: {e}"))
+            })?;
+        }
+
+        if let Some(container) = &job.container {
+            validate_container_expressions(container).map_err(|e| {
+                ParserError::InvalidExpression(format!("job `{job_id}` container: {e}"))
+            })?;
+        }
+        if let Some(services) = &job.services {
+            if let Value::Object(services) = services {
+                for (service_name, service) in services {
+                    validate_container_expressions(service).map_err(|e| {
+                        ParserError::InvalidExpression(format!(
+                            "job `{job_id}` service `{service_name}`: {e}"
+                        ))
+                    })?;
+                }
+            } else {
+                validate_value_expressions(services, Some(CTX_JOB_CONTAINER)).map_err(|e| {
+                    ParserError::InvalidExpression(format!("job `{job_id}` services: {e}"))
+                })?;
+            }
+        }
+        if let Some(defaults) = &job.defaults {
+            if let Some(run) = &defaults.run {
+                if let Some(shell) = &run.shell {
+                    validate_expressions_in_string(shell, false, Some(CTX_JOB_DEFAULTS_RUN))
+                        .map_err(|e| {
+                            ParserError::InvalidExpression(format!(
+                                "job `{job_id}` defaults.run.shell: {e}"
+                            ))
+                        })?;
+                }
+                if let Some(working_directory) = &run.working_directory {
+                    validate_expressions_in_string(
+                        working_directory,
+                        false,
+                        Some(CTX_JOB_DEFAULTS_RUN),
+                    )
+                    .map_err(|e| {
+                        ParserError::InvalidExpression(format!(
+                            "job `{job_id}` defaults.run.working-directory: {e}"
+                        ))
+                    })?;
+                }
+            }
+        }
+        for (output_name, output) in &job.outputs {
+            validate_value_expressions(output, Some(CTX_RUNNER)).map_err(|e| {
+                ParserError::InvalidExpression(format!(
+                    "job `{job_id}` output `{output_name}`: {e}"
+                ))
             })?;
         }
 
