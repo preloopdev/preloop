@@ -813,7 +813,7 @@ async fn apply_runner_refresh_config(
 }
 
 async fn re_resolve_broker_url(http: &HttpClient, server_url: &str) -> Option<String> {
-    let url = format!("{}/_apis/connectionData?connectOptions=1", server_url);
+    let url = format!("{}/_apis/connectionData?connectOptions=0", server_url);
     if let Ok(resp) = http.get_json::<serde_json::Value>(&url).await {
         if let Some(broker_url) = resp.get("brokerUrl").and_then(|v| v.as_str()) {
             return Some(broker_url.to_string());
