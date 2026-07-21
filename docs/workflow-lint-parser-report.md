@@ -4,6 +4,11 @@
 **aksh command:** `cargo run -p aksh-runner -- lint -W <workflow>`  
 **Reference linter:** `actionlint`
 
+Remote reusable workflows are resolved through GitHub's Contents API when the
+server or standalone lint command encounters `owner/repo/.github/workflows/x.yml@ref`.
+Set `AKSH_GITHUB_TOKEN` for private repositories; public repositories can use
+unauthenticated requests subject to GitHub API rate limits.
+
 This document tracks real public GitHub Actions workflows exercised against `aksh` and `actionlint`. Results are from the current default branches at the time of each run; workflows can change upstream.
 
 ## Current results
@@ -93,6 +98,19 @@ uses: ./.github/workflows/test_windows.yml
 
 The lint CLI now accepts `--workspace-root`, loads local workflow files, and passes them to the same reusable-workflow expander used by server submissions.
 
+### 4. Remote reusable workflow resolution — implemented
+
+Remote references are fetched from:
+
+```text
+https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={ref}
+```
+
+Fetched workflows are inserted into the reusable-workflow table and scanned
+for nested remote references up to the same depth limit used by the parser.
+The server resolves these before job expansion, matching the official runner's
+server-side `ReusableWorkflowsLoader` architecture.
+
 ### 4. Custom runner labels
 
 Some repositories use organization-specific labels, for example TypeScript's `1ES.Pool=...` and `1ES.ImageOverride=...`. These are valid in GitHub's environment but may not be known to `actionlint` or local runner configuration. They should not be treated as generic parser failures.
@@ -102,4 +120,4 @@ Some repositories use organization-specific labels, for example TypeScript's `1E
 1. Add deferred handling for remaining scalar fields such as `timeout-minutes`.
 2. Run Neovim and Kubernetes workflows from full sparse checkouts to exercise local reusable workflow expansion.
 3. Run the full Deno generated workflow periodically; it currently provides the largest successful expansion observed here.
-4. Keep this table updated with the workflow commit SHA when recording long-lived comparisons.
+5. Keep this table updated with the workflow commit SHA when recording long-lived comparisons.
