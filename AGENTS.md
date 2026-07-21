@@ -13,7 +13,7 @@
 | `aksh-gha-parser`                   | Workflow YAML → typed model → job DAG/matrix expansion                                     |
 | `aksh-gha-expressions`              | `${{ }}` parser/evaluator                                                                  |
 | `aksh-gha-protocol`                 | Wire DTOs, session crypto, secret wrappers, NDJSON events                                  |
-| `aksh-runner`                       | Rust runner: Listener + Worker (faithful to `actions/runner` v2.335.1)                     |
+| `aksh-runner`                       | Rust runner: Listener + Worker (faithful to `actions/runner` v2.336.0)                     |
 | `aksh-runner-client`                | CLI for submitting workflows                                                               |
 | `aksh-cache` / `aksh-artifacts`     | File-backed protocol storage                                                               |
 | `aksh-dap`                          | Debug Adapter Protocol bridge                                                              |
@@ -43,7 +43,10 @@ just dogfood    # E2E with real runner
 - `docs/fidelity-gap.md` — protocol gaps and conformance status
 - `CONTRIBUTING.md` — dev workflow and compatibility checklist
 - `fixtures/workflows/dogfood.yml` — local self-hosted validation workflow
-- `.runner-watch/golden/v2.335.1/` — protocol golden captures
+- `.runner-watch/golden/v2.335.1/` — protocol golden captures (prior baseline)
+- `versions.toml` — pinned official runner (`2.336.0`)
+- Official runner binary cache: `~/.cache/actions-runner/current` (osx-arm64)
+- Official runner source checkout: `/tmp/runner-v2.336.0` (commit `98aabcd`)
 
 ## Agent Preferences
 
