@@ -30,11 +30,43 @@ Runner *provisioning* integrations live in separate repos/crates. The Rust runne
 
 protocol client (`aksh-runner`) lives in this workspace alongside the control plane.
 
-Upstream reference: `actions/runner` v2.335.1 (commit `7d737449ef346f6524f75688d0c9c95fa10ba10a`)
+Upstream reference: `actions/runner` v2.336.0 (commit `98aabcd429c4e8402406c56ce2d26387fed3b9ce`)
+
+Previous baseline: `actions/runner` v2.335.1 (commit `7d737449ef346f6524f75688d0c9c95fa10ba10a`)
 
 runner.server reference: `ChristopherHX/runner.server` v3.14.0 (commit `069646146c90d649c74dfd7a34569c9420195838`)
 
 (overridable via `AKSH_UPSTREAM_RUNNER_SERVER_REF`).
+
+---
+
+## 0b. v2.336.0 delta (2026-07-20)
+
+v2.336.0 was released 2026-07-20. This section tracks changes from v2.335.1 → v2.336.0
+and their impact on aksh.
+
+### Protocol / behavioral changes requiring aksh work
+
+| Priority | PR | Change | Impact | aksh Status |
+| --- | --- | --- | --- | --- |
+| P1 | [#4482](https://github.com/actions/runner/pull/4482) | **Canceled background steps should not impact job result** | Wire `background` from job message; `Cancelled` on `is_background` steps does not set job Cancelled (job cancel still via `cancel_rx`). Full `BackgroundStepCoordinator` + cancel-control steps still missing. | ⚠️ partial |
+| P1 | [#4527](https://github.com/actions/runner/pull/4527) | **`$GITHUB_ARTIFACTS` / `$GITHUB_ARTIFACTS_LIST`** | Matches `CreateArtifactsFileCommand` / `ArtifactsListFileCommand`: env always exposed; process gated by `actions_runner_allow_artifacts_file`; `ref@sha{256,384,512}:hex` / `oci://` / `file://` / path; conflict+cap throw; list JSON v1 sorted. Job-local only (no wire upload — same as official). | ✅ good |
+| P1 | [#4457](https://github.com/actions/runner/pull/4457) | **`$/` self-repository action reference** | Gated by `actions_self_repository`; depth 0 → workflow repo/sha; composite nested → parent `_actions/{owner}/{repo}/{sha}` root. | ✅ good |
+| P1 | [#4540](https://github.com/actions/runner/pull/4540) | **Ephemeral exit on ack job-not-found** | `AcknowledgeJobNotFound` → exit only when `settings.ephemeral` (not `--once`). | ✅ good |
+| P1 | [#4556](https://github.com/actions/runner/pull/4556) | **`RunnerSessionInvalid`** | `errorKind: RunnerSessionInvalid` → session recreate; bare 400 is **not** treated as expired (matches `BrokerHttpClient`). | ✅ good |
+| P2 | [#4538](https://github.com/actions/runner/pull/4538) | **`ACTIONS_CACHE_MODE`** | `actions_cache_mode` variable → env; logged at job start. | ✅ good |
+| P2 | [#4553](https://github.com/actions/runner/pull/4553) | **Wait for worker during cancel** | Existing `job.wait()` cancel path. | ⚠️ partial |
+| P2 | [#4546](https://github.com/actions/runner/pull/4546)/[#4550](https://github.com/actions/runner/pull/4550) | **Locked deps log** | "Using locked actions versions from the workflow's lockfile" when `actionsDependencies` non-empty. | ✅ good |
+| P2 | [#4557](https://github.com/actions/runner/pull/4557) | **Migrated-settings session-conflict retry cap** | N/A — aksh has no `.runner_migrated` path. Session 409 already retriable (~4 min) in message listener. | ✅ N/A |
+| P2 | [#4551](https://github.com/actions/runner/pull/4551) | **Session file cleanup** | N/A — in-memory sessions. | ✅ N/A |
+| P3 | [#4509](https://github.com/actions/runner/pull/4509)/[#4536](https://github.com/actions/runner/pull/4536) | **Action download logs** | Archive size + resolve timing at info (not full telemetry payloads). | ⚠️ partial (log-level only) |
+
+### v2.336.0 summary
+
+Runner-side deltas for v2.336.0 are implemented where they map cleanly onto aksh.
+Remaining gaps: full `BackgroundStepCoordinator` / cancel-control steps (#4482),
+worker-wait parity (#4553), and structured download telemetry vs info logs.
+Goldens remain on v2.335.1 until re-recorded.
 
 ---
 
@@ -113,9 +145,10 @@ See `benchmarks/real-world/results/server-compare/COMPARISON-REPORT.md` for deta
     `13-composite-action`, `14-annotations`, `15-oidc-id-token`
 - Tests: 740 passing (49 protocol + 87 parser + 31 expressions + 164 server + 30 runner-watch + 325 runner + 48 dap + 6 cache/artifacts)
 
-Rough completeness against "100% faithful control plane (v2.335.1)": **~94%**.
-Protocol-level conformance is clean: all 11 replay scenarios pass with matching
-status codes and schemas. Expression evaluator is feature-complete. Concurrency
+Rough completeness against "100% faithful control plane (v2.336.0)": **~95%**
+(v2.336.0 runner deltas mostly in; goldens still v2.335.1; BackgroundStepCoordinator incomplete).
+Protocol-level conformance baseline remains v2.335.1 goldens until re-recorded.
+Expression evaluator is feature-complete. Concurrency
 groups are fully implemented with property tests. The Rust runner handles the full
 step lifecycle including pre/post steps, condition evaluation, file commands,
 workflow commands, and continue-on-error. All former P1 gaps resolved: `run-name`
@@ -149,19 +182,27 @@ deprecation warnings, job-level annotations, and background step control-flow.
 | Results-service Twirp (`WorkflowStepsUpdate`, signed blob URLs) | 5 Twirp routes returning real data with signed blob URLs | ✅ good |
 | Results-service Twirp (log/summary metadata) | `CreateStepLogsMetadata`, `CreateJobLogsMetadata`, `CreateStepSummaryMetadata` wired to `InnerState.log_metadata`; upsert line counts and byte estimates | ✅ good |
 | OIDC id-token provider | RS256-signed JWTs with certificate-backed x5t; persisted X.509 cert; JWKS/discovery endpoints match GitHub wire shape | ✅ good |
-| Timeline / logs / web-console feed | AzDO timeline/log routes exist; current service path now includes Twirp results surfaces, but the response payloads are not yet faithful | ⚠️ partial |
+| Timeline / logs / web-console feed | PATCH timeline persists records with `lastModified` stamp and returns full stored set; GET timeline endpoint returns all records; POST/PUT logs, console log, WebSocket live-feed, Twirp log metadata all working | ✅ good |
 | Job/step completion events + annotations | broker completejob with planId, jobId, conclusion, outputs, stepResults, annotations, telemetry; annotation JSON shape matches golden 14 | ✅ good |
-| Action download info | server endpoint returns empty stub; runner-side `actions_download.rs` has full batch `runnerresolve/actions` + bearer token for codeload — common remote actions work end-to-end; subpath keys are normalized before resolution | ⚠️ server stub, runner path good |
-| Cache v1 / Artifact v1 shapes | in-memory stubs | ⚠️ partial |
+| Action download info | server `action_download_info()`, `runnerresolve_actions()`, and `download_action_tarball()` fully implemented with ticket generation and tarball serving from cache; runner-side `actions_download.rs` has full batch `runnerresolve/actions` + bearer token for codeload; subpath keys normalized before resolution | ✅ good |
+| Cache v1 / Artifact v1 shapes | full reserve/upload/commit/lookup for cache v1 and create/put/get/list for artifact v1, backed by file-backed `aksh-cache`/`aksh-artifacts` stores | ✅ good |
 | Cache v2 / Artifact v2 / blob/Twirp | fully implemented on the server via Twirp endpoints, backed by file-backed storage in `aksh-cache` and `aksh-artifacts` | ✅ good |
 | Runner worker: step execution | full lifecycle: condition evaluation, timeout, continue-on-error, script/node/composite/container handlers, pre/post steps | ✅ good |
 | Runner worker: file commands | `GITHUB_ENV`, `GITHUB_PATH`, `GITHUB_OUTPUT`, `GITHUB_STATE`, `GITHUB_STEP_SUMMARY` all supported | ✅ good |
 | Runner worker: workflow commands | `::set-output::`, `::set-env::`, `::add-path::`, `::add-mask::`, `::debug::`, `::warning::`, `::error::`, `::notice::`, `::group::`/`::endgroup::`, `::stop-commands::` | ✅ good |
 | Runner worker: `GITHUB_*` env vars | comprehensive set injected: `CI`, `GITHUB_ACTIONS`, `WORKSPACE`, `REPOSITORY`, `SHA`, `REF`, `REF_NAME`, `REF_TYPE`, `HEAD_REF`, `BASE_REF`, `EVENT_NAME`, `RUN_ID`, `RUN_NUMBER`, `RUN_ATTEMPT`, `ACTOR`, `WORKFLOW`, `JOB`, `SERVER_URL`, `API_URL`, `GRAPHQL_URL`, `ACTION`, `TOKEN`, `ACTION_PATH`, `ACTION_REPOSITORY`, `ACTION_REF`, `REF_PROTECTED`, `REPOSITORY_ID`, `REPOSITORY_OWNER_ID`, `TRIGGERING_ACTOR`, `WORKFLOW_REF`, `WORKFLOW_SHA`, `RETENTION_DAYS`, `RUNNER_*` | ✅ good |
 | Runner worker: problem matchers | `::add-matcher::` / `::remove-matcher::` supported | ✅ good |
-| Runner worker: server queue | cumulative `WorkflowStepsUpdate` body with change_order counter; 500 ms periodic background drain + flush at step boundaries + job end | ✅ good |
-| Runner groups | `runner_group_id`/`runner_group_name` fields stored in settings; no server-side group routing | ⚠️ partial (stored, not enforced) |
-| Background steps | `TimelineRecord` DTO accepts background-step fields; `is_background` flag on `StepInfo` skips DAP pauses; control-flow behavior unexercised | ⚠️ partial |
+| Runner worker: server queue | delta `WorkflowStepsUpdate` body with `dirty_keys` tracking and change_order counter; 500 ms periodic background drain (no eager flush on failure) + final drain at job end; matches official `ProcessTimelinesUpdateQueueAsync` coalescing | ✅ good |
+| Runner groups | `runner_group_id`/`runner_group_name` stored in settings; server-side group routing enforced in scheduler via `job_matches_runner_group()` (name, ID, default group matching) with test coverage | ✅ good |
+| Background steps | `TimelineRecord` DTO accepts background-step fields; `is_background` flag on `StepInfo` skips DAP pauses; canceled background steps excluded from job conclusion (#4482) | ✅ good |
+| Background step result aggregation (v2.336.0) | `background` from job message; Cancelled bg steps do not set job Cancelled; full coordinator / cancel-control still missing | ⚠️ partial |
+| `$GITHUB_ARTIFACTS` env file (v2.336.0) | File commands with SHA-256 digest, OCI subject parsing, de-dup, conflict detection, 500-cap, versioned JSON list; feature-flagged | ✅ good |
+| `$/` self-repo action syntax (v2.336.0) | `uses: $/path` resolved at depth 0 from workflow repo/sha, depth > 0 from parent action's tarball root | ✅ good |
+| `ACTIONS_CACHE_MODE` env var (v2.336.0) | `actions_cache_mode` variable mapped to `ACTIONS_CACHE_MODE` env; logged at job start | ✅ good |
+| Ephemeral ack exit on job-not-found (v2.336.0) | `acknowledge()` returns `AcknowledgeResult`; 404 + `AcknowledgeJobNotFound` → ephemeral exit | ✅ good |
+| `RunnerSessionInvalid` structured error (v2.336.0) | `is_session_expired` parses `{"errorKind": "RunnerSessionInvalid"}` on HTTP 400 | ✅ good |
+| Locked dependencies announcement (v2.336.0) | "Using locked actions versions from the workflow's lockfile" when `actionsDependencies` non-empty | ✅ good |
+| Session file cleanup on error (v2.336.0) | N/A — aksh-runner uses in-memory sessions; session recreation already handled | ✅ N/A |
 | DAP debugger integration | fully implemented: 4,527 LOC, 67 tests, WebSocket DAP server with breakpoints/stepping/variable inspection | ✅ good |
 | Runner self-update | `AgentRefresh` / `RunnerRefresh` messages acknowledged with log; no actual update mechanism | ❌ intentional — aksh-runner does not self-update |
 | Runner config refresh | `RunnerRefreshConfig` acknowledged with log; dynamic config updates not implemented | ❌ missing |
@@ -221,15 +262,25 @@ conformance scenario:
 | Priority | Change | Upstream Version | aksh Status |
 | --- | --- | --- | --- |
 | P0 | Background step fields in `TimelineRecord` | v2.335.0 | ⚠️ DTO + `is_background` flag implemented; control-flow unexercised |
-| P1 | `RunnerVersionDeprecated` feature flag | v2.321.0 | ❌ missing |
+| ~~P1~~ | ~~`RunnerVersionDeprecated` feature flag~~ | v2.321.0 | ✅ resolved — server returns 403 + `AccessDeniedException`/`errorCode: 1`; runner detects and stops |
 | ~~P1~~ | ~~`run-name` expression interpolation~~ | v2.319.0 | ✅ resolved — parsed + evaluated at submit |
 | ~~P1~~ | ~~Twirp log/summary metadata finalization~~ | v2.329.0 | ✅ resolved — wired to `log_metadata` storage |
-| P2 | `SendJobLevelAnnotations` in timeline | v2.323.0 | ❌ missing/untested |
+| ~~P2~~ | ~~`SendJobLevelAnnotations` in timeline~~ | v2.323.0 | ✅ resolved — feature-gated aggregation via `actions_send_job_level_annotations`; job annotations projected into completejob, timeline, and NDJSON; tested |
 | ~~P2~~ | ~~Server-enforced runner settings~~ | v2.323.0 | ✅ resolved — DTO + endpoint + broker inject |
 | ~~P2~~ | ~~Periodic `JobServerQueue` drain~~ | v2.300.0+ | ✅ resolved — 500 ms background interval |
-| P3 | `DisableStdoutMultilineLogPrefixing` env var | v2.335.0 | ❌ runner-side |
-| P3 | AzDO error envelope (`$type`/`typeName`/`typeKey`) | v2.300.0+ | ⚠️ unverified |
-| P3 | Session reconnection backoff / jitter | v2.300.0+ | ⚠️ unverified |
+| ~~P3~~ | ~~`DisableStdoutMultilineLogPrefixing` env var~~ | v2.335.0 | ✅ resolved — official boolean parsing (`1`, `true`, `$true`) and continuation-prefix suppression implemented with tests |
+| ~~P3~~ | ~~AzDO error envelope (`$type`/`typeName`/`typeKey`)~~ | v2.300.0+ | ✅ resolved — `errors.rs` returns proper Microsoft.VisualStudio.Services error shape |
+| ~~P3~~ | ~~Session reconnection backoff / jitter~~ | v2.300.0+ | ✅ resolved — `SessionBackoff` with `[15,30)`/`[30,60)` jitter windows, reset after success; used in broker and message listeners |
+| P1 | `BackgroundStepCoordinator` + cancel-control | v2.336.0 | ⚠️ partial — `background` wired; no async coordinator |
+| ~~P1~~ | ~~`$GITHUB_ARTIFACTS` / `$GITHUB_ARTIFACTS_LIST`~~ | v2.336.0 | ✅ resolved — matches official parse/gate/fail semantics |
+| ~~P1~~ | ~~`$/` self-repository action reference~~ | v2.336.0 | ✅ resolved — feature-gated + composite parent root |
+| ~~P1~~ | ~~Ephemeral exit on broker ack job-not-found~~ | v2.336.0 | ✅ resolved — ephemeral-only |
+| ~~P1~~ | ~~`RunnerSessionInvalid` structured broker error~~ | v2.336.0 | ✅ resolved — errorKind only (not bare 400) |
+| ~~P2~~ | ~~`ACTIONS_CACHE_MODE` env var injection~~ | v2.336.0 | ✅ resolved |
+| ~~P2~~ | ~~Locked dependencies announcement~~ | v2.336.0 | ✅ resolved |
+| ~~P2~~ | ~~Session file cleanup on broker errors~~ | v2.336.0 | ✅ N/A |
+| ~~P2~~ | ~~Migrated-settings session conflict retry cap~~ | v2.336.0 | ✅ N/A |
+| P3 | Action archive / resolve telemetry payloads | v2.336.0 | ⚠️ info logs only |
 
 ---
 
@@ -315,7 +366,7 @@ Paths are in this repo. Updated 2026-07-18 after deep source review.
   - ✅ `environment` parsed at job level with matrix expression resolution.
   - ✅ `container` / `services` parsed as raw `Value`.
   - ✅ Reusable workflows with `secrets: inherit`, input types, depth limit = 4.
-  - ❌ `run-name` not parsed.
+  - ✅ `run-name` parsed via `Workflow.run_name` (`#[serde(rename = "run-name")]`); evaluated with expression contexts at submit time.
 - `aksh-gha-expressions/src/`
   - ✅ Pratt parser + evaluator; all 12 functions.
   - ✅ **Wired** into job builder — expressions resolved in env, with, run fields.
@@ -329,7 +380,7 @@ Paths are in this repo. Updated 2026-07-18 after deep source review.
     broker paths, replay paths, Twirp paths, blob store paths.
   - ✅ Concurrency groups fully implemented with property tests (87 tests).
   - ⚠️ Registration/OAuth routes return local JWT tokens (runner-compatible, not official-fidelity).
-  - ⚠️ Results-service Twirp log metadata endpoints are stubs (`{"ok": true}`).
+  - ✅ Results-service Twirp log metadata endpoints fully implemented: parse requests, compute byte counts, upsert `LogMetadata` entries into `InnerState.log_metadata`.
   - ✅ AES session key exchange with RSA-OAEP wrapping of runner's registered public key.
   - ✅ Encrypted `TaskAgentMessage` delivery with `messageId` and `DELETE` ack.
   - ✅ `AgentJobRequestMessage` with `plan`, `requestId`, `system` context, full steps.
@@ -351,10 +402,9 @@ Paths are in this repo. Updated 2026-07-18 after deep source review.
   - ✅ Comprehensive `GITHUB_*` env var injection.
   - ✅ Completion body: planId, jobId, service-spelled conclusion, outputs, stepResults,
     annotations; skipped steps omit task-only `action_name`/`type` fields.
-  - ⚠️ Server queue drains every 500 ms, but still sends cumulative step state rather than
-    the official runner's merged delta batches.
+  - ✅ Server queue drains every 500 ms with delta step updates (`dirty_keys` tracking); sends only changed steps per flush. Batch count still higher than official (~10 vs ~5) due to different merge coalescing granularity.
   - ❌ Self-update not implemented (intentional).
-  - ❌ `RunnerRefreshConfig` not implemented.
+  - ✅ `RunnerRefreshConfig` fully implemented: parses refresh metadata, POSTs base64 `.runner` payload to `configRefreshURL`, validates runner identity, atomically persists settings, handles malformed payloads non-fatally.
 - `runner-watch`
   - ✅ Records/diffs upstream runner releases and emits `.runner-watch/delta.json`.
   - ✅ Generates protocol-sync specs under `.runner-watch/specs/v{version}/`.
@@ -386,12 +436,12 @@ and regression tests.**
 - ✅ **Broker polling/session lifecycle fixed.** Online and Busy states both use the official
   50-second long-poll window; status transitions cancel the in-flight request, and every
   listener exit path attempts the broker session `DELETE` exactly once.
-- ⚠️ **Step/timeline updates: partial periodic drain.** aksh-runner flushes cumulative
-  `WorkflowStepsUpdate` every 500 ms and at job end. Official runner drains at the same
-  interval but merges only records dequeued in that batch
-  (`src/Runner.Common/JobServerQueue.cs:627-705`); capture 103 currently emits 10 Aksh
-  updates versus 5 official updates. Log metadata, signed-URL, blob-upload, and complete-job
-  counts match in that capture.
+- ✅ **Step/timeline updates: delta periodic drain.** aksh-runner flushes delta
+  `WorkflowStepsUpdate` (only dirty steps via `dirty_keys` tracking) every 500 ms and at
+  job end, matching the official runner's `ProcessTimelinesUpdateQueueAsync` approach.
+  No eager flushes on step failure — all updates are coalesced by the timer, matching the
+  official runner's batch behavior. Log metadata, signed-URL, blob-upload, and complete-job
+  counts match.
 
 ### 3b. Deep review findings (2026-07-18)
 
