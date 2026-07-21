@@ -5,7 +5,6 @@
 //!
 //! The `ReportingContext` from `job_runner` is threaded through so log upload
 //! can happen right after each step completes (F019 + F020).
-
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::{watch, Mutex};
