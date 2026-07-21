@@ -139,11 +139,17 @@ fn stringify_value(value: &Value) -> String {
 }
 
 /// Validate expressions in a string.
-pub fn validate_expressions_in_string(input: &str, is_condition: bool) -> Result<(), String> {
+pub fn validate_expressions_in_string(
+    input: &str,
+    is_condition: bool,
+    allowed_contexts: Option<&[&str]>,
+) -> Result<(), String> {
     if is_condition && !input.contains("${{") {
         let effective = aksh_gha_expressions::effective_condition(Some(input));
-        return aksh_gha_expressions::validate_expression(&effective)
-            .map_err(|e| format!("invalid condition `{input}`: {e}"));
+        aksh_gha_expressions::validate_expression(&effective)
+            .map_err(|e| format!("invalid condition `{input}`: {e}"))?;
+        validate_contexts(&effective, allowed_contexts, input)?;
+        return Ok(());
     }
 
     let mut remaining = input;
@@ -156,23 +162,52 @@ pub fn validate_expressions_in_string(input: &str, is_condition: bool) -> Result
 
         aksh_gha_expressions::validate_expression(expr)
             .map_err(|e| format!("invalid expression `${{{{ {expr} }}}}` in `{input}`: {e}"))?;
+        validate_contexts(expr, allowed_contexts, input)?;
+    }
+    Ok(())
+}
+
+fn validate_contexts(
+    expr: &str,
+    allowed_contexts: Option<&[&str]>,
+    input: &str,
+) -> Result<(), String> {
+    let Some(allowed) = allowed_contexts else {
+        return Ok(());
+    };
+    let contexts = aksh_gha_expressions::collect_contexts(expr)
+        .map_err(|e| format!("invalid expression in `{input}`: {e}"))?;
+    for ctx in &contexts {
+        if !allowed.iter().any(|a| a.eq_ignore_ascii_case(ctx)) {
+            return Err(format!(
+                "context \"{ctx}\" is not allowed here. available contexts are {}.",
+                allowed
+                    .iter()
+                    .map(|a| format!("\"{a}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
     }
     Ok(())
 }
 
 /// Recursively validate expressions inside a serde_json::Value.
-pub fn validate_value_expressions(value: &Value) -> Result<(), String> {
+pub fn validate_value_expressions(
+    value: &Value,
+    allowed_contexts: Option<&[&str]>,
+) -> Result<(), String> {
     match value {
-        Value::String(s) => validate_expressions_in_string(s, false),
+        Value::String(s) => validate_expressions_in_string(s, false, allowed_contexts),
         Value::Array(arr) => {
             for item in arr {
-                validate_value_expressions(item)?;
+                validate_value_expressions(item, allowed_contexts)?;
             }
             Ok(())
         }
         Value::Object(map) => {
             for val in map.values() {
-                validate_value_expressions(val)?;
+                validate_value_expressions(val, allowed_contexts)?;
             }
             Ok(())
         }
@@ -180,14 +215,19 @@ pub fn validate_value_expressions(value: &Value) -> Result<(), String> {
     }
 }
 
-fn validate_env_expressions(env: &crate::models::Env) -> Result<(), String> {
+fn validate_env_expressions(
+    env: &crate::models::Env,
+    allowed_contexts: Option<&[&str]>,
+) -> Result<(), String> {
     match env {
         crate::models::Env::Empty => Ok(()),
-        crate::models::Env::Expression(expr) => validate_expressions_in_string(expr, false),
+        crate::models::Env::Expression(expr) => {
+            validate_expressions_in_string(expr, false, allowed_contexts)
+        }
         crate::models::Env::Map(map) => {
             for val in map.values() {
                 if let EnvValue::String(s) = val {
-                    validate_expressions_in_string(s, false)?;
+                    validate_expressions_in_string(s, false, allowed_contexts)?;
                 }
             }
             Ok(())
@@ -195,67 +235,128 @@ fn validate_env_expressions(env: &crate::models::Env) -> Result<(), String> {
     }
 }
 
+const CTX_RUN_NAME: &[&str] = &["github", "inputs", "vars"];
+const CTX_WORKFLOW_ENV: &[&str] = &["github", "inputs", "vars", "secrets"];
+const CTX_WORKFLOW_CONCURRENCY: &[&str] = &["github", "inputs", "vars"];
+const CTX_JOB_IF: &[&str] = &[
+    "github",
+    "inputs",
+    "vars",
+    "needs",
+    "always",
+    "failure",
+    "cancelled",
+    "success",
+];
+const CTX_JOB_RUNS_ON: &[&str] = &["github", "inputs", "vars", "needs", "matrix", "strategy"];
+const CTX_JOB_ENV: &[&str] = &[
+    "github", "inputs", "vars", "needs", "strategy", "matrix", "secrets", "env",
+];
+const CTX_JOB_CONCURRENCY: &[&str] = &["github", "inputs", "vars", "needs", "strategy", "matrix"];
+const CTX_STEP_IF: &[&str] = &[
+    "github",
+    "inputs",
+    "vars",
+    "needs",
+    "strategy",
+    "matrix",
+    "secrets",
+    "steps",
+    "job",
+    "runner",
+    "env",
+    "always",
+    "failure",
+    "cancelled",
+    "success",
+    "hashfiles",
+];
+const CTX_STEP_ENV: &[&str] = &[
+    "github",
+    "inputs",
+    "vars",
+    "needs",
+    "strategy",
+    "matrix",
+    "secrets",
+    "steps",
+    "job",
+    "runner",
+    "env",
+    "hashfiles",
+];
+const CTX_STEP_WITH: &[&str] = CTX_STEP_ENV;
+const CTX_STEP_RUN: &[&str] = CTX_STEP_ENV;
+const CTX_STEP_NAME: &[&str] = CTX_STEP_ENV;
+const CTX_STEP_WORKING_DIR: &[&str] = CTX_STEP_ENV;
+
 /// Validate all `${{ }}` expressions in a workflow.
 pub fn validate_workflow_expressions(workflow: &Workflow) -> Result<(), ParserError> {
     if let Some(run_name) = &workflow.run_name {
-        validate_expressions_in_string(run_name, false).map_err(ParserError::InvalidExpression)?;
+        validate_expressions_in_string(run_name, false, Some(CTX_RUN_NAME))
+            .map_err(ParserError::InvalidExpression)?;
     }
-    validate_env_expressions(&workflow.env).map_err(ParserError::InvalidExpression)?;
+    validate_env_expressions(&workflow.env, Some(CTX_WORKFLOW_ENV))
+        .map_err(ParserError::InvalidExpression)?;
 
     if let Some(concurrency) = &workflow.concurrency {
-        validate_expressions_in_string(&concurrency.group, false)
+        validate_expressions_in_string(&concurrency.group, false, Some(CTX_WORKFLOW_CONCURRENCY))
             .map_err(ParserError::InvalidExpression)?;
         if let Some(expr) = &concurrency.cancel_in_progress {
-            validate_expressions_in_string(expr, false).map_err(ParserError::InvalidExpression)?;
+            validate_expressions_in_string(expr, false, Some(CTX_WORKFLOW_CONCURRENCY))
+                .map_err(ParserError::InvalidExpression)?;
         }
     }
 
     for (job_id, job) in &workflow.jobs {
         if let Some(name) = &job.name {
-            validate_expressions_in_string(name, false)
+            validate_expressions_in_string(name, false, Some(CTX_JOB_RUNS_ON))
                 .map_err(|e| ParserError::InvalidExpression(format!("job `{job_id}`: {e}")))?;
         }
         match &job.runs_on {
             RunsOn::Single(s) => {
-                validate_expressions_in_string(s, false).map_err(|e| {
+                validate_expressions_in_string(s, false, Some(CTX_JOB_RUNS_ON)).map_err(|e| {
                     ParserError::InvalidExpression(format!("job `{job_id}` runs-on: {e}"))
                 })?;
             }
             RunsOn::Many(list) => {
                 for s in list {
-                    validate_expressions_in_string(s, false).map_err(|e| {
-                        ParserError::InvalidExpression(format!("job `{job_id}` runs-on: {e}"))
-                    })?;
+                    validate_expressions_in_string(s, false, Some(CTX_JOB_RUNS_ON)).map_err(
+                        |e| ParserError::InvalidExpression(format!("job `{job_id}` runs-on: {e}")),
+                    )?;
                 }
             }
             RunsOn::Dynamic(v) => {
-                validate_value_expressions(v).map_err(|e| {
+                validate_value_expressions(v, Some(CTX_JOB_RUNS_ON)).map_err(|e| {
                     ParserError::InvalidExpression(format!("job `{job_id}` runs-on: {e}"))
                 })?;
             }
         }
         if let Some(cond) = &job.if_condition {
-            validate_expressions_in_string(cond, true).map_err(|e| {
+            validate_expressions_in_string(cond, true, Some(CTX_JOB_IF)).map_err(|e| {
                 ParserError::InvalidExpression(format!("job `{job_id}` if condition: {e}"))
             })?;
         }
-        validate_env_expressions(&job.env)
+        validate_env_expressions(&job.env, Some(CTX_JOB_ENV))
             .map_err(|e| ParserError::InvalidExpression(format!("job `{job_id}` env: {e}")))?;
 
         if let Some(concurrency) = &job.concurrency {
-            validate_expressions_in_string(&concurrency.group, false).map_err(|e| {
-                ParserError::InvalidExpression(format!("job `{job_id}` concurrency: {e}"))
-            })?;
-            if let Some(expr) = &concurrency.cancel_in_progress {
-                validate_expressions_in_string(expr, false).map_err(|e| {
-                    ParserError::InvalidExpression(format!(
-                        "job `{job_id}` concurrency cancel-in-progress: {e}"
-                    ))
+            validate_expressions_in_string(&concurrency.group, false, Some(CTX_JOB_CONCURRENCY))
+                .map_err(|e| {
+                    ParserError::InvalidExpression(format!("job `{job_id}` concurrency: {e}"))
                 })?;
+            if let Some(expr) = &concurrency.cancel_in_progress {
+                validate_expressions_in_string(expr, false, Some(CTX_JOB_CONCURRENCY)).map_err(
+                    |e| {
+                        ParserError::InvalidExpression(format!(
+                            "job `{job_id}` concurrency cancel-in-progress: {e}"
+                        ))
+                    },
+                )?;
             }
         }
         if let Some(JobContinueOnError::Expression(expr)) = &job.continue_on_error {
-            validate_expressions_in_string(expr, false).map_err(|e| {
+            validate_expressions_in_string(expr, false, Some(CTX_JOB_RUNS_ON)).map_err(|e| {
                 ParserError::InvalidExpression(format!("job `{job_id}` continue-on-error: {e}"))
             })?;
         }
@@ -267,36 +368,38 @@ pub fn validate_workflow_expressions(workflow: &Workflow) -> Result<(), ParserEr
                 .map(|n| format!("step `{n}`"))
                 .unwrap_or_else(|| format!("step #{step_idx}"));
             if let Some(name) = &step.name {
-                validate_expressions_in_string(name, false).map_err(|e| {
+                validate_expressions_in_string(name, false, Some(CTX_STEP_NAME)).map_err(|e| {
                     ParserError::InvalidExpression(format!("job `{job_id}` {step_ref}: {e}"))
                 })?;
             }
             if let Some(cond) = &step.if_condition {
-                validate_expressions_in_string(cond, true).map_err(|e| {
+                validate_expressions_in_string(cond, true, Some(CTX_STEP_IF)).map_err(|e| {
                     ParserError::InvalidExpression(format!(
                         "job `{job_id}` {step_ref} if condition: {e}"
                     ))
                 })?;
             }
-            validate_env_expressions(&step.env).map_err(|e| {
+            validate_env_expressions(&step.env, Some(CTX_STEP_ENV)).map_err(|e| {
                 ParserError::InvalidExpression(format!("job `{job_id}` {step_ref} env: {e}"))
             })?;
             for val in step.with.values() {
-                validate_value_expressions(val).map_err(|e| {
+                validate_value_expressions(val, Some(CTX_STEP_WITH)).map_err(|e| {
                     ParserError::InvalidExpression(format!("job `{job_id}` {step_ref} with: {e}"))
                 })?;
             }
             if let Some(run) = &step.run {
-                validate_expressions_in_string(run, false).map_err(|e| {
+                validate_expressions_in_string(run, false, Some(CTX_STEP_RUN)).map_err(|e| {
                     ParserError::InvalidExpression(format!("job `{job_id}` {step_ref} run: {e}"))
                 })?;
             }
             if let Some(wd) = &step.working_directory {
-                validate_expressions_in_string(wd, false).map_err(|e| {
-                    ParserError::InvalidExpression(format!(
-                        "job `{job_id}` {step_ref} working-directory: {e}"
-                    ))
-                })?;
+                validate_expressions_in_string(wd, false, Some(CTX_STEP_WORKING_DIR)).map_err(
+                    |e| {
+                        ParserError::InvalidExpression(format!(
+                            "job `{job_id}` {step_ref} working-directory: {e}"
+                        ))
+                    },
+                )?;
             }
         }
     }
