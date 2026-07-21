@@ -39,7 +39,7 @@ pub fn run_action<'a>(
 }
 
 /// Run an action from a resolved directory.
-async fn run_action_from_dir(
+pub(crate) async fn run_action_from_dir(
     action_dir: &std::path::Path,
     with: &serde_json::Value,
     workspace: &str,
