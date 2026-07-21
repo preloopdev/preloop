@@ -249,12 +249,13 @@ const CTX_JOB_IF: &[&str] = &[
     "success",
 ];
 const CTX_JOB_RUNS_ON: &[&str] = &["github", "inputs", "vars", "needs", "matrix", "strategy"];
+const CTX_STRATEGY: &[&str] = &["github", "inputs", "vars", "needs", "matrix", "strategy"];
 const CTX_JOB_ENV: &[&str] = &[
     "github", "inputs", "vars", "needs", "strategy", "matrix", "secrets", "env",
 ];
 const CTX_JOB_CONCURRENCY: &[&str] = &["github", "inputs", "vars", "needs", "strategy", "matrix"];
 const CTX_JOB_DEFAULTS_RUN: &[&str] = &["github", "strategy", "matrix", "needs", "env", "vars"];
-const CTX_JOB_CONTAINER: &[&str] = &["github", "needs", "strategy", "matrix", "vars"];
+const CTX_JOB_CONTAINER: &[&str] = &["github", "inputs", "needs", "strategy", "matrix", "vars"];
 const CTX_CONTAINER_CREDENTIALS: &[&str] = &["secrets", "env", "github", "vars"];
 const CTX_RUNNER: &[&str] = &[
     "github", "needs", "strategy", "matrix", "secrets", "steps", "job", "runner", "env", "vars",
@@ -334,6 +335,23 @@ pub fn validate_workflow_expressions(workflow: &Workflow) -> Result<(), ParserEr
     }
 
     for (job_id, job) in &workflow.jobs {
+        if let Some(crate::models::MatrixValue::Expression(expression)) = &job.strategy.matrix {
+            validate_expressions_in_string(expression, false, Some(CTX_STRATEGY)).map_err(|e| {
+                ParserError::InvalidExpression(format!("job `{job_id}` strategy.matrix: {e}"))
+            })?;
+        }
+        if let Some(crate::models::DeferredBool::Expression(expression)) = &job.strategy.fail_fast {
+            validate_expressions_in_string(expression, false, Some(CTX_STRATEGY)).map_err(|e| {
+                ParserError::InvalidExpression(format!("job `{job_id}` strategy.fail-fast: {e}"))
+            })?;
+        }
+        if let Some(crate::models::DeferredNumber::Expression(expression)) =
+            &job.strategy.max_parallel
+        {
+            validate_expressions_in_string(expression, false, Some(CTX_STRATEGY)).map_err(|e| {
+                ParserError::InvalidExpression(format!("job `{job_id}` strategy.max-parallel: {e}"))
+            })?;
+        }
         if let Some(name) = &job.name {
             validate_expressions_in_string(name, false, Some(CTX_JOB_RUNS_ON))
                 .map_err(|e| ParserError::InvalidExpression(format!("job `{job_id}`: {e}")))?;
@@ -455,6 +473,17 @@ pub fn validate_workflow_expressions(workflow: &Workflow) -> Result<(), ParserEr
                         "job `{job_id}` {step_ref} if condition: {e}"
                     ))
                 })?;
+            }
+            if let Some(crate::models::DeferredBool::Expression(expression)) =
+                &step.continue_on_error
+            {
+                validate_expressions_in_string(expression, false, Some(CTX_STEP_IF)).map_err(
+                    |e| {
+                        ParserError::InvalidExpression(format!(
+                            "job `{job_id}` {step_ref} continue-on-error: {e}"
+                        ))
+                    },
+                )?;
             }
             validate_env_expressions(&step.env, Some(CTX_STEP_ENV)).map_err(|e| {
                 ParserError::InvalidExpression(format!("job `{job_id}` {step_ref} env: {e}"))
