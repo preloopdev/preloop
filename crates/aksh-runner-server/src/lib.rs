@@ -19,6 +19,7 @@ mod actions;
 use actions::*;
 mod reusable_workflows;
 use reusable_workflows::*;
+mod remote_workflows;
 mod runs;
 use runs::*;
 mod runtime_scheduling;
