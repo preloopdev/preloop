@@ -298,6 +298,8 @@ fn mount_file_command_dirs(
         "GITHUB_OUTPUT",
         "GITHUB_STATE",
         "GITHUB_STEP_SUMMARY",
+        "GITHUB_ARTIFACTS",
+        "GITHUB_ARTIFACTS_LIST",
     ] {
         let Some(path) = env.get(key) else {
             continue;
