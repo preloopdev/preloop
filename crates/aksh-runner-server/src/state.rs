@@ -430,6 +430,9 @@ pub(crate) struct InnerState {
     pub(crate) timeline_events: BTreeMap<RunId, Vec<NdjsonEvent>>,
     /// Per-timeline changeId counter for timeline PATCH versioning.
     pub(crate) timeline_change_ids: BTreeMap<String, i32>,
+    /// Persisted timeline records keyed by `{plan_id}/{timeline_id}`.
+    /// Upserted on each PATCH; returned by GET.
+    pub(crate) timeline_records: BTreeMap<String, BTreeMap<uuid::Uuid, azdo::TimelineRecord>>,
     pub(crate) live_log_lines:
         BTreeMap<String, Arc<tokio::sync::Mutex<Vec<LiveLogFeedLinesWrapper>>>>,
     pub(crate) live_log_tx: BTreeMap<String, broadcast::Sender<LiveLogFeedLinesWrapper>>,
