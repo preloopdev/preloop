@@ -30,7 +30,7 @@ independently usable — anyone can `cargo install aksh` and point their own run
 - `aksh-conformance`: fixtures and harnesses comparing aksh behavior with upstream
   `runner.server`.
 - `aksh-runner`: Rust reimplementation of the GitHub Actions runner (Listener + Worker),
-  faithful to `actions/runner` v2.335.1. Registers, polls, executes workflows, and reports results.
+  faithful to `actions/runner` v2.336.0. Registers, polls, executes workflows, and reports results.
   See [`crates/aksh-runner/README.md`](crates/aksh-runner/README.md) for details.
 - `aksh-dap`: Debug Adapter Protocol bridge for step-level workflow debugging.
 
@@ -49,7 +49,7 @@ for anyone building or testing GitHub Actions workflows outside GitHub:
 
 ## Current Status
 
-**As of 2026-06-29, aksh is tracked by runner-watch against the official `actions/runner` v2.335.1 protocol surface.**
+**As of 2026-07-21, aksh is tracked by runner-watch against the official `actions/runner` v2.336.0 protocol surface.**
 
 aksh currently supports the core runner lifecycle:
 
