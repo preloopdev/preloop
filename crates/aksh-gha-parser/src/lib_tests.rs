@@ -1051,3 +1051,70 @@ jobs:
         Some("false")
     );
 }
+
+#[test]
+fn reusable_workflow_expression_matrix_uses_caller_inputs() {
+    let caller = parse_workflow(
+        r#"
+on: push
+jobs:
+  test:
+    uses: ./.github/workflows/test.yml
+    with:
+      test-matrix: '{"os":["ubuntu-latest","windows-latest"]}'
+    secrets: inherit
+"#,
+    )
+    .unwrap();
+    let called = r#"
+on:
+  workflow_call:
+    inputs:
+      test-matrix:
+        required: true
+        type: string
+jobs:
+  test:
+    strategy:
+      matrix: ${{ fromJSON(inputs.test-matrix) }}
+      fail-fast: ${{ matrix.os == 'ubuntu-latest' }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - run: echo ${{ matrix.os }}
+"#;
+    let mut reusable = std::collections::BTreeMap::new();
+    reusable.insert(".github/workflows/test.yml".to_owned(), called.to_owned());
+
+    let expanded = expand_jobs_with_reusables(&caller, &reusable).unwrap();
+    assert_eq!(expanded.jobs.len(), 2);
+    assert!(expanded
+        .jobs
+        .iter()
+        .all(|job| job.matrix.get("os").is_some()));
+}
+
+#[test]
+fn strategy_expression_scalars_are_preserved_and_resolved() {
+    let workflow = parse_workflow(
+        r#"
+on: push
+jobs:
+  build:
+    strategy:
+      fail-fast: ${{ matrix.experimental }}
+      max-parallel: ${{ matrix.parallelism }}
+      matrix:
+        include:
+          - experimental: true
+            parallelism: 3
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+"#,
+    )
+    .unwrap();
+    let plans = expand_jobs(&workflow).unwrap();
+    assert_eq!(plans.len(), 1);
+    assert!(plans[0].fail_fast);
+    assert_eq!(plans[0].max_parallel, Some(3));
+}
