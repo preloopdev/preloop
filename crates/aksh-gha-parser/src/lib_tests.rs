@@ -102,6 +102,23 @@ jobs:
 }
 
 #[test]
+fn parses_and_expands_opencode_test_workflow_fixture() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let fixture_path = root
+        .join("fixtures")
+        .join("workflows")
+        .join("opencode-test.yml");
+    let yaml = std::fs::read_to_string(&fixture_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", fixture_path.display()));
+    let parsed = parse_workflow(&yaml).expect("parse_workflow failed for opencode-test.yml");
+    let expanded = expand_jobs(&parsed).expect("expand_jobs failed for opencode-test.yml");
+    assert_eq!(expanded.len(), 4);
+}
+#[test]
 fn schedule_trigger_matches_event_name() {
     let workflow = parse_workflow(
         r#"

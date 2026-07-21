@@ -10,6 +10,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::models::{EnvValue, JobContinueOnError, ParserError, RunsOn, Workflow};
 use aksh_gha_expressions::{eval_expression, Context};
 use indexmap::IndexMap;
 use serde_json::{Map, Value};
@@ -135,6 +136,172 @@ fn stringify_value(value: &Value) -> String {
         Value::Array(a) => serde_json::to_string(a).unwrap_or_default(),
         Value::Object(o) => serde_json::to_string(o).unwrap_or_default(),
     }
+}
+
+/// Validate expressions in a string.
+pub fn validate_expressions_in_string(input: &str, is_condition: bool) -> Result<(), String> {
+    if is_condition && !input.contains("${{") {
+        let effective = aksh_gha_expressions::effective_condition(Some(input));
+        return aksh_gha_expressions::validate_expression(&effective)
+            .map_err(|e| format!("invalid condition `{input}`: {e}"));
+    }
+
+    let mut remaining = input;
+    while let Some(start) = remaining.find("${{") {
+        remaining = &remaining[start + 3..];
+        let end = find_expression_end(remaining)
+            .ok_or_else(|| format!("unclosed ${{ expression in `{input}`"))?;
+        let expr = remaining[..end].trim();
+        remaining = &remaining[end + 2..];
+
+        aksh_gha_expressions::validate_expression(expr)
+            .map_err(|e| format!("invalid expression `${{{{ {expr} }}}}` in `{input}`: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Recursively validate expressions inside a serde_json::Value.
+pub fn validate_value_expressions(value: &Value) -> Result<(), String> {
+    match value {
+        Value::String(s) => validate_expressions_in_string(s, false),
+        Value::Array(arr) => {
+            for item in arr {
+                validate_value_expressions(item)?;
+            }
+            Ok(())
+        }
+        Value::Object(map) => {
+            for val in map.values() {
+                validate_value_expressions(val)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_env_expressions(env: &crate::models::Env) -> Result<(), String> {
+    match env {
+        crate::models::Env::Empty => Ok(()),
+        crate::models::Env::Expression(expr) => validate_expressions_in_string(expr, false),
+        crate::models::Env::Map(map) => {
+            for val in map.values() {
+                if let EnvValue::String(s) = val {
+                    validate_expressions_in_string(s, false)?;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Validate all `${{ }}` expressions in a workflow.
+pub fn validate_workflow_expressions(workflow: &Workflow) -> Result<(), ParserError> {
+    if let Some(run_name) = &workflow.run_name {
+        validate_expressions_in_string(run_name, false).map_err(ParserError::InvalidExpression)?;
+    }
+    validate_env_expressions(&workflow.env).map_err(ParserError::InvalidExpression)?;
+
+    if let Some(concurrency) = &workflow.concurrency {
+        validate_expressions_in_string(&concurrency.group, false)
+            .map_err(ParserError::InvalidExpression)?;
+        if let Some(expr) = &concurrency.cancel_in_progress {
+            validate_expressions_in_string(expr, false).map_err(ParserError::InvalidExpression)?;
+        }
+    }
+
+    for (job_id, job) in &workflow.jobs {
+        if let Some(name) = &job.name {
+            validate_expressions_in_string(name, false)
+                .map_err(|e| ParserError::InvalidExpression(format!("job `{job_id}`: {e}")))?;
+        }
+        match &job.runs_on {
+            RunsOn::Single(s) => {
+                validate_expressions_in_string(s, false).map_err(|e| {
+                    ParserError::InvalidExpression(format!("job `{job_id}` runs-on: {e}"))
+                })?;
+            }
+            RunsOn::Many(list) => {
+                for s in list {
+                    validate_expressions_in_string(s, false).map_err(|e| {
+                        ParserError::InvalidExpression(format!("job `{job_id}` runs-on: {e}"))
+                    })?;
+                }
+            }
+            RunsOn::Dynamic(v) => {
+                validate_value_expressions(v).map_err(|e| {
+                    ParserError::InvalidExpression(format!("job `{job_id}` runs-on: {e}"))
+                })?;
+            }
+        }
+        if let Some(cond) = &job.if_condition {
+            validate_expressions_in_string(cond, true).map_err(|e| {
+                ParserError::InvalidExpression(format!("job `{job_id}` if condition: {e}"))
+            })?;
+        }
+        validate_env_expressions(&job.env)
+            .map_err(|e| ParserError::InvalidExpression(format!("job `{job_id}` env: {e}")))?;
+
+        if let Some(concurrency) = &job.concurrency {
+            validate_expressions_in_string(&concurrency.group, false).map_err(|e| {
+                ParserError::InvalidExpression(format!("job `{job_id}` concurrency: {e}"))
+            })?;
+            if let Some(expr) = &concurrency.cancel_in_progress {
+                validate_expressions_in_string(expr, false).map_err(|e| {
+                    ParserError::InvalidExpression(format!(
+                        "job `{job_id}` concurrency cancel-in-progress: {e}"
+                    ))
+                })?;
+            }
+        }
+        if let Some(JobContinueOnError::Expression(expr)) = &job.continue_on_error {
+            validate_expressions_in_string(expr, false).map_err(|e| {
+                ParserError::InvalidExpression(format!("job `{job_id}` continue-on-error: {e}"))
+            })?;
+        }
+
+        for (step_idx, step) in job.steps.iter().enumerate() {
+            let step_ref = step
+                .name
+                .as_deref()
+                .map(|n| format!("step `{n}`"))
+                .unwrap_or_else(|| format!("step #{step_idx}"));
+            if let Some(name) = &step.name {
+                validate_expressions_in_string(name, false).map_err(|e| {
+                    ParserError::InvalidExpression(format!("job `{job_id}` {step_ref}: {e}"))
+                })?;
+            }
+            if let Some(cond) = &step.if_condition {
+                validate_expressions_in_string(cond, true).map_err(|e| {
+                    ParserError::InvalidExpression(format!(
+                        "job `{job_id}` {step_ref} if condition: {e}"
+                    ))
+                })?;
+            }
+            validate_env_expressions(&step.env).map_err(|e| {
+                ParserError::InvalidExpression(format!("job `{job_id}` {step_ref} env: {e}"))
+            })?;
+            for val in step.with.values() {
+                validate_value_expressions(val).map_err(|e| {
+                    ParserError::InvalidExpression(format!("job `{job_id}` {step_ref} with: {e}"))
+                })?;
+            }
+            if let Some(run) = &step.run {
+                validate_expressions_in_string(run, false).map_err(|e| {
+                    ParserError::InvalidExpression(format!("job `{job_id}` {step_ref} run: {e}"))
+                })?;
+            }
+            if let Some(wd) = &step.working_directory {
+                validate_expressions_in_string(wd, false).map_err(|e| {
+                    ParserError::InvalidExpression(format!(
+                        "job `{job_id}` {step_ref} working-directory: {e}"
+                    ))
+                })?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Build an expression evaluation context from workflow data.

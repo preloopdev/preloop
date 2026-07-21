@@ -32,6 +32,7 @@ pub(super) fn validate_function_calls(expr: &Expr) -> Result<(), ExpressionError
                     | "join"
                     | "hashfiles"
                     | "tojson"
+                    | "case"
             ) {
                 return Err(ExpressionError::UnknownFunction(name.clone()));
             }
@@ -238,6 +239,25 @@ fn eval_call(name: &str, args: &[Expr], context: &Context) -> Result<Value, Expr
         "tojson" => Ok(Value::String(
             serde_json::to_string(values.first().unwrap_or(&Value::Null)).unwrap_or_default(),
         )),
+        "case" => {
+            if values.len() < 2 {
+                return Err(ExpressionError::InvalidFormat(
+                    "case() requires at least 2 arguments".to_owned(),
+                ));
+            }
+            let num_pairs = values.len() / 2;
+            for i in 0..num_pairs {
+                let cond = &values[i * 2];
+                if is_truthy(cond) {
+                    return Ok(values[i * 2 + 1].clone());
+                }
+            }
+            if values.len() % 2 == 1 {
+                Ok(values.last().cloned().unwrap_or(Value::Null))
+            } else {
+                Ok(Value::Null)
+            }
+        }
         _ => Err(ExpressionError::UnknownFunction(name.to_owned())),
     }
 }
