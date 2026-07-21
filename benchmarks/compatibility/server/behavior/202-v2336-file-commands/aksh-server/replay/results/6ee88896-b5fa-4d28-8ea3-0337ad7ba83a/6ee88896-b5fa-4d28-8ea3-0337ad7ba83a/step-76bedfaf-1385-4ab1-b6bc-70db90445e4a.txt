@@ -1,0 +1,8 @@
+﻿2026-07-21T18:29:26.5736134Z ##[group]Run echo "FC_TEST=from-github-env" >> "$GITHUB_ENV"
+2026-07-21T18:29:26.5737138Z [36;1mecho "FC_TEST=from-github-env" >> "$GITHUB_ENV"[0m
+2026-07-21T18:29:26.5737918Z [36;1mecho "MULTILINE<<EOF" >> "$GITHUB_ENV"[0m
+2026-07-21T18:29:26.5738565Z [36;1mecho "line one" >> "$GITHUB_ENV"[0m
+2026-07-21T18:29:26.5739148Z [36;1mecho "line two" >> "$GITHUB_ENV"[0m
+2026-07-21T18:29:26.5739726Z [36;1mecho "EOF" >> "$GITHUB_ENV"[0m
+2026-07-21T18:29:26.5748822Z shell: /usr/bin/bash -e {0}
+2026-07-21T18:29:26.5749398Z ##[endgroup]

@@ -1,0 +1,40 @@
+name: 105 command logs annotations
+on: workflow_dispatch
+jobs:
+  logs:
+    runs-on: [self-hosted, overnight]
+    steps:
+      - name: Groups and annotations
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '::group::outer'
+          echo 'plain stdout'
+          printf 'split '
+          printf 'line\n'
+          printf 'no-final-newline'
+          printf '\n'
+          echo '::warning file=sample.txt,line=3,col=2::warning text'
+          echo '::error file=sample.txt,line=4,endLine=4,col=1,endColumn=5::error text'
+          echo '::notice title=notice::notice text'
+          echo '::endgroup::'
+      - name: Mask and stop commands
+        shell: bash
+        env:
+          SECRET_VALUE: overnight-secret-123
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$SECRET_VALUE"
+          echo "secret=$SECRET_VALUE"
+          token=resume-$RANDOM
+          echo "::stop-commands::$token"
+          echo '::warning::this must remain plain text'
+          echo "::$token::"
+          echo "AKSH_ORACLE: masked_and_resumed=true secret_len=${#SECRET_VALUE}"
+      - name: Large and Unicode output
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          print('é東京🙂' * 4096)
+          PY
+          printf 'AKSH_ORACLE: unicode=ok large=16384\n'
