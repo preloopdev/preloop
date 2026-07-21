@@ -671,7 +671,7 @@ mod tests {
         assert_eq!(step_conclusion::SUCCEEDED, 2);
         assert_eq!(step_conclusion::FAILED, 3);
         assert_eq!(step_conclusion::SKIPPED, 7);
-        assert_eq!(step_status::IN_PROGRESS, 2);
+        assert_eq!(step_status::IN_PROGRESS, 3);
         assert_eq!(step_status::COMPLETED, 6);
     }
 
