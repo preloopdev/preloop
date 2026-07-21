@@ -1,0 +1,57 @@
+name: 102 failure needs conditions
+on: workflow_dispatch
+jobs:
+  soft-failure:
+    runs-on: [self-hosted, overnight]
+    steps:
+      - id: tolerated
+        name: Tolerated failure
+        continue-on-error: true
+        shell: bash
+        run: |
+          echo 'AKSH_ORACLE: tolerated outcome=failure conclusion=success'
+          exit 7
+      - name: Assert outcome and conclusion
+        shell: bash
+        run: |
+          test '${{ steps.tolerated.outcome }}' = failure
+          test '${{ steps.tolerated.conclusion }}' = success
+  hard-failure:
+    runs-on: [self-hosted, overnight]
+    steps:
+      - name: Before failure
+        run: "echo 'AKSH_ORACLE: before=ran'"
+      - name: Hard failure
+        run: exit 9
+      - name: Success-only step
+        if: success()
+        run: echo MUST_NOT_RUN
+      - name: Failure step
+        if: failure()
+        run: "echo 'AKSH_ORACLE: failure=ran'"
+      - name: Always step
+        if: always()
+        run: "echo 'AKSH_ORACLE: always=ran'"
+  skipped:
+    if: github.ref == 'refs/heads/never-run-this-job'
+    runs-on: [self-hosted, overnight]
+    steps:
+      - run: echo MUST_NOT_RUN
+  observer:
+    if: always()
+    needs: [soft-failure, hard-failure, skipped]
+    runs-on: [self-hosted, overnight]
+    steps:
+      - name: Observe results and annotations
+        shell: bash
+        env:
+          SOFT: ${{ needs.soft-failure.result }}
+          HARD: ${{ needs.hard-failure.result }}
+          SKIPPED: ${{ needs.skipped.result }}
+        run: |
+          set -euo pipefail
+          test "$SOFT" = success
+          test "$HARD" = failure
+          test "$SKIPPED" = skipped
+          echo "::warning title=dependency::soft=$SOFT hard=$HARD skipped=$SKIPPED"
+          echo "AKSH_ORACLE: results soft=$SOFT hard=$HARD skipped=$SKIPPED"
