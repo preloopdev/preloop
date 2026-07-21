@@ -308,6 +308,8 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
                 "system.github.id_token_request_url",
                 "ACTIONS_ID_TOKEN_REQUEST_URL",
             ),
+            // v2.336.0 (#4538): effective cache mode surfaced to steps
+            ("actions_cache_mode", "ACTIONS_CACHE_MODE"),
         ];
         for (var_key, env_key) in mappings {
             if job.env.contains_key(*env_key) {
@@ -475,6 +477,12 @@ pub fn build_step_list(steps: &[serde_json::Value], job_message: &serde_json::Va
 
         let timeout_minutes = step.get("timeoutInMinutes").and_then(|v| v.as_u64());
 
+        // Official ActionStep.Background (DTPipelines) — wire `background: true`.
+        let is_background = step
+            .get("background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         let env = extract_step_env(step);
 
         // Determine step type (reuse `reference` from above)
@@ -510,6 +518,15 @@ pub fn build_step_list(steps: &[serde_json::Value], job_message: &serde_json::Va
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string()
+                    } else if repo_type.eq_ignore_ascii_case("selfRepository") {
+                        // v2.336.0 $/ self-repository action reference
+                        // (PipelineConstants.SelfRepositoryAlias).
+                        let path = ref_val
+                            .get("path")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim_start_matches('/');
+                        format!("$/{path}")
                     } else {
                         // Remote action: combine name + /path + @ref
                         let name = ref_val.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -571,7 +588,7 @@ pub fn build_step_list(steps: &[serde_json::Value], job_message: &serde_json::Va
             timeout_minutes,
             env,
             raw: step.clone(),
-            is_background: false,
+            is_background,
         });
     }
 
