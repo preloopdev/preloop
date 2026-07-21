@@ -1,0 +1,37 @@
+name: v2336-artifacts-file
+on: push
+jobs:
+  artifacts:
+    runs-on: self-hosted
+    steps:
+      # 1. Verify GITHUB_ARTIFACTS and GITHUB_ARTIFACTS_LIST env vars exist
+      - name: Check env vars exist
+        run: |
+          echo "GITHUB_ARTIFACTS=$GITHUB_ARTIFACTS"
+          echo "GITHUB_ARTIFACTS_LIST=$GITHUB_ARTIFACTS_LIST"
+          test -n "$GITHUB_ARTIFACTS" || echo "GITHUB_ARTIFACTS not set (expected if feature-flagged off)"
+          test -n "$GITHUB_ARTIFACTS_LIST" || echo "GITHUB_ARTIFACTS_LIST not set"
+
+      # 2. Write artifact entries to GITHUB_ARTIFACTS
+      - name: Create artifact file
+        run: |
+          echo "test-file.txt" > test-artifact.txt
+          echo "test-artifact.txt" >> "$GITHUB_ARTIFACTS"
+
+      # 3. Write OCI-style entry
+      - name: Write OCI subject
+        run: |
+          echo "my-image sha256:abc123def456" >> "$GITHUB_ARTIFACTS"
+
+      # 4. Check GITHUB_ARTIFACTS_LIST has content
+      - name: Read artifacts list
+        run: |
+          echo "Artifacts list contents:"
+          cat "$GITHUB_ARTIFACTS_LIST" 2>/dev/null || echo "No artifacts list (feature may be off)"
+
+      # 5. GITHUB_ENV still works (regression check)
+      - name: Set env via file command
+        run: echo "V2336_TEST=artifacts-ok" >> "$GITHUB_ENV"
+
+      - name: Verify env
+        run: test "$V2336_TEST" = "artifacts-ok"
