@@ -690,6 +690,8 @@ fn timeline_record_state_serialization() {
         background_control_step_ids: vec![],
         parallel_group_id: None,
         steps: vec![],
+        last_modified: None,
+        log: None,
     };
     let json = serde_json::to_string(&record).unwrap();
     assert!(json.contains("\"state\":\"inProgress\""));
