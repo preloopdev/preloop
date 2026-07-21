@@ -15,6 +15,18 @@ pub struct TimelineReference {
     pub location: Option<String>,
 }
 
+/// Lightweight reference to a `TaskLog` entry, embedded in timeline records.
+///
+/// The official API returns this in the `log` field of each `TimelineRecord`
+/// so consumers can fetch log lines by ID.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskLogReference {
+    #[serde(rename = "id")]
+    pub id: i64,
+    #[serde(rename = "location", skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+}
+
 /// A single timeline record — represents the status of a job or step.
 ///
 /// The runner PATCHes these as steps execute. Each record tracks
@@ -71,6 +83,10 @@ pub struct TimelineRecord {
     pub parallel_group_id: Option<String>,
     #[serde(rename = "steps", default)]
     pub steps: Vec<TimelineRecord>,
+    #[serde(rename = "lastModified", skip_serializing_if = "Option::is_none")]
+    pub last_modified: Option<String>,
+    #[serde(rename = "log", skip_serializing_if = "Option::is_none")]
+    pub log: Option<TaskLogReference>,
 }
 
 /// Type of timeline record (job vs step).

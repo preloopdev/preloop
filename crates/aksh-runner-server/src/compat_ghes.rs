@@ -119,6 +119,13 @@ pub(crate) async fn patch_timeline_records_org(
     .await
 }
 
+pub(crate) async fn get_timeline_records_org(
+    State(shared): State<Arc<SharedState>>,
+    Path((_org, scope, hub, plan_id, timeline_id)): Path<(String, String, String, String, String)>,
+) -> Json<serde_json::Value> {
+    get_timeline_records(State(shared), Path((scope, hub, plan_id, timeline_id))).await
+}
+
 pub(crate) async fn create_log_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, scope, hub, plan_id)): Path<(String, String, String, String)>,
