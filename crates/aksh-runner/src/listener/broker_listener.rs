@@ -223,9 +223,19 @@ pub async fn run_broker_loop(
                             }
                         }
                     } else {
+                        // Session conflict (409) is retriable with normal backoff
+                        // (official TaskAgentSessionConflictException path). #4557
+                        // only affects migrated-settings retry caps, which aksh
+                        // does not implement.
                         consecutive_errors += 1;
                         let delay = retry_backoff.next_delay();
-                        warn!("Failed to create broker session: {e:#}. Retrying in {delay:?}");
+                        if is_session_conflict(&e) {
+                            warn!(
+                                "Session conflict (409) creating broker session: {e:#}. Retrying in {delay:?}"
+                            );
+                        } else {
+                            warn!("Failed to create broker session: {e:#}. Retrying in {delay:?}");
+                        }
                         tokio::select! {
                             _ = &mut shutdown => return Ok(()),
                             _ = tokio::time::sleep(delay) => {}
@@ -329,7 +339,24 @@ pub async fn run_broker_loop(
                             .to_string();
 
                         if !runner_request_id.is_empty() {
-                            let _ = client.acknowledge(&token, &session_id, &runner_request_id).await;
+                            match client.acknowledge(&token, &session_id, &runner_request_id).await {
+                                Ok(crate::client::broker::AcknowledgeResult::JobNotFound) => {
+                                    // Official Runner.cs: only `settings.Ephemeral`
+                                    // exits on RunnerRequestJobNotFoundException.
+                                    // --once is not included in the when-filter.
+                                    if config.settings.ephemeral {
+                                        info!("Acknowledge returned job-not-found — exiting ephemeral runner cleanly");
+                                        return Ok(());
+                                    }
+                                    warn!("Acknowledge returned job-not-found — ignoring (non-ephemeral)");
+                                    continue;
+                                }
+                                Ok(crate::client::broker::AcknowledgeResult::Ok) => {}
+                                Err(e) => {
+                                    // Official: best-effort acknowledge — log and continue.
+                                    warn!("Acknowledge failed: {e:#}");
+                                }
+                            }
                         }
 
                         match classify_message(&message_type) {
@@ -594,12 +621,34 @@ fn is_unauthorized(err: &anyhow::Error) -> bool {
     }
 }
 
-fn is_session_expired(err: &anyhow::Error) -> bool {
+/// v2.336.0 (#4557): Detect session conflict (HTTP 409) from broker.
+fn is_session_conflict(err: &anyhow::Error) -> bool {
     if let Some(http_err) = err.downcast_ref::<crate::client::http::HttpError>() {
         match http_err {
             crate::client::http::HttpError::Status { status, .. } => {
+                *status == reqwest::StatusCode::CONFLICT
+            }
+        }
+    } else {
+        false
+    }
+}
+
+fn is_session_expired(err: &anyhow::Error) -> bool {
+    if let Some(http_err) = err.downcast_ref::<crate::client::http::HttpError>() {
+        match http_err {
+            crate::client::http::HttpError::Status { status, body } => {
+                // Official BrokerHttpClient: errorKind RunnerSessionInvalid →
+                // TaskAgentSessionExpiredException (recreate session).
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
+                    if json.get("errorKind").and_then(|v| v.as_str())
+                        == Some("RunnerSessionInvalid")
+                    {
+                        return true;
+                    }
+                }
+                // Pre-structured-body / AzDO session paths still use 404.
                 *status == reqwest::StatusCode::NOT_FOUND
-                    || *status == reqwest::StatusCode::BAD_REQUEST
             }
         }
     } else {
@@ -933,12 +982,13 @@ mod tests {
     }
 
     #[test]
-    fn is_session_expired_detects_400() {
+    fn is_session_expired_rejects_bare_400_without_error_kind() {
+        // Official only maps structured RunnerSessionInvalid, not bare 400.
         let err = anyhow::Error::new(crate::client::http::HttpError::Status {
             status: reqwest::StatusCode::BAD_REQUEST,
             body: "bad session".to_string(),
         });
-        assert!(is_session_expired(&err));
+        assert!(!is_session_expired(&err));
     }
 
     #[test]
@@ -948,6 +998,15 @@ mod tests {
             body: "ok".to_string(),
         });
         assert!(!is_session_expired(&err));
+    }
+
+    #[test]
+    fn is_session_expired_detects_runner_session_invalid_error_kind() {
+        let err = anyhow::Error::new(crate::client::http::HttpError::Status {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            body: r#"{"source":"actions-broker-listener","errorKind":"RunnerSessionInvalid","statusCode":400,"errorMessage":"Runner session is invalid"}"#.to_string(),
+        });
+        assert!(is_session_expired(&err));
     }
 
     #[test]
