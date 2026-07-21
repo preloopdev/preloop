@@ -1,6 +1,6 @@
 use super::*;
 
-// ─── Phase E: Timeline, logs, completion ────────────────────────────────────
+// Timeline, logs, completion
 
 /// PATCH timeline records — runner updates step/job state.
 pub(crate) async fn patch_timeline_records(
@@ -9,7 +9,6 @@ pub(crate) async fn patch_timeline_records(
     Json(wrapper): Json<azdo::VssJsonCollectionWrapper<azdo::TimelineRecord>>,
 ) -> Json<serde_json::Value> {
     let mut records = wrapper.value;
-    let count = records.len();
     let timeline_key = format!("{}/{}", plan_id, timeline_id);
     let callback_job = {
         let inner = shared.state.inner.lock().await;
@@ -83,7 +82,10 @@ pub(crate) async fn patch_timeline_records(
 
     let new_change_id = {
         let mut inner = shared.state.inner.lock().await;
-        let current = inner.timeline_change_ids.entry(timeline_key).or_insert(0);
+        let current = inner
+            .timeline_change_ids
+            .entry(timeline_key.clone())
+            .or_insert(0);
         *current += 1;
         let new_id = *current;
 
@@ -155,11 +157,25 @@ pub(crate) async fn patch_timeline_records(
     for event in projected {
         shared.state.emit(event).await;
     }
-    // Stamp each record with the server's current changeId.
+    // Stamp each record with server-computed fields.
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     for record in &mut records {
         record.change_id = Some(new_change_id);
+        record.last_modified = Some(now.clone());
     }
-    Json(json!({ "count": count, "value": records }))
+
+    // Persist records (upsert by record ID) and return the full stored set.
+    let response_records = {
+        let mut inner = shared.state.inner.lock().await;
+        let stored = inner.timeline_records.entry(timeline_key).or_default();
+        for record in records {
+            stored.insert(record.id, record);
+        }
+        let vals: Vec<_> = stored.values().cloned().collect();
+        vals
+    };
+
+    Json(json!({ "count": response_records.len(), "value": response_records }))
 }
 pub(crate) fn timeline_status(record: &azdo::TimelineRecord) -> Option<ExecutionStatus> {
     match record.result {
@@ -358,6 +374,44 @@ pub(crate) async fn patch_timeline_records_plan(
         State(shared),
         Path((String::new(), String::new(), plan_id, timeline_id)),
         Json(wrapper),
+    )
+    .await
+}
+
+/// GET `/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id` — read back full timeline.
+pub(crate) async fn get_timeline_records(
+    State(shared): State<Arc<SharedState>>,
+    Path((_scope, _hub, plan_id, timeline_id)): Path<(String, String, String, String)>,
+) -> Json<serde_json::Value> {
+    let timeline_key = format!("{}/{}", plan_id, timeline_id);
+    let inner = shared.state.inner.lock().await;
+    let change_id = inner
+        .timeline_change_ids
+        .get(&timeline_key)
+        .copied()
+        .unwrap_or(0);
+    let records: Vec<_> = inner
+        .timeline_records
+        .get(&timeline_key)
+        .map(|m| m.values().cloned().collect())
+        .unwrap_or_default();
+    Json(json!({
+        "id": timeline_id,
+        "changeId": change_id,
+        "lastChangedBy": uuid::Uuid::nil(),
+        "lastChangedOn": "0001-01-01T00:00:00",
+        "records": records
+    }))
+}
+
+/// GET `/_apis/v1/plans/:plan_id/timelines/:timeline_id/records`
+pub(crate) async fn get_timeline_records_plan(
+    State(shared): State<Arc<SharedState>>,
+    Path((plan_id, timeline_id)): Path<(String, String)>,
+) -> Json<serde_json::Value> {
+    get_timeline_records(
+        State(shared),
+        Path((String::new(), String::new(), plan_id, timeline_id)),
     )
     .await
 }
