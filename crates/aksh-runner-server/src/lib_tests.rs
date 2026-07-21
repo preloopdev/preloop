@@ -2526,7 +2526,9 @@ async fn twirp_diag_route_issues_random_blob_url_and_accepts_bearerless_upload()
     let (_, blob_token) = diag_url
         .split_once("/twirp-blob/diag/")
         .expect("diagnostic URL must use the bearerless diag blob endpoint");
-    let blob_uuid = uuid::Uuid::parse_str(blob_token).expect("diagnostic token must be a UUID");
+    let (blob_token_clean, _) = blob_token.split_once('?').unwrap_or((blob_token, ""));
+    let blob_uuid =
+        uuid::Uuid::parse_str(blob_token_clean).expect("diagnostic token must be a UUID");
     assert_eq!(blob_uuid.as_bytes()[6] >> 4, 4, "token must be UUIDv4");
     assert_eq!(
         blob_uuid.as_bytes()[8] & 0xc0,
@@ -4036,7 +4038,7 @@ async fn github_app_manifest_registration_flow() {
 
 #[tokio::test]
 async fn runner_oauth2_token_client_assertion_verification() {
-    use aksh_gha_protocol::crypto::sign_jwt_ps256;
+    use aksh_gha_protocol::crypto::{sign_jwt_ps256, sign_jwt_rs256};
     use serde_json::Value;
 
     let temp = tempfile::tempdir().unwrap();
@@ -4127,6 +4129,42 @@ async fn runner_oauth2_token_client_assertion_verification() {
         .unwrap();
     let token_resp: Value = serde_json::from_slice(&bytes).unwrap();
     assert!(token_resp["access_token"].is_string());
+
+    // 4b. Test RS256 algorithm verification
+    let rs256_header = json!({
+        "typ": "JWT",
+        "alg": "RS256"
+    });
+    let rs256_client_assertion = sign_jwt_rs256(&rs256_header, &claims, &rsa_params).unwrap();
+    let rs256_form_body = serde_urlencoded::to_string([
+        (
+            "client_assertion_type",
+            "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+        ),
+        ("client_assertion", &rs256_client_assertion),
+        ("grant_type", "client_credentials"),
+    ])
+    .unwrap();
+
+    let rs256_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/runner/server/_apis/v1/oauth2/token")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(rs256_form_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(rs256_response.status(), StatusCode::OK);
+    let rs256_bytes = axum::body::to_bytes(rs256_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let rs256_token_resp: Value = serde_json::from_slice(&rs256_bytes).unwrap();
+    assert!(rs256_token_resp["access_token"].is_string());
 
     // 5. Test negative case: Invalid signature (wrong key)
     let wrong_keypair = aksh_gha_protocol::crypto::AgentRsaKeypair::generate().unwrap();

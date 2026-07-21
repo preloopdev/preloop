@@ -93,7 +93,7 @@ pub(crate) fn build_app(
         .route("/broker/:runner_id/completejob", post(broker_complete_job))
         .route(
             "/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id",
-            patch(patch_timeline_records),
+            patch(patch_timeline_records).get(get_timeline_records),
         )
         .route(
             "/_apis/v1/Logfiles/:scope/:hub/:plan_id",
@@ -129,7 +129,7 @@ pub(crate) fn build_app(
         )
         .route(
             "/runner/server/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id",
-            patch(patch_timeline_records),
+            patch(patch_timeline_records).get(get_timeline_records),
         )
         .route(
             "/runner/server/_apis/v1/Logfiles/:scope/:hub/:plan_id",
@@ -159,7 +159,7 @@ pub(crate) fn build_app(
         // These alias the scope/hub-prefixed handlers above so both URL forms work.
         .route(
             "/_apis/v1/plans/:plan_id/timelines/:timeline_id/records",
-            patch(patch_timeline_records_plan),
+            patch(patch_timeline_records_plan).get(get_timeline_records_plan),
         )
         .route(
             "/_apis/v1/plans/:plan_id/logs",
@@ -177,7 +177,7 @@ pub(crate) fn build_app(
         // which is http://…/runner/server so all plan-level AzDO calls land here.
         .route(
             "/runner/server/_apis/v1/plans/:plan_id/timelines/:timeline_id/records",
-            patch(patch_timeline_records_plan),
+            patch(patch_timeline_records_plan).get(get_timeline_records_plan),
         )
         .route(
             "/runner/server/_apis/v1/plans/:plan_id/logs",
@@ -267,7 +267,7 @@ pub(crate) fn build_app(
         )
         .route(
             "/:org/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id",
-            patch(patch_timeline_records_org),
+            patch(patch_timeline_records_org).get(get_timeline_records_org),
         )
         .route(
             "/:org/_apis/v1/Logfiles/:scope/:hub/:plan_id",
