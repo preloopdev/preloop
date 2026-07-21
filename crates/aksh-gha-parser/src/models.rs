@@ -662,13 +662,81 @@ impl Needs {
 pub struct Strategy {
     /// Matrix block.
     #[serde(default)]
-    pub matrix: Option<Matrix>,
+    pub matrix: Option<MatrixValue>,
     /// Fail-fast flag.
     #[serde(default, rename = "fail-fast")]
-    pub fail_fast: Option<bool>,
+    pub fail_fast: Option<DeferredBool>,
     /// Max parallel jobs.
     #[serde(default, rename = "max-parallel")]
-    pub max_parallel: Option<u64>,
+    pub max_parallel: Option<DeferredNumber>,
+}
+
+/// A workflow scalar that may be deferred as a GitHub Actions expression.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum DeferredBool {
+    /// Literal boolean value.
+    Literal(bool),
+    /// Expression evaluated when the job is expanded.
+    Expression(String),
+}
+
+/// A workflow number that may be deferred as a GitHub Actions expression.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum DeferredNumber {
+    /// Literal unsigned integer value.
+    Literal(u64),
+    /// Expression evaluated when the job is expanded.
+    Expression(String),
+}
+
+/// A static matrix or an expression producing a matrix object.
+#[derive(Debug, Clone)]
+pub enum MatrixValue {
+    /// Structured matrix axes, includes, and excludes.
+    Static(Matrix),
+    /// Expression that evaluates to a matrix object.
+    Expression(String),
+}
+
+impl Serialize for MatrixValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Static(matrix) => matrix.serialize(serializer),
+            Self::Expression(expression) => expression.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for MatrixValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_yaml::Value::deserialize(deserializer)?;
+        if let serde_yaml::Value::String(expression) = value {
+            return Ok(Self::Expression(expression));
+        }
+        let mut value = value;
+        if let serde_yaml::Value::Mapping(mapping) = &mut value {
+            for field in ["include", "exclude"] {
+                let key = serde_yaml::Value::String(field.to_owned());
+                if let Some(serde_yaml::Value::String(expression)) = mapping.get(&key).cloned() {
+                    mapping.insert(
+                        key,
+                        serde_yaml::Value::Sequence(vec![serde_yaml::Value::String(expression)]),
+                    );
+                }
+            }
+        }
+        serde_yaml::from_value(value)
+            .map(Self::Static)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 /// Concurrency queue mode for a group.
@@ -804,7 +872,7 @@ pub struct Step {
     pub shell: Option<String>,
     /// Whether to continue on error.
     #[serde(default, rename = "continue-on-error")]
-    pub continue_on_error: Option<bool>,
+    pub continue_on_error: Option<DeferredBool>,
 }
 
 /// Action metadata from `action.yml` or `action.yaml`.
