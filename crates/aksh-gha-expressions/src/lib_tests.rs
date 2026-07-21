@@ -54,10 +54,8 @@ fn evaluates_json_join_and_comparisons() {
         eval_expression("case(false, 'first', 'default')", &context).unwrap(),
         Value::String("default".to_owned())
     );
-    assert_eq!(
-        eval_expression("case(false, 'first')", &context).unwrap(),
-        Value::Null
-    );
+    assert!(validate_expression("case(true, 'a')").is_err());
+    assert!(validate_expression("case(true, 'a', false, 'b')").is_err());
     assert!(validate_expression("case(github.ref == 'refs/heads/dev', format('{0}-{1}', github.workflow, github.run_id), 'default')").is_ok());
     assert_eq!(
         eval_expression("fromJson('[\"a\",\"b\"]')", &context).unwrap(),
@@ -73,6 +71,22 @@ fn evaluates_json_join_and_comparisons() {
     );
     assert_eq!(
         eval_expression("2 <= 2", &context).unwrap(),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        eval_expression("'B' > 'a'", &context).unwrap(),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        eval_expression("'a' < 'B'", &context).unwrap(),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        eval_expression("'ABC' >= 'abc'", &context).unwrap(),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        eval_expression("'abc' <= 'ABC'", &context).unwrap(),
         Value::Bool(true)
     );
     assert_eq!(
