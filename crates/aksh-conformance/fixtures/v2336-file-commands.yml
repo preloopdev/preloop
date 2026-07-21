@@ -1,0 +1,51 @@
+name: 202 v2336 file commands
+on: push
+jobs:
+  file-commands:
+    runs-on: self-hosted
+    steps:
+      - name: Set env var
+        run: |
+          echo "FC_TEST=from-github-env" >> "$GITHUB_ENV"
+          echo "MULTILINE<<EOF" >> "$GITHUB_ENV"
+          echo "line one" >> "$GITHUB_ENV"
+          echo "line two" >> "$GITHUB_ENV"
+          echo "EOF" >> "$GITHUB_ENV"
+      - name: Use env var
+        shell: bash
+        run: |
+          echo "AKSH_ORACLE: FC_TEST=$FC_TEST"
+          echo "AKSH_ORACLE: MULTILINE_LINES=$(echo "$MULTILINE" | wc -l | tr -d ' ')"
+          test "$FC_TEST" = "from-github-env"
+      - name: Produce output
+        id: out
+        run: |
+          echo "simple=hello" >> "$GITHUB_OUTPUT"
+          echo "heredoc<<DELIM" >> "$GITHUB_OUTPUT"
+          echo "multi" >> "$GITHUB_OUTPUT"
+          echo "line" >> "$GITHUB_OUTPUT"
+          echo "DELIM" >> "$GITHUB_OUTPUT"
+      - name: Read output
+        run: |
+          echo "AKSH_ORACLE: simple=${{ steps.out.outputs.simple }}"
+          echo "AKSH_ORACLE: heredoc=${{ steps.out.outputs.heredoc }}"
+          test "${{ steps.out.outputs.simple }}" = "hello"
+      - name: Add to PATH
+        run: echo "/tmp/v2336-fc-test-path" >> "$GITHUB_PATH"
+      - name: Verify PATH
+        shell: bash
+        run: |
+          echo "$PATH" | grep -q "v2336-fc-test-path"
+          echo "AKSH_ORACLE: path-addition=ok"
+      - name: Save state
+        run: echo "saved_key=saved_value" >> "$GITHUB_STATE"
+      - name: Write summary
+        run: |
+          echo "### File Commands Test" >> "$GITHUB_STEP_SUMMARY"
+          echo "AKSH_ORACLE: summary=written"
+      - name: Check GITHUB_ARTIFACTS env
+        run: |
+          echo "AKSH_ORACLE: GITHUB_ARTIFACTS=${GITHUB_ARTIFACTS:-unset}"
+          echo "AKSH_ORACLE: GITHUB_ARTIFACTS_LIST=${GITHUB_ARTIFACTS_LIST:-unset}"
+      - name: All file command checks passed
+        run: 'echo "AKSH_ORACLE: all-fc-checks=passed"'
