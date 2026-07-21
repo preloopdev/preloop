@@ -1,11 +1,17 @@
-//! File commands — GITHUB_ENV, GITHUB_PATH, GITHUB_OUTPUT, GITHUB_STATE, GITHUB_STEP_SUMMARY.
+//! File commands — GITHUB_ENV, GITHUB_PATH, GITHUB_OUTPUT, GITHUB_STATE, GITHUB_STEP_SUMMARY,
+//! GITHUB_ARTIFACTS, GITHUB_ARTIFACTS_LIST.
 //!
 //! Before each step, create empty temp files and export the env vars.
 //! After the step, parse the files and apply the values.
+//!
+//! `$GITHUB_ARTIFACTS` / `$GITHUB_ARTIFACTS_LIST` match actions/runner v2.336.0
+//! (`CreateArtifactsFileCommand` / `ArtifactsListFileCommand`).
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
+use regex::Regex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use tracing::debug;
 
 /// Paths to the file command temp files for a step.
@@ -15,10 +21,25 @@ pub struct FileCommandPaths {
     pub output_file: PathBuf,
     pub state_file: PathBuf,
     pub summary_file: PathBuf,
+    /// v2.336.0 (#4527): Write-side file for artifact subject declarations.
+    pub artifacts_file: PathBuf,
+    /// v2.336.0 (#4527): Read-side file populated with aggregated artifact subjects JSON.
+    pub artifacts_list_file: PathBuf,
 }
 
 /// Create temp files for file commands and return the paths.
+///
+/// When `job` is provided, `$GITHUB_ARTIFACTS_LIST` is pre-populated with the
+/// current job-scoped aggregate (official `PopulateInitialContents`).
 pub fn create_file_commands(temp_dir: &Path) -> Result<FileCommandPaths> {
+    create_file_commands_with_job(temp_dir, None)
+}
+
+/// Like [`create_file_commands`], optionally seeding `$GITHUB_ARTIFACTS_LIST`.
+pub fn create_file_commands_with_job(
+    temp_dir: &Path,
+    job: Option<&super::contexts::JobContext>,
+) -> Result<FileCommandPaths> {
     std::fs::create_dir_all(temp_dir)?;
 
     let paths = FileCommandPaths {
@@ -27,20 +48,72 @@ pub fn create_file_commands(temp_dir: &Path) -> Result<FileCommandPaths> {
         output_file: temp_dir.join(format!("github_output_{}", uuid::Uuid::new_v4())),
         state_file: temp_dir.join(format!("github_state_{}", uuid::Uuid::new_v4())),
         summary_file: temp_dir.join(format!("github_step_summary_{}", uuid::Uuid::new_v4())),
+        artifacts_file: temp_dir.join(format!("github_artifacts_{}", uuid::Uuid::new_v4())),
+        artifacts_list_file: temp_dir
+            .join(format!("github_artifacts_list_{}", uuid::Uuid::new_v4())),
     };
 
-    // Create empty files
     for path in [
         &paths.env_file,
         &paths.path_file,
         &paths.output_file,
         &paths.state_file,
         &paths.summary_file,
+        &paths.artifacts_file,
+        &paths.artifacts_list_file,
     ] {
         std::fs::write(path, "")?;
     }
 
+    // Official always creates the list file path; contents only when feature on.
+    if let Some(job) = job {
+        if artifacts_feature_enabled(job) {
+            write_artifacts_list_file(&paths.artifacts_list_file, job)?;
+        }
+    }
+
     Ok(paths)
+}
+
+fn artifacts_feature_enabled(job: &super::contexts::JobContext) -> bool {
+    job.variables
+        .get("actions_runner_allow_artifacts_file")
+        .and_then(|v| v.get("value"))
+        .and_then(|v| v.as_str())
+        .is_some_and(matches_official_bool)
+        || std::env::var("ACTIONS_RUNNER_ALLOW_ARTIFACTS_FILE")
+            .is_ok_and(|v| matches_official_bool(&v))
+}
+
+fn matches_official_bool(v: &str) -> bool {
+    // StringUtil.ConvertToBoolean / GetBoolean truthy set used by the runner.
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "t" | "y" | "yes" | "on"
+    )
+}
+
+fn write_artifacts_list_file(path: &Path, job: &super::contexts::JobContext) -> Result<()> {
+    // Official ArtifactsListFileCommand: sort by name, compact JSON, UTF-8 no BOM.
+    let mut subjects: Vec<_> = job.artifact_subjects.values().collect();
+    subjects.sort_by(|a, b| a.name.cmp(&b.name));
+    let subjects_json: Vec<serde_json::Value> = subjects
+        .into_iter()
+        .map(|s| {
+            serde_json::json!({
+                "name": s.name,
+                "digest": s.digest,
+                "kind": s.kind,
+            })
+        })
+        .collect();
+    let list_json = serde_json::json!({
+        "version": 1,
+        "subjects": subjects_json,
+    });
+    std::fs::write(path, serde_json::to_string(&list_json)?)
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
 }
 
 /// Get the env vars to export for file commands.
@@ -65,6 +138,15 @@ pub fn file_command_env(paths: &FileCommandPaths) -> HashMap<String, String> {
     env.insert(
         "GITHUB_STEP_SUMMARY".to_string(),
         paths.summary_file.to_string_lossy().to_string(),
+    );
+    // v2.336.0 (#4527): Artifact file commands (feature-flagged)
+    env.insert(
+        "GITHUB_ARTIFACTS".to_string(),
+        paths.artifacts_file.to_string_lossy().to_string(),
+    );
+    env.insert(
+        "GITHUB_ARTIFACTS_LIST".to_string(),
+        paths.artifacts_list_file.to_string_lossy().to_string(),
     );
     env
 }
@@ -250,6 +332,86 @@ pub fn apply_file_commands(
         }
     }
 
+    // v2.336.0 CreateArtifactsFileCommand — feature-gated; env path always set.
+    // Failures throw (fail the step), matching official ProcessCommand.
+    if artifacts_feature_enabled(job) && paths.artifacts_file.exists() {
+        process_artifacts_file(paths, job)?;
+    }
+
+    Ok(())
+}
+
+const ARTIFACTS_MAX_FILE_BYTES: u64 = 1024 * 1024;
+const ARTIFACTS_MAX_AGGREGATE: usize = 500;
+
+fn process_artifacts_file(
+    paths: &FileCommandPaths,
+    job: &mut super::contexts::JobContext,
+) -> Result<()> {
+    let meta = std::fs::metadata(&paths.artifacts_file)
+        .with_context(|| format!("reading {}", paths.artifacts_file.display()))?;
+    if meta.len() == 0 {
+        return Ok(());
+    }
+    if meta.len() > ARTIFACTS_MAX_FILE_BYTES {
+        bail!(
+            "$GITHUB_ARTIFACTS file exceeds the maximum size of {} KiB (got {} KiB).",
+            ARTIFACTS_MAX_FILE_BYTES / 1024,
+            meta.len() / 1024
+        );
+    }
+
+    let content = std::fs::read_to_string(&paths.artifacts_file)
+        .with_context(|| format!("reading {}", paths.artifacts_file.display()))?;
+
+    // Parse fully before mutating the aggregate (official: fail without partial pollution).
+    let mut parsed: Vec<(usize, super::contexts::ArtifactSubject)> = Vec::new();
+    for (idx, raw) in content.lines().enumerate() {
+        let line_number = idx + 1;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        match parse_artifact_entry(trimmed, job.workspace.as_deref()) {
+            Ok(subject) => parsed.push((line_number, subject)),
+            Err(e) => {
+                bail!("Invalid $GITHUB_ARTIFACTS entry on line {line_number}: {e}");
+            }
+        }
+    }
+
+    let mut added = 0usize;
+    for (line_number, subject) in parsed {
+        let name = subject.name.clone();
+        if let Some(existing) = job.artifact_subjects.get(&name) {
+            if existing.digest == subject.digest {
+                // Identical declaration — silently deduplicate.
+                continue;
+            }
+            bail!(
+                "Invalid $GITHUB_ARTIFACTS entry on line {line_number}: Conflicting digest for artifact '{name}': previously declared as '{}', now declared as '{}'.",
+                existing.digest,
+                subject.digest
+            );
+        }
+        if job.artifact_subjects.len() >= ARTIFACTS_MAX_AGGREGATE {
+            bail!(
+                "Invalid $GITHUB_ARTIFACTS entry on line {line_number}: The job has exceeded the maximum of {ARTIFACTS_MAX_AGGREGATE} declared artifacts."
+            );
+        }
+        job.artifact_subjects.insert(name, subject);
+        added += 1;
+    }
+
+    if added > 0 {
+        tracing::info!(
+            "Captured {added} artifact subject(s) from this step (job total: {})",
+            job.artifact_subjects.len()
+        );
+    }
+
+    // Next step's InitializeFiles rewrites the list; keep current file in sync too.
+    write_artifacts_list_file(&paths.artifacts_list_file, job)?;
     Ok(())
 }
 
@@ -288,9 +450,140 @@ pub fn cleanup_file_commands(paths: &FileCommandPaths) {
         &paths.output_file,
         &paths.state_file,
         &paths.summary_file,
+        &paths.artifacts_file,
+        &paths.artifacts_list_file,
     ] {
         let _ = std::fs::remove_file(path);
     }
+}
+
+/// Parse one `$GITHUB_ARTIFACTS` line (official `CreateArtifactsFileCommand.ParseLine`).
+///
+/// Formats:
+/// - `file://path` or bare path → file subject (sha256 of contents)
+/// - `oci://ref@sha256|384|512:hex` or bare `ref@sha{256,384,512}:hex` → oci subject
+fn parse_artifact_entry(
+    line: &str,
+    workspace: Option<&str>,
+) -> Result<super::contexts::ArtifactSubject> {
+    let trimmed = line.trim();
+    if trimmed.contains('=') {
+        bail!("entries containing '=' are reserved and not permitted");
+    }
+
+    static SCHEME_RE: OnceLock<Regex> = OnceLock::new();
+    static OCI_RE: OnceLock<Regex> = OnceLock::new();
+    let scheme_re = SCHEME_RE
+        .get_or_init(|| Regex::new(r"^[A-Za-z][A-Za-z0-9+.\-]*://").expect("scheme regex"));
+    let oci_re = OCI_RE.get_or_init(|| {
+        Regex::new(r"^(?P<ref>.+)@(?P<algo>sha(?:256|384|512)):(?P<hex>[0-9a-fA-F]+)$")
+            .expect("oci digest regex")
+    });
+
+    if let Some(path) = trimmed
+        .strip_prefix("file://")
+        .or_else(|| trimmed.strip_prefix("FILE://"))
+    {
+        if path.trim().is_empty() {
+            bail!("file:// entries must include a path");
+        }
+        return make_file_subject(path, workspace);
+    }
+    if let Some(rest) = trimmed
+        .strip_prefix("oci://")
+        .or_else(|| trimmed.strip_prefix("OCI://"))
+    {
+        let Some(caps) = oci_re.captures(rest) else {
+            bail!("oci:// entries must include an @sha{{256,384,512}}:<hex> digest");
+        };
+        return make_oci_subject(&caps);
+    }
+    if scheme_re.is_match(trimmed) {
+        bail!("unsupported URI scheme");
+    }
+    if let Some(caps) = oci_re.captures(trimmed) {
+        let algo = caps.name("algo").unwrap().as_str();
+        let hex = caps.name("hex").unwrap().as_str();
+        if expected_hex_len(algo) == Some(hex.len()) {
+            return make_oci_subject(&caps);
+        }
+    }
+    make_file_subject(trimmed, workspace)
+}
+
+fn expected_hex_len(algo: &str) -> Option<usize> {
+    match algo.to_ascii_lowercase().as_str() {
+        "sha256" => Some(64),
+        "sha384" => Some(96),
+        "sha512" => Some(128),
+        _ => None,
+    }
+}
+
+fn make_oci_subject(caps: &regex::Captures<'_>) -> Result<super::contexts::ArtifactSubject> {
+    let ref_name = caps.name("ref").unwrap().as_str();
+    let algo = caps.name("algo").unwrap().as_str().to_ascii_lowercase();
+    let hex = caps.name("hex").unwrap().as_str().to_ascii_lowercase();
+    let Some(expected) = expected_hex_len(&algo) else {
+        bail!("unsupported digest algorithm");
+    };
+    if hex.len() != expected {
+        bail!(
+            "digest '{algo}' must be {expected} hex characters, got {}",
+            hex.len()
+        );
+    }
+    if ref_name.is_empty() {
+        bail!("oci subject must include a reference");
+    }
+    Ok(super::contexts::ArtifactSubject {
+        name: ref_name.to_string(),
+        digest: format!("{algo}:{hex}"),
+        kind: "oci".to_string(),
+    })
+}
+
+fn make_file_subject(
+    declared_path: &str,
+    workspace: Option<&str>,
+) -> Result<super::contexts::ArtifactSubject> {
+    use sha2::Digest;
+
+    let file_path = if Path::new(declared_path).is_absolute() {
+        PathBuf::from(declared_path)
+    } else {
+        let base = workspace
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        base.join(declared_path)
+    };
+
+    if file_path.is_dir() {
+        bail!("'{declared_path}' is a directory, not a regular file");
+    }
+    if !file_path.exists() {
+        if !Path::new(declared_path).is_absolute() {
+            let root = workspace.unwrap_or(".");
+            bail!(
+                "file '{declared_path}' does not exist (relative paths are resolved against the workspace root '{root}')"
+            );
+        }
+        bail!("file '{declared_path}' does not exist");
+    }
+
+    let content = std::fs::read(&file_path)
+        .with_context(|| format!("reading artifact file {}", file_path.display()))?;
+    let digest = format!("sha256:{:x}", sha2::Sha256::digest(&content));
+    let name = file_path
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_else(|| declared_path.to_string());
+
+    Ok(super::contexts::ArtifactSubject {
+        name,
+        digest,
+        kind: "file".to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -369,8 +662,88 @@ mod tests {
         let paths = create_file_commands(dir.path()).unwrap();
         assert!(paths.env_file.exists());
         assert!(paths.output_file.exists());
+        assert!(paths.artifacts_file.exists());
+        assert!(paths.artifacts_list_file.exists());
         cleanup_file_commands(&paths);
         assert!(!paths.env_file.exists());
+    }
+
+    #[test]
+    fn parse_artifact_oci_at_digest() {
+        let s = parse_artifact_entry(
+            "ghcr.io/octocat/myapp:1.0.0@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            None,
+        )
+        .unwrap();
+        assert_eq!(s.name, "ghcr.io/octocat/myapp:1.0.0");
+        assert_eq!(
+            s.digest,
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(s.kind, "oci");
+    }
+
+    #[test]
+    fn parse_artifact_file_path() {
+        let dir = TempDir::new().unwrap();
+        let f = dir.path().join("binary.bin");
+        std::fs::write(&f, b"hello").unwrap();
+        let s = parse_artifact_entry("binary.bin", Some(dir.path().to_str().unwrap())).unwrap();
+        assert_eq!(s.name, "binary.bin");
+        assert_eq!(s.kind, "file");
+        assert!(s.digest.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn parse_artifact_rejects_equals() {
+        let err = parse_artifact_entry("name=value", None).unwrap_err();
+        assert!(err.to_string().contains("reserved"));
+    }
+
+    #[test]
+    fn artifacts_processing_requires_feature_flag() {
+        let dir = TempDir::new().unwrap();
+        let paths = create_file_commands(dir.path()).unwrap();
+        let f = dir.path().join("a.bin");
+        std::fs::write(&f, b"x").unwrap();
+        std::fs::write(&paths.artifacts_file, "a.bin\n").unwrap();
+        let mut job = crate::worker::contexts::JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        job.workspace = Some(dir.path().to_string_lossy().into());
+        apply_file_commands(&paths, "step", &mut job).unwrap();
+        assert!(job.artifact_subjects.is_empty());
+
+        job.variables = serde_json::json!({
+            "actions_runner_allow_artifacts_file": {"value": "true"}
+        });
+        apply_file_commands(&paths, "step", &mut job).unwrap();
+        assert_eq!(job.artifact_subjects.len(), 1);
+    }
+
+    #[test]
+    fn artifacts_conflict_fails_step() {
+        let dir = TempDir::new().unwrap();
+        let paths = create_file_commands(dir.path()).unwrap();
+        std::fs::write(
+            &paths.artifacts_file,
+            "img@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
+             img@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
+        )
+        .unwrap();
+        let mut job = crate::worker::contexts::JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({
+                "actions_runner_allow_artifacts_file": {"value": "true"}
+            }),
+            serde_json::json!({}),
+        );
+        let err = apply_file_commands(&paths, "step", &mut job).unwrap_err();
+        assert!(err.to_string().contains("Conflicting digest"));
     }
 
     #[test]
