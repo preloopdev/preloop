@@ -795,6 +795,7 @@ pub(crate) async fn handle_github_webhook(
                 vars: BTreeMap::new(),
                 secrets: BTreeMap::new(),
                 reusable_workflows: BTreeMap::new(),
+                reusable_workflow_shas: BTreeMap::new(),
                 enable_debugger: false,
                 debugger_welcome_message: None,
                 sha: resolved_sha.clone(),

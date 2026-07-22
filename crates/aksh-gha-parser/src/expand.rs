@@ -380,6 +380,7 @@ pub(crate) fn coerce_value(
 fn expand_jobs_with_reusables_internal(
     workflow: &Workflow,
     reusable_workflows: &BTreeMap<String, String>,
+    reusable_workflow_shas: &BTreeMap<String, String>,
     depth: usize,
     reusable_calls: &mut BTreeMap<String, ReusableCallMetadata>,
     inputs: Option<&BTreeMap<String, Value>>,
@@ -502,6 +503,7 @@ fn expand_jobs_with_reusables_internal(
                 let mut called_plans = expand_jobs_with_reusables_internal(
                     &called,
                     reusable_workflows,
+                    reusable_workflow_shas,
                     depth + 1,
                     reusable_calls,
                     Some(&resolved_inputs),
@@ -532,6 +534,12 @@ fn expand_jobs_with_reusables_internal(
                     called_plan.secrets_map.extend(secrets_map.clone());
                     called_plan.workflow_file = Some(path.clone());
                     called_plan.workflow_ref = Some(uses.clone());
+                    called_plan.workflow_sha = reusable_workflow_shas.get(uses).cloned();
+                    called_plan.workflow_repository =
+                        uses.split_once('/').and_then(|(owner, rest)| {
+                            rest.split_once('/')
+                                .map(|(repo, _)| format!("{owner}/{repo}"))
+                        });
                     called_plan.oidc_id_token_granted &= id_token_granted(
                         job.permissions.as_ref().or(workflow.permissions.as_ref()),
                     );
@@ -549,6 +557,11 @@ fn expand_jobs_with_reusables_internal(
                         caller_concurrency: job.concurrency.clone(),
                         embedded_concurrency: called.concurrency.clone(),
                         matrix: matrix.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                        workflow_sha: reusable_workflow_shas.get(uses).cloned(),
+                        workflow_repository: uses.split_once('/').and_then(|(owner, rest)| {
+                            rest.split_once('/')
+                                .map(|(repo, _)| format!("{owner}/{repo}"))
+                        }),
                     },
                 );
 
@@ -582,10 +595,20 @@ pub fn expand_jobs_with_reusables(
     workflow: &Workflow,
     reusable_workflows: &BTreeMap<String, String>,
 ) -> Result<ExpandedWorkflows, ParserError> {
+    expand_jobs_with_reusables_and_shas(workflow, reusable_workflows, &BTreeMap::new())
+}
+
+/// Expand jobs and inline reusable workflows with resolved remote metadata.
+pub fn expand_jobs_with_reusables_and_shas(
+    workflow: &Workflow,
+    reusable_workflows: &BTreeMap<String, String>,
+    reusable_workflow_shas: &BTreeMap<String, String>,
+) -> Result<ExpandedWorkflows, ParserError> {
     let mut reusable_calls = BTreeMap::new();
     let mut plans = expand_jobs_with_reusables_internal(
         workflow,
         reusable_workflows,
+        reusable_workflow_shas,
         0,
         &mut reusable_calls,
         None,
