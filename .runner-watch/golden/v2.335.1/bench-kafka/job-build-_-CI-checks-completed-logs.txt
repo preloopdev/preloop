@@ -1,0 +1,688 @@
+2026-07-22T20:42:23.2063658Z Current runner version: '2.335.1'
+2026-07-22T20:42:23.2090260Z ##[group]Runner Image Provisioner
+2026-07-22T20:42:23.2091149Z Hosted Compute Agent
+2026-07-22T20:42:23.2091789Z Version: 20260707.563
+2026-07-22T20:42:23.2092496Z Commit: 02667638d2b423fbc733a8e32a88b44996a3ba6e
+2026-07-22T20:42:23.2093232Z Build Date: 2026-07-07T19:33:50Z
+2026-07-22T20:42:23.2093916Z Worker ID: {3e0066fc-bc3b-4af9-afc8-84b9bd341053}
+2026-07-22T20:42:23.2094732Z Azure Region: westus
+2026-07-22T20:42:23.2095343Z ##[endgroup]
+2026-07-22T20:42:23.2097215Z ##[group]Operating System
+2026-07-22T20:42:23.2097893Z Ubuntu
+2026-07-22T20:42:23.2098430Z 24.04.4
+2026-07-22T20:42:23.2099006Z LTS
+2026-07-22T20:42:23.2099573Z ##[endgroup]
+2026-07-22T20:42:23.2100121Z ##[group]Runner Image
+2026-07-22T20:42:23.2100818Z Image: ubuntu-24.04
+2026-07-22T20:42:23.2101411Z Version: 20260714.240.1
+2026-07-22T20:42:23.2102726Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260714.240/images/ubuntu/Ubuntu2404-Readme.md
+2026-07-22T20:42:23.2104317Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260714.240
+2026-07-22T20:42:23.2105372Z ##[endgroup]
+2026-07-22T20:42:23.2108931Z ##[group]GITHUB_TOKEN Permissions
+2026-07-22T20:42:23.2111807Z Actions: write
+2026-07-22T20:42:23.2112446Z ArtifactMetadata: write
+2026-07-22T20:42:23.2113138Z Attestations: write
+2026-07-22T20:42:23.2113739Z Checks: write
+2026-07-22T20:42:23.2114307Z CodeQuality: write
+2026-07-22T20:42:23.2114949Z Contents: write
+2026-07-22T20:42:23.2115525Z CopilotRequests: write
+2026-07-22T20:42:23.2116463Z Deployments: write
+2026-07-22T20:42:23.2117199Z Discussions: write
+2026-07-22T20:42:23.2117768Z Drives: write
+2026-07-22T20:42:23.2118348Z Issues: write
+2026-07-22T20:42:23.2118963Z Metadata: read
+2026-07-22T20:42:23.2119623Z Models: read
+2026-07-22T20:42:23.2120215Z Packages: write
+2026-07-22T20:42:23.2120771Z Pages: write
+2026-07-22T20:42:23.2121306Z PullRequests: write
+2026-07-22T20:42:23.2122014Z RepositoryProjects: write
+2026-07-22T20:42:23.2122635Z SecurityEvents: write
+2026-07-22T20:42:23.2123259Z Statuses: write
+2026-07-22T20:42:23.2123905Z VulnerabilityAlerts: read
+2026-07-22T20:42:23.2124510Z ##[endgroup]
+2026-07-22T20:42:23.2127106Z Secret source: Actions
+2026-07-22T20:42:23.2127891Z Prepare workflow directory
+2026-07-22T20:42:23.2482342Z Prepare all required actions
+2026-07-22T20:42:23.2594632Z Uses: apache/kafka/.github/workflows/build.yml@refs/heads/trunk (3c257464fe4c2e83d85c13d611546e28f09f967c)
+2026-07-22T20:42:23.2600636Z ##[group] Inputs
+2026-07-22T20:42:23.2601795Z   is-trunk: true
+2026-07-22T20:42:23.2602457Z   is-public-fork: false
+2026-07-22T20:42:23.2603159Z ##[endgroup]
+2026-07-22T20:42:23.2603771Z Complete job name: build / CI checks completed
+2026-07-22T20:42:23.3467934Z ##[group]Run printenv
+2026-07-22T20:42:23.3468713Z [36;1mprintenv[0m
+2026-07-22T20:42:23.4202182Z shell: /usr/bin/bash -e {0}
+2026-07-22T20:42:23.4203264Z env:
+2026-07-22T20:42:23.4280366Z   GITHUB_CONTEXT: {
+  "token": "***",
+  "job": "checks-complete",
+  "ref": "refs/heads/trunk",
+  "sha": "3c257464fe4c2e83d85c13d611546e28f09f967c",
+  "repository": "apache/kafka",
+  "repository_owner": "apache",
+  "repository_owner_id": "47359",
+  "repositoryUrl": "git://github.com/apache/kafka.git",
+  "run_id": "29940786887",
+  "run_number": "31777",
+  "retention_days": "90",
+  "run_attempt": "1",
+  "artifact_cache_size_limit": "10",
+  "repository_visibility": "public",
+  "actor_id": "8959638",
+  "actor": "mjsax",
+  "workflow": "CI",
+  "head_ref": "",
+  "base_ref": "",
+  "event_name": "push",
+  "server_url": "https://github.com",
+  "api_url": "https://api.github.com",
+  "graphql_url": "https://api.github.com/graphql",
+  "ref_name": "trunk",
+  "ref_protected": true,
+  "ref_type": "branch",
+  "secret_source": "Actions",
+  "event": {
+    "after": "3c257464fe4c2e83d85c13d611546e28f09f967c",
+    "base_ref": null,
+    "before": "3d48cb3fa1f08794fe0c6ac3b89492f0f2ddbbe0",
+    "commits": [
+      {
+        "author": {
+          "email": "lucliu@confluent.io",
+          "name": "Lucy Liu",
+          "username": "lucliu1108"
+        },
+        "committer": {
+          "email": "noreply@github.com",
+          "name": "GitHub",
+          "username": "web-flow"
+        },
+        "distinct": true,
+        "id": "3c257464fe4c2e83d85c13d611546e28f09f967c",
+        "message": "MINOR: Fix KStream leftJoin doc and test param naming for KStream-GlobalKTable  (#22889)\n\nThis PR fixes:\n- Wrong description regarding leftJoin(GlobalKTable, ...) Javadoc when\nkeySelector is null\n- Wrong param ordering for ValueJoinerWithStreamAndMappedKey for 2 unit\ntests\n\nReviewers: Matthias J. Sax <matthias@confluent.io>",
+        "timestamp": "2026-07-22T10:04:21-07:00",
+        "tree_id": "9c3536c43f6c04530deb719068e580edc49af846",
+        "url": "https://github.com/apache/kafka/commit/3c257464fe4c2e83d85c13d611546e28f09f967c"
+      }
+    ],
+    "compare": "https://github.com/apache/kafka/compare/3d48cb3fa1f0...3c257464fe4c",
+    "created": false,
+    "deleted": false,
+    "enterprise": {
+      "avatar_url": "https://avatars.githubusercontent.com/b/212555?v=4",
+      "created_at": "2024-08-17T07:54:05Z",
+      "description": null,
+      "html_url": "https://github.com/enterprises/the-asf",
+      "id": 212555,
+      "name": "The ASF",
+      "node_id": "E_kgDOAAM-Sw",
+      "slug": "the-asf",
+      "updated_at": "2026-07-12T11:35:24Z",
+      "website_url": null
+    },
+    "forced": false,
+    "head_commit": {
+      "author": {
+        "email": "lucliu@confluent.io",
+        "name": "Lucy Liu",
+        "username": "lucliu1108"
+      },
+      "committer": {
+        "email": "noreply@github.com",
+        "name": "GitHub",
+        "username": "web-flow"
+      },
+      "distinct": true,
+      "id": "3c257464fe4c2e83d85c13d611546e28f09f967c",
+      "message": "MINOR: Fix KStream leftJoin doc and test param naming for KStream-GlobalKTable  (#22889)\n\nThis PR fixes:\n- Wrong description regarding leftJoin(GlobalKTable, ...) Javadoc when\nkeySelector is null\n- Wrong param ordering for ValueJoinerWithStreamAndMappedKey for 2 unit\ntests\n\nReviewers: Matthias J. Sax <matthias@confluent.io>",
+      "timestamp": "2026-07-22T10:04:21-07:00",
+      "tree_id": "9c3536c43f6c04530deb719068e580edc49af846",
+      "url": "https://github.com/apache/kafka/commit/3c257464fe4c2e83d85c13d611546e28f09f967c"
+    },
+    "organization": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/47359?v=4",
+      "description": "",
+      "events_url": "https://api.github.com/orgs/apache/events",
+      "hooks_url": "https://api.github.com/orgs/apache/hooks",
+      "id": 47359,
+      "issues_url": "https://api.github.com/orgs/apache/issues",
+      "login": "apache",
+      "members_url": "https://api.github.com/orgs/apache/members{/member}",
+      "node_id": "MDEyOk9yZ2FuaXphdGlvbjQ3MzU5",
+      "public_members_url": "https://api.github.com/orgs/apache/public_members{/member}",
+      "repos_url": "https://api.github.com/orgs/apache/repos",
+      "url": "https://api.github.com/orgs/apache"
+    },
+    "pusher": {
+      "email": "mjsax@apache.org",
+      "name": "mjsax"
+    },
+    "ref": "refs/heads/trunk",
+    "repository": {
+      "allow_forking": true,
+      "archive_url": "https://api.github.com/repos/apache/kafka/{archive_format}{/ref}",
+      "archived": false,
+      "assignees_url": "https://api.github.com/repos/apache/kafka/assignees{/user}",
+      "blobs_url": "https://api.github.com/repos/apache/kafka/git/blobs{/sha}",
+      "branches_url": "https://api.github.com/repos/apache/kafka/branches{/branch}",
+      "clone_url": "https://github.com/apache/kafka.git",
+      "collaborators_url": "https://api.github.com/repos/apache/kafka/collaborators{/collaborator}",
+      "comments_url": "https://api.github.com/repos/apache/kafka/comments{/number}",
+      "commits_url": "https://api.github.com/repos/apache/kafka/commits{/sha}",
+      "compare_url": "https://api.github.com/repos/apache/kafka/compare/{base}...{head}",
+      "contents_url": "https://api.github.com/repos/apache/kafka/contents/{+path}",
+      "contributors_url": "https://api.github.com/repos/apache/kafka/contributors",
+      "created_at": 1313431576,
+      "custom_properties": {},
+      "default_branch": "trunk",
+      "deployments_url": "https://api.github.com/repos/apache/kafka/deployments",
+      "description": "Apache Kafka - A distributed event streaming platform",
+      "disabled": false,
+      "downloads_url": "https://api.github.com/repos/apache/kafka/downloads",
+      "events_url": "https://api.github.com/repos/apache/kafka/events",
+      "fork": false,
+      "forks": 15368,
+      "forks_count": 15368,
+      "forks_url": "https://api.github.com/repos/apache/kafka/forks",
+      "full_name": "apache/kafka",
+      "git_commits_url": "https://api.github.com/repos/apache/kafka/git/commits{/sha}",
+      "git_refs_url": "https://api.github.com/repos/apache/kafka/git/refs{/sha}",
+      "git_tags_url": "https://api.github.com/repos/apache/kafka/git/tags{/sha}",
+      "git_url": "git://github.com/apache/kafka.git",
+      "has_discussions": false,
+      "has_downloads": true,
+      "has_issues": false,
+      "has_pages": false,
+      "has_projects": true,
+      "has_pull_requests": true,
+      "has_wiki": false,
+      "homepage": "https://kafka.apache.org/",
+      "hooks_url": "https://api.github.com/repos/apache/kafka/hooks",
+      "html_url": "https://github.com/apache/kafka",
+      "id": 2211243,
+      "is_template": false,
+      "issue_comment_url": "https://api.github.com/repos/apache/kafka/issues/comments{/number}",
+      "issue_events_url": "https://api.github.com/repos/apache/kafka/issues/events{/number}",
+      "issues_url": "https://api.github.com/repos/apache/kafka/issues{/number}",
+      "keys_url": "https://api.github.com/repos/apache/kafka/keys{/key_id}",
+      "labels_url": "https://api.github.com/repos/apache/kafka/labels{/name}",
+      "language": "Java",
+      "languages_url": "https://api.github.com/repos/apache/kafka/languages",
+      "license": {
+        "key": "apache-2.0",
+        "name": "Apache License 2.0",
+        "node_id": "MDc6TGljZW5zZTI=",
+        "spdx_id": "Apache-2.0",
+        "url": "https://api.github.com/licenses/apache-2.0"
+      },
+      "master_branch": "trunk",
+      "merges_url": "https://api.github.com/repos/apache/kafka/merges",
+      "milestones_url": "https://api.github.com/repos/apache/kafka/milestones{/number}",
+      "mirror_url": null,
+      "name": "kafka",
+      "node_id": "MDEwOlJlcG9zaXRvcnkyMjExMjQz",
+      "notifications_url": "https://api.github.com/repos/apache/kafka/notifications{?since,all,participating}",
+      "open_issues": 456,
+      "open_issues_count": 456,
+      "organization": "apache",
+      "owner": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/47359?v=4",
+        "email": null,
+        "events_url": "https://api.github.com/users/apache/events{/privacy}",
+        "followers_url": "https://api.github.com/users/apache/followers",
+        "following_url": "https://api.github.com/users/apache/following{/other_user}",
+        "gists_url": "https://api.github.com/users/apache/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/apache",
+        "id": 47359,
+        "login": "apache",
+        "name": "apache",
+        "node_id": "MDEyOk9yZ2FuaXphdGlvbjQ3MzU5",
+        "organizations_url": "https://api.github.com/users/apache/orgs",
+        "received_events_url": "https://api.github.com/users/apache/received_events",
+        "repos_url": "https://api.github.com/users/apache/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/apache/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/apache/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/apache",
+        "user_view_type": "public"
+      },
+      "private": false,
+      "pull_request_creation_policy": "all",
+      "pulls_url": "https://api.github.com/repos/apache/kafka/pulls{/number}",
+      "pushed_at": 1784739862,
+      "releases_url": "https://api.github.com/repos/apache/kafka/releases{/id}",
+      "size": 301138,
+      "ssh_url": "git@github.com:apache/kafka.git",
+      "stargazers": 33300,
+      "stargazers_count": 33300,
+      "stargazers_url": "https://api.github.com/repos/apache/kafka/stargazers",
+      "statuses_url": "https://api.github.com/repos/apache/kafka/statuses/{sha}",
+      "subscribers_url": "https://api.github.com/repos/apache/kafka/subscribers",
+      "subscription_url": "https://api.github.com/repos/apache/kafka/subscription",
+      "svn_url": "https://github.com/apache/kafka",
+      "tags_url": "https://api.github.com/repos/apache/kafka/tags",
+      "teams_url": "https://api.github.com/repos/apache/kafka/teams",
+      "topics": [
+        "java",
+        "kafka",
+        "scala",
+        "streaming"
+      ],
+      "trees_url": "https://api.github.com/repos/apache/kafka/git/trees{/sha}",
+      "updated_at": "2026-07-22T17:03:59Z",
+      "url": "https://api.github.com/repos/apache/kafka",
+      "visibility": "public",
+      "watchers": 33300,
+      "watchers_count": 33300,
+      "web_commit_signoff_required": false
+    },
+    "sender": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/8959638?v=4",
+      "events_url": "https://api.github.com/users/mjsax/events{/privacy}",
+      "followers_url": "https://api.github.com/users/mjsax/followers",
+      "following_url": "https://api.github.com/users/mjsax/following{/other_user}",
+      "gists_url": "https://api.github.com/users/mjsax/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/mjsax",
+      "id": 8959638,
+      "login": "mjsax",
+      "node_id": "MDQ6VXNlcjg5NTk2Mzg=",
+      "organizations_url": "https://api.github.com/users/mjsax/orgs",
+      "received_events_url": "https://api.github.com/users/mjsax/received_events",
+      "repos_url": "https://api.github.com/users/mjsax/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/mjsax/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/mjsax/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/mjsax",
+      "user_view_type": "public"
+    }
+  },
+  "workflow_ref": "apache/kafka/.github/workflows/ci.yml@refs/heads/trunk",
+  "workflow_sha": "3c257464fe4c2e83d85c13d611546e28f09f967c",
+  "repository_id": "2211243",
+  "triggering_actor": "mjsax",
+  "workspace": "/home/runner/work/kafka/kafka",
+  "action": "__run"
+}
+2026-07-22T20:42:23.4339206Z ##[endgroup]
+2026-07-22T20:42:23.4666633Z SHELL=/bin/bash
+2026-07-22T20:42:23.4667349Z SELENIUM_JAR_PATH=/usr/share/java/selenium-server.jar
+2026-07-22T20:42:23.4668041Z CONDA=/usr/share/miniconda
+2026-07-22T20:42:23.4668620Z GITHUB_WORKSPACE=/home/runner/work/kafka/kafka
+2026-07-22T20:42:23.4669354Z JAVA_HOME_11_X64=/usr/lib/jvm/temurin-11-jdk-amd64
+2026-07-22T20:42:23.4670449Z JAVA_HOME_25_X64=/usr/lib/jvm/temurin-25-jdk-amd64
+2026-07-22T20:42:23.4672218Z GITHUB_PATH=/home/runner/work/_temp/_runner_file_commands/add_path_13912718-9799-49ef-8b40-65cffbe41ea4
+2026-07-22T20:42:23.4673897Z GITHUB_ACTION=__run
+2026-07-22T20:42:23.4674753Z JAVA_HOME=/usr/lib/jvm/temurin-17-jdk-amd64
+2026-07-22T20:42:23.4675724Z GITHUB_RUN_NUMBER=31777
+2026-07-22T20:42:23.4676806Z RUNNER_NAME=GitHub Actions 1023480636
+2026-07-22T20:42:23.4677732Z GRADLE_HOME=/usr/share/gradle-9.6.1
+2026-07-22T20:42:23.4678324Z GITHUB_REPOSITORY_OWNER_ID=47359
+2026-07-22T20:42:23.4678986Z ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE=/opt/actionarchivecache
+2026-07-22T20:42:23.4679708Z XDG_CONFIG_HOME=/home/runner/.config
+2026-07-22T20:42:23.4680344Z MEMORY_PRESSURE_WRITE=c29tZSAyMDAwMDAgMjAwMDAwMAA=
+2026-07-22T20:42:23.4681055Z DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
+2026-07-22T20:42:23.4681669Z ANT_HOME=/usr/share/ant
+2026-07-22T20:42:23.4682213Z JAVA_HOME_8_X64=/usr/lib/jvm/temurin-8-jdk-amd64
+2026-07-22T20:42:23.4682866Z GITHUB_TRIGGERING_ACTOR=mjsax
+2026-07-22T20:42:23.4683422Z GITHUB_REF_TYPE=branch
+2026-07-22T20:42:23.4683942Z HOMEBREW_CLEANUP_PERIODIC_FULL_DAYS=3650
+2026-07-22T20:42:23.4684573Z ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED=1
+2026-07-22T20:42:23.4685270Z ANDROID_NDK=/usr/local/lib/android/sdk/ndk/27.3.13750724
+2026-07-22T20:42:23.4686625Z BOOTSTRAP_HASKELL_NONINTERACTIVE=1
+2026-07-22T20:42:23.4687417Z ***
+2026-07-22T20:42:23.4687859Z PIPX_BIN_DIR=/opt/pipx_bin
+2026-07-22T20:42:23.4688381Z LOGNAME=runner
+2026-07-22T20:42:23.4688851Z GITHUB_REPOSITORY_ID=2211243
+2026-07-22T20:42:23.4689372Z GITHUB_ACTIONS=true
+2026-07-22T20:42:23.4689852Z USE_BAZEL_FALLBACK_VERSION=silent:
+2026-07-22T20:42:23.4690581Z ANDROID_NDK_LATEST_HOME=/usr/local/lib/android/sdk/ndk/29.0.14206865
+2026-07-22T20:42:23.4691382Z SYSTEMD_EXEC_PID=2031
+2026-07-22T20:42:23.4691923Z GITHUB_SHA=3c257464fe4c2e83d85c13d611546e28f09f967c
+2026-07-22T20:42:23.4692750Z GITHUB_WORKFLOW_REF=apache/kafka/.github/workflows/ci.yml@refs/heads/trunk
+2026-07-22T20:42:23.4693661Z POWERSHELL_DISTRIBUTION_CHANNEL=GitHub-Actions-Linux
+2026-07-22T20:42:23.4694347Z RUNNER_ENVIRONMENT=github-hosted
+2026-07-22T20:42:23.4694896Z DOTNET_MULTILEVEL_LOOKUP=0
+2026-07-22T20:42:23.4695434Z GITHUB_REF=refs/heads/trunk
+2026-07-22T20:42:23.4695938Z RUNNER_OS=Linux
+2026-07-22T20:42:23.4696895Z GITHUB_REF_PROTECTED=true
+2026-07-22T20:42:23.4697407Z HOME=/home/runner
+2026-07-22T20:42:23.4697903Z GITHUB_API_URL=https://api.github.com
+2026-07-22T20:42:23.4698484Z LANG=C.UTF-8
+2026-07-22T20:42:23.4698992Z GOROOT_1_25_X64=/opt/hostedtoolcache/go/1.25.12/x64
+2026-07-22T20:42:23.4699751Z RUNNER_TRACKING_ID=github_a7ea4c4e-00ca-49f6-8cc4-6ca226719ad9
+2026-07-22T20:42:23.4700429Z RUNNER_ARCH=X64
+2026-07-22T20:42:23.4701203Z MEMORY_PRESSURE_WATCH=/sys/fs/cgroup/system.slice/hosted-compute-agent.service/memory.pressure
+2026-07-22T20:42:23.4702126Z RUNNER_TEMP=/home/runner/work/_temp
+2026-07-22T20:42:23.4703048Z GITHUB_STATE=/home/runner/work/_temp/_runner_file_commands/save_state_13912718-9799-49ef-8b40-65cffbe41ea4
+2026-07-22T20:42:23.4704010Z EDGEWEBDRIVER=/usr/local/share/edge_driver
+2026-07-22T20:42:23.4704648Z JAVA_HOME_21_X64=/usr/lib/jvm/temurin-21-jdk-amd64
+2026-07-22T20:42:23.4705638Z GITHUB_ENV=/home/runner/work/_temp/_runner_file_commands/set_env_13912718-9799-49ef-8b40-65cffbe41ea4
+2026-07-22T20:42:23.4707176Z GITHUB_EVENT_PATH=/home/runner/work/_temp/_github_workflow/event.json
+2026-07-22T20:42:23.4707974Z INVOCATION_ID=f1ee0f75bdb74005b0b565a769d68fb7
+2026-07-22T20:42:23.4708594Z GITHUB_EVENT_NAME=push
+2026-07-22T20:42:23.4709112Z GITHUB_RUN_ID=29940786887
+2026-07-22T20:42:23.4709671Z JAVA_HOME_17_X64=/usr/lib/jvm/temurin-17-jdk-amd64
+2026-07-22T20:42:23.4710415Z ANDROID_NDK_HOME=/usr/local/lib/android/sdk/ndk/27.3.13750724
+2026-07-22T20:42:23.4711534Z GITHUB_STEP_SUMMARY=/home/runner/work/_temp/_runner_file_commands/step_summary_13912718-9799-49ef-8b40-65cffbe41ea4
+2026-07-22T20:42:23.4712518Z HOMEBREW_NO_AUTO_UPDATE=1
+2026-07-22T20:42:23.4713034Z GITHUB_ACTOR=mjsax
+2026-07-22T20:42:23.4713701Z NVM_DIR=/home/runner/.nvm
+2026-07-22T20:42:23.4714219Z SGX_AESM_ADDR=1
+2026-07-22T20:42:23.4714681Z GITHUB_RUN_ATTEMPT=1
+2026-07-22T20:42:23.4715178Z ANDROID_HOME=/usr/local/lib/android/sdk
+2026-07-22T20:42:23.4715829Z GITHUB_GRAPHQL_URL=https://api.github.com/graphql
+2026-07-22T20:42:23.4716664Z ACCEPT_EULA=Y
+2026-07-22T20:42:23.4717104Z USER=runner
+2026-07-22T20:42:23.4718180Z PSModulePath=/root/.local/share/powershell/Modules:/usr/local/share/powershell/Modules:/opt/microsoft/powershell/7/Modules:/usr/share/az_15.6.1
+2026-07-22T20:42:23.4719414Z GITHUB_SERVER_URL=https://github.com
+2026-07-22T20:42:23.4720018Z PIPX_HOME=/opt/pipx
+2026-07-22T20:42:23.4720585Z GECKOWEBDRIVER=/usr/local/share/gecko_driver
+2026-07-22T20:42:23.4721315Z CHROMEWEBDRIVER=/usr/local/share/chromedriver-linux64
+2026-07-22T20:42:23.4722004Z SHLVL=1
+2026-07-22T20:42:23.4722465Z ANDROID_SDK_ROOT=/usr/local/lib/android/sdk
+2026-07-22T20:42:23.4723100Z VCPKG_INSTALLATION_ROOT=/usr/local/share/vcpkg
+2026-07-22T20:42:23.4723735Z GITHUB_ACTOR_ID=8959638
+2026-07-22T20:42:23.4724555Z ACTIONS_ORCHESTRATION_ID=96d56038-1dd8-4c5a-950a-fa7deafe29cd.build.checks-complete.__default
+2026-07-22T20:42:23.4725499Z RUNNER_TOOL_CACHE=/opt/hostedtoolcache
+2026-07-22T20:42:23.4726195Z ImageVersion=20260714.240.1
+2026-07-22T20:42:23.4727010Z DOTNET_NOLOGO=1
+2026-07-22T20:42:23.4727466Z GITHUB_CONTEXT={
+2026-07-22T20:42:23.4731573Z   "token": "***",
+2026-07-22T20:42:23.4732048Z   "job": "checks-complete",
+2026-07-22T20:42:23.4732571Z   "ref": "refs/heads/trunk",
+2026-07-22T20:42:23.4733131Z   "sha": "3c257464fe4c2e83d85c13d611546e28f09f967c",
+2026-07-22T20:42:23.4733760Z   "repository": "apache/kafka",
+2026-07-22T20:42:23.4734320Z   "repository_owner": "apache",
+2026-07-22T20:42:23.4734855Z   "repository_owner_id": "47359",
+2026-07-22T20:42:23.4735476Z   "repositoryUrl": "git://github.com/apache/kafka.git",
+2026-07-22T20:42:23.4736294Z   "run_id": "29940786887",
+2026-07-22T20:42:23.4736791Z   "run_number": "31777",
+2026-07-22T20:42:23.4737305Z   "retention_days": "90",
+2026-07-22T20:42:23.4737808Z   "run_attempt": "1",
+2026-07-22T20:42:23.4738296Z   "artifact_cache_size_limit": "10",
+2026-07-22T20:42:23.4738888Z   "repository_visibility": "public",
+2026-07-22T20:42:23.4739447Z   "actor_id": "8959638",
+2026-07-22T20:42:23.4739923Z   "actor": "mjsax",
+2026-07-22T20:42:23.4740747Z   "workflow": "CI",
+2026-07-22T20:42:23.4741571Z   "head_ref": "",
+2026-07-22T20:42:23.4742342Z   "base_ref": "",
+2026-07-22T20:42:23.4743111Z   "event_name": "push",
+2026-07-22T20:42:23.4744021Z   "server_url": "https://github.com",
+2026-07-22T20:42:23.4745196Z   "api_url": "https://api.github.com",
+2026-07-22T20:42:23.4746607Z   "graphql_url": "https://api.github.com/graphql",
+2026-07-22T20:42:23.4747788Z   "ref_name": "trunk",
+2026-07-22T20:42:23.4748634Z   "ref_protected": true,
+2026-07-22T20:42:23.4749524Z   "ref_type": "branch",
+2026-07-22T20:42:23.4750431Z   "secret_source": "Actions",
+2026-07-22T20:42:23.4751316Z   "event": {
+2026-07-22T20:42:23.4752253Z     "after": "3c257464fe4c2e83d85c13d611546e28f09f967c",
+2026-07-22T20:42:23.4753341Z     "base_ref": null,
+2026-07-22T20:42:23.4754294Z     "before": "3d48cb3fa1f08794fe0c6ac3b89492f0f2ddbbe0",
+2026-07-22T20:42:23.4755396Z     "commits": [
+2026-07-22T20:42:23.4756454Z       {
+2026-07-22T20:42:23.4757140Z         "author": {
+2026-07-22T20:42:23.4757993Z           "email": "lucliu@confluent.io",
+2026-07-22T20:42:23.4759027Z           "name": "Lucy Liu",
+2026-07-22T20:42:23.4759858Z           "username": "lucliu1108"
+2026-07-22T20:42:23.4760724Z         },
+2026-07-22T20:42:23.4761494Z         "committer": {
+2026-07-22T20:42:23.4762482Z           "email": "noreply@github.com",
+2026-07-22T20:42:23.4763421Z           "name": "GitHub",
+2026-07-22T20:42:23.4764195Z           "username": "web-flow"
+2026-07-22T20:42:23.4765045Z         },
+2026-07-22T20:42:23.4765826Z         "distinct": true,
+2026-07-22T20:42:23.4767115Z         "id": "3c257464fe4c2e83d85c13d611546e28f09f967c",
+2026-07-22T20:42:23.4771565Z         "message": "MINOR: Fix KStream leftJoin doc and test param naming for KStream-GlobalKTable  (#22889)\n\nThis PR fixes:\n- Wrong description regarding leftJoin(GlobalKTable, ...) Javadoc when\nkeySelector is null\n- Wrong param ordering for ValueJoinerWithStreamAndMappedKey for 2 unit\ntests\n\nReviewers: Matthias J. Sax <matthias@confluent.io>",
+2026-07-22T20:42:23.4775888Z         "timestamp": "2026-07-22T10:04:21-07:00",
+2026-07-22T20:42:23.4777392Z         "tree_id": "9c3536c43f6c04530deb719068e580edc49af846",
+2026-07-22T20:42:23.4779035Z         "url": "https://github.com/apache/kafka/commit/3c257464fe4c2e83d85c13d611546e28f09f967c"
+2026-07-22T20:42:23.4780550Z       }
+2026-07-22T20:42:23.4781293Z     ],
+2026-07-22T20:42:23.4782451Z     "compare": "https://github.com/apache/kafka/compare/3d48cb3fa1f0...3c257464fe4c",
+2026-07-22T20:42:23.4783941Z     "created": false,
+2026-07-22T20:42:23.4784791Z     "deleted": false,
+2026-07-22T20:42:23.4785637Z     "enterprise": {
+2026-07-22T20:42:23.4787107Z       "avatar_url": "https://avatars.githubusercontent.com/b/212555?v=4",
+2026-07-22T20:42:23.4788499Z       "created_at": "2024-08-17T07:54:05Z",
+2026-07-22T20:42:23.4789527Z       "description": null,
+2026-07-22T20:42:23.4790526Z       "html_url": "https://github.com/enterprises/the-asf",
+2026-07-22T20:42:23.4791694Z       "id": 212555,
+2026-07-22T20:42:23.4792931Z       "name": "The ASF",
+2026-07-22T20:42:23.4793844Z       "node_id": "E_kgDOAAM-Sw",
+2026-07-22T20:42:23.4794787Z       "slug": "the-asf",
+2026-07-22T20:42:23.4795623Z       "updated_at": "2026-07-12T11:35:24Z",
+2026-07-22T20:42:23.4796647Z       "website_url": null
+2026-07-22T20:42:23.4797199Z     },
+2026-07-22T20:42:23.4797645Z     "forced": false,
+2026-07-22T20:42:23.4798111Z     "head_commit": {
+2026-07-22T20:42:23.4798563Z       "author": {
+2026-07-22T20:42:23.4799042Z         "email": "lucliu@confluent.io",
+2026-07-22T20:42:23.4799610Z         "name": "Lucy Liu",
+2026-07-22T20:42:23.4800126Z         "username": "lucliu1108"
+2026-07-22T20:42:23.4800630Z       },
+2026-07-22T20:42:23.4801054Z       "committer": {
+2026-07-22T20:42:23.4801535Z         "email": "noreply@github.com",
+2026-07-22T20:42:23.4802086Z         "name": "GitHub",
+2026-07-22T20:42:23.4802578Z         "username": "web-flow"
+2026-07-22T20:42:23.4803073Z       },
+2026-07-22T20:42:23.4803486Z       "distinct": true,
+2026-07-22T20:42:23.4804018Z       "id": "3c257464fe4c2e83d85c13d611546e28f09f967c",
+2026-07-22T20:42:23.4806651Z       "message": "MINOR: Fix KStream leftJoin doc and test param naming for KStream-GlobalKTable  (#22889)\n\nThis PR fixes:\n- Wrong description regarding leftJoin(GlobalKTable, ...) Javadoc when\nkeySelector is null\n- Wrong param ordering for ValueJoinerWithStreamAndMappedKey for 2 unit\ntests\n\nReviewers: Matthias J. Sax <matthias@confluent.io>",
+2026-07-22T20:42:23.4809049Z       "timestamp": "2026-07-22T10:04:21-07:00",
+2026-07-22T20:42:23.4809713Z       "tree_id": "9c3536c43f6c04530deb719068e580edc49af846",
+2026-07-22T20:42:23.4810627Z       "url": "https://github.com/apache/kafka/commit/3c257464fe4c2e83d85c13d611546e28f09f967c"
+2026-07-22T20:42:23.4811487Z     },
+2026-07-22T20:42:23.4811902Z     "organization": {
+2026-07-22T20:42:23.4812525Z       "avatar_url": "https://avatars.githubusercontent.com/u/47359?v=4",
+2026-07-22T20:42:23.4813248Z       "description": "",
+2026-07-22T20:42:23.4813983Z       "events_url": "https://api.github.com/orgs/apache/events",
+2026-07-22T20:42:23.4814788Z       "hooks_url": "https://api.github.com/orgs/apache/hooks",
+2026-07-22T20:42:23.4815433Z       "id": 47359,
+2026-07-22T20:42:23.4815984Z       "issues_url": "https://api.github.com/orgs/apache/issues",
+2026-07-22T20:42:23.4816977Z       "login": "apache",
+2026-07-22T20:42:23.4817623Z       "members_url": "https://api.github.com/orgs/apache/members{/member}",
+2026-07-22T20:42:23.4818406Z       "node_id": "MDEyOk9yZ2FuaXphdGlvbjQ3MzU5",
+2026-07-22T20:42:23.4819251Z       "public_members_url": "https://api.github.com/orgs/apache/public_members{/member}",
+2026-07-22T20:42:23.4820440Z       "repos_url": "https://api.github.com/orgs/apache/repos",
+2026-07-22T20:42:23.4821161Z       "url": "https://api.github.com/orgs/apache"
+2026-07-22T20:42:23.4821746Z     },
+2026-07-22T20:42:23.4822156Z     "pusher": {
+2026-07-22T20:42:23.4822609Z       "email": "mjsax@apache.org",
+2026-07-22T20:42:23.4823137Z       "name": "mjsax"
+2026-07-22T20:42:23.4823582Z     },
+2026-07-22T20:42:23.4824002Z     "ref": "refs/heads/trunk",
+2026-07-22T20:42:23.4824502Z     "repository": {
+2026-07-22T20:42:23.4824960Z       "allow_forking": true,
+2026-07-22T20:42:23.4825714Z       "archive_url": "https://api.github.com/repos/apache/kafka/{archive_format}{/ref}",
+2026-07-22T20:42:23.4826945Z       "archived": false,
+2026-07-22T20:42:23.4827722Z       "assignees_url": "https://api.github.com/repos/apache/kafka/assignees{/user}",
+2026-07-22T20:42:23.4828702Z       "blobs_url": "https://api.github.com/repos/apache/kafka/git/blobs{/sha}",
+2026-07-22T20:42:23.4829661Z       "branches_url": "https://api.github.com/repos/apache/kafka/branches{/branch}",
+2026-07-22T20:42:23.4830528Z       "clone_url": "https://github.com/apache/kafka.git",
+2026-07-22T20:42:23.4831486Z       "collaborators_url": "https://api.github.com/repos/apache/kafka/collaborators{/collaborator}",
+2026-07-22T20:42:23.4832562Z       "comments_url": "https://api.github.com/repos/apache/kafka/comments{/number}",
+2026-07-22T20:42:23.4833683Z       "commits_url": "https://api.github.com/repos/apache/kafka/commits{/sha}",
+2026-07-22T20:42:23.4834658Z       "compare_url": "https://api.github.com/repos/apache/kafka/compare/{base}...{head}",
+2026-07-22T20:42:23.4835658Z       "contents_url": "https://api.github.com/repos/apache/kafka/contents/{+path}",
+2026-07-22T20:42:23.4836933Z       "contributors_url": "https://api.github.com/repos/apache/kafka/contributors",
+2026-07-22T20:42:23.4837736Z       "created_at": 1313431576,
+2026-07-22T20:42:23.4838265Z       "custom_properties": {},
+2026-07-22T20:42:23.4838776Z       "default_branch": "trunk",
+2026-07-22T20:42:23.4839498Z       "deployments_url": "https://api.github.com/repos/apache/kafka/deployments",
+2026-07-22T20:42:23.4840463Z       "description": "Apache Kafka - A distributed event streaming platform",
+2026-07-22T20:42:23.4841208Z       "disabled": false,
+2026-07-22T20:42:23.4841869Z       "downloads_url": "https://api.github.com/repos/apache/kafka/downloads",
+2026-07-22T20:42:23.4842791Z       "events_url": "https://api.github.com/repos/apache/kafka/events",
+2026-07-22T20:42:23.4843482Z       "fork": false,
+2026-07-22T20:42:23.4843930Z       "forks": 15368,
+2026-07-22T20:42:23.4844384Z       "forks_count": 15368,
+2026-07-22T20:42:23.4845005Z       "forks_url": "https://api.github.com/repos/apache/kafka/forks",
+2026-07-22T20:42:23.4845696Z       "full_name": "apache/kafka",
+2026-07-22T20:42:23.4846666Z       "git_commits_url": "https://api.github.com/repos/apache/kafka/git/commits{/sha}",
+2026-07-22T20:42:23.4847655Z       "git_refs_url": "https://api.github.com/repos/apache/kafka/git/refs{/sha}",
+2026-07-22T20:42:23.4848594Z       "git_tags_url": "https://api.github.com/repos/apache/kafka/git/tags{/sha}",
+2026-07-22T20:42:23.4849421Z       "git_url": "git://github.com/apache/kafka.git",
+2026-07-22T20:42:23.4850051Z       "has_discussions": false,
+2026-07-22T20:42:23.4850594Z       "has_downloads": true,
+2026-07-22T20:42:23.4851104Z       "has_issues": false,
+2026-07-22T20:42:23.4851589Z       "has_pages": false,
+2026-07-22T20:42:23.4852070Z       "has_projects": true,
+2026-07-22T20:42:23.4852571Z       "has_pull_requests": true,
+2026-07-22T20:42:23.4853076Z       "has_wiki": false,
+2026-07-22T20:42:23.4853593Z       "homepage": "https://kafka.apache.org/",
+2026-07-22T20:42:23.4854320Z       "hooks_url": "https://api.github.com/repos/apache/kafka/hooks",
+2026-07-22T20:42:23.4855067Z       "html_url": "https://github.com/apache/kafka",
+2026-07-22T20:42:23.4855668Z       "id": 2211243,
+2026-07-22T20:42:23.4856323Z       "is_template": false,
+2026-07-22T20:42:23.4857277Z       "issue_comment_url": "https://api.github.com/repos/apache/kafka/issues/comments{/number}",
+2026-07-22T20:42:23.4858386Z       "issue_events_url": "https://api.github.com/repos/apache/kafka/issues/events{/number}",
+2026-07-22T20:42:23.4859404Z       "issues_url": "https://api.github.com/repos/apache/kafka/issues{/number}",
+2026-07-22T20:42:23.4860326Z       "keys_url": "https://api.github.com/repos/apache/kafka/keys{/key_id}",
+2026-07-22T20:42:23.4861228Z       "labels_url": "https://api.github.com/repos/apache/kafka/labels{/name}",
+2026-07-22T20:42:23.4861998Z       "language": "Java",
+2026-07-22T20:42:23.4862714Z       "languages_url": "https://api.github.com/repos/apache/kafka/languages",
+2026-07-22T20:42:23.4863435Z       "license": {
+2026-07-22T20:42:23.4863883Z         "key": "apache-2.0",
+2026-07-22T20:42:23.4864407Z         "name": "Apache License 2.0",
+2026-07-22T20:42:23.4864981Z         "node_id": "MDc6TGljZW5zZTI=",
+2026-07-22T20:42:23.4865537Z         "spdx_id": "Apache-2.0",
+2026-07-22T20:42:23.4866398Z         "url": "https://api.github.com/licenses/apache-2.0"
+2026-07-22T20:42:23.4867057Z       },
+2026-07-22T20:42:23.4867474Z       "master_branch": "trunk",
+2026-07-22T20:42:23.4868130Z       "merges_url": "https://api.github.com/repos/apache/kafka/merges",
+2026-07-22T20:42:23.4869067Z       "milestones_url": "https://api.github.com/repos/apache/kafka/milestones{/number}",
+2026-07-22T20:42:23.4870021Z       "mirror_url": null,
+2026-07-22T20:42:23.4870497Z       "name": "kafka",
+2026-07-22T20:42:23.4871006Z       "node_id": "MDEwOlJlcG9zaXRvcnkyMjExMjQz",
+2026-07-22T20:42:23.4871989Z       "notifications_url": "https://api.github.com/repos/apache/kafka/notifications{?since,all,participating}",
+2026-07-22T20:42:23.4872942Z       "open_issues": 456,
+2026-07-22T20:42:23.4873424Z       "open_issues_count": 456,
+2026-07-22T20:42:23.4873962Z       "organization": "apache",
+2026-07-22T20:42:23.4874456Z       "owner": {
+2026-07-22T20:42:23.4875044Z         "avatar_url": "https://avatars.githubusercontent.com/u/47359?v=4",
+2026-07-22T20:42:23.4875758Z         "email": null,
+2026-07-22T20:42:23.4876665Z         "events_url": "https://api.github.com/users/apache/events{/privacy}",
+2026-07-22T20:42:23.4877552Z         "followers_url": "https://api.github.com/users/apache/followers",
+2026-07-22T20:42:23.4878477Z         "following_url": "https://api.github.com/users/apache/following{/other_user}",
+2026-07-22T20:42:23.4879405Z         "gists_url": "https://api.github.com/users/apache/gists{/gist_id}",
+2026-07-22T20:42:23.4880110Z         "gravatar_id": "",
+2026-07-22T20:42:23.4880635Z         "html_url": "https://github.com/apache",
+2026-07-22T20:42:23.4881222Z         "id": 47359,
+2026-07-22T20:42:23.4881672Z         "login": "apache",
+2026-07-22T20:42:23.4882154Z         "name": "apache",
+2026-07-22T20:42:23.4882703Z         "node_id": "MDEyOk9yZ2FuaXphdGlvbjQ3MzU5",
+2026-07-22T20:42:23.4883475Z         "organizations_url": "https://api.github.com/users/apache/orgs",
+2026-07-22T20:42:23.4884402Z         "received_events_url": "https://api.github.com/users/apache/received_events",
+2026-07-22T20:42:23.4885285Z         "repos_url": "https://api.github.com/users/apache/repos",
+2026-07-22T20:42:23.4885947Z         "site_admin": false,
+2026-07-22T20:42:23.4886805Z         "starred_url": "https://api.github.com/users/apache/starred{/owner}{/repo}",
+2026-07-22T20:42:23.4887778Z         "subscriptions_url": "https://api.github.com/users/apache/subscriptions",
+2026-07-22T20:42:23.4888556Z         "type": "Organization",
+2026-07-22T20:42:23.4889116Z         "url": "https://api.github.com/users/apache",
+2026-07-22T20:42:23.4889733Z         "user_view_type": "public"
+2026-07-22T20:42:23.4890241Z       },
+2026-07-22T20:42:23.4890650Z       "private": false,
+2026-07-22T20:42:23.4891165Z       "pull_request_creation_policy": "all",
+2026-07-22T20:42:23.4891950Z       "pulls_url": "https://api.github.com/repos/apache/kafka/pulls{/number}",
+2026-07-22T20:42:23.4892708Z       "pushed_at": 1784739862,
+2026-07-22T20:42:23.4893428Z       "releases_url": "https://api.github.com/repos/apache/kafka/releases{/id}",
+2026-07-22T20:42:23.4894365Z       "size": 301138,
+2026-07-22T20:42:23.4894886Z       "ssh_url": "git@github.com:apache/kafka.git",
+2026-07-22T20:42:23.4895494Z       "stargazers": 33300,
+2026-07-22T20:42:23.4895990Z       "stargazers_count": 33300,
+2026-07-22T20:42:23.4896827Z       "stargazers_url": "https://api.github.com/repos/apache/kafka/stargazers",
+2026-07-22T20:42:23.4897782Z       "statuses_url": "https://api.github.com/repos/apache/kafka/statuses/{sha}",
+2026-07-22T20:42:23.4898728Z       "subscribers_url": "https://api.github.com/repos/apache/kafka/subscribers",
+2026-07-22T20:42:23.4899735Z       "subscription_url": "https://api.github.com/repos/apache/kafka/subscription",
+2026-07-22T20:42:23.4900563Z       "svn_url": "https://github.com/apache/kafka",
+2026-07-22T20:42:23.4901289Z       "tags_url": "https://api.github.com/repos/apache/kafka/tags",
+2026-07-22T20:42:23.4902111Z       "teams_url": "https://api.github.com/repos/apache/kafka/teams",
+2026-07-22T20:42:23.4902797Z       "topics": [
+2026-07-22T20:42:23.4903226Z         "java",
+2026-07-22T20:42:23.4903645Z         "kafka",
+2026-07-22T20:42:23.4904071Z         "scala",
+2026-07-22T20:42:23.4904491Z         "streaming"
+2026-07-22T20:42:23.4904912Z       ],
+2026-07-22T20:42:23.4905497Z       "trees_url": "https://api.github.com/repos/apache/kafka/git/trees{/sha}",
+2026-07-22T20:42:23.4906527Z       "updated_at": "2026-07-22T17:03:59Z",
+2026-07-22T20:42:23.4907161Z       "url": "https://api.github.com/repos/apache/kafka",
+2026-07-22T20:42:23.4907793Z       "visibility": "public",
+2026-07-22T20:42:23.4908296Z       "watchers": 33300,
+2026-07-22T20:42:23.4908778Z       "watchers_count": 33300,
+2026-07-22T20:42:23.4909314Z       "web_commit_signoff_required": false
+2026-07-22T20:42:23.4909865Z     },
+2026-07-22T20:42:23.4910284Z     "sender": {
+2026-07-22T20:42:23.4910894Z       "avatar_url": "https://avatars.githubusercontent.com/u/8959638?v=4",
+2026-07-22T20:42:23.4911803Z       "events_url": "https://api.github.com/users/mjsax/events{/privacy}",
+2026-07-22T20:42:23.4912670Z       "followers_url": "https://api.github.com/users/mjsax/followers",
+2026-07-22T20:42:23.4913578Z       "following_url": "https://api.github.com/users/mjsax/following{/other_user}",
+2026-07-22T20:42:23.4914481Z       "gists_url": "https://api.github.com/users/mjsax/gists{/gist_id}",
+2026-07-22T20:42:23.4915178Z       "gravatar_id": "",
+2026-07-22T20:42:23.4915696Z       "html_url": "https://github.com/mjsax",
+2026-07-22T20:42:23.4916417Z       "id": 8959638,
+2026-07-22T20:42:23.4916861Z       "login": "mjsax",
+2026-07-22T20:42:23.4917344Z       "node_id": "MDQ6VXNlcjg5NTk2Mzg=",
+2026-07-22T20:42:23.4918064Z       "organizations_url": "https://api.github.com/users/mjsax/orgs",
+2026-07-22T20:42:23.4918984Z       "received_events_url": "https://api.github.com/users/mjsax/received_events",
+2026-07-22T20:42:23.4919845Z       "repos_url": "https://api.github.com/users/mjsax/repos",
+2026-07-22T20:42:23.4920496Z       "site_admin": false,
+2026-07-22T20:42:23.4921182Z       "starred_url": "https://api.github.com/users/mjsax/starred{/owner}{/repo}",
+2026-07-22T20:42:23.4922132Z       "subscriptions_url": "https://api.github.com/users/mjsax/subscriptions",
+2026-07-22T20:42:23.4922875Z       "type": "User",
+2026-07-22T20:42:23.4923385Z       "url": "https://api.github.com/users/mjsax",
+2026-07-22T20:42:23.4924008Z       "user_view_type": "public"
+2026-07-22T20:42:23.4924503Z     }
+2026-07-22T20:42:23.4924893Z   },
+2026-07-22T20:42:23.4925473Z   "workflow_ref": "apache/kafka/.github/workflows/ci.yml@refs/heads/trunk",
+2026-07-22T20:42:23.4926426Z   "workflow_sha": "3c257464fe4c2e83d85c13d611546e28f09f967c",
+2026-07-22T20:42:23.4927087Z   "repository_id": "2211243",
+2026-07-22T20:42:23.4927597Z   "triggering_actor": "mjsax",
+2026-07-22T20:42:23.4928149Z   "workspace": "/home/runner/work/kafka/kafka",
+2026-07-22T20:42:23.4928764Z   "action": "__run"
+2026-07-22T20:42:23.4929193Z }
+2026-07-22T20:42:23.4929706Z GITHUB_WORKFLOW_SHA=3c257464fe4c2e83d85c13d611546e28f09f967c
+2026-07-22T20:42:23.4930583Z GOROOT_1_24_X64=/opt/hostedtoolcache/go/1.24.13/x64
+2026-07-22T20:42:23.4931222Z GITHUB_REF_NAME=trunk
+2026-07-22T20:42:23.4931704Z GITHUB_JOB=checks-complete
+2026-07-22T20:42:23.4932201Z XDG_RUNTIME_DIR=/run/user/1001
+2026-07-22T20:42:23.4932746Z AZURE_EXTENSION_DIR=/opt/az/azcliextensions
+2026-07-22T20:42:23.4933396Z GOROOT_1_26_X64=/opt/hostedtoolcache/go/1.26.5/x64
+2026-07-22T20:42:23.4934020Z GITHUB_REPOSITORY=apache/kafka
+2026-07-22T20:42:23.4934554Z CHROME_BIN=/usr/bin/google-chrome
+2026-07-22T20:42:23.4935190Z ANDROID_NDK_ROOT=/usr/local/lib/android/sdk/ndk/27.3.13750724
+2026-07-22T20:42:23.4935864Z GITHUB_RETENTION_DAYS=90
+2026-07-22T20:42:23.4936514Z JOURNAL_STREAM=9:11739
+2026-07-22T20:42:23.4937009Z RUNNER_WORKSPACE=/home/runner/work/kafka
+2026-07-22T20:42:23.4937589Z GITHUB_ACTION_REPOSITORY=
+2026-07-22T20:42:23.4938078Z HCA_CLOUD_PROVIDER=azure
+2026-07-22T20:42:23.4939795Z PATH=/snap/bin:/home/runner/.local/bin:/opt/pipx_bin:/home/runner/.cargo/bin:/home/runner/.config/composer/vendor/bin:/usr/local/.ghcup/bin:/home/runner/.dotnet/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
+2026-07-22T20:42:23.4941570Z GITHUB_BASE_REF=
+2026-07-22T20:42:23.4942030Z GHCUP_INSTALL_BASE_PREFIX=/usr/local
+2026-07-22T20:42:23.4942558Z CI=true
+2026-07-22T20:42:23.4943141Z SWIFT_PATH=/usr/share/swift/usr/bin
+2026-07-22T20:42:23.4943674Z ImageOS=ubuntu24
+2026-07-22T20:42:23.4944133Z GITHUB_REPOSITORY_OWNER=apache
+2026-07-22T20:42:23.4944645Z GITHUB_HEAD_REF=
+2026-07-22T20:42:23.4945078Z GITHUB_ACTION_REF=
+2026-07-22T20:42:23.4945534Z ENABLE_RUNNER_TRACING=true
+2026-07-22T20:42:23.4946200Z GITHUB_WORKFLOW=CI
+2026-07-22T20:42:23.4946670Z DEBIAN_FRONTEND=noninteractive
+2026-07-22T20:42:23.4947580Z GITHUB_OUTPUT=/home/runner/work/_temp/_runner_file_commands/set_output_13912718-9799-49ef-8b40-65cffbe41ea4
+2026-07-22T20:42:23.4948552Z AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache
+2026-07-22T20:42:23.4949120Z _=/usr/bin/printenv
+2026-07-22T20:42:23.5106597Z ##[group]Run if [[ "success" == "success" && "success" == "success" ]]; then
+2026-07-22T20:42:23.5107584Z [36;1mif [[ "success" == "success" && "success" == "success" ]]; then[0m
+2026-07-22T20:42:23.5108368Z [36;1m  echo "Required jobs completed successfully!"[0m
+2026-07-22T20:42:23.5108996Z [36;1m  exit 0[0m
+2026-07-22T20:42:23.5109447Z [36;1melse[0m
+2026-07-22T20:42:23.5109985Z [36;1m  echo "Required jobs did not complete successfully"[0m
+2026-07-22T20:42:23.5110623Z [36;1m  exit 1[0m
+2026-07-22T20:42:23.5111044Z [36;1mfi[0m
+2026-07-22T20:42:23.5168432Z shell: /usr/bin/bash -e {0}
+2026-07-22T20:42:23.5168974Z ##[endgroup]
+2026-07-22T20:42:23.5254037Z Required jobs completed successfully!
+2026-07-22T20:42:23.5342584Z Cleaning up orphan processes

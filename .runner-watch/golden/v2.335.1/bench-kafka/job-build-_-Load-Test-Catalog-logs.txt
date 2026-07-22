@@ -1,0 +1,368 @@
+2026-07-22T17:40:12.9323164Z Current runner version: '2.336.0'
+2026-07-22T17:40:12.9349231Z ##[group]Runner Image Provisioner
+2026-07-22T17:40:12.9350141Z Hosted Compute Agent
+2026-07-22T17:40:12.9350726Z Version: 20260707.563
+2026-07-22T17:40:12.9351573Z Commit: 02667638d2b423fbc733a8e32a88b44996a3ba6e
+2026-07-22T17:40:12.9352371Z Build Date: 2026-07-07T19:33:50Z
+2026-07-22T17:40:12.9353091Z Worker ID: {d1f39b97-c674-4fed-b513-32d31761c1ba}
+2026-07-22T17:40:12.9354138Z Azure Region: eastus
+2026-07-22T17:40:12.9354745Z ##[endgroup]
+2026-07-22T17:40:12.9356277Z ##[group]Operating System
+2026-07-22T17:40:12.9357036Z Ubuntu
+2026-07-22T17:40:12.9357592Z 24.04.4
+2026-07-22T17:40:12.9358122Z LTS
+2026-07-22T17:40:12.9358654Z ##[endgroup]
+2026-07-22T17:40:12.9359197Z ##[group]Runner Image
+2026-07-22T17:40:12.9359829Z Image: ubuntu-24.04
+2026-07-22T17:40:12.9360423Z Version: 20260720.247.2
+2026-07-22T17:40:12.9362149Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260720.247/images/ubuntu/Ubuntu2404-Readme.md
+2026-07-22T17:40:12.9363681Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260720.247
+2026-07-22T17:40:12.9364707Z ##[endgroup]
+2026-07-22T17:40:12.9367858Z ##[group]GITHUB_TOKEN Permissions
+2026-07-22T17:40:12.9370349Z Actions: write
+2026-07-22T17:40:12.9371331Z ArtifactMetadata: write
+2026-07-22T17:40:12.9372056Z Attestations: write
+2026-07-22T17:40:12.9372697Z Checks: write
+2026-07-22T17:40:12.9373250Z CodeQuality: write
+2026-07-22T17:40:12.9373870Z Contents: write
+2026-07-22T17:40:12.9374420Z CopilotRequests: write
+2026-07-22T17:40:12.9374985Z Deployments: write
+2026-07-22T17:40:12.9375652Z Discussions: write
+2026-07-22T17:40:12.9376199Z Drives: write
+2026-07-22T17:40:12.9376749Z Issues: write
+2026-07-22T17:40:12.9377294Z Metadata: read
+2026-07-22T17:40:12.9377945Z Models: read
+2026-07-22T17:40:12.9378576Z Packages: write
+2026-07-22T17:40:12.9379146Z Pages: write
+2026-07-22T17:40:12.9379708Z PullRequests: write
+2026-07-22T17:40:12.9380333Z RepositoryProjects: write
+2026-07-22T17:40:12.9381336Z SecurityEvents: write
+2026-07-22T17:40:12.9382084Z Statuses: write
+2026-07-22T17:40:12.9382649Z VulnerabilityAlerts: read
+2026-07-22T17:40:12.9383277Z ##[endgroup]
+2026-07-22T17:40:12.9385427Z Secret source: Actions
+2026-07-22T17:40:12.9386420Z Prepare workflow directory
+2026-07-22T17:40:12.9713038Z Prepare all required actions
+2026-07-22T17:40:12.9755368Z Getting action download info
+2026-07-22T17:40:13.2346113Z Download action repository 'actions/checkout@v5' (SHA:fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09)
+2026-07-22T17:40:13.4861184Z Download action repository 'actions/upload-artifact@v4' (SHA:ea165f8d65b6e75b540449e92b4886f43607fa02)
+2026-07-22T17:40:13.7440415Z Uses: apache/kafka/.github/workflows/build.yml@refs/heads/trunk (3c257464fe4c2e83d85c13d611546e28f09f967c)
+2026-07-22T17:40:13.7445305Z ##[group] Inputs
+2026-07-22T17:40:13.7446199Z   is-trunk: true
+2026-07-22T17:40:13.7446682Z   is-public-fork: false
+2026-07-22T17:40:13.7447167Z ##[endgroup]
+2026-07-22T17:40:13.7447660Z Complete job name: build / Load Test Catalog
+2026-07-22T17:40:13.8329495Z ##[group]Run actions/checkout@v5
+2026-07-22T17:40:13.8330387Z with:
+2026-07-22T17:40:13.8331037Z   persist-credentials: false
+2026-07-22T17:40:13.8331579Z   repository: apache/kafka
+2026-07-22T17:40:13.8335505Z   token: ***
+2026-07-22T17:40:13.8335967Z   ssh-strict: true
+2026-07-22T17:40:13.8336389Z   ssh-user: git
+2026-07-22T17:40:13.8336791Z   clean: true
+2026-07-22T17:40:13.8337224Z   sparse-checkout-cone-mode: true
+2026-07-22T17:40:13.8337757Z   fetch-depth: 1
+2026-07-22T17:40:13.8338185Z   fetch-tags: false
+2026-07-22T17:40:13.8338623Z   show-progress: true
+2026-07-22T17:40:13.8339063Z   lfs: false
+2026-07-22T17:40:13.8339456Z   submodules: false
+2026-07-22T17:40:13.8339895Z   set-safe-directory: true
+2026-07-22T17:40:13.8340398Z   allow-unsafe-pr-checkout: false
+2026-07-22T17:40:13.8341419Z ##[endgroup]
+2026-07-22T17:40:13.9367957Z Syncing repository: apache/kafka
+2026-07-22T17:40:13.9370419Z ##[group]Getting Git version info
+2026-07-22T17:40:13.9372584Z Working directory is '/home/runner/work/kafka/kafka'
+2026-07-22T17:40:13.9374251Z [command]/usr/bin/git version
+2026-07-22T17:40:13.9440734Z git version 2.54.0
+2026-07-22T17:40:13.9495310Z ##[endgroup]
+2026-07-22T17:40:13.9512074Z Temporarily overriding HOME='/home/runner/work/_temp/43af9983-7547-4cd9-9ae4-c254617e89d1' before making global git config changes
+2026-07-22T17:40:13.9514642Z Adding repository directory to the temporary git global config as a safe directory
+2026-07-22T17:40:13.9517217Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/kafka/kafka
+2026-07-22T17:40:13.9565480Z Deleting the contents of '/home/runner/work/kafka/kafka'
+2026-07-22T17:40:13.9570559Z ##[group]Initializing the repository
+2026-07-22T17:40:13.9576140Z [command]/usr/bin/git init /home/runner/work/kafka/kafka
+2026-07-22T17:40:13.9676690Z hint: Using 'master' as the name for the initial branch. This default branch name
+2026-07-22T17:40:13.9679019Z hint: will change to "main" in Git 3.0. To configure the initial branch name
+2026-07-22T17:40:13.9681527Z hint: to use in all of your new repositories, which will suppress this warning,
+2026-07-22T17:40:13.9683326Z hint: call:
+2026-07-22T17:40:13.9684371Z hint:
+2026-07-22T17:40:13.9685483Z hint: 	git config --global init.defaultBranch <name>
+2026-07-22T17:40:13.9686787Z hint:
+2026-07-22T17:40:13.9688026Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+2026-07-22T17:40:13.9690021Z hint: 'development'. The just-created branch can be renamed via this command:
+2026-07-22T17:40:13.9691993Z hint:
+2026-07-22T17:40:13.9693153Z hint: 	git branch -m <name>
+2026-07-22T17:40:13.9694362Z hint:
+2026-07-22T17:40:13.9695916Z hint: Disable this message with "git config set advice.defaultBranchName false"
+2026-07-22T17:40:13.9698341Z Initialized empty Git repository in /home/runner/work/kafka/kafka/.git/
+2026-07-22T17:40:13.9702738Z [command]/usr/bin/git remote add origin https://github.com/apache/kafka
+2026-07-22T17:40:13.9739069Z ##[endgroup]
+2026-07-22T17:40:13.9740429Z ##[group]Disabling automatic garbage collection
+2026-07-22T17:40:13.9744687Z [command]/usr/bin/git config --local gc.auto 0
+2026-07-22T17:40:13.9778941Z ##[endgroup]
+2026-07-22T17:40:13.9780287Z ##[group]Setting up auth
+2026-07-22T17:40:13.9788134Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-07-22T17:40:13.9826874Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-07-22T17:40:14.0168700Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-07-22T17:40:14.0208773Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-07-22T17:40:14.0441964Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-07-22T17:40:14.0476607Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-07-22T17:40:14.0702356Z [command]/usr/bin/git config --local http.https://github.com/.extraheader AUTHORIZATION: basic ***
+2026-07-22T17:40:14.0736872Z ##[endgroup]
+2026-07-22T17:40:14.0738280Z ##[group]Fetching the repository
+2026-07-22T17:40:14.0747460Z [command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +3c257464fe4c2e83d85c13d611546e28f09f967c:refs/remotes/origin/trunk
+2026-07-22T17:40:18.5416723Z From https://github.com/apache/kafka
+2026-07-22T17:40:18.5418287Z  * [new ref]         3c257464fe4c2e83d85c13d611546e28f09f967c -> origin/trunk
+2026-07-22T17:40:18.5454836Z ##[endgroup]
+2026-07-22T17:40:18.5456511Z ##[group]Determining the checkout info
+2026-07-22T17:40:18.5458339Z ##[endgroup]
+2026-07-22T17:40:18.5472077Z [command]/usr/bin/git sparse-checkout disable
+2026-07-22T17:40:18.5529617Z [command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+2026-07-22T17:40:18.5563745Z ##[group]Checking out the ref
+2026-07-22T17:40:18.5566637Z [command]/usr/bin/git checkout --progress --force -B trunk refs/remotes/origin/trunk
+2026-07-22T17:40:19.1636352Z Switched to a new branch 'trunk'
+2026-07-22T17:40:19.1637447Z branch 'trunk' set up to track 'origin/trunk'.
+2026-07-22T17:40:19.1667504Z ##[endgroup]
+2026-07-22T17:40:19.1713580Z [command]/usr/bin/git log -1 --format=%H
+2026-07-22T17:40:19.1739042Z 3c257464fe4c2e83d85c13d611546e28f09f967c
+2026-07-22T17:40:19.1749083Z ##[group]Removing auth
+2026-07-22T17:40:19.1753348Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-07-22T17:40:19.1790380Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-07-22T17:40:19.2019823Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-07-22T17:40:19.2043884Z http.https://github.com/.extraheader
+2026-07-22T17:40:19.2052586Z [command]/usr/bin/git config --local --unset-all http.https://github.com/.extraheader
+2026-07-22T17:40:19.2080678Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-07-22T17:40:19.2305368Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-07-22T17:40:19.2333742Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-07-22T17:40:19.2555665Z ##[endgroup]
+2026-07-22T17:40:19.2875026Z ##[group]Run actions/checkout@v5
+2026-07-22T17:40:19.2875396Z with:
+2026-07-22T17:40:19.2875630Z   ref: test-catalog
+2026-07-22T17:40:19.2875898Z   persist-credentials: false
+2026-07-22T17:40:19.2876200Z   fetch-depth: 100
+2026-07-22T17:40:19.2876466Z   path: test-catalog
+2026-07-22T17:40:19.2876748Z   repository: apache/kafka
+2026-07-22T17:40:19.2879649Z   token: ***
+2026-07-22T17:40:19.2879898Z   ssh-strict: true
+2026-07-22T17:40:19.2880140Z   ssh-user: git
+2026-07-22T17:40:19.2880376Z   clean: true
+2026-07-22T17:40:19.2880625Z   sparse-checkout-cone-mode: true
+2026-07-22T17:40:19.2881257Z   fetch-tags: false
+2026-07-22T17:40:19.2881526Z   show-progress: true
+2026-07-22T17:40:19.2881778Z   lfs: false
+2026-07-22T17:40:19.2882007Z   submodules: false
+2026-07-22T17:40:19.2882264Z   set-safe-directory: true
+2026-07-22T17:40:19.2882554Z   allow-unsafe-pr-checkout: false
+2026-07-22T17:40:19.2882845Z ##[endgroup]
+2026-07-22T17:40:19.3738155Z Syncing repository: apache/kafka
+2026-07-22T17:40:19.3743675Z ##[group]Getting Git version info
+2026-07-22T17:40:19.3744216Z Working directory is '/home/runner/work/kafka/kafka/test-catalog'
+2026-07-22T17:40:19.3782666Z [command]/usr/bin/git version
+2026-07-22T17:40:19.3819259Z git version 2.54.0
+2026-07-22T17:40:19.3839844Z ##[endgroup]
+2026-07-22T17:40:19.3853329Z Temporarily overriding HOME='/home/runner/work/_temp/0d8ad999-cfb2-4545-9666-7d3f02798de4' before making global git config changes
+2026-07-22T17:40:19.3854409Z Adding repository directory to the temporary git global config as a safe directory
+2026-07-22T17:40:19.3859650Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/kafka/kafka/test-catalog
+2026-07-22T17:40:19.3889377Z ##[group]Initializing the repository
+2026-07-22T17:40:19.3894722Z [command]/usr/bin/git init /home/runner/work/kafka/kafka/test-catalog
+2026-07-22T17:40:19.3933660Z hint: Using 'master' as the name for the initial branch. This default branch name
+2026-07-22T17:40:19.3935201Z hint: will change to "main" in Git 3.0. To configure the initial branch name
+2026-07-22T17:40:19.3936020Z hint: to use in all of your new repositories, which will suppress this warning,
+2026-07-22T17:40:19.3937272Z hint: call:
+2026-07-22T17:40:19.3937773Z hint:
+2026-07-22T17:40:19.3938372Z hint: 	git config --global init.defaultBranch <name>
+2026-07-22T17:40:19.3939068Z hint:
+2026-07-22T17:40:19.3939782Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+2026-07-22T17:40:19.3941141Z hint: 'development'. The just-created branch can be renamed via this command:
+2026-07-22T17:40:19.3942024Z hint:
+2026-07-22T17:40:19.3942507Z hint: 	git branch -m <name>
+2026-07-22T17:40:19.3942995Z hint:
+2026-07-22T17:40:19.3943698Z hint: Disable this message with "git config set advice.defaultBranchName false"
+2026-07-22T17:40:19.3944827Z Initialized empty Git repository in /home/runner/work/kafka/kafka/test-catalog/.git/
+2026-07-22T17:40:19.3947508Z [command]/usr/bin/git remote add origin https://github.com/apache/kafka
+2026-07-22T17:40:19.3977828Z ##[endgroup]
+2026-07-22T17:40:19.3978676Z ##[group]Disabling automatic garbage collection
+2026-07-22T17:40:19.3982689Z [command]/usr/bin/git config --local gc.auto 0
+2026-07-22T17:40:19.4011452Z ##[endgroup]
+2026-07-22T17:40:19.4012322Z ##[group]Setting up auth
+2026-07-22T17:40:19.4018887Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-07-22T17:40:19.4049147Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-07-22T17:40:19.4266353Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-07-22T17:40:19.4296082Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-07-22T17:40:19.4510048Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-07-22T17:40:19.4539906Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-07-22T17:40:19.4758501Z [command]/usr/bin/git config --local http.https://github.com/.extraheader AUTHORIZATION: basic ***
+2026-07-22T17:40:19.4792883Z ##[endgroup]
+2026-07-22T17:40:19.4793843Z ##[group]Fetching the repository
+2026-07-22T17:40:19.4803198Z [command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=100 origin +refs/heads/test-catalog*:refs/remotes/origin/test-catalog* +refs/tags/test-catalog*:refs/tags/test-catalog*
+2026-07-22T17:40:20.2295698Z From https://github.com/apache/kafka
+2026-07-22T17:40:20.2296576Z  * [new branch]      test-catalog -> origin/test-catalog
+2026-07-22T17:40:20.2320731Z ##[endgroup]
+2026-07-22T17:40:20.2321976Z ##[group]Determining the checkout info
+2026-07-22T17:40:20.2327988Z [command]/usr/bin/git branch --list --remote origin/test-catalog
+2026-07-22T17:40:20.2358849Z   origin/test-catalog
+2026-07-22T17:40:20.2364468Z ##[endgroup]
+2026-07-22T17:40:20.2369337Z [command]/usr/bin/git sparse-checkout disable
+2026-07-22T17:40:20.2405353Z [command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+2026-07-22T17:40:20.2434074Z ##[group]Checking out the ref
+2026-07-22T17:40:20.2438036Z [command]/usr/bin/git checkout --progress --force -B test-catalog refs/remotes/origin/test-catalog
+2026-07-22T17:40:20.2540226Z Switched to a new branch 'test-catalog'
+2026-07-22T17:40:20.2543526Z branch 'test-catalog' set up to track 'origin/test-catalog'.
+2026-07-22T17:40:20.2548794Z ##[endgroup]
+2026-07-22T17:40:20.2583564Z [command]/usr/bin/git log -1 --format=%H
+2026-07-22T17:40:20.2605189Z ef74769d428dbb94b823bff2f5175a2403eb23c0
+2026-07-22T17:40:20.2614587Z ##[group]Removing auth
+2026-07-22T17:40:20.2618443Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-07-22T17:40:20.2647930Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-07-22T17:40:20.2863037Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-07-22T17:40:20.2884285Z http.https://github.com/.extraheader
+2026-07-22T17:40:20.2893071Z [command]/usr/bin/git config --local --unset-all http.https://github.com/.extraheader
+2026-07-22T17:40:20.2923905Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-07-22T17:40:20.3134600Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-07-22T17:40:20.3163683Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-07-22T17:40:20.3375238Z ##[endgroup]
+2026-07-22T17:40:20.3545204Z ##[group]Run cd test-catalog
+2026-07-22T17:40:20.3545595Z [36;1mcd test-catalog[0m
+2026-07-22T17:40:20.3546032Z [36;1mSHA=$(git rev-list -1 --before $DAYS.days.ago origin/test-catalog)[0m
+2026-07-22T17:40:20.3546456Z [36;1mecho $SHA[0m
+2026-07-22T17:40:20.3546708Z [36;1mgit switch --detach $SHA[0m
+2026-07-22T17:40:20.3546979Z [36;1mgit show --no-patch[0m
+2026-07-22T17:40:20.3595380Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:40:20.3595673Z env:
+2026-07-22T17:40:20.3595875Z   DAYS: 7
+2026-07-22T17:40:20.3596081Z ##[endgroup]
+2026-07-22T17:40:20.3701711Z 29a58cec2195bcdf74cbbb3e114b6a96f4e99172
+2026-07-22T17:40:20.3813981Z HEAD is now at 29a58ce Update test catalog data for GHA workflow run 29328642050
+2026-07-22T17:40:20.3836100Z commit 29a58cec2195bcdf74cbbb3e114b6a96f4e99172
+2026-07-22T17:40:20.3836796Z Author: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>
+2026-07-22T17:40:20.3837281Z Date:   Tue Jul 14 14:42:28 2026 +0000
+2026-07-22T17:40:20.3837545Z 
+2026-07-22T17:40:20.3837710Z     Update test catalog data for GHA workflow run 29328642050
+2026-07-22T17:40:20.3838162Z     
+2026-07-22T17:40:20.3838827Z     Commit: https://github.com/apache/kafka/commit/c57175ea43fa7d90eb4f6b8cd47d8f9966490a0b
+2026-07-22T17:40:20.3839835Z     GitHub Run: https://github.com/apache/kafka/actions/runs/29328642050
+2026-07-22T17:40:20.3954343Z Prepare all required actions
+2026-07-22T17:40:20.3954916Z Getting action download info
+2026-07-22T17:40:20.5020661Z Download action repository 'actions/setup-python@v6' (SHA:ece7cb06caefa5fff74198d8649806c4678c61a1)
+2026-07-22T17:40:20.6311783Z ##[group]Run ./.github/actions/setup-python
+2026-07-22T17:40:20.6312108Z ##[endgroup]
+2026-07-22T17:40:20.6443311Z ##[group]Run actions/setup-python@v6
+2026-07-22T17:40:20.6443582Z with:
+2026-07-22T17:40:20.6443781Z   python-version: 3.12
+2026-07-22T17:40:20.6444001Z   check-latest: false
+2026-07-22T17:40:20.6446642Z   token: ***
+2026-07-22T17:40:20.6446846Z   update-environment: true
+2026-07-22T17:40:20.6447081Z   allow-prereleases: false
+2026-07-22T17:40:20.6447304Z   freethreaded: false
+2026-07-22T17:40:20.6447529Z ##[endgroup]
+2026-07-22T17:40:20.7688660Z ##[group]Installed versions
+2026-07-22T17:40:20.7783346Z Successfully set up CPython (3.12.13)
+2026-07-22T17:40:20.7784197Z ##[endgroup]
+2026-07-22T17:40:20.7885251Z ##[group]Run pip install -r .github/scripts/requirements.txt
+2026-07-22T17:40:20.7885690Z [36;1mpip install -r .github/scripts/requirements.txt[0m
+2026-07-22T17:40:20.7984207Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-07-22T17:40:20.7984626Z env:
+2026-07-22T17:40:20.7984941Z   pythonLocation: /opt/hostedtoolcache/Python/3.12.13/x64
+2026-07-22T17:40:20.7985460Z   PKG_CONFIG_PATH: /opt/hostedtoolcache/Python/3.12.13/x64/lib/pkgconfig
+2026-07-22T17:40:20.7985966Z   Python_ROOT_DIR: /opt/hostedtoolcache/Python/3.12.13/x64
+2026-07-22T17:40:20.7986419Z   Python2_ROOT_DIR: /opt/hostedtoolcache/Python/3.12.13/x64
+2026-07-22T17:40:20.7986884Z   Python3_ROOT_DIR: /opt/hostedtoolcache/Python/3.12.13/x64
+2026-07-22T17:40:20.7987351Z   LD_LIBRARY_PATH: /opt/hostedtoolcache/Python/3.12.13/x64/lib
+2026-07-22T17:40:20.7987915Z ##[endgroup]
+2026-07-22T17:40:23.0343641Z Collecting PyYAML~=6.0 (from -r .github/scripts/requirements.txt (line 17))
+2026-07-22T17:40:23.0852922Z   Downloading pyyaml-6.0.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl.metadata (2.4 kB)
+2026-07-22T17:40:23.1249255Z Collecting pytz==2024.2 (from -r .github/scripts/requirements.txt (line 18))
+2026-07-22T17:40:23.1280870Z   Downloading pytz-2024.2-py2.py3-none-any.whl.metadata (22 kB)
+2026-07-22T17:40:23.1556995Z Collecting requests==2.33.0 (from -r .github/scripts/requirements.txt (line 19))
+2026-07-22T17:40:23.1590112Z   Downloading requests-2.33.0-py3-none-any.whl.metadata (5.1 kB)
+2026-07-22T17:40:23.2680624Z Collecting charset_normalizer<4,>=2 (from requests==2.33.0->-r .github/scripts/requirements.txt (line 19))
+2026-07-22T17:40:23.2716515Z   Downloading charset_normalizer-3.4.9-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl.metadata (41 kB)
+2026-07-22T17:40:23.2899884Z Collecting idna<4,>=2.5 (from requests==2.33.0->-r .github/scripts/requirements.txt (line 19))
+2026-07-22T17:40:23.2933135Z   Downloading idna-3.18-py3-none-any.whl.metadata (6.1 kB)
+2026-07-22T17:40:23.3147334Z Collecting urllib3<3,>=1.26 (from requests==2.33.0->-r .github/scripts/requirements.txt (line 19))
+2026-07-22T17:40:23.3181068Z   Downloading urllib3-2.7.0-py3-none-any.whl.metadata (6.9 kB)
+2026-07-22T17:40:23.3368255Z Collecting certifi>=2023.5.7 (from requests==2.33.0->-r .github/scripts/requirements.txt (line 19))
+2026-07-22T17:40:23.3400074Z   Downloading certifi-2026.7.22-py3-none-any.whl.metadata (2.5 kB)
+2026-07-22T17:40:23.3480582Z Downloading pytz-2024.2-py2.py3-none-any.whl (508 kB)
+2026-07-22T17:40:23.3608150Z Downloading requests-2.33.0-py3-none-any.whl (65 kB)
+2026-07-22T17:40:23.3669112Z Downloading pyyaml-6.0.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (807 kB)
+2026-07-22T17:40:23.3751636Z    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 807.9/807.9 kB 99.3 MB/s  0:00:00
+2026-07-22T17:40:23.3785354Z Downloading charset_normalizer-3.4.9-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (224 kB)
+2026-07-22T17:40:23.3860094Z Downloading idna-3.18-py3-none-any.whl (65 kB)
+2026-07-22T17:40:23.3916162Z Downloading urllib3-2.7.0-py3-none-any.whl (131 kB)
+2026-07-22T17:40:23.3974472Z Downloading certifi-2026.7.22-py3-none-any.whl (136 kB)
+2026-07-22T17:40:23.4712693Z Installing collected packages: pytz, urllib3, PyYAML, idna, charset_normalizer, certifi, requests
+2026-07-22T17:40:23.8465149Z 
+2026-07-22T17:40:23.8479828Z Successfully installed PyYAML-6.0.3 certifi-2026.7.22 charset_normalizer-3.4.9 idna-3.18 pytz-2024.2 requests-2.33.0 urllib3-2.7.0
+2026-07-22T17:40:23.9018747Z ##[group]Run python .github/scripts/format-test-catalog.py --path "test-catalog/test-catalog/**/*.yaml"
+2026-07-22T17:40:23.9019558Z [36;1mpython .github/scripts/format-test-catalog.py --path "test-catalog/test-catalog/**/*.yaml"[0m
+2026-07-22T17:40:23.9066143Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:40:23.9066434Z env:
+2026-07-22T17:40:23.9066742Z   pythonLocation: /opt/hostedtoolcache/Python/3.12.13/x64
+2026-07-22T17:40:23.9067257Z   PKG_CONFIG_PATH: /opt/hostedtoolcache/Python/3.12.13/x64/lib/pkgconfig
+2026-07-22T17:40:23.9067764Z   Python_ROOT_DIR: /opt/hostedtoolcache/Python/3.12.13/x64
+2026-07-22T17:40:23.9068213Z   Python2_ROOT_DIR: /opt/hostedtoolcache/Python/3.12.13/x64
+2026-07-22T17:40:23.9068676Z   Python3_ROOT_DIR: /opt/hostedtoolcache/Python/3.12.13/x64
+2026-07-22T17:40:23.9069133Z   LD_LIBRARY_PATH: /opt/hostedtoolcache/Python/3.12.13/x64/lib
+2026-07-22T17:40:23.9069518Z ##[endgroup]
+2026-07-22T17:40:23.9590457Z Found 34 YAML files
+2026-07-22T17:40:25.1787161Z Wrote 25441 test methods from 1927 classes to combined-test-catalog.txt
+2026-07-22T17:40:25.2756837Z Node 20 is being deprecated. This workflow is running with Node 24 by default. If you need to temporarily use Node 20, you can set the ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true environment variable. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+2026-07-22T17:40:25.2758835Z ##[group]Run actions/upload-artifact@v4
+2026-07-22T17:40:25.2759108Z with:
+2026-07-22T17:40:25.2759308Z   name: combined-test-catalog
+2026-07-22T17:40:25.2759569Z   path: combined-test-catalog.txt
+2026-07-22T17:40:25.2759833Z   compression-level: 9
+2026-07-22T17:40:25.2760054Z   if-no-files-found: warn
+2026-07-22T17:40:25.2760273Z   overwrite: false
+2026-07-22T17:40:25.2760641Z   include-hidden-files: false
+2026-07-22T17:40:25.2761143Z env:
+2026-07-22T17:40:25.2761397Z   pythonLocation: /opt/hostedtoolcache/Python/3.12.13/x64
+2026-07-22T17:40:25.2761829Z   PKG_CONFIG_PATH: /opt/hostedtoolcache/Python/3.12.13/x64/lib/pkgconfig
+2026-07-22T17:40:25.2762307Z   Python_ROOT_DIR: /opt/hostedtoolcache/Python/3.12.13/x64
+2026-07-22T17:40:25.2762688Z   Python2_ROOT_DIR: /opt/hostedtoolcache/Python/3.12.13/x64
+2026-07-22T17:40:25.2763059Z   Python3_ROOT_DIR: /opt/hostedtoolcache/Python/3.12.13/x64
+2026-07-22T17:40:25.2763435Z   LD_LIBRARY_PATH: /opt/hostedtoolcache/Python/3.12.13/x64/lib
+2026-07-22T17:40:25.2763751Z ##[endgroup]
+2026-07-22T17:40:25.4366902Z (node:2585) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+2026-07-22T17:40:25.4368188Z (Use `node --trace-deprecation ...` to show where the warning was created)
+2026-07-22T17:40:25.4412157Z With the provided path, there will be 1 file uploaded
+2026-07-22T17:40:25.4417246Z Artifact name is valid!
+2026-07-22T17:40:25.4418306Z Root directory input is valid!
+2026-07-22T17:40:25.5805160Z Beginning upload of artifact content to blob storage
+2026-07-22T17:40:25.6726050Z (node:2585) [DEP0169] DeprecationWarning: `url.parse()` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for `url.parse()` vulnerabilities.
+2026-07-22T17:40:25.7463712Z Uploaded bytes 247225
+2026-07-22T17:40:25.7652518Z Finished uploading artifact content to blob storage!
+2026-07-22T17:40:25.7654457Z SHA256 digest of uploaded artifact zip is 8f9b45277dfe283d6ca81e93fd0e3731dbc248f2d5baec713c15d036615cb786
+2026-07-22T17:40:25.7656254Z Finalizing artifact upload
+2026-07-22T17:40:25.9461682Z Artifact combined-test-catalog.zip successfully finalized. Artifact ID 8539099751
+2026-07-22T17:40:25.9463053Z Artifact combined-test-catalog has been successfully uploaded! Final size is 247225 bytes. Artifact ID is 8539099751
+2026-07-22T17:40:25.9468911Z Artifact download URL: https://github.com/apache/kafka/actions/runs/29940786887/artifacts/8539099751
+2026-07-22T17:40:25.9640400Z Post job cleanup.
+2026-07-22T17:40:25.9684510Z Post job cleanup.
+2026-07-22T17:40:26.1044902Z Post job cleanup.
+2026-07-22T17:40:26.1969803Z [command]/usr/bin/git version
+2026-07-22T17:40:26.2012304Z git version 2.54.0
+2026-07-22T17:40:26.2051180Z Temporarily overriding HOME='/home/runner/work/_temp/ec1fb683-228c-4f72-935a-785e65429377' before making global git config changes
+2026-07-22T17:40:26.2052938Z Adding repository directory to the temporary git global config as a safe directory
+2026-07-22T17:40:26.2056816Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/kafka/kafka/test-catalog
+2026-07-22T17:40:26.2102594Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-07-22T17:40:26.2163209Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-07-22T17:40:26.2408065Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-07-22T17:40:26.2441584Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-07-22T17:40:26.2682643Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-07-22T17:40:26.2719179Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-07-22T17:40:26.3145219Z Post job cleanup.
+2026-07-22T17:40:26.3988719Z [command]/usr/bin/git version
+2026-07-22T17:40:26.4024782Z git version 2.54.0
+2026-07-22T17:40:26.4061968Z Temporarily overriding HOME='/home/runner/work/_temp/81a956e3-9797-4fc3-bd73-c602526a5a6e' before making global git config changes
+2026-07-22T17:40:26.4063009Z Adding repository directory to the temporary git global config as a safe directory
+2026-07-22T17:40:26.4066964Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/kafka/kafka
+2026-07-22T17:40:26.4104008Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-07-22T17:40:26.4136444Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-07-22T17:40:26.4421372Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-07-22T17:40:26.4453709Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-07-22T17:40:26.4709762Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-07-22T17:40:26.4744566Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-07-22T17:40:26.5139573Z Cleaning up orphan processes
+2026-07-22T17:40:26.5462501Z ##[warning]Node.js 20 is deprecated. The following actions target Node.js 20 but are being forced to run on Node.js 24: actions/upload-artifact@v4. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/

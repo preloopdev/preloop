@@ -1,0 +1,318 @@
+2026-07-22T20:42:49.1301464Z Current runner version: '2.336.0'
+2026-07-22T20:42:49.1321228Z ##[group]Runner Image Provisioner
+2026-07-22T20:42:49.1322004Z Hosted Compute Agent
+2026-07-22T20:42:49.1322474Z Version: 20260707.563
+2026-07-22T20:42:49.1322953Z Commit: 02667638d2b423fbc733a8e32a88b44996a3ba6e
+2026-07-22T20:42:49.1323600Z Build Date: 2026-07-07T19:33:50Z
+2026-07-22T20:42:49.1324149Z Worker ID: {9d29fefb-f6a5-4de7-b4d0-e7963365bee9}
+2026-07-22T20:42:49.1324759Z Azure Region: westus
+2026-07-22T20:42:49.1325230Z ##[endgroup]
+2026-07-22T20:42:49.1326246Z ##[group]Operating System
+2026-07-22T20:42:49.1326937Z Ubuntu
+2026-07-22T20:42:49.1327359Z 24.04.4
+2026-07-22T20:42:49.1327783Z LTS
+2026-07-22T20:42:49.1328260Z ##[endgroup]
+2026-07-22T20:42:49.1328699Z ##[group]Runner Image
+2026-07-22T20:42:49.1329217Z Image: ubuntu-24.04
+2026-07-22T20:42:49.1329682Z Version: 20260714.240.1
+2026-07-22T20:42:49.1331068Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260714.240/images/ubuntu/Ubuntu2404-Readme.md
+2026-07-22T20:42:49.1332271Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260714.240
+2026-07-22T20:42:49.1333074Z ##[endgroup]
+2026-07-22T20:42:49.1333974Z ##[group]GITHUB_TOKEN Permissions
+2026-07-22T20:42:49.1335598Z Contents: write
+2026-07-22T20:42:49.1336092Z Metadata: read
+2026-07-22T20:42:49.1336537Z ##[endgroup]
+2026-07-22T20:42:49.1338575Z Secret source: Actions
+2026-07-22T20:42:49.1339426Z Prepare workflow directory
+2026-07-22T20:42:49.1596142Z Prepare all required actions
+2026-07-22T20:42:49.1630298Z Getting action download info
+2026-07-22T20:42:49.5543567Z Download action repository 'actions/checkout@v5' (SHA:fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09)
+2026-07-22T20:42:50.0276496Z Download action repository 'actions/download-artifact@v5' (SHA:634f93cb2916e3fdff6788551b99b062d0335ce0)
+2026-07-22T20:42:50.5557084Z Uses: apache/kafka/.github/workflows/build.yml@refs/heads/trunk (3c257464fe4c2e83d85c13d611546e28f09f967c)
+2026-07-22T20:42:50.5561216Z ##[group] Inputs
+2026-07-22T20:42:50.5561952Z   is-trunk: true
+2026-07-22T20:42:50.5562356Z   is-public-fork: false
+2026-07-22T20:42:50.5562780Z ##[endgroup]
+2026-07-22T20:42:50.5563205Z Complete job name: build / Update Test Catalog
+2026-07-22T20:42:50.6234370Z ##[group]Run actions/checkout@v5
+2026-07-22T20:42:50.6235077Z with:
+2026-07-22T20:42:50.6235452Z   persist-credentials: true
+2026-07-22T20:42:50.6235878Z   ref: test-catalog
+2026-07-22T20:42:50.6236351Z   repository: apache/kafka
+2026-07-22T20:42:50.6240521Z   token: ***
+2026-07-22T20:42:50.6240895Z   ssh-strict: true
+2026-07-22T20:42:50.6241269Z   ssh-user: git
+2026-07-22T20:42:50.6241630Z   clean: true
+2026-07-22T20:42:50.6242021Z   sparse-checkout-cone-mode: true
+2026-07-22T20:42:50.6242464Z   fetch-depth: 1
+2026-07-22T20:42:50.6242825Z   fetch-tags: false
+2026-07-22T20:42:50.6243194Z   show-progress: true
+2026-07-22T20:42:50.6243568Z   lfs: false
+2026-07-22T20:42:50.6243922Z   submodules: false
+2026-07-22T20:42:50.6244413Z   set-safe-directory: true
+2026-07-22T20:42:50.6245040Z   allow-unsafe-pr-checkout: false
+2026-07-22T20:42:50.6245947Z ##[endgroup]
+2026-07-22T20:42:50.7059521Z Syncing repository: apache/kafka
+2026-07-22T20:42:50.7060955Z ##[group]Getting Git version info
+2026-07-22T20:42:50.7061608Z Working directory is '/home/runner/work/kafka/kafka'
+2026-07-22T20:42:50.7062519Z [command]/usr/bin/git version
+2026-07-22T20:42:50.7085923Z git version 2.54.0
+2026-07-22T20:42:50.7101084Z ##[endgroup]
+2026-07-22T20:42:50.7112134Z Temporarily overriding HOME='/home/runner/work/_temp/1bcbbcc5-956e-4826-8d92-0a5ba97c3ec7' before making global git config changes
+2026-07-22T20:42:50.7113713Z Adding repository directory to the temporary git global config as a safe directory
+2026-07-22T20:42:50.7115756Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/kafka/kafka
+2026-07-22T20:42:50.7144447Z Deleting the contents of '/home/runner/work/kafka/kafka'
+2026-07-22T20:42:50.7147964Z ##[group]Initializing the repository
+2026-07-22T20:42:50.7151447Z [command]/usr/bin/git init /home/runner/work/kafka/kafka
+2026-07-22T20:42:50.7227975Z hint: Using 'master' as the name for the initial branch. This default branch name
+2026-07-22T20:42:50.7229095Z hint: will change to "main" in Git 3.0. To configure the initial branch name
+2026-07-22T20:42:50.7230438Z hint: to use in all of your new repositories, which will suppress this warning,
+2026-07-22T20:42:50.7231508Z hint: call:
+2026-07-22T20:42:50.7232091Z hint:
+2026-07-22T20:42:50.7232797Z hint: 	git config --global init.defaultBranch <name>
+2026-07-22T20:42:50.7233684Z hint:
+2026-07-22T20:42:50.7234508Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+2026-07-22T20:42:50.7235824Z hint: 'development'. The just-created branch can be renamed via this command:
+2026-07-22T20:42:50.7237041Z hint:
+2026-07-22T20:42:50.7237669Z hint: 	git branch -m <name>
+2026-07-22T20:42:50.7238357Z hint:
+2026-07-22T20:42:50.7239233Z hint: Disable this message with "git config set advice.defaultBranchName false"
+2026-07-22T20:42:50.7240597Z Initialized empty Git repository in /home/runner/work/kafka/kafka/.git/
+2026-07-22T20:42:50.7242695Z [command]/usr/bin/git remote add origin https://github.com/apache/kafka
+2026-07-22T20:42:50.7297375Z ##[endgroup]
+2026-07-22T20:42:50.7298490Z ##[group]Disabling automatic garbage collection
+2026-07-22T20:42:50.7300472Z [command]/usr/bin/git config --local gc.auto 0
+2026-07-22T20:42:50.7325737Z ##[endgroup]
+2026-07-22T20:42:50.7327446Z ##[group]Setting up auth
+2026-07-22T20:42:50.7330797Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-07-22T20:42:50.7355114Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-07-22T20:42:50.7600628Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-07-22T20:42:50.7624900Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-07-22T20:42:50.7810910Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-07-22T20:42:50.7836122Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-07-22T20:42:50.8020121Z [command]/usr/bin/git config --local http.https://github.com/.extraheader AUTHORIZATION: basic ***
+2026-07-22T20:42:50.8049491Z ##[endgroup]
+2026-07-22T20:42:50.8050143Z ##[group]Fetching the repository
+2026-07-22T20:42:50.8056262Z [command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +refs/heads/test-catalog*:refs/remotes/origin/test-catalog* +refs/tags/test-catalog*:refs/tags/test-catalog*
+2026-07-22T20:42:51.4180522Z From https://github.com/apache/kafka
+2026-07-22T20:42:51.4182257Z  * [new branch]      test-catalog -> origin/test-catalog
+2026-07-22T20:42:51.4201060Z ##[endgroup]
+2026-07-22T20:42:51.4202471Z ##[group]Determining the checkout info
+2026-07-22T20:42:51.4206672Z [command]/usr/bin/git branch --list --remote origin/test-catalog
+2026-07-22T20:42:51.4227687Z   origin/test-catalog
+2026-07-22T20:42:51.4236282Z ##[endgroup]
+2026-07-22T20:42:51.4237515Z [command]/usr/bin/git sparse-checkout disable
+2026-07-22T20:42:51.4266969Z [command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+2026-07-22T20:42:51.4290178Z ##[group]Checking out the ref
+2026-07-22T20:42:51.4292544Z [command]/usr/bin/git checkout --progress --force -B test-catalog refs/remotes/origin/test-catalog
+2026-07-22T20:42:51.4413909Z Switched to a new branch 'test-catalog'
+2026-07-22T20:42:51.4415833Z branch 'test-catalog' set up to track 'origin/test-catalog'.
+2026-07-22T20:42:51.4421308Z ##[endgroup]
+2026-07-22T20:42:51.4455875Z [command]/usr/bin/git log -1 --format=%H
+2026-07-22T20:42:51.4471536Z ef74769d428dbb94b823bff2f5175a2403eb23c0
+2026-07-22T20:42:51.4666050Z ##[group]Run rm -rf test-catalog
+2026-07-22T20:42:51.4667236Z [36;1mrm -rf test-catalog[0m
+2026-07-22T20:42:51.4738318Z shell: /usr/bin/bash -e {0}
+2026-07-22T20:42:51.4739217Z ##[endgroup]
+2026-07-22T20:42:51.4965060Z Node 20 is being deprecated. This workflow is running with Node 24 by default. If you need to temporarily use Node 20, you can set the ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true environment variable. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+2026-07-22T20:42:51.4969442Z ##[group]Run actions/download-artifact@v5
+2026-07-22T20:42:51.4970348Z with:
+2026-07-22T20:42:51.4970980Z   name: test-catalog
+2026-07-22T20:42:51.4971697Z   path: test-catalog
+2026-07-22T20:42:51.4972413Z   merge-multiple: false
+2026-07-22T20:42:51.4973169Z   repository: apache/kafka
+2026-07-22T20:42:51.4973929Z   run-id: 29940786887
+2026-07-22T20:42:51.4974619Z ##[endgroup]
+2026-07-22T20:42:51.6195272Z Downloading single artifact
+2026-07-22T20:42:51.6309346Z (node:2039) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+2026-07-22T20:42:51.6311916Z (Use `node --trace-deprecation ...` to show where the warning was created)
+2026-07-22T20:42:51.9246151Z Preparing to download the following artifacts:
+2026-07-22T20:42:51.9248441Z - test-catalog (ID: 8544140754, Size: 221937, Expected Digest: sha256:a9a2a16ae908899c4c6dec3cbd6de4a08f197da26735ae09ee5c3740b1111752)
+2026-07-22T20:42:52.1778490Z Redirecting to blob download url: https://productionresultssa8.blob.core.windows.net/actions-results/96d56038-1dd8-4c5a-950a-fa7deafe29cd/workflow-job-run-db864af7-e73d-5995-8b1f-779e44f4123f/artifacts/cad0120cdaddfecf65a0a63e7b113fe0338bcb277e6bbb1bc646dd75da906c46.zip
+2026-07-22T20:42:52.1782584Z Starting download of artifact to: /home/runner/work/kafka/kafka/test-catalog
+2026-07-22T20:42:52.4513313Z (node:2039) [DEP0005] DeprecationWarning: Buffer() is deprecated due to security and usability issues. Please use the Buffer.alloc(), Buffer.allocUnsafe(), or Buffer.from() methods instead.
+2026-07-22T20:42:52.6478501Z SHA256 digest of downloaded artifact is a9a2a16ae908899c4c6dec3cbd6de4a08f197da26735ae09ee5c3740b1111752
+2026-07-22T20:42:52.6480298Z Artifact download completed successfully.
+2026-07-22T20:42:52.6483314Z Total of 1 artifact(s) downloaded
+2026-07-22T20:42:52.6484360Z Download artifact has finished successfully
+2026-07-22T20:42:52.6667437Z ##[group]Run pwd
+2026-07-22T20:42:52.6668114Z [36;1mpwd[0m
+2026-07-22T20:42:52.6668713Z [36;1mls -R[0m
+2026-07-22T20:42:52.6669467Z [36;1mgit config user.name 'github-actions[bot]'[0m
+2026-07-22T20:42:52.6670692Z [36;1mgit config user.email '41898282+github-actions[bot]@users.noreply.github.com'[0m
+2026-07-22T20:42:52.6671844Z [36;1mgit add test-catalog[0m
+2026-07-22T20:42:52.6672867Z [36;1mgit diff --quiet && git diff --staged --quiet || git commit -m "$COMMIT_MSG"[0m
+2026-07-22T20:42:52.6674016Z [36;1mgit push[0m
+2026-07-22T20:42:52.6728947Z shell: /usr/bin/bash -e {0}
+2026-07-22T20:42:52.6729675Z env:
+2026-07-22T20:42:52.6731768Z   COMMIT_MSG: Update test catalog data for GHA workflow run 29940786887
+
+Commit: https://github.com/apache/kafka/commit/3c257464fe4c2e83d85c13d611546e28f09f967c
+GitHub Run: https://github.com/apache/kafka/actions/runs/29940786887
+
+2026-07-22T20:42:52.6734007Z ##[endgroup]
+2026-07-22T20:42:52.6808483Z /home/runner/work/kafka/kafka
+2026-07-22T20:42:52.6822158Z .:
+2026-07-22T20:42:52.6823386Z README.md
+2026-07-22T20:42:52.6824121Z test-catalog
+2026-07-22T20:42:52.6824608Z 
+2026-07-22T20:42:52.6824986Z ./test-catalog:
+2026-07-22T20:42:52.6825739Z clients
+2026-07-22T20:42:52.6826306Z connect
+2026-07-22T20:42:52.6827104Z coordinator-common
+2026-07-22T20:42:52.6827750Z core
+2026-07-22T20:42:52.6828410Z generator
+2026-07-22T20:42:52.6829013Z group-coordinator
+2026-07-22T20:42:52.6829641Z metadata
+2026-07-22T20:42:52.6830235Z raft
+2026-07-22T20:42:52.6830808Z server
+2026-07-22T20:42:52.6831419Z server-common
+2026-07-22T20:42:52.6832258Z share-coordinator
+2026-07-22T20:42:52.6832890Z shell
+2026-07-22T20:42:52.6833448Z storage
+2026-07-22T20:42:52.6834007Z streams
+2026-07-22T20:42:52.6834580Z test-common
+2026-07-22T20:42:52.6835159Z tools
+2026-07-22T20:42:52.6835750Z transaction-coordinator
+2026-07-22T20:42:52.6836426Z trogdor
+2026-07-22T20:42:52.6836742Z 
+2026-07-22T20:42:52.6837293Z ./test-catalog/clients:
+2026-07-22T20:42:52.6838167Z clients-integration-tests
+2026-07-22T20:42:52.6838854Z tests.yaml
+2026-07-22T20:42:52.6839185Z 
+2026-07-22T20:42:52.6839571Z ./test-catalog/clients/clients-integration-tests:
+2026-07-22T20:42:52.6840440Z tests.yaml
+2026-07-22T20:42:52.6840762Z 
+2026-07-22T20:42:52.6841046Z ./test-catalog/connect:
+2026-07-22T20:42:52.6841696Z api
+2026-07-22T20:42:52.6842281Z basic-auth-extension
+2026-07-22T20:42:52.6842915Z file
+2026-07-22T20:42:52.6843460Z json
+2026-07-22T20:42:52.6844008Z mirror
+2026-07-22T20:42:52.6844581Z mirror-client
+2026-07-22T20:42:52.6845208Z runtime
+2026-07-22T20:42:52.6845783Z transforms
+2026-07-22T20:42:52.6846110Z 
+2026-07-22T20:42:52.6846405Z ./test-catalog/connect/api:
+2026-07-22T20:42:52.6847323Z tests.yaml
+2026-07-22T20:42:52.6847662Z 
+2026-07-22T20:42:52.6848017Z ./test-catalog/connect/basic-auth-extension:
+2026-07-22T20:42:52.6848847Z tests.yaml
+2026-07-22T20:42:52.6849177Z 
+2026-07-22T20:42:52.6849476Z ./test-catalog/connect/file:
+2026-07-22T20:42:52.6850171Z tests.yaml
+2026-07-22T20:42:52.6850515Z 
+2026-07-22T20:42:52.6850818Z ./test-catalog/connect/json:
+2026-07-22T20:42:52.6851508Z tests.yaml
+2026-07-22T20:42:52.6851830Z 
+2026-07-22T20:42:52.6852130Z ./test-catalog/connect/mirror:
+2026-07-22T20:42:52.6852832Z tests.yaml
+2026-07-22T20:42:52.6853164Z 
+2026-07-22T20:42:52.6853473Z ./test-catalog/connect/mirror-client:
+2026-07-22T20:42:52.6854249Z tests.yaml
+2026-07-22T20:42:52.6854613Z 
+2026-07-22T20:42:52.6854909Z ./test-catalog/connect/runtime:
+2026-07-22T20:42:52.6855619Z tests.yaml
+2026-07-22T20:42:52.6855945Z 
+2026-07-22T20:42:52.6856245Z ./test-catalog/connect/transforms:
+2026-07-22T20:42:52.6857199Z tests.yaml
+2026-07-22T20:42:52.6857530Z 
+2026-07-22T20:42:52.6857839Z ./test-catalog/coordinator-common:
+2026-07-22T20:42:52.6858597Z tests.yaml
+2026-07-22T20:42:52.6858918Z 
+2026-07-22T20:42:52.6859194Z ./test-catalog/core:
+2026-07-22T20:42:52.6859832Z tests.yaml
+2026-07-22T20:42:52.6860156Z 
+2026-07-22T20:42:52.6860452Z ./test-catalog/generator:
+2026-07-22T20:42:52.6861126Z tests.yaml
+2026-07-22T20:42:52.6861648Z 
+2026-07-22T20:42:52.6861955Z ./test-catalog/group-coordinator:
+2026-07-22T20:42:52.6862693Z tests.yaml
+2026-07-22T20:42:52.6863027Z 
+2026-07-22T20:42:52.6863312Z ./test-catalog/metadata:
+2026-07-22T20:42:52.6863975Z tests.yaml
+2026-07-22T20:42:52.6864302Z 
+2026-07-22T20:42:52.6864573Z ./test-catalog/raft:
+2026-07-22T20:42:52.6865206Z tests.yaml
+2026-07-22T20:42:52.6865537Z 
+2026-07-22T20:42:52.6865806Z ./test-catalog/server:
+2026-07-22T20:42:52.6866450Z tests.yaml
+2026-07-22T20:42:52.6866876Z 
+2026-07-22T20:42:52.6867177Z ./test-catalog/server-common:
+2026-07-22T20:42:52.6867890Z tests.yaml
+2026-07-22T20:42:52.6868208Z 
+2026-07-22T20:42:52.6868517Z ./test-catalog/share-coordinator:
+2026-07-22T20:42:52.6869258Z tests.yaml
+2026-07-22T20:42:52.6869582Z 
+2026-07-22T20:42:52.6869853Z ./test-catalog/shell:
+2026-07-22T20:42:52.6870493Z tests.yaml
+2026-07-22T20:42:52.6870818Z 
+2026-07-22T20:42:52.6871088Z ./test-catalog/storage:
+2026-07-22T20:42:52.6871753Z storage-api
+2026-07-22T20:42:52.6872337Z tests.yaml
+2026-07-22T20:42:52.6872662Z 
+2026-07-22T20:42:52.6872970Z ./test-catalog/storage/storage-api:
+2026-07-22T20:42:52.6873713Z tests.yaml
+2026-07-22T20:42:52.6874039Z 
+2026-07-22T20:42:52.6874311Z ./test-catalog/streams:
+2026-07-22T20:42:52.6874960Z examples
+2026-07-22T20:42:52.6875543Z integration-tests
+2026-07-22T20:42:52.6876172Z streams-scala
+2026-07-22T20:42:52.6876844Z test-utils
+2026-07-22T20:42:52.6877511Z tests.yaml
+2026-07-22T20:42:52.6877832Z 
+2026-07-22T20:42:52.6878140Z ./test-catalog/streams/examples:
+2026-07-22T20:42:52.6878858Z tests.yaml
+2026-07-22T20:42:52.6879311Z 
+2026-07-22T20:42:52.6879644Z ./test-catalog/streams/integration-tests:
+2026-07-22T20:42:52.6880441Z tests.yaml
+2026-07-22T20:42:52.6880767Z 
+2026-07-22T20:42:52.6881084Z ./test-catalog/streams/streams-scala:
+2026-07-22T20:42:52.6881834Z tests.yaml
+2026-07-22T20:42:52.6882152Z 
+2026-07-22T20:42:52.6882458Z ./test-catalog/streams/test-utils:
+2026-07-22T20:42:52.6883181Z tests.yaml
+2026-07-22T20:42:52.6883500Z 
+2026-07-22T20:42:52.6883791Z ./test-catalog/test-common:
+2026-07-22T20:42:52.6884495Z test-common-internal-api
+2026-07-22T20:42:52.6885177Z test-common-runtime
+2026-07-22T20:42:52.6885819Z test-common-util
+2026-07-22T20:42:52.6886175Z 
+2026-07-22T20:42:52.6886578Z ./test-catalog/test-common/test-common-internal-api:
+2026-07-22T20:42:52.6887638Z tests.yaml
+2026-07-22T20:42:52.6887962Z 
+2026-07-22T20:42:52.6888337Z ./test-catalog/test-common/test-common-runtime:
+2026-07-22T20:42:52.6889160Z tests.yaml
+2026-07-22T20:42:52.6889481Z 
+2026-07-22T20:42:52.6889829Z ./test-catalog/test-common/test-common-util:
+2026-07-22T20:42:52.6890649Z tests.yaml
+2026-07-22T20:42:52.6890965Z 
+2026-07-22T20:42:52.6891242Z ./test-catalog/tools:
+2026-07-22T20:42:52.6891865Z tests.yaml
+2026-07-22T20:42:52.6892435Z tools-api
+2026-07-22T20:42:52.6892753Z 
+2026-07-22T20:42:52.6893049Z ./test-catalog/tools/tools-api:
+2026-07-22T20:42:52.6893739Z tests.yaml
+2026-07-22T20:42:52.6894056Z 
+2026-07-22T20:42:52.6894379Z ./test-catalog/transaction-coordinator:
+2026-07-22T20:42:52.6895154Z tests.yaml
+2026-07-22T20:42:52.6895462Z 
+2026-07-22T20:42:52.6895739Z ./test-catalog/trogdor:
+2026-07-22T20:42:52.6896374Z tests.yaml
+2026-07-22T20:42:53.0923662Z Everything up-to-date
+2026-07-22T20:42:53.1054696Z Post job cleanup.
+2026-07-22T20:42:53.1705824Z [command]/usr/bin/git version
+2026-07-22T20:42:53.1734644Z git version 2.54.0
+2026-07-22T20:42:53.1761179Z Temporarily overriding HOME='/home/runner/work/_temp/08fde75d-4a00-45e2-aef1-b6f4f075c289' before making global git config changes
+2026-07-22T20:42:53.1761945Z Adding repository directory to the temporary git global config as a safe directory
+2026-07-22T20:42:53.1765009Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/kafka/kafka
+2026-07-22T20:42:53.1793480Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-07-22T20:42:53.1846540Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-07-22T20:42:53.2031088Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-07-22T20:42:53.2049427Z http.https://github.com/.extraheader
+2026-07-22T20:42:53.2057653Z [command]/usr/bin/git config --local --unset-all http.https://github.com/.extraheader
+2026-07-22T20:42:53.2082629Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-07-22T20:42:53.2264455Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-07-22T20:42:53.2289304Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-07-22T20:42:53.2617844Z Cleaning up orphan processes
+2026-07-22T20:42:53.2872859Z ##[warning]Node.js 20 is deprecated. The following actions target Node.js 20 but are being forced to run on Node.js 24: actions/download-artifact@v5. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
