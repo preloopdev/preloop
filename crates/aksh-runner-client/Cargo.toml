@@ -13,6 +13,7 @@ workspace = true
 anyhow.workspace = true
 clap.workspace = true
 aksh-gha-protocol = { path = "../aksh-gha-protocol" }
+aksh-gha-parser = { path = "../aksh-gha-parser" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
