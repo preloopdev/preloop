@@ -9,6 +9,10 @@ server or standalone lint command encounters `owner/repo/.github/workflows/x.yml
 Set `AKSH_GITHUB_TOKEN` for private repositories; public repositories can use
 unauthenticated requests subject to GitHub API rate limits.
 
+The server also resolves each remote reference to its immutable commit SHA and
+propagates the repository, ref, and SHA into expanded job plans and reusable-call
+metadata.
+
 This document tracks real public GitHub Actions workflows exercised against `aksh` and `actionlint`. Results are from the current default branches at the time of each run; workflows can change upstream.
 
 ## Current results

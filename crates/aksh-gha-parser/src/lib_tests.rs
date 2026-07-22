@@ -1118,3 +1118,49 @@ jobs:
     assert!(plans[0].fail_fast);
     assert_eq!(plans[0].max_parallel, Some(3));
 }
+
+#[test]
+fn reusable_workflow_sha_propagates_to_plans_and_call_metadata() {
+    let caller = parse_workflow(
+        r#"
+on: push
+jobs:
+  call:
+    uses: octo/demo/.github/workflows/build.yml@v1
+"#,
+    )
+    .unwrap();
+    let called = r#"
+on:
+  workflow_call:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+"#;
+    let mut reusable = BTreeMap::new();
+    reusable.insert(
+        "octo/demo/.github/workflows/build.yml@v1".to_owned(),
+        called.to_owned(),
+    );
+    let mut shas = BTreeMap::new();
+    shas.insert(
+        "octo/demo/.github/workflows/build.yml@v1".to_owned(),
+        "0123456789abcdef".to_owned(),
+    );
+
+    let expanded = expand_jobs_with_reusables_and_shas(&caller, &reusable, &shas).unwrap();
+    assert_eq!(
+        expanded.jobs[0].workflow_sha.as_deref(),
+        Some("0123456789abcdef")
+    );
+    assert_eq!(
+        expanded.jobs[0].workflow_repository.as_deref(),
+        Some("octo/demo")
+    );
+    assert_eq!(
+        expanded.reusable_calls["call"].workflow_sha.as_deref(),
+        Some("0123456789abcdef")
+    );
+}
