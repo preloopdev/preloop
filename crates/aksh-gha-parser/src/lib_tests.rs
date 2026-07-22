@@ -1164,3 +1164,71 @@ jobs:
         Some("0123456789abcdef")
     );
 }
+
+#[test]
+fn matrix_expanded_reusable_workflow_needs_resolution() {
+    let caller = parse_workflow(
+        r#"
+on: push
+jobs:
+  build:
+    uses: octo/demo/.github/workflows/build.yml@v1
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+  package:
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+"#,
+    )
+    .unwrap();
+    let called = r#"
+on:
+  workflow_call:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo test
+"#;
+    let mut reusable = BTreeMap::new();
+    reusable.insert(
+        "octo/demo/.github/workflows/build.yml@v1".to_owned(),
+        called.to_owned(),
+    );
+    let shas = BTreeMap::new();
+
+    let expanded = expand_jobs_with_reusables_and_shas(&caller, &reusable, &shas).unwrap();
+    // We expect package to depend on both matrix instances of the reusable workflow call
+    let package_job = expanded
+        .jobs
+        .iter()
+        .find(|j| j.base_id == "package")
+        .unwrap();
+    assert_eq!(package_job.needs.len(), 2);
+    let needs_ids: Vec<String> = package_job.needs.iter().map(|n| n.0.clone()).collect();
+    assert!(needs_ids.contains(&"build (ubuntu-latest)/test".to_owned()));
+    assert!(needs_ids.contains(&"build (windows-latest)/test".to_owned()));
+}
+
+#[test]
+fn parses_step_with_boolean_input() {
+    let yaml = r#"
+on: push
+jobs:
+  test:
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        if: true
+        with:
+          persist-credentials: false
+          fetch-depth: 25
+"#;
+    let parsed = parse_workflow(yaml).unwrap();
+    let expanded = expand_jobs(&parsed).unwrap();
+    assert_eq!(expanded.len(), 1);
+}
