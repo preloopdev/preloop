@@ -420,6 +420,12 @@ pub struct ReusableCallMetadata {
     /// Caller strategy matrix values.
     #[serde(default)]
     pub matrix: BTreeMap<String, Value>,
+    /// Resolved called-workflow commit SHA.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_sha: Option<String>,
+    /// Resolved called-workflow repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_repository: Option<String>,
 }
 
 /// Trigger syntax.
