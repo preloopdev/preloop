@@ -32,10 +32,39 @@ pub(super) fn validate_function_calls(expr: &Expr) -> Result<(), ExpressionError
                     | "join"
                     | "hashfiles"
                     | "tojson"
+                    | "case"
             ) {
                 return Err(ExpressionError::UnknownFunction(name.clone()));
             }
+            if name.eq_ignore_ascii_case("case") && (args.len() < 3 || args.len().is_multiple_of(2))
+            {
+                return Err(ExpressionError::EvenCaseParameters);
+            }
             args.iter().try_for_each(validate_function_calls)
+        }
+    }
+}
+
+/// Collect all top-level context names referenced in an expression AST.
+pub(super) fn collect_contexts_from_expr(expr: &Expr, out: &mut std::collections::HashSet<String>) {
+    match expr {
+        Expr::Path(path) => {
+            if let Some(first) = path.first() {
+                out.insert(first.to_ascii_lowercase());
+            }
+        }
+        Expr::Literal(_) => {}
+        Expr::UnaryNot(inner) | Expr::MemberAccess { expr: inner, .. } => {
+            collect_contexts_from_expr(inner, out);
+        }
+        Expr::Binary { left, right, .. } => {
+            collect_contexts_from_expr(left, out);
+            collect_contexts_from_expr(right, out);
+        }
+        Expr::Call { args, .. } => {
+            for arg in args {
+                collect_contexts_from_expr(arg, out);
+            }
         }
     }
 }
@@ -119,14 +148,28 @@ fn abstract_equal(left: &Value, right: &Value) -> bool {
 }
 
 fn compare_values(
-    left: &Value,
-    right: &Value,
+    left_value: &Value,
+    right_value: &Value,
     predicate: impl FnOnce(std::cmp::Ordering) -> bool,
 ) -> bool {
-    if let (Some(left), Some(right)) = (numeric_value(left), numeric_value(right)) {
-        return left.partial_cmp(&right).is_some_and(predicate);
+    if let (Some(left), Some(right)) = (numeric_value(left_value), numeric_value(right_value)) {
+        if let Some(ordering) = left.partial_cmp(&right) {
+            return predicate(ordering);
+        }
+        // A failed numeric conversion for mixed values is not a string
+        // comparison; preserve the runner's false result for NaN.
+        if !matches!(
+            (left_value, right_value),
+            (Value::String(_), Value::String(_))
+        ) {
+            return false;
+        }
     }
-    predicate(string_value(left).cmp(&string_value(right)))
+    predicate(
+        string_value(left_value)
+            .to_ascii_lowercase()
+            .cmp(&string_value(right_value).to_ascii_lowercase()),
+    )
 }
 
 fn numeric_value(value: &Value) -> Option<f64> {
@@ -203,6 +246,24 @@ fn is_decimal_number(value: &str) -> bool {
 
 fn eval_call(name: &str, args: &[Expr], context: &Context) -> Result<Value, ExpressionError> {
     let lower = name.to_ascii_lowercase();
+    // case() uses lazy evaluation — handle before eager collect
+    if lower == "case" {
+        if args.len() < 3 || args.len().is_multiple_of(2) {
+            return Err(ExpressionError::EvenCaseParameters);
+        }
+        // Evaluate predicate-result pairs lazily
+        for i in (0..args.len() - 1).step_by(2) {
+            let predicate = eval(&args[i], context)?;
+            if !predicate.is_boolean() {
+                return Err(ExpressionError::NonBooleanCasePredicate);
+            }
+            if predicate.as_bool().unwrap_or(false) {
+                return eval(&args[i + 1], context);
+            }
+        }
+        // No predicate matched — return default (last arg)
+        return eval(&args[args.len() - 1], context);
+    }
     let values = args
         .iter()
         .map(|arg| eval(arg, context))
