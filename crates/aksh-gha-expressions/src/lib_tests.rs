@@ -47,6 +47,16 @@ fn evaluates_json_join_and_comparisons() {
         Value::String("first".to_owned())
     );
     assert_eq!(
+        eval_expression("fromJson('{\"a\": \"val_a\", \"b\": \"val_b\"}')[github.ref == 'refs/heads/main' && 'a' || 'b']", &{
+            let mut ctx = Context::default();
+            let mut gh = serde_json::Map::new();
+            gh.insert("ref".to_owned(), serde_json::Value::String("refs/heads/main".to_owned()));
+            ctx.insert("github", serde_json::Value::Object(gh));
+            ctx
+        }).unwrap(),
+        Value::String("val_a".to_owned())
+    );
+    assert_eq!(
         eval_expression("case(false, 'first', true, 'second', 'third')", &context).unwrap(),
         Value::String("second".to_owned())
     );

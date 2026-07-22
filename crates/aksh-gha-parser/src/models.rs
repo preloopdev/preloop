@@ -159,6 +159,18 @@ pub struct Workflow {
 }
 
 impl Workflow {
+    pub(crate) fn supports_inputs(&self) -> bool {
+        match &self.on {
+            Trigger::Single(s) => s == "workflow_call" || s == "workflow_dispatch",
+            Trigger::Many(v) => v
+                .iter()
+                .any(|s| s == "workflow_call" || s == "workflow_dispatch"),
+            Trigger::Map(map) => {
+                map.contains_key("workflow_call") || map.contains_key("workflow_dispatch")
+            }
+        }
+    }
+
     /// Returns the workflow_call trigger definition if the workflow is callable.
     pub fn workflow_call_trigger(&self) -> Result<Option<WorkflowCallTrigger>, ParserError> {
         match &self.on {

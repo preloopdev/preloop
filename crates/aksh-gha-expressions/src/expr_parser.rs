@@ -123,7 +123,7 @@ impl Parser {
 
     fn parse_ident_or_call(&mut self, name: String) -> Result<Expr, ExpressionError> {
         self.advance();
-        if matches!(self.current(), Token::LParen) {
+        let mut expr = if matches!(self.current(), Token::LParen) {
             self.advance();
             let mut args = Vec::new();
             if !matches!(self.current(), Token::RParen) {
@@ -137,71 +137,11 @@ impl Parser {
                 }
             }
             self.expect(Token::RParen)?;
-            let call = Expr::Call { name, args };
-            // Check for trailing member access: fromJSON('...').*.name or fn()[0]
-            let suffix = self.parse_member_suffix();
-            if suffix.is_empty() {
-                Ok(call)
-            } else {
-                Ok(Expr::MemberAccess {
-                    expr: Box::new(call),
-                    path: suffix,
-                })
-            }
+            Expr::Call { name, args }
         } else {
-            let mut path = vec![name];
-            loop {
-                match self.current() {
-                    // Dot access: a.b or a.*
-                    Token::Dot => {
-                        self.advance();
-                        match self.current().clone() {
-                            Token::Ident(segment) => {
-                                self.advance();
-                                path.push(segment);
-                            }
-                            Token::Star => {
-                                self.advance();
-                                path.push("*".to_string());
-                            }
-                            other => {
-                                return Err(ExpressionError::Unexpected(format!("{other:?}")));
-                            }
-                        }
-                    }
-                    // Bracket access: a['key'] or a[0]
-                    Token::LBracket => {
-                        self.advance();
-                        let segment = match self.current().clone() {
-                            Token::String(s) => {
-                                self.advance();
-                                s
-                            }
-                            Token::Number(n) => {
-                                self.advance();
-                                n
-                            }
-                            Token::Ident(s) => {
-                                self.advance();
-                                s
-                            }
-                            other => {
-                                return Err(ExpressionError::Unexpected(format!("{other:?}")));
-                            }
-                        };
-                        self.expect(Token::RBracket)?;
-                        path.push(segment);
-                    }
-                    _ => break,
-                }
-            }
-            Ok(Expr::Path(path))
-        }
-    }
+            Expr::Path(vec![name])
+        };
 
-    /// Parse trailing `.ident`, `.*`, or `['key']` segments after an expression.
-    fn parse_member_suffix(&mut self) -> Vec<String> {
-        let mut path = Vec::new();
         loop {
             match self.current() {
                 Token::Dot => {
@@ -209,41 +149,92 @@ impl Parser {
                     match self.current().clone() {
                         Token::Ident(segment) => {
                             self.advance();
-                            path.push(segment);
+                            expr = match expr {
+                                Expr::Path(mut path) => {
+                                    path.push(segment);
+                                    Expr::Path(path)
+                                }
+                                other => Expr::MemberAccess {
+                                    expr: Box::new(other),
+                                    path: vec![segment],
+                                },
+                            };
                         }
                         Token::Star => {
                             self.advance();
-                            path.push("*".to_string());
+                            expr = match expr {
+                                Expr::Path(mut path) => {
+                                    path.push("*".to_string());
+                                    Expr::Path(path)
+                                }
+                                other => Expr::MemberAccess {
+                                    expr: Box::new(other),
+                                    path: vec!["*".to_string()],
+                                },
+                            };
                         }
-                        _ => break,
+                        other => {
+                            return Err(ExpressionError::Unexpected(format!("{other:?}")));
+                        }
                     }
                 }
                 Token::LBracket => {
                     self.advance();
-                    let segment = match self.current().clone() {
-                        Token::String(s) => {
-                            self.advance();
-                            s
+                    let index = self.parse_expr()?;
+                    self.expect(Token::RBracket)?;
+                    expr = match (expr, &index) {
+                        (Expr::Path(mut path), Expr::Literal(Value::String(s))) => {
+                            path.push(s.clone());
+                            Expr::Path(path)
                         }
-                        Token::Number(n) => {
-                            self.advance();
-                            n
+                        (Expr::Path(mut path), Expr::Literal(Value::Number(n))) => {
+                            path.push(n.to_string());
+                            Expr::Path(path)
                         }
-                        Token::Ident(s) => {
-                            self.advance();
-                            s
+                        (Expr::Path(mut path), Expr::Path(p)) if p.len() == 1 => {
+                            path.push(p[0].clone());
+                            Expr::Path(path)
                         }
-                        _ => break,
+                        (
+                            Expr::MemberAccess {
+                                expr: base,
+                                mut path,
+                            },
+                            Expr::Literal(Value::String(s)),
+                        ) => {
+                            path.push(s.clone());
+                            Expr::MemberAccess { expr: base, path }
+                        }
+                        (
+                            Expr::MemberAccess {
+                                expr: base,
+                                mut path,
+                            },
+                            Expr::Literal(Value::Number(n)),
+                        ) => {
+                            path.push(n.to_string());
+                            Expr::MemberAccess { expr: base, path }
+                        }
+                        (
+                            Expr::MemberAccess {
+                                expr: base,
+                                mut path,
+                            },
+                            Expr::Path(p),
+                        ) if p.len() == 1 => {
+                            path.push(p[0].clone());
+                            Expr::MemberAccess { expr: base, path }
+                        }
+                        (base, idx) => Expr::IndexAccess {
+                            expr: Box::new(base),
+                            index: Box::new(idx.clone()),
+                        },
                     };
-                    if self.expect(Token::RBracket).is_err() {
-                        break;
-                    }
-                    path.push(segment);
                 }
                 _ => break,
             }
         }
-        path
+        Ok(expr)
     }
 
     fn expect(&mut self, expected: Token) -> Result<(), ExpressionError> {

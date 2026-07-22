@@ -13,6 +13,10 @@ pub(super) fn validate_function_calls(expr: &Expr) -> Result<(), ExpressionError
         Expr::UnaryNot(inner) | Expr::MemberAccess { expr: inner, .. } => {
             validate_function_calls(inner)
         }
+        Expr::IndexAccess { expr: inner, index } => {
+            validate_function_calls(inner)?;
+            validate_function_calls(index)
+        }
         Expr::Binary { left, right, .. } => {
             validate_function_calls(left)?;
             validate_function_calls(right)
@@ -56,6 +60,10 @@ pub(super) fn collect_contexts_from_expr(expr: &Expr, out: &mut std::collections
         Expr::Literal(_) => {}
         Expr::UnaryNot(inner) | Expr::MemberAccess { expr: inner, .. } => {
             collect_contexts_from_expr(inner, out);
+        }
+        Expr::IndexAccess { expr: inner, index } => {
+            collect_contexts_from_expr(inner, out);
+            collect_contexts_from_expr(index, out);
         }
         Expr::Binary { left, right, .. } => {
             collect_contexts_from_expr(left, out);
@@ -124,6 +132,36 @@ pub(super) fn eval(expr: &Expr, context: &Context) -> Result<Value, ExpressionEr
         Expr::MemberAccess { expr, path } => {
             let base = eval(expr, context)?;
             Ok(Context::resolve_value(base, path))
+        }
+        Expr::IndexAccess { expr, index } => {
+            let base = eval(expr, context)?;
+            let idx = eval(index, context)?;
+            match (base, idx) {
+                (Value::Object(map), idx_val) => {
+                    let key = match idx_val {
+                        Value::String(s) => s,
+                        Value::Number(n) => n.to_string(),
+                        Value::Bool(b) => b.to_string(),
+                        _ => return Ok(Value::Null),
+                    };
+                    Ok(map.get(&key).cloned().unwrap_or(Value::Null))
+                }
+                (Value::Array(arr), Value::Number(n)) => {
+                    if let Some(i) = n.as_u64() {
+                        Ok(arr.get(i as usize).cloned().unwrap_or(Value::Null))
+                    } else {
+                        Ok(Value::Null)
+                    }
+                }
+                (Value::Array(arr), Value::String(s)) => {
+                    if let Ok(i) = s.parse::<usize>() {
+                        Ok(arr.get(i).cloned().unwrap_or(Value::Null))
+                    } else {
+                        Ok(Value::Null)
+                    }
+                }
+                _ => Ok(Value::Null),
+            }
         }
     }
 }

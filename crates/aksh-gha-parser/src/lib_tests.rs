@@ -1232,3 +1232,40 @@ jobs:
     let expanded = expand_jobs(&parsed).unwrap();
     assert_eq!(expanded.len(), 1);
 }
+
+#[test]
+fn allows_inputs_in_job_outputs_for_reusable_workflows() {
+    let yaml = r#"
+on:
+  workflow_call:
+    inputs:
+      test-input:
+        required: true
+        type: string
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      out1: ${{ inputs.test-input }}
+    steps:
+      - run: echo ok
+"#;
+    let parsed = parse_workflow(yaml);
+    assert!(parsed.is_ok(), "Failed to parse: {:?}", parsed.err());
+}
+
+#[test]
+fn rejects_inputs_in_job_outputs_for_non_reusable_workflows() {
+    let yaml = r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      out1: ${{ inputs.test-input }}
+    steps:
+      - run: echo ok
+"#;
+    let parsed = parse_workflow(yaml);
+    assert!(parsed.is_err(), "Expected parsing to fail");
+}

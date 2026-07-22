@@ -300,7 +300,7 @@ const CTX_STEP_WORKING_DIR: &[&str] = CTX_STEP_ENV;
 /// Validate a job container or service value. Container images/options inherit
 /// the job-container context, while `credentials` and `env` have their own
 /// narrower schema-defined contexts.
-fn validate_container_expressions(value: &Value) -> Result<(), String> {
+fn validate_container_expressions(value: &Value, allowed_runner: &[&str]) -> Result<(), String> {
     let Value::Object(map) = value else {
         return validate_value_expressions(value, Some(CTX_JOB_CONTAINER));
     };
@@ -308,7 +308,7 @@ fn validate_container_expressions(value: &Value) -> Result<(), String> {
     for (key, value) in map {
         let allowed = match key.as_str() {
             "credentials" => CTX_CONTAINER_CREDENTIALS,
-            "env" => CTX_RUNNER,
+            "env" => allowed_runner,
             _ => CTX_JOB_CONTAINER,
         };
         validate_value_expressions(value, Some(allowed))?;
@@ -318,6 +318,15 @@ fn validate_container_expressions(value: &Value) -> Result<(), String> {
 
 /// Validate all `${{ }}` expressions in a workflow.
 pub fn validate_workflow_expressions(workflow: &Workflow) -> Result<(), ParserError> {
+    let mut allowed_runner_storage;
+    let allowed_runner = if workflow.supports_inputs() {
+        allowed_runner_storage = CTX_RUNNER.to_vec();
+        allowed_runner_storage.push("inputs");
+        allowed_runner_storage.as_slice()
+    } else {
+        CTX_RUNNER
+    };
+
     if let Some(run_name) = &workflow.run_name {
         validate_expressions_in_string(run_name, false, Some(CTX_RUN_NAME))
             .map_err(ParserError::InvalidExpression)?;
@@ -405,14 +414,14 @@ pub fn validate_workflow_expressions(workflow: &Workflow) -> Result<(), ParserEr
         }
 
         if let Some(container) = &job.container {
-            validate_container_expressions(container).map_err(|e| {
+            validate_container_expressions(container, allowed_runner).map_err(|e| {
                 ParserError::InvalidExpression(format!("job `{job_id}` container: {e}"))
             })?;
         }
         if let Some(services) = &job.services {
             if let Value::Object(services) = services {
                 for (service_name, service) in services {
-                    validate_container_expressions(service).map_err(|e| {
+                    validate_container_expressions(service, allowed_runner).map_err(|e| {
                         ParserError::InvalidExpression(format!(
                             "job `{job_id}` service `{service_name}`: {e}"
                         ))
@@ -449,7 +458,7 @@ pub fn validate_workflow_expressions(workflow: &Workflow) -> Result<(), ParserEr
             }
         }
         for (output_name, output) in &job.outputs {
-            validate_value_expressions(output, Some(CTX_RUNNER)).map_err(|e| {
+            validate_value_expressions(output, Some(allowed_runner)).map_err(|e| {
                 ParserError::InvalidExpression(format!(
                     "job `{job_id}` output `{output_name}`: {e}"
                 ))

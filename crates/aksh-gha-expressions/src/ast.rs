@@ -19,6 +19,11 @@ pub(crate) enum Expr {
         expr: Box<Expr>,
         path: Vec<String>,
     },
+    /// Dynamic index or member access using brackets, e.g. `fromJSON('...')[needs.meta.outputs.run-kind]`
+    IndexAccess {
+        expr: Box<Expr>,
+        index: Box<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

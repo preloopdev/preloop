@@ -73,6 +73,34 @@ deep reusable workflow chaining, complex matrix expansion, and YAML edge cases.
 | [rails/rails](https://github.com/rails/rails/blob/main/.github/workflows/rails_releaser_tests.yml) | `rails_releaser_tests.yml` | **pass** — 1 job plan, 11 steps | exit 0 — clean | Simple test. |
 | [apache/pulsar](https://github.com/apache/pulsar/blob/master/.github/workflows/ci-pulsarbot.yaml) | `ci-pulsarbot.yaml` | **pass** — 1 job plan, 10 steps | exit 0 — clean | Pulsar bot CI. |
 
+### Batch 3: Diverse project workflows (20 projects)
+
+A third batch targeting large generated workflows, complex expressions, reusable
+workflow chaining, and multi-platform build matrices.
+
+| Repository | Workflow | `aksh` result | `actionlint` result | Notes |
+|---|---:|---:|---:|---|
+| [ClickHouse/ClickHouse](https://github.com/ClickHouse/ClickHouse/blob/master/.github/workflows/pull_request.yml) | `pull_request.yml` | **pass** — 60 job plans, 905 steps | shellcheck findings | 393 KB; largest single workflow tested. |
+| [valkey-io/valkey](https://github.com/valkey-io/valkey/blob/unstable/.github/workflows/daily.yml) | `daily.yml` | **pass** — 15 job plans, 86 steps | shellcheck findings | 121 KB; large matrix with platform variants. |
+| [neondatabase/neon](https://github.com/neondatabase/neon/blob/main/.github/workflows/build_and_test.yml) | `build_and_test.yml` | **pass** — 14 job plans, 88 steps | shellcheck findings | Supports dynamic bracket index expressions with nested property paths (finding #9). |
+| [dotnet/runtime](https://github.com/dotnet/runtime/blob/main/.github/workflows/holistic-review-orchestrator.yml) | `holistic-review-orchestrator.yml` | **pass** — 1 job plan, 12 steps | shellcheck findings | Orchestrator workflow (35 KB). |
+| [envoyproxy/envoy](https://github.com/envoyproxy/envoy/blob/main/.github/workflows/_run.yml) | `_run.yml` | **pass** — 1 job plan, 54 steps | shellcheck findings | Called workflow (`workflow_call`); `inputs` context in expression-valued job names handled correctly. |
+| [facebook/react-native](https://github.com/facebook/react-native/blob/main/.github/workflows/test-all.yml) | `test-all.yml` | **pass** — 21 job plans, 68 steps | shellcheck findings | Requires `--workspace-root` for local reusable deps. |
+| [microsoft/playwright](https://github.com/microsoft/playwright/blob/main/.github/workflows/tests_secondary.yml) | `tests_secondary.yml` | **pass** — 26 job plans, 135 steps | shellcheck findings | Multi-browser matrix (chromium/firefox/webkit). |
+| [moby/buildkit](https://github.com/moby/buildkit/blob/master/.github/workflows/buildkit.yml) | `buildkit.yml` | **pass** — 1 job plan, 54 steps | exit 0 — clean | Propagates `workflow_call` context to remote reusable workflows, permitting `inputs` (finding #8). |
+| [docker/compose](https://github.com/docker/compose/blob/main/.github/workflows/ci.yml) | `ci.yml` | **pass** — 20 job plans, 115 steps | shellcheck findings | Same remote `bake.yml` dependency (finding #8). |
+| [neovim/neovim](https://github.com/neovim/neovim/blob/master/.github/workflows/test.yml) | `test.yml` | **pass** — 28 job plans, 333 steps | shellcheck findings | Already tested standalone; full repo with `--workspace-root` expands correctly. |
+| [actions/runner](https://github.com/actions/runner/blob/main/.github/workflows/release.yml) | `release.yml` | **pass** — 7 job plans, 80 steps | exit 1 — shellcheck + old action versions | Official runner's own release workflow. |
+| [tauri-apps/tauri](https://github.com/tauri-apps/tauri/blob/dev/.github/workflows/test-core.yml) | `test-core.yml` | **pass** — 21 job plans, 78 steps | exit 0 — clean | Multi-target Rust build (Android/Linux/macOS/Windows). |
+| [django/django](https://github.com/django/django/blob/main/.github/workflows/schedule_tests.yml) | `schedule_tests.yml` | **pass** — 7 job plans, 49 steps | shellcheck findings | Multi-database / multi-Python scheduled CI. |
+| [npm/cli](https://github.com/npm/cli/blob/latest/.github/workflows/node-integration.yml) | `node-integration.yml` | **pass** — 1 job plan, 14 steps | shellcheck findings | CITGM integration test runner. |
+| [sveltejs/kit](https://github.com/sveltejs/kit/blob/version-3/.github/workflows/ci.yml) | `ci.yml` | **pass** — 7 job plans, 93 steps | shellcheck findings | Monorepo CI with pnpm workspace. |
+| [FreeCAD/FreeCAD](https://github.com/FreeCAD/FreeCAD/blob/main/.github/workflows/build_release.yml) | `build_release.yml` | **pass** — 7 job plans, 62 steps | shellcheck findings | Multi-platform CMake CI (Windows/Linux/macOS). |
+| [wasmerio/wasmer](https://github.com/wasmerio/wasmer/blob/main/.github/workflows/test.yaml) | `test.yaml` | **pass** — 9 job plans, 129 steps | shellcheck findings | Multi-runtime (Wasm/Cranelift/LLVM) test matrix. |
+| [hashicorp/packer](https://github.com/hashicorp/packer/blob/main/.github/workflows/build.yml) | `build.yml` | **pass** — 9 job plans, 78 steps | shellcheck findings | Multi-arch Go build matrix. |
+| [biomejs/biome](https://github.com/biomejs/biome/blob/main/.github/workflows/release.yml) | `release.yml` | **pass** — 6 job plans, 51 steps | shellcheck findings | Rust/JS monorepo release orchestration. |
+| [elastic/elasticsearch](https://github.com/elastic/elasticsearch/blob/main/.github/workflows/updatecli-compose.yml) | `updatecli-compose.yml` | **pass** — 1 job plan, 5 steps | shellcheck findings | Simple manifest update workflow. |
+
 `actionlint` exit status is nonzero for the listed shellcheck findings even when YAML and workflow schema validation succeeds. Treat those separately from parser/schema failures.
 
 ## Reproduction
@@ -206,6 +234,52 @@ The expander creates suffixed job ids (`build (linux, amd64)`, `build (darwin, a
 but `package-docker` references the bare `build`. GitHub's runner interprets
 `needs: [build]` as a dependency on all matrix instances of job `build`. The
 parser now resolves bare needed job names to the set of all matrix-expanded instances (both reusable workflow calls and regular matrix jobs).
+
+### 8. `inputs` context not propagated to fetched remote reusable workflows — implemented
+
+When a workflow references a remote reusable workflow (e.g. `docker/github-builder/.github/workflows/bake.yml@ref`),
+the fetched remote workflow uses `inputs` in job outputs:
+
+```yaml
+# In bake.yml (has on: workflow_call with inputs)
+finalize:
+  outputs:
+    artifact-name: ${{ inputs.artifact-upload && inputs.artifact-name || '' }}
+```
+
+The resolver fetches the remote workflow and inserts it into the reusable-workflow
+table, but the expression validator does not recognize the `workflow_call` event
+context for the fetched workflow. The `inputs` context is therefore rejected:
+
+```text
+context "inputs" is not allowed here. available contexts are "github", "needs",
+"strategy", "matrix", "secrets", "steps", "job", "runner", "env", "vars"
+```
+
+Observed in `moby/buildkit` and `docker/compose`, both of which depend on
+`docker/github-builder/bake.yml`.
+
+Resolved: The expression validator dynamically checks if the workflow trigger supports the `inputs` context (meaning it declares a `workflow_call` or `workflow_dispatch` trigger) and expands `CTX_RUNNER` to include `"inputs"` if so. This permits called reusable workflows to access `inputs` in job outputs.
+
+### 9. Expression parser chokes on dot token inside bracket index with multi-line `format()` — implemented
+
+Complex expressions using multi-line `format()` inside `fromJSON()` with bracket
+indexing cause the expression tokenizer to fail:
+
+```yaml
+env:
+  SLACK_CHANNEL: ${{ fromJSON(format('{
+    "storage-release": "{0}",
+    "compute-release": "{1}"
+  }',
+    vars.SLACK_STORAGE_CHANNEL_ID,
+    vars.SLACK_COMPUTE_CHANNEL_ID
+  ))[needs.meta.outputs.run-kind] }}
+```
+
+Resolved: Rewrote the expression parser's member/bracket indexing logic to parse any arbitrary expression inside brackets (`LBracket ... RBracket`), and added `Expr::IndexAccess` to the AST to represent dynamic indexing.
+
+Observed in `neondatabase/neon/build_and_test.yml`.
 
 ## Suggested next validation set
 
