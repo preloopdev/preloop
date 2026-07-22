@@ -449,6 +449,7 @@ pub(crate) async fn submit_run_inner(
                 OidcJobContext {
                     environment: job.oidc_environment.clone(),
                     job_workflow_ref: job.oidc_job_workflow_ref.clone(),
+                    job_workflow_sha: job.workflow_sha.clone(),
                 },
             );
             inner.next_request_id += 1;
