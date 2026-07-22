@@ -128,7 +128,19 @@ pub async fn run_steps(
                 setup_lines.push(format!("{ts} ##[group]GITHUB_TOKEN Permissions"));
                 for (perm, level) in perms {
                     if let Some(level_str) = level.as_str() {
-                        setup_lines.push(format!("{ts} {perm}: {level_str}"));
+                        // Official runner capitalizes permission names
+                        let capitalized = perm
+                            .split('-')
+                            .map(|w| {
+                                let mut c = w.chars();
+                                match c.next() {
+                                    None => String::new(),
+                                    Some(f) => f.to_uppercase().to_string() + c.as_str(),
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("-");
+                        setup_lines.push(format!("{ts} {capitalized}: {level_str}"));
                     }
                 }
                 setup_lines.push(format!("{ts} ##[endgroup]"));
@@ -150,6 +162,38 @@ pub async fn run_steps(
         }
         setup_lines.push(format!("{ts} Prepare workflow directory"));
         setup_lines.push(format!("{ts} Prepare all required actions"));
+
+        // Reusable workflow: log `Uses:` and `##[group] Inputs` block
+        // matching official runner's JobExtension.InitializeJob output.
+        let wf_file_path = job.context_data.get("job").and_then(|j| {
+            let decoded = super::job_extension::decode_typed_value(j);
+            decoded
+                .get("workflow_file_path")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+        });
+        if let Some(wf_path) = &wf_file_path {
+            setup_lines.push(format!("{ts} Uses: {wf_path}"));
+            // Log inputs if present
+            if let Some(inputs_val) = job.context_data.get("inputs") {
+                let inputs = super::job_extension::decode_typed_value(inputs_val);
+                if let Some(obj) = inputs.as_object() {
+                    if !obj.is_empty() {
+                        setup_lines.push(format!("{ts} ##[group] Inputs"));
+                        for (key, val) in obj {
+                            let display = match val {
+                                serde_json::Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            };
+                            setup_lines.push(format!("{ts}   {key}: {display}"));
+                        }
+                        setup_lines.push(format!("{ts} ##[endgroup]"));
+                    }
+                }
+            }
+        }
+
         setup_lines.push(format!("{ts} Complete job name: {}", job.job_name));
 
         let setup_content = setup_lines.join("\n");
@@ -817,7 +861,19 @@ pub async fn run_steps(
 
     // Upload "Complete job" log matching official runner
     {
-        let complete_content = format!("{ts} Cleaning up orphan processes");
+        let mut complete_lines = Vec::new();
+
+        // Log job outputs if any were declared
+        // Official runner: "Evaluate and set job outputs" + "Set output '<name>'"
+        if !job.job_output_keys.is_empty() {
+            complete_lines.push(format!("{ts} Evaluate and set job outputs"));
+            for name in &job.job_output_keys {
+                complete_lines.push(format!("{ts} Set output '{name}'"));
+            }
+        }
+
+        complete_lines.push(format!("{ts} Cleaning up orphan processes"));
+        let complete_content = complete_lines.join("\n");
         {
             let mut q = queue.lock().await;
             q.record_step_logs(&complete_step_id, &complete_content);

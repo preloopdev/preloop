@@ -45,6 +45,9 @@ pub struct JobContext {
     pub matchers: MatcherRegistry,
     /// Container state for job/service containers (Phase 2).
     pub container_state: Option<super::container_ops::ContainerState>,
+    /// Declared job-level output names (from jobOutputs in the job message).
+    /// Used by the "Complete job" step to log "Evaluate and set job outputs".
+    pub job_output_keys: Vec<String>,
     /// Live log queue for WebSocket streaming (None when not connected).
     pub live_logs: Option<std::sync::Arc<crate::worker::live_logs::LiveLogQueue>>,
     /// Synthetic step IDs for "Set up job" and "Complete job" (generated in steps_runner, read in job_runner).
@@ -159,6 +162,7 @@ impl JobContext {
             action_paths: HashMap::new(),
             matchers: MatcherRegistry::new(),
             container_state: None,
+            job_output_keys: Vec::new(),
             live_logs: None,
             setup_step_id: None,
             complete_step_id: None,

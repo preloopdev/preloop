@@ -133,6 +133,31 @@ pub async fn run_job(
     let workspace = super::job_extension::setup_workspace(&job_message)?;
     job_ctx.workspace = Some(workspace.clone());
     super::job_extension::inject_github_env(&mut job_ctx, &job_message);
+    // Extract declared job output names for "Complete job" logging.
+    if let Some(outputs_val) = job_message.get("jobOutputs") {
+        // jobOutputs uses Azure DevOps typed-dict encoding:
+        // { "type": 2, "map": [{"Key": {"lit": "name"}, "Value": ...}, ...] }
+        // Extract the actual output names from the map entries.
+        if let Some(map) = outputs_val.get("map").and_then(|v| v.as_array()) {
+            job_ctx.job_output_keys = map
+                .iter()
+                .filter_map(|entry| {
+                    entry
+                        .get("Key")
+                        .and_then(|k| k.get("lit"))
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                })
+                .collect();
+        } else if let Some(obj) = outputs_val.as_object() {
+            // Fallback: plain object keys (excluding typed-dict metadata)
+            job_ctx.job_output_keys = obj
+                .keys()
+                .filter(|k| !matches!(k.as_str(), "type" | "file" | "line" | "col" | "map"))
+                .cloned()
+                .collect();
+        }
+    }
     // v2.336.0 (#4546/#4550): Announce locked dependencies in Setup Job log
     if let Some(deps) = job_message
         .get("actionsDependencies")
