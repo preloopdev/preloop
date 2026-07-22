@@ -8,6 +8,8 @@ use std::collections::BTreeMap;
 
 use aksh_runner::cli::{Cli, Commands};
 
+const MAX_REUSABLE_WORKFLOW_DEPTH: usize = 4;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -113,9 +115,12 @@ async fn resolve_remote_workflows(
         .user_agent("aksh-runner")
         .build()?;
     let token = std::env::var("AKSH_GITHUB_TOKEN").ok();
-    let mut queue = vec![root_yaml.to_owned()];
+    let mut queue = vec![(root_yaml.to_owned(), 0usize)];
     let mut visited = std::collections::BTreeSet::new();
-    while let Some(yaml) = queue.pop() {
+    while let Some((yaml, depth)) = queue.pop() {
+        if depth >= MAX_REUSABLE_WORKFLOW_DEPTH {
+            anyhow::bail!("nested reusable workflow depth exceeded");
+        }
         let workflow = aksh_gha_parser::parse_workflow(&yaml)?;
         for job in workflow.jobs.values() {
             let Some(reference) = job.uses.as_deref() else {
@@ -140,7 +145,7 @@ async fn resolve_remote_workflows(
             }
             let contents = request.send().await?.error_for_status()?.text().await?;
             workflows.insert(reference.to_owned(), contents.clone());
-            queue.push(contents);
+            queue.push((contents, depth + 1));
         }
     }
     Ok(workflows)

@@ -32,7 +32,7 @@ pub(crate) async fn resolve_remote_workflows(
     let mut queue = vec![(submission.workflow_yaml.clone(), 0usize)];
     let mut visited = std::collections::BTreeSet::new();
     while let Some((workflow_yaml, depth)) = queue.pop() {
-        if depth > MAX_REUSABLE_WORKFLOW_DEPTH {
+        if depth >= MAX_REUSABLE_WORKFLOW_DEPTH {
             return Err(ApiError::bad_request(
                 "nested reusable workflow depth exceeded",
             ));
