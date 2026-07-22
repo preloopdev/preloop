@@ -1,0 +1,93 @@
+2026-07-22T17:27:04.0303430Z Current runner version: '2.335.1'
+2026-07-22T17:27:04.0329330Z ##[group]Runner Image Provisioner
+2026-07-22T17:27:04.0330157Z Hosted Compute Agent
+2026-07-22T17:27:04.0330851Z Version: 20260707.563
+2026-07-22T17:27:04.0331487Z Commit: 02667638d2b423fbc733a8e32a88b44996a3ba6e
+2026-07-22T17:27:04.0332236Z Build Date: 2026-07-07T19:33:50Z
+2026-07-22T17:27:04.0333026Z Worker ID: {e11955e1-61b9-4e36-8216-d231ba89168b}
+2026-07-22T17:27:04.0333755Z Azure Region: eastus
+2026-07-22T17:27:04.0334371Z ##[endgroup]
+2026-07-22T17:27:04.0336350Z ##[group]Operating System
+2026-07-22T17:27:04.0337041Z Ubuntu
+2026-07-22T17:27:04.0337658Z 24.04.4
+2026-07-22T17:27:04.0338464Z LTS
+2026-07-22T17:27:04.0339019Z ##[endgroup]
+2026-07-22T17:27:04.0339673Z ##[group]Runner Image
+2026-07-22T17:27:04.0340333Z Image: ubuntu-24.04
+2026-07-22T17:27:04.0340940Z Version: 20260714.240.1
+2026-07-22T17:27:04.0342258Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260714.240/images/ubuntu/Ubuntu2404-Readme.md
+2026-07-22T17:27:04.0343820Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260714.240
+2026-07-22T17:27:04.0344818Z ##[endgroup]
+2026-07-22T17:27:04.0345956Z ##[group]GITHUB_TOKEN Permissions
+2026-07-22T17:27:04.0348448Z Contents: read
+2026-07-22T17:27:04.0349154Z Metadata: read
+2026-07-22T17:27:04.0349772Z ##[endgroup]
+2026-07-22T17:27:04.0351940Z Secret source: Actions
+2026-07-22T17:27:04.0352830Z Prepare workflow directory
+2026-07-22T17:27:04.0736967Z Prepare all required actions
+2026-07-22T17:27:04.0799234Z Uses: team-getveritas/aksh-bench-buildkit/.github/workflows/.test.yml@refs/heads/main (87e7fe79125bc5df1e063311bfd1fd3d47e3ec93)
+2026-07-22T17:27:04.0804265Z ##[group] Inputs
+2026-07-22T17:27:04.0804955Z   cache_scope: build-integration-tests
+2026-07-22T17:27:04.0805937Z   pkgs: ./client ./cmd/buildctl ./worker/containerd ./solver ./frontend
+2026-07-22T17:27:04.0806773Z   kinds: integration
+2026-07-22T17:27:04.0807362Z   tags: 
+2026-07-22T17:27:04.0808362Z   codecov_flags: core
+2026-07-22T17:27:04.0810740Z   includes: - pkg: ./...
+  skip-integration-tests: 1
+  typ: integration gateway
+- pkg: ./client
+  worker: containerd
+  tags: nydus
+  typ: integration
+- pkg: ./client
+  worker: oci
+  tags: nydus
+  typ: integration
+- pkg: ./...
+  tags: nydus
+  skip-integration-tests: 1
+  typ: integration
+- pkg: ./cache/remotecache/gha
+  worker: oci
+  typ: integration
+
+2026-07-22T17:27:04.0812981Z ##[endgroup]
+2026-07-22T17:27:04.0813554Z Complete job name: test / prepare
+2026-07-22T17:27:04.1538937Z ##[group]Run echo "uses: Set up Docker Buildx"
+2026-07-22T17:27:04.1539932Z [36;1mecho "uses: Set up Docker Buildx"[0m
+2026-07-22T17:27:04.2491007Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:27:04.2492230Z env:
+2026-07-22T17:27:04.2492831Z   GO_VERSION: 1.26
+2026-07-22T17:27:04.2493410Z   SETUP_BUILDX_VERSION: edge
+2026-07-22T17:27:04.2494172Z   SETUP_BUILDKIT_IMAGE: moby/buildkit:latest
+2026-07-22T17:27:04.2494906Z ##[endgroup]
+2026-07-22T17:27:04.2713139Z uses: Set up Docker Buildx
+2026-07-22T17:27:04.2891202Z ##[group]Run echo "run: Deps"
+2026-07-22T17:27:04.2891773Z [36;1mecho "run: Deps"[0m
+2026-07-22T17:27:04.2953663Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:27:04.2954178Z env:
+2026-07-22T17:27:04.2954578Z   GO_VERSION: 1.26
+2026-07-22T17:27:04.2955025Z   SETUP_BUILDX_VERSION: edge
+2026-07-22T17:27:04.2955575Z   SETUP_BUILDKIT_IMAGE: moby/buildkit:latest
+2026-07-22T17:27:04.2956137Z ##[endgroup]
+2026-07-22T17:27:04.3043472Z run: Deps
+2026-07-22T17:27:04.3081258Z ##[group]Run echo "uses: Set outputs"
+2026-07-22T17:27:04.3081838Z [36;1mecho "uses: Set outputs"[0m
+2026-07-22T17:27:04.3141050Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:27:04.3141549Z env:
+2026-07-22T17:27:04.3141972Z   GO_VERSION: 1.26
+2026-07-22T17:27:04.3142421Z   SETUP_BUILDX_VERSION: edge
+2026-07-22T17:27:04.3142956Z   SETUP_BUILDKIT_IMAGE: moby/buildkit:latest
+2026-07-22T17:27:04.3143525Z ##[endgroup]
+2026-07-22T17:27:04.3224888Z uses: Set outputs
+2026-07-22T17:27:04.3265124Z ##[group]Run echo "uses: Build"
+2026-07-22T17:27:04.3265872Z [36;1mecho "uses: Build"[0m
+2026-07-22T17:27:04.3324020Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:27:04.3324521Z env:
+2026-07-22T17:27:04.3324928Z   GO_VERSION: 1.26
+2026-07-22T17:27:04.3325374Z   SETUP_BUILDX_VERSION: edge
+2026-07-22T17:27:04.3325901Z   SETUP_BUILDKIT_IMAGE: moby/buildkit:latest
+2026-07-22T17:27:04.3326459Z ##[endgroup]
+2026-07-22T17:27:04.3407666Z uses: Build
+2026-07-22T17:27:04.3488834Z Evaluate and set job outputs
+2026-07-22T17:27:04.3523442Z Cleaning up orphan processes

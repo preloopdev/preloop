@@ -61,6 +61,10 @@ enum Commands {
     Run(RunArgs),
     /// Write default config and surface map.
     Init(InitArgs),
+    /// Download golden job logs from GitHub for a recorded scenario.
+    ExtractLogs(ExtractLogsArgs),
+    /// Run log content conformance: diff aksh E2E logs against golden baselines.
+    LogConform(LogConformArgs),
 }
 
 #[derive(Debug, Args)]
@@ -130,6 +134,35 @@ struct ConformArgs {
     /// Skip cargo test --workspace before replay.
     #[arg(long)]
     skip_cargo_test: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+struct ExtractLogsArgs {
+    /// Runner version whose .runner-watch/golden/v{N} directory should be used.
+    #[arg(long)]
+    runner: String,
+    /// Only extract for a single scenario.
+    #[arg(long)]
+    scenario: Option<String>,
+    /// Override the GitHub run ID (skip reading summary.json).
+    #[arg(long)]
+    run_id: Option<u64>,
+    /// GitHub repo in owner/repo format.
+    #[arg(long, default_value = "preloopdev/aksh-conformance-sample")]
+    repo: String,
+    /// Overwrite existing golden log files.
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+struct LogConformArgs {
+    /// Runner version whose .runner-watch/golden/v{N} directory should be used.
+    #[arg(long)]
+    runner: String,
+    /// Only check a single scenario.
+    #[arg(long)]
+    scenario: Option<String>,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -399,6 +432,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Pr(args) => pr(&config, &args).await,
         Commands::Run(args) => run_all(&config, &args).await,
         Commands::Init(args) => init_files(&config, &args).await,
+        Commands::ExtractLogs(args) => extract_logs(&config, &args).await,
+        Commands::LogConform(args) => log_conform(&config, &args).await,
     }
 }
 
@@ -3203,6 +3238,400 @@ crate_name = "aksh-runner-server"
 path = "crates/aksh-runner-server/src/lib.rs"
 area = "broker/admin flow"
 "#;
+
+// ---------------------------------------------------------------------------
+// extract-logs: download golden job logs from GitHub Actions API
+// ---------------------------------------------------------------------------
+
+async fn extract_logs(_config: &Config, args: &ExtractLogsArgs) -> anyhow::Result<()> {
+    let version_dir = normalize_version_dir(&args.runner);
+    let golden_root = PathBuf::from(DEFAULT_ROOT)
+        .join("golden")
+        .join(&version_dir);
+    if !golden_root.exists() {
+        bail!("golden dir not found: {}", golden_root.display());
+    }
+
+    let scenarios = if let Some(name) = &args.scenario {
+        let dir = golden_root.join(name);
+        if !dir.exists() {
+            bail!("scenario dir not found: {}", dir.display());
+        }
+        vec![dir]
+    } else {
+        let mut dirs: Vec<PathBuf> = fs::read_dir(&golden_root)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_dir() && p.join("summary.json").exists())
+            .collect();
+        dirs.sort();
+        dirs
+    };
+
+    for scenario_dir in &scenarios {
+        let scenario_name = scenario_dir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
+
+        // Determine run_id: CLI override or from summary.json
+        let run_id = if let Some(id) = args.run_id {
+            id
+        } else {
+            let summary_path = scenario_dir.join("summary.json");
+            if !summary_path.exists() {
+                eprintln!("skip {scenario_name}: no summary.json (use --run-id to provide one)");
+                continue;
+            }
+            let summary: Value = serde_json::from_str(&fs::read_to_string(&summary_path)?)?;
+            match summary.get("run_id").and_then(Value::as_u64) {
+                Some(id) => id,
+                None => {
+                    eprintln!("skip {scenario_name}: no run_id in summary.json (use --run-id)");
+                    continue;
+                }
+            }
+        };
+
+        // Check if golden logs already exist
+        let existing_logs: Vec<PathBuf> = fs::read_dir(scenario_dir)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension().is_some_and(|ext| ext == "txt")
+                    && p.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .contains("-logs")
+            })
+            .collect();
+        if !existing_logs.is_empty() && !args.force {
+            println!(
+                "skip {scenario_name}: {} golden log(s) already exist (use --force to overwrite)",
+                existing_logs.len()
+            );
+            continue;
+        }
+
+        println!("extracting logs for {scenario_name} (run_id={run_id})...");
+
+        // Get jobs for this run
+        let jobs_output = Command::new("gh")
+            .args([
+                "api",
+                &format!("repos/{}/actions/runs/{}/jobs", args.repo, run_id),
+                "--jq",
+                ".jobs[] | [.id, .name, .conclusion] | @tsv",
+            ])
+            .output()
+            .await?;
+        if !jobs_output.status.success() {
+            let stderr = String::from_utf8_lossy(&jobs_output.stderr);
+            eprintln!("  error fetching jobs for {scenario_name}: {stderr}");
+            continue;
+        }
+        let jobs_text = String::from_utf8_lossy(&jobs_output.stdout);
+
+        let mut extracted = 0u32;
+        for line in jobs_text.lines() {
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() < 3 {
+                continue;
+            }
+            let job_id = parts[0];
+            let job_name = parts[1];
+            let conclusion = parts[2];
+
+            // Download job log
+            let log_output = Command::new("gh")
+                .args([
+                    "api",
+                    &format!("repos/{}/actions/jobs/{}/logs", args.repo, job_id),
+                ])
+                .output()
+                .await?;
+            if !log_output.status.success() {
+                let stderr = String::from_utf8_lossy(&log_output.stderr);
+                eprintln!("  error downloading log for job {job_name}: {stderr}");
+                continue;
+            }
+
+            // Sanitize job name for filename
+            let safe_name: String = job_name
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                        c
+                    } else {
+                        '-'
+                    }
+                })
+                .collect();
+            let log_path = scenario_dir.join(format!("job-{safe_name}-logs.txt"));
+
+            // Strip BOM if present
+            let mut log_bytes = log_output.stdout;
+            if log_bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+                log_bytes = log_bytes[3..].to_vec();
+            }
+
+            fs::write(&log_path, &log_bytes)?;
+            println!(
+                "  wrote {} ({} bytes, conclusion={conclusion})",
+                log_path.display(),
+                log_bytes.len()
+            );
+            extracted += 1;
+        }
+
+        if extracted == 0 {
+            eprintln!("  warning: no logs extracted for {scenario_name}");
+        } else {
+            println!("  {extracted} log file(s) extracted for {scenario_name}");
+        }
+    }
+
+    Ok(())
+}
+
+//
+// log-conform: run log content diff against golden baselines
+//
+
+async fn log_conform(_config: &Config, args: &LogConformArgs) -> anyhow::Result<()> {
+    let version_dir = normalize_version_dir(&args.runner);
+    let golden_root = PathBuf::from(DEFAULT_ROOT)
+        .join("golden")
+        .join(&version_dir);
+    if !golden_root.exists() {
+        bail!("golden dir not found: {}", golden_root.display());
+    }
+
+    // Find scenarios that have golden log .txt files
+    let scenarios = if let Some(name) = &args.scenario {
+        let dir = golden_root.join(name);
+        if !dir.exists() {
+            bail!("scenario dir not found: {}", dir.display());
+        }
+        vec![dir]
+    } else {
+        let mut dirs: Vec<PathBuf> = fs::read_dir(&golden_root)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_dir()
+                    && fs::read_dir(p).is_ok_and(|entries| {
+                        entries.filter_map(|e| e.ok()).any(|e| {
+                            let name = e.file_name().to_string_lossy().to_string();
+                            name.ends_with("-logs.txt")
+                        })
+                    })
+            })
+            .collect();
+        dirs.sort();
+        dirs
+    };
+
+    if scenarios.is_empty() {
+        bail!(
+            "no scenarios with golden log files found under {}",
+            golden_root.display()
+        );
+    }
+
+    // Check that verify-log-conformance.py exists
+    let diff_script = PathBuf::from("benchmarks/real-world/log-content-diff.py");
+    if !diff_script.exists() {
+        bail!("log-content-diff.py not found at {}", diff_script.display());
+    }
+
+    println!(
+        "log-conform: checking {} scenario(s) against golden baselines",
+        scenarios.len()
+    );
+
+    let mut failed_scenarios = Vec::new();
+
+    for scenario_dir in &scenarios {
+        let scenario_name = scenario_dir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+
+        let golden_logs: Vec<PathBuf> = fs::read_dir(scenario_dir)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension().is_some_and(|ext| ext == "txt")
+                    && p.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .contains("-logs")
+            })
+            .collect();
+
+        if golden_logs.is_empty() {
+            continue;
+        }
+
+        // Find corresponding scenario workflow
+        let scenario_workflow = PathBuf::from("experiments/mitm/scenarios")
+            .join(&scenario_name)
+            .join(format!("{scenario_name}.yml"));
+        if !scenario_workflow.exists() {
+            eprintln!(
+                "skip {scenario_name}: workflow file not found at {}",
+                scenario_workflow.display()
+            );
+            continue;
+        }
+
+        println!("--- {scenario_name} ---");
+
+        let conformance_bin = PathBuf::from("target/debug/aksh-conformance");
+        if !conformance_bin.exists() {
+            bail!("aksh-conformance not built; run `cargo build -p aksh-conformance` first");
+        }
+
+        // Run E2E and save logs
+        let save_dir = PathBuf::from("/tmp/aksh-log-conform").join(&scenario_name);
+        fs::create_dir_all(&save_dir)?;
+        // Clear old logs
+        for e in fs::read_dir(&save_dir)?.flatten() {
+            let _ = fs::remove_file(e.path());
+        }
+
+        let e2e_status = Command::new(&conformance_bin)
+            .args([
+                "runner-e2e",
+                "--runner-bin",
+                "target/debug/aksh-runner",
+                "--workflow",
+                scenario_workflow.to_str().unwrap(),
+                "--save-logs",
+                save_dir.to_str().unwrap(),
+            ])
+            .status()
+            .await?;
+
+        if !e2e_status.success() {
+            eprintln!("  E2E run failed for {scenario_name}");
+            failed_scenarios.push((scenario_name.clone(), "E2E run failed".to_string()));
+            continue;
+        }
+
+        // Compare each golden log against the corresponding aksh log
+        // Collect aksh logs for fallback matching
+        let mut aksh_logs: Vec<PathBuf> = fs::read_dir(&save_dir)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "log"))
+            .collect();
+        aksh_logs.sort();
+
+        // Sort golden logs too for positional fallback
+        let mut golden_logs_sorted = golden_logs.clone();
+        golden_logs_sorted.sort();
+
+        // If exact name matching fails and counts match, use positional pairing
+        let use_positional =
+            golden_logs_sorted.len() == aksh_logs.len() && golden_logs_sorted.len() > 1;
+
+        for (idx, golden_log) in golden_logs_sorted.iter().enumerate() {
+            let log_name = golden_log
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+
+            // Derive the job name from golden filename: "job-<name>-logs.txt" → "<name>"
+            let job_name = log_name
+                .strip_prefix("job-")
+                .unwrap_or(&log_name)
+                .strip_suffix("-logs.txt")
+                .unwrap_or(&log_name);
+
+            // Find matching aksh log: <job_name>.log in save_dir
+            let aksh_log = save_dir.join(format!("{job_name}.log"));
+            let aksh_log = if aksh_log.exists() {
+                aksh_log
+            } else if use_positional {
+                // Positional fallback for matrix jobs where names differ
+                eprintln!(
+                    "  note: using positional match for {log_name} → {}",
+                    aksh_logs[idx]
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                );
+                aksh_logs[idx].clone()
+            } else {
+                eprintln!("  ⚠ {log_name}: no matching aksh log '{job_name}.log' found");
+                continue;
+            };
+
+            // Run log-content-diff.py --official <golden> --aksh <aksh>
+            let diff_output = Command::new("python3")
+                .args([
+                    diff_script.to_str().unwrap(),
+                    "--official",
+                    golden_log.to_str().unwrap(),
+                    "--aksh",
+                    aksh_log.to_str().unwrap(),
+                ])
+                .output()
+                .await?;
+
+            let stdout = String::from_utf8_lossy(&diff_output.stdout);
+            let stderr = String::from_utf8_lossy(&diff_output.stderr);
+
+            // Check for high/medium severity issues (excluding warning annotations)
+            let has_issues = stdout.lines().any(|line| {
+                (line.contains("[HIGH]") || line.contains("[MEDIUM]"))
+                    && !line.contains("##[warning]")
+                    && !line.contains("warning count")
+                    && !line.contains("missing annotations")
+            });
+
+            if has_issues {
+                eprintln!("  🔴 {log_name}: conformance mismatch");
+                for line in stdout.lines() {
+                    if line.contains("[HIGH]") || line.contains("[MEDIUM]") {
+                        eprintln!("    {line}");
+                    }
+                }
+                failed_scenarios
+                    .push((scenario_name.clone(), format!("log mismatch in {log_name}")));
+            } else {
+                println!("  ✅ {log_name}: log content matches golden");
+            }
+
+            if !stderr.is_empty() {
+                for line in stderr.lines() {
+                    eprintln!("    {line}");
+                }
+            }
+        }
+    }
+
+    if failed_scenarios.is_empty() {
+        println!("\nSUCCESS: all log conformance checks passed.");
+        Ok(())
+    } else {
+        println!(
+            "\nFAIL: {} scenario(s) had log conformance issues:",
+            failed_scenarios.len()
+        );
+        for (name, reason) in &failed_scenarios {
+            println!("  - {name}: {reason}");
+        }
+        bail!(
+            "log conformance failed for {} scenario(s)",
+            failed_scenarios.len()
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {

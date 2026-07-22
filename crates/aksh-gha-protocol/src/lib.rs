@@ -346,6 +346,9 @@ pub struct JobPlan {
     /// Job-level concurrency queue mode: `"single"` or `"max"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency_queue: Option<String>,
+    /// Job-level timeout in minutes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_minutes: Option<u64>,
 }
 
 fn default_fail_fast() -> bool {
@@ -384,6 +387,9 @@ pub struct StepPlan {
     /// Whether to continue on error.
     #[serde(default)]
     pub continue_on_error: Option<bool>,
+    /// Step-level timeout in minutes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_minutes: Option<u64>,
 }
 
 /// Context material sent to a runner.

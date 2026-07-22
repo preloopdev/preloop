@@ -1,0 +1,342 @@
+﻿2026-07-22T16:58:37.0159081Z Current runner version: '2.336.0'
+2026-07-22T16:58:37.0183266Z ##[group]Runner Image Provisioner
+2026-07-22T16:58:37.0184046Z Hosted Compute Agent
+2026-07-22T16:58:37.0184660Z Version: 20260707.563
+2026-07-22T16:58:37.0185211Z Commit: 02667638d2b423fbc733a8e32a88b44996a3ba6e
+2026-07-22T16:58:37.0186192Z Build Date: 2026-07-07T19:33:50Z
+2026-07-22T16:58:37.0187274Z Worker ID: {5e0668e9-65ed-4c9f-80ab-c526cd91def8}
+2026-07-22T16:58:37.0188313Z Azure Region: centralus
+2026-07-22T16:58:37.0189534Z ##[endgroup]
+2026-07-22T16:58:37.0191916Z ##[group]Operating System
+2026-07-22T16:58:37.0192855Z Ubuntu
+2026-07-22T16:58:37.0193788Z 24.04.4
+2026-07-22T16:58:37.0194524Z LTS
+2026-07-22T16:58:37.0195278Z ##[endgroup]
+2026-07-22T16:58:37.0196158Z ##[group]Runner Image
+2026-07-22T16:58:37.0196915Z Image: ubuntu-24.04
+2026-07-22T16:58:37.0198081Z Version: 20260714.240.1
+2026-07-22T16:58:37.0199612Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260714.240/images/ubuntu/Ubuntu2404-Readme.md
+2026-07-22T16:58:37.0200981Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260714.240
+2026-07-22T16:58:37.0202214Z ##[endgroup]
+2026-07-22T16:58:37.0203846Z ##[group]GITHUB_TOKEN Permissions
+2026-07-22T16:58:37.0206327Z Contents: read
+2026-07-22T16:58:37.0206902Z Metadata: read
+2026-07-22T16:58:37.0207409Z ##[endgroup]
+2026-07-22T16:58:37.0209850Z Secret source: Actions
+2026-07-22T16:58:37.0211086Z Prepare workflow directory
+2026-07-22T16:58:37.0577229Z Prepare all required actions
+2026-07-22T16:58:37.0619883Z Getting action download info
+2026-07-22T16:58:37.3813421Z Download action repository 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' (SHA:3d3c42e5aac5ba805825da76410c181273ba90b1)
+2026-07-22T16:58:37.7588861Z Download action repository 'docker/bake-action@d3418bd7d0e9324001bca92fa8ba175ea7e6dc9b' (SHA:d3418bd7d0e9324001bca92fa8ba175ea7e6dc9b)
+2026-07-22T16:58:38.6599759Z Getting action download info
+2026-07-22T16:58:38.8667712Z Download action repository 'actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3' (SHA:3a2844b7e9c422d3c10d287c895573f7108da1b3)
+2026-07-22T16:58:39.2871922Z Complete job name: prepare
+2026-07-22T16:58:39.3690035Z ##[group]Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+2026-07-22T16:58:39.3691616Z with:
+2026-07-22T16:58:39.3692327Z   repository: moby/buildkit
+2026-07-22T16:58:39.3700336Z   token: ***
+2026-07-22T16:58:39.3701055Z   ssh-strict: true
+2026-07-22T16:58:39.3701772Z   ssh-user: git
+2026-07-22T16:58:39.3702516Z   persist-credentials: true
+2026-07-22T16:58:39.3703350Z   clean: true
+2026-07-22T16:58:39.3704093Z   sparse-checkout-cone-mode: true
+2026-07-22T16:58:39.3704982Z   fetch-depth: 1
+2026-07-22T16:58:39.3705696Z   fetch-tags: false
+2026-07-22T16:58:39.3706448Z   show-progress: true
+2026-07-22T16:58:39.3707205Z   lfs: false
+2026-07-22T16:58:39.3707883Z   submodules: false
+2026-07-22T16:58:39.3708721Z   set-safe-directory: true
+2026-07-22T16:58:39.3709582Z   allow-unsafe-pr-checkout: false
+2026-07-22T16:58:39.3710778Z env:
+2026-07-22T16:58:39.3711424Z   GO_VERSION: 1.26
+2026-07-22T16:58:39.3712175Z   SETUP_BUILDX_VERSION: edge
+2026-07-22T16:58:39.3713141Z   SETUP_BUILDKIT_IMAGE: moby/buildkit:latest
+2026-07-22T16:58:39.3714125Z   SCOUT_VERSION: 1.20.2
+2026-07-22T16:58:39.3714901Z   IMAGE_NAME: moby/buildkit
+2026-07-22T16:58:39.3715698Z   DESTDIR: ./bin
+2026-07-22T16:58:39.3716383Z ##[endgroup]
+2026-07-22T16:58:39.4725337Z Syncing repository: moby/buildkit
+2026-07-22T16:58:39.4727806Z ##[group]Getting Git version info
+2026-07-22T16:58:39.4729225Z Working directory is '/home/runner/work/buildkit/buildkit'
+2026-07-22T16:58:39.4731104Z [command]/usr/bin/git version
+2026-07-22T16:58:39.4762435Z git version 2.54.0
+2026-07-22T16:58:39.4781933Z ##[endgroup]
+2026-07-22T16:58:39.4792901Z Temporarily overriding HOME='/home/runner/work/_temp/510505db-9dd2-4098-95bf-45dc7d86739a' before making global git config changes
+2026-07-22T16:58:39.4797007Z Adding repository directory to the temporary git global config as a safe directory
+2026-07-22T16:58:39.4801204Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/buildkit/buildkit
+2026-07-22T16:58:39.4839024Z Deleting the contents of '/home/runner/work/buildkit/buildkit'
+2026-07-22T16:58:39.4842333Z ##[group]Determining repository object format
+2026-07-22T16:58:39.4844929Z ##[endgroup]
+2026-07-22T16:58:39.4846923Z ##[group]Initializing the repository
+2026-07-22T16:58:39.4849099Z [command]/usr/bin/git init /home/runner/work/buildkit/buildkit
+2026-07-22T16:58:39.4937206Z hint: Using 'master' as the name for the initial branch. This default branch name
+2026-07-22T16:58:39.4939735Z hint: will change to "main" in Git 3.0. To configure the initial branch name
+2026-07-22T16:58:39.4942348Z hint: to use in all of your new repositories, which will suppress this warning,
+2026-07-22T16:58:39.4943651Z hint: call:
+2026-07-22T16:58:39.4944307Z hint:
+2026-07-22T16:58:39.4945162Z hint: 	git config --global init.defaultBranch <name>
+2026-07-22T16:58:39.4946182Z hint:
+2026-07-22T16:58:39.4947229Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+2026-07-22T16:58:39.4949365Z hint: 'development'. The just-created branch can be renamed via this command:
+2026-07-22T16:58:39.4950819Z hint:
+2026-07-22T16:58:39.4951745Z hint: 	git branch -m <name>
+2026-07-22T16:58:39.4952536Z hint:
+2026-07-22T16:58:39.4953638Z hint: Disable this message with "git config set advice.defaultBranchName false"
+2026-07-22T16:58:39.4955443Z Initialized empty Git repository in /home/runner/work/buildkit/buildkit/.git/
+2026-07-22T16:58:39.4958652Z [command]/usr/bin/git remote add origin https://github.com/moby/buildkit
+2026-07-22T16:58:39.4990750Z ##[endgroup]
+2026-07-22T16:58:39.4993312Z ##[group]Disabling automatic garbage collection
+2026-07-22T16:58:39.4995749Z [command]/usr/bin/git config --local gc.auto 0
+2026-07-22T16:58:39.5019567Z ##[endgroup]
+2026-07-22T16:58:39.5021147Z ##[group]Setting up auth
+2026-07-22T16:58:39.5022123Z Removing SSH command configuration
+2026-07-22T16:58:39.5023794Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-07-22T16:58:39.5051640Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-07-22T16:58:39.5324177Z Removing HTTP extra header
+2026-07-22T16:58:39.5330598Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-07-22T16:58:39.5360239Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-07-22T16:58:39.5528034Z Removing includeIf entries pointing to credentials config files
+2026-07-22T16:58:39.5534003Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-07-22T16:58:39.5560053Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-07-22T16:58:39.5737597Z [command]/usr/bin/git config --file /home/runner/work/_temp/git-credentials-9285270d-8102-4d7a-92e5-ab1528a025c0.config http.https://github.com/.extraheader AUTHORIZATION: basic ***
+2026-07-22T16:58:39.5767994Z [command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/buildkit/buildkit/.git.path /home/runner/work/_temp/git-credentials-9285270d-8102-4d7a-92e5-ab1528a025c0.config
+2026-07-22T16:58:39.5791814Z [command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/buildkit/buildkit/.git/worktrees/*.path /home/runner/work/_temp/git-credentials-9285270d-8102-4d7a-92e5-ab1528a025c0.config
+2026-07-22T16:58:39.5818056Z [command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-9285270d-8102-4d7a-92e5-ab1528a025c0.config
+2026-07-22T16:58:39.5842303Z [command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-9285270d-8102-4d7a-92e5-ab1528a025c0.config
+2026-07-22T16:58:39.5864486Z ##[endgroup]
+2026-07-22T16:58:39.5865742Z ##[group]Fetching the repository
+2026-07-22T16:58:39.5871270Z [command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +f245789f41eb3a7cf3f3c960fe0e994c5fcd3da8:refs/remotes/origin/master
+2026-07-22T16:58:41.8557490Z From https://github.com/moby/buildkit
+2026-07-22T16:58:41.8558772Z  * [new ref]         f245789f41eb3a7cf3f3c960fe0e994c5fcd3da8 -> origin/master
+2026-07-22T16:58:41.8590279Z [command]/usr/bin/git branch --list --remote origin/master
+2026-07-22T16:58:41.8611830Z   origin/master
+2026-07-22T16:58:41.8619401Z [command]/usr/bin/git rev-parse refs/remotes/origin/master
+2026-07-22T16:58:41.8638591Z f245789f41eb3a7cf3f3c960fe0e994c5fcd3da8
+2026-07-22T16:58:41.8650312Z ##[endgroup]
+2026-07-22T16:58:41.8651059Z ##[group]Determining the checkout info
+2026-07-22T16:58:41.8651841Z ##[endgroup]
+2026-07-22T16:58:41.8652384Z [command]/usr/bin/git sparse-checkout disable
+2026-07-22T16:58:41.8687077Z [command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+2026-07-22T16:58:41.8710180Z ##[group]Checking out the ref
+2026-07-22T16:58:41.8714953Z [command]/usr/bin/git checkout --progress --force -B master refs/remotes/origin/master
+2026-07-22T16:58:42.2168179Z Reset branch 'master'
+2026-07-22T16:58:42.2169041Z branch 'master' set up to track 'origin/master'.
+2026-07-22T16:58:42.2182194Z ##[endgroup]
+2026-07-22T16:58:42.2227955Z [command]/usr/bin/git log -1 --format=%H
+2026-07-22T16:58:42.2250518Z f245789f41eb3a7cf3f3c960fe0e994c5fcd3da8
+2026-07-22T16:58:42.2464007Z ##[group]Run docker/bake-action/subaction/matrix@d3418bd7d0e9324001bca92fa8ba175ea7e6dc9b
+2026-07-22T16:58:42.2464566Z with:
+2026-07-22T16:58:42.2464829Z   target: release
+2026-07-22T16:58:42.2465119Z   fields: platforms
+2026-07-22T16:58:42.2465418Z   workdir: .
+2026-07-22T16:58:42.2465717Z env:
+2026-07-22T16:58:42.2465974Z   GO_VERSION: 1.26
+2026-07-22T16:58:42.2466286Z   SETUP_BUILDX_VERSION: edge
+2026-07-22T16:58:42.2466646Z   SETUP_BUILDKIT_IMAGE: moby/buildkit:latest
+2026-07-22T16:58:42.2467011Z   SCOUT_VERSION: 1.20.2
+2026-07-22T16:58:42.2467305Z   IMAGE_NAME: moby/buildkit
+2026-07-22T16:58:42.2467614Z   DESTDIR: ./bin
+2026-07-22T16:58:42.2467951Z ##[endgroup]
+2026-07-22T16:58:42.2593971Z ##[group]Run actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
+2026-07-22T16:58:42.2594495Z with:
+2026-07-22T16:58:42.2599367Z   script: function getInputList(name) {
+  return core.getInput(name) ? core.getInput(name).split(/[\r?\n,]+/).filter(x => x !== '') : [];
+}
+
+const workdir = core.getInput('workdir');
+const files = getInputList('files');
+const target = core.getInput('target');
+const fields = getInputList('fields');
+
+let def = {};
+await core.group(`Parsing definition`, async () => {
+  let args = ['buildx', 'bake'];
+  for (const file of files) {
+    args.push('--file', file);
+  }
+  if (target) {
+    args.push(target);
+  }
+  args.push('--print');
+  const res = await exec.getExecOutput('docker', args, {
+    ignoreReturnCode: true,
+    silent: true,
+    cwd: workdir
+  });
+  if (res.stderr.length > 0 && res.exitCode != 0) {
+    throw new Error(res.stderr);
+  }
+  def = JSON.parse(res.stdout.trim());
+  core.info(JSON.stringify(def, null, 2));
+});
+
+await core.group(`Generating matrix`, async () => {
+  const result = [];
+  for (const targetName of Object.keys(def.target)) {
+    const target = def.target[targetName];
+    const entry = { target: targetName };
+    if (fields.length === 0) {
+      result.push({ ...entry });
+      continue;
+    }
+    let fieldFound = false;
+    Object.keys(target).forEach(field => {
+      if (fields.includes(field)) {
+        fieldFound = true;
+        const value = target[field];
+        if (Array.isArray(value)) {
+          value.forEach((v) => {
+            entry[field] = v;
+            result.push({ ...entry });
+          });
+        } else {
+          entry[field] = value;
+          result.push({ ...entry });
+        }
+      }
+    });
+    if (!fieldFound) {
+      result.push({ ...entry });
+    }
+  }
+  core.info(JSON.stringify(result, null, 2));
+  core.setOutput('includes', JSON.stringify(result));
+});
+
+2026-07-22T16:58:42.2606596Z   github-token: ***
+2026-07-22T16:58:42.2606924Z   debug: false
+2026-07-22T16:58:42.2607207Z   user-agent: actions/github-script
+2026-07-22T16:58:42.2607523Z   result-encoding: json
+2026-07-22T16:58:42.2607847Z   retries: 0
+2026-07-22T16:58:42.2608150Z   retry-exempt-status-codes: 400,401,403,404,422
+2026-07-22T16:58:42.2608665Z env:
+2026-07-22T16:58:42.2608925Z   GO_VERSION: 1.26
+2026-07-22T16:58:42.2609220Z   SETUP_BUILDX_VERSION: edge
+2026-07-22T16:58:42.2609578Z   SETUP_BUILDKIT_IMAGE: moby/buildkit:latest
+2026-07-22T16:58:42.2609918Z   SCOUT_VERSION: 1.20.2
+2026-07-22T16:58:42.2610195Z   IMAGE_NAME: moby/buildkit
+2026-07-22T16:58:42.2610564Z   DESTDIR: ./bin
+2026-07-22T16:58:42.2610834Z   INPUT_WORKDIR: .
+2026-07-22T16:58:42.2611108Z   INPUT_FILES: 
+2026-07-22T16:58:42.2611386Z   INPUT_TARGET: release
+2026-07-22T16:58:42.2611703Z   INPUT_FIELDS: platforms
+2026-07-22T16:58:42.2612014Z ##[endgroup]
+2026-07-22T16:58:42.3544253Z ##[group]Parsing definition
+2026-07-22T16:58:42.6566477Z {
+2026-07-22T16:58:42.6567198Z   "group": {
+2026-07-22T16:58:42.6567943Z     "default": {
+2026-07-22T16:58:42.6568786Z       "targets": [
+2026-07-22T16:58:42.6569459Z         "release"
+2026-07-22T16:58:42.6570145Z       ]
+2026-07-22T16:58:42.6570680Z     }
+2026-07-22T16:58:42.6571283Z   },
+2026-07-22T16:58:42.6571789Z   "target": {
+2026-07-22T16:58:42.6572223Z     "release": {
+2026-07-22T16:58:42.6572636Z       "context": ".",
+2026-07-22T16:58:42.6573508Z       "dockerfile": "Dockerfile",
+2026-07-22T16:58:42.6574100Z       "args": {
+2026-07-22T16:58:42.6574576Z         "BUILDKIT_CONTEXT_KEEP_GIT_DIR": "1",
+2026-07-22T16:58:42.6575172Z         "GO_VERSION": "1.26"
+2026-07-22T16:58:42.6575631Z       },
+2026-07-22T16:58:42.6576053Z       "target": "release",
+2026-07-22T16:58:42.6576566Z       "platforms": [
+2026-07-22T16:58:42.6577043Z         "darwin/amd64",
+2026-07-22T16:58:42.6577427Z         "darwin/arm64",
+2026-07-22T16:58:42.6577871Z         "linux/amd64",
+2026-07-22T16:58:42.6578277Z         "linux/arm/v7",
+2026-07-22T16:58:42.6579229Z         "linux/arm64",
+2026-07-22T16:58:42.6579674Z         "linux/s390x",
+2026-07-22T16:58:42.6580203Z         "linux/ppc64le",
+2026-07-22T16:58:42.6580736Z         "linux/riscv64",
+2026-07-22T16:58:42.6581194Z         "windows/amd64",
+2026-07-22T16:58:42.6581636Z         "windows/arm64"
+2026-07-22T16:58:42.6582246Z       ],
+2026-07-22T16:58:42.6582643Z       "output": [
+2026-07-22T16:58:42.6583041Z         {
+2026-07-22T16:58:42.6583528Z           "dest": "./bin",
+2026-07-22T16:58:42.6583976Z           "type": "local"
+2026-07-22T16:58:42.6584524Z         }
+2026-07-22T16:58:42.6584976Z       ]
+2026-07-22T16:58:42.6585370Z     }
+2026-07-22T16:58:42.6585835Z   }
+2026-07-22T16:58:42.6586237Z }
+2026-07-22T16:58:42.6587246Z ##[endgroup]
+2026-07-22T16:58:42.6588037Z ##[group]Generating matrix
+2026-07-22T16:58:42.6588757Z [
+2026-07-22T16:58:42.6589241Z   {
+2026-07-22T16:58:42.6589702Z     "target": "release",
+2026-07-22T16:58:42.6590372Z     "platforms": "darwin/amd64"
+2026-07-22T16:58:42.6590938Z   },
+2026-07-22T16:58:42.6591414Z   {
+2026-07-22T16:58:42.6591921Z     "target": "release",
+2026-07-22T16:58:42.6592482Z     "platforms": "darwin/arm64"
+2026-07-22T16:58:42.6593089Z   },
+2026-07-22T16:58:42.6593513Z   {
+2026-07-22T16:58:42.6593994Z     "target": "release",
+2026-07-22T16:58:42.6594572Z     "platforms": "linux/amd64"
+2026-07-22T16:58:42.6595127Z   },
+2026-07-22T16:58:42.6595612Z   {
+2026-07-22T16:58:42.6596094Z     "target": "release",
+2026-07-22T16:58:42.6596648Z     "platforms": "linux/arm/v7"
+2026-07-22T16:58:42.6597208Z   },
+2026-07-22T16:58:42.6597649Z   {
+2026-07-22T16:58:42.6598105Z     "target": "release",
+2026-07-22T16:58:42.6598821Z     "platforms": "linux/arm64"
+2026-07-22T16:58:42.6599379Z   },
+2026-07-22T16:58:42.6599816Z   {
+2026-07-22T16:58:42.6600408Z     "target": "release",
+2026-07-22T16:58:42.6601230Z     "platforms": "linux/s390x"
+2026-07-22T16:58:42.6601785Z   },
+2026-07-22T16:58:42.6602177Z   {
+2026-07-22T16:58:42.6602669Z     "target": "release",
+2026-07-22T16:58:42.6603243Z     "platforms": "linux/ppc64le"
+2026-07-22T16:58:42.6603810Z   },
+2026-07-22T16:58:42.6604209Z   {
+2026-07-22T16:58:42.6604602Z     "target": "release",
+2026-07-22T16:58:42.6604972Z     "platforms": "linux/riscv64"
+2026-07-22T16:58:42.6605306Z   },
+2026-07-22T16:58:42.6605626Z   {
+2026-07-22T16:58:42.6605987Z     "target": "release",
+2026-07-22T16:58:42.6606387Z     "platforms": "windows/amd64"
+2026-07-22T16:58:42.6606747Z   },
+2026-07-22T16:58:42.6607016Z   {
+2026-07-22T16:58:42.6607278Z     "target": "release",
+2026-07-22T16:58:42.6607590Z     "platforms": "windows/arm64"
+2026-07-22T16:58:42.6607923Z   }
+2026-07-22T16:58:42.6608156Z ]
+2026-07-22T16:58:42.6608904Z ##[endgroup]
+2026-07-22T16:58:42.6782672Z Post job cleanup.
+2026-07-22T16:58:42.7555880Z [command]/usr/bin/git version
+2026-07-22T16:58:42.7589456Z git version 2.54.0
+2026-07-22T16:58:42.7631067Z Temporarily overriding HOME='/home/runner/work/_temp/073fd11e-2b50-47a3-9934-2c87c3ca8a4b' before making global git config changes
+2026-07-22T16:58:42.7632615Z Adding repository directory to the temporary git global config as a safe directory
+2026-07-22T16:58:42.7636978Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/buildkit/buildkit
+2026-07-22T16:58:42.7662583Z Removing SSH command configuration
+2026-07-22T16:58:42.7668304Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-07-22T16:58:42.7696702Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-07-22T16:58:42.7888257Z Removing HTTP extra header
+2026-07-22T16:58:42.7893726Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-07-22T16:58:42.7920716Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-07-22T16:58:42.8102186Z Removing includeIf entries pointing to credentials config files
+2026-07-22T16:58:42.8109025Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-07-22T16:58:42.8132823Z includeif.gitdir:/home/runner/work/buildkit/buildkit/.git.path
+2026-07-22T16:58:42.8133926Z includeif.gitdir:/home/runner/work/buildkit/buildkit/.git/worktrees/*.path
+2026-07-22T16:58:42.8134746Z includeif.gitdir:/github/workspace/.git.path
+2026-07-22T16:58:42.8135384Z includeif.gitdir:/github/workspace/.git/worktrees/*.path
+2026-07-22T16:58:42.8141568Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/buildkit/buildkit/.git.path
+2026-07-22T16:58:42.8158325Z /home/runner/work/_temp/git-credentials-9285270d-8102-4d7a-92e5-ab1528a025c0.config
+2026-07-22T16:58:42.8166604Z [command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/buildkit/buildkit/.git.path \/home\/runner\/work\/_temp\/git\-credentials\-9285270d\-8102\-4d7a\-92e5\-ab1528a025c0\.config
+2026-07-22T16:58:42.8193839Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/buildkit/buildkit/.git/worktrees/*.path
+2026-07-22T16:58:42.8210468Z /home/runner/work/_temp/git-credentials-9285270d-8102-4d7a-92e5-ab1528a025c0.config
+2026-07-22T16:58:42.8218696Z [command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/buildkit/buildkit/.git/worktrees/*.path \/home\/runner\/work\/_temp\/git\-credentials\-9285270d\-8102\-4d7a\-92e5\-ab1528a025c0\.config
+2026-07-22T16:58:42.8249688Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git.path
+2026-07-22T16:58:42.8266548Z /github/runner_temp/git-credentials-9285270d-8102-4d7a-92e5-ab1528a025c0.config
+2026-07-22T16:58:42.8272129Z [command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git.path \/github\/runner_temp\/git\-credentials\-9285270d\-8102\-4d7a\-92e5\-ab1528a025c0\.config
+2026-07-22T16:58:42.8295702Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git/worktrees/*.path
+2026-07-22T16:58:42.8312258Z /github/runner_temp/git-credentials-9285270d-8102-4d7a-92e5-ab1528a025c0.config
+2026-07-22T16:58:42.8318225Z [command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git/worktrees/*.path \/github\/runner_temp\/git\-credentials\-9285270d\-8102\-4d7a\-92e5\-ab1528a025c0\.config
+2026-07-22T16:58:42.8349825Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-07-22T16:58:42.8522351Z Removing credentials config '/home/runner/work/_temp/git-credentials-9285270d-8102-4d7a-92e5-ab1528a025c0.config'
+2026-07-22T16:58:42.8737667Z Evaluate and set job outputs
+2026-07-22T16:58:42.8747410Z Set output 'binaries-platforms'
+2026-07-22T16:58:42.8750085Z Cleaning up orphan processes

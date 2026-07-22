@@ -1,0 +1,40 @@
+2026-07-22T17:35:25.6826672Z Current runner version: '2.335.1'
+2026-07-22T17:35:25.6851243Z ##[group]Runner Image Provisioner
+2026-07-22T17:35:25.6852100Z Hosted Compute Agent
+2026-07-22T17:35:25.6852648Z Version: 20260707.563
+2026-07-22T17:35:25.6853218Z Commit: 02667638d2b423fbc733a8e32a88b44996a3ba6e
+2026-07-22T17:35:25.6853932Z Build Date: 2026-07-07T19:33:50Z
+2026-07-22T17:35:25.6854565Z Worker ID: {4507b2e2-ec29-4e93-b20c-428fb0fab226}
+2026-07-22T17:35:25.6855180Z Azure Region: westus3
+2026-07-22T17:35:25.6856029Z ##[endgroup]
+2026-07-22T17:35:25.6857475Z ##[group]Operating System
+2026-07-22T17:35:25.6858115Z Ubuntu
+2026-07-22T17:35:25.6858599Z 24.04.4
+2026-07-22T17:35:25.6859070Z LTS
+2026-07-22T17:35:25.6859565Z ##[endgroup]
+2026-07-22T17:35:25.6860061Z ##[group]Runner Image
+2026-07-22T17:35:25.6860598Z Image: ubuntu-24.04
+2026-07-22T17:35:25.6861133Z Version: 20260720.247.2
+2026-07-22T17:35:25.6862249Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260720.247/images/ubuntu/Ubuntu2404-Readme.md
+2026-07-22T17:35:25.6863607Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260720.247
+2026-07-22T17:35:25.6864444Z ##[endgroup]
+2026-07-22T17:35:25.6865510Z ##[group]GITHUB_TOKEN Permissions
+2026-07-22T17:35:25.6867510Z Contents: read
+2026-07-22T17:35:25.6868117Z Metadata: read
+2026-07-22T17:35:25.6868626Z Packages: read
+2026-07-22T17:35:25.6869126Z ##[endgroup]
+2026-07-22T17:35:25.6871110Z Secret source: Actions
+2026-07-22T17:35:25.6871796Z Prepare workflow directory
+2026-07-22T17:35:25.7474348Z Prepare all required actions
+2026-07-22T17:35:25.7527480Z Complete job name: check-permissions
+2026-07-22T17:35:25.8035498Z ##[group]Run echo "check-permissions passed"
+2026-07-22T17:35:25.8036432Z [36;1mecho "check-permissions passed"[0m
+2026-07-22T17:35:25.8637631Z shell: /usr/bin/bash -euxo pipefail {0}
+2026-07-22T17:35:25.8638840Z env:
+2026-07-22T17:35:25.8639491Z   RUST_BACKTRACE: 1
+2026-07-22T17:35:25.8640035Z   COPT: -Werror
+2026-07-22T17:35:25.8640932Z   E2E_CONCURRENCY_GROUP: hibnjoroge/aksh-bench-neon-e2e-tests-main-45761161d60f1cf8bd26d38fe7706287d6a8f9ff
+2026-07-22T17:35:25.8641925Z ##[endgroup]
+2026-07-22T17:35:25.8921844Z + echo 'check-permissions passed'
+2026-07-22T17:35:25.8923047Z check-permissions passed
+2026-07-22T17:35:25.9081559Z Cleaning up orphan processes

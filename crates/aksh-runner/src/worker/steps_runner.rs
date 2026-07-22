@@ -362,6 +362,13 @@ pub async fn run_steps(
             step.context_name.clone(),
             resolved_display_name.clone(),
         );
+        // Set github.action to the step's context_name for this step.
+        // Official runner: StepsRunner.cs sets github.action = step.ContextName
+        // before each step executes, which also syncs GITHUB_ACTION env var.
+        step_ctx.job.set_github_context_value(
+            "action",
+            Some(serde_json::Value::String(step.context_name.clone())),
+        );
         {
             let expr_ctx = step_ctx.job.build_expression_context();
             for (k, v) in &step.env {

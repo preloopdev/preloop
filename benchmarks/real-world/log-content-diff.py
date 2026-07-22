@@ -54,11 +54,11 @@ class LogLine:
 
         # Parse tab-separated format: job\tstep\tcontent
         parts = raw.split("\t", 2)
-        if len(parts) >= 3:
+        if len(parts) >= 3 and not TIMESTAMP_RE.match(parts[0]):
             self.job = parts[0]
             self.step = parts[1]
             self.content = parts[2]
-        elif len(parts) == 2:
+        elif len(parts) == 2 and not TIMESTAMP_RE.match(parts[0]):
             self.step = parts[0]
             self.content = parts[1]
 

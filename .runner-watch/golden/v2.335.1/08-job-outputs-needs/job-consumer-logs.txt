@@ -1,0 +1,21 @@
+2026-07-12T22:38:13.3972082Z Current runner version: '2.335.1'
+2026-07-12T22:38:13.3974577Z Runner name: 'cmp-gh-1-84401'
+2026-07-12T22:38:13.3974918Z Runner group name: 'Default'
+2026-07-12T22:38:13.3975291Z Machine name: 'container'
+2026-07-12T22:38:13.3976372Z ##[group]GITHUB_TOKEN Permissions
+2026-07-12T22:38:13.3977169Z Contents: read
+2026-07-12T22:38:13.3977426Z Metadata: read
+2026-07-12T22:38:13.3977702Z Packages: read
+2026-07-12T22:38:13.3977981Z ##[endgroup]
+2026-07-12T22:38:13.3978835Z Secret source: Actions
+2026-07-12T22:38:13.3979276Z Runner is running behind proxy server 'http://127.0.0.1:18081' for all HTTP requests.
+2026-07-12T22:38:13.3979784Z Runner is running behind proxy server 'http://127.0.0.1:18081' for all HTTPS requests.
+2026-07-12T22:38:13.3980206Z Prepare workflow directory
+2026-07-12T22:38:13.4159590Z Prepare all required actions
+2026-07-12T22:38:13.4256604Z Complete job name: consumer
+2026-07-12T22:38:13.4449812Z ##[group]Run echo "got 42"
+2026-07-12T22:38:13.4450134Z [36;1mecho "got 42"[0m
+2026-07-12T22:38:13.4504960Z shell: /usr/bin/bash -e {0}
+2026-07-12T22:38:13.4505345Z ##[endgroup]
+2026-07-12T22:38:13.4642014Z got 42
+2026-07-12T22:38:13.4693412Z Cleaning up orphan processes

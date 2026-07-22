@@ -1,0 +1,13 @@
+2026-07-15T06:15:11.871Z Current runner version: '2.335.1'
+2026-07-15T06:15:11.871Z Runner name: 'flow-aksh-14-annotations-1-1784096041'
+2026-07-15T06:15:11.871Z Runner group name: 'Default'
+2026-07-15T06:15:11.871Z Machine name: 'container'
+2026-07-15T06:15:11.871Z Secret source: Actions
+2026-07-15T06:15:11.871Z Prepare workflow directory
+2026-07-15T06:15:11.871Z Prepare all required actions
+2026-07-15T06:15:11.871Z Complete job name: build
+2026-07-15T06:15:12.336Z ::warning title=w::a warning
+2026-07-15T06:15:12.336Z ::error title=e::an error
+2026-07-15T06:15:12.336Z ##[error]Process completed with exit code 1.
+2026-07-15T06:15:12.336Z ##[error]process exit code 1
+2026-07-15T06:15:12.726Z Cleaning up orphan processes

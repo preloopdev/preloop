@@ -1,0 +1,66 @@
+2026-07-15T06:05:07.825Z Current runner version: '2.335.1'
+2026-07-15T06:05:07.825Z Runner name: 'flow-aksh-11-cache-roundtrip-1-1784095474'
+2026-07-15T06:05:07.825Z Runner group name: 'Default'
+2026-07-15T06:05:07.825Z Machine name: 'container'
+2026-07-15T06:05:07.825Z Secret source: Actions
+2026-07-15T06:05:07.825Z Prepare workflow directory
+2026-07-15T06:05:07.825Z Prepare all required actions
+2026-07-15T06:05:07.825Z Complete job name: build
+2026-07-15T06:05:08.189Z ##[warning]Input 'save-always' has been deprecated with message: save-always does not work as intended and will be removed in a future release.
+A separate `actions/cache/restore` step should be used instead.
+See https://github.com/actions/cache/tree/main/save#always-save-cache for more details.
+
+2026-07-15T06:05:08.277Z ::debug::Cache service version: v2
+2026-07-15T06:05:08.277Z ::debug::Resolved Keys:
+2026-07-15T06:05:08.277Z ::debug::["mitm-29393186677"]
+2026-07-15T06:05:08.277Z ::debug::Checking zstd --quiet --version
+2026-07-15T06:05:08.280Z ::debug::Unable to locate executable file: zstd. Please verify either the file path exists or the file can be found within a directory specified by the PATH environment variable. Also check the file mode to verify the file is executable.
+2026-07-15T06:05:08.280Z ::debug::
+2026-07-15T06:05:08.280Z ::debug::zstd version: null
+2026-07-15T06:05:08.281Z ::debug::[Request] GetCacheEntryDownloadURL https://results-receiver.actions.githubusercontent.com/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL
+2026-07-15T06:05:08.404Z ::debug::[Response] - 200
+2026-07-15T06:05:08.405Z ::debug::Headers: {%0A  "content-length": "54",%0A  "content-type": "application/json",%0A  "date": "Wed, 15 Jul 2026 06:05:08 GMT",%0A  "x-github-backend": "Kubernetes",%0A  "x-github-request-id": "C270:383E4:1811180:1AE10FB:6A572314",%0A  "server": "github.com"%0A}
+2026-07-15T06:05:08.405Z ::debug::Body: {%0A  "ok": false,%0A  "signed_download_url": "",%0A  "matched_key": ""%0A}
+2026-07-15T06:05:08.405Z ::debug::Cache not found for version fd99f62ce0cfdd960603267b50ea15ed0f531ffa3f333fa01faed7eb0aa4167a of keys: mitm-29393186677
+2026-07-15T06:05:08.405Z Cache not found for input keys: mitm-29393186677
+2026-07-15T06:05:08.573Z Wed Jul 15 06:05:08 UTC 2026
+2026-07-15T06:05:08.841Z ##[warning]Input 'save-always' has been deprecated with message: save-always does not work as intended and will be removed in a future release.
+A separate `actions/cache/restore` step should be used instead.
+See https://github.com/actions/cache/tree/main/save#always-save-cache for more details.
+
+2026-07-15T06:05:08.925Z ::debug::Cache service version: v2
+2026-07-15T06:05:08.925Z ::debug::Checking zstd --quiet --version
+2026-07-15T06:05:08.928Z ::debug::Unable to locate executable file: zstd. Please verify either the file path exists or the file can be found within a directory specified by the PATH environment variable. Also check the file mode to verify the file is executable.
+2026-07-15T06:05:08.928Z ::debug::
+2026-07-15T06:05:08.929Z ::debug::zstd version: null
+2026-07-15T06:05:08.930Z ::debug::implicitDescendants 'false'
+2026-07-15T06:05:08.932Z ::debug::followSymbolicLinks 'true'
+2026-07-15T06:05:08.932Z ::debug::implicitDescendants 'false'
+2026-07-15T06:05:08.932Z ::debug::omitBrokenSymbolicLinks 'true'
+2026-07-15T06:05:08.932Z ::debug::Search path '/tmp/flow-aksh-1/_work/default/default/.cache-dir'
+2026-07-15T06:05:08.939Z ::debug::Matched: .cache-dir
+2026-07-15T06:05:08.940Z ::debug::Cache Paths:
+2026-07-15T06:05:08.940Z ::debug::[".cache-dir"]
+2026-07-15T06:05:08.946Z ::debug::Archive Path: /tmp/flow-aksh-1/_work/_temp/5dc73a3e-9abc-4caa-aeea-0d75160bf390/cache.tgz
+2026-07-15T06:05:08.954Z [command]/usr/bin/tar --posix -cf cache.tgz --exclude cache.tgz -P -C /tmp/flow-aksh-1/_work/default/default --files-from manifest.txt -z
+2026-07-15T06:05:08.961Z ::debug::File Size: 295
+2026-07-15T06:05:08.961Z ::debug::Reserving Cache
+2026-07-15T06:05:08.961Z ::debug::[Request] CreateCacheEntry https://results-receiver.actions.githubusercontent.com/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry
+2026-07-15T06:05:09.075Z ::debug::[Response] - 200
+2026-07-15T06:05:09.075Z ::debug::Headers: {%0A  "content-length": "438",%0A  "content-type": "application/json",%0A  "date": "Wed, 15 Jul 2026 06:05:09 GMT",%0A  "x-github-backend": "Kubernetes",%0A  "x-github-request-id": "C276:14A8CF:E0D54E:1009431:6A572315",%0A  "server": "github.com"%0A}
+2026-07-15T06:05:09.076Z ::add-mask::WuGkgfqI+cF3FGC9zSXRlI+WxKGxpkNPUdw1T2KnKDM=
+2026-07-15T06:05:09.077Z ::add-mask::WuGkgfqI%252BcF3FGC9zSXRlI%252BWxKGxpkNPUdw1T2KnKDM%253D
+2026-07-15T06:05:09.077Z ::debug::Body: {%0A  "ok": true,%0A  "signed_upload_url": "https://productionresultssa12.blob.core.windows.net/actions-cache/286-5756188085?se=2026-07-15T07%253A05%253A09Z&sig=WuGkgfqI%252BcF3FGC9zSXRlI%252BWxKGxpkNPUdw1T2KnKDM%253D&ske=2026-07-15T07%253A18%253A11Z&skoid=ca7593d4-ee42-46cd-af88-8b886a2f84eb&sks=b&skt=2026-07-15T03%253A18%253A11Z&sktid=398a6654-997b-47e9-b12b-9515b896b4de&skv=2025-11-05&sp=cw&spr=https&sr=b&st=2026-07-15T06%253A05%253A04Z&sv=2025-11-05",%0A  "message": ""%0A}
+2026-07-15T06:05:09.077Z ::debug::Attempting to upload cache located at: /tmp/flow-aksh-1/_work/_temp/5dc73a3e-9abc-4caa-aeea-0d75160bf390/cache.tgz
+2026-07-15T06:05:09.077Z ::debug::Use Azure SDK: true
+2026-07-15T06:05:09.077Z ::debug::Upload concurrency: 8
+2026-07-15T06:05:09.077Z ::debug::Upload chunk size: 67108864
+2026-07-15T06:05:09.078Z ::debug::BlobClient: 286-5756188085:productionresultssa12:actions-cache
+2026-07-15T06:05:09.216Z Sent 295 of 295 (100.0%), 0.0 MBs/sec
+2026-07-15T06:05:09.216Z ::debug::[Request] FinalizeCacheEntryUpload https://results-receiver.actions.githubusercontent.com/twirp/github.actions.results.api.v1.CacheService/FinalizeCacheEntryUpload
+2026-07-15T06:05:09.433Z ::debug::[Response] - 200
+2026-07-15T06:05:09.433Z ::debug::Headers: {%0A  "content-length": "48",%0A  "content-type": "application/json",%0A  "date": "Wed, 15 Jul 2026 06:05:09 GMT",%0A  "x-github-backend": "Kubernetes",%0A  "x-github-request-id": "C27C:2A9946:845E226:9186B53:6A572315",%0A  "server": "github.com"%0A}
+2026-07-15T06:05:09.433Z ::debug::Body: {%0A  "ok": true,%0A  "entry_id": "5756188085",%0A  "message": ""%0A}
+2026-07-15T06:05:09.433Z ::debug::FinalizeCacheEntryUploadResponse: true
+2026-07-15T06:05:09.435Z Cache saved with key: mitm-29393186677
+2026-07-15T06:05:09.565Z Cleaning up orphan processes

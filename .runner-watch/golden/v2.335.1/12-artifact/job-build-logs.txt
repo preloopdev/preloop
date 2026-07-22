@@ -1,0 +1,83 @@
+2026-07-15T06:08:27.177Z Current runner version: '2.335.1'
+2026-07-15T06:08:27.177Z Runner name: 'flow-aksh-12-artifact-1-1784095674'
+2026-07-15T06:08:27.177Z Runner group name: 'Default'
+2026-07-15T06:08:27.177Z Machine name: 'container'
+2026-07-15T06:08:27.177Z Secret source: Actions
+2026-07-15T06:08:27.177Z Prepare workflow directory
+2026-07-15T06:08:27.177Z Prepare all required actions
+2026-07-15T06:08:27.177Z Complete job name: build
+2026-07-15T06:08:27.960Z ::debug::followSymbolicLinks 'true'
+2026-07-15T06:08:27.961Z ::debug::implicitDescendants 'true'
+2026-07-15T06:08:27.961Z ::debug::omitBrokenSymbolicLinks 'true'
+2026-07-15T06:08:27.961Z ::debug::excludeHiddenFiles 'true'
+2026-07-15T06:08:27.963Z ::debug::followSymbolicLinks 'true'
+2026-07-15T06:08:27.963Z ::debug::implicitDescendants 'true'
+2026-07-15T06:08:27.963Z ::debug::matchDirectories 'true'
+2026-07-15T06:08:27.963Z ::debug::omitBrokenSymbolicLinks 'true'
+2026-07-15T06:08:27.964Z ::debug::excludeHiddenFiles 'true'
+2026-07-15T06:08:27.966Z ::debug::Search path '/tmp/flow-aksh-1/_work/default/default/out.txt'
+2026-07-15T06:08:27.969Z ::debug::File:/tmp/flow-aksh-1/_work/default/default/out.txt was found using the provided searchPath
+2026-07-15T06:08:27.969Z With the provided path, there will be 1 file uploaded
+2026-07-15T06:08:27.969Z ::debug::Root artifact directory is /tmp/flow-aksh-1/_work/default/default
+2026-07-15T06:08:27.970Z Artifact name is valid!
+2026-07-15T06:08:27.970Z Root directory input is valid!
+2026-07-15T06:08:27.971Z ::debug::Workflow Run Backend ID: 14bcd2cb-f1d8-42f7-9215-82c6acc559be
+2026-07-15T06:08:27.972Z ::debug::Workflow Job Run Backend ID: ee2497d7-4487-50b8-abe8-8fc4f85a314d
+2026-07-15T06:08:27.973Z ::debug::[Request] CreateArtifact https://results-receiver.actions.githubusercontent.com/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact
+2026-07-15T06:08:28.268Z ::debug::[Response] - 200
+2026-07-15T06:08:28.268Z ::debug::Headers: {%0A  "content-length": "580",%0A  "content-type": "application/json",%0A  "date": "Wed, 15 Jul 2026 06:08:28 GMT",%0A  "x-github-backend": "Kubernetes",%0A  "x-github-request-id": "C95A:2E3E25:5D3D544:666AB8A:6A5723DC",%0A  "server": "github.com"%0A}
+2026-07-15T06:08:28.269Z ::add-mask::OYbOQOUgeRdPeMXjeKVTx3eCh075+TuTIdDeKKt7Sf0=
+2026-07-15T06:08:28.269Z ::add-mask::OYbOQOUgeRdPeMXjeKVTx3eCh075%252BTuTIdDeKKt7Sf0%253D
+2026-07-15T06:08:28.269Z ::debug::Body: {%0A  "ok": true,%0A  "signed_upload_url": "https://productionresultssa13.blob.core.windows.net/actions-results/14bcd2cb-f1d8-42f7-9215-82c6acc559be/workflow-job-run-ee2497d7-4487-50b8-abe8-8fc4f85a314d/artifacts/762069bc07a6e1b5df123a5ae7bd91c10daa04694fbaa17fba0cd6a8dcce8f22.zip?se=2026-07-15T07%253A08%253A28Z&sig=OYbOQOUgeRdPeMXjeKVTx3eCh075%252BTuTIdDeKKt7Sf0%253D&ske=2026-07-15T07%253A28%253A53Z&skoid=ca7593d4-ee42-46cd-af88-8b886a2f84eb&sks=b&skt=2026-07-15T03%253A28%253A53Z&sktid=398a6654-997b-47e9-b12b-9515b896b4de&skv=2025-11-05&sp=cw&spr=https&sr=b&st=2026-07-15T06%253A08%253A23Z&sv=2025-11-05"%0A}
+2026-07-15T06:08:28.270Z ::debug::Creating Artifact archive with compressionLevel: 6
+2026-07-15T06:08:28.270Z ::debug::Zip write high watermark value 8388608
+2026-07-15T06:08:28.270Z ::debug::Zip read high watermark value 8388608
+2026-07-15T06:08:28.277Z ::debug::Uploading artifact zip to blob storage with maxConcurrency: 5, bufferSize: 8388608
+2026-07-15T06:08:28.277Z Beginning upload of artifact content to blob storage
+2026-07-15T06:08:28.289Z ::debug::Zip stream for upload has ended.
+2026-07-15T06:08:28.291Z ::debug::Zip stream for upload has finished.
+2026-07-15T06:08:28.403Z Uploaded bytes 133
+2026-07-15T06:08:28.528Z Finished uploading artifact content to blob storage!
+2026-07-15T06:08:28.528Z SHA256 digest of uploaded artifact zip is 694dd55751e0ef3dea8eba0dc2b8eb78dde4f8d7773670191d21120330bf222c
+2026-07-15T06:08:28.528Z Finalizing artifact upload
+2026-07-15T06:08:28.529Z ::debug::[Request] FinalizeArtifact https://results-receiver.actions.githubusercontent.com/twirp/github.actions.results.api.v1.ArtifactService/FinalizeArtifact
+2026-07-15T06:08:28.865Z ::debug::[Response] - 200
+2026-07-15T06:08:28.865Z ::debug::Headers: {%0A  "content-length": "38",%0A  "content-type": "application/json",%0A  "date": "Wed, 15 Jul 2026 06:08:29 GMT",%0A  "x-github-backend": "Kubernetes",%0A  "x-github-request-id": "C961:30BEDE:1855314:1B29A37:6A5723DC",%0A  "server": "github.com"%0A}
+2026-07-15T06:08:28.865Z ::debug::Body: {%0A  "ok": true,%0A  "artifact_id": "8334102511"%0A}
+2026-07-15T06:08:28.865Z Artifact out.zip successfully finalized. Artifact ID 8334102511
+2026-07-15T06:08:28.865Z Artifact out has been successfully uploaded! Final size is 133 bytes. Artifact ID is 8334102511
+2026-07-15T06:08:28.865Z Artifact download URL: https://github.com/preloopdev/aksh-conformance-sample/actions/runs/29393343646/artifacts/8334102511
+2026-07-15T06:08:29.267Z ::debug::Resolved path is /tmp/flow-aksh-1/_work/default/default/dl
+2026-07-15T06:08:29.267Z Downloading single artifact
+2026-07-15T06:08:29.270Z ::debug::Workflow Run Backend ID: 14bcd2cb-f1d8-42f7-9215-82c6acc559be
+2026-07-15T06:08:29.270Z ::debug::Workflow Job Run Backend ID: ee2497d7-4487-50b8-abe8-8fc4f85a314d
+2026-07-15T06:08:29.270Z ::debug::[Request] ListArtifacts https://results-receiver.actions.githubusercontent.com/twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts
+2026-07-15T06:08:29.416Z ::debug::[Response] - 200
+2026-07-15T06:08:29.416Z ::debug::Headers: {%0A  "content-length": "323",%0A  "content-type": "application/json",%0A  "date": "Wed, 15 Jul 2026 06:08:29 GMT",%0A  "x-github-backend": "Kubernetes",%0A  "x-github-request-id": "C96A:7ED91:184670B:1B1C828:6A5723DD",%0A  "server": "github.com"%0A}
+2026-07-15T06:08:29.416Z ::debug::Body: {%0A  "artifacts": [%0A    {%0A      "workflow_run_backend_id": "14bcd2cb-f1d8-42f7-9215-82c6acc559be",%0A      "workflow_job_run_backend_id": "ee2497d7-4487-50b8-abe8-8fc4f85a314d",%0A      "database_id": "8334102511",%0A      "name": "out",%0A      "size": "133",%0A      "created_at": "2026-07-15T06:08:29Z",%0A      "digest": "sha256:694dd55751e0ef3dea8eba0dc2b8eb78dde4f8d7773670191d21120330bf222c"%0A    }%0A  ]%0A}
+2026-07-15T06:08:29.416Z ::debug::Found named artifact 'out' (ID: 8334102511, Size: 133)
+2026-07-15T06:08:29.416Z Preparing to download the following artifacts:
+2026-07-15T06:08:29.416Z - out (ID: 8334102511, Size: 133, Expected Digest: sha256:694dd55751e0ef3dea8eba0dc2b8eb78dde4f8d7773670191d21120330bf222c)
+2026-07-15T06:08:29.418Z ::debug::Artifact destination folder does not exist, creating: /tmp/flow-aksh-1/_work/default/default/dl
+2026-07-15T06:08:29.419Z ::debug::Workflow Run Backend ID: 14bcd2cb-f1d8-42f7-9215-82c6acc559be
+2026-07-15T06:08:29.419Z ::debug::Workflow Job Run Backend ID: ee2497d7-4487-50b8-abe8-8fc4f85a314d
+2026-07-15T06:08:29.421Z ::debug::[Request] ListArtifacts https://results-receiver.actions.githubusercontent.com/twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts
+2026-07-15T06:08:29.562Z ::debug::[Response] - 200
+2026-07-15T06:08:29.562Z ::debug::Headers: {%0A  "content-length": "323",%0A  "content-type": "application/json",%0A  "date": "Wed, 15 Jul 2026 06:08:29 GMT",%0A  "x-github-backend": "Kubernetes",%0A  "x-github-request-id": "C96E:3981D:5A9BD4E:63D128D:6A5723DD",%0A  "server": "github.com"%0A}
+2026-07-15T06:08:29.562Z ::debug::Body: {%0A  "artifacts": [%0A    {%0A      "workflow_run_backend_id": "14bcd2cb-f1d8-42f7-9215-82c6acc559be",%0A      "workflow_job_run_backend_id": "ee2497d7-4487-50b8-abe8-8fc4f85a314d",%0A      "database_id": "8334102511",%0A      "name": "out",%0A      "size": "133",%0A      "created_at": "2026-07-15T06:08:29Z",%0A      "digest": "sha256:694dd55751e0ef3dea8eba0dc2b8eb78dde4f8d7773670191d21120330bf222c"%0A    }%0A  ]%0A}
+2026-07-15T06:08:29.562Z ::debug::[Request] GetSignedArtifactURL https://results-receiver.actions.githubusercontent.com/twirp/github.actions.results.api.v1.ArtifactService/GetSignedArtifactURL
+2026-07-15T06:08:29.774Z ::debug::[Response] - 200
+2026-07-15T06:08:29.774Z ::debug::Headers: {%0A  "content-length": "629",%0A  "content-type": "application/json",%0A  "date": "Wed, 15 Jul 2026 06:08:29 GMT",%0A  "x-github-backend": "Kubernetes",%0A  "x-github-request-id": "C96F:3A5D61:5EE0945:6800D6B:6A5723DD",%0A  "server": "github.com"%0A}
+2026-07-15T06:08:29.774Z ::add-mask::MtIKfTDNNXE0GC1MwH+VtD6kTK0CvVbWk5DzoKHHeJs=
+2026-07-15T06:08:29.774Z ::add-mask::MtIKfTDNNXE0GC1MwH%252BVtD6kTK0CvVbWk5DzoKHHeJs%253D
+2026-07-15T06:08:29.774Z ::debug::Body: {%0A  "signed_url": "https://productionresultssa13.blob.core.windows.net/actions-results/14bcd2cb-f1d8-42f7-9215-82c6acc559be/workflow-job-run-ee2497d7-4487-50b8-abe8-8fc4f85a314d/artifacts/762069bc07a6e1b5df123a5ae7bd91c10daa04694fbaa17fba0cd6a8dcce8f22.zip?rscd=attachment%253B+filename%253D%2522out.zip%2522&rsct=application%252Fzip&se=2026-07-15T06%253A18%253A29Z&sig=MtIKfTDNNXE0GC1MwH%252BVtD6kTK0CvVbWk5DzoKHHeJs%253D&ske=2026-07-15T07%253A29%253A53Z&skoid=ca7593d4-ee42-46cd-af88-8b886a2f84eb&sks=b&skt=2026-07-15T03%253A29%253A53Z&sktid=398a6654-997b-47e9-b12b-9515b896b4de&skv=2025-11-05&sp=r&spr=https&sr=b&st=2026-07-15T06%253A08%253A24Z&sv=2025-11-05"%0A}
+2026-07-15T06:08:29.775Z Redirecting to blob download url: https://productionresultssa13.blob.core.windows.net/actions-results/14bcd2cb-f1d8-42f7-9215-82c6acc559be/workflow-job-run-ee2497d7-4487-50b8-abe8-8fc4f85a314d/artifacts/762069bc07a6e1b5df123a5ae7bd91c10daa04694fbaa17fba0cd6a8dcce8f22.zip
+2026-07-15T06:08:29.775Z Starting download of artifact to: /tmp/flow-aksh-1/_work/default/default/dl
+2026-07-15T06:08:29.893Z (node:398) [DEP0005] DeprecationWarning: Buffer() is deprecated due to security and usability issues. Please use the Buffer.alloc(), Buffer.allocUnsafe(), or Buffer.from() methods instead.
+2026-07-15T06:08:29.893Z (Use `node --trace-deprecation ...` to show where the warning was created)
+2026-07-15T06:08:29.901Z SHA256 digest of downloaded artifact is 694dd55751e0ef3dea8eba0dc2b8eb78dde4f8d7773670191d21120330bf222c
+2026-07-15T06:08:29.901Z Artifact download completed successfully.
+2026-07-15T06:08:29.901Z Total of 1 artifact(s) downloaded
+2026-07-15T06:08:29.902Z Download artifact has finished successfully
+2026-07-15T06:08:30.153Z hi
+2026-07-15T06:08:30.570Z Cleaning up orphan processes

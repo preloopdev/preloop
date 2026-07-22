@@ -1,0 +1,15 @@
+name: mock_build
+on:
+  workflow_call:
+    inputs:
+      go-version:
+        type: string
+        default: "1.21"
+    secrets:
+      gh_pat:
+        required: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "mock build"

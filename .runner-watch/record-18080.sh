@@ -221,3 +221,15 @@ rm -f "$LATEST"
 ln -s "$CAPTURE_DIR" "$LATEST"
 
 echo "done. status=$STATUS, flows=$FLOW_COUNT, runner_exit=$RUNNER_EXIT"
+
+# Auto-extract golden logs from GitHub if a run_id is available.
+if command -v cargo >/dev/null 2>&1; then
+    GOLDEN_DIR=".runner-watch/golden/v${RUNNER_VERSION}/$SCENARIO"
+    if [ -d "$GOLDEN_DIR" ] && [ -f "$GOLDEN_DIR/summary.json" ]; then
+        echo "extracting golden logs for $SCENARIO..."
+        cargo run -p runner-watch --quiet -- extract-logs \
+            --runner "$RUNNER_VERSION" \
+            --scenario "$SCENARIO" \
+            --force 2>&1 || echo "note: extract-logs failed (non-fatal)"
+    fi
+fi

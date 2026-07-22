@@ -1,0 +1,12 @@
+2026-07-15T05:21:15.252Z Current runner version: '2.335.1'
+2026-07-15T05:21:15.252Z Runner name: 'flow-aksh-07-step-failure-1-1784092785'
+2026-07-15T05:21:15.252Z Runner group name: 'Default'
+2026-07-15T05:21:15.252Z Machine name: 'container'
+2026-07-15T05:21:15.252Z Secret source: Actions
+2026-07-15T05:21:15.252Z Prepare workflow directory
+2026-07-15T05:21:15.252Z Prepare all required actions
+2026-07-15T05:21:15.252Z Complete job name: build
+2026-07-15T05:21:15.786Z ##[error]Process completed with exit code 1.
+2026-07-15T05:21:15.786Z ##[error]process exit code 1
+2026-07-15T05:21:16.815Z ran-on-failure
+2026-07-15T05:21:17.000Z Cleaning up orphan processes

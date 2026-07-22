@@ -1,0 +1,41 @@
+2026-07-22T17:35:31.0689538Z Current runner version: '2.335.1'
+2026-07-22T17:35:31.0718858Z ##[group]Runner Image Provisioner
+2026-07-22T17:35:31.0720117Z Hosted Compute Agent
+2026-07-22T17:35:31.0720728Z Version: 20260707.563
+2026-07-22T17:35:31.0721450Z Commit: 02667638d2b423fbc733a8e32a88b44996a3ba6e
+2026-07-22T17:35:31.0722266Z Build Date: 2026-07-07T19:33:50Z
+2026-07-22T17:35:31.0723020Z Worker ID: {ba38357d-8315-4aa4-aa31-24b3238bfbd2}
+2026-07-22T17:35:31.0723807Z Azure Region: eastus2
+2026-07-22T17:35:31.0724413Z ##[endgroup]
+2026-07-22T17:35:31.0726445Z ##[group]Operating System
+2026-07-22T17:35:31.0727604Z Ubuntu
+2026-07-22T17:35:31.0728349Z 24.04.4
+2026-07-22T17:35:31.0729124Z LTS
+2026-07-22T17:35:31.0729881Z ##[endgroup]
+2026-07-22T17:35:31.0730604Z ##[group]Runner Image
+2026-07-22T17:35:31.0731313Z Image: ubuntu-24.04
+2026-07-22T17:35:31.0731906Z Version: 20260720.247.2
+2026-07-22T17:35:31.0733295Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260720.247/images/ubuntu/Ubuntu2404-Readme.md
+2026-07-22T17:35:31.0734780Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260720.247
+2026-07-22T17:35:31.0736014Z ##[endgroup]
+2026-07-22T17:35:31.0737319Z ##[group]GITHUB_TOKEN Permissions
+2026-07-22T17:35:31.0739815Z Contents: read
+2026-07-22T17:35:31.0740468Z Metadata: read
+2026-07-22T17:35:31.0741090Z Packages: read
+2026-07-22T17:35:31.0741718Z ##[endgroup]
+2026-07-22T17:35:31.0743962Z Secret source: Actions
+2026-07-22T17:35:31.0745294Z Prepare workflow directory
+2026-07-22T17:35:31.1321877Z Prepare all required actions
+2026-07-22T17:35:31.1379243Z Complete job name: meta
+2026-07-22T17:35:31.1991313Z ##[group]Run echo "run-kind=push-main" >> "$GITHUB_OUTPUT"
+2026-07-22T17:35:31.1992375Z [36;1mecho "run-kind=push-main" >> "$GITHUB_OUTPUT"[0m
+2026-07-22T17:35:31.2545958Z shell: /usr/bin/bash -euxo pipefail {0}
+2026-07-22T17:35:31.2547328Z env:
+2026-07-22T17:35:31.2548048Z   RUST_BACKTRACE: 1
+2026-07-22T17:35:31.2548640Z   COPT: -Werror
+2026-07-22T17:35:31.2549753Z   E2E_CONCURRENCY_GROUP: hibnjoroge/aksh-bench-neon-e2e-tests-main-45761161d60f1cf8bd26d38fe7706287d6a8f9ff
+2026-07-22T17:35:31.2550925Z ##[endgroup]
+2026-07-22T17:35:31.2784478Z + echo run-kind=push-main
+2026-07-22T17:35:31.2964895Z Evaluate and set job outputs
+2026-07-22T17:35:31.2974696Z Set output 'run-kind'
+2026-07-22T17:35:31.2977134Z Cleaning up orphan processes

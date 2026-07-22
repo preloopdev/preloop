@@ -44,6 +44,10 @@ jobs:
             --aksh-url http://127.0.0.1:9090 \
             --skip-cargo-test
 
+      - name: Run log content conformance tests
+        run: |
+         python3 benchmarks/real-world/verify-log-conformance.py
+
       - name: Upload conformance reports
         if: always()
         uses: actions/upload-artifact@v4

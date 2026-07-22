@@ -1,0 +1,22 @@
+2026-07-12T22:38:09.0950479Z Current runner version: '2.335.1'
+2026-07-12T22:38:09.0952886Z Runner name: 'cmp-gh-1-84401'
+2026-07-12T22:38:09.0953310Z Runner group name: 'Default'
+2026-07-12T22:38:09.0953764Z Machine name: 'container'
+2026-07-12T22:38:09.0955041Z ##[group]GITHUB_TOKEN Permissions
+2026-07-12T22:38:09.0955959Z Contents: read
+2026-07-12T22:38:09.0956256Z Metadata: read
+2026-07-12T22:38:09.0956563Z Packages: read
+2026-07-12T22:38:09.0956866Z ##[endgroup]
+2026-07-12T22:38:09.0957738Z Secret source: Actions
+2026-07-12T22:38:09.0958217Z Runner is running behind proxy server 'http://127.0.0.1:18081' for all HTTP requests.
+2026-07-12T22:38:09.0958833Z Runner is running behind proxy server 'http://127.0.0.1:18081' for all HTTPS requests.
+2026-07-12T22:38:09.0959313Z Prepare workflow directory
+2026-07-12T22:38:09.1141890Z Prepare all required actions
+2026-07-12T22:38:09.1179569Z Complete job name: producer
+2026-07-12T22:38:09.1418967Z ##[group]Run echo "value=42" >> "$GITHUB_OUTPUT"
+2026-07-12T22:38:09.1419359Z [36;1mecho "value=42" >> "$GITHUB_OUTPUT"[0m
+2026-07-12T22:38:09.1492807Z shell: /usr/bin/bash -e {0}
+2026-07-12T22:38:09.1493234Z ##[endgroup]
+2026-07-12T22:38:09.1712729Z Evaluate and set job outputs
+2026-07-12T22:38:09.1725427Z Set output 'value'
+2026-07-12T22:38:09.1726338Z Cleaning up orphan processes

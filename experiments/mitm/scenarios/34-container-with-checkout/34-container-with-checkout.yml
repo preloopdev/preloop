@@ -13,7 +13,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Verify repo was checked out
         run: |
-          test -f .github/workflows/34-container-with-checkout.yml
+          test -f experiments/mitm/scenarios/34-container-with-checkout/34-container-with-checkout.yml
           echo "Checkout successful"
           ls -la
       - name: Show git info in container

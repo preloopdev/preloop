@@ -1,0 +1,60 @@
+2026-07-22T17:35:35.8763521Z Current runner version: '2.336.0'
+2026-07-22T17:35:35.8790738Z ##[group]Runner Image Provisioner
+2026-07-22T17:35:35.8791755Z Hosted Compute Agent
+2026-07-22T17:35:35.8792365Z Version: 20260707.563
+2026-07-22T17:35:35.8793103Z Commit: 02667638d2b423fbc733a8e32a88b44996a3ba6e
+2026-07-22T17:35:35.8793867Z Build Date: 2026-07-07T19:33:50Z
+2026-07-22T17:35:35.8794569Z Worker ID: {8dfe6dc6-ab3d-4de7-bc0f-9f75d01cfd3f}
+2026-07-22T17:35:35.8795389Z Azure Region: northcentralus
+2026-07-22T17:35:35.8796019Z ##[endgroup]
+2026-07-22T17:35:35.8797374Z ##[group]Operating System
+2026-07-22T17:35:35.8798094Z Ubuntu
+2026-07-22T17:35:35.8798645Z 24.04.4
+2026-07-22T17:35:35.8799569Z LTS
+2026-07-22T17:35:35.8800169Z ##[endgroup]
+2026-07-22T17:35:35.8800739Z ##[group]Runner Image
+2026-07-22T17:35:35.8801414Z Image: ubuntu-24.04
+2026-07-22T17:35:35.8801999Z Version: 20260714.240.1
+2026-07-22T17:35:35.8803374Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260714.240/images/ubuntu/Ubuntu2404-Readme.md
+2026-07-22T17:35:35.8804877Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260714.240
+2026-07-22T17:35:35.8805923Z ##[endgroup]
+2026-07-22T17:35:35.8807121Z ##[group]GITHUB_TOKEN Permissions
+2026-07-22T17:35:35.8810203Z Contents: read
+2026-07-22T17:35:35.8810855Z Metadata: read
+2026-07-22T17:35:35.8811437Z Packages: read
+2026-07-22T17:35:35.8812055Z ##[endgroup]
+2026-07-22T17:35:35.8814323Z Secret source: Actions
+2026-07-22T17:35:35.8815871Z Prepare workflow directory
+2026-07-22T17:35:35.9454498Z Prepare all required actions
+2026-07-22T17:35:35.9758653Z Complete job name: lint-yamls
+2026-07-22T17:35:36.0340505Z ##[group]Checking docker version
+2026-07-22T17:35:36.0356579Z ##[command]/usr/bin/docker version --format '{{.Server.APIVersion}}'
+2026-07-22T17:35:36.1135511Z '1.48'
+2026-07-22T17:35:36.1155183Z Docker daemon API version: '1.48'
+2026-07-22T17:35:36.1156224Z ##[command]/usr/bin/docker version --format '{{.Client.APIVersion}}'
+2026-07-22T17:35:36.1339621Z '1.48'
+2026-07-22T17:35:36.1354442Z Docker client API version: '1.48'
+2026-07-22T17:35:36.1361224Z ##[endgroup]
+2026-07-22T17:35:36.1364094Z ##[group]Clean up resources from previous jobs
+2026-07-22T17:35:36.1370644Z ##[command]/usr/bin/docker ps --all --quiet --no-trunc --filter "label=040cf7"
+2026-07-22T17:35:36.1525137Z ##[command]/usr/bin/docker network prune --force --filter "label=040cf7"
+2026-07-22T17:35:36.1672870Z ##[endgroup]
+2026-07-22T17:35:36.1673524Z ##[group]Create local container network
+2026-07-22T17:35:36.1685104Z ##[command]/usr/bin/docker network create --label 040cf7 github_network_48c8e888bed5478e8030a45b408d0cee
+2026-07-22T17:35:36.2392414Z f83da5a693034bf5d6e49654757fce548b72e221736e548e0ab1ddcf35c43260
+2026-07-22T17:35:36.2410734Z ##[endgroup]
+2026-07-22T17:35:36.2437069Z ##[group]Starting job container
+2026-07-22T17:35:36.2463510Z ##[command]/usr/bin/docker --config /home/runner/work/_temp/.docker_bc4a7827-998e-40e9-b76b-978c418b85f1 login ghcr.io -u hibnjoroge --password-stdin
+2026-07-22T17:35:36.5564134Z ##[command]/usr/bin/docker --config /home/runner/work/_temp/.docker_bc4a7827-998e-40e9-b76b-978c418b85f1 pull ghcr.io/neondatabase/build-tools:latest
+2026-07-22T17:35:36.9433426Z Error response from daemon: manifest unknown
+2026-07-22T17:35:36.9464142Z ##[warning]Docker pull failed with exit code 1, back off 6.23 seconds before retry.
+2026-07-22T17:35:43.1773632Z ##[command]/usr/bin/docker --config /home/runner/work/_temp/.docker_bc4a7827-998e-40e9-b76b-978c418b85f1 pull ghcr.io/neondatabase/build-tools:latest
+2026-07-22T17:35:43.6510877Z Error response from daemon: manifest unknown
+2026-07-22T17:35:43.6524552Z ##[warning]Docker pull failed with exit code 1, back off 7.043 seconds before retry.
+2026-07-22T17:35:50.6953107Z ##[command]/usr/bin/docker --config /home/runner/work/_temp/.docker_bc4a7827-998e-40e9-b76b-978c418b85f1 pull ghcr.io/neondatabase/build-tools:latest
+2026-07-22T17:35:51.2577117Z Error response from daemon: manifest unknown
+2026-07-22T17:35:51.2690489Z ##[error]Docker pull failed with exit code 1
+2026-07-22T17:35:51.2823223Z Remove container network: github_network_48c8e888bed5478e8030a45b408d0cee
+2026-07-22T17:35:51.2833839Z ##[command]/usr/bin/docker network rm github_network_48c8e888bed5478e8030a45b408d0cee
+2026-07-22T17:35:51.4102253Z github_network_48c8e888bed5478e8030a45b408d0cee
+2026-07-22T17:35:51.4183392Z Cleaning up orphan processes

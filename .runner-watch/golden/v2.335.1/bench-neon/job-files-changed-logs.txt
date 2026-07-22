@@ -1,0 +1,61 @@
+2026-07-22T17:35:31.8018829Z Current runner version: '2.336.0'
+2026-07-22T17:35:31.8040031Z ##[group]Runner Image Provisioner
+2026-07-22T17:35:31.8040793Z Hosted Compute Agent
+2026-07-22T17:35:31.8041268Z Version: 20260707.563
+2026-07-22T17:35:31.8041745Z Commit: 02667638d2b423fbc733a8e32a88b44996a3ba6e
+2026-07-22T17:35:31.8042407Z Build Date: 2026-07-07T19:33:50Z
+2026-07-22T17:35:31.8042951Z Worker ID: {da6c31fe-f8cb-4e33-a408-31e06333d8a2}
+2026-07-22T17:35:31.8043546Z Azure Region: westus
+2026-07-22T17:35:31.8044020Z ##[endgroup]
+2026-07-22T17:35:31.8045078Z ##[group]Operating System
+2026-07-22T17:35:31.8045657Z Ubuntu
+2026-07-22T17:35:31.8046135Z 24.04.4
+2026-07-22T17:35:31.8046534Z LTS
+2026-07-22T17:35:31.8047324Z ##[endgroup]
+2026-07-22T17:35:31.8047780Z ##[group]Runner Image
+2026-07-22T17:35:31.8048319Z Image: ubuntu-24.04
+2026-07-22T17:35:31.8048842Z Version: 20260714.240.1
+2026-07-22T17:35:31.8049863Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260714.240/images/ubuntu/Ubuntu2404-Readme.md
+2026-07-22T17:35:31.8051056Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260714.240
+2026-07-22T17:35:31.8051833Z ##[endgroup]
+2026-07-22T17:35:31.8052793Z ##[group]GITHUB_TOKEN Permissions
+2026-07-22T17:35:31.8054315Z Contents: read
+2026-07-22T17:35:31.8054883Z Metadata: read
+2026-07-22T17:35:31.8055335Z Packages: read
+2026-07-22T17:35:31.8055837Z ##[endgroup]
+2026-07-22T17:35:31.8057758Z Secret source: Actions
+2026-07-22T17:35:31.8059039Z Prepare workflow directory
+2026-07-22T17:35:31.8514414Z Prepare all required actions
+2026-07-22T17:35:31.8589268Z Complete job name: files-changed
+2026-07-22T17:35:31.9208050Z ##[group]Run echo "uses: Harden the runner (Audit all outbound calls)"
+2026-07-22T17:35:31.9209013Z [36;1mecho "uses: Harden the runner (Audit all outbound calls)"[0m
+2026-07-22T17:35:32.0136136Z shell: /usr/bin/bash -euxo pipefail {0}
+2026-07-22T17:35:32.0137742Z env:
+2026-07-22T17:35:32.0138659Z   RUST_BACKTRACE: 1
+2026-07-22T17:35:32.0139354Z   COPT: -Werror
+2026-07-22T17:35:32.0140586Z   E2E_CONCURRENCY_GROUP: hibnjoroge/aksh-bench-neon-e2e-tests-main-45761161d60f1cf8bd26d38fe7706287d6a8f9ff
+2026-07-22T17:35:32.0142018Z ##[endgroup]
+2026-07-22T17:35:32.0353038Z + echo 'uses: Harden the runner (Audit all outbound calls)'
+2026-07-22T17:35:32.0354161Z uses: Harden the runner (Audit all outbound calls)
+2026-07-22T17:35:32.0524382Z ##[group]Run echo "uses: Checkout"
+2026-07-22T17:35:32.0524845Z [36;1mecho "uses: Checkout"[0m
+2026-07-22T17:35:32.0576828Z shell: /usr/bin/bash -euxo pipefail {0}
+2026-07-22T17:35:32.0577460Z env:
+2026-07-22T17:35:32.0577778Z   RUST_BACKTRACE: 1
+2026-07-22T17:35:32.0578122Z   COPT: -Werror
+2026-07-22T17:35:32.0578790Z   E2E_CONCURRENCY_GROUP: hibnjoroge/aksh-bench-neon-e2e-tests-main-45761161d60f1cf8bd26d38fe7706287d6a8f9ff
+2026-07-22T17:35:32.0579519Z ##[endgroup]
+2026-07-22T17:35:32.0653487Z + echo 'uses: Checkout'
+2026-07-22T17:35:32.0654065Z uses: Checkout
+2026-07-22T17:35:32.0686000Z ##[group]Run echo "uses: Check for file changes"
+2026-07-22T17:35:32.0686537Z [36;1mecho "uses: Check for file changes"[0m
+2026-07-22T17:35:32.0737432Z shell: /usr/bin/bash -euxo pipefail {0}
+2026-07-22T17:35:32.0737887Z env:
+2026-07-22T17:35:32.0738204Z   RUST_BACKTRACE: 1
+2026-07-22T17:35:32.0738549Z   COPT: -Werror
+2026-07-22T17:35:32.0739220Z   E2E_CONCURRENCY_GROUP: hibnjoroge/aksh-bench-neon-e2e-tests-main-45761161d60f1cf8bd26d38fe7706287d6a8f9ff
+2026-07-22T17:35:32.0739972Z ##[endgroup]
+2026-07-22T17:35:32.0809362Z + echo 'uses: Check for file changes'
+2026-07-22T17:35:32.0809838Z uses: Check for file changes
+2026-07-22T17:35:32.0886609Z Evaluate and set job outputs
+2026-07-22T17:35:32.0897913Z Cleaning up orphan processes

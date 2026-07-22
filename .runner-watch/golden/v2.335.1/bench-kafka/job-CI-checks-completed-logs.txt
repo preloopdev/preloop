@@ -1,0 +1,40 @@
+2026-07-22T17:35:53.6811232Z Current runner version: '2.336.0'
+2026-07-22T17:35:53.6836888Z ##[group]Runner Image Provisioner
+2026-07-22T17:35:53.6837712Z Hosted Compute Agent
+2026-07-22T17:35:53.6838309Z Version: 20260707.563
+2026-07-22T17:35:53.6838970Z Commit: 02667638d2b423fbc733a8e32a88b44996a3ba6e
+2026-07-22T17:35:53.6839963Z Build Date: 2026-07-07T19:33:50Z
+2026-07-22T17:35:53.6840683Z Worker ID: {2d00b829-d4ac-43dd-a9e3-dda16b3b6798}
+2026-07-22T17:35:53.6841465Z Azure Region: northcentralus
+2026-07-22T17:35:53.6842066Z ##[endgroup]
+2026-07-22T17:35:53.6843733Z ##[group]Operating System
+2026-07-22T17:35:53.6844312Z Ubuntu
+2026-07-22T17:35:53.6844854Z 24.04.4
+2026-07-22T17:35:53.6845327Z LTS
+2026-07-22T17:35:53.6845780Z ##[endgroup]
+2026-07-22T17:35:53.6846327Z ##[group]Runner Image
+2026-07-22T17:35:53.6846872Z Image: ubuntu-24.04
+2026-07-22T17:35:53.6847421Z Version: 20260714.240.1
+2026-07-22T17:35:53.6848623Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260714.240/images/ubuntu/Ubuntu2404-Readme.md
+2026-07-22T17:35:53.6850318Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260714.240
+2026-07-22T17:35:53.6851273Z ##[endgroup]
+2026-07-22T17:35:53.6852459Z ##[group]GITHUB_TOKEN Permissions
+2026-07-22T17:35:53.6854866Z Contents: read
+2026-07-22T17:35:53.6855426Z Metadata: read
+2026-07-22T17:35:53.6855959Z Packages: read
+2026-07-22T17:35:53.6856470Z ##[endgroup]
+2026-07-22T17:35:53.6858573Z Secret source: Actions
+2026-07-22T17:35:53.6859851Z Prepare workflow directory
+2026-07-22T17:35:53.7196583Z Prepare all required actions
+2026-07-22T17:35:53.7298674Z Complete job name: CI checks completed
+2026-07-22T17:35:53.8113844Z ##[group]Run echo "run: Env"
+2026-07-22T17:35:53.8115766Z [36;1mecho "run: Env"[0m
+2026-07-22T17:35:53.8703862Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:35:53.8705174Z ##[endgroup]
+2026-07-22T17:35:53.9042785Z run: Env
+2026-07-22T17:35:53.9201360Z ##[group]Run echo "run: Check Dependency Outcomes"
+2026-07-22T17:35:53.9202136Z [36;1mecho "run: Check Dependency Outcomes"[0m
+2026-07-22T17:35:53.9241974Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:35:53.9242901Z ##[endgroup]
+2026-07-22T17:35:53.9310135Z run: Check Dependency Outcomes
+2026-07-22T17:35:53.9409090Z Cleaning up orphan processes

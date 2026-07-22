@@ -1,0 +1,65 @@
+2026-07-22T17:26:22.9712359Z Current runner version: '2.336.0'
+2026-07-22T17:26:22.9736377Z ##[group]Runner Image Provisioner
+2026-07-22T17:26:22.9737584Z Hosted Compute Agent
+2026-07-22T17:26:22.9738201Z Version: 20260707.563
+2026-07-22T17:26:22.9738852Z Commit: 02667638d2b423fbc733a8e32a88b44996a3ba6e
+2026-07-22T17:26:22.9739651Z Build Date: 2026-07-07T19:33:50Z
+2026-07-22T17:26:22.9740324Z Worker ID: {bf7e409a-f01b-47fb-bb0f-c21726682eff}
+2026-07-22T17:26:22.9741014Z Azure Region: westus2
+2026-07-22T17:26:22.9741640Z ##[endgroup]
+2026-07-22T17:26:22.9743100Z ##[group]Operating System
+2026-07-22T17:26:22.9743908Z Ubuntu
+2026-07-22T17:26:22.9744454Z 24.04.4
+2026-07-22T17:26:22.9744966Z LTS
+2026-07-22T17:26:22.9745525Z ##[endgroup]
+2026-07-22T17:26:22.9746065Z ##[group]Runner Image
+2026-07-22T17:26:22.9747102Z Image: ubuntu-24.04
+2026-07-22T17:26:22.9747728Z Version: 20260714.240.1
+2026-07-22T17:26:22.9748920Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260714.240/images/ubuntu/Ubuntu2404-Readme.md
+2026-07-22T17:26:22.9750530Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260714.240
+2026-07-22T17:26:22.9751494Z ##[endgroup]
+2026-07-22T17:26:22.9752722Z ##[group]GITHUB_TOKEN Permissions
+2026-07-22T17:26:22.9754557Z Contents: read
+2026-07-22T17:26:22.9755273Z Metadata: read
+2026-07-22T17:26:22.9755873Z Packages: read
+2026-07-22T17:26:22.9756450Z ##[endgroup]
+2026-07-22T17:26:22.9758743Z Secret source: Actions
+2026-07-22T17:26:22.9760260Z Prepare workflow directory
+2026-07-22T17:26:23.0122217Z Prepare all required actions
+2026-07-22T17:26:23.0444595Z Complete job name: build (20.x)
+2026-07-22T17:26:23.1293220Z ##[group]Run echo "uses: step"
+2026-07-22T17:26:23.1293961Z [36;1mecho "uses: step"[0m
+2026-07-22T17:26:23.5409062Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:26:23.5410205Z ##[endgroup]
+2026-07-22T17:26:23.5625822Z uses: step
+2026-07-22T17:26:23.5753577Z ##[group]Run echo "uses: Use Node.js 20.x"
+2026-07-22T17:26:23.5754239Z [36;1mecho "uses: Use Node.js 20.x"[0m
+2026-07-22T17:26:23.5812217Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:26:23.5812749Z ##[endgroup]
+2026-07-22T17:26:23.5890443Z uses: Use Node.js 20.x
+2026-07-22T17:26:23.5929569Z ##[group]Run echo "uses: Cache node modules"
+2026-07-22T17:26:23.5930225Z [36;1mecho "uses: Cache node modules"[0m
+2026-07-22T17:26:23.5982782Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:26:23.5983307Z ##[endgroup]
+2026-07-22T17:26:23.6057737Z uses: Cache node modules
+2026-07-22T17:26:23.6131420Z ##[group]Run echo "run: Install dependencies"
+2026-07-22T17:26:23.6132086Z [36;1mecho "run: Install dependencies"[0m
+2026-07-22T17:26:23.6185128Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:26:23.6185630Z ##[endgroup]
+2026-07-22T17:26:23.6260541Z run: Install dependencies
+2026-07-22T17:26:23.6297838Z ##[group]Run echo "run: Unit Test"
+2026-07-22T17:26:23.6298430Z [36;1mecho "run: Unit Test"[0m
+2026-07-22T17:26:23.6351142Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:26:23.6351641Z ##[endgroup]
+2026-07-22T17:26:23.6426845Z run: Unit Test
+2026-07-22T17:26:23.6464516Z ##[group]Run echo "run: Build release"
+2026-07-22T17:26:23.6465112Z [36;1mecho "run: Build release"[0m
+2026-07-22T17:26:23.6518203Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:26:23.6518710Z ##[endgroup]
+2026-07-22T17:26:23.6592720Z run: Build release
+2026-07-22T17:26:23.6631014Z ##[group]Run echo "run: Test generated DTS"
+2026-07-22T17:26:23.6631659Z [36;1mecho "run: Test generated DTS"[0m
+2026-07-22T17:26:23.6685278Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:26:23.6685789Z ##[endgroup]
+2026-07-22T17:26:23.6760952Z run: Test generated DTS
+2026-07-22T17:26:23.6843780Z Cleaning up orphan processes

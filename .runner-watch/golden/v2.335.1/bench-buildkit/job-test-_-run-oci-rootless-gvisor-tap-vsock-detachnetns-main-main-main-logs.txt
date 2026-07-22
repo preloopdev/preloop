@@ -1,0 +1,176 @@
+2026-07-22T17:27:09.5491781Z Current runner version: '2.335.1'
+2026-07-22T17:27:09.5518005Z ##[group]Runner Image Provisioner
+2026-07-22T17:27:09.5518966Z Hosted Compute Agent
+2026-07-22T17:27:09.5519570Z Version: 20260707.563
+2026-07-22T17:27:09.5520187Z Commit: 02667638d2b423fbc733a8e32a88b44996a3ba6e
+2026-07-22T17:27:09.5520992Z Build Date: 2026-07-07T19:33:50Z
+2026-07-22T17:27:09.5521665Z Worker ID: {1baba968-0ac1-4c23-ba4e-5f1b1095c83e}
+2026-07-22T17:27:09.5522349Z Azure Region: westus
+2026-07-22T17:27:09.5522962Z ##[endgroup]
+2026-07-22T17:27:09.5524776Z ##[group]Operating System
+2026-07-22T17:27:09.5525737Z Ubuntu
+2026-07-22T17:27:09.5526276Z 24.04.4
+2026-07-22T17:27:09.5526774Z LTS
+2026-07-22T17:27:09.5527325Z ##[endgroup]
+2026-07-22T17:27:09.5527883Z ##[group]Runner Image
+2026-07-22T17:27:09.5528497Z Image: ubuntu-24.04
+2026-07-22T17:27:09.5529108Z Version: 20260714.240.1
+2026-07-22T17:27:09.5530333Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260714.240/images/ubuntu/Ubuntu2404-Readme.md
+2026-07-22T17:27:09.5531923Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260714.240
+2026-07-22T17:27:09.5532902Z ##[endgroup]
+2026-07-22T17:27:09.5534051Z ##[group]GITHUB_TOKEN Permissions
+2026-07-22T17:27:09.5536555Z Contents: read
+2026-07-22T17:27:09.5537249Z Metadata: read
+2026-07-22T17:27:09.5537826Z ##[endgroup]
+2026-07-22T17:27:09.5539974Z Secret source: Actions
+2026-07-22T17:27:09.5540828Z Prepare workflow directory
+2026-07-22T17:27:09.6012466Z Prepare all required actions
+2026-07-22T17:27:09.6101486Z Uses: team-getveritas/aksh-bench-buildkit/.github/workflows/.test.yml@refs/heads/main (87e7fe79125bc5df1e063311bfd1fd3d47e3ec93)
+2026-07-22T17:27:09.6107139Z ##[group] Inputs
+2026-07-22T17:27:09.6107818Z   cache_scope: build-integration-tests
+2026-07-22T17:27:09.6108649Z   pkgs: ./client ./cmd/buildctl ./worker/containerd ./solver ./frontend
+2026-07-22T17:27:09.6109630Z   kinds: integration
+2026-07-22T17:27:09.6110219Z   tags: 
+2026-07-22T17:27:09.6110926Z   codecov_flags: core
+2026-07-22T17:27:09.6113193Z   includes: - pkg: ./...
+  skip-integration-tests: 1
+  typ: integration gateway
+- pkg: ./client
+  worker: containerd
+  tags: nydus
+  typ: integration
+- pkg: ./client
+  worker: oci
+  tags: nydus
+  typ: integration
+- pkg: ./...
+  tags: nydus
+  skip-integration-tests: 1
+  typ: integration
+- pkg: ./cache/remotecache/gha
+  worker: oci
+  typ: integration
+
+2026-07-22T17:27:09.6115742Z ##[endgroup]
+2026-07-22T17:27:09.6116704Z Complete job name: test / run (oci-rootless-gvisor-tap-vsock-detachnetns, main, main, main)
+2026-07-22T17:27:09.6910007Z ##[group]Run echo "run: Prepare"
+2026-07-22T17:27:09.6910874Z [36;1mecho "run: Prepare"[0m
+2026-07-22T17:27:09.7799668Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:27:09.7801442Z env:
+2026-07-22T17:27:09.7802358Z   GO_VERSION: 1.26
+2026-07-22T17:27:09.7803427Z   SETUP_BUILDX_VERSION: edge
+2026-07-22T17:27:09.7804526Z   SETUP_BUILDKIT_IMAGE: moby/buildkit:latest
+2026-07-22T17:27:09.7806050Z   TESTFLAGS: -v --parallel=6 --timeout=30m
+2026-07-22T17:27:09.7807379Z   GOTESTSUM_FORMAT: standard-verbose
+2026-07-22T17:27:09.7808411Z   TEST_IMAGE_BUILD: 0
+2026-07-22T17:27:09.7809442Z ##[endgroup]
+2026-07-22T17:27:09.8341847Z run: Prepare
+2026-07-22T17:27:09.8442629Z ##[group]Run echo "uses: Checkout"
+2026-07-22T17:27:09.8443244Z [36;1mecho "uses: Checkout"[0m
+2026-07-22T17:27:09.8506660Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:27:09.8507555Z env:
+2026-07-22T17:27:09.8508265Z   GO_VERSION: 1.26
+2026-07-22T17:27:09.8509096Z   SETUP_BUILDX_VERSION: edge
+2026-07-22T17:27:09.8510073Z   SETUP_BUILDKIT_IMAGE: moby/buildkit:latest
+2026-07-22T17:27:09.8511140Z   TESTFLAGS: -v --parallel=6 --timeout=30m
+2026-07-22T17:27:09.8512213Z   GOTESTSUM_FORMAT: standard-verbose
+2026-07-22T17:27:09.8513157Z   TEST_IMAGE_BUILD: 0
+2026-07-22T17:27:09.8513887Z ##[endgroup]
+2026-07-22T17:27:09.8615790Z uses: Checkout
+2026-07-22T17:27:09.8655289Z ##[group]Run echo "uses: Expose GitHub Runtime"
+2026-07-22T17:27:09.8656045Z [36;1mecho "uses: Expose GitHub Runtime"[0m
+2026-07-22T17:27:09.8716151Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:27:09.8716718Z env:
+2026-07-22T17:27:09.8717176Z   GO_VERSION: 1.26
+2026-07-22T17:27:09.8717684Z   SETUP_BUILDX_VERSION: edge
+2026-07-22T17:27:09.8718279Z   SETUP_BUILDKIT_IMAGE: moby/buildkit:latest
+2026-07-22T17:27:09.8718934Z   TESTFLAGS: -v --parallel=6 --timeout=30m
+2026-07-22T17:27:09.8719533Z   GOTESTSUM_FORMAT: standard-verbose
+2026-07-22T17:27:09.8720065Z   TEST_IMAGE_BUILD: 0
+2026-07-22T17:27:09.8720514Z ##[endgroup]
+2026-07-22T17:27:09.8808851Z uses: Expose GitHub Runtime
+2026-07-22T17:27:09.8847546Z ##[group]Run echo "uses: Set up QEMU"
+2026-07-22T17:27:09.8848164Z [36;1mecho "uses: Set up QEMU"[0m
+2026-07-22T17:27:09.8907203Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:27:09.8907713Z env:
+2026-07-22T17:27:09.8908107Z   GO_VERSION: 1.26
+2026-07-22T17:27:09.8908557Z   SETUP_BUILDX_VERSION: edge
+2026-07-22T17:27:09.8909092Z   SETUP_BUILDKIT_IMAGE: moby/buildkit:latest
+2026-07-22T17:27:09.8909698Z   TESTFLAGS: -v --parallel=6 --timeout=30m
+2026-07-22T17:27:09.8910305Z   GOTESTSUM_FORMAT: standard-verbose
+2026-07-22T17:27:09.8910837Z   TEST_IMAGE_BUILD: 0
+2026-07-22T17:27:09.8911275Z ##[endgroup]
+2026-07-22T17:27:09.8996243Z uses: Set up QEMU
+2026-07-22T17:27:09.9034670Z ##[group]Run echo "uses: Set up Docker Buildx"
+2026-07-22T17:27:09.9035665Z [36;1mecho "uses: Set up Docker Buildx"[0m
+2026-07-22T17:27:09.9094438Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:27:09.9095175Z env:
+2026-07-22T17:27:09.9095590Z   GO_VERSION: 1.26
+2026-07-22T17:27:09.9096062Z   SETUP_BUILDX_VERSION: edge
+2026-07-22T17:27:09.9096599Z   SETUP_BUILDKIT_IMAGE: moby/buildkit:latest
+2026-07-22T17:27:09.9097205Z   TESTFLAGS: -v --parallel=6 --timeout=30m
+2026-07-22T17:27:09.9097805Z   GOTESTSUM_FORMAT: standard-verbose
+2026-07-22T17:27:09.9098328Z   TEST_IMAGE_BUILD: 0
+2026-07-22T17:27:09.9098763Z ##[endgroup]
+2026-07-22T17:27:09.9183448Z uses: Set up Docker Buildx
+2026-07-22T17:27:09.9223311Z ##[group]Run echo "uses: Build test image"
+2026-07-22T17:27:09.9223949Z [36;1mecho "uses: Build test image"[0m
+2026-07-22T17:27:09.9282897Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:27:09.9283396Z env:
+2026-07-22T17:27:09.9283786Z   GO_VERSION: 1.26
+2026-07-22T17:27:09.9284237Z   SETUP_BUILDX_VERSION: edge
+2026-07-22T17:27:09.9284767Z   SETUP_BUILDKIT_IMAGE: moby/buildkit:latest
+2026-07-22T17:27:09.9285824Z   TESTFLAGS: -v --parallel=6 --timeout=30m
+2026-07-22T17:27:09.9286420Z   GOTESTSUM_FORMAT: standard-verbose
+2026-07-22T17:27:09.9286945Z   TEST_IMAGE_BUILD: 0
+2026-07-22T17:27:09.9287384Z ##[endgroup]
+2026-07-22T17:27:09.9371987Z uses: Build test image
+2026-07-22T17:27:09.9423108Z ##[group]Run echo "run: Test"
+2026-07-22T17:27:09.9424073Z [36;1mecho "run: Test"[0m
+2026-07-22T17:27:09.9512389Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:27:09.9513277Z env:
+2026-07-22T17:27:09.9513982Z   GO_VERSION: 1.26
+2026-07-22T17:27:09.9514722Z   SETUP_BUILDX_VERSION: edge
+2026-07-22T17:27:09.9515797Z   SETUP_BUILDKIT_IMAGE: moby/buildkit:latest
+2026-07-22T17:27:09.9516425Z   TESTFLAGS: -v --parallel=6 --timeout=30m
+2026-07-22T17:27:09.9517054Z   GOTESTSUM_FORMAT: standard-verbose
+2026-07-22T17:27:09.9517599Z   TEST_IMAGE_BUILD: 0
+2026-07-22T17:27:09.9518046Z ##[endgroup]
+2026-07-22T17:27:09.9603494Z run: Test
+2026-07-22T17:27:09.9643274Z ##[group]Run echo "uses: Send to Codecov"
+2026-07-22T17:27:09.9643896Z [36;1mecho "uses: Send to Codecov"[0m
+2026-07-22T17:27:09.9702440Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:27:09.9702948Z env:
+2026-07-22T17:27:09.9703345Z   GO_VERSION: 1.26
+2026-07-22T17:27:09.9703794Z   SETUP_BUILDX_VERSION: edge
+2026-07-22T17:27:09.9704338Z   SETUP_BUILDKIT_IMAGE: moby/buildkit:latest
+2026-07-22T17:27:09.9705186Z   TESTFLAGS: -v --parallel=6 --timeout=30m
+2026-07-22T17:27:09.9705913Z   GOTESTSUM_FORMAT: standard-verbose
+2026-07-22T17:27:09.9706449Z   TEST_IMAGE_BUILD: 0
+2026-07-22T17:27:09.9706889Z ##[endgroup]
+2026-07-22T17:27:09.9790389Z uses: Send to Codecov
+2026-07-22T17:27:09.9829222Z ##[group]Run echo "uses: Generate annotations"
+2026-07-22T17:27:09.9829910Z [36;1mecho "uses: Generate annotations"[0m
+2026-07-22T17:27:09.9888096Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:27:09.9888601Z env:
+2026-07-22T17:27:09.9889007Z   GO_VERSION: 1.26
+2026-07-22T17:27:09.9889477Z   SETUP_BUILDX_VERSION: edge
+2026-07-22T17:27:09.9890030Z   SETUP_BUILDKIT_IMAGE: moby/buildkit:latest
+2026-07-22T17:27:09.9890656Z   TESTFLAGS: -v --parallel=6 --timeout=30m
+2026-07-22T17:27:09.9891268Z   GOTESTSUM_FORMAT: standard-verbose
+2026-07-22T17:27:09.9891816Z   TEST_IMAGE_BUILD: 0
+2026-07-22T17:27:09.9892267Z ##[endgroup]
+2026-07-22T17:27:09.9975484Z uses: Generate annotations
+2026-07-22T17:27:10.0014549Z ##[group]Run echo "uses: Upload test reports"
+2026-07-22T17:27:10.0015576Z [36;1mecho "uses: Upload test reports"[0m
+2026-07-22T17:27:10.0074483Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:27:10.0075322Z env:
+2026-07-22T17:27:10.0075748Z   GO_VERSION: 1.26
+2026-07-22T17:27:10.0076189Z   SETUP_BUILDX_VERSION: edge
+2026-07-22T17:27:10.0076715Z   SETUP_BUILDKIT_IMAGE: moby/buildkit:latest
+2026-07-22T17:27:10.0077331Z   TESTFLAGS: -v --parallel=6 --timeout=30m
+2026-07-22T17:27:10.0077907Z   GOTESTSUM_FORMAT: standard-verbose
+2026-07-22T17:27:10.0078424Z   TEST_IMAGE_BUILD: 0
+2026-07-22T17:27:10.0078846Z ##[endgroup]
+2026-07-22T17:27:10.0163969Z uses: Upload test reports
+2026-07-22T17:27:10.0287845Z Cleaning up orphan processes

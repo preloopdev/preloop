@@ -1,0 +1,45 @@
+2026-07-05T21:04:56.2064174Z Current runner version: '2.335.1'
+2026-07-05T21:04:56.2098229Z ##[group]Runner Image Provisioner
+2026-07-05T21:04:56.2099194Z Hosted Compute Agent
+2026-07-05T21:04:56.2099796Z Version: 20260624.560
+2026-07-05T21:04:56.2100506Z Commit: 925d229a51159bc391ae97e54a2dd1fe20af789d
+2026-07-05T21:04:56.2101281Z Build Date: 2026-06-24T18:26:47Z
+2026-07-05T21:04:56.2101967Z Worker ID: {bd7278aa-5cae-436f-96dc-5cfdb73c0e7b}
+2026-07-05T21:04:56.2102811Z Azure Region: centralus
+2026-07-05T21:04:56.2103411Z ##[endgroup]
+2026-07-05T21:04:56.2104870Z ##[group]Operating System
+2026-07-05T21:04:56.2105529Z Ubuntu
+2026-07-05T21:04:56.2106405Z 24.04.4
+2026-07-05T21:04:56.2107070Z LTS
+2026-07-05T21:04:56.2107642Z ##[endgroup]
+2026-07-05T21:04:56.2108197Z ##[group]Runner Image
+2026-07-05T21:04:56.2108864Z Image: ubuntu-24.04
+2026-07-05T21:04:56.2109444Z Version: 20260628.225.1
+2026-07-05T21:04:56.2110801Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260628.225/images/ubuntu/Ubuntu2404-Readme.md
+2026-07-05T21:04:56.2112395Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260628.225
+2026-07-05T21:04:56.2113417Z ##[endgroup]
+2026-07-05T21:04:56.2114671Z ##[group]GITHUB_TOKEN Permissions
+2026-07-05T21:04:56.2117380Z Contents: read
+2026-07-05T21:04:56.2118002Z Metadata: read
+2026-07-05T21:04:56.2118563Z Packages: read
+2026-07-05T21:04:56.2119232Z ##[endgroup]
+2026-07-05T21:04:56.2121434Z Secret source: Actions
+2026-07-05T21:04:56.2122367Z Prepare workflow directory
+2026-07-05T21:04:56.2471604Z Prepare all required actions
+2026-07-05T21:04:56.2571208Z Complete job name: ubuntu-latest-job
+2026-07-05T21:04:56.3377546Z ##[group]Run echo "Runner: GitHub Actions 1000000174"
+2026-07-05T21:04:56.3378541Z [36;1mecho "Runner: GitHub Actions 1000000174"[0m
+2026-07-05T21:04:56.3379243Z [36;1mecho "OS: Linux"[0m
+2026-07-05T21:04:56.3379924Z [36;1mecho "Arch: X64"[0m
+2026-07-05T21:04:56.3380983Z [36;1mif [[ "Linux" != "Linux" ]]; then[0m
+2026-07-05T21:04:56.3381726Z [36;1m  echo "FAIL: expected Linux"[0m
+2026-07-05T21:04:56.3382502Z [36;1m  exit 1[0m
+2026-07-05T21:04:56.3383025Z [36;1mfi[0m
+2026-07-05T21:04:56.3383763Z [36;1mecho "PASS: ubuntu-latest dispatched to Linux runner"[0m
+2026-07-05T21:04:56.3763214Z shell: /usr/bin/bash -e {0}
+2026-07-05T21:04:56.3764247Z ##[endgroup]
+2026-07-05T21:04:56.3972817Z Runner: GitHub Actions 1000000174
+2026-07-05T21:04:56.3973951Z OS: Linux
+2026-07-05T21:04:56.3974761Z Arch: X64
+2026-07-05T21:04:56.3975879Z PASS: ubuntu-latest dispatched to Linux runner
+2026-07-05T21:04:56.4137409Z Cleaning up orphan processes

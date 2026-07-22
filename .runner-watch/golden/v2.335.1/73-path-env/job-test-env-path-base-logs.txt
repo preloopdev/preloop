@@ -1,0 +1,66 @@
+2026-07-05T21:04:57.6762061Z Current runner version: '2.335.1'
+2026-07-05T21:04:57.6795282Z ##[group]Runner Image Provisioner
+2026-07-05T21:04:57.6796686Z Hosted Compute Agent
+2026-07-05T21:04:57.6797555Z Version: 20260624.560
+2026-07-05T21:04:57.6798461Z Commit: 925d229a51159bc391ae97e54a2dd1fe20af789d
+2026-07-05T21:04:57.6799912Z Build Date: 2026-06-24T18:26:47Z
+2026-07-05T21:04:57.6800988Z Worker ID: {376e8323-ee5e-4a78-b7ba-0ff58a311d06}
+2026-07-05T21:04:57.6802050Z Azure Region: centralus
+2026-07-05T21:04:57.6802907Z ##[endgroup]
+2026-07-05T21:04:57.6804882Z ##[group]Operating System
+2026-07-05T21:04:57.6805869Z Ubuntu
+2026-07-05T21:04:57.6806706Z 24.04.4
+2026-07-05T21:04:57.6807454Z LTS
+2026-07-05T21:04:57.6808259Z ##[endgroup]
+2026-07-05T21:04:57.6809064Z ##[group]Runner Image
+2026-07-05T21:04:57.6810145Z Image: ubuntu-24.04
+2026-07-05T21:04:57.6811009Z Version: 20260628.225.1
+2026-07-05T21:04:57.6812921Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260628.225/images/ubuntu/Ubuntu2404-Readme.md
+2026-07-05T21:04:57.6815420Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260628.225
+2026-07-05T21:04:57.6817023Z ##[endgroup]
+2026-07-05T21:04:57.6818892Z ##[group]GITHUB_TOKEN Permissions
+2026-07-05T21:04:57.6822005Z Contents: read
+2026-07-05T21:04:57.6822915Z Metadata: read
+2026-07-05T21:04:57.6823725Z Packages: read
+2026-07-05T21:04:57.6824635Z ##[endgroup]
+2026-07-05T21:04:57.6827335Z Secret source: Actions
+2026-07-05T21:04:57.6828523Z Prepare workflow directory
+2026-07-05T21:04:57.7228778Z Prepare all required actions
+2026-07-05T21:04:57.7311291Z Complete job name: test-env-path-base
+2026-07-05T21:04:57.8100320Z ##[group]Run echo "PATH: $PATH"
+2026-07-05T21:04:57.8101048Z [36;1mecho "PATH: $PATH"[0m
+2026-07-05T21:04:57.8101772Z [36;1mif [[ "$PATH" != *"/usr/local/custom"* ]]; then[0m
+2026-07-05T21:04:57.8102535Z [36;1m  echo "FAIL: job-level env.PATH should be in PATH"[0m
+2026-07-05T21:04:57.8103432Z [36;1m  exit 1[0m
+2026-07-05T21:04:57.8103912Z [36;1mfi[0m
+2026-07-05T21:04:57.8104506Z [36;1mecho "PASS: job-level env.PATH used as base"[0m
+2026-07-05T21:04:57.8413227Z shell: /usr/bin/bash -e {0}
+2026-07-05T21:04:57.8414983Z env:
+2026-07-05T21:04:57.8415685Z   PATH: /usr/local/custom:/usr/bin:/bin
+2026-07-05T21:04:57.8416471Z ##[endgroup]
+2026-07-05T21:04:57.8745787Z PATH: /usr/local/custom:/usr/bin:/bin
+2026-07-05T21:04:57.8746491Z PASS: job-level env.PATH used as base
+2026-07-05T21:04:57.8837246Z ##[group]Run echo "/tmp/over-env-path" >> "$GITHUB_PATH"
+2026-07-05T21:04:57.8838061Z [36;1mecho "/tmp/over-env-path" >> "$GITHUB_PATH"[0m
+2026-07-05T21:04:57.8857278Z shell: /usr/bin/bash -e {0}
+2026-07-05T21:04:57.8857884Z env:
+2026-07-05T21:04:57.8858380Z   PATH: /usr/local/custom:/usr/bin:/bin
+2026-07-05T21:04:57.8859004Z ##[endgroup]
+2026-07-05T21:04:57.8939421Z ##[group]Run echo "PATH: $PATH"
+2026-07-05T21:04:57.8940331Z [36;1mecho "PATH: $PATH"[0m
+2026-07-05T21:04:57.8940961Z [36;1mif [[ "$PATH" != /tmp/over-env-path:* ]]; then[0m
+2026-07-05T21:04:57.8941689Z [36;1m  echo "FAIL: GITHUB_PATH should be prepended"[0m
+2026-07-05T21:04:57.8942333Z [36;1m  exit 1[0m
+2026-07-05T21:04:57.8942788Z [36;1mfi[0m
+2026-07-05T21:04:57.8943323Z [36;1mif [[ "$PATH" != *"/usr/local/custom"* ]]; then[0m
+2026-07-05T21:04:57.8944095Z [36;1m  echo "FAIL: env.PATH base should still be present"[0m
+2026-07-05T21:04:57.8944762Z [36;1m  exit 1[0m
+2026-07-05T21:04:57.8945236Z [36;1mfi[0m
+2026-07-05T21:04:57.8945812Z [36;1mecho "PASS: GITHUB_PATH prepended to env.PATH base"[0m
+2026-07-05T21:04:57.8965997Z shell: /usr/bin/bash -e {0}
+2026-07-05T21:04:57.8966557Z env:
+2026-07-05T21:04:57.8967052Z   PATH: /usr/local/custom:/usr/bin:/bin
+2026-07-05T21:04:57.8967632Z ##[endgroup]
+2026-07-05T21:04:57.9012230Z PATH: /tmp/over-env-path:/usr/local/custom:/usr/bin:/bin
+2026-07-05T21:04:57.9013665Z PASS: GITHUB_PATH prepended to env.PATH base
+2026-07-05T21:04:57.9117577Z Cleaning up orphan processes

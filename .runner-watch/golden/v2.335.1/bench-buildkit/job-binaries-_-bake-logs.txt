@@ -1,0 +1,56 @@
+2026-07-22T17:26:52.7362207Z Current runner version: '2.335.1'
+2026-07-22T17:26:52.7386708Z ##[group]Runner Image Provisioner
+2026-07-22T17:26:52.7387541Z Hosted Compute Agent
+2026-07-22T17:26:52.7388087Z Version: 20260707.563
+2026-07-22T17:26:52.7388647Z Commit: 02667638d2b423fbc733a8e32a88b44996a3ba6e
+2026-07-22T17:26:52.7389323Z Build Date: 2026-07-07T19:33:50Z
+2026-07-22T17:26:52.7389974Z Worker ID: {530672fd-1a55-41a0-bcf4-1d85640f59e0}
+2026-07-22T17:26:52.7390605Z Azure Region: westus3
+2026-07-22T17:26:52.7391146Z ##[endgroup]
+2026-07-22T17:26:52.7392486Z ##[group]Operating System
+2026-07-22T17:26:52.7393115Z Ubuntu
+2026-07-22T17:26:52.7393579Z 24.04.4
+2026-07-22T17:26:52.7394039Z LTS
+2026-07-22T17:26:52.7394524Z ##[endgroup]
+2026-07-22T17:26:52.7395004Z ##[group]Runner Image
+2026-07-22T17:26:52.7395864Z Image: ubuntu-24.04
+2026-07-22T17:26:52.7396434Z Version: 20260714.240.1
+2026-07-22T17:26:52.7397535Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260714.240/images/ubuntu/Ubuntu2404-Readme.md
+2026-07-22T17:26:52.7398904Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260714.240
+2026-07-22T17:26:52.7399708Z ##[endgroup]
+2026-07-22T17:26:52.7400751Z ##[group]GITHUB_TOKEN Permissions
+2026-07-22T17:26:52.7402688Z Contents: read
+2026-07-22T17:26:52.7403300Z Metadata: read
+2026-07-22T17:26:52.7403782Z ##[endgroup]
+2026-07-22T17:26:52.7406152Z Secret source: Actions
+2026-07-22T17:26:52.7406890Z Prepare workflow directory
+2026-07-22T17:26:52.7732414Z Prepare all required actions
+2026-07-22T17:26:52.7830739Z Uses: team-getveritas/aksh-bench-buildkit/.github/workflows/mock_bake.yml@refs/heads/main (87e7fe79125bc5df1e063311bfd1fd3d47e3ec93)
+2026-07-22T17:26:52.7835586Z ##[group] Inputs
+2026-07-22T17:26:52.7836296Z   runner: ubuntu-24.04
+2026-07-22T17:26:52.7836958Z   artifact-name: buildkit-binaries
+2026-07-22T17:26:52.7837941Z   artifact-upload: true
+2026-07-22T17:26:52.7838467Z   cache: true
+2026-07-22T17:26:52.7839113Z   cache-scope: binaries
+2026-07-22T17:26:52.7839660Z   target: release
+2026-07-22T17:26:52.7840148Z   output: local
+2026-07-22T17:26:52.7840632Z   sbom: true
+2026-07-22T17:26:52.7841090Z   sign: true
+2026-07-22T17:26:52.7841563Z   push: false
+2026-07-22T17:26:52.7842020Z   vars: 
+2026-07-22T17:26:52.7842474Z   set-meta-annotations: false
+2026-07-22T17:26:52.7843238Z   meta-images: 
+2026-07-22T17:26:52.7843785Z   meta-tags: 
+2026-07-22T17:26:52.7844271Z   meta-flavor: 
+2026-07-22T17:26:52.7844758Z   meta-annotations: 
+2026-07-22T17:26:52.7845441Z   meta-bake-target: 
+2026-07-22T17:26:52.7846081Z ##[endgroup]
+2026-07-22T17:26:52.7846561Z Complete job name: binaries / bake
+2026-07-22T17:26:53.4928257Z ##[group]Run echo "mock bake"
+2026-07-22T17:26:53.4928964Z [36;1mecho "mock bake"[0m
+2026-07-22T17:26:53.6134327Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:26:53.6135820Z ##[endgroup]
+2026-07-22T17:26:53.6395208Z mock bake
+2026-07-22T17:26:53.6527279Z Evaluate and set job outputs
+2026-07-22T17:26:53.6533474Z Set output 'artifact-name'
+2026-07-22T17:26:53.6536202Z Cleaning up orphan processes

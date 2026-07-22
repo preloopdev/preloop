@@ -1,0 +1,39 @@
+2026-07-22T17:26:24.0278522Z Current runner version: '2.336.0'
+2026-07-22T17:26:24.0304770Z ##[group]Runner Image Provisioner
+2026-07-22T17:26:24.0305729Z Hosted Compute Agent
+2026-07-22T17:26:24.0306341Z Version: 20260707.563
+2026-07-22T17:26:24.0307028Z Commit: 02667638d2b423fbc733a8e32a88b44996a3ba6e
+2026-07-22T17:26:24.0307823Z Build Date: 2026-07-07T19:33:50Z
+2026-07-22T17:26:24.0308513Z Worker ID: {3906d6aa-a28d-4181-b010-305c0e7c6c0a}
+2026-07-22T17:26:24.0309294Z Azure Region: eastus
+2026-07-22T17:26:24.0309877Z ##[endgroup]
+2026-07-22T17:26:24.0311546Z ##[group]Operating System
+2026-07-22T17:26:24.0312260Z Ubuntu
+2026-07-22T17:26:24.0312797Z 24.04.4
+2026-07-22T17:26:24.0313635Z LTS
+2026-07-22T17:26:24.0314154Z ##[endgroup]
+2026-07-22T17:26:24.0314695Z ##[group]Runner Image
+2026-07-22T17:26:24.0315405Z Image: ubuntu-24.04
+2026-07-22T17:26:24.0315973Z Version: 20260714.240.1
+2026-07-22T17:26:24.0317277Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260714.240/images/ubuntu/Ubuntu2404-Readme.md
+2026-07-22T17:26:24.0318784Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260714.240
+2026-07-22T17:26:24.0319796Z ##[endgroup]
+2026-07-22T17:26:24.0320926Z ##[group]GITHUB_TOKEN Permissions
+2026-07-22T17:26:24.0323215Z Contents: read
+2026-07-22T17:26:24.0323849Z Metadata: read
+2026-07-22T17:26:24.0324517Z Packages: read
+2026-07-22T17:26:24.0325142Z ##[endgroup]
+2026-07-22T17:26:24.0327814Z Secret source: Actions
+2026-07-22T17:26:24.0329376Z Prepare workflow directory
+2026-07-22T17:26:24.0684030Z Prepare all required actions
+2026-07-22T17:26:24.0797461Z Uses: hibnjoroge/aksh-bench-gum/.github/workflows/mock_build.yml@refs/heads/main (4a34bebe730dc6c37508c1a3f61c712b8e71f55d)
+2026-07-22T17:26:24.0803318Z ##[group] Inputs
+2026-07-22T17:26:24.0804075Z   go-version: 1.21
+2026-07-22T17:26:24.0804755Z ##[endgroup]
+2026-07-22T17:26:24.0805334Z Complete job name: build / build
+2026-07-22T17:26:24.1771322Z ##[group]Run echo "mock build"
+2026-07-22T17:26:24.1772115Z [36;1mecho "mock build"[0m
+2026-07-22T17:26:24.2608806Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:26:24.2610008Z ##[endgroup]
+2026-07-22T17:26:24.2851720Z mock build
+2026-07-22T17:26:24.3015414Z Cleaning up orphan processes

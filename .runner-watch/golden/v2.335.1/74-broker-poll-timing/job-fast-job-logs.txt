@@ -1,0 +1,46 @@
+2026-07-05T21:04:59.0431658Z Current runner version: '2.335.1'
+2026-07-05T21:04:59.0460564Z ##[group]Runner Image Provisioner
+2026-07-05T21:04:59.0461337Z Hosted Compute Agent
+2026-07-05T21:04:59.0461907Z Version: 20260624.560
+2026-07-05T21:04:59.0462485Z Commit: 925d229a51159bc391ae97e54a2dd1fe20af789d
+2026-07-05T21:04:59.0463158Z Build Date: 2026-06-24T18:26:47Z
+2026-07-05T21:04:59.0463931Z Worker ID: {a0ea22cd-1cc0-4521-bd49-502fa8ec4035}
+2026-07-05T21:04:59.0464589Z Azure Region: northcentralus
+2026-07-05T21:04:59.0465117Z ##[endgroup]
+2026-07-05T21:04:59.0466549Z ##[group]Operating System
+2026-07-05T21:04:59.0467110Z Ubuntu
+2026-07-05T21:04:59.0467610Z 24.04.4
+2026-07-05T21:04:59.0468095Z LTS
+2026-07-05T21:04:59.0468555Z ##[endgroup]
+2026-07-05T21:04:59.0469053Z ##[group]Runner Image
+2026-07-05T21:04:59.0469584Z Image: ubuntu-24.04
+2026-07-05T21:04:59.0470224Z Version: 20260628.225.1
+2026-07-05T21:04:59.0471410Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260628.225/images/ubuntu/Ubuntu2404-Readme.md
+2026-07-05T21:04:59.0472770Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260628.225
+2026-07-05T21:04:59.0473616Z ##[endgroup]
+2026-07-05T21:04:59.0474680Z ##[group]GITHUB_TOKEN Permissions
+2026-07-05T21:04:59.0476900Z Contents: read
+2026-07-05T21:04:59.0477411Z Metadata: read
+2026-07-05T21:04:59.0477950Z Packages: read
+2026-07-05T21:04:59.0478442Z ##[endgroup]
+2026-07-05T21:04:59.0480693Z Secret source: Actions
+2026-07-05T21:04:59.0481386Z Prepare workflow directory
+2026-07-05T21:04:59.0794474Z Prepare all required actions
+2026-07-05T21:04:59.0891849Z Complete job name: fast-job
+2026-07-05T21:04:59.1513683Z ##[group]Run echo "Start: $(date +%s%N)"
+2026-07-05T21:04:59.1514480Z [36;1mecho "Start: $(date +%s%N)"[0m
+2026-07-05T21:04:59.1515238Z [36;1mecho "This job should complete and the runner should exit promptly"[0m
+2026-07-05T21:04:59.1516042Z [36;1mecho "End: $(date +%s%N)"[0m
+2026-07-05T21:04:59.1822075Z shell: /usr/bin/bash -e {0}
+2026-07-05T21:04:59.1823142Z ##[endgroup]
+2026-07-05T21:04:59.2025517Z Start: 1783285499197595916
+2026-07-05T21:04:59.2032270Z This job should complete and the runner should exit promptly
+2026-07-05T21:04:59.2046041Z End: 1783285499198912277
+2026-07-05T21:04:59.2137749Z ##[group]Run echo "If the broker poll is 200ms (not 50s), this job completes fast"
+2026-07-05T21:04:59.2138803Z [36;1mecho "If the broker poll is 200ms (not 50s), this job completes fast"[0m
+2026-07-05T21:04:59.2139565Z [36;1mecho "PASS: job completed"[0m
+2026-07-05T21:04:59.2158986Z shell: /usr/bin/bash -e {0}
+2026-07-05T21:04:59.2159564Z ##[endgroup]
+2026-07-05T21:04:59.2203871Z If the broker poll is 200ms (not 50s), this job completes fast
+2026-07-05T21:04:59.2205972Z PASS: job completed
+2026-07-05T21:04:59.2286523Z Cleaning up orphan processes

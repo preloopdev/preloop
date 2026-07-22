@@ -1,0 +1,75 @@
+2026-07-22T17:26:22.3285063Z Current runner version: '2.336.0'
+2026-07-22T17:26:22.3312304Z ##[group]Runner Image Provisioner
+2026-07-22T17:26:22.3313499Z Hosted Compute Agent
+2026-07-22T17:26:22.3314118Z Version: 20260707.563
+2026-07-22T17:26:22.3314810Z Commit: 02667638d2b423fbc733a8e32a88b44996a3ba6e
+2026-07-22T17:26:22.3315603Z Build Date: 2026-07-07T19:33:50Z
+2026-07-22T17:26:22.3316338Z Worker ID: {17321354-caa3-4204-ab36-336f410b360b}
+2026-07-22T17:26:22.3317136Z Azure Region: northcentralus
+2026-07-22T17:26:22.3317790Z ##[endgroup]
+2026-07-22T17:26:22.3319333Z ##[group]Operating System
+2026-07-22T17:26:22.3320081Z Ubuntu
+2026-07-22T17:26:22.3320672Z 24.04.4
+2026-07-22T17:26:22.3321243Z LTS
+2026-07-22T17:26:22.3321797Z ##[endgroup]
+2026-07-22T17:26:22.3322371Z ##[group]Runner Image
+2026-07-22T17:26:22.3323245Z Image: ubuntu-24.04
+2026-07-22T17:26:22.3323882Z Version: 20260714.240.1
+2026-07-22T17:26:22.3325252Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260714.240/images/ubuntu/Ubuntu2404-Readme.md
+2026-07-22T17:26:22.3326782Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260714.240
+2026-07-22T17:26:22.3327908Z ##[endgroup]
+2026-07-22T17:26:22.3329211Z ##[group]GITHUB_TOKEN Permissions
+2026-07-22T17:26:22.3331800Z Contents: read
+2026-07-22T17:26:22.3332455Z Metadata: read
+2026-07-22T17:26:22.3333283Z Packages: read
+2026-07-22T17:26:22.3333965Z ##[endgroup]
+2026-07-22T17:26:22.3336373Z Secret source: Actions
+2026-07-22T17:26:22.3337988Z Prepare workflow directory
+2026-07-22T17:26:22.3701234Z Prepare all required actions
+2026-07-22T17:26:22.4088898Z Complete job name: lint (20.x)
+2026-07-22T17:26:22.5052528Z ##[group]Run echo "run: Fetch commit count"
+2026-07-22T17:26:22.5053719Z [36;1mecho "run: Fetch commit count"[0m
+2026-07-22T17:26:22.6189044Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:26:22.6189884Z ##[endgroup]
+2026-07-22T17:26:22.6407589Z run: Fetch commit count
+2026-07-22T17:26:22.6526025Z ##[group]Run echo "uses: step"
+2026-07-22T17:26:22.6526573Z [36;1mecho "uses: step"[0m
+2026-07-22T17:26:22.6588182Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:26:22.6588699Z ##[endgroup]
+2026-07-22T17:26:22.6674793Z uses: step
+2026-07-22T17:26:22.6717419Z ##[group]Run echo "uses: Use Node.js 20.x"
+2026-07-22T17:26:22.6718042Z [36;1mecho "uses: Use Node.js 20.x"[0m
+2026-07-22T17:26:22.6777652Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:26:22.6778189Z ##[endgroup]
+2026-07-22T17:26:22.6861442Z uses: Use Node.js 20.x
+2026-07-22T17:26:22.6899654Z ##[group]Run echo "uses: Cache node modules"
+2026-07-22T17:26:22.6900297Z [36;1mecho "uses: Cache node modules"[0m
+2026-07-22T17:26:22.6959278Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:26:22.6959794Z ##[endgroup]
+2026-07-22T17:26:22.7043095Z uses: Cache node modules
+2026-07-22T17:26:22.7117749Z ##[group]Run echo "run: Install dependencies"
+2026-07-22T17:26:22.7118388Z [36;1mecho "run: Install dependencies"[0m
+2026-07-22T17:26:22.7177709Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:26:22.7178213Z ##[endgroup]
+2026-07-22T17:26:22.7260170Z run: Install dependencies
+2026-07-22T17:26:22.7298148Z ##[group]Run echo "run: Collect changed files"
+2026-07-22T17:26:22.7299003Z [36;1mecho "run: Collect changed files"[0m
+2026-07-22T17:26:22.7357748Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:26:22.7358296Z ##[endgroup]
+2026-07-22T17:26:22.7439576Z run: Collect changed files
+2026-07-22T17:26:22.7477319Z ##[group]Run echo "run: Lint"
+2026-07-22T17:26:22.7477836Z [36;1mecho "run: Lint"[0m
+2026-07-22T17:26:22.7535839Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:26:22.7536347Z ##[endgroup]
+2026-07-22T17:26:22.7616930Z run: Lint
+2026-07-22T17:26:22.7654421Z ##[group]Run echo "run: Build generated types"
+2026-07-22T17:26:22.7655060Z [36;1mecho "run: Build generated types"[0m
+2026-07-22T17:26:22.7713237Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:26:22.7713760Z ##[endgroup]
+2026-07-22T17:26:22.7795057Z run: Build generated types
+2026-07-22T17:26:22.7833144Z ##[group]Run echo "run: Check types"
+2026-07-22T17:26:22.7833737Z [36;1mecho "run: Check types"[0m
+2026-07-22T17:26:22.7892339Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:26:22.7892939Z ##[endgroup]
+2026-07-22T17:26:22.7975718Z run: Check types
+2026-07-22T17:26:22.8122122Z Cleaning up orphan processes

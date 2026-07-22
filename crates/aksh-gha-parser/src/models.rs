@@ -589,6 +589,9 @@ pub struct Job {
     pub container: Option<Value>,
     /// Service containers (`services:`) — raw value, evaluated runner-side.
     pub services: Option<Value>,
+    /// Job-level timeout in minutes.
+    #[serde(default, rename = "timeout-minutes")]
+    pub timeout_minutes: Option<DeferredNumber>,
     /// Job-level defaults for run steps (`defaults.run`).
     #[serde(default)]
     pub defaults: Option<JobDefaults>,
@@ -908,6 +911,9 @@ pub struct Step {
     /// Whether to continue on error.
     #[serde(default, rename = "continue-on-error")]
     pub continue_on_error: Option<DeferredBool>,
+    /// Step-level timeout in minutes.
+    #[serde(default, rename = "timeout-minutes")]
+    pub timeout_minutes: Option<DeferredNumber>,
 }
 
 /// Action metadata from `action.yml` or `action.yaml`.

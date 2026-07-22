@@ -1,0 +1,86 @@
+2026-07-22T17:35:43.0920472Z Current runner version: '2.336.0'
+2026-07-22T17:35:43.0948089Z ##[group]Runner Image Provisioner
+2026-07-22T17:35:43.0949016Z Hosted Compute Agent
+2026-07-22T17:35:43.0949634Z Version: 20260707.563
+2026-07-22T17:35:43.0950462Z Commit: 02667638d2b423fbc733a8e32a88b44996a3ba6e
+2026-07-22T17:35:43.0951223Z Build Date: 2026-07-07T19:33:50Z
+2026-07-22T17:35:43.0951948Z Worker ID: {2e053b86-be33-49e4-865a-2df36d3a7761}
+2026-07-22T17:35:43.0952770Z Azure Region: northcentralus
+2026-07-22T17:35:43.0953409Z ##[endgroup]
+2026-07-22T17:35:43.0955058Z ##[group]Operating System
+2026-07-22T17:35:43.0955768Z Ubuntu
+2026-07-22T17:35:43.0956344Z 24.04.4
+2026-07-22T17:35:43.0956938Z LTS
+2026-07-22T17:35:43.0957493Z ##[endgroup]
+2026-07-22T17:35:43.0958051Z ##[group]Runner Image
+2026-07-22T17:35:43.0958788Z Image: ubuntu-24.04
+2026-07-22T17:35:43.0959383Z Version: 20260714.240.1
+2026-07-22T17:35:43.0960755Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260714.240/images/ubuntu/Ubuntu2404-Readme.md
+2026-07-22T17:35:43.0962265Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260714.240
+2026-07-22T17:35:43.0963789Z ##[endgroup]
+2026-07-22T17:35:43.0965317Z ##[group]GITHUB_TOKEN Permissions
+2026-07-22T17:35:43.0967811Z Contents: read
+2026-07-22T17:35:43.0968441Z Metadata: read
+2026-07-22T17:35:43.0969166Z Packages: read
+2026-07-22T17:35:43.0969777Z ##[endgroup]
+2026-07-22T17:35:43.0972309Z Secret source: Actions
+2026-07-22T17:35:43.0973832Z Prepare workflow directory
+2026-07-22T17:35:43.1538222Z Prepare all required actions
+2026-07-22T17:35:43.1613177Z Complete job name: JUnit tests Java 17
+2026-07-22T17:35:43.2431419Z ##[group]Run echo "uses: Checkout code"
+2026-07-22T17:35:43.2432711Z [36;1mecho "uses: Checkout code"[0m
+2026-07-22T17:35:43.2967457Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:35:43.3053980Z env:
+2026-07-22T17:35:43.3054808Z   job-variation: 17-noflaky-nonew
+2026-07-22T17:35:43.3055350Z ##[endgroup]
+2026-07-22T17:35:43.3314873Z uses: Checkout code
+2026-07-22T17:35:43.3456839Z ##[group]Run echo "uses: Setup Python"
+2026-07-22T17:35:43.3457470Z [36;1mecho "uses: Setup Python"[0m
+2026-07-22T17:35:43.3521691Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:35:43.3522196Z env:
+2026-07-22T17:35:43.3522631Z   job-variation: 17-noflaky-nonew
+2026-07-22T17:35:43.3523152Z ##[endgroup]
+2026-07-22T17:35:43.3610192Z uses: Setup Python
+2026-07-22T17:35:43.3649128Z ##[group]Run echo "uses: Setup Gradle"
+2026-07-22T17:35:43.3649723Z [36;1mecho "uses: Setup Gradle"[0m
+2026-07-22T17:35:43.3708370Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:35:43.3708866Z env:
+2026-07-22T17:35:43.3709289Z   job-variation: 17-noflaky-nonew
+2026-07-22T17:35:43.3709801Z ##[endgroup]
+2026-07-22T17:35:43.3792519Z uses: Setup Gradle
+2026-07-22T17:35:43.3830459Z ##[group]Run echo "uses: Load Test Catalog"
+2026-07-22T17:35:43.3831096Z [36;1mecho "uses: Load Test Catalog"[0m
+2026-07-22T17:35:43.3890513Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:35:43.3891017Z env:
+2026-07-22T17:35:43.3891430Z   job-variation: 17-noflaky-nonew
+2026-07-22T17:35:43.3891957Z ##[endgroup]
+2026-07-22T17:35:43.3975206Z uses: Load Test Catalog
+2026-07-22T17:35:43.4019602Z ##[group]Run echo "uses: JUnit Tests"
+2026-07-22T17:35:43.4020177Z [36;1mecho "uses: JUnit Tests"[0m
+2026-07-22T17:35:43.4079514Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:35:43.4080013Z env:
+2026-07-22T17:35:43.4080427Z   job-variation: 17-noflaky-nonew
+2026-07-22T17:35:43.4080928Z ##[endgroup]
+2026-07-22T17:35:43.4163306Z uses: JUnit Tests
+2026-07-22T17:35:43.4201282Z ##[group]Run echo "uses: Archive JUnit HTML reports"
+2026-07-22T17:35:43.4201985Z [36;1mecho "uses: Archive JUnit HTML reports"[0m
+2026-07-22T17:35:43.4260429Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:35:43.4260920Z env:
+2026-07-22T17:35:43.4261338Z   job-variation: 17-noflaky-nonew
+2026-07-22T17:35:43.4261853Z ##[endgroup]
+2026-07-22T17:35:43.4343400Z uses: Archive JUnit HTML reports
+2026-07-22T17:35:43.4381295Z ##[group]Run echo "uses: Archive JUnit XML"
+2026-07-22T17:35:43.4381919Z [36;1mecho "uses: Archive JUnit XML"[0m
+2026-07-22T17:35:43.4442194Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:35:43.4442687Z env:
+2026-07-22T17:35:43.4443108Z   job-variation: 17-noflaky-nonew
+2026-07-22T17:35:43.4443615Z ##[endgroup]
+2026-07-22T17:35:43.4527823Z uses: Archive JUnit XML
+2026-07-22T17:35:43.4589738Z ##[group]Run echo "run: Parse JUnit tests"
+2026-07-22T17:35:43.4590345Z [36;1mecho "run: Parse JUnit tests"[0m
+2026-07-22T17:35:43.4650718Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:35:43.4651215Z env:
+2026-07-22T17:35:43.4651628Z   job-variation: 17-noflaky-nonew
+2026-07-22T17:35:43.4652128Z ##[endgroup]
+2026-07-22T17:35:43.4735997Z run: Parse JUnit tests
+2026-07-22T17:35:43.4823022Z Cleaning up orphan processes

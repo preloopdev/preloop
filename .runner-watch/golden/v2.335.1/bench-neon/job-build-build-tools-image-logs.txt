@@ -1,0 +1,42 @@
+2026-07-22T17:35:31.0157871Z Current runner version: '2.336.0'
+2026-07-22T17:35:31.0194987Z ##[group]Runner Image Provisioner
+2026-07-22T17:35:31.0196204Z Hosted Compute Agent
+2026-07-22T17:35:31.0197078Z Version: 20260707.563
+2026-07-22T17:35:31.0198083Z Commit: 02667638d2b423fbc733a8e32a88b44996a3ba6e
+2026-07-22T17:35:31.0199206Z Build Date: 2026-07-07T19:33:50Z
+2026-07-22T17:35:31.0200179Z Worker ID: {2ab4456d-a067-46e5-8872-db069217de5c}
+2026-07-22T17:35:31.0201568Z Azure Region: eastus
+2026-07-22T17:35:31.0202422Z ##[endgroup]
+2026-07-22T17:35:31.0205022Z ##[group]Operating System
+2026-07-22T17:35:31.0206034Z Ubuntu
+2026-07-22T17:35:31.0206794Z 24.04.4
+2026-07-22T17:35:31.0207677Z LTS
+2026-07-22T17:35:31.0208446Z ##[endgroup]
+2026-07-22T17:35:31.0209318Z ##[group]Runner Image
+2026-07-22T17:35:31.0210274Z Image: ubuntu-24.04
+2026-07-22T17:35:31.0211347Z Version: 20260720.247.2
+2026-07-22T17:35:31.0213466Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260720.247/images/ubuntu/Ubuntu2404-Readme.md
+2026-07-22T17:35:31.0215998Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260720.247
+2026-07-22T17:35:31.0217550Z ##[endgroup]
+2026-07-22T17:35:31.0219353Z ##[group]GITHUB_TOKEN Permissions
+2026-07-22T17:35:31.0222611Z Contents: read
+2026-07-22T17:35:31.0223995Z Metadata: read
+2026-07-22T17:35:31.0224860Z Packages: read
+2026-07-22T17:35:31.0225724Z ##[endgroup]
+2026-07-22T17:35:31.0228848Z Secret source: Actions
+2026-07-22T17:35:31.0230812Z Prepare workflow directory
+2026-07-22T17:35:31.0994697Z Prepare all required actions
+2026-07-22T17:35:31.1057301Z Complete job name: build-build-tools-image
+2026-07-22T17:35:31.1870647Z ##[group]Run echo "build-tools-image stubbed"
+2026-07-22T17:35:31.1871690Z [36;1mecho "build-tools-image stubbed"[0m
+2026-07-22T17:35:31.2837563Z shell: /usr/bin/bash -euxo pipefail {0}
+2026-07-22T17:35:31.2838941Z env:
+2026-07-22T17:35:31.2839620Z   RUST_BACKTRACE: 1
+2026-07-22T17:35:31.2840229Z   COPT: -Werror
+2026-07-22T17:35:31.2841507Z   E2E_CONCURRENCY_GROUP: hibnjoroge/aksh-bench-neon-e2e-tests-main-45761161d60f1cf8bd26d38fe7706287d6a8f9ff
+2026-07-22T17:35:31.2842780Z ##[endgroup]
+2026-07-22T17:35:31.3066348Z + echo 'build-tools-image stubbed'
+2026-07-22T17:35:31.3067156Z build-tools-image stubbed
+2026-07-22T17:35:31.3228669Z Evaluate and set job outputs
+2026-07-22T17:35:31.3235590Z Set output 'image'
+2026-07-22T17:35:31.3237819Z Cleaning up orphan processes

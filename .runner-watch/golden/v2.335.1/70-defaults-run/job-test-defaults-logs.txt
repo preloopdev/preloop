@@ -1,0 +1,71 @@
+2026-07-05T21:04:53.2354595Z Current runner version: '2.335.1'
+2026-07-05T21:04:53.2381607Z ##[group]Runner Image Provisioner
+2026-07-05T21:04:53.2382508Z Hosted Compute Agent
+2026-07-05T21:04:53.2383307Z Version: 20260624.560
+2026-07-05T21:04:53.2383952Z Commit: 925d229a51159bc391ae97e54a2dd1fe20af789d
+2026-07-05T21:04:53.2384755Z Build Date: 2026-06-24T18:26:47Z
+2026-07-05T21:04:53.2385475Z Worker ID: {9796dd2b-e55a-4038-a0b8-48c3990c7718}
+2026-07-05T21:04:53.2386168Z Azure Region: eastus2
+2026-07-05T21:04:53.2386836Z ##[endgroup]
+2026-07-05T21:04:53.2388209Z ##[group]Operating System
+2026-07-05T21:04:53.2388914Z Ubuntu
+2026-07-05T21:04:53.2389500Z 24.04.4
+2026-07-05T21:04:53.2390024Z LTS
+2026-07-05T21:04:53.2390609Z ##[endgroup]
+2026-07-05T21:04:53.2391179Z ##[group]Runner Image
+2026-07-05T21:04:53.2391794Z Image: ubuntu-24.04
+2026-07-05T21:04:53.2392437Z Version: 20260628.225.1
+2026-07-05T21:04:53.2394062Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260628.225/images/ubuntu/Ubuntu2404-Readme.md
+2026-07-05T21:04:53.2395721Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260628.225
+2026-07-05T21:04:53.2396690Z ##[endgroup]
+2026-07-05T21:04:53.2398022Z ##[group]GITHUB_TOKEN Permissions
+2026-07-05T21:04:53.2399979Z Contents: read
+2026-07-05T21:04:53.2400695Z Metadata: read
+2026-07-05T21:04:53.2401282Z Packages: read
+2026-07-05T21:04:53.2401840Z ##[endgroup]
+2026-07-05T21:04:53.2404518Z Secret source: Actions
+2026-07-05T21:04:53.2405562Z Prepare workflow directory
+2026-07-05T21:04:53.2816700Z Prepare all required actions
+2026-07-05T21:04:53.2877115Z Complete job name: test-defaults
+2026-07-05T21:04:53.3617453Z ##[group]Run mkdir -p subdir
+2026-07-05T21:04:53.3618221Z [36;1mmkdir -p subdir[0m
+2026-07-05T21:04:53.3619103Z [36;1mecho "MARKER_VALUE=from-subdir" > subdir/marker.txt[0m
+2026-07-05T21:04:53.3619934Z [36;1mecho "Created marker in subdir"[0m
+2026-07-05T21:04:53.4201178Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-07-05T21:04:53.4202383Z ##[endgroup]
+2026-07-05T21:04:53.4411702Z Created marker in subdir
+2026-07-05T21:04:53.4517711Z ##[group]Run echo "PWD is: $PWD"
+2026-07-05T21:04:53.4518448Z [36;1mecho "PWD is: $PWD"[0m
+2026-07-05T21:04:53.4519081Z [36;1mif [[ "$PWD" != *"/subdir" ]]; then[0m
+2026-07-05T21:04:53.4519971Z [36;1m  echo "FAIL: expected PWD to end with /subdir, got $PWD"[0m
+2026-07-05T21:04:53.4520736Z [36;1m  exit 1[0m
+2026-07-05T21:04:53.4521433Z [36;1mfi[0m
+2026-07-05T21:04:53.4522043Z [36;1mecho "PASS: working directory is subdir"[0m
+2026-07-05T21:04:53.4559167Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-07-05T21:04:53.4560037Z ##[endgroup]
+2026-07-05T21:04:53.4710432Z PWD is: /home/runner/work/aksh-conformance-sample/aksh-conformance-sample/subdir
+2026-07-05T21:04:53.4711834Z PASS: working directory is subdir
+2026-07-05T21:04:53.4754110Z ##[group]Run cat marker.txt
+2026-07-05T21:04:53.4754664Z [36;1mcat marker.txt[0m
+2026-07-05T21:04:53.4755147Z [36;1msource marker.txt[0m
+2026-07-05T21:04:53.4755725Z [36;1mif [[ "$MARKER_VALUE" != "from-subdir" ]]; then[0m
+2026-07-05T21:04:53.4756367Z [36;1m  echo "FAIL: marker not found"[0m
+2026-07-05T21:04:53.4756901Z [36;1m  exit 1[0m
+2026-07-05T21:04:53.4757315Z [36;1mfi[0m
+2026-07-05T21:04:53.4757765Z [36;1mecho "PASS: marker read from subdir"[0m
+2026-07-05T21:04:53.4793518Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-07-05T21:04:53.4794179Z ##[endgroup]
+2026-07-05T21:04:53.4864248Z MARKER_VALUE=from-subdir
+2026-07-05T21:04:53.4867372Z PASS: marker read from subdir
+2026-07-05T21:04:53.4905140Z ##[group]Run echo "PWD is: $PWD"
+2026-07-05T21:04:53.4905707Z [36;1mecho "PWD is: $PWD"[0m
+2026-07-05T21:04:53.4906237Z [36;1mif [[ "$PWD" == *"/subdir" ]]; then[0m
+2026-07-05T21:04:53.4906936Z [36;1m  echo "FAIL: step override should have overridden defaults"[0m
+2026-07-05T21:04:53.4907600Z [36;1m  exit 1[0m
+2026-07-05T21:04:53.4908019Z [36;1mfi[0m
+2026-07-05T21:04:53.4908580Z [36;1mecho "PASS: step-level working-directory overrides defaults"[0m
+2026-07-05T21:04:53.4943921Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-07-05T21:04:53.4944579Z ##[endgroup]
+2026-07-05T21:04:53.5000705Z PWD is: /home/runner/work/aksh-conformance-sample/aksh-conformance-sample
+2026-07-05T21:04:53.5001918Z PASS: step-level working-directory overrides defaults
+2026-07-05T21:04:53.5088506Z Cleaning up orphan processes

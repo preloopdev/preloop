@@ -1,0 +1,22 @@
+2026-07-13T00:22:07.2710925Z Current runner version: '2.335.1'
+2026-07-13T00:22:07.2713798Z Runner name: 'cmp-gh-1-50199'
+2026-07-13T00:22:07.2714256Z Runner group name: 'Default'
+2026-07-13T00:22:07.2714788Z Machine name: 'container'
+2026-07-13T00:22:07.2716261Z ##[group]GITHUB_TOKEN Permissions
+2026-07-13T00:22:07.2717592Z Contents: read
+2026-07-13T00:22:07.2717938Z Metadata: read
+2026-07-13T00:22:07.2718248Z Packages: read
+2026-07-13T00:22:07.2718566Z ##[endgroup]
+2026-07-13T00:22:07.2719722Z Secret source: Actions
+2026-07-13T00:22:07.2720249Z Runner is running behind proxy server 'http://127.0.0.1:18081' for all HTTP requests.
+2026-07-13T00:22:07.2720906Z Runner is running behind proxy server 'http://127.0.0.1:18081' for all HTTPS requests.
+2026-07-13T00:22:07.2721429Z Prepare workflow directory
+2026-07-13T00:22:07.2912240Z Prepare all required actions
+2026-07-13T00:22:07.3018289Z Complete job name: build (1)
+2026-07-13T00:22:07.3265228Z ##[group]Run if [ "1" = "1" ]; then exit 1; fi
+2026-07-13T00:22:07.3265661Z [36;1mif [ "1" = "1" ]; then exit 1; fi[0m
+2026-07-13T00:22:07.3265986Z [36;1msleep 20[0m
+2026-07-13T00:22:07.3356168Z shell: /usr/bin/bash -e {0}
+2026-07-13T00:22:07.3356600Z ##[endgroup]
+2026-07-13T00:22:07.3779500Z ##[error]Process completed with exit code 1.
+2026-07-13T00:22:07.3840920Z Cleaning up orphan processes

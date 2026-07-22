@@ -1,0 +1,51 @@
+name: mock_bake
+on:
+  workflow_call:
+    inputs:
+      runner:
+        type: string
+      artifact-name:
+        type: string
+      artifact-upload:
+        type: boolean
+      cache:
+        type: boolean
+      cache-scope:
+        type: string
+      target:
+        type: string
+      output:
+        type: string
+      sbom:
+        type: boolean
+      sign:
+        type: boolean
+      push:
+        type: boolean
+      vars:
+        type: string
+      set-meta-annotations:
+        type: boolean
+      meta-images:
+        type: string
+      meta-tags:
+        type: string
+      meta-flavor:
+        type: string
+      meta-annotations:
+        type: string
+      meta-bake-target:
+        type: string
+    secrets:
+      registry-auths:
+        required: false
+    outputs:
+      artifact-name:
+        value: ${{ jobs.bake.outputs.artifact-name }}
+jobs:
+  bake:
+    runs-on: ubuntu-latest
+    outputs:
+      artifact-name: "buildkit-binaries"
+    steps:
+      - run: echo "mock bake"

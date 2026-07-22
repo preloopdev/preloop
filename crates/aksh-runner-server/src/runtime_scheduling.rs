@@ -995,38 +995,90 @@ pub(crate) fn apply_matrix_fail_fast(
     cancelled_jobs
 }
 
+fn base_need_name(need: &str) -> String {
+    let caller_id = need.split('/').next().unwrap_or(need);
+    caller_id
+        .split('(')
+        .next()
+        .unwrap_or(caller_id)
+        .trim()
+        .to_owned()
+}
+
+fn get_outputs_dict(data: &azdo::PipelineContextData) -> Option<&azdo::PipelineContextData> {
+    match data {
+        azdo::PipelineContextData::Dict(map) => map.get("outputs"),
+        _ => None,
+    }
+}
+
 pub(crate) fn hydrate_needs_context(job: &mut QueuedJob, run: &RunRecord) {
-    let needs = job
-        .needs
-        .iter()
-        .filter_map(|need| need_context(run, need).map(|context| (need.0.clone(), context)))
-        .collect();
+    let mut needs = BTreeMap::new();
+    for need in &job.needs {
+        if let Some(context) = need_context(run, need) {
+            needs.insert(need.0.clone(), context.clone());
+
+            let base_name = base_need_name(&need.0);
+            if base_name != need.0 {
+                if let Some(azdo::PipelineContextData::Dict(existing_dict)) =
+                    needs.get_mut(&base_name)
+                {
+                    if let Some(azdo::PipelineContextData::Dict(outputs)) =
+                        get_outputs_dict(&context)
+                    {
+                        if let Some(azdo::PipelineContextData::Dict(existing_outputs)) =
+                            existing_dict.get_mut("outputs")
+                        {
+                            existing_outputs.extend(outputs.clone());
+                        }
+                    }
+                } else {
+                    needs.insert(base_name, context);
+                }
+            }
+        }
+    }
     job.message
         .context_data
         .insert("needs".to_owned(), azdo::PipelineContextData::Dict(needs));
 }
 pub(crate) fn needs_json_context(run: &RunRecord, needs: &[JobId]) -> serde_json::Value {
-    let values = needs
-        .iter()
-        .filter_map(|need| {
-            let statuses = matching_need_statuses(run, need);
-            let result = aggregate_need_status(&statuses)?;
-            let matching_ids = matching_need_ids(run, need);
-            let mut outputs = serde_json::Map::new();
-            for job_id in matching_ids {
-                if let Some(job_outputs) = run.job_outputs.get(&job_id) {
-                    outputs.extend(job_outputs.clone());
-                }
+    let mut values = serde_json::Map::new();
+    for need in needs {
+        let statuses = matching_need_statuses(run, need);
+        let Some(result) = aggregate_need_status(&statuses) else {
+            continue;
+        };
+        let matching_ids = matching_need_ids(run, need);
+        let mut outputs = serde_json::Map::new();
+        for job_id in matching_ids {
+            if let Some(job_outputs) = run.job_outputs.get(&job_id) {
+                outputs.extend(job_outputs.clone());
             }
-            Some((
-                need.0.clone(),
-                json!({
-                    "result": status_string(result),
-                    "outputs": outputs,
-                }),
-            ))
-        })
-        .collect();
+        }
+        let payload = json!({
+            "result": status_string(result),
+            "outputs": outputs,
+        });
+
+        values.insert(need.0.clone(), payload.clone());
+
+        let base_name = base_need_name(&need.0);
+        if base_name != need.0 {
+            if let Some(existing) = values.get_mut(&base_name) {
+                if let Some(existing_map) = existing.as_object_mut() {
+                    if let Some(existing_outputs) = existing_map
+                        .get_mut("outputs")
+                        .and_then(|o| o.as_object_mut())
+                    {
+                        existing_outputs.extend(outputs.clone());
+                    }
+                }
+            } else {
+                values.insert(base_name, payload);
+            }
+        }
+    }
     serde_json::Value::Object(values)
 }
 

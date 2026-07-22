@@ -295,6 +295,7 @@ mod tests {
             concurrency_group: None,
             concurrency_cancel_in_progress: None,
             concurrency_queue: None,
+            timeout_minutes: None,
         }
     }
 

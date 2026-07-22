@@ -1,0 +1,33 @@
+2026-07-15T17:52:58.3514413Z Current runner version: '2.335.1'
+2026-07-15T17:52:58.3516930Z Runner name: 'dbg-gh'
+2026-07-15T17:52:58.3517353Z Runner group name: 'Default'
+2026-07-15T17:52:58.3517846Z Machine name: 'container'
+2026-07-15T17:52:58.3519094Z ##[group]GITHUB_TOKEN Permissions
+2026-07-15T17:52:58.3520182Z Contents: read
+2026-07-15T17:52:58.3520481Z Metadata: read
+2026-07-15T17:52:58.3520764Z Packages: read
+2026-07-15T17:52:58.3521088Z ##[endgroup]
+2026-07-15T17:52:58.3522030Z Secret source: Actions
+2026-07-15T17:52:58.3522398Z Prepare workflow directory
+2026-07-15T17:52:58.4312603Z Prepare all required actions
+2026-07-15T17:52:58.4353763Z Complete job name: build
+2026-07-15T17:52:58.4709831Z ##[group]Run echo first
+2026-07-15T17:52:58.4710136Z [36;1mecho first[0m
+2026-07-15T17:52:58.7144848Z shell: /usr/bin/bash -e {0}
+2026-07-15T17:52:58.7145863Z ##[endgroup]
+2026-07-15T17:53:00.3815583Z first
+2026-07-15T17:53:00.4089138Z ##[group]Run echo "VAL=$VAL"
+2026-07-15T17:53:00.4089747Z [36;1mecho "VAL=$VAL"[0m
+2026-07-15T17:53:00.6246004Z shell: /usr/bin/bash -e {0}
+2026-07-15T17:53:00.6246556Z env:
+2026-07-15T17:53:00.6246883Z   VAL: hello
+2026-07-15T17:53:00.6247202Z ##[endgroup]
+2026-07-15T17:53:00.9670284Z VAL=hello
+2026-07-15T17:53:00.9735797Z ##[group]Run echo line1
+2026-07-15T17:53:00.9736003Z [36;1mecho line1[0m
+2026-07-15T17:53:00.9736130Z [36;1mecho line2[0m
+2026-07-15T17:53:01.0622995Z shell: /usr/bin/bash -e {0}
+2026-07-15T17:53:01.0623496Z ##[endgroup]
+2026-07-15T17:53:01.5060860Z line1
+2026-07-15T17:53:01.5063099Z line2
+2026-07-15T17:53:01.5106426Z Cleaning up orphan processes

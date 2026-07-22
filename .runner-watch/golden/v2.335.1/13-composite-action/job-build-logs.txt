@@ -1,0 +1,39 @@
+2026-07-15T06:10:57.337Z Current runner version: '2.335.1'
+2026-07-15T06:10:57.337Z Runner name: 'flow-aksh-13-composite-action-1-1784095807'
+2026-07-15T06:10:57.337Z Runner group name: 'Default'
+2026-07-15T06:10:57.337Z Machine name: 'container'
+2026-07-15T06:10:57.337Z Secret source: Actions
+2026-07-15T06:10:57.337Z Prepare workflow directory
+2026-07-15T06:10:57.337Z Prepare all required actions
+2026-07-15T06:10:57.337Z Complete job name: build
+2026-07-15T06:10:58.172Z ::debug::GITHUB_WORKSPACE = '/tmp/flow-aksh-1/_work/default/default'
+2026-07-15T06:10:58.173Z ::debug::qualified repository = 'preloopdev/aksh-conformance-sample'
+2026-07-15T06:10:58.173Z ::debug::ref = 'refs/heads/main'
+2026-07-15T06:10:58.173Z ::debug::commit = 'fa15233646a89d62390b3c383463af4cac483040'
+2026-07-15T06:10:58.173Z ::debug::clean = true
+2026-07-15T06:10:58.173Z ::debug::filter = undefined
+2026-07-15T06:10:58.173Z ::debug::fetch depth = 1
+2026-07-15T06:10:58.173Z ::debug::fetch tags = false
+2026-07-15T06:10:58.173Z ::debug::show progress = true
+2026-07-15T06:10:58.173Z ::debug::lfs = false
+2026-07-15T06:10:58.173Z ::debug::submodules = false
+2026-07-15T06:10:58.173Z ::debug::recursive submodules = false
+2026-07-15T06:10:58.176Z ::debug::GitHub Host URL = 
+2026-07-15T06:10:58.176Z ::add-matcher::/tmp/flow-aksh-1/_work/default/_actions/actions/checkout/34e114876b0b11c390a56381ad16ebd13914f8d5/dist/problem-matcher.json
+2026-07-15T06:10:58.177Z Syncing repository: preloopdev/aksh-conformance-sample
+2026-07-15T06:10:58.177Z ::group::Getting Git version info
+2026-07-15T06:10:58.177Z Working directory is '/tmp/flow-aksh-1/_work/default/default'
+2026-07-15T06:10:58.179Z ::endgroup::
+2026-07-15T06:10:58.179Z Deleting the contents of '/tmp/flow-aksh-1/_work/default/default'
+2026-07-15T06:10:58.180Z The repository will be downloaded using the GitHub REST API
+2026-07-15T06:10:58.180Z To create a local Git repository instead, add Git 2.18 or higher to the PATH
+2026-07-15T06:10:58.180Z Downloading the archive
+2026-07-15T06:10:58.848Z Writing archive to disk
+2026-07-15T06:10:58.849Z Extracting the archive
+2026-07-15T06:10:58.850Z ::debug::Checking tar --version
+2026-07-15T06:10:58.860Z ::debug::tar (GNU tar) 1.35%0ACopyright (C) 2023 Free Software Foundation, Inc.%0ALicense GPLv3+: GNU GPL version 3 or later <https://gnu.org/licenses/gpl.html>.%0AThis is free software: you are free to change and redistribute it.%0AThere is NO WARRANTY, to the extent permitted by law.%0A%0AWritten by John Gilmore and Jay Fenlason.
+2026-07-15T06:10:58.862Z [command]/usr/bin/tar xz --warning=no-unknown-keyword --overwrite -C /tmp/flow-aksh-1/_work/default/default/d0ecacff-da48-4856-a27a-fff817b3a085 -f /tmp/flow-aksh-1/_work/default/default/d0ecacff-da48-4856-a27a-fff817b3a085.tar.gz
+2026-07-15T06:10:58.867Z Resolved version preloopdev-aksh-conformance-sample-fa15233
+2026-07-15T06:10:58.872Z ::remove-matcher owner=checkout-git::
+2026-07-15T06:10:59.165Z hello world
+2026-07-15T06:10:59.650Z Cleaning up orphan processes

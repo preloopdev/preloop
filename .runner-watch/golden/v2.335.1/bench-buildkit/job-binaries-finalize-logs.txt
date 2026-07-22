@@ -1,0 +1,245 @@
+﻿2026-07-22T17:03:01.6515600Z Current runner version: '2.336.0'
+2026-07-22T17:03:01.6542496Z ##[group]Runner Image Provisioner
+2026-07-22T17:03:01.6543407Z Hosted Compute Agent
+2026-07-22T17:03:01.6543979Z Version: 20260707.563
+2026-07-22T17:03:01.6545002Z Commit: 02667638d2b423fbc733a8e32a88b44996a3ba6e
+2026-07-22T17:03:01.6545749Z Build Date: 2026-07-07T19:33:50Z
+2026-07-22T17:03:01.6546437Z Worker ID: {2d582779-3599-4450-b038-46d04b617e89}
+2026-07-22T17:03:01.6547280Z Azure Region: northcentralus
+2026-07-22T17:03:01.6547905Z ##[endgroup]
+2026-07-22T17:03:01.6549895Z ##[group]Operating System
+2026-07-22T17:03:01.6550862Z Ubuntu
+2026-07-22T17:03:01.6551382Z 24.04.4
+2026-07-22T17:03:01.6551987Z LTS
+2026-07-22T17:03:01.6552491Z ##[endgroup]
+2026-07-22T17:03:01.6553020Z ##[group]Runner Image
+2026-07-22T17:03:01.6553683Z Image: ubuntu-24.04
+2026-07-22T17:03:01.6554235Z Version: 20260714.240.1
+2026-07-22T17:03:01.6555649Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260714.240/images/ubuntu/Ubuntu2404-Readme.md
+2026-07-22T17:03:01.6557279Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260714.240
+2026-07-22T17:03:01.6558379Z ##[endgroup]
+2026-07-22T17:03:01.6559601Z ##[group]GITHUB_TOKEN Permissions
+2026-07-22T17:03:01.6562187Z Contents: read
+2026-07-22T17:03:01.6562816Z Metadata: read
+2026-07-22T17:03:01.6563435Z ##[endgroup]
+2026-07-22T17:03:01.6565611Z Secret source: Actions
+2026-07-22T17:03:01.6566908Z Prepare workflow directory
+2026-07-22T17:03:01.6989901Z Prepare all required actions
+2026-07-22T17:03:01.7035714Z Getting action download info
+2026-07-22T17:03:02.0171385Z Download action repository 'actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c' (SHA:3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c)
+2026-07-22T17:03:02.4713725Z Download action repository 'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a' (SHA:043fb46d1a93c77aae656e7c1c64a875d1fc6a0a)
+2026-07-22T17:03:02.6418439Z Complete job name: binaries-finalize
+2026-07-22T17:03:02.7221153Z ##[group]Run actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+2026-07-22T17:03:02.7222419Z with:
+2026-07-22T17:03:02.7222867Z   path: /tmp/buildx-output
+2026-07-22T17:03:02.7223371Z   name: buildkit-binaries
+2026-07-22T17:03:02.7223859Z   merge-multiple: false
+2026-07-22T17:03:02.7224342Z   repository: moby/buildkit
+2026-07-22T17:03:02.7224838Z   run-id: 29940352620
+2026-07-22T17:03:02.7225304Z   skip-decompress: false
+2026-07-22T17:03:02.7225780Z   digest-mismatch: error
+2026-07-22T17:03:02.7226796Z env:
+2026-07-22T17:03:02.7227226Z   GO_VERSION: 1.26
+2026-07-22T17:03:02.7227685Z   SETUP_BUILDX_VERSION: edge
+2026-07-22T17:03:02.7228233Z   SETUP_BUILDKIT_IMAGE: moby/buildkit:latest
+2026-07-22T17:03:02.7228814Z   SCOUT_VERSION: 1.20.2
+2026-07-22T17:03:02.7229285Z   IMAGE_NAME: moby/buildkit
+2026-07-22T17:03:02.7229765Z   DESTDIR: ./bin
+2026-07-22T17:03:02.7230378Z ##[endgroup]
+2026-07-22T17:03:02.8743988Z Downloading single artifact
+2026-07-22T17:03:03.0213045Z Preparing to download the following artifacts:
+2026-07-22T17:03:03.0215598Z - buildkit-binaries (ID: 8538024163, Size: 651641402, Expected Digest: sha256:5c5353a8d75696a2a25a539a9537e1f8e8b413432513ae9718bf18385c7a2c72)
+2026-07-22T17:03:03.2505978Z Redirecting to blob download url: https://productionresultssa19.blob.core.windows.net/actions-results/ecae4e3c-ad79-4600-a8a9-6074bc0822ee/workflow-job-run-f2efdf25-8f2b-552a-a75f-48978fbdde7f/artifacts/49029e8a2288b86d34542f69c0293746b42a1d9618575f3207f5781c33621cca.zip
+2026-07-22T17:03:03.2512583Z Starting download of artifact to: /tmp/buildx-output
+2026-07-22T17:03:03.4092147Z (node:2194) [DEP0005] DeprecationWarning: Buffer() is deprecated due to security and usability issues. Please use the Buffer.alloc(), Buffer.allocUnsafe(), or Buffer.from() methods instead.
+2026-07-22T17:03:03.4097874Z (Use `node --trace-deprecation ...` to show where the warning was created)
+2026-07-22T17:03:15.2131677Z SHA256 digest of downloaded artifact is 5c5353a8d75696a2a25a539a9537e1f8e8b413432513ae9718bf18385c7a2c72
+2026-07-22T17:03:15.2135407Z Artifact download completed successfully.
+2026-07-22T17:03:15.2136323Z Total of 1 artifact(s) downloaded
+2026-07-22T17:03:15.2137163Z Download artifact has finished successfully
+2026-07-22T17:03:15.2361233Z ##[group]Run for pdir in /tmp/buildx-output/*/; do
+2026-07-22T17:03:15.2361805Z [36;1mfor pdir in /tmp/buildx-output/*/; do[0m
+2026-07-22T17:03:15.2362155Z [36;1m  ([0m
+2026-07-22T17:03:15.2362402Z [36;1m    cd "$pdir"[0m
+2026-07-22T17:03:15.2362748Z [36;1m    binname=$(find . -name 'buildkit-*')[0m
+2026-07-22T17:03:15.2363265Z [36;1m    filename=$(basename "$binname" | sed -E 's/\.(tar\.gz|zip)$//')[0m
+2026-07-22T17:03:15.2363785Z [36;1m    mv "provenance.json" "${filename}.provenance.json"[0m
+2026-07-22T17:03:15.2364246Z [36;1m    mv "sbom-binaries.spdx.json" "${filename}.sbom.json"[0m
+2026-07-22T17:03:15.2364693Z [36;1m    find . -name 'sbom*.json' -exec rm {} \;[0m
+2026-07-22T17:03:15.2365106Z [36;1m    if [ -f "provenance.sigstore.json" ]; then[0m
+2026-07-22T17:03:15.2365600Z [36;1m      mv "provenance.sigstore.json" "${filename}.sigstore.json"[0m
+2026-07-22T17:03:15.2366003Z [36;1m    fi[0m
+2026-07-22T17:03:15.2366239Z [36;1m  )[0m
+2026-07-22T17:03:15.2366516Z [36;1mdone[0m
+2026-07-22T17:03:15.2366765Z [36;1mmkdir -p "./bin"[0m
+2026-07-22T17:03:15.2367075Z [36;1mmv /tmp/buildx-output/**/* "./bin/"[0m
+2026-07-22T17:03:15.2452711Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:03:15.2453060Z env:
+2026-07-22T17:03:15.2453329Z   GO_VERSION: 1.26
+2026-07-22T17:03:15.2453645Z   SETUP_BUILDX_VERSION: edge
+2026-07-22T17:03:15.2454022Z   SETUP_BUILDKIT_IMAGE: moby/buildkit:latest
+2026-07-22T17:03:15.2454391Z   SCOUT_VERSION: 1.20.2
+2026-07-22T17:03:15.2454690Z   IMAGE_NAME: moby/buildkit
+2026-07-22T17:03:15.2454997Z   DESTDIR: ./bin
+2026-07-22T17:03:15.2455267Z ##[endgroup]
+2026-07-22T17:03:15.3601868Z ##[group]Run tree -nh .
+2026-07-22T17:03:15.3602240Z [36;1mtree -nh .[0m
+2026-07-22T17:03:15.3664261Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:03:15.3664626Z env:
+2026-07-22T17:03:15.3665026Z   GO_VERSION: 1.26
+2026-07-22T17:03:15.3665339Z   SETUP_BUILDX_VERSION: edge
+2026-07-22T17:03:15.3665715Z   SETUP_BUILDKIT_IMAGE: moby/buildkit:latest
+2026-07-22T17:03:15.3666112Z   SCOUT_VERSION: 1.20.2
+2026-07-22T17:03:15.3666427Z   IMAGE_NAME: moby/buildkit
+2026-07-22T17:03:15.3666746Z   DESTDIR: ./bin
+2026-07-22T17:03:15.3667040Z ##[endgroup]
+2026-07-22T17:03:15.3860864Z [4.0K]  .
+2026-07-22T17:03:15.3862118Z ├── [ 79K]  buildkit-f245789.darwin-amd64.provenance.json
+2026-07-22T17:03:15.3863320Z ├── [150K]  buildkit-f245789.darwin-amd64.sbom.json
+2026-07-22T17:03:15.3864596Z ├── [116K]  buildkit-f245789.darwin-amd64.sigstore.json
+2026-07-22T17:03:15.3865979Z ├── [ 16M]  buildkit-f245789.darwin-amd64.tar.gz
+2026-07-22T17:03:15.3867235Z ├── [ 79K]  buildkit-f245789.darwin-arm64.provenance.json
+2026-07-22T17:03:15.3867972Z ├── [150K]  buildkit-f245789.darwin-arm64.sbom.json
+2026-07-22T17:03:15.3868686Z ├── [116K]  buildkit-f245789.darwin-arm64.sigstore.json
+2026-07-22T17:03:15.3869414Z ├── [ 15M]  buildkit-f245789.darwin-arm64.tar.gz
+2026-07-22T17:03:15.3870409Z ├── [146K]  buildkit-f245789.linux-amd64.provenance.json
+2026-07-22T17:03:15.3871000Z ├── [663K]  buildkit-f245789.linux-amd64.sbom.json
+2026-07-22T17:03:15.3871476Z ├── [204K]  buildkit-f245789.linux-amd64.sigstore.json
+2026-07-22T17:03:15.3871952Z ├── [ 89M]  buildkit-f245789.linux-amd64.tar.gz
+2026-07-22T17:03:15.3872440Z ├── [146K]  buildkit-f245789.linux-arm-v7.provenance.json
+2026-07-22T17:03:15.3872926Z ├── [661K]  buildkit-f245789.linux-arm-v7.sbom.json
+2026-07-22T17:03:15.3873399Z ├── [204K]  buildkit-f245789.linux-arm-v7.sigstore.json
+2026-07-22T17:03:15.3873865Z ├── [ 67M]  buildkit-f245789.linux-arm-v7.tar.gz
+2026-07-22T17:03:15.3874345Z ├── [146K]  buildkit-f245789.linux-arm64.provenance.json
+2026-07-22T17:03:15.3874860Z ├── [661K]  buildkit-f245789.linux-arm64.sbom.json
+2026-07-22T17:03:15.3875334Z ├── [204K]  buildkit-f245789.linux-arm64.sigstore.json
+2026-07-22T17:03:15.3875790Z ├── [ 82M]  buildkit-f245789.linux-arm64.tar.gz
+2026-07-22T17:03:15.3876520Z ├── [146K]  buildkit-f245789.linux-ppc64le.provenance.json
+2026-07-22T17:03:15.3877013Z ├── [661K]  buildkit-f245789.linux-ppc64le.sbom.json
+2026-07-22T17:03:15.3877505Z ├── [204K]  buildkit-f245789.linux-ppc64le.sigstore.json
+2026-07-22T17:03:15.3877977Z ├── [ 84M]  buildkit-f245789.linux-ppc64le.tar.gz
+2026-07-22T17:03:15.3878462Z ├── [146K]  buildkit-f245789.linux-riscv64.provenance.json
+2026-07-22T17:03:15.3878950Z ├── [661K]  buildkit-f245789.linux-riscv64.sbom.json
+2026-07-22T17:03:15.3879428Z ├── [204K]  buildkit-f245789.linux-riscv64.sigstore.json
+2026-07-22T17:03:15.3879898Z ├── [ 86M]  buildkit-f245789.linux-riscv64.tar.gz
+2026-07-22T17:03:15.3880802Z ├── [146K]  buildkit-f245789.linux-s390x.provenance.json
+2026-07-22T17:03:15.3881322Z ├── [661K]  buildkit-f245789.linux-s390x.sbom.json
+2026-07-22T17:03:15.3881780Z ├── [204K]  buildkit-f245789.linux-s390x.sigstore.json
+2026-07-22T17:03:15.3882220Z ├── [ 88M]  buildkit-f245789.linux-s390x.tar.gz
+2026-07-22T17:03:15.3882753Z ├── [ 93K]  buildkit-f245789.windows-amd64.provenance.json
+2026-07-22T17:03:15.3883228Z ├── [537K]  buildkit-f245789.windows-amd64.sbom.json
+2026-07-22T17:03:15.3883692Z ├── [134K]  buildkit-f245789.windows-amd64.sigstore.json
+2026-07-22T17:03:15.3884144Z ├── [ 49M]  buildkit-f245789.windows-amd64.tar.gz
+2026-07-22T17:03:15.3884610Z ├── [ 93K]  buildkit-f245789.windows-arm64.provenance.json
+2026-07-22T17:03:15.3885079Z ├── [535K]  buildkit-f245789.windows-arm64.sbom.json
+2026-07-22T17:03:15.3885536Z ├── [134K]  buildkit-f245789.windows-arm64.sigstore.json
+2026-07-22T17:03:15.3885991Z └── [ 45M]  buildkit-f245789.windows-arm64.tar.gz
+2026-07-22T17:03:15.3886235Z 
+2026-07-22T17:03:15.3886353Z 1 directory, 40 files
+2026-07-22T17:03:15.3953260Z ##[group]Run actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+2026-07-22T17:03:15.3953742Z with:
+2026-07-22T17:03:15.3953993Z   name: buildkit-release
+2026-07-22T17:03:15.3954271Z   path: ./bin/*
+2026-07-22T17:03:15.3954529Z   if-no-files-found: error
+2026-07-22T17:03:15.3954852Z   compression-level: 6
+2026-07-22T17:03:15.3955119Z   overwrite: false
+2026-07-22T17:03:15.3955391Z   include-hidden-files: false
+2026-07-22T17:03:15.3955693Z   archive: true
+2026-07-22T17:03:15.3955930Z env:
+2026-07-22T17:03:15.3956160Z   GO_VERSION: 1.26
+2026-07-22T17:03:15.3956418Z   SETUP_BUILDX_VERSION: edge
+2026-07-22T17:03:15.3956729Z   SETUP_BUILDKIT_IMAGE: moby/buildkit:latest
+2026-07-22T17:03:15.3957058Z   SCOUT_VERSION: 1.20.2
+2026-07-22T17:03:15.3957329Z   IMAGE_NAME: moby/buildkit
+2026-07-22T17:03:15.3957625Z   DESTDIR: ./bin
+2026-07-22T17:03:15.3957875Z ##[endgroup]
+2026-07-22T17:03:15.5460663Z With the provided path, there will be 40 files uploaded
+2026-07-22T17:03:15.5465984Z Artifact name is valid!
+2026-07-22T17:03:15.5466461Z Root directory input is valid!
+2026-07-22T17:03:15.7298944Z Uploading artifact: buildkit-release.zip
+2026-07-22T17:03:15.7343674Z Beginning upload of artifact content to blob storage
+2026-07-22T17:03:16.5535753Z Uploaded bytes 8388608
+2026-07-22T17:03:16.7501276Z Uploaded bytes 16777216
+2026-07-22T17:03:16.8178407Z Uploaded bytes 25165824
+2026-07-22T17:03:17.0528464Z Uploaded bytes 33554432
+2026-07-22T17:03:17.3656432Z Uploaded bytes 41943040
+2026-07-22T17:03:17.6646065Z Uploaded bytes 50331648
+2026-07-22T17:03:17.8899085Z Uploaded bytes 58720256
+2026-07-22T17:03:18.2221022Z Uploaded bytes 67108864
+2026-07-22T17:03:18.5812002Z Uploaded bytes 75497472
+2026-07-22T17:03:18.6490645Z Uploaded bytes 83886080
+2026-07-22T17:03:18.9421449Z Uploaded bytes 92274688
+2026-07-22T17:03:19.2513481Z Uploaded bytes 100663296
+2026-07-22T17:03:19.4368012Z Uploaded bytes 109051904
+2026-07-22T17:03:19.6871883Z Uploaded bytes 117440512
+2026-07-22T17:03:19.9080582Z Uploaded bytes 125829120
+2026-07-22T17:03:20.2025916Z Uploaded bytes 134217728
+2026-07-22T17:03:20.4756485Z Uploaded bytes 142606336
+2026-07-22T17:03:20.7402857Z Uploaded bytes 150994944
+2026-07-22T17:03:20.9981103Z Uploaded bytes 159383552
+2026-07-22T17:03:21.2348391Z Uploaded bytes 167772160
+2026-07-22T17:03:21.5249039Z Uploaded bytes 176160768
+2026-07-22T17:03:21.7994067Z Uploaded bytes 184549376
+2026-07-22T17:03:22.1775591Z Uploaded bytes 192937984
+2026-07-22T17:03:22.2499257Z Uploaded bytes 201326592
+2026-07-22T17:03:22.5805097Z Uploaded bytes 209715200
+2026-07-22T17:03:22.8314685Z Uploaded bytes 218103808
+2026-07-22T17:03:22.9897202Z Uploaded bytes 226492416
+2026-07-22T17:03:23.3127485Z Uploaded bytes 234881024
+2026-07-22T17:03:23.5984001Z Uploaded bytes 243269632
+2026-07-22T17:03:23.8278517Z Uploaded bytes 251658240
+2026-07-22T17:03:24.1414296Z Uploaded bytes 260046848
+2026-07-22T17:03:24.4035914Z Uploaded bytes 268435456
+2026-07-22T17:03:24.7049471Z Uploaded bytes 276824064
+2026-07-22T17:03:24.8660419Z Uploaded bytes 285212672
+2026-07-22T17:03:25.1936048Z Uploaded bytes 293601280
+2026-07-22T17:03:25.3927222Z Uploaded bytes 301989888
+2026-07-22T17:03:25.6537391Z Uploaded bytes 310378496
+2026-07-22T17:03:25.8865048Z Uploaded bytes 318767104
+2026-07-22T17:03:26.1635140Z Uploaded bytes 327155712
+2026-07-22T17:03:26.4337945Z Uploaded bytes 335544320
+2026-07-22T17:03:26.7264343Z Uploaded bytes 343932928
+2026-07-22T17:03:27.1663689Z Uploaded bytes 352321536
+2026-07-22T17:03:27.2050154Z Uploaded bytes 360710144
+2026-07-22T17:03:27.4153593Z Uploaded bytes 369098752
+2026-07-22T17:03:27.7176731Z Uploaded bytes 377487360
+2026-07-22T17:03:27.9184503Z Uploaded bytes 385875968
+2026-07-22T17:03:28.1968963Z Uploaded bytes 394264576
+2026-07-22T17:03:28.4411865Z Uploaded bytes 402653184
+2026-07-22T17:03:28.7509672Z Uploaded bytes 411041792
+2026-07-22T17:03:28.9735501Z Uploaded bytes 419430400
+2026-07-22T17:03:29.4193372Z Uploaded bytes 427819008
+2026-07-22T17:03:29.6854697Z Uploaded bytes 436207616
+2026-07-22T17:03:29.7591313Z Uploaded bytes 444596224
+2026-07-22T17:03:29.9824735Z Uploaded bytes 452984832
+2026-07-22T17:03:30.3595794Z Uploaded bytes 461373440
+2026-07-22T17:03:30.6637196Z Uploaded bytes 469762048
+2026-07-22T17:03:31.0243923Z Uploaded bytes 478150656
+2026-07-22T17:03:31.0299632Z Uploaded bytes 486539264
+2026-07-22T17:03:31.3895627Z Uploaded bytes 494927872
+2026-07-22T17:03:31.5781269Z Uploaded bytes 503316480
+2026-07-22T17:03:31.8069629Z Uploaded bytes 511705088
+2026-07-22T17:03:32.1331464Z Uploaded bytes 520093696
+2026-07-22T17:03:32.3461600Z Uploaded bytes 528482304
+2026-07-22T17:03:32.5870999Z Uploaded bytes 536870912
+2026-07-22T17:03:32.8867068Z Uploaded bytes 545259520
+2026-07-22T17:03:33.0857511Z Uploaded bytes 553648128
+2026-07-22T17:03:33.3394565Z Uploaded bytes 562036736
+2026-07-22T17:03:33.6782805Z Uploaded bytes 570425344
+2026-07-22T17:03:33.9245712Z Uploaded bytes 578813952
+2026-07-22T17:03:34.1581254Z Uploaded bytes 587202560
+2026-07-22T17:03:34.4669251Z Uploaded bytes 595591168
+2026-07-22T17:03:34.8207633Z Uploaded bytes 603979776
+2026-07-22T17:03:34.9317056Z Uploaded bytes 612368384
+2026-07-22T17:03:35.1383595Z Uploaded bytes 620756992
+2026-07-22T17:03:35.4778911Z Uploaded bytes 629145600
+2026-07-22T17:03:35.6660394Z Uploaded bytes 637534208
+2026-07-22T17:03:35.9855008Z Uploaded bytes 645922816
+2026-07-22T17:03:36.1726981Z Uploaded bytes 651633981
+2026-07-22T17:03:36.2081374Z Finished uploading artifact content to blob storage!
+2026-07-22T17:03:36.2084964Z SHA256 digest of uploaded artifact is b779ff56e1a62e7b03bef51c7bad9b2ba8090baa1a3be4ae98869d40bac0ad52
+2026-07-22T17:03:36.2087450Z Finalizing artifact upload
+2026-07-22T17:03:36.4639189Z Artifact buildkit-release successfully finalized. Artifact ID 8538043961
+2026-07-22T17:03:36.4640806Z Artifact buildkit-release has been successfully uploaded! Final size is 651633981 bytes. Artifact ID is 8538043961
+2026-07-22T17:03:36.4646549Z Artifact download URL: https://github.com/moby/buildkit/actions/runs/29940352620/artifacts/8538043961
+2026-07-22T17:03:36.4832875Z Cleaning up orphan processes

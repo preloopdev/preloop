@@ -69,6 +69,18 @@ fn evaluate_run_name(
     result
 }
 
+fn sanitize_orchestration_id(id: &str) -> String {
+    id.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 pub(crate) async fn submit_run_inner(
     shared: &Arc<SharedState>,
     mut submission: WorkflowSubmission,
@@ -490,11 +502,14 @@ pub(crate) async fn submit_run_inner(
                 "system.github.results_endpoint".to_owned(),
                 aksh_gha_protocol::azdo::VariableValue::new(public_base_url()),
             );
+            let raw_orchestration_id = format!(
+                "{}.{}.{}",
+                agent_msg.plan.plan_id, job.base_id, agent_msg.job_name
+            );
             agent_msg.variables.insert(
                 "system.orchestrationId".to_owned(),
-                aksh_gha_protocol::azdo::VariableValue::new(format!(
-                    "{}.{}.{}",
-                    agent_msg.plan.plan_id, job.base_id, agent_msg.job_name
+                aksh_gha_protocol::azdo::VariableValue::new(sanitize_orchestration_id(
+                    &raw_orchestration_id,
                 )),
             );
 

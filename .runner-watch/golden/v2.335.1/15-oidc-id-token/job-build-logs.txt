@@ -1,0 +1,12 @@
+2026-07-15T06:18:42.531Z Current runner version: '2.335.1'
+2026-07-15T06:18:42.531Z Runner name: 'flow-aksh-15-oidc-id-token-1-1784096290'
+2026-07-15T06:18:42.531Z Runner group name: 'Default'
+2026-07-15T06:18:42.531Z Machine name: 'container'
+2026-07-15T06:18:42.531Z Secret source: Actions
+2026-07-15T06:18:42.531Z Prepare workflow directory
+2026-07-15T06:18:42.531Z Prepare all required actions
+2026-07-15T06:18:42.531Z Complete job name: build
+2026-07-15T06:18:43.059Z /tmp/flow-aksh-1/_work/default/_temp/1c3c362a-74e7-4fd9-a413-47fcf237a9ff.sh: line 1: curl: command not found
+2026-07-15T06:18:43.060Z ##[error]Process completed with exit code 127.
+2026-07-15T06:18:43.060Z ##[error]process exit code 127
+2026-07-15T06:18:43.395Z Cleaning up orphan processes

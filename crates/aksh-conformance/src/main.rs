@@ -78,6 +78,9 @@ enum CommandKind {
         /// Optional path to write recorded HTTP flows to.
         #[arg(long)]
         record_flows: Option<PathBuf>,
+        /// Optional path to save replayed runner logs to.
+        #[arg(long)]
+        save_logs: Option<PathBuf>,
     },
     /// H2: Generate a flow diff report against the golden scenario captures.
     #[command(name = "runner-diff")]
@@ -112,7 +115,8 @@ async fn main() -> anyhow::Result<()> {
             runner_bin,
             workflow,
             record_flows,
-        } => run_runner_e2e(runner_bin, workflow, record_flows).await,
+            save_logs,
+        } => run_runner_e2e(runner_bin, workflow, record_flows, save_logs).await,
         CommandKind::RunnerDiff { scenario, target } => run_runner_diff(scenario, target).await,
     }
 }
@@ -510,6 +514,7 @@ async fn run_runner_e2e(
     runner_bin: PathBuf,
     workflow: PathBuf,
     record_flows: Option<PathBuf>,
+    save_logs: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     use std::time::Duration;
 
@@ -549,6 +554,23 @@ async fn run_runner_e2e(
     // Pre-seed any private action references locally before starting the server
     preseed_private_actions(&workflow, &state_dir)?;
 
+    // Detect workspace root
+    let mut workspace_root = None;
+    if let Some(parent) = workflow.parent() {
+        if parent.ends_with(".github/workflows") {
+            if let Some(grandparent) = parent.parent() {
+                if let Some(workspace) = grandparent.parent() {
+                    workspace_root = Some(workspace.to_path_buf());
+                }
+            }
+        } else if workflow
+            .to_string_lossy()
+            .contains("experiments/mitm/scenarios")
+        {
+            workspace_root = Some(PathBuf::from("."));
+        }
+    }
+
     // Start server in background on port 9191
     let mut server_cmd = Command::new(server_bin);
     server_cmd
@@ -558,6 +580,10 @@ async fn run_runner_e2e(
         .arg("127.0.0.1:9191")
         .arg("--state-dir")
         .arg(state_dir.to_str().unwrap());
+
+    if let Some(ws) = &workspace_root {
+        server_cmd.env("AKSH_LOCAL_WORKSPACE", ws.to_str().unwrap());
+    }
 
     if let Some(path) = &record_flows {
         server_cmd.arg("--record-flows").arg(path);
@@ -598,6 +624,8 @@ async fn run_runner_e2e(
             "e2e-runner",
             "--work",
             "_work",
+            "--labels",
+            "self-hosted,mitm,linux,x64,macos,arm64",
             "--no-externals",
             "--unattended",
             "--replace",
@@ -624,12 +652,36 @@ async fn run_runner_e2e(
         workflow.clone()
     };
 
+    // Detect trigger event
+    let event = if let Ok(content) = std::fs::read_to_string(&submit_workflow_path) {
+        if content.contains("workflow_dispatch") {
+            "workflow_dispatch"
+        } else if content.contains("workflow_run") {
+            "workflow_run"
+        } else {
+            "push"
+        }
+    } else {
+        "push"
+    };
+
     // Submit workflow
-    let submit_output = Command::new(client_bin)
-        .args(["--server", "http://127.0.0.1:9191", "submit", "-W"])
-        .arg(&submit_workflow_path)
-        .output()
-        .await?;
+    let mut client_args = vec![
+        "--server".to_string(),
+        "http://127.0.0.1:9191".to_string(),
+        "submit".to_string(),
+        "-W".to_string(),
+        submit_workflow_path.to_string_lossy().to_string(),
+        "--event".to_string(),
+        event.to_string(),
+    ];
+
+    if let Some(ws) = &workspace_root {
+        client_args.push("--workspace-root".to_string());
+        client_args.push(ws.to_string_lossy().to_string());
+    }
+
+    let submit_output = Command::new(client_bin).args(&client_args).output().await?;
     if !submit_output.status.success() {
         let err = String::from_utf8_lossy(&submit_output.stderr);
         let _ = server.kill().await;
@@ -644,22 +696,18 @@ async fn run_runner_e2e(
         .to_string();
 
     // Loop runner until the run reaches a terminal status (handles multi-job workflows).
-    let terminal = ["completed", "success", "failed", "cancelled"];
+    let terminal = ["completed", "success", "failure", "failed", "cancelled"];
     let run_status_url = format!("http://127.0.0.1:9191/api/v1/runs/{}", run_id);
     let native_api_token =
         std::env::var("AKSH_SYSTEM_TOKEN").unwrap_or_else(|_| "aksh-system-token".to_owned());
     let mut run_status = "unknown".to_string();
-    let mut last_runner_status = None::<bool>;
-    for _ in 0..50 {
-        let status = Command::new(&runner_bin)
-            .arg("--runner-root")
-            .arg(&runner_root)
-            .arg("run")
-            .arg("--once")
-            .status()
-            .await?;
-        last_runner_status = Some(status.success());
-        // Poll run status
+
+    let mut runner_cmd = Command::new(&runner_bin);
+    runner_cmd.arg("--runner-root").arg(&runner_root).arg("run");
+    let mut runner_proc = runner_cmd.spawn()?;
+
+    for _ in 0..300 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
         if let Ok(resp) = client
             .get(&run_status_url)
             .bearer_auth(&native_api_token)
@@ -676,8 +724,9 @@ async fn run_runner_e2e(
             break;
         }
     }
-    let run_success = last_runner_status.unwrap_or(false)
-        && matches!(run_status.as_str(), "completed" | "success");
+
+    let _ = runner_proc.kill().await;
+    let run_success = matches!(run_status.as_str(), "completed" | "success");
 
     let verdict = serde_json::json!({
         "success": run_success,
@@ -685,6 +734,50 @@ async fn run_runner_e2e(
         "status": run_status,
     });
     println!("{}", serde_json::to_string_pretty(&verdict)?);
+
+    if let Some(save_path) = save_logs {
+        let results_dir = state_dir.join("replay").join("results");
+        if results_dir.exists() {
+            std::fs::create_dir_all(&save_path)?;
+            for entry in WalkDir::new(&results_dir)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
+                if entry.file_type().is_file() && entry.file_name() == "job-logs.txt" {
+                    let file_path = entry.path();
+                    if let Ok(content) = std::fs::read_to_string(file_path) {
+                        let mut job_name = None;
+                        for line in content.lines() {
+                            if let Some(pos) = line.find("Complete job name: ") {
+                                let name =
+                                    line[pos + "Complete job name: ".len()..].trim().to_string();
+                                if !name.is_empty() {
+                                    job_name = Some(name);
+                                    break;
+                                }
+                            }
+                        }
+                        let dest_name = job_name.unwrap_or_else(|| {
+                            file_path
+                                .parent()
+                                .and_then(|p| p.file_name())
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("job-logs")
+                                .to_string()
+                        });
+                        // Handle duplicate job names (e.g. matrix fan-out)
+                        let mut dest_path = save_path.join(format!("{dest_name}.log"));
+                        let mut counter = 2u32;
+                        while dest_path.exists() {
+                            dest_path = save_path.join(format!("{dest_name}-{counter}.log"));
+                            counter += 1;
+                        }
+                        std::fs::write(&dest_path, content)?;
+                    }
+                }
+            }
+        }
+    }
 
     let _ = server.kill().await;
     Ok(())

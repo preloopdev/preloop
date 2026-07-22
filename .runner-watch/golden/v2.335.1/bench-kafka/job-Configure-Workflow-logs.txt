@@ -1,0 +1,41 @@
+2026-07-22T17:35:28.5433974Z Current runner version: '2.336.0'
+2026-07-22T17:35:28.5467746Z ##[group]Runner Image Provisioner
+2026-07-22T17:35:28.5469099Z Hosted Compute Agent
+2026-07-22T17:35:28.5470356Z Version: 20260707.563
+2026-07-22T17:35:28.5471372Z Commit: 02667638d2b423fbc733a8e32a88b44996a3ba6e
+2026-07-22T17:35:28.5472724Z Build Date: 2026-07-07T19:33:50Z
+2026-07-22T17:35:28.5473865Z Worker ID: {fc765a50-728d-4523-a090-4e08a4679974}
+2026-07-22T17:35:28.5474895Z Azure Region: centralus
+2026-07-22T17:35:28.5475994Z ##[endgroup]
+2026-07-22T17:35:28.5477920Z ##[group]Operating System
+2026-07-22T17:35:28.5478965Z Ubuntu
+2026-07-22T17:35:28.5479810Z 24.04.4
+2026-07-22T17:35:28.5480760Z LTS
+2026-07-22T17:35:28.5481650Z ##[endgroup]
+2026-07-22T17:35:28.5482509Z ##[group]Runner Image
+2026-07-22T17:35:28.5483393Z Image: ubuntu-24.04
+2026-07-22T17:35:28.5484547Z Version: 20260714.240.1
+2026-07-22T17:35:28.5486443Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260714.240/images/ubuntu/Ubuntu2404-Readme.md
+2026-07-22T17:35:28.5489057Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260714.240
+2026-07-22T17:35:28.5490780Z ##[endgroup]
+2026-07-22T17:35:28.5492790Z ##[group]GITHUB_TOKEN Permissions
+2026-07-22T17:35:28.5495713Z Contents: read
+2026-07-22T17:35:28.5496612Z Metadata: read
+2026-07-22T17:35:28.5497495Z Packages: read
+2026-07-22T17:35:28.5498516Z ##[endgroup]
+2026-07-22T17:35:28.5501504Z Secret source: Actions
+2026-07-22T17:35:28.5504469Z Prepare workflow directory
+2026-07-22T17:35:28.5875366Z Prepare all required actions
+2026-07-22T17:35:28.6020891Z Complete job name: Configure Workflow
+2026-07-22T17:35:28.6974403Z ##[group]Run echo "run: Env"
+2026-07-22T17:35:28.6975613Z [36;1mecho "run: Env"[0m
+2026-07-22T17:35:28.7705324Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:35:28.7706522Z ##[endgroup]
+2026-07-22T17:35:28.7950409Z run: Env
+2026-07-22T17:35:28.8277614Z ##[group]Run echo "run: Configure Outputs"
+2026-07-22T17:35:28.8278659Z [36;1mecho "run: Configure Outputs"[0m
+2026-07-22T17:35:28.8348671Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:35:28.8349255Z ##[endgroup]
+2026-07-22T17:35:28.8447899Z run: Configure Outputs
+2026-07-22T17:35:28.8540998Z Evaluate and set job outputs
+2026-07-22T17:35:28.8555660Z Cleaning up orphan processes

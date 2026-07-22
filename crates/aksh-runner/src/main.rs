@@ -116,6 +116,11 @@ async fn resolve_remote_workflows(
         .build()?;
     let token = std::env::var("AKSH_GITHUB_TOKEN").ok();
     let mut queue = vec![(root_yaml.to_owned(), 0usize)];
+    // Seed the queue with locally-resolved workflows so their remote
+    // references are also discovered and fetched.
+    for contents in workflows.values() {
+        queue.push((contents.clone(), 0usize));
+    }
     let mut visited = std::collections::BTreeSet::new();
     while let Some((yaml, depth)) = queue.pop() {
         if depth >= MAX_REUSABLE_WORKFLOW_DEPTH {
@@ -126,11 +131,19 @@ async fn resolve_remote_workflows(
             let Some(reference) = job.uses.as_deref() else {
                 continue;
             };
-            if reference.starts_with("./") || workflows.contains_key(reference) {
+            if reference.starts_with("./") {
+                continue;
+            }
+            if let Some(contents) = workflows.get(reference).cloned() {
+                if visited.insert(reference.to_owned()) {
+                    queue.push((contents, depth + 1));
+                }
                 continue;
             }
             let Some((owner, repo, path, git_ref)) = parse_remote_reference(reference) else {
-                anyhow::bail!("unsupported reusable workflow reference `{reference}`");
+                // Not a reusable workflow reference (e.g. a regular composite action);
+                // skip instead of bailing.
+                continue;
             };
             if !visited.insert(reference.to_owned()) {
                 continue;

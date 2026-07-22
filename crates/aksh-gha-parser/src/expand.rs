@@ -56,12 +56,7 @@ fn resolved_continue_on_error(
                     message: error.to_string(),
                 }
             })?;
-            result
-                .as_bool()
-                .ok_or_else(|| ParserError::InvalidContinueOnError {
-                    job_id: job_id.to_owned(),
-                    message: format!("expression returned {result}, expected a boolean"),
-                })
+            Ok(result.as_bool().unwrap_or(false))
         }
     }
 }
@@ -121,18 +116,33 @@ fn resolve_deferred_number(
     value: Option<&DeferredNumber>,
     matrix: &IndexMap<String, Value>,
     inputs: Option<&BTreeMap<String, Value>>,
+    default: Option<u64>,
 ) -> Result<Option<u64>, ParserError> {
-    let Some(value) = value else { return Ok(None) };
+    let Some(value) = value else {
+        return Ok(default);
+    };
     match value {
         DeferredNumber::Literal(value) => Ok(Some(*value)),
         DeferredNumber::Expression(expression) => {
             let result = eval_expression(expression, &expression_context(matrix, inputs))
                 .map_err(|error| ParserError::InvalidExpression(error.to_string()))?;
-            result.as_u64().map(Some).ok_or_else(|| {
-                ParserError::InvalidExpression(format!(
-                    "expression returned {result}, expected a number"
-                ))
-            })
+            match result {
+                Value::Null => Ok(default),
+                Value::String(ref s) => {
+                    if let Ok(n) = s.parse::<u64>() {
+                        Ok(Some(n))
+                    } else {
+                        Err(ParserError::InvalidExpression(format!(
+                            "expression returned {result}, expected a number"
+                        )))
+                    }
+                }
+                _ => result.as_u64().map(Some).ok_or_else(|| {
+                    ParserError::InvalidExpression(format!(
+                        "expression returned {result}, expected a number"
+                    ))
+                }),
+            }
         }
     }
 }
@@ -234,7 +244,9 @@ fn job_plan_from_job(
         resolved_continue_on_error(job_id, job.continue_on_error.as_ref(), &matrix)?;
     let fail_fast = resolve_deferred_bool(job.strategy.fail_fast.as_ref(), &matrix, inputs, true)?;
     let max_parallel =
-        resolve_deferred_number(job.strategy.max_parallel.as_ref(), &matrix, inputs)?;
+        resolve_deferred_number(job.strategy.max_parallel.as_ref(), &matrix, inputs, None)?;
+    let timeout_minutes =
+        resolve_deferred_number(job.timeout_minutes.as_ref(), &matrix, inputs, None)?;
     let steps = job
         .steps
         .iter()
@@ -275,6 +287,7 @@ fn job_plan_from_job(
         concurrency_group,
         concurrency_cancel_in_progress,
         concurrency_queue,
+        timeout_minutes,
     })
 }
 
@@ -396,6 +409,16 @@ fn expand_jobs_with_reusables_internal(
             let yaml = reusable_workflows
                 .get(uses)
                 .or_else(|| reusable_workflows.get(&path))
+                .or_else(|| {
+                    // For owner/repo/.github/workflows/file.yml@ref references (e.g.
+                    // "huggingface/transformers/.github/workflows/collated-reports.yml@sha")
+                    // try matching just the .github/workflows/... portion against
+                    // workspace-root-loaded workflows.
+                    let workflow_path = path
+                        .find(".github/workflows/")
+                        .and_then(|pos| path.get(pos..));
+                    workflow_path.and_then(|wp| reusable_workflows.get(wp))
+                })
                 .ok_or_else(|| ParserError::MissingReusableWorkflow { path: uses.clone() })?;
             let called = parse_workflow(yaml)?;
             let trigger = called
@@ -500,13 +523,28 @@ fn expand_jobs_with_reusables_internal(
                 expand_matrix(job_id, job.strategy.matrix.as_ref(), Some(&resolved_inputs))?;
             for matrix in matrices {
                 let expanded_job_id = matrix_expand::expanded_job_id(job_id, &matrix);
+                let caller_context = expression_context(&matrix, Some(&resolved_inputs));
+                let evaluated_inputs: BTreeMap<String, Value> = resolved_inputs
+                    .iter()
+                    .map(|(k, v)| {
+                        let evaluated = match v {
+                            Value::String(s)
+                                if s.trim().starts_with("${{") && s.trim().ends_with("}}") =>
+                            {
+                                eval_expression(s, &caller_context).unwrap_or_else(|_| v.clone())
+                            }
+                            _ => v.clone(),
+                        };
+                        (k.clone(), evaluated)
+                    })
+                    .collect();
                 let mut called_plans = expand_jobs_with_reusables_internal(
                     &called,
                     reusable_workflows,
                     reusable_workflow_shas,
                     depth + 1,
                     reusable_calls,
-                    Some(&resolved_inputs),
+                    Some(&evaluated_inputs),
                 )?;
 
                 let mut inner_job_ids = Vec::new();
@@ -529,7 +567,7 @@ fn expand_jobs_with_reusables_internal(
                     called_plan.env.extend(global_env.clone());
                     called_plan.env.extend(job.env.clone().into_strings());
 
-                    called_plan.inputs.extend(resolved_inputs.clone());
+                    called_plan.inputs.extend(evaluated_inputs.clone());
                     called_plan.secrets_inherit = secrets_inherit;
                     called_plan.secrets_map.extend(secrets_map.clone());
                     called_plan.workflow_file = Some(path.clone());
@@ -553,7 +591,7 @@ fn expand_jobs_with_reusables_internal(
                         caller_job_id: expanded_job_id,
                         output_definitions: output_definitions.clone(),
                         inner_job_ids,
-                        inputs: resolved_inputs.clone(),
+                        inputs: evaluated_inputs.clone(),
                         caller_concurrency: job.concurrency.clone(),
                         embedded_concurrency: called.concurrency.clone(),
                         matrix: matrix.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
@@ -696,6 +734,12 @@ fn step_plan(
         continue_on_error: step.continue_on_error.as_ref().map_or(Ok(None), |value| {
             resolve_deferred_bool(Some(value), matrix, inputs, false).map(Some)
         })?,
+        timeout_minutes: resolve_deferred_number(
+            step.timeout_minutes.as_ref(),
+            matrix,
+            inputs,
+            None,
+        )?,
     })
 }
 

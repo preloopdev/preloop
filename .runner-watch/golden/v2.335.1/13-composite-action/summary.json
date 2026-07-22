@@ -5,8 +5,9 @@
   "ended_at": "2026-06-30T16:01:56Z",
   "status": "ok",
   "runner_exit_code": 143,
-  "flows_count":       36,
+  "flows_count": 36,
   "runner_version": "2.335.1",
   "runner_server_ref": "992ccbbbf9afcde477c38c316e053b1af457ad40",
-  "mitmproxy_version": "Mitmproxy: 12.2.3"
+  "mitmproxy_version": "Mitmproxy: 12.2.3",
+  "run_id": 29393459019
 }

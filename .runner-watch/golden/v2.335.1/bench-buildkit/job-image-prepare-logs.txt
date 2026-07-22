@@ -1,0 +1,115 @@
+﻿2026-07-22T16:58:37.1378812Z Current runner version: '2.335.1'
+2026-07-22T16:58:37.1404305Z ##[group]Runner Image Provisioner
+2026-07-22T16:58:37.1405267Z Hosted Compute Agent
+2026-07-22T16:58:37.1405852Z Version: 20260707.563
+2026-07-22T16:58:37.1406722Z Commit: 02667638d2b423fbc733a8e32a88b44996a3ba6e
+2026-07-22T16:58:37.1407474Z Build Date: 2026-07-07T19:33:50Z
+2026-07-22T16:58:37.1408169Z Worker ID: {d4ddfeca-7773-4eda-bac4-c85aeee246fc}
+2026-07-22T16:58:37.1408965Z Azure Region: northcentralus
+2026-07-22T16:58:37.1409567Z ##[endgroup]
+2026-07-22T16:58:37.1411075Z ##[group]Operating System
+2026-07-22T16:58:37.1411848Z Ubuntu
+2026-07-22T16:58:37.1412368Z 24.04.4
+2026-07-22T16:58:37.1412906Z LTS
+2026-07-22T16:58:37.1413464Z ##[endgroup]
+2026-07-22T16:58:37.1414302Z ##[group]Runner Image
+2026-07-22T16:58:37.1415018Z Image: ubuntu-24.04
+2026-07-22T16:58:37.1415581Z Version: 20260714.240.1
+2026-07-22T16:58:37.1417089Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260714.240/images/ubuntu/Ubuntu2404-Readme.md
+2026-07-22T16:58:37.1418630Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260714.240
+2026-07-22T16:58:37.1419656Z ##[endgroup]
+2026-07-22T16:58:37.1420716Z ##[group]GITHUB_TOKEN Permissions
+2026-07-22T16:58:37.1422909Z Contents: read
+2026-07-22T16:58:37.1423523Z Metadata: read
+2026-07-22T16:58:37.1424143Z ##[endgroup]
+2026-07-22T16:58:37.1426901Z Secret source: Actions
+2026-07-22T16:58:37.1427900Z Prepare workflow directory
+2026-07-22T16:58:37.1835249Z Prepare all required actions
+2026-07-22T16:58:37.1873451Z Getting action download info
+2026-07-22T16:58:37.4493868Z Download action repository 'actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3' (SHA:3a2844b7e9c422d3c10d287c895573f7108da1b3)
+2026-07-22T16:58:37.9096016Z Complete job name: image-prepare
+2026-07-22T16:58:37.9901423Z ##[group]Run actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
+2026-07-22T16:58:37.9902530Z with:
+2026-07-22T16:58:37.9908307Z   script: const defaultBase = core.getInput('default-base');
+const ref = core.getInput('ref');
+const imageName = core.getInput('image-name');
+
+function getTagSuffixAndLatest(base, target) {
+  let tagSuffix = '';
+  if (target) {
+    tagSuffix += `-${target}`;
+  }
+  if (base && base !== defaultBase) {
+    tagSuffix += `-${base}`;
+  }
+  let tagLatest = '';
+  if (ref && ref.startsWith('refs/tags/v')) {
+    const version = ref.replace('refs/tags/', '');
+    if (/^v[0-9]+\.[0-9]+\.[0-9]+$/.test(version)) {
+      tagLatest = target ? target : 'latest';
+      if (base && base !== defaultBase) {
+        tagLatest += `-${base}`;
+      }
+    }
+  }
+  return { tagSuffix, tagLatest };
+}
+
+const matrix = [
+  { base: 'alpine' },
+  { base: 'alpine', target: 'rootless'},
+  { base: 'ubuntu', buildTags: 'nvidia venus' }
+]
+
+for (const entry of matrix) {
+  const { tagSuffix, tagLatest } = getTagSuffixAndLatest(entry.base, entry.target);
+  entry.imageName = imageName;
+  entry.tagSuffix = tagSuffix;
+  entry.tagLatest = tagLatest;
+}
+
+core.info(JSON.stringify(matrix, null, 2));
+core.setOutput('includes', JSON.stringify(matrix));
+
+2026-07-22T16:58:37.9917831Z   github-token: ***
+2026-07-22T16:58:37.9918304Z   debug: false
+2026-07-22T16:58:37.9918758Z   user-agent: actions/github-script
+2026-07-22T16:58:37.9919290Z   result-encoding: json
+2026-07-22T16:58:37.9919737Z   retries: 0
+2026-07-22T16:58:37.9920208Z   retry-exempt-status-codes: 400,401,403,404,422
+2026-07-22T16:58:37.9921110Z env:
+2026-07-22T16:58:37.9921521Z   GO_VERSION: 1.26
+2026-07-22T16:58:37.9921974Z   SETUP_BUILDX_VERSION: edge
+2026-07-22T16:58:37.9922509Z   SETUP_BUILDKIT_IMAGE: moby/buildkit:latest
+2026-07-22T16:58:37.9923081Z   SCOUT_VERSION: 1.20.2
+2026-07-22T16:58:37.9923546Z   IMAGE_NAME: moby/buildkit
+2026-07-22T16:58:37.9924032Z   DESTDIR: ./bin
+2026-07-22T16:58:37.9924487Z   INPUT_DEFAULT-BASE: alpine
+2026-07-22T16:58:37.9924991Z   INPUT_REF: refs/heads/master
+2026-07-22T16:58:37.9925508Z   INPUT_IMAGE-NAME: moby/buildkit
+2026-07-22T16:58:37.9926012Z ##[endgroup]
+2026-07-22T16:58:38.0941441Z [
+2026-07-22T16:58:38.0942445Z   {
+2026-07-22T16:58:38.0942894Z     "base": "alpine",
+2026-07-22T16:58:38.0943395Z     "imageName": "moby/buildkit",
+2026-07-22T16:58:38.0943999Z     "tagSuffix": "",
+2026-07-22T16:58:38.0944562Z     "tagLatest": ""
+2026-07-22T16:58:38.0945032Z   },
+2026-07-22T16:58:38.0945452Z   {
+2026-07-22T16:58:38.0945886Z     "base": "alpine",
+2026-07-22T16:58:38.0946825Z     "target": "rootless",
+2026-07-22T16:58:38.0947468Z     "imageName": "moby/buildkit",
+2026-07-22T16:58:38.0948097Z     "tagSuffix": "-rootless",
+2026-07-22T16:58:38.0948789Z     "tagLatest": ""
+2026-07-22T16:58:38.0949276Z   },
+2026-07-22T16:58:38.0949678Z   {
+2026-07-22T16:58:38.0950108Z     "base": "ubuntu",
+2026-07-22T16:58:38.0950625Z     "buildTags": "nvidia venus",
+2026-07-22T16:58:38.0951225Z     "imageName": "moby/buildkit",
+2026-07-22T16:58:38.0951808Z     "tagSuffix": "-ubuntu",
+2026-07-22T16:58:38.0952324Z     "tagLatest": ""
+2026-07-22T16:58:38.0952800Z   }
+2026-07-22T16:58:38.0953213Z ]
+2026-07-22T16:58:38.1144790Z Evaluate and set job outputs
+2026-07-22T16:58:38.1151509Z Set output 'includes'
+2026-07-22T16:58:38.1153671Z Cleaning up orphan processes

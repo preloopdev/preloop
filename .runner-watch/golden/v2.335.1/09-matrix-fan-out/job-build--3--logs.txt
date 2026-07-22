@@ -1,0 +1,23 @@
+2026-07-13T00:22:07.2322584Z Current runner version: '2.335.1'
+2026-07-13T00:22:07.2325091Z Runner name: 'cmp-gh-3-50199'
+2026-07-13T00:22:07.2325492Z Runner group name: 'Default'
+2026-07-13T00:22:07.2325982Z Machine name: 'container'
+2026-07-13T00:22:07.2327237Z ##[group]GITHUB_TOKEN Permissions
+2026-07-13T00:22:07.2328158Z Contents: read
+2026-07-13T00:22:07.2328467Z Metadata: read
+2026-07-13T00:22:07.2328780Z Packages: read
+2026-07-13T00:22:07.2329070Z ##[endgroup]
+2026-07-13T00:22:07.2329962Z Secret source: Actions
+2026-07-13T00:22:07.2330456Z Runner is running behind proxy server 'http://127.0.0.1:18081' for all HTTP requests.
+2026-07-13T00:22:07.2331040Z Runner is running behind proxy server 'http://127.0.0.1:18081' for all HTTPS requests.
+2026-07-13T00:22:07.2331545Z Prepare workflow directory
+2026-07-13T00:22:07.2522389Z Prepare all required actions
+2026-07-13T00:22:07.2743238Z Complete job name: build (3)
+2026-07-13T00:22:07.3035239Z ##[group]Run if [ "3" = "1" ]; then exit 1; fi
+2026-07-13T00:22:07.3036122Z [36;1mif [ "3" = "1" ]; then exit 1; fi[0m
+2026-07-13T00:22:07.3036671Z [36;1msleep 20[0m
+2026-07-13T00:22:07.3222837Z shell: /usr/bin/bash -e {0}
+2026-07-13T00:22:07.3223254Z ##[endgroup]
+2026-07-13T00:22:22.5062758Z ##[error]The operation was canceled.
+2026-07-13T00:22:22.5103759Z Cleaning up orphan processes
+2026-07-13T00:22:22.5130872Z Terminate orphan process: pid (332) (sleep)

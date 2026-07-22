@@ -1,0 +1,75 @@
+2026-07-22T17:35:34.2064876Z Current runner version: '2.336.0'
+2026-07-22T17:35:34.2089172Z ##[group]Runner Image Provisioner
+2026-07-22T17:35:34.2090017Z Hosted Compute Agent
+2026-07-22T17:35:34.2090589Z Version: 20260707.563
+2026-07-22T17:35:34.2091154Z Commit: 02667638d2b423fbc733a8e32a88b44996a3ba6e
+2026-07-22T17:35:34.2091791Z Build Date: 2026-07-07T19:33:50Z
+2026-07-22T17:35:34.2092418Z Worker ID: {574de1c7-7d8b-42af-b676-1769068f6903}
+2026-07-22T17:35:34.2093066Z Azure Region: westus2
+2026-07-22T17:35:34.2093553Z ##[endgroup]
+2026-07-22T17:35:34.2094906Z ##[group]Operating System
+2026-07-22T17:35:34.2095472Z Ubuntu
+2026-07-22T17:35:34.2096118Z 24.04.4
+2026-07-22T17:35:34.2096613Z LTS
+2026-07-22T17:35:34.2097076Z ##[endgroup]
+2026-07-22T17:35:34.2097592Z ##[group]Runner Image
+2026-07-22T17:35:34.2098143Z Image: ubuntu-24.04
+2026-07-22T17:35:34.2098630Z Version: 20260714.240.1
+2026-07-22T17:35:34.2099873Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260714.240/images/ubuntu/Ubuntu2404-Readme.md
+2026-07-22T17:35:34.2101239Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260714.240
+2026-07-22T17:35:34.2102068Z ##[endgroup]
+2026-07-22T17:35:34.2103176Z ##[group]GITHUB_TOKEN Permissions
+2026-07-22T17:35:34.2105029Z Contents: read
+2026-07-22T17:35:34.2105531Z Metadata: read
+2026-07-22T17:35:34.2106275Z Packages: read
+2026-07-22T17:35:34.2106782Z ##[endgroup]
+2026-07-22T17:35:34.2109220Z Secret source: Actions
+2026-07-22T17:35:34.2110232Z Prepare workflow directory
+2026-07-22T17:35:34.2436867Z Prepare all required actions
+2026-07-22T17:35:34.2584870Z Complete job name: Compile and Check (Merge Ref)
+2026-07-22T17:35:34.3485211Z ##[group]Run echo "run: Env"
+2026-07-22T17:35:34.3486547Z [36;1mecho "run: Env"[0m
+2026-07-22T17:35:34.4523689Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:35:34.4525112Z ##[endgroup]
+2026-07-22T17:35:34.4857346Z run: Env
+2026-07-22T17:35:34.4960893Z ##[group]Run echo "uses: Checkout code"
+2026-07-22T17:35:34.4961600Z [36;1mecho "uses: Checkout code"[0m
+2026-07-22T17:35:34.4994664Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:35:34.4995265Z ##[endgroup]
+2026-07-22T17:35:34.5052922Z uses: Checkout code
+2026-07-22T17:35:34.5093423Z ##[group]Run echo "uses: Setup Python"
+2026-07-22T17:35:34.5094069Z [36;1mecho "uses: Setup Python"[0m
+2026-07-22T17:35:34.5126102Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:35:34.5126765Z ##[endgroup]
+2026-07-22T17:35:34.5181963Z uses: Setup Python
+2026-07-22T17:35:34.5220935Z ##[group]Run echo "run: Check Python dependency conflicts"
+2026-07-22T17:35:34.5221698Z [36;1mecho "run: Check Python dependency conflicts"[0m
+2026-07-22T17:35:34.5254710Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-07-22T17:35:34.5255441Z ##[endgroup]
+2026-07-22T17:35:34.5307875Z run: Check Python dependency conflicts
+2026-07-22T17:35:34.5351025Z ##[group]Run echo "uses: Setup Gradle"
+2026-07-22T17:35:34.5351656Z [36;1mecho "uses: Setup Gradle"[0m
+2026-07-22T17:35:34.5379902Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:35:34.5380479Z ##[endgroup]
+2026-07-22T17:35:34.5429820Z uses: Setup Gradle
+2026-07-22T17:35:34.5544704Z ##[group]Run echo "run: Compile and validate"
+2026-07-22T17:35:34.5545621Z [36;1mecho "run: Compile and validate"[0m
+2026-07-22T17:35:34.5574486Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:35:34.5574948Z ##[endgroup]
+2026-07-22T17:35:34.5622962Z run: Compile and validate
+2026-07-22T17:35:34.5656446Z ##[group]Run echo "uses: Archive check reports"
+2026-07-22T17:35:34.5657051Z [36;1mecho "uses: Archive check reports"[0m
+2026-07-22T17:35:34.5684692Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:35:34.5685159Z ##[endgroup]
+2026-07-22T17:35:34.5732322Z uses: Archive check reports
+2026-07-22T17:35:34.5778908Z ##[group]Run echo "run: Check generated documentation"
+2026-07-22T17:35:34.5779544Z [36;1mecho "run: Check generated documentation"[0m
+2026-07-22T17:35:34.5807153Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:35:34.5807606Z ##[endgroup]
+2026-07-22T17:35:34.5855382Z run: Check generated documentation
+2026-07-22T17:35:34.5888587Z ##[group]Run echo "run: Verify license file"
+2026-07-22T17:35:34.5889142Z [36;1mecho "run: Verify license file"[0m
+2026-07-22T17:35:34.5917320Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:35:34.5917785Z ##[endgroup]
+2026-07-22T17:35:34.5964907Z run: Verify license file
+2026-07-22T17:35:34.6050055Z Cleaning up orphan processes

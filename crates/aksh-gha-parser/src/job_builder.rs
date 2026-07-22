@@ -416,7 +416,7 @@ pub fn build_agent_job_message(
         steps,
         retry_count: None,
         pre_job_timeout: None,
-        job_timeout: None,
+        job_timeout: plan.timeout_minutes.map(|m| m as i64),
         job_container: plan.container.clone(),
         job_service_containers: non_empty_services(plan.services.clone()),
         job_outputs: job_outputs_token(&plan.job_outputs),
@@ -606,8 +606,10 @@ fn build_task_step(step: &crate::StepPlan, context: &Context) -> TaskStep {
     // the same as GitHub's default `success()`.
     let condition = Some(
         step.if_condition
-            .clone()
-            .unwrap_or_else(|| "success()".to_owned()),
+            .as_deref()
+            .map(strip_expression_markers)
+            .unwrap_or("success()")
+            .to_owned(),
     );
 
     // Build displayNameToken — TemplateToken literal matching GitHub's wire format.
@@ -662,7 +664,7 @@ fn build_task_step(step: &crate::StepPlan, context: &Context) -> TaskStep {
             .working_directory
             .as_ref()
             .map(|wd| resolve_string(wd, context).unwrap_or_else(|_| wd.clone())),
-        timeout_in_minutes: None,
+        timeout_in_minutes: step.timeout_minutes.map(|m| m as u32),
     }
 }
 
@@ -670,6 +672,15 @@ fn step_input_to_string(value: &Value) -> String {
     match value {
         Value::String(value) => value.clone(),
         other => other.to_string(),
+    }
+}
+
+fn strip_expression_markers(s: &str) -> &str {
+    let trimmed = s.trim();
+    if trimmed.starts_with("${{") && trimmed.ends_with("}}") {
+        trimmed[3..trimmed.len() - 2].trim()
+    } else {
+        trimmed
     }
 }
 

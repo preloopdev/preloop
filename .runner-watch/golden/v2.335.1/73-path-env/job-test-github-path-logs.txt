@@ -1,0 +1,76 @@
+2026-07-05T21:04:58.5667857Z Current runner version: '2.335.1'
+2026-07-05T21:04:58.5690513Z ##[group]Runner Image Provisioner
+2026-07-05T21:04:58.5691371Z Hosted Compute Agent
+2026-07-05T21:04:58.5691876Z Version: 20260624.560
+2026-07-05T21:04:58.5692503Z Commit: 925d229a51159bc391ae97e54a2dd1fe20af789d
+2026-07-05T21:04:58.5693164Z Build Date: 2026-06-24T18:26:47Z
+2026-07-05T21:04:58.5693757Z Worker ID: {1ea3eb4a-7b6e-4e35-96be-084d6347f8f0}
+2026-07-05T21:04:58.5694504Z Azure Region: northcentralus
+2026-07-05T21:04:58.5695056Z ##[endgroup]
+2026-07-05T21:04:58.5696759Z ##[group]Operating System
+2026-07-05T21:04:58.5697367Z Ubuntu
+2026-07-05T21:04:58.5697838Z 24.04.4
+2026-07-05T21:04:58.5698379Z LTS
+2026-07-05T21:04:58.5698839Z ##[endgroup]
+2026-07-05T21:04:58.5699612Z ##[group]Runner Image
+2026-07-05T21:04:58.5700293Z Image: ubuntu-24.04
+2026-07-05T21:04:58.5700809Z Version: 20260628.225.1
+2026-07-05T21:04:58.5702016Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260628.225/images/ubuntu/Ubuntu2404-Readme.md
+2026-07-05T21:04:58.5703405Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260628.225
+2026-07-05T21:04:58.5704338Z ##[endgroup]
+2026-07-05T21:04:58.5705406Z ##[group]GITHUB_TOKEN Permissions
+2026-07-05T21:04:58.5707220Z Contents: read
+2026-07-05T21:04:58.5707775Z Metadata: read
+2026-07-05T21:04:58.5708347Z Packages: read
+2026-07-05T21:04:58.5708860Z ##[endgroup]
+2026-07-05T21:04:58.5711091Z Secret source: Actions
+2026-07-05T21:04:58.5711911Z Prepare workflow directory
+2026-07-05T21:04:58.6121196Z Prepare all required actions
+2026-07-05T21:04:58.6260685Z Complete job name: test-github-path
+2026-07-05T21:04:58.7287484Z ##[group]Run echo "Initial PATH: $PATH"
+2026-07-05T21:04:58.7288667Z [36;1mecho "Initial PATH: $PATH"[0m
+2026-07-05T21:04:58.7290255Z [36;1mecho "INITIAL_PATH=$PATH" >> "$GITHUB_ENV"[0m
+2026-07-05T21:04:58.7716948Z shell: /usr/bin/bash -e {0}
+2026-07-05T21:04:58.7717989Z ##[endgroup]
+2026-07-05T21:04:58.7897193Z Initial PATH: /snap/bin:/home/runner/.local/bin:/opt/pipx_bin:/home/runner/.cargo/bin:/home/runner/.config/composer/vendor/bin:/usr/local/.ghcup/bin:/home/runner/.dotnet/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
+2026-07-05T21:04:58.8080095Z ##[group]Run echo "/tmp/custom-bin-1" >> "$GITHUB_PATH"
+2026-07-05T21:04:58.8080822Z [36;1mecho "/tmp/custom-bin-1" >> "$GITHUB_PATH"[0m
+2026-07-05T21:04:58.8081460Z [36;1mecho "Added /tmp/custom-bin-1 to GITHUB_PATH"[0m
+2026-07-05T21:04:58.8111113Z shell: /usr/bin/bash -e {0}
+2026-07-05T21:04:58.8111610Z env:
+2026-07-05T21:04:58.8113239Z   INITIAL_PATH: /snap/bin:/home/runner/.local/bin:/opt/pipx_bin:/home/runner/.cargo/bin:/home/runner/.config/composer/vendor/bin:/usr/local/.ghcup/bin:/home/runner/.dotnet/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
+2026-07-05T21:04:58.8114952Z ##[endgroup]
+2026-07-05T21:04:58.8165787Z Added /tmp/custom-bin-1 to GITHUB_PATH
+2026-07-05T21:04:58.8201421Z ##[group]Run echo "PATH now: $PATH"
+2026-07-05T21:04:58.8201986Z [36;1mecho "PATH now: $PATH"[0m
+2026-07-05T21:04:58.8202530Z [36;1mif [[ "$PATH" != /tmp/custom-bin-1:* ]]; then[0m
+2026-07-05T21:04:58.8203227Z [36;1m  echo "FAIL: /tmp/custom-bin-1 should be at start of PATH"[0m
+2026-07-05T21:04:58.8203841Z [36;1m  exit 1[0m
+2026-07-05T21:04:58.8204221Z [36;1mfi[0m
+2026-07-05T21:04:58.8204660Z [36;1mecho "PASS: GITHUB_PATH entry prepended"[0m
+2026-07-05T21:04:58.8234100Z shell: /usr/bin/bash -e {0}
+2026-07-05T21:04:58.8234562Z env:
+2026-07-05T21:04:58.8236080Z   INITIAL_PATH: /snap/bin:/home/runner/.local/bin:/opt/pipx_bin:/home/runner/.cargo/bin:/home/runner/.config/composer/vendor/bin:/usr/local/.ghcup/bin:/home/runner/.dotnet/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
+2026-07-05T21:04:58.8237699Z ##[endgroup]
+2026-07-05T21:04:58.8293391Z PATH now: /tmp/custom-bin-1:/snap/bin:/home/runner/.local/bin:/opt/pipx_bin:/home/runner/.cargo/bin:/home/runner/.config/composer/vendor/bin:/usr/local/.ghcup/bin:/home/runner/.dotnet/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
+2026-07-05T21:04:58.8296748Z PASS: GITHUB_PATH entry prepended
+2026-07-05T21:04:58.8328469Z ##[group]Run echo "/tmp/custom-bin-2" >> "$GITHUB_PATH"
+2026-07-05T21:04:58.8329187Z [36;1mecho "/tmp/custom-bin-2" >> "$GITHUB_PATH"[0m
+2026-07-05T21:04:58.8357040Z shell: /usr/bin/bash -e {0}
+2026-07-05T21:04:58.8357491Z env:
+2026-07-05T21:04:58.8359015Z   INITIAL_PATH: /snap/bin:/home/runner/.local/bin:/opt/pipx_bin:/home/runner/.cargo/bin:/home/runner/.config/composer/vendor/bin:/usr/local/.ghcup/bin:/home/runner/.dotnet/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
+2026-07-05T21:04:58.8360891Z ##[endgroup]
+2026-07-05T21:04:58.8443692Z ##[group]Run echo "PATH: $PATH"
+2026-07-05T21:04:58.8444209Z [36;1mecho "PATH: $PATH"[0m
+2026-07-05T21:04:58.8444783Z [36;1mif [[ "$PATH" != /tmp/custom-bin-2:*/tmp/custom-bin-1:* ]]; then[0m
+2026-07-05T21:04:58.8445574Z [36;1m  echo "FAIL: expected /tmp/custom-bin-2 before /tmp/custom-bin-1"[0m
+2026-07-05T21:04:58.8446283Z [36;1m  exit 1[0m
+2026-07-05T21:04:58.8446659Z [36;1mfi[0m
+2026-07-05T21:04:58.8447343Z [36;1mecho "PASS: multiple GITHUB_PATH entries in correct order"[0m
+2026-07-05T21:04:58.8475225Z shell: /usr/bin/bash -e {0}
+2026-07-05T21:04:58.8475677Z env:
+2026-07-05T21:04:58.8477187Z   INITIAL_PATH: /snap/bin:/home/runner/.local/bin:/opt/pipx_bin:/home/runner/.cargo/bin:/home/runner/.config/composer/vendor/bin:/usr/local/.ghcup/bin:/home/runner/.dotnet/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
+2026-07-05T21:04:58.8478810Z ##[endgroup]
+2026-07-05T21:04:58.8530337Z PATH: /tmp/custom-bin-2:/tmp/custom-bin-1:/snap/bin:/home/runner/.local/bin:/opt/pipx_bin:/home/runner/.cargo/bin:/home/runner/.config/composer/vendor/bin:/usr/local/.ghcup/bin:/home/runner/.dotnet/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
+2026-07-05T21:04:58.8532889Z PASS: multiple GITHUB_PATH entries in correct order
+2026-07-05T21:04:58.8605042Z Cleaning up orphan processes

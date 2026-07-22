@@ -1,0 +1,55 @@
+2026-07-22T17:35:34.2887103Z Current runner version: '2.335.1'
+2026-07-22T17:35:34.2914120Z ##[group]Runner Image Provisioner
+2026-07-22T17:35:34.2915240Z Hosted Compute Agent
+2026-07-22T17:35:34.2915791Z Version: 20260707.563
+2026-07-22T17:35:34.2916505Z Commit: 02667638d2b423fbc733a8e32a88b44996a3ba6e
+2026-07-22T17:35:34.2917220Z Build Date: 2026-07-07T19:33:50Z
+2026-07-22T17:35:34.2917963Z Worker ID: {f075649f-6d5c-48d2-8f08-4219aa0f2a06}
+2026-07-22T17:35:34.2918693Z Azure Region: westus
+2026-07-22T17:35:34.2919244Z ##[endgroup]
+2026-07-22T17:35:34.2920802Z ##[group]Operating System
+2026-07-22T17:35:34.2921770Z Ubuntu
+2026-07-22T17:35:34.2922273Z 24.04.4
+2026-07-22T17:35:34.2922876Z LTS
+2026-07-22T17:35:34.2923366Z ##[endgroup]
+2026-07-22T17:35:34.2923938Z ##[group]Runner Image
+2026-07-22T17:35:34.2924576Z Image: ubuntu-24.04
+2026-07-22T17:35:34.2925135Z Version: 20260714.240.1
+2026-07-22T17:35:34.2926432Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260714.240/images/ubuntu/Ubuntu2404-Readme.md
+2026-07-22T17:35:34.2927930Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260714.240
+2026-07-22T17:35:34.2928942Z ##[endgroup]
+2026-07-22T17:35:34.2930137Z ##[group]GITHUB_TOKEN Permissions
+2026-07-22T17:35:34.2932909Z Contents: read
+2026-07-22T17:35:34.2933532Z Metadata: read
+2026-07-22T17:35:34.2934153Z Packages: read
+2026-07-22T17:35:34.2934717Z ##[endgroup]
+2026-07-22T17:35:34.2936861Z Secret source: Actions
+2026-07-22T17:35:34.2937701Z Prepare workflow directory
+2026-07-22T17:35:34.3290717Z Prepare all required actions
+2026-07-22T17:35:34.3403653Z Complete job name: Load Test Catalog
+2026-07-22T17:35:34.4207508Z ##[group]Run echo "uses: Checkout main"
+2026-07-22T17:35:34.4208375Z [36;1mecho "uses: Checkout main"[0m
+2026-07-22T17:35:34.4982780Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:35:34.4983954Z ##[endgroup]
+2026-07-22T17:35:34.5217611Z uses: Checkout main
+2026-07-22T17:35:34.5452433Z ##[group]Run echo "uses: Checkout test-catalog"
+2026-07-22T17:35:34.5453668Z [36;1mecho "uses: Checkout test-catalog"[0m
+2026-07-22T17:35:34.5541791Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:35:34.5542729Z ##[endgroup]
+2026-07-22T17:35:34.5630837Z uses: Checkout test-catalog
+2026-07-22T17:35:34.5728284Z ##[group]Run echo "uses: Setup Python"
+2026-07-22T17:35:34.5728911Z [36;1mecho "uses: Setup Python"[0m
+2026-07-22T17:35:34.5787078Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:35:34.5787604Z ##[endgroup]
+2026-07-22T17:35:34.5865667Z uses: Setup Python
+2026-07-22T17:35:34.5903390Z ##[group]Run echo "run: Combine Catalog into single file"
+2026-07-22T17:35:34.5904170Z [36;1mecho "run: Combine Catalog into single file"[0m
+2026-07-22T17:35:34.5957876Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:35:34.5958385Z ##[endgroup]
+2026-07-22T17:35:34.6035139Z run: Combine Catalog into single file
+2026-07-22T17:35:34.6086335Z ##[group]Run echo "uses: Archive Combined Test Catalog"
+2026-07-22T17:35:34.6087076Z [36;1mecho "uses: Archive Combined Test Catalog"[0m
+2026-07-22T17:35:34.6141949Z shell: /usr/bin/bash -e {0}
+2026-07-22T17:35:34.6142465Z ##[endgroup]
+2026-07-22T17:35:34.6218237Z uses: Archive Combined Test Catalog
+2026-07-22T17:35:34.6302260Z Cleaning up orphan processes
