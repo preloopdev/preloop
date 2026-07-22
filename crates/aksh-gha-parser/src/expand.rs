@@ -624,9 +624,10 @@ pub fn expand_jobs_with_reusables_and_shas(
                 new_needs.push(need.clone());
             } else {
                 let prefix = format!("{}/", need.0);
+                let prefix_matrix = format!("{} (", need.0);
                 let mut matched = false;
                 for id in &expanded_ids {
-                    if id.starts_with(&prefix) {
+                    if id.starts_with(&prefix) || id.starts_with(&prefix_matrix) {
                         new_needs.push(JobId(id.clone()));
                         matched = true;
                     }

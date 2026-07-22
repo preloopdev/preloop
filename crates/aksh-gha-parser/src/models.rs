@@ -509,6 +509,23 @@ impl EnvValue {
     }
 }
 
+fn deserialize_if_condition<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        None => Ok(None),
+        Some(serde_json::Value::Bool(b)) => Ok(Some(b.to_string())),
+        Some(serde_json::Value::Number(n)) => Ok(Some(n.to_string())),
+        Some(serde_json::Value::String(s)) => Ok(Some(s)),
+        Some(serde_json::Value::Null) => Ok(None),
+        Some(_) => Err(serde::de::Error::custom(
+            "expected a string, boolean, or number for `if` condition",
+        )),
+    }
+}
+
 /// Workflow job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
@@ -522,7 +539,7 @@ pub struct Job {
     #[serde(default)]
     pub needs: Needs,
     /// Optional if condition.
-    #[serde(default, rename = "if")]
+    #[serde(default, deserialize_with = "deserialize_if_condition", rename = "if")]
     pub if_condition: Option<String>,
     /// Job-level failure tolerance.
     #[serde(default, rename = "continue-on-error")]
@@ -868,7 +885,7 @@ pub struct Step {
     #[serde(default)]
     pub with: BTreeMap<String, Value>,
     /// Optional if condition.
-    #[serde(default, rename = "if")]
+    #[serde(default, deserialize_with = "deserialize_if_condition", rename = "if")]
     pub if_condition: Option<String>,
     /// Working directory override.
     #[serde(default, rename = "working-directory")]
