@@ -969,6 +969,7 @@ jobs:
         }
 
         #[test]
+        #[ignore = "expensive RSA generation; use just test-properties-full"]
         fn prop_signed_jwt_verifies(
             _ in 0..4u32,
         ) {
@@ -994,6 +995,7 @@ jobs:
         }
 
         #[test]
+        #[ignore = "expensive RSA generation; use just test-properties-full"]
         fn prop_kid_matches_thumbprint(
             _ in 0..4u32,
         ) {
