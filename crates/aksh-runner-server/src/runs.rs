@@ -176,7 +176,11 @@ pub(crate) async fn submit_run_inner(
             submission.event
         )));
     }
-    let expanded = expand_jobs_with_reusables(&workflow, &submission.reusable_workflows)?;
+    let expanded = aksh_gha_parser::expand_jobs_with_reusables_and_shas(
+        &workflow,
+        &submission.reusable_workflows,
+        &submission.reusable_workflow_shas,
+    )?;
     let mut jobs = expanded.jobs;
     if !submission.dispatch_inputs.is_empty() {
         for job in &mut jobs {
