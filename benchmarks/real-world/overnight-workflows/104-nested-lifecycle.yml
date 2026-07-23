@@ -1,0 +1,49 @@
+name: 104 nested lifecycle semantics
+on: workflow_dispatch
+jobs:
+  lifecycle:
+    runs-on: [self-hosted, overnight]
+    env:
+      TRACE: lifecycle-trace
+    steps:
+      - name: Reset trace
+        shell: bash
+        run: ': > "$RUNNER_TEMP/$TRACE"'
+      - name: Pre-like setup
+        id: setup
+        shell: bash
+        run: |
+          echo setup >> "$RUNNER_TEMP/$TRACE"
+          {
+            echo 'STATE_VALUE=from-setup'
+            echo 'MULTI<<EOF'
+            echo 'first'
+            echo 'second'
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+      - name: Nested action one
+        shell: bash
+        env:
+          STATE_VALUE: ${{ steps.setup.outputs.STATE_VALUE }}
+        run: |
+          echo nested-one >> "$RUNNER_TEMP/$TRACE"
+          test "$STATE_VALUE" = from-setup
+          echo "one=$STATE_VALUE" >> "$GITHUB_STEP_SUMMARY"
+      - name: Nested action two
+        shell: bash
+        run: |
+          echo nested-two >> "$RUNNER_TEMP/$TRACE"
+          echo 'LIFECYCLE_ENV=visible-after-step' >> "$GITHUB_ENV"
+      - name: Verify lifecycle ordering
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(tr '\n' , < "$RUNNER_TEMP/$TRACE")" = 'setup,nested-one,nested-two,'
+          test "$LIFECYCLE_ENV" = visible-after-step
+          echo 'AKSH_ORACLE: lifecycle=setup,nested-one,nested-two env=visible-after-step'
+      - name: Post-like cleanup
+        if: always()
+        shell: bash
+        run: |
+          echo cleanup >> "$RUNNER_TEMP/$TRACE"
+          echo "AKSH_ORACLE: post=$(tail -1 "$RUNNER_TEMP/$TRACE")"

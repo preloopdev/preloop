@@ -1,0 +1,9 @@
+﻿2026-07-21T18:29:26.6348859Z ##[group]Run echo "AKSH_ORACLE: all-fc-checks=passed"
+2026-07-21T18:29:26.6349481Z [36;1mecho "AKSH_ORACLE: all-fc-checks=passed"[0m
+2026-07-21T18:29:26.6352091Z shell: /usr/bin/bash -e {0}
+2026-07-21T18:29:26.6352461Z env:
+2026-07-21T18:29:26.6352756Z   FC_TEST: from-github-env
+2026-07-21T18:29:26.6353133Z   MULTILINE: line one
+line two
+2026-07-21T18:29:26.6353517Z ##[endgroup]
+2026-07-21T18:29:26.6367383Z AKSH_ORACLE: all-fc-checks=passed

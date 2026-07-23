@@ -1,0 +1,5 @@
+﻿2026-07-21T18:27:07.9764799Z ##[group]Run echo "AKSH_ORACLE: after-cancel=ran"
+2026-07-21T18:27:07.9765459Z [36;1mecho "AKSH_ORACLE: after-cancel=ran"[0m
+2026-07-21T18:27:07.9768358Z shell: /usr/bin/bash -e {0}
+2026-07-21T18:27:07.9768817Z ##[endgroup]
+2026-07-21T18:27:07.9782514Z AKSH_ORACLE: after-cancel=ran

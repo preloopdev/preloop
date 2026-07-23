@@ -1,0 +1,8 @@
+﻿2026-07-21T18:29:26.6181439Z ##[group]Run echo "saved_key=saved_value" >> "$GITHUB_STATE"
+2026-07-21T18:29:26.6182133Z [36;1mecho "saved_key=saved_value" >> "$GITHUB_STATE"[0m
+2026-07-21T18:29:26.6184840Z shell: /usr/bin/bash -e {0}
+2026-07-21T18:29:26.6185241Z env:
+2026-07-21T18:29:26.6185552Z   FC_TEST: from-github-env
+2026-07-21T18:29:26.6185951Z   MULTILINE: line one
+line two
+2026-07-21T18:29:26.6186369Z ##[endgroup]

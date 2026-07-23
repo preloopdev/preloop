@@ -19,6 +19,7 @@ This document set breaks the updated Preloop plan into logical areas that can be
 13. [Rosetta x86_64 and CI Performance](13_rosetta_x86_64_and_ci_performance.md)
 14. [Runtime Tiers and Portable Handoff](14_runtime_tiers_and_portable_handoff.md)
 15. [CI Efficiency Levers](15_ci_efficiency_levers.md)
+16. [CLI, Failure Debugging, and Reproducibility](16_cli_debugging_and_reproducibility.md)
 
 ## Source context used
 

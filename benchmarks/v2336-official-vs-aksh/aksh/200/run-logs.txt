@@ -1,0 +1,105 @@
+﻿2026-07-21T17:26:22.8812627Z Current runner version: '2.335.1'
+2026-07-21T17:26:22.8815204Z Runner name: 'v2336-test'
+2026-07-21T17:26:22.8815546Z Runner group name: 'Default'
+2026-07-21T17:26:22.8816027Z Machine name: 'container'
+2026-07-21T17:26:22.8817203Z ##[group]GITHUB_TOKEN Permissions
+2026-07-21T17:26:22.8818651Z Contents: read
+2026-07-21T17:26:22.8818922Z Metadata: read
+2026-07-21T17:26:22.8819205Z Packages: read
+2026-07-21T17:26:22.8819454Z ##[endgroup]
+2026-07-21T17:26:22.8820502Z Secret source: Actions
+2026-07-21T17:26:22.8820899Z Prepare workflow directory
+2026-07-21T17:26:22.8968425Z Prepare all required actions
+2026-07-21T17:26:22.8988084Z Complete job name: combined
+2026-07-21T17:26:23.4121560Z ##[group]Run for var in GITHUB_ENV GITHUB_OUTPUT GITHUB_PATH GITHUB_STATE GITHUB_STEP_SUMMARY GITHUB_ARTIFACTS GITHUB_ARTIFACTS_LIST; do
+2026-07-21T17:26:23.4123641Z [36;1mfor var in GITHUB_ENV GITHUB_OUTPUT GITHUB_PATH GITHUB_STATE GITHUB_STEP_SUMMARY GITHUB_ARTIFACTS GITHUB_ARTIFACTS_LIST; do[0m
+2026-07-21T17:26:23.4124905Z [36;1m  val=$(eval echo "\$$var")[0m
+2026-07-21T17:26:23.4125491Z [36;1m  echo "$var=$val"[0m
+2026-07-21T17:26:23.4125962Z [36;1mdone[0m
+2026-07-21T17:26:23.4134756Z shell: /usr/bin/bash -e {0}
+2026-07-21T17:26:23.4135300Z ##[endgroup]
+2026-07-21T17:26:23.4213991Z GITHUB_ENV=/tmp/tmp.rOuU0iqoZz/_work/_temp/_runner_file_commands/set_env_9d2eb918-8520-4669-8cdf-41f727895c1e
+2026-07-21T17:26:23.4215612Z GITHUB_OUTPUT=/tmp/tmp.rOuU0iqoZz/_work/_temp/_runner_file_commands/set_output_9d2eb918-8520-4669-8cdf-41f727895c1e
+2026-07-21T17:26:23.4217229Z GITHUB_PATH=/tmp/tmp.rOuU0iqoZz/_work/_temp/_runner_file_commands/add_path_9d2eb918-8520-4669-8cdf-41f727895c1e
+2026-07-21T17:26:23.4218764Z GITHUB_STATE=/tmp/tmp.rOuU0iqoZz/_work/_temp/_runner_file_commands/save_state_9d2eb918-8520-4669-8cdf-41f727895c1e
+2026-07-21T17:26:23.4220402Z GITHUB_STEP_SUMMARY=/tmp/tmp.rOuU0iqoZz/_work/_temp/_runner_file_commands/step_summary_9d2eb918-8520-4669-8cdf-41f727895c1e
+2026-07-21T17:26:23.4221510Z GITHUB_ARTIFACTS=
+2026-07-21T17:26:23.4221927Z GITHUB_ARTIFACTS_LIST=
+2026-07-21T17:26:23.4269367Z ##[group]Run echo "V2336_COMBINED=combined-ok" >> "$GITHUB_ENV"
+2026-07-21T17:26:23.4270202Z [36;1mecho "V2336_COMBINED=combined-ok" >> "$GITHUB_ENV"[0m
+2026-07-21T17:26:23.4273929Z shell: /usr/bin/bash -e {0}
+2026-07-21T17:26:23.4274441Z ##[endgroup]
+2026-07-21T17:26:23.4332508Z ##[group]Run test "$V2336_COMBINED" = "combined-ok"
+2026-07-21T17:26:23.4333142Z [36;1mtest "$V2336_COMBINED" = "combined-ok"[0m
+2026-07-21T17:26:23.4336655Z shell: /usr/bin/bash -e {0}
+2026-07-21T17:26:23.4337131Z env:
+2026-07-21T17:26:23.4337459Z   V2336_COMBINED: combined-ok
+2026-07-21T17:26:23.4337893Z ##[endgroup]
+2026-07-21T17:26:23.4376699Z ##[group]Run echo "result=42" >> "$GITHUB_OUTPUT"
+2026-07-21T17:26:23.4377376Z [36;1mecho "result=42" >> "$GITHUB_OUTPUT"[0m
+2026-07-21T17:26:23.4380755Z shell: /usr/bin/bash -e {0}
+2026-07-21T17:26:23.4381155Z env:
+2026-07-21T17:26:23.4381477Z   V2336_COMBINED: combined-ok
+2026-07-21T17:26:23.4381913Z ##[endgroup]
+2026-07-21T17:26:23.4446587Z ##[group]Run echo "Producer result: 42"
+2026-07-21T17:26:23.4447098Z [36;1mecho "Producer result: 42"[0m
+2026-07-21T17:26:23.4447547Z [36;1mtest "42" = "42"[0m
+2026-07-21T17:26:23.4450717Z shell: /usr/bin/bash -e {0}
+2026-07-21T17:26:23.4451115Z env:
+2026-07-21T17:26:23.4451427Z   V2336_COMBINED: combined-ok
+2026-07-21T17:26:23.4451831Z ##[endgroup]
+2026-07-21T17:26:23.4465902Z Producer result: 42
+2026-07-21T17:26:23.4488771Z ##[group]Run exit 1
+2026-07-21T17:26:23.4489145Z [36;1mexit 1[0m
+2026-07-21T17:26:23.4492042Z shell: /usr/bin/bash -e {0}
+2026-07-21T17:26:23.4492431Z env:
+2026-07-21T17:26:23.4492738Z   V2336_COMBINED: combined-ok
+2026-07-21T17:26:23.4493135Z ##[endgroup]
+2026-07-21T17:26:23.4512103Z ##[error]Process completed with exit code 1.
+2026-07-21T17:26:23.4544051Z ##[group]Run echo "still-running-after-soft-fail"
+2026-07-21T17:26:23.4544635Z [36;1mecho "still-running-after-soft-fail"[0m
+2026-07-21T17:26:23.4548024Z shell: /usr/bin/bash -e {0}
+2026-07-21T17:26:23.4548443Z env:
+2026-07-21T17:26:23.4548745Z   V2336_COMBINED: combined-ok
+2026-07-21T17:26:23.4549136Z ##[endgroup]
+2026-07-21T17:26:23.4561902Z still-running-after-soft-fail
+2026-07-21T17:26:23.4594856Z ##[group]Run echo "/tmp/v2336-test-bin" >> "$GITHUB_PATH"
+2026-07-21T17:26:23.4595484Z [36;1mecho "/tmp/v2336-test-bin" >> "$GITHUB_PATH"[0m
+2026-07-21T17:26:23.4598330Z shell: /usr/bin/bash -e {0}
+2026-07-21T17:26:23.4598707Z env:
+2026-07-21T17:26:23.4599014Z   V2336_COMBINED: combined-ok
+2026-07-21T17:26:23.4599400Z ##[endgroup]
+2026-07-21T17:26:23.4636466Z ##[group]Run echo "$PATH" | grep -q "v2336-test-bin"
+2026-07-21T17:26:23.4637094Z [36;1mecho "$PATH" | grep -q "v2336-test-bin"[0m
+2026-07-21T17:26:23.4641702Z shell: /usr/bin/bash -e {0}
+2026-07-21T17:26:23.4642092Z env:
+2026-07-21T17:26:23.4642409Z   V2336_COMBINED: combined-ok
+2026-07-21T17:26:23.4642789Z ##[endgroup]
+2026-07-21T17:26:23.4718592Z ##[group]Run echo "saved=state-value" >> "$GITHUB_STATE"
+2026-07-21T17:26:23.4719180Z [36;1mecho "saved=state-value" >> "$GITHUB_STATE"[0m
+2026-07-21T17:26:23.4722542Z shell: /usr/bin/bash -e {0}
+2026-07-21T17:26:23.4722998Z env:
+2026-07-21T17:26:23.4723332Z   V2336_COMBINED: combined-ok
+2026-07-21T17:26:23.4723703Z ##[endgroup]
+2026-07-21T17:26:23.4763024Z ##[group]Run echo "### v2.336.0 Combined Test" >> "$GITHUB_STEP_SUMMARY"
+2026-07-21T17:26:23.4763808Z [36;1mecho "### v2.336.0 Combined Test" >> "$GITHUB_STEP_SUMMARY"[0m
+2026-07-21T17:26:23.4764470Z [36;1mecho "All checks passed." >> "$GITHUB_STEP_SUMMARY"[0m
+2026-07-21T17:26:23.4767597Z shell: /usr/bin/bash -e {0}
+2026-07-21T17:26:23.4767970Z env:
+2026-07-21T17:26:23.4768267Z   V2336_COMBINED: combined-ok
+2026-07-21T17:26:23.4768644Z ##[endgroup]
+2026-07-21T17:26:23.4817941Z ##[group]Run echo "test-subject sha256:deadbeef" >> "$GITHUB_ARTIFACTS" 2>/dev/null || true
+2026-07-21T17:26:23.4818889Z [36;1mecho "test-subject sha256:deadbeef" >> "$GITHUB_ARTIFACTS" 2>/dev/null || true[0m
+2026-07-21T17:26:23.4822274Z shell: /usr/bin/bash -e {0}
+2026-07-21T17:26:23.4822647Z env:
+2026-07-21T17:26:23.4822942Z   V2336_COMBINED: combined-ok
+2026-07-21T17:26:23.4823318Z ##[endgroup]
+2026-07-21T17:26:23.4837941Z /tmp/tmp.rOuU0iqoZz/_work/_temp/073eab7d-e212-4dc9-b7cc-8407bf8ea678.sh: line 1: : No such file or directory
+2026-07-21T17:26:23.4864150Z ##[group]Run echo "ALL_V2336_COMBINED_CHECKS_PASSED"
+2026-07-21T17:26:23.4864712Z [36;1mecho "ALL_V2336_COMBINED_CHECKS_PASSED"[0m
+2026-07-21T17:26:23.4868139Z shell: /usr/bin/bash -e {0}
+2026-07-21T17:26:23.4868544Z env:
+2026-07-21T17:26:23.4868843Z   V2336_COMBINED: combined-ok
+2026-07-21T17:26:23.4869268Z ##[endgroup]
+2026-07-21T17:26:23.4884616Z ALL_V2336_COMBINED_CHECKS_PASSED
+2026-07-21T17:26:23.4930884Z Cleaning up orphan processes

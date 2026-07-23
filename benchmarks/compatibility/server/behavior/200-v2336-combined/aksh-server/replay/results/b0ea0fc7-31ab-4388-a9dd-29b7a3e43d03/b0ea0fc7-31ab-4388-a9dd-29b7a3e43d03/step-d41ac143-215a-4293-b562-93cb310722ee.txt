@@ -1,0 +1,7 @@
+﻿2026-07-21T18:24:23.2342069Z ##[group]Run echo "AKSH_ORACLE: all-checks=passed"
+2026-07-21T18:24:23.2342608Z [36;1mecho "AKSH_ORACLE: all-checks=passed"[0m
+2026-07-21T18:24:23.2344941Z shell: /usr/bin/bash -e {0}
+2026-07-21T18:24:23.2345307Z env:
+2026-07-21T18:24:23.2345597Z   V2336_COMBINED: combined-ok
+2026-07-21T18:24:23.2345965Z ##[endgroup]
+2026-07-21T18:24:23.2361024Z AKSH_ORACLE: all-checks=passed

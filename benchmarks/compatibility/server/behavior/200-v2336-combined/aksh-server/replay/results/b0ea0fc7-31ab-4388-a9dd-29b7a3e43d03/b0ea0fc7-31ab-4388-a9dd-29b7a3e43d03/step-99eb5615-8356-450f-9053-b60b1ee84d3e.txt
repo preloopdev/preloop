@@ -1,0 +1,7 @@
+﻿2026-07-21T18:24:23.2043395Z ##[group]Run exit 1
+2026-07-21T18:24:23.2043769Z [36;1mexit 1[0m
+2026-07-21T18:24:23.2046332Z shell: /usr/bin/bash -e {0}
+2026-07-21T18:24:23.2046773Z env:
+2026-07-21T18:24:23.2047078Z   V2336_COMBINED: combined-ok
+2026-07-21T18:24:23.2047475Z ##[endgroup]
+2026-07-21T18:24:23.2064961Z ##[error]Process completed with exit code 1.
