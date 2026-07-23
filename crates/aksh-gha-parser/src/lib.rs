@@ -15,7 +15,7 @@ mod models;
 mod trigger;
 mod yaml;
 
-pub use expand::{expand_jobs, expand_jobs_with_reusables};
+pub use expand::{expand_jobs, expand_jobs_with_reusables, expand_jobs_with_reusables_and_shas};
 pub use models::*;
 pub use yaml::{parse_action_metadata, parse_workflow};
 

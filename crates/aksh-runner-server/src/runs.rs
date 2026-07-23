@@ -74,6 +74,7 @@ pub(crate) async fn submit_run_inner(
     mut submission: WorkflowSubmission,
 ) -> Result<RunAccepted, ApiError> {
     let workflow = parse_workflow(&submission.workflow_yaml)?;
+    crate::remote_workflows::resolve_remote_workflows(&mut submission).await?;
     if submission.event == "workflow_dispatch" {
         workflow.apply_workflow_dispatch_inputs(&mut submission.payload)?;
         if submission.dispatch_inputs.is_empty() {
@@ -175,7 +176,11 @@ pub(crate) async fn submit_run_inner(
             submission.event
         )));
     }
-    let expanded = expand_jobs_with_reusables(&workflow, &submission.reusable_workflows)?;
+    let expanded = aksh_gha_parser::expand_jobs_with_reusables_and_shas(
+        &workflow,
+        &submission.reusable_workflows,
+        &submission.reusable_workflow_shas,
+    )?;
     let mut jobs = expanded.jobs;
     if !submission.dispatch_inputs.is_empty() {
         for job in &mut jobs {
@@ -444,6 +449,7 @@ pub(crate) async fn submit_run_inner(
                 OidcJobContext {
                     environment: job.oidc_environment.clone(),
                     job_workflow_ref: job.oidc_job_workflow_ref.clone(),
+                    job_workflow_sha: job.workflow_sha.clone(),
                 },
             );
             inner.next_request_id += 1;
