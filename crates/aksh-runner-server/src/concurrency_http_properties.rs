@@ -861,6 +861,7 @@ pub(crate) mod http_sequences {
         })]
 
         #[test]
+        #[ignore = "expensive generated HTTP state-machine run; use just test-properties-full"]
         fn generated_http_sequence_invariants(case in arb_case()) {
             run_generated_sequence(case);
         }

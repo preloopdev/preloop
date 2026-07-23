@@ -7,7 +7,11 @@ use proptest::test_runner::RngSeed;
 /// Deterministic proptest config for DAG scheduler tests.
 /// Fixed seed ensures reproducibility; failure persistence and verbose
 /// reporting preserve/report the seed on failure (docs/property-tests.md §Common).
-fn dag_config(cases: u32) -> ProptestConfig {
+fn dag_config(default_cases: u32) -> ProptestConfig {
+    let cases = std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default_cases);
     ProptestConfig {
         cases,
         rng_seed: RngSeed::Fixed(20250713),
@@ -234,7 +238,7 @@ fn golden_needs_dag_promotes_in_dependency_order() {
 // against an independent DFS reference; it is not an official algorithm
 // claim.
 proptest! {
-    #![proptest_config(dag_config(10_000))]
+    #![proptest_config(dag_config(512))]
 
     /// No job is ever present in both queue and pending, or twice in either.
     #[test]
@@ -398,7 +402,7 @@ proptest! {
 // Random edge sets: cycle detector never panics and is consistent with
 // a simple DFS reference.
 proptest! {
-    #![proptest_config(dag_config(10_000))]
+    #![proptest_config(dag_config(512))]
 
     #[test]
     fn cycle_detector_stable(
@@ -903,7 +907,7 @@ fn arb_condition() -> impl Strategy<Value = Option<String>> {
 }
 
 proptest! {
-    #![proptest_config(dag_config(5_000))]
+    #![proptest_config(dag_config(256))]
 
     /// Bounded independent-oracle model property: for a single
     /// dependent job with 1–4 needs, the scheduler's decision

@@ -48,6 +48,9 @@ pub enum Commands {
     /// Start the runner listener (polls for jobs, spawns workers).
     Run(RunArgs),
 
+    /// Lint and dry-run workflow parsing and job expansion without running it.
+    Lint(LintArgs),
+
     /// Internal: worker process spawned per job (reads NDJSON on stdin).
     #[command(hide = true)]
     Worker(WorkerArgs),
@@ -115,6 +118,18 @@ pub struct RunArgs {
     /// Protocol path to use.
     #[arg(long, default_value = "broker")]
     pub via: ProtocolPath,
+}
+
+/// Arguments for `lint`.
+#[derive(Debug, Clone, clap::Args)]
+pub struct LintArgs {
+    /// Workflow YAML path.
+    #[arg(short = 'W', long)]
+    pub workflow: PathBuf,
+
+    /// Repository workspace root used to collect local reusable workflows.
+    #[arg(long)]
+    pub workspace_root: Option<PathBuf>,
 }
 
 /// Protocol path selection.
