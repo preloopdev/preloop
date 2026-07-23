@@ -1,0 +1,30 @@
+name: 107 remote action resolution
+on: workflow_dispatch
+jobs:
+  actions:
+    runs-on: [self-hosted, overnight]
+    steps:
+      - name: Checkout pinned action source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          path: primary
+      - name: Checkout explicit secondary repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: actions/checkout
+          ref: 34e114876b0b11c390a56381ad16ebd13914f8d5
+          path: secondary
+      - name: Execute pinned JavaScript action
+        uses: actions/github-script@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          script: |
+            core.setOutput('value', 'stable')
+            core.info('AKSH_ORACLE: github-script=executed')
+      - name: Verify downloaded trees
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d primary/.git
+          test -d secondary/.git
+          test -f secondary/action.yml
+          echo 'AKSH_ORACLE: primary_git=true secondary_action=true'

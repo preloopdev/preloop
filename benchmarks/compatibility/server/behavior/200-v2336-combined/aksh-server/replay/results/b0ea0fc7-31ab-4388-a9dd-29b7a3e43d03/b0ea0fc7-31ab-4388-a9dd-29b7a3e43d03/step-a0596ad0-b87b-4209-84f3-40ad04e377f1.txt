@@ -1,0 +1,4 @@
+﻿2026-07-21T18:24:23.1829281Z ##[group]Run echo "V2336_COMBINED=combined-ok" >> "$GITHUB_ENV"
+2026-07-21T18:24:23.1830104Z [36;1mecho "V2336_COMBINED=combined-ok" >> "$GITHUB_ENV"[0m
+2026-07-21T18:24:23.1833509Z shell: /usr/bin/bash -e {0}
+2026-07-21T18:24:23.1833963Z ##[endgroup]

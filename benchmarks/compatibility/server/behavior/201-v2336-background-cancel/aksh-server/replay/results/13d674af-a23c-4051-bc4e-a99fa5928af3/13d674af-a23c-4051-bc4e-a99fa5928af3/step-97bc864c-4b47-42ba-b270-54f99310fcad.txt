@@ -1,0 +1,5 @@
+﻿2026-07-21T18:27:07.9565336Z ##[group]Run echo "AKSH_ORACLE: normal-step=ok"
+2026-07-21T18:27:07.9566140Z [36;1mecho "AKSH_ORACLE: normal-step=ok"[0m
+2026-07-21T18:27:07.9576838Z shell: /usr/bin/bash -e {0}
+2026-07-21T18:27:07.9577521Z ##[endgroup]
+2026-07-21T18:27:07.9652682Z AKSH_ORACLE: normal-step=ok

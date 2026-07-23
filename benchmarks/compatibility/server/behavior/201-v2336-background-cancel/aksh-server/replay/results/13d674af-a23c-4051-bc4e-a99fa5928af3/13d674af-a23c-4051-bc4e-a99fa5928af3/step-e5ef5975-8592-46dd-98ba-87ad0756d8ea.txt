@@ -1,0 +1,15 @@
+﻿2026-07-21T18:27:07.4232964Z Current runner version: '2.335.1'
+2026-07-21T18:27:07.4235866Z Runner name: 'cmp-aksh-1-63409'
+2026-07-21T18:27:07.4236262Z Runner group name: 'Default'
+2026-07-21T18:27:07.4236811Z Machine name: 'container'
+2026-07-21T18:27:07.4238006Z ##[group]GITHUB_TOKEN Permissions
+2026-07-21T18:27:07.4239133Z Contents: read
+2026-07-21T18:27:07.4239429Z Metadata: read
+2026-07-21T18:27:07.4239704Z Packages: read
+2026-07-21T18:27:07.4239988Z ##[endgroup]
+2026-07-21T18:27:07.4240913Z Secret source: Actions
+2026-07-21T18:27:07.4241417Z Runner is running behind proxy server 'http://127.0.0.1:18081' for all HTTP requests.
+2026-07-21T18:27:07.4242001Z Runner is running behind proxy server 'http://127.0.0.1:18081' for all HTTPS requests.
+2026-07-21T18:27:07.4242525Z Prepare workflow directory
+2026-07-21T18:27:07.4398746Z Prepare all required actions
+2026-07-21T18:27:07.4418317Z Complete job name: bg-cancel
