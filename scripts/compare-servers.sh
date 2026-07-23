@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SCENARIO="${1:?Usage: $0 <scenario.yml>}"
 MODE="${2:-both}"
-GH_REPO="${GH_REPO:-preloopdev/aksh-conformance-sample}"
+GH_REPO="${GH_REPO:-Bnjoroge1/aksh-conformance}"
 TEMPLATE="${TEMPLATE:-/private/tmp/bench-runner.smolmachine}"
 OFFICIAL_RUNNER_HOST="${OFFICIAL_RUNNER_HOST:-$HOME/cachingv4}"
 AKSH_SERVER_BIN="$REPO_ROOT/target/aarch64-unknown-linux-musl/release/aksh-runner-server"
@@ -63,7 +63,11 @@ run_github() {
     token=$(gh api "repos/$GH_REPO/actions/runners/registration-token" --method POST --jq .token)
 
     local vm="cmp-gh-$$"
-    smolvm machine create --name "$vm" --from "$TEMPLATE" \
+    local template_arg="--from $TEMPLATE"
+    if [ ! -f "$TEMPLATE" ]; then
+        template_arg="--image ubuntu:24.04"
+    fi
+    smolvm machine create --name "$vm" $template_arg \
         --net -v "${OFFICIAL_RUNNER_HOST}:/opt/runners:ro" -v "$REPO_ROOT:/workspace:ro" >/dev/null 2>&1
     smolvm machine update --name "$vm" --rosetta >/dev/null 2>&1
     smolvm machine start --name "$vm" >/dev/null 2>&1
@@ -73,6 +77,15 @@ run_github() {
     # Start N non-ephemeral runners (for multi-job), or 1 ephemeral (single-job)
     smolvm machine exec --name "$vm" -- bash -lc "
         set -euo pipefail
+
+       echo 'Waiting for internet access...'
+       for n in \$(seq 1 30); do
+          getent hosts github.com >/dev/null && break; sleep 1
+       done
+
+       echo 'Installing runner dependencies (git, curl, wget, nodejs, libicu, mitmproxy)...'
+       apt-get update -qq && apt-get install -y -qq --no-install-recommends git curl wget ca-certificates nodejs npm libicu-dev mitmproxy >/dev/null 2>&1
+
         mkdir -p /tmp/cap/vm-mitm /tmp/cap/vm-mitm-conf
         nohup env MITM_CAPTURE_DIR=/tmp/cap/vm-mitm mitmdump \
             --listen-host 127.0.0.1 --listen-port $MITM_PORT \
@@ -87,6 +100,7 @@ run_github() {
         export NODE_EXTRA_CA_CERTS=/tmp/cap/vm-mitm-conf/mitmproxy-ca-cert.pem
         export SSL_CERT_FILE=/tmp/cap/vm-mitm-conf/mitmproxy-ca-cert.pem
         export GITHUB_ACTIONS_RUNNER_TLS_NO_VERIFY=1 RUNNER_ALLOW_RUNASROOT=1
+
         case "$SCENARIO" in
             *container*|*services*|*docker*)
                 echo 'Installing and starting Docker inside guest VM...'
@@ -178,7 +192,11 @@ run_aksh() {
     mkdir -p "$cap_dir"
 
     local vm="cmp-aksh-$$"
-    smolvm machine create --name "$vm" --from "$TEMPLATE" \
+    local template_arg="--from $TEMPLATE"
+    if [ ! -f "$TEMPLATE" ]; then
+        template_arg="--image ubuntu:24.04"
+    fi
+    smolvm machine create --name "$vm" $template_arg \
         --net -v "${OFFICIAL_RUNNER_HOST}:/opt/runners:ro" -v "$REPO_ROOT:/workspace" >/dev/null 2>&1
     smolvm machine update --name "$vm" --rosetta >/dev/null 2>&1
     smolvm machine start --name "$vm" >/dev/null 2>&1
@@ -211,6 +229,15 @@ print(json.dumps({
 
     smolvm machine exec --name "$vm" -- bash -lc "
         set -u
+
+       echo 'Waiting for internet access...'
+       for n in \$(seq 1 30); do
+          getent hosts github.com >/dev/null && break; sleep 1
+       done
+
+       echo 'Installing runner dependencies (git, curl, wget, nodejs, libicu, mitmproxy)...'
+       apt-get update -qq && apt-get install -y -qq --no-install-recommends git curl wget ca-certificates nodejs npm libicu-dev mitmproxy >/dev/null 2>&1
+
         mkdir -p /tmp/cap/vm-mitm /tmp/cap/vm-mitm-conf
         nohup env MITM_CAPTURE_DIR=/tmp/cap/vm-mitm BACKEND_PORT=80 mitmdump \\
             --listen-host 127.0.0.1 --listen-port $MITM_PORT \\
@@ -221,10 +248,10 @@ print(json.dumps({
             bash -c '</dev/tcp/127.0.0.1/$MITM_PORT' 2>/dev/null && break; sleep .25
         done
         chmod +x /usr/local/bin/aksh-runner-server
-        RUST_LOG=info AKSH_PUBLIC_URL=http://127.0.0.1 AKSH_GITHUB_TOKEN='$GITHUB_ACTIONS_TOKEN' aksh-runner-server serve --listen 0.0.0.0:80 --state-dir /tmp/aksh-state > /tmp/server.log 2>&1 &
+        RUST_LOG=info AKSH_PUBLIC_URL=http://127.0.0.1 AKSH_GITHUB_TOKEN='$GITHUB_ACTIONS_TOKEN' aksh-runner-server serve --listen 127.0.0.1:80 --state-dir /tmp/aksh-state > /tmp/server.log 2>&1 &
         server_pid=\$!
         sleep 2
-        wget -qO- http://127.0.0.1/healthz >/dev/null || { echo 'healthz failed'; exit 1; }
+        wget -qO- http://127.0.0.1/healthz >/dev/null || { echo 'healthz failed'; cat /tmp/server.log; cp /tmp/server.log $result_base/server.log || true; exit 1; }
         case "$SCENARIO" in
             *container*|*services*|*docker*)
                 echo 'Installing and starting Docker inside guest VM...'
