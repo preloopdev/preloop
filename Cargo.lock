@@ -190,6 +190,7 @@ dependencies = [
 name = "aksh-runner-client"
 version = "0.2.0"
 dependencies = [
+ "aksh-gha-parser",
  "aksh-gha-protocol",
  "anyhow",
  "clap",
