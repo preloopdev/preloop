@@ -179,6 +179,13 @@ impl ApiError {
             message: message.into(),
         }
     }
+
+    pub(crate) fn bad_gateway(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            message: message.into(),
+        }
+    }
 }
 
 impl From<aksh_gha_parser::ParserError> for ApiError {

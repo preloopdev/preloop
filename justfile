@@ -26,7 +26,12 @@ clippy:
 test:
     cargo test --workspace --quiet
 
-test-ci: fmt-check clippy test
+test-properties-full:
+    PROPTEST_CASES=10000 cargo test -p aksh-runner-server --quiet
+    PROPTEST_CASES=10000 cargo test -p aksh-runner-server --quiet -- --ignored
+
+test-ci: fmt-check clippy
+    PROPTEST_CASES=8 cargo test --workspace --quiet
     @echo CI: all checks passed
 
 #lint (ast-grep structural rules)
