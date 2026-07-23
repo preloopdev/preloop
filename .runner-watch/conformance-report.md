@@ -1,7 +1,17 @@
 # runner-watch conformance report
 
-✅ All 1 scenario(s) matched recorded baseline responses (see replay caveats below).
+❌ 10 of 11 scenario(s) diverged.
 
+- [01-register-and-idle](.runner-watch/conformance/v2.335.1/01-register-and-idle.md)
+- [06-multi-step](.runner-watch/conformance/v2.335.1/06-multi-step.md)
+- [07-step-failure](.runner-watch/conformance/v2.335.1/07-step-failure.md)
+- [08-job-outputs-needs](.runner-watch/conformance/v2.335.1/08-job-outputs-needs.md)
+- [09-matrix-fan-out](.runner-watch/conformance/v2.335.1/09-matrix-fan-out.md)
+- [10-uses-checkout](.runner-watch/conformance/v2.335.1/10-uses-checkout.md)
+- [11-cache-roundtrip](.runner-watch/conformance/v2.335.1/11-cache-roundtrip.md)
+- [12-artifact](.runner-watch/conformance/v2.335.1/12-artifact.md)
+- [13-composite-action](.runner-watch/conformance/v2.335.1/13-composite-action.md)
+- [14-annotations](.runner-watch/conformance/v2.335.1/14-annotations.md)
 - [15-oidc-id-token](.runner-watch/conformance/v2.335.1/15-oidc-id-token.md)
 
 ## Replay methodology and known gaps
