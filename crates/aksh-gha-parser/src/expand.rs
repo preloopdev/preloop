@@ -9,9 +9,9 @@ use indexmap::IndexMap;
 use serde_json::Value;
 
 use crate::{
-    dag, matrix_expand, parse_workflow, Concurrency, ConcurrencyQueue, ExpandedWorkflows,
-    InputType, Job, JobContinueOnError, JobDefaults, Matrix, ParserError, ReusableCallMetadata,
-    Step, Workflow,
+    dag, matrix_expand, parse_workflow, Concurrency, ConcurrencyQueue, DeferredBool,
+    DeferredNumber, ExpandedWorkflows, InputType, Job, JobContinueOnError, JobDefaults,
+    MatrixValue, ParserError, ReusableCallMetadata, Step, Workflow,
 };
 
 fn resolved_continue_on_error(
@@ -62,6 +62,77 @@ fn resolved_continue_on_error(
                     job_id: job_id.to_owned(),
                     message: format!("expression returned {result}, expected a boolean"),
                 })
+        }
+    }
+}
+
+fn expression_context(
+    matrix: &IndexMap<String, Value>,
+    inputs: Option<&BTreeMap<String, Value>>,
+) -> Context {
+    let mut context = Context::default();
+    context.insert(
+        "matrix",
+        Value::Object(
+            matrix
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        ),
+    );
+    if let Some(inputs) = inputs {
+        context.insert(
+            "inputs",
+            Value::Object(
+                inputs
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    context
+}
+
+fn resolve_deferred_bool(
+    value: Option<&DeferredBool>,
+    matrix: &IndexMap<String, Value>,
+    inputs: Option<&BTreeMap<String, Value>>,
+    default: bool,
+) -> Result<bool, ParserError> {
+    let Some(value) = value else {
+        return Ok(default);
+    };
+    match value {
+        DeferredBool::Literal(value) => Ok(*value),
+        DeferredBool::Expression(expression) => {
+            let result = eval_expression(expression, &expression_context(matrix, inputs))
+                .map_err(|error| ParserError::InvalidExpression(error.to_string()))?;
+            result.as_bool().ok_or_else(|| {
+                ParserError::InvalidExpression(format!(
+                    "expression returned {result}, expected a boolean"
+                ))
+            })
+        }
+    }
+}
+
+fn resolve_deferred_number(
+    value: Option<&DeferredNumber>,
+    matrix: &IndexMap<String, Value>,
+    inputs: Option<&BTreeMap<String, Value>>,
+) -> Result<Option<u64>, ParserError> {
+    let Some(value) = value else { return Ok(None) };
+    match value {
+        DeferredNumber::Literal(value) => Ok(Some(*value)),
+        DeferredNumber::Expression(expression) => {
+            let result = eval_expression(expression, &expression_context(matrix, inputs))
+                .map_err(|error| ParserError::InvalidExpression(error.to_string()))?;
+            result.as_u64().map(Some).ok_or_else(|| {
+                ParserError::InvalidExpression(format!(
+                    "expression returned {result}, expected a number"
+                ))
+            })
         }
     }
 }
@@ -125,7 +196,7 @@ pub fn expand_jobs(workflow: &Workflow) -> Result<Vec<JobPlan>, ParserError> {
     let mut plans = Vec::new();
     let global_env = workflow.env.clone().into_strings();
     for (job_id, job) in &workflow.jobs {
-        for matrix in expand_matrix(job_id, job.strategy.matrix.as_ref())? {
+        for matrix in expand_matrix(job_id, job.strategy.matrix.as_ref(), None)? {
             let oidc_environment = oidc_environment(job.environment.as_ref(), &matrix);
             let expanded_id = matrix_expand::expanded_job_id(job_id, &matrix);
             let mut env = global_env.clone();
@@ -138,6 +209,7 @@ pub fn expand_jobs(workflow: &Workflow) -> Result<Vec<JobPlan>, ParserError> {
                 env,
                 oidc_environment,
                 workflow.permissions.as_ref(),
+                None,
             )?);
         }
     }
@@ -145,6 +217,7 @@ pub fn expand_jobs(workflow: &Workflow) -> Result<Vec<JobPlan>, ParserError> {
     Ok(plans)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn job_plan_from_job(
     job_id: &str,
     job: &Job,
@@ -153,11 +226,21 @@ fn job_plan_from_job(
     env: BTreeMap<String, String>,
     oidc_environment: Option<String>,
     workflow_permissions: Option<&Value>,
+    inputs: Option<&BTreeMap<String, Value>>,
 ) -> Result<JobPlan, ParserError> {
     let (concurrency_group, concurrency_cancel_in_progress, concurrency_queue) =
         concurrency_fields(job.concurrency.as_ref());
     let continue_on_error =
         resolved_continue_on_error(job_id, job.continue_on_error.as_ref(), &matrix)?;
+    let fail_fast = resolve_deferred_bool(job.strategy.fail_fast.as_ref(), &matrix, inputs, true)?;
+    let max_parallel =
+        resolve_deferred_number(job.strategy.max_parallel.as_ref(), &matrix, inputs)?;
+    let steps = job
+        .steps
+        .iter()
+        .cloned()
+        .map(|step| step_plan(step, &job.defaults, &matrix, inputs))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(JobPlan {
         id: JobId(expanded_id),
         base_id: job_id.to_owned(),
@@ -167,16 +250,11 @@ fn job_plan_from_job(
         needs: job.needs.ids(),
         matrix,
         env,
-        steps: job
-            .steps
-            .iter()
-            .cloned()
-            .map(|s| step_plan(s, &job.defaults))
-            .collect(),
+        steps,
         if_condition: job.if_condition.clone(),
         continue_on_error,
-        fail_fast: job.strategy.fail_fast.unwrap_or(true),
-        max_parallel: job.strategy.max_parallel,
+        fail_fast,
+        max_parallel,
         secrets_inherit: false,
         container: job.container.clone(),
         services: non_empty_services(job.services.clone()),
@@ -302,8 +380,10 @@ pub(crate) fn coerce_value(
 fn expand_jobs_with_reusables_internal(
     workflow: &Workflow,
     reusable_workflows: &BTreeMap<String, String>,
+    reusable_workflow_shas: &BTreeMap<String, String>,
     depth: usize,
     reusable_calls: &mut BTreeMap<String, ReusableCallMetadata>,
+    inputs: Option<&BTreeMap<String, Value>>,
 ) -> Result<Vec<JobPlan>, ParserError> {
     let mut plans = Vec::new();
     let global_env = workflow.env.clone().into_strings();
@@ -416,14 +496,17 @@ fn expand_jobs_with_reusables_internal(
                 .map(|(k, v)| (k.clone(), v.value.clone()))
                 .collect();
 
-            let matrices = expand_matrix(job_id, job.strategy.matrix.as_ref())?;
+            let matrices =
+                expand_matrix(job_id, job.strategy.matrix.as_ref(), Some(&resolved_inputs))?;
             for matrix in matrices {
                 let expanded_job_id = matrix_expand::expanded_job_id(job_id, &matrix);
                 let mut called_plans = expand_jobs_with_reusables_internal(
                     &called,
                     reusable_workflows,
+                    reusable_workflow_shas,
                     depth + 1,
                     reusable_calls,
+                    Some(&resolved_inputs),
                 )?;
 
                 let mut inner_job_ids = Vec::new();
@@ -451,6 +534,12 @@ fn expand_jobs_with_reusables_internal(
                     called_plan.secrets_map.extend(secrets_map.clone());
                     called_plan.workflow_file = Some(path.clone());
                     called_plan.workflow_ref = Some(uses.clone());
+                    called_plan.workflow_sha = reusable_workflow_shas.get(uses).cloned();
+                    called_plan.workflow_repository =
+                        uses.split_once('/').and_then(|(owner, rest)| {
+                            rest.split_once('/')
+                                .map(|(repo, _)| format!("{owner}/{repo}"))
+                        });
                     called_plan.oidc_id_token_granted &= id_token_granted(
                         job.permissions.as_ref().or(workflow.permissions.as_ref()),
                     );
@@ -468,6 +557,11 @@ fn expand_jobs_with_reusables_internal(
                         caller_concurrency: job.concurrency.clone(),
                         embedded_concurrency: called.concurrency.clone(),
                         matrix: matrix.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                        workflow_sha: reusable_workflow_shas.get(uses).cloned(),
+                        workflow_repository: uses.split_once('/').and_then(|(owner, rest)| {
+                            rest.split_once('/')
+                                .map(|(repo, _)| format!("{owner}/{repo}"))
+                        }),
                     },
                 );
 
@@ -476,7 +570,7 @@ fn expand_jobs_with_reusables_internal(
             continue;
         }
 
-        for matrix in expand_matrix(job_id, job.strategy.matrix.as_ref())? {
+        for matrix in expand_matrix(job_id, job.strategy.matrix.as_ref(), inputs)? {
             let oidc_environment = oidc_environment(job.environment.as_ref(), &matrix);
             let expanded_id = matrix_expand::expanded_job_id(job_id, &matrix);
             let mut env = global_env.clone();
@@ -489,6 +583,7 @@ fn expand_jobs_with_reusables_internal(
                 env,
                 oidc_environment,
                 workflow.permissions.as_ref(),
+                inputs,
             )?);
         }
     }
@@ -500,9 +595,24 @@ pub fn expand_jobs_with_reusables(
     workflow: &Workflow,
     reusable_workflows: &BTreeMap<String, String>,
 ) -> Result<ExpandedWorkflows, ParserError> {
+    expand_jobs_with_reusables_and_shas(workflow, reusable_workflows, &BTreeMap::new())
+}
+
+/// Expand jobs and inline reusable workflows with resolved remote metadata.
+pub fn expand_jobs_with_reusables_and_shas(
+    workflow: &Workflow,
+    reusable_workflows: &BTreeMap<String, String>,
+    reusable_workflow_shas: &BTreeMap<String, String>,
+) -> Result<ExpandedWorkflows, ParserError> {
     let mut reusable_calls = BTreeMap::new();
-    let mut plans =
-        expand_jobs_with_reusables_internal(workflow, reusable_workflows, 0, &mut reusable_calls)?;
+    let mut plans = expand_jobs_with_reusables_internal(
+        workflow,
+        reusable_workflows,
+        reusable_workflow_shas,
+        0,
+        &mut reusable_calls,
+        None,
+    )?;
 
     // Post-process: Rewrite needs to replace base job IDs of reusable calls with their expanded inner job IDs.
     let expanded_ids: std::collections::HashSet<String> =
@@ -514,9 +624,10 @@ pub fn expand_jobs_with_reusables(
                 new_needs.push(need.clone());
             } else {
                 let prefix = format!("{}/", need.0);
+                let prefix_matrix = format!("{} (", need.0);
                 let mut matched = false;
                 for id in &expanded_ids {
-                    if id.starts_with(&prefix) {
+                    if id.starts_with(&prefix) || id.starts_with(&prefix_matrix) {
                         new_needs.push(JobId(id.clone()));
                         matched = true;
                     }
@@ -553,7 +664,12 @@ fn normalize_reusable_path(uses: &str) -> String {
         .into_owned()
 }
 
-fn step_plan(step: Step, defaults: &Option<JobDefaults>) -> StepPlan {
+fn step_plan(
+    step: Step,
+    defaults: &Option<JobDefaults>,
+    matrix: &IndexMap<String, Value>,
+    inputs: Option<&BTreeMap<String, Value>>,
+) -> Result<StepPlan, ParserError> {
     // Merge job-level defaults into step — step values take precedence.
     let working_directory = step.working_directory.or_else(|| {
         defaults
@@ -567,7 +683,7 @@ fn step_plan(step: Step, defaults: &Option<JobDefaults>) -> StepPlan {
             .and_then(|d| d.run.as_ref())
             .and_then(|r| r.shell.clone())
     });
-    StepPlan {
+    Ok(StepPlan {
         id: step.id,
         name: step.name,
         run: step.run,
@@ -577,19 +693,57 @@ fn step_plan(step: Step, defaults: &Option<JobDefaults>) -> StepPlan {
         if_condition: step.if_condition,
         working_directory,
         shell,
-        continue_on_error: step.continue_on_error,
-    }
+        continue_on_error: step.continue_on_error.as_ref().map_or(Ok(None), |value| {
+            resolve_deferred_bool(Some(value), matrix, inputs, false).map(Some)
+        })?,
+    })
 }
 
 fn expand_matrix(
     job_id: &str,
-    matrix: Option<&Matrix>,
+    matrix: Option<&MatrixValue>,
+    inputs: Option<&BTreeMap<String, Value>>,
 ) -> Result<Vec<IndexMap<String, Value>>, ParserError> {
     let Some(matrix) = matrix else {
         return Ok(vec![IndexMap::new()]);
     };
 
-    let spec = matrix_expand::matrix_to_spec(job_id, matrix)?;
+    let mut matrix = match matrix {
+        MatrixValue::Static(matrix) => matrix.clone(),
+        MatrixValue::Expression(expression) => {
+            let value = eval_expression(expression, &expression_context(&IndexMap::new(), inputs))
+                .map_err(|error| ParserError::InvalidExpression(error.to_string()))?;
+            if value.is_null() {
+                return Ok(vec![IndexMap::new()]);
+            }
+            serde_json::from_value(value).map_err(|error| {
+                ParserError::InvalidExpression(format!(
+                    "matrix expression did not return a matrix object: {error}"
+                ))
+            })?
+        }
+    };
+    for (field, values) in [
+        ("include", &mut matrix.include),
+        ("exclude", &mut matrix.exclude),
+    ] {
+        if values.len() == 1 {
+            if let Value::String(expression) = &values[0] {
+                let resolved =
+                    eval_expression(expression, &expression_context(&IndexMap::new(), inputs))
+                        .map_err(|error| ParserError::InvalidExpression(error.to_string()))?;
+                if resolved.is_null() {
+                    return Ok(vec![IndexMap::new()]);
+                }
+                *values = resolved.as_array().cloned().ok_or_else(|| {
+                    ParserError::InvalidExpression(format!(
+                        "matrix {field} expression did not return an array"
+                    ))
+                })?;
+            }
+        }
+    }
+    let spec = matrix_expand::matrix_to_spec(job_id, &matrix)?;
     Ok(matrix_expand::expand_matrix_spec(&spec)
         .into_iter()
         .map(|combination| combination.values)

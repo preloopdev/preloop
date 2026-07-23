@@ -704,6 +704,7 @@ async fn cron_loop(
             vars: Default::default(),
             secrets: Default::default(),
             reusable_workflows: Default::default(),
+            reusable_workflow_shas: Default::default(),
             enable_debugger: false,
             debugger_welcome_message: None,
             sha: resolved_sha.clone().unwrap_or_else(|| "0".repeat(40)),
