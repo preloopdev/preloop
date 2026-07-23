@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 
-# ── Log line parsing ────────────────────────────────────────────────
+# Log line parsing 
 
 TIMESTAMP_RE = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z?)")
 GROUP_RE = re.compile(r"##\[group\](.*)")
