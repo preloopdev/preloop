@@ -1,0 +1,47 @@
+name: 106 cache artifact pipeline
+on: workflow_dispatch
+jobs:
+  create:
+    runs-on: [self-hosted, overnight]
+    steps:
+      - name: Create unusual files
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/overnight-cache" "$RUNNER_TEMP/overnight-artifact"
+          mkdir -p "$RUNNER_TEMP/overnight-cache/nested" "$RUNNER_TEMP/overnight-artifact"
+          : > "$RUNNER_TEMP/overnight-cache/empty"
+          printf 'café / 東京\n' > "$RUNNER_TEMP/overnight-cache/nested/unicode.txt"
+          printf '#!/bin/sh\necho executable\n' > "$RUNNER_TEMP/overnight-cache/run.sh"
+          chmod +x "$RUNNER_TEMP/overnight-cache/run.sh"
+          sha256sum "$RUNNER_TEMP/overnight-cache/nested/unicode.txt" > "$RUNNER_TEMP/overnight-artifact/hashes.txt"
+      - name: Restore cache
+        id: restore
+        uses: actions/cache@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          path: ${{ runner.temp }}/overnight-cache
+          key: overnight-cache-v1-${{ runner.os }}-${{ hashFiles('**/106-cache-artifact-pipeline.yml') }}
+          restore-keys: overnight-cache-v1-${{ runner.os }}-
+      - name: Record cache state
+        shell: bash
+        run: "echo 'AKSH_ORACLE: cache_hit=${{ steps.restore.outputs.cache-hit }}'"
+      - name: Upload artifact
+        uses: actions/upload-artifact@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          name: overnight-cache-hashes-${{ github.run_id }}
+          path: ${{ runner.temp }}/overnight-artifact/hashes.txt
+  verify:
+    needs: create
+    runs-on: [self-hosted, overnight]
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          name: overnight-cache-hashes-${{ github.run_id }}
+          path: ${{ runner.temp }}/downloaded
+      - name: Verify artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s "$RUNNER_TEMP/downloaded/hashes.txt"
+          echo 'AKSH_ORACLE: artifact=present'

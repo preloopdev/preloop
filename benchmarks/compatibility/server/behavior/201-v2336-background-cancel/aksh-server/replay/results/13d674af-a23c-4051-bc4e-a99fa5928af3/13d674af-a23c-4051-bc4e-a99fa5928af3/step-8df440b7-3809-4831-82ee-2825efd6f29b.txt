@@ -1,0 +1,7 @@
+﻿2026-07-21T18:27:07.9702437Z ##[group]Run echo "AKSH_ORACLE: about-to-fail"
+2026-07-21T18:27:07.9703192Z [36;1mecho "AKSH_ORACLE: about-to-fail"[0m
+2026-07-21T18:27:07.9703755Z [36;1mexit 1[0m
+2026-07-21T18:27:07.9706842Z shell: /usr/bin/bash -e {0}
+2026-07-21T18:27:07.9707296Z ##[endgroup]
+2026-07-21T18:27:07.9721253Z AKSH_ORACLE: about-to-fail
+2026-07-21T18:27:07.9730582Z ##[error]Process completed with exit code 1.
