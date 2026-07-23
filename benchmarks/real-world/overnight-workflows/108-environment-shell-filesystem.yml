@@ -1,0 +1,43 @@
+name: 108 environment shell filesystem
+on: workflow_dispatch
+env:
+  LEVEL: workflow
+  SPECIAL: 'a $b `c` "d"'
+defaults:
+  run:
+    shell: bash
+jobs:
+  filesystem:
+    runs-on: [self-hosted, overnight]
+    env:
+      LEVEL: job
+    steps:
+      - name: Create paths and command files
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK_DIR="$RUNNER_TEMP/space dir"
+          mkdir -p "$WORK_DIR/sub dir"
+          printf 'hello\n' > "$WORK_DIR/file with spaces.txt"
+          printf '東京\n' > "$WORK_DIR/sub dir/unicode.txt"
+          printf 'PATH_VALUE=%s\n' "$WORK_DIR/sub dir" >> "$GITHUB_ENV"
+          printf 'result<<EOT\nline one\nline two\nEOT\n' >> "$GITHUB_OUTPUT"
+      - name: Verify precedence and paths
+        shell: bash
+        env:
+          LEVEL: step
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/space dir"
+          test "$LEVEL" = step
+          test -f 'file with spaces.txt'
+          test -f 'sub dir/unicode.txt'
+          # shellcheck disable=SC2016
+          test "$SPECIAL" = 'a $b `c` "d"'
+          echo 'AKSH_ORACLE: level=step spaces=true unicode=true special=true'
+      - name: Use explicit sh
+        shell: sh
+        run: |
+          cd "$RUNNER_TEMP/space dir"
+          test -n "$PATH_VALUE"
+          printf 'AKSH_ORACLE: sh=ok\n'

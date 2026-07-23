@@ -1,0 +1,7 @@
+﻿2026-07-21T18:24:23.2095267Z ##[group]Run echo "AKSH_ORACLE: after-soft-fail=ran"
+2026-07-21T18:24:23.2095859Z [36;1mecho "AKSH_ORACLE: after-soft-fail=ran"[0m
+2026-07-21T18:24:23.2098293Z shell: /usr/bin/bash -e {0}
+2026-07-21T18:24:23.2098677Z env:
+2026-07-21T18:24:23.2099001Z   V2336_COMBINED: combined-ok
+2026-07-21T18:24:23.2099445Z ##[endgroup]
+2026-07-21T18:24:23.2113077Z AKSH_ORACLE: after-soft-fail=ran
