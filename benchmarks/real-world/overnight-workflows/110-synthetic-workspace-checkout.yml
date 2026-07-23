@@ -1,0 +1,31 @@
+name: 110 synthetic workspace checkout
+on: workflow_dispatch
+jobs:
+  verify:
+    runs-on: [self-hosted, overnight]
+    steps:
+      - name: Primary checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 1
+      - name: Inspect primary snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d .git
+          git rev-parse --verify HEAD
+          printf 'AKSH_ORACLE: primary_git=true head=%s\n' "$(git rev-parse HEAD)"
+          test -f .gitignore
+      - name: Explicit secondary checkout must remain explicit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: actions/checkout
+          ref: 34e114876b0b11c390a56381ad16ebd13914f8d5
+          path: explicit-secondary
+      - name: Verify secondary checkout boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d explicit-secondary/.git
+          test -f explicit-secondary/action.yml
+          echo 'AKSH_ORACLE: secondary_explicit=true'

@@ -1,0 +1,68 @@
+name: 109 dag matrix scheduler
+on: workflow_dispatch
+jobs:
+  root:
+    runs-on: [self-hosted, overnight]
+    outputs:
+      token: ${{ steps.root.outputs.token }}
+    steps:
+      - id: root
+        run: echo 'token=ready' >> "$GITHUB_OUTPUT"
+  build:
+    needs: root
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - name: linux-a
+            expected: success
+          - name: linux-b
+            expected: success
+          - name: tolerated
+            expected: failure
+    runs-on: [self-hosted, overnight]
+    continue-on-error: ${{ matrix.expected == 'failure' }}
+    outputs:
+      cell: ${{ steps.cell.outputs.cell }}
+    steps:
+      - id: cell
+        name: Build matrix cell
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "cell=${{ matrix.name }}" >> "$GITHUB_OUTPUT"
+          if test '${{ matrix.expected }}' = failure; then
+            echo 'AKSH_ORACLE: expected-cell-failure=${{ matrix.name }}'
+            exit 4
+          fi
+          echo 'AKSH_ORACLE: cell=${{ matrix.name }} success'
+  test:
+    if: always()
+    needs: [root, build]
+    runs-on: [self-hosted, overnight]
+    steps:
+      - name: Observe matrix aggregate
+        shell: bash
+        env:
+          ROOT: ${{ needs.root.result }}
+          BUILD: ${{ needs.build.result }}
+        run: |
+          set -euo pipefail
+          test "$ROOT" = success
+          test "$BUILD" = success
+          echo "AKSH_ORACLE: root=$ROOT build=$BUILD"
+  package:
+    needs: test
+    runs-on: [self-hosted, overnight]
+    steps:
+      - run: "echo 'AKSH_ORACLE: package=ran'"
+  final:
+    if: always()
+    needs: [root, build, test, package]
+    runs-on: [self-hosted, overnight]
+    steps:
+      - run: >-
+          echo "AKSH_ORACLE: final root=${{ needs.root.result }}
+          build=${{ needs.build.result }} test=${{ needs.test.result }}
+          package=${{ needs.package.result }}"

@@ -1,0 +1,15 @@
+﻿2026-07-21T18:24:22.6426183Z Current runner version: '2.335.1'
+2026-07-21T18:24:22.6428689Z Runner name: 'cmp-aksh-1-57379'
+2026-07-21T18:24:22.6429097Z Runner group name: 'Default'
+2026-07-21T18:24:22.6429601Z Machine name: 'container'
+2026-07-21T18:24:22.6430771Z ##[group]GITHUB_TOKEN Permissions
+2026-07-21T18:24:22.6431747Z Contents: read
+2026-07-21T18:24:22.6432067Z Metadata: read
+2026-07-21T18:24:22.6432361Z Packages: read
+2026-07-21T18:24:22.6432618Z ##[endgroup]
+2026-07-21T18:24:22.6433462Z Secret source: Actions
+2026-07-21T18:24:22.6433943Z Runner is running behind proxy server 'http://127.0.0.1:18081' for all HTTP requests.
+2026-07-21T18:24:22.6434539Z Runner is running behind proxy server 'http://127.0.0.1:18081' for all HTTPS requests.
+2026-07-21T18:24:22.6434953Z Prepare workflow directory
+2026-07-21T18:24:22.6577647Z Prepare all required actions
+2026-07-21T18:24:22.6597274Z Complete job name: combined

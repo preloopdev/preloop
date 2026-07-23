@@ -1,0 +1,8 @@
+﻿2026-07-21T18:29:26.6084951Z ##[group]Run echo "/tmp/v2336-fc-test-path" >> "$GITHUB_PATH"
+2026-07-21T18:29:26.6085671Z [36;1mecho "/tmp/v2336-fc-test-path" >> "$GITHUB_PATH"[0m
+2026-07-21T18:29:26.6088509Z shell: /usr/bin/bash -e {0}
+2026-07-21T18:29:26.6088911Z env:
+2026-07-21T18:29:26.6089231Z   FC_TEST: from-github-env
+2026-07-21T18:29:26.6089646Z   MULTILINE: line one
+line two
+2026-07-21T18:29:26.6090071Z ##[endgroup]

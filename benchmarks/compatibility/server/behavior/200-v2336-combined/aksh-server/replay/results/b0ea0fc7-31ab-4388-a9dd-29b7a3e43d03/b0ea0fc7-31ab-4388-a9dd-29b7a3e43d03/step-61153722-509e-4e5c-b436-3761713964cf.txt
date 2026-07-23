@@ -1,0 +1,8 @@
+﻿2026-07-21T18:24:23.2183928Z ##[group]Run echo "$PATH" | grep -q "v2336-test-bin"
+2026-07-21T18:24:23.2184508Z [36;1mecho "$PATH" | grep -q "v2336-test-bin"[0m
+2026-07-21T18:24:23.2185028Z [36;1mecho "AKSH_ORACLE: path-addition=ok"[0m
+2026-07-21T18:24:23.2189096Z shell: /usr/bin/bash -e {0}
+2026-07-21T18:24:23.2189469Z env:
+2026-07-21T18:24:23.2214366Z   V2336_COMBINED: combined-ok
+2026-07-21T18:24:23.2214781Z ##[endgroup]
+2026-07-21T18:24:23.2232502Z AKSH_ORACLE: path-addition=ok

@@ -1,0 +1,36 @@
+﻿2026-07-21T17:26:24.5997056Z Current runner version: '2.335.1'
+2026-07-21T17:26:24.6000113Z Runner name: 'v2336-test'
+2026-07-21T17:26:24.6000575Z Runner group name: 'Default'
+2026-07-21T17:26:24.6001116Z Machine name: 'container'
+2026-07-21T17:26:24.6002459Z ##[group]GITHUB_TOKEN Permissions
+2026-07-21T17:26:24.6003994Z Contents: read
+2026-07-21T17:26:24.6004301Z Metadata: read
+2026-07-21T17:26:24.6004571Z Packages: read
+2026-07-21T17:26:24.6004862Z ##[endgroup]
+2026-07-21T17:26:24.6006095Z Secret source: Actions
+2026-07-21T17:26:24.6006522Z Prepare workflow directory
+2026-07-21T17:26:24.6180918Z Prepare all required actions
+2026-07-21T17:26:24.6199315Z Complete job name: bg-cancel
+2026-07-21T17:26:25.1189760Z ##[group]Run echo "normal-step-ok"
+2026-07-21T17:26:25.1190422Z [36;1mecho "normal-step-ok"[0m
+2026-07-21T17:26:25.1199266Z shell: /usr/bin/bash -e {0}
+2026-07-21T17:26:25.1199845Z ##[endgroup]
+2026-07-21T17:26:25.1276836Z normal-step-ok
+2026-07-21T17:26:25.1327888Z ##[group]Run echo "this-step-will-fail-but-job-continues"
+2026-07-21T17:26:25.1328775Z [36;1mecho "this-step-will-fail-but-job-continues"[0m
+2026-07-21T17:26:25.1329394Z [36;1mexit 1[0m
+2026-07-21T17:26:25.1332970Z shell: /usr/bin/bash -e {0}
+2026-07-21T17:26:25.1333436Z ##[endgroup]
+2026-07-21T17:26:25.1350058Z this-step-will-fail-but-job-continues
+2026-07-21T17:26:25.1355324Z ##[error]Process completed with exit code 1.
+2026-07-21T17:26:25.1390397Z ##[group]Run echo "job-still-running"
+2026-07-21T17:26:25.1390941Z [36;1mecho "job-still-running"[0m
+2026-07-21T17:26:25.1394237Z shell: /usr/bin/bash -e {0}
+2026-07-21T17:26:25.1394678Z ##[endgroup]
+2026-07-21T17:26:25.1410910Z job-still-running
+2026-07-21T17:26:25.1437490Z ##[group]Run echo "JOB_CONCLUSION_SHOULD_BE_SUCCESS"
+2026-07-21T17:26:25.1438138Z [36;1mecho "JOB_CONCLUSION_SHOULD_BE_SUCCESS"[0m
+2026-07-21T17:26:25.1441185Z shell: /usr/bin/bash -e {0}
+2026-07-21T17:26:25.1441602Z ##[endgroup]
+2026-07-21T17:26:25.1470671Z JOB_CONCLUSION_SHOULD_BE_SUCCESS
+2026-07-21T17:26:25.1523732Z Cleaning up orphan processes

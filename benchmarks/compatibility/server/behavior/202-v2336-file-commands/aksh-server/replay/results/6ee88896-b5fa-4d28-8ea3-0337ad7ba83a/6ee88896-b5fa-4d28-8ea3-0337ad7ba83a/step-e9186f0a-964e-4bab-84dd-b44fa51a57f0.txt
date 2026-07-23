@@ -1,0 +1,10 @@
+﻿2026-07-21T18:29:26.6128593Z ##[group]Run echo "$PATH" | grep -q "v2336-fc-test-path"
+2026-07-21T18:29:26.6129318Z [36;1mecho "$PATH" | grep -q "v2336-fc-test-path"[0m
+2026-07-21T18:29:26.6129921Z [36;1mecho "AKSH_ORACLE: path-addition=ok"[0m
+2026-07-21T18:29:26.6134528Z shell: /usr/bin/bash -e {0}
+2026-07-21T18:29:26.6134921Z env:
+2026-07-21T18:29:26.6135226Z   FC_TEST: from-github-env
+2026-07-21T18:29:26.6135623Z   MULTILINE: line one
+line two
+2026-07-21T18:29:26.6136026Z ##[endgroup]
+2026-07-21T18:29:26.6155946Z AKSH_ORACLE: path-addition=ok
