@@ -1,0 +1,67 @@
+name: 101 dynamic matrix dataflow
+on:
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: deterministic seed
+        required: false
+        default: overnight
+        type: string
+jobs:
+  produce:
+    runs-on: [self-hosted, overnight]
+    outputs:
+      matrix: ${{ steps.data.outputs.matrix }}
+      multiline: ${{ steps.data.outputs.multiline }}
+    steps:
+      - id: data
+        name: Produce encoded outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          matrix='{"include":[{"name":"plain","value":"0"},{"name":"false-string","value":"false"},{"name":"unicode","value":"café / 東京"},{"name":"spaces","value":"a b c"}]}'
+          printf 'matrix<<MATRIX\n%s\nMATRIX\n' "$matrix" >> "$GITHUB_OUTPUT"
+          {
+            echo 'multiline<<TEXT'
+            echo 'line one'
+            echo 'line two ::warning:: not a command'
+            echo 'TEXT'
+          } >> "$GITHUB_OUTPUT"
+          printf 'AKSH_ORACLE: produce seed=%s matrix_sha=%s\n' '${{ inputs.seed }}' "$(printf '%s' "$matrix" | sha256sum | cut -d' ' -f1)"
+  matrix:
+    needs: produce
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.produce.outputs.matrix) }}
+    runs-on: [self-hosted, overnight]
+    outputs:
+      observed: ${{ steps.observe.outputs.observed }}
+    steps:
+      - id: observe
+        name: Observe matrix context
+        shell: bash
+        env:
+          MATRIX_NAME: ${{ matrix.name }}
+          MATRIX_VALUE: ${{ matrix.value }}
+          TEXT: ${{ needs.produce.outputs.multiline }}
+        run: |
+          set -euo pipefail
+          test -n "$MATRIX_NAME"
+          printf 'observed=%s=%s\n' "$MATRIX_NAME" "$MATRIX_VALUE" >> "$GITHUB_OUTPUT"
+          printf 'AKSH_ORACLE: matrix name=%s value=%s text_sha=%s\n' "$MATRIX_NAME" "$MATRIX_VALUE" "$(printf '%s' "$TEXT" | sha256sum | cut -d' ' -f1)"
+  aggregate:
+    if: always()
+    needs: [produce, matrix]
+    runs-on: [self-hosted, overnight]
+    steps:
+      - name: Verify dependency results
+        shell: bash
+        env:
+          PRODUCE: ${{ needs.produce.result }}
+          MATRIX: ${{ needs.matrix.result }}
+        run: |
+          set -euo pipefail
+          test "$PRODUCE" = success
+          test "$MATRIX" = success
+          echo "AKSH_ORACLE: aggregate produce=$PRODUCE matrix=$MATRIX"

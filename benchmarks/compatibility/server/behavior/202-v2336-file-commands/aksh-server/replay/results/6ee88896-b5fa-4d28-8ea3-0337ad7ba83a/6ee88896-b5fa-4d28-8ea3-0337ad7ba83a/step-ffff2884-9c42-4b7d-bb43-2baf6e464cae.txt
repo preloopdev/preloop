@@ -1,0 +1,10 @@
+﻿2026-07-21T18:29:26.6228554Z ##[group]Run echo "### File Commands Test" >> "$GITHUB_STEP_SUMMARY"
+2026-07-21T18:29:26.6229308Z [36;1mecho "### File Commands Test" >> "$GITHUB_STEP_SUMMARY"[0m
+2026-07-21T18:29:26.6229908Z [36;1mecho "AKSH_ORACLE: summary=written"[0m
+2026-07-21T18:29:26.6232635Z shell: /usr/bin/bash -e {0}
+2026-07-21T18:29:26.6233022Z env:
+2026-07-21T18:29:26.6233320Z   FC_TEST: from-github-env
+2026-07-21T18:29:26.6233704Z   MULTILINE: line one
+line two
+2026-07-21T18:29:26.6234101Z ##[endgroup]
+2026-07-21T18:29:26.6249861Z AKSH_ORACLE: summary=written

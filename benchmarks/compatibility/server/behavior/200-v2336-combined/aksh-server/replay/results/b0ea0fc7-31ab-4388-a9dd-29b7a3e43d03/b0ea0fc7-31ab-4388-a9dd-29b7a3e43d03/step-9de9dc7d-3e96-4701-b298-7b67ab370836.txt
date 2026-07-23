@@ -1,0 +1,6 @@
+﻿2026-07-21T18:24:23.2143757Z ##[group]Run echo "/tmp/v2336-test-bin" >> "$GITHUB_PATH"
+2026-07-21T18:24:23.2144383Z [36;1mecho "/tmp/v2336-test-bin" >> "$GITHUB_PATH"[0m
+2026-07-21T18:24:23.2147023Z shell: /usr/bin/bash -e {0}
+2026-07-21T18:24:23.2147398Z env:
+2026-07-21T18:24:23.2147698Z   V2336_COMBINED: combined-ok
+2026-07-21T18:24:23.2148076Z ##[endgroup]

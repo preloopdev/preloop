@@ -1,0 +1,5 @@
+﻿2026-07-21T18:27:07.9824167Z ##[group]Run echo "AKSH_ORACLE: job-conclusion=success"
+2026-07-21T18:27:07.9824916Z [36;1mecho "AKSH_ORACLE: job-conclusion=success"[0m
+2026-07-21T18:27:07.9828032Z shell: /usr/bin/bash -e {0}
+2026-07-21T18:27:07.9828459Z ##[endgroup]
+2026-07-21T18:27:07.9843089Z AKSH_ORACLE: job-conclusion=success

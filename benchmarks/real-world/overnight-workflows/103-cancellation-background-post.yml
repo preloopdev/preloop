@@ -1,0 +1,39 @@
+name: 103 cancellation background post
+on:
+  workflow_dispatch:
+    inputs:
+      slot:
+        required: false
+        default: default
+        type: string
+concurrency:
+  group: overnight-cancel-${{ inputs.slot }}
+  cancel-in-progress: true
+jobs:
+  cancellable:
+    runs-on: [self-hosted, overnight]
+    steps:
+      - name: Start background worker
+        shell: bash
+        run: |
+          set -euo pipefail
+          trap 'echo "AKSH_ORACLE: trap=TERM"' TERM
+          trap 'echo "AKSH_ORACLE: trap=EXIT"' EXIT
+          (trap '' TERM; while :; do sleep 1; done) &
+          echo $! > "$RUNNER_TEMP/background.pid"
+          echo ready > "$RUNNER_TEMP/ready"
+          echo 'AKSH_ORACLE: background=started'
+      - name: Long foreground step
+        shell: bash
+        run: |
+          echo 'AKSH_ORACLE: foreground=started'
+          sleep 300
+      - name: Cancel-only step
+        if: cancelled()
+        run: "echo 'AKSH_ORACLE: cancelled-step=ran'"
+      - name: Always cleanup
+        if: always()
+        shell: bash
+        run: |
+          if test -f "$RUNNER_TEMP/background.pid"; then kill "$(cat "$RUNNER_TEMP/background.pid")" 2>/dev/null || true; fi
+          echo 'AKSH_ORACLE: cleanup=ran'
