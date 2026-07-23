@@ -102,6 +102,23 @@ jobs:
 }
 
 #[test]
+fn parses_and_expands_opencode_test_workflow_fixture() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let fixture_path = root
+        .join("fixtures")
+        .join("workflows")
+        .join("opencode-test.yml");
+    let yaml = std::fs::read_to_string(&fixture_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", fixture_path.display()));
+    let parsed = parse_workflow(&yaml).expect("parse_workflow failed for opencode-test.yml");
+    let expanded = expand_jobs(&parsed).expect("expand_jobs failed for opencode-test.yml");
+    assert_eq!(expanded.len(), 4);
+}
+#[test]
 fn schedule_trigger_matches_event_name() {
     let workflow = parse_workflow(
         r#"
@@ -788,6 +805,140 @@ fn preserves_job_output_expressions() {
         Some("${{ steps.gen.outputs.value }}")
     );
 }
+
+#[test]
+fn job_outputs_reject_unknown_function_expression() {
+    let result = parse_workflow(
+        r#"on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      value: ${{ notARealFunction() }}
+    steps:
+      - run: echo ok
+"#,
+    );
+
+    match result {
+        Err(ParserError::InvalidExpression(message)) => {
+            assert!(
+                message.contains("output `value`"),
+                "output field context missing from error: {message}"
+            );
+        }
+        other => panic!("expected invalid output expression, got {other:?}"),
+    }
+}
+
+#[test]
+fn job_outputs_accept_steps_context_expression() {
+    let workflow = parse_workflow(
+        r#"on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      value: ${{ steps.build.outputs.value }}
+    steps:
+      - id: build
+        run: echo ok
+"#,
+    )
+    .expect("steps context is allowed in job outputs");
+
+    assert_eq!(
+        workflow.jobs["build"].outputs["value"]
+            .as_str()
+            .expect("job output expression should remain a string"),
+        "${{ steps.build.outputs.value }}"
+    );
+}
+
+#[test]
+fn job_container_rejects_secrets_context_expression() {
+    let result = parse_workflow(
+        r#"on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: ${{ secrets.IMAGE }}
+    steps:
+      - run: echo ok
+"#,
+    );
+
+    match result {
+        Err(ParserError::InvalidExpression(message)) => {
+            assert!(
+                message.contains("container"),
+                "container field context missing from error: {message}"
+            );
+            assert!(
+                message.contains("secrets"),
+                "forbidden context missing from error: {message}"
+            );
+        }
+        other => panic!("expected invalid container expression, got {other:?}"),
+    }
+}
+
+#[test]
+fn job_defaults_run_working_directory_rejects_secrets_and_accepts_matrix() {
+    let invalid = parse_workflow(
+        r#"on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ secrets.WORKING_DIR }}
+    steps:
+      - run: echo ok
+"#,
+    );
+
+    match invalid {
+        Err(ParserError::InvalidExpression(message)) => {
+            assert!(
+                message.contains("working-directory"),
+                "working-directory field context missing from error: {message}"
+            );
+            assert!(
+                message.contains("secrets"),
+                "forbidden context missing from error: {message}"
+            );
+        }
+        other => panic!("expected invalid defaults expression, got {other:?}"),
+    }
+
+    let workflow = parse_workflow(
+        r#"on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        directory: [workspace]
+    defaults:
+      run:
+        working-directory: ${{ matrix.directory }}
+    steps:
+      - run: echo ok
+"#,
+    )
+    .expect("matrix context is allowed in job defaults.run.working-directory");
+
+    assert_eq!(
+        workflow.jobs["build"]
+            .defaults
+            .as_ref()
+            .and_then(|defaults| defaults.run.as_ref())
+            .and_then(|run| run.working_directory.as_deref()),
+        Some("${{ matrix.directory }}")
+    );
+}
+
 #[test]
 fn concurrency_bare_string_shorthand() {
     let wf = parse_workflow(
@@ -899,4 +1050,185 @@ jobs:
         plans[0].concurrency_cancel_in_progress.as_deref(),
         Some("false")
     );
+}
+
+#[test]
+fn reusable_workflow_expression_matrix_uses_caller_inputs() {
+    let caller = parse_workflow(
+        r#"
+on: push
+jobs:
+  test:
+    uses: ./.github/workflows/test.yml
+    with:
+      test-matrix: '{"os":["ubuntu-latest","windows-latest"]}'
+    secrets: inherit
+"#,
+    )
+    .unwrap();
+    let called = r#"
+on:
+  workflow_call:
+    inputs:
+      test-matrix:
+        required: true
+        type: string
+jobs:
+  test:
+    strategy:
+      matrix: ${{ fromJSON(inputs.test-matrix) }}
+      fail-fast: ${{ matrix.os == 'ubuntu-latest' }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - run: echo ${{ matrix.os }}
+"#;
+    let mut reusable = std::collections::BTreeMap::new();
+    reusable.insert(".github/workflows/test.yml".to_owned(), called.to_owned());
+
+    let expanded = expand_jobs_with_reusables(&caller, &reusable).unwrap();
+    assert_eq!(expanded.jobs.len(), 2);
+    assert!(expanded
+        .jobs
+        .iter()
+        .all(|job| job.matrix.get("os").is_some()));
+}
+
+#[test]
+fn strategy_expression_scalars_are_preserved_and_resolved() {
+    let workflow = parse_workflow(
+        r#"
+on: push
+jobs:
+  build:
+    strategy:
+      fail-fast: ${{ matrix.experimental }}
+      max-parallel: ${{ matrix.parallelism }}
+      matrix:
+        include:
+          - experimental: true
+            parallelism: 3
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+"#,
+    )
+    .unwrap();
+    let plans = expand_jobs(&workflow).unwrap();
+    assert_eq!(plans.len(), 1);
+    assert!(plans[0].fail_fast);
+    assert_eq!(plans[0].max_parallel, Some(3));
+}
+
+#[test]
+fn reusable_workflow_sha_propagates_to_plans_and_call_metadata() {
+    let caller = parse_workflow(
+        r#"
+on: push
+jobs:
+  call:
+    uses: octo/demo/.github/workflows/build.yml@v1
+"#,
+    )
+    .unwrap();
+    let called = r#"
+on:
+  workflow_call:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+"#;
+    let mut reusable = BTreeMap::new();
+    reusable.insert(
+        "octo/demo/.github/workflows/build.yml@v1".to_owned(),
+        called.to_owned(),
+    );
+    let mut shas = BTreeMap::new();
+    shas.insert(
+        "octo/demo/.github/workflows/build.yml@v1".to_owned(),
+        "0123456789abcdef".to_owned(),
+    );
+
+    let expanded = expand_jobs_with_reusables_and_shas(&caller, &reusable, &shas).unwrap();
+    assert_eq!(
+        expanded.jobs[0].workflow_sha.as_deref(),
+        Some("0123456789abcdef")
+    );
+    assert_eq!(
+        expanded.jobs[0].workflow_repository.as_deref(),
+        Some("octo/demo")
+    );
+    assert_eq!(
+        expanded.reusable_calls["call"].workflow_sha.as_deref(),
+        Some("0123456789abcdef")
+    );
+}
+
+#[test]
+fn matrix_expanded_reusable_workflow_needs_resolution() {
+    let caller = parse_workflow(
+        r#"
+on: push
+jobs:
+  build:
+    uses: octo/demo/.github/workflows/build.yml@v1
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+  package:
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+"#,
+    )
+    .unwrap();
+    let called = r#"
+on:
+  workflow_call:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo test
+"#;
+    let mut reusable = BTreeMap::new();
+    reusable.insert(
+        "octo/demo/.github/workflows/build.yml@v1".to_owned(),
+        called.to_owned(),
+    );
+    let shas = BTreeMap::new();
+
+    let expanded = expand_jobs_with_reusables_and_shas(&caller, &reusable, &shas).unwrap();
+    // We expect package to depend on both matrix instances of the reusable workflow call
+    let package_job = expanded
+        .jobs
+        .iter()
+        .find(|j| j.base_id == "package")
+        .unwrap();
+    assert_eq!(package_job.needs.len(), 2);
+    let needs_ids: Vec<String> = package_job.needs.iter().map(|n| n.0.clone()).collect();
+    assert!(needs_ids.contains(&"build (ubuntu-latest)/test".to_owned()));
+    assert!(needs_ids.contains(&"build (windows-latest)/test".to_owned()));
+}
+
+#[test]
+fn parses_step_with_boolean_input() {
+    let yaml = r#"
+on: push
+jobs:
+  test:
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        if: true
+        with:
+          persist-credentials: false
+          fetch-depth: 25
+"#;
+    let parsed = parse_workflow(yaml).unwrap();
+    let expanded = expand_jobs(&parsed).unwrap();
+    assert_eq!(expanded.len(), 1);
 }

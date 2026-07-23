@@ -363,6 +363,7 @@ impl ProdState {
                 inputs: BTreeMap::new(),
                 secrets: BTreeMap::new(),
                 reusable_workflows: BTreeMap::new(),
+                reusable_workflow_shas: BTreeMap::new(),
                 enable_debugger: false,
                 debugger_welcome_message: None,
                 ..Default::default()

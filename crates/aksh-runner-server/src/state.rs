@@ -130,6 +130,8 @@ pub struct AppState {
 pub(crate) struct OidcJobContext {
     pub(crate) environment: Option<String>,
     pub(crate) job_workflow_ref: Option<String>,
+    /// Immutable commit SHA of the called reusable workflow, when resolved.
+    pub(crate) job_workflow_sha: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
