@@ -1,0 +1,38 @@
+﻿2026-07-21T18:27:07.4233091Z Current runner version: '2.335.1'
+2026-07-21T18:27:07.4235872Z Runner name: 'cmp-aksh-1-63409'
+2026-07-21T18:27:07.4236266Z Runner group name: 'Default'
+2026-07-21T18:27:07.4236815Z Machine name: 'container'
+2026-07-21T18:27:07.4238009Z ##[group]GITHUB_TOKEN Permissions
+2026-07-21T18:27:07.4239136Z Contents: read
+2026-07-21T18:27:07.4239431Z Metadata: read
+2026-07-21T18:27:07.4239706Z Packages: read
+2026-07-21T18:27:07.4239990Z ##[endgroup]
+2026-07-21T18:27:07.4240916Z Secret source: Actions
+2026-07-21T18:27:07.4241420Z Runner is running behind proxy server 'http://127.0.0.1:18081' for all HTTP requests.
+2026-07-21T18:27:07.4242004Z Runner is running behind proxy server 'http://127.0.0.1:18081' for all HTTPS requests.
+2026-07-21T18:27:07.4242528Z Prepare workflow directory
+2026-07-21T18:27:07.4398775Z Prepare all required actions
+2026-07-21T18:27:07.4418329Z Complete job name: bg-cancel
+2026-07-21T18:27:07.9565376Z ##[group]Run echo "AKSH_ORACLE: normal-step=ok"
+2026-07-21T18:27:07.9566144Z [36;1mecho "AKSH_ORACLE: normal-step=ok"[0m
+2026-07-21T18:27:07.9576861Z shell: /usr/bin/bash -e {0}
+2026-07-21T18:27:07.9577526Z ##[endgroup]
+2026-07-21T18:27:07.9652711Z AKSH_ORACLE: normal-step=ok
+2026-07-21T18:27:07.9702458Z ##[group]Run echo "AKSH_ORACLE: about-to-fail"
+2026-07-21T18:27:07.9703196Z [36;1mecho "AKSH_ORACLE: about-to-fail"[0m
+2026-07-21T18:27:07.9703758Z [36;1mexit 1[0m
+2026-07-21T18:27:07.9706846Z shell: /usr/bin/bash -e {0}
+2026-07-21T18:27:07.9707298Z ##[endgroup]
+2026-07-21T18:27:07.9721276Z AKSH_ORACLE: about-to-fail
+2026-07-21T18:27:07.9730608Z ##[error]Process completed with exit code 1.
+2026-07-21T18:27:07.9764812Z ##[group]Run echo "AKSH_ORACLE: after-cancel=ran"
+2026-07-21T18:27:07.9765469Z [36;1mecho "AKSH_ORACLE: after-cancel=ran"[0m
+2026-07-21T18:27:07.9768366Z shell: /usr/bin/bash -e {0}
+2026-07-21T18:27:07.9768820Z ##[endgroup]
+2026-07-21T18:27:07.9782540Z AKSH_ORACLE: after-cancel=ran
+2026-07-21T18:27:07.9824184Z ##[group]Run echo "AKSH_ORACLE: job-conclusion=success"
+2026-07-21T18:27:07.9824919Z [36;1mecho "AKSH_ORACLE: job-conclusion=success"[0m
+2026-07-21T18:27:07.9828037Z shell: /usr/bin/bash -e {0}
+2026-07-21T18:27:07.9828461Z ##[endgroup]
+2026-07-21T18:27:07.9843171Z AKSH_ORACLE: job-conclusion=success
+2026-07-21T18:27:07.9890596Z Cleaning up orphan processes

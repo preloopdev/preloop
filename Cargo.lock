@@ -30,7 +30,7 @@ dependencies = [
 
 [[package]]
 name = "aksh-artifacts"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aksh-gha-protocol",
  "proptest",
@@ -42,7 +42,7 @@ dependencies = [
 
 [[package]]
 name = "aksh-cache"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proptest",
  "sha2",
@@ -53,7 +53,7 @@ dependencies = [
 
 [[package]]
 name = "aksh-conformance"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aksh-gha-parser",
  "aksh-gha-protocol",
@@ -73,7 +73,7 @@ dependencies = [
 
 [[package]]
 name = "aksh-dap"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aksh-gha-expressions",
  "aksh-gha-protocol",
@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "aksh-gha-expressions"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "glob",
  "indexmap",
@@ -113,7 +113,7 @@ dependencies = [
 
 [[package]]
 name = "aksh-gha-parser"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aksh-gha-expressions",
  "aksh-gha-protocol",
@@ -128,7 +128,7 @@ dependencies = [
 
 [[package]]
 name = "aksh-gha-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes",
  "anyhow",
@@ -149,7 +149,7 @@ dependencies = [
 
 [[package]]
 name = "aksh-runner"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aksh-dap",
  "aksh-gha-expressions",
@@ -188,7 +188,7 @@ dependencies = [
 
 [[package]]
 name = "aksh-runner-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aksh-gha-protocol",
  "anyhow",
@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "aksh-runner-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aksh-artifacts",
  "aksh-cache",
@@ -2072,7 +2072,7 @@ dependencies = [
 
 [[package]]
 name = "runner-watch"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aksh-gha-protocol",
  "anyhow",
