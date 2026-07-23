@@ -12,7 +12,7 @@ mod lexer;
 pub use conditions::{contains_status_check_function, effective_condition, is_truthy};
 pub use context::Context;
 
-use evaluator::{eval, validate_function_calls};
+use evaluator::{collect_contexts_from_expr, eval, validate_function_calls};
 use expr_parser::Parser;
 use lexer::Lexer;
 
@@ -28,6 +28,12 @@ pub enum ExpressionError {
     /// Unknown function.
     #[error("unknown function `{0}`")]
     UnknownFunction(String),
+    /// `case()` must have predicate/result pairs followed by a default.
+    #[error("case() requires an odd number of arguments (at least 3)")]
+    EvenCaseParameters,
+    /// `case()` predicates must evaluate to booleans.
+    #[error("case() predicate must evaluate to a boolean value")]
+    NonBooleanCasePredicate,
     /// Invalid `format()` template or argument reference.
     #[error("invalid format string: {0}")]
     InvalidFormat(String),
@@ -44,6 +50,18 @@ pub fn validate_expression(input: &str) -> Result<(), ExpressionError> {
     let expr = parser.parse_expr()?;
     parser.expect_end()?;
     validate_function_calls(&expr)
+}
+
+/// Collect top-level context names (e.g. "github", "matrix") from an expression string.
+pub fn collect_contexts(input: &str) -> Result<std::collections::HashSet<String>, ExpressionError> {
+    let trimmed = trim_expression_markers(input);
+    let tokens = Lexer::new(trimmed).lex()?;
+    let mut parser = Parser::new(tokens);
+    let expr = parser.parse_expr()?;
+    parser.expect_end()?;
+    let mut contexts = std::collections::HashSet::new();
+    collect_contexts_from_expr(&expr, &mut contexts);
+    Ok(contexts)
 }
 
 /// Parse and evaluate a GitHub Actions expression.
