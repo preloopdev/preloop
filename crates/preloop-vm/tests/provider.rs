@@ -45,6 +45,9 @@ set -eu
 
 args="$0.args"
 : > "$args"
+printf 'SMOLVM_EGRESS_FLOOR=%s\n' "${SMOLVM_EGRESS_FLOOR-}" > "$0.env"
+env_file="$0.env"
+printf 'SMOLVM_EGRESS_FLOOR=%s\n' "${SMOLVM_EGRESS_FLOOR-}" > "$env_file"
 for arg in "$@"; do
   printf '%s\n' "$arg" >> "$args"
 done
@@ -97,6 +100,13 @@ esac
             .lines()
             .map(str::to_owned)
             .collect()
+    }
+
+    fn captured_env(executable: &Path) -> String {
+        fs::read_to_string(executable.with_extension("env"))
+            .unwrap_or_default()
+            .trim()
+            .to_owned()
     }
 
     fn valid_spec(name: MachineName) -> MachineSpec {
@@ -350,5 +360,14 @@ esac
                 hostile,
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn provider_sets_smolvm_egress_floor_strict_environment_variable() {
+        let (_directory, executable) = fake_smolvm();
+        let provider = SmolVmProvider::new(executable.clone());
+        let spec = valid_spec(MachineName::new("test-floor").unwrap());
+        provider.create(&spec).await.unwrap();
+        assert_eq!(captured_env(&executable), "SMOLVM_EGRESS_FLOOR=strict");
     }
 }
