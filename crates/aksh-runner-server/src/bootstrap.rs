@@ -5,6 +5,8 @@ use super::*;
 pub struct ServerConfig {
     /// Address to bind.
     pub listen: SocketAddr,
+    /// Optional Unix domain socket path to bind.
+    pub unix_socket: Option<PathBuf>,
     /// State directory for cache/artifacts and future durable state.
     pub state_dir: PathBuf,
     /// Optional file path to write recorded flows to (NDJSON format).
@@ -260,6 +262,50 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
 
     match config.tls {
         TlsMode::None => {
+            #[cfg(unix)]
+            if let Some(unix_path) = &config.unix_socket {
+                use std::os::unix::fs::PermissionsExt;
+
+                if let Some(parent) = unix_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                match std::fs::remove_file(unix_path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+                let unix_listener = tokio::net::UnixListener::bind(unix_path)?;
+                std::fs::set_permissions(unix_path, std::fs::Permissions::from_mode(0o600))?;
+                info!(path = %unix_path.display(), "aksh runner server listening on unix socket");
+                let router_unix = router.clone();
+                let shutdown_unix = shutdown.clone();
+                tokio::spawn(async move {
+                    use hyper_util::rt::{TokioExecutor, TokioIo};
+                    use hyper_util::server::conn::auto::Builder as AutoBuilder;
+                    use hyper_util::service::TowerToHyperService;
+
+                    loop {
+                        tokio::select! {
+                            _ = shutdown_unix.cancelled() => break,
+                            accept_result = unix_listener.accept() => {
+                                let Ok((stream, _)) = accept_result else {
+                                    continue;
+                                };
+                                let io = TokioIo::new(stream);
+                                let service = TowerToHyperService::new(router_unix.clone());
+                                tokio::spawn(async move {
+                                    if let Err(error) = AutoBuilder::new(TokioExecutor::new())
+                                        .serve_connection_with_upgrades(io, service)
+                                        .await
+                                    {
+                                        warn!(%error, "Unix socket HTTP connection failed");
+                                    }
+                                });
+                            }
+                        }
+                    }
+                });
+            }
             let listener = TcpListener::bind(config.listen).await?;
             info!(listen = %config.listen, scheme = "http", "aksh runner server listening");
             axum::serve(listener, router)
