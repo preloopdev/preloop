@@ -48,6 +48,14 @@ pub(crate) struct RunRecord {
     pub(crate) reusable_calls: BTreeMap<String, aksh_gha_parser::ReusableCallMetadata>,
     #[serde(default)]
     pub(crate) jobs_list: Vec<JobDetail>,
+    pub(crate) created_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) run_number: u64,
+    pub(crate) run_attempt: u64,
+    pub(crate) workflow_path_str: String,
+    pub(crate) event: String,
+    pub(crate) conclusion: Option<String>,
 }
 
 #[derive(Debug, Clone)]
