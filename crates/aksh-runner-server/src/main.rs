@@ -50,6 +50,9 @@ enum Command {
         /// Enable the cron scheduler for schedule-triggered workflows.
         #[arg(long)]
         enable_scheduler: bool,
+        /// Optional Unix domain socket path to listen on.
+        #[arg(long, env = "AKSH_UNIX_SOCKET")]
+        unix_socket: Option<PathBuf>,
     },
     /// Generate a persistent self-signed TLS certificate (no openssl needed).
     Cert {
@@ -100,6 +103,7 @@ async fn main() -> anyhow::Result<()> {
             test_api_token,
             oidc_issuer,
             enable_scheduler,
+            unix_socket,
         } => {
             let tls = match (tls_cert, tls_key, tls_self_signed) {
                 (Some(cert), Some(key), false) => TlsMode::PemFiles { cert, key },
@@ -109,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
             };
             serve(ServerConfig {
                 listen,
+                unix_socket,
                 state_dir,
                 record_flows,
                 tls,
