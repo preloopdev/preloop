@@ -242,7 +242,11 @@ impl SmolVmProvider {
     }
 
     fn command(&self) -> Command {
-        Command::new(&self.binary)
+        let mut cmd = Command::new(&self.binary);
+        if std::env::var_os("SMOLVM_EGRESS_FLOOR").is_none() {
+            cmd.env("SMOLVM_EGRESS_FLOOR", "strict");
+        }
+        cmd
     }
 
     async fn checked(
