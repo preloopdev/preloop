@@ -2057,6 +2057,166 @@ jobs:
 }
 
 #[tokio::test]
+async fn broker_job_refs_use_session_runner_id_for_pool_and_root_polls() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    // Registration IDs are allocated monotonically. Register a predecessor so
+    // this test exercises the replacement runner path instead of the first
+    // runner's special-looking ID 1.
+    let _ = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/v1/Agent/1/0",
+        json!({"name": "runner-before-replacement", "version": "2.335.1"}),
+    )
+    .await;
+
+    let runner = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/v1/Agent/1/0",
+        json!({
+            "name": "runner-replacement",
+            "version": "2.335.1",
+            "labels": [
+                {"name": "self-hosted", "type": "system"},
+                {"name": "ubuntu-latest", "type": "system"}
+            ]
+        }),
+    )
+    .await;
+    let runner_id = runner["id"].as_i64().unwrap();
+    assert!(runner_id > 1, "replacement runner must have an ID above 1");
+
+    let runner_token = state
+        .local_jwt(json!({
+            "sub": format!("aksh-runner-listen-{runner_id}"),
+            "scp": "ActionsRuntime.RunnerListen",
+        }))
+        .unwrap();
+
+    // The pool-path session is explicitly tied to runner 2 by its agent body.
+    // The root broker session is tied to the same runner by its listen token.
+    let pool_session = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/distributedtask/pools/1/sessions",
+        json!({
+            "agent": {"id": runner_id, "name": "runner-replacement"},
+            "ownerName": "replacement pool session",
+            "useFipsEncryption": false
+        }),
+        &runner_token,
+    )
+    .await;
+    let pool_session_id = pool_session["sessionId"].as_str().unwrap();
+
+    let root_session = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/runner/server/session",
+        json!({}),
+        &runner_token,
+    )
+    .await;
+    let root_session_id = root_session["sessionId"].as_str().unwrap();
+
+    let workflow = "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo broker-id\n";
+    for _ in 0..2 {
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": workflow,
+                "event": "push",
+                "payload": {"ref": "refs/heads/main", "commits": []},
+                "repository": "preloopdev/aksh",
+                "git_ref": "refs/heads/main",
+                "secrets": {},
+                "vars": {},
+                "reusable_workflows": {}
+            }),
+        )
+        .await;
+        assert_eq!(accepted["queued_jobs"], 1);
+    }
+
+    let pool_ref = request_json_with_bearer(
+        &app,
+        Method::GET,
+        &format!(
+            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId={pool_session_id}&status=Online&runnerVersion=2.335.1&waitSeconds=0"
+        ),
+        Value::Null,
+        &runner_token,
+    )
+    .await;
+    assert_eq!(pool_ref["messageType"], "RunnerJobRequest");
+    let pool_body: Value = serde_json::from_str(pool_ref["body"].as_str().unwrap()).unwrap();
+    let expected_run_service_url = format!("{}/broker/{runner_id}/", public_base_url());
+    assert_eq!(pool_body["run_service_url"], expected_run_service_url);
+    assert!(!pool_body["run_service_url"]
+        .as_str()
+        .unwrap()
+        .contains("/broker/1/"));
+    let pool_request_id = pool_body["runner_request_id"].as_str().unwrap();
+
+    let root_ref = request_json_with_bearer(
+        &app,
+        Method::GET,
+        &format!(
+            "/runner/server/message?sessionId={root_session_id}&status=Online&runnerVersion=2.335.1&waitSeconds=0"
+        ),
+        Value::Null,
+        &runner_token,
+    )
+    .await;
+    assert_eq!(root_ref["messageType"], "RunnerJobRequest");
+    let root_body: Value = serde_json::from_str(root_ref["body"].as_str().unwrap()).unwrap();
+    assert_eq!(root_body["run_service_url"], expected_run_service_url);
+    assert!(!root_body["run_service_url"]
+        .as_str()
+        .unwrap()
+        .contains("/broker/1/"));
+    let root_request_id = root_body["runner_request_id"].as_str().unwrap();
+
+    // The runner-2 token must also authorize acquisition on the URL advertised
+    // by both message paths; a hard-coded /broker/1 URL would fail this flow.
+    for request_id in [pool_request_id, root_request_id] {
+        let acquired = request_json_with_bearer(
+            &app,
+            Method::POST,
+            &format!("/broker/{runner_id}/acquirejob"),
+            json!({
+                "jobMessageId": request_id,
+                "billingOwnerId": "local",
+                "runnerOS": "Linux"
+            }),
+            &runner_token,
+        )
+        .await;
+        assert_eq!(
+            acquired["resources"]["endpoints"][0]["url"],
+            expected_run_service_url
+        );
+        let _ = request_json_with_bearer(
+            &app,
+            Method::POST,
+            &format!("/broker/{runner_id}/completejob"),
+            json!({
+                "jobId": request_id,
+                "planId": acquired["plan"]["planId"]
+            }),
+            &runner_token,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
 async fn action_download_info_returns_remote_action_tickets() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
@@ -6957,6 +7117,37 @@ fn git_fixture_output_allow_failure(worktree: &FsPath, args: &[&str]) -> (bool, 
     (output.status.success(), output.stdout)
 }
 
+fn git_pack_bytes(repository: &FsPath) -> u64 {
+    let pack_dir = repository.join("objects/pack");
+    let Ok(entries) = fs::read_dir(pack_dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            if entry
+                .path()
+                .extension()
+                .and_then(|extension| extension.to_str())
+                == Some("pack")
+            {
+                entry.metadata().ok().map(|metadata| metadata.len())
+            } else {
+                None
+            }
+        })
+        .sum()
+}
+
+fn git_alternate_object_directories(repository: &FsPath) -> Vec<std::path::PathBuf> {
+    fs::read_to_string(repository.join("objects/info/alternates"))
+        .unwrap()
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| std::fs::canonicalize(line).unwrap())
+        .collect()
+}
+
 fn create_snapshot_fixture(root: &FsPath) -> (std::path::PathBuf, std::path::PathBuf) {
     let workspace = root.join("workspace");
     fs::create_dir_all(&workspace).unwrap();
@@ -7053,7 +7244,12 @@ async fn workspace_snapshot_captures_git_state_without_mutating_source() {
 
     let repository = state_dir.join(&snapshot.repository);
     assert!(repository.join("objects").is_dir());
-    assert!(!repository.join("objects/info/alternates").exists());
+    let state_dir = std::fs::canonicalize(&state_dir).unwrap();
+    let alternates = git_alternate_object_directories(&repository);
+    assert!(!alternates.is_empty());
+    assert!(alternates.iter().all(|alternate| {
+        alternate.starts_with(&state_dir) && !alternate.starts_with(&workspace)
+    }));
     let commit = snapshot.commit_sha.as_str();
     assert!(
         git_fixture_output_allow_failure(
@@ -7102,6 +7298,137 @@ async fn workspace_snapshot_captures_git_state_without_mutating_source() {
             ]
         )
         .0
+    );
+}
+
+#[tokio::test]
+async fn workspace_snapshots_reuse_large_base_objects_and_materialize_changes() {
+    let temp = tempfile::tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    git_fixture_command(&workspace, &["init", "-b", "main"]);
+    git_fixture_command(&workspace, &["config", "user.name", "Snapshot Test"]);
+    git_fixture_command(
+        &workspace,
+        &["config", "user.email", "snapshot@example.test"],
+    );
+    fs::write(workspace.join(".gitignore"), "*.ignored\nignored-dir/\n").unwrap();
+
+    // A packed, multi-megabyte base makes accidentally copying every reachable
+    // object into each run repository observable rather than a tiny-fixture
+    // optimization detail.
+    for file in 0..64u8 {
+        let mut state = 0x9e37_79b9u32 ^ u32::from(file).wrapping_mul(0x045d_9f3b);
+        let contents: Vec<u8> = (0..65_536)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect();
+        fs::write(workspace.join(format!("base-{file:02}.bin")), contents).unwrap();
+    }
+    git_fixture_command(&workspace, &["add", "."]);
+    git_fixture_command(&workspace, &["commit", "-m", "large base"]);
+    git_fixture_command(&workspace, &["gc", "--aggressive", "--prune=now"]);
+    let source_pack_bytes = git_pack_bytes(&workspace.join(".git"));
+    assert!(source_pack_bytes > 1_000_000);
+
+    fs::create_dir_all(&state_dir).unwrap();
+    let first_run: RunId = "22222222-2222-4222-8222-222222222222".parse().unwrap();
+    let second_run: RunId = "33333333-3333-4333-8333-333333333333".parse().unwrap();
+    let changed_run: RunId = "44444444-4444-4444-8444-444444444444".parse().unwrap();
+
+    let first = create_workspace_snapshot(&state_dir, &workspace, first_run)
+        .await
+        .expect("first snapshot should succeed");
+    let second = create_workspace_snapshot(&state_dir, &workspace, second_run)
+        .await
+        .expect("second unchanged snapshot should succeed");
+    let first_repository = state_dir.join(&first.repository);
+    let second_repository = state_dir.join(&second.repository);
+    assert_eq!(first.commit_sha, second.commit_sha);
+
+    let state_dir = std::fs::canonicalize(&state_dir).unwrap();
+    let first_alternates = git_alternate_object_directories(&first_repository);
+    let second_alternates = git_alternate_object_directories(&second_repository);
+    assert_eq!(first_alternates, second_alternates);
+    assert!(first_alternates
+        .iter()
+        .all(|alternate| { alternate.starts_with(&state_dir) && alternate != &state_dir }));
+    assert!(
+        git_pack_bytes(&first_repository) < source_pack_bytes / 2,
+        "first run repository contains a full-base pack"
+    );
+    assert!(
+        git_pack_bytes(&second_repository) < source_pack_bytes / 2,
+        "second run repository contains a full-base pack instead of reusing the cache"
+    );
+
+    fs::write(workspace.join("base-00.bin"), b"changed unstaged base\n").unwrap();
+    fs::write(workspace.join("base-01.bin"), b"changed staged base\n").unwrap();
+    git_fixture_command(&workspace, &["add", "base-01.bin"]);
+    fs::remove_file(workspace.join("base-02.bin")).unwrap();
+    fs::write(workspace.join("new.txt"), b"new untracked file\n").unwrap();
+    fs::write(workspace.join("not-in-snapshot.ignored"), b"ignored\n").unwrap();
+    fs::create_dir_all(workspace.join("ignored-dir")).unwrap();
+    fs::write(workspace.join("ignored-dir/hidden.txt"), b"ignored\n").unwrap();
+
+    let changed = create_workspace_snapshot(&state_dir, &workspace, changed_run)
+        .await
+        .expect("changed snapshot should succeed");
+    let changed_repository = state_dir.join(&changed.repository);
+    let commit = changed.commit_sha.as_str();
+    assert_eq!(
+        git_fixture_output(
+            &changed_repository,
+            &["show", &format!("{commit}:base-00.bin")]
+        ),
+        b"changed unstaged base\n"
+    );
+    assert_eq!(
+        git_fixture_output(
+            &changed_repository,
+            &["show", &format!("{commit}:base-01.bin")]
+        ),
+        b"changed staged base\n"
+    );
+    assert_eq!(
+        git_fixture_output(&changed_repository, &["show", &format!("{commit}:new.txt")]),
+        b"new untracked file\n"
+    );
+    assert!(
+        !git_fixture_output_allow_failure(
+            &changed_repository,
+            &["cat-file", "-e", &format!("{commit}:base-02.bin")]
+        )
+        .0
+    );
+    assert!(
+        !git_fixture_output_allow_failure(
+            &changed_repository,
+            &[
+                "cat-file",
+                "-e",
+                &format!("{commit}:not-in-snapshot.ignored")
+            ]
+        )
+        .0
+    );
+    assert!(
+        !git_fixture_output_allow_failure(
+            &changed_repository,
+            &[
+                "cat-file",
+                "-e",
+                &format!("{commit}:ignored-dir/hidden.txt")
+            ]
+        )
+        .0
+    );
+    assert_eq!(
+        git_alternate_object_directories(&changed_repository),
+        first_alternates
     );
 }
 
