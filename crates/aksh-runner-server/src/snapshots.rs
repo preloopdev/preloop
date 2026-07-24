@@ -129,15 +129,48 @@ async fn create_workspace_snapshot_inner(
     )
     .await?;
 
-    let common_dir_output = run_git(
-        Command::new("git")
-            .arg("-C")
-            .arg(workspace)
-            .args(["rev-parse", "--git-common-dir"]),
-        "resolve source Git common directory",
-    )
-    .await?;
-    let common_dir = output_path(&common_dir_output, workspace)?;
+    let mut source_revision = Command::new("git");
+    source_revision
+        .arg("-C")
+        .arg(workspace)
+        .args(["rev-parse", "--git-common-dir", "HEAD"]);
+    let source_revision = source_revision.output().await.map_err(|error| {
+        ApiError::internal(format!(
+            "failed to resolve source Git common directory and HEAD: {error}"
+        ))
+    })?;
+    let mut source_revision_lines = source_revision.stdout.split(|byte| *byte == b'\n');
+    let common_dir_text = source_revision_lines
+        .next()
+        .and_then(|line| std::str::from_utf8(line).ok())
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .ok_or_else(|| {
+            ApiError::internal(format!(
+                "git produced no Git common directory while trying to resolve source Git common directory: {}",
+                String::from_utf8_lossy(&source_revision.stderr).trim()
+            ))
+        })?;
+    let common_dir = output_path_text(common_dir_text, workspace)?;
+    let source_head = if source_revision.status.success() {
+        let head = source_revision_lines
+            .next()
+            .and_then(|line| std::str::from_utf8(line).ok())
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .ok_or_else(|| {
+                ApiError::internal(
+                    "git produced no source HEAD while trying to resolve source Git HEAD",
+                )
+            })?;
+        Some(head.to_owned())
+    } else {
+        // `rev-parse --git-common-dir HEAD` exits unsuccessfully for an unborn
+        // HEAD, but still emits the common directory. This matches the prior
+        // behavior where a failed standalone HEAD lookup simply skipped
+        // read-tree after the common directory had been resolved.
+        None
+    };
     let source_objects = common_dir.join("objects");
     if !source_objects.is_dir() {
         return Err(ApiError::bad_request(format!(
@@ -147,16 +180,7 @@ async fn create_workspace_snapshot_inner(
     }
     let cached_objects = ensure_object_cache(state_dir, workspace, &common_dir).await?;
 
-    let source_head = Command::new("git")
-        .arg("-C")
-        .arg(workspace)
-        .args(["rev-parse", "--verify", "HEAD"])
-        .output()
-        .await
-        .map_err(|error| ApiError::internal(format!("failed to resolve source HEAD: {error}")))?;
-
-    if source_head.status.success() {
-        let head = output_text(&source_head, "resolve source HEAD")?;
+    if let Some(head) = source_head {
         run_snapshot_git(
             workspace,
             staging_repository,
@@ -218,22 +242,19 @@ async fn create_workspace_snapshot_inner(
         )));
     }
 
-    run_snapshot_git(
+    let mut update_refs = snapshot_git_command(
         workspace,
         staging_repository,
         staging_index,
         &cached_objects,
-        ["update-ref", SNAPSHOT_REF, commit_sha.as_str()],
-        "publish snapshot ref",
-    )
-    .await?;
-    run_snapshot_git(
-        workspace,
-        staging_repository,
-        staging_index,
-        &cached_objects,
-        ["symbolic-ref", "HEAD", SNAPSHOT_REF],
-        "set snapshot default ref",
+    );
+    update_refs.args(["update-ref", "--stdin"]);
+    let update_input =
+        format!("update {SNAPSHOT_REF} {commit_sha}\nsymref-update HEAD {SNAPSHOT_REF}\n");
+    run_git_with_stdin(
+        &mut update_refs,
+        update_input.as_bytes(),
+        "publish snapshot refs",
     )
     .await?;
 
@@ -350,8 +371,8 @@ fn output_text(output: &std::process::Output, operation: &str) -> Result<String,
     Ok(value.to_owned())
 }
 
-fn output_path(output: &std::process::Output, workspace: &FsPath) -> Result<PathBuf, ApiError> {
-    let path = PathBuf::from(output_text(output, "resolve source Git common directory")?);
+fn output_path_text(value: &str, workspace: &FsPath) -> Result<PathBuf, ApiError> {
+    let path = PathBuf::from(value);
     let path = if path.is_absolute() {
         path
     } else {
@@ -363,6 +384,39 @@ fn output_path(output: &std::process::Output, workspace: &FsPath) -> Result<Path
             path.display()
         ))
     })
+}
+
+async fn run_git_with_stdin(
+    command: &mut Command,
+    input: &[u8],
+    operation: &str,
+) -> Result<std::process::Output, ApiError> {
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| ApiError::internal(format!("failed to {operation}: {error}")))?;
+    let mut stdin = child.stdin.take().ok_or_else(|| {
+        ApiError::internal(format!("failed to {operation}: Git stdin was not piped"))
+    })?;
+    stdin
+        .write_all(input)
+        .await
+        .map_err(|error| ApiError::internal(format!("failed to {operation}: {error}")))?;
+    drop(stdin);
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|error| ApiError::internal(format!("failed to {operation}: {error}")))?;
+    if !output.status.success() {
+        return Err(ApiError::internal(format!(
+            "failed to {operation}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(output)
 }
 
 async fn ensure_object_cache(
@@ -381,7 +435,24 @@ async fn ensure_object_cache(
         ApiError::internal(format!("failed to create snapshot object cache: {error}"))
     })?;
     let _guard = acquire_cache_lock(&lock).await?;
+    let mut source_head_command = Command::new("git");
+    source_head_command
+        .args(["-C"])
+        .arg(workspace)
+        .args(["rev-parse", "HEAD"]);
+    let source_head = output_text(
+        &run_git(
+            &mut source_head_command,
+            "resolve source HEAD for snapshot object cache",
+        )
+        .await?,
+        "resolve source HEAD for snapshot object cache",
+    )?;
+    let mut last_head = repository.as_os_str().to_os_string();
+    last_head.push(".last-head");
+    let last_head = PathBuf::from(last_head);
 
+    let mut cloned = false;
     if !repository.is_dir() {
         let staging = root.join(format!("{key}.{}.tmp", uuid::Uuid::new_v4()));
         let mut clone = Command::new("git");
@@ -399,7 +470,7 @@ async fn ensure_object_cache(
             .args(["config", "gc.auto", "0"]);
         run_git(&mut disable_gc, "disable snapshot cache auto-gc").await?;
         match tokio::fs::rename(&staging, &repository).await {
-            Ok(()) => {}
+            Ok(()) => cloned = true,
             Err(error) if repository.is_dir() => {
                 let _ = tokio::fs::remove_dir_all(&staging).await;
                 let _ = error;
@@ -411,16 +482,44 @@ async fn ensure_object_cache(
                 )));
             }
         }
+    }
+
+    if cloned {
+        tokio::fs::write(&last_head, format!("{source_head}\n"))
+            .await
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "failed to record snapshot object cache HEAD: {error}"
+                ))
+            })?;
     } else {
         // Fetch only adds immutable objects and atomically updates refs. Auto
         // GC is disabled, so active run alternates cannot lose base objects.
-        let mut fetch = Command::new("git");
-        fetch
-            .env("GIT_DIR", &repository)
-            .args(["fetch", "--quiet", "--force", "--prune"])
-            .arg(workspace)
-            .args(["+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"]);
-        run_git(&mut fetch, "refresh snapshot object cache").await?;
+        let cached_head = match tokio::fs::read_to_string(&last_head).await {
+            Ok(value) => Some(value.trim().to_owned()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(ApiError::internal(format!(
+                    "failed to read snapshot object cache HEAD: {error}"
+                )));
+            }
+        };
+        if cached_head.as_deref() != Some(source_head.as_str()) {
+            let mut fetch = Command::new("git");
+            fetch
+                .env("GIT_DIR", &repository)
+                .args(["fetch", "--quiet", "--force", "--prune"])
+                .arg(workspace)
+                .args(["+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"]);
+            run_git(&mut fetch, "refresh snapshot object cache").await?;
+            tokio::fs::write(&last_head, format!("{source_head}\n"))
+                .await
+                .map_err(|error| {
+                    ApiError::internal(format!(
+                        "failed to record snapshot object cache HEAD: {error}"
+                    ))
+                })?;
+        }
     }
 
     std::fs::canonicalize(repository.join("objects")).map_err(|error| {
