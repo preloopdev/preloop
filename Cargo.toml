@@ -11,6 +11,9 @@ members = [
     "crates/aksh-runner-client",
     "crates/aksh-runner-server",
     "crates/runner-watch",
+    "crates/preloop-vm",
+    "crates/preloop-orchestrator",
+    "crates/preloop-cli",
 ]
 resolver = "2"
 
@@ -29,6 +32,8 @@ anyhow = "1.0"
 async-trait = "0.1"
 axum = { version = "0.7", features = ["ws"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
+hyper = "1.0"
+hyper-util = { version = "0.1", features = ["full"] }
 rcgen = "0.13"
 base64 = "0.22"
 bytes = "1.6"
