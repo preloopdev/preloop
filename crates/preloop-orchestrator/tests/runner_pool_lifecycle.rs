@@ -142,6 +142,22 @@ impl VmProvider for RecordingVmProvider {
         Ok(())
     }
 
+    async fn start_forkable(&self, name: &MachineName) -> Result<(), VmError> {
+        self.start(name).await
+    }
+
+    async fn fork(&self, _golden: &MachineName, clone: &MachineName) -> Result<(), VmError> {
+        let mut state = self.state.lock().await;
+        state
+            .machines
+            .insert(clone.as_str().to_owned(), MachineState::Running);
+        state.events.push(Event::Create(clone.as_str().to_owned()));
+        state.events.push(Event::Start(clone.as_str().to_owned()));
+        drop(state);
+        self.notify_changed();
+        Ok(())
+    }
+
     async fn stop(&self, name: &MachineName) -> Result<(), VmError> {
         let mut state = self.state.lock().await;
         state
@@ -279,8 +295,10 @@ impl Fixture {
         std::env::set_var(&token_env, &token);
         let config = RunnerPoolConfig {
             size: 1,
+            use_fork: false,
             name_prefix: format!("pool-{label}-{id}"),
             base_image: "ghcr.io/preloop/base:latest".to_owned(),
+            workspace: None,
             artifact_stem,
             runner_bundle: bundle,
             runner_binary_name: "aksh-runner".to_owned(),
