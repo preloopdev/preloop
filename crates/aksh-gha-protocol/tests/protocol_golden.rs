@@ -19,3 +19,24 @@ fn ndjson_event_shape_is_stable() {
         "{\"type\":\"job_status\",\"run_id\":\"00000000-0000-0000-0000-000000000001\",\"job_id\":\"test[os=ubuntu-latest]\",\"status\":\"success\"}\n"
     );
 }
+
+#[test]
+fn workflow_submission_accepts_local_workspace_input_without_serializing_host_path() {
+    let trusted_input = serde_json::json!({
+        "workflow_yaml": "name: CI\njobs: {}",
+        "event": "push",
+        "repository": "local/example",
+        "local_workspace": "/Users/alice/src/example",
+    });
+    let submission: aksh_gha_protocol::WorkflowSubmission =
+        serde_json::from_value(trusted_input).expect("trusted local submission should deserialize");
+
+    assert_eq!(
+        submission.local_workspace.as_deref(),
+        Some("/Users/alice/src/example")
+    );
+
+    let serialized = serde_json::to_value(submission).expect("submission should serialize");
+    assert!(serialized.get("local_workspace").is_none());
+    assert!(!serialized.to_string().contains("/Users/alice/src/example"));
+}
