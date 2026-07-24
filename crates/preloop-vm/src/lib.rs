@@ -179,6 +179,10 @@ pub trait VmProvider: Send + Sync {
     async fn create(&self, spec: &MachineSpec) -> Result<(), VmError>;
     /// Start an existing machine.
     async fn start(&self, name: &MachineName) -> Result<(), VmError>;
+    /// Start an existing machine as a forkable base (CoW memory + disks).
+    async fn start_forkable(&self, name: &MachineName) -> Result<(), VmError>;
+    /// Fork a running forkable machine into a new clone with CoW memory and disks.
+    async fn fork(&self, golden: &MachineName, clone: &MachineName) -> Result<(), VmError>;
     /// Stop an existing machine.
     async fn stop(&self, name: &MachineName) -> Result<(), VmError>;
     /// Delete a machine and its mutable overlay.
@@ -347,6 +351,37 @@ impl VmProvider for SmolVmProvider {
                 "start".into(),
                 "--name".into(),
                 name.as_str().into(),
+            ],
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn start_forkable(&self, name: &MachineName) -> Result<(), VmError> {
+        self.checked(
+            "start_forkable",
+            &[
+                "machine".into(),
+                "start".into(),
+                "--name".into(),
+                name.as_str().into(),
+                "--forkable".into(),
+            ],
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn fork(&self, golden: &MachineName, clone: &MachineName) -> Result<(), VmError> {
+        self.checked(
+            "fork",
+            &[
+                "machine".into(),
+                "fork".into(),
+                "--golden".into(),
+                golden.as_str().into(),
+                "--name".into(),
+                clone.as_str().into(),
             ],
         )
         .await
