@@ -701,6 +701,7 @@ async fn cron_loop(
             repository,
             git_ref: format!("refs/heads/{default_branch}"),
             workflow_path: Some(workflow_path.to_owned()),
+            local_workspace: None,
             vars: Default::default(),
             secrets: Default::default(),
             reusable_workflows: Default::default(),
