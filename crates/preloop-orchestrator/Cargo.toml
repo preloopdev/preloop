@@ -9,6 +9,7 @@ description = "Job scheduling and VM lifecycle orchestration for Preloop CI"
 
 [dependencies]
 preloop-vm = { path = "../preloop-vm" }
+aksh-gha-protocol = { path = "../aksh-gha-protocol" }
 aksh-runner-server = { path = "../aksh-runner-server" }
 aksh-gha-parser = { path = "../aksh-gha-parser" }
 anyhow = { workspace = true }
@@ -19,4 +20,5 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.10"
 uuid = { workspace = true }
