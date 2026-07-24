@@ -15,6 +15,9 @@ axum.workspace = true
 base64.workspace = true
 bytes.workspace = true
 clap.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+tower.workspace = true
 aksh-artifacts = { path = "../aksh-artifacts" }
 aksh-cache = { path = "../aksh-cache" }
 aksh-gha-parser = { path = "../aksh-gha-parser" }
