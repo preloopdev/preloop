@@ -63,6 +63,9 @@ e2e-teardown:
 serve:
     AKSH_LOCAL_WORKSPACE="${AKSH_LOCAL_WORKSPACE:-$PWD}" cargo run --release -p aksh-runner-server -- serve --listen 127.0.0.1:9090
 
+serve-dev:
+    AKSH_LOCAL_WORKSPACE="${AKSH_LOCAL_WORKSPACE:-$PWD}" cargo run --release -p aksh-runner-server -- serve --listen 127.0.0.1:9090 --enable-test-api --test-api-token dev-token
+
 #submit 
 
 submit-ci:
