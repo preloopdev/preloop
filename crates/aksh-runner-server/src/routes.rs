@@ -344,10 +344,12 @@ pub(crate) fn build_app(
         .route("/_apis/connectionData", get(connection_data))
         .route(
             "/api/v1/runs",
-            post(submit_run).route_layer(middleware::from_fn_with_state(
-                shared.clone(),
-                require_native_bearer,
-            )),
+            post(submit_run)
+                .get(list_runs)
+                .route_layer(middleware::from_fn_with_state(
+                    shared.clone(),
+                    require_native_bearer,
+                )),
         )
         .route("/api/v1/scheduler/history", get(get_scheduler_history))
         .route(

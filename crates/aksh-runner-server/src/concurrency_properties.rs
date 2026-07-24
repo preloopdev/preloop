@@ -378,6 +378,14 @@ impl ProdState {
             job_check_run_ids: BTreeMap::new(),
             reusable_calls: BTreeMap::new(),
             jobs_list: Vec::new(),
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            run_number: run_n as u64,
+            run_attempt: 1,
+            workflow_path_str: ".github/workflows/workflow.yml".to_owned(),
+            event: "push".to_owned(),
+            conclusion: None,
         };
         self.inner.runs.insert(run_id, record);
     }
