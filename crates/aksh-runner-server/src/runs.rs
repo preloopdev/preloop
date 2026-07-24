@@ -318,7 +318,12 @@ pub(crate) async fn submit_run_inner(
 
     // Capture the workspace once per run, before any job is queued. Every
     // redirected checkout then fetches the same immutable local tree.
-    let workspace_snapshot = if let Some(workspace) = shared.state.local_workspace.as_deref() {
+    let local_workspace = submission
+        .local_workspace
+        .as_deref()
+        .map(std::path::Path::new)
+        .or(shared.state.local_workspace.as_deref());
+    let workspace_snapshot = if let Some(workspace) = local_workspace {
         match create_workspace_snapshot(&shared.state.state_dir, workspace, run_id).await {
             Ok(snapshot) => Some(snapshot),
             Err(error) => {
@@ -332,6 +337,23 @@ pub(crate) async fn submit_run_inner(
 
     {
         let mut inner = shared.state.inner.lock().await;
+        let run_number = {
+            let counter = inner
+                .workflow_run_counters
+                .entry(workflow_path.clone())
+                .or_insert(0);
+            *counter += 1;
+            *counter
+        };
+        let created_at = chrono::Utc::now();
+        let event = submission.event.clone();
+        let mut github = github;
+        if let Some(object) = github.as_object_mut() {
+            object.insert(
+                "run_number".to_owned(),
+                serde_json::json!(run_number.to_string()),
+            );
+        }
         let mut statuses = BTreeMap::new();
         let mut ready_jobs = 0usize;
         let mut job_base_ids = BTreeMap::new();
@@ -359,6 +381,14 @@ pub(crate) async fn submit_run_inner(
                     job_check_run_ids: BTreeMap::new(),
                     reusable_calls,
                     jobs_list: Vec::new(),
+                    created_at,
+                    started_at: None,
+                    completed_at: Some(created_at),
+                    run_number,
+                    run_attempt: 1,
+                    workflow_path_str: workflow_path.clone(),
+                    event: event.clone(),
+                    conclusion: Some("failure".to_owned()),
                 },
             );
             drop(inner);
@@ -379,6 +409,7 @@ pub(crate) async fn submit_run_inner(
                 .await;
             return Ok(RunAccepted {
                 run_id,
+                run_number,
                 queued_jobs,
             });
         }
@@ -628,6 +659,14 @@ pub(crate) async fn submit_run_inner(
                             job_check_run_ids: BTreeMap::new(),
                             reusable_calls,
                             jobs_list: Vec::new(),
+                            created_at,
+                            started_at: None,
+                            completed_at: Some(created_at),
+                            run_number,
+                            run_attempt: 1,
+                            workflow_path_str: workflow_path.clone(),
+                            event: event.clone(),
+                            conclusion: Some("cancelled".to_owned()),
                         },
                     );
                     drop(inner);
@@ -648,6 +687,7 @@ pub(crate) async fn submit_run_inner(
                         .await;
                     return Ok(RunAccepted {
                         run_id,
+                        run_number,
                         queued_jobs,
                     });
                 }
@@ -679,6 +719,14 @@ pub(crate) async fn submit_run_inner(
                     job_check_run_ids: BTreeMap::new(),
                     reusable_calls,
                     jobs_list: Vec::new(),
+                    created_at,
+                    started_at: None,
+                    completed_at: None,
+                    run_number,
+                    run_attempt: 1,
+                    workflow_path_str: workflow_path.clone(),
+                    event: event.clone(),
+                    conclusion: None,
                 },
             );
             drop(inner);
@@ -699,6 +747,7 @@ pub(crate) async fn submit_run_inner(
                 .await;
             return Ok(RunAccepted {
                 run_id,
+                run_number,
                 queued_jobs,
             });
         }
@@ -722,6 +771,14 @@ pub(crate) async fn submit_run_inner(
                 job_check_run_ids: BTreeMap::new(),
                 reusable_calls: reusable_calls.clone(),
                 jobs_list: Vec::new(),
+                created_at,
+                started_at: None,
+                completed_at: None,
+                run_number,
+                run_attempt: 1,
+                workflow_path_str: workflow_path.clone(),
+                event: event.clone(),
+                conclusion: None,
             },
         );
 
@@ -913,6 +970,14 @@ pub(crate) async fn submit_run_inner(
                 job_check_run_ids: BTreeMap::new(),
                 reusable_calls,
                 jobs_list: Vec::new(),
+                created_at,
+                started_at: None,
+                completed_at: None,
+                run_number,
+                run_attempt: 1,
+                workflow_path_str: workflow_path.clone(),
+                event: event.clone(),
+                conclusion: None,
             },
         );
         let cancel_count = inner.cancellation_queue.len();
@@ -940,14 +1005,29 @@ pub(crate) async fn submit_run_inner(
             .await;
         Ok(RunAccepted {
             run_id,
+            run_number,
             queued_jobs,
         })
     }
 }
 pub(crate) async fn submit_run(
     State(shared): State<Arc<SharedState>>,
-    Json(submission): Json<WorkflowSubmission>,
+    headers: axum::http::HeaderMap,
+    Json(mut submission): Json<WorkflowSubmission>,
 ) -> Result<Json<RunAccepted>, ApiError> {
+    if let Some(encoded) = headers
+        .get("x-preloop-local-workspace")
+        .and_then(|value| value.to_str().ok())
+    {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|_| ApiError::bad_request("invalid local workspace header"))?;
+        submission.local_workspace = Some(
+            String::from_utf8(bytes)
+                .map_err(|_| ApiError::bad_request("local workspace path is not UTF-8"))?,
+        );
+    }
     submit_run_inner(&shared, submission).await.map(Json)
 }
 
@@ -1043,6 +1123,64 @@ pub(crate) async fn get_run(
     }
 
     Ok(Json(run))
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ListRunsQuery {
+    #[serde(default)]
+    workflow: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    event: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_limit")]
+    limit: Option<usize>,
+}
+
+fn deserialize_limit<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<usize>, D::Error> {
+    Option::<usize>::deserialize(deserializer)
+}
+
+pub(crate) async fn list_runs(
+    State(shared): State<Arc<SharedState>>,
+    Query(query): Query<ListRunsQuery>,
+) -> Result<Json<Vec<RunRecord>>, ApiError> {
+    let inner = shared.state.inner.lock().await;
+    let limit = query.limit.unwrap_or(50).min(200);
+
+    let runs: Vec<RunRecord> = inner
+        .runs
+        .values()
+        .rev()
+        .filter(|run| {
+            if let Some(workflow) = &query.workflow {
+                if !run.workflow_path_str.contains(workflow) {
+                    return false;
+                }
+            }
+            if let Some(status) = &query.status {
+                let run_status = serde_json::to_value(run.status)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_owned))
+                    .unwrap_or_default();
+                if run_status != *status {
+                    return false;
+                }
+            }
+            if let Some(event) = &query.event {
+                if run.event != *event {
+                    return false;
+                }
+            }
+            true
+        })
+        .take(limit)
+        .cloned()
+        .collect();
+
+    Ok(Json(runs))
 }
 
 pub(crate) async fn get_run_logs(
@@ -1165,7 +1303,7 @@ pub(crate) async fn rerun_run(
             .map(|run| run.submission.clone())
             .ok_or_else(|| ApiError::not_found("run not found"))?
     };
-    submit_run(State(shared), Json(submission)).await
+    submit_run_inner(&shared, submission).await.map(Json)
 }
 
 pub(crate) async fn run_events(
