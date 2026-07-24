@@ -64,7 +64,7 @@ pub struct ConfigureArgs {
     pub url: String,
 
     /// Registration token.
-    #[arg(long)]
+    #[arg(long, env = "PRELOOP_RUNNER_TOKEN")]
     pub token: String,
 
     /// Runner name (defaults to hostname).
