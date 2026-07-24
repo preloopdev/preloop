@@ -26,12 +26,13 @@ pub(crate) struct WorkspaceSnapshot {
     pub(crate) repository: String,
 }
 
-/// Capture `workspace` as a self-contained bare repository for `run_id`.
+/// Capture `workspace` as an immutable cache-backed bare repository for `run_id`.
 ///
 /// A private index and a temporary bare object database keep the user's index,
-/// refs, and working tree untouched. The source object database is available
-/// only as a temporary alternate while the synthetic tree is assembled; a
-/// final repack copies every reachable object into the snapshot repository.
+/// refs, and working tree untouched. Committed objects are incrementally fetched
+/// into a state-directory cache; each run stores only its synthetic dirty-tree
+/// objects and references that private cache as an alternate. No snapshot keeps
+/// a path to the user's source repository.
 pub(crate) async fn create_workspace_snapshot(
     state_dir: &FsPath,
     workspace: &FsPath,
@@ -144,6 +145,7 @@ async fn create_workspace_snapshot_inner(
             source_objects.display()
         )));
     }
+    let cached_objects = ensure_object_cache(state_dir, workspace, &common_dir).await?;
 
     let source_head = Command::new("git")
         .arg("-C")
@@ -159,7 +161,7 @@ async fn create_workspace_snapshot_inner(
             workspace,
             staging_repository,
             staging_index,
-            &source_objects,
+            &cached_objects,
             ["read-tree", head.as_str()],
             "seed snapshot index",
         )
@@ -170,7 +172,7 @@ async fn create_workspace_snapshot_inner(
         workspace,
         staging_repository,
         staging_index,
-        &source_objects,
+        &cached_objects,
     );
     add.args(["add", "--all", "--", ":/"]);
     if let Some(excluded_state) = state_dir_exclusion(state_dir, workspace)? {
@@ -182,7 +184,7 @@ async fn create_workspace_snapshot_inner(
         workspace,
         staging_repository,
         staging_index,
-        &source_objects,
+        &cached_objects,
         ["write-tree"],
         "write snapshot tree",
     )
@@ -193,7 +195,7 @@ async fn create_workspace_snapshot_inner(
         workspace,
         staging_repository,
         staging_index,
-        &source_objects,
+        &cached_objects,
     );
     commit
         .env("GIT_AUTHOR_NAME", "aksh")
@@ -220,7 +222,7 @@ async fn create_workspace_snapshot_inner(
         workspace,
         staging_repository,
         staging_index,
-        &source_objects,
+        &cached_objects,
         ["update-ref", SNAPSHOT_REF, commit_sha.as_str()],
         "publish snapshot ref",
     )
@@ -229,25 +231,37 @@ async fn create_workspace_snapshot_inner(
         workspace,
         staging_repository,
         staging_index,
-        &source_objects,
+        &cached_objects,
         ["symbolic-ref", "HEAD", SNAPSHOT_REF],
         "set snapshot default ref",
     )
     .await?;
 
-    let mut repack = Command::new("git");
-    repack
-        .env("GIT_DIR", staging_repository)
-        .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", &source_objects)
-        .args(["repack", "-a", "-d"]);
-    run_git(&mut repack, "make snapshot object database self-contained").await?;
+    let alternate_file = staging_repository.join("objects/info/alternates");
+    tokio::fs::create_dir_all(alternate_file.parent().expect("alternates parent"))
+        .await
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "failed to create snapshot alternates directory: {error}"
+            ))
+        })?;
+    tokio::fs::write(&alternate_file, format!("{}\n", cached_objects.display()))
+        .await
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "failed to publish snapshot object alternate: {error}"
+            ))
+        })?;
 
-    // This check deliberately omits GIT_ALTERNATE_OBJECT_DIRECTORIES. A pass
-    // proves the published repository does not depend on the source checkout.
+    // Prove that the synthetic commit is fully connected through the persisted
+    // cache without decompressing and re-hashing every historical blob on every
+    // submission. Git clone/fetch validate incoming objects; connectivity-only
+    // catches a missing alternate object while keeping warm snapshots bounded by
+    // the current tree rather than total repository history.
     let mut fsck = Command::new("git");
     fsck.env("GIT_DIR", staging_repository)
-        .args(["fsck", "--full", "--no-dangling"]);
-    run_git(&mut fsck, "verify self-contained snapshot repository").await?;
+        .args(["fsck", "--connectivity-only", "--no-dangling"]);
+    run_git(&mut fsck, "verify incremental snapshot repository").await?;
 
     tokio::fs::rename(staging_repository, final_repository)
         .await
@@ -349,6 +363,108 @@ fn output_path(output: &std::process::Output, workspace: &FsPath) -> Result<Path
             path.display()
         ))
     })
+}
+
+async fn ensure_object_cache(
+    state_dir: &FsPath,
+    workspace: &FsPath,
+    common_dir: &FsPath,
+) -> Result<PathBuf, ApiError> {
+    use sha2::Digest;
+
+    let identity = common_dir.to_string_lossy();
+    let key = format!("{:x}", sha2::Sha256::digest(identity.as_bytes()));
+    let root = state_dir.join("snapshot-object-cache");
+    let repository = root.join(format!("{key}.git"));
+    let lock = root.join(format!("{key}.lock"));
+    tokio::fs::create_dir_all(&root).await.map_err(|error| {
+        ApiError::internal(format!("failed to create snapshot object cache: {error}"))
+    })?;
+    let _guard = acquire_cache_lock(&lock).await?;
+
+    if !repository.is_dir() {
+        let staging = root.join(format!("{key}.{}.tmp", uuid::Uuid::new_v4()));
+        let mut clone = Command::new("git");
+        clone
+            .args(["clone", "--bare", "--local", "--quiet"])
+            .arg(workspace)
+            .arg(&staging);
+        if let Err(error) = run_git(&mut clone, "initialize snapshot object cache").await {
+            let _ = tokio::fs::remove_dir_all(&staging).await;
+            return Err(error);
+        }
+        let mut disable_gc = Command::new("git");
+        disable_gc
+            .env("GIT_DIR", &staging)
+            .args(["config", "gc.auto", "0"]);
+        run_git(&mut disable_gc, "disable snapshot cache auto-gc").await?;
+        match tokio::fs::rename(&staging, &repository).await {
+            Ok(()) => {}
+            Err(error) if repository.is_dir() => {
+                let _ = tokio::fs::remove_dir_all(&staging).await;
+                let _ = error;
+            }
+            Err(error) => {
+                let _ = tokio::fs::remove_dir_all(&staging).await;
+                return Err(ApiError::internal(format!(
+                    "failed to publish snapshot object cache: {error}"
+                )));
+            }
+        }
+    } else {
+        // Fetch only adds immutable objects and atomically updates refs. Auto
+        // GC is disabled, so active run alternates cannot lose base objects.
+        let mut fetch = Command::new("git");
+        fetch
+            .env("GIT_DIR", &repository)
+            .args(["fetch", "--quiet", "--force", "--prune"])
+            .arg(workspace)
+            .args(["+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"]);
+        run_git(&mut fetch, "refresh snapshot object cache").await?;
+    }
+
+    std::fs::canonicalize(repository.join("objects")).map_err(|error| {
+        ApiError::internal(format!("failed to resolve snapshot object cache: {error}"))
+    })
+}
+
+struct CacheLock(PathBuf);
+
+impl Drop for CacheLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.0);
+    }
+}
+
+async fn acquire_cache_lock(path: &FsPath) -> Result<CacheLock, ApiError> {
+    let started = std::time::Instant::now();
+    loop {
+        match std::fs::create_dir(path) {
+            Ok(()) => return Ok(CacheLock(path.to_owned())),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = std::fs::metadata(path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|age| age > std::time::Duration::from_secs(60));
+                if stale {
+                    let _ = std::fs::remove_dir(path);
+                    continue;
+                }
+                if started.elapsed() > std::time::Duration::from_secs(10) {
+                    return Err(ApiError::internal(
+                        "timed out waiting for snapshot object cache",
+                    ));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            Err(error) => {
+                return Err(ApiError::internal(format!(
+                    "failed to lock snapshot object cache: {error}"
+                )));
+            }
+        }
+    }
 }
 
 fn state_dir_exclusion(state_dir: &FsPath, workspace: &FsPath) -> Result<Option<String>, ApiError> {
