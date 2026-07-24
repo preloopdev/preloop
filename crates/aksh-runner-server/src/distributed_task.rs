@@ -535,6 +535,23 @@ pub(crate) async fn complete_job_inner(
         );
         propagate_reusable_outputs(run);
         run.status = summarize_run(run.jobs.values().copied());
+        // A completed job proves that the run has started. Keep the first
+        // observed completion as a conservative fallback when the runner did
+        // not report an earlier start transition.
+        if run.started_at.is_none() {
+            run.started_at = Some(chrono::Utc::now());
+        }
+        if matches!(
+            run.status,
+            ExecutionStatus::Success
+                | ExecutionStatus::Failure
+                | ExecutionStatus::Cancelled
+                | ExecutionStatus::Skipped
+        ) && run.completed_at.is_none()
+        {
+            run.completed_at = Some(chrono::Utc::now());
+            run.conclusion = Some(status_string(run.status));
+        }
     }
     // Use the status actually stored (may differ from completion if terminal-locked).
     let effective_status = inner
