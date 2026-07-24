@@ -174,15 +174,28 @@ impl AppState {
         let cache = CacheStore::new(state_dir.join("cache")).await?;
         let artifacts = ArtifactStore::new(state_dir.join("artifacts")).await?;
         let (events, _) = broadcast::channel(1024);
-        let keypair = AgentRsaKeypair::generate()
-            .map_err(|e| anyhow::anyhow!("Failed to generate RSA keypair: {}", e))?;
-        let oidc_keypair = load_or_generate_oidc_keypair(&state_dir)?;
+        let oidc_state_dir = state_dir.clone();
+        let keypair_handle = tokio::task::spawn_blocking(AgentRsaKeypair::generate);
+        let oidc_handle =
+            tokio::task::spawn_blocking(move || load_or_generate_oidc_keypair(&oidc_state_dir));
+        #[cfg(not(test))]
+        let hmac_handle = {
+            let hmac_state_dir = state_dir.clone();
+            tokio::task::spawn_blocking(move || load_or_generate_hmac_key(&hmac_state_dir))
+        };
+        #[cfg(not(test))]
+        let (keypair_result, oidc_result, hmac_result) =
+            tokio::join!(keypair_handle, oidc_handle, hmac_handle);
+        #[cfg(test)]
+        let (keypair_result, oidc_result) = tokio::join!(keypair_handle, oidc_handle);
+        let keypair = keypair_result??;
+        let oidc_keypair = oidc_result??;
         let system_token =
             env::var("AKSH_SYSTEM_TOKEN").unwrap_or_else(|_| DEFAULT_AKSH_SYSTEM_TOKEN.to_owned());
         #[cfg(test)]
         let local_jwt_key = TEST_LOCAL_JWT_KEY.to_vec();
         #[cfg(not(test))]
-        let local_jwt_key = load_or_generate_hmac_key(&state_dir)?;
+        let local_jwt_key = hmac_result??;
         let registry_path = state_dir.join("artifact_v2_registry.json");
         let (registry, next_id) = if registry_path.exists() {
             if let Ok(content) = std::fs::read_to_string(&registry_path) {
