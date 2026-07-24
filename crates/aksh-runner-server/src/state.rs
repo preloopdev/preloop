@@ -385,18 +385,21 @@ pub(crate) fn load_or_generate_hmac_key(state_dir: &std::path::Path) -> anyhow::
 }
 
 impl InnerState {
-    /// Look up dispatch metadata for the runner that owns a given session.
-    pub(crate) fn runner_capabilities_for_session(&self, session_id: &str) -> RunnerCapabilities {
-        let runner_id = self
-            .broker_session_runners
+    /// Return the runner that owns a listener session.
+    pub(crate) fn runner_id_for_session(&self, session_id: &str) -> Option<i64> {
+        self.broker_session_runners
             .get(session_id)
             .copied()
             .or_else(|| {
                 self.sessions
                     .get(session_id)
                     .map(|session| session.runner_id)
-            });
-        runner_id
+            })
+    }
+
+    /// Look up dispatch metadata for the runner that owns a given session.
+    pub(crate) fn runner_capabilities_for_session(&self, session_id: &str) -> RunnerCapabilities {
+        self.runner_id_for_session(session_id)
             .and_then(|runner_id| self.runners.get(&runner_id))
             .map(|runner| RunnerCapabilities {
                 known: true,
@@ -411,6 +414,7 @@ impl InnerState {
 #[derive(Default)]
 pub(crate) struct InnerState {
     pub(crate) runs: BTreeMap<RunId, RunRecord>,
+    pub(crate) workflow_run_counters: BTreeMap<String, u64>,
     pub(crate) queue: VecDeque<QueuedJob>,
     pub(crate) pending_jobs: VecDeque<QueuedJob>,
     pub(crate) runners: BTreeMap<i64, RegisteredRunner>,
