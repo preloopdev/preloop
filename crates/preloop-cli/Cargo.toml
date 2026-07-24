@@ -1,0 +1,31 @@
+[package]
+name = "preloop-cli"
+version = "0.21.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Preloop CI command-line interface"
+
+[[bin]]
+name = "preloop"
+path = "src/main.rs"
+
+[dependencies]
+preloop-orchestrator = { path = "../preloop-orchestrator" }
+preloop-vm = { path = "../preloop-vm" }
+aksh-runner-server = { path = "../aksh-runner-server" }
+aksh-gha-parser = { path = "../aksh-gha-parser" }
+anyhow = { workspace = true }
+base64 = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+reqwest = { workspace = true }
+rand = { workspace = true }
+futures-util = "0.3"
+aksh-gha-protocol = { path = "../aksh-gha-protocol" }
