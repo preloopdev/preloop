@@ -412,9 +412,14 @@ fn local_runner_pool_config(
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(2),
+        use_fork: std::env::var("PRELOOP_USE_FORK")
+            .ok()
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false),
         name_prefix: "preloop-runner".into(),
         base_image: std::env::var("PRELOOP_RUNNER_BASE_IMAGE")
             .unwrap_or_else(|_| "ubuntu:24.04".into()),
+        workspace: None,
         artifact_stem: home.join("vms/preloop-runner-base"),
         runner_bundle,
         runner_binary_name: "aksh-runner".into(),

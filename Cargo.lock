@@ -1810,12 +1810,14 @@ name = "preloop-orchestrator"
 version = "0.21.0"
 dependencies = [
  "aksh-gha-parser",
+ "aksh-gha-protocol",
  "aksh-runner-server",
  "anyhow",
  "async-trait",
  "preloop-vm",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",
