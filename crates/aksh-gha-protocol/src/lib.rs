@@ -149,6 +149,12 @@ pub struct WorkflowSubmission {
     /// Repository-relative path of the submitted workflow file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_path: Option<String>,
+    /// Canonical host workspace used only by a trusted local control plane.
+    ///
+    /// This is accepted on input but never returned from run APIs, so host
+    /// filesystem layout does not leak into run metadata.
+    #[serde(default, skip_serializing)]
+    pub local_workspace: Option<String>,
     /// Caller-provided variables.
     #[serde(default)]
     pub vars: BTreeMap<String, String>,
@@ -235,6 +241,8 @@ fn default_actor() -> String {
 pub struct RunAccepted {
     /// New run id.
     pub run_id: RunId,
+    /// Monotonic run number for this workflow path.
+    pub run_number: u64,
     /// Number of expanded jobs queued for runners.
     pub queued_jobs: usize,
 }
