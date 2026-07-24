@@ -792,6 +792,7 @@ pub(crate) async fn handle_github_webhook(
                 repository: repo_full_name.clone(),
                 git_ref: effective.git_ref.clone(),
                 workflow_path: Some(format!(".github/workflows/{filename}")),
+                local_workspace: None,
                 vars: BTreeMap::new(),
                 secrets: BTreeMap::new(),
                 reusable_workflows: BTreeMap::new(),
