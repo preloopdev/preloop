@@ -183,7 +183,7 @@ fn runner_version_deprecated_response(
 
 pub(crate) async fn next_message_broker_ref(
     State(shared): State<Arc<SharedState>>,
-    Path(pool_id): Path<i64>,
+    Path(_pool_id): Path<i64>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
     if let Some(response) = runner_version_deprecated_response(&shared, &params) {
@@ -201,6 +201,9 @@ pub(crate) async fn next_message_broker_ref(
 
     loop {
         let mut inner = shared.state.inner.lock().await;
+        let runner_id = inner
+            .runner_id_for_session(&session_id)
+            .ok_or_else(|| ApiError::forbidden("broker session has no runner owner"))?;
         if let Some(message) = inner
             .inflight_messages
             .get(&session_id)
@@ -227,7 +230,7 @@ pub(crate) async fn next_message_broker_ref(
                 }
 
                 if request.result.is_none() {
-                    return Ok(Json(broker_job_ref(request, pool_id)).into_response());
+                    return Ok(Json(broker_job_ref(request, runner_id)).into_response());
                 }
             }
             inner.session_active_requests.remove(&session_id);
@@ -290,7 +293,7 @@ pub(crate) async fn next_message_broker_ref(
             })
             .await;
 
-        return Ok(Json(broker_job_ref(&request, pool_id)).into_response());
+        return Ok(Json(broker_job_ref(&request, runner_id)).into_response());
     }
 }
 
@@ -551,7 +554,7 @@ pub(crate) async fn next_message_broker_ref_root(
                         .job_requests
                         .get(&request_id)
                         .expect("queued request must exist");
-                    Some(broker_job_ref_root(request, 1))
+                    Some(broker_job_ref_root(request, runner_id))
                 } else {
                     None
                 }
