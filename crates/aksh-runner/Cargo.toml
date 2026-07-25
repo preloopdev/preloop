@@ -8,7 +8,7 @@ rust-version.workspace = true
 description = "Rust reimplementation of the GitHub Actions runner (Runner.Listener + Runner.Worker)"
 
 [[bin]]
-name = "aksh-runner"
+name = "preloop-runner"
 path = "src/main.rs"
 
 [lints]
