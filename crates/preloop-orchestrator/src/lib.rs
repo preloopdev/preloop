@@ -717,14 +717,39 @@ async fn run_one_runner<P: VmProvider + 'static>(
         if let Err(error) = provider.delete(name).await {
             warn!(machine = name.as_str(), %error, "failed to delete preserved machine");
         }
-        return result.map(|()| successor);
+        return finish(&provider, result, successor).await;
     }
 
     // Report the runner's own failure in preference to a teardown failure.
-    let delete_result = provider.delete(name).await;
-    result?;
-    delete_result?;
-    Ok(successor)
+    let delete_result = provider.delete(name).await.map_err(OrchestratorError::from);
+    finish(&provider, result.and(delete_result), successor).await
+}
+
+/// Hand the replacement back, or discard it if this runner is failing.
+///
+/// A pre-provisioned successor owns a live VM. Returning early on the runner's
+/// error would drop the handle and strand that machine until the pool next
+/// swept stale names, so failure paths delete it explicitly.
+async fn finish<P: VmProvider + 'static>(
+    provider: &Arc<P>,
+    result: Result<(), OrchestratorError>,
+    successor: Option<ReadyRunner>,
+) -> Result<Option<ReadyRunner>, OrchestratorError> {
+    match result {
+        Ok(()) => Ok(successor),
+        Err(error) => {
+            if let Some(successor) = successor {
+                if let Err(cleanup) = provider.delete(&successor.name).await {
+                    warn!(
+                        machine = successor.name.as_str(),
+                        %cleanup,
+                        "failed to delete the replacement runner of a failed slot"
+                    );
+                }
+            }
+            Err(error)
+        }
+    }
 }
 
 /// Run the guest runner to completion, signalling the first job it accepts.
