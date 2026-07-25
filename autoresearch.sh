@@ -5,20 +5,28 @@
 # runner pool), runs a fixed offline workflow through it, and compares the
 # wall-clock cost against the identical shell work executed on the host.
 #
+# The primary workload is a 4-shard matrix: independent jobs are how real CI
+# workflows are shaped, and a fixed-size runner pool is where preloop stops
+# keeping up with the host.
+#
 # Primary metric:
-#   e2e_ms         median wall clock of `preloop run` with a warm pool
+#   e2e_ms          trimmed-mean wall clock of `preloop run` on the matrix
 #
 # Secondary metrics:
-#   e2e_min_ms     best observed `preloop run`
-#   host_ms        median wall clock of the host-native equivalent
-#   overhead_ms    e2e_ms - host_ms (the gap we are closing)
-#   overhead_ratio e2e_ms / host_ms
-#   submit_ms      POST /api/v1/runs, i.e. workspace snapshot cost
-#   api_total_ms   submit -> terminal status, measured without the CLI
-#   job_ms         first-to-last job log timestamp inside the VM
-#   dispatch_ms    api_total_ms - submit_ms - job_ms (queue, claim, report)
-#   pool_boot_ms   engine start -> every pool slot registered
-#   slot_ready_ms  median fork -> runner-registered latency
+#   e2e_min_ms      best observed matrix run
+#   host_ms         host-native equivalent, shards run concurrently
+#   overhead_ms     e2e_ms - host_ms (the gap we are closing)
+#   overhead_ratio  e2e_ms / host_ms
+#   single_ms       same work as one job, so the one-job path cannot regress
+#   host_single_ms  host-native single shard
+#   single_ratio    single_ms / host_single_ms
+#   submit_ms       POST /api/v1/runs, i.e. workspace snapshot cost
+#   api_total_ms    submit -> terminal status, measured without the CLI
+#   job_ms          first-to-last job log timestamp across all shards
+#   dispatch_ms     api_total_ms - submit_ms - job_ms (queue, claim, report)
+#   pool_boot_ms    engine start -> warm pool settled
+#   warm_runners    how many runners the engine chose to keep warm
+#   replenish_wait_ms  wait for the pool to refill between measured runs
 #
 # See benchmarks/preloop-perf/bench.py for the workload definition.
 
