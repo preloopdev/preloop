@@ -280,7 +280,11 @@ async fn connect_websocket(
             Ok(Err(error)) => debug!(%error, attempt, "live log websocket connect failed"),
             Err(_) => debug!(attempt, "live log websocket connect timed out"),
         }
-        random_backoff().await;
+        // Only back off when another attempt follows; sleeping after the last
+        // failure just delays the caller's fall back to blob-only logging.
+        if attempt + 1 < RETRIES {
+            random_backoff().await;
+        }
     }
     None
 }
