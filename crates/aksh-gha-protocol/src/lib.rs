@@ -131,7 +131,7 @@ impl<'de> Deserialize<'de> for SecretString {
 /// Redaction-safe map of secret names to values.
 pub type SecretMap = BTreeMap<String, SecretString>;
 
-/// Incoming workflow submission.
+/// Complete workflow request submitted to the control plane.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WorkflowSubmission {
     /// YAML workflow contents.
@@ -222,6 +222,45 @@ pub struct WorkflowSubmission {
     /// String-valued workflow_dispatch inputs for `github.event.inputs`.
     #[serde(default)]
     pub dispatch_inputs_stringified: BTreeMap<String, String>,
+    /// Run only these jobs (by YAML key) and their transitive `needs:`
+    /// dependencies. An empty list means run all jobs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selected_jobs: Vec<String>,
+    /// Explicit base ref for the run (populates `github.base_ref`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_ref: Option<String>,
+    /// Keep the failed job VM alive for interactive debugging.
+    #[serde(default)]
+    pub preserve_on_failure: bool,
+}
+
+impl WorkflowSubmission {
+    /// Serialize for transmission *to* the control plane, exposing secret values.
+    ///
+    /// [`SecretString`] redacts on `Serialize` so that a submission embedded in
+    /// server state (for example `RunRecord`) can never leak secrets through an
+    /// API response. Sending secrets is the one legitimate exception, so it is
+    /// opt-in at the call site rather than a property of the type.
+    pub fn to_request_json(&self) -> Result<serde_json::Value, serde_json::Error> {
+        let mut value = serde_json::to_value(self)?;
+        if self.secrets.is_empty() {
+            return Ok(value);
+        }
+        let exposed = self
+            .secrets
+            .iter()
+            .map(|(name, secret)| {
+                (
+                    name.clone(),
+                    serde_json::Value::String(secret.expose().to_owned()),
+                )
+            })
+            .collect();
+        if let Some(object) = value.as_object_mut() {
+            object.insert("secrets".to_owned(), serde_json::Value::Object(exposed));
+        }
+        Ok(value)
+    }
 }
 
 fn default_ref() -> String {
@@ -665,6 +704,72 @@ mod tests {
         assert_eq!(serde_json::to_string(&secret).unwrap(), "\"<redacted>\"");
         assert_eq!(secret.expose(), "super-secret");
     }
+
+    #[test]
+    fn workflow_submission_redacts_secrets_on_plain_serialization() {
+        let submission = submission_with_secrets();
+
+        // Anything that embeds a submission in server state (RunRecord) and
+        // serializes it must never emit the real values.
+        let json = serde_json::to_string(&submission).unwrap();
+
+        assert!(
+            !json.contains("actual-value") && !json.contains("another-secret"),
+            "plain serialization leaked a secret value: {json}"
+        );
+        assert!(json.contains("<redacted>"), "expected redaction marker");
+
+        #[derive(Serialize)]
+        struct Nested {
+            submission: WorkflowSubmission,
+        }
+        let nested = serde_json::to_string(&Nested { submission }).unwrap();
+        assert!(
+            !nested.contains("actual-value") && !nested.contains("another-secret"),
+            "nested serialization leaked a secret value: {nested}"
+        );
+    }
+
+    #[test]
+    fn workflow_submission_request_json_exposes_secrets_for_the_wire() {
+        let submission = submission_with_secrets();
+
+        let value = submission.to_request_json().unwrap();
+
+        assert_eq!(value["secrets"]["TOKEN"], "actual-value");
+        assert_eq!(value["secrets"]["KEY"], "another-secret");
+        assert!(
+            !value.to_string().contains("<redacted>"),
+            "request JSON still contains a redaction marker"
+        );
+
+        // The server recovers the real values from the request body.
+        let deserialized: WorkflowSubmission = serde_json::from_value(value).unwrap();
+        assert_eq!(deserialized.secrets["TOKEN"].expose(), "actual-value");
+        assert_eq!(deserialized.secrets["KEY"].expose(), "another-secret");
+    }
+
+    #[test]
+    fn workflow_submission_request_json_matches_plain_shape_without_secrets() {
+        let submission = WorkflowSubmission::default();
+
+        assert_eq!(
+            submission.to_request_json().unwrap(),
+            serde_json::to_value(&submission).unwrap()
+        );
+    }
+
+    fn submission_with_secrets() -> WorkflowSubmission {
+        let mut submission = WorkflowSubmission::default();
+        submission
+            .secrets
+            .insert("TOKEN".to_owned(), SecretString::new("actual-value"));
+        submission
+            .secrets
+            .insert("KEY".to_owned(), SecretString::new("another-secret"));
+        submission
+    }
+
     #[test]
     fn annotation_event_serializes_optional_source_fields() {
         let event = NdjsonEvent::Annotation {
