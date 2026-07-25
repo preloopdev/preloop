@@ -63,22 +63,46 @@ fn runner_volumes(config: &RunnerPoolConfig) -> Vec<VolumeMount> {
 
 fn base_install_commands() -> Vec<Vec<String>> {
     [
-        vec!["apt-get", "update", "-qq"],
+        // One shell round trip instead of two: every `exec` is a host process
+        // spawn plus a vsock round trip, and this runs on the engine's
+        // start-up critical path.
         vec![
-            "apt-get",
-            "install",
-            "-y",
-            "-qq",
-            "--no-install-recommends",
-            "git",
-            "curl",
-            "ca-certificates",
-            "nodejs",
+            "sh",
+            "-c",
+            "apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+             git curl ca-certificates nodejs",
         ],
     ]
     .into_iter()
     .map(|command| command.into_iter().map(str::to_owned).collect())
     .collect()
+}
+
+/// How long to wait for a freshly started guest to accept commands.
+const GUEST_READY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Gap between guest readiness probes.
+const GUEST_READY_POLL: Duration = Duration::from_millis(25);
+
+/// Block until the guest agent executes a trivial command.
+///
+/// `machine start` returns once the agent marker appears, but the guest can
+/// still refuse the first `exec`. Polling costs one round trip when the guest
+/// is already up, where a fixed sleep charged every boot for the worst case.
+async fn await_guest_ready<P: VmProvider>(
+    provider: &P,
+    name: &MachineName,
+) -> Result<(), OrchestratorError> {
+    let deadline = tokio::time::Instant::now() + GUEST_READY_TIMEOUT;
+    let probe = ["true".to_owned()];
+    loop {
+        match provider.exec(name, &probe).await {
+            Ok(_) => return Ok(()),
+            Err(error) if tokio::time::Instant::now() >= deadline => {
+                return Err(OrchestratorError::from(error))
+            }
+            Err(_) => tokio::time::sleep(GUEST_READY_POLL).await,
+        }
+    }
 }
 
 async fn install_base_dependencies<P: VmProvider>(
@@ -429,8 +453,10 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         };
         self.provider.create(&spec).await?;
         self.provider.start_forkable(golden).await?;
-        // Let the golden VM fully boot and settle.
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        if let Err(error) = await_guest_ready(self.provider.as_ref(), golden).await {
+            let _ = self.provider.delete(golden).await;
+            return Err(error);
+        }
         if let Err(error) = install_base_dependencies(self.provider.as_ref(), golden).await {
             let _ = self.provider.delete(golden).await;
             return Err(error);
@@ -899,7 +925,7 @@ mod lifecycle_tests {
                 .lock()
                 .await
                 .push(format!("exec:{}:{:?}", name.as_str(), argv));
-            if self.fail_install && argv.first().is_some_and(|arg| arg == "apt-get") {
+            if self.fail_install && argv.iter().any(|arg| arg.contains("apt-get")) {
                 return Err(test_error("install-failure"));
             }
             if self.fail_run && argv.iter().any(|arg| arg == "run") {
