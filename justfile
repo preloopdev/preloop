@@ -64,6 +64,10 @@ sg-scan-strict:
 #dogfood (e2e against aksh with real runner) 
 
 dogfood: build
+    ./scripts/aksh-e2e-bench.sh
+
+# Preloop end-to-end performance benchmark (see benchmarks/preloop-perf/).
+bench-preloop:
     ./autoresearch.sh
 
 # e2e redirect (one-time setup) 
