@@ -7537,6 +7537,81 @@ async fn workspace_snapshot_captures_git_state_without_mutating_source() {
 }
 
 #[tokio::test]
+async fn terminal_run_discards_workspace_snapshot_but_preserves_object_cache() {
+    let temp = tempfile::tempdir().unwrap();
+    let (state_dir, workspace) = create_snapshot_fixture(temp.path());
+    let mut state = AppState::new(state_dir.clone()).await.unwrap();
+    state.local_workspace = Some(workspace);
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = submit_yaml(
+        &app,
+        r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo snapshot
+"#,
+        "owner/repo",
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let repository = state_dir.join("snapshots").join(run_id.to_string());
+    let object_cache = state_dir.join("snapshot-object-cache");
+    assert!(
+        repository.is_dir(),
+        "submission should create the run snapshot"
+    );
+    assert!(
+        object_cache.is_dir(),
+        "submission should create the shared object cache"
+    );
+
+    let job_id = {
+        let inner = state.inner.lock().await;
+        inner
+            .runs
+            .get(&run_id)
+            .and_then(|run| run.jobs.keys().next())
+            .cloned()
+            .expect("submitted run should have one dispatchable job")
+    };
+    complete_via_api(&app, &run_id.to_string(), &job_id.to_string()).await;
+
+    assert_eq!(
+        get_run_json(&app, &run_id.to_string()).await["status"],
+        "success"
+    );
+    assert!(
+        !repository.exists(),
+        "terminal completion should remove the run's workspace snapshot"
+    );
+    assert!(
+        object_cache.is_dir(),
+        "terminal completion must preserve the shared snapshot object cache"
+    );
+}
+
+#[tokio::test]
+async fn discard_workspace_snapshot_is_idempotent_when_repository_absent() {
+    let temp = tempfile::tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let snapshots = state_dir.join("snapshots");
+    let object_cache = state_dir.join("snapshot-object-cache");
+    fs::create_dir_all(&snapshots).unwrap();
+    fs::create_dir_all(&object_cache).unwrap();
+    let run_id: RunId = "55555555-5555-4555-8555-555555555555".parse().unwrap();
+
+    discard_workspace_snapshot(&state_dir, run_id).await;
+    discard_workspace_snapshot(&state_dir, run_id).await;
+
+    assert!(!snapshots.join(run_id.to_string()).exists());
+    assert!(object_cache.is_dir());
+}
+
+#[tokio::test]
 async fn workspace_snapshots_reuse_large_base_objects_and_materialize_changes() {
     let temp = tempfile::tempdir().unwrap();
     let state_dir = temp.path().join("state");
