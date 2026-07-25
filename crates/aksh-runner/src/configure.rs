@@ -18,6 +18,36 @@ const DISTTASK_AGENT_ACCEPT: &str = "application/json; api-version=6.0-preview.2
 const DISTTASK_AGENT_CONTENT_TYPE: &str =
     "application/json; charset=utf-8; api-version=6.0-preview.2";
 
+/// Environment variable carrying a pre-generated keypair as `RSAParameters` JSON.
+///
+/// Generating a 2048-bit RSA key costs 70-180 ms, and for a pool of
+/// single-use runners that lands squarely on the path between a job arriving
+/// and a runner being ready for the next one. A supervising orchestrator can
+/// generate keys ahead of time and hand one over instead. Each runner still
+/// gets its own key; only the timing changes.
+pub const RSA_PARAMS_ENV: &str = "PRELOOP_RUNNER_RSA_PARAMS";
+
+/// Read a caller-supplied keypair, if one was injected.
+///
+/// A malformed value is a configuration error rather than a reason to
+/// silently fall back: falling back would hide the failure behind a slower
+/// runner that still works.
+fn supplied_keypair() -> Result<Option<aksh_gha_protocol::crypto::AgentRsaKeypair>> {
+    let Ok(raw) = std::env::var(RSA_PARAMS_ENV) else {
+        return Ok(None);
+    };
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    let params: aksh_gha_protocol::crypto::RsaParametersExport =
+        serde_json::from_str(raw.trim())
+            .with_context(|| format!("parsing {RSA_PARAMS_ENV} as RSAParameters JSON"))?;
+    let keypair = aksh_gha_protocol::crypto::AgentRsaKeypair::from_rsaparams(&params)
+        .map_err(|e| anyhow::anyhow!("importing keypair from {RSA_PARAMS_ENV}: {e}"))?;
+    info!("Using pre-generated RSA keypair from {RSA_PARAMS_ENV}");
+    Ok(Some(keypair))
+}
+
 /// Run the `configure` subcommand.
 pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<()> {
     let root = global.runner_root();
@@ -88,9 +118,14 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
         }
     }
 
-    // Step 3: Generate RSA keypair
-    let keypair = aksh_gha_protocol::crypto::AgentRsaKeypair::generate()
-        .map_err(|e| anyhow::anyhow!("generating RSA keypair: {e}"))?;
+    // Step 3: Obtain the RSA keypair
+    let keypair = supplied_keypair()?.map_or_else(
+        || {
+            aksh_gha_protocol::crypto::AgentRsaKeypair::generate()
+                .map_err(|e| anyhow::anyhow!("generating RSA keypair: {e}"))
+        },
+        Ok,
+    )?;
     let (rsa_params, public_key_xml) = export_keypair(&keypair);
 
     // Step 4: Determine runner name

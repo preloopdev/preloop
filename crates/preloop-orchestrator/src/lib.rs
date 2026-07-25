@@ -1,8 +1,10 @@
 //! SmolVM-backed ephemeral runner pool for Preloop CI.
 
 pub mod environment;
+mod keys;
 
 use crate::environment::{EnvironmentResolver, EnvironmentSpec};
+use crate::keys::{KeyPool, StagedKey};
 use aksh_gha_protocol::RUNNER_BUSY_SENTINEL;
 
 /// Line an ephemeral runner prints when it accepts a job. Re-exported so a
@@ -10,8 +12,8 @@ use aksh_gha_protocol::RUNNER_BUSY_SENTINEL;
 pub use aksh_gha_protocol::RUNNER_BUSY_SENTINEL as RUNNER_BUSY_LINE;
 
 use preloop_vm::{
-    MachineName, MachineSpec, MachineState, NetworkPolicy, OutputChunk, SmolVmProvider,
-    SocketMount, VmError, VmProvider, VolumeMount,
+    MachineName, MachineSpec, MachineState, NetworkPolicy, OutputChunk, SecretSource,
+    SmolVmProvider, SocketMount, VmError, VmProvider, VolumeMount,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -27,6 +29,9 @@ use tracing::{info, warn};
 const GUEST_CONTROL_DIR: &str = "/run/preloop-control";
 const GUEST_CONTROL_SOCKET: &str = "/run/preloop-control/engine.sock";
 const GUEST_FAILURE_MARKER: &str = "/var/lib/preloop-runner/.preloop-job-failed";
+/// Guest variable `preloop-runner configure` reads a pre-generated keypair from.
+/// Must match `aksh_runner::configure::RSA_PARAMS_ENV`.
+const RUNNER_RSA_PARAMS_ENV: &str = "PRELOOP_RUNNER_RSA_PARAMS";
 
 /// How long a preserved VM survives with nobody attached.
 const DEBUG_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
@@ -187,6 +192,10 @@ pub struct RunnerPoolConfig {
     /// failed is held open for interactive debugging. Whether any individual
     /// job opts in is decided per run by the control plane, not here.
     pub debug_dir: Option<PathBuf>,
+    /// Directory used to hand pre-generated runner keypairs to `configure`.
+    ///
+    /// Unset means every runner generates its own keypair inside its guest.
+    pub runner_key_dir: Option<PathBuf>,
 }
 
 /// Cache of environment-specific golden VMs.
@@ -347,13 +356,19 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // Runners currently registered and waiting for work. Slots consult it
         // to decide whether a replacement is worth booting mid-job.
         let idle = Arc::new(AtomicUsize::new(0));
+        // Filled in the background so no slot ever waits on RSA generation.
+        let keys = Arc::new(KeyPool::new());
+        keys.spawn_refill();
         for slot in 0..self.config.size {
             let provider = self.provider.clone();
             let config = self.config.clone();
             let slot_shutdown = shutdown.child_token();
             let slot_registry = golden_registry.clone();
             let slot_resolver = resolver.clone();
-            let slot_idle = idle.clone();
+            let slot_handles = PoolHandles {
+                idle: idle.clone(),
+                keys: keys.clone(),
+            };
             slots.spawn(async move {
                 run_slot(
                     provider,
@@ -362,7 +377,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     slot_shutdown,
                     slot_registry,
                     slot_resolver,
-                    slot_idle,
+                    slot_handles,
                 )
                 .await
             });
@@ -508,6 +523,15 @@ struct ReadyRunner {
     run: Vec<String>,
 }
 
+/// Handles every slot in the pool shares.
+#[derive(Clone)]
+struct PoolHandles {
+    /// Runners across the whole pool that are registered and unclaimed.
+    idle: Arc<AtomicUsize>,
+    /// Keypairs generated ahead of time for runner registration.
+    keys: Arc<KeyPool>,
+}
+
 /// What a slot needs in order to build its next runner.
 struct SlotPlan<'a> {
     /// Pool slot index, used to name machines.
@@ -518,6 +542,8 @@ struct SlotPlan<'a> {
     golden: Option<&'a MachineName>,
     /// Runners across the whole pool that are registered and unclaimed.
     idle: &'a AtomicUsize,
+    /// Keypairs generated ahead of time for runner registration.
+    keys: &'a Arc<KeyPool>,
 }
 async fn run_slot<P: VmProvider + 'static>(
     provider: Arc<P>,
@@ -526,8 +552,9 @@ async fn run_slot<P: VmProvider + 'static>(
     shutdown: CancellationToken,
     golden_registry: Arc<GoldenRegistry>,
     _environment_resolver: Arc<EnvironmentResolver>,
-    idle: Arc<AtomicUsize>,
+    handles: PoolHandles,
 ) -> Result<(), OrchestratorError> {
+    let PoolHandles { idle, keys } = handles;
     let default_fingerprint =
         EnvironmentSpec::new(config.base_image.clone(), Vec::new()).fingerprint;
     let mut generation: u64 = 0;
@@ -542,7 +569,9 @@ async fn run_slot<P: VmProvider + 'static>(
             Some(runner) => runner,
             None => {
                 generation += 1;
-                match provision_slot(&provider, &config, slot, generation, golden.as_ref()).await {
+                match provision_slot(&provider, &config, slot, generation, golden.as_ref(), &keys)
+                    .await
+                {
                     Ok(runner) => runner,
                     Err(error) => {
                         warn!(slot, %error, "provisioning runner failed; retrying");
@@ -567,6 +596,7 @@ async fn run_slot<P: VmProvider + 'static>(
                 generation,
                 golden: golden.as_ref(),
                 idle: &idle,
+                keys: &keys,
             },
         )
         .await;
@@ -599,9 +629,10 @@ async fn provision_slot<P: VmProvider + 'static>(
     slot: usize,
     generation: u64,
     golden: Option<&MachineName>,
+    keys: &Arc<KeyPool>,
 ) -> Result<ReadyRunner, OrchestratorError> {
     let name = MachineName::new(format!("{}-{slot}-{generation}", config.name_prefix))?;
-    match provision_runner(provider, config, &name, golden).await {
+    match provision_runner(provider, config, &name, golden, keys).await {
         Ok(run) => Ok(ReadyRunner { name, run }),
         Err(error) => {
             if let Err(cleanup) = provider.delete(&name).await {
@@ -639,6 +670,7 @@ async fn run_one_runner<P: VmProvider + 'static>(
         generation: next_generation,
         golden,
         idle,
+        keys,
     } = plan;
 
     let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
@@ -663,7 +695,7 @@ async fn run_one_runner<P: VmProvider + 'static>(
         if idle.fetch_sub(1, Ordering::AcqRel) > 1 {
             return None;
         }
-        match provision_slot(&provider, config, slot, next_generation, golden).await {
+        match provision_slot(&provider, config, slot, next_generation, golden, keys).await {
             Ok(successor) => Some(successor),
             Err(error) => {
                 warn!(slot, %error, "pre-provisioning the replacement runner failed");
@@ -809,6 +841,7 @@ async fn provision_runner<P: VmProvider + 'static>(
     config: &RunnerPoolConfig,
     name: &MachineName,
     golden: Option<&MachineName>,
+    keys: &Arc<KeyPool>,
 ) -> Result<Vec<String>, OrchestratorError> {
     if let Some(golden) = golden {
         // Fork from the already-booted golden VM — instant CoW clone.
@@ -864,16 +897,27 @@ async fn provision_runner<P: VmProvider + 'static>(
         "--ephemeral".into(),
         "--no-externals".into(),
     ]);
+    let mut secrets = vec![(
+        "PRELOOP_RUNNER_TOKEN".to_owned(),
+        SecretSource::HostEnv(config.registration_token_env.clone()),
+    )];
+    // Held until `configure` returns; dropping it wipes the key from disk.
+    let staged = stage_runner_key(config, name, keys).await;
+    if let Some(staged) = &staged {
+        match staged.path() {
+            Ok(path) => secrets.push((
+                RUNNER_RSA_PARAMS_ENV.to_owned(),
+                SecretSource::HostFile(path),
+            )),
+            Err(error) => {
+                warn!(%error, "staged runner key unreadable; the guest will generate one")
+            }
+        }
+    }
     provider
-        .exec_with_secret_env(
-            name,
-            &configure,
-            &[(
-                "PRELOOP_RUNNER_TOKEN".into(),
-                config.registration_token_env.clone(),
-            )],
-        )
+        .exec_with_secret_env(name, &configure, &secrets)
         .await?;
+    drop(staged);
 
     info!(machine = name.as_str(), "ephemeral runner ready");
     let mut run = guest_env_prefix(config);
@@ -885,6 +929,26 @@ async fn provision_runner<P: VmProvider + 'static>(
         "/var/lib/preloop-runner".into(),
     ]);
     Ok(run)
+}
+
+/// Stage a pre-generated keypair for one `configure` call, if one is ready.
+///
+/// Absent a staged key the guest generates its own, which is simply the
+/// slower path — never a failure.
+async fn stage_runner_key(
+    config: &RunnerPoolConfig,
+    name: &MachineName,
+    keys: &Arc<KeyPool>,
+) -> Option<StagedKey> {
+    let directory = config.runner_key_dir.as_deref()?;
+    let params = keys.take().await?;
+    match StagedKey::write(directory, name.as_str(), &params) {
+        Ok(staged) => Some(staged),
+        Err(error) => {
+            warn!(path = %directory.display(), %error, "could not stage a runner keypair");
+            None
+        }
+    }
 }
 
 /// Hold a failed runner's VM open so `preloop shell` can attach.
@@ -1038,6 +1102,7 @@ mod lifecycle_tests {
             memory_mib: 128,
             storage_gib: 1,
             debug_dir: None,
+            runner_key_dir: None,
         }
     }
 
@@ -1138,7 +1203,7 @@ mod lifecycle_tests {
             &self,
             name: &MachineName,
             _argv: &[String],
-            _secrets: &[(String, String)],
+            _secrets: &[(String, SecretSource)],
         ) -> Result<ExecOutput, VmError> {
             self.events
                 .lock()
@@ -1181,7 +1246,7 @@ mod lifecycle_tests {
         golden: Option<&MachineName>,
         expected: &str,
     ) {
-        let error = provision_slot(&provider, config, 0, 1, golden)
+        let error = provision_slot(&provider, config, 0, 1, golden, &Arc::new(KeyPool::new()))
             .await
             .expect_err("provisioning failure must propagate");
         let name = MachineName::new(format!("{}-0-1", config.name_prefix)).unwrap();
@@ -1239,7 +1304,7 @@ mod lifecycle_tests {
     async fn runner_error_wins_when_delete_also_fails() {
         let provider = Arc::new(TestProvider::new(false, false, false, true, true));
         let config = test_config(false);
-        let runner = provision_slot(&provider, &config, 0, 1, None)
+        let runner = provision_slot(&provider, &config, 0, 1, None, &Arc::new(KeyPool::new()))
             .await
             .expect("provisioning succeeds");
         let idle = AtomicUsize::new(0);
@@ -1253,6 +1318,7 @@ mod lifecycle_tests {
                 generation: 2,
                 golden: None,
                 idle: &idle,
+                keys: &Arc::new(KeyPool::new()),
             },
         )
         .await
