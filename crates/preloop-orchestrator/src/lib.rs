@@ -16,7 +16,6 @@ use preloop_vm::{
     SmolVmProvider, SocketMount, VmError, VmProvider, VolumeMount,
 };
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -213,9 +212,13 @@ pub struct RunnerPoolConfig {
 /// Cache of environment-specific golden VMs.
 pub(crate) struct GoldenRegistry {
     goldens: RwLock<HashMap<String, MachineName>>,
-    /// Fingerprints whose golden is currently being prepared, preventing
-    /// concurrent `run_slot` calls from racing to create the same golden.
-    preparing: tokio::sync::Mutex<HashSet<String>>,
+    /// Serializes golden construction. Held across the whole build so two
+    /// slots cannot create the same golden concurrently — the second would
+    /// otherwise delete the first's half-built VM, since
+    /// `prepare_golden_for_env` removes any existing machine of that name.
+    /// Builds are rare and expensive, so serializing distinct environments
+    /// too costs nothing measurable.
+    build_lock: tokio::sync::Mutex<()>,
     name_prefix: String,
 }
 
@@ -223,7 +226,7 @@ impl GoldenRegistry {
     pub fn new(name_prefix: String) -> Self {
         Self {
             goldens: RwLock::new(HashMap::new()),
-            preparing: tokio::sync::Mutex::new(HashSet::new()),
+            build_lock: tokio::sync::Mutex::new(()),
             name_prefix,
         }
     }
@@ -238,32 +241,29 @@ impl GoldenRegistry {
         self.goldens.read().await.get(fingerprint).cloned()
     }
 
-    /// Get the golden for `fingerprint`, or prepare it via `build` while
-    /// holding a per-fingerprint lock so concurrent slots do not race.
+    /// Get the golden for `fingerprint`, or construct it via `build`.
+    ///
+    /// `build` returns the prepared machine name. It runs under a lock held
+    /// for its whole duration, and is skipped entirely if another caller
+    /// registered the same fingerprint while this one waited.
     pub async fn get_or_prepare(
         &self,
         fingerprint: &str,
-        build: impl Future<Output = Result<(MachineName, String), OrchestratorError>>,
+        build: impl Future<Output = Result<MachineName, OrchestratorError>>,
     ) -> Result<MachineName, OrchestratorError> {
         // Fast path: already registered.
         if let Some(golden) = self.get(fingerprint).await {
             return Ok(golden);
         }
-        let mut preparing = self.preparing.lock().await;
-        // Re-check — another slot may have finished while we waited.
+        // Held across `build` so a concurrent caller cannot start a second
+        // build of the same golden.
+        let _guard = self.build_lock.lock().await;
+        // Re-check: another caller may have built it while we waited.
         if let Some(golden) = self.get(fingerprint).await {
             return Ok(golden);
         }
-        preparing.insert(fingerprint.to_owned());
-        drop(preparing);
-
-        let (name, fingerprint) = build.await?;
-        self.insert(fingerprint.clone(), name.clone()).await;
-
-        let mut preparing = self.preparing.lock().await;
-        preparing.remove(&fingerprint);
-        drop(preparing);
-
+        let name = build.await?;
+        self.insert(fingerprint.to_owned(), name.clone()).await;
         Ok(name)
     }
 
@@ -570,6 +570,11 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
 struct ReadyRunner {
     name: MachineName,
     run: Vec<String>,
+    /// Environment fingerprint of the golden this runner was forked from.
+    /// A spare built for one environment must not serve a job needing
+    /// another, so a mismatch discards it rather than running the job on
+    /// the wrong base image.
+    fingerprint: Option<String>,
 }
 
 /// Handles every slot in the pool shares.
@@ -591,6 +596,9 @@ struct SlotPlan<'a> {
     generation: u64,
     /// Fork base, when the pool has one.
     golden: Option<&'a MachineName>,
+    /// Environment fingerprint of `golden`, recorded on the replacement so a
+    /// later iteration can tell whether the spare still matches the work.
+    fingerprint: Option<String>,
     /// Runners across the whole pool that are registered and unclaimed.
     idle: &'a AtomicUsize,
     /// Keypairs generated ahead of time for runner registration.
@@ -649,7 +657,7 @@ async fn run_slot<P: VmProvider + 'static>(
     let mut spare: Option<ReadyRunner> = None;
 
     while !shutdown.is_cancelled() {
-        let golden = if config.use_fork {
+        let (golden, fingerprint) = if config.use_fork {
             // Read the `runs-on` labels of the next queued job so the pool
             // can select the correct base-image golden before forking.
             let env_base = match &config.next_job_runs_on {
@@ -663,26 +671,23 @@ async fn run_slot<P: VmProvider + 'static>(
                 }
                 None => config.base_image.clone(),
             };
-            let env_base_for_closure = env_base.clone();
             let env_spec = EnvironmentSpec::new(env_base, Vec::new());
             let fingerprint = env_spec.fingerprint.clone();
 
-            match golden_registry
-                .get_or_prepare(&fingerprint.clone(), {
+            let selected = match golden_registry
+                .get_or_prepare(&fingerprint, {
                     let provider = provider.clone();
                     let config = config.clone();
                     let name_prefix = golden_registry.name_prefix().to_owned();
                     let fp = fingerprint.clone();
-                    let base = env_base_for_closure;
                     async move {
                         let name = MachineName::new(format!(
                             "{}-golden-{}",
                             name_prefix,
                             &fp[..12.min(fp.len())]
                         ))?;
-                        let spec = EnvironmentSpec::new(base, Vec::new());
-                        prepare_golden_for_env(&provider, &config, &name, &spec).await?;
-                        Ok((name, fp))
+                        prepare_golden_for_env(&provider, &config, &name, &env_spec).await?;
+                        Ok(name)
                     }
                 })
                 .await
@@ -694,17 +699,42 @@ async fn run_slot<P: VmProvider + 'static>(
                         EnvironmentSpec::new(config.base_image.clone(), Vec::new()).fingerprint;
                     golden_registry.get(&default_fingerprint).await
                 }
-            }
+            };
+            (selected, Some(fingerprint))
         } else {
             // create-per-runner path: no golden, provision fresh each time.
-            None
+            (None, None)
         };
+
+        // A spare forked from a different environment would run the job on
+        // the wrong base image. Discard it and provision against the golden
+        // this iteration actually selected.
+        if let Some(ready) = spare.take() {
+            if ready.fingerprint == fingerprint {
+                spare = Some(ready);
+            } else {
+                warn!(
+                    slot,
+                    "discarding spare runner built for a different environment"
+                );
+                let _ = provider.delete(&ready.name).await;
+            }
+        }
+
         let runner = match spare.take() {
             Some(runner) => runner,
             None => {
                 generation += 1;
-                match provision_slot(&provider, &config, slot, generation, golden.as_ref(), &keys)
-                    .await
+                match provision_slot(
+                    &provider,
+                    &config,
+                    slot,
+                    generation,
+                    golden.as_ref(),
+                    &keys,
+                    fingerprint.clone(),
+                )
+                .await
                 {
                     Ok(runner) => runner,
                     Err(error) => {
@@ -729,6 +759,7 @@ async fn run_slot<P: VmProvider + 'static>(
                 slot,
                 generation,
                 golden: golden.as_ref(),
+                fingerprint: fingerprint.clone(),
                 idle: &idle,
                 keys: &keys,
                 building: &building,
@@ -765,10 +796,15 @@ async fn provision_slot<P: VmProvider + 'static>(
     generation: u64,
     golden: Option<&MachineName>,
     keys: &Arc<KeyPool>,
+    fingerprint: Option<String>,
 ) -> Result<ReadyRunner, OrchestratorError> {
     let name = MachineName::new(format!("{}-{slot}-{generation}", config.name_prefix))?;
     match provision_runner(provider, config, &name, golden, keys).await {
-        Ok(run) => Ok(ReadyRunner { name, run }),
+        Ok(run) => Ok(ReadyRunner {
+            name,
+            run,
+            fingerprint,
+        }),
         Err(error) => {
             if let Err(cleanup) = provider.delete(&name).await {
                 warn!(
@@ -798,12 +834,17 @@ async fn run_one_runner<P: VmProvider + 'static>(
     shutdown: CancellationToken,
     plan: SlotPlan<'_>,
 ) -> Result<Option<ReadyRunner>, OrchestratorError> {
-    let ReadyRunner { name, run } = runner;
+    let ReadyRunner {
+        name,
+        run,
+        fingerprint: _,
+    } = runner;
     let name = &name;
     let SlotPlan {
         slot,
         generation: next_generation,
         golden,
+        fingerprint,
         idle,
         keys,
         building,
@@ -842,7 +883,17 @@ async fn run_one_runner<P: VmProvider + 'static>(
             .saturating_sub(idle_after)
             .max(usize::from(idle_after == 0));
         let _reservation = Reservation::take(building, wanted)?;
-        match provision_slot(&provider, config, slot, next_generation, golden, keys).await {
+        match provision_slot(
+            &provider,
+            config,
+            slot,
+            next_generation,
+            golden,
+            keys,
+            fingerprint,
+        )
+        .await
+        {
             Ok(successor) => Some(successor),
             Err(error) => {
                 warn!(slot, %error, "pre-provisioning the replacement runner failed");
@@ -1395,9 +1446,17 @@ mod lifecycle_tests {
         golden: Option<&MachineName>,
         expected: &str,
     ) {
-        let error = provision_slot(&provider, config, 0, 1, golden, &Arc::new(KeyPool::new()))
-            .await
-            .expect_err("provisioning failure must propagate");
+        let error = provision_slot(
+            &provider,
+            config,
+            0,
+            1,
+            golden,
+            &Arc::new(KeyPool::new()),
+            None,
+        )
+        .await
+        .expect_err("provisioning failure must propagate");
         let name = MachineName::new(format!("{}-0-1", config.name_prefix)).unwrap();
         assert!(error.to_string().contains(expected));
         assert!(!provider.has_machine(&name).await);
@@ -1453,9 +1512,17 @@ mod lifecycle_tests {
     async fn runner_error_wins_when_delete_also_fails() {
         let provider = Arc::new(TestProvider::new(false, false, false, true, true));
         let config = test_config(false);
-        let runner = provision_slot(&provider, &config, 0, 1, None, &Arc::new(KeyPool::new()))
-            .await
-            .expect("provisioning succeeds");
+        let runner = provision_slot(
+            &provider,
+            &config,
+            0,
+            1,
+            None,
+            &Arc::new(KeyPool::new()),
+            None,
+        )
+        .await
+        .expect("provisioning succeeds");
         let idle = AtomicUsize::new(0);
         let error = run_one_runner(
             provider,
@@ -1466,6 +1533,7 @@ mod lifecycle_tests {
                 slot: 0,
                 generation: 2,
                 golden: None,
+                fingerprint: None,
                 idle: &idle,
                 keys: &Arc::new(KeyPool::new()),
                 building: &AtomicUsize::new(0),
