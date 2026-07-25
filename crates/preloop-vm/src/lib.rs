@@ -234,7 +234,9 @@ pub trait VmProvider: Send + Sync {
 pub struct SmolVmProvider {
     binary: PathBuf,
     capture_limit: usize,
-    lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes operations that build or replace a machine's base against
+    /// everything else. See [`SmolVmProvider::exclusive`].
+    lifecycle_lock: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl Default for SmolVmProvider {
@@ -249,7 +251,7 @@ impl SmolVmProvider {
         Self {
             binary: binary.into(),
             capture_limit: DEFAULT_CAPTURE_LIMIT,
-            lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
+            lifecycle_lock: Arc::new(tokio::sync::RwLock::new(())),
         }
     }
 
@@ -319,12 +321,33 @@ impl SmolVmProvider {
         Ok(result)
     }
 
-    async fn lifecycle_checked(
+    /// Run an operation that constructs or replaces a machine's base image,
+    /// excluding every other lifecycle operation for its duration.
+    async fn exclusive(
         &self,
         operation: &'static str,
         args: &[String],
     ) -> Result<ExecOutput, VmError> {
-        let _guard = self.lifecycle_lock.lock().await;
+        let _guard = self.lifecycle_lock.write().await;
+        self.checked(operation, args).await
+    }
+
+    /// Run an operation that only touches one already-defined machine.
+    ///
+    /// These run concurrently with each other: a pool replenishing several
+    /// slots at once issues a delete and a fork per slot, and serializing them
+    /// made the whole refill wait one VM operation at a time. Forking four
+    /// clones from the same golden — including the first forks, which trigger
+    /// the base freeze — measured 101-119 ms concurrently against 271-283 ms
+    /// serially, with every clone usable and no failures across three trials.
+    /// They stay excluded from base construction, so a golden cannot be
+    /// replaced underneath a fork.
+    async fn concurrent(
+        &self,
+        operation: &'static str,
+        args: &[String],
+    ) -> Result<ExecOutput, VmError> {
+        let _guard = self.lifecycle_lock.read().await;
         self.checked(operation, args).await
     }
 }
@@ -378,11 +401,11 @@ impl VmProvider for SmolVmProvider {
                 format!("{}:{}", mount.host.display(), mount.guest.display()),
             ]);
         }
-        self.lifecycle_checked("create", &args).await.map(|_| ())
+        self.exclusive("create", &args).await.map(|_| ())
     }
 
     async fn start(&self, name: &MachineName) -> Result<(), VmError> {
-        self.lifecycle_checked(
+        self.exclusive(
             "start",
             &[
                 "machine".into(),
@@ -396,7 +419,7 @@ impl VmProvider for SmolVmProvider {
     }
 
     async fn start_forkable(&self, name: &MachineName) -> Result<(), VmError> {
-        self.lifecycle_checked(
+        self.exclusive(
             "start_forkable",
             &[
                 "machine".into(),
@@ -411,7 +434,7 @@ impl VmProvider for SmolVmProvider {
     }
 
     async fn fork(&self, golden: &MachineName, clone: &MachineName) -> Result<(), VmError> {
-        self.lifecycle_checked(
+        self.concurrent(
             "fork",
             &[
                 "machine".into(),
@@ -427,7 +450,7 @@ impl VmProvider for SmolVmProvider {
     }
 
     async fn stop(&self, name: &MachineName) -> Result<(), VmError> {
-        self.lifecycle_checked(
+        self.concurrent(
             "stop",
             &[
                 "machine".into(),
@@ -441,7 +464,7 @@ impl VmProvider for SmolVmProvider {
     }
 
     async fn delete(&self, name: &MachineName) -> Result<(), VmError> {
-        self.lifecycle_checked(
+        self.concurrent(
             "delete",
             &[
                 "machine".into(),
@@ -462,7 +485,7 @@ impl VmProvider for SmolVmProvider {
             "--name".into(),
             name.as_str().into(),
         ];
-        match self.lifecycle_checked("status", &args).await {
+        match self.concurrent("status", &args).await {
             Ok(output) => {
                 let text = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
                 Ok(if text.contains("running") {
@@ -484,7 +507,7 @@ impl VmProvider for SmolVmProvider {
 
     async fn list(&self) -> Result<Vec<MachineName>, VmError> {
         let output = self
-            .lifecycle_checked("list", &["machine".into(), "ls".into(), "--json".into()])
+            .concurrent("list", &["machine".into(), "ls".into(), "--json".into()])
             .await?;
         let values: serde_json::Value = serde_json::from_slice(&output.stdout)
             .map_err(|error| VmError::Protocol(error.to_string()))?;
@@ -615,7 +638,7 @@ impl VmProvider for SmolVmProvider {
                 "pack output path must be absolute".into(),
             ));
         }
-        self.lifecycle_checked(
+        self.exclusive(
             "pack",
             &[
                 "pack".into(),
