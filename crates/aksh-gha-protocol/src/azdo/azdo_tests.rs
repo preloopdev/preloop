@@ -497,6 +497,7 @@ fn arb_job() -> impl Strategy<Value = AgentJobRequestMessage> {
                 debugger_welcome_message,
                 aksh_debug_run_id: None,
                 aksh_debug_transport: None,
+                preloop_preserve_on_failure: None,
             },
         )
 }
