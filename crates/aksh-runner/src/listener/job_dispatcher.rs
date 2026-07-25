@@ -200,12 +200,15 @@ pub async fn spawn_job(
             let status = std::process::Command::new("cargo")
                 .args(["build", "--quiet", "--manifest-path"])
                 .arg(&manifest)
-                .args(["--bin", "aksh-runner"])
+                .args(["--bin", "preloop-runner"])
                 .status()
-                .expect("build aksh-runner test worker");
-            assert!(status.success(), "building aksh-runner test worker failed");
+                .expect("build preloop-runner test worker");
+            assert!(
+                status.success(),
+                "building preloop-runner test worker failed"
+            );
             if let Ok(target_dir_env) = std::env::var("CARGO_TARGET_DIR") {
-                std::path::PathBuf::from(target_dir_env).join("debug/aksh-runner")
+                std::path::PathBuf::from(target_dir_env).join("debug/preloop-runner")
             } else {
                 manifest
                     .parent()
@@ -214,7 +217,7 @@ pub async fn spawn_job(
                     .unwrap()
                     .parent()
                     .unwrap()
-                    .join("target/debug/aksh-runner")
+                    .join("target/debug/preloop-runner")
             }
         });
         let mut command = tokio::process::Command::new(binary);
