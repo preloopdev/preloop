@@ -26,7 +26,7 @@ pub struct ServerConfig {
     pub test_api_token: Option<String>,
     /// OIDC issuer URL. Defaults to `{public_base_url}/oidc`.
     ///
-    /// This must identify an issuer controlled by the aksh deployment. Setting
+    /// This must identify an issuer controlled by the preloop deployment. Setting
     /// GitHub's hosted issuer does not make locally signed tokens GitHub-trusted.
     pub oidc_issuer: Option<String>,
     /// Enable the cron scheduler for schedule-triggered workflows.
