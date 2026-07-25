@@ -47,17 +47,17 @@ WS = CACHE / "ws"
 ENGINE_LOG = CACHE / "engine.log"
 
 # Bump when the fixture recipe changes so cached workspaces are rebuilt.
-FIXTURE_VERSION = 1
+FIXTURE_VERSION = 2
 FIXTURE_DIRS = 12
 FIXTURE_FILES_PER_DIR = 25
 
 LISTEN = os.environ.get("PRELOOP_BENCH_LISTEN", "127.0.0.1:19090")
 BASE_URL = f"http://{LISTEN}"
 TOKEN = "0" * 64
-POOL_SIZE = 2
 
 WARMUP_RUNS = 2
 CLI_RUNS = int(os.environ.get("PRELOOP_BENCH_CLI_RUNS", "9"))
+SINGLE_RUNS = int(os.environ.get("PRELOOP_BENCH_SINGLE_RUNS", "5"))
 API_RUNS = int(os.environ.get("PRELOOP_BENCH_API_RUNS", "9"))
 HOST_RUNS = int(os.environ.get("PRELOOP_BENCH_HOST_RUNS", "5"))
 
@@ -78,6 +78,9 @@ BASE_IMAGE = os.environ.get(
 # Fixed-size guest work. Kept identical in the workflow and the host baseline.
 FSGEN_FILES = 1500
 NODE_ITERATIONS = 3_000_000
+# Parallel jobs in the primary workload. Matrices are the norm in real CI and
+# they are where a fixed-size runner pool stops keeping up.
+MATRIX_JOBS = int(os.environ.get("PRELOOP_BENCH_MATRIX_JOBS", "4"))
 
 GIT_ENV = {
     "GIT_AUTHOR_NAME": "preloop-bench",
@@ -90,13 +93,7 @@ GIT_ENV = {
     "GIT_CONFIG_SYSTEM": "/dev/null",
 }
 
-WORKFLOW = f"""name: bench
-on: push
-
-jobs:
-  bench:
-    runs-on: self-hosted
-    steps:
+STEPS = f"""    steps:
       - name: noop
         run: 'true'
       - name: fsgen
@@ -118,32 +115,63 @@ jobs:
         run: node -e 'let h=0;for(let i=0;i<{NODE_ITERATIONS};i++){{h=(h*31+i)>>>0}}console.log(h)'
 """
 
+# Primary workload: one job per matrix shard, all independent.
+MATRIX_WORKFLOW = """name: bench
+on: push
+
+jobs:
+  bench:
+    runs-on: self-hosted
+    strategy:
+      matrix:
+        shard: [{shards}]
+{steps}""".format(
+    shards=", ".join(str(shard) for shard in range(MATRIX_JOBS)), steps=STEPS
+)
+
+# Secondary workload: the same work as a single job, so a matrix-focused change
+# cannot quietly regress the one-job path.
+SINGLE_WORKFLOW = """name: single
+on: push
+
+jobs:
+  single:
+    runs-on: self-hosted
+{steps}""".format(steps=STEPS)
+
 HOST_BASELINE = f"""#!/usr/bin/env bash
-# Host-native equivalent of benchmarks/preloop-perf workflow `bench.yml`.
+# Host-native equivalent of the benchmark workflow. `$1` shards run
+# concurrently, exactly as independent matrix jobs would.
 set -euo pipefail
-RUNNER_TEMP="$(mktemp -d)"
-trap 'rm -rf "$RUNNER_TEMP"' EXIT
 
 sha256() {{ if command -v sha256sum >/dev/null; then sha256sum; else shasum -a 256; fi; }}
 
-# step: noop
-true
+shard() {{
+  local RUNNER_TEMP; RUNNER_TEMP="$(mktemp -d)"
+  trap 'rm -rf "$RUNNER_TEMP"' RETURN
 
-# step: fsgen
-out="$RUNNER_TEMP/fsgen"
-rm -rf "$out"; mkdir -p "$out"
-i=0
-while [ $i -lt {FSGEN_FILES} ]; do
-  printf '%s\\n' "line-$i-{'a' * 60}" > "$out/f$i.txt"
-  i=$((i+1))
-done
-sync
+  # step: noop
+  true
 
-# step: fsread
-find "$RUNNER_TEMP/fsgen" -type f -print0 | xargs -0 cat | sha256 >/dev/null
+  # step: fsgen
+  local out="$RUNNER_TEMP/fsgen"
+  rm -rf "$out"; mkdir -p "$out"
+  local i=0
+  while [ $i -lt {FSGEN_FILES} ]; do
+    printf '%s\\n' "line-$i-{'a' * 60}" > "$out/f$i.txt"
+    i=$((i+1))
+  done
+  sync
 
-# step: node
-node -e 'let h=0;for(let i=0;i<{NODE_ITERATIONS};i++){{h=(h*31+i)>>>0}}console.log(h)' >/dev/null
+  # step: fsread
+  find "$out" -type f -print0 | xargs -0 cat | sha256 >/dev/null
+
+  # step: node
+  node -e 'let h=0;for(let i=0;i<{NODE_ITERATIONS};i++){{h=(h*31+i)>>>0}}console.log(h)' >/dev/null
+}}
+
+for _ in $(seq 1 "${{1:?shard count required}}"); do shard & done
+wait
 """
 
 
@@ -192,7 +220,8 @@ def fixture_stamp() -> str:
             "version": FIXTURE_VERSION,
             "dirs": FIXTURE_DIRS,
             "files": FIXTURE_FILES_PER_DIR,
-            "workflow": WORKFLOW,
+            "matrix": MATRIX_WORKFLOW,
+            "single": SINGLE_WORKFLOW,
         },
         sort_keys=True,
     )
@@ -226,7 +255,8 @@ def ensure_fixture() -> None:
     (WS / "README.md").write_text("preloop performance benchmark fixture\n")
     workflows = WS / ".github/workflows"
     workflows.mkdir(parents=True)
-    (workflows / "bench.yml").write_text(WORKFLOW)
+    (workflows / "bench.yml").write_text(MATRIX_WORKFLOW)
+    (workflows / "single.yml").write_text(SINGLE_WORKFLOW)
 
     env = {**os.environ, **GIT_ENV}
     for cmd in (
@@ -401,7 +431,6 @@ def start_engine() -> subprocess.Popen:
         "PRELOOP_HOME": str(HOME),
         "PRELOOP_LISTEN": LISTEN,
         "PRELOOP_RUNNER_BUNDLE": str(RUNNER_BUNDLE),
-        "PRELOOP_RUNNER_POOL_SIZE": str(POOL_SIZE),
         "PRELOOP_RUNNER_BASE_IMAGE": BASE_IMAGE,
         "AKSH_SYSTEM_TOKEN": TOKEN,
         "RUST_LOG": "info",
@@ -444,15 +473,27 @@ def ready_count() -> int:
     return len(READY_MARKER.findall(ENGINE_LOG.read_text(errors="replace")))
 
 
-def wait_for_pool(process: subprocess.Popen, timeout: float = 300.0) -> float:
-    """Block until the engine serves HTTP and every pool slot is registered."""
+def wait_for_pool(process: subprocess.Popen, timeout: float = 300.0) -> tuple[float, int]:
+    """Block until every warm runner the engine wants has registered.
+
+    The pool size is the engine's own decision, so the harness discovers it
+    rather than pinning it: wait for the first runner, then for the count to
+    stop growing. Pinning would hide any change to how preloop sizes its pool.
+    """
     started = time.time()
     deadline = started + timeout
+    settled_for = 0.0
+    last = 0
     while time.time() < deadline:
         if process.poll() is not None:
             die(f"engine exited early ({process.returncode}); log:\n{ENGINE_LOG.read_text()[-4000:]}")
-        if ready_count() >= POOL_SIZE:
-            return (time.time() - started) * 1000.0
+        current = ready_count()
+        if current != last:
+            last, settled_for = current, 0.0
+        elif current > 0:
+            settled_for += 0.1
+            if settled_for >= 1.5:
+                return (time.time() - started - settled_for) * 1000.0, current
         time.sleep(0.1)
     die(f"pool not ready within {timeout}s; log:\n{ENGINE_LOG.read_text()[-4000:]}")
 
@@ -481,8 +522,9 @@ class Pool:
             time.sleep(0.02)
         die(f"pool did not replenish to {self.expected} ready runners within {timeout}s")
 
-    def job_started(self) -> None:
-        self.expected += 1
+    def jobs_started(self, count: int) -> None:
+        """Each finished job burns one ephemeral runner, which is replaced."""
+        self.expected += count
 
 
 def stop_engine(process: subprocess.Popen) -> None:
@@ -510,10 +552,10 @@ def cli_env() -> dict:
     return env
 
 
-def cli_run() -> float:
+def cli_run(workflow: str = "bench.yml") -> float:
     """Wall-clock milliseconds for one `preloop run`, as a developer sees it."""
     started = time.perf_counter()
-    result = run([str(CLI_BIN), "run", "-f", "bench.yml"], cwd=WS, env=cli_env())
+    result = run([str(CLI_BIN), "run", "-f", workflow], cwd=WS, env=cli_env())
     elapsed = (time.perf_counter() - started) * 1000.0
     if result.returncode != 0:
         die(f"`preloop run` failed ({result.returncode}):\n{result.stdout}\n{result.stderr}")
@@ -538,9 +580,14 @@ LOG_TIMESTAMP = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)", re.M
 
 
 def api_run() -> dict:
-    """One instrumented run, split into submit / dispatch / in-VM phases."""
+    """One instrumented matrix run, split into submit / dispatch / in-VM phases.
+
+    `job_ms` spans the first to the last log line across all shards, so for a
+    matrix it measures how long the whole fan-out took inside the VMs — the
+    number that grows when jobs queue behind a too-small pool.
+    """
     submission = {
-        "workflow_yaml": WORKFLOW,
+        "workflow_yaml": MATRIX_WORKFLOW,
         "event": "push",
         "repository": "local/preloop-perf",
         "git_ref": "refs/heads/main",
@@ -587,9 +634,9 @@ def iso_ms(stamp: str) -> float:
     return datetime.strptime(stamp.rstrip("Z"), "%Y-%m-%dT%H:%M:%S.%f").timestamp()
 
 
-def host_run(script: Path) -> float:
+def host_run(script: Path, shards: int) -> float:
     started = time.perf_counter()
-    result = run(["bash", str(script)])
+    result = run(["bash", str(script), str(shards)])
     elapsed = (time.perf_counter() - started) * 1000.0
     if result.returncode != 0:
         die(f"host baseline failed:\n{result.stdout}\n{result.stderr}")
@@ -633,47 +680,61 @@ def main() -> int:
 
     engine = start_engine()
     try:
-        pool_boot_ms = wait_for_pool(engine)
-        log(f"pool ready in {pool_boot_ms:.0f} ms")
+        pool_boot_ms, warm_runners = wait_for_pool(engine)
+        log(f"pool ready in {pool_boot_ms:.0f} ms with {warm_runners} warm runner(s)")
 
-        pool = Pool(POOL_SIZE)
+        pool = Pool(warm_runners)
         replenish_waits: list[float] = []
 
-        def measured(action, record_wait: bool = False):
+        def measured(action, jobs: int, record_wait: bool = False):
             waited = pool.await_warm()
             if record_wait:
                 replenish_waits.append(waited)
-            pool.job_started()
+            pool.jobs_started(jobs)
             return action()
 
         for _ in range(WARMUP_RUNS):
-            measured(cli_run)
+            measured(cli_run, MATRIX_JOBS)
 
-        cli_samples = [measured(cli_run, record_wait=True) for _ in range(CLI_RUNS)]
-        api_samples = [measured(api_run) for _ in range(API_RUNS)]
-        host_samples = [host_run(host_script) for _ in range(HOST_RUNS)]
+        cli_samples = [
+            measured(cli_run, MATRIX_JOBS, record_wait=True) for _ in range(CLI_RUNS)
+        ]
+        single_samples = [
+            measured(lambda: cli_run("single.yml"), 1) for _ in range(SINGLE_RUNS)
+        ]
+        api_samples = [measured(api_run, MATRIX_JOBS) for _ in range(API_RUNS)]
+        host_samples = [host_run(host_script, MATRIX_JOBS) for _ in range(HOST_RUNS)]
+        host_single_samples = [host_run(host_script, 1) for _ in range(HOST_RUNS)]
     finally:
         stop_engine(engine)
 
     e2e = trimmed_mean(cli_samples)
     host = trimmed_mean(host_samples)
+    single = trimmed_mean(single_samples)
+    host_single = trimmed_mean(host_single_samples)
 
     metric("e2e_ms", e2e)
     metric("e2e_min_ms", min(cli_samples))
     metric("host_ms", host)
     metric("overhead_ms", e2e - host)
     metric("overhead_ratio", e2e / host, 3)
+    metric("single_ms", single)
+    metric("host_single_ms", host_single)
+    metric("single_ratio", single / host_single, 3)
     metric("submit_ms", trimmed_mean(s["submit_ms"] for s in api_samples))
     metric("api_total_ms", trimmed_mean(s["total_ms"] for s in api_samples))
     metric("job_ms", trimmed_mean(s["job_ms"] for s in api_samples))
     metric("dispatch_ms", trimmed_mean(s["dispatch_ms"] for s in api_samples))
     metric("pool_boot_ms", pool_boot_ms)
     metric("replenish_wait_ms", statistics.median(replenish_waits))
+    metric("warm_runners", float(warm_runners), 0)
 
     spread = max(cli_samples) - min(cli_samples)
     print(f"ASI cli_runs={len(cli_samples)}")
+    print(f"ASI matrix_jobs={MATRIX_JOBS}")
     print(f"ASI cli_spread_ms={round(spread, 1)}")
     print(f"ASI cli_samples={[round(s) for s in cli_samples]}")
+    print(f"ASI single_samples={[round(s) for s in single_samples]}")
     print(f"ASI api_samples={[round(s['total_ms']) for s in api_samples]}")
     print(f"ASI host_samples={[round(s) for s in host_samples]}")
     return 0
