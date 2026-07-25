@@ -3,8 +3,8 @@ use preloop_orchestrator::{
     artifact_payload, RunnerPool, RunnerPoolConfig, DEBUG_MARKER_IDLE, RUNNER_BUSY_LINE,
 };
 use preloop_vm::{
-    ExecOutput, MachineName, MachineSpec, MachineState, NetworkPolicy, OutputChunk, SocketMount,
-    VmError, VmProvider, VolumeMount,
+    ExecOutput, MachineName, MachineSpec, MachineState, NetworkPolicy, OutputChunk, SecretSource,
+    SocketMount, VmError, VmProvider, VolumeMount,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -32,7 +32,7 @@ enum Event {
     Delete(String),
     Pack(String),
     Exec(String, Vec<String>),
-    Configure(String, Vec<String>, Vec<(String, String)>),
+    Configure(String, Vec<String>, Vec<(String, SecretSource)>),
 }
 
 #[derive(Debug, Default)]
@@ -222,7 +222,7 @@ impl VmProvider for RecordingVmProvider {
         &self,
         name: &MachineName,
         argv: &[String],
-        secrets: &[(String, String)],
+        secrets: &[(String, SecretSource)],
     ) -> Result<ExecOutput, VmError> {
         let mut state = self.state.lock().await;
         state.events.push(Event::Configure(
@@ -335,6 +335,7 @@ impl Fixture {
             memory_mib: 256,
             storage_gib: 10,
             debug_dir: None,
+            runner_key_dir: None,
         };
         Self {
             _env_guard: env_guard,
@@ -474,16 +475,23 @@ async fn configure_passes_secret_environment_mapping_without_token_value() {
         .expect("runner configure command");
     assert_eq!(
         configure.1,
-        &vec![("PRELOOP_RUNNER_TOKEN".to_owned(), fixture.token_env.clone())]
+        &vec![(
+            "PRELOOP_RUNNER_TOKEN".to_owned(),
+            SecretSource::HostEnv(fixture.token_env.clone())
+        )]
     );
     assert!(configure
         .0
         .iter()
         .all(|argument| argument != &fixture.token));
-    assert!(configure
-        .1
-        .iter()
-        .all(|(key, value)| key != &fixture.token && value != &fixture.token));
+    // Only a reference to the credential is ever handed to SmolVM.
+    assert!(configure.1.iter().all(|(key, source)| {
+        key != &fixture.token
+            && match source {
+                SecretSource::HostEnv(name) => name != &fixture.token,
+                SecretSource::HostFile(path) => path.as_os_str() != fixture.token.as_str(),
+            }
+    }));
 }
 
 #[tokio::test]
