@@ -574,21 +574,24 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
                     update_run_status(&mut final_status, render_event(&line));
                 }
             }
-            if final_status.is_some_and(|status| is_terminal_status(&status)) {
+            if final_status.is_some_and(ExecutionStatus::is_terminal) {
                 break;
             }
         }
-        if !final_status.is_some_and(|status| is_terminal_status(&status))
+        if !final_status.is_some_and(ExecutionStatus::is_terminal)
             && !pending.trim().is_empty()
             && seen_events.insert(pending.trim().to_owned())
         {
             update_run_status(&mut final_status, render_event(pending.trim()));
         }
 
-        if final_status.is_some_and(|status| is_terminal_status(&status)) {
+        if final_status.is_some_and(ExecutionStatus::is_terminal) {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        // The server holds `events.ndjson` open until the run is terminal, so
+        // reaching here means the stream dropped early. Retry promptly rather
+        // than adding a fixed poll interval to every run's wall clock.
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
     if let Some(status) = final_status {
@@ -606,19 +609,9 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn is_terminal_status(status: &ExecutionStatus) -> bool {
-    matches!(
-        status,
-        ExecutionStatus::Success
-            | ExecutionStatus::Failure
-            | ExecutionStatus::Cancelled
-            | ExecutionStatus::Skipped
-    )
-}
-
 fn update_run_status(current: &mut Option<ExecutionStatus>, next: Option<ExecutionStatus>) {
     if let Some(status) = next {
-        if is_terminal_status(&status) || current.is_none() {
+        if status.is_terminal() || current.is_none() {
             *current = Some(status);
         }
     }

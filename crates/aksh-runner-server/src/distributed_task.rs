@@ -480,7 +480,7 @@ pub(crate) async fn complete_job_inner(
     shared: Arc<SharedState>,
     completion: JobCompletion,
 ) -> Result<Json<RunRecord>, ApiError> {
-    if !is_terminal_status(completion.status) {
+    if !completion.status.is_terminal() {
         return Err(ApiError::bad_request(
             "job completion status must be terminal",
         ));
@@ -496,7 +496,7 @@ pub(crate) async fn complete_job_inner(
             .get(&completion.job_id)
             .copied()
             .ok_or_else(|| ApiError::bad_request("job does not belong to run"))?;
-        if is_terminal_status(prior) && prior != ExecutionStatus::Cancelled {
+        if prior.is_terminal() && prior != ExecutionStatus::Cancelled {
             return Ok(Json(run.clone()));
         }
         let tolerated = run
