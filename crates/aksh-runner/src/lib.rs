@@ -22,6 +22,7 @@
 pub mod cli;
 pub mod client;
 pub mod configure;
+pub mod control_bridge;
 pub mod listener;
 pub mod process;
 pub mod settings;
