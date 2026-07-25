@@ -15,6 +15,7 @@ use preloop_vm::{
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -343,12 +344,16 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         }
 
         let mut slots = JoinSet::new();
+        // Runners currently registered and waiting for work. Slots consult it
+        // to decide whether a replacement is worth booting mid-job.
+        let idle = Arc::new(AtomicUsize::new(0));
         for slot in 0..self.config.size {
             let provider = self.provider.clone();
             let config = self.config.clone();
             let slot_shutdown = shutdown.child_token();
             let slot_registry = golden_registry.clone();
             let slot_resolver = resolver.clone();
+            let slot_idle = idle.clone();
             slots.spawn(async move {
                 run_slot(
                     provider,
@@ -357,6 +362,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     slot_shutdown,
                     slot_registry,
                     slot_resolver,
+                    slot_idle,
                 )
                 .await
             });
@@ -502,6 +508,17 @@ struct ReadyRunner {
     run: Vec<String>,
 }
 
+/// What a slot needs in order to build its next runner.
+struct SlotPlan<'a> {
+    /// Pool slot index, used to name machines.
+    slot: usize,
+    /// Generation for the replacement machine name.
+    generation: u64,
+    /// Fork base, when the pool has one.
+    golden: Option<&'a MachineName>,
+    /// Runners across the whole pool that are registered and unclaimed.
+    idle: &'a AtomicUsize,
+}
 async fn run_slot<P: VmProvider + 'static>(
     provider: Arc<P>,
     config: RunnerPoolConfig,
@@ -509,6 +526,7 @@ async fn run_slot<P: VmProvider + 'static>(
     shutdown: CancellationToken,
     golden_registry: Arc<GoldenRegistry>,
     _environment_resolver: Arc<EnvironmentResolver>,
+    idle: Arc<AtomicUsize>,
 ) -> Result<(), OrchestratorError> {
     let default_fingerprint =
         EnvironmentSpec::new(config.base_image.clone(), Vec::new()).fingerprint;
@@ -544,9 +562,12 @@ async fn run_slot<P: VmProvider + 'static>(
             &config,
             runner,
             shutdown.clone(),
-            golden.as_ref(),
-            slot,
-            generation,
+            SlotPlan {
+                slot,
+                generation,
+                golden: golden.as_ref(),
+                idle: &idle,
+            },
         )
         .await;
         spare = match successor {
@@ -609,16 +630,21 @@ async fn run_one_runner<P: VmProvider + 'static>(
     config: &RunnerPoolConfig,
     runner: ReadyRunner,
     shutdown: CancellationToken,
-    golden: Option<&MachineName>,
-    slot: usize,
-    next_generation: u64,
+    plan: SlotPlan<'_>,
 ) -> Result<Option<ReadyRunner>, OrchestratorError> {
     let ReadyRunner { name, run } = runner;
     let name = &name;
+    let SlotPlan {
+        slot,
+        generation: next_generation,
+        golden,
+        idle,
+    } = plan;
 
     let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
     let run_provider = provider.clone();
     let run_name = name.clone();
+    idle.fetch_add(1, Ordering::AcqRel);
     let mut run_task =
         tokio::spawn(async move { run_until_exit(&run_provider, &run_name, &run, busy_tx).await });
 
@@ -627,6 +653,14 @@ async fn run_one_runner<P: VmProvider + 'static>(
     // drops the sender, and this yields `None` without provisioning anything.
     let build_successor = async {
         if busy_rx.await.is_err() {
+            idle.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        // Booting a VM costs real CPU, and it would be spent alongside the job
+        // that just started. Only pay that while the job runs when the pool has
+        // nothing left to hand out — otherwise an idle peer already covers the
+        // next arrival and the replacement can wait for teardown.
+        if idle.fetch_sub(1, Ordering::AcqRel) > 1 {
             return None;
         }
         match provision_slot(&provider, config, slot, next_generation, golden).await {
@@ -1183,14 +1217,18 @@ mod lifecycle_tests {
         let runner = provision_slot(&provider, &config, 0, 1, None)
             .await
             .expect("provisioning succeeds");
+        let idle = AtomicUsize::new(0);
         let error = run_one_runner(
             provider,
             &config,
             runner,
             CancellationToken::new(),
-            None,
-            0,
-            2,
+            SlotPlan {
+                slot: 0,
+                generation: 2,
+                golden: None,
+                idle: &idle,
+            },
         )
         .await
         .expect_err("runner failure must propagate");
