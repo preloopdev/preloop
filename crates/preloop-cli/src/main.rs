@@ -309,10 +309,14 @@ async fn cmd_engine() -> anyhow::Result<()> {
         .unwrap_or_else(|_| format!("http://127.0.0.1:{}", listen.port()));
     std::env::set_var("AKSH_PUBLIC_URL", &public_url);
 
+    // Shared with the runner pool so it can size provisioning to the work
+    // actually waiting, not just to whether it has an idle runner left.
+    let queue_depth = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut server = tokio::spawn(aksh_runner_server::serve(
         aksh_runner_server::ServerConfig {
             listen,
             unix_socket: Some(socket.clone()),
+            queue_depth: Some(queue_depth.clone()),
             state_dir,
             record_flows: None,
             tls: aksh_runner_server::TlsMode::None,
@@ -330,7 +334,7 @@ async fn cmd_engine() -> anyhow::Result<()> {
     }
 
     let shutdown = tokio_util::sync::CancellationToken::new();
-    let mut pool = match local_runner_pool_config(&home, public_url) {
+    let mut pool = match local_runner_pool_config(&home, public_url, queue_depth) {
         Ok(config) => {
             let pool_shutdown = shutdown.clone();
             Some(tokio::spawn(async move {
@@ -412,6 +416,7 @@ async fn wait_for_engine_socket(socket: &std::path::Path) -> anyhow::Result<()> 
 fn local_runner_pool_config(
     home: &std::path::Path,
     server_url: String,
+    queue_depth: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) -> anyhow::Result<RunnerPoolConfig> {
     let control_bridge = home.join("control-bridge");
     std::fs::create_dir_all(&control_bridge)?;
@@ -467,6 +472,7 @@ fn local_runner_pool_config(
         storage_gib: 20,
         debug_dir: Some(home.join("state").join("debug")),
         runner_key_dir: Some(home.join("runner-keys")),
+        pending_jobs: Some(queue_depth),
     })
 }
 
