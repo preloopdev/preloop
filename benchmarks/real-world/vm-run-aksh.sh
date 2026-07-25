@@ -17,7 +17,7 @@ if [ -x /opt/runners/aksh-runner ]; then
 elif [ -x /opt/aksh/aksh-runner ]; then
   AKSH_RUNNER="/opt/aksh/aksh-runner"
 else
-  AKSH_RUNNER="/workspace/target/aarch64-unknown-linux-musl/release/aksh-runner"
+  AKSH_RUNNER="/workspace/target/aarch64-unknown-linux-musl/release/preloop-runner"
 fi
 
 log() { echo "[aksh-runner-j${JOB_INDEX} $(date +%T.%3N)] $*"; }
