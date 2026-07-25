@@ -9,6 +9,7 @@ use preloop_orchestrator::{RunnerPool, RunnerPoolConfig};
 use preloop_vm::SmolVmProvider;
 use rand::RngCore;
 use std::collections::HashSet;
+use std::io::Read;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -191,13 +192,13 @@ async fn ensure_engine_running() -> anyhow::Result<()> {
     let client = build_client();
     let url = server_url();
 
-    if client
+    let mut health_req = client
         .get(format!("{url}/healthz"))
-        .timeout(Duration::from_millis(500))
-        .send()
-        .await
-        .is_ok()
-    {
+        .timeout(Duration::from_millis(500));
+    if let Some(token) = api_token() {
+        health_req = health_req.bearer_auth(token);
+    }
+    if health_req.send().await.is_ok() {
         return Ok(());
     }
 
@@ -232,10 +233,18 @@ async fn ensure_engine_running() -> anyhow::Result<()> {
     cmd.arg("engine");
     cmd.env("AKSH_SYSTEM_TOKEN", token);
     cmd.env("PRELOOP_HOME", &preloop_dir);
+    if std::env::var_os("RUST_LOG").is_none() {
+        cmd.env("RUST_LOG", "info,preloop=debug,aksh=debug");
+    }
+
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(preloop_dir.join("engine.log"))?;
 
     cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::null());
-    cmd.stderr(std::process::Stdio::null());
+    cmd.stdout(log_file.try_clone()?);
+    cmd.stderr(log_file);
 
     let mut child = cmd
         .spawn()
@@ -313,6 +322,8 @@ async fn cmd_engine() -> anyhow::Result<()> {
             enable_scheduler: false,
         },
     ));
+    // Keep the server in the race so a bind failure surfaces its own error
+    // instead of a generic socket-wait timeout.
     tokio::select! {
         result = &mut server => return result?,
         result = wait_for_engine_socket(&socket) => result?,
@@ -402,11 +413,31 @@ fn local_runner_pool_config(
     home: &std::path::Path,
     server_url: String,
 ) -> anyhow::Result<RunnerPoolConfig> {
+    let control_bridge = home.join("control-bridge");
+    std::fs::create_dir_all(&control_bridge)?;
+    set_private_directory_permissions(&control_bridge)?;
     let runner_bundle = std::env::var_os("PRELOOP_RUNNER_BUNDLE")
         .map(PathBuf::from)
-        .or_else(|| std::env::current_exe().ok()?.parent().map(|dir| dir.join("preloop-runner")))
-        .filter(|path| path.join("aksh-runner").is_file())
-        .context("Linux runner bundle unavailable; set PRELOOP_RUNNER_BUNDLE to a directory containing aksh-runner")?;
+        .filter(|path| linux_runner_bundle(path))
+        .or_else(|| {
+            let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+            let target_dir = exe_dir.parent()?;
+            // Prefer Linux guest binaries when the CLI itself is a macOS
+            // development build. The runner executes inside Linux VMs.
+            let candidates = [
+                target_dir.join("aarch64-unknown-linux-gnu/debug"),
+                target_dir.join("aarch64-unknown-linux-musl/debug"),
+                target_dir.join("aarch64-unknown-linux-gnu/release"),
+                target_dir.join("aarch64-unknown-linux-musl/release"),
+                exe_dir.join("preloop-runner"),
+                exe_dir.to_path_buf(),
+            ];
+            candidates
+                .into_iter()
+                .find(|directory| directory.join("preloop-runner").is_file())
+        })
+        .filter(|path| linux_runner_bundle(path))
+        .context("Linux runner bundle unavailable; run `just build-preloop` to build target/aarch64-unknown-linux-gnu/debug/preloop-runner")?;
     Ok(RunnerPoolConfig {
         size: std::env::var("PRELOOP_RUNNER_POOL_SIZE")
             .ok()
@@ -415,15 +446,16 @@ fn local_runner_pool_config(
         use_fork: std::env::var("PRELOOP_USE_FORK")
             .ok()
             .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false),
+            .unwrap_or(true),
         name_prefix: "preloop-runner".into(),
         base_image: std::env::var("PRELOOP_RUNNER_BASE_IMAGE")
             .unwrap_or_else(|_| "ubuntu:24.04".into()),
         workspace: None,
         artifact_stem: home.join("vms/preloop-runner-base"),
         runner_bundle,
-        runner_binary_name: "aksh-runner".into(),
+        runner_binary_name: "preloop-runner".into(),
         server_url,
+        control_socket: Some(home.join("preloop.sock")),
         registration_token_env: "AKSH_SYSTEM_TOKEN".into(),
         labels: vec![
             "self-hosted".into(),
@@ -433,7 +465,17 @@ fn local_runner_pool_config(
         cpus: 4,
         memory_mib: 4096,
         storage_gib: 20,
+        debug_dir: Some(home.join("state").join("debug")),
     })
+}
+
+fn linux_runner_bundle(path: &std::path::Path) -> bool {
+    let binary = path.join("preloop-runner");
+    let Ok(mut file) = std::fs::File::open(binary) else {
+        return false;
+    };
+    let mut magic = [0_u8; 4];
+    file.read_exact(&mut magic).is_ok() && magic == *b"\x7fELF"
 }
 
 async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
@@ -449,6 +491,8 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
                 name.to_owned(),
                 aksh_gha_protocol::SecretString::new(value.to_owned()),
             );
+        } else {
+            anyhow::bail!("invalid --secret format `{secret}`: expected NAME=VALUE");
         }
     }
 
@@ -460,12 +504,18 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         workflow_path: Some(workflow_path.display().to_string()),
         local_workspace: None,
         secrets,
+        selected_jobs: args.job.into_iter().collect(),
+        base_ref: args.base,
+        preserve_on_failure: args.preserve_on_failure,
         ..Default::default()
     };
 
     let client = build_client();
     let url = server_url();
-    let mut request = client.post(format!("{url}/api/v1/runs")).json(&submission);
+    // Secrets redact on plain serialization; sending them is opt-in.
+    let mut request = client
+        .post(format!("{url}/api/v1/runs"))
+        .json(&submission.to_request_json()?);
     if std::env::var("AKSH_URL").is_err() {
         let workspace = std::fs::canonicalize(".")?;
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -856,9 +906,96 @@ async fn cmd_secret(args: SecretArgs) -> anyhow::Result<()> {
 }
 
 async fn cmd_shell(args: ShellArgs) -> anyhow::Result<()> {
-    let run_ref = args.run_ref.as_deref().unwrap_or("last-failed");
-    println!("preloop shell: {run_ref}");
-    anyhow::bail!("")
+    let debug_dir = preloop_home().join("state").join("debug");
+
+    // Find the preserved VM. If a run_ref is given, treat it as a machine
+    // name prefix; otherwise pick the first (usually only) marker.
+    let machine_name = if let Some(run_ref) = &args.run_ref {
+        let path = debug_dir.join(run_ref);
+        if path.is_file() {
+            run_ref.clone()
+        } else {
+            // Try matching as a prefix (e.g. "0" → "preloop-runner-0")
+            find_debug_machine(&debug_dir, Some(run_ref))?
+        }
+    } else {
+        find_debug_machine(&debug_dir, None)?
+    };
+
+    let marker = debug_dir.join(&machine_name);
+    eprintln!("[preloop] Connecting to preserved VM: {machine_name}");
+    eprintln!("[preloop] Exit the shell to release the VM.");
+
+    // Claim the session before starting so the orchestrator stops counting down.
+    let _ = std::fs::write(&marker, preloop_orchestrator::DEBUG_MARKER_ACTIVE);
+
+    // Spawn a background task to touch the marker every 15 seconds,
+    // keeping the orchestrator's 10-minute timeout alive.
+    let heartbeat_marker = marker.clone();
+    let heartbeat = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            if std::fs::write(&heartbeat_marker, preloop_orchestrator::DEBUG_MARKER_ACTIVE).is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    // Run smolvm machine shell interactively.
+    let status = std::process::Command::new("smolvm")
+        .args(["machine", "shell", "--name", &machine_name])
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .context("failed to run smolvm machine shell")?;
+
+    heartbeat.abort();
+
+    // Remove the marker so the orchestrator cleans up the VM.
+    let _ = std::fs::remove_file(&marker);
+    eprintln!("[preloop] Shell exited — VM will be cleaned up.");
+
+    if !status.success() {
+        anyhow::bail!("shell exited with {status}");
+    }
+    Ok(())
+}
+
+fn find_debug_machine(
+    debug_dir: &std::path::Path,
+    prefix: Option<&String>,
+) -> anyhow::Result<String> {
+    let entries: Vec<String> = std::fs::read_dir(debug_dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Some(prefix) = prefix {
+                if name.contains(prefix) {
+                    Some(name)
+                } else {
+                    None
+                }
+            } else {
+                Some(name)
+            }
+        })
+        .collect();
+
+    match entries.len() {
+        0 => anyhow::bail!(
+            "no preserved VMs found. Run with --preserve-on-failure to keep failed job VMs alive"
+        ),
+        1 => Ok(entries.into_iter().next().unwrap()),
+        _ => anyhow::bail!(
+            "multiple preserved VMs found: {}. Specify one with: preloop shell <name>",
+            entries.join(", ")
+        ),
+    }
 }
 
 #[cfg(test)]

@@ -1,7 +1,8 @@
 use async_trait::async_trait;
-use preloop_orchestrator::{artifact_payload, RunnerPool, RunnerPoolConfig};
+use preloop_orchestrator::{artifact_payload, RunnerPool, RunnerPoolConfig, DEBUG_MARKER_IDLE};
 use preloop_vm::{
-    ExecOutput, MachineName, MachineSpec, MachineState, OutputChunk, VmError, VmProvider,
+    ExecOutput, MachineName, MachineSpec, MachineState, NetworkPolicy, OutputChunk, SocketMount,
+    VmError, VmProvider, VolumeMount,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -12,6 +13,8 @@ use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+static TEST_ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
 #[derive(Debug, Clone, Copy)]
 enum RunAction {
@@ -33,6 +36,7 @@ enum Event {
 #[derive(Debug, Default)]
 struct ProviderState {
     machines: HashMap<String, MachineState>,
+    created_specs: Vec<MachineSpec>,
     events: Vec<Event>,
     run_calls: usize,
     pack_calls: usize,
@@ -82,6 +86,7 @@ impl RecordingVmProvider {
         let state = self.state.lock().await;
         ProviderStateSnapshot {
             machines: state.machines.clone(),
+            created_specs: state.created_specs.clone(),
             events: state.events.clone(),
             pack_calls: state.pack_calls,
         }
@@ -95,6 +100,7 @@ impl RecordingVmProvider {
 #[derive(Debug, Clone)]
 struct ProviderStateSnapshot {
     machines: HashMap<String, MachineState>,
+    created_specs: Vec<MachineSpec>,
     events: Vec<Event>,
     pack_calls: usize,
 }
@@ -123,6 +129,7 @@ impl VmProvider for RecordingVmProvider {
         state
             .machines
             .insert(spec.name.as_str().to_owned(), MachineState::Stopped);
+        state.created_specs.push(spec.clone());
         state
             .events
             .push(Event::Create(spec.name.as_str().to_owned()));
@@ -200,7 +207,7 @@ impl VmProvider for RecordingVmProvider {
     }
 
     async fn exec(&self, name: &MachineName, argv: &[String]) -> Result<ExecOutput, VmError> {
-        let is_run = argv.get(1).is_some_and(|argument| argument == "run");
+        let is_run = argv.iter().any(|argument| argument == "run");
         let action = {
             let mut state = self.state.lock().await;
             state
@@ -269,6 +276,7 @@ impl VmProvider for RecordingVmProvider {
 }
 
 struct Fixture {
+    _env_guard: std::sync::MutexGuard<'static, ()>,
     root: PathBuf,
     config: RunnerPoolConfig,
     token_env: String,
@@ -277,6 +285,9 @@ struct Fixture {
 
 impl Fixture {
     fn new(label: &str, payload_exists: bool) -> Self {
+        let env_guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let id = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
             "preloop-orchestrator-{label}-{}-{id}",
@@ -289,6 +300,9 @@ impl Fixture {
         if payload_exists {
             fs::write(artifact_payload(&artifact_stem), b"existing-artifact").unwrap();
         }
+        let control_socket = root.join("engine.sock");
+        fs::write(&control_socket, b"test-control-socket").unwrap();
+        fs::create_dir(root.join("control-bridge")).unwrap();
 
         let token_env = format!("PRELOOP_TEST_TOKEN_{label}_{id}");
         let token = format!("sentinel-registration-token-{id}");
@@ -301,15 +315,18 @@ impl Fixture {
             workspace: None,
             artifact_stem,
             runner_bundle: bundle,
-            runner_binary_name: "aksh-runner".to_owned(),
+            runner_binary_name: "preloop-runner".to_owned(),
             server_url: "https://preloop.example".to_owned(),
+            control_socket: None,
             registration_token_env: token_env.clone(),
             labels: vec!["self-hosted".to_owned(), "linux".to_owned()],
             cpus: 2,
             memory_mib: 256,
             storage_gib: 10,
+            debug_dir: None,
         };
         Self {
+            _env_guard: env_guard,
             root,
             config,
             token_env,
@@ -338,6 +355,25 @@ async fn run_until_cancelled(
         .await;
     shutdown.cancel();
     task.await.unwrap().unwrap();
+}
+
+async fn wait_for_debug_marker(provider: &RecordingVmProvider, marker: &Path) {
+    provider
+        .wait_until(|state| {
+            state.events.iter().any(|event| {
+                matches!(event, Event::Exec(_, argv) if argv.iter().any(|argument| argument == "-f"))
+            })
+        })
+        .await;
+    while !marker.is_file() {
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn yield_to_pool() {
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
 }
 
 #[tokio::test]
@@ -410,6 +446,140 @@ async fn configure_passes_secret_environment_mapping_without_token_value() {
 }
 
 #[tokio::test]
+async fn runner_keeps_public_only_egress_and_wires_control_socket_and_environment() {
+    let fixture = Fixture::new("control", true);
+    let mut config = fixture.config.clone();
+    config.control_socket = Some(fixture.root.join("engine.sock"));
+    let provider = Arc::new(RecordingVmProvider::with_machines(
+        &[],
+        vec![RunAction::Wait],
+    ));
+    let pool = RunnerPool::new(provider.clone(), config.clone()).unwrap();
+    run_until_cancelled(pool, &provider, CancellationToken::new(), 1).await;
+
+    let runner = fixture.config.name_prefix.clone() + "-0";
+    let snapshot = provider.snapshot().await;
+    let spec = snapshot
+        .created_specs
+        .iter()
+        .find(|spec| spec.name.as_str() == runner)
+        .expect("runner machine specification");
+    assert_eq!(spec.network, NetworkPolicy::PublicOnly);
+    assert_eq!(
+        &spec.volumes,
+        &vec![
+            VolumeMount {
+                host: fixture.root.join("runner-bundle"),
+                guest: PathBuf::from("/opt/preloop/bin"),
+                read_only: true,
+            },
+            VolumeMount {
+                host: fixture.root.join("control-bridge"),
+                guest: PathBuf::from("/run/preloop-control"),
+                read_only: false,
+            },
+        ]
+    );
+    assert_eq!(
+        &spec.sockets,
+        &vec![SocketMount {
+            host: config.control_socket.clone().unwrap(),
+            guest: PathBuf::from("/run/preloop-control/engine.sock"),
+        }]
+    );
+
+    let expected_prefix = vec![
+        "/usr/bin/env".to_owned(),
+        "PRELOOP_CONTROL_ORIGIN=https://preloop.example".to_owned(),
+        "PRELOOP_CONTROL_SOCKET=/run/preloop-control/engine.sock".to_owned(),
+    ];
+    let configure = snapshot
+        .events
+        .iter()
+        .find_map(|event| match event {
+            Event::Configure(name, argv, _) if name == &runner => Some(argv),
+            _ => None,
+        })
+        .expect("runner configure command");
+    assert_eq!(
+        &configure[..expected_prefix.len()],
+        expected_prefix.as_slice()
+    );
+
+    let run = snapshot
+        .events
+        .iter()
+        .find_map(|event| match event {
+            Event::Exec(name, argv) if name == &runner && argv.iter().any(|arg| arg == "run") => {
+                Some(argv)
+            }
+            _ => None,
+        })
+        .expect("runner run command");
+    assert_eq!(&run[..expected_prefix.len()], expected_prefix.as_slice());
+}
+
+/// Control-socket routing and failure-marker debugging are independent knobs.
+///
+/// The marker used to be gated behind `control_socket.is_some()`, so a pool
+/// configured for debugging but without a mounted socket silently never told
+/// the runner where to write the marker — preservation could never trigger.
+#[tokio::test]
+async fn guest_environment_tracks_control_socket_and_debug_dir_independently() {
+    const ORIGIN: &str = "PRELOOP_CONTROL_ORIGIN=https://preloop.example";
+    const SOCKET: &str = "PRELOOP_CONTROL_SOCKET=/run/preloop-control/engine.sock";
+    const MARKER: &str = "PRELOOP_FAILURE_MARKER=/var/lib/preloop-runner/.preloop-job-failed";
+
+    let cases: [(bool, bool, Vec<&str>); 4] = [
+        (false, false, vec![]),
+        (true, false, vec!["/usr/bin/env", ORIGIN, SOCKET]),
+        (false, true, vec!["/usr/bin/env", MARKER]),
+        (true, true, vec!["/usr/bin/env", ORIGIN, SOCKET, MARKER]),
+    ];
+
+    for (with_socket, with_debug_dir, expected) in cases {
+        let fixture = Fixture::new("guestenv", true);
+        let mut config = fixture.config.clone();
+        if with_socket {
+            config.control_socket = Some(fixture.root.join("engine.sock"));
+        }
+        if with_debug_dir {
+            config.debug_dir = Some(fixture.root.join("debug"));
+        }
+
+        let provider = Arc::new(RecordingVmProvider::with_machines(
+            &[],
+            vec![RunAction::Wait],
+        ));
+        let pool = RunnerPool::new(provider.clone(), config.clone()).unwrap();
+        run_until_cancelled(pool, &provider, CancellationToken::new(), 1).await;
+
+        let runner = config.name_prefix.clone() + "-0";
+        let snapshot = provider.snapshot().await;
+        let configure = snapshot
+            .events
+            .iter()
+            .find_map(|event| match event {
+                Event::Configure(name, argv, _) if name == &runner => Some(argv),
+                _ => None,
+            })
+            .expect("runner configure command")
+            .clone();
+
+        // The prefix is everything before the runner executable itself.
+        let prefix: Vec<&str> = configure
+            .iter()
+            .take_while(|arg| !arg.ends_with(&config.runner_binary_name))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            prefix, expected,
+            "socket={with_socket} debug_dir={with_debug_dir}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn completed_runner_is_deleted_before_slot_is_replenished() {
     let fixture = Fixture::new("replenish", true);
     let provider = Arc::new(RecordingVmProvider::with_machines(
@@ -423,7 +593,7 @@ async fn completed_runner_is_deleted_before_slot_is_replenished() {
     let runner = fixture.config.name_prefix.clone() + "-0";
     let first_run = events
         .iter()
-        .position(|event| matches!(event, Event::Exec(name, argv) if name == &runner && argv.get(1).is_some_and(|arg| arg == "run")))
+        .position(|event| matches!(event, Event::Exec(name, argv) if name == &runner && argv.iter().any(|arg| arg == "run")))
         .unwrap();
     let second_create = events
         .iter()
@@ -488,4 +658,107 @@ async fn cancellation_deletes_owned_active_machine() {
         .events
         .iter()
         .any(|event| matches!(event, Event::Delete(name) if name == &runner)));
+}
+
+#[tokio::test]
+async fn preserved_runner_expires_at_idle_timeout_without_heartbeat() {
+    tokio::time::pause();
+    let fixture = Fixture::new("debug-idle", true);
+    let mut config = fixture.config.clone();
+    let debug_dir = fixture.root.join("debug");
+    config.debug_dir = Some(debug_dir.clone());
+    let provider = Arc::new(RecordingVmProvider::with_machines(
+        &[],
+        vec![RunAction::Complete],
+    ));
+    let runner = config.name_prefix.clone() + "-0";
+    let marker = debug_dir.join(&runner);
+    let shutdown = CancellationToken::new();
+    let task_provider = provider.clone();
+    let task_shutdown = shutdown.clone();
+    let pool = RunnerPool::new(provider.clone(), config).unwrap();
+    let task = tokio::spawn(async move { pool.run(task_shutdown).await });
+
+    wait_for_debug_marker(&provider, &marker).await;
+    assert_eq!(fs::read_to_string(&marker).unwrap(), DEBUG_MARKER_IDLE);
+
+    tokio::time::advance(std::time::Duration::from_secs(599)).await;
+    yield_to_pool().await;
+    assert!(task_provider
+        .snapshot()
+        .await
+        .machines
+        .contains_key(&runner));
+
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    yield_to_pool().await;
+    provider
+        .wait_until(|state| {
+            state
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Delete(name) if name == &runner))
+        })
+        .await;
+    shutdown.cancel();
+    task.await.unwrap().unwrap();
+    assert!(!provider.snapshot().await.machines.contains_key(&runner));
+}
+
+#[tokio::test]
+async fn removing_debug_marker_releases_preserved_runner_on_next_poll() {
+    tokio::time::pause();
+    let fixture = Fixture::new("debug-remove", true);
+    let mut config = fixture.config.clone();
+    let debug_dir = fixture.root.join("debug");
+    config.debug_dir = Some(debug_dir.clone());
+    let provider = Arc::new(RecordingVmProvider::with_machines(
+        &[],
+        vec![RunAction::Complete],
+    ));
+    let runner = config.name_prefix.clone() + "-0";
+    let marker = debug_dir.join(&runner);
+    let shutdown = CancellationToken::new();
+    let task_provider = provider.clone();
+    let task_shutdown = shutdown.clone();
+    let pool = RunnerPool::new(provider.clone(), config).unwrap();
+    let task = tokio::spawn(async move { pool.run(task_shutdown).await });
+
+    wait_for_debug_marker(&provider, &marker).await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    fs::remove_file(&marker).unwrap();
+
+    tokio::time::advance(std::time::Duration::from_secs(9)).await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert!(task_provider
+        .snapshot()
+        .await
+        .machines
+        .contains_key(&runner));
+
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    println!(
+        "events at removal poll: {:?}",
+        task_provider.snapshot().await.events
+    );
+    assert!(task_provider
+        .snapshot()
+        .await
+        .events
+        .iter()
+        .any(|event| matches!(event, Event::Delete(name) if name == &runner)));
+    shutdown.cancel();
+    task.await.unwrap().unwrap();
+    assert!(!provider.snapshot().await.machines.contains_key(&runner));
 }
