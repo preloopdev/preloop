@@ -13,6 +13,9 @@ pub struct ServerConfig {
     pub record_flows: Option<PathBuf>,
     /// TLS mode (default: no TLS).
     pub tls: TlsMode,
+    /// Shared counter published with the number of jobs still queued after
+    /// each claim. Supply one to let a co-hosted runner pool scale to demand.
+    pub queue_depth: Option<Arc<std::sync::atomic::AtomicUsize>>,
     /// Enable privileged local/CI simulation endpoints.
     pub enable_test_api: bool,
     /// Bearer token required by privileged simulation endpoints.
@@ -184,6 +187,9 @@ async fn run_background_reaper(shared: Arc<SharedState>) {
 /// Start the server and block until shutdown.
 pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     let mut state = AppState::new(config.state_dir.clone()).await?;
+    if let Some(queue_depth) = config.queue_depth.clone() {
+        state.queue_depth = queue_depth;
+    }
     if !config.listen.ip().is_loopback() && state.system_token == DEFAULT_AKSH_SYSTEM_TOKEN {
         anyhow::bail!(
             "AKSH_SYSTEM_TOKEN must be explicitly configured when listening beyond loopback"

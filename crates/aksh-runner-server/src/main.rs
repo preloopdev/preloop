@@ -112,6 +112,7 @@ async fn main() -> anyhow::Result<()> {
                 _ => unreachable!("clap ensures mutual exclusion"),
             };
             serve(ServerConfig {
+                queue_depth: None,
                 listen,
                 unix_socket,
                 state_dir,

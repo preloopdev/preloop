@@ -107,6 +107,10 @@ pub struct AppState {
     pub(crate) inner: Arc<Mutex<InnerState>>,
     pub(crate) events: broadcast::Sender<NdjsonEvent>,
     pub(crate) message_notify: Arc<Notify>,
+    /// Jobs accepted and still waiting for a runner, refreshed whenever one
+    /// is claimed. A supervising runner pool reads it to decide whether the
+    /// work already queued outruns the runners it has left.
+    pub queue_depth: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) cache: CacheStore,
     pub(crate) artifacts: ArtifactStore,
     /// Optional GitHub App Webhook Secret for signature verification.
@@ -236,6 +240,7 @@ impl AppState {
             inner: Arc::new(Mutex::new(inner)),
             events,
             message_notify: Arc::new(Notify::new()),
+            queue_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             cache,
             artifacts,
             webhook_secret,
