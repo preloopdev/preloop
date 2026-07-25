@@ -44,8 +44,6 @@ pub(crate) async fn create_workspace_snapshot(
             workspace.display()
         ))
     })?;
-    ensure_git_worktree(&workspace).await?;
-
     let snapshots_dir = state_dir.join("snapshots");
     tokio::fs::create_dir_all(&snapshots_dir)
         .await
@@ -121,56 +119,25 @@ async fn create_workspace_snapshot_inner(
     final_repository: &FsPath,
     run_id: RunId,
 ) -> Result<String, ApiError> {
-    run_git(
-        Command::new("git")
-            .args(["init", "--bare", "--quiet"])
-            .arg(staging_repository),
-        "initialize snapshot repository",
-    )
-    .await?;
-
-    let mut source_revision = Command::new("git");
-    source_revision
-        .arg("-C")
-        .arg(workspace)
-        .args(["rev-parse", "--git-common-dir", "HEAD"]);
-    let source_revision = source_revision.output().await.map_err(|error| {
-        ApiError::internal(format!(
-            "failed to resolve source Git common directory and HEAD: {error}"
-        ))
-    })?;
-    let mut source_revision_lines = source_revision.stdout.split(|byte| *byte == b'\n');
-    let common_dir_text = source_revision_lines
-        .next()
-        .and_then(|line| std::str::from_utf8(line).ok())
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .ok_or_else(|| {
-            ApiError::internal(format!(
-                "git produced no Git common directory while trying to resolve source Git common directory: {}",
-                String::from_utf8_lossy(&source_revision.stderr).trim()
-            ))
-        })?;
-    let common_dir = output_path_text(common_dir_text, workspace)?;
-    let source_head = if source_revision.status.success() {
-        let head = source_revision_lines
-            .next()
-            .and_then(|line| std::str::from_utf8(line).ok())
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .ok_or_else(|| {
-                ApiError::internal(
-                    "git produced no source HEAD while trying to resolve source Git HEAD",
-                )
-            })?;
-        Some(head.to_owned())
-    } else {
-        // `rev-parse --git-common-dir HEAD` exits unsuccessfully for an unborn
-        // HEAD, but still emits the common directory. This matches the prior
-        // behavior where a failed standalone HEAD lookup simply skipped
-        // read-tree after the common directory had been resolved.
-        None
-    };
+    // Creating the staging repository does not depend on anything we learn
+    // from the workspace, so pay for both spawns at once. Every millisecond
+    // here sits directly in `POST /api/v1/runs`.
+    //
+    // `--template=` skips copying the sample hooks and description into a
+    // repository that only ever serves one fetch.
+    let mut init_command = Command::new("git");
+    init_command
+        .args(["init", "--bare", "--quiet", "--template="])
+        .arg(staging_repository);
+    let (init, probe) = tokio::join!(
+        run_git(&mut init_command, "initialize snapshot repository"),
+        probe_workspace(workspace),
+    );
+    init?;
+    let WorkspaceRevision {
+        common_dir,
+        source_head,
+    } = probe?;
     let source_objects = common_dir.join("objects");
     if !source_objects.is_dir() {
         return Err(ApiError::bad_request(format!(
@@ -178,7 +145,12 @@ async fn create_workspace_snapshot_inner(
             source_objects.display()
         )));
     }
-    let cached_objects = ensure_object_cache(state_dir, workspace, &common_dir).await?;
+    let cache =
+        ensure_object_cache(state_dir, workspace, &common_dir, source_head.as_deref()).await?;
+    let ObjectCache {
+        objects: cached_objects,
+        refreshed: cache_refreshed,
+    } = cache;
 
     if let Some(head) = source_head {
         run_snapshot_git(
@@ -275,14 +247,24 @@ async fn create_workspace_snapshot_inner(
         })?;
 
     // Prove that the synthetic commit is fully connected through the persisted
-    // cache without decompressing and re-hashing every historical blob on every
-    // submission. Git clone/fetch validate incoming objects; connectivity-only
-    // catches a missing alternate object while keeping warm snapshots bounded by
-    // the current tree rather than total repository history.
-    let mut fsck = Command::new("git");
-    fsck.env("GIT_DIR", staging_repository)
-        .args(["fsck", "--connectivity-only", "--no-dangling"]);
-    run_git(&mut fsck, "verify incremental snapshot repository").await?;
+    // cache, without decompressing and re-hashing every historical blob. Git
+    // clone/fetch validate incoming objects; connectivity-only catches an
+    // alternate that is missing an object the new tree needs.
+    //
+    // Only a clone or fetch can change what the alternate holds, and the
+    // objects this run wrote live in the staging repository itself, so a run
+    // that reused the cache untouched is already covered by the check that ran
+    // when those objects landed. Re-verifying every submission cost ~30 % of
+    // snapshot time for a result that cannot have changed.
+    if cache_refreshed {
+        let mut fsck = Command::new("git");
+        fsck.env("GIT_DIR", staging_repository).args([
+            "fsck",
+            "--connectivity-only",
+            "--no-dangling",
+        ]);
+        run_git(&mut fsck, "verify incremental snapshot repository").await?;
+    }
 
     tokio::fs::rename(staging_repository, final_repository)
         .await
@@ -294,22 +276,71 @@ async fn create_workspace_snapshot_inner(
     Ok(commit_sha)
 }
 
-async fn ensure_git_worktree(workspace: &FsPath) -> Result<(), ApiError> {
-    let output = run_git(
-        Command::new("git")
-            .arg("-C")
-            .arg(workspace)
-            .args(["rev-parse", "--is-inside-work-tree"]),
-        "validate local Git workspace",
-    )
-    .await?;
-    if output.stdout != b"true\n" && output.stdout != b"true\r\n" {
+/// What one `git rev-parse` tells us about the source workspace.
+struct WorkspaceRevision {
+    /// Canonical `.git` common directory backing the worktree.
+    common_dir: PathBuf,
+    /// Current `HEAD` commit, absent when the branch is unborn.
+    source_head: Option<String>,
+}
+
+/// Validate the workspace and resolve its common directory and `HEAD` in a
+/// single `git` invocation.
+///
+/// Process spawns dominate snapshot creation, so the three questions the
+/// snapshot needs are asked together rather than one process each.
+async fn probe_workspace(workspace: &FsPath) -> Result<WorkspaceRevision, ApiError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args([
+            "rev-parse",
+            "--is-inside-work-tree",
+            "--git-common-dir",
+            "HEAD",
+        ])
+        .output()
+        .await
+        .map_err(|error| {
+            ApiError::internal(format!("failed to inspect local Git workspace: {error}"))
+        })?;
+    // An unborn HEAD makes `rev-parse` exit non-zero after it has already
+    // printed the answers that do resolve, so the lines are parsed either way.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines().map(str::trim);
+
+    if lines.next() != Some("true") {
         return Err(ApiError::bad_request(format!(
             "local workspace is not a Git worktree: {}",
             workspace.display()
         )));
     }
-    Ok(())
+    let common_dir = lines
+        .next()
+        .filter(|line| !line.is_empty())
+        .ok_or_else(|| {
+            ApiError::internal(format!(
+                "git produced no Git common directory for {}: {}",
+                workspace.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        })?;
+    let common_dir = output_path_text(common_dir, workspace)?;
+    let source_head = if output.status.success() {
+        let head = lines
+            .next()
+            .filter(|line| !line.is_empty())
+            .ok_or_else(|| {
+                ApiError::internal("git produced no source HEAD for the local workspace")
+            })?;
+        Some(head.to_owned())
+    } else {
+        None
+    };
+    Ok(WorkspaceRevision {
+        common_dir,
+        source_head,
+    })
 }
 
 fn snapshot_git_command(
@@ -419,11 +450,20 @@ async fn run_git_with_stdin(
     Ok(output)
 }
 
+/// Result of pointing a snapshot at the persistent object cache.
+struct ObjectCache {
+    /// Object directory to expose as the snapshot's alternate.
+    objects: PathBuf,
+    /// Whether this call added objects to the cache.
+    refreshed: bool,
+}
+
 async fn ensure_object_cache(
     state_dir: &FsPath,
     workspace: &FsPath,
     common_dir: &FsPath,
-) -> Result<PathBuf, ApiError> {
+    source_head: Option<&str>,
+) -> Result<ObjectCache, ApiError> {
     use sha2::Digest;
 
     let identity = common_dir.to_string_lossy();
@@ -435,19 +475,6 @@ async fn ensure_object_cache(
         ApiError::internal(format!("failed to create snapshot object cache: {error}"))
     })?;
     let _guard = acquire_cache_lock(&lock).await?;
-    let mut source_head_command = Command::new("git");
-    source_head_command
-        .args(["-C"])
-        .arg(workspace)
-        .args(["rev-parse", "HEAD"]);
-    let source_head = output_text(
-        &run_git(
-            &mut source_head_command,
-            "resolve source HEAD for snapshot object cache",
-        )
-        .await?,
-        "resolve source HEAD for snapshot object cache",
-    )?;
     let mut last_head = repository.as_os_str().to_os_string();
     last_head.push(".last-head");
     let last_head = PathBuf::from(last_head);
@@ -484,14 +511,9 @@ async fn ensure_object_cache(
         }
     }
 
+    let mut refreshed = cloned;
     if cloned {
-        tokio::fs::write(&last_head, format!("{source_head}\n"))
-            .await
-            .map_err(|error| {
-                ApiError::internal(format!(
-                    "failed to record snapshot object cache HEAD: {error}"
-                ))
-            })?;
+        record_cache_head(&last_head, source_head).await?;
     } else {
         // Fetch only adds immutable objects and atomically updates refs. Auto
         // GC is disabled, so active run alternates cannot lose base objects.
@@ -504,7 +526,8 @@ async fn ensure_object_cache(
                 )));
             }
         };
-        if cached_head.as_deref() != Some(source_head.as_str()) {
+        // An unborn HEAD gives nothing to compare, so always refresh.
+        if source_head.is_none() || cached_head.as_deref() != source_head {
             let mut fetch = Command::new("git");
             fetch
                 .env("GIT_DIR", &repository)
@@ -512,18 +535,33 @@ async fn ensure_object_cache(
                 .arg(workspace)
                 .args(["+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"]);
             run_git(&mut fetch, "refresh snapshot object cache").await?;
-            tokio::fs::write(&last_head, format!("{source_head}\n"))
-                .await
-                .map_err(|error| {
-                    ApiError::internal(format!(
-                        "failed to record snapshot object cache HEAD: {error}"
-                    ))
-                })?;
+            record_cache_head(&last_head, source_head).await?;
+            refreshed = true;
         }
     }
 
-    std::fs::canonicalize(repository.join("objects")).map_err(|error| {
+    let objects = std::fs::canonicalize(repository.join("objects")).map_err(|error| {
         ApiError::internal(format!("failed to resolve snapshot object cache: {error}"))
+    })?;
+    Ok(ObjectCache { objects, refreshed })
+}
+
+/// Persist the workspace HEAD the cache was last synced to.
+///
+/// An unborn HEAD has nothing to record; clearing the marker keeps the next
+/// call on the always-fetch path.
+async fn record_cache_head(marker: &FsPath, source_head: Option<&str>) -> Result<(), ApiError> {
+    let result = match source_head {
+        Some(head) => tokio::fs::write(marker, format!("{head}\n")).await,
+        None => match tokio::fs::remove_file(marker).await {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        },
+    };
+    result.map_err(|error| {
+        ApiError::internal(format!(
+            "failed to record snapshot object cache HEAD: {error}"
+        ))
     })
 }
 
