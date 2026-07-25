@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-SERVER=/workspace/target/aarch64-unknown-linux-musl/release/aksh-runner-server
+SERVER=/workspace/target/aarch64-unknown-linux-musl/release/preloop-server
 CLIENT=/workspace/target/aarch64-unknown-linux-musl/release/aksh-runner-client
 # Prefer pinned v2.336.0; fall back to container layout.
 RUNNER_SRC="${RUNNER_SRC:-}"
@@ -32,7 +32,7 @@ fi
 OUTDIR=/workspace/benchmarks/v2336-official-vs-aksh
 FLOWS=$OUTDIR/combined-flows.jsonl
 
-pkill -f "aksh-runner-server.*:80" 2>/dev/null || true
+pkill -f "preloop-server.*:80" 2>/dev/null || true
 sleep 1
 
 mkdir -p "$OUTDIR"

@@ -822,6 +822,9 @@ pub(crate) async fn handle_github_webhook(
                 filter_branch,
                 dispatch_inputs,
                 dispatch_inputs_stringified,
+                selected_jobs: vec![],
+                base_ref: None,
+                preserve_on_failure: false,
             };
 
             // Call submit_run_inner — it performs the authoritative trigger match.
