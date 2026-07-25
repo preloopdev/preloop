@@ -54,16 +54,38 @@ pub struct LiveLogQueue {
 }
 
 impl LiveLogQueue {
-    /// Connect to the live console feed and return a queue even if the initial
-    /// WebSocket connection fails. Failed live streaming must not fail the job.
-    pub async fn connect(feed_url: String, access_token: String) -> Arc<Self> {
-        let ws = WebSocketSender::connect(feed_url, access_token).await;
+    /// Return a live-log queue immediately and connect to the console feed in
+    /// the background.
+    ///
+    /// Live console streaming is best-effort: the durable step-log blobs are
+    /// the source of truth. Dialing the feed inline put up to
+    /// `RETRIES * (CONNECT_TIMEOUT + backoff)` in front of the job's first
+    /// step, so an unreachable feed endpoint delayed every job by ~1s. Lines
+    /// produced before the socket is up stay queued and go out on the first
+    /// drain after it connects.
+    pub fn connect(feed_url: String, access_token: String) -> Arc<Self> {
         let (shutdown_tx, _) = watch::channel(false);
-        Arc::new(Self {
+        let queue = Arc::new(Self {
             lines: Mutex::new(VecDeque::new()),
-            ws: tokio::sync::Mutex::new(ws),
+            ws: tokio::sync::Mutex::new(None),
             shutdown_tx,
-        })
+        });
+        let connecting = Arc::clone(&queue);
+        tokio::spawn(async move {
+            let mut shutdown_rx = connecting.shutdown_tx.subscribe();
+            let sender = tokio::select! {
+                sender = WebSocketSender::connect(feed_url, access_token) => sender,
+                _ = shutdown_rx.changed() => return,
+            };
+            let Some(sender) = sender else { return };
+            // The drain task tears the socket down on shutdown; installing a
+            // freshly dialed one afterwards would leak a live connection.
+            if *connecting.shutdown_tx.borrow() {
+                return;
+            }
+            *connecting.ws.lock().await = Some(sender);
+        });
+        queue
     }
 
     /// Build a queue with no WebSocket, used by tests and degraded live-log mode.
