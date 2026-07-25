@@ -466,6 +466,7 @@ fn local_runner_pool_config(
         memory_mib: RUNNER_MEMORY_MIB,
         storage_gib: 20,
         debug_dir: Some(home.join("state").join("debug")),
+        runner_key_dir: Some(home.join("runner-keys")),
     })
 }
 

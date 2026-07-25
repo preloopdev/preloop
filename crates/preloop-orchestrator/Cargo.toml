@@ -24,4 +24,5 @@ sha2 = "0.10"
 uuid = { workspace = true }
 
 [dev-dependencies]
+tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

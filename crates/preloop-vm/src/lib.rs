@@ -100,6 +100,18 @@ pub enum NetworkPolicy {
     },
 }
 
+/// Where a guest environment value is resolved from, at launch time.
+///
+/// SmolVM never persists the value itself, only this reference, so a secret
+/// stays out of the machine record and out of any packed artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SecretSource {
+    /// Read from a host environment variable of this name.
+    HostEnv(String),
+    /// Read from this absolute host file.
+    HostFile(PathBuf),
+}
+
 /// Persistent VM configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MachineSpec {
@@ -209,12 +221,12 @@ pub trait VmProvider: Send + Sync {
     async fn list(&self) -> Result<Vec<MachineName>, VmError>;
     /// Execute a guest command and return bounded output.
     async fn exec(&self, name: &MachineName, argv: &[String]) -> Result<ExecOutput, VmError>;
-    /// Execute with guest environment values resolved from named host variables.
+    /// Execute with guest environment values resolved from the host at launch.
     async fn exec_with_secret_env(
         &self,
         name: &MachineName,
         argv: &[String],
-        secrets: &[(String, String)],
+        secrets: &[(String, SecretSource)],
     ) -> Result<ExecOutput, VmError>;
     /// Execute while forwarding output fragments to the caller.
     async fn exec_stream(
@@ -539,7 +551,7 @@ impl VmProvider for SmolVmProvider {
         &self,
         name: &MachineName,
         argv: &[String],
-        secrets: &[(String, String)],
+        secrets: &[(String, SecretSource)],
     ) -> Result<ExecOutput, VmError> {
         if argv.is_empty() {
             return Err(VmError::InvalidSpec("guest command is empty".into()));
@@ -550,21 +562,35 @@ impl VmProvider for SmolVmProvider {
             "--name".into(),
             name.as_str().into(),
         ];
-        for (guest, host) in secrets {
-            if guest.is_empty()
-                || host.is_empty()
-                || !guest
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-                || !host
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-            {
+        for (guest, source) in secrets {
+            if !is_env_identifier(guest) {
                 return Err(VmError::InvalidSpec(
                     "secret environment names must be non-empty ASCII identifiers".into(),
                 ));
             }
-            args.extend(["--secret-env".into(), format!("{guest}={host}")]);
+            match source {
+                SecretSource::HostEnv(host) => {
+                    if !is_env_identifier(host) {
+                        return Err(VmError::InvalidSpec(
+                            "secret environment names must be non-empty ASCII identifiers".into(),
+                        ));
+                    }
+                    args.extend(["--secret-env".into(), format!("{guest}={host}")]);
+                }
+                SecretSource::HostFile(path) => {
+                    // SmolVM resolves the path itself; a relative one would be
+                    // read against its working directory, not the caller's.
+                    if !path.is_absolute() {
+                        return Err(VmError::InvalidSpec(
+                            "secret file paths must be absolute".into(),
+                        ));
+                    }
+                    args.extend([
+                        "--secret-file".into(),
+                        format!("{guest}={}", path.display()),
+                    ]);
+                }
+            }
         }
         args.push("--".into());
         args.extend_from_slice(argv);
@@ -652,6 +678,14 @@ impl VmProvider for SmolVmProvider {
         .await
         .map(|_| ())
     }
+}
+
+/// Whether a name is usable as a shell environment variable identifier.
+fn is_env_identifier(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 fn validate_spec(spec: &MachineSpec) -> Result<(), VmError> {
