@@ -23,7 +23,7 @@ unset all_proxy ALL_PROXY http_proxy https_proxy HTTP_PROXY HTTPS_PROXY \
       no_proxy NO_PROXY 2>/dev/null || true
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-AKSH_BIN="$SCRIPT_DIR/target/release/aksh-runner-server"
+AKSH_BIN="$SCRIPT_DIR/target/release/preloop-server"
 RUNNER_DIR="${RUNNER_DIR:-$HOME/mitm-proxy/experiments/mitm/.cache/runner-official}"
 AKSH_PORT=9090
 # Clients use port 80 via pfctl redirect (runner strips non-default HTTP ports)

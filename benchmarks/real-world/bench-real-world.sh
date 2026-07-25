@@ -40,7 +40,7 @@ start_fresh_server() {
   sleep 0.3
   export AKSH_PUBLIC_URL="http://127.0.0.1:$PORT"
   local t0=$(ms)
-  RUST_LOG=info "$AKSH/aksh-runner-server" serve --listen "127.0.0.1:$PORT" \
+  RUST_LOG=info "$AKSH/preloop-server" serve --listen "127.0.0.1:$PORT" \
     --state-dir "/tmp/bench-state-$$" > /tmp/bench-server.log 2>&1 &
   SERVER_PID=$!
   local ok=0

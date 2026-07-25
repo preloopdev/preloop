@@ -18,7 +18,7 @@ unset all_proxy ALL_PROXY http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 AKSH_STATE="${AKSH_STATE:-$HOME/mitm-proxy/experiments/mitm/.cache/aksh-state}"
-AKSH_BIN="${AKSH_BIN:-$REPO_ROOT/target/release/aksh-runner-server}"
+AKSH_BIN="${AKSH_BIN:-$REPO_ROOT/target/release/preloop-server}"
 RUNNER_DIR="${RUNNER_DIR:-$HOME/mitm-proxy/experiments/mitm/.cache/runner-official}"
 AKSH_PORT="${AKSH_PORT:-9090}"
 # aksh binds 9090, but clients (and the runner) reach it via the port-80 redirect.
@@ -240,7 +240,7 @@ Environment:
   AKSH_STATE=~/mitm-proxy/experiments/mitm/.cache/aksh-state
   RUNNER_DIR=~/mitm-proxy/experiments/mitm/.cache/runner-official
   AKSH_PORT=9090
-  AKSH_BIN=target/release/aksh-runner-server
+  AKSH_BIN=target/release/preloop-server
 EOF
         exit 0
         ;;

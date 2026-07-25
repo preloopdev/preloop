@@ -50,14 +50,14 @@ for i in $(seq 1 "$NUM_RUNNERS"); do
 set -euo pipefail
 rm -rf '$root'
 mkdir -p '$root'
-/workspace/target/aarch64-unknown-linux-musl/release/aksh-runner \
+/workspace/target/aarch64-unknown-linux-musl/release/preloop-runner \
   --runner-root '$root' configure \
   --url 'https://github.com/$GH_REPO' \
   --token '$REG_TOKEN' \
   --name '$name' \
   --unattended --replace --ephemeral \
   --labels 'self-hosted,linux,x64,mitm' >&2
-RUST_LOG=info /workspace/target/aarch64-unknown-linux-musl/release/aksh-runner \
+RUST_LOG=info /workspace/target/aarch64-unknown-linux-musl/release/preloop-runner \
   --runner-root '$root' run --once 2>&1
 echo 'EXIT='\$?
 " > "/tmp/runner-${WFBASE}-${i}.log" 2>&1 &
