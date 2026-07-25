@@ -482,20 +482,77 @@ const RUNNER_CPUS: u16 = 4;
 /// runner commits far less than its ceiling.
 const RUNNER_MEMORY_MIB: u32 = 4096;
 
-/// How many runners to keep warm, derived from what the host can run at once.
+/// Resident memory an idle runner VM actually holds, in MiB.
 ///
-/// A fixed pool capped every workflow at that many concurrent jobs regardless
-/// of the machine: on a 16-core host a matrix ran two shards at a time and left
-/// the rest of the CPU idle. Each runner is a VM with `cpus_per_runner` vCPUs,
-/// so roughly `parallelism / cpus_per_runner` of them fit before the jobs start
-/// competing for the same cores.
+/// Measured at ~390 MiB for a forked runner sitting on its long poll, against a
+/// 4096 MiB ceiling: SmolVM balloons the guest, so the ceiling says nothing
+/// about the cost of keeping one warm.
+const IDLE_RUNNER_MIB: u64 = 400;
+
+/// Share of host memory this is willing to hold in idle runners.
+const IDLE_MEMORY_SHARE: u64 = 8;
+
+/// Most runners to keep warm, however large the host.
+const WARM_POOL_CAP: usize = 8;
+
+/// How many runners to keep warm.
 ///
-/// Clamped to `[1, 8]`: at least one so a small machine still runs anything, at
-/// most eight so a very large one does not sit on dozens of idle VMs. Set
+/// Two different resources set the bounds, and conflating them under-sized the
+/// pool. Running jobs are CPU-bound, so `parallelism / cpus_per_runner` is what
+/// the host can execute at once. Warm runners are *idle*, consuming memory and
+/// almost no CPU, and their job is to absorb a fan-out without anyone waiting
+/// on a VM build — which costs ~500 ms under load and shows up as a cliff the
+/// moment a matrix is one job wider than the pool.
+///
+/// So the warm set is allowed past the CPU budget, bounded by the memory we are
+/// willing to leave parked and never below what the host can actually run.
+/// Capped at `WARM_POOL_CAP` so a very large machine does not sit on dozens of
+/// idle VMs. Set
 /// `PRELOOP_RUNNER_POOL_SIZE` to override.
 fn host_runner_pool_size(cpus_per_runner: u16) -> usize {
     let parallelism = std::thread::available_parallelism().map_or(2, |value| value.get());
-    (parallelism / usize::from(cpus_per_runner.max(1))).clamp(1, 8)
+    let by_cpu = (parallelism / usize::from(cpus_per_runner.max(1))).max(1);
+    let by_memory = host_memory_mib()
+        .map(|total| (total / IDLE_MEMORY_SHARE / IDLE_RUNNER_MIB) as usize)
+        .unwrap_or(by_cpu);
+    // Not `clamp`: on a host with more CPU budget than the cap its lower bound
+    // would exceed its upper bound and panic.
+    let target = by_cpu.saturating_mul(2).min(by_memory).min(WARM_POOL_CAP);
+    target.max(by_cpu.min(WARM_POOL_CAP)).max(1)
+}
+
+/// Total physical memory in MiB, or `None` when it cannot be determined.
+#[cfg(target_os = "macos")]
+fn host_memory_mib() -> Option<u64> {
+    let output = std::process::Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()?;
+    let bytes: u64 = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .ok()?;
+    Some(bytes / (1024 * 1024))
+}
+
+/// Total physical memory in MiB, or `None` when it cannot be determined.
+#[cfg(target_os = "linux")]
+fn host_memory_mib() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kib: u64 = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    Some(kib / 1024)
+}
+
+/// Total physical memory in MiB, or `None` when it cannot be determined.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn host_memory_mib() -> Option<u64> {
+    None
 }
 
 fn linux_runner_bundle(path: &std::path::Path) -> bool {
@@ -1033,13 +1090,22 @@ mod tests {
     fn warm_pool_tracks_host_capacity_within_bounds() {
         let parallelism = std::thread::available_parallelism().map_or(2, |value| value.get());
 
-        // One runner per `cpus_per_runner` cores, never zero and never unbounded.
-        assert_eq!(host_runner_pool_size(1), parallelism.clamp(1, 8));
-        assert_eq!(host_runner_pool_size(4), (parallelism / 4).clamp(1, 8));
-        // A host smaller than one runner still gets a runner.
-        assert_eq!(host_runner_pool_size(u16::MAX), 1);
-        // A zero would divide by zero; treat it as one core per runner.
-        assert_eq!(host_runner_pool_size(0), parallelism.clamp(1, 8));
+        // `cpus_per_runner = 0` would divide by zero; it is read as one core.
+        for cpus in [0_u16, 1, 2, 4, 64, u16::MAX] {
+            let by_cpu = (parallelism / usize::from(cpus.max(1))).max(1);
+            let size = host_runner_pool_size(cpus);
+
+            assert!(size >= 1, "a host must always keep a runner warm");
+            assert!(size <= WARM_POOL_CAP, "{size} exceeds the warm pool cap");
+            assert!(
+                size >= by_cpu.min(WARM_POOL_CAP),
+                "warm pool {size} starves the {by_cpu} jobs this host can run at once"
+            );
+            assert!(
+                size <= by_cpu.saturating_mul(2).max(1),
+                "warm pool {size} parks more than twice the CPU budget of {by_cpu}"
+            );
+        }
     }
 
     #[test]
