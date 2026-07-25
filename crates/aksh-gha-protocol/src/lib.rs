@@ -21,6 +21,14 @@ pub mod masking;
 /// Protocol version exposed by this crate's runner-compatible DTOs.
 pub const PROTOCOL_VERSION: &str = "2026-06-25.aksh.v1";
 
+/// Line a runner prints on stdout the moment it accepts a job.
+///
+/// An ephemeral runner is single-use, so the orchestrator supervising it can
+/// start building its replacement as soon as the current one is spoken for
+/// rather than waiting for the job to end. This is a private channel between
+/// our runner and our orchestrator; it never crosses the GitHub wire protocol.
+pub const RUNNER_BUSY_SENTINEL: &str = "::preloop-runner::job-acquired";
+
 /// Stable identifier for a workflow run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
