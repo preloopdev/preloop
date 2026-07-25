@@ -49,6 +49,11 @@ chrono.workspace = true
 chrono-tz.workspace = true
 
 serde_yaml.workspace = true
+
+[[bin]]
+name = "preloop-server"
+path = "src/main.rs"
+
 [dev-dependencies]
 tempfile.workspace = true
 tower.workspace = true
