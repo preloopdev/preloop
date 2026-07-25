@@ -610,6 +610,28 @@ async fn persist_snapshot_index(staging_index: &FsPath, destination: &FsPath) {
 
 struct CacheLock(PathBuf);
 
+/// Drop a finished run's snapshot repository.
+///
+/// The repository exists so the run's checkouts can fetch the workspace; once
+/// every job is terminal nothing can ask for it again, and a re-run captures a
+/// fresh snapshot. Keeping them made the state directory grow without bound —
+/// enough matrix runs filled the disk and the engine began failing blob writes
+/// with HTTP 500. The persistent object cache is untouched: it is shared and
+/// is what makes the next snapshot cheap.
+pub(crate) async fn discard_workspace_snapshot(state_dir: &FsPath, run_id: RunId) {
+    let repository = state_dir.join("snapshots").join(run_id.to_string());
+    match tokio::fs::remove_dir_all(&repository).await {
+        Ok(()) => debug!(%run_id, "Discarded finished run's workspace snapshot"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => warn!(
+            %run_id,
+            path = %repository.display(),
+            %error,
+            "Failed to discard workspace snapshot"
+        ),
+    }
+}
+
 impl Drop for CacheLock {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir(&self.0);
