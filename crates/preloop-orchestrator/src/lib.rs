@@ -4,8 +4,8 @@ pub mod environment;
 
 use crate::environment::{EnvironmentResolver, EnvironmentSpec};
 use preloop_vm::{
-    MachineName, MachineSpec, MachineState, NetworkPolicy, SmolVmProvider, VmError, VmProvider,
-    VolumeMount,
+    MachineName, MachineSpec, MachineState, NetworkPolicy, SmolVmProvider, SocketMount, VmError,
+    VmProvider, VolumeMount,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -16,6 +16,103 @@ use tokio::sync::RwLock;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
+
+const GUEST_CONTROL_DIR: &str = "/run/preloop-control";
+const GUEST_CONTROL_SOCKET: &str = "/run/preloop-control/engine.sock";
+const GUEST_FAILURE_MARKER: &str = "/var/lib/preloop-runner/.preloop-job-failed";
+
+/// How long a preserved VM survives with nobody attached.
+const DEBUG_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+/// How often the preserved VM re-checks the debug marker.
+const DEBUG_POLL_INTERVAL: Duration = Duration::from_secs(10);
+/// Marker mtime newer than this counts as an active `preloop shell` session.
+/// Must exceed the CLI heartbeat interval.
+const DEBUG_HEARTBEAT_WINDOW: Duration = Duration::from_secs(30);
+
+/// Debug marker contents written by the orchestrator when it parks a failed VM.
+pub const DEBUG_MARKER_IDLE: &str = "preserved";
+/// Debug marker contents written by `preloop shell` while a session is live.
+///
+/// The orchestrator only extends the idle deadline for a marker in this state,
+/// so its own initial write cannot masquerade as a heartbeat.
+pub const DEBUG_MARKER_ACTIVE: &str = "active";
+
+fn control_bridge_dir(config: &RunnerPoolConfig) -> Option<PathBuf> {
+    config
+        .control_socket
+        .as_deref()
+        .and_then(Path::parent)
+        .map(|parent| parent.join("control-bridge"))
+}
+
+fn runner_volumes(config: &RunnerPoolConfig) -> Vec<VolumeMount> {
+    let mut volumes = vec![VolumeMount {
+        host: config.runner_bundle.clone(),
+        guest: PathBuf::from("/opt/preloop/bin"),
+        read_only: true,
+    }];
+    if let Some(host) = control_bridge_dir(config) {
+        volumes.push(VolumeMount {
+            host,
+            guest: PathBuf::from(GUEST_CONTROL_DIR),
+            read_only: false,
+        });
+    }
+    volumes
+}
+
+fn base_install_commands() -> Vec<Vec<String>> {
+    [
+        vec!["apt-get", "update", "-qq"],
+        vec![
+            "apt-get",
+            "install",
+            "-y",
+            "-qq",
+            "--no-install-recommends",
+            "git",
+            "curl",
+            "ca-certificates",
+            "nodejs",
+        ],
+    ]
+    .into_iter()
+    .map(|command| command.into_iter().map(str::to_owned).collect())
+    .collect()
+}
+
+async fn install_base_dependencies<P: VmProvider>(
+    provider: &P,
+    name: &MachineName,
+) -> Result<(), OrchestratorError> {
+    for command in base_install_commands() {
+        provider.exec(name, &command).await?;
+    }
+    Ok(())
+}
+
+/// `env` prefix for guest runner invocations, empty when nothing needs setting.
+///
+/// Control-socket routing and failure-marker debugging are independent
+/// features: a pool can debug failed jobs without a mounted control socket and
+/// vice versa, so neither may gate the other.
+fn guest_env_prefix(config: &RunnerPoolConfig) -> Vec<String> {
+    let mut env = Vec::new();
+    if config.control_socket.is_some() {
+        env.push(format!(
+            "PRELOOP_CONTROL_ORIGIN={}",
+            config.server_url.trim_end_matches('/')
+        ));
+        env.push(format!("PRELOOP_CONTROL_SOCKET={GUEST_CONTROL_SOCKET}"));
+    }
+    if config.debug_dir.is_some() {
+        env.push(format!("PRELOOP_FAILURE_MARKER={GUEST_FAILURE_MARKER}"));
+    }
+    if !env.is_empty() {
+        env.insert(0, "/usr/bin/env".to_owned());
+    }
+    env
+}
 
 /// Local ephemeral-runner pool configuration.
 #[derive(Debug, Clone)]
@@ -34,12 +131,14 @@ pub struct RunnerPoolConfig {
     pub workspace: Option<PathBuf>,
     /// Host path stem for the reusable packed VM artifact.
     pub artifact_stem: PathBuf,
-    /// Host directory containing the Linux `aksh-runner` executable.
+    /// Host directory containing the Linux `preloop-runner` executable.
     pub runner_bundle: PathBuf,
     /// Runner executable filename within `runner_bundle`.
     pub runner_binary_name: String,
     /// Guest-visible control-plane URL.
     pub server_url: String,
+    /// Host Unix socket used for runner control-plane traffic.
+    pub control_socket: Option<PathBuf>,
     /// Host environment variable containing the registration credential.
     pub registration_token_env: String,
     /// Runner labels advertised to the scheduler.
@@ -50,6 +149,12 @@ pub struct RunnerPoolConfig {
     pub memory_mib: u32,
     /// Storage per runner in GiB.
     pub storage_gib: u32,
+    /// Directory for debug session markers (e.g. `~/.preloop/state/debug`).
+    ///
+    /// When set, a runner whose job requested `preserve_on_failure` and then
+    /// failed is held open for interactive debugging. Whether any individual
+    /// job opts in is decided per run by the control plane, not here.
+    pub debug_dir: Option<PathBuf>,
 }
 
 /// Cache of environment-specific golden VMs.
@@ -113,6 +218,21 @@ impl RunnerPoolConfig {
                 "runner binary name must be a filename".into(),
             ));
         }
+        if let Some(socket) = &self.control_socket {
+            if !socket.is_absolute() || !socket.exists() {
+                return Err(OrchestratorError::Config(format!(
+                    "control socket does not exist: {}",
+                    socket.display()
+                )));
+            }
+            let bridge = control_bridge_dir(self).expect("control socket has a parent");
+            if !bridge.is_dir() {
+                return Err(OrchestratorError::Config(format!(
+                    "control bridge directory does not exist: {}",
+                    bridge.display()
+                )));
+            }
+        }
         if std::env::var_os(&self.registration_token_env).is_none() {
             return Err(OrchestratorError::Config(format!(
                 "registration token environment variable `{}` is not set",
@@ -161,7 +281,12 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
 
     /// Prepare the immutable runner image once, then supervise all slots until cancellation.
     pub async fn run(&self, shutdown: CancellationToken) -> Result<(), OrchestratorError> {
-        self.prepare_artifact().await?;
+        // SmolVM currently drops socket mounts from `machine create --from`.
+        // Local control-plane sockets therefore use an image-backed golden VM;
+        // remote TCP pools can retain the packed-artifact path.
+        if self.config.control_socket.is_none() {
+            self.prepare_artifact().await?;
+        }
         self.remove_stale_machines().await?;
 
         let resolver = Arc::new(EnvironmentResolver::new(self.config.base_image.clone()));
@@ -248,30 +373,15 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             cpus: self.config.cpus,
             memory_mib: self.config.memory_mib,
             storage_gib: self.config.storage_gib,
-            network: NetworkPolicy::Unrestricted,
+            network: NetworkPolicy::PublicOnly,
             volumes: Vec::new(),
+            sockets: Vec::new(),
         };
         self.provider.create(&spec).await?;
         self.provider.start(&name).await?;
-        for command in [
-            vec!["apt-get", "update", "-qq"],
-            vec![
-                "apt-get",
-                "install",
-                "-y",
-                "-qq",
-                "--no-install-recommends",
-                "git",
-                "curl",
-                "ca-certificates",
-                "nodejs",
-            ],
-        ] {
-            let argv = command.into_iter().map(str::to_owned).collect::<Vec<_>>();
-            if let Err(error) = self.provider.exec(&name, &argv).await {
-                let _ = self.provider.delete(&name).await;
-                return Err(error.into());
-            }
+        if let Err(error) = install_base_dependencies(self.provider.as_ref(), &name).await {
+            let _ = self.provider.delete(&name).await;
+            return Err(error);
         }
         self.provider.stop(&name).await?;
         self.provider
@@ -301,21 +411,30 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         }
         let spec = MachineSpec {
             name: golden.clone(),
-            image: self.config.artifact_payload().display().to_string(),
+            image: self.config.base_image.clone(),
             cpus: self.config.cpus,
             memory_mib: self.config.memory_mib,
             storage_gib: self.config.storage_gib,
-            network: NetworkPolicy::Unrestricted,
-            volumes: vec![VolumeMount {
-                host: self.config.runner_bundle.clone(),
-                guest: PathBuf::from("/opt/preloop/bin"),
-                read_only: true,
-            }],
+            network: NetworkPolicy::PublicOnly,
+            volumes: runner_volumes(&self.config),
+            sockets: self
+                .config
+                .control_socket
+                .iter()
+                .map(|host| SocketMount {
+                    host: host.clone(),
+                    guest: PathBuf::from(GUEST_CONTROL_SOCKET),
+                })
+                .collect(),
         };
         self.provider.create(&spec).await?;
         self.provider.start_forkable(golden).await?;
         // Let the golden VM fully boot and settle.
         tokio::time::sleep(Duration::from_secs(2)).await;
+        if let Err(error) = install_base_dependencies(self.provider.as_ref(), golden).await {
+            let _ = self.provider.delete(golden).await;
+            return Err(error);
+        }
         for layer in &env_spec.toolchains {
             for command in layer.install_commands() {
                 if let Err(error) = self.provider.exec(golden, &command).await {
@@ -390,65 +509,21 @@ async fn run_one_runner<P: VmProvider + 'static>(
         provider.delete(name).await?;
     }
 
-    if let Some(golden) = golden {
-        // Fork from the already-booted golden VM — instant CoW clone.
-        provider.fork(golden, name).await?;
-    } else {
-        // Fallback: create from artifact.
-        let spec = MachineSpec {
-            name: name.clone(),
-            image: config.artifact_payload().display().to_string(),
-            cpus: config.cpus,
-            memory_mib: config.memory_mib,
-            storage_gib: config.storage_gib,
-            network: NetworkPolicy::Unrestricted,
-            volumes: vec![VolumeMount {
-                host: config.runner_bundle.clone(),
-                guest: PathBuf::from("/opt/preloop/bin"),
-                read_only: true,
-            }],
-        };
-        provider.create(&spec).await?;
-        provider.start(name).await?;
-    }
+    // From here on a machine may exist, so every failure path must delete it.
+    let run = match provision_runner(&provider, config, name, golden).await {
+        Ok(run) => run,
+        Err(error) => {
+            if let Err(cleanup) = provider.delete(name).await {
+                warn!(
+                    machine = name.as_str(),
+                    %cleanup,
+                    "failed to delete machine after provisioning error"
+                );
+            }
+            return Err(error);
+        }
+    };
 
-    let runner = format!("/opt/preloop/bin/{}", config.runner_binary_name);
-    let labels = config.labels.join(",");
-    let configure = vec![
-        runner.clone(),
-        "configure".into(),
-        "--url".into(),
-        config.server_url.clone(),
-        "--name".into(),
-        name.as_str().into(),
-        "--labels".into(),
-        labels,
-        "--runner-root".into(),
-        "/var/lib/preloop-runner".into(),
-        "--unattended".into(),
-        "--replace".into(),
-        "--ephemeral".into(),
-        "--no-externals".into(),
-    ];
-    provider
-        .exec_with_secret_env(
-            name,
-            &configure,
-            &[(
-                "PRELOOP_RUNNER_TOKEN".into(),
-                config.registration_token_env.clone(),
-            )],
-        )
-        .await?;
-
-    info!(machine = name.as_str(), "ephemeral runner ready");
-    let run = vec![
-        runner,
-        "run".into(),
-        "--once".into(),
-        "--runner-root".into(),
-        "/var/lib/preloop-runner".into(),
-    ];
     let run_provider = provider.clone();
     let run_name = name.clone();
     let mut run_task = tokio::spawn(async move { run_provider.exec(&run_name, &run).await });
@@ -466,10 +541,186 @@ async fn run_one_runner<P: VmProvider + 'static>(
             Err(error) => Err(OrchestratorError::Pool(error.to_string())),
         },
     };
+
+    // The runner writes this marker only when the job it ran opted in via
+    // `preserve_on_failure` and then genuinely failed, so preservation is
+    // decided per run rather than by engine-wide configuration.
+    let preserved = match &config.debug_dir {
+        Some(debug_dir)
+            if provider
+                .exec(
+                    name,
+                    &["test".into(), "-f".into(), GUEST_FAILURE_MARKER.into()],
+                )
+                .await
+                .is_ok() =>
+        {
+            Some(debug_dir.clone())
+        }
+        _ => None,
+    };
+
+    if let Some(debug_dir) = preserved {
+        hold_for_debugging(name, &debug_dir, &shutdown).await;
+        if let Err(error) = provider.delete(name).await {
+            warn!(machine = name.as_str(), %error, "failed to delete preserved machine");
+        }
+        return result;
+    }
+
+    // Report the runner's own failure in preference to a teardown failure.
     let delete_result = provider.delete(name).await;
     result?;
     delete_result?;
     Ok(())
+}
+
+/// Create, boot, and register one ephemeral runner; return its `run` argv.
+///
+/// The caller owns cleanup: on any error the machine may already exist.
+async fn provision_runner<P: VmProvider + 'static>(
+    provider: &Arc<P>,
+    config: &RunnerPoolConfig,
+    name: &MachineName,
+    golden: Option<&MachineName>,
+) -> Result<Vec<String>, OrchestratorError> {
+    if let Some(golden) = golden {
+        // Fork from the already-booted golden VM — instant CoW clone.
+        provider.fork(golden, name).await?;
+    } else {
+        // Socket mounts are currently ignored by SmolVM's packed-artifact
+        // create path, so local pools fall back to the base image directly.
+        let uses_control_socket = config.control_socket.is_some();
+        let spec = MachineSpec {
+            name: name.clone(),
+            image: if uses_control_socket {
+                config.base_image.clone()
+            } else {
+                config.artifact_payload().display().to_string()
+            },
+            cpus: config.cpus,
+            memory_mib: config.memory_mib,
+            storage_gib: config.storage_gib,
+            network: NetworkPolicy::PublicOnly,
+            volumes: runner_volumes(config),
+            sockets: config
+                .control_socket
+                .iter()
+                .map(|host| SocketMount {
+                    host: host.clone(),
+                    guest: PathBuf::from(GUEST_CONTROL_SOCKET),
+                })
+                .collect(),
+        };
+        provider.create(&spec).await?;
+        provider.start(name).await?;
+        if uses_control_socket {
+            install_base_dependencies(provider.as_ref(), name).await?;
+        }
+    }
+
+    let runner = format!("/opt/preloop/bin/{}", config.runner_binary_name);
+    let labels = config.labels.join(",");
+    let mut configure = guest_env_prefix(config);
+    configure.extend([
+        runner.clone(),
+        "configure".into(),
+        "--url".into(),
+        config.server_url.clone(),
+        "--name".into(),
+        name.as_str().into(),
+        "--labels".into(),
+        labels,
+        "--runner-root".into(),
+        "/var/lib/preloop-runner".into(),
+        "--unattended".into(),
+        "--replace".into(),
+        "--ephemeral".into(),
+        "--no-externals".into(),
+    ]);
+    provider
+        .exec_with_secret_env(
+            name,
+            &configure,
+            &[(
+                "PRELOOP_RUNNER_TOKEN".into(),
+                config.registration_token_env.clone(),
+            )],
+        )
+        .await?;
+
+    info!(machine = name.as_str(), "ephemeral runner ready");
+    let mut run = guest_env_prefix(config);
+    run.extend([
+        runner,
+        "run".into(),
+        "--once".into(),
+        "--runner-root".into(),
+        "/var/lib/preloop-runner".into(),
+    ]);
+    Ok(run)
+}
+
+/// Hold a failed runner's VM open so `preloop shell` can attach.
+///
+/// The marker file is the session handle: `preloop shell` refreshes its mtime
+/// while attached and removes it on exit, which releases the slot immediately
+/// instead of stranding it until the idle deadline.
+async fn hold_for_debugging(name: &MachineName, debug_dir: &Path, shutdown: &CancellationToken) {
+    let marker = debug_dir.join(name.as_str());
+    if let Err(error) =
+        std::fs::create_dir_all(debug_dir).and_then(|()| std::fs::write(&marker, DEBUG_MARKER_IDLE))
+    {
+        warn!(
+            machine = name.as_str(),
+            path = %marker.display(),
+            %error,
+            "cannot record debug marker — deleting VM instead of preserving it"
+        );
+        return;
+    }
+
+    warn!(
+        machine = name.as_str(),
+        timeout_secs = DEBUG_IDLE_TIMEOUT.as_secs(),
+        "job failed — VM preserved for debugging; attach with `preloop shell`"
+    );
+
+    let mut deadline = tokio::time::Instant::now() + DEBUG_IDLE_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            info!(
+                machine = name.as_str(),
+                "debug idle timeout expired — deleting preserved VM"
+            );
+            break;
+        }
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = tokio::time::sleep(remaining.min(DEBUG_POLL_INTERVAL)) => {}
+        }
+        let Ok(state) = std::fs::read_to_string(&marker) else {
+            // `preloop shell` removed the marker: the session is over.
+            info!(
+                machine = name.as_str(),
+                "debug session ended — deleting preserved VM"
+            );
+            break;
+        };
+        // Only a live `preloop shell` heartbeat extends the window. Matching on
+        // mtime alone would let this function's own initial write renew it.
+        if state.trim() == DEBUG_MARKER_ACTIVE
+            && std::fs::metadata(&marker)
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age < DEBUG_HEARTBEAT_WINDOW)
+        {
+            deadline = tokio::time::Instant::now() + DEBUG_IDLE_TIMEOUT;
+        }
+    }
+    let _ = std::fs::remove_file(&marker);
 }
 
 /// Return the runner artifact payload generated for an output stem.
@@ -477,4 +728,298 @@ pub fn artifact_payload(stem: &Path) -> PathBuf {
     let mut value = stem.as_os_str().to_owned();
     value.push(".smolmachine");
     PathBuf::from(value)
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use preloop_vm::{ExecOutput, OutputChunk};
+    use std::collections::HashMap;
+    use tokio::sync::Mutex;
+
+    #[derive(Debug)]
+    struct TestProvider {
+        machines: Mutex<HashMap<String, MachineState>>,
+        events: Mutex<Vec<String>>,
+        fail_start: bool,
+        fail_install: bool,
+        fail_configure: bool,
+        fail_run: bool,
+        fail_delete: bool,
+    }
+
+    impl TestProvider {
+        fn new(
+            fail_start: bool,
+            fail_install: bool,
+            fail_configure: bool,
+            fail_run: bool,
+            fail_delete: bool,
+        ) -> Self {
+            Self {
+                machines: Mutex::new(HashMap::new()),
+                events: Mutex::new(Vec::new()),
+                fail_start,
+                fail_install,
+                fail_configure,
+                fail_run,
+                fail_delete,
+            }
+        }
+
+        async fn has_machine(&self, name: &MachineName) -> bool {
+            self.machines.lock().await.contains_key(name.as_str())
+        }
+
+        async fn events(&self) -> Vec<String> {
+            self.events.lock().await.clone()
+        }
+    }
+
+    fn test_error(message: &'static str) -> VmError {
+        VmError::Command {
+            operation: "lifecycle-test",
+            exit_code: 1,
+            message: message.to_owned(),
+        }
+    }
+
+    fn test_output() -> ExecOutput {
+        ExecOutput {
+            exit_code: 0,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            truncated: false,
+        }
+    }
+
+    fn test_config(control_socket: bool) -> RunnerPoolConfig {
+        RunnerPoolConfig {
+            size: 1,
+            use_fork: false,
+            name_prefix: "lifecycle-test".to_owned(),
+            base_image: "base-image".to_owned(),
+            workspace: None,
+            artifact_stem: PathBuf::from("/tmp/lifecycle-artifact"),
+            runner_bundle: PathBuf::from("/tmp"),
+            runner_binary_name: "runner".to_owned(),
+            server_url: "https://runner.test".to_owned(),
+            control_socket: control_socket.then(|| PathBuf::from("/tmp/engine.sock")),
+            registration_token_env: "LIFECYCLE_TEST_TOKEN".to_owned(),
+            labels: vec!["test".to_owned()],
+            cpus: 1,
+            memory_mib: 128,
+            storage_gib: 1,
+            debug_dir: None,
+        }
+    }
+
+    #[async_trait]
+    impl VmProvider for TestProvider {
+        async fn create(&self, spec: &MachineSpec) -> Result<(), VmError> {
+            self.machines
+                .lock()
+                .await
+                .insert(spec.name.as_str().to_owned(), MachineState::Stopped);
+            self.events
+                .lock()
+                .await
+                .push(format!("create:{}", spec.name.as_str()));
+            Ok(())
+        }
+
+        async fn start(&self, name: &MachineName) -> Result<(), VmError> {
+            self.events
+                .lock()
+                .await
+                .push(format!("start:{}", name.as_str()));
+            if self.fail_start {
+                return Err(test_error("start-failure"));
+            }
+            self.machines
+                .lock()
+                .await
+                .insert(name.as_str().to_owned(), MachineState::Running);
+            Ok(())
+        }
+
+        async fn start_forkable(&self, name: &MachineName) -> Result<(), VmError> {
+            self.start(name).await
+        }
+
+        async fn fork(&self, _golden: &MachineName, clone: &MachineName) -> Result<(), VmError> {
+            self.events
+                .lock()
+                .await
+                .push(format!("create:{}", clone.as_str()));
+            self.machines
+                .lock()
+                .await
+                .insert(clone.as_str().to_owned(), MachineState::Running);
+            Ok(())
+        }
+
+        async fn stop(&self, name: &MachineName) -> Result<(), VmError> {
+            self.machines
+                .lock()
+                .await
+                .insert(name.as_str().to_owned(), MachineState::Stopped);
+            Ok(())
+        }
+
+        async fn delete(&self, name: &MachineName) -> Result<(), VmError> {
+            self.events
+                .lock()
+                .await
+                .push(format!("delete:{}", name.as_str()));
+            if self.fail_delete {
+                return Err(test_error("delete-failure"));
+            }
+            self.machines.lock().await.remove(name.as_str());
+            Ok(())
+        }
+
+        async fn status(&self, name: &MachineName) -> Result<MachineState, VmError> {
+            Ok(self
+                .machines
+                .lock()
+                .await
+                .get(name.as_str())
+                .copied()
+                .unwrap_or(MachineState::Missing))
+        }
+
+        async fn list(&self) -> Result<Vec<MachineName>, VmError> {
+            Ok(Vec::new())
+        }
+
+        async fn exec(&self, name: &MachineName, argv: &[String]) -> Result<ExecOutput, VmError> {
+            self.events
+                .lock()
+                .await
+                .push(format!("exec:{}:{:?}", name.as_str(), argv));
+            if self.fail_install && argv.first().is_some_and(|arg| arg == "apt-get") {
+                return Err(test_error("install-failure"));
+            }
+            if self.fail_run && argv.iter().any(|arg| arg == "run") {
+                return Err(test_error("run-failure"));
+            }
+            Ok(test_output())
+        }
+
+        async fn exec_with_secret_env(
+            &self,
+            name: &MachineName,
+            _argv: &[String],
+            _secrets: &[(String, String)],
+        ) -> Result<ExecOutput, VmError> {
+            self.events
+                .lock()
+                .await
+                .push(format!("configure:{}", name.as_str()));
+            if self.fail_configure {
+                return Err(test_error("configure-failure"));
+            }
+            Ok(test_output())
+        }
+
+        async fn exec_stream(
+            &self,
+            _name: &MachineName,
+            _argv: &[String],
+            _output: tokio::sync::mpsc::Sender<OutputChunk>,
+        ) -> Result<i32, VmError> {
+            Ok(0)
+        }
+
+        async fn copy(&self, _source: &str, _destination: &str) -> Result<(), VmError> {
+            Ok(())
+        }
+
+        async fn pack(&self, _name: &MachineName, _output: &Path) -> Result<(), VmError> {
+            Ok(())
+        }
+    }
+
+    async fn provisioning_failure(
+        provider: Arc<TestProvider>,
+        config: &RunnerPoolConfig,
+        name: &MachineName,
+        golden: Option<&MachineName>,
+        expected: &str,
+    ) {
+        let error = run_one_runner(
+            provider.clone(),
+            config,
+            name,
+            CancellationToken::new(),
+            golden,
+        )
+        .await
+        .expect_err("provisioning failure must propagate");
+        assert!(error.to_string().contains(expected));
+        assert!(!provider.has_machine(name).await);
+        let events = provider.events().await;
+        let create = events
+            .iter()
+            .position(|event| event == &format!("create:{}", name.as_str()))
+            .expect("machine creation event");
+        assert!(events[create + 1..]
+            .iter()
+            .any(|event| event == &format!("delete:{}", name.as_str())));
+    }
+
+    #[tokio::test]
+    async fn provisioning_failures_delete_created_runner() {
+        let name = MachineName::new("lifecycle-test-runner").unwrap();
+        let cases = [
+            (
+                TestProvider::new(true, false, false, false, false),
+                false,
+                "start-failure",
+            ),
+            (
+                TestProvider::new(false, true, false, false, false),
+                true,
+                "install-failure",
+            ),
+            (
+                TestProvider::new(false, false, true, false, false),
+                false,
+                "configure-failure",
+            ),
+        ];
+        for (provider, control_socket, expected) in cases {
+            provisioning_failure(
+                Arc::new(provider),
+                &test_config(control_socket),
+                &name,
+                None,
+                expected,
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn fork_provisioning_failure_deletes_cloned_runner() {
+        let provider = Arc::new(TestProvider::new(false, false, true, false, false));
+        let config = test_config(false);
+        let name = MachineName::new("lifecycle-test-runner").unwrap();
+        let golden = MachineName::new("lifecycle-test-golden").unwrap();
+        provisioning_failure(provider, &config, &name, Some(&golden), "configure-failure").await;
+    }
+
+    #[tokio::test]
+    async fn runner_error_wins_when_delete_also_fails() {
+        let provider = Arc::new(TestProvider::new(false, false, false, true, true));
+        let config = test_config(false);
+        let name = MachineName::new("lifecycle-test-runner").unwrap();
+        let error = run_one_runner(provider, &config, &name, CancellationToken::new(), None)
+            .await
+            .expect_err("runner failure must propagate");
+        assert!(error.to_string().contains("run-failure"));
+        assert!(!error.to_string().contains("delete-failure"));
+    }
 }
