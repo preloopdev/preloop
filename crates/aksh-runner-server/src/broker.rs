@@ -242,6 +242,7 @@ pub(crate) async fn next_message_broker_ref(
             .state
             .queue_depth
             .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
+        runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
         let Some(queued) = claimed else {
             drop(inner);
             if wait_seconds == 0 {
@@ -542,6 +543,7 @@ pub(crate) async fn next_message_broker_ref_root(
                     .state
                     .queue_depth
                     .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
+                runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
                 if let Some(queued) = claimed {
                     if let Some(run) = inner.runs.get_mut(&queued.run_id) {
                         run.status = ExecutionStatus::InProgress;

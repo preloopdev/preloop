@@ -68,6 +68,7 @@ pub(crate) async fn next_message(
             .state
             .queue_depth
             .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
+        runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
         let Some(queued) = claimed else {
             drop(inner);
             if wait_seconds == 0 {
@@ -282,7 +283,7 @@ pub(crate) async fn complete_job_compat(
     .await
 }
 
-/// GET /_apis/v1/AgentRequest/:pool_id/:request_id — query a job request lease/result.
+/// GET /_apis/v1/AgentRequest/:pool_id/:request_id to query a job request lease/result.
 ///
 /// The official listener calls this when another job arrives while the previous
 /// worker process may still be unwinding. Returning a completed `result` lets it

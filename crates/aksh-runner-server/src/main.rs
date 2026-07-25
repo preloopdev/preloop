@@ -113,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
             };
             serve(ServerConfig {
                 queue_depth: None,
+                next_job_runs_on: None,
                 listen,
                 unix_socket,
                 state_dir,
