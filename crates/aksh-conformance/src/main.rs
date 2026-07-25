@@ -70,7 +70,7 @@ enum CommandKind {
     #[command(name = "runner-e2e")]
     RunnerE2e {
         /// Path to the runner executable.
-        #[arg(long, default_value = "target/release/aksh-runner")]
+        #[arg(long, default_value = "target/release/preloop-runner")]
         runner_bin: PathBuf,
         /// Path to the GHA workflow file to run.
         #[arg(long)]
@@ -521,13 +521,15 @@ async fn run_runner_e2e(
         anyhow::bail!("workflow file not found: {}", workflow.display());
     }
 
-    let server_bin = if std::path::Path::new("target/release/aksh-runner-server").exists() {
-        "target/release/aksh-runner-server"
+    let server_bin = if std::path::Path::new("target/release/preloop-server").exists() {
+        "target/release/preloop-server"
     } else {
-        "target/debug/aksh-runner-server"
+        "target/debug/preloop-server"
     };
     if !std::path::Path::new(server_bin).exists() {
-        anyhow::bail!("server binary not found: please build aksh-runner-server");
+        anyhow::bail!(
+            "server binary not found at {server_bin}: build it with `cargo build -p aksh-runner-server`"
+        );
     }
 
     let client_bin = if std::path::Path::new("target/release/aksh-runner-client").exists() {

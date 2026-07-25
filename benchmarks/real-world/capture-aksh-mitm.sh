@@ -115,7 +115,7 @@ export RUST_LOG=info
 killall aksh-runner 2>/dev/null || true
 sleep 0.5
 
-BIN=/workspace/target/aarch64-unknown-linux-musl/release/aksh-runner
+BIN=/workspace/target/aarch64-unknown-linux-musl/release/preloop-runner
 rm -rf '$RUNNER_ROOT' && mkdir -p '$RUNNER_ROOT'
 
 \$BIN --runner-root '$RUNNER_ROOT' configure \

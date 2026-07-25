@@ -29,7 +29,7 @@ cargo build --release -p aksh-runner-server --manifest-path "$WORKTREE_ROOT/Carg
 AKSH_BIN="$WORKTREE_ROOT/target/release/aksh-server"
 if [ ! -x "$AKSH_BIN" ]; then
     # Fallback: cargo build puts binaries in target/release with the crate's binary name.
-    AKSH_BIN="$WORKTREE_ROOT/target/release/aksh-runner-server"
+    AKSH_BIN="$WORKTREE_ROOT/target/release/preloop-server"
 fi
 if [ ! -x "$AKSH_BIN" ]; then
     echo "aksh binary not found after build" >&2

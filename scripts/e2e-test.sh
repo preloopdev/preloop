@@ -8,8 +8,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SERVER_PORT="${AKSH_PORT:-9191}"
 SERVER_URL="http://127.0.0.1:${SERVER_PORT}"
 RUNNER_DIR="/tmp/aksh-e2e-runner"
-RUNNER_BIN="$REPO_ROOT/target/release/aksh-runner"
-SERVER_BIN="$REPO_ROOT/target/release/aksh-runner-server"
+RUNNER_BIN="$REPO_ROOT/target/release/preloop-runner"
+SERVER_BIN="$REPO_ROOT/target/release/preloop-server"
 VERBOSE="${2:-}"
 
 red()   { printf '\033[1;31m%s\033[0m\n' "$*"; }
@@ -17,7 +17,7 @@ green() { printf '\033[1;32m%s\033[0m\n' "$*"; }
 info()  { printf '\033[1;34m▸ %s\033[0m\n' "$*"; }
 
 cleanup() {
-    pkill -f "aksh-runner-server.*${SERVER_PORT}" 2>/dev/null || true
+    pkill -f "preloop-server.*${SERVER_PORT}" 2>/dev/null || true
 }
 
 # Read workflow file
@@ -31,7 +31,7 @@ WORKFLOW_YAML=$(cat "$WORKFLOW_FILE")
 
 # Start server
 info "Starting server on port $SERVER_PORT..."
-pkill -f "aksh-runner-server.*${SERVER_PORT}" 2>/dev/null || true
+pkill -f "preloop-server.*${SERVER_PORT}" 2>/dev/null || true
 sleep 1
 RUST_LOG=info AKSH_PUBLIC_URL="$SERVER_URL" "$SERVER_BIN" serve --listen "0.0.0.0:${SERVER_PORT}" > /tmp/aksh-e2e-server.log 2>&1 &
 SERVER_PID=$!

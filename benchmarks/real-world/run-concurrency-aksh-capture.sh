@@ -4,8 +4,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-SERVER_BIN="${SERVER_BIN:-$REPO_ROOT/target/release/aksh-runner-server}"
-RUNNER_BIN="${RUNNER_BIN:-$REPO_ROOT/target/release/aksh-runner}"
+SERVER_BIN="${SERVER_BIN:-$REPO_ROOT/target/release/preloop-server}"
+RUNNER_BIN="${RUNNER_BIN:-$REPO_ROOT/target/release/preloop-runner}"
 PORT="${AKSH_PORT:-9211}"
 SERVER_URL="http://127.0.0.1:${PORT}"
 TS=$(date -u +%Y-%m-%dT%H-%M-%SZ)
@@ -18,12 +18,12 @@ mkdir -p "$OUT" "$STATE_DIR" "$RUNNER_DIR" "$LOG_DIR"
 cleanup() {
   if [[ -n "${RPID:-}" ]]; then kill "$RPID" 2>/dev/null || true; fi
   if [[ -n "${SPID:-}" ]]; then kill "$SPID" 2>/dev/null || true; fi
-  pkill -f "aksh-runner-server.*${PORT}" 2>/dev/null || true
+  pkill -f "preloop-server.*${PORT}" 2>/dev/null || true
 }
 trap cleanup EXIT
 
 echo "OUT=$OUT"
-pkill -f "aksh-runner-server.*${PORT}" 2>/dev/null || true
+pkill -f "preloop-server.*${PORT}" 2>/dev/null || true
 sleep 1
 
 RUST_LOG=info AKSH_PUBLIC_URL="$SERVER_URL" \
