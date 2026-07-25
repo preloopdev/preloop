@@ -466,7 +466,6 @@ fn local_runner_pool_config(
         memory_mib: 4096,
         storage_gib: 20,
         debug_dir: Some(home.join("state").join("debug")),
-        package_index_cache: Some(home.join("package-index")),
     })
 }
 
