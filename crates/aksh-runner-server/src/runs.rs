@@ -187,6 +187,47 @@ pub(crate) async fn submit_run_inner(
             job.inputs = submission.dispatch_inputs.clone();
         }
     }
+
+    // Filter to selected jobs and their transitive needs: closure.
+    if !submission.selected_jobs.is_empty() {
+        let pairs: Vec<(String, Vec<String>)> = jobs
+            .iter()
+            .map(|job| {
+                (
+                    job.base_id.clone(),
+                    job.needs.iter().map(|n| n.0.clone()).collect(),
+                )
+            })
+            .collect();
+        // Reject the whole selection if any id is unknown. Silently dropping a
+        // typo would run a subset of the requested jobs and report success.
+        let known: std::collections::BTreeSet<&str> =
+            pairs.iter().map(|(id, _)| id.as_str()).collect();
+        let unknown: Vec<&str> = submission
+            .selected_jobs
+            .iter()
+            .map(String::as_str)
+            .filter(|id| !known.contains(id))
+            .collect();
+        if !unknown.is_empty() {
+            return Err(ApiError::bad_request(format!(
+                "unknown job(s) in selected_jobs: {}. available jobs: {}",
+                unknown.join(", "),
+                known.into_iter().collect::<Vec<_>>().join(", ")
+            )));
+        }
+        let graph = aksh_gha_parser::dag::needs_graph_from_pairs(&pairs);
+        let closure = aksh_gha_parser::dag::dependency_closure(&graph, &submission.selected_jobs);
+        let before = jobs.len();
+        jobs.retain(|job| closure.contains(&job.base_id));
+        tracing::info!(
+            selected = ?submission.selected_jobs,
+            before,
+            after = jobs.len(),
+            "filtered jobs to dependency closure"
+        );
+    }
+
     let reusable_calls = expanded.reusable_calls;
     let run_id = RunId::new();
     let repository_owner = submission
@@ -256,7 +297,7 @@ pub(crate) async fn submit_run_inner(
         "actor": "aksh-system",
         "workflow": workflow.name.clone().unwrap_or_default(),
         "head_ref": "",
-        "base_ref": "",
+        "base_ref": submission.base_ref.as_deref().unwrap_or(""),
         "event_name": submission.event,
         "server_url": "https://github.com",
         "api_url": "https://api.github.com",
@@ -456,6 +497,10 @@ pub(crate) async fn submit_run_inner(
                 &submission.vars,
             )
             .map_err(|e| ApiError::bad_request(format!("failed to build job message: {e}")))?;
+
+            // Per-run debugging opt-in. Absent unless this submission asked for
+            // it, so the default job message shape is unchanged.
+            agent_msg.preloop_preserve_on_failure = submission.preserve_on_failure.then_some(true);
 
             if let Some(snapshot) = workspace_snapshot.as_ref() {
                 let redirected =
