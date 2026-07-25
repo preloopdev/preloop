@@ -425,6 +425,7 @@ pub fn build_agent_job_message(
         debugger_welcome_message: None,
         aksh_debug_run_id: None,
         aksh_debug_transport: None,
+        preloop_preserve_on_failure: None,
     })
 }
 
