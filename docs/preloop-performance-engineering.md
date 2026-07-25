@@ -291,18 +291,38 @@ Measured breakdown of a typical ~9 s:
 The 9→20 s spread is almost entirely apt and CDN variance. It is the only
 remaining network dependency and the only nondeterministic part of the system.
 
-### Why it cannot be fixed today
+### The packed-machine blocker
 
-The golden must carry `--mount-socket`: the host Unix socket is the runner's
-only channel to the control plane. Every image path that would skip the pull and
-the apt silently drops that mount.
+With strict egress, the golden must carry `--mount-socket`: the host Unix
+socket is the runner's only route to the local control plane. Preloop also
+volume-mounts the socket's parent directory at `/run/preloop-control`; that
+ordinary virtiofs mount makes the path visible, while `--mount-socket` supplies
+the connectable endpoint. The volume alone is insufficient.
 
-| path | create+start | offline | `--mount-socket` |
-|---|---|---|---|
-| registry image (today) | 1.7 s + 6 s apt | ✗ | **kept** |
-| `create --from x.smolmachine` | 0.3 s | ✓ | dropped |
-| `--image ./rootfs/` (unpacked dir) | 0.13 s | ✓ | dropped; also needs a workload cmd, which forces the container path |
-| `--image golden.tar` (synthesized docker-save) | 1.3 s | ✓ | dropped |
+The installed SmolVM 1.6.13 registry-image path preserves that combination and
+is the path used by every successful benchmark above. `create --from
+x.smolmachine` does not. This is not merely inferred from a missing path:
+
+1. An Ubuntu 24.04 VM was prepared with git, curl, CA certificates, and Node,
+   stopped, and packed into a 122.6 MB `.smolmachine` artifact.
+2. A clean preloop engine accepted that artifact as
+   `PRELOOP_RUNNER_BASE_IMAGE`, created the golden, and forked runner VMs.
+3. Every runner registration repeatedly failed while posting to the local
+   control origin; a `preloop run` remained queued and timed out after 300 s.
+4. Current upstream source (`src/cli/machine.rs`, commit `a31810e`) parses CLI
+   socket flags into `params.published_sockets` on normal `--image` creation,
+   but `run_from_smolmachine` hard-codes `published_sockets: Vec::new()`.
+
+That source difference is the root cause: the CLI accepts `--mount-socket`,
+machine creation succeeds, and the option is discarded before the VM record is
+built. The same `--from` branch handles `.smolmachine` artifacts pulled from a
+registry, so both local and registry pack references are affected.
+
+Earlier exploratory notes also grouped `--image <rootfs-dir>` and
+`--image <OCI-archive>` with this defect. Do not use that as an upstream claim:
+current upstream source routes those through the normal creation branch, which
+does parse `--mount-socket`. Their SmolVM 1.6.13 runtime behavior should be
+retested separately after the packed-machine fix.
 
 `machine update` can change volumes, ports, env, CPU, memory and disks but not
 sockets. `machine fork` takes only `--golden`, `--name`, `--forkable`,
@@ -315,16 +335,18 @@ Two alternative channels were tested and are closed:
   would work — but `SMOLVM_EGRESS_FLOOR=strict` refuses it with `EACCES`.
   `SMOLVM_EGRESS_ALLOW_PRIVATE=1` does not lift it; `--allow-cidr 127.0.0.0/8`
   breaks the in-guest image pull.
-* **Volume-mount the directory containing the socket.** The socket file becomes
-  *visible* in the guest but is not connectable — virtiofs passes the inode, not
-  the endpoint. `curl --unix-socket` fails with exit 7.
+* **Volume-mount the directory containing the socket without
+  `--mount-socket`.** The socket file becomes *visible* in the guest but is not
+  connectable — virtiofs passes the inode, not the endpoint.
+  `curl --unix-socket` fails with exit 7. Preloop intentionally supplies both
+  the directory volume and the published-socket mapping.
 
 The failure is silent: `create` succeeds, the machine boots, and you only
 discover the socket is missing later. *[Inference]* that reads like an oversight
 in those code paths rather than an intentional restriction, but intent cannot be
 established from outside.
 
-### Everything on our side is already done
+### Packed artifact creation and extraction
 
 Producing a prepared golden is cheap and verified:
 
@@ -333,25 +355,37 @@ Producing a prepared golden is cheap and verified:
 * `machine cp` pulls it at 240 MB/s (~1.3 s).
 * Synthesizing a `docker save`-shaped archive (manifest + config + layer) takes
   **91 ms** in Python.
-* `machine create --image golden.tar` + `start` = ~1.3 s, tools already present.
+* `machine create --image golden.tar` + `start` = ~1.3 s in an earlier local
+  image experiment, tools already present. Retest socket forwarding on this
+  branch separately; it is not the same source path as `--from`.
+
+A packed artifact does **not** currently imply a sub-second engine cold start.
+`machine start` on an already extracted packed VM measured 0.28 s, but a first
+`create --from` extracted the artifact into the new machine's own directory and
+took 18.1 s even for a 19 MB Alpine pack. The prepared Ubuntu pack produced
+golden and clone VMs after roughly 20 s. Therefore the socket fix makes packed
+goldens functional; it is not, by itself, proof of a cold-start win. A shared
+extraction cache or a reusable golden would still be needed.
 
 ### Options
 
 | # | option | effect | needs |
 |---|---|---|---|
 | 1 | Publish an Ubuntu base image with git/curl/ca-certificates/node baked in | 9 s → **~3 s**, keeps `ubuntu-latest` parity | nothing external |
-| 2 | Upstream: honour `--mount-socket` on `create --from` / `--image <archive>`, **or** mount flags on `machine fork`, **or** socket mounts in `machine update` | 9 s → **~0.5–2 s**, fully offline | smolvm change |
-| 2b | Upstream alternative: a scoped egress allowance for one host port | same, via TCP instead of the socket | smolvm change |
+| 2 | Upstream: preserve CLI `--mount-socket` / `--expose-socket` in `run_from_smolmachine` | makes packed machines functional with host services; latency depends on extraction | smolvm change |
+| 2b | Upstream alternative: a scoped egress allowance for one host port | removes the local control socket requirement, but changes the isolation mechanism | smolvm change |
+| 2c | Cache extracted pack assets across machine records | removes the measured first-create extraction cost | smolvm change |
 | 3 | Persist the golden across engine restarts | helps restarts only, not reboots | leaves a ~1 GB VM alive after the daemon exits; needs `preloop stop` |
 | 4 | Start golden prep at login/daemon autostart | hides it rather than removing it | product decision |
 | 5 | Do nothing | it is once per boot | — |
 
-Recommendation: **1 now, 2 in parallel, 4 if it should feel instant.** 1 and 2
-stack — a baked image behind a `--from` that keeps the socket gives ~0.5 s.
+Recommendation: **1 for cold-start latency now; 2 for packed-machine
+correctness; investigate 2c before claiming packed-machine latency.** Option 4
+can hide whatever unavoidable preparation remains.
 
-Enabling fact for option 3, verified: a mounted host socket is resolved **per
-connection**. After the host unlinks and rebinds the socket at the same path,
-the guest reaches the *new* server with no VM restart.
+Do not rely on a running VM surviving replacement of its host socket file. A
+controlled unlink-and-rebind test caused subsequent guest connections to fail;
+the previous claim that the host path was resolved per connection was wrong.
 
 Caveat on measuring any of this: `pool_boot_ms` swings 9–20 s on network alone
 and cannot resolve anything under a few seconds. Measure the apt step directly,
@@ -369,12 +403,16 @@ Gathered the hard way; all verified on 1.6.13.
 2. `SMOLVM_EGRESS_FLOOR=strict` (set unconditionally by `SmolVmProvider`) blocks
    guest→host loopback. Without it, guest `127.0.0.1:<port>` transparently
    reaches the host.
-3. `machine create --from` / `--image <dir|archive>` silently drop
-   `--mount-socket`.
+3. `machine create --from` silently drops `--mount-socket` and
+   `--expose-socket`: current upstream `run_from_smolmachine` sets
+   `published_sockets: Vec::new()` even though the normal branch parses the CLI
+   flags. Local OCI archive/rootfs paths use a different branch and need
+   separate runtime validation.
 4. `machine fork` has no mount flags; clones inherit the golden's mounts.
 5. A third virtiofs mount on the golden destabilised forks (§5).
-6. A mounted Unix socket is resolved per connection and survives the host
-   replacing the socket file.
+6. Replacing the host socket file under a running VM broke subsequent guest
+   connections in a controlled test; restart or remount instead of assuming
+   per-connection path resolution.
 7. `exec` and `exec --stream` cost the same (~50 ms). **`--stream` output is
    capped at 11 MB** — bulk transfers must use `machine cp`.
 8. The guest accepts `exec` ~67 ms after `machine start --forkable`, on the
