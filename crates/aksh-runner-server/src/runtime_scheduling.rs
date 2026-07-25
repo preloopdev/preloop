@@ -657,7 +657,7 @@ pub(crate) fn cancel_holder(
             }
             // If all jobs cancelled, mark run cancelled when appropriate.
             if let Some(run) = inner.runs.get_mut(run_id) {
-                if run.jobs.values().all(|s| concurrency::is_terminal(*s)) {
+                if run.jobs.values().all(|status| status.is_terminal()) {
                     run.status = summarize_run(run.jobs.values().copied());
                 }
             }
@@ -751,11 +751,7 @@ pub(crate) fn dependency_decision(run: &RunRecord, job: &QueuedJob) -> Dependenc
         .iter()
         .flat_map(|need| matching_need_statuses(run, need))
         .collect::<Vec<_>>();
-    if direct_statuses.is_empty()
-        || direct_statuses
-            .iter()
-            .any(|status| !is_terminal_status(*status))
-    {
+    if direct_statuses.is_empty() || direct_statuses.iter().any(|status| !status.is_terminal()) {
         return DependencyDecision::Wait;
     }
     let statuses = ancestor_statuses(run, job);
@@ -817,16 +813,6 @@ pub(crate) fn ancestor_statuses(run: &RunRecord, job: &QueuedJob) -> Vec<Executi
         }
     }
     statuses
-}
-
-pub(crate) fn is_terminal_status(status: ExecutionStatus) -> bool {
-    matches!(
-        status,
-        ExecutionStatus::Success
-            | ExecutionStatus::Failure
-            | ExecutionStatus::Skipped
-            | ExecutionStatus::Cancelled
-    )
 }
 
 /// Check if a job's `runs-on` labels match a runner's registered labels.
