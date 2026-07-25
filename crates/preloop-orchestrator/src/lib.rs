@@ -16,6 +16,8 @@ use preloop_vm::{
     SmolVmProvider, SocketMount, VmError, VmProvider, VolumeMount,
 };
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -202,11 +204,18 @@ pub struct RunnerPoolConfig {
     /// is empty", which underprovisions whenever a workflow fans out wider
     /// than the pool.
     pub pending_jobs: Option<Arc<AtomicUsize>>,
+    /// `runs-on` labels of the job at the front of the dispatch queue,
+    /// refreshed after each claim. The pool reads them to select the correct
+    /// base-image golden before provisioning.
+    pub next_job_runs_on: Option<Arc<std::sync::RwLock<Vec<String>>>>,
 }
 
 /// Cache of environment-specific golden VMs.
 pub(crate) struct GoldenRegistry {
     goldens: RwLock<HashMap<String, MachineName>>,
+    /// Fingerprints whose golden is currently being prepared, preventing
+    /// concurrent `run_slot` calls from racing to create the same golden.
+    preparing: tokio::sync::Mutex<HashSet<String>>,
     name_prefix: String,
 }
 
@@ -214,13 +223,48 @@ impl GoldenRegistry {
     pub fn new(name_prefix: String) -> Self {
         Self {
             goldens: RwLock::new(HashMap::new()),
+            preparing: tokio::sync::Mutex::new(HashSet::new()),
             name_prefix,
         }
+    }
+
+    /// Return the name prefix used for golden VM names.
+    pub fn name_prefix(&self) -> &str {
+        &self.name_prefix
     }
 
     /// Get existing golden or return None if not yet prepared.
     pub async fn get(&self, fingerprint: &str) -> Option<MachineName> {
         self.goldens.read().await.get(fingerprint).cloned()
+    }
+
+    /// Get the golden for `fingerprint`, or prepare it via `build` while
+    /// holding a per-fingerprint lock so concurrent slots do not race.
+    pub async fn get_or_prepare(
+        &self,
+        fingerprint: &str,
+        build: impl Future<Output = Result<(MachineName, String), OrchestratorError>>,
+    ) -> Result<MachineName, OrchestratorError> {
+        // Fast path: already registered.
+        if let Some(golden) = self.get(fingerprint).await {
+            return Ok(golden);
+        }
+        let mut preparing = self.preparing.lock().await;
+        // Re-check — another slot may have finished while we waited.
+        if let Some(golden) = self.get(fingerprint).await {
+            return Ok(golden);
+        }
+        preparing.insert(fingerprint.to_owned());
+        drop(preparing);
+
+        let (name, fingerprint) = build.await?;
+        self.insert(fingerprint.clone(), name.clone()).await;
+
+        let mut preparing = self.preparing.lock().await;
+        preparing.remove(&fingerprint);
+        drop(preparing);
+
+        Ok(name)
     }
 
     /// Register a prepared golden VM for a fingerprint.
@@ -319,6 +363,55 @@ pub struct RunnerPool<P: VmProvider = SmolVmProvider> {
     config: RunnerPoolConfig,
 }
 
+/// Prepare a running forkable golden VM with the requested environment.
+async fn prepare_golden_for_env<P: VmProvider + 'static>(
+    provider: &Arc<P>,
+    config: &RunnerPoolConfig,
+    golden: &MachineName,
+    env_spec: &EnvironmentSpec,
+) -> Result<(), OrchestratorError> {
+    if provider.status(golden).await? != MachineState::Missing {
+        provider.delete(golden).await?;
+    }
+    let spec = MachineSpec {
+        name: golden.clone(),
+        image: env_spec.base.clone(),
+        cpus: config.cpus,
+        memory_mib: config.memory_mib,
+        storage_gib: config.storage_gib,
+        network: NetworkPolicy::PublicOnly,
+        volumes: runner_volumes(config),
+        sockets: config
+            .control_socket
+            .iter()
+            .map(|host| SocketMount {
+                host: host.clone(),
+                guest: PathBuf::from(GUEST_CONTROL_SOCKET),
+            })
+            .collect(),
+    };
+    provider.create(&spec).await?;
+    provider.start_forkable(golden).await?;
+    if let Err(error) = await_guest_ready(provider.as_ref(), golden).await {
+        let _ = provider.delete(golden).await;
+        return Err(error);
+    }
+    if let Err(error) = install_base_dependencies(provider.as_ref(), golden).await {
+        let _ = provider.delete(golden).await;
+        return Err(error);
+    }
+    for layer in &env_spec.toolchains {
+        for command in layer.install_commands() {
+            if let Err(error) = provider.exec(golden, &command).await {
+                let _ = provider.delete(golden).await;
+                return Err(error.into());
+            }
+        }
+    }
+    info!(machine = golden.as_str(), "golden fork base ready");
+    Ok(())
+}
+
 impl<P: VmProvider + 'static> RunnerPool<P> {
     /// Construct a runner pool.
     pub fn new(provider: Arc<P>, config: RunnerPoolConfig) -> Result<Self, OrchestratorError> {
@@ -346,9 +439,9 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             let default_environment =
                 EnvironmentSpec::new(self.config.base_image.clone(), Vec::new());
             let golden = MachineName::new(format!("{}-golden", golden_registry.name_prefix))?;
-            if let Err(error) = self
-                .prepare_golden_for_env(&golden, &default_environment)
-                .await
+            if let Err(error) =
+                prepare_golden_for_env(&self.provider, &self.config, &golden, &default_environment)
+                    .await
             {
                 warn!(%error, "golden fork base unavailable; falling back to create-per-runner");
             } else {
@@ -457,58 +550,6 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         Ok(())
     }
 
-    /// Prepare a running forkable golden VM from the packed artifact and
-    /// install the requested environment toolchains.
-    /// The golden VM is booted but NOT registered as a runner — each fork
-    /// gets its own unique identity via configure.
-    async fn prepare_golden_for_env(
-        &self,
-        golden: &MachineName,
-        env_spec: &EnvironmentSpec,
-    ) -> Result<(), OrchestratorError> {
-        if self.provider.status(golden).await? != MachineState::Missing {
-            self.provider.delete(golden).await?;
-        }
-        let spec = MachineSpec {
-            name: golden.clone(),
-            image: self.config.base_image.clone(),
-            cpus: self.config.cpus,
-            memory_mib: self.config.memory_mib,
-            storage_gib: self.config.storage_gib,
-            network: NetworkPolicy::PublicOnly,
-            volumes: runner_volumes(&self.config),
-            sockets: self
-                .config
-                .control_socket
-                .iter()
-                .map(|host| SocketMount {
-                    host: host.clone(),
-                    guest: PathBuf::from(GUEST_CONTROL_SOCKET),
-                })
-                .collect(),
-        };
-        self.provider.create(&spec).await?;
-        self.provider.start_forkable(golden).await?;
-        if let Err(error) = await_guest_ready(self.provider.as_ref(), golden).await {
-            let _ = self.provider.delete(golden).await;
-            return Err(error);
-        }
-        if let Err(error) = install_base_dependencies(self.provider.as_ref(), golden).await {
-            let _ = self.provider.delete(golden).await;
-            return Err(error);
-        }
-        for layer in &env_spec.toolchains {
-            for command in layer.install_commands() {
-                if let Err(error) = self.provider.exec(golden, &command).await {
-                    let _ = self.provider.delete(golden).await;
-                    return Err(error.into());
-                }
-            }
-        }
-        info!(machine = golden.as_str(), "golden fork base ready");
-        Ok(())
-    }
-
     async fn remove_stale_machines(&self) -> Result<(), OrchestratorError> {
         for name in self.provider.list().await? {
             if name
@@ -604,16 +645,60 @@ async fn run_slot<P: VmProvider + 'static>(
         keys,
         building,
     } = handles;
-    let default_fingerprint =
-        EnvironmentSpec::new(config.base_image.clone(), Vec::new()).fingerprint;
     let mut generation: u64 = 0;
     let mut spare: Option<ReadyRunner> = None;
 
     while !shutdown.is_cancelled() {
-        // Until jobs are connected to environment selection, all slots use
-        // the default base-only golden. An absent entry preserves the
-        // create-per-runner fallback used by non-fork mode and tests.
-        let golden = golden_registry.get(&default_fingerprint).await;
+        let golden = if config.use_fork {
+            // Read the `runs-on` labels of the next queued job so the pool
+            // can select the correct base-image golden before forking.
+            let env_base = match &config.next_job_runs_on {
+                Some(lock) => {
+                    let labels = lock.read().map(|g| g.clone()).unwrap_or_default();
+                    if labels.is_empty() {
+                        config.base_image.clone()
+                    } else {
+                        EnvironmentSpec::default_base(&labels)
+                    }
+                }
+                None => config.base_image.clone(),
+            };
+            let env_base_for_closure = env_base.clone();
+            let env_spec = EnvironmentSpec::new(env_base, Vec::new());
+            let fingerprint = env_spec.fingerprint.clone();
+
+            match golden_registry
+                .get_or_prepare(&fingerprint.clone(), {
+                    let provider = provider.clone();
+                    let config = config.clone();
+                    let name_prefix = golden_registry.name_prefix().to_owned();
+                    let fp = fingerprint.clone();
+                    let base = env_base_for_closure;
+                    async move {
+                        let name = MachineName::new(format!(
+                            "{}-golden-{}",
+                            name_prefix,
+                            &fp[..12.min(fp.len())]
+                        ))?;
+                        let spec = EnvironmentSpec::new(base, Vec::new());
+                        prepare_golden_for_env(&provider, &config, &name, &spec).await?;
+                        Ok((name, fp))
+                    }
+                })
+                .await
+            {
+                Ok(name) => Some(name),
+                Err(error) => {
+                    warn!(%error, %fingerprint, "failed to prepare environment golden; falling back to default");
+                    let default_fingerprint =
+                        EnvironmentSpec::new(config.base_image.clone(), Vec::new()).fingerprint;
+                    golden_registry.get(&default_fingerprint).await
+                }
+            }
+        } else {
+            // create-per-runner path: no golden, provision fresh each time.
+            None
+        };
         let runner = match spare.take() {
             Some(runner) => runner,
             None => {
@@ -1166,6 +1251,7 @@ mod lifecycle_tests {
             debug_dir: None,
             runner_key_dir: None,
             pending_jobs: None,
+            next_job_runs_on: None,
         }
     }
 
