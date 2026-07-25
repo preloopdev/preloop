@@ -20,6 +20,8 @@ use tracing::{info, warn};
 const GUEST_CONTROL_DIR: &str = "/run/preloop-control";
 const GUEST_CONTROL_SOCKET: &str = "/run/preloop-control/engine.sock";
 const GUEST_FAILURE_MARKER: &str = "/var/lib/preloop-runner/.preloop-job-failed";
+/// Where APT keeps the downloaded package index inside the guest.
+const GUEST_PACKAGE_INDEX_DIR: &str = "/var/lib/apt/lists";
 
 /// How long a preserved VM survives with nobody attached.
 const DEBUG_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
@@ -61,20 +63,54 @@ fn runner_volumes(config: &RunnerPoolConfig) -> Vec<VolumeMount> {
     volumes
 }
 
+/// Volumes for the golden VM: the runner bundle plus a persistent package
+/// index so repeat engine starts do not re-download it.
+///
+/// The index directory is keyed by base image; two images have unrelated
+/// indexes and must not share one.
+fn golden_volumes(config: &RunnerPoolConfig) -> Vec<VolumeMount> {
+    let mut volumes = runner_volumes(config);
+    if let Some(host) = package_index_dir(config) {
+        volumes.push(VolumeMount {
+            host,
+            guest: PathBuf::from(GUEST_PACKAGE_INDEX_DIR),
+            read_only: false,
+        });
+    }
+    volumes
+}
+
+/// Create and return the host directory backing the guest package index.
+fn package_index_dir(config: &RunnerPoolConfig) -> Option<PathBuf> {
+    use sha2::{Digest, Sha256};
+    let root = config.package_index_cache.as_ref()?;
+    let key = format!("{:x}", Sha256::digest(config.base_image.as_bytes()));
+    let directory = root.join(&key[..16]);
+    // APT refuses to run without its staging subdirectory.
+    if let Err(error) = std::fs::create_dir_all(directory.join("partial")) {
+        warn!(path = %directory.display(), %error, "package index cache unavailable");
+        return None;
+    }
+    Some(directory)
+}
+
+const BASE_PACKAGES: &str = "git curl ca-certificates nodejs";
+
 fn base_install_commands() -> Vec<Vec<String>> {
-    [
-        // One shell round trip instead of two: every `exec` is a host process
-        // spawn plus a vsock round trip, and this runs on the engine's
-        // start-up critical path.
-        vec![
-            "sh",
-            "-c",
-            "apt-get update -qq && apt-get install -y -qq --no-install-recommends \
-             git curl ca-certificates nodejs",
-        ],
-    ]
+    // One shell round trip instead of several: every `exec` is a host process
+    // spawn plus a vsock round trip, and this runs on the engine's start-up
+    // critical path.
+    //
+    // The install is attempted against the persisted index first. It fails
+    // immediately when the index is empty or has gone stale against the
+    // mirror, and only then is a refresh worth its network round trip.
+    let install = format!("apt-get install -y -qq --no-install-recommends {BASE_PACKAGES}");
+    [vec![
+        "sh".to_owned(),
+        "-c".to_owned(),
+        format!("{install} || {{ apt-get update -qq && {install}; }}"),
+    ]]
     .into_iter()
-    .map(|command| command.into_iter().map(str::to_owned).collect())
     .collect()
 }
 
@@ -179,6 +215,12 @@ pub struct RunnerPoolConfig {
     /// failed is held open for interactive debugging. Whether any individual
     /// job opts in is decided per run by the control plane, not here.
     pub debug_dir: Option<PathBuf>,
+    /// Host directory persisting the guest APT package index across engine
+    /// restarts.
+    ///
+    /// The golden VM is rebuilt from the base image on every engine start, so
+    /// without this `apt-get update` re-downloads the whole index each time.
+    pub package_index_cache: Option<PathBuf>,
 }
 
 /// Cache of environment-specific golden VMs.
@@ -440,7 +482,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             memory_mib: self.config.memory_mib,
             storage_gib: self.config.storage_gib,
             network: NetworkPolicy::PublicOnly,
-            volumes: runner_volumes(&self.config),
+            volumes: golden_volumes(&self.config),
             sockets: self
                 .config
                 .control_socket
@@ -838,6 +880,7 @@ mod lifecycle_tests {
             memory_mib: 128,
             storage_gib: 1,
             debug_dir: None,
+            package_index_cache: None,
         }
     }
 
