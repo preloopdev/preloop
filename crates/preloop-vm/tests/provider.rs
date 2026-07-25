@@ -27,8 +27,8 @@ fn machine_names_accept_dns_like_names_and_reject_invalid_boundaries() {
 mod unix {
     use super::*;
     use preloop_vm::{
-        ExecOutput, MachineSpec, MachineState, NetworkPolicy, SmolVmProvider, VmProvider,
-        VolumeMount,
+        ExecOutput, MachineSpec, MachineState, NetworkPolicy, SmolVmProvider, SocketMount,
+        VmProvider, VolumeMount,
     };
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -118,16 +118,19 @@ esac
             storage_gib: 10,
             network: NetworkPolicy::Disabled,
             volumes: Vec::new(),
+            sockets: Vec::new(),
         }
     }
 
     #[tokio::test]
-    async fn create_emits_exact_network_and_volume_arguments() {
+    async fn create_emits_exact_network_volume_and_socket_arguments() {
         let (directory, executable) = fake_smolvm();
         let host_rw = directory.path().join("workspace");
         let host_ro = directory.path().join("cache");
+        let host_socket = directory.path().join("engine.sock");
         fs::create_dir_all(&host_rw).unwrap();
         fs::create_dir_all(&host_ro).unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(&host_socket).unwrap();
         let spec = MachineSpec {
             name: MachineName::new("ci-01").unwrap(),
             image: "ghcr.io/acme/runner:latest".to_owned(),
@@ -150,6 +153,10 @@ esac
                     read_only: true,
                 },
             ],
+            sockets: vec![SocketMount {
+                host: host_socket.clone(),
+                guest: PathBuf::from("/run/preloop-engine.sock"),
+            }],
         };
 
         SmolVmProvider::new(&executable)
@@ -184,6 +191,8 @@ esac
                 format!("{}:/workspace", host_rw.display()),
                 "--volume".to_owned(),
                 format!("{}:/cache:ro", host_ro.display()),
+                "--mount-socket".to_owned(),
+                format!("{}:/run/preloop-engine.sock", host_socket.display()),
             ]
         );
     }
@@ -242,6 +251,78 @@ esac
         assert!(matches!(
             SmolVmProvider::new(&executable).create(&spec).await,
             Err(VmError::InvalidSpec(message)) if message.starts_with("volume source does not exist:")
+        ));
+        assert!(!executable.with_extension("args").exists());
+
+        let (_directory, executable) = fake_smolvm();
+        let mut spec = valid_spec(MachineName::new("valid").unwrap());
+        spec.sockets.push(SocketMount {
+            host: PathBuf::from("relative/socket"),
+            guest: PathBuf::from("/run/engine.sock"),
+        });
+        assert!(matches!(
+            SmolVmProvider::new(&executable).create(&spec).await,
+            Err(VmError::InvalidSpec(message)) if message == "socket paths must be absolute"
+        ));
+        assert!(!executable.with_extension("args").exists());
+
+        let (directory, executable) = fake_smolvm();
+        let host_socket = directory.path().join("engine.sock");
+        fs::write(&host_socket, b"socket").unwrap();
+        let mut spec = valid_spec(MachineName::new("valid").unwrap());
+        spec.sockets.push(SocketMount {
+            host: host_socket,
+            guest: PathBuf::from("relative/guest.sock"),
+        });
+        assert!(matches!(
+            SmolVmProvider::new(&executable).create(&spec).await,
+            Err(VmError::InvalidSpec(message)) if message == "socket paths must be absolute"
+        ));
+        assert!(!executable.with_extension("args").exists());
+
+        let (directory, executable) = fake_smolvm();
+        let mut spec = valid_spec(MachineName::new("valid").unwrap());
+        spec.sockets.push(SocketMount {
+            host: directory.path().join("missing.sock"),
+            guest: PathBuf::from("/run/engine.sock"),
+        });
+        assert!(matches!(
+            SmolVmProvider::new(&executable).create(&spec).await,
+            Err(VmError::InvalidSpec(message)) if message.starts_with("socket source does not exist:")
+        ));
+        assert!(!executable.with_extension("args").exists());
+
+        // A socket mount is a hole in the guest boundary: an ordinary file that
+        // merely exists must not be accepted in place of a real endpoint.
+        let (directory, executable) = fake_smolvm();
+        let regular_file = directory.path().join("not-a-socket");
+        fs::write(&regular_file, b"socket").unwrap();
+        let mut spec = valid_spec(MachineName::new("valid").unwrap());
+        spec.sockets.push(SocketMount {
+            host: regular_file,
+            guest: PathBuf::from("/run/engine.sock"),
+        });
+        assert!(matches!(
+            SmolVmProvider::new(&executable).create(&spec).await,
+            Err(VmError::InvalidSpec(message)) if message.starts_with("socket source is not a Unix socket:")
+        ));
+        assert!(!executable.with_extension("args").exists());
+
+        // Nor may the named path be a symlink that could be repointed at a
+        // privileged endpoint (for example a container runtime socket).
+        let (directory, executable) = fake_smolvm();
+        let real_socket = directory.path().join("real.sock");
+        let link = directory.path().join("link.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&real_socket).unwrap();
+        std::os::unix::fs::symlink(&real_socket, &link).unwrap();
+        let mut spec = valid_spec(MachineName::new("valid").unwrap());
+        spec.sockets.push(SocketMount {
+            host: link,
+            guest: PathBuf::from("/run/engine.sock"),
+        });
+        assert!(matches!(
+            SmolVmProvider::new(&executable).create(&spec).await,
+            Err(VmError::InvalidSpec(message)) if message.starts_with("socket source must not be a symlink:")
         ));
         assert!(!executable.with_extension("args").exists());
     }
