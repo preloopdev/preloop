@@ -624,6 +624,27 @@ pub async fn run_job(
         return Err(e);
     }
 
+    // Preloop: signal the orchestrator to hold this VM open for debugging.
+    // Gated on the per-run opt-in carried in the job message, so preservation
+    // is a property of the run rather than of the engine that happens to be up.
+    // Cancellation is not a failure — preserving it would pin a pool slot on
+    // every Ctrl-C.
+    let preserve_requested = job_message
+        .get("preloopPreserveOnFailure")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if preserve_requested && conclusion.eq_ignore_ascii_case("failed") {
+        if let Some(path) = std::env::var_os("PRELOOP_FAILURE_MARKER") {
+            let path = std::path::PathBuf::from(path);
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(error) = std::fs::write(&path, &conclusion) {
+                warn!(path = %path.display(), %error, "failed to write Preloop failure marker");
+            }
+        }
+    }
+
     info!("Job {job_name} finished with result: {conclusion}");
     Ok(())
 }
@@ -697,10 +718,14 @@ fn spawn_renew_loop(
                 // Probe in parallel, non-blocking. The resulting status text
                 // is also sent in completejob telemetry by the official
                 // runner (the probes themselves are not step output).
-                let inner = http.inner_client();
                 let (broker_result, run_result, ws_result, token_result) = tokio::join!(
-                    async { inner.get(&broker_health).send().await },
-                    async { inner.get(&run_health).send().await },
+                    async {
+                        http.client_for(&broker_health)
+                            .get(&broker_health)
+                            .send()
+                            .await
+                    },
+                    async { http.client_for(&run_health).get(&run_health).send().await },
                     async {
                         // WebSocket upgrade probe — matching official runner headers exactly.
                         // Official sends: Authorization, Connection: Upgrade, Upgrade: websocket,
@@ -709,7 +734,7 @@ fn spawn_renew_loop(
                         let mut nonce = [0u8; 16];
                         rand::Rng::fill(&mut rand::thread_rng(), &mut nonce);
                         let ws_key = base64::engine::general_purpose::STANDARD.encode(nonce);
-                        inner
+                        http.client_for(&results_ws)
                             .get(&results_ws)
                             .header("Authorization", format!("Bearer {}", rpt.access_token))
                             .header("Connection", "Upgrade")
@@ -719,7 +744,7 @@ fn spawn_renew_loop(
                             .send()
                             .await
                     },
-                    async { inner.get(&token_ready).send().await },
+                    async { http.client_for(&token_ready).get(&token_ready).send().await },
                 );
                 let status_text = |result: &Result<reqwest::Response, reqwest::Error>| match result
                 {

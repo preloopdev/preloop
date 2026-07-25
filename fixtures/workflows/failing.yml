@@ -1,0 +1,17 @@
+name: Fail for Debug Test
+on: push
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create debug state
+        run: |
+          echo "debug-marker-12345" > /tmp/preloop-debug.txt
+          mkdir -p /tmp/preloop-artifacts
+          echo '{"status": "failed", "step": 1}' > /tmp/preloop-artifacts/state.json
+
+      - name: Intentionally fail
+        run: |
+          echo "[test] Intentionally failing job for debug inspection..."
+          exit 1
