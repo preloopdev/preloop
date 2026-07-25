@@ -442,7 +442,7 @@ fn local_runner_pool_config(
         size: std::env::var("PRELOOP_RUNNER_POOL_SIZE")
             .ok()
             .and_then(|value| value.parse().ok())
-            .unwrap_or(2),
+            .unwrap_or_else(|| host_runner_pool_size(RUNNER_CPUS)),
         use_fork: std::env::var("PRELOOP_USE_FORK")
             .ok()
             .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
@@ -462,11 +462,33 @@ fn local_runner_pool_config(
             "Linux".into(),
             std::env::consts::ARCH.into(),
         ],
-        cpus: 4,
-        memory_mib: 4096,
+        cpus: RUNNER_CPUS,
+        memory_mib: RUNNER_MEMORY_MIB,
         storage_gib: 20,
         debug_dir: Some(home.join("state").join("debug")),
     })
+}
+
+/// vCPUs given to each runner VM.
+const RUNNER_CPUS: u16 = 4;
+/// Memory given to each runner VM, in MiB. SmolVM balloons this, so an idle
+/// runner commits far less than its ceiling.
+const RUNNER_MEMORY_MIB: u32 = 4096;
+
+/// How many runners to keep warm, derived from what the host can run at once.
+///
+/// A fixed pool capped every workflow at that many concurrent jobs regardless
+/// of the machine: on a 16-core host a matrix ran two shards at a time and left
+/// the rest of the CPU idle. Each runner is a VM with `cpus_per_runner` vCPUs,
+/// so roughly `parallelism / cpus_per_runner` of them fit before the jobs start
+/// competing for the same cores.
+///
+/// Clamped to `[1, 8]`: at least one so a small machine still runs anything, at
+/// most eight so a very large one does not sit on dozens of idle VMs. Set
+/// `PRELOOP_RUNNER_POOL_SIZE` to override.
+fn host_runner_pool_size(cpus_per_runner: u16) -> usize {
+    let parallelism = std::thread::available_parallelism().map_or(2, |value| value.get());
+    (parallelism / usize::from(cpus_per_runner.max(1))).clamp(1, 8)
 }
 
 fn linux_runner_bundle(path: &std::path::Path) -> bool {
@@ -998,6 +1020,19 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(std::iter::once("preloop").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn warm_pool_tracks_host_capacity_within_bounds() {
+        let parallelism = std::thread::available_parallelism().map_or(2, |value| value.get());
+
+        // One runner per `cpus_per_runner` cores, never zero and never unbounded.
+        assert_eq!(host_runner_pool_size(1), parallelism.clamp(1, 8));
+        assert_eq!(host_runner_pool_size(4), (parallelism / 4).clamp(1, 8));
+        // A host smaller than one runner still gets a runner.
+        assert_eq!(host_runner_pool_size(u16::MAX), 1);
+        // A zero would divide by zero; treat it as one core per runner.
+        assert_eq!(host_runner_pool_size(0), parallelism.clamp(1, 8));
     }
 
     #[test]
