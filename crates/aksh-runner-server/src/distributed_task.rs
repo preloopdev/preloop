@@ -692,5 +692,8 @@ pub(crate) async fn complete_job_inner(
             reason: None,
         })
         .await;
+    if record.status.is_terminal() {
+        discard_workspace_snapshot(&shared.state.state_dir, completion.run_id).await;
+    }
     Ok(Json(record))
 }
