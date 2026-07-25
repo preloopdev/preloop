@@ -306,6 +306,16 @@ pub enum ExecutionStatus {
     Cancelled,
 }
 
+impl ExecutionStatus {
+    /// Whether the run or job has reached a final state and will not change.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Success | Self::Failure | Self::Skipped | Self::Cancelled
+        )
+    }
+}
+
 /// A parsed and expanded job ready to send to a runner.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobPlan {
@@ -647,6 +657,31 @@ pub enum NdjsonEvent {
         #[serde(default)]
         outputs: BTreeMap<String, String>,
     },
+}
+
+impl NdjsonEvent {
+    /// Run this event belongs to.
+    pub fn run_id(&self) -> RunId {
+        match self {
+            Self::RunAccepted { run_id, .. }
+            | Self::JobStatus { run_id, .. }
+            | Self::Log { run_id, .. }
+            | Self::Annotation { run_id, .. }
+            | Self::RunStatus { run_id, .. }
+            | Self::JobCompleted { run_id, .. } => *run_id,
+        }
+    }
+
+    /// Final run-level status carried by this event, if any.
+    ///
+    /// Only a terminal `RunStatus` closes an event stream: job-level terminals
+    /// still leave sibling jobs running.
+    pub fn terminal_run_status(&self) -> Option<ExecutionStatus> {
+        match self {
+            Self::RunStatus { status, .. } if status.is_terminal() => Some(*status),
+            _ => None,
+        }
+    }
 }
 
 /// Annotation severity.
