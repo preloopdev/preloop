@@ -16,6 +16,10 @@ pub struct ServerConfig {
     /// Shared counter published with the number of jobs still queued after
     /// each claim. Supply one to let a co-hosted runner pool scale to demand.
     pub queue_depth: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    /// Shared list, refreshed after each claim, of the `runs-on` labels of
+    /// the job at the front of the dispatch queue. Supply one to let a
+    /// co-hosted runner pool select the correct base-image golden.
+    pub next_job_runs_on: Option<Arc<std::sync::RwLock<Vec<String>>>>,
     /// Enable privileged local/CI simulation endpoints.
     pub enable_test_api: bool,
     /// Bearer token required by privileged simulation endpoints.
@@ -189,6 +193,9 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     let mut state = AppState::new(config.state_dir.clone()).await?;
     if let Some(queue_depth) = config.queue_depth.clone() {
         state.queue_depth = queue_depth;
+    }
+    if let Some(next_job_runs_on) = config.next_job_runs_on.clone() {
+        state.next_job_runs_on = next_job_runs_on;
     }
     if !config.listen.ip().is_loopback() && state.system_token == DEFAULT_AKSH_SYSTEM_TOKEN {
         anyhow::bail!(
