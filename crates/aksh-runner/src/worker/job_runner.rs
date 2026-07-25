@@ -327,7 +327,7 @@ pub async fn run_job(
             .as_ref()
             .map(|rpt| rpt.access_token.clone())
             .unwrap_or_default();
-        Some(super::live_logs::LiveLogQueue::connect(feed_url, token).await)
+        Some(super::live_logs::LiveLogQueue::connect(feed_url, token))
     } else {
         None
     };
