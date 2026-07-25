@@ -212,6 +212,66 @@ pub(crate) async fn blob_get(
     }
 }
 
+/// Execution plans whose uploaded logs are kept on disk.
+///
+/// `preloop logs` prefers these blobs and falls back to the in-memory log
+/// blocks when they are gone, so a pruned run still reports its logs for as
+/// long as the engine lives.
+pub(crate) const REPLAY_PLANS_RETAINED: usize = 64;
+
+/// Bound the replay directory to the most recently written plans.
+///
+/// Every job uploads its step and job logs here and nothing removed them, so
+/// the directory grew for the lifetime of the state directory. It is the same
+/// failure mode that filled the disk during benchmarking, just slower: the
+/// snapshot fix bounded the large per-run repositories, this bounds the small
+/// per-job blobs.
+///
+/// Retention is by modification time rather than by run, because blobs are
+/// keyed by execution plan and a run's plan ids are not recoverable once its
+/// records are gone.
+pub(crate) async fn prune_replay_results(state_dir: &std::path::Path) {
+    let root = state_dir.join("replay").join("results");
+    let plans = match collect_plan_directories(&root).await {
+        Ok(plans) => plans,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            tracing::warn!(path = %root.display(), %error, "failed to scan replay results");
+            return;
+        }
+    };
+    if plans.len() <= REPLAY_PLANS_RETAINED {
+        return;
+    }
+
+    let mut plans = plans;
+    // Newest first, so everything past the retention window is the tail.
+    plans.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
+    for (path, _) in plans.into_iter().skip(REPLAY_PLANS_RETAINED) {
+        if let Err(error) = tokio::fs::remove_dir_all(&path).await {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = %path.display(), %error, "failed to prune replay results");
+            }
+        }
+    }
+}
+
+async fn collect_plan_directories(
+    root: &std::path::Path,
+) -> std::io::Result<Vec<(std::path::PathBuf, std::time::SystemTime)>> {
+    let mut entries = tokio::fs::read_dir(root).await?;
+    let mut plans = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let metadata = match entry.metadata().await {
+            Ok(metadata) if metadata.is_dir() => metadata,
+            _ => continue,
+        };
+        let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+        plans.push((entry.path(), modified));
+    }
+    Ok(plans)
+}
+
 /// Accept blob uploads (logs, summaries) at signed-URL paths.
 /// Stores them in a local replay directory for conformance inspection.
 pub(crate) async fn replay_results_put(
