@@ -3,6 +3,7 @@ use axum::body::{to_bytes, Body};
 use axum::http::{Method, Request, StatusCode};
 use serde_json::Value;
 use sha1::{Digest, Sha1};
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
 use std::path::Path as FsPath;
@@ -15,6 +16,99 @@ const TEST_API_TOKEN: &str = "property-test-token";
 
 fn app(state: AppState, shutdown: CancellationToken) -> Router {
     app_with_test_api(state, shutdown, TEST_API_TOKEN)
+}
+
+/// `preserve_on_failure` is a property of the run, carried to the runner on the
+/// job message. It must be absent unless asked for, so the default wire shape
+/// stays byte-identical to what an official runner expects.
+#[tokio::test]
+async fn preserve_on_failure_reaches_the_job_message_only_when_requested() {
+    for (requested, expected) in [(true, Some(true)), (false, None)] {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+                "event": "push",
+                "repository": "owner/repo",
+                "preserve_on_failure": requested
+            }),
+        )
+        .await;
+
+        let inner = state.inner.lock().await;
+        let queued = inner.queue.front().expect("job should be queued");
+        assert_eq!(
+            queued.message.preloop_preserve_on_failure, expected,
+            "preserve_on_failure={requested}"
+        );
+
+        // Absent means absent on the wire, not `false`.
+        let wire = serde_json::to_value(&queued.message).unwrap();
+        assert_eq!(
+            wire.get("preloopPreserveOnFailure")
+                .and_then(Value::as_bool),
+            expected,
+            "wire shape for preserve_on_failure={requested}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn run_apis_never_return_submitted_secret_values() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "secrets": {
+                "NPM_TOKEN": "npm_LIVE_CREDENTIAL",
+                "DEPLOY_KEY": "deploy_LIVE_CREDENTIAL"
+            }
+        }),
+    )
+    .await;
+    let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+
+    // The server must still receive the real values: they are what the job runs with.
+    {
+        let inner = state.inner.lock().await;
+        let run = inner.runs.get(&run_id.parse::<RunId>().unwrap()).unwrap();
+        assert_eq!(
+            run.submission.secrets["NPM_TOKEN"].expose(),
+            "npm_LIVE_CREDENTIAL"
+        );
+    }
+
+    // ...but no run-facing response may echo them back.
+    for uri in [
+        format!("/api/v1/runs/{run_id}"),
+        "/api/v1/runs?limit=50".to_owned(),
+    ] {
+        let body = request_json(&app, Method::GET, &uri, Value::Null)
+            .await
+            .to_string();
+        assert!(
+            !body.contains("npm_LIVE_CREDENTIAL") && !body.contains("deploy_LIVE_CREDENTIAL"),
+            "{uri} leaked a secret value: {body}"
+        );
+        assert!(
+            body.contains("NPM_TOKEN"),
+            "{uri} should still expose secret names: {body}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -76,6 +170,147 @@ jobs:
             .filter(|status| **status == ExecutionStatus::Cancelled)
             .count(),
         2
+    );
+}
+
+fn selected_jobs_workflow() -> &'static str {
+    r#"
+on: push
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo lint
+  build:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo build
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo test
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo docs
+"#
+}
+
+#[tokio::test]
+async fn selected_jobs_rejects_unknown_id_without_creating_run() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let (status, body) = try_req(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": selected_jobs_workflow(),
+            "event": "push",
+            "repository": "owner/repo",
+            "selected_jobs": ["tset"]
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].as_str().unwrap().contains("tset"));
+    assert!(state.inner.lock().await.runs.is_empty());
+}
+
+#[tokio::test]
+async fn selected_jobs_rejects_partial_typo_without_running_valid_subset() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let (status, body) = try_req(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": selected_jobs_workflow(),
+            "event": "push",
+            "repository": "owner/repo",
+            "selected_jobs": ["build", "tset"]
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a typo must reject the whole selection, not run a subset: {body}"
+    );
+    assert!(body["error"].as_str().unwrap().contains("tset"));
+    assert!(state.inner.lock().await.runs.is_empty());
+}
+
+#[tokio::test]
+async fn selected_jobs_runs_transitive_needs_closure_without_independent_jobs() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": selected_jobs_workflow(),
+            "event": "push",
+            "repository": "owner/repo",
+            "selected_jobs": ["test"]
+        }),
+    )
+    .await;
+
+    let inner = state.inner.lock().await;
+    assert_eq!(inner.runs.len(), 1);
+    let run = inner.runs.values().next().unwrap();
+    let base_ids: BTreeSet<String> = run.job_base_ids.values().cloned().collect();
+    assert_eq!(
+        base_ids,
+        BTreeSet::from(["lint".to_owned(), "build".to_owned(), "test".to_owned(),])
+    );
+    assert!(!base_ids.contains("docs"));
+}
+
+#[tokio::test]
+async fn selected_jobs_empty_runs_all_workflow_jobs() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": selected_jobs_workflow(),
+            "event": "push",
+            "repository": "owner/repo",
+            "selected_jobs": []
+        }),
+    )
+    .await;
+
+    let inner = state.inner.lock().await;
+    assert_eq!(inner.runs.len(), 1);
+    let run = inner.runs.values().next().unwrap();
+    let base_ids: BTreeSet<String> = run.job_base_ids.values().cloned().collect();
+    assert_eq!(
+        base_ids,
+        BTreeSet::from([
+            "lint".to_owned(),
+            "build".to_owned(),
+            "test".to_owned(),
+            "docs".to_owned(),
+        ])
     );
 }
 
@@ -3576,36 +3811,6 @@ async fn full_runner_lifecycle_register_session_poll_complete() {
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
-    // Non-asserting helper
-    async fn try_req(app: &Router, method: Method, uri: &str, body: Value) -> (StatusCode, Value) {
-        let mut builder = Request::builder().method(method).uri(uri);
-        if uri.starts_with("/api/v1/")
-            || uri.starts_with("/_apis/")
-            || uri.starts_with("/runner/server/_apis/")
-            || uri.starts_with("/broker/")
-            || uri.starts_with("/twirp/")
-        {
-            builder = builder.header(header::AUTHORIZATION, "Bearer aksh-system-token");
-        } else if uri.starts_with("/internal/test/") {
-            builder = builder.header(header::AUTHORIZATION, format!("Bearer {TEST_API_TOKEN}"));
-        } else if uri.starts_with("/api/v3/actions/runner-registration") {
-            builder = builder.header(header::AUTHORIZATION, "RemoteAuth aksh-registration-token");
-        }
-        let request = if body.is_null() {
-            builder.body(Body::empty()).unwrap()
-        } else {
-            builder
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap()
-        };
-        let response = app.clone().oneshot(request).await.unwrap();
-        let status = response.status();
-        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let val = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-        (status, val)
-    }
-
     // 1. connectionData
     let (s, conn) = try_req(
         &app,
@@ -3693,6 +3898,36 @@ async fn full_runner_lifecycle_register_session_poll_complete() {
     )
     .await;
     assert_eq!(final_run["status"], "success");
+}
+
+// Non-asserting helper for tests that need to inspect an error response.
+async fn try_req(app: &Router, method: Method, uri: &str, body: Value) -> (StatusCode, Value) {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if uri.starts_with("/api/v1/")
+        || uri.starts_with("/_apis/")
+        || uri.starts_with("/runner/server/_apis/")
+        || uri.starts_with("/broker/")
+        || uri.starts_with("/twirp/")
+    {
+        builder = builder.header(header::AUTHORIZATION, "Bearer aksh-system-token");
+    } else if uri.starts_with("/internal/test/") {
+        builder = builder.header(header::AUTHORIZATION, format!("Bearer {TEST_API_TOKEN}"));
+    } else if uri.starts_with("/api/v3/actions/runner-registration") {
+        builder = builder.header(header::AUTHORIZATION, "RemoteAuth aksh-registration-token");
+    }
+    let request = if body.is_null() {
+        builder.body(Body::empty()).unwrap()
+    } else {
+        builder
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let val = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, val)
 }
 
 async fn request_json(app: &Router, method: Method, uri: &str, body: Value) -> Value {
