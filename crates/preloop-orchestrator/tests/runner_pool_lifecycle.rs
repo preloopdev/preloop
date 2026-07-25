@@ -324,7 +324,6 @@ impl Fixture {
             memory_mib: 256,
             storage_gib: 10,
             debug_dir: None,
-            package_index_cache: None,
         };
         Self {
             _env_guard: env_guard,
