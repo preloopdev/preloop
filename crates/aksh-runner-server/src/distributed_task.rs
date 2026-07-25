@@ -63,7 +63,12 @@ pub(crate) async fn next_message(
         }
 
         let runner = inner.runner_capabilities_for_session(&session_id);
-        let Some(queued) = take_matching_job(&mut inner.queue, &runner) else {
+        let claimed = take_matching_job(&mut inner.queue, &runner);
+        shared
+            .state
+            .queue_depth
+            .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
+        let Some(queued) = claimed else {
             drop(inner);
             if wait_seconds == 0 {
                 return (StatusCode::OK, Json(None));

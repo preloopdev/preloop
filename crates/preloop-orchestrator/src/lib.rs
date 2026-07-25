@@ -196,6 +196,12 @@ pub struct RunnerPoolConfig {
     ///
     /// Unset means every runner generates its own keypair inside its guest.
     pub runner_key_dir: Option<PathBuf>,
+    /// Jobs the control plane still has queued after the most recent claim.
+    ///
+    /// Unset makes a slot fall back to "build a replacement only once the pool
+    /// is empty", which underprovisions whenever a workflow fans out wider
+    /// than the pool.
+    pub pending_jobs: Option<Arc<AtomicUsize>>,
 }
 
 /// Cache of environment-specific golden VMs.
@@ -683,16 +689,23 @@ async fn run_one_runner<P: VmProvider + 'static>(
     // Resolves once the runner reports a job and its replacement is ready. A
     // runner that exits without taking a job (shutdown, transient failure)
     // drops the sender, and this yields `None` without provisioning anything.
+    let pending_jobs = config.pending_jobs.as_deref();
     let build_successor = async {
         if busy_rx.await.is_err() {
             idle.fetch_sub(1, Ordering::AcqRel);
             return None;
         }
         // Booting a VM costs real CPU, and it would be spent alongside the job
-        // that just started. Only pay that while the job runs when the pool has
-        // nothing left to hand out — otherwise an idle peer already covers the
-        // next arrival and the replacement can wait for teardown.
-        if idle.fetch_sub(1, Ordering::AcqRel) > 1 {
+        // that just started, so only pay it when the pool is actually short.
+        //
+        // "Short" is queued work the remaining idle runners cannot absorb. A
+        // matrix that exactly fills the pool leaves nothing queued, so only the
+        // last slot builds — enough to serve whatever arrives next. A matrix
+        // wider than the pool leaves a backlog, and then every slot builds, so
+        // the second wave finds warm runners instead of paying fork+configure.
+        let idle_after = idle.fetch_sub(1, Ordering::AcqRel).saturating_sub(1);
+        let queued = pending_jobs.map_or(0, |pending| pending.load(Ordering::Acquire));
+        if idle_after > 0 && queued <= idle_after {
             return None;
         }
         match provision_slot(&provider, config, slot, next_generation, golden, keys).await {
@@ -1103,6 +1116,7 @@ mod lifecycle_tests {
             storage_gib: 1,
             debug_dir: None,
             runner_key_dir: None,
+            pending_jobs: None,
         }
     }
 
