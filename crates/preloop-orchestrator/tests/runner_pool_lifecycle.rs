@@ -336,6 +336,7 @@ impl Fixture {
             storage_gib: 10,
             debug_dir: None,
             runner_key_dir: None,
+            pending_jobs: None,
         };
         Self {
             _env_guard: env_guard,

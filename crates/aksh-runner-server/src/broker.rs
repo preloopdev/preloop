@@ -237,7 +237,12 @@ pub(crate) async fn next_message_broker_ref(
         }
 
         let runner = inner.runner_capabilities_for_session(&session_id);
-        let Some(queued) = take_matching_job(&mut inner.queue, &runner) else {
+        let claimed = take_matching_job(&mut inner.queue, &runner);
+        shared
+            .state
+            .queue_depth
+            .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
+        let Some(queued) = claimed else {
             drop(inner);
             if wait_seconds == 0 {
                 return Ok((StatusCode::OK, Json(json!({}))).into_response());
@@ -532,7 +537,12 @@ pub(crate) async fn next_message_broker_ref_root(
                 None
             } else {
                 let runner = inner.runner_capabilities_for_session(&session_id);
-                if let Some(queued) = take_matching_job(&mut inner.queue, &runner) {
+                let claimed = take_matching_job(&mut inner.queue, &runner);
+                shared
+                    .state
+                    .queue_depth
+                    .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
+                if let Some(queued) = claimed {
                     if let Some(run) = inner.runs.get_mut(&queued.run_id) {
                         run.status = ExecutionStatus::InProgress;
                         run.jobs
