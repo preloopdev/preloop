@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
@@ -69,6 +70,15 @@ pub struct VolumeMount {
     pub read_only: bool,
 }
 
+/// Host Unix socket exposed at a fixed guest path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SocketMount {
+    /// Host socket path.
+    pub host: PathBuf,
+    /// Absolute guest socket path.
+    pub guest: PathBuf,
+}
+
 /// Explicit VM egress policy. Networking is disabled unless selected here.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum NetworkPolicy {
@@ -77,6 +87,10 @@ pub enum NetworkPolicy {
     Disabled,
     /// Unrestricted outbound networking.
     Unrestricted,
+    /// Full outbound networking with the egress hard-floor enabled: loopback,
+    /// RFC 1918, link-local / cloud metadata, CGNAT, and IPv6 private ranges
+    /// are denied. Enforced by `SMOLVM_EGRESS_FLOOR=strict` in the provider.
+    PublicOnly,
     /// Restrict outbound traffic to these host names and CIDRs.
     Restricted {
         /// DNS host names allowed for egress.
@@ -103,6 +117,8 @@ pub struct MachineSpec {
     pub network: NetworkPolicy,
     /// Narrowly scoped host mounts.
     pub volumes: Vec<VolumeMount>,
+    /// Narrowly scoped host Unix sockets.
+    pub sockets: Vec<SocketMount>,
 }
 
 /// Observable VM state.
@@ -218,6 +234,7 @@ pub trait VmProvider: Send + Sync {
 pub struct SmolVmProvider {
     binary: PathBuf,
     capture_limit: usize,
+    lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Default for SmolVmProvider {
@@ -232,6 +249,7 @@ impl SmolVmProvider {
         Self {
             binary: binary.into(),
             capture_limit: DEFAULT_CAPTURE_LIMIT,
+            lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -300,6 +318,15 @@ impl SmolVmProvider {
         }
         Ok(result)
     }
+
+    async fn lifecycle_checked(
+        &self,
+        operation: &'static str,
+        args: &[String],
+    ) -> Result<ExecOutput, VmError> {
+        let _guard = self.lifecycle_lock.lock().await;
+        self.checked(operation, args).await
+    }
 }
 
 #[async_trait]
@@ -328,6 +355,7 @@ impl VmProvider for SmolVmProvider {
         match &spec.network {
             NetworkPolicy::Disabled => {}
             NetworkPolicy::Unrestricted => args.push("--net".into()),
+            NetworkPolicy::PublicOnly => args.push("--net".into()),
             NetworkPolicy::Restricted { hosts, cidrs } => {
                 for host in hosts {
                     args.extend(["--allow-host".into(), host.clone()]);
@@ -344,11 +372,17 @@ impl VmProvider for SmolVmProvider {
             }
             args.extend(["--volume".into(), value]);
         }
-        self.checked("create", &args).await.map(|_| ())
+        for mount in &spec.sockets {
+            args.extend([
+                "--mount-socket".into(),
+                format!("{}:{}", mount.host.display(), mount.guest.display()),
+            ]);
+        }
+        self.lifecycle_checked("create", &args).await.map(|_| ())
     }
 
     async fn start(&self, name: &MachineName) -> Result<(), VmError> {
-        self.checked(
+        self.lifecycle_checked(
             "start",
             &[
                 "machine".into(),
@@ -362,7 +396,7 @@ impl VmProvider for SmolVmProvider {
     }
 
     async fn start_forkable(&self, name: &MachineName) -> Result<(), VmError> {
-        self.checked(
+        self.lifecycle_checked(
             "start_forkable",
             &[
                 "machine".into(),
@@ -377,7 +411,7 @@ impl VmProvider for SmolVmProvider {
     }
 
     async fn fork(&self, golden: &MachineName, clone: &MachineName) -> Result<(), VmError> {
-        self.checked(
+        self.lifecycle_checked(
             "fork",
             &[
                 "machine".into(),
@@ -393,7 +427,7 @@ impl VmProvider for SmolVmProvider {
     }
 
     async fn stop(&self, name: &MachineName) -> Result<(), VmError> {
-        self.checked(
+        self.lifecycle_checked(
             "stop",
             &[
                 "machine".into(),
@@ -407,7 +441,7 @@ impl VmProvider for SmolVmProvider {
     }
 
     async fn delete(&self, name: &MachineName) -> Result<(), VmError> {
-        self.checked(
+        self.lifecycle_checked(
             "delete",
             &[
                 "machine".into(),
@@ -428,7 +462,7 @@ impl VmProvider for SmolVmProvider {
             "--name".into(),
             name.as_str().into(),
         ];
-        match self.checked("status", &args).await {
+        match self.lifecycle_checked("status", &args).await {
             Ok(output) => {
                 let text = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
                 Ok(if text.contains("running") {
@@ -450,7 +484,7 @@ impl VmProvider for SmolVmProvider {
 
     async fn list(&self) -> Result<Vec<MachineName>, VmError> {
         let output = self
-            .checked("list", &["machine".into(), "ls".into(), "--json".into()])
+            .lifecycle_checked("list", &["machine".into(), "ls".into(), "--json".into()])
             .await?;
         let values: serde_json::Value = serde_json::from_slice(&output.stdout)
             .map_err(|error| VmError::Protocol(error.to_string()))?;
@@ -581,7 +615,7 @@ impl VmProvider for SmolVmProvider {
                 "pack output path must be absolute".into(),
             ));
         }
-        self.checked(
+        self.lifecycle_checked(
             "pack",
             &[
                 "pack".into(),
@@ -618,7 +652,49 @@ fn validate_spec(spec: &MachineSpec) -> Result<(), VmError> {
             )));
         }
     }
+    for mount in &spec.sockets {
+        if !mount.host.is_absolute() || !mount.guest.is_absolute() {
+            return Err(VmError::InvalidSpec("socket paths must be absolute".into()));
+        }
+        validate_socket_source(&mount.host)?;
+    }
     Ok(())
+}
+
+/// A socket mount punches a hole in the guest boundary, so the host path must
+/// be exactly what the caller named: a real socket, reached without traversing
+/// a symlink that could be repointed at another endpoint.
+#[cfg(unix)]
+fn validate_socket_source(host: &Path) -> Result<(), VmError> {
+    use std::os::unix::fs::FileTypeExt;
+
+    let symlink_meta = std::fs::symlink_metadata(host).map_err(|error| {
+        VmError::InvalidSpec(format!(
+            "socket source does not exist: {} ({error})",
+            host.display()
+        ))
+    })?;
+    if symlink_meta.file_type().is_symlink() {
+        return Err(VmError::InvalidSpec(format!(
+            "socket source must not be a symlink: {}",
+            host.display()
+        )));
+    }
+    if !symlink_meta.file_type().is_socket() {
+        return Err(VmError::InvalidSpec(format!(
+            "socket source is not a Unix socket: {}",
+            host.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_socket_source(host: &Path) -> Result<(), VmError> {
+    Err(VmError::InvalidSpec(format!(
+        "socket mounts require Unix: {}",
+        host.display()
+    )))
 }
 
 async fn read_bounded(
