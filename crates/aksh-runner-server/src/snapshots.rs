@@ -149,16 +149,31 @@ async fn create_workspace_snapshot_inner(
         ensure_object_cache(state_dir, workspace, &common_dir, source_head.as_deref()).await?;
     let ObjectCache {
         objects: cached_objects,
+        index: cache_index,
         refreshed: cache_refreshed,
     } = cache;
 
-    if let Some(head) = source_head {
+    // `git add --all` has to decide, for every path, whether the working tree
+    // still matches the index. With a cold index it re-hashes the whole tree;
+    // with the previous run's stat data it only re-hashes what changed. On a
+    // 6000-file workspace that is 156 ms versus 16 ms.
+    //
+    // The reuse is safe because the index is reset to HEAD immediately after:
+    // `--reset` takes every entry's object id from the tree (so every blob it
+    // names is reachable from HEAD and lives in the object cache) and keeps
+    // stat data only where the path is unchanged. The persisted index
+    // contributes cached stat information and nothing else. Plain `read-tree`
+    // would drop that stat data and put us back on the slow path.
+    if let Some(head) = source_head.as_deref() {
+        if cache_index.is_file() {
+            let _ = tokio::fs::copy(&cache_index, staging_index).await;
+        }
         run_snapshot_git(
             workspace,
             staging_repository,
             staging_index,
             &cached_objects,
-            ["read-tree", head.as_str()],
+            ["read-tree", "--reset", head],
             "seed snapshot index",
         )
         .await?;
@@ -186,6 +201,10 @@ async fn create_workspace_snapshot_inner(
     )
     .await?;
     let tree = output_text(&tree_output, "write snapshot tree")?;
+
+    // Best effort: the index is a cache, so a failed hand-off only costs the
+    // next submission its stat data.
+    persist_snapshot_index(staging_index, &cache_index).await;
 
     let mut commit = snapshot_git_command(
         workspace,
@@ -454,6 +473,8 @@ async fn run_git_with_stdin(
 struct ObjectCache {
     /// Object directory to expose as the snapshot's alternate.
     objects: PathBuf,
+    /// Persisted index carrying this workspace's cached stat data.
+    index: PathBuf,
     /// Whether this call added objects to the cache.
     refreshed: bool,
 }
@@ -543,7 +564,13 @@ async fn ensure_object_cache(
     let objects = std::fs::canonicalize(repository.join("objects")).map_err(|error| {
         ApiError::internal(format!("failed to resolve snapshot object cache: {error}"))
     })?;
-    Ok(ObjectCache { objects, refreshed })
+    let mut index = repository.as_os_str().to_owned();
+    index.push(".index");
+    Ok(ObjectCache {
+        objects,
+        index: PathBuf::from(index),
+        refreshed,
+    })
 }
 
 /// Persist the workspace HEAD the cache was last synced to.
@@ -563,6 +590,22 @@ async fn record_cache_head(marker: &FsPath, source_head: Option<&str>) -> Result
             "failed to record snapshot object cache HEAD: {error}"
         ))
     })
+}
+
+/// Hand this run's index to the next one, atomically.
+///
+/// Concurrent submissions for the same workspace simply race to publish; the
+/// index holds only stat data, so either winner is correct.
+async fn persist_snapshot_index(staging_index: &FsPath, destination: &FsPath) {
+    let Some(parent) = destination.parent() else {
+        return;
+    };
+    let staged = parent.join(format!("{}.tmp", uuid::Uuid::new_v4()));
+    if tokio::fs::copy(staging_index, &staged).await.is_err()
+        || tokio::fs::rename(&staged, destination).await.is_err()
+    {
+        let _ = tokio::fs::remove_file(&staged).await;
+    }
 }
 
 struct CacheLock(PathBuf);
