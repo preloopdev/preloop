@@ -312,11 +312,13 @@ async fn cmd_engine() -> anyhow::Result<()> {
     // Shared with the runner pool so it can size provisioning to the work
     // actually waiting, not just to whether it has an idle runner left.
     let queue_depth = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let next_job_runs_on = std::sync::Arc::new(std::sync::RwLock::new(Vec::new()));
     let mut server = tokio::spawn(aksh_runner_server::serve(
         aksh_runner_server::ServerConfig {
             listen,
             unix_socket: Some(socket.clone()),
             queue_depth: Some(queue_depth.clone()),
+            next_job_runs_on: Some(next_job_runs_on.clone()),
             state_dir,
             record_flows: None,
             tls: aksh_runner_server::TlsMode::None,
@@ -334,7 +336,8 @@ async fn cmd_engine() -> anyhow::Result<()> {
     }
 
     let shutdown = tokio_util::sync::CancellationToken::new();
-    let mut pool = match local_runner_pool_config(&home, public_url, queue_depth) {
+    let mut pool = match local_runner_pool_config(&home, public_url, queue_depth, next_job_runs_on)
+    {
         Ok(config) => {
             let pool_shutdown = shutdown.clone();
             Some(tokio::spawn(async move {
@@ -417,6 +420,7 @@ fn local_runner_pool_config(
     home: &std::path::Path,
     server_url: String,
     queue_depth: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    next_job_runs_on: std::sync::Arc<std::sync::RwLock<Vec<String>>>,
 ) -> anyhow::Result<RunnerPoolConfig> {
     let control_bridge = home.join("control-bridge");
     std::fs::create_dir_all(&control_bridge)?;
@@ -473,6 +477,7 @@ fn local_runner_pool_config(
         debug_dir: Some(home.join("state").join("debug")),
         runner_key_dir: Some(home.join("runner-keys")),
         pending_jobs: Some(queue_depth),
+        next_job_runs_on: Some(next_job_runs_on),
     })
 }
 

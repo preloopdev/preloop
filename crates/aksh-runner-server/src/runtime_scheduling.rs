@@ -1089,6 +1089,19 @@ pub(crate) fn summarize_run(statuses: impl Iterator<Item = ExecutionStatus>) -> 
     }
 }
 
+/// Refresh the shared next-job labels from the front of the dispatch queue.
+///
+/// Called after every claim so a co-hosted runner pool can select the correct
+/// base-image golden before provisioning the next runner.
+pub(crate) fn sync_next_job_labels(inner: &InnerState, shared: &std::sync::RwLock<Vec<String>>) {
+    let labels = inner
+        .queue
+        .front()
+        .map(|job| job.runs_on.clone())
+        .unwrap_or_default();
+    let _ = shared.write().map(|mut guard| *guard = labels);
+}
+
 #[cfg(test)]
 mod runner_group_tests {
     use super::*;

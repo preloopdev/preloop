@@ -111,6 +111,10 @@ pub struct AppState {
     /// is claimed. A supervising runner pool reads it to decide whether the
     /// work already queued outruns the runners it has left.
     pub queue_depth: Arc<std::sync::atomic::AtomicUsize>,
+    /// `runs-on` labels of the job at the front of the dispatch queue,
+    /// refreshed after each claim so a co-hosted runner pool can select the
+    /// right golden before the next fork.
+    pub next_job_runs_on: Arc<std::sync::RwLock<Vec<String>>>,
     pub(crate) cache: CacheStore,
     pub(crate) artifacts: ArtifactStore,
     /// Optional GitHub App Webhook Secret for signature verification.
@@ -241,6 +245,7 @@ impl AppState {
             events,
             message_notify: Arc::new(Notify::new()),
             queue_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            next_job_runs_on: Arc::new(std::sync::RwLock::new(Vec::new())),
             cache,
             artifacts,
             webhook_secret,
