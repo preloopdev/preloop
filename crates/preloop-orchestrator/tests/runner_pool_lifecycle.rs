@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use preloop_orchestrator::{artifact_payload, RunnerPool, RunnerPoolConfig, DEBUG_MARKER_IDLE};
+use preloop_orchestrator::{
+    artifact_payload, RunnerPool, RunnerPoolConfig, DEBUG_MARKER_IDLE, RUNNER_BUSY_LINE,
+};
 use preloop_vm::{
     ExecOutput, MachineName, MachineSpec, MachineState, NetworkPolicy, OutputChunk, SocketMount,
     VmError, VmProvider, VolumeMount,
@@ -207,29 +209,13 @@ impl VmProvider for RecordingVmProvider {
     }
 
     async fn exec(&self, name: &MachineName, argv: &[String]) -> Result<ExecOutput, VmError> {
-        let is_run = argv.iter().any(|argument| argument == "run");
-        let action = {
-            let mut state = self.state.lock().await;
-            state
-                .events
-                .push(Event::Exec(name.as_str().to_owned(), argv.to_vec()));
-            if is_run {
-                state.run_calls += 1;
-                self.run_actions
-                    .lock()
-                    .await
-                    .get(state.run_calls - 1)
-                    .copied()
-                    .unwrap_or(RunAction::Wait)
-            } else {
-                RunAction::Complete
-            }
-        };
+        let mut state = self.state.lock().await;
+        state
+            .events
+            .push(Event::Exec(name.as_str().to_owned(), argv.to_vec()));
+        drop(state);
         self.notify_changed();
-        match action {
-            RunAction::Complete => Ok(output()),
-            RunAction::Wait => std::future::pending().await,
-        }
+        Ok(output())
     }
 
     async fn exec_with_secret_env(
@@ -251,11 +237,36 @@ impl VmProvider for RecordingVmProvider {
 
     async fn exec_stream(
         &self,
-        _name: &MachineName,
-        _argv: &[String],
-        _output: tokio::sync::mpsc::Sender<OutputChunk>,
+        name: &MachineName,
+        argv: &[String],
+        output: tokio::sync::mpsc::Sender<OutputChunk>,
     ) -> Result<i32, VmError> {
-        Ok(0)
+        // The pool runs the guest runner here, so this is where a job is
+        // modelled: announce that the runner is busy, then behave as the
+        // scripted action says.
+        let action = {
+            let mut state = self.state.lock().await;
+            state
+                .events
+                .push(Event::Exec(name.as_str().to_owned(), argv.to_vec()));
+            state.run_calls += 1;
+            self.run_actions
+                .lock()
+                .await
+                .get(state.run_calls - 1)
+                .copied()
+                .unwrap_or(RunAction::Wait)
+        };
+        self.notify_changed();
+        let _ = output
+            .send(OutputChunk::Stdout(
+                format!("{RUNNER_BUSY_LINE}\n").into_bytes(),
+            ))
+            .await;
+        match action {
+            RunAction::Complete => Ok(0),
+            RunAction::Wait => std::future::pending().await,
+        }
     }
 
     async fn copy(&self, _source: &str, _destination: &str) -> Result<(), VmError> {
@@ -376,6 +387,36 @@ async fn yield_to_pool() {
     }
 }
 
+/// Name of the first machine slot 0 created.
+///
+/// Slot machines carry a generation suffix so a replacement can be built while
+/// its predecessor is still alive, so tests resolve the name instead of
+/// assuming one machine per slot.
+fn first_slot_machine(events: &[Event], name_prefix: &str) -> String {
+    let slot_prefix = format!("{name_prefix}-0-");
+    events
+        .iter()
+        .find_map(|event| match event {
+            Event::Create(name) if name.starts_with(&slot_prefix) => Some(name.clone()),
+            _ => None,
+        })
+        .expect("slot 0 created a machine")
+}
+
+/// Block until slot 0 has created its first machine, then return the name.
+async fn await_first_slot_machine(provider: &RecordingVmProvider, name_prefix: &str) -> String {
+    let slot_prefix = format!("{name_prefix}-0-");
+    provider
+        .wait_until(|state| {
+            state
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Create(name) if name.starts_with(&slot_prefix)))
+        })
+        .await;
+    first_slot_machine(&provider.snapshot().await.events, name_prefix)
+}
+
 #[tokio::test]
 async fn artifact_preparation_runs_once_and_reuses_payload_on_next_run() {
     let fixture = Fixture::new("artifact", false);
@@ -457,8 +498,8 @@ async fn runner_keeps_public_only_egress_and_wires_control_socket_and_environmen
     let pool = RunnerPool::new(provider.clone(), config.clone()).unwrap();
     run_until_cancelled(pool, &provider, CancellationToken::new(), 1).await;
 
-    let runner = fixture.config.name_prefix.clone() + "-0";
     let snapshot = provider.snapshot().await;
+    let runner = first_slot_machine(&snapshot.events, &fixture.config.name_prefix);
     let spec = snapshot
         .created_specs
         .iter()
@@ -554,8 +595,8 @@ async fn guest_environment_tracks_control_socket_and_debug_dir_independently() {
         let pool = RunnerPool::new(provider.clone(), config.clone()).unwrap();
         run_until_cancelled(pool, &provider, CancellationToken::new(), 1).await;
 
-        let runner = config.name_prefix.clone() + "-0";
         let snapshot = provider.snapshot().await;
+        let runner = first_slot_machine(&snapshot.events, &config.name_prefix);
         let configure = snapshot
             .events
             .iter()
@@ -579,8 +620,15 @@ async fn guest_environment_tracks_control_socket_and_debug_dir_independently() {
     }
 }
 
+/// A slot must build its replacement while the current job is still running,
+/// and must still tear the finished runner down.
+///
+/// Waiting for the job to end before provisioning put a fork plus a full
+/// runner registration in front of every job that arrives while the pool is
+/// saturated — the cost a matrix workflow pays on every shard past the pool
+/// size.
 #[tokio::test]
-async fn completed_runner_is_deleted_before_slot_is_replenished() {
+async fn slot_builds_its_replacement_while_the_job_runs() {
     let fixture = Fixture::new("replenish", true);
     let provider = Arc::new(RecordingVmProvider::with_machines(
         &[],
@@ -590,29 +638,36 @@ async fn completed_runner_is_deleted_before_slot_is_replenished() {
     run_until_cancelled(pool, &provider, CancellationToken::new(), 2).await;
 
     let events = provider.snapshot().await.events;
-    let runner = fixture.config.name_prefix.clone() + "-0";
-    let first_run = events
-        .iter()
-        .position(|event| matches!(event, Event::Exec(name, argv) if name == &runner && argv.iter().any(|arg| arg == "run")))
-        .unwrap();
-    let second_create = events
+    let slot_prefix = fixture.config.name_prefix.clone() + "-0-";
+    let (first_run, first_runner) = events
         .iter()
         .enumerate()
-        .filter_map(|(index, event)| {
-            (index > first_run && matches!(event, Event::Create(name) if name == &runner))
-                .then_some(index)
+        .find_map(|(index, event)| match event {
+            Event::Exec(name, argv)
+                if name.starts_with(&slot_prefix) && argv.iter().any(|arg| arg == "run") =>
+            {
+                Some((index, name.clone()))
+            }
+            _ => None,
         })
-        .next()
-        .unwrap();
-    assert!(events[first_run + 1..second_create]
+        .expect("the slot ran a runner");
+
+    let replacement_created = events
         .iter()
-        .any(|event| matches!(event, Event::Delete(name) if name == &runner)));
+        .enumerate()
+        .position(|(index, event)| {
+            index > first_run
+                && matches!(event, Event::Create(name) if name.starts_with(&slot_prefix) && name != &first_runner)
+        })
+        .expect("the slot created a replacement runner");
+    let first_deleted = events
+        .iter()
+        .position(|event| matches!(event, Event::Delete(name) if name == &first_runner))
+        .expect("the finished runner was deleted");
+
     assert!(
-        events
-            .iter()
-            .filter(|event| matches!(event, Event::Create(name) if name == &runner))
-            .count()
-            >= 2
+        replacement_created < first_deleted,
+        "replacement must be built before the finished runner is torn down, got {events:?}"
     );
 }
 
@@ -651,8 +706,8 @@ async fn cancellation_deletes_owned_active_machine() {
     let pool = RunnerPool::new(provider.clone(), fixture.config.clone()).unwrap();
     run_until_cancelled(pool, &provider, CancellationToken::new(), 1).await;
 
-    let runner = fixture.config.name_prefix.clone() + "-0";
     let snapshot = provider.snapshot().await;
+    let runner = first_slot_machine(&snapshot.events, &fixture.config.name_prefix);
     assert_eq!(snapshot.machines.get(&runner), None);
     assert!(snapshot
         .events
@@ -671,14 +726,15 @@ async fn preserved_runner_expires_at_idle_timeout_without_heartbeat() {
         &[],
         vec![RunAction::Complete],
     ));
-    let runner = config.name_prefix.clone() + "-0";
-    let marker = debug_dir.join(&runner);
+    let name_prefix = config.name_prefix.clone();
     let shutdown = CancellationToken::new();
     let task_provider = provider.clone();
     let task_shutdown = shutdown.clone();
     let pool = RunnerPool::new(provider.clone(), config).unwrap();
     let task = tokio::spawn(async move { pool.run(task_shutdown).await });
 
+    let runner = await_first_slot_machine(&provider, &name_prefix).await;
+    let marker = debug_dir.join(&runner);
     wait_for_debug_marker(&provider, &marker).await;
     assert_eq!(fs::read_to_string(&marker).unwrap(), DEBUG_MARKER_IDLE);
 
@@ -716,14 +772,15 @@ async fn removing_debug_marker_releases_preserved_runner_on_next_poll() {
         &[],
         vec![RunAction::Complete],
     ));
-    let runner = config.name_prefix.clone() + "-0";
-    let marker = debug_dir.join(&runner);
+    let name_prefix = config.name_prefix.clone();
     let shutdown = CancellationToken::new();
     let task_provider = provider.clone();
     let task_shutdown = shutdown.clone();
     let pool = RunnerPool::new(provider.clone(), config).unwrap();
     let task = tokio::spawn(async move { pool.run(task_shutdown).await });
 
+    let runner = await_first_slot_machine(&provider, &name_prefix).await;
+    let marker = debug_dir.join(&runner);
     wait_for_debug_marker(&provider, &marker).await;
     for _ in 0..100 {
         tokio::task::yield_now().await;

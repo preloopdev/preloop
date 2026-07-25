@@ -3,16 +3,22 @@
 pub mod environment;
 
 use crate::environment::{EnvironmentResolver, EnvironmentSpec};
+use aksh_gha_protocol::RUNNER_BUSY_SENTINEL;
+
+/// Line an ephemeral runner prints when it accepts a job. Re-exported so a
+/// `VmProvider` implementation can model the handshake this pool relies on.
+pub use aksh_gha_protocol::RUNNER_BUSY_SENTINEL as RUNNER_BUSY_LINE;
+
 use preloop_vm::{
-    MachineName, MachineSpec, MachineState, NetworkPolicy, SmolVmProvider, SocketMount, VmError,
-    VmProvider, VolumeMount,
+    MachineName, MachineSpec, MachineState, NetworkPolicy, OutputChunk, SmolVmProvider,
+    SocketMount, VmError, VmProvider, VolumeMount,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -489,6 +495,13 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
     }
 }
 
+/// A provisioned, registered runner waiting to be handed a job.
+#[derive(Debug)]
+struct ReadyRunner {
+    name: MachineName,
+    run: Vec<String>,
+}
+
 async fn run_slot<P: VmProvider + 'static>(
     provider: Arc<P>,
     config: RunnerPoolConfig,
@@ -497,75 +510,153 @@ async fn run_slot<P: VmProvider + 'static>(
     golden_registry: Arc<GoldenRegistry>,
     _environment_resolver: Arc<EnvironmentResolver>,
 ) -> Result<(), OrchestratorError> {
-    let name = MachineName::new(format!("{}-{slot}", config.name_prefix))?;
     let default_fingerprint =
         EnvironmentSpec::new(config.base_image.clone(), Vec::new()).fingerprint;
+    let mut generation: u64 = 0;
+    let mut spare: Option<ReadyRunner> = None;
+
     while !shutdown.is_cancelled() {
         // Until jobs are connected to environment selection, all slots use
         // the default base-only golden. An absent entry preserves the
         // create-per-runner fallback used by non-fork mode and tests.
         let golden = golden_registry.get(&default_fingerprint).await;
-        if let Err(error) = run_one_runner(
+        let runner = match spare.take() {
+            Some(runner) => runner,
+            None => {
+                generation += 1;
+                match provision_slot(&provider, &config, slot, generation, golden.as_ref()).await {
+                    Ok(runner) => runner,
+                    Err(error) => {
+                        warn!(slot, %error, "provisioning runner failed; retrying");
+                        tokio::select! {
+                            _ = shutdown.cancelled() => break,
+                            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                        }
+                        continue;
+                    }
+                }
+            }
+        };
+
+        generation += 1;
+        let successor = run_one_runner(
             provider.clone(),
             &config,
-            &name,
+            runner,
             shutdown.clone(),
             golden.as_ref(),
+            slot,
+            generation,
         )
-        .await
-        {
-            warn!(machine = name.as_str(), %error, "ephemeral runner failed; replenishing slot");
-            tokio::select! {
-                _ = shutdown.cancelled() => break,
-                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+        .await;
+        spare = match successor {
+            Ok(spare) => spare,
+            Err(error) => {
+                warn!(slot, %error, "ephemeral runner failed; replenishing slot");
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                }
+                None
             }
-        }
+        };
     }
-    let _ = provider.delete(&name).await;
+
+    if let Some(spare) = spare {
+        let _ = provider.delete(&spare.name).await;
+    }
     Ok(())
 }
 
-async fn run_one_runner<P: VmProvider + 'static>(
-    provider: Arc<P>,
+/// Provision one ephemeral runner for a slot under a fresh machine name.
+///
+/// Names carry a generation so a replacement can boot while its predecessor is
+/// still being torn down; reusing one name per slot forced those to serialize.
+async fn provision_slot<P: VmProvider + 'static>(
+    provider: &Arc<P>,
     config: &RunnerPoolConfig,
-    name: &MachineName,
-    shutdown: CancellationToken,
+    slot: usize,
+    generation: u64,
     golden: Option<&MachineName>,
-) -> Result<(), OrchestratorError> {
-    if provider.status(name).await? != MachineState::Missing {
-        provider.delete(name).await?;
-    }
-
-    // From here on a machine may exist, so every failure path must delete it.
-    let run = match provision_runner(&provider, config, name, golden).await {
-        Ok(run) => run,
+) -> Result<ReadyRunner, OrchestratorError> {
+    let name = MachineName::new(format!("{}-{slot}-{generation}", config.name_prefix))?;
+    match provision_runner(provider, config, &name, golden).await {
+        Ok(run) => Ok(ReadyRunner { name, run }),
         Err(error) => {
-            if let Err(cleanup) = provider.delete(name).await {
+            if let Err(cleanup) = provider.delete(&name).await {
                 warn!(
                     machine = name.as_str(),
                     %cleanup,
                     "failed to delete machine after provisioning error"
                 );
             }
-            return Err(error);
+            Err(error)
+        }
+    }
+}
+
+/// Run one job on a provisioned runner, building its replacement in parallel.
+///
+/// The runner is single-use, so the moment it announces that it has taken a
+/// job its successor can start booting. That moves fork + configure — the bulk
+/// of a slot's turnaround — off the path of whatever job arrives next, which is
+/// what a matrix workflow deeper than the pool spends its time waiting on.
+///
+/// Returns the replacement when one was built, so the caller can use it
+/// immediately instead of provisioning again.
+async fn run_one_runner<P: VmProvider + 'static>(
+    provider: Arc<P>,
+    config: &RunnerPoolConfig,
+    runner: ReadyRunner,
+    shutdown: CancellationToken,
+    golden: Option<&MachineName>,
+    slot: usize,
+    next_generation: u64,
+) -> Result<Option<ReadyRunner>, OrchestratorError> {
+    let ReadyRunner { name, run } = runner;
+    let name = &name;
+
+    let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
+    let run_provider = provider.clone();
+    let run_name = name.clone();
+    let mut run_task =
+        tokio::spawn(async move { run_until_exit(&run_provider, &run_name, &run, busy_tx).await });
+
+    // Resolves once the runner reports a job and its replacement is ready. A
+    // runner that exits without taking a job (shutdown, transient failure)
+    // drops the sender, and this yields `None` without provisioning anything.
+    let build_successor = async {
+        if busy_rx.await.is_err() {
+            return None;
+        }
+        match provision_slot(&provider, config, slot, next_generation, golden).await {
+            Ok(successor) => Some(successor),
+            Err(error) => {
+                warn!(slot, %error, "pre-provisioning the replacement runner failed");
+                None
+            }
         }
     };
 
-    let run_provider = provider.clone();
-    let run_name = name.clone();
-    let mut run_task = tokio::spawn(async move { run_provider.exec(&run_name, &run).await });
-    let result = tokio::select! {
+    let (result, successor) = tokio::select! {
         _ = shutdown.cancelled() => {
             // Killing the host-side `smolvm machine exec` process does not
             // terminate the guest command. Abort the wrapper first, then stop
             // the VM so deletion cannot wait indefinitely on a live listener.
             run_task.abort();
             let _ = run_task.await;
-            provider.stop(name).await.map_err(OrchestratorError::from)
+            (provider.stop(name).await.map_err(OrchestratorError::from), None)
         },
-        result = &mut run_task => match result {
-            Ok(result) => result.map(|_| ()).map_err(OrchestratorError::from),
-            Err(error) => Err(OrchestratorError::Pool(error.to_string())),
+        pair = async {
+            // Concurrent on purpose: the successor is built while the job is
+            // still running, which is the whole point of the busy signal.
+            tokio::join!(&mut run_task, build_successor)
+        } => {
+            let result = match pair.0 {
+                Ok(result) => result.map_err(OrchestratorError::from),
+                Err(error) => Err(OrchestratorError::Pool(error.to_string())),
+            };
+            (result, pair.1)
         },
     };
 
@@ -592,14 +683,63 @@ async fn run_one_runner<P: VmProvider + 'static>(
         if let Err(error) = provider.delete(name).await {
             warn!(machine = name.as_str(), %error, "failed to delete preserved machine");
         }
-        return result;
+        return result.map(|()| successor);
     }
 
     // Report the runner's own failure in preference to a teardown failure.
     let delete_result = provider.delete(name).await;
     result?;
     delete_result?;
-    Ok(())
+    Ok(successor)
+}
+
+/// Run the guest runner to completion, signalling the first job it accepts.
+///
+/// Streaming rather than buffering the guest's output is what makes the busy
+/// signal observable while the job is still running; it also drops SmolVM's
+/// 30-second buffered-exec read timeout.
+async fn run_until_exit<P: VmProvider + 'static>(
+    provider: &Arc<P>,
+    name: &MachineName,
+    run: &[String],
+    busy: tokio::sync::oneshot::Sender<()>,
+) -> Result<(), VmError> {
+    let (chunks, mut receiver) = mpsc::channel(64);
+    let watcher = tokio::spawn(async move {
+        let mut busy = Some(busy);
+        let mut pending = String::new();
+        while let Some(chunk) = receiver.recv().await {
+            let OutputChunk::Stdout(bytes) = chunk else {
+                continue;
+            };
+            if busy.is_none() {
+                continue;
+            }
+            pending.push_str(&String::from_utf8_lossy(&bytes));
+            if pending.contains(RUNNER_BUSY_SENTINEL) {
+                if let Some(busy) = busy.take() {
+                    let _ = busy.send(());
+                }
+                pending.clear();
+            } else if pending.len() > 2 * RUNNER_BUSY_SENTINEL.len() {
+                // Keep only enough tail to rejoin a sentinel split across reads.
+                let keep = pending.len() - RUNNER_BUSY_SENTINEL.len();
+                pending.drain(..keep);
+            }
+        }
+    });
+
+    let code = provider.exec_stream(name, run, chunks).await?;
+    let _ = watcher.await;
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(VmError::Command {
+            operation: "run",
+            exit_code: code,
+            message: format!("guest runner exited with code {code}"),
+        })
+    }
 }
 
 /// Create, boot, and register one ephemeral runner; return its `run` argv.
@@ -953,10 +1093,17 @@ mod lifecycle_tests {
 
         async fn exec_stream(
             &self,
-            _name: &MachineName,
-            _argv: &[String],
+            name: &MachineName,
+            argv: &[String],
             _output: tokio::sync::mpsc::Sender<OutputChunk>,
         ) -> Result<i32, VmError> {
+            self.events
+                .lock()
+                .await
+                .push(format!("run:{}", name.as_str()));
+            if self.fail_run && argv.iter().any(|arg| arg == "run") {
+                return Err(test_error("run-failure"));
+            }
             Ok(0)
         }
 
@@ -972,21 +1119,15 @@ mod lifecycle_tests {
     async fn provisioning_failure(
         provider: Arc<TestProvider>,
         config: &RunnerPoolConfig,
-        name: &MachineName,
         golden: Option<&MachineName>,
         expected: &str,
     ) {
-        let error = run_one_runner(
-            provider.clone(),
-            config,
-            name,
-            CancellationToken::new(),
-            golden,
-        )
-        .await
-        .expect_err("provisioning failure must propagate");
+        let error = provision_slot(&provider, config, 0, 1, golden)
+            .await
+            .expect_err("provisioning failure must propagate");
+        let name = MachineName::new(format!("{}-0-1", config.name_prefix)).unwrap();
         assert!(error.to_string().contains(expected));
-        assert!(!provider.has_machine(name).await);
+        assert!(!provider.has_machine(&name).await);
         let events = provider.events().await;
         let create = events
             .iter()
@@ -999,7 +1140,6 @@ mod lifecycle_tests {
 
     #[tokio::test]
     async fn provisioning_failures_delete_created_runner() {
-        let name = MachineName::new("lifecycle-test-runner").unwrap();
         let cases = [
             (
                 TestProvider::new(true, false, false, false, false),
@@ -1021,7 +1161,6 @@ mod lifecycle_tests {
             provisioning_failure(
                 Arc::new(provider),
                 &test_config(control_socket),
-                &name,
                 None,
                 expected,
             )
@@ -1033,19 +1172,28 @@ mod lifecycle_tests {
     async fn fork_provisioning_failure_deletes_cloned_runner() {
         let provider = Arc::new(TestProvider::new(false, false, true, false, false));
         let config = test_config(false);
-        let name = MachineName::new("lifecycle-test-runner").unwrap();
         let golden = MachineName::new("lifecycle-test-golden").unwrap();
-        provisioning_failure(provider, &config, &name, Some(&golden), "configure-failure").await;
+        provisioning_failure(provider, &config, Some(&golden), "configure-failure").await;
     }
 
     #[tokio::test]
     async fn runner_error_wins_when_delete_also_fails() {
         let provider = Arc::new(TestProvider::new(false, false, false, true, true));
         let config = test_config(false);
-        let name = MachineName::new("lifecycle-test-runner").unwrap();
-        let error = run_one_runner(provider, &config, &name, CancellationToken::new(), None)
+        let runner = provision_slot(&provider, &config, 0, 1, None)
             .await
-            .expect_err("runner failure must propagate");
+            .expect("provisioning succeeds");
+        let error = run_one_runner(
+            provider,
+            &config,
+            runner,
+            CancellationToken::new(),
+            None,
+            0,
+            2,
+        )
+        .await
+        .expect_err("runner failure must propagate");
         assert!(error.to_string().contains("run-failure"));
         assert!(!error.to_string().contains("delete-failure"));
     }
