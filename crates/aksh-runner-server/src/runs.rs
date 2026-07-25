@@ -980,7 +980,7 @@ pub(crate) async fn submit_run_inner(
         // the local status map and is installed below with the final record.
         if let Some(provisional) = inner.runs.get(&run_id) {
             for (job_id, status) in &provisional.jobs {
-                if concurrency::is_terminal(*status) {
+                if status.is_terminal() {
                     statuses.insert(job_id.clone(), *status);
                 }
             }
@@ -1351,35 +1351,96 @@ pub(crate) async fn rerun_run(
     submit_run_inner(&shared, submission).await.map(Json)
 }
 
+/// Upper bound on how long an event stream waits for the next event.
+///
+/// A run that stalls must not pin a connection forever; clients reconnect and
+/// re-receive the snapshot, so closing here costs only a round trip.
+const EVENT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// NDJSON event feed for a run: a snapshot of everything so far, then live
+/// events until the run reaches a terminal status.
+///
+/// Holding the response open is what keeps `preloop run` off a poll timer —
+/// snapshot-and-close forced clients to re-request on an interval, which added
+/// that interval to every run's wall clock.
 pub(crate) async fn run_events(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
 ) -> Result<Response, ApiError> {
-    let inner = shared.state.inner.lock().await;
-    let run = inner
-        .runs
-        .get(&run_id)
-        .ok_or_else(|| ApiError::not_found("run not found"))?;
-    let mut out = event_to_ndjson(&NdjsonEvent::RunStatus {
-        run_id,
-        status: run.status,
-        reason: None,
-    })?;
-    for (job_id, status) in &run.jobs {
-        out.push_str(&event_to_ndjson(&NdjsonEvent::JobStatus {
+    // Subscribe before snapshotting so nothing emitted in between is lost. The
+    // overlap can replay a line the snapshot already carried; clients
+    // de-duplicate, and applying a status twice is idempotent.
+    let receiver = shared.state.events.subscribe();
+
+    let (snapshot, settled) = {
+        let inner = shared.state.inner.lock().await;
+        let run = inner
+            .runs
+            .get(&run_id)
+            .ok_or_else(|| ApiError::not_found("run not found"))?;
+        let mut out = event_to_ndjson(&NdjsonEvent::RunStatus {
             run_id,
-            job_id: job_id.clone(),
-            status: *status,
+            status: run.status,
             reason: None,
-        })?);
-    }
-    if let Some(events) = inner.timeline_events.get(&run_id) {
-        for event in events {
-            out.push_str(&event_to_ndjson(event)?);
+        })?;
+        for (job_id, status) in &run.jobs {
+            out.push_str(&event_to_ndjson(&NdjsonEvent::JobStatus {
+                run_id,
+                job_id: job_id.clone(),
+                status: *status,
+                reason: None,
+            })?);
         }
-    }
+        if let Some(events) = inner.timeline_events.get(&run_id) {
+            for event in events {
+                out.push_str(&event_to_ndjson(event)?);
+            }
+        }
+        (out, run.status.is_terminal())
+    };
+
+    let body = if settled {
+        Body::from(snapshot)
+    } else {
+        let head = stream::once(async move { Ok::<Bytes, std::io::Error>(Bytes::from(snapshot)) });
+        Body::from_stream(head.chain(live_run_events(run_id, receiver)))
+    };
+
     Ok(Response::builder()
         .header("content-type", "application/x-ndjson")
-        .body(Body::from(out))
+        .body(body)
         .expect("static response builder"))
+}
+
+/// Live tail of a run's events, ending once the run status turns terminal.
+fn live_run_events(
+    run_id: RunId,
+    receiver: broadcast::Receiver<NdjsonEvent>,
+) -> impl stream::Stream<Item = Result<Bytes, std::io::Error>> {
+    stream::unfold(
+        (receiver, false),
+        move |(mut receiver, finished)| async move {
+            if finished {
+                return None;
+            }
+            loop {
+                let event =
+                    match tokio::time::timeout(EVENT_STREAM_IDLE_TIMEOUT, receiver.recv()).await {
+                        Ok(Ok(event)) => event,
+                        // A lagging consumer missed events; the snapshot it gets on
+                        // reconnect is authoritative, so keep tailing from here.
+                        Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                        Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => return None,
+                    };
+                if event.run_id() != run_id {
+                    continue;
+                }
+                let Ok(line) = event_to_ndjson(&event) else {
+                    continue;
+                };
+                let finished = event.terminal_run_status().is_some();
+                return Some((Ok(Bytes::from(line)), (receiver, finished)));
+            }
+        },
+    )
 }

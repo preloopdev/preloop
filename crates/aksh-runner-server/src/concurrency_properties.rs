@@ -428,7 +428,7 @@ impl ProdState {
         // Mark all jobs terminal first
         if let Some(run) = self.inner.runs.get_mut(&run_id) {
             for status in run.jobs.values_mut() {
-                if !concurrency::is_terminal(*status) {
+                if !status.is_terminal() {
                     *status = ExecutionStatus::Success;
                 }
             }
@@ -443,7 +443,7 @@ impl ProdState {
         // Mark this job terminal
         if let Some(run) = self.inner.runs.get_mut(&run_id) {
             if let Some(status) = run.jobs.get_mut(&job_id) {
-                if !concurrency::is_terminal(*status) {
+                if !status.is_terminal() {
                     *status = ExecutionStatus::Success;
                 }
             }
