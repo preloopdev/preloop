@@ -156,6 +156,33 @@ pub fn topo_layers(edges: &NeedsGraph) -> Option<Vec<Vec<String>>> {
     Some(layers)
 }
 
+/// Compute the transitive dependency closure for a set of root job ids.
+///
+/// Given a needs graph and one or more root ids (the jobs the user selected),
+/// returns the set of all job ids that must run: the roots themselves plus
+/// every transitive `needs:` dependency. Unknown root ids are silently
+/// included (validation happens later when matching against expanded jobs).
+pub fn dependency_closure(
+    edges: &NeedsGraph,
+    roots: &[String],
+) -> std::collections::BTreeSet<String> {
+    use std::collections::BTreeSet;
+    let mut closed = BTreeSet::new();
+    let mut stack: Vec<String> = roots.to_vec();
+    while let Some(node) = stack.pop() {
+        if closed.insert(node.clone()) {
+            if let Some(deps) = edges.get(&node) {
+                for dep in deps {
+                    if !closed.contains(dep) {
+                        stack.push(dep.clone());
+                    }
+                }
+            }
+        }
+    }
+    closed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,5 +441,57 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn dependency_closure_single_root_no_deps() {
+        let g = needs_graph_from_pairs(&[
+            ("lint".into(), vec![]),
+            ("build".into(), vec![]),
+            ("test".into(), vec!["build".into()]),
+        ]);
+        let closed = dependency_closure(&g, &["lint".into()]);
+        assert_eq!(closed, ["lint".into()].into());
+    }
+
+    #[test]
+    fn dependency_closure_transitive() {
+        let g = needs_graph_from_pairs(&[
+            ("lint".into(), vec![]),
+            ("build".into(), vec!["lint".into()]),
+            ("test".into(), vec!["build".into()]),
+            ("deploy".into(), vec!["test".into()]),
+        ]);
+        let closed = dependency_closure(&g, &["test".into()]);
+        assert_eq!(
+            closed,
+            ["lint", "build", "test"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        );
+    }
+
+    #[test]
+    fn dependency_closure_diamond() {
+        let g = needs_graph_from_pairs(&[
+            ("a".into(), vec![]),
+            ("b".into(), vec!["a".into()]),
+            ("c".into(), vec!["a".into()]),
+            ("d".into(), vec!["b".into(), "c".into()]),
+        ]);
+        let closed = dependency_closure(&g, &["d".into()]);
+        assert_eq!(
+            closed,
+            ["a", "b", "c", "d"].iter().map(|s| s.to_string()).collect()
+        );
+    }
+
+    #[test]
+    fn dependency_closure_unknown_root_included() {
+        let g = needs_graph_from_pairs(&[("a".into(), vec![])]);
+        let closed = dependency_closure(&g, &["unknown".into()]);
+        assert!(closed.contains("unknown"));
+        assert!(!closed.contains("a"));
     }
 }
