@@ -365,6 +365,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // Filled in the background so no slot ever waits on RSA generation.
         let keys = Arc::new(KeyPool::new());
         keys.spawn_refill();
+        let building = Arc::new(AtomicUsize::new(0));
         for slot in 0..self.config.size {
             let provider = self.provider.clone();
             let config = self.config.clone();
@@ -374,6 +375,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             let slot_handles = PoolHandles {
                 idle: idle.clone(),
                 keys: keys.clone(),
+                building: building.clone(),
             };
             slots.spawn(async move {
                 run_slot(
@@ -536,6 +538,8 @@ struct PoolHandles {
     idle: Arc<AtomicUsize>,
     /// Keypairs generated ahead of time for runner registration.
     keys: Arc<KeyPool>,
+    /// Replacements currently being built across the whole pool.
+    building: Arc<AtomicUsize>,
 }
 
 /// What a slot needs in order to build its next runner.
@@ -550,6 +554,41 @@ struct SlotPlan<'a> {
     idle: &'a AtomicUsize,
     /// Keypairs generated ahead of time for runner registration.
     keys: &'a Arc<KeyPool>,
+    /// Replacements currently being built across the whole pool.
+    building: &'a AtomicUsize,
+}
+
+/// A claim on one of the replacement builds the backlog justifies.
+///
+/// Held for the duration of the build so concurrent slots see it, and released
+/// on drop so an error path cannot strand the count.
+struct Reservation<'a>(&'a AtomicUsize);
+
+impl<'a> Reservation<'a> {
+    /// Claim a build slot, or `None` when `wanted` are already in flight.
+    fn take(building: &'a AtomicUsize, wanted: usize) -> Option<Self> {
+        let mut current = building.load(Ordering::Acquire);
+        loop {
+            if current >= wanted {
+                return None;
+            }
+            match building.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self(building)),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 async fn run_slot<P: VmProvider + 'static>(
     provider: Arc<P>,
@@ -560,7 +599,11 @@ async fn run_slot<P: VmProvider + 'static>(
     _environment_resolver: Arc<EnvironmentResolver>,
     handles: PoolHandles,
 ) -> Result<(), OrchestratorError> {
-    let PoolHandles { idle, keys } = handles;
+    let PoolHandles {
+        idle,
+        keys,
+        building,
+    } = handles;
     let default_fingerprint =
         EnvironmentSpec::new(config.base_image.clone(), Vec::new()).fingerprint;
     let mut generation: u64 = 0;
@@ -603,6 +646,7 @@ async fn run_slot<P: VmProvider + 'static>(
                 golden: golden.as_ref(),
                 idle: &idle,
                 keys: &keys,
+                building: &building,
             },
         )
         .await;
@@ -677,6 +721,7 @@ async fn run_one_runner<P: VmProvider + 'static>(
         golden,
         idle,
         keys,
+        building,
     } = plan;
 
     let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
@@ -696,18 +741,22 @@ async fn run_one_runner<P: VmProvider + 'static>(
             return None;
         }
         // Booting a VM costs real CPU, and it would be spent alongside the job
-        // that just started, so only pay it when the pool is actually short.
+        // that just started, so build exactly as many replacements as the
+        // backlog needs and no more.
         //
-        // "Short" is queued work the remaining idle runners cannot absorb. A
-        // matrix that exactly fills the pool leaves nothing queued, so only the
-        // last slot builds — enough to serve whatever arrives next. A matrix
-        // wider than the pool leaves a backlog, and then every slot builds, so
-        // the second wave finds warm runners instead of paying fork+configure.
+        // The shortfall is queued work the remaining idle runners cannot
+        // absorb. Every claiming slot computes it, so a reservation counter
+        // decides which of them actually build: without it, a matrix one job
+        // wider than the pool had all four slots boot a replacement to serve a
+        // single straggler, and the contention cost more than the wait.
         let idle_after = idle.fetch_sub(1, Ordering::AcqRel).saturating_sub(1);
         let queued = pending_jobs.map_or(0, |pending| pending.load(Ordering::Acquire));
-        if idle_after > 0 && queued <= idle_after {
-            return None;
-        }
+        // With nothing queued still keep one runner coming, so the pool is not
+        // empty for whatever arrives next.
+        let wanted = queued
+            .saturating_sub(idle_after)
+            .max(usize::from(idle_after == 0));
+        let _reservation = Reservation::take(building, wanted)?;
         match provision_slot(&provider, config, slot, next_generation, golden, keys).await {
             Ok(successor) => Some(successor),
             Err(error) => {
@@ -1333,6 +1382,7 @@ mod lifecycle_tests {
                 golden: None,
                 idle: &idle,
                 keys: &Arc::new(KeyPool::new()),
+                building: &AtomicUsize::new(0),
             },
         )
         .await
