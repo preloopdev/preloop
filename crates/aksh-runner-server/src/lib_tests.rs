@@ -8087,3 +8087,54 @@ jobs:
         b"tracked unstaged change\n"
     );
 }
+
+/// Uploaded job logs must stay bounded, and pruning must not cost a run its
+/// logs: `get_run_logs` prefers the blob and falls back to the in-memory
+/// blocks, so an evicted plan degrades instead of disappearing.
+#[tokio::test]
+async fn replay_results_are_pruned_to_the_retention_window() {
+    let temp = tempfile::tempdir().unwrap();
+    let results = temp.path().join("replay").join("results");
+
+    // One directory per execution plan, oldest first so mtime ordering is
+    // unambiguous rather than dependent on filesystem timestamp resolution.
+    let total = crate::blob_store::REPLAY_PLANS_RETAINED + 8;
+    let mut plans = Vec::new();
+    for index in 0..total {
+        let plan = results.join(format!("plan-{index:03}"));
+        std::fs::create_dir_all(&plan).unwrap();
+        std::fs::write(plan.join("job-logs.txt"), format!("log {index}")).unwrap();
+        filetime::set_file_mtime(
+            &plan,
+            filetime::FileTime::from_unix_time(1_700_000_000 + index as i64, 0),
+        )
+        .unwrap();
+        plans.push(plan);
+    }
+
+    crate::blob_store::prune_replay_results(temp.path()).await;
+
+    let surviving: Vec<_> = plans.iter().filter(|plan| plan.exists()).collect();
+    assert_eq!(
+        surviving.len(),
+        crate::blob_store::REPLAY_PLANS_RETAINED,
+        "retention window must bound the directory"
+    );
+    assert!(
+        plans[total - 1].exists(),
+        "the most recent plan must survive"
+    );
+    assert!(!plans[0].exists(), "the oldest plan must be evicted");
+    assert_eq!(
+        std::fs::read_to_string(plans[total - 1].join("job-logs.txt")).unwrap(),
+        format!("log {}", total - 1),
+        "surviving logs must be intact"
+    );
+}
+
+#[tokio::test]
+async fn pruning_replay_results_is_a_no_op_without_a_replay_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    crate::blob_store::prune_replay_results(temp.path()).await;
+    assert!(!temp.path().join("replay").exists());
+}

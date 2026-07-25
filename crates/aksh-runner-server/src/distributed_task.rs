@@ -694,6 +694,10 @@ pub(crate) async fn complete_job_inner(
         .await;
     if record.status.is_terminal() {
         discard_workspace_snapshot(&shared.state.state_dir, completion.run_id).await;
+        // Off the completion path on purpose: this is housekeeping, and the
+        // runner is waiting on this response before its slot can turn over.
+        let state_dir = shared.state.state_dir.clone();
+        tokio::spawn(async move { prune_replay_results(&state_dir).await });
     }
     Ok(Json(record))
 }
