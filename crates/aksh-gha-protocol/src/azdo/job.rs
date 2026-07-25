@@ -156,6 +156,18 @@ pub struct AgentJobRequestMessage {
         skip_serializing_if = "Option::is_none"
     )]
     pub aksh_debug_transport: Option<String>,
+
+    /// Preloop extension: keep this job's runner VM alive if the job fails, so
+    /// the user can attach with `preloop shell`.
+    ///
+    /// Absent for every run that did not request it, so the default wire shape
+    /// is unchanged and an official runner is unaffected.
+    #[serde(
+        rename = "preloopPreserveOnFailure",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub preloop_preserve_on_failure: Option<bool>,
 }
 
 fn is_false(b: &bool) -> bool {
