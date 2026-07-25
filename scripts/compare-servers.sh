@@ -10,7 +10,7 @@ MODE="${2:-both}"
 GH_REPO="${GH_REPO:-Bnjoroge1/aksh-conformance}"
 TEMPLATE="${TEMPLATE:-/private/tmp/bench-runner.smolmachine}"
 OFFICIAL_RUNNER_HOST="${OFFICIAL_RUNNER_HOST:-$HOME/cachingv4}"
-AKSH_SERVER_BIN="$REPO_ROOT/target/aarch64-unknown-linux-musl/release/aksh-runner-server"
+AKSH_SERVER_BIN="$REPO_ROOT/target/aarch64-unknown-linux-musl/release/preloop-server"
 RESULTS_DIR="$REPO_ROOT/benchmarks/compatibility/server/behavior/${SCENARIO%.yml}"
 PROTOCOL_DIR="$REPO_ROOT/benchmarks/compatibility/server/protocol/captures/${SCENARIO%.yml}"
 MITM_PORT=18081
@@ -203,7 +203,7 @@ run_aksh() {
     enable_rosetta "$vm"
     log "VM $vm started"
 
-    smolvm machine cp "$AKSH_SERVER_BIN" "$vm:/usr/local/bin/aksh-runner-server" 2>&1 | tail -1
+    smolvm machine cp "$AKSH_SERVER_BIN" "$vm:/usr/local/bin/preloop-server" 2>&1 | tail -1
 
     # Prepare modified workflow YAML (change runs-on to just self-hosted)
     local modified_yaml
@@ -247,8 +247,8 @@ print(json.dumps({
         for n in \$(seq 1 40); do
             bash -c '</dev/tcp/127.0.0.1/$MITM_PORT' 2>/dev/null && break; sleep .25
         done
-        chmod +x /usr/local/bin/aksh-runner-server
-        RUST_LOG=info AKSH_PUBLIC_URL=http://127.0.0.1 AKSH_GITHUB_TOKEN='$GITHUB_ACTIONS_TOKEN' aksh-runner-server serve --listen 127.0.0.1:80 --state-dir /tmp/aksh-state > /tmp/server.log 2>&1 &
+        chmod +x /usr/local/bin/preloop-server
+        RUST_LOG=info AKSH_PUBLIC_URL=http://127.0.0.1 AKSH_GITHUB_TOKEN='$GITHUB_ACTIONS_TOKEN' preloop-server serve --listen 127.0.0.1:80 --state-dir /tmp/aksh-state > /tmp/server.log 2>&1 &
         server_pid=\$!
         sleep 2
         wget -qO- http://127.0.0.1/healthz >/dev/null || { echo 'healthz failed'; cat /tmp/server.log; cp /tmp/server.log $result_base/server.log || true; exit 1; }

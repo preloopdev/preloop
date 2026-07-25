@@ -10,7 +10,7 @@ MODE="${1:?Usage: $0 <github|aksh> <serde|axum|bat|all>}"
 REPO="${2:-all}"
 VM_NAME="build-runner"  # existing warm VM with Rust + runners
 AKSH_BIN="$HOME/aksh-runner"  # aksh binaries inside VM (via ssh)
-HOST_SERVER="$HOME/cachingv4/target/release/aksh-runner-server"
+HOST_SERVER="$HOME/cachingv4/target/release/preloop-server"
 HOST_CLIENT="$HOME/cachingv4/target/release/aksh-runner-client"
 GH_REPO="preloopdev/aksh-conformance-sample"
 RESULTS_DIR="$HOME/cachingv4/benchmarks/real-world/results"
@@ -85,7 +85,7 @@ run_aksh_server() {
   log "Running $wf against aksh-server..."
   
   # Start server on host Mac
-  pkill -f aksh-runner-server 2>/dev/null || true; sleep 0.3
+  pkill -f preloop-server 2>/dev/null || true; sleep 0.3
   # Server listens on all interfaces so VM can reach it via host IP
   local host_ip
   host_ip=$(ipconfig getifaddr en0 2>/dev/null || echo "127.0.0.1")

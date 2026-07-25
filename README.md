@@ -77,8 +77,8 @@ cargo run -p aksh-runner-client -- submit -W .github/workflows/ci.yml
 
 The conformance target is `ChristopherHX/runner.server` at commit
 `992ccbbbf9afcde477c38c316e053b1af457ad40` unless `AKSH_UPSTREAM_RUNNER_SERVER_REF` is
-set. See [docs/reference/runner-server.md](docs/reference/runner-server.md) for the mapped
-surface and deliberate differences.
+set. See [docs/fidelity-gap.md](docs/fidelity-gap.md) for the mapped surface and
+deliberate differences.
 
 ## Architecture
 

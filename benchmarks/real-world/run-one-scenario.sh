@@ -46,7 +46,7 @@ RUNNER_ROOT="/tmp/aksh-${JOB}"
 log "Starting runner: $RUNNER_NAME in $VM..."
 smolvm machine exec --name "$VM" -- bash -c "
 set -euo pipefail
-export AKSH_RUNNER=/workspace/target/aarch64-unknown-linux-musl/release/aksh-runner
+export AKSH_RUNNER=/workspace/target/aarch64-unknown-linux-musl/release/preloop-runner
 
 # Configure
 rm -rf '$RUNNER_ROOT'

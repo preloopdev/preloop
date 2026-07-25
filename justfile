@@ -9,6 +9,25 @@ build:
 build-all:
     cargo build --release --workspace
 
+#preloop
+
+# Build the macOS CLI/server and the ARM64 Linux runner used inside SmolVM.
+build-preloop:
+    cargo zigbuild -p aksh-runner --target aarch64-unknown-linux-gnu
+    cargo build -p preloop-cli -p aksh-runner-server
+
+# Run a workflow locally with failed VMs preserved for `just preloop-shell`.
+preloop-run WF="fixtures/workflows/failing.yml": build-preloop
+    ./target/debug/preloop run -f "{{WF}}" --preserve-on-failure
+
+# Submit a workflow and return immediately.
+preloop-run-detached WF="fixtures/workflows/failing.yml": build-preloop
+    ./target/debug/preloop run -f "{{WF}}" --preserve-on-failure --detach
+
+# Open the most recently preserved failed runner VM.
+preloop-shell: build-preloop
+    ./target/debug/preloop shell
+
 
 check:
     cargo check --workspace
@@ -80,7 +99,7 @@ build-runner:
     cargo build --release -p aksh-runner
 
 runner-e2e WF:
-    cargo run -p aksh-conformance -- runner-e2e --runner-bin target/release/aksh-runner --workflow {{WF}}
+    cargo run -p aksh-conformance -- runner-e2e --runner-bin target/release/preloop-runner --workflow {{WF}}
 
 conform-runner S:
     cargo run -p aksh-conformance -- runner-diff --scenario {{S}} --target github
@@ -89,7 +108,7 @@ conform-local S:
     cargo run -p aksh-conformance -- runner-diff --scenario {{S}} --target aksh
 
 conform-smoke: build-runner build
-    cargo run -p aksh-conformance -- runner-e2e --runner-bin target/release/aksh-runner --workflow crates/aksh-conformance/fixtures/hello-world.yml --record-flows /tmp/smoke-flows.jsonl
+    cargo run -p aksh-conformance -- runner-e2e --runner-bin target/release/preloop-runner --workflow crates/aksh-conformance/fixtures/hello-world.yml --record-flows /tmp/smoke-flows.jsonl
 
 conform-ci: build-all
     cargo run --release -p aksh-runner-server -- serve --listen 127.0.0.1:9090 & \
