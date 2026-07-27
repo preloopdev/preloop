@@ -196,7 +196,10 @@ pub async fn run_node_action(
         }
     }
 
-    // Apply defaults from manifest inputs, evaluating any ${{ }} expressions
+    // Apply defaults from manifest inputs, evaluating any ${{ }} expressions.
+    // Defaults are read with `as_str()` — matching the official runner, which
+    // treats all YAML scalars as strings.  Typed JSON coercion (e.g. YAML
+    // octal `0755` → Number 493 → "493") would diverge from GitHub.
     if let Some(manifest_inputs) = &manifest.inputs {
         let expr_ctx = ctx.job.build_expression_context();
         for (key, input_def) in manifest_inputs {
