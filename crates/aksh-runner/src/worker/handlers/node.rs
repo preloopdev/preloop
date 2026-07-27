@@ -248,11 +248,17 @@ pub async fn run_node_action(
     // The official runner invokes the bundled Node by absolute path and never
     // prepends its directory to PATH. Child processes inherit the job's PATH
     // unchanged — this is what lets setup-node's toolcache entry win.
-    let node_path = if bundled_node.is_file() {
-        bundled_node.to_string_lossy().to_string()
-    } else {
-        "node".to_string()
-    };
+    // The official runner requires bundled externals and never falls back to
+    // system Node.  Doing so would silently run actions on a different major
+    // version than GitHub uses, breaking compatibility.
+    if !bundled_node.is_file() {
+        anyhow::bail!(
+            "bundled Node.js runtime {node_version} is missing at {}; \
+             run `configure` without --no-externals to download it",
+            bundled_node.display()
+        );
+    }
+    let node_path = bundled_node.to_string_lossy().to_string();
 
     // Set GITHUB_ACTION_PATH
     env.insert(
