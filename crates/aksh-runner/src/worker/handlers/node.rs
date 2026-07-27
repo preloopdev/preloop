@@ -240,13 +240,16 @@ pub async fn run_node_action(
             break;
         }
     }
-    let node_bin = runner_root
+    let bundled_node = runner_root
         .join("externals")
         .join(node_version)
         .join("bin")
         .join("node");
-    let node_path = if node_bin.exists() {
-        node_bin.to_string_lossy().to_string()
+    // The official runner invokes the bundled Node by absolute path and never
+    // prepends its directory to PATH. Child processes inherit the job's PATH
+    // unchanged — this is what lets setup-node's toolcache entry win.
+    let node_path = if bundled_node.is_file() {
+        bundled_node.to_string_lossy().to_string()
     } else {
         "node".to_string()
     };
