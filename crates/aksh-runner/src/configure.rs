@@ -172,7 +172,19 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
         }
     }
 
-    // Step 6: Register agent with the server (F003: correct endpoint)
+    // Step 6: Download Node.js externals (unless --no-externals).
+    //
+    // Runs before agent registration so a download failure does not orphan a
+    // server-side agent entry. Registration cannot be retried without
+    // --replace, and the orchestrator would have to deregister the dead agent
+    // before provisioning a replacement.
+    if !args.no_externals {
+        download_externals(&http, &root)
+            .await
+            .context("downloading Node.js externals")?;
+    }
+
+    // Step 7: Register agent with the server (F003: correct endpoint)
     let agent_response = create_agent(
         &http,
         &registration,
@@ -292,15 +304,6 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
         "Runner '{}' configured successfully (agent ID: {})",
         runner_name, agent_id
     );
-
-    // Step 7: Download Node.js externals (unless --no-externals)
-    if !args.no_externals {
-        if let Err(e) = download_externals(&http, &root).await {
-            warn!(
-                "Failed to download Node.js externals: {e:#}. JS actions will need node on PATH."
-            );
-        }
-    }
 
     Ok(())
 }
