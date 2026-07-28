@@ -1,0 +1,29 @@
+name: Debug Demo
+on: push
+
+# Exercises the full pause-fix-retry loop.
+#
+#   preloop run -f fixtures/workflows/debug-demo.yml
+#
+# `verify` fails because fixtures/debug-demo/marker.txt says BROKEN. The job
+# pauses there instead of dying. Fix the file on the host, then `s` at the
+# prompt (sync + retry) — only `verify` re-runs, `slow setup` is not repeated,
+# and `downstream` proves the job carried on from the failed step.
+
+jobs:
+  demo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: slow setup
+        run: |
+          echo "pretending to install a toolchain..."
+          sleep 2
+          echo "setup complete this must NOT re-run on retry"
+
+      - name: verify
+        run: ./fixtures/debug-demo/check.sh
+
+      - name: downstream
+        run: echo "downstream ran — the job continued past the repaired step"

@@ -1,0 +1,25 @@
+[package]
+name = "preloop-loadtest"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "preloop-loadtest"
+path = "src/main.rs"
+
+[dependencies]
+aksh-runner-server = { path = "../../crates/aksh-runner-server" }
+aksh-gha-parser = { path = "../../crates/aksh-gha-parser" }
+aksh-gha-expressions = { path = "../../crates/aksh-gha-expressions" }
+aksh-gha-protocol = { path = "../../crates/aksh-gha-protocol" }
+tokio = { version = "1.37", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "fs"] }
+tokio-util = "0.7"
+axum = { version = "0.7", features = ["ws"] }
+hyper = "1.0"
+tower = "0.5"
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+tempfile = "3.10"
+anyhow = "1.0"
+uuid = { version = "1.8", features = ["v4"] }

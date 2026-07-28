@@ -1809,6 +1809,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "preloop-loadtest"
+version = "0.1.0"
+dependencies = [
+ "aksh-gha-expressions",
+ "aksh-gha-parser",
+ "aksh-gha-protocol",
+ "aksh-runner-server",
+ "anyhow",
+ "axum",
+ "hyper",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "uuid",
+]
+
+[[package]]
 name = "preloop-orchestrator"
 version = "0.21.0"
 dependencies = [

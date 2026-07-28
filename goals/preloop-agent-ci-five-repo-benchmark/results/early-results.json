@@ -1,0 +1,64 @@
+{
+  "status": "early",
+  "date": "2026-07-27",
+  "host": "darwin arm64 Apple M4 Max",
+  "preloop": {
+    "commit": "working tree after local-loopback checkout fix",
+    "engine_url": "http://127.0.0.1:19090",
+    "runner_pool": "SmolVM, one runner slot, 4 vCPU/4096 MiB configured",
+    "checkout_mode": "immutable local workspace snapshot"
+  },
+  "agent_ci": {
+    "package": "@redwoodjs/agent-ci",
+    "invocation": "npx --yes @redwoodjs/agent-ci run --workflow .bench/benchmark.yml --no-matrix --jobs 1 --quiet --json"
+  },
+  "scope": {
+    "workflow_selection": "one representative job slice per repository, with matrices reduced to one first combination where needed",
+    "repetitions": ["cold", "warm"],
+    "resource_metrics": "not collected; neither run captured comparable peak CPU/memory/network samples"
+  },
+  "repositories": [
+    {
+      "name": "BurntSushi/ripgrep",
+      "commit": "f9c05a949d1a0dc8e16dee28ca9605d38611faeb",
+      "workflow_slice": "ci.yml -> rustfmt",
+      "preloop": {"cold": {"status": "passed", "wall_seconds": 7.83}, "warm": {"status": "passed", "wall_seconds": 8.87}},
+      "agent_ci": {"cold": {"status": "passed", "job_seconds": 8.241, "wall_seconds": 13.57}, "warm": {"status": "passed", "job_seconds": 6.681, "wall_seconds": 12.54}}
+    },
+    {
+      "name": "pallets/flask",
+      "commit": "36e4a824f340fdee7ed50937ba8e7f6bc7d17f81",
+      "workflow_slice": "pre-commit.yaml -> main",
+      "preloop": {"cold": {"status": "failed", "wall_seconds": 39.85}, "warm": {"status": "failed", "wall_seconds": 32.51}, "failure": "astral-sh/setup-uv action crashes under guest Node.js 18: ReferenceError: File is not defined"},
+      "agent_ci": {"cold": {"status": "failed", "job_seconds": 2.222, "wall_seconds": 7.29}, "warm": {"status": "failed", "job_seconds": 2.775, "wall_seconds": 8.09}, "failure": "pre-commit command fails"}
+    },
+    {
+      "name": "vitejs/vite",
+      "commit": "3ac77d9dd742968961af38a5a91ed6b061ceda7d",
+      "workflow_slice": "ci.yml -> lint",
+      "preloop": {"cold": {"status": "failed", "wall_seconds": 68.52}, "warm": {"status": "failed", "wall_seconds": 35.32}, "failure": "pnpm/action-setup self-installer fails under guest Node.js 18 with an undefined path"},
+      "agent_ci": {"cold": {"status": "failed", "job_seconds": 17.809, "wall_seconds": 29.15}, "warm": {"status": "failed", "job_seconds": 18.310, "wall_seconds": 30.31}, "failure": "Check formatting step fails"}
+    },
+    {
+      "name": "go-chi/chi",
+      "commit": "8b258c7bb28f97a5f2a856ff7ef962578fec9215",
+      "workflow_slice": "ci.yml -> test, first matrix combination only",
+      "preloop": {"cold": {"status": "failed", "wall_seconds": 6.31}, "warm": {"status": "failed", "wall_seconds": 107.16}, "failure": "workflow did not reach a successful test conclusion; checkout/action setup path failed"},
+      "agent_ci": {"cold": {"status": "failed", "job_seconds": 11.199, "wall_seconds": 16.69}, "warm": {"status": "failed", "job_seconds": 0.359, "wall_seconds": 4.82}, "failure": "Install Go step fails on warm attempt; checkout path fails on cold attempt"}
+    },
+    {
+      "name": "testcontainers/testcontainers-go",
+      "commit": "ea854ecb16425b6e77bc19e95080213fb69a6ac9",
+      "workflow_slice": "ci.yml -> detect-modules",
+      "preloop": {"cold": {"status": "passed", "wall_seconds": 1.69}, "warm": {"status": "passed", "wall_seconds": 126.85}},
+      "agent_ci": {"cold": {"status": "passed", "job_seconds": 1.184, "wall_seconds": 9.24}, "warm": {"status": "passed", "job_seconds": 0.670, "wall_seconds": 8.34}}
+    }
+  ],
+  "interpretation": [
+    "Both systems agree on pass/fail for the selected slice in the cold sample for all five repositories.",
+    "Preloop successfully performs local snapshot checkout without GitHub credentials; the ripgrep and testcontainers slices completed end to end.",
+    "Preloop currently fails modern Node 20+ actions in the Ubuntu guest because the guest image exposes Node.js 18.19.1; this is a runner-image compatibility gap, not a checkout-authentication failure.",
+    "The warm testcontainers Preloop result is anomalously slow and needs phase tracing before being treated as a cache result.",
+    "These are representative job slices, not full workflow matrices, and resource samples are absent. This is not the final benchmark report."
+  ]
+}
