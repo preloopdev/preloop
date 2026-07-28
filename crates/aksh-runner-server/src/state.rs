@@ -84,10 +84,75 @@ impl AppState {
             .ok()
     }
 
+    /// Agent job UUID a runtime token was minted for.
+    ///
+    /// The counterpart to [`Self::runner_id_from_token`]: a job runtime token
+    /// names exactly one job, so any surface a worker calls can authorize
+    /// against the job rather than merely against token validity.
+    pub(crate) fn job_uuid_from_token(&self, token: &str) -> Option<uuid::Uuid> {
+        let payload = self.verify_local_jwt_claims(token)?;
+        // `scp` is `Actions.Results:{plan_id}:{job_id}`; `sub` is the job on
+        // its own. Require both to agree so a token minted for a different
+        // surface cannot be replayed here.
+        let subject_job = payload
+            .get("sub")?
+            .as_str()?
+            .strip_prefix("aksh-job-")?
+            .parse::<uuid::Uuid>()
+            .ok()?;
+        let scope_job = payload
+            .get("scp")?
+            .as_str()?
+            .strip_prefix("Actions.Results:")?
+            .rsplit(':')
+            .next()?
+            .parse::<uuid::Uuid>()
+            .ok()?;
+        (subject_job == scope_job).then_some(subject_job)
+    }
+
+    /// Agent job UUID a debug-worker token was minted for.
+    ///
+    /// Distinct from [`Self::job_uuid_from_token`]: the runtime token is
+    /// handed to workflow code as `GITHUB_TOKEN`, so accepting it on debug
+    /// surfaces would let an untrusted step forge session requests for its own
+    /// job. This token never leaves the trusted runner process.
+    pub(crate) fn job_uuid_from_debug_token(&self, token: &str) -> Option<uuid::Uuid> {
+        let payload = self.verify_local_jwt_claims(token)?;
+        // `scp` is `DebugWorker:{plan_id}:{job_id}`; `sub` is the job on its
+        // own. Require both to agree so a token minted for a different surface
+        // cannot be replayed here.
+        let subject_job = payload
+            .get("sub")?
+            .as_str()?
+            .strip_prefix("aksh-debug-worker-")?
+            .parse::<uuid::Uuid>()
+            .ok()?;
+        let scope_job = payload
+            .get("scp")?
+            .as_str()?
+            .strip_prefix("DebugWorker:")?
+            .rsplit(':')
+            .next()?
+            .parse::<uuid::Uuid>()
+            .ok()?;
+        (subject_job == scope_job).then_some(subject_job)
+    }
+
     pub(crate) fn mint_runtime_token(&self, plan_id: &str, job_id: &uuid::Uuid) -> String {
         self.local_jwt(json!({
             "sub": format!("aksh-job-{job_id}"),
             "scp": format!("Actions.Results:{plan_id}:{job_id}"),
+        }))
+        .expect("fixed local JWT claims must serialize")
+    }
+
+    /// Mint the token the runner process uses to speak for a job's debug
+    /// session, kept separate from the runtime token that workflow code sees.
+    pub(crate) fn mint_debug_worker_token(&self, plan_id: &str, job_id: &uuid::Uuid) -> String {
+        self.local_jwt(json!({
+            "sub": format!("aksh-debug-worker-{job_id}"),
+            "scp": format!("DebugWorker:{plan_id}:{job_id}"),
         }))
         .expect("fixed local JWT claims must serialize")
     }
@@ -132,6 +197,11 @@ pub struct AppState {
     pub runner_version_deprecated: bool,
     /// Optional cron scheduler (active when `--enable-scheduler` is set).
     pub scheduler: Option<Arc<crate::scheduler::Scheduler>>,
+    /// GitHub App credentials for minting installation tokens.
+    ///
+    /// `None` when no App is configured, in which case job tokens fall back to
+    /// `AKSH_GITHUB_TOKEN` and then to the local HMAC JWT.
+    pub(crate) github_app: Option<crate::github_app::GitHubAppCredentials>,
 }
 
 #[derive(Debug, Clone)]
@@ -240,6 +310,7 @@ impl AppState {
                 )
             })
             .unwrap_or(false);
+        let github_app = crate::github_app::load_from_env()?;
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
             events,
@@ -255,6 +326,7 @@ impl AppState {
             local_jwt_key,
             runner_version_deprecated,
             scheduler: None,
+            github_app,
         })
     }
 
@@ -514,4 +586,6 @@ pub(crate) struct InnerState {
     pub(crate) run_concurrency: BTreeMap<RunId, aksh_gha_parser::Concurrency>,
     /// Which concurrency key a holder currently occupies (for release).
     pub(crate) holder_keys: BTreeMap<RunId, Vec<(String, String)>>,
+    /// Live debug sessions holding paused jobs open.
+    pub(crate) debug_sessions: crate::debug_sessions::DebugSessionRegistry,
 }
