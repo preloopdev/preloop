@@ -168,6 +168,19 @@ pub struct AgentJobRequestMessage {
         skip_serializing_if = "Option::is_none"
     )]
     pub preloop_preserve_on_failure: Option<bool>,
+
+    /// aksh extension: commit of the immutable workspace snapshot this job
+    /// checked out.
+    ///
+    /// The pristine ref a debug session diffs the live workspace against. It
+    /// is what makes change detection free — tracked files are restorable from
+    /// this commit, so no pre-image ever has to be stored.
+    #[serde(
+        rename = "akshSnapshotCommit",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub aksh_snapshot_commit: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
