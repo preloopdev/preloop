@@ -72,23 +72,23 @@ fn migration_flag(
         from_workflow: workflow_value.is_some(),
         from_system: system_value.is_some_and(|value| !value.is_empty()),
     }
-    }
+}
 
 #[test]
 fn parses_system_node_major_version() {
-        assert_eq!(parse_node_major("v20.19.0\n").unwrap(), 20);
-        assert_eq!(parse_node_major("v24.3.0\n").unwrap(), 24);
-        assert!(parse_node_major("node-unknown\n").is_err());
-    }
+    assert_eq!(parse_node_major("v20.19.0\n").unwrap(), 20);
+    assert_eq!(parse_node_major("v24.3.0\n").unwrap(), 24);
+    assert!(parse_node_major("node-unknown\n").is_err());
+}
 
 #[test]
 fn required_major_from_version_extracts_correctly() {
-        assert_eq!(required_major_from_version("node20"), Some(20));
-        assert_eq!(required_major_from_version("node24"), Some(24));
-        assert_eq!(required_major_from_version("node16"), Some(16));
-        assert_eq!(required_major_from_version(""), None);
-        assert_eq!(required_major_from_version("python3"), None);
-    }
+    assert_eq!(required_major_from_version("node20"), Some(20));
+    assert_eq!(required_major_from_version("node24"), Some(24));
+    assert_eq!(required_major_from_version("node16"), Some(16));
+    assert_eq!(required_major_from_version(""), None);
+    assert_eq!(required_major_from_version("python3"), None);
+}
 
 #[allow(clippy::too_many_arguments)]
 fn resolve_node_version(
@@ -322,9 +322,7 @@ pub async fn run_node_action(
                 );
             }
         }
-        info!(
-            "Bundled {node_version} not found, using system Node v{major} (--no-externals)"
-        );
+        info!("Bundled {node_version} not found, using system Node v{major} (--no-externals)");
         path.to_owned()
     };
 
