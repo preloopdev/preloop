@@ -83,12 +83,34 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
         }
     }
 
+    // Drop sessions whose worker stopped polling before reading pause credit,
+    // and sessions whose job has since ended. Either way a crashed or finished
+    // job must not go on suspending a timeout.
+    let active_request_ids: std::collections::BTreeSet<i64> =
+        active_reqs.iter().map(|(id, ..)| *id).collect();
+    // Read pause credit before the sweep: sweeping discards the very sessions
+    // that earned it, so measuring afterwards would retroactively bill a job
+    // for time it spent legitimately paused and cancel it early.
+    let paused_credits: std::collections::BTreeMap<i64, Duration> = active_reqs
+        .iter()
+        .map(|(id, ..)| (*id, inner.debug_sessions.paused_for_request(*id, now)))
+        .collect();
+    crate::debug_sessions::sweep(&mut inner.debug_sessions, now, &active_request_ids);
+
     for (request_id, run_id, job_id, started_at, last_renewed_at, timeout_triggered) in active_reqs
     {
         // 1. Check Timeout Enforcement
         if let Some(started_at) = started_at {
             if !timeout_triggered {
-                let elapsed = now.duration_since(started_at).unwrap_or_default();
+                // Time spent paused at a failed step is debugging, not
+                // execution. Without this subtraction a `timeout-minutes: 10`
+                // job is cancelled ten minutes into a debug session, through a
+                // path no client can see.
+                let paused = paused_credits.get(&request_id).copied().unwrap_or_default();
+                let elapsed = now
+                    .duration_since(started_at)
+                    .unwrap_or_default()
+                    .saturating_sub(paused);
                 let job_timeout = inner
                     .broker_messages
                     .get(&request_id)
