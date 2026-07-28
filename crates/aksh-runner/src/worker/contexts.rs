@@ -336,6 +336,20 @@ impl JobContext {
                     }
                 }
             }
+            // `github.workspace` is supplied by the runner at execution time,
+            // not by the server's job message. Actions use it in input
+            // defaults such as `working-directory: ${{ github.workspace }}`.
+            // Fill it in only when `context_data` has nothing usable, so a
+            // value written through `set_github_context_value` — the mutable
+            // source of truth — is not silently overwritten on every rebuild.
+            if let Some(workspace) = &self.workspace {
+                if let Some(obj) = gh.as_object_mut() {
+                    let current = obj.get("workspace").and_then(|v| v.as_str()).unwrap_or("");
+                    if current.is_empty() {
+                        obj.insert("workspace".to_string(), serde_json::json!(workspace));
+                    }
+                }
+            }
             ctx.insert("github", gh);
         }
 
@@ -439,6 +453,28 @@ impl JobContext {
         if let Some(vars) = self.variables.as_object() {
             let mut secrets_map = serde_json::Map::new();
             for (key, val) in vars {
+                // `system.*` variables are runner/server plumbing — the job
+                // runtime token, the debug-worker token — not workflow
+                // secrets. Surfacing them here would hand untrusted workflow
+                // YAML the very credentials it is meant to be fenced off
+                // from, via `${{ secrets['system.preloop.debug_worker_token'] }}`.
+                // Real GitHub Actions does not expose them either. Every
+                // legitimate consumer reads these straight out of the raw
+                // `variables` map by exact key, so nothing is starved; log
+                // masking is applied independently in `new`, so they stay
+                // redacted regardless.
+                //
+                // Prefix-matched rather than allowlisted deliberately, so a
+                // future `system.*` credential is fenced off by default
+                // instead of leaking until someone remembers to list it. The
+                // cost is that a user secret named `system.foo` would be
+                // dropped here: user secret names are not validated
+                // (aksh-gha-parser job_builder.rs:257). That fails closed
+                // rather than open, the value is still masked, and GitHub
+                // secret names cannot contain `.`, so nothing valid collides.
+                if key.starts_with("system.") {
+                    continue;
+                }
                 let is_secret = val
                     .get("isSecret")
                     .and_then(|v| v.as_bool())
