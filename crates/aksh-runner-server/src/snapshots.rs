@@ -693,10 +693,17 @@ fn state_dir_exclusion(state_dir: &FsPath, workspace: &FsPath) -> Result<Option<
 }
 
 /// Rewrite default primary checkout steps to fetch the local snapshot.
+///
+/// `runtime_token` is pinned onto the step so the checkout authenticates to
+/// [`snapshot_git_http`] with the local HMAC job JWT it expects. Without it the
+/// step would fall back to `${{ github.token }}`, which carries a GitHub App
+/// installation token or PAT whenever one is configured — neither of which
+/// [`authorize_snapshot_token`] can verify.
 pub(crate) fn redirect_primary_checkout(
     message: &mut aksh_gha_protocol::azdo::AgentJobRequestMessage,
     snapshot: &WorkspaceSnapshot,
     github_server_url: &str,
+    runtime_token: &str,
 ) -> usize {
     let mut redirected = 0;
     for step in &mut message.steps {
@@ -720,6 +727,8 @@ pub(crate) fn redirect_primary_checkout(
             .insert("ref".to_owned(), snapshot.commit_sha.clone());
         step.inputs
             .insert("github-server-url".to_owned(), github_server_url.to_owned());
+        step.inputs
+            .insert("token".to_owned(), runtime_token.to_owned());
         redirected += 1;
     }
     redirected
