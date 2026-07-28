@@ -32,7 +32,7 @@ pub(crate) struct LogMetadata {
 pub(crate) struct RunRecord {
     pub(crate) run_id: RunId,
     pub(crate) run_name: Option<String>,
-    pub(crate) submission: WorkflowSubmission,
+    pub(crate) submission: Arc<WorkflowSubmission>,
     pub(crate) jobs: BTreeMap<JobId, ExecutionStatus>,
     pub(crate) status: ExecutionStatus,
     pub(crate) job_outputs: BTreeMap<JobId, BTreeMap<String, serde_json::Value>>,
