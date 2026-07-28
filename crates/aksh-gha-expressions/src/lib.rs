@@ -20,6 +20,7 @@ use expr_parser::Parser;
 use lexer::Lexer;
 
 const PARSED_EXPRESSION_CACHE_CAPACITY: usize = 1024;
+const MAX_CACHEABLE_EXPRESSION_BYTES: usize = 4096;
 
 struct ParsedExpressionCache {
     entries: HashMap<String, Arc<ast::Expr>>,
@@ -38,6 +39,14 @@ impl ParsedExpressionCache {
 static PARSED_EXPRESSION_CACHE: OnceLock<Mutex<ParsedExpressionCache>> = OnceLock::new();
 
 fn parse_cached(input: &str) -> Result<Arc<ast::Expr>, ExpressionError> {
+    if input.len() > MAX_CACHEABLE_EXPRESSION_BYTES {
+        let tokens = Lexer::new(input).lex()?;
+        let mut parser = Parser::new(tokens);
+        let expr = Arc::new(parser.parse_expr()?);
+        parser.expect_end()?;
+        return Ok(expr);
+    }
+
     let cache = PARSED_EXPRESSION_CACHE.get_or_init(|| Mutex::new(ParsedExpressionCache::new()));
     if let Some(expr) = cache.lock().entries.get(input).cloned() {
         return Ok(expr);
