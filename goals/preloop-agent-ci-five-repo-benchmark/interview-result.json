@@ -1,0 +1,27 @@
+{
+  "stage": "interview",
+  "title": "Preloop versus Agent CI benchmark",
+  "goalSlug": "preloop-agent-ci-five-repo-benchmark",
+  "answers": {
+    "comparison": {
+      "answer": "Run the same pinned workflow revision on both systems and compare end-to-end and phase timings.",
+      "selectedOptionIds": ["same-workflow"]
+    },
+    "repetitions": {
+      "answer": "Three cold-start runs and five warm runs per system and repository, with failures retained rather than retried away.",
+      "selectedOptionIds": ["3-cold-5-warm"]
+    },
+    "repositories": {
+      "answer": "Use public repositories at pinned commits; select five diverse projects with no private credentials required beyond Agent CI access.",
+      "selectedOptionIds": ["public-pinned"]
+    },
+    "agent-ci-access": {
+      "answer": "Agent CI access details were not specified; the plan must document the required CLI/API setup and keep credentials outside the repository."
+    }
+  },
+  "assumptions": [
+    "The benchmark compares equivalent executions rather than claiming identical infrastructure.",
+    "The five repositories can be selected from public source with reproducible pinned revisions.",
+    "Agent CI credentials and quota are supplied at execution time and are never committed."
+  ]
+}
