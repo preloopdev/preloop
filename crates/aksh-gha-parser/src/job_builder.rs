@@ -56,7 +56,8 @@ fn job_outputs_token(outputs: &BTreeMap<String, String>) -> Option<Value> {
         "map": map,
     }))
 }
-fn normalized_github_context(github: &Value) -> Value {
+/// Normalize the server-supplied GitHub context for runner job messages.
+pub fn normalize_github_context(github: &Value) -> Value {
     let mut object = match github {
         Value::Object(value) => value.clone(),
         _ => serde_json::Map::new(),
@@ -147,9 +148,29 @@ pub fn build_agent_job_message(
     secrets: &BTreeMap<String, String>,
     vars: &BTreeMap<String, String>,
 ) -> Result<AgentJobRequestMessage, String> {
+    let github_context = normalize_github_context(github);
+    build_agent_job_message_with_normalized_context(
+        plan,
+        &github_context,
+        global_env,
+        secrets,
+        vars,
+    )
+}
+
+/// Build a job message using a context already normalized for runner wire data.
+///
+/// Callers constructing multiple messages for one submission can normalize the
+/// immutable GitHub context once and reuse it across matrix jobs.
+pub fn build_agent_job_message_with_normalized_context(
+    plan: &JobPlan,
+    github_context: &Value,
+    global_env: &BTreeMap<String, String>,
+    secrets: &BTreeMap<String, String>,
+    vars: &BTreeMap<String, String>,
+) -> Result<AgentJobRequestMessage, String> {
     let timeline_id = uuid::Uuid::new_v4();
     let job_id = uuid::Uuid::new_v4();
-    let github_context = normalized_github_context(github);
 
     // Build expression evaluation context
     let strategy = plan
@@ -165,7 +186,7 @@ pub fn build_agent_job_message(
     );
 
     let expr_context = build_context(
-        &github_context,
+        github_context,
         &plan.env,
         vars,
         &plan.matrix,
@@ -185,7 +206,7 @@ pub fn build_agent_job_message(
     }
 
     let job_expr_context = build_context(
-        &github_context,
+        github_context,
         &plan.env,
         vars,
         &plan.matrix,
@@ -311,7 +332,7 @@ pub fn build_agent_job_message(
     let mut context_data = BTreeMap::new();
     context_data.insert(
         "github".to_owned(),
-        PipelineContextData::from_json(&github_context),
+        PipelineContextData::from_json(github_context),
     );
     let inputs_ctx = plan
         .inputs

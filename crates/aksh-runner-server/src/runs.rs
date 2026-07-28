@@ -444,6 +444,7 @@ pub(crate) async fn submit_run_inner(
     // shrinks the critical section from O(jobs × build_cost) to
     // O(jobs × map_insert).
     let base_url = public_base_url();
+    let normalized_github = aksh_gha_parser::job_builder::normalize_github_context(&github);
     let secrets_exposed: BTreeMap<String, String> = submission
         .secrets
         .iter()
@@ -525,14 +526,15 @@ pub(crate) async fn submit_run_inner(
         }
 
         // Heavy work: build the agent message outside the lock.
-        let mut agent_msg = aksh_gha_parser::job_builder::build_agent_job_message(
-            &job,
-            &github,
-            &job.env,
-            &secrets_exposed,
-            &submission.vars,
-        )
-        .map_err(|e| ApiError::bad_request(format!("failed to build job message: {e}")))?;
+        let mut agent_msg =
+            aksh_gha_parser::job_builder::build_agent_job_message_with_normalized_context(
+                &job,
+                &normalized_github,
+                &job.env,
+                &secrets_exposed,
+                &submission.vars,
+            )
+            .map_err(|e| ApiError::bad_request(format!("failed to build job message: {e}")))?;
 
         agent_msg.preloop_preserve_on_failure = submission.preserve_on_failure.then_some(true);
 
