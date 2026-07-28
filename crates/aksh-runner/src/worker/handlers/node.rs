@@ -24,6 +24,37 @@ struct MigrationFlag {
     from_system: bool,
 }
 
+fn system_node_major(node_path: &str) -> Result<u64> {
+    let output = std::process::Command::new(node_path)
+        .arg("--version")
+        .output()
+        .with_context(|| format!("checking Node.js runtime at {node_path}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Node.js runtime at {node_path} failed --version with {}",
+            output.status
+        );
+    }
+    parse_node_major(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_node_major(version: &str) -> Result<u64> {
+    version
+        .trim()
+        .strip_prefix('v')
+        .and_then(|value| value.split('.').next())
+        .and_then(|value| value.parse::<u64>().ok())
+        .with_context(|| format!("could not parse Node.js version {version:?}"))
+}
+
+/// Extract the required major version from a `node_version` string like
+/// "node20", "node24", etc. Used to validate system-Node fallback.
+fn required_major_from_version(node_version: &str) -> Option<u64> {
+    node_version
+        .strip_prefix("node")
+        .and_then(|v| v.parse::<u64>().ok())
+}
+
 fn node_bool(value: &str) -> bool {
     value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("$true")
 }
@@ -41,7 +72,23 @@ fn migration_flag(
         from_workflow: workflow_value.is_some(),
         from_system: system_value.is_some_and(|value| !value.is_empty()),
     }
-}
+    }
+
+#[test]
+fn parses_system_node_major_version() {
+        assert_eq!(parse_node_major("v20.19.0\n").unwrap(), 20);
+        assert_eq!(parse_node_major("v24.3.0\n").unwrap(), 24);
+        assert!(parse_node_major("node-unknown\n").is_err());
+    }
+
+#[test]
+fn required_major_from_version_extracts_correctly() {
+        assert_eq!(required_major_from_version("node20"), Some(20));
+        assert_eq!(required_major_from_version("node24"), Some(24));
+        assert_eq!(required_major_from_version("node16"), Some(16));
+        assert_eq!(required_major_from_version(""), None);
+        assert_eq!(required_major_from_version("python3"), None);
+    }
 
 #[allow(clippy::too_many_arguments)]
 fn resolve_node_version(
@@ -251,17 +298,35 @@ pub async fn run_node_action(
     // The official runner invokes the bundled Node by absolute path and never
     // prepends its directory to PATH. Child processes inherit the job's PATH
     // unchanged — this is what lets setup-node's toolcache entry win.
-    // The official runner requires bundled externals and never falls back to
-    // system Node.  Doing so would silently run actions on a different major
-    // version than GitHub uses, breaking compatibility.
-    if !bundled_node.is_file() {
-        anyhow::bail!(
-            "bundled Node.js runtime {node_version} is missing at {}; \
-             run `configure` without --no-externals to download it",
-            bundled_node.display()
+    let node_path = if bundled_node.is_file() {
+        bundled_node.to_string_lossy().to_string()
+    } else {
+        // Bundled externals are missing (--no-externals). Fall back to system
+        // Node, but enforce that its major version matches what the action
+        // declared. Without this, a node24 action silently runs on Node 20.
+        let required = required_major_from_version(node_version);
+        let path = "node";
+        let major = system_node_major(path).with_context(|| {
+            format!(
+                "bundled {node_version} is missing at {} and system node is unusable; \
+                 run `configure` without --no-externals to download it",
+                bundled_node.display()
+            )
+        })?;
+        if let Some(req) = required {
+            if major != req {
+                anyhow::bail!(
+                    "bundled {node_version} is missing at {}; system Node is v{major} \
+                     but the action requires Node {req}",
+                    bundled_node.display()
+                );
+            }
+        }
+        info!(
+            "Bundled {node_version} not found, using system Node v{major} (--no-externals)"
         );
-    }
-    let node_path = bundled_node.to_string_lossy().to_string();
+        path.to_owned()
+    };
 
     // Set GITHUB_ACTION_PATH
     env.insert(

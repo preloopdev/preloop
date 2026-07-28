@@ -565,7 +565,7 @@ async fn download_externals(http: &HttpClient, root: &std::path::Path) -> Result
 
     for (name, version) in &node_versions {
         let dest = externals_dir.join(name);
-        if dest.exists() {
+        if dest.join("bin/node").is_file() {
             info!("Externals {name} already present, skipping");
             continue;
         }
@@ -578,8 +578,14 @@ async fn download_externals(http: &HttpClient, root: &std::path::Path) -> Result
         let decoder = flate2::read::GzDecoder::new(bytes.as_ref());
         let mut archive = tar::Archive::new(decoder);
 
-        // Extract, stripping top-level directory
-        std::fs::create_dir_all(&dest)?;
+        // Extract into a temporary directory, then publish atomically. A
+        // failed download or extraction must not leave a directory that a
+        // later configure mistakenly treats as a complete external.
+        let temp = externals_dir.join(format!(".{name}.tmp-{}", std::process::id()));
+        if temp.exists() {
+            std::fs::remove_dir_all(&temp)?;
+        }
+        std::fs::create_dir_all(&temp)?;
         for entry in archive.entries()? {
             let mut entry = entry?;
             let path = entry.path()?.into_owned();
@@ -588,12 +594,20 @@ async fn download_externals(http: &HttpClient, root: &std::path::Path) -> Result
             if stripped.components().count() == 0 {
                 continue;
             }
-            let target = dest.join(&stripped);
+            let target = temp.join(&stripped);
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             entry.unpack(&target)?;
         }
+        if !temp.join("bin/node").is_file() {
+            std::fs::remove_dir_all(&temp)?;
+            anyhow::bail!("downloaded {name} archive did not contain bin/node");
+        }
+        if dest.exists() {
+            std::fs::remove_dir_all(&dest)?;
+        }
+        std::fs::rename(&temp, &dest)?;
         info!("Extracted {name} to {}", dest.display());
     }
 
