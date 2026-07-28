@@ -100,3 +100,36 @@ pub(crate) fn bearer_token(request: &Request) -> Option<&str> {
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
 }
+
+/// The job a worker request speaks for, proven by its debug-worker token.
+///
+/// Carried in request extensions so handlers authorize against the job rather
+/// than against mere token validity. Without it every worker route is
+/// reachable by any live job's token, which makes session ids the only thing
+/// standing between one job and another's debug session.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WorkerJob(pub(crate) uuid::Uuid);
+
+/// Require a job debug-worker token and record which job it names.
+///
+/// Deliberately not the job runtime token: that one is injected into the job
+/// as `GITHUB_TOKEN`, so any workflow step could read it and drive debug
+/// surfaces on its own behalf. The debug-worker token is minted per job
+/// (`sub: aksh-debug-worker-{uuid}`) and delivered only to the trusted runner
+/// process, so it identifies the caller precisely; neither a runtime token nor
+/// a runner listen token is accepted here.
+pub(crate) async fn require_worker_bearer(
+    State(shared): State<Arc<SharedState>>,
+    mut request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let job =
+        bearer_token(&request).and_then(|token| shared.state.job_uuid_from_debug_token(token));
+    match job {
+        Some(job) => {
+            request.extensions_mut().insert(WorkerJob(job));
+            Ok(next.run(request).await)
+        }
+        None => Err(ApiError::unauthorized("job debug-worker token required")),
+    }
+}
