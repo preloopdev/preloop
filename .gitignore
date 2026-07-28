@@ -76,6 +76,7 @@ benchmarks/real-world/results/**/vm-mitm/
 benchmarks/real-world/results/**/vm-mitm-conf/
 benchmarks/real-world/results/**/vm-runner*.log
 benchmarks/real-world/results/**/runner-*/
+benchmarks/preloop-perf/results/
 *.smolmachine
 rust_out
 /goal

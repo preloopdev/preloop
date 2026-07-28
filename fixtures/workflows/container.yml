@@ -1,0 +1,44 @@
+name: Containers
+on: push
+
+# Container jobs and service containers.
+#
+#   preloop run -f fixtures/workflows/container.yml
+#
+# Both images are pulled into the golden at engine start (scanned from this
+# file), so runners boot with them already present — look for "Image is up to
+# date" rather than a download.
+
+jobs:
+  in-container:
+    runs-on: ubuntu-latest
+    container:
+      image: alpine:3
+    steps:
+      - name: prove we are inside the container
+        run: |
+          echo "os-release:"
+          head -1 /etc/os-release
+          echo "expected Alpine, not Ubuntu"
+
+  with-service:
+    runs-on: ubuntu-latest
+    services:
+      db:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: test
+        ports:
+          - 5432:5432
+    steps:
+      - name: reach the service
+        run: |
+          for _ in $(seq 1 30); do
+            if nc -z localhost 5432 2>/dev/null; then
+              echo "postgres reachable on localhost:5432"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "postgres never came up"
+          exit 1

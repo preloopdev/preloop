@@ -1,0 +1,17 @@
+# Taste (Continuously Learned by [CommandCode][cmd])
+- Prefers story-style, narrative explanations when learning about complex systems — not dry technical docs. Confidence: 0.85
+- Wants explanations aimed at a total beginner's level, assuming no prior project context. Confidence: 0.85
+- Values depth and thoroughness: wants to "understand every single part," not surface-level summaries. Confidence: 0.8
+- Probes for design limitations, edge cases, and real-world usability gaps — not just how a system works but where it breaks down and what the user-experience tradeoffs are. Frames questions from an end-user perspective ("so as a user if my agent is debugging..."). Confidence: 0.75
+- Cares about clean separation between proprietary/internal features and standard-compatible behavior — wants to know that custom mechanisms are properly gated and won't leak into standard protocol paths (e.g., "what if I want to use the Axe runner against GitHub? Is it going to do the same thing, which we don't want?"). Confidence: 0.7
+- Cares about polished, high-quality design output; explicitly invokes the "impeccable" design skill for visual deliverables. Confidence: 0.8
+- Prefers editorial long-form aesthetic: warm-tinted paper/light background, serif display + clean grotesque body text, monospace for code/paths. Reads like a beautifully designed long-form essay (Stripe Press / Increment style). Confidence: 0.75
+- Does not want generic "AI-slop" aesthetics (neon-on-dark, purple gradients, glass cards). Confidence: 0.7
+- Uses `cloudflared` quick tunnels to expose local content publicly. When asked to "expose" something, expects a cloudflared tunnel. Confidence: 0.8
+- Prefers PNG exports for documentation diagrams; wants to remove excalidraw source files and SVGs from the repo, keeping only the rendered PNGs. Confidence: 0.6
+- Expects the assistant to work autonomously to completion without pausing for confirmation mid-task; repeatedly uses short continuation prompts ("continue", "continue and finish", "can u finish this") when the assistant stops partway. Confidence: 0.8
+- Uses casual, terse messaging style ("can u finish this", "continue and finish") — informal and brief rather than fully spelled-out requests. Confidence: 0.75
+- Prefers pragmatic, minimal solutions over over-engineered features: when a simpler change achieves the goal (e.g., always granting all capabilities vs. building a dynamic update endpoint), the user agrees with and expects the simpler path. Confidence: 0.7
+- When asking for a walkthrough of a large code change, wants it organized by area/component — each section explaining what it tests or covers and why it matters, so they get a mental map of the change's scope before any deep dive. Confidence: 0.75
+- When committing changes, wants modified/tracked files committed but untracked (new) files left out for personal review before they enter version control. Confidence: 0.85
+- Prefers changes broken into multiple logical, atomic commits organized by component or concern area rather than one large monolithic commit. Confidence: 0.75

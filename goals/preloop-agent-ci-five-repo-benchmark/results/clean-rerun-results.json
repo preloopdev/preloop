@@ -1,0 +1,42 @@
+{
+  "date": "2026-07-27",
+  "scope": "five representative filtered workflow slices at pinned commits",
+  "measurement": {
+    "wall": "/usr/bin/time -l real",
+    "cpu": "/usr/bin/time -l user+sys",
+    "cli_max_rss": "/usr/bin/time -l maximum resident set size",
+    "host_peak_rss": "250ms sampled process-tree aggregate; Preloop includes smolvm host processes",
+    "raw_artifacts": "/tmp/preloop-agent-ci-bench/results/clean-rerun/"
+  },
+  "repositories": {
+    "ripgrep": "f9c05a949d1a0dc8e16dee28ca9605d38611faeb",
+    "flask": "36e4a824f340fdee7ed50937ba8e7f6bc7d17f81",
+    "vite": "3ac77d9dd742968961af38a5a91ed6b061ceda7d",
+    "chi": "8b258c7bb28f97a5f2a856ff7ef962578fec9215",
+    "testcontainers-go": "ea854ecb16425b6e77bc19e95080213fb69a6ac9"
+  },
+  "primary": [
+    {"system":"preloop","repository":"ripgrep","cold_s":57.51,"warm_s":11.01,"cold":"pass","warm":"pass","cli_cpu_s":[0.01,0.01],"cli_max_rss_mib":[20.44,20.41]},
+    {"system":"agent-ci","repository":"ripgrep","cold_s":20.62,"warm_s":14.48,"cold":"pass","warm":"pass","cli_cpu_s":[11.71,6.47],"cli_max_rss_mib":[287.27,348.84]},
+    {"system":"preloop","repository":"flask","cold_s":136.89,"warm_s":131.16,"cold":"pass","warm":"pass","cli_cpu_s":[0.15,0.14],"cli_max_rss_mib":[20.47,20.48]},
+    {"system":"agent-ci","repository":"flask","cold_s":10.23,"warm_s":9.91,"cold":"fail","warm":"fail","cli_cpu_s":[6.59,6.52],"cli_max_rss_mib":[370.92,330.05],"failure":"pre-commit step"},
+    {"system":"preloop","repository":"vite","cold_s":638.62,"warm_s":92.45,"cold":"pass","warm":"pass","cli_cpu_s":[0.70,0.09],"cli_max_rss_mib":[20.49,20.50],"run_ids":["e23436c0-8065-45ea-bc64-f9bd2c6eebb8","c127e374-ef6f-41d3-b69e-bee6a49439c2"]},
+    {"system":"agent-ci","repository":"vite","cold_s":43.07,"warm_s":38.71,"cold":"pass","warm":"pass","cli_cpu_s":[20.78,21.98],"cli_max_rss_mib":[361.42,355.40]},
+    {"system":"preloop","repository":"chi","cold_s":52.06,"warm_s":49.99,"cold":"pass","warm":"pass","cli_cpu_s":[0.05,0.05],"cli_max_rss_mib":[20.39,20.39],"run_ids":["8f297347-3177-405d-946f-f282435c12f7","da0a13cb-2dec-4aa4-b686-5bd847decca6"]},
+    {"system":"agent-ci","repository":"chi","cold_s":null,"warm_s":null,"cold":"unavailable","warm":"unavailable","failure":"Docker socket missing/dangling before corrected rerun"},
+    {"system":"preloop","repository":"testcontainers-go","cold_s":19.23,"warm_s":7.36,"cold":"pass","warm":"pass","cli_cpu_s":[0.01,0.01],"cli_max_rss_mib":[20.45,20.36]},
+    {"system":"agent-ci","repository":"testcontainers-go","cold_s":10.73,"warm_s":10.47,"cold":"pass","warm":"pass","cli_cpu_s":[8.82,8.86],"cli_max_rss_mib":[381.81,366.36]}
+  ],
+  "extra_warm": [
+    {"repository":"ripgrep","preloop_s":8.48,"preloop":"pass","agent_ci_s":17.03,"agent_ci":"pass"},
+    {"repository":"flask","preloop_s":134.74,"preloop":"pass","agent_ci_s":9.88,"agent_ci":"fail"},
+    {"repository":"vite","preloop_s":64.06,"preloop":"fail","agent_ci_s":32.84,"agent_ci":"fail","failure":"original formatting slice"},
+    {"repository":"chi","preloop_s":1.42,"preloop":"fail","agent_ci_s":7.66,"agent_ci":"fail","failure":"original matrix/version slice"},
+    {"repository":"testcontainers-go","preloop_s":28.01,"preloop":"pass","agent_ci_s":10.74,"agent_ci":"pass"}
+  ],
+  "anomalies": [
+    {"system":"preloop","repository":"ripgrep","mode":"cold","elapsed_s":1103.37,"reason":"Docker Hub unauthenticated TOOMANYREQUESTS; excluded from normal cold comparison"}
+  ],
+  "verification": {"just_test_ci":"pass","bundled_node":"/var/lib/preloop-runner/externals/node24/bin/node"},
+  "limitations": ["Representative slices, not full matrices","Preloop sampled host RSS is not guest RSS","Agent CI has no equivalent Preloop API phase telemetry","Corrected Agent CI chi rerun was blocked by unavailable Docker runtime"]
+}
