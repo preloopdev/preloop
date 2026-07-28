@@ -280,7 +280,7 @@ pub(crate) async fn submit_run_inner(
         "branch"
     };
 
-    let github = json!({
+    let mut github = json!({
         "ref": submission.git_ref,
         "sha": sha,
         "repository": submission.repository,
@@ -418,6 +418,25 @@ pub(crate) async fn submit_run_inner(
         github_tokens.extend(jobs.iter().map(|job| (job.id.clone(), pat.clone())));
     }
 
+    // Reserve the workflow run number before pre-building messages. The
+    // message builder consumes the GitHub context, so delaying this counter
+    // update until after pre-building would expose "1" for every run.
+    let run_number = {
+        let mut inner = shared.state.inner.lock().await;
+        let counter = inner
+            .workflow_run_counters
+            .entry(workflow_path.clone())
+            .or_insert(0);
+        *counter += 1;
+        *counter
+    };
+    if let Some(object) = github.as_object_mut() {
+        object.insert(
+            "run_number".to_owned(),
+            serde_json::json!(run_number.to_string()),
+        );
+    }
+
     // ── Pre-build job messages outside the lock ─────────────────────────
     //
     // Condition evaluation, build_agent_job_message, token minting, and
@@ -450,7 +469,7 @@ pub(crate) async fn submit_run_inner(
     let mut pre_job_continue_on_error: BTreeMap<String, bool> = BTreeMap::new();
     let mut pre_initially_skipped: Vec<(RunId, JobId)> = Vec::new();
 
-    for job in &jobs {
+    for job in jobs {
         pre_job_base_ids.insert(job.id.clone(), job.base_id.clone());
         pre_job_needs.insert(job.id.clone(), job.needs.clone());
         pre_job_fail_fast.insert(job.base_id.clone(), job.fail_fast);
@@ -470,8 +489,7 @@ pub(crate) async fn submit_run_inner(
         // Evaluate condition for root jobs (no needs) outside the lock.
         let mut skipped = false;
         if job.needs.is_empty() {
-            let condition =
-                aksh_gha_expressions::effective_condition(job.if_condition.as_deref());
+            let condition = aksh_gha_expressions::effective_condition(job.if_condition.as_deref());
             let should_run = aksh_gha_expressions::eval_bool(&condition, &condition_context)
                 .map_err(|error| {
                     ApiError::bad_request(format!(
@@ -490,7 +508,7 @@ pub(crate) async fn submit_run_inner(
             // Still need to record the prebuilt entry so the index stays
             // aligned, but we skip the expensive message build.
             prebuilt.push(PrebuiltJob {
-                job: job.clone(),
+                job,
                 agent_msg: None,
                 request_id: 0,
                 condition_context,
@@ -508,7 +526,7 @@ pub(crate) async fn submit_run_inner(
 
         // Heavy work: build the agent message outside the lock.
         let mut agent_msg = aksh_gha_parser::job_builder::build_agent_job_message(
-            job,
+            &job,
             &github,
             &job.env,
             &secrets_exposed,
@@ -531,12 +549,8 @@ pub(crate) async fn submit_run_inner(
             .mint_runtime_token(&agent_msg.plan.plan_id, &agent_msg.job_id);
 
         if let Some(snapshot) = workspace_snapshot.as_ref() {
-            let redirected = redirect_primary_checkout(
-                &mut agent_msg,
-                snapshot,
-                &base_url,
-                &runtime_token,
-            );
+            let redirected =
+                redirect_primary_checkout(&mut agent_msg, snapshot, &base_url, &runtime_token);
             if redirected > 0 {
                 info!(
                     %run_id,
@@ -617,9 +631,7 @@ pub(crate) async fn submit_run_inner(
             );
             job_dict.insert(
                 "workflow_repository".to_owned(),
-                aksh_gha_protocol::azdo::PipelineContextData::String(
-                    submission.repository.clone(),
-                ),
+                aksh_gha_protocol::azdo::PipelineContextData::String(submission.repository.clone()),
             );
             job_dict.insert(
                 "workflow_file_path".to_owned(),
@@ -655,7 +667,7 @@ pub(crate) async fn submit_run_inner(
         };
 
         prebuilt.push(PrebuiltJob {
-            job: job.clone(),
+            job,
             agent_msg: Some(agent_msg),
             request_id,
             condition_context,
@@ -668,29 +680,15 @@ pub(crate) async fn submit_run_inner(
 
     {
         let mut inner = shared.state.inner.lock().await;
-        let run_number = {
-            let counter = inner
-                .workflow_run_counters
-                .entry(workflow_path.clone())
-                .or_insert(0);
-            *counter += 1;
-            *counter
-        };
         let created_at = chrono::Utc::now();
         let event = submission.event.clone();
-        let mut github = github;
-        if let Some(object) = github.as_object_mut() {
-            object.insert(
-                "run_number".to_owned(),
-                serde_json::json!(run_number.to_string()),
-            );
-        }
+        let github = github;
         let mut statuses = pre_statuses;
         let mut ready_jobs = 0usize;
-        let mut job_base_ids = pre_job_base_ids;
-        let mut job_needs = pre_job_needs;
-        let mut job_fail_fast = pre_job_fail_fast;
-        let mut job_continue_on_error = pre_job_continue_on_error;
+        let job_base_ids = pre_job_base_ids;
+        let job_needs = pre_job_needs;
+        let job_fail_fast = pre_job_fail_fast;
+        let job_continue_on_error = pre_job_continue_on_error;
         let mut ready_by_base: BTreeMap<String, u64> = BTreeMap::new();
         let initially_skipped = pre_initially_skipped;
         let mut built_jobs: Vec<QueuedJob> = Vec::new();
@@ -751,7 +749,9 @@ pub(crate) async fn submit_run_inner(
             }
             let job = &pb.job;
             let agent_msg = pb.agent_msg.expect("non-skipped job must have agent_msg");
-            let job_request = pb.job_request.expect("non-skipped job must have job_request");
+            let job_request = pb
+                .job_request
+                .expect("non-skipped job must have job_request");
 
             inner
                 .id_token_grants

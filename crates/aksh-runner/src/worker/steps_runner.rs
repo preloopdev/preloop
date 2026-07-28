@@ -1126,10 +1126,10 @@ pub async fn run_steps(
             // separately so container-init failures are never lost.
             any_failed = init_failed
                 || step_ctx
-                .job
-                .steps
-                .values()
-                .any(|result| result.conclusion == "Failure");
+                    .job
+                    .steps
+                    .values()
+                    .any(|result| result.conclusion == "Failure");
             step_ctx.job.job_status = if any_failed {
                 JobStatus::Failure
             } else {

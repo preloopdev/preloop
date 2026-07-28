@@ -703,10 +703,7 @@ fn secrets_context_excludes_system_plumbing_variables() {
     // Runner/server plumbing must not be, or untrusted workflow YAML could
     // read the job runtime token and the debug-worker token straight out of
     // `${{ secrets[...] }}` and defeat the debug privilege split.
-    for plumbing in [
-        "system.github.token",
-        "system.preloop.debug_worker_token",
-    ] {
+    for plumbing in ["system.github.token", "system.preloop.debug_worker_token"] {
         assert!(
             expr_ctx
                 .resolve(&["secrets".to_owned(), plumbing.to_owned()])
