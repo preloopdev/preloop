@@ -13,8 +13,29 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::time::Duration;
 
+mod debug_session;
+
 fn server_url() -> String {
     std::env::var("AKSH_URL").unwrap_or_else(|_| "http://127.0.0.1:9090".to_owned())
+}
+
+fn should_send_local_workspace_header(url: &str, uses_default_transport: bool) -> bool {
+    if uses_default_transport {
+        return true;
+    }
+
+    // An explicit loopback URL is still a local engine invocation. Do not
+    // trust a host path for an arbitrary remote server.
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 fn api_token() -> Option<String> {
@@ -72,6 +93,9 @@ enum Command {
     /// Open a shell in a preserved VM.
     Shell(ShellArgs),
 
+    /// Attach to a job paused at a failed step: inspect, fix, retry.
+    Debug(debug_session::DebugArgs),
+
     /// Internal persistent control plane and local runner pool.
     #[command(hide = true)]
     Engine,
@@ -95,7 +119,19 @@ struct RunArgs {
     #[arg(long)]
     base: Option<String>,
 
-    /// Keep the failed job VM alive for `preloop shell`.
+    /// Tear down on failure instead of pausing for debugging.
+    ///
+    /// Pausing is the default in a terminal: a failed step holds its microVM
+    /// open so you can fix and retry from that step. Non-interactive runs
+    /// (`--detach`, pipes, CI) never pause, so nothing hangs.
+    #[arg(long)]
+    no_debug: bool,
+
+    /// Keep the failed job VM alive even when nothing can attach interactively.
+    ///
+    /// Pausing already implies this for an interactive run. Pass it to hold a
+    /// VM open for a later `preloop shell` from a detached or piped run, which
+    /// otherwise tears down because there is nobody to answer the pause.
     #[arg(long)]
     preserve_on_failure: bool,
 
@@ -180,6 +216,9 @@ async fn main() -> anyhow::Result<()> {
         Command::Cancel(args) => cmd_cancel(args).await,
         Command::Secret(args) => cmd_secret(args).await,
         Command::Shell(args) => cmd_shell(args).await,
+        Command::Debug(args) => {
+            debug_session::run(args, build_client(), server_url(), api_token()).await
+        }
         Command::Engine => unreachable!("engine handled before client startup"),
     }
 }
@@ -476,6 +515,11 @@ fn local_runner_pool_config(
         storage_gib: 20,
         debug_dir: Some(home.join("state").join("debug")),
         runner_key_dir: Some(home.join("runner-keys")),
+        // Warm the golden with the images this project's workflows declare,
+        // so `container:`/`services:` jobs do not re-pull on every run.
+        preload_images: preloop_orchestrator::environment::scan_workflow_images(
+            &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        ),
         pending_jobs: Some(queue_depth),
         next_job_runs_on: Some(next_job_runs_on),
     })
@@ -597,7 +641,14 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         secrets,
         selected_jobs: args.job.into_iter().collect(),
         base_ref: args.base,
-        preserve_on_failure: args.preserve_on_failure,
+        // On by default where it can be acted on: a paused job blocks until a
+        // controller answers, so pausing a piped or detached run would hang
+        // something with no way to respond. `--preserve-on-failure` is the
+        // escape hatch for exactly that case — hold the VM for a later
+        // `preloop shell` without anyone attached now.
+        preserve_on_failure: !args.no_debug
+            && (args.preserve_on_failure
+                || (!args.detach && std::io::IsTerminal::is_terminal(&std::io::stdin()))),
         ..Default::default()
     };
 
@@ -607,7 +658,7 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     let mut request = client
         .post(format!("{url}/api/v1/runs"))
         .json(&submission.to_request_json()?);
-    if std::env::var("AKSH_URL").is_err() {
+    if should_send_local_workspace_header(&url, std::env::var("AKSH_URL").is_err()) {
         let workspace = std::fs::canonicalize(".")?;
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(workspace.as_os_str().to_string_lossy().as_bytes());
@@ -655,8 +706,32 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
 
         let mut stream = events_response.bytes_stream();
         let mut pending = String::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
+        let mut paused: Option<aksh_gha_protocol::debug_session::DebugSession> = None;
+        loop {
+            // The server holds this stream open until the run is terminal, and
+            // a job paused at a failed step never gets there. Watching only the
+            // stream would sit silently forever with the answer one poll away,
+            // so race the next chunk against a check for a paused session.
+            let chunk = tokio::select! {
+                biased;
+                chunk = stream.next() => match chunk {
+                    Some(chunk) => chunk?,
+                    None => break,
+                },
+                () = tokio::time::sleep(Duration::from_millis(750)) => {
+                    paused = debug_session::paused_for_run(
+                        &client,
+                        &url,
+                        api_token(),
+                        accepted.run_id,
+                    )
+                    .await;
+                    if paused.is_some() {
+                        break;
+                    }
+                    continue;
+                }
+            };
             pending.push_str(&String::from_utf8_lossy(&chunk));
             while let Some(newline) = pending.find('\n') {
                 let line = pending[..newline].trim().to_owned();
@@ -669,6 +744,19 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
                 break;
             }
         }
+
+        if let Some(session) = paused {
+            match debug_session::prompt_at_failure(&client, &url, api_token(), session).await {
+                // Resumed: reconnect and keep reporting the run.
+                Ok(true) => continue,
+                Ok(false) => break,
+                Err(error) => {
+                    eprintln!("debug session error: {error:#}");
+                    break;
+                }
+            }
+        }
+
         if !final_status.is_some_and(ExecutionStatus::is_terminal)
             && !pending.trim().is_empty()
             && seen_events.insert(pending.trim().to_owned())
@@ -679,6 +767,7 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         if final_status.is_some_and(ExecutionStatus::is_terminal) {
             break;
         }
+
         // The server holds `events.ndjson` open until the run is terminal, so
         // reaching here means the stream dropped early. Retry promptly rather
         // than adding a fixed poll interval to every run's wall clock.
@@ -1123,7 +1212,7 @@ mod tests {
         assert!(args.job.is_none());
         assert!(args.event.is_none());
         assert!(args.base.is_none());
-        assert!(!args.preserve_on_failure);
+        assert!(!args.no_debug, "pausing on failure is the default");
         assert!(args.secrets.is_empty());
     }
 
@@ -1139,7 +1228,7 @@ mod tests {
             "pull_request",
             "--base",
             "main",
-            "--preserve-on-failure",
+            "--no-debug",
             "--secret",
             "TOKEN=abc",
             "--secret",
@@ -1153,7 +1242,7 @@ mod tests {
         assert_eq!(args.job.unwrap(), "test");
         assert_eq!(args.event.unwrap(), "pull_request");
         assert_eq!(args.base.unwrap(), "main");
-        assert!(args.preserve_on_failure);
+        assert!(args.no_debug);
         assert_eq!(args.secrets, vec!["TOKEN=abc", "KEY=xyz"]);
     }
 
@@ -1320,5 +1409,29 @@ mod tests {
             panic!("expected Cancel");
         };
         assert_eq!(args.run_id.as_deref(), Some("run-42"));
+    }
+
+    #[test]
+    fn local_engine_url_keeps_workspace_checkout_offline() {
+        assert!(
+            should_send_local_workspace_header("http://127.0.0.1:19090", false),
+            "an explicit loopback engine URL still targets the local engine"
+        );
+    }
+
+    #[test]
+    fn remote_engine_url_does_not_send_host_workspace_path() {
+        assert!(!should_send_local_workspace_header(
+            "https://ci.example.test",
+            false
+        ));
+    }
+
+    #[test]
+    fn default_engine_transport_sends_workspace_path() {
+        assert!(should_send_local_workspace_header(
+            "http://127.0.0.1:9090",
+            true
+        ));
     }
 }
