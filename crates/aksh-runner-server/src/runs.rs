@@ -701,7 +701,7 @@ pub(crate) async fn submit_run_inner(
                 RunRecord {
                     run_id,
                     run_name,
-                    submission,
+                    submission: Arc::new(submission),
                     jobs: BTreeMap::new(),
                     job_outputs: BTreeMap::new(),
                     job_base_ids: BTreeMap::new(),
@@ -831,7 +831,7 @@ pub(crate) async fn submit_run_inner(
                         RunRecord {
                             run_id,
                             run_name,
-                            submission,
+                            submission: Arc::new(submission),
                             jobs: statuses,
                             job_outputs: BTreeMap::new(),
                             job_base_ids,
@@ -891,7 +891,7 @@ pub(crate) async fn submit_run_inner(
                 RunRecord {
                     run_id,
                     run_name,
-                    submission,
+                    submission: Arc::new(submission),
                     jobs: statuses,
                     job_outputs: BTreeMap::new(),
                     job_base_ids,
@@ -943,7 +943,7 @@ pub(crate) async fn submit_run_inner(
             RunRecord {
                 run_id,
                 run_name: run_name.clone(),
-                submission: submission.clone(),
+                submission: Arc::new(submission.clone()),
                 jobs: statuses.clone(),
                 job_outputs: BTreeMap::new(),
                 job_base_ids: job_base_ids.clone(),
@@ -1142,7 +1142,7 @@ pub(crate) async fn submit_run_inner(
             RunRecord {
                 run_id,
                 run_name,
-                submission,
+                submission: Arc::new(submission),
                 jobs: statuses,
                 job_outputs: BTreeMap::new(),
                 job_base_ids,
@@ -1483,7 +1483,7 @@ pub(crate) async fn rerun_run(
         inner
             .runs
             .get(&run_id)
-            .map(|run| run.submission.clone())
+            .map(|run| (*run.submission).clone())
             .ok_or_else(|| ApiError::not_found("run not found"))?
     };
     submit_run_inner(&shared, submission).await.map(Json)
