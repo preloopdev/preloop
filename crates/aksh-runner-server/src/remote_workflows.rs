@@ -23,11 +23,13 @@ struct GithubCommitResponse {
 /// not already supplied by a caller (local workflows and test fixtures).
 pub(crate) async fn resolve_remote_workflows(
     submission: &mut WorkflowSubmission,
+    root_workflow: &aksh_gha_parser::Workflow,
 ) -> Result<(), ApiError> {
-    let client = reqwest::Client::builder()
-        .user_agent("aksh-runner-server")
-        .build()
-        .map_err(|error| ApiError::internal(format!("build GitHub client: {error}")))?;
+    if !root_workflow.jobs.values().any(|job| job.uses.is_some()) {
+        return Ok(());
+    }
+
+    let mut client = None;
     let token = std::env::var("AKSH_GITHUB_TOKEN").ok();
     let mut queue = vec![(submission.workflow_yaml.clone(), 0usize)];
     let mut visited = std::collections::BTreeSet::new();
@@ -59,6 +61,12 @@ pub(crate) async fn resolve_remote_workflows(
             if !visited.insert(reference.to_owned()) {
                 continue;
             }
+            let client = client.get_or_insert(
+                reqwest::Client::builder()
+                    .user_agent("aksh-runner-server")
+                    .build()
+                    .map_err(|error| ApiError::internal(format!("build GitHub client: {error}")))?,
+            );
             let mut request = client
                 .get(format!(
                     "https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={git_ref}"
