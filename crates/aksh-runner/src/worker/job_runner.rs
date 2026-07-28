@@ -401,11 +401,36 @@ pub async fn run_job(
         }
     });
 
-    // Spawn job-timeout timer that trips cancel and sets the timed_out flag
+    // Spawn job-timeout timer that trips cancel and sets the timed_out flag.
+    //
+    // Ticked rather than slept in one shot, so seconds spent paused at a failed
+    // step do not count. Each tick measures real elapsed time instead of
+    // assuming a full second passed, so a starved or oversubscribed executor
+    // cannot stretch the budget. The server suspends its own copy of this
+    // clock; if only one side did, the other would cancel a job
+    // mid-debug-session and the user would see a timeout with no explanation.
+    let debug_paused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let timeout_tx = job_cancel_tx.clone();
     let timeout_flag = timed_out.clone();
+    let timer_paused = debug_paused.clone();
     let timeout_handle = tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(job_timeout_minutes * 60)).await;
+        let budget = std::time::Duration::from_secs(job_timeout_minutes * 60);
+        let deadline = tokio::time::Instant::now() + budget;
+        let mut paused_total = std::time::Duration::ZERO;
+        let tick = std::time::Duration::from_secs(1);
+        let mut last_check = tokio::time::Instant::now();
+        loop {
+            tokio::time::sleep(tick).await;
+            let now = tokio::time::Instant::now();
+            let elapsed_tick = now - last_check;
+            last_check = now;
+            if timer_paused.load(std::sync::atomic::Ordering::SeqCst) {
+                paused_total += elapsed_tick;
+            }
+            if now >= deadline + paused_total {
+                break;
+            }
+        }
         warn!("Job timeout ({job_timeout_minutes} minutes) reached — cancelling");
         timeout_flag.store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = timeout_tx.send(true);
@@ -466,9 +491,47 @@ pub async fn run_job(
         }
     }
 
+    // Whether a live pause-on-failure session was armed for this job. A live
+    // session already held the VM open and reported itself, so the
+    // post-mortem marker below must not fire a second time for the same
+    // failure.
+    let mut debug_was_active = false;
     let job_result = if let Err(e) = debugger_result {
         Err(e)
     } else {
+        // Live pause-on-failure. Reuses the existing per-run opt-in rather
+        // than adding a second flag meaning nearly the same thing: both say
+        // "do not throw this failure away". When a session opens, the worker
+        // blocks in the step loop and the post-mortem marker path below never
+        // fires,  the live session supersedes it.
+        // Every way this can come up empty is reported. Silently falling back
+        // to "no debugging" is the one outcome a user cannot diagnose: they
+        // asked for a pause, the job died, and nothing said why.
+        let debug_client = if job_message
+            .get("preloopPreserveOnFailure")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            match build_debug_pause_client(
+                &job_message,
+                job_id,
+                job_name,
+                &workspace,
+                debug_paused.clone(),
+            ) {
+                Ok(client) => {
+                    info!("Pause-on-failure enabled — a failed step will hold this VM open");
+                    Some(client)
+                }
+                Err(error) => {
+                    warn!(%error, "pause-on-failure requested but unavailable — a failed step will fail normally");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        debug_was_active = debug_client.is_some();
         super::steps_runner::run_steps(
             &ordered_steps,
             &mut job_ctx,
@@ -478,6 +541,10 @@ pub async fn run_job(
             reporting.as_deref(),
             job_container_spec.as_ref(),
             &service_specs,
+            debug_client.as_ref(),
+            job_message
+                .get("akshSnapshotCommit")
+                .and_then(|v| v.as_str()),
         )
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))
@@ -633,7 +700,7 @@ pub async fn run_job(
         .get("preloopPreserveOnFailure")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    if preserve_requested && conclusion.eq_ignore_ascii_case("failed") {
+    if preserve_requested && conclusion.eq_ignore_ascii_case("failed") && !debug_was_active {
         if let Some(path) = std::env::var_os("PRELOOP_FAILURE_MARKER") {
             let path = std::path::PathBuf::from(path);
             if let Some(parent) = path.parent() {
@@ -784,6 +851,58 @@ fn spawn_renew_loop(
             }
         }
     })
+}
+
+/// Build the pause-on-failure client, naming whichever prerequisite is absent.
+///
+/// Each of these is a distinct operational fault — a server that did not send
+/// the run id, a job message without a control endpoint, an unusable
+/// transport — and collapsing them into `None` made "pause-on-failure did
+/// nothing" impossible to diagnose from the job log.
+fn build_debug_pause_client(
+    job_message: &serde_json::Value,
+    job_id: &str,
+    job_name: &str,
+    workspace: &str,
+    paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<super::debug_pause::DebugPauseClient> {
+    let run_id = job_message
+        .get("akshDebugRunId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("job message carries no akshDebugRunId"))?
+        .parse::<aksh_gha_protocol::RunId>()
+        .map_err(|error| anyhow::anyhow!("akshDebugRunId is not a run id: {error}"))?;
+    let agent_job_id = job_id
+        .parse::<uuid::Uuid>()
+        .map_err(|error| anyhow::anyhow!("job id `{job_id}` is not an agent job GUID: {error}"))?;
+    let (service_url, _runtime_token) = extract_service_endpoint(job_message)
+        .ok_or_else(|| anyhow::anyhow!("job message has no SystemVssConnection endpoint"))?;
+    // The runtime token is scoped to job reporting and is revoked at job
+    // completion — exactly when a pause needs to keep talking to the server.
+    // The debug-worker token is minted for that longer window.
+    let token = job_message
+        .get("variables")
+        .and_then(|v| v.get("system.preloop.debug_worker_token"))
+        .and_then(|v| v.get("value").or(Some(v)))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("job message carries no debug-worker token"))?
+        .to_owned();
+    Ok(super::debug_pause::DebugPauseClient::new(
+        &service_url,
+        token,
+        run_id,
+        aksh_gha_protocol::JobId(job_id.to_owned()),
+        agent_job_id,
+        job_name.to_owned(),
+    )?
+    .with_pause_flag(paused)
+    .with_workspace(
+        Some(workspace.to_owned()),
+        job_message
+            .get("akshSnapshotCommit")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+    ))
 }
 
 fn renew_backoff(attempt: u32) -> Duration {
