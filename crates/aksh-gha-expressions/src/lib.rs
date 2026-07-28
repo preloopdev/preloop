@@ -1,8 +1,9 @@
 //! GitHub Actions expression parsing and evaluation.
 
+use parking_lot::Mutex;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 mod ast;
 mod conditions;
@@ -38,13 +39,7 @@ static PARSED_EXPRESSION_CACHE: OnceLock<Mutex<ParsedExpressionCache>> = OnceLoc
 
 fn parse_cached(input: &str) -> Result<Arc<ast::Expr>, ExpressionError> {
     let cache = PARSED_EXPRESSION_CACHE.get_or_init(|| Mutex::new(ParsedExpressionCache::new()));
-    if let Some(expr) = cache
-        .lock()
-        .expect("expression cache lock is not poisoned")
-        .entries
-        .get(input)
-        .cloned()
-    {
+    if let Some(expr) = cache.lock().entries.get(input).cloned() {
         return Ok(expr);
     }
 
@@ -53,7 +48,7 @@ fn parse_cached(input: &str) -> Result<Arc<ast::Expr>, ExpressionError> {
     let expr = Arc::new(parser.parse_expr()?);
     parser.expect_end()?;
 
-    let mut cache = cache.lock().expect("expression cache lock is not poisoned");
+    let mut cache = cache.lock();
     if let Some(existing) = cache.entries.get(input).cloned() {
         return Ok(existing);
     }
