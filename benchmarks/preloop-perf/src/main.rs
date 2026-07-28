@@ -17,7 +17,7 @@ use axum::body::{to_bytes, Body};
 use axum::http::{Method, Request, StatusCode};
 use axum::Router;
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -156,10 +156,6 @@ fn metric(name: &str, value: f64, digits: u32) {
     println!("METRIC {}={}", name, (value * factor).round() / factor);
 }
 
-fn asi(key: &str, value: &str) {
-    println!("ASI {}={}", key, value);
-}
-
 // ── server load benchmark ───────────────────────────────────────────────────
 
 async fn bench_server_load(state_dir: &Path) -> Result<()> {
@@ -202,10 +198,8 @@ async fn bench_server_load(state_dir: &Path) -> Result<()> {
         assert!(status.is_success());
     }
     let sequential_elapsed = start.elapsed();
-    let sequential_rps =
-        sequential_count as f64 / sequential_elapsed.as_secs_f64();
-    let sequential_latency_ms =
-        sequential_elapsed.as_secs_f64() * 1000.0 / sequential_count as f64;
+    let sequential_rps = sequential_count as f64 / sequential_elapsed.as_secs_f64();
+    let sequential_latency_ms = sequential_elapsed.as_secs_f64() * 1000.0 / sequential_count as f64;
     eprintln!(
         "[loadtest]   sequential: {sequential_count} reqs in {:.1}ms = {sequential_rps:.0} rps, {sequential_latency_ms:.2}ms/req",
         sequential_elapsed.as_secs_f64() * 1000.0
@@ -353,13 +347,7 @@ async fn bench_server_load(state_dir: &Path) -> Result<()> {
     let poll_count = 500;
     let start = Instant::now();
     for _ in 0..poll_count {
-        let (status, _) = request(
-            &app,
-            Method::GET,
-            "/api/v1/runs?limit=50",
-            Value::Null,
-        )
-        .await;
+        let (status, _) = request(&app, Method::GET, "/api/v1/runs?limit=50", Value::Null).await;
         assert!(status.is_success());
     }
     let poll_elapsed = start.elapsed();
@@ -391,8 +379,8 @@ fn bench_parser() -> Result<()> {
     // Simple workflow parse
     let start = Instant::now();
     for _ in 0..iterations {
-        let wf = aksh_gha_parser::parse_workflow(SIMPLE_WORKFLOW)
-            .expect("simple workflow must parse");
+        let wf =
+            aksh_gha_parser::parse_workflow(SIMPLE_WORKFLOW).expect("simple workflow must parse");
         std::hint::black_box(&wf);
     }
     let simple_us = start.elapsed().as_micros() as f64 / iterations as f64;
@@ -400,8 +388,8 @@ fn bench_parser() -> Result<()> {
     // Matrix workflow parse + expand
     let start = Instant::now();
     for _ in 0..iterations {
-        let wf = aksh_gha_parser::parse_workflow(MATRIX_WORKFLOW)
-            .expect("matrix workflow must parse");
+        let wf =
+            aksh_gha_parser::parse_workflow(MATRIX_WORKFLOW).expect("matrix workflow must parse");
         let expanded = aksh_gha_parser::expand_jobs(&wf);
         std::hint::black_box(&expanded);
     }
@@ -410,8 +398,8 @@ fn bench_parser() -> Result<()> {
     // Complex DAG workflow parse + expand
     let start = Instant::now();
     for _ in 0..iterations {
-        let wf = aksh_gha_parser::parse_workflow(COMPLEX_WORKFLOW)
-            .expect("complex workflow must parse");
+        let wf =
+            aksh_gha_parser::parse_workflow(COMPLEX_WORKFLOW).expect("complex workflow must parse");
         let expanded = aksh_gha_parser::expand_jobs(&wf);
         std::hint::black_box(&expanded);
     }
@@ -490,8 +478,7 @@ fn bench_expressions() -> Result<()> {
         }
     }
     let validate_elapsed = start.elapsed();
-    let validate_us =
-        validate_elapsed.as_micros() as f64 / total_evals as f64;
+    let validate_us = validate_elapsed.as_micros() as f64 / total_evals as f64;
 
     eprintln!("[loadtest]   validate: {validate_us:.2} µs/expr");
 
@@ -536,9 +523,7 @@ async fn bench_snapshots(_state_dir: &Path) -> Result<()> {
         }
 
         // Generate deterministic files
-        let content: Vec<u8> = (0..file_size_bytes)
-            .map(|i| (i % 256) as u8)
-            .collect();
+        let content: Vec<u8> = (0..file_size_bytes).map(|i| (i % 256) as u8).collect();
         let dirs = (file_count as f64).sqrt() as usize;
         for i in 0..file_count {
             let dir_idx = i % dirs.max(1);
@@ -612,7 +597,7 @@ async fn bench_snapshots(_state_dir: &Path) -> Result<()> {
 
 // ── cold boot benchmark ────────────────────────────────────────────────────
 
-async fn bench_cold_boot(state_dir: &Path) -> Result<()> {
+async fn bench_cold_boot(_state_dir: &Path) -> Result<()> {
     eprintln!("[loadtest] === Cold Boot Benchmark ===");
 
     let iterations = 5;
@@ -692,13 +677,8 @@ async fn bench_contention(state_dir: &Path) -> Result<()> {
                         errors.fetch_add(1, Ordering::Relaxed);
                     }
                 } else {
-                    let (status, _) = request(
-                        &app,
-                        Method::GET,
-                        "/api/v1/runs?limit=20",
-                        Value::Null,
-                    )
-                    .await;
+                    let (status, _) =
+                        request(&app, Method::GET, "/api/v1/runs?limit=20", Value::Null).await;
                     if status.is_success() {
                         polls.fetch_add(1, Ordering::Relaxed);
                     } else {
