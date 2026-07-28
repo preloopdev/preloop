@@ -554,7 +554,6 @@ pub(crate) struct InnerState {
     pub(crate) next_cache_id: i64,
     pub(crate) next_message_id: i64,
     pub(crate) next_log_id: usize,
-    pub(crate) next_request_id: i64,
     pub(crate) flows_file: Option<std::fs::File>,
     pub(crate) next_flow_index: usize,
     /// Sessions created via the AzDO distributedtask path (full encrypted message format).
