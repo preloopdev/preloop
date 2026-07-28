@@ -25,7 +25,7 @@ use thiserror::Error;
 use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const GUEST_CONTROL_DIR: &str = "/run/preloop-control";
 const GUEST_CONTROL_SOCKET: &str = "/run/preloop-control/engine.sock";
@@ -74,7 +74,119 @@ fn runner_volumes(config: &RunnerPoolConfig) -> Vec<VolumeMount> {
     volumes
 }
 
-const BASE_PACKAGES: &str = "git curl ca-certificates nodejs";
+/// Packages the golden image carries.
+///
+/// Tracks the apt package list of GitHub's `ubuntu-latest` runner image, which
+/// is what workflows are written against. Any gap here produces the exact bug
+/// class this project exists to eliminate: "works on GitHub, fails locally".
+///
+/// Deliberately *only* the apt baseline — not `ubuntu-latest`'s preinstalled
+/// toolchains (Android SDK, five JDKs, .NET, browsers, cloud CLIs). Those come
+/// to ~90 GB and are the job of `actions/setup-*` and `container:`, which keeps
+/// workflows portable. This list is ~350 MB.
+const BASE_PACKAGES: &str = "\
+     git curl wget ca-certificates gnupg2 sudo openssh-client \
+     build-essential pkg-config libssl-dev make autoconf automake libtool m4 \
+     bison flex texinfo patchelf swig dpkg-dev fakeroot binutils \
+     libicu-dev libsqlite3-dev libyaml-dev \
+     nodejs npm python3 python3-pip python-is-python3 \
+     unzip zip xz-utils zstd bzip2 brotli lz4 pigz p7zip-full tar \
+     jq file tree shellcheck parallel time acl locales tzdata \
+     rsync dnsutils iputils-ping net-tools iproute2 netcat-openbsd \
+     sqlite3 rpm aria2 mercurial";
+
+/// Container engine, installed separately from [`BASE_PACKAGES`].
+///
+/// Kept apart because it needs storage configuration the other packages do not
+/// — see [`DOCKER_DATA_ROOT`].
+const DOCKER_PACKAGES: &str = "docker.io";
+
+/// Where the container engine stores images and layers.
+///
+/// Must be a real filesystem, not the guest's overlayfs root. containerd's
+/// overlayfs snapshotter mounts each container's rootfs as an overlay whose
+/// `lowerdir` is an image layer; when those layers themselves sit on an
+/// overlayfs, the mount fails with `invalid argument` and every `docker create`
+/// exits 1. `/storage` is plain ext4 on `/dev/vda`.
+///
+/// Tempting and wrong: putting this on the overlay root so that images pulled
+/// into the golden are inherited by forks. Inheritance does work there -- and
+/// the images are then unusable, because a layer arriving through a *lower*
+/// overlay cannot back another overlay mount. Pull-and-run appears to succeed
+/// when testing in a single VM, since those writes land in that VM's own upper
+/// layer; the failure only shows up in a fork.
+const DOCKER_DATA_ROOT: &str = "/storage/docker";
+
+/// Standard loopback entries for `/etc/hosts`.
+/// Runner root inside the guest. Must match the `--runner-root` argument
+/// passed to configure at provision time.
+const RUNNER_ROOT: &str = "/var/lib/preloop-runner";
+
+/// Standard loopback entries for `/etc/hosts`.
+///
+/// The base image ships an **empty** `/etc/hosts`, and `nsswitch.conf` is
+/// `hosts: files dns` — so `localhost` falls through to the upstream resolver
+/// and fails to resolve at all. Everything still works over `127.0.0.1`, which
+/// is why this hides so well.
+///
+/// It breaks a large share of real workflows: `services:` containers are
+/// reached at `localhost:<port>`, and most test suites connect to `localhost`
+/// by name. GitHub's runners resolve it, so a workflow that depends on it is
+/// correct — the gap is ours.
+const LOOPBACK_HOSTS: &str = "127.0.0.1 localhost\\n\
+                              ::1 localhost ip6-localhost ip6-loopback\\n\
+                              fe00::0 ip6-localnet\\n\
+                              ff00::0 ip6-mcastprefix\\n\
+                              ff02::1 ip6-allnodes\\n\
+                              ff02::2 ip6-allrouters\\n";
+
+/// The golden image's package baseline. Exposed for the fidelity tests.
+pub fn base_packages() -> &'static str {
+    BASE_PACKAGES
+}
+
+/// Where the container engine stores layers. Exposed for the fidelity tests.
+pub fn docker_data_root() -> &'static str {
+    DOCKER_DATA_ROOT
+}
+
+/// Loopback `/etc/hosts` contents. Exposed for the fidelity tests.
+pub fn loopback_hosts() -> &'static str {
+    LOOPBACK_HOSTS
+}
+
+fn node_externals() -> Vec<Vec<String>> {
+    [vec![
+        "sh".to_owned(),
+        "-c".to_owned(),
+        format!(
+            "RUNNER_EXTERNALS={RUNNER_ROOT}/externals && \
+             mkdir -p \"$RUNNER_EXTERNALS\" && \
+             for entry in 'node20 v20.19.0' 'node24 v24.3.0'; do \
+               set -- $entry; \
+               NAME=$1; VERSION=$2; \
+               DEST=$RUNNER_EXTERNALS/$NAME; \
+               if [ -f \"$DEST/bin/node\" ]; then \
+                 echo \"$NAME already present, skipping\"; continue; \
+               fi; \
+               echo \"Installing $NAME $VERSION into golden...\"; \
+               TEMP=$(mktemp -d \"$RUNNER_EXTERNALS/.$NAME.XXXXXX\") && \
+               curl -fsSL \"https://nodejs.org/dist/$VERSION/node-$VERSION-linux-x64.tar.gz\" \\\
+                 | tar -xz --strip-components=1 -C \"$TEMP\" && \
+               if [ ! -f \"$TEMP/bin/node\" ]; then \
+                 echo \"ERROR: $NAME tarball missing bin/node\" >&2; \
+                 rm -rf \"$TEMP\"; exit 1; \
+               fi && \
+               [ -d \"$DEST\" ] && rm -rf \"$DEST\"; \
+               mv \"$TEMP\" \"$DEST\" && \
+               echo \"$NAME $VERSION baked\" || \
+               {{ rm -rf \"$TEMP\"; echo \"FAILED baking $NAME\" >&2; exit 1; }}; \
+             done"
+        ),
+    ]]
+    .into_iter()
+    .collect()
+}
 
 fn base_install_commands() -> Vec<Vec<String>> {
     // One shell round trip instead of several: every `exec` is a host process
@@ -85,11 +197,52 @@ fn base_install_commands() -> Vec<Vec<String>> {
         "-c".to_owned(),
         format!(
             "apt-get update -qq && \
-             apt-get install -y -qq --no-install-recommends {BASE_PACKAGES}"
+             DEBIAN_FRONTEND=noninteractive \
+             apt-get install -y -qq --no-install-recommends {BASE_PACKAGES} && \
+             printf '{LOOPBACK_HOSTS}' > /etc/hosts && \
+             (DEBIAN_FRONTEND=noninteractive \
+              apt-get install -y -qq {DOCKER_PACKAGES} && \
+              mkdir -p {DOCKER_DATA_ROOT} /etc/docker && \
+              printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\"}}\\n' > /etc/docker/daemon.json \
+              || true)"
         ),
     ]]
     .into_iter()
     .collect()
+}
+
+/// Start the container engine, if one is installed.
+///
+/// Runs per machine rather than in the golden: a daemon captured mid-flight by
+/// a fork would wake up with stale state and a socket it does not own. Machines
+/// are pre-provisioned, so this sits off the critical path of any job.
+///
+/// Never fatal. A pool without a working container engine still runs every job
+/// that does not use `container:` or `services:`.
+///
+/// Readiness is `docker info` rather than `pgrep dockerd`, because a forked VM
+/// can carry a `[dockerd] <defunct>` entry from its golden: a name match sees
+/// the zombie, concludes Docker is up, and leaves the runner with no daemon.
+/// A stale `/var/run/docker.pid` naming that same pid blocks startup outright,
+/// and is only removed once `docker info` has failed -- so it is stale by
+/// definition.
+fn docker_start_command() -> Vec<String> {
+    vec![
+        "sh".to_owned(),
+        "-c".to_owned(),
+        format!(
+            "command -v dockerd >/dev/null 2>&1 || exit 0; \
+             docker info >/dev/null 2>&1 && exit 0; \
+             rm -f /var/run/docker.pid; \
+             mkdir -p {DOCKER_DATA_ROOT}; \
+             (dockerd >/var/log/dockerd.log 2>&1 &) ; \
+             for _ in $(seq 1 50); do \
+               docker info >/dev/null 2>&1 && exit 0; \
+               sleep 0.2; \
+             done; \
+             exit 0"
+        ),
+    ]
 }
 
 /// How long to wait for a freshly started guest to accept commands.
@@ -126,6 +279,9 @@ async fn install_base_dependencies<P: VmProvider>(
     for command in base_install_commands() {
         provider.exec(name, &command).await?;
     }
+    for command in node_externals() {
+        provider.exec(name, &command).await?;
+    }
     Ok(())
 }
 
@@ -134,8 +290,11 @@ async fn install_base_dependencies<P: VmProvider>(
 /// Control-socket routing and failure-marker debugging are independent
 /// features: a pool can debug failed jobs without a mounted control socket and
 /// vice versa, so neither may gate the other.
-fn guest_env_prefix(config: &RunnerPoolConfig) -> Vec<String> {
+fn guest_env_prefix(config: &RunnerPoolConfig, name: &MachineName) -> Vec<String> {
     let mut env = Vec::new();
+    // The guest needs its own VM name so a debug session can tell a controller
+    // which machine to open a shell into. Nothing else in the guest knows it.
+    env.push(format!("PRELOOP_MACHINE_NAME={}", name.as_str()));
     if config.control_socket.is_some() {
         env.push(format!(
             "PRELOOP_CONTROL_ORIGIN={}",
@@ -206,6 +365,11 @@ pub struct RunnerPoolConfig {
     /// `runs-on` labels of the job at the front of the dispatch queue,
     /// refreshed after each claim. The pool reads them to select the correct
     /// base-image golden before provisioning.
+    /// Container images pulled into every golden at build time.
+    ///
+    /// Deliberately not part of the environment fingerprint -- see
+    /// [`crate::environment::scan_workflow_images`].
+    pub preload_images: Vec<String>,
     pub next_job_runs_on: Option<Arc<std::sync::RwLock<Vec<String>>>>,
 }
 
@@ -363,6 +527,78 @@ pub struct RunnerPool<P: VmProvider = SmolVmProvider> {
     config: RunnerPoolConfig,
 }
 
+/// Pull `images` into a golden so every runner forked from it starts warm.
+///
+/// Forking copy-on-writes the golden's ext4 storage disk as well as its overlay
+/// root, so an image sitting in [`DOCKER_DATA_ROOT`] costs each runner nothing
+/// and is usable the instant it boots. Left to job time it is re-pulled by
+/// every ephemeral runner that needs it: measured cold, 3.5s for
+/// `postgres:16-alpine` and 8.7s for `node:20`, on every run.
+///
+/// Only images the workspace's own workflows declare are pulled, so a warm
+/// golden can never make a job pass locally that would fail on GitHub.
+async fn preload_images<P: VmProvider>(
+    provider: &P,
+    golden: &MachineName,
+    images: &[String],
+) -> Result<(), OrchestratorError> {
+    if images.is_empty() {
+        return Ok(());
+    }
+    // The golden has no dockerd yet -- that starts per runner at provision
+    // time -- so this brings one up and leaves it running. Stopping it here
+    // would not produce a clean slate: a fork restores the golden's process
+    // table, so `pkill` leaves `[dockerd] <defunct>`, a pidfile naming that
+    // zombie, and a half-torn-down containerd whose socket the next daemon
+    // cannot dial. Handing forks a live daemon avoids all three.
+    //
+    // The trailing `sync` is load-bearing: forking captures the disk, not the
+    // page cache, so hundreds of MB of fresh layers would otherwise reach forks
+    // as metadata pointing at unreadable blobs (EIO on every inherited image).
+    let refs = images
+        .iter()
+        .map(|image| format!("'{}'", image.replace('\'', "'\\''")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let script = format!(
+        "command -v dockerd >/dev/null 2>&1 || {{ echo 'no dockerd' >&2; exit 1; }}; \
+         mkdir -p {DOCKER_DATA_ROOT}; \
+         docker info >/dev/null 2>&1 || (dockerd >/var/log/dockerd-preload.log 2>&1 &); \
+         for _ in $(seq 1 150); do docker info >/dev/null 2>&1 && break; sleep 0.2; done; \
+         docker info >/dev/null 2>&1 || {{ echo 'dockerd never became ready' >&2; exit 1; }}; \
+         pulled=0; \
+         for image in {refs}; do \
+           docker pull -q \"$image\" >/dev/null 2>&1 && pulled=$((pulled+1)) \
+             || echo \"preload miss: $image\" >&2; \
+         done; \
+         sync; \
+         echo \"$pulled\""
+    );
+    let output = provider
+        .exec(golden, &["sh".to_owned(), "-c".to_owned(), script])
+        .await?;
+    // Report what actually landed. An earlier version logged the requested
+    // count unconditionally, hiding a preload that pulled nothing at all.
+    let pulled = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .rev()
+        .find_map(|line| line.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    if pulled == 0 {
+        return Err(OrchestratorError::Config(format!(
+            "image preload pulled none of {} requested images",
+            images.len()
+        )));
+    }
+    info!(
+        machine = golden.as_str(),
+        pulled,
+        requested = images.len(),
+        "preloaded container images into golden"
+    );
+    Ok(())
+}
+
 /// Prepare a running forkable golden VM with the requested environment.
 async fn prepare_golden_for_env<P: VmProvider + 'static>(
     provider: &Arc<P>,
@@ -407,6 +643,13 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
                 return Err(error.into());
             }
         }
+    }
+    if let Err(error) = preload_images(provider.as_ref(), golden, &config.preload_images).await {
+        // A preload miss costs a run-time pull, not a broken job.
+        warn!(
+            machine = golden.as_str(),
+            %error, "image preload failed; jobs will pull at run time"
+        );
     }
     info!(machine = golden.as_str(), "golden fork base ready");
     Ok(())
@@ -994,13 +1237,43 @@ async fn run_until_exit<P: VmProvider + 'static>(
     busy: tokio::sync::oneshot::Sender<()>,
 ) -> Result<(), VmError> {
     let (chunks, mut receiver) = mpsc::channel(64);
+    let machine = name.as_str().to_owned();
     let watcher = tokio::spawn(async move {
         let mut busy = Some(busy);
         let mut pending = String::new();
+        // Guest output is the only window into the worker. Forwarding it to
+        // tracing is what makes an in-VM failure diagnosable from the host;
+        // consuming it purely to sniff for the busy sentinel meant every
+        // worker-side decision was invisible.
+        let mut line_buffer = String::new();
         while let Some(chunk) = receiver.recv().await {
-            let OutputChunk::Stdout(bytes) = chunk else {
-                continue;
+            let (bytes, is_stdout) = match chunk {
+                OutputChunk::Stdout(bytes) => (bytes, true),
+                OutputChunk::Stderr(bytes) => (bytes, false),
             };
+            line_buffer.push_str(&String::from_utf8_lossy(&bytes));
+            // Cap retained tail to prevent unbounded growth from a guest
+            // that never emits newlines (e.g. progress bar, binary output).
+            const LINE_BUFFER_CAP: usize = 64 * 1024;
+            if line_buffer.len() > LINE_BUFFER_CAP {
+                // Round forward to a char boundary: `String::drain` panics
+                // mid-codepoint, and a multi-byte char can straddle the cut.
+                let mut drain = line_buffer.len() - LINE_BUFFER_CAP;
+                while drain < line_buffer.len() && !line_buffer.is_char_boundary(drain) {
+                    drain += 1;
+                }
+                line_buffer.drain(..drain);
+            }
+            while let Some(newline) = line_buffer.find('\n') {
+                let line: String = line_buffer.drain(..=newline).collect();
+                let line = line.trim_end();
+                if !line.is_empty() {
+                    debug!(machine = machine.as_str(), stdout = is_stdout, "{line}");
+                }
+            }
+            if !is_stdout {
+                continue;
+            }
             if busy.is_none() {
                 continue;
             }
@@ -1078,7 +1351,7 @@ async fn provision_runner<P: VmProvider + 'static>(
 
     let runner = format!("/opt/preloop/bin/{}", config.runner_binary_name);
     let labels = config.labels.join(",");
-    let mut configure = guest_env_prefix(config);
+    let mut configure = guest_env_prefix(config, name);
     configure.extend([
         runner.clone(),
         "configure".into(),
@@ -1117,8 +1390,19 @@ async fn provision_runner<P: VmProvider + 'static>(
         .await?;
     drop(staged);
 
+    // Bring the container engine up before the runner accepts work, so a job
+    // declaring `container:` or `services:` does not race the daemon. Failure
+    // is not fatal — only container jobs depend on it.
+    if let Err(error) = provider.exec(name, &docker_start_command()).await {
+        warn!(
+            machine = name.as_str(),
+            %error,
+            "container engine did not start; `container:` and `services:` jobs will fail"
+        );
+    }
+
     info!(machine = name.as_str(), "ephemeral runner ready");
-    let mut run = guest_env_prefix(config);
+    let mut run = guest_env_prefix(config, name);
     run.extend([
         runner,
         "run".into(),
@@ -1302,6 +1586,7 @@ mod lifecycle_tests {
             debug_dir: None,
             runner_key_dir: None,
             pending_jobs: None,
+            preload_images: Vec::new(),
             next_job_runs_on: None,
         }
     }
