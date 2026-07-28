@@ -376,6 +376,48 @@ pub(crate) async fn submit_run_inner(
         None
     };
 
+    // Resolve the real GitHub credential for each job *before* taking the
+    // dispatch lock: an installation-token round-trip must never stall every
+    // other run behind `state.inner`. A job with no entry here falls back to
+    // the local HMAC JWT minted inside the loop, so the effective order stays
+    // GitHub App > PAT > local JWT.
+    let mut github_tokens: BTreeMap<JobId, String> = BTreeMap::new();
+    if let Some(app) = &shared.state.github_app {
+        for job in &jobs {
+            match crate::github_app::get_or_mint_token(
+                app,
+                &repository_owner,
+                job.permissions.as_ref(),
+            )
+            .await
+            {
+                Ok(token) => {
+                    info!(
+                        %run_id,
+                        job = %job.id,
+                        owner = %repository_owner,
+                        "Minted GitHub App installation token for job"
+                    );
+                    github_tokens.insert(job.id.clone(), token);
+                }
+                Err(error) => {
+                    warn!(
+                        %run_id,
+                        job = %job.id,
+                        owner = %repository_owner,
+                        "GitHub App token minting failed, falling back: {error:#}"
+                    );
+                    if let Ok(pat) = std::env::var("AKSH_GITHUB_TOKEN") {
+                        github_tokens.insert(job.id.clone(), pat);
+                    }
+                }
+            }
+        }
+    } else if let Ok(pat) = std::env::var("AKSH_GITHUB_TOKEN") {
+        info!(%run_id, "Using AKSH_GITHUB_TOKEN PAT for run jobs");
+        github_tokens.extend(jobs.iter().map(|job| (job.id.clone(), pat.clone())));
+    }
+
     {
         let mut inner = shared.state.inner.lock().await;
         let run_number = {
@@ -502,9 +544,21 @@ pub(crate) async fn submit_run_inner(
             // it, so the default job message shape is unchanged.
             agent_msg.preloop_preserve_on_failure = submission.preserve_on_failure.then_some(true);
 
+            // Local HMAC JWT scoped to this job. It authenticates the job back
+            // to this server (snapshot Git, and the endpoint AccessToken the
+            // broker mints on delivery) no matter which credential ends up as
+            // the job's `GITHUB_TOKEN`.
+            let runtime_token = shared
+                .state
+                .mint_runtime_token(&agent_msg.plan.plan_id, &agent_msg.job_id);
+
             if let Some(snapshot) = workspace_snapshot.as_ref() {
-                let redirected =
-                    redirect_primary_checkout(&mut agent_msg, snapshot, &public_base_url());
+                let redirected = redirect_primary_checkout(
+                    &mut agent_msg,
+                    snapshot,
+                    &public_base_url(),
+                    &runtime_token,
+                );
                 if redirected > 0 {
                     info!(
                         %run_id,
@@ -513,6 +567,11 @@ pub(crate) async fn submit_run_inner(
                         commit = %snapshot.commit_sha,
                         "Redirected primary checkout to local workspace snapshot"
                     );
+                    // Carried so a debug session can diff the live workspace
+                    // against the tree the job actually checked out. Only
+                    // meaningful once a checkout actually points at the
+                    // snapshot; otherwise the job never saw that tree.
+                    agent_msg.aksh_snapshot_commit = Some(snapshot.commit_sha.clone());
                 }
             }
 
@@ -546,17 +605,30 @@ pub(crate) async fn submit_run_inner(
                     }
                 }
             }
-            // Mint a dynamic JWT for the job and inject it as GITHUB_TOKEN.
-            let token = shared
-                .state
-                .mint_runtime_token(&agent_msg.plan.plan_id, &agent_msg.job_id);
+            // Token fallback: GitHub App > PAT > local JWT. The App/PAT
+            // credential was resolved above, outside the dispatch lock; an
+            // absent entry means both were unavailable. The local runtime token
+            // always stays in the endpoint AccessToken (runner<->server auth);
+            // only `system.github.token` — which becomes the job's
+            // `GITHUB_TOKEN` — carries the real GitHub credential.
+            let github_token = github_tokens.remove(&job.id).unwrap_or(runtime_token);
             agent_msg.variables.insert(
                 "system.github.token".to_owned(),
-                aksh_gha_protocol::azdo::VariableValue::secret(token.clone()),
+                aksh_gha_protocol::azdo::VariableValue::secret(github_token.clone()),
             );
             agent_msg.variables.insert(
                 "github_token".to_owned(),
-                aksh_gha_protocol::azdo::VariableValue::secret(token.clone()),
+                aksh_gha_protocol::azdo::VariableValue::secret(github_token),
+            );
+            // Mint a separate debug-worker token delivered only to the trusted
+            // runner process. Never surfaced as GITHUB_TOKEN so untrusted
+            // workflow code cannot forge debug session requests.
+            let debug_token = shared
+                .state
+                .mint_debug_worker_token(&agent_msg.plan.plan_id, &agent_msg.job_id);
+            agent_msg.variables.insert(
+                "system.preloop.debug_worker_token".to_owned(),
+                aksh_gha_protocol::azdo::VariableValue::secret(debug_token),
             );
             agent_msg.variables.insert(
                 "system.github.launch_endpoint".to_owned(),
@@ -604,7 +676,10 @@ pub(crate) async fn submit_run_inner(
 
             agent_msg.enable_debugger = submission.enable_debugger;
             agent_msg.debugger_welcome_message = submission.debugger_welcome_message.clone();
-            if submission.enable_debugger {
+            // Pause-on-failure needs the run id too: the worker addresses its
+            // debug session by it. Set it for either debugging mode rather
+            // than leaving the live-pause path silently inert.
+            if submission.enable_debugger || submission.preserve_on_failure {
                 agent_msg.aksh_debug_run_id = Some(run_id.to_string());
                 agent_msg.aksh_debug_transport = Some("local".to_string());
             }
