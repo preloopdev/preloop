@@ -337,6 +337,7 @@ impl Fixture {
             debug_dir: None,
             runner_key_dir: None,
             pending_jobs: None,
+            preload_images: Vec::new(),
             next_job_runs_on: None,
         };
         Self {
@@ -539,8 +540,11 @@ async fn runner_keeps_public_only_egress_and_wires_control_socket_and_environmen
         }]
     );
 
+    // The guest is always told its own machine name: a debug session needs it
+    // to tell a controller which VM to open a shell into.
     let expected_prefix = vec![
         "/usr/bin/env".to_owned(),
+        format!("PRELOOP_MACHINE_NAME={runner}"),
         "PRELOOP_CONTROL_ORIGIN=https://preloop.example".to_owned(),
         "PRELOOP_CONTROL_SOCKET=/run/preloop-control/engine.sock".to_owned(),
     ];
@@ -581,11 +585,13 @@ async fn guest_environment_tracks_control_socket_and_debug_dir_independently() {
     const SOCKET: &str = "PRELOOP_CONTROL_SOCKET=/run/preloop-control/engine.sock";
     const MARKER: &str = "PRELOOP_FAILURE_MARKER=/var/lib/preloop-runner/.preloop-job-failed";
 
+    // `PRELOOP_MACHINE_NAME` is unconditional and slot-dependent, so each case
+    // lists only the knob-driven tail.
     let cases: [(bool, bool, Vec<&str>); 4] = [
         (false, false, vec![]),
-        (true, false, vec!["/usr/bin/env", ORIGIN, SOCKET]),
-        (false, true, vec!["/usr/bin/env", MARKER]),
-        (true, true, vec!["/usr/bin/env", ORIGIN, SOCKET, MARKER]),
+        (true, false, vec![ORIGIN, SOCKET]),
+        (false, true, vec![MARKER]),
+        (true, true, vec![ORIGIN, SOCKET, MARKER]),
     ];
 
     for (with_socket, with_debug_dir, expected) in cases {
@@ -623,8 +629,11 @@ async fn guest_environment_tracks_control_socket_and_debug_dir_independently() {
             .take_while(|arg| !arg.ends_with(&config.runner_binary_name))
             .map(String::as_str)
             .collect();
+        let machine_name = format!("PRELOOP_MACHINE_NAME={runner}");
+        let mut want = vec!["/usr/bin/env", machine_name.as_str()];
+        want.extend(expected);
         assert_eq!(
-            prefix, expected,
+            prefix, want,
             "socket={with_socket} debug_dir={with_debug_dir}"
         );
     }

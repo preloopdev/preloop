@@ -1,12 +1,72 @@
 //! Toolchain and base-image resolution for disposable job environments.
 
-use aksh_gha_protocol::JobPlan;
+use aksh_gha_protocol::{oci_image_ref, JobPlan};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
+
+/// Collect every container image the workspace's workflows declare.
+///
+/// Read from the YAML rather than from expanded job plans because this runs at
+/// startup, before any job is queued, so the golden can be warmed during its
+/// single build instead of triggering a second one later. That is also why
+/// images stay out of [`EnvironmentSpec`]'s fingerprint: a distinct fingerprint
+/// forces a fresh golden build (measured 249s) to save a 4-9s pull, and
+/// preloading is semantically free -- a spare image is harmless, a missing one
+/// is simply pulled.
+///
+/// Parsing is deliberately lenient. A workflow this cannot read is a missed
+/// preload, which costs a run-time pull, never a failure.
+pub fn scan_workflow_images(workspace: &Path) -> Vec<String> {
+    let mut images = BTreeSet::new();
+    let Ok(entries) = fs::read_dir(workspace.join(".github").join("workflows")) else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Reject symlinks and non-regular files to prevent path traversal
+        // and reads from device nodes (e.g. /dev/zero).
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        if !matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("yml" | "yaml")
+        ) {
+            continue;
+        }
+        let Ok(meta) = path.metadata() else {
+            continue;
+        };
+        if meta.len() > 2 * 1024 * 1024 {
+            continue; // skip files > 2 MB
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(doc) = serde_yaml::from_str::<Value>(&text) else {
+            continue;
+        };
+        let Some(jobs) = doc.get("jobs").and_then(Value::as_object) else {
+            continue;
+        };
+        for job in jobs.values() {
+            if let Some(image) = job.get("container").and_then(oci_image_ref) {
+                images.insert(image);
+            }
+            if let Some(services) = job.get("services").and_then(Value::as_object) {
+                images.extend(services.values().filter_map(oci_image_ref));
+            }
+        }
+    }
+    images.into_iter().collect()
+}
 
 /// A toolchain that must be available in a job VM.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -373,6 +433,7 @@ mod tests {
             secrets_map: BTreeMap::new(),
             job_outputs: BTreeMap::new(),
             oidc_id_token_granted: false,
+            permissions: None,
             oidc_environment: None,
             oidc_job_workflow_ref: None,
             concurrency_group: None,
