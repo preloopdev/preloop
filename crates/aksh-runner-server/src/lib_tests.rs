@@ -60,6 +60,41 @@ async fn preserve_on_failure_reaches_the_job_message_only_when_requested() {
 }
 
 #[tokio::test]
+async fn prebuilt_messages_preserve_monotonic_workflow_run_numbers() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let workflow =
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+
+    let first = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": workflow,
+            "event": "push",
+            "repository": "owner/repo"
+        }),
+    )
+    .await;
+    let second = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": workflow,
+            "event": "push",
+            "repository": "owner/repo"
+        }),
+    )
+    .await;
+
+    assert_eq!(first["run_number"], 1);
+    assert_eq!(second["run_number"], 2);
+}
+
+#[tokio::test]
 async fn run_apis_never_return_submitted_secret_values() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
@@ -4197,7 +4232,10 @@ async fn debug_session_suspends_job_timeout() {
     )
     .await;
     assert_eq!(lease["controller"], "test-agent");
-    assert_eq!(lease["capabilities"], json!(["step.retry", "job.retry_from", "job.abort"]));
+    assert_eq!(
+        lease["capabilities"],
+        json!(["step.retry", "job.retry_from", "job.abort"])
+    );
 
     let events = request_json(
         &app,
