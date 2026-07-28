@@ -4073,6 +4073,621 @@ async fn job_timeout_enforcement_cancels_job() {
     }
 }
 
+/// A paused debug session must suspend job-timeout enforcement.
+///
+/// Prerequisite covered separately by
+/// `preserve_on_failure_carries_the_run_id_for_the_debug_session`.
+///
+/// Without this the server reaper cancels a debug session out from under the
+/// user — and `timeout-minutes: 10` is a completely ordinary thing to write,
+/// so the failure would be common and would look like a crash.
+#[tokio::test]
+async fn debug_session_suspends_job_timeout() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown,
+    });
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: \"false\"\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "preserve_on_failure": true
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    let _msg = request_json(
+        &app,
+        Method::GET,
+        "/runner/server/_apis/v1/Message/1?sessionId=default",
+        Value::Null,
+    )
+    .await;
+
+    let (request_id, agent_job_id, worker_token) = {
+        let inner = state.inner.lock().await;
+        let (id, record) = inner.job_requests.iter().next().unwrap();
+        (
+            *id,
+            record.agent_job_id,
+            state.mint_debug_worker_token(&record.plan_id, &record.agent_job_id),
+        )
+    };
+
+    // The worker fails a step and opens a session. It authenticates with the
+    // job debug-worker token — not a runner listen token, and deliberately not
+    // the runtime token the job itself can read as GITHUB_TOKEN.
+    let opened = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/api/v1/debug/sessions",
+        json!({
+            "run_id": run_id,
+            "job_id": "build",
+            "agent_job_id": agent_job_id,
+            "job_name": "build",
+            "step": {
+                "index": 0,
+                "total": 1,
+                "context_name": "__run",
+                "display_name": "Run false",
+                "command": "false",
+                "exit_code": 1,
+                "elapsed_ms": 20,
+                "diagnostics": []
+            }
+        }),
+        &worker_token,
+    )
+    .await;
+    let session_id = opened["session_id"].as_str().unwrap().to_owned();
+
+    // Backdate the job and its pause by the same amount, inside the pause
+    // credit ceiling, so every elapsed second is debugging rather than
+    // execution.
+    {
+        let mut inner = state.inner.lock().await;
+        let past = SystemTime::now() - Duration::from_secs(10_000);
+        inner.job_requests.get_mut(&request_id).unwrap().started_at = Some(past);
+        inner
+            .debug_sessions
+            .backdate_pause_for_test(&session_id, past);
+    }
+
+    reap_once(&shared).await;
+
+    {
+        let inner = state.inner.lock().await;
+        assert!(
+            !inner
+                .job_requests
+                .get(&request_id)
+                .unwrap()
+                .timeout_triggered,
+            "a paused job must not time out — the clock is suspended while debugging"
+        );
+        assert!(inner.cancellation_queue.is_empty());
+    }
+
+    // A controller lists the session and sees the failure.
+    let listed = request_json(&app, Method::GET, "/api/v1/debug/sessions", Value::Null).await;
+    assert_eq!(listed["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["sessions"][0]["state"], "paused");
+    assert_eq!(listed["sessions"][0]["step"]["display_name"], "Run false");
+
+    // An agent acquires the lease and receives a structured failure event.
+    let lease = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/agent/debug/sessions/{session_id}/lease"),
+        json!({
+            "controller": "test-agent",
+            "capabilities": ["job.retry_from"]
+        }),
+    )
+    .await;
+    assert_eq!(lease["controller"], "test-agent");
+    assert_eq!(lease["capabilities"], json!(["step.retry", "job.retry_from", "job.abort"]));
+
+    let events = request_json(
+        &app,
+        Method::GET,
+        &format!("/api/v1/agent/debug/sessions/{session_id}/events?after=0"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(events["events"][0]["event"], "step_failed");
+
+    // The agent retries from the first step; the worker's long poll picks it
+    // up through the same verdict state machine as the human CLI.
+    let operation = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/agent/debug/sessions/{session_id}/operations"),
+        json!({
+            "request_id": "agent-retry-1",
+            "expected_version": 1,
+            "lease_id": lease["lease_id"],
+            "operation": {
+                "operation": "retry_from",
+                "step_index": 0
+            }
+        }),
+    )
+    .await;
+    assert_eq!(operation["status"], "retrying");
+    assert_eq!(operation["prev_version"], 1);
+    assert_eq!(operation["new_version"], 2);
+
+    let audit = request_json(
+        &app,
+        Method::GET,
+        &format!("/api/v1/agent/debug/sessions/{session_id}/audit"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(audit[0]["request_id"], "agent-retry-1");
+
+    let delivered = request_json_with_bearer(
+        &app,
+        Method::GET,
+        &format!("/api/v1/debug/sessions/{session_id}/verdict?wait=0"),
+        Value::Null,
+        &worker_token,
+    )
+    .await;
+    assert_eq!(delivered["verdict"], "retry");
+    assert_eq!(delivered["retry_from_step"], 0);
+
+    // Delivering the verdict banks the paused interval and restarts the clock.
+    // Suspension is not amnesty: push the start back so that *executing* time
+    // alone exceeds the timeout, and the reaper must act.
+    {
+        let mut inner = state.inner.lock().await;
+        let banked = inner
+            .debug_sessions
+            .paused_for_request(request_id, SystemTime::now());
+        assert!(
+            banked >= Duration::from_secs(9_500),
+            "the pause should have banked its full duration, got {banked:?}"
+        );
+        inner.job_requests.get_mut(&request_id).unwrap().started_at =
+            Some(SystemTime::now() - Duration::from_secs(21_700) - banked);
+    }
+
+    reap_once(&shared).await;
+    {
+        let inner = state.inner.lock().await;
+        assert!(
+            inner
+                .job_requests
+                .get(&request_id)
+                .unwrap()
+                .timeout_triggered,
+            "execution time still counts once the session resumes"
+        );
+    }
+}
+
+/// Status of a bearer-authenticated request, for asserting rejections.
+async fn request_status_with_bearer(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    body: Value,
+    bearer: &str,
+) -> StatusCode {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+    let request = if body.is_null() {
+        builder.body(Body::empty()).unwrap()
+    } else {
+        builder = builder.header(header::CONTENT_TYPE, "application/json");
+        builder.body(Body::from(body.to_string())).unwrap()
+    };
+    app.clone().oneshot(request).await.unwrap().status()
+}
+
+/// One job's debug-worker token must not reach another job's debug session.
+///
+/// Token validity alone used to authorize every worker route, so any live job
+/// could open a session on another job's behalf — suspending its timeout — and
+/// could drain its verdict, since taking a verdict consumes it.
+#[tokio::test]
+async fn a_job_token_cannot_touch_another_jobs_debug_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: \"false\"\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "preserve_on_failure": true
+        }),
+    )
+    .await;
+    let run_id: RunId = {
+        let inner = state.inner.lock().await;
+        inner.job_requests.values().next().unwrap().run_id
+    };
+
+    request_json(
+        &app,
+        Method::GET,
+        "/runner/server/_apis/v1/Message/1?sessionId=default",
+        Value::Null,
+    )
+    .await;
+
+    let (agent_job_id, victim_token, attacker_token) = {
+        let inner = state.inner.lock().await;
+        let record = inner.job_requests.values().next().unwrap();
+        (
+            record.agent_job_id,
+            state.mint_debug_worker_token(&record.plan_id, &record.agent_job_id),
+            // A token for some other live job, minted the same way.
+            state.mint_debug_worker_token(&record.plan_id, &uuid::Uuid::new_v4()),
+        )
+    };
+
+    let open_body = json!({
+        "run_id": run_id,
+        "job_id": "build",
+        "agent_job_id": agent_job_id,
+        "job_name": "build",
+        "step": {
+            "index": 0,
+            "total": 1,
+            "context_name": "__run",
+            "display_name": "Run false",
+            "command": "false",
+            "exit_code": 1,
+            "elapsed_ms": 20,
+            "diagnostics": []
+        }
+    });
+
+    // Opening a session for a job you are not is refused outright.
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::POST,
+            "/api/v1/debug/sessions",
+            open_body.clone(),
+            &attacker_token,
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+
+    let opened = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/api/v1/debug/sessions",
+        open_body,
+        &victim_token,
+    )
+    .await;
+    let session_id = opened["session_id"].as_str().unwrap().to_owned();
+
+    // A controller queues a verdict for the paused worker.
+    request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/debug/sessions/{session_id}/verdict"),
+        json!({ "verdict": "continue", "controller": "cli" }),
+    )
+    .await;
+
+    // The other job cannot steal it, and cannot close the session either.
+    // Reported as 404 so session ids are not probeable.
+    for (method, path, body) in [
+        (
+            Method::GET,
+            format!("/api/v1/debug/sessions/{session_id}/verdict?wait=0"),
+            Value::Null,
+        ),
+        (
+            Method::POST,
+            format!("/api/v1/debug/sessions/{session_id}/close"),
+            json!({ "state": "aborted" }),
+        ),
+    ] {
+        assert_eq!(
+            request_status_with_bearer(&app, method, &path, body, &attacker_token).await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    // The verdict is still there for its rightful owner.
+    let delivered = request_json_with_bearer(
+        &app,
+        Method::GET,
+        &format!("/api/v1/debug/sessions/{session_id}/verdict?wait=0"),
+        Value::Null,
+        &victim_token,
+    )
+    .await;
+    assert_eq!(delivered["verdict"], "continue");
+}
+
+/// A runner listen token is not a worker token.
+#[tokio::test]
+async fn the_debug_surface_rejects_a_non_job_token() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::GET,
+            "/api/v1/debug/sessions/dbg_whatever/verdict?wait=0",
+            Value::Null,
+            "not-a-token",
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // A job runtime token is not enough either. That token is handed to the
+    // job as GITHUB_TOKEN, so any `run:` step can read it; accepting it here
+    // would let untrusted workflow code drive its own debug session.
+    let runtime_token = state.mint_runtime_token("plan", &uuid::Uuid::new_v4());
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::GET,
+            "/api/v1/debug/sessions/dbg_whatever/verdict?wait=0",
+            Value::Null,
+            &runtime_token,
+        )
+        .await,
+        StatusCode::UNAUTHORIZED,
+        "GITHUB_TOKEN must not reach the debug surface"
+    );
+}
+
+/// Pause credit is finite: past the ceiling the job times out normally.
+///
+/// Otherwise a worker that keeps polling opts its job out of `timeout-minutes`
+/// altogether, and holds its microVM for as long as it likes.
+#[tokio::test]
+async fn pause_credit_runs_out_and_the_job_times_out() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown,
+    });
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: \"false\"\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "preserve_on_failure": true
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    request_json(
+        &app,
+        Method::GET,
+        "/runner/server/_apis/v1/Message/1?sessionId=default",
+        Value::Null,
+    )
+    .await;
+
+    let (request_id, agent_job_id, worker_token) = {
+        let inner = state.inner.lock().await;
+        let (id, record) = inner.job_requests.iter().next().unwrap();
+        (
+            *id,
+            record.agent_job_id,
+            state.mint_debug_worker_token(&record.plan_id, &record.agent_job_id),
+        )
+    };
+
+    let opened = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/api/v1/debug/sessions",
+        json!({
+            "run_id": run_id,
+            "job_id": "build",
+            "agent_job_id": agent_job_id,
+            "job_name": "build",
+            "step": {
+                "index": 0,
+                "total": 1,
+                "context_name": "__run",
+                "display_name": "Run false",
+                "command": "false",
+                "exit_code": 1,
+                "elapsed_ms": 20,
+                "diagnostics": []
+            }
+        }),
+        &worker_token,
+    )
+    .await;
+    let session_id = opened["session_id"].as_str().unwrap().to_owned();
+
+    // The worker is still polling — `worker_seen_at` is fresh, so the
+    // abandonment sweep does not apply. Only the credit ceiling can end this.
+    let ceiling = crate::debug_sessions::MAX_PAUSE_CREDIT;
+    {
+        let mut inner = state.inner.lock().await;
+        let past = SystemTime::now() - ceiling - Duration::from_secs(22_000);
+        inner.job_requests.get_mut(&request_id).unwrap().started_at = Some(past);
+        inner
+            .debug_sessions
+            .backdate_pause_for_test(&session_id, past);
+    }
+
+    reap_once(&shared).await;
+
+    let inner = state.inner.lock().await;
+    assert!(
+        inner
+            .job_requests
+            .get(&request_id)
+            .unwrap()
+            .timeout_triggered,
+        "pause credit must be finite — an endless pause is an endless job"
+    );
+}
+
+/// An empty long poll must never be mistaken for a decision.
+#[tokio::test]
+async fn verdict_poll_timeout_is_not_an_abort() {
+    verdict_poll_timeout_is_not_an_abort_impl().await;
+}
+
+/// The worker addresses its debug session by run id, so `preserve_on_failure`
+/// must carry one.
+///
+/// This was silently missing at first: the field was only populated for DAP
+/// runs, so the live-pause path constructed no client and fell through to the
+/// old post-mortem behaviour with no error anywhere.
+#[tokio::test]
+async fn preserve_on_failure_carries_the_run_id_for_the_debug_session() {
+    for (preserve, expect_run_id) in [(true, true), (false, false)] {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+                "event": "push",
+                "repository": "owner/repo",
+                "preserve_on_failure": preserve
+            }),
+        )
+        .await;
+        let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+
+        let queued = {
+            let inner = state.inner.lock().await;
+            inner.queue.front().cloned().unwrap()
+        };
+        assert_eq!(
+            queued.message.aksh_debug_run_id.as_deref() == Some(run_id.as_str()),
+            expect_run_id,
+            "preserve_on_failure={preserve} must {} carry the run id",
+            if expect_run_id { "" } else { "not" }
+        );
+
+        // The wire shape stays clean when debugging was not requested.
+        let encoded = serde_json::to_value(&queued.message).unwrap();
+        assert_eq!(
+            encoded.get("akshDebugRunId").is_some(),
+            expect_run_id,
+            "absent means absent on the wire"
+        );
+    }
+}
+
+async fn verdict_poll_timeout_is_not_an_abort_impl() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+
+    request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: \"false\"\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "preserve_on_failure": true
+        }),
+    )
+    .await;
+    let _msg = request_json(
+        &app,
+        Method::GET,
+        "/runner/server/_apis/v1/Message/1?sessionId=default",
+        Value::Null,
+    )
+    .await;
+    let (run_id, agent_job_id, worker_token) = {
+        let inner = state.inner.lock().await;
+        let record = inner.job_requests.values().next().unwrap();
+        (
+            record.run_id,
+            record.agent_job_id,
+            state.mint_debug_worker_token(&record.plan_id, &record.agent_job_id),
+        )
+    };
+
+    let opened = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/api/v1/debug/sessions",
+        json!({
+            "run_id": run_id,
+            "job_id": "build",
+            "agent_job_id": agent_job_id,
+            "job_name": "build",
+            "step": {
+                "index": 0, "total": 1, "context_name": "__run",
+                "display_name": "Run false", "elapsed_ms": 5, "diagnostics": []
+            }
+        }),
+        &worker_token,
+    )
+    .await;
+    let session_id = opened["session_id"].as_str().unwrap();
+
+    let polled = request_json_with_bearer(
+        &app,
+        Method::GET,
+        &format!("/api/v1/debug/sessions/{session_id}/verdict?wait=0"),
+        Value::Null,
+        &worker_token,
+    )
+    .await;
+    assert!(
+        polled.get("verdict").is_none() || polled["verdict"].is_null(),
+        "an expired poll must carry no verdict, got {polled}"
+    );
+
+    // The session is still open and still holding the job.
+    let listed = request_json(&app, Method::GET, "/api/v1/debug/sessions", Value::Null).await;
+    assert_eq!(listed["sessions"].as_array().unwrap().len(), 1);
+}
+
 #[tokio::test]
 async fn runner_lease_expiration_disconnect_reaper() {
     let temp = tempfile::tempdir().unwrap();
@@ -7812,6 +8427,7 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
             repository: "snapshots/11111111-1111-4111-8111-111111111111".to_owned(),
         },
         "http://127.0.0.1:9090",
+        "local-runtime-jwt",
     );
 
     assert_eq!(redirected, 1);
@@ -7828,6 +8444,9 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
         primary.get("github-server-url"),
         Some(&"http://127.0.0.1:9090".to_owned())
     );
+    // Pinned so snapshot checkout keeps working when GITHUB_TOKEN carries a
+    // GitHub App installation token or PAT the snapshot endpoint cannot verify.
+    assert_eq!(primary.get("token"), Some(&"local-runtime-jwt".to_owned()));
     assert_eq!(primary.get("path"), Some(&"source".to_owned()));
     assert_eq!(primary.get("fetch-depth"), Some(&"0".to_owned()));
     assert_eq!(message.steps[1].inputs, original_explicit);
