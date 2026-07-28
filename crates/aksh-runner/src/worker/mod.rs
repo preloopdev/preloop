@@ -10,6 +10,9 @@ pub mod commands;
 pub mod completion;
 pub mod container_ops;
 pub mod contexts;
+pub mod debug_pause;
+#[cfg(test)]
+mod debug_pause_tests;
 pub mod execution_context;
 pub mod execution_types;
 pub mod file_commands;
@@ -26,6 +29,7 @@ pub mod step_conditions;
 pub mod step_records;
 pub mod steps_runner;
 pub mod template;
+pub mod workspace_diff;
 
 use anyhow::{Context, Result};
 use tokio::sync::watch;
