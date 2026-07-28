@@ -76,6 +76,8 @@ async fn run_steps_marks_condition_error_as_failure() {
         None,
         None,
         &[],
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -114,6 +116,8 @@ async fn run_steps_continue_on_error_sets_failure_outcome_success_conclusion() {
         None,
         None,
         &[],
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -162,6 +166,8 @@ async fn run_steps_job_status_remains_success_after_continue_on_error() {
         None,
         None,
         &[],
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -226,6 +232,8 @@ async fn run_steps_conditions_reflect_prior_failure() {
         None,
         None,
         &[],
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -288,6 +296,8 @@ async fn run_steps_implicitly_gates_conditions_with_success() {
         None,
         None,
         &[],
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -347,6 +357,8 @@ async fn run_steps_outputs_are_visible_to_later_step_expressions() {
         None,
         None,
         &[],
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -393,6 +405,8 @@ async fn run_steps_multiline_outputs_are_visible_to_later_steps() {
         None,
         None,
         &[],
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -433,6 +447,8 @@ async fn run_steps_file_command_parse_error_fails_successful_step() {
         None,
         None,
         &[],
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -472,6 +488,8 @@ async fn run_steps_file_command_parse_error_respects_continue_on_error() {
         None,
         None,
         &[],
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -516,6 +534,8 @@ async fn run_steps_github_env_is_visible_to_later_steps() {
         None,
         None,
         &[],
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -558,6 +578,8 @@ async fn run_steps_all_steps_pass() {
         None,
         None,
         &[],
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -606,6 +628,8 @@ async fn run_steps_step_env_override_job_env() {
         None,
         None,
         &[],
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -656,6 +680,8 @@ async fn run_steps_honors_script_working_directory() {
         None,
         None,
         &[],
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -703,6 +729,8 @@ async fn test_step_summary_size_limit_and_scrubbing() {
         None,
         None,
         &[],
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -734,6 +762,8 @@ async fn test_step_summary_size_limit_and_scrubbing() {
         None,
         None,
         &[],
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -802,6 +832,8 @@ async fn run_steps_cancelled_condition_runs_only_when_cancelled() {
         None,
         None,
         &[],
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -875,6 +907,8 @@ async fn run_steps_outcome_visible_in_later_step_condition() {
         None,
         None,
         &[],
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -931,6 +965,8 @@ async fn run_steps_step_env_evaluates_expressions() {
         None,
         None,
         &[],
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -976,6 +1012,8 @@ async fn run_steps_display_name_evaluates_expression() {
         None,
         None,
         &[],
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -1016,6 +1054,8 @@ async fn run_steps_condition_uses_env_context() {
         None,
         None,
         &[],
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -1061,6 +1101,8 @@ async fn run_steps_display_name_from_format_token_script() {
         None,
         None,
         &[],
+        None,
+        None,
     )
     .await
     .unwrap();

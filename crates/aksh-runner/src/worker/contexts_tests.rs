@@ -286,6 +286,22 @@ fn build_expression_context_has_required_roots() {
 }
 
 #[test]
+fn build_expression_context_exposes_runner_workspace_on_github_context() {
+    let mut ctx = JobContext::new(
+        "job1".into(),
+        "Test Job".into(),
+        serde_json::json!({}),
+        serde_json::json!({"github": {"repository": "owner/repo"}}),
+    );
+    ctx.workspace = Some("/runner/_work/repo/repo".into());
+
+    let value =
+        aksh_gha_expressions::eval_expression("github.workspace", &ctx.build_expression_context())
+            .unwrap();
+    assert_eq!(value.as_str(), Some("/runner/_work/repo/repo"));
+}
+
+#[test]
 fn job_status_failure_reflects_in_context() {
     let mut ctx = JobContext::new(
         "job1".into(),
@@ -658,6 +674,46 @@ fn secrets_context_resolves_in_expressions() {
             .as_str(),
         Some("s3cr3t")
     );
+}
+
+#[test]
+fn secrets_context_excludes_system_plumbing_variables() {
+    let ctx = JobContext::new(
+        "job1".into(),
+        "Test".into(),
+        serde_json::json!({
+            "system.github.token": {"value": "ghp_tok", "isSecret": true},
+            "system.preloop.debug_worker_token": {"value": "dbg_tok", "isSecret": true},
+            "MY_SECRET": {"value": "s3cr3t", "isSecret": true}
+        }),
+        serde_json::json!({}),
+    );
+
+    let expr_ctx = ctx.build_expression_context();
+
+    // Workflow-authored secrets stay reachable — guards against the filter
+    // being widened into "the secrets context is always empty".
+    assert_eq!(
+        expr_ctx
+            .resolve(&["secrets".to_owned(), "MY_SECRET".to_owned()])
+            .as_str(),
+        Some("s3cr3t")
+    );
+
+    // Runner/server plumbing must not be, or untrusted workflow YAML could
+    // read the job runtime token and the debug-worker token straight out of
+    // `${{ secrets[...] }}` and defeat the debug privilege split.
+    for plumbing in [
+        "system.github.token",
+        "system.preloop.debug_worker_token",
+    ] {
+        assert!(
+            expr_ctx
+                .resolve(&["secrets".to_owned(), plumbing.to_owned()])
+                .is_null(),
+            "`{plumbing}` must not be reachable through the secrets context"
+        );
+    }
 }
 
 #[test]

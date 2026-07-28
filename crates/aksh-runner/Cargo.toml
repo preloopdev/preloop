@@ -52,3 +52,6 @@ zip.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 proptest.workspace = true
+# Real HTTP round-trips for the debug-session client: a hand-rolled fake would
+# not exercise serde, status handling, or the long-poll timeout path.
+axum.workspace = true
