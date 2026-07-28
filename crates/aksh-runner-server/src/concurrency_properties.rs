@@ -353,7 +353,7 @@ impl ProdState {
         let record = RunRecord {
             run_id,
             run_name: None,
-            submission: WorkflowSubmission {
+            submission: Arc::new(WorkflowSubmission {
                 workflow_yaml: String::new(),
                 event: "push".to_owned(),
                 payload: serde_json::Value::Null,
@@ -367,7 +367,7 @@ impl ProdState {
                 enable_debugger: false,
                 debugger_welcome_message: None,
                 ..Default::default()
-            },
+            }),
             jobs,
             status: ExecutionStatus::Queued,
             job_outputs: BTreeMap::new(),
