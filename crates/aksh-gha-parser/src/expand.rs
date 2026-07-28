@@ -145,6 +145,58 @@ fn non_empty_services(services: Option<serde_json::Value>) -> Option<serde_json:
     }
 }
 
+/// Resolve the effective permissions map from workflow/job YAML.
+///
+/// `permissions: read-all` → all scopes set to `read`.
+/// `permissions: write-all` → all scopes set to `write`.
+/// `permissions: {}` → empty map (no permissions).
+/// `permissions: { contents: read, issues: write }` → explicit map.
+/// Job-level overrides workflow-level entirely (not merged).
+fn resolve_permissions(
+    job_permissions: Option<&Value>,
+    workflow_permissions: Option<&Value>,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    let effective = job_permissions.or(workflow_permissions)?;
+    match effective {
+        Value::String(value) => {
+            let level = match value.as_str() {
+                "read-all" => "read",
+                "write-all" => "write",
+                _ => return Some(std::collections::BTreeMap::new()),
+            };
+            // GitHub's known permission scopes.
+            let scopes = [
+                "actions",
+                "attestations",
+                "checks",
+                "contents",
+                "deployments",
+                "id-token",
+                "issues",
+                "discussions",
+                "packages",
+                "pages",
+                "pull-requests",
+                "repository-projects",
+                "security-events",
+                "statuses",
+            ];
+            Some(
+                scopes
+                    .into_iter()
+                    .map(|s| (s.to_owned(), level.to_owned()))
+                    .collect(),
+            )
+        }
+        Value::Object(map) => Some(
+            map.iter()
+                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned())))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
 fn id_token_granted(permissions: Option<&Value>) -> bool {
     match permissions {
         Some(Value::String(value)) => value == "write-all",
@@ -270,6 +322,7 @@ fn job_plan_from_job(
             .map(|(k, v)| (k.clone(), v.as_str().unwrap_or(&v.to_string()).to_string()))
             .collect(),
         oidc_id_token_granted: id_token_granted(job.permissions.as_ref().or(workflow_permissions)),
+        permissions: resolve_permissions(job.permissions.as_ref(), workflow_permissions),
         oidc_environment,
         oidc_job_workflow_ref: None,
         concurrency_group,
