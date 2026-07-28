@@ -32,6 +32,9 @@ __pycache__/
 /.credentials
 /.credentials_rsaparams
 /.aksh/
+/.omp/
+/.mcp/
+
 
 # Local toolchains & runner binaries
 .cargo/
@@ -75,3 +78,4 @@ benchmarks/real-world/results/**/vm-runner*.log
 benchmarks/real-world/results/**/runner-*/
 *.smolmachine
 rust_out
+/goal

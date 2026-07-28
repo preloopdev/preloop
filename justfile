@@ -16,13 +16,14 @@ build-preloop:
     cargo zigbuild -p aksh-runner --target aarch64-unknown-linux-gnu
     cargo build -p preloop-cli -p aksh-runner-server
 
-# Run a workflow locally with failed VMs preserved for `just preloop-shell`.
+# Run a workflow locally. A failed step pauses for `preloop debug`.
 preloop-run WF="fixtures/workflows/failing.yml": build-preloop
-    ./target/debug/preloop run -f "{{WF}}" --preserve-on-failure
+    ./target/debug/preloop run -f "{{WF}}"
 
-# Submit a workflow and return immediately.
+# Submit a workflow and return immediately, keeping a failed VM for
+# `just preloop-shell`. Nothing is attached, so it preserves instead of pausing.
 preloop-run-detached WF="fixtures/workflows/failing.yml": build-preloop
-    ./target/debug/preloop run -f "{{WF}}" --preserve-on-failure --detach
+    ./target/debug/preloop run -f "{{WF}}" --detach --preserve-on-failure
 
 # Open the most recently preserved failed runner VM.
 preloop-shell: build-preloop
