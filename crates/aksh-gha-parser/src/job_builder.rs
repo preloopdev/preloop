@@ -554,10 +554,6 @@ fn populate_runner_variables(variables: &mut BTreeMap<String, VariableValue>, pl
         ("system.github.launch_endpoint", ""),
         ("system.github.results_endpoint", ""),
         ("system.github.results_upload_with_sdk", "true"),
-        (
-            "system.github.token.permissions",
-            r#"{"Contents":"read","Metadata":"read","Packages":"read"}"#,
-        ),
         ("system.orchestrationId", ""),
         ("system.phaseDisplayName", plan.name.as_str()),
         ("system.runnerEnvironment", "self-hosted"),
@@ -571,6 +567,33 @@ fn populate_runner_variables(variables: &mut BTreeMap<String, VariableValue>, pl
     variables
         .entry("github_token".to_owned())
         .or_insert_with(|| VariableValue::secret(String::new()));
+    // Build the permissions JSON from the resolved plan permissions.
+    // Keys are PascalCase in the wire format (e.g. "Contents", "PullRequests").
+    let perms_json = match &plan.permissions {
+        Some(map) if !map.is_empty() => {
+            let pascal: serde_json::Map<String, serde_json::Value> = map
+                .iter()
+                .map(|(k, v)| {
+                    let pascal_key = k
+                        .split('-')
+                        .map(|part| {
+                            let mut chars = part.chars();
+                            match chars.next() {
+                                Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+                                None => String::new(),
+                            }
+                        })
+                        .collect::<String>();
+                    (pascal_key, serde_json::Value::String(v.clone()))
+                })
+                .collect();
+            serde_json::Value::Object(pascal).to_string()
+        }
+        _ => r#"{"Contents":"read","Metadata":"read","Packages":"read"}"#.to_owned(),
+    };
+    variables
+        .entry("system.github.token.permissions".to_owned())
+        .or_insert_with(|| VariableValue::new(perms_json));
     variables
         .entry("system.github.token".to_owned())
         .or_insert_with(|| VariableValue::secret(String::new()));

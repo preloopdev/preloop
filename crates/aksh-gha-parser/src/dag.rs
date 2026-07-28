@@ -317,6 +317,7 @@ mod tests {
             secrets_map: Default::default(),
             job_outputs: Default::default(),
             oidc_id_token_granted: false,
+            permissions: None,
             oidc_environment: None,
             oidc_job_workflow_ref: None,
             concurrency_group: None,
