@@ -172,6 +172,10 @@ pub struct AppState {
     pub(crate) inner: Arc<Mutex<InnerState>>,
     pub(crate) events: broadcast::Sender<NdjsonEvent>,
     pub(crate) message_notify: Arc<Notify>,
+    /// Atomic counter for pre-allocating request IDs outside the dispatch
+    /// lock.  Monotonically increases; the inner counter is no longer the
+    /// source of truth once this is in use.
+    pub(crate) next_request_id: Arc<std::sync::atomic::AtomicI64>,
     /// Jobs accepted and still waiting for a runner, refreshed whenever one
     /// is claimed. A supervising runner pool reads it to decide whether the
     /// work already queued outruns the runners it has left.
@@ -315,6 +319,7 @@ impl AppState {
             inner: Arc::new(Mutex::new(inner)),
             events,
             message_notify: Arc::new(Notify::new()),
+            next_request_id: Arc::new(std::sync::atomic::AtomicI64::new(1)),
             queue_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             next_job_runs_on: Arc::new(std::sync::RwLock::new(Vec::new())),
             cache,

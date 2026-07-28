@@ -418,6 +418,254 @@ pub(crate) async fn submit_run_inner(
         github_tokens.extend(jobs.iter().map(|job| (job.id.clone(), pat.clone())));
     }
 
+    // ── Pre-build job messages outside the lock ─────────────────────────
+    //
+    // Condition evaluation, build_agent_job_message, token minting, and
+    // snapshot redirect are all pure computations.  Moving them here
+    // shrinks the critical section from O(jobs × build_cost) to
+    // O(jobs × map_insert).
+    let base_url = public_base_url();
+    let secrets_exposed: BTreeMap<String, String> = submission
+        .secrets
+        .iter()
+        .map(|(k, v)| (k.clone(), v.expose().to_owned()))
+        .collect();
+
+    struct PrebuiltJob {
+        job: aksh_gha_protocol::JobPlan,
+        agent_msg: Option<aksh_gha_protocol::azdo::AgentJobRequestMessage>,
+        request_id: i64,
+        condition_context: aksh_gha_expressions::Context,
+        skipped: bool,
+        id_token_granted: bool,
+        oidc_ctx: OidcJobContext,
+        job_request: Option<TaskAgentJobRequestRecord>,
+    }
+
+    let mut prebuilt: Vec<PrebuiltJob> = Vec::with_capacity(jobs.len());
+    let mut pre_statuses: BTreeMap<JobId, ExecutionStatus> = BTreeMap::new();
+    let mut pre_job_base_ids: BTreeMap<JobId, String> = BTreeMap::new();
+    let mut pre_job_needs: BTreeMap<JobId, Vec<JobId>> = BTreeMap::new();
+    let mut pre_job_fail_fast: BTreeMap<String, bool> = BTreeMap::new();
+    let mut pre_job_continue_on_error: BTreeMap<String, bool> = BTreeMap::new();
+    let mut pre_initially_skipped: Vec<(RunId, JobId)> = Vec::new();
+
+    for job in &jobs {
+        pre_job_base_ids.insert(job.id.clone(), job.base_id.clone());
+        pre_job_needs.insert(job.id.clone(), job.needs.clone());
+        pre_job_fail_fast.insert(job.base_id.clone(), job.fail_fast);
+        pre_job_continue_on_error.insert(job.id.to_string(), job.continue_on_error);
+        pre_statuses.insert(job.id.clone(), ExecutionStatus::Queued);
+
+        let condition_context = build_context(
+            &github,
+            &BTreeMap::new(),
+            &submission.vars,
+            &indexmap::IndexMap::new(),
+            &serde_json::json!({}),
+            &BTreeMap::new(),
+            &job.inputs,
+        );
+
+        // Evaluate condition for root jobs (no needs) outside the lock.
+        let mut skipped = false;
+        if job.needs.is_empty() {
+            let condition =
+                aksh_gha_expressions::effective_condition(job.if_condition.as_deref());
+            let should_run = aksh_gha_expressions::eval_bool(&condition, &condition_context)
+                .map_err(|error| {
+                    ApiError::bad_request(format!(
+                        "failed to evaluate condition for job `{}`: {error}",
+                        job.id
+                    ))
+                })?;
+            if !should_run {
+                pre_statuses.insert(job.id.clone(), ExecutionStatus::Skipped);
+                pre_initially_skipped.push((run_id, job.id.clone()));
+                skipped = true;
+            }
+        }
+
+        if skipped {
+            // Still need to record the prebuilt entry so the index stays
+            // aligned, but we skip the expensive message build.
+            prebuilt.push(PrebuiltJob {
+                job: job.clone(),
+                agent_msg: None,
+                request_id: 0,
+                condition_context,
+                skipped: true,
+                id_token_granted: false,
+                oidc_ctx: OidcJobContext {
+                    environment: None,
+                    job_workflow_ref: None,
+                    job_workflow_sha: None,
+                },
+                job_request: None,
+            });
+            continue;
+        }
+
+        // Heavy work: build the agent message outside the lock.
+        let mut agent_msg = aksh_gha_parser::job_builder::build_agent_job_message(
+            job,
+            &github,
+            &job.env,
+            &secrets_exposed,
+            &submission.vars,
+        )
+        .map_err(|e| ApiError::bad_request(format!("failed to build job message: {e}")))?;
+
+        agent_msg.preloop_preserve_on_failure = submission.preserve_on_failure.then_some(true);
+
+        // Pre-allocate request ID atomically (no lock needed).
+        let request_id = shared
+            .state
+            .next_request_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        agent_msg.request_id = request_id;
+
+        // Mint tokens outside the lock (HMAC computation).
+        let runtime_token = shared
+            .state
+            .mint_runtime_token(&agent_msg.plan.plan_id, &agent_msg.job_id);
+
+        if let Some(snapshot) = workspace_snapshot.as_ref() {
+            let redirected = redirect_primary_checkout(
+                &mut agent_msg,
+                snapshot,
+                &base_url,
+                &runtime_token,
+            );
+            if redirected > 0 {
+                info!(
+                    %run_id,
+                    job = %job.id,
+                    %redirected,
+                    commit = %snapshot.commit_sha,
+                    "Redirected primary checkout to local workspace snapshot"
+                );
+                agent_msg.aksh_snapshot_commit = Some(snapshot.commit_sha.clone());
+            }
+        }
+
+        let id_token_granted = job.oidc_id_token_granted;
+        if id_token_granted {
+            let oidc_url = format!(
+                "{}/runner/server/_apis/distributedtask/hubs/actions/plans/{}/jobs/{}/oidctoken?api-version=2.0",
+                base_url,
+                agent_msg.plan.plan_id,
+                agent_msg.job_id,
+            );
+            for endpoint in &mut agent_msg.resources.endpoints {
+                if endpoint.name.eq_ignore_ascii_case("SystemVssConnection") {
+                    endpoint
+                        .data
+                        .insert("GenerateIdTokenUrl".to_owned(), oidc_url.clone());
+                }
+            }
+        }
+
+        let github_token = github_tokens
+            .remove(&job.id)
+            .unwrap_or_else(|| runtime_token.clone());
+        agent_msg.variables.insert(
+            "system.github.token".to_owned(),
+            aksh_gha_protocol::azdo::VariableValue::secret(github_token.clone()),
+        );
+        agent_msg.variables.insert(
+            "github_token".to_owned(),
+            aksh_gha_protocol::azdo::VariableValue::secret(github_token),
+        );
+        let debug_token = shared
+            .state
+            .mint_debug_worker_token(&agent_msg.plan.plan_id, &agent_msg.job_id);
+        agent_msg.variables.insert(
+            "system.preloop.debug_worker_token".to_owned(),
+            aksh_gha_protocol::azdo::VariableValue::secret(debug_token),
+        );
+        agent_msg.variables.insert(
+            "system.github.launch_endpoint".to_owned(),
+            aksh_gha_protocol::azdo::VariableValue::new(base_url.clone()),
+        );
+        agent_msg.variables.insert(
+            "system.github.results_endpoint".to_owned(),
+            aksh_gha_protocol::azdo::VariableValue::new(base_url.clone()),
+        );
+        agent_msg.variables.insert(
+            "system.orchestrationId".to_owned(),
+            aksh_gha_protocol::azdo::VariableValue::new(format!(
+                "{}.{}.{}",
+                agent_msg.plan.plan_id, job.base_id, agent_msg.job_name
+            )),
+        );
+        agent_msg.file_table = vec![workflow_path.clone()];
+        if let Some(aksh_gha_protocol::azdo::PipelineContextData::Dict(job_dict)) =
+            agent_msg.context_data.get_mut("job")
+        {
+            job_dict.insert(
+                "check_run_id".to_owned(),
+                aksh_gha_protocol::azdo::PipelineContextData::Number(0.0),
+            );
+            job_dict.insert(
+                "workflow_ref".to_owned(),
+                aksh_gha_protocol::azdo::PipelineContextData::String(workflow_ref.clone()),
+            );
+            job_dict.insert(
+                "workflow_sha".to_owned(),
+                aksh_gha_protocol::azdo::PipelineContextData::String(sha.clone()),
+            );
+            job_dict.insert(
+                "workflow_repository".to_owned(),
+                aksh_gha_protocol::azdo::PipelineContextData::String(
+                    submission.repository.clone(),
+                ),
+            );
+            job_dict.insert(
+                "workflow_file_path".to_owned(),
+                aksh_gha_protocol::azdo::PipelineContextData::String(workflow_path.clone()),
+            );
+        }
+        agent_msg.enable_debugger = submission.enable_debugger;
+        agent_msg.debugger_welcome_message = submission.debugger_welcome_message.clone();
+        if submission.enable_debugger || submission.preserve_on_failure {
+            agent_msg.aksh_debug_run_id = Some(run_id.to_string());
+            agent_msg.aksh_debug_transport = Some("local".to_string());
+        }
+
+        let oidc_ctx = OidcJobContext {
+            environment: job.oidc_environment.clone(),
+            job_workflow_ref: job.oidc_job_workflow_ref.clone(),
+            job_workflow_sha: job.workflow_sha.clone(),
+        };
+
+        let job_request = TaskAgentJobRequestRecord {
+            request_id,
+            run_id,
+            job_id: job.id.clone(),
+            agent_job_id: agent_msg.job_id,
+            plan_id: agent_msg.plan.plan_id.clone(),
+            plan_type: agent_msg.plan.plan_type.clone(),
+            timeline_id: agent_msg.timeline.id,
+            result: None,
+            locked_until: agent_request_locked_until(),
+            started_at: None,
+            last_renewed_at: None,
+            timeout_triggered: false,
+        };
+
+        prebuilt.push(PrebuiltJob {
+            job: job.clone(),
+            agent_msg: Some(agent_msg),
+            request_id,
+            condition_context,
+            skipped: false,
+            id_token_granted,
+            oidc_ctx,
+            job_request: Some(job_request),
+        });
+    }
+
     {
         let mut inner = shared.state.inner.lock().await;
         let run_number = {
@@ -437,14 +685,14 @@ pub(crate) async fn submit_run_inner(
                 serde_json::json!(run_number.to_string()),
             );
         }
-        let mut statuses = BTreeMap::new();
+        let mut statuses = pre_statuses;
         let mut ready_jobs = 0usize;
-        let mut job_base_ids = BTreeMap::new();
-        let mut job_needs = BTreeMap::new();
-        let mut job_fail_fast = BTreeMap::new();
-        let mut job_continue_on_error = BTreeMap::new();
+        let mut job_base_ids = pre_job_base_ids;
+        let mut job_needs = pre_job_needs;
+        let mut job_fail_fast = pre_job_fail_fast;
+        let mut job_continue_on_error = pre_job_continue_on_error;
         let mut ready_by_base: BTreeMap<String, u64> = BTreeMap::new();
-        let mut initially_skipped = Vec::new();
+        let initially_skipped = pre_initially_skipped;
         let mut built_jobs: Vec<QueuedJob> = Vec::new();
         if empty_workflow_concurrency_group {
             let queued_jobs = 0;
@@ -496,220 +744,35 @@ pub(crate) async fn submit_run_inner(
                 queued_jobs,
             });
         }
-        for job in jobs {
-            job_base_ids.insert(job.id.clone(), job.base_id.clone());
-            job_needs.insert(job.id.clone(), job.needs.clone());
-            job_fail_fast.insert(job.base_id.clone(), job.fail_fast);
-            job_continue_on_error.insert(job.id.to_string(), job.continue_on_error);
-            statuses.insert(job.id.clone(), ExecutionStatus::Queued);
-            let condition_context = build_context(
-                &github,
-                &BTreeMap::new(),
-                &submission.vars,
-                &indexmap::IndexMap::new(),
-                &serde_json::json!({}),
-                &BTreeMap::new(),
-                &job.inputs,
-            );
-            if job.needs.is_empty() {
-                let condition =
-                    aksh_gha_expressions::effective_condition(job.if_condition.as_deref());
-                let should_run = aksh_gha_expressions::eval_bool(&condition, &condition_context)
-                    .map_err(|error| {
-                        ApiError::bad_request(format!(
-                            "failed to evaluate condition for job `{}`: {error}",
-                            job.id
-                        ))
-                    })?;
-                if !should_run {
-                    statuses.insert(job.id.clone(), ExecutionStatus::Skipped);
-                    initially_skipped.push((run_id, job.id.clone()));
-                    continue;
-                }
+        // ── Install pre-built jobs under the lock (map inserts only) ────
+        for pb in prebuilt {
+            if pb.skipped {
+                continue;
             }
-            let mut agent_msg = aksh_gha_parser::job_builder::build_agent_job_message(
-                &job,
-                &github,
-                &job.env,
-                &submission
-                    .secrets
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.expose().to_owned()))
-                    .collect(),
-                &submission.vars,
-            )
-            .map_err(|e| ApiError::bad_request(format!("failed to build job message: {e}")))?;
+            let job = &pb.job;
+            let agent_msg = pb.agent_msg.expect("non-skipped job must have agent_msg");
+            let job_request = pb.job_request.expect("non-skipped job must have job_request");
 
-            // Per-run debugging opt-in. Absent unless this submission asked for
-            // it, so the default job message shape is unchanged.
-            agent_msg.preloop_preserve_on_failure = submission.preserve_on_failure.then_some(true);
-
-            // Local HMAC JWT scoped to this job. It authenticates the job back
-            // to this server (snapshot Git, and the endpoint AccessToken the
-            // broker mints on delivery) no matter which credential ends up as
-            // the job's `GITHUB_TOKEN`.
-            let runtime_token = shared
-                .state
-                .mint_runtime_token(&agent_msg.plan.plan_id, &agent_msg.job_id);
-
-            if let Some(snapshot) = workspace_snapshot.as_ref() {
-                let redirected = redirect_primary_checkout(
-                    &mut agent_msg,
-                    snapshot,
-                    &public_base_url(),
-                    &runtime_token,
-                );
-                if redirected > 0 {
-                    info!(
-                        %run_id,
-                        job = %job.id,
-                        %redirected,
-                        commit = %snapshot.commit_sha,
-                        "Redirected primary checkout to local workspace snapshot"
-                    );
-                    // Carried so a debug session can diff the live workspace
-                    // against the tree the job actually checked out. Only
-                    // meaningful once a checkout actually points at the
-                    // snapshot; otherwise the job never saw that tree.
-                    agent_msg.aksh_snapshot_commit = Some(snapshot.commit_sha.clone());
-                }
-            }
-
-            let id_token_granted = job.oidc_id_token_granted;
             inner
                 .id_token_grants
-                .insert((run_id, job.id.clone()), id_token_granted);
-            inner.oidc_job_contexts.insert(
-                (run_id, job.id.clone()),
-                OidcJobContext {
-                    environment: job.oidc_environment.clone(),
-                    job_workflow_ref: job.oidc_job_workflow_ref.clone(),
-                    job_workflow_sha: job.workflow_sha.clone(),
-                },
-            );
-            inner.next_request_id += 1;
-            let request_id = inner.next_request_id;
-            agent_msg.request_id = request_id;
-            if id_token_granted {
-                let oidc_url = format!(
-                    "{}/runner/server/_apis/distributedtask/hubs/actions/plans/{}/jobs/{}/oidctoken?api-version=2.0",
-                    public_base_url(),
-                    agent_msg.plan.plan_id,
-                    agent_msg.job_id,
-                );
-                for endpoint in &mut agent_msg.resources.endpoints {
-                    if endpoint.name.eq_ignore_ascii_case("SystemVssConnection") {
-                        endpoint
-                            .data
-                            .insert("GenerateIdTokenUrl".to_owned(), oidc_url.clone());
-                    }
-                }
-            }
-            // Token fallback: GitHub App > PAT > local JWT. The App/PAT
-            // credential was resolved above, outside the dispatch lock; an
-            // absent entry means both were unavailable. The local runtime token
-            // always stays in the endpoint AccessToken (runner<->server auth);
-            // only `system.github.token` — which becomes the job's
-            // `GITHUB_TOKEN` — carries the real GitHub credential.
-            let github_token = github_tokens.remove(&job.id).unwrap_or(runtime_token);
-            agent_msg.variables.insert(
-                "system.github.token".to_owned(),
-                aksh_gha_protocol::azdo::VariableValue::secret(github_token.clone()),
-            );
-            agent_msg.variables.insert(
-                "github_token".to_owned(),
-                aksh_gha_protocol::azdo::VariableValue::secret(github_token),
-            );
-            // Mint a separate debug-worker token delivered only to the trusted
-            // runner process. Never surfaced as GITHUB_TOKEN so untrusted
-            // workflow code cannot forge debug session requests.
-            let debug_token = shared
-                .state
-                .mint_debug_worker_token(&agent_msg.plan.plan_id, &agent_msg.job_id);
-            agent_msg.variables.insert(
-                "system.preloop.debug_worker_token".to_owned(),
-                aksh_gha_protocol::azdo::VariableValue::secret(debug_token),
-            );
-            agent_msg.variables.insert(
-                "system.github.launch_endpoint".to_owned(),
-                aksh_gha_protocol::azdo::VariableValue::new(public_base_url()),
-            );
-            agent_msg.variables.insert(
-                "system.github.results_endpoint".to_owned(),
-                aksh_gha_protocol::azdo::VariableValue::new(public_base_url()),
-            );
-            agent_msg.variables.insert(
-                "system.orchestrationId".to_owned(),
-                aksh_gha_protocol::azdo::VariableValue::new(format!(
-                    "{}.{}.{}",
-                    agent_msg.plan.plan_id, job.base_id, agent_msg.job_name
-                )),
-            );
+                .insert((run_id, job.id.clone()), pb.id_token_granted);
+            inner
+                .oidc_job_contexts
+                .insert((run_id, job.id.clone()), pb.oidc_ctx);
 
-            agent_msg.file_table = vec![workflow_path.clone()];
-            if let Some(aksh_gha_protocol::azdo::PipelineContextData::Dict(job_dict)) =
-                agent_msg.context_data.get_mut("job")
-            {
-                job_dict.insert(
-                    "check_run_id".to_owned(),
-                    aksh_gha_protocol::azdo::PipelineContextData::Number(0.0),
-                );
-                job_dict.insert(
-                    "workflow_ref".to_owned(),
-                    aksh_gha_protocol::azdo::PipelineContextData::String(workflow_ref.clone()),
-                );
-                job_dict.insert(
-                    "workflow_sha".to_owned(),
-                    aksh_gha_protocol::azdo::PipelineContextData::String(sha.clone()),
-                );
-                job_dict.insert(
-                    "workflow_repository".to_owned(),
-                    aksh_gha_protocol::azdo::PipelineContextData::String(
-                        submission.repository.clone(),
-                    ),
-                );
-                job_dict.insert(
-                    "workflow_file_path".to_owned(),
-                    aksh_gha_protocol::azdo::PipelineContextData::String(workflow_path.clone()),
-                );
-            }
-
-            agent_msg.enable_debugger = submission.enable_debugger;
-            agent_msg.debugger_welcome_message = submission.debugger_welcome_message.clone();
-            // Pause-on-failure needs the run id too: the worker addresses its
-            // debug session by it. Set it for either debugging mode rather
-            // than leaving the live-pause path silently inert.
-            if submission.enable_debugger || submission.preserve_on_failure {
-                agent_msg.aksh_debug_run_id = Some(run_id.to_string());
-                agent_msg.aksh_debug_transport = Some("local".to_string());
-            }
             inner
                 .inflight_requests
-                .insert(request_id, (run_id, job.id.clone()));
-            let job_request = TaskAgentJobRequestRecord {
-                request_id,
-                run_id,
-                job_id: job.id.clone(),
-                agent_job_id: agent_msg.job_id,
-                plan_id: agent_msg.plan.plan_id.clone(),
-                plan_type: agent_msg.plan.plan_type.clone(),
-                timeline_id: agent_msg.timeline.id,
-                result: None,
-                locked_until: agent_request_locked_until(),
-                started_at: None,
-                last_renewed_at: None,
-                timeout_triggered: false,
-            };
+                .insert(job_request.request_id, (run_id, job.id.clone()));
             inner
                 .plan_requests
-                .insert(job_request.plan_id.clone(), request_id);
+                .insert(job_request.plan_id.clone(), pb.request_id);
             inner
                 .agent_job_requests
-                .insert(job_request.agent_job_id, request_id);
+                .insert(job_request.agent_job_id, pb.request_id);
             inner
                 .timeline_requests
-                .insert(job_request.timeline_id, request_id);
-            inner.job_requests.insert(request_id, job_request);
+                .insert(job_request.timeline_id, pb.request_id);
+            inner.job_requests.insert(pb.request_id, job_request);
 
             let queued_job = QueuedJob {
                 run_id,
@@ -717,7 +780,7 @@ pub(crate) async fn submit_run_inner(
                 base_id: job.base_id.clone(),
                 needs: job.needs.clone(),
                 if_condition: job.if_condition.clone(),
-                condition_context,
+                condition_context: pb.condition_context,
                 max_parallel: job.max_parallel,
                 runs_on: job.runs_on.clone(),
                 runner_group: job.runner_group.clone(),
@@ -733,8 +796,6 @@ pub(crate) async fn submit_run_inner(
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect(),
             };
-            job_base_ids.insert(job.id.clone(), job.base_id.clone());
-            job_fail_fast.insert(job.base_id.clone(), job.fail_fast);
             built_jobs.push(queued_job);
         }
 
