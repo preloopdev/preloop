@@ -31,25 +31,24 @@ pub(crate) async fn resolve_remote_workflows(
 
     let mut client = None;
     let token = std::env::var("AKSH_GITHUB_TOKEN").ok();
-    let mut queue = vec![(submission.workflow_yaml.clone(), 0usize)];
+    let mut queue = vec![(root_workflow.clone(), 0usize)];
     let mut visited = std::collections::BTreeSet::new();
-    while let Some((workflow_yaml, depth)) = queue.pop() {
+    while let Some((workflow, depth)) = queue.pop() {
         if depth >= MAX_REUSABLE_WORKFLOW_DEPTH {
             return Err(ApiError::bad_request(
                 "nested reusable workflow depth exceeded",
             ));
         }
-        let workflow = aksh_gha_parser::parse_workflow(&workflow_yaml)?;
         for job in workflow.jobs.values() {
             let Some(reference) = job.uses.as_deref() else {
                 continue;
             };
             if reference.starts_with("./") {
                 continue;
-            }
+            };
             if let Some(contents) = submission.reusable_workflows.get(reference).cloned() {
                 if visited.insert(reference.to_owned()) {
-                    queue.push((contents, depth + 1));
+                    queue.push((aksh_gha_parser::parse_workflow(&contents)?, depth + 1));
                 }
                 continue;
             }
@@ -118,7 +117,7 @@ pub(crate) async fn resolve_remote_workflows(
             submission
                 .reusable_workflow_shas
                 .insert(reference.to_owned(), commit.sha);
-            queue.push((contents, depth + 1));
+            queue.push((aksh_gha_parser::parse_workflow(&contents)?, depth + 1));
         }
     }
     Ok(())
