@@ -1,9 +1,11 @@
-# Plan 001: Caching performance strategy for local, self-hosted, and managed CI
+# Plan 001: Caching strategy for local CI
 
 > **Status**: Proposed architecture and implementation roadmap
 >
+> **Scope**: Local CI only. The architecture is designed to extend to self-hosted and managed deployments, but implementation targets `~/.preloop/cache/v1` on a single developer machine.
+>
 > **Priority**: P1
-> **Category**: performance, correctness, security, architecture
+> **Category**: performance, correctness, architecture
 > **Planned at**: commit `1342346a`, 2026-07-27
 > **Drift check before implementation**: `git diff --stat 1342346a..HEAD -- crates/aksh-cache crates/aksh-runner-server crates/aksh-runner crates/preloop-orchestrator docs`
 
@@ -12,16 +14,18 @@
 Preloop should not build one undifferentiated cache. It should build a layered cache system with three properties:
 
 1. **Immutable content-addressed blobs** hold bytes once and are addressed by a verified digest.
-2. **Scoped metadata** maps workflow-visible keys to those blobs under a server-derived tenant, repository, and trust domain.
+2. **Scoped metadata** maps workflow-visible keys to those blobs.
 3. **Guest-local materialization** makes hot content available to a runner without making a shared writable filesystem part of job correctness.
 
-The deployment profiles use the same logical model but different storage:
+**Local CI storage layout:**
 
-| Profile | Durable metadata | Durable blobs | Hot tier | Primary goal |
-|---|---|---|---|---|
-| Local CI | SQLite under `~/.preloop/cache/v1` | Local content-addressed files | Golden/COW disk and host page cache | Lowest repeated-run latency with bounded disk use |
-| Self-hosted CI | SQLite for one node; Postgres for multiple nodes | Persistent disk or S3-compatible storage such as MinIO | Per-runner-node NVMe/read-through cache | Reliable reuse across runners without requiring shared mounts |
-| Managed CI | Regional Postgres | Versioned object storage with KMS encryption | Regional node-local NVMe/read-through cache | Multi-tenant isolation, scale, predictable cost, and regional throughput |
+| Layer | Storage |
+|---|---|
+| Durable metadata | SQLite under `~/.preloop/cache/v1` |
+| Durable blobs | Local content-addressed files under `~/.preloop/cache/v1/blobs/` |
+| Hot tier | Golden/COW disk and host page cache |
+
+The same logical model extends to self-hosted (Postgres + S3) and managed (Postgres + object store + KMS) deployments in future phases. The local profile uses one developer machine, one implicit tenant, loopback control plane, and disposable SmolVM runners.
 
 The first performance work should target measured losses, not speculative caching:
 
@@ -45,10 +49,9 @@ This evidence says the priority order is:
 - Make a cache miss equivalent to normal uncached execution, except when a workflow explicitly requests `fail-on-cache-miss`.
 - Eliminate repeated downloads and archive work that dominates warm jobs.
 - Keep process memory usage proportional to a transfer chunk, not cache size.
-- Prevent untrusted jobs, repositories, and tenants from poisoning caches consumed by trusted jobs.
-- Bound disk/object-store growth with quotas, expiration, admission, and eviction.
+- Bound disk growth with quotas, expiration, admission, and eviction.
 - Give operators enough telemetry to explain every hit, miss, restore, save, and eviction.
-- Use one architecture across local, self-hosted, and managed deployments without forcing managed-service complexity into local CI.
+- Design metadata/blob interfaces that extend to self-hosted and managed deployments later.
 
 ## Non-goals
 
@@ -230,27 +233,9 @@ schema_version
 
 Compatibility inputs then vary by class.
 
-### Trust domain
+### Trust domain (local CI)
 
-Recommended trust classes:
-
-```text
-trusted-default-branch
-trusted-protected-branch:<ref-id>
-untrusted-pr:<source-repository-id>:<pr-number>
-trusted-manual:<actor-policy-id>
-```
-
-Derive this from the authenticated run, checked-out ref, source repository, permissions, and execution policy. Do not derive it only from event name or request fields; `pull_request_target`, reusable workflows, and manually elevated runs make that unsafe.
-
-Default policy:
-
-- trusted jobs may read and write trusted repository caches;
-- untrusted pull-request jobs may read explicitly allowed base-branch dependency caches;
-- untrusted jobs write only to their isolated PR/fork namespace;
-- trusted jobs never restore from an untrusted namespace;
-- public immutable tool/action/image content verified by digest may be shared globally;
-- private repositories and mutable build products never cross tenant/repository boundaries.
+In local CI, all runs share a single trust domain: the developer's OS account. No derivation from event names, refs, or permissions is needed. The trust domain field exists in the key structure for future self-hosted/managed extensibility but defaults to a fixed local value.
 
 ### Key recipes
 
@@ -375,9 +360,7 @@ A node-local entry is an optimization. Its loss must fall back to L3 or origin.
 
 The runner accesses user `actions/cache` entries through the protocol, not a shared writable filesystem. BYO self-hosted runners cannot be assumed to share a mount with the control plane.
 
-## Deployment profiles
-
-### Local CI
+## Deployment profile: local CI
 
 Assumptions:
 
@@ -422,76 +405,21 @@ Local performance targets, to validate rather than assume:
 - corrected Vite warm total below 45 s on the benchmark host;
 - memory stays bounded during multi-gigabyte cache transfers.
 
-### Self-hosted CI
+### Self-hosted CI (future)
 
-Assumptions:
+Single-node: SQLite with WAL, persistent local blob filesystem, HTTPS cache API with expiring capability URLs. Multi-node: Postgres, MinIO, node-local read-through CAS, direct signed URLs. Namespaces mandatory even for one org because repositories and fork PRs differ in trust.
 
-- one organization or a small set of tenants;
-- official runners may be remote/BYO;
-- runners may be long-lived or ephemeral;
-- service restart must not lose important cache metadata.
+### Managed CI (future)
 
-Single-node recommendation:
+Regional Postgres with row-level authorization. Object storage with KMS envelope encryption. Short-lived signed URLs (5–15 minutes). Regional NVMe hot tiers. Immutable global cache only for public tools/actions/OCI layers. Per-tenant rate limits, quotas, cost attribution, and complete audit logs.
 
-- SQLite metadata with WAL;
-- persistent local blob filesystem;
-- background index/metadata backup;
-- HTTPS cache API with expiring capability URLs.
+## Security design (local CI)
 
-Multi-node recommendation:
+In local CI, the trust boundary is the developer's OS account. There are no adversarial tenants, no untrusted PRs from forks, and no remote runners. This simplifies the security model considerably.
 
-- Postgres metadata;
-- S3-compatible blob store such as MinIO;
-- node-local read-through CAS on runner/control nodes;
-- direct signed upload/download URLs;
-- distributed reservation using a database uniqueness constraint, not an in-memory mutex.
+### Never cache (even locally)
 
-Policy:
-
-- namespaces are mandatory even for one organization because repositories and fork PRs differ in trust;
-- configurable per-repository and per-tenant quotas;
-- trusted-default-branch caches may seed trusted feature branches;
-- untrusted PR writes remain isolated;
-- node-local hot tiers are disposable and reconcile from durable metadata;
-- action/tool/image mirrors may be organization-wide only when immutable and verified;
-- audit cache administration and cross-scope policy decisions;
-- support offline/air-gapped operation by pre-seeding verified action/tool/image CAS entries.
-
-Suggested initial sizing—not a universal default:
-
-- reserve node-local NVMe for the measured working set, typically 50–200 GiB per runner node;
-- set repository logical quotas from observed package/build sizes rather than a fixed global number;
-- alert at 70%, begin eviction at 80%, and reject new writes only at the hard limit after eviction cannot recover space.
-
-### Managed CI
-
-Assumptions:
-
-- adversarial multi-tenancy;
-- many repositories and concurrent runners;
-- regional execution;
-- customer-visible retention, deletion, and billing requirements.
-
-Required architecture:
-
-- regional Postgres metadata with explicit tenant/repository/trust columns and row-level authorization in the service layer;
-- object storage with bucket/versioning/lifecycle rules and envelope encryption through KMS;
-- short-lived operation-specific signed URLs, normally 5–15 minutes;
-- multipart upload with maximum compressed and uncompressed size enforcement;
-- regional node-local NVMe read-through caches;
-- immutable, integrity-verified global cache only for public tools/actions/OCI layers;
-- private and mutable content isolated by tenant and repository;
-- deletion workflow that removes logical entries immediately and garbage-collects blobs after a grace period;
-- per-tenant rate limits, concurrent-transfer limits, quotas, and cost attribution;
-- complete audit logs for administrative reads/deletes and policy changes.
-
-Managed cache tiers should be regional. Cross-region replication is useful for immutable global tools and customer-selected durable caches, but synchronous cross-region writes should not sit on every job’s completion path.
-
-## Security design
-
-### Never cache
-
-- runner RSA private keys or shared runner credentials;
+- Runner RSA private keys or shared runner credentials;
 - OAuth, GitHub, cloud, package-registry, or signing tokens;
 - `.runner`, `.credentials`, `.credentials_rsaparams`;
 - `.npmrc`, `.pypirc`, `.netrc`, Docker auth config, cloud CLI credential directories;
@@ -499,53 +427,15 @@ Managed cache tiers should be regional. Cross-region replication is useful for i
 - decrypted job messages;
 - arbitrary home directories.
 
-Path deny-lists are defense in depth, not the primary boundary. The primary controls are narrow cache paths, trust-scoped namespaces, ephemeral credentials, and no implicit whole-workspace caching.
+Path deny-lists are defense in depth, not the primary boundary. The primary controls are narrow cache paths and no implicit whole-workspace caching.
 
-### Poisoning prevention
+### Deduplication
 
-- Derive namespace and trust from authenticated server state.
-- Permit global sharing only for immutable bytes verified against an upstream digest/signature.
-- Resolve mutable action and image references to immutable identities before storage.
-- Never let an untrusted job write a key that a trusted job can restore.
-- Treat restore-prefix matches as scoped reads; a prefix must not cross trust/repository boundaries.
-- Record producer run, repository, commit, and trust domain in metadata for audit and incident response.
+Physical byte reuse is safe locally because the OS account is the sole trust boundary. Two repositories on the same machine share the same trust domain. Deduplication across repos is a win, not a risk.
 
-### Capability URLs
+### Capability URLs (local)
 
-A signed upload/download capability must bind:
-
-```text
-tenant + repository + operation + blob/upload id + maximum size + expiry + nonce
-```
-
-Properties:
-
-- short expiry;
-- read or write, never both;
-- no privilege escalation through path/query changes;
-- maximum upload size enforced independently from client headers;
-- safe retry/idempotency semantics;
-- revocable through upload state or signing-key rotation;
-- no permanent bearer tokens in logs.
-
-### Archive safety
-
-The cache service may treat archives as opaque, but runner extraction must still enforce:
-
-- no path traversal outside requested roots;
-- safe symlink/hardlink handling;
-- maximum expanded size and file count in managed CI;
-- compression-bomb limits;
-- no setuid/device nodes or ownership restoration that crosses policy;
-- integrity check before extraction.
-
-### Encryption and deletion
-
-- Local: rely on user-account filesystem permissions unless the operator selects encrypted storage.
-- Self-hosted: support encrypted disks/object storage and organization-managed keys.
-- Managed: envelope encryption with per-tenant or policy-group KMS context; TLS for every transfer.
-- Do not use a customer-specific encryption key for globally deduplicated private blobs unless the encryption/deduplication design explicitly supports it.
-- Deleting a tenant/repository must remove metadata immediately and enqueue physical garbage collection. Backups need documented retention and cryptographic erasure behavior.
+Not needed for local CI — the loopback control plane is trusted. The interface is designed to support expiring signed URLs for self-hosted/managed deployments later.
 
 ## Correctness rules
 
@@ -762,7 +652,7 @@ Success criteria for the first campaign:
 
 ## Phased roadmap
 
-### Phase 0: Instrument before changing policy
+### Phase 0: Instrument before changing policy (local CI)
 
 Target areas:
 
@@ -791,34 +681,11 @@ Do not optimize a phase that cannot be separately measured.
 
 Acceptance: corrected Vite passes twice, the second run restores a cache, and warm total meets the first-campaign target.
 
-### Phase 2: Immutable supply and VM caches
+### Future phases (not in scope now)
 
-1. Resolve action tags/branches to commit SHA and cache immutable archives by digest.
-2. Resolve base/container image tags to OCI digests.
-3. Update golden compatibility identity to include resolved immutable inputs.
-4. Maintain preload coverage as selection metadata.
-5. Produce and consume a prepared digest-pinned Ubuntu base artifact.
-6. Mirror upstream tool/image downloads used by normal jobs.
-
-Acceptance: a cold run does not pull from Docker Hub or run baseline apt installation on the job path.
-
-### Phase 3: Self-hosted durable backend
-
-1. Introduce metadata/blob-store interfaces without weakening local behavior.
-2. Implement single-node SQLite/filesystem and multi-node Postgres/S3-compatible backends.
-3. Add node-local read-through CAS.
-4. Derive cache namespace and trust server-side.
-5. Add expiring capability URLs, quotas, and audit events.
-6. Validate with an official runner on a separate machine/network namespace.
-
-### Phase 4: Managed multi-tenancy
-
-1. Enforce tenant/repository/trust policy on every cache operation.
-2. Add KMS envelope encryption and deletion lifecycle.
-3. Add regional object storage and NVMe hot tiers.
-4. Add per-tenant quotas, rate limits, cost attribution, and abuse controls.
-5. Add managed threat-model and cross-tenant penetration tests.
-6. Add SLOs and capacity planning from production distributions.
+- **Phase 2**: Immutable supply and VM caches (action digest resolution, OCI digest pinning, prepared base artifacts)
+- **Phase 3**: Self-hosted durable backend (Postgres metadata, S3 blobs, node-local read-through CAS)
+- **Phase 4**: Managed multi-tenancy (KMS encryption, tenant isolation, regional object storage)
 
 ## Implementation boundaries
 
