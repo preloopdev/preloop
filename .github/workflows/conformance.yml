@@ -1,52 +1,57 @@
-name: conformance
+name: server-conformance
 
 on:
   pull_request:
   push:
-
-# Replays the committed official runner goldens (.runner-watch/golden/v2.335.1)
-# against a locally-started aksh and fails the PR on endpoint/status regressions.
-#
-# This is pure Rust HTTP replay: no official runner binary, no mitmproxy, no
-# port-80 redirect, no sudo. See docs/conformance-scenarios.md — the gate is
-# endpoint-coverage + status-code parity, not full response-body fidelity.
+  schedule:
+    - cron: "45 3 * * *"
 
 jobs:
-  conformance:
+  server-light:
+    name: Server light conformance
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@1.86
-
       - uses: Swatinem/rust-cache@v2
-
-      - name: Build aksh + runner-watch
-        run: cargo build -p aksh-runner-server -p runner-watch
-
-      - name: Start aksh
-        run: |
-          target/debug/preloop-server serve \
-            --listen 127.0.0.1:9090 --state-dir /tmp/aksh-ci-state &
-          for i in $(seq 1 80); do
-            if curl -sf http://127.0.0.1:9090/healthz >/dev/null; then
-              echo "aksh ready"; exit 0
-            fi
-            sleep 0.25
-          done
-          echo "aksh did not become healthy" >&2
-          exit 1
-
-      - name: Run conformance replay
-        run: |
-          cargo run -p runner-watch -- conform \
-            --runner v2.335.1 \
-            --aksh-url http://127.0.0.1:9090 \
-            --skip-cargo-test
-
-      - name: Upload conformance reports
+      - name: Replay official runner flows
+        run: bash ./benchmarks/conformance/run.sh
+      - name: Upload light report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: conformance-reports
-          path: .runner-watch/conformance/**
+          name: server-light-conformance
+          path: |
+            .runner-watch/conformance/**
+            .runner-watch/conformance-report.md
+          if-no-files-found: error
+
+  # The deep profile uses the official runner and pre-packed smolVM machines
+  # to compare GitHub and aksh-server. It runs on every PR and fails closed
+  # when infrastructure or any captured response differs.
+  server-deep:
+    name: Server deep conformance
+    if: github.event_name == 'pull_request' || github.event_name == 'schedule'
+    runs-on: [self-hosted, smolvm]
+    timeout-minutes: 180
+    env:
+      GH_REPO: ${{ vars.SERVER_CONFORMANCE_REPO || 'preloopdev/aksh-conformance' }}
+      AKSH_GITHUB_TOKEN: ${{ secrets.SERVER_CONFORMANCE_TOKEN }}
+      TEMPLATE: ${{ vars.SERVER_CONFORMANCE_TEMPLATE || '/private/tmp/bench-runner.smolmachine' }}
+      OFFICIAL_RUNNER_HOST: ${{ vars.SERVER_CONFORMANCE_RUNNER_HOST || '/Users/bnjoroge/cachingv4' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build current PR server for smolVM
+        run: cargo zigbuild -p aksh-runner-server --release --target aarch64-unknown-linux-musl
+      - name: Run deep server conformance
+        run: bash ./scripts/conform-server-deep.sh
+      - name: Upload deep captures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-deep-conformance
+          path: |
+            benchmarks/compatibility/server/behavior/**
+            benchmarks/compatibility/server/protocol/captures/**
+          if-no-files-found: error
