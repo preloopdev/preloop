@@ -38,20 +38,32 @@ The scenario definitions live in `experiments/mitm/scenarios/`. Each new scenari
 a unique workflow fixture basename matching the directory name because the official backend runs
 `gh workflow run <basename>`.
 
-| # | Directory | Fixture | Surface exercised | Expected current aksh status | Record now? |
-|---|---|---|---|---|---|
-| 06 | `06-multi-step` | `06-multi-step.yml` | step list, env, multiline run scripts, logs/timeline | mostly implemented | yes |
-| 07 | `07-step-failure` | `07-step-failure.yml` | step failure conclusions and conditional execution | mostly implemented | yes |
-| 08 | `08-job-outputs-needs` | `08-job-outputs-needs.yml` | job outputs propagated through `needs` context | implemented | yes |
-| 09 | `09-matrix-fan-out` | `09-matrix-fan-out.yml` | matrix expansion and fail-fast sibling cancellation | implemented | yes |
-| 10 | `10-uses-checkout` | `10-uses-checkout.yml` | action resolution/download and codeload auth | partial/stubbed | yes |
-| 11 | `11-cache-roundtrip` | `11-cache-roundtrip.yml` | modern cache restore/save paths | runner-side v2 save/restore verified against GitHub with ephemeral runners; local server v2 remains separate gap | yes |
-| 12 | `12-artifact` | `12-artifact.yml` | artifact upload/download v4 paths | runner-side v4 upload/download completed successfully against GitHub in scenario 62; local server-side artifact service remains separate gap | yes |
-| 13 | `13-composite-action` | `13-composite-action.yml` | local composite action resolution | partial | yes |
-| 14 | `14-annotations` | `14-annotations.yml` | workflow command annotations and timeline issues | partial | yes |
-| 15 | `15-oidc-id-token` | `15-oidc-id-token.yml` | OIDC token endpoint and requested audience | implemented | yes |
-| 16 | `16-container-job` | `16-container-job.yml` | job container startup/protocol | missing/deferred | no, Linux+Docker required |
-| 17 | `17-service-container` | `17-service-container.yml` | service container startup/protocol | missing/deferred | no, Linux+Docker required |
+| # | Directory | Surface exercised | v2.336.0 golden |
+|---|---|---|---|
+| 01 | `01-register-and-idle` | registration, session creation, idle polling | yes |
+| 02 | `02-trivial-job` | minimal broker job lifecycle | yes |
+| 03 | `03-cancellation` | cancellation delivery and completion | yes |
+| 04 | `04-request-ack` | explicit request acknowledgement | yes |
+| 05 | `05-multi-job` | multiple jobs in one workflow | yes |
+| 06 | `06-multi-step` | step list, env, multiline scripts, logs/timeline | yes |
+| 07 | `07-step-failure` | failure conclusions and conditional execution | yes |
+| 08 | `08-job-outputs-needs` | job outputs through `needs` | yes |
+| 09 | `09-matrix-fan-out` | matrix expansion and fail-fast | yes |
+| 10 | `10-uses-checkout` | action resolution and codeload auth | yes |
+| 11 | `11-cache-roundtrip` | cache v2 restore/save and blob handoff | yes |
+| 12 | `12-artifact` | artifact v4 upload/download | yes |
+| 13 | `13-composite-action` | local composite action resolution | yes |
+| 14 | `14-annotations` | annotations and timeline issues | yes |
+| 15 | `15-oidc-id-token` | OIDC token endpoint and audience | yes |
+| 16 | `16-container-job` | job container startup/protocol | yes |
+| 17 | `17-service-container` | service container startup/protocol | yes |
+| 30 | `30-container-job-basic` | basic container job | yes |
+| 31 | `31-container-with-services` | job container with services | yes |
+| 32 | `32-services-no-container` | host job with services | yes |
+| 33 | `33-container-env-options` | container env and options | yes |
+| 34 | `34-container-with-checkout` | checkout inside a job container | yes |
+| 35 | `35-container-lifecycle` | lifecycle and continue-on-error | yes |
+| 36 | `36-docker-action` | `docker://` action references | yes |
 
 ## Files generated
 
@@ -87,34 +99,35 @@ cd experiments/mitm
 bin/record-golden.sh --scenario 06-multi-step --non-interactive
 ```
 
-Then import that golden into this repo:
+Container scenarios require Linux and Docker. Record them with:
 
 ```sh
-cd ~/runner-watcher
-cargo run -p runner-watch -- record-golden --runner v2.335.1 --scenario 06-multi-step
+experiments/mitm/bin/record-golden-linux.sh
 ```
 
-Repeat for `06-multi-step` through `15-oidc-id-token`. Defer `16-container-job` and
-`17-service-container` until a Linux runner with Docker is available.
+The committed corpus lives at `.runner-watch/golden/v2.336.0/`. The corpus checker
+requires one non-empty, version-matched capture for every scenario definition.
+Capture success means the official runner completed its protocol exchange. It does
+not imply every workload step succeeded; the isolated smolVM capture environment
+cannot faithfully provide embedded Docker DNS/localhost or trusted proxy TLS for
+all of scenarios 31, 32, 34, and 35.
 
 ## Running conformance
 
-Start aksh, then replay all imported goldens:
+Replay the complete current corpus:
 
 ```sh
-experiments/mitm/bin/up-aksh.sh
-cargo run -p runner-watch -- conform --runner v2.335.1 --aksh-url http://127.0.0.1:9090
+just conform
 ```
 
 Outputs:
 
-- `.runner-watch/conformance/v2.335.1/<scenario>.md`
-- `.runner-watch/conformance-report.md`
+- `.runner-watch/conformance/v2.336.0/<scenario>.md`
+- `.runner-watch/conformance/v2.336.0/conformance-report.md`
 
-Important: the current conformance gate fails only on missing official-only endpoints. Some partial
-compatibility bugs show up only as body/status diffs or runner log errors, especially checkout,
-annotations, cache, artifact, and composite-action behavior. Inspect each per-scenario report; do
-not rely only on the rollup pass/fail.
+The gate fails on missing official-only endpoints, status mismatches, request body
+schema mismatches, and acquirejob response schema regressions. Local URLs, tokens,
+IDs, and other volatile values are normalized.
 
 ## Expansion rules
 
