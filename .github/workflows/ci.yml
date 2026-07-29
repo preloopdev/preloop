@@ -20,7 +20,9 @@ on:
 # PR / push: fast profile — 256 cases for pure/model/runner, 64 for HTTP.
 # Scheduled / manual intensive: release mode, 10k cases, 100k shrink iters.
 #
-# Live GitHub or privileged official-runner probes are NEVER run in PR CI.
+# The regular Linux jobs never run live GitHub or privileged official-runner
+# probes. `runner-conformance.yml` runs the privileged deep runner probe on the
+# dedicated smolVM self-hosted pool for every pull request.
 # The differential harness dry-run (credential-free) runs in both profiles.
 #
 # Sleep-guard: each property-test job mechanically scans new test files for
