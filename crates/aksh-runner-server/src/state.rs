@@ -149,6 +149,11 @@ impl AppState {
 
     /// Mint the token the runner process uses to speak for a job's debug
     /// session, kept separate from the runtime token that workflow code sees.
+    ///
+    /// Reached only through [`crate::debug_sessions::issue_worker_token`], and
+    /// never as a job variable: the official runner copies every secret
+    /// variable into the `secrets` context, so a job message is a publication
+    /// channel to the workflow being debugged.
     pub(crate) fn mint_debug_worker_token(&self, plan_id: &str, job_id: &uuid::Uuid) -> String {
         self.local_jwt(json!({
             "sub": format!("aksh-debug-worker-{job_id}"),
