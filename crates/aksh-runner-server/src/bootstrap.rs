@@ -88,9 +88,10 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
     // job must not go on suspending a timeout.
     let active_request_ids: std::collections::BTreeSet<i64> =
         active_reqs.iter().map(|(id, ..)| *id).collect();
-    // Read pause credit before the sweep: sweeping discards the very sessions
-    // that earned it, so measuring afterwards would retroactively bill a job
-    // for time it spent legitimately paused and cancel it early.
+    // Pause credit outlives the sessions that earned it: the registry retires
+    // it with the job request, not with the session. The sweep below therefore
+    // cannot retroactively bill a job for time it spent legitimately paused —
+    // which is what used to cancel a job one tick after it resumed.
     let paused_credits: std::collections::BTreeMap<i64, Duration> = active_reqs
         .iter()
         .map(|(id, ..)| (*id, inner.debug_sessions.paused_for_request(*id, now)))
