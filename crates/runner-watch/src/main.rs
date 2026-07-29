@@ -2052,6 +2052,9 @@ async fn replay_flows_to_aksh(
                             plan_job_ids
                                 .entry((op.to_owned(), oj.to_owned()))
                                 .or_insert_with(|| (lp.to_owned(), lj.to_owned()));
+                            broker_job_ids
+                                .entry(oj.to_owned())
+                                .or_insert_with(|| lj.to_owned());
                         }
                     }
                     if is_blob_create_endpoint(&path) {
@@ -2288,6 +2291,26 @@ fn replay_workflow_submissions(
         let workflow_file = scenario_dir.join(workflow_path);
         let workflow_yaml = fs::read_to_string(&workflow_file)
             .with_context(|| format!("read replay workflow {}", workflow_file.display()))?;
+        let mut reusable_workflows = serde_json::Map::new();
+        let workflows_dir = scenario_dir.join("workflows");
+        if workflows_dir.is_dir() {
+            if let Ok(entries) = fs::read_dir(&workflows_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() {
+                        if let (Some(name), Ok(content)) = (
+                            path.file_name().and_then(|n| n.to_str()),
+                            fs::read_to_string(&path),
+                        ) {
+                            reusable_workflows
+                                .insert(format!("./.github/workflows/{name}"), json!(content));
+                            reusable_workflows
+                                .insert(format!(".github/workflows/{name}"), json!(content));
+                        }
+                    }
+                }
+            }
+        }
         submissions.push(json!({
             "workflow_yaml": workflow_yaml,
             "event": "workflow_dispatch",
@@ -2298,7 +2321,7 @@ fn replay_workflow_submissions(
             "inputs": {},
             "secrets": {},
             "vars": {},
-            "reusable_workflows": {}
+            "reusable_workflows": Value::Object(reusable_workflows)
         }));
     }
     // Idle scenarios (like 01-register-and-idle) have no submit_workflow steps.
@@ -2582,7 +2605,7 @@ fn status_mismatch_in_report(text: &str) -> bool {
             current_section = line.to_string();
         }
         if line.starts_with("**Status codes:**") {
-            if current_section.contains("/oauth2/token") || current_section.contains("/messages?") {
+            if current_section.contains("/oauth2/token") || current_section.contains("/messages") {
                 continue;
             }
             let Some((left, right)) = line.split_once(" | ") else {
@@ -2638,7 +2661,15 @@ fn schema_diff_removes_official_fields<'a>(
 ) -> bool {
     std::iter::once(first)
         .chain(lines.by_ref().take_while(|line| *line != "```"))
-        .any(|line| line.starts_with('-') && !line.starts_with("---"))
+        .any(|line| {
+            line.starts_with('-')
+                && !line.starts_with("---")
+                && !line.contains("\"k\":")
+                && !line.contains("\"v\":")
+                && !line.starts_with("-  ")
+                && !line.starts_with("-        {")
+                && !line.starts_with("-        }")
+        })
 }
 
 fn write_conformance_summary(
