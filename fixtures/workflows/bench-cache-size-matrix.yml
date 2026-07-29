@@ -1,0 +1,250 @@
+name: bench-cache-size-matrix
+
+on:
+  push:
+  pull_request:
+
+# Cache benchmark: tests 5 cache sizes (500KB, 5MB, 25MB, 100MB, 500MB)
+# Each size runs save in one job, restore in a dependent job.
+# The curl-based API calls bypass the need for Node.js actions.
+
+jobs:
+  save-small:
+    runs-on: self-hosted
+    steps:
+      - name: create 500KB payload and save to cache
+        run: |
+          mkdir -p /tmp/cache-data
+          dd if=/dev/urandom of=/tmp/cache-data/payload.bin bs=1024 count=512 2>/dev/null
+          cd /tmp && tar czf cache-payload.tar.gz -C /tmp/cache-data .
+          ARCHIVE_SIZE=$(stat -c%s cache-payload.tar.gz 2>/dev/null || stat -f%z cache-payload.tar.gz)
+          CACHE_URL="${ACTIONS_CACHE_SERVICE_URL:-http://127.0.0.1:9090}"
+          TOKEN="${GITHUB_TOKEN:-}"
+          KEY="bench-size-small-${GITHUB_RUN_ID:-$$}"
+          # Create
+          RESP=$(curl -s -X POST "$CACHE_URL/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry" \
+            -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
+            -d "{\"key\":\"$KEY\",\"version\":\"v1\",\"scope\":\"bench\",\"repository\":\"size\"}")
+          URL=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('signed_upload_url',''))" 2>/dev/null)
+          if [ -n "$URL" ]; then
+            UP_START=$(python3 -c "import time;print(time.time())")
+            curl -s -X PUT "$URL" -H "Content-Type: application/octet-stream" --data-binary @cache-payload.tar.gz
+            UP_MS=$(python3 -c "print(int((time.time()-$UP_START)*1000))")
+            # Finalize
+            curl -s -X POST "$CACHE_URL/twirp/github.actions.results.api.v1.CacheService/FinalizeCacheEntry" \
+              -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
+              -d "{\"key\":\"$KEY\",\"version\":\"v1\",\"scope\":\"bench\",\"repository\":\"size\"}" > /dev/null
+            echo "CACHE_BENCH size=500KB archive=${ARCHIVE_SIZE}B upload_ms=${UP_MS} key=$KEY"
+          else
+            echo "CACHE_BENCH size=500KB status=already_exists key=$KEY"
+          fi
+
+  restore-small:
+    runs-on: self-hosted
+    needs: save-small
+    steps:
+      - name: restore 500KB cache and measure
+        run: |
+          CACHE_URL="${ACTIONS_CACHE_SERVICE_URL:-http://127.0.0.1:9090}"
+          TOKEN="${GITHUB_TOKEN:-}"
+          KEY="bench-size-small-${GITHUB_RUN_ID:-$$}"
+          # Lookup
+          L_START=$(python3 -c "import time;print(time.time())")
+          RESP=$(curl -s -X POST "$CACHE_URL/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadUrl" \
+            -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
+            -d "{\"key\":\"$KEY\",\"version\":\"v1\",\"restoreKeys\":[],\"scope\":\"bench\",\"repository\":\"size\"}")
+          L_MS=$(python3 -c "print(int((time.time()-$L_START)*1000))")
+          OK=$(echo "$RESP" | python3 -c "import sys,json;print(json.load(sys.stdin).get('ok',''))" 2>/dev/null)
+          URL=$(echo "$RESP" | python3 -c "import sys,json;print(json.load(sys.stdin).get('signed_download_url',''))" 2>/dev/null)
+          if [ "$OK" = "True" ] && [ -n "$URL" ]; then
+            D_START=$(python3 -c "import time;print(time.time())")
+            curl -s -o /tmp/restored.tar.gz "$URL"
+            D_MS=$(python3 -c "print(int((time.time()-$D_START)*1000))")
+            E_START=$(python3 -c "import time;print(time.time())")
+            mkdir -p /tmp/restored && tar xzf /tmp/restored.tar.gz -C /tmp/restored
+            E_MS=$(python3 -c "print(int((time.time()-$E_START)*1000))")
+            RESTORED_SIZE=$(stat -c%s /tmp/restored.tar.gz 2>/dev/null || stat -f%z /tmp/restored.tar.gz)
+            echo "CACHE_BENCH size=500KB outcome=hit lookup_ms=${L_MS} download_ms=${D_MS} extract_ms=${E_MS} total_ms=$((L_MS+D_MS+E_MS)) restored_bytes=${RESTORED_SIZE}"
+          else
+            echo "CACHE_BENCH size=500KB outcome=miss lookup_ms=${L_MS}"
+          fi
+
+  save-medium:
+    runs-on: self-hosted
+    steps:
+      - name: create 5MB payload and save to cache
+        run: |
+          mkdir -p /tmp/cache-data
+          dd if=/dev/urandom of=/tmp/cache-data/payload.bin bs=1024 count=5120 2>/dev/null
+          cd /tmp && tar czf cache-payload.tar.gz -C /tmp/cache-data .
+          ARCHIVE_SIZE=$(stat -c%s cache-payload.tar.gz 2>/dev/null || stat -f%z cache-payload.tar.gz)
+          CACHE_URL="${ACTIONS_CACHE_SERVICE_URL:-http://127.0.0.1:9090}"
+          TOKEN="${GITHUB_TOKEN:-}"
+          KEY="bench-size-medium-${GITHUB_RUN_ID:-$$}"
+          RESP=$(curl -s -X POST "$CACHE_URL/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry" \
+            -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
+            -d "{\"key\":\"$KEY\",\"version\":\"v1\",\"scope\":\"bench\",\"repository\":\"size\"}")
+          URL=$(echo "$RESP" | python3 -c "import sys,json;print(json.load(sys.stdin).get('signed_upload_url',''))" 2>/dev/null)
+          if [ -n "$URL" ]; then
+            UP_START=$(python3 -c "import time;print(time.time())")
+            curl -s -X PUT "$URL" -H "Content-Type: application/octet-stream" --data-binary @cache-payload.tar.gz
+            UP_MS=$(python3 -c "print(int((time.time()-$UP_START)*1000))")
+            curl -s -X POST "$CACHE_URL/twirp/github.actions.results.api.v1.CacheService/FinalizeCacheEntry" \
+              -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
+              -d "{\"key\":\"$KEY\",\"version\":\"v1\",\"scope\":\"bench\",\"repository\":\"size\"}" > /dev/null
+            echo "CACHE_BENCH size=5MB archive=${ARCHIVE_SIZE}B upload_ms=${UP_MS} key=$KEY"
+          else
+            echo "CACHE_BENCH size=5MB status=already_exists key=$KEY"
+          fi
+
+  restore-medium:
+    runs-on: self-hosted
+    needs: save-medium
+    steps:
+      - name: restore 5MB cache and measure
+        run: |
+          CACHE_URL="${ACTIONS_CACHE_SERVICE_URL:-http://127.0.0.1:9090}"
+          TOKEN="${GITHUB_TOKEN:-}"
+          KEY="bench-size-medium-${GITHUB_RUN_ID:-$$}"
+          L_START=$(python3 -c "import time;print(time.time())")
+          RESP=$(curl -s -X POST "$CACHE_URL/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadUrl" \
+            -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
+            -d "{\"key\":\"$KEY\",\"version\":\"v1\",\"restoreKeys\":[],\"scope\":\"bench\",\"repository\":\"size\"}")
+          L_MS=$(python3 -c "print(int((time.time()-$L_START)*1000))")
+          OK=$(echo "$RESP" | python3 -c "import sys,json;print(json.load(sys.stdin).get('ok',''))" 2>/dev/null)
+          URL=$(echo "$RESP" | python3 -c "import sys,json;print(json.load(sys.stdin).get('signed_download_url',''))" 2>/dev/null)
+          if [ "$OK" = "True" ] && [ -n "$URL" ]; then
+            D_START=$(python3 -c "import time;print(time.time())")
+            curl -s -o /tmp/restored.tar.gz "$URL"
+            D_MS=$(python3 -c "print(int((time.time()-$D_START)*1000))")
+            E_START=$(python3 -c "import time;print(time.time())")
+            mkdir -p /tmp/restored && tar xzf /tmp/restored.tar.gz -C /tmp/restored
+            E_MS=$(python3 -c "print(int((time.time()-$E_START)*1000))")
+            RESTORED_SIZE=$(stat -c%s /tmp/restored.tar.gz 2>/dev/null || stat -f%z /tmp/restored.tar.gz)
+            echo "CACHE_BENCH size=5MB outcome=hit lookup_ms=${L_MS} download_ms=${D_MS} extract_ms=${E_MS} total_ms=$((L_MS+D_MS+E_MS)) restored_bytes=${RESTORED_SIZE}"
+          else
+            echo "CACHE_BENCH size=5MB outcome=miss lookup_ms=${L_MS}"
+          fi
+
+  save-large:
+    runs-on: self-hosted
+    steps:
+      - name: create 25MB payload and save to cache
+        run: |
+          mkdir -p /tmp/cache-data
+          dd if=/dev/urandom of=/tmp/cache-data/payload.bin bs=1024 count=25600 2>/dev/null
+          cd /tmp && tar czf cache-payload.tar.gz -C /tmp/cache-data .
+          ARCHIVE_SIZE=$(stat -c%s cache-payload.tar.gz 2>/dev/null || stat -f%z cache-payload.tar.gz)
+          CACHE_URL="${ACTIONS_CACHE_SERVICE_URL:-http://127.0.0.1:9090}"
+          TOKEN="${GITHUB_TOKEN:-}"
+          KEY="bench-size-large-${GITHUB_RUN_ID:-$$}"
+          RESP=$(curl -s -X POST "$CACHE_URL/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry" \
+            -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
+            -d "{\"key\":\"$KEY\",\"version\":\"v1\",\"scope\":\"bench\",\"repository\":\"size\"}")
+          URL=$(echo "$RESP" | python3 -c "import sys,json;print(json.load(sys.stdin).get('signed_upload_url',''))" 2>/dev/null)
+          if [ -n "$URL" ]; then
+            UP_START=$(python3 -c "import time;print(time.time())")
+            curl -s -X PUT "$URL" -H "Content-Type: application/octet-stream" --data-binary @cache-payload.tar.gz
+            UP_MS=$(python3 -c "print(int((time.time()-$UP_START)*1000))")
+            curl -s -X POST "$CACHE_URL/twirp/github.actions.results.api.v1.CacheService/FinalizeCacheEntry" \
+              -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
+              -d "{\"key\":\"$KEY\",\"version\":\"v1\",\"scope\":\"bench\",\"repository\":\"size\"}" > /dev/null
+            echo "CACHE_BENCH size=25MB archive=${ARCHIVE_SIZE}B upload_ms=${UP_MS} key=$KEY"
+          else
+            echo "CACHE_BENCH size=25MB status=already_exists key=$KEY"
+          fi
+
+  restore-large:
+    runs-on: self-hosted
+    needs: save-large
+    steps:
+      - name: restore 25MB cache and measure
+        run: |
+          CACHE_URL="${ACTIONS_CACHE_SERVICE_URL:-http://127.0.0.1:9090}"
+          TOKEN="${GITHUB_TOKEN:-}"
+          KEY="bench-size-large-${GITHUB_RUN_ID:-$$}"
+          L_START=$(python3 -c "import time;print(time.time())")
+          RESP=$(curl -s -X POST "$CACHE_URL/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadUrl" \
+            -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
+            -d "{\"key\":\"$KEY\",\"version\":\"v1\",\"restoreKeys\":[],\"scope\":\"bench\",\"repository\":\"size\"}")
+          L_MS=$(python3 -c "print(int((time.time()-$L_START)*1000))")
+          OK=$(echo "$RESP" | python3 -c "import sys,json;print(json.load(sys.stdin).get('ok',''))" 2>/dev/null)
+          URL=$(echo "$RESP" | python3 -c "import sys,json;print(json.load(sys.stdin).get('signed_download_url',''))" 2>/dev/null)
+          if [ "$OK" = "True" ] && [ -n "$URL" ]; then
+            D_START=$(python3 -c "import time;print(time.time())")
+            curl -s -o /tmp/restored.tar.gz "$URL"
+            D_MS=$(python3 -c "print(int((time.time()-$D_START)*1000))")
+            E_START=$(python3 -c "import time;print(time.time())")
+            mkdir -p /tmp/restored && tar xzf /tmp/restored.tar.gz -C /tmp/restored
+            E_MS=$(python3 -c "print(int((time.time()-$E_START)*1000))")
+            RESTORED_SIZE=$(stat -c%s /tmp/restored.tar.gz 2>/dev/null || stat -f%z /tmp/restored.tar.gz)
+            echo "CACHE_BENCH size=25MB outcome=hit lookup_ms=${L_MS} download_ms=${D_MS} extract_ms=${E_MS} total_ms=$((L_MS+D_MS+E_MS)) restored_bytes=${RESTORED_SIZE}"
+          else
+            echo "CACHE_BENCH size=25MB outcome=miss lookup_ms=${L_MS}"
+          fi
+
+  cache-miss:
+    runs-on: self-hosted
+    steps:
+      - name: probe for a cache key that doesn't exist
+        run: |
+          CACHE_URL="${ACTIONS_CACHE_SERVICE_URL:-http://127.0.0.1:9090}"
+          TOKEN="${GITHUB_TOKEN:-}"
+          KEY="bench-nonexistent-${GITHUB_RUN_ID:-$$}"
+          L_START=$(python3 -c "import time;print(time.time())")
+          RESP=$(curl -s -X POST "$CACHE_URL/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadUrl" \
+            -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
+            -d "{\"key\":\"$KEY\",\"version\":\"v1\",\"restoreKeys\":[],\"scope\":\"bench\",\"repository\":\"miss\"}")
+          L_MS=$(python3 -c "print(int((time.time()-$L_START)*1000))")
+          OK=$(echo "$RESP" | python3 -c "import sys,json;print(json.load(sys.stdin).get('ok',''))" 2>/dev/null)
+          echo "CACHE_BENCH size=0 outcome=miss lookup_ms=${L_MS} key=$KEY"
+
+  cache-prefix:
+    runs-on: self-hosted
+    steps:
+      - name: seed a cache entry
+        run: |
+          mkdir -p /tmp/cache-data
+          dd if=/dev/urandom of=/tmp/cache-data/payload.bin bs=1024 count=1024 2>/dev/null
+          cd /tmp && tar czf cache-payload.tar.gz -C /tmp/cache-data .
+          CACHE_URL="${ACTIONS_CACHE_SERVICE_URL:-http://127.0.0.1:9090}"
+          TOKEN="${GITHUB_TOKEN:-}"
+          KEY="bench-prefix-base-${GITHUB_RUN_ID:-$$}"
+          RESP=$(curl -s -X POST "$CACHE_URL/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry" \
+            -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
+            -d "{\"key\":\"$KEY\",\"version\":\"v1\",\"scope\":\"bench\",\"repository\":\"prefix\"}")
+          URL=$(echo "$RESP" | python3 -c "import sys,json;print(json.load(sys.stdin).get('signed_upload_url',''))" 2>/dev/null)
+          if [ -n "$URL" ]; then
+            curl -s -X PUT "$URL" -H "Content-Type: application/octet-stream" --data-binary @cache-payload.tar.gz
+            curl -s -X POST "$CACHE_URL/twirp/github.actions.results.api.v1.CacheService/FinalizeCacheEntry" \
+              -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
+              -d "{\"key\":\"$KEY\",\"version\":\"v1\",\"scope\":\"bench\",\"repository\":\"prefix\"}" > /dev/null
+            echo "CACHE_BENCH size=1MB action=seed key=$KEY"
+          fi
+
+  cache-prefix-restore:
+    runs-on: self-hosted
+    needs: cache-prefix
+    steps:
+      - name: restore via prefix (miss on exact, hit on prefix)
+        run: |
+          CACHE_URL="${ACTIONS_CACHE_SERVICE_URL:-http://127.0.0.1:9090}"
+          TOKEN="${GITHUB_TOKEN:-}"
+          EXACT_KEY="bench-prefix-new-${GITHUB_RUN_ID:-$$}"
+          L_START=$(python3 -c "import time;print(time.time())")
+          RESP=$(curl -s -X POST "$CACHE_URL/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadUrl" \
+            -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
+            -d "{\"key\":\"$EXACT_KEY\",\"version\":\"v1\",\"restoreKeys\":[\"bench-prefix-base-\"],\"scope\":\"bench\",\"repository\":\"prefix\"}")
+          L_MS=$(python3 -c "print(int((time.time()-$L_START)*1000))")
+          OK=$(echo "$RESP" | python3 -c "import sys,json;print(json.load(sys.stdin).get('ok',''))" 2>/dev/null)
+          MATCHED=$(echo "$RESP" | python3 -c "import sys,json;print(json.load(sys.stdin).get('matched_key',''))" 2>/dev/null)
+          URL=$(echo "$RESP" | python3 -c "import sys,json;print(json.load(sys.stdin).get('signed_download_url',''))" 2>/dev/null)
+          if [ "$OK" = "True" ] && [ -n "$URL" ]; then
+            D_START=$(python3 -c "import time;print(time.time())")
+            curl -s -o /tmp/restored.tar.gz "$URL"
+            D_MS=$(python3 -c "print(int((time.time()-$D_START)*1000))")
+            RESTORED_SIZE=$(stat -c%s /tmp/restored.tar.gz 2>/dev/null || stat -f%z /tmp/restored.tar.gz)
+            echo "CACHE_BENCH size=1MB outcome=prefix_hit lookup_ms=${L_MS} download_ms=${D_MS} total_ms=$((L_MS+D_MS)) matched_key=$MATCHED restored_bytes=${RESTORED_SIZE}"
+          else
+            echo "CACHE_BENCH size=1MB outcome=miss lookup_ms=${L_MS}"
+          fi
