@@ -1,0 +1,7 @@
+name: mitm multi-job-b
+on: workflow_dispatch
+jobs:
+  job-b:
+    runs-on: [self-hosted, mitm]
+    steps:
+      - run: echo "job B"

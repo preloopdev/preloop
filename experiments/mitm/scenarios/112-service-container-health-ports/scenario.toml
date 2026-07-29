@@ -1,0 +1,16 @@
+description = "Service container health check polling and host port binding"
+duration_seconds_max = 300
+
+[[steps]]
+kind = "submit_workflow"
+path = "112-service-container-health-ports.yml"
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_assigned"
+timeout = 120
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_completed"
+timeout = 240
