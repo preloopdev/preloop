@@ -152,6 +152,9 @@ pub(crate) async fn create_session_disttask(
         Json(json!({
             "sessionId": session_id.to_string(),
             "ownerName": owner_name,
+            "agent": {
+                "authorization": {},
+            },
             "assignmentQueued": false,
             "orchestrationId": "",
             "encryptionKey": {
