@@ -393,6 +393,7 @@ pub(crate) async fn twirp_cache_v2_finalize(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<CacheV2FinalizeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let t0 = std::time::Instant::now();
     let storage_key = scoped_cache_key(
         &request.key,
         request.scope.as_deref(),
@@ -432,9 +433,11 @@ pub(crate) async fn twirp_cache_v2_finalize(
         .join("cache")
         .join(&token)
         .join("data");
+    let t_read = std::time::Instant::now();
     let bytes = tokio::fs::read(&blob_path).await.map_err(|e| {
         ApiError::not_found(format!("cache blob not found (not yet uploaded?): {e}"))
     })?;
+    let read_ms = t_read.elapsed().as_millis();
 
     let (key, version) = {
         let inner = shared.state.inner.lock().await;
@@ -468,7 +471,15 @@ pub(crate) async fn twirp_cache_v2_finalize(
     )
     .await;
 
-    info!(key, version, size = bytes.len(), "cache v2 finalized");
+    let total_ms = t0.elapsed().as_millis();
+    tracing::info!(
+        key,
+        version,
+        size = bytes.len(),
+        read_ms,
+        total_ms,
+        "cache v2 finalized"
+    );
     Ok(Json(json!({ "ok": true, "entry_id": "1", "message": "" })))
 }
 
@@ -476,6 +487,7 @@ pub(crate) async fn twirp_cache_v2_get_dl_url(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<CacheV2GetDlUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let t0 = std::time::Instant::now();
     let storage_key = scoped_cache_key(
         &request.key,
         request.scope.as_deref(),
@@ -486,19 +498,28 @@ pub(crate) async fn twirp_cache_v2_get_dl_url(
         .iter()
         .map(|key| scoped_cache_key(key, request.scope.as_deref(), request.repository.as_deref()))
         .collect::<Vec<_>>();
+    let t_lookup = std::time::Instant::now();
     let result = shared
         .state
         .cache
         .get(&storage_key, &request.version, &storage_restore_keys)
         .await
         .map_err(|e| ApiError::internal(format!("cache lookup error: {e}")))?;
+    let lookup_ms = t_lookup.elapsed().as_millis();
 
     let (entry, _bytes) = match result {
         Some(r) => r,
         None => {
+            tracing::info!(
+                key = %request.key,
+                version = %request.version,
+                lookup_ms,
+                outcome = "miss",
+                "cache restore"
+            );
             return Ok(Json(
                 json!({ "ok": false, "signed_download_url": "", "matched_key": "" }),
-            ))
+            ));
         }
     };
 
@@ -515,7 +536,16 @@ pub(crate) async fn twirp_cache_v2_get_dl_url(
         .split_once('\0')
         .map(|(_, key)| key.to_owned())
         .unwrap_or_else(|| entry.key.clone());
-    info!(key = %matched_key, "cache v2 download URL issued");
+    let total_ms = t0.elapsed().as_millis();
+    tracing::info!(
+        key = %matched_key,
+        version = %request.version,
+        size = entry.size,
+        lookup_ms,
+        total_ms,
+        outcome = "hit",
+        "cache restore"
+    );
     Ok(Json(json!({
         "ok": true,
         "signed_download_url": download_url,
