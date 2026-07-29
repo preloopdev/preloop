@@ -72,6 +72,15 @@ pub(crate) struct TaskAgentJobRequestRecord {
     pub(crate) started_at: Option<std::time::SystemTime>,
     pub(crate) last_renewed_at: Option<std::time::SystemTime>,
     pub(crate) timeout_triggered: bool,
+    /// Whether this job request has already spent its one debug-worker token
+    /// exchange.
+    ///
+    /// The exchange authenticates with the job runtime token, which the runner
+    /// also exports to steps as `ACTIONS_RUNTIME_TOKEN`. A worker acquires the
+    /// credential during job setup, before the first step runs, so consuming
+    /// the exchange closes the window in which workflow code could replay that
+    /// token to mint a debug credential of its own.
+    pub(crate) debug_token_issued: bool,
 }
 
 #[derive(Debug, Clone)]
