@@ -6,7 +6,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MITM_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 CACHE="$MITM_DIR/.cache"
 MITM_PORT="${MITM_PORT:-8080}"
-MITM_URL="http://127.0.0.1:$MITM_PORT"
+MITM_HOST="${MITM_HOST:-127.0.0.1}"
+MITM_LISTEN_HOST="${MITM_LISTEN_HOST:-$MITM_HOST}"
+MITM_URL="http://$MITM_HOST:$MITM_PORT"
 
 usage() {
     echo "Usage: $0 --backend {official|runner-server|aksh} --scenario <name> [--non-interactive]" >&2
@@ -38,8 +40,10 @@ export MITM_CAPTURE_DIR="$CAPTURE_DIR"
 echo "capture dir: $CAPTURE_DIR"
 
 
-# Port conflict detection.
-if lsof -ti:$MITM_PORT &>/dev/null; then
+# Port conflict detection. lsof can block on remote filesystems and is not
+# installed in minimal capture hosts. Probe loopback because the advertised
+# proxy host may be a Docker bridge that drops packets while nothing listens.
+if curl -fsS --connect-timeout 1 --max-time 2 --proxy "http://127.0.0.1:$MITM_PORT" http://mitm.it/ >/dev/null 2>&1; then
     echo "port $MITM_PORT (mitmproxy) is already in use — stop it first or choose another MITM_PORT" >&2
     exit 2
 fi
@@ -67,7 +71,8 @@ echo "starting mitmdump..."
 CONFDIR="$CACHE/mitmproxy"
 mkdir -p "$CONFDIR"
 mitmdump \
-    --listen-host 127.0.0.1 \
+    --quiet \
+    --listen-host "$MITM_LISTEN_HOST" \
     --listen-port "$MITM_PORT" \
     --set confdir="$CONFDIR" \
     -s "$MITM_DIR/addons/capture.py" \
@@ -78,7 +83,7 @@ echo "$MITM_PID" > "$CAPTURE_DIR/mitmdump.pid"
 # Wait for mitmproxy.
 echo "waiting for mitmproxy..."
 for i in $(seq 1 30); do
-    if nc -z 127.0.0.1 "$MITM_PORT" 2>/dev/null; then
+    if curl -fsS --connect-timeout 1 --max-time 2 --proxy "http://127.0.0.1:$MITM_PORT" http://mitm.it/ >/dev/null 2>&1; then
         break
     fi
     if [ "$i" -eq 30 ]; then
@@ -90,8 +95,20 @@ for i in $(seq 1 30); do
 done
 
 # Prepare runner dir.
-RUNNER_DIR="$CACHE/runner-$BACKEND"
+RUNNER_DIR="$CACHE/runner-$BACKEND-$(uname -s)-$(uname -m)"
 RUNNER_VERSION=$(grep runner_version "$MITM_DIR/versions.toml" | cut -d'"' -f2)
+
+stop_cached_runner_processes() {
+    # run.sh may exit before its Listener/Worker children. Those children can
+    # rewrite credentials while the next ephemeral runner is being configured.
+    for process in Runner.Listener Runner.Worker; do
+        pkill -TERM -f "$RUNNER_DIR/bin/$process" 2>/dev/null || true
+    done
+    sleep 1
+    for process in Runner.Listener Runner.Worker; do
+        pkill -KILL -f "$RUNNER_DIR/bin/$process" 2>/dev/null || true
+    done
+}
 
 setup_runner() {
     local config_url="$1"
@@ -101,12 +118,23 @@ setup_runner() {
     if [ ! -f "$RUNNER_DIR/run.sh" ]; then
         echo "downloading actions/runner v$RUNNER_VERSION..."
         mkdir -p "$RUNNER_DIR"
-        TARBALL="actions-runner-osx-arm64-${RUNNER_VERSION}.tar.gz"
+        case "$(uname -s)/$(uname -m)" in
+            Darwin/arm64) RUNNER_PLATFORM="osx-arm64" ;;
+            Darwin/x86_64) RUNNER_PLATFORM="osx-x64" ;;
+            Linux/aarch64|Linux/arm64) RUNNER_PLATFORM="linux-arm64" ;;
+            Linux/x86_64) RUNNER_PLATFORM="linux-x64" ;;
+            *) echo "unsupported runner host: $(uname -s)/$(uname -m)" >&2; return 1 ;;
+        esac
+        TARBALL="actions-runner-${RUNNER_PLATFORM}-${RUNNER_VERSION}.tar.gz"
         curl -fsSL "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/${TARBALL}" -o "$RUNNER_DIR/runner.tar.gz"
         tar xzf "$RUNNER_DIR/runner.tar.gz" -C "$RUNNER_DIR"
         rm "$RUNNER_DIR/runner.tar.gz"
+        if [ -x "$RUNNER_DIR/bin/installdependencies.sh" ]; then
+            "$RUNNER_DIR/bin/installdependencies.sh"
+        fi
     fi
 
+    stop_cached_runner_processes
     cd "$RUNNER_DIR"
 
     if [ -f .runner ]; then
@@ -125,6 +153,7 @@ HTTP_PROXY=$MITM_URL
 no_proxy=
 NO_PROXY=
 GITHUB_ACTIONS_RUNNER_TLS_NO_VERIFY=1
+GIT_SSL_NO_VERIFY=true
 NODE_EXTRA_CA_CERTS=$MITM_DIR/.cache/mitmproxy/mitmproxy-ca-cert.pem
 SSL_CERT_FILE=$MITM_DIR/.cache/mitmproxy/mitmproxy-ca-cert.pem
 ENVEOF
@@ -133,13 +162,14 @@ ENVEOF
     export http_proxy="$MITM_URL"  HTTP_PROXY="$MITM_URL"
     export no_proxy= NO_PROXY=
     export GITHUB_ACTIONS_RUNNER_TLS_NO_VERIFY=1
+    export GIT_SSL_NO_VERIFY=true
 
     echo "configuring runner..."
     ./config.sh --unattended \
         --url "$config_url" \
         --token "$config_token" \
         --name "$config_name" \
-        --labels self-hosted,mitm \
+        --labels "${RUNNER_LABELS:-self-hosted,mitm}" \
         --work _work \
         --replace || return 1
 }
@@ -204,7 +234,8 @@ echo "cleaning up..."
 if [ "${RUNNER_PID:-}" != "" ] && kill -0 "$RUNNER_PID" 2>/dev/null; then
     echo "stopping runner..."
     kill -INT "$RUNNER_PID" 2>/dev/null || true
-    for i in $(seq 1 30); do
+    stop_cached_runner_processes
+    for i in $(seq 1 5); do
         if ! kill -0 "$RUNNER_PID" 2>/dev/null; then break; fi
         sleep 1
     done
@@ -215,6 +246,7 @@ if [ "${RUNNER_PID:-}" != "" ] && kill -0 "$RUNNER_PID" 2>/dev/null; then
     fi
     wait "$RUNNER_PID" 2>/dev/null || RUNNER_EXIT=$?
 fi
+stop_cached_runner_processes
 
 echo "stopping mitmdump..."
 kill -INT "$MITM_PID" 2>/dev/null || true

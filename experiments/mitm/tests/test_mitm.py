@@ -18,7 +18,7 @@ from _compare import (
     redact_report,
     render_report,
 )
-from _run_scenario import match_event
+from _run_scenario import match_event, wait_for_event
 
 
 # ── normalize_path tests ─────────────────────────────────────────────
@@ -189,6 +189,26 @@ class TestMatchEvent:
 
     def test_empty_flows(self):
         assert match_event("runner_registered", []) is False
+
+    def test_wait_ignores_events_before_cursor(self, tmp_path: Path):
+        flows = [
+            {
+                "flow_index": 1,
+                "method": "PATCH",
+                "status": 200,
+                "path": "/_apis/distributedtask/hubs/actions/jobrequests/first",
+            },
+            {
+                "flow_index": 2,
+                "method": "PATCH",
+                "status": 200,
+                "path": "/_apis/distributedtask/hubs/actions/jobrequests/second",
+            },
+        ]
+        (tmp_path / "flows.jsonl").write_text(
+            "".join(json.dumps(flow) + "\n" for flow in flows)
+        )
+        assert wait_for_event("job_completed", tmp_path, 0.1, after_flow_index=1)
 
 
 # ── render_report tests ──────────────────────────────────────────────
