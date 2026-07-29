@@ -171,12 +171,12 @@ The core tooling exists and is functional. Remaining work is polish and coverage
 | Component | Status | Notes |
 |---|---|---|
 | H1 `aksh-conformance runner-e2e` | ✅ Exists | Subcommand implemented; boots runner, submits workflow, waits for completion |
-| H2 `aksh-conformance runner-diff` | ✅ Exists | Flow diff vs goldens; wired to justfile `conform-runner`/`conform-local` |
+| H2 `aksh-conformance runner-diff` | ✅ Exists | Flow diff vs goldens; the full committed replay is wired to `just conform` |
 | `runner-watch compare` | ✅ Exists | Pure-Rust flow comparison (`compare.rs`), triage, spec generation |
 | MITM scenarios | ✅ 24 scenarios | 01-17 (host workflows) + 30-36 (container workflows) with `scenario.toml` |
 | Golden recordings | ✅ 18 goldens | `.runner-watch/golden/v2.335.1/` — recorded from official runner v2.335.1 on GitHub |
-| Justfile targets | ✅ Working | `conform-local`, `conform-runner` wire to `runner-diff` |
-| `--record-flows` on server | ✅ Implemented | Full NDJSON flows.jsonl middleware; wired to `runner-e2e` and `just conform-smoke` |
+| Justfile target | ✅ Working | `just conform` replays and strictly compares every committed flow |
+| `--record-flows` on server | ✅ Implemented | Full NDJSON flows.jsonl middleware; wired to `runner-e2e` and the replay harness |
 | `fixtures/runner/` corpus | ⚠️ Not a directory | 229 inline unit tests + 24 scenario workflows serve the purpose; formal corpus deferred |
 | Benchmarks (M11) | ✅ Complete | CI pipeline + container benchmarks in `docs/runner/11-benchmarks.md` |
 | Milestone docs | ⚠️ Partial | 00, 11, 12, 13, 14 exist; others deferred until gates are formalized |

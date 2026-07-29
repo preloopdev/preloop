@@ -155,7 +155,7 @@ Push a commit or open a pull request. `aksh` will:
    # Or: export AKSH_GITHUB_APP_PRIVATE_KEY_PATH=/secure/path/aksh-app.pem
    ```
 
-   When these values are set, aksh signs a GitHub App JWT, exchanges it for a per-job installation access token, and applies each workflow/job `permissions:` declaration to the token supplied to the official runner. If no App configuration is present, `AKSH_GITHUB_TOKEN` remains the job-token fallback.
+   When these values are set, aksh signs a GitHub App JWT and exchanges it for a per-job installation access token scoped to the run's repository and to that job's effective `permissions:`. A job declaring no `permissions:` gets GitHub's restricted default (`contents`, `metadata`, `packages` at `read`), never the installation's full grant. If no App configuration is present at all, `AKSH_GITHUB_TOKEN` is the job token. If an App *is* configured but minting fails, `AKSH_GITHUB_APP_MINT_FAILURE` decides — `local` (the default) keeps the job on the local HMAC JWT rather than silently widening its authority to the PAT. See [GitHub Tokens](./github-tokens.md).
 
 6. **Confirm delivery and job credential use**:
    Push a commit or open a pull request. aksh verifies the webhook and queues matching jobs. The installed App's scoped token is supplied to the runner job. Remote workflow retrieval and GitHub Check Run reporting currently continue to use `AKSH_GITHUB_TOKEN`; configure `AKSH_LOCAL_WORKSPACE` for offline workflow loading, or provide that token for those server-side GitHub API calls.

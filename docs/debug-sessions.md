@@ -606,10 +606,10 @@ and the agent reads attacker-influenced material — repository files, test
 fixtures, dependency error text, logs.
 
 **Authorization.** The worker-facing routes (`POST /api/v1/debug/sessions`,
-`GET …/verdict`, `POST …/close`) require a *job runtime token*, and authorize
+`GET …/verdict`, `POST …/close`) require a *debug-worker token*, and authorize
 against the job it names rather than against its validity. The token is minted
-per job as `sub: aksh-job-{agent_job_id}` with a matching `scp`, so it
-identifies exactly one caller:
+per job as `sub: aksh-debug-worker-{agent_job_id}` with a matching
+`scp: DebugWorker:{plan}:{job}`, so it identifies exactly one caller:
 
 - a job may only open a session for itself;
 - a session may only be polled or closed by the job that owns it;
@@ -620,6 +620,40 @@ an unauthorized poll would not merely read another job's session, it would
 drain the verdict its worker is waiting for, and that worker would then sit out
 the liveness window and be swept — a hang with no attributable cause. A runner
 *listen* token is not accepted here; it names a machine, not a job.
+
+The job *runtime* token is not accepted either: the runner exports it to steps
+as `ACTIONS_RUNTIME_TOKEN`, and it stands in for `GITHUB_TOKEN` when no GitHub
+App is configured, so accepting it would let a `run:` step drive its own debug
+session.
+
+**Acquisition.** The debug-worker token is not delivered on the job message. It
+used to arrive as a secret variable, `system.preloop.debug_worker_token`, which
+was safe only under the Rust runner — `contexts.rs` drops every `system.*` key
+from the `secrets` context. Official runner v2.336.0 has no such filter: it
+copies every `isSecret` variable except `system.github.token` into `secrets`,
+so the credential was readable from the workflow being debugged as
+`${{ secrets['system.preloop.debug_worker_token'] }}`. The server does not
+choose which runner claims a job, so the variable had to go.
+
+The worker now acquires it during job setup, before the first step runs:
+
+```
+POST /api/v1/debug/worker-token      Authorization: Bearer <job runtime token>
+{ "agent_job_id": "<uuid>" }      →  { "token": "<debug-worker token>" }
+```
+
+The runtime token is the only job-scoped credential the worker already holds,
+so it authenticates the exchange — and the exchange is built to be worth
+nothing to a step that later replays it:
+
+- the token must name a single job (`sub`/`scp` must agree), and that job must
+  be the one named in the body — `403` otherwise;
+- the job must have a live, uncompleted request — `404` otherwise;
+- its run must have set `preserve_on_failure`; a run that never asked to pause
+  has no debug credential at all — `403` otherwise;
+- issuance is one-shot per job request — `409` otherwise. The worker spends it
+  before any step runs, so a step that finds `ACTIONS_RUNTIME_TOKEN` in its
+  environment finds the exchange already consumed.
 
 Controller-facing routes (`GET /api/v1/debug/sessions`, `POST …/verdict`) and
 the whole `/api/v1/agent/debug/…` surface use native authentication, which is
@@ -674,7 +708,8 @@ transferring the lease.
 | Workspace snapshot | `create_workspace_snapshot`, `redirect_primary_checkout` in `runs.rs` |
 | Wire flag | `preserve_on_failure` → `preloop_preserve_on_failure`, `azdo/job.rs` ~170 |
 | Session registry / HTTP surface | `debug_sessions.rs`, `aksh-runner-server` |
-| Worker authorization | `require_worker_bearer` + `WorkerJob`, `auth.rs`; `job_uuid_from_token`, `state.rs` |
+| Worker authorization | `require_worker_bearer` + `WorkerJob`, `auth.rs`; `job_uuid_from_debug_token`, `state.rs` |
+| Credential acquisition | `issue_worker_token`, `debug_sessions.rs`; `require_job_runtime_bearer`, `auth.rs`; `DebugPauseClient::acquire`, `debug_pause.rs` |
 | Timeout suspension (server) | `reap_once`, `bootstrap.rs` |
 | Timeout suspension (runner) | job-timeout timer + `DebugPauseClient::with_pause_flag`, `job_runner.rs` |
 | VM hold (post-mortem, no attach) | `hold_for_debugging`, `DEBUG_IDLE_TIMEOUT`, `preloop-orchestrator/src/lib.rs` |
