@@ -1,8 +1,6 @@
 server := "http://127.0.0.1:9090"
 repo := "preloopdev/aksh"
 
-
-
 build:
     cargo build --release -p aksh-runner-server
 
@@ -52,6 +50,7 @@ test-properties-full:
 
 test-ci: fmt-check clippy
     PROPTEST_CASES=8 cargo test --workspace --quiet
+    just conform
     @echo CI: all checks passed
 
 #lint (ast-grep structural rules)
@@ -70,6 +69,10 @@ dogfood: build
 # Preloop end-to-end performance benchmark (see benchmarks/preloop-perf/).
 bench-preloop:
     ./autoresearch.sh
+
+# Same harness, single trial and short load windows.
+bench-preloop-quick:
+    ./autoresearch.sh --quick
 
 # e2e redirect (one-time setup) 
 
@@ -106,20 +109,26 @@ build-runner:
 runner-e2e WF:
     cargo run -p aksh-conformance -- runner-e2e --runner-bin target/release/preloop-runner --workflow {{WF}}
 
-conform-runner S:
-    cargo run -p aksh-conformance -- runner-diff --scenario {{S}} --target github
+# Replay every committed official-runner flow and fail on protocol drift.
+conform:
+    bash ./benchmarks/conformance/run.sh
 
-conform-local S:
-    cargo run -p aksh-conformance -- runner-diff --scenario {{S}} --target aksh
+# Replay every committed official-runner flow against the current server.
+conform-server-light:
+    bash ./benchmarks/conformance/run.sh
 
-conform-smoke: build-runner build
-    cargo run -p aksh-conformance -- runner-e2e --runner-bin target/release/preloop-runner --workflow crates/aksh-conformance/fixtures/hello-world.yml --record-flows /tmp/smoke-flows.jsonl
+# Build the current server, run live official-runner GitHub/server comparisons,
+# and fail on conclusion, job, step, or flow-count differences.
+conform-server-deep:
+    cargo zigbuild -p aksh-runner-server --release --target aarch64-unknown-linux-musl
+    bash ./scripts/conform-server-deep.sh
 
-conform-ci: build-all
-    cargo run --release -p aksh-runner-server -- serve --listen 127.0.0.1:9090 & \
-    SERVER_PID=$! ; \
-    sleep 2 ; \
-    cargo run -p runner-watch -- conform --runner v2.335.1 --aksh-url http://127.0.0.1:9090 ; \
-    STATUS=$? ; \
-    kill $SERVER_PID ; \
-    exit $STATUS
+# Compare workflow/job status responses from the official and aksh runners.
+conform-runner-light:
+    python3 benchmarks/real-world/runner-conformance.py --mode light
+
+# Run the numbered runner corpus on smolVM with both runner implementations,
+# then fail on workflow, job, or step-level differences.
+conform-runner-deep:
+    bash ./benchmarks/real-world/batch-conformance.sh both '10[1-9]-*' '110-*'
+    python3 benchmarks/real-world/runner-conformance.py --mode deep
