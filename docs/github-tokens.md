@@ -84,7 +84,7 @@ setup: Preloop always supplies *some* `GITHUB_TOKEN` value.
 ## 4. Setting up a GitHub App (recommended)
 
 A GitHub App gives each job a short-lived installation token scoped to the
-permissions that job declares.
+repository the run belongs to and to the permissions that job declares.
 
 1. Visit `http://<server>/api/v1/github/register` in a browser. Use the
    server's final public HTTPS URL if you also want webhook delivery — GitHub
@@ -115,6 +115,7 @@ permissions that job declares.
 | `AKSH_GITHUB_APP_PRIVATE_KEY` | Inline PEM, older alias. |
 | `AKSH_GITHUB_APP_PRIVATE_KEY_PATH` | PEM file path, older alias. |
 | `AKSH_GITHUB_APP_INSTALLATION_ID` | Pins one installation and skips discovery. |
+| `AKSH_GITHUB_APP_MINT_FAILURE` | What a job's `GITHUB_TOKEN` becomes if minting fails: `local` (default), `error`, or `pat`. See below. |
 | `AKSH_GITHUB_API_URL` | REST API base. Defaults to `https://api.github.com`; set it for GitHub Enterprise Server. |
 
 The four private-key variables are tried in the order listed and the first
@@ -127,7 +128,9 @@ Kubernetes env vars — are un-escaped before parsing.
 Partial configuration (an App ID with no key, or a key with no App ID) logs a
 warning and simply disables minting. A key that *is* set but cannot be read or
 parsed is a hard startup error: the operator clearly meant to configure an App,
-and booting without one would silently downgrade every job token.
+and booting without one would silently downgrade every job token. An
+unrecognised `AKSH_GITHUB_APP_MINT_FAILURE` value is likewise fatal at startup,
+so a typo cannot quietly select a different policy.
 
 ### What happens per job
 
@@ -136,6 +139,14 @@ and booting without one would silently downgrade every job token.
   `account.login` case-insensitively. The resulting id is cached in-process for
   the server's lifetime; `AKSH_GITHUB_APP_INSTALLATION_ID` skips discovery
   altogether.
+- The token is minted with **both** `repositories` and `permissions` always
+  present in the request body. `repositories` holds the single repository from
+  the run's `owner/repo` slug, and `permissions` holds the job's effective
+  scopes. Omitting either field is what GitHub treats as "grant everything this
+  installation can reach", so neither is ever left out.
+- A run whose `repository` is not an `owner/repo` slug — a pure local-workspace
+  submission, say — cannot be repository-scoped, so minting fails before any
+  network call and `AKSH_GITHUB_APP_MINT_FAILURE` takes over.
 - Only the installation id is cached — never the token, since permissions vary
   per job. Every job mints a fresh one.
 - The App authenticates with an RS256 JWT that is backdated 60 seconds for clock
@@ -144,10 +155,23 @@ and booting without one would silently downgrade every job token.
   longer than an hour may see `$GITHUB_TOKEN` expire mid-run.
 - Minting happens for every job in a run before the dispatch lock is taken, so a
   slow GitHub round-trip cannot stall other runs.
-- If minting fails for any reason — App not installed for that owner, network
-  error, revoked key — the server logs a warning and falls back (see §6). A mint
-  failure never fails the job. A run whose `repository` is not a real GitHub
-  slug, such as a pure local-workspace submission, degrades this way by design.
+
+### When minting fails
+
+A mint can fail for many reasons: the App is not installed on that owner, the
+key was revoked, the API is rate-limited, the requested permissions exceed the
+installation's grant, or the run's `repository` is not a real slug.
+
+Falling back to `AKSH_GITHUB_TOKEN` automatically would be a silent privilege
+escalation — it trades a repository-scoped, `permissions:`-bounded token for a
+static PAT that is neither. `AKSH_GITHUB_APP_MINT_FAILURE` therefore makes the
+choice explicit:
+
+| Value | Behavior |
+|---|---|
+| `local` (default) | The job keeps the local HMAC JWT. It runs normally but cannot reach `api.github.com`. Scope can never widen. |
+| `error` | The submission is rejected with `502 Bad Gateway` before any state is mutated, so a misconfiguration is loud instead of silent. |
+| `pat` | The job receives `AKSH_GITHUB_TOKEN`, accepting that the PAT ignores `permissions:` and is not repository-scoped. |
 
 ### How `permissions:` maps to token scopes
 
@@ -165,17 +189,28 @@ Two rules govern what actually reaches GitHub:
 
 - A scope set to `none` is **dropped** from the request rather than forwarded.
   The installation-token API has no `none` level and rejects unknown values with
-  a `422`, which would fail the whole mint and fall the job back to the broader
-  PAT — more access, not less. Omitting the key is what withholds the scope.
+  a `422`, which would fail the whole mint. Omitting the key is what withholds
+  the scope.
 - `id-token` and `models` are dropped for the same reason: neither is a GitHub
   App installation permission. `permissions: id-token: write` still works
   exactly as before, because OIDC id-tokens are issued by Preloop's own
   `/oidctoken` endpoint, not by the App token.
 
-If the workflow declares no `permissions:` at all, the request omits the
-`permissions` field, which grants the installation's full permission set — the
-same thing Actions does. A token can never exceed what the App was granted at
-install time.
+If the workflow declares no `permissions:` at all, the job gets GitHub's
+restricted default — `contents: read`, `metadata: read`, `packages: read`, the
+same three scopes the official runner prints in its setup log — stated
+explicitly in the request. It does **not** get the installation's full
+permission set.
+
+If every declared scope is withheld (`permissions: {}`, or a block whose entries
+are all `none` or Actions-only), the request asks for `metadata: read` alone.
+That is the narrowest token GitHub will issue, and it is used instead of an empty
+`permissions` object because an empty object is not a documented way to request
+an empty token.
+
+A token can never exceed what the App was granted at install time. The converse
+matters too: requesting a scope the App was *not* granted fails the mint with a
+`422`, so grant the App at least the permissions your workflows declare.
 
 ### Enterprise considerations
 
@@ -201,7 +236,9 @@ export AKSH_GITHUB_TOKEN="github_pat_..."
 - The PAT is injected verbatim as `GITHUB_TOKEN` for **all** jobs. It is not
   scoped per repository and it **ignores `permissions:`** entirely — a workflow
   declaring `permissions: contents: read` still receives the PAT's full rights.
-  `permissions:` is only enforced on the GitHub App path.
+  `permissions:` is only enforced on the GitHub App path. This is exactly why a
+  failed App mint does not reach for the PAT unless
+  `AKSH_GITHUB_APP_MINT_FAILURE=pat` says so.
 - Fine-grained PATs are strongly preferred over classic tokens; scope them to
   the specific repositories and permissions your workflows need.
 - The same `AKSH_GITHUB_TOKEN` is also used server-side for Check Run
@@ -213,16 +250,20 @@ export AKSH_GITHUB_TOKEN="github_pat_..."
 ## 6. Token priority
 
 ```
-GitHub App installation token (scoped to `permissions:`, fresh per job, 1h TTL)
-  ↓ falls back to
-AKSH_GITHUB_TOKEN PAT (static, operator-provided, unscoped)
+GitHub App installation token
+  (scoped to one repository and to `permissions:`, fresh per job, 1h TTL)
+  ↓ configured? no App at all
+AKSH_GITHUB_TOKEN PAT (static, operator-provided, unscoped, ignores permissions:)
   ↓ falls back to
 Local HMAC JWT (only works against the Preloop server)
 ```
 
-The App path is attempted whenever App credentials are configured; a mint
-failure logs a warning and falls through. Every job therefore receives some
-`GITHUB_TOKEN` value.
+With App credentials configured, the App path is the *only* path a successful
+job token comes from — the PAT is not a silent second choice. A failed mint is
+resolved by `AKSH_GITHUB_APP_MINT_FAILURE` (see §4), which defaults to the local
+HMAC JWT. With no App configured at all, the PAT is the primary job token.
+Either way every job receives some `GITHUB_TOKEN` value, unless the policy is
+`error`, which rejects the submission outright.
 
 Regardless of which branch is taken, `ACTIONS_RUNTIME_TOKEN` and the pinned
 `actions/checkout` token stay local HMAC JWTs, so cache, artifacts, logs, OIDC,
