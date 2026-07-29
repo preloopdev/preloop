@@ -133,3 +133,37 @@ pub(crate) async fn require_worker_bearer(
         None => Err(ApiError::unauthorized("job debug-worker token required")),
     }
 }
+
+/// The job a request speaks for, proven by its runtime token.
+///
+/// Distinct type from [`WorkerJob`] on purpose: a runtime token is weaker —
+/// the runner exports it to steps as `ACTIONS_RUNTIME_TOKEN` — so the two must
+/// not be interchangeable in a handler signature. Only the credential
+/// *exchange* accepts this identity; the debug-session routes themselves still
+/// demand a [`WorkerJob`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct JobRuntimeIdentity(pub(crate) uuid::Uuid);
+
+/// Require a job runtime token and record which job it names.
+///
+/// The runtime token is the only credential a worker process holds that the
+/// server can tie to a single job, so it is what the debug-worker token
+/// exchange authenticates with. It buys nothing on its own: the handler still
+/// has to find a live, pause-enabled job request for that exact job, and the
+/// exchange is one-shot. A runner listen token, the native system token and a
+/// debug-worker token are all rejected here — each names something other than
+/// one job.
+pub(crate) async fn require_job_runtime_bearer(
+    State(shared): State<Arc<SharedState>>,
+    mut request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let job = bearer_token(&request).and_then(|token| shared.state.job_uuid_from_token(token));
+    match job {
+        Some(job) => {
+            request.extensions_mut().insert(JobRuntimeIdentity(job));
+            Ok(next.run(request).await)
+        }
+        None => Err(ApiError::unauthorized("job runtime token required")),
+    }
+}
