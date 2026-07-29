@@ -35,6 +35,7 @@ SCENARIO_DIR="$MITM_DIR/scenarios/$SCENARIO"
 
 TIMESTAMP=$(date -u +%Y-%m-%dT%H-%M-%SZ)
 CAPTURE_DIR="$MITM_DIR/captures/$BACKEND/$SCENARIO/$TIMESTAMP"
+SHORT_TS=$(date -u +%s)
 mkdir -p "$CAPTURE_DIR"
 export MITM_CAPTURE_DIR="$CAPTURE_DIR"
 echo "capture dir: $CAPTURE_DIR"
@@ -57,7 +58,7 @@ if [ "$BACKEND" = "aksh" ]; then
     echo "ThisIsIgnored" > "$CACHE/aksh.token"
 fi
 STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-RUNNER_NAME="mitm-$BACKEND-$SCENARIO-$TIMESTAMP"
+RUNNER_NAME="m-$BACKEND-$SCENARIO-$SHORT_TS"
 
 # Determine backend port for mitm proxy port-80 forwarding.
 if [ "$BACKEND" = "runner-server" ]; then
