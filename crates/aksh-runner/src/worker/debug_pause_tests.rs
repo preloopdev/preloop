@@ -91,7 +91,7 @@ fn client(base_url: &str) -> DebugPauseClient {
     DebugPauseClient::with_http(
         Arc::new(crate::client::http::HttpClient::with_control(None, None).unwrap()),
         base_url,
-        "job-runtime-token".to_owned(),
+        "debug-worker-token".to_owned(),
         RunId::new(),
         JobId("build".to_owned()),
         uuid::Uuid::new_v4(),
@@ -99,6 +99,182 @@ fn client(base_url: &str) -> DebugPauseClient {
     )
     .unwrap()
     .with_workspace(Some("/work".to_owned()), Some("deadbeef".to_owned()))
+}
+
+/// What the fake control plane recorded about the credential exchange.
+#[derive(Default)]
+struct Exchange {
+    /// Bearer and body of the token exchange.
+    request: parking_lot::Mutex<Option<(Option<String>, Value)>>,
+    /// Bearers seen on each session route, in call order.
+    session_bearers: parking_lot::Mutex<Vec<Option<String>>>,
+    /// Status the exchange answers with.
+    status: axum::http::StatusCode,
+}
+
+fn bearer(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::to_owned)
+}
+
+async fn spawn_exchange(state: Arc<Exchange>) -> String {
+    let record = |state: &Arc<Exchange>, headers: &axum::http::HeaderMap| {
+        state.session_bearers.lock().push(bearer(headers));
+    };
+    let app = Router::new()
+        .route(
+            "/api/v1/debug/worker-token",
+            post(
+                |State(state): State<Arc<Exchange>>,
+                 headers: axum::http::HeaderMap,
+                 Json(body): Json<Value>| async move {
+                    *state.request.lock() = Some((bearer(&headers), body));
+                    if state.status.is_success() {
+                        (
+                            state.status,
+                            Json(json!({ "token": "minted-debug-worker-token" })),
+                        )
+                    } else {
+                        (state.status, Json(json!({ "error": "denied" })))
+                    }
+                },
+            ),
+        )
+        .route(
+            "/api/v1/debug/sessions",
+            post(
+                move |State(state): State<Arc<Exchange>>,
+                      headers: axum::http::HeaderMap,
+                      Json(_): Json<Value>| async move {
+                    record(&state, &headers);
+                    Json(json!({ "session_id": "dbg_test" }))
+                },
+            ),
+        )
+        .route(
+            "/api/v1/debug/sessions/:id/verdict",
+            get(
+                move |State(state): State<Arc<Exchange>>, headers: axum::http::HeaderMap| async move {
+                    record(&state, &headers);
+                    Json(json!({ "verdict": "continue", "version": 1 }))
+                },
+            ),
+        )
+        .route(
+            "/api/v1/debug/sessions/:id/close",
+            post(
+                move |State(state): State<Arc<Exchange>>,
+                      headers: axum::http::HeaderMap,
+                      Json(_): Json<Value>| async move {
+                    record(&state, &headers);
+                    Json(json!({ "ok": true }))
+                },
+            ),
+        )
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}")
+}
+
+/// The worker acquires its debug credential over an authenticated exchange and
+/// then speaks with *that* credential, never the runtime token.
+///
+/// The credential cannot travel on the job message: the official runner copies
+/// every secret variable into the `secrets` context, so a workflow being
+/// debugged could read it out of its own YAML. The runtime token is the only
+/// job-scoped credential the worker already holds, so it buys the exchange —
+/// and must buy nothing else, which is why the session calls are asserted to
+/// carry the issued token instead.
+#[tokio::test]
+async fn the_worker_trades_its_runtime_token_for_the_debug_credential() {
+    let state = Arc::new(Exchange {
+        status: axum::http::StatusCode::OK,
+        ..Default::default()
+    });
+    let base = spawn_exchange(state.clone()).await;
+    let agent_job_id = uuid::Uuid::new_v4();
+
+    let client = DebugPauseClient::acquire_with_http(
+        Arc::new(crate::client::http::HttpClient::with_control(None, None).unwrap()),
+        &format!("{base}/broker/4"),
+        "job-runtime-token",
+        RunId::new(),
+        JobId("build".to_owned()),
+        agent_job_id,
+        "build".to_owned(),
+    )
+    .await
+    .expect("the exchange must yield a usable client");
+
+    let (exchange_bearer, exchange_body) = state.request.lock().clone().expect("exchange happened");
+    assert_eq!(
+        exchange_bearer.as_deref(),
+        Some("job-runtime-token"),
+        "the exchange is what the runtime token is for"
+    );
+    assert_eq!(
+        exchange_body["agent_job_id"],
+        json!(agent_job_id),
+        "the server rejects a mismatch, so the job must name itself"
+    );
+
+    let decision = client
+        .pause(failed_step(), Vec::new(), Vec::new(), Vec::new())
+        .await;
+    assert_eq!(decision.map(|d| d.verdict), Some(Verdict::Continue));
+
+    let seen = state.session_bearers.lock().clone();
+    assert_eq!(seen.len(), 3, "open, verdict poll, and close");
+    for bearer in seen {
+        assert_eq!(
+            bearer.as_deref(),
+            Some("minted-debug-worker-token"),
+            "session routes must be driven by the issued credential"
+        );
+    }
+}
+
+/// A refused exchange leaves pause-on-failure unavailable, not half-armed.
+///
+/// The server declines when the run never asked for pause-on-failure, or when
+/// the one-shot exchange is already spent. Either way the worker must surface
+/// the fault and fail the step normally rather than build a client whose every
+/// call will 401.
+#[tokio::test]
+async fn a_refused_exchange_yields_no_client() {
+    let state = Arc::new(Exchange {
+        status: axum::http::StatusCode::FORBIDDEN,
+        ..Default::default()
+    });
+    let base = spawn_exchange(state.clone()).await;
+
+    let result = DebugPauseClient::acquire_with_http(
+        Arc::new(crate::client::http::HttpClient::with_control(None, None).unwrap()),
+        &base,
+        "job-runtime-token",
+        RunId::new(),
+        JobId("build".to_owned()),
+        uuid::Uuid::new_v4(),
+        "build".to_owned(),
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "a denied exchange must not produce a client that cannot talk"
+    );
+    assert!(
+        state.session_bearers.lock().is_empty(),
+        "no session traffic may be attempted without a credential"
+    );
 }
 
 fn failed_step() -> FailedStep {

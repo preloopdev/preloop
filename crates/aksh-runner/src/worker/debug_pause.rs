@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use aksh_gha_protocol::debug_session::{
     AttemptRecord, Diagnostic, FailedStep, OpenSessionRequest, OpenSessionResponse, RevertPolicy,
-    Verdict, VerdictResponse, WorkspaceChange,
+    Verdict, VerdictResponse, WorkerTokenRequest, WorkerTokenResponse, WorkspaceChange,
 };
 use aksh_gha_protocol::{JobId, RunId};
 use tracing::{info, warn};
@@ -49,6 +49,36 @@ fn origin_of(service_url: &str) -> anyhow::Result<String> {
         Some(port) => format!("{}://{host}:{port}", parsed.scheme()),
         None => format!("{}://{host}", parsed.scheme()),
     })
+}
+
+/// Trade the job runtime token for this job's debug-worker credential.
+///
+/// The credential is fetched rather than read out of the job message because
+/// the job message is shared ground with the official runner, which copies
+/// every secret variable into the `secrets` context — a workflow could then
+/// read the debug credential straight out of its own YAML.
+///
+/// The server issues at most once per job request and only for a run that
+/// enabled pause-on-failure, so this must be called during job setup, before
+/// any step runs.
+async fn exchange_worker_token(
+    http: &HttpClient,
+    base_url: &str,
+    runtime_token: &str,
+    agent_job_id: uuid::Uuid,
+) -> anyhow::Result<String> {
+    let url = format!("{base_url}/api/v1/debug/worker-token");
+    let response = http
+        .client_for(&url)
+        .post(&url)
+        .bearer_auth(runtime_token)
+        .json(&WorkerTokenRequest { agent_job_id })
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<WorkerTokenResponse>()
+        .await?;
+    Ok(response.token)
 }
 
 /// Server-side long-poll ceiling. Requests use this so the connection cycles
@@ -99,23 +129,50 @@ pub struct DebugPauseClient {
 }
 
 impl DebugPauseClient {
-    /// Build a client from the job message's control-plane endpoint.
+    /// Build a client, acquiring the debug-worker credential from the server.
     ///
     /// `service_url` is the `SystemVssConnection` endpoint, which carries a
     /// path prefix (`http://host:9090/broker/4`). The native debug surface is
     /// origin-rooted, so only scheme/host/port are kept — appending to the full
     /// endpoint produces `/broker/4/api/v1/...` and a 404.
-    pub fn new(
+    ///
+    /// `runtime_token` is that endpoint's `AccessToken`. It is spent solely to
+    /// authenticate the exchange; the session routes themselves reject it.
+    pub async fn acquire(
         service_url: &str,
-        token: String,
+        runtime_token: &str,
         run_id: RunId,
         job_id: JobId,
         agent_job_id: uuid::Uuid,
         job_name: String,
     ) -> anyhow::Result<Self> {
+        Self::acquire_with_http(
+            Arc::new(HttpClient::new(None)?),
+            service_url,
+            runtime_token,
+            run_id,
+            job_id,
+            agent_job_id,
+            job_name,
+        )
+        .await
+    }
+
+    /// [`Self::acquire`] with an explicit transport. Test seam.
+    pub async fn acquire_with_http(
+        http: Arc<HttpClient>,
+        service_url: &str,
+        runtime_token: &str,
+        run_id: RunId,
+        job_id: JobId,
+        agent_job_id: uuid::Uuid,
+        job_name: String,
+    ) -> anyhow::Result<Self> {
+        let base_url = origin_of(service_url)?;
+        let token = exchange_worker_token(&http, &base_url, runtime_token, agent_job_id).await?;
         Ok(Self {
-            http: Arc::new(HttpClient::new(None)?),
-            base_url: origin_of(service_url)?,
+            http,
+            base_url,
             token,
             run_id,
             job_id,
@@ -129,7 +186,8 @@ impl DebugPauseClient {
         })
     }
 
-    /// Build a client with an explicit transport. Test seam.
+    /// Build a client around an already-acquired credential, with an explicit
+    /// transport. Test seam for the session protocol itself.
     pub fn with_http(
         http: Arc<HttpClient>,
         service_url: &str,
