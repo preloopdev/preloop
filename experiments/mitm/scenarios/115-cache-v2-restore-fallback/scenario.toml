@@ -1,0 +1,16 @@
+description = "Cache v2 exact key miss with multi-line restore-keys prefix matching fallback"
+duration_seconds_max = 300
+
+[[steps]]
+kind = "submit_workflow"
+path = "115-cache-v2-restore-fallback.yml"
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_assigned"
+timeout = 120
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_completed"
+timeout = 240

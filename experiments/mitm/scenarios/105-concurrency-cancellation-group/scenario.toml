@@ -1,0 +1,16 @@
+description = "Workflow and job concurrency group cancellation in progress"
+duration_seconds_max = 300
+
+[[steps]]
+kind = "submit_workflow"
+path = "105-concurrency-cancellation-group.yml"
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_assigned"
+timeout = 120
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_completed"
+timeout = 240
