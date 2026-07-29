@@ -1,0 +1,9 @@
+name: 103-composite-nested-post
+on: workflow_dispatch
+jobs:
+  composite-test:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run local composite action
+        uses: ./.github/actions/nested-setup

@@ -1,0 +1,18 @@
+name: 101-dynamic-matrix-dataflow
+on: workflow_dispatch
+jobs:
+  setup:
+    runs-on: self-hosted
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - id: set-matrix
+        run: echo 'matrix={"include":[{"os":"ubuntu-latest","node":"18"},{"os":"ubuntu-latest","node":"20"}]}' >> $GITHUB_OUTPUT
+
+  build:
+    needs: setup
+    runs-on: self-hosted
+    strategy:
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+    steps:
+      - run: echo "Node version ${{ matrix.node }}"

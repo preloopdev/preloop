@@ -1,0 +1,11 @@
+name: 111-github-state-post-execution
+on: workflow_dispatch
+jobs:
+  state-test:
+    runs-on: self-hosted
+    steps:
+      - name: Setup state
+        id: setup
+        run: |
+          echo "CUSTOM_STATE_KEY=secret_value_123" >> $GITHUB_STATE
+          echo "SESSION_ID=sess_abc" >> $GITHUB_STATE

@@ -1,0 +1,16 @@
+description = "Dynamic matrix expansion via fromJson step outputs and DAG fan-out"
+duration_seconds_max = 300
+
+[[steps]]
+kind = "submit_workflow"
+path = "101-dynamic-matrix-dataflow.yml"
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_assigned"
+timeout = 120
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_completed"
+timeout = 240

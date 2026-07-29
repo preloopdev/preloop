@@ -1,0 +1,16 @@
+description = "Step-level timeout enforcement, signal escalation, and post-timeout cleanup"
+duration_seconds_max = 300
+
+[[steps]]
+kind = "submit_workflow"
+path = "114-step-timeout-graceful-kill.yml"
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_assigned"
+timeout = 120
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_completed"
+timeout = 240

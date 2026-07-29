@@ -1,0 +1,21 @@
+name: Reusable Workflow
+on:
+  workflow_call:
+    inputs:
+      deploy-target:
+        required: true
+        type: string
+      enable-flags:
+        required: false
+        type: boolean
+    outputs:
+      status:
+        value: ${{ jobs.deploy.outputs.status }}
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+    outputs:
+      status: deployed
+    steps:
+      - run: echo "Deploying to ${{ inputs.deploy-target }}"

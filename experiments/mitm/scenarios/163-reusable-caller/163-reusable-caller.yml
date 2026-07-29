@@ -1,0 +1,8 @@
+name: 163 Reusable Caller
+on: workflow_dispatch
+jobs:
+  call-reusable:
+    uses: ./.github/workflows/reusable.yml
+    with:
+      deploy-target: staging
+      enable-flags: true
