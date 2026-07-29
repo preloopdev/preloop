@@ -2,22 +2,25 @@
 # batch-conformance.sh — Run conformance workflows in batches of 4
 # Each workflow dispatched on GitHub, picked up by a pre-packed smolvm runner
 #
-# Usage: ./batch-conformance.sh <aksh|official|both> [workflow-glob]
+# Usage: ./batch-conformance.sh <aksh|official|both> [workflow-glob ...]
 # Examples:
 #   ./batch-conformance.sh aksh "8*"          # run 80-89 with aksh-runner
 #   ./batch-conformance.sh both               # run all new scenarios with both runners
 #   ./batch-conformance.sh official "98-*"    # run specific workflow
 set -euo pipefail
 
-RUNNER_TYPE="${1:?Usage: $0 <aksh|official|both> [workflow-glob]}"
-WF_GLOB="${2:-}"
+RUNNER_TYPE="${1:?Usage: $0 <aksh|official|both> [workflow-glob ...]}"
+shift
+WF_PATTERNS=("$@")
 
-GH_REPO="${GH_REPO:-Bnjoroge1/aksh-conformance}"
-HOST_WORKSPACE="/Users/bnjoroge/macos-runners"
-RESULTS_DIR="$HOST_WORKSPACE/benchmarks/compatibility/runner/behavior"
+GH_REPO="${GH_REPO:-preloopdev/aksh-conformance}"
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+HOST_WORKSPACE="${HOST_WORKSPACE:-/Users/bnjoroge/macos-runners}"
+RESULTS_DIR="${RESULTS_DIR:-$REPO_ROOT/benchmarks/compatibility/runner/behavior}"
 TMP_DIR="/tmp/batch-conformance-$$"
 BATCH_SIZE=4
 VM_PREFIX="bench-aksh"
+AKSH_RUNNER_HOST="${AKSH_RUNNER_HOST:-}"
 
 mkdir -p "$RESULTS_DIR" "$TMP_DIR"
 
@@ -25,17 +28,27 @@ mkdir -p "$RESULTS_DIR" "$TMP_DIR"
 ms() { python3 -c "import time; print(int(time.time()*1000))"; }
 now_iso() { date -u +"%Y-%m-%dT%H:%M:%S.%3NZ"; }
 log() { echo "[$(date +%T.%3N)] $*" | tee -a "$TMP_DIR/batch.log"; }
+matches_workflow() {
+  local wf="$1"
+  local pattern
+  for pattern in "${WF_PATTERNS[@]}"; do
+    # shellcheck disable=SC2254
+    case "$wf" in $pattern) return 0 ;; esac
+  done
+  return 1
+}
 
 # ── Discover workflows ──────────────────────────────────────────────
 log "Fetching workflow list from $GH_REPO..."
 ALL_WFS=$(gh api "repos/$GH_REPO/contents/.github/workflows" --jq '.[].name' | sort)
 
 # Filter to conformance gap workflows (80-110)
-if [ -n "$WF_GLOB" ]; then
+if [ ${#WF_PATTERNS[@]} -gt 0 ]; then
   WORKFLOWS=()
   while IFS= read -r wf; do
-    # shellcheck disable=SC2254
-    case "$wf" in $WF_GLOB) WORKFLOWS+=("$wf") ;; esac
+    if matches_workflow "$wf"; then
+      WORKFLOWS+=("$wf")
+    fi
   done <<< "$ALL_WFS"
 else
   WORKFLOWS=()
@@ -94,6 +107,11 @@ run_batch() {
     local vm="${VM_PREFIX}-${i}"
     smolvm machine start --name "$vm" > /dev/null 2>&1
     log "  VM $vm started"
+    if [ "$runner_mode" = "aksh" ] && [ -n "$AKSH_RUNNER_HOST" ]; then
+      smolvm machine cp "$AKSH_RUNNER_HOST" "$vm:/opt/runners/aksh-runner"
+      smolvm machine exec --name "$vm" -- chmod +x /opt/runners/aksh-runner
+      log "  Current aksh runner copied to $vm"
+    fi
   done
 
   # Start runners in VMs (they'll register and wait for jobs)
