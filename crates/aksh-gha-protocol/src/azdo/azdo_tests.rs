@@ -162,7 +162,12 @@ fn expected_step_wire(step: &TaskStep) -> Value {
                 json!(reference.reference_type.as_deref().unwrap_or("repository")),
             );
             if let Some(value) = &reference.name {
-                object.insert("name".to_owned(), json!(value));
+                let field = if reference.reference_type.as_deref() == Some("containerRegistry") {
+                    "image"
+                } else {
+                    "name"
+                };
+                object.insert(field.to_owned(), json!(value));
             }
             if let Some(value) = &reference.version {
                 object.insert("ref".to_owned(), json!(value));
@@ -206,7 +211,12 @@ fn expected_step_wire(step: &TaskStep) -> Value {
     if let Some(value) = &step.condition {
         object.insert("condition".to_owned(), json!(value));
     }
-    object.insert("continueOnError".to_owned(), json!(step.continue_on_error));
+    object.insert(
+        "continueOnError".to_owned(),
+        step.continue_on_error
+            .map(|value| json!({"type": 5, "file": 1, "line": 0, "col": 0, "bool": value}))
+            .unwrap_or(Value::Null),
+    );
     if let Some(value) = &step.working_directory {
         object.insert("workingDirectory".to_owned(), json!(value));
     }
