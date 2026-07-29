@@ -2257,9 +2257,19 @@ jobs:
     );
     assert!(acquired["variables"]["system.github.token"]["value"].is_string());
     assert_eq!(
+        acquired["variables"]["actions_runner_allow_artifacts_file"]["value"],
+        "false"
+    );
+    assert_eq!(
+        acquired["variables"]["actions_self_repository"]["value"],
+        "true"
+    );
+    assert!(acquired.get("runnerSettings").is_none());
+    assert_eq!(
         acquired["resources"]["endpoints"][0]["url"],
         "http://127.0.0.1:9090/broker/1/"
     );
+    assert!(acquired["resources"]["endpoints"][0]["data"]["ConnectivityAndDNSChecks"].is_string());
     assert!(acquired["plan"]["planId"].is_string());
     assert!(acquired["jobId"].is_string());
     assert!(acquired["steps"].is_array());
@@ -3935,6 +3945,106 @@ async fn full_runner_lifecycle_register_session_poll_complete() {
     assert_eq!(final_run["status"], "success");
 }
 
+/// The runner prints its `GITHUB_TOKEN Permissions` group from this variable, so
+/// it must state what the job's token actually carries: the restricted default
+/// when the workflow declares nothing (matching the official runner's setup
+/// log), and nothing at all when the workflow withholds everything.
+#[tokio::test]
+async fn the_wire_token_permissions_match_the_declared_policy() {
+    for (declaration, expected) in [
+        (
+            "",
+            r#"{"Contents":"read","Metadata":"read","Packages":"read"}"#,
+        ),
+        ("permissions: {}\n", "{}"),
+        (
+            "permissions:\n  contents: read\n  pull-requests: write\n",
+            r#"{"Contents":"read","PullRequests":"write"}"#,
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": format!(
+                    "on: push\n{declaration}jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
+                ),
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+
+        let inner = state.inner.lock().await;
+        let queued = inner.queue.front().expect("job should be queued");
+        assert_eq!(
+            queued
+                .message
+                .variables
+                .get("system.github.token.permissions")
+                .and_then(|variable| variable.value.as_deref()),
+            Some(expected),
+            "wire permissions for {declaration:?}"
+        );
+    }
+}
+
+/// A failed installation-token mint must never silently reach for the broad
+/// `AKSH_GITHUB_TOKEN` PAT: that would swap a repository-scoped,
+/// `permissions:`-bounded token for an unscoped one. Only
+/// `AKSH_GITHUB_APP_MINT_FAILURE` decides, and its default leaves the job on the
+/// local HMAC JWT, which carries no GitHub authority at all.
+#[tokio::test]
+async fn app_token_mint_failure_follows_the_configured_policy() {
+    use crate::github_app::{GitHubAppCredentials, MintFailurePolicy};
+
+    // A key is needed to populate the credentials but is never exercised: a
+    // `repository` with no `owner/repo` slug cannot be scoped to a repository,
+    // so the mint fails before it signs anything or opens a socket.
+    let private_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+
+    for (policy, expected) in [
+        (MintFailurePolicy::LocalJwt, StatusCode::OK),
+        (MintFailurePolicy::Error, StatusCode::BAD_GATEWAY),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        state.github_app = Some(GitHubAppCredentials::for_tests(
+            "424",
+            private_key.clone(),
+            policy,
+        ));
+        let app = app(state.clone(), CancellationToken::new());
+
+        let (status, _) = try_req(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+                "event": "push",
+                "repository": "local-workspace-only"
+            }),
+        )
+        .await;
+        assert_eq!(status, expected, "policy {policy:?}");
+
+        let queued = state.inner.lock().await.queue.len();
+        match policy {
+            // The job still runs; it just has no GitHub credential.
+            MintFailurePolicy::LocalJwt => assert_eq!(queued, 1),
+            // Refusal happens before any state is mutated.
+            MintFailurePolicy::Error => assert_eq!(queued, 0),
+            MintFailurePolicy::Pat => unreachable!("covered by a github_app unit test"),
+        }
+    }
+}
+
 // Non-asserting helper for tests that need to inspect an error response.
 async fn try_req(app: &Router, method: Method, uri: &str, body: Value) -> (StatusCode, Value) {
     let mut builder = Request::builder().method(method).uri(uri);
@@ -4503,6 +4613,300 @@ async fn the_debug_surface_rejects_a_non_job_token() {
     );
 }
 
+/// The debug-worker credential must never be a job variable.
+///
+/// Official runner v2.336.0 builds its `secrets` context from every `isSecret`
+/// variable in the job message, replacing only `system.github.token` with
+/// `GITHUB_TOKEN`. A secret variable is therefore a publication channel to the
+/// workflow being debugged: `${{ secrets['system.preloop.debug_worker_token'] }}`
+/// would have handed a `run:` step the credential that drives debug sessions.
+/// The Rust runner's own `system.*` filter is no defence — the server does not
+/// choose which runner claims the job.
+///
+/// So the assertion is on the message, not on any runner's projection of it.
+#[tokio::test]
+async fn the_job_message_never_carries_the_debug_worker_token() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: \"false\"\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "preserve_on_failure": true,
+            "secrets": {"NPM_TOKEN": "npm_LIVE_CREDENTIAL"}
+        }),
+    )
+    .await;
+
+    let wire = {
+        let inner = state.inner.lock().await;
+        let queued = inner.queue.front().expect("job should be queued");
+        serde_json::to_value(&queued.message).unwrap()
+    };
+
+    assert!(
+        !wire.to_string().contains("debug_worker_token"),
+        "the debug credential must not ship anywhere on the job message"
+    );
+
+    // Rebuild the official runner's secrets projection over the real message.
+    let variables = wire["variables"]
+        .as_object()
+        .expect("job message variables");
+    let official_secrets: BTreeSet<&str> = variables
+        .iter()
+        .filter(|(key, value)| {
+            value["isSecret"].as_bool().unwrap_or(false)
+                && !key.eq_ignore_ascii_case("system.github.token")
+        })
+        .map(|(key, _)| key.as_str())
+        .collect();
+
+    // Non-vacuous: the projection does surface the run's own secrets, so its
+    // silence about the debug credential means absence rather than a broken
+    // filter.
+    assert!(
+        official_secrets.contains("NPM_TOKEN"),
+        "the projection must be the real one: {official_secrets:?}"
+    );
+    assert!(
+        !official_secrets
+            .iter()
+            .any(|key| key.contains("debug_worker_token")),
+        "an official-style secrets context must not see a debug credential: {official_secrets:?}"
+    );
+}
+
+/// Open a debug session as a worker would, for exchange tests.
+fn open_session_body(run_id: RunId, agent_job_id: uuid::Uuid) -> Value {
+    json!({
+        "run_id": run_id,
+        "job_id": "build",
+        "agent_job_id": agent_job_id,
+        "job_name": "build",
+        "step": {
+            "index": 0,
+            "total": 1,
+            "context_name": "__run",
+            "display_name": "Run false",
+            "command": "false",
+            "exit_code": 1,
+            "elapsed_ms": 20,
+            "diagnostics": []
+        }
+    })
+}
+
+/// The exchange that replaces the removed variable is as narrow as the
+/// credential it issues.
+///
+/// The runtime token is the only job-scoped credential a worker already holds,
+/// so it is what authenticates here — but it is also exported to steps as
+/// `ACTIONS_RUNTIME_TOKEN`, so the exchange has to be worth nothing to a step
+/// that replays it. Hence: exactly one issuance per job request, spent by the
+/// worker during job setup before any step runs.
+#[tokio::test]
+async fn the_debug_worker_token_exchange_is_narrowly_authorized() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: \"false\"\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "preserve_on_failure": true
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    let (agent_job_id, plan_id) = {
+        let inner = state.inner.lock().await;
+        let (_, record) = inner.job_requests.iter().next().unwrap();
+        (record.agent_job_id, record.plan_id.clone())
+    };
+    let runtime_token = state.mint_runtime_token(&plan_id, &agent_job_id);
+    let asking_for_itself = json!({ "agent_job_id": agent_job_id });
+    let exchange = "/api/v1/debug/worker-token";
+
+    let refused = |bearer: String, body: Value| {
+        let app = app.clone();
+        async move { request_status_with_bearer(&app, Method::POST, exchange, body, &bearer).await }
+    };
+
+    assert_eq!(
+        refused("not-a-token".to_owned(), asking_for_itself.clone()).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        refused(state.system_token.clone(), asking_for_itself.clone()).await,
+        StatusCode::UNAUTHORIZED,
+        "the native admin credential is not a job identity"
+    );
+    // A debug-worker token cannot mint its own successor: its `sub` names a
+    // debug worker, not a job, so it is not a runtime token.
+    assert_eq!(
+        refused(
+            state.mint_debug_worker_token(&plan_id, &agent_job_id),
+            asking_for_itself.clone()
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // Neither direction of a job mismatch is allowed: not another job's token
+    // asking for this job, nor this job's token asking for another.
+    let stranger = uuid::Uuid::new_v4();
+    assert_eq!(
+        refused(
+            state.mint_runtime_token(&plan_id, &stranger),
+            asking_for_itself.clone()
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        refused(runtime_token.clone(), json!({ "agent_job_id": stranger })).await,
+        StatusCode::FORBIDDEN
+    );
+
+    // The job's own runtime token succeeds, and buys a *different* credential.
+    let issued = request_json_with_bearer(
+        &app,
+        Method::POST,
+        exchange,
+        asking_for_itself.clone(),
+        &runtime_token,
+    )
+    .await;
+    let worker_token = issued["token"].as_str().expect("issued token").to_owned();
+    assert_ne!(worker_token, runtime_token);
+
+    // What it buys is precisely what the session surface demands, and what the
+    // runtime token is still refused for.
+    let opened = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/api/v1/debug/sessions",
+        open_session_body(run_id, agent_job_id),
+        &worker_token,
+    )
+    .await;
+    assert!(opened["session_id"].as_str().is_some());
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::POST,
+            "/api/v1/debug/sessions",
+            open_session_body(run_id, agent_job_id),
+            &runtime_token,
+        )
+        .await,
+        StatusCode::UNAUTHORIZED,
+        "the exchange must not have widened what a runtime token can reach"
+    );
+
+    // One shot. A step that later finds `ACTIONS_RUNTIME_TOKEN` in its
+    // environment has nothing left to spend.
+    assert_eq!(
+        refused(runtime_token, asking_for_itself).await,
+        StatusCode::CONFLICT
+    );
+}
+
+/// No pause-on-failure opt-in, no debug credential at all.
+///
+/// The runner only builds a pause client for a run that asked for one, so
+/// issuing outside that case would grow the credential's blast radius to every
+/// job on the server for no behavioural gain.
+#[tokio::test]
+async fn the_exchange_refuses_a_run_that_never_asked_to_pause() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo"
+        }),
+    )
+    .await;
+
+    let (agent_job_id, plan_id) = {
+        let inner = state.inner.lock().await;
+        let (_, record) = inner.job_requests.iter().next().unwrap();
+        (record.agent_job_id, record.plan_id.clone())
+    };
+
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::POST,
+            "/api/v1/debug/worker-token",
+            json!({ "agent_job_id": agent_job_id }),
+            &state.mint_runtime_token(&plan_id, &agent_job_id),
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+/// A completed job cannot acquire a debug credential.
+#[tokio::test]
+async fn the_exchange_refuses_a_job_that_is_no_longer_running() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: \"false\"\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "preserve_on_failure": true
+        }),
+    )
+    .await;
+
+    let (agent_job_id, plan_id) = {
+        let mut inner = state.inner.lock().await;
+        let (_, record) = inner.job_requests.iter_mut().next().unwrap();
+        record.result = Some(ExecutionStatus::Failure);
+        (record.agent_job_id, record.plan_id.clone())
+    };
+
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::POST,
+            "/api/v1/debug/worker-token",
+            json!({ "agent_job_id": agent_job_id }),
+            &state.mint_runtime_token(&plan_id, &agent_job_id),
+        )
+        .await,
+        StatusCode::NOT_FOUND
+    );
+}
+
 /// Pause credit is finite: past the ceiling the job times out normally.
 ///
 /// Otherwise a worker that keeps polling opts its job out of `timeout-minutes`
@@ -4597,6 +5001,144 @@ async fn pause_credit_runs_out_and_the_job_times_out() {
             .unwrap()
             .timeout_triggered,
         "pause credit must be finite — an endless pause is an endless job"
+    );
+}
+
+/// Resuming a job must not hand its paused time back to the reaper.
+///
+/// The credit lived in the session record, and closing the session dropped it,
+/// so the subtraction that kept the job alive while paused disappeared the
+/// instant it resumed. A job paused for hours was then cancelled on the very
+/// next reaper tick, reported as an ordinary timeout, with the debugging time
+/// billed as execution and nothing in any client able to explain it.
+#[tokio::test]
+async fn resuming_a_job_does_not_rebill_the_time_it_spent_paused() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown,
+    });
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: \"false\"\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "preserve_on_failure": true
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    request_json(
+        &app,
+        Method::GET,
+        "/runner/server/_apis/v1/Message/1?sessionId=default",
+        Value::Null,
+    )
+    .await;
+
+    let (request_id, agent_job_id, worker_token) = {
+        let inner = state.inner.lock().await;
+        let (id, record) = inner.job_requests.iter().next().unwrap();
+        (
+            *id,
+            record.agent_job_id,
+            state.mint_debug_worker_token(&record.plan_id, &record.agent_job_id),
+        )
+    };
+
+    let opened = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/api/v1/debug/sessions",
+        json!({
+            "run_id": run_id,
+            "job_id": "build",
+            "agent_job_id": agent_job_id,
+            "job_name": "build",
+            "step": {
+                "index": 0,
+                "total": 1,
+                "context_name": "__run",
+                "display_name": "Run false",
+                "command": "false",
+                "exit_code": 1,
+                "elapsed_ms": 20,
+                "diagnostics": []
+            }
+        }),
+        &worker_token,
+    )
+    .await;
+    let session_id = opened["session_id"].as_str().unwrap().to_owned();
+
+    // 22_000s since the job started, 10_000 of them paused: 12_000s of
+    // execution against the default 21_600s timeout. Inside the budget only if
+    // the pause is subtracted.
+    {
+        let mut inner = state.inner.lock().await;
+        let now = SystemTime::now();
+        inner.job_requests.get_mut(&request_id).unwrap().started_at =
+            Some(now - Duration::from_secs(22_000));
+        inner
+            .debug_sessions
+            .backdate_pause_for_test(&session_id, now - Duration::from_secs(10_000));
+    }
+
+    // The controller says continue and the worker closes the session: from here
+    // on nothing in the registry holds this request open.
+    let closed = request_json_with_bearer(
+        &app,
+        Method::POST,
+        &format!("/api/v1/debug/sessions/{session_id}/close"),
+        json!({ "state": "resumed" }),
+        &worker_token,
+    )
+    .await;
+    assert_eq!(closed["ok"], true);
+
+    {
+        let inner = state.inner.lock().await;
+        assert!(
+            inner.debug_sessions.list().is_empty(),
+            "the session is closed, so the credit cannot be coming from a live one"
+        );
+        assert!(
+            inner
+                .debug_sessions
+                .paused_for_request(request_id, SystemTime::now())
+                >= Duration::from_secs(9_500),
+            "the closed session's pause must still be credited to its request"
+        );
+    }
+
+    reap_once(&shared).await;
+
+    let inner = state.inner.lock().await;
+    assert!(
+        !inner
+            .job_requests
+            .get(&request_id)
+            .unwrap()
+            .timeout_triggered,
+        "a resumed job must be billed for execution only — 12_000s of it here"
+    );
+    assert!(inner.cancellation_queue.is_empty());
+    // And the reaper's own sweep does not confiscate it either: the request is
+    // still active, so the credit has to survive the tick.
+    assert!(
+        inner
+            .debug_sessions
+            .paused_for_request(request_id, SystemTime::now())
+            >= Duration::from_secs(9_500),
+        "a reaper tick must not reset an active request's pause credit"
     );
 }
 

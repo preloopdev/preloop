@@ -171,7 +171,9 @@ fn node_externals() -> Vec<Vec<String>> {
                fi; \
                echo \"Installing $NAME $VERSION into golden...\"; \
                TEMP=$(mktemp -d \"$RUNNER_EXTERNALS/.$NAME.XXXXXX\") && \
-               curl -fsSL \"https://nodejs.org/dist/$VERSION/node-$VERSION-linux-x64.tar.gz\" \\\
+                ARCH=$(uname -m); \
+                if [ \"$ARCH\" = \"aarch64\" ] || [ \"$ARCH\" = \"arm64\" ]; then NODE_ARCH=linux-arm64; else NODE_ARCH=linux-x64; fi; \
+                curl -fsSL \"https://nodejs.org/dist/$VERSION/node-$VERSION-$NODE_ARCH.tar.gz\" \\\
                  | tar -xz --strip-components=1 -C \"$TEMP\" && \
                if [ ! -f \"$TEMP/bin/node\" ]; then \
                  echo \"ERROR: $NAME tarball missing bin/node\" >&2; \
@@ -277,10 +279,26 @@ async fn install_base_dependencies<P: VmProvider>(
     name: &MachineName,
 ) -> Result<(), OrchestratorError> {
     for command in base_install_commands() {
-        provider.exec(name, &command).await?;
+        let output = provider.exec(name, &command).await?;
+        if output.exit_code != 0 {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(OrchestratorError::Config(format!(
+                "base package install failed (exit {}): {}",
+                output.exit_code,
+                stderr.lines().last().unwrap_or("unknown error")
+            )));
+        }
     }
     for command in node_externals() {
-        provider.exec(name, &command).await?;
+        let output = provider.exec(name, &command).await?;
+        if output.exit_code != 0 {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(OrchestratorError::Config(format!(
+                "node externals install failed (exit {}): {}",
+                output.exit_code,
+                stderr.lines().last().unwrap_or("unknown error")
+            )));
+        }
     }
     Ok(())
 }

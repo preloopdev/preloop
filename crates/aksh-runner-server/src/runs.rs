@@ -306,14 +306,6 @@ pub(crate) async fn submit_run_inner(
         "ref_protected": false,
         "ref_type": ref_type,
         "secret_source": "Actions",
-        // Public-repository workflow_dispatch defaults observed from the
-        // official runner setup log. The worker uses this context to emit the
-        // same GITHUB_TOKEN Permissions group before user steps.
-        "token_permissions": {
-            "contents": "read",
-            "metadata": "read",
-            "packages": "read"
-        },
         "event": submission.payload,
         "workflow_ref": workflow_ref,
         "workflow_sha": sha,
@@ -379,36 +371,68 @@ pub(crate) async fn submit_run_inner(
     // Resolve the real GitHub credential for each job *before* taking the
     // dispatch lock: an installation-token round-trip must never stall every
     // other run behind `state.inner`. A job with no entry here falls back to
-    // the local HMAC JWT minted inside the loop, so the effective order stays
-    // GitHub App > PAT > local JWT.
+    // the local HMAC JWT minted inside the loop. With an App configured that is
+    // the *only* alternative to a real installation token, unless
+    // `AKSH_GITHUB_APP_MINT_FAILURE` explicitly says otherwise; the PAT is the
+    // primary credential only when no App is configured at all.
     let mut github_tokens: BTreeMap<JobId, String> = BTreeMap::new();
     if let Some(app) = &shared.state.github_app {
         for job in &jobs {
-            match crate::github_app::get_or_mint_token(
-                app,
-                &repository_owner,
-                job.permissions.as_ref(),
-            )
-            .await
+            // The full slug, not just the owner: the owner selects the
+            // installation, the repository bounds the token. Permissions are
+            // resolved to the job's effective set here so the mint request
+            // always states them outright — an absent `permissions:` block
+            // must mean the restricted default, never the App's full grant.
+            let permissions =
+                aksh_gha_parser::effective_token_permissions(job.permissions.as_ref());
+            match crate::github_app::get_or_mint_token(app, &submission.repository, &permissions)
+                .await
             {
                 Ok(token) => {
                     info!(
                         %run_id,
                         job = %job.id,
-                        owner = %repository_owner,
+                        repository = %submission.repository,
                         "Minted GitHub App installation token for job"
                     );
                     github_tokens.insert(job.id.clone(), token);
                 }
                 Err(error) => {
-                    warn!(
-                        %run_id,
-                        job = %job.id,
-                        owner = %repository_owner,
-                        "GitHub App token minting failed, falling back: {error:#}"
-                    );
-                    if let Ok(pat) = std::env::var("AKSH_GITHUB_TOKEN") {
-                        github_tokens.insert(job.id.clone(), pat);
+                    // Never silently widen scope: only an explicit
+                    // `AKSH_GITHUB_APP_MINT_FAILURE=pat` reaches for the PAT,
+                    // and `=error` refuses the run outright.
+                    let fallback = crate::github_app::fallback_token(
+                        app.mint_failure,
+                        std::env::var("AKSH_GITHUB_TOKEN").ok(),
+                    )
+                    .map_err(|refusal| {
+                        ApiError::bad_gateway(format!(
+                            "GitHub App token minting failed for job {} in {}: \
+                             {error:#} ({refusal})",
+                            job.id, submission.repository
+                        ))
+                    })?;
+                    match fallback {
+                        Some(pat) => {
+                            warn!(
+                                %run_id,
+                                job = %job.id,
+                                repository = %submission.repository,
+                                "GitHub App token minting failed; using the \
+                                 AKSH_GITHUB_TOKEN PAT as configured by \
+                                 AKSH_GITHUB_APP_MINT_FAILURE=pat, which ignores \
+                                 `permissions:`: {error:#}"
+                            );
+                            github_tokens.insert(job.id.clone(), pat);
+                        }
+                        None => warn!(
+                            %run_id,
+                            job = %job.id,
+                            repository = %submission.repository,
+                            "GitHub App token minting failed; the job keeps the \
+                             local HMAC JWT and cannot reach the GitHub API: \
+                             {error:#}"
+                        ),
                     }
                 }
             }
@@ -593,13 +617,20 @@ pub(crate) async fn submit_run_inner(
             "github_token".to_owned(),
             aksh_gha_protocol::azdo::VariableValue::secret(github_token),
         );
-        let debug_token = shared
-            .state
-            .mint_debug_worker_token(&agent_msg.plan.plan_id, &agent_msg.job_id);
         agent_msg.variables.insert(
-            "system.preloop.debug_worker_token".to_owned(),
-            aksh_gha_protocol::azdo::VariableValue::secret(debug_token),
+            "actions_runner_allow_artifacts_file".to_owned(),
+            aksh_gha_protocol::azdo::VariableValue::new("false"),
         );
+        agent_msg.variables.insert(
+            "actions_self_repository".to_owned(),
+            aksh_gha_protocol::azdo::VariableValue::new("true"),
+        );
+        // The debug-worker token is deliberately not a job variable. An
+        // official runner copies every `isSecret` variable into the `secrets`
+        // context, so shipping it here would publish it to workflow YAML as
+        // `${{ secrets['system.preloop.debug_worker_token'] }}`. The worker
+        // acquires it instead over `POST /api/v1/debug/worker-token`, which
+        // authenticates against this job's runtime token.
         agent_msg.variables.insert(
             "system.github.launch_endpoint".to_owned(),
             aksh_gha_protocol::azdo::VariableValue::new(base_url.clone()),
@@ -666,6 +697,7 @@ pub(crate) async fn submit_run_inner(
             started_at: None,
             last_renewed_at: None,
             timeout_triggered: false,
+            debug_token_issued: false,
         };
 
         prebuilt.push(PrebuiltJob {
