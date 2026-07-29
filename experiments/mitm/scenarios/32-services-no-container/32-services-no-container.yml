@@ -3,7 +3,7 @@ on: workflow_dispatch
 
 jobs:
   services-host:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     services:
       nginx:
         image: nginx:1.27-alpine
