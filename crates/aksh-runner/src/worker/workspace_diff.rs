@@ -41,23 +41,7 @@ pub fn diff_workspace(workspace: &Path, snapshot_commit: &str) -> Result<Workspa
         workspace,
         &["diff", "--name-status", "-z", snapshot_commit, "--"],
     )?;
-    let mut fields = tracked.split('\0').filter(|s| !s.is_empty());
-    while let Some(status) = fields.next() {
-        let Some(path) = fields.next() else { break };
-        let status = match status.chars().next() {
-            Some('A') => ChangeStatus::Added,
-            Some('D') => ChangeStatus::Deleted,
-            // Treat renames/copies/type changes as modifications: the revert is
-            // the same operation either way.
-            Some(_) => ChangeStatus::Modified,
-            None => continue,
-        };
-        changes.push(WorkspaceChange {
-            path: path.to_owned(),
-            status,
-            category: ChangeCategory::Tracked,
-        });
-    }
+    changes.extend(parse_name_status(&tracked));
 
     // Untracked but not ignored. `--exclude-standard` is what keeps this from
     // descending into `target/`.
@@ -86,6 +70,81 @@ pub fn diff_workspace(workspace: &Path, snapshot_commit: &str) -> Result<Workspa
     Ok(WorkspaceDiff { changes, counts })
 }
 
+/// Parse a `git diff --name-status -z` stream into revert actions.
+///
+/// The stream is `status\0path\0` per entry — except renames and copies, which
+/// carry `status\0old\0new\0`. Consuming one path unconditionally read the new
+/// path as the *following* entry's status, so one `git mv` desynchronised every
+/// change after it in the diff: paths reported as statuses, statuses as paths,
+/// and the tail silently dropped.
+///
+/// Rename detection is parsed rather than suppressed with `--no-renames`. The
+/// two-path shape has to be handled correctly regardless: copy detection is
+/// reachable from a repo's own `diff.renames = copies`, which the runner does
+/// not own, and a parser whose invariant depends on a flag being present breaks
+/// quietly the day the flag moves.
+///
+/// A rename becomes the two facts a revert needs: the old path is missing and
+/// restorable from the snapshot, the new path is an addition to delete. A copy
+/// leaves its source alone, so only the new path is reported.
+fn parse_name_status(stream: &str) -> Vec<WorkspaceChange> {
+    fn tracked(path: &str, status: ChangeStatus) -> WorkspaceChange {
+        WorkspaceChange {
+            path: path.to_owned(),
+            status,
+            category: ChangeCategory::Tracked,
+        }
+    }
+
+    let mut changes = Vec::new();
+    let mut fields = stream.split('\0').filter(|field| !field.is_empty());
+    while let Some(status) = fields.next() {
+        let Some(code) = status.chars().next() else {
+            continue;
+        };
+        match code {
+            'R' | 'C' => {
+                let (Some(old), Some(new)) = (fields.next(), fields.next()) else {
+                    break;
+                };
+                // The source of a copy still holds its snapshot content; only a
+                // rename leaves a hole where the old path was.
+                if code == 'R' {
+                    changes.push(tracked(old, ChangeStatus::Deleted));
+                }
+                changes.push(tracked(new, ChangeStatus::Added));
+            }
+            _ => {
+                let Some(path) = fields.next() else { break };
+                changes.push(tracked(
+                    path,
+                    match code {
+                        'A' => ChangeStatus::Added,
+                        'D' => ChangeStatus::Deleted,
+                        // Type changes and unmerged entries revert the way a
+                        // modification does: check the snapshot's version out.
+                        _ => ChangeStatus::Modified,
+                    },
+                ));
+            }
+        }
+    }
+    changes
+}
+
+/// Whether reverting a change means deleting the path rather than restoring it.
+///
+/// True when the pristine snapshot has no version to restore: an untracked
+/// file, or a tracked addition — a staged new file, or the destination half of
+/// a rename or copy.
+fn reverts_by_deletion(change: &WorkspaceChange) -> bool {
+    match change.category {
+        ChangeCategory::Untracked => true,
+        ChangeCategory::Tracked => change.status == ChangeStatus::Added,
+        ChangeCategory::Cache => false,
+    }
+}
+
 /// Revert a selected subset of changes. Returns how many paths were reverted.
 ///
 /// Refuses outright on a [`ChangeCategory::Cache`] entry rather than skipping
@@ -109,25 +168,48 @@ pub fn revert_paths(
 
     let mut reverted = 0usize;
 
-    // Restore tracked files from the pristine commit in one call.
-    let tracked: Vec<&str> = paths
+    // Restore, in one call, every tracked path the pristine commit still has.
+    let restore: Vec<&str> = paths
         .iter()
-        .filter(|c| c.category == ChangeCategory::Tracked)
+        .filter(|c| c.category == ChangeCategory::Tracked && !reverts_by_deletion(c))
         .map(|c| c.path.as_str())
         .collect();
-    if !tracked.is_empty() {
+    if !restore.is_empty() {
         let mut args = vec!["checkout", snapshot_commit, "--"];
-        args.extend(tracked.iter().copied());
+        args.extend(restore.iter().copied());
         git(workspace, &args).context("restoring tracked files from the workspace snapshot")?;
-        reverted += tracked.len();
+        reverted += restore.len();
     }
 
-    // Untracked files did not exist in the pristine tree, so removal is the
-    // revert.
-    for change in paths
+    // A tracked addition is absent from the snapshot, so `git checkout` cannot
+    // produce it — it fails the *whole* batch with "did not exist in", taking
+    // the genuinely restorable paths down with it. Dropping the index entry is
+    // what returns the index to the snapshot; the file itself is deleted below,
+    // through the same guarded removal untracked debris goes through.
+    let staged: Vec<&str> = paths
         .iter()
-        .filter(|c| c.category == ChangeCategory::Untracked)
-    {
+        .filter(|c| c.category == ChangeCategory::Tracked && reverts_by_deletion(c))
+        .map(|c| c.path.as_str())
+        .collect();
+    if !staged.is_empty() {
+        // `--force` because git guards `--cached` against dropping an index
+        // entry that differs from both HEAD and the worktree — a staged edit to
+        // a renamed file is exactly that, and discarding it is the whole point:
+        // the file itself is deleted immediately below.
+        let mut args = vec![
+            "rm",
+            "--cached",
+            "--force",
+            "--quiet",
+            "--ignore-unmatch",
+            "--",
+        ];
+        args.extend(staged.iter().copied());
+        git(workspace, &args).context("unstaging paths the workspace snapshot does not have")?;
+    }
+
+    // Paths that did not exist in the pristine tree: removal is the revert.
+    for change in paths.iter().filter(|c| reverts_by_deletion(c)) {
         let target = workspace.join(&change.path);
         // Lexical rejection above stops `../`, but not a symlinked parent:
         // a step that leaves `link -> /etc` behind would turn `link/passwd`
@@ -306,8 +388,15 @@ mod tests {
             run(&["init", "-q", "-b", "main"]);
             run(&["config", "user.email", "t@example.com"]);
             run(&["config", "user.name", "t"]);
+            // Pin rename detection to git's default rather than inheriting the
+            // developer's `diff.renames`, so the two-path entries these tests
+            // exercise appear regardless of who runs them.
+            run(&["config", "diff.renames", "true"]);
             std::fs::write(path.join(".gitignore"), "target/\n").unwrap();
             std::fs::write(path.join("lib.rs"), "original\n").unwrap();
+            // A second tracked file, so a diff can carry an entry *after* a
+            // rename — which is where a desynchronised parse shows up.
+            std::fs::write(path.join("notes.md"), "notes\n").unwrap();
             std::fs::create_dir_all(path.join("target/debug")).unwrap();
             std::fs::write(path.join("target/debug/artifact"), "warm cache\n").unwrap();
             run(&["add", "."]);
@@ -333,6 +422,239 @@ mod tests {
         fn diff(&self) -> WorkspaceDiff {
             diff_workspace(&self.path, &self.commit).unwrap()
         }
+
+        /// Run git in the fixture, asserting it succeeded.
+        fn git(&self, args: &[&str]) {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&self.path)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        /// The raw `--name-status -z` stream `diff_workspace` parses.
+        ///
+        /// Asserted on directly so a test cannot pass vacuously when git
+        /// declines to report the rename or copy it claims to exercise.
+        fn name_status(&self) -> String {
+            super::git(
+                &self.path,
+                &["diff", "--name-status", "-z", &self.commit, "--"],
+            )
+            .unwrap()
+        }
+
+        /// Every change as `(path, sigil)`, sorted — git's ordering across
+        /// rename detection is not a contract worth asserting.
+        fn shape(&self) -> Vec<(String, char)> {
+            let mut shape: Vec<(String, char)> = self
+                .diff()
+                .changes
+                .iter()
+                .map(|change| (change.path.clone(), change.status.sigil()))
+                .collect();
+            shape.sort();
+            shape
+        }
+    }
+
+    /// The `-z` stream is parsed by entry shape, not by position: a rename or
+    /// copy carries two paths, and consuming one left the second to be read as
+    /// the next entry's status — mislabelling everything after it and dropping
+    /// the tail.
+    #[test]
+    fn two_path_entries_do_not_desynchronise_the_parse() {
+        let parsed = parse_name_status(
+            "R096\0old.rs\0new.rs\0M\0kept.rs\0C100\0src.rs\0dup.rs\0A\0added.rs\0D\0gone.rs\0",
+        );
+        let shape: Vec<(&str, char)> = parsed
+            .iter()
+            .map(|change| (change.path.as_str(), change.status.sigil()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                // A rename is the two facts a revert needs.
+                ("old.rs", '-'),
+                ("new.rs", '+'),
+                ("kept.rs", 'M'),
+                // A copy's source still holds its snapshot content, so
+                // `src.rs` is deliberately absent.
+                ("dup.rs", '+'),
+                ("added.rs", '+'),
+                ("gone.rs", '-'),
+            ]
+        );
+        assert!(parsed
+            .iter()
+            .all(|change| change.category == ChangeCategory::Tracked));
+        // A truncated entry invents nothing.
+        assert!(parse_name_status("R100\0old-only\0").is_empty());
+    }
+
+    /// A staged rename: `git mv` puts both halves in the index, so git reports
+    /// one `R` entry with two paths. The old path is restorable; the new one
+    /// exists nowhere in the snapshot and must be deleted instead — a
+    /// `git checkout <snapshot> -- new` fails the *whole* batch, taking the
+    /// restorable paths down with it.
+    #[test]
+    fn a_staged_rename_restores_the_old_path_and_deletes_the_new_one() {
+        let fixture = Fixture::new();
+        fixture.git(&["mv", "lib.rs", "renamed.rs"]);
+
+        let raw = fixture.name_status();
+        assert!(
+            raw.split('\0').any(|field| field.starts_with('R')),
+            "git must report a rename here, got {raw:?}"
+        );
+        assert_eq!(
+            fixture.shape(),
+            vec![("lib.rs".to_owned(), '-'), ("renamed.rs".to_owned(), '+')]
+        );
+
+        let diff = fixture.diff();
+        assert!(diff
+            .changes
+            .iter()
+            .all(|c| c.category == ChangeCategory::Tracked));
+        assert_eq!(
+            revert_paths(&fixture.path, &fixture.commit, &diff.changes).unwrap(),
+            2
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.path.join("lib.rs")).unwrap(),
+            "original\n"
+        );
+        assert!(
+            !fixture.path.join("renamed.rs").exists(),
+            "the rename's destination must be gone"
+        );
+        // Index as well as worktree: a leftover staged addition would make the
+        // retry's own diff report debris that is no longer there.
+        assert_eq!(fixture.shape(), Vec::new());
+    }
+
+    /// An unstaged `mv` cannot be a rename — the destination is untracked, so
+    /// git reports a tracked deletion plus untracked debris. Both halves still
+    /// have to revert, through different mechanisms.
+    #[test]
+    fn an_unstaged_rename_restores_the_old_path_and_deletes_the_new_one() {
+        let fixture = Fixture::new();
+        std::fs::rename(fixture.path.join("lib.rs"), fixture.path.join("renamed.rs")).unwrap();
+
+        let diff = fixture.diff();
+        let old = diff
+            .changes
+            .iter()
+            .find(|c| c.path == "lib.rs")
+            .expect("the vacated path must be reported");
+        assert_eq!(old.status, ChangeStatus::Deleted);
+        assert_eq!(old.category, ChangeCategory::Tracked);
+        let new = diff
+            .changes
+            .iter()
+            .find(|c| c.path == "renamed.rs")
+            .expect("the destination must be reported");
+        assert_eq!(new.status, ChangeStatus::Added);
+        assert_eq!(
+            new.category,
+            ChangeCategory::Untracked,
+            "an unstaged destination is not in the index"
+        );
+
+        revert_paths(&fixture.path, &fixture.commit, &diff.changes).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(fixture.path.join("lib.rs")).unwrap(),
+            "original\n"
+        );
+        assert!(!fixture.path.join("renamed.rs").exists());
+        assert_eq!(fixture.shape(), Vec::new());
+    }
+
+    /// A rename that also edited the file, with an ordinary modification in the
+    /// same diff. The trailing entry is the point: it is what a desynchronised
+    /// parse mislabels or loses.
+    #[test]
+    fn a_modified_rename_keeps_the_rest_of_the_diff_intact() {
+        let fixture = Fixture::new();
+        fixture.git(&["mv", "lib.rs", "renamed.rs"]);
+        // Edited too, but similar enough to stay above git's 50% rename
+        // threshold — a heavier edit is reported as an unrelated add and delete
+        // instead, which is the case the unstaged test already covers.
+        std::fs::write(fixture.path.join("renamed.rs"), "original\nedit\n").unwrap();
+        std::fs::write(fixture.path.join("notes.md"), "clobbered\n").unwrap();
+
+        let raw = fixture.name_status();
+        assert!(
+            raw.split('\0').any(|field| field.starts_with('R')),
+            "git must report a rename here, got {raw:?}"
+        );
+        assert_eq!(
+            fixture.shape(),
+            vec![
+                ("lib.rs".to_owned(), '-'),
+                ("notes.md".to_owned(), 'M'),
+                ("renamed.rs".to_owned(), '+'),
+            ]
+        );
+
+        let diff = fixture.diff();
+        revert_paths(&fixture.path, &fixture.commit, &diff.changes).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(fixture.path.join("lib.rs")).unwrap(),
+            "original\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.path.join("notes.md")).unwrap(),
+            "notes\n",
+            "the entry after the rename must be restored, not skipped"
+        );
+        assert!(!fixture.path.join("renamed.rs").exists());
+        assert_eq!(fixture.shape(), Vec::new());
+    }
+
+    /// Copy detection is reachable from the repo's own `diff.renames`, which the
+    /// runner does not own — so the parser has to handle `C` whether or not we
+    /// would have asked for it. A copy leaves its source alone: only the new
+    /// path is debris, and reverting it must not delete the original.
+    #[test]
+    fn a_detected_copy_deletes_only_the_new_path() {
+        let fixture = Fixture::new();
+        fixture.git(&["config", "diff.renames", "copies"]);
+        // A copy is detected against a source that is itself in the diff, and
+        // the destination has to be staged to be part of one at all.
+        std::fs::write(fixture.path.join("lib.rs"), "regenerated\n").unwrap();
+        std::fs::write(fixture.path.join("copy.rs"), "original\n").unwrap();
+        fixture.git(&["add", "copy.rs"]);
+
+        let raw = fixture.name_status();
+        assert!(
+            raw.split('\0').any(|field| field.starts_with('C')),
+            "git must report a copy here, got {raw:?}"
+        );
+        assert_eq!(
+            fixture.shape(),
+            vec![("copy.rs".to_owned(), '+'), ("lib.rs".to_owned(), 'M')]
+        );
+
+        let diff = fixture.diff();
+        revert_paths(&fixture.path, &fixture.commit, &diff.changes).unwrap();
+        assert!(
+            !fixture.path.join("copy.rs").exists(),
+            "the copy's destination is debris"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.path.join("lib.rs")).unwrap(),
+            "original\n",
+            "the copy's source is restored, not deleted"
+        );
+        assert_eq!(fixture.shape(), Vec::new());
     }
 
     /// A symlinked parent must not turn a workspace-relative revert into a
