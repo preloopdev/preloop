@@ -27,10 +27,10 @@ use aksh_gha_protocol::debug_session::{
     AgentAuditEntry, AgentEvent, AgentEventsResponse, AgentLeaseRequest, AgentLeaseResponse,
     AgentOperation, AgentOperationRequest, AgentOperationResponse, DebugSession,
     OpenSessionRequest, OpenSessionResponse, SessionState, Verdict, VerdictRequest,
-    VerdictResponse,
+    VerdictResponse, WorkerTokenRequest, WorkerTokenResponse,
 };
 
-use crate::auth::WorkerJob;
+use crate::auth::{JobRuntimeIdentity, WorkerJob};
 use crate::errors::ApiError;
 use crate::state::SharedState;
 
@@ -129,11 +129,6 @@ impl SessionRecord {
         total.min(MAX_PAUSE_CREDIT)
     }
 
-    /// Whether this session still has pause credit left to spend.
-    fn within_credit(&self, now: SystemTime) -> bool {
-        self.paused_total(now) < MAX_PAUSE_CREDIT
-    }
-
     /// Fold the open interval into the banked total and close it.
     fn bank_paused(&mut self, now: SystemTime) {
         if let Some(since) = self.paused_since.take() {
@@ -205,6 +200,17 @@ pub(crate) struct DebugSessionRegistry {
     agent_audit_archive: BTreeMap<String, Vec<AgentAuditEntry>>,
     /// Archive insertion order, so the oldest history is the first evicted.
     archive_order: std::collections::VecDeque<String>,
+    /// Pause credit banked by sessions that have already left the registry,
+    /// keyed by the job request that earned it.
+    ///
+    /// A session's banked total lives in its record, and the record does not
+    /// outlive the session: closing it retains the history and drops the rest.
+    /// Summed from live records alone, [`Self::paused_for_request`] would snap
+    /// back to zero the instant a worker resumed — and the reaper would start
+    /// billing the job for the hours it spent paused, cancelling it through a
+    /// path no client can see. Credit therefore outlives its session and is
+    /// retired only with its request, in [`Self::sweep_abandoned`].
+    retired_credit: BTreeMap<i64, Duration>,
     /// Wakes long-pollers when a verdict lands or a session changes.
     ///
     /// Held by the registry rather than by the handlers so the wakeup sits
@@ -615,14 +621,25 @@ impl DebugSessionRegistry {
         }
         if !state.is_open() && !retain_for_agent_reconnect {
             if let Some(record) = self.sessions.remove(session_id) {
-                self.archive(session_id.to_owned(), record);
+                self.retire(session_id.to_owned(), record);
             }
         }
         self.notify.notify_waiters();
     }
 
-    /// Retain a closed session's history, evicting the oldest past the bound.
-    fn archive(&mut self, session_id: String, record: SessionRecord) {
+    /// Drop a record for good, keeping what has to outlive it.
+    ///
+    /// Two things do: the agent-visible history, so a reconnecting controller
+    /// can still read what happened, and the pause credit, so the reaper does
+    /// not re-bill the job for time it already spent paused. Both are bounded —
+    /// history by [`MAX_ARCHIVED_SESSIONS`], credit by the request's lifetime.
+    fn retire(&mut self, session_id: String, record: SessionRecord) {
+        // `paused_seconds` is complete only if the open interval was banked
+        // first; both callers do that before handing the record over.
+        self.bank_credit(
+            record.request_id,
+            Duration::from_secs(record.session.paused_seconds),
+        );
         if self
             .agent_event_archive
             .insert(session_id.clone(), record.agent_events)
@@ -640,29 +657,52 @@ impl DebugSessionRegistry {
         }
     }
 
+    /// Add a closed session's banked pause to its request's standing credit.
+    ///
+    /// Saturating and capped at [`MAX_PAUSE_CREDIT`]: a retry loop banks a
+    /// fresh interval on every failure, and the ceiling is per request
+    /// precisely so failing repeatedly cannot buy unbounded credit.
+    fn bank_credit(&mut self, request_id: i64, banked: Duration) {
+        if banked.is_zero() {
+            return;
+        }
+        let credit = self.retired_credit.entry(request_id).or_default();
+        *credit = credit.saturating_add(banked).min(MAX_PAUSE_CREDIT);
+    }
+
     /// Paused duration to exclude from timeout accounting for a job request.
     ///
-    /// Summed across sessions because a job that failed, retried, and failed
-    /// again has banked time from each pause, then capped: the per-session
-    /// ceiling would otherwise be trivially bypassed by failing repeatedly.
+    /// Summed across every session the request has had — live and retired —
+    /// because a job that failed, retried, and failed again banked time in each
+    /// pause, then capped: a per-session ceiling would be trivially bypassed by
+    /// failing repeatedly.
     pub(crate) fn paused_for_request(&self, request_id: i64, now: SystemTime) -> Duration {
         self.sessions
             .values()
             .filter(|r| r.request_id == request_id)
             .map(|r| r.paused_total(now))
             .sum::<Duration>()
+            .saturating_add(
+                self.retired_credit
+                    .get(&request_id)
+                    .copied()
+                    .unwrap_or_default(),
+            )
             .min(MAX_PAUSE_CREDIT)
     }
 
     /// Whether a job request has an open session that still holds it.
     ///
-    /// A session out of pause credit stops protecting the job from the
+    /// A request out of pause credit stops protecting the job from the
     /// disconnect reaper: at that point the pause is no longer something the
-    /// control plane is willing to wait for.
+    /// control plane is willing to wait for. The ceiling applies to the
+    /// request's whole history, so reopening a session does not renew it.
     pub(crate) fn is_paused(&self, request_id: i64, now: SystemTime) -> bool {
-        self.sessions.values().any(|r| {
-            r.request_id == request_id && r.session.state.is_open() && r.within_credit(now)
-        })
+        let held = self
+            .sessions
+            .values()
+            .any(|r| r.request_id == request_id && r.session.state.is_open());
+        held && self.paused_for_request(request_id, now) < MAX_PAUSE_CREDIT
     }
 
     /// Handle a long-poller registers on before checking session state.
@@ -717,10 +757,19 @@ impl DebugSessionRegistry {
             .map(|(id, _)| id.clone())
             .collect();
         for id in &stale {
-            if let Some(record) = self.sessions.remove(id) {
-                self.archive(id.clone(), record);
+            if let Some(mut record) = self.sessions.remove(id) {
+                // The interval is still open — the worker stopped polling
+                // mid-pause. Close it here or the credit earned up to the
+                // sweep is lost and the reaper re-bills the job for it.
+                record.bank_paused(now);
+                self.retire(id.clone(), record);
             }
         }
+        // A request that is no longer active has nobody left to ask about its
+        // credit: it can neither time out nor be reaped again. This is the only
+        // thing that bounds the credit map over a long-lived server.
+        self.retired_credit
+            .retain(|request_id, _| active_requests.contains(request_id));
         if !stale.is_empty() {
             self.notify.notify_waiters();
         }
@@ -775,6 +824,109 @@ fn plausible_workspace(path: &str) -> bool {
         && !path.contains([
             '\0', '\n', '\r', '\'', '"', '`', '$', ';', '&', '|', '<', '>', '(', ')',
         ])
+}
+
+/// Worker: exchange the job runtime token for this job's debug-worker token.
+///
+/// This exchange exists because the credential cannot ride along in the job
+/// message. The official runner projects every `isSecret` variable into the
+/// `secrets` context, so a `system.preloop.debug_worker_token` variable would
+/// be readable from workflow YAML — the exact privilege the debug split
+/// withholds. The Rust runner's own `system.*` filter protected only the Rust
+/// runner; the server does not choose which runner claims a job.
+///
+/// Every condition below is load-bearing, and none of them is a fallback:
+///
+/// 1. The presented token must be a job runtime token naming a single job
+///    (enforced by [`crate::auth::require_job_runtime_bearer`]).
+/// 2. The named job must be the one being asked for — a job cannot acquire a
+///    credential for its neighbour.
+/// 3. That job must have a live, uncompleted request.
+/// 4. Its run must have opted into pause-on-failure. Without the opt-in no
+///    debug credential exists for the job at all.
+/// 5. The exchange is one-shot. The worker spends it during job setup, before
+///    the first step runs, so a step that later replays the runtime token it
+///    sees as `ACTIONS_RUNTIME_TOKEN` finds nothing left to spend.
+pub(crate) async fn issue_worker_token(
+    State(shared): State<Arc<SharedState>>,
+    Extension(caller): Extension<JobRuntimeIdentity>,
+    Json(req): Json<WorkerTokenRequest>,
+) -> Result<Json<WorkerTokenResponse>, ApiError> {
+    if caller.0 != req.agent_job_id {
+        return Err(ApiError::forbidden(
+            "a job may only acquire its own debug-worker token",
+        ));
+    }
+    let mut inner = shared.state.inner.lock().await;
+
+    // Keyed on the agent job GUID for the same reason `open_session` is: it is
+    // what the worker knows itself as, and it separates matrix legs sharing a
+    // workflow-level job id.
+    let request_id = inner
+        .agent_job_requests
+        .get(&req.agent_job_id)
+        .copied()
+        .filter(|id| {
+            inner
+                .job_requests
+                .get(id)
+                .is_some_and(|record| record.result.is_none())
+        })
+        .ok_or_else(|| {
+            ApiError::not_found(format!(
+                "no active job request for agent job {}",
+                req.agent_job_id
+            ))
+        })?;
+
+    let record = inner
+        .job_requests
+        .get(&request_id)
+        .expect("request id came from a liveness-filtered lookup");
+    let (run_id, plan_id, already_issued) = (
+        record.run_id,
+        record.plan_id.clone(),
+        record.debug_token_issued,
+    );
+
+    // The runner only builds a pause client under `preloopPreserveOnFailure`,
+    // so gating on the same flag issues the credential exactly when it is
+    // used, and never otherwise.
+    let preserve = inner
+        .runs
+        .get(&run_id)
+        .is_some_and(|run| run.submission.preserve_on_failure);
+    if !preserve {
+        return Err(ApiError::forbidden(
+            "this run did not enable pause-on-failure",
+        ));
+    }
+    if already_issued {
+        // Distinct from a 403 so a worker can tell "someone beat me to it"
+        // from "not allowed at all" in its log.
+        return Err(ApiError::conflict(format!(
+            "debug-worker token already issued for agent job {}",
+            req.agent_job_id
+        )));
+    }
+
+    inner
+        .job_requests
+        .get_mut(&request_id)
+        .expect("request id came from a liveness-filtered lookup")
+        .debug_token_issued = true;
+    drop(inner);
+
+    info!(
+        %run_id,
+        agent_job = %req.agent_job_id,
+        "issued debug-worker token to the job's worker"
+    );
+    Ok(Json(WorkerTokenResponse {
+        token: shared
+            .state
+            .mint_debug_worker_token(&plan_id, &req.agent_job_id),
+    }))
 }
 
 /// Worker: open a session after a step failed.
@@ -1253,7 +1405,152 @@ mod tests {
             registry.sweep_abandoned(at(WORKER_LIVENESS_WINDOW.as_secs() + 10), &active([7]));
         assert_eq!(swept, vec![id]);
         assert!(!registry.is_paused(7, at(0)));
-        assert_eq!(registry.paused_for_request(7, at(1_000)).as_secs(), 0);
+        // Accrual stops at the sweep, but the credit earned up to it is kept:
+        // the job really was paused for those 100 seconds, and re-billing them
+        // would cancel a job that is executing well inside its timeout.
+        assert_eq!(registry.paused_for_request(7, at(1_000)).as_secs(), 100);
+    }
+
+    /// Closing a session must not hand the job's paused time back to the
+    /// reaper.
+    ///
+    /// The banked total lives in the session record, and closing drops it. Read
+    /// from live records alone the credit snapped to zero exactly when the job
+    /// resumed, so a job paused for an hour was cancelled an hour early — and
+    /// the cancellation looked like an ordinary timeout, with nothing to
+    /// attribute it to.
+    #[test]
+    fn credit_survives_the_close_that_resumes_the_job() {
+        let (mut registry, id) = registry_with_session();
+        registry.set_verdict(
+            &id,
+            &VerdictRequest {
+                verdict: Verdict::Continue,
+                revert: Default::default(),
+                controller: Some("cli".to_owned()),
+                source_revision: None,
+                retry_from_step: None,
+            },
+        );
+        registry.take_verdict(&id, at(100));
+        registry.close(&id, SessionState::Resumed, at(100));
+
+        assert!(registry.get(&id).is_none(), "the session is gone");
+        assert!(!registry.is_paused(7, at(100)), "the job is running again");
+        assert_eq!(registry.paused_for_request(7, at(100)).as_secs(), 100);
+        // And it stays banked rather than growing: the clock is stopped.
+        assert_eq!(registry.paused_for_request(7, at(5_000)).as_secs(), 100);
+    }
+
+    /// A retry loop banks a fresh interval per failure; the request's credit is
+    /// the sum, not the last one.
+    #[test]
+    fn credit_accumulates_across_retries() {
+        let mut registry = DebugSessionRegistry::default();
+        let run_id = RunId::new();
+        let job_id = JobId("build".to_owned());
+        let retry = VerdictRequest {
+            verdict: Verdict::Retry,
+            revert: Default::default(),
+            controller: None,
+            source_revision: None,
+            retry_from_step: None,
+        };
+
+        // Three failures, each paused 100s and closed before the next attempt.
+        for attempt in 0..3u64 {
+            let opened_at = attempt * 200;
+            let session =
+                registry.open(7, test_open_request(run_id, job_id.clone()), at(opened_at));
+            registry.set_verdict(&session.session_id, &retry);
+            registry.take_verdict(&session.session_id, at(opened_at + 100));
+            registry.close(
+                &session.session_id,
+                SessionState::Resumed,
+                at(opened_at + 100),
+            );
+            assert_eq!(
+                registry
+                    .paused_for_request(7, at(opened_at + 100))
+                    .as_secs(),
+                (attempt + 1) * 100
+            );
+        }
+
+        // A fourth pause, still open, adds to the retired total rather than
+        // starting over.
+        registry.open(7, test_open_request(run_id, job_id), at(600));
+        assert_eq!(registry.paused_for_request(7, at(650)).as_secs(), 350);
+    }
+
+    /// The ceiling is per request, so closing and reopening cannot renew it.
+    #[test]
+    fn accumulated_credit_is_capped_at_the_ceiling() {
+        let mut registry = DebugSessionRegistry::default();
+        let run_id = RunId::new();
+        let job_id = JobId("build".to_owned());
+        // Three quarters of the ceiling, banked and retired.
+        let long_pause = MAX_PAUSE_CREDIT.as_secs() * 3 / 4;
+        let first = registry.open(7, test_open_request(run_id, job_id.clone()), at(0));
+        registry.set_verdict(
+            &first.session_id,
+            &VerdictRequest {
+                verdict: Verdict::Retry,
+                revert: Default::default(),
+                controller: None,
+                source_revision: None,
+                retry_from_step: None,
+            },
+        );
+        registry.take_verdict(&first.session_id, at(long_pause));
+        registry.close(&first.session_id, SessionState::Resumed, at(long_pause));
+        assert_eq!(
+            registry.paused_for_request(7, at(long_pause)).as_secs(),
+            long_pause
+        );
+
+        // The retry fails and pauses for as long again: 1.5x the ceiling in
+        // total, which must still buy exactly one ceiling's worth.
+        let second = registry.open(7, test_open_request(run_id, job_id), at(long_pause + 1));
+        assert_ne!(second.session_id, first.session_id, "a fresh session");
+        assert_eq!(second.paused_seconds, 0, "credit is not double counted");
+        assert!(
+            registry.is_paused(7, at(long_pause + 2)),
+            "credit remains, so the pause still holds the job"
+        );
+        assert_eq!(
+            registry.paused_for_request(7, at(long_pause * 2 + 1)),
+            MAX_PAUSE_CREDIT
+        );
+        assert!(
+            !registry.is_paused(7, at(long_pause * 2 + 1)),
+            "out of credit: the job's own timeout takes over again"
+        );
+    }
+
+    /// An archived session's credit outlives its history, and both outlive the
+    /// worker that abandoned it — until the request itself ends.
+    #[test]
+    fn credit_outlives_the_archive_and_is_retired_with_the_request() {
+        let (mut registry, id) = registry_with_session();
+        registry.close(&id, SessionState::Aborted, at(100));
+        // Archived, not merely dropped: an agent can still read the history.
+        assert!(registry.agent_events(&id, 0).is_ok());
+        assert_eq!(registry.paused_for_request(7, at(100)).as_secs(), 100);
+
+        // Reaper ticks pass with the job still winding down.
+        registry.sweep_abandoned(at(200), &active([7]));
+        assert_eq!(
+            registry.paused_for_request(7, at(200)).as_secs(),
+            100,
+            "a sweep must not confiscate an active request's credit"
+        );
+
+        // The job ends. Nothing can ask about its timeout again, so the credit
+        // goes with it — this is what bounds the map on a long-lived server.
+        registry.sweep_abandoned(at(300), &std::collections::BTreeSet::new());
+        assert_eq!(registry.paused_for_request(7, at(300)).as_secs(), 0);
+        assert!(registry.retired_credit.is_empty());
     }
 
     #[test]
