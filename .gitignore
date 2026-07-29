@@ -72,6 +72,8 @@ benchmarks/compatibility/server/protocol/captures/**/flow.*.bin
 # Benchmark capture artifacts — keep metadata (summary.json, jobs.json, github-run-id.txt)
 # but drop large flows, runner logs, certs, and per-runner capture dirs.
 benchmarks/real-world/results/**/flows.jsonl
+.runner-watch/golden
+benchmarks/real-world/results/public-runs
 benchmarks/real-world/results/**/vm-mitm/
 benchmarks/real-world/results/**/vm-mitm-conf/
 benchmarks/real-world/results/**/vm-runner*.log
@@ -80,3 +82,12 @@ benchmarks/preloop-perf/results/
 *.smolmachine
 rust_out
 /goal
+ # Conformance capture artifacts (timestamped runs, crypto material)                                                                             
+/benchmarks/compatibility/conformance/
+
+# Real-world benchmark raw run data (keep reports, drop logs/zips)
+benchmarks/real-world/results/aksh-runs/**/logs/
+benchmarks/real-world/results/aksh-runs/**/logs.zip
+
+# Scratch bench scripts at root
+/bench-cache.* 

@@ -3,18 +3,34 @@
 #
 # Exercises the full stack: server throughput under concurrent load, parser,
 # expression evaluator, workspace snapshotting, protocol serialization,
-# mutex contention, and cold boot time.
+# mutex contention, and cold boot time. Then drives the same submission path
+# over real TCP with `oha` and emits a machine-generated HTML dashboard.
 #
-# Optionally profiles the server under load with samply and generates a
-# flamegraph. Produces an HTML report with all results.
+# Every phase fails closed. A missing binary, a server that never becomes
+# ready, an `oha` invocation the installed build rejects, unparsable metric
+# output, malformed JSON, or a load run without successful responses aborts the
+# harness instead of silently degrading into an empty report.
+#
+# Artifacts (all under benchmarks/preloop-perf/results/):
+#   harness-report.html  machine-generated dashboard for this run
+#   metrics.json         every METRIC line, parsed
+#   environment.json     host, toolchain, and tool versions for this run
+#   oha-submit.json      raw oha output for POST /api/v1/runs
+#   oha-poll.json        raw oha output for GET /api/v1/runs
+#
+# `report.html` and `implementation-report.html` in that directory are the
+# curated editorial write-up and are deliberately NOT written by this script.
 #
 # Primary metric:
-#   server_rps       peak requests/sec under concurrent load (higher is better)
+#   server_rps       median peak requests/sec under concurrent load (higher is
+#                    better). `server_rps_min` / `_max` / `_spread_pct` describe
+#                    run-to-run stability; see `preloop-loadtest` for the trial
+#                    methodology.
 #
 # Usage:
-#   ./autoresearch.sh              # full run with all benchmarks
-#   ./autoresearch.sh --quick      # fast run, fewer iterations
-#   ./autoresearch.sh --profile    # include samply profiling
+#   ./autoresearch.sh              # full run, PRELOOP_BENCH_TRIALS trials
+#   ./autoresearch.sh --quick      # single trial, short oha windows
+#   ./autoresearch.sh --profile    # additionally profile with samply
 #
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -22,523 +38,832 @@ cd "$(dirname "$0")"
 REPO="$(pwd)"
 RESULTS_DIR="${REPO}/benchmarks/preloop-perf/results"
 LOADTEST_BIN="${REPO}/target/release/preloop-loadtest"
-REPORT_HTML="${RESULTS_DIR}/report.html"
-FLAMEGRAPH_SVG="${RESULTS_DIR}/flamegraph.svg"
+SERVER_BIN="${REPO}/target/release/preloop-server"
+HARNESS_REPORT="${RESULTS_DIR}/harness-report.html"
 METRICS_FILE="${RESULTS_DIR}/metrics.json"
-PROFILE_MODE="${1:-}"
+ENVIRONMENT_FILE="${RESULTS_DIR}/environment.json"
+FLAMEGRAPH_SVG="${RESULTS_DIR}/flamegraph.svg"
+PROFILE_JSON="${RESULTS_DIR}/profile.json"
+OHA_SUBMIT_JSON="${RESULTS_DIR}/oha-submit.json"
+OHA_POLL_JSON="${RESULTS_DIR}/oha-poll.json"
 AGENT_CI_DATA="${REPO}/goals/preloop-agent-ci-five-repo-benchmark/results/clean-rerun-results.json"
+
+SYSTEM_TOKEN="aksh-system-token"
+OHA_PORT="${OHA_PORT:-19999}"
+OHA_CONNECTIONS=32
+OHA_POLL_CONNECTIONS=16
+OHA_SUBMIT_WINDOW=10s
+OHA_POLL_WINDOW=5s
+# Trials are executed inside preloop-loadtest; the harness only chooses how many.
+BENCH_TRIALS="${PRELOOP_BENCH_TRIALS:-3}"
+PROFILE=0
+
+log() { echo "[harness] $*" >&2; }
+die() { echo "[harness] ERROR: $*" >&2; exit 1; }
+
+# Descriptive-only lookups (CPU model, tool banners). A missing tool is recorded
+# as "unavailable" instead of aborting. Never used on a measurement path.
+soft() { "$@" 2>/dev/null || echo unavailable; }
+
+for arg in "$@"; do
+    case "$arg" in
+        --profile) PROFILE=1 ;;
+        --quick)
+            BENCH_TRIALS=1
+            OHA_SUBMIT_WINDOW=3s
+            OHA_POLL_WINDOW=2s
+            ;;
+        -h|--help)
+            sed -n '2,32p' "$0" >&2
+            exit 0
+            ;;
+        *) die "unknown argument: $arg (expected --quick, --profile, or --help)" ;;
+    esac
+done
+
+case "$BENCH_TRIALS" in
+    ''|*[!0-9]*) die "PRELOOP_BENCH_TRIALS must be a positive integer, got '${BENCH_TRIALS}'" ;;
+    0) die "PRELOOP_BENCH_TRIALS must be >= 1" ;;
+esac
 
 mkdir -p "$RESULTS_DIR"
 
-log() { echo "[harness] $*" >&2; }
+# ── cleanup ──────────────────────────────────────────────────────────────────
+# One scratch directory and one background PID, both released on every exit
+# path including failures and Ctrl-C.
+
+SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/preloop-perf.XXXXXX")"
+SERVER_PID=""
+
+cleanup() {
+    local status=$?
+    if [ -n "$SERVER_PID" ]; then
+        # Idempotent teardown: the server may already be gone.
+        kill "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+    fi
+    rm -rf "$SCRATCH"
+    return $status
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# ── preflight ────────────────────────────────────────────────────────────────
+
+for tool in cargo curl python3; do
+    command -v "$tool" >/dev/null 2>&1 || die "required tool not on PATH: $tool"
+done
+command -v oha >/dev/null 2>&1 || die "oha is required for the real-TCP load phase; install with: cargo install oha"
+
+# The installed oha decides how JSON is requested: 1.x uses
+# `--output-format json`, older builds used a bare `-j`. Probe --help instead of
+# guessing, because an unknown flag makes oha exit 2 with no JSON at all.
+OHA_HELP="$(oha --help 2>&1)" || die "oha --help failed; oha install is broken"
+if printf '%s\n' "$OHA_HELP" | grep -q -- '--output-format'; then
+    OHA_JSON_FLAG="--output-format json"
+elif printf '%s\n' "$OHA_HELP" | grep -qE '(^|[[:space:]])-j([[:space:],]|$)'; then
+    OHA_JSON_FLAG="-j"
+else
+    die "installed oha ($(soft oha --version)) exposes no JSON output flag; --help lists neither --output-format nor -j"
+fi
+read -r -a OHA_JSON_ARGS <<<"$OHA_JSON_FLAG"
+log "oha JSON flag: ${OHA_JSON_FLAG}"
 
 # ── build ────────────────────────────────────────────────────────────────────
 
-log "Building loadtest binary (release)..."
-build_start=$(python3 -c 'import time; print(time.time())')
-cargo build --release -p preloop-loadtest 2>&1 | tail -3 >&2
-build_end=$(python3 -c 'import time; print(time.time())')
-build_secs=$(python3 -c "print(round(${build_end} - ${build_start}, 1))")
+log "Building preloop-loadtest and preloop-server (release)..."
+SECONDS=0
+cargo build --release -p preloop-loadtest -p aksh-runner-server >&2
+build_secs=$SECONDS
 log "Build completed in ${build_secs}s"
 
-if [ ! -f "$LOADTEST_BIN" ]; then
-    echo "ERROR: loadtest binary not found at $LOADTEST_BIN" >&2
-    exit 1
-fi
+[ -x "$LOADTEST_BIN" ] || die "loadtest binary not found at $LOADTEST_BIN"
+[ -x "$SERVER_BIN" ] || die "server binary not found at $SERVER_BIN"
+
+# ── environment + tool recording ─────────────────────────────────────────────
+# Recorded before measuring so a report always states which host, toolchain,
+# and tool versions produced its numbers.
+
+log "Recording environment..."
+ENV_GIT_COMMIT="$(soft git rev-parse --short HEAD)"
+ENV_GIT_DIRTY_FILES="$(git status --porcelain | wc -l | tr -d ' ')"
+python3 - "$ENVIRONMENT_FILE" <<PYEOF
+import json, sys
+environment = {
+    "generated_utc": __import__("datetime").datetime.now(
+        __import__("datetime").timezone.utc
+    ).isoformat(timespec="seconds"),
+    "host": {
+        "os": "$(soft uname -s)",
+        "kernel": "$(soft uname -r)",
+        "arch": "$(soft uname -m)",
+        "hostname": "$(soft hostname)",
+        "cpu": "$(soft sysctl -n machdep.cpu.brand_string)",
+        "logical_cpus": "$(getconf _NPROCESSORS_ONLN)",
+    },
+    "tools": {
+        "rustc": "$(soft rustc --version)",
+        "cargo": "$(soft cargo --version)",
+        "git": "$(soft git --version)",
+        "oha": "$(soft oha --version)",
+        "python3": "$(soft python3 --version)",
+        "samply": "$(soft samply --version)",
+    },
+    "repo": {
+        "commit": "${ENV_GIT_COMMIT}",
+        "uncommitted_files": ${ENV_GIT_DIRTY_FILES},
+    },
+    "settings": {
+        "trials": ${BENCH_TRIALS},
+        "oha_json_flag": "${OHA_JSON_FLAG}",
+        "oha_submit_window": "${OHA_SUBMIT_WINDOW}",
+        "oha_submit_connections": ${OHA_CONNECTIONS},
+        "oha_poll_window": "${OHA_POLL_WINDOW}",
+        "oha_poll_connections": ${OHA_POLL_CONNECTIONS},
+        "profile_requested": ${PROFILE},
+    },
+}
+with open(sys.argv[1], "w") as handle:
+    json.dump(environment, handle, indent=2, sort_keys=True)
+PYEOF
+log "Environment: ${ENVIRONMENT_FILE}"
 
 # ── run loadtest ─────────────────────────────────────────────────────────────
 
-log "Running comprehensive loadtest..."
-loadtest_start=$(python3 -c 'import time; print(time.time())')
+METRICS_RAW="${SCRATCH}/metrics.txt"
+LOADTEST_RAW="${SCRATCH}/loadtest.log"
 
-# Capture all output — METRIC lines go to stdout, logs to stderr
-LOADTEST_RAW=$(mktemp)
-"$LOADTEST_BIN" all > "$LOADTEST_RAW" 2>&1
-loadtest_exit=$?
-
-# Show full output on stderr, extract METRIC lines
-cat "$LOADTEST_RAW" >&2
-METRIC_OUTPUT=$(grep '^METRIC ' "$LOADTEST_RAW" || true)
-rm -f "$LOADTEST_RAW"
-
-loadtest_end=$(python3 -c 'import time; print(time.time())')
-loadtest_secs=$(python3 -c "print(round(${loadtest_end} - ${loadtest_start}, 1))")
-log "Loadtest completed in ${loadtest_secs}s (exit=${loadtest_exit})"
-
-if [ $loadtest_exit -ne 0 ]; then
-    echo "ERROR: loadtest binary failed with exit code $loadtest_exit" >&2
-    exit 1
+log "Running comprehensive loadtest (${BENCH_TRIALS} trial(s))..."
+SECONDS=0
+if ! PRELOOP_BENCH_TRIALS="$BENCH_TRIALS" "$LOADTEST_BIN" all >"$LOADTEST_RAW" 2>&1; then
+    cat "$LOADTEST_RAW" >&2
+    die "preloop-loadtest failed; see output above"
 fi
+loadtest_secs=$SECONDS
+cat "$LOADTEST_RAW" >&2
+log "Loadtest completed in ${loadtest_secs}s"
+
+grep '^METRIC ' "$LOADTEST_RAW" >"$METRICS_RAW" || die "preloop-loadtest emitted no METRIC lines"
+{
+    echo "METRIC build_secs=${build_secs}"
+    echo "METRIC loadtest_secs=${loadtest_secs}"
+} >>"$METRICS_RAW"
 
 # ── profiling (optional) ────────────────────────────────────────────────────
+# --profile is an explicit request, so a missing or failing profiler is an
+# error rather than a silently skipped step.
 
-if [ "$PROFILE_MODE" = "--profile" ]; then
-    if command -v samply &>/dev/null; then
-        log "Profiling server-load benchmark with samply..."
-        samply record --save-only -o "${RESULTS_DIR}/profile.json" -- \
-            "$LOADTEST_BIN" server-load 2>&2 || true
-        log "Profile saved to ${RESULTS_DIR}/profile.json"
-    fi
-
-    if command -v cargo-flamegraph &>/dev/null || command -v flamegraph &>/dev/null; then
-        log "Generating flamegraph..."
-        # Use dtrace on macOS
-        cargo flamegraph --bin preloop-loadtest --root -- server-load \
-            -o "$FLAMEGRAPH_SVG" 2>&2 || {
-            log "Flamegraph generation failed (may need sudo for dtrace)"
-            # Try generating a basic SVG placeholder
-            cat > "$FLAMEGRAPH_SVG" <<'SVGEOF'
-<svg xmlns="http://www.w3.org/2000/svg" width="800" height="100">
-  <rect width="800" height="100" fill="#f0f0f0"/>
-  <text x="400" y="55" text-anchor="middle" font-size="16" fill="#666">
-    Flamegraph requires sudo/dtrace permissions. Run: sudo ./autoresearch.sh --profile
-  </text>
-</svg>
-SVGEOF
-        }
-    fi
+if [ "$PROFILE" -eq 1 ]; then
+    command -v samply >/dev/null 2>&1 || die "--profile requires samply on PATH (cargo install samply)"
+    log "Profiling server-load benchmark with samply..."
+    PRELOOP_BENCH_TRIALS=1 samply record --save-only -o "$PROFILE_JSON" -- \
+        "$LOADTEST_BIN" server-load >&2 \
+        || die "samply record failed (dtrace may need elevated privileges: sudo ./autoresearch.sh --profile)"
+    log "Profile saved to ${PROFILE_JSON}"
 fi
 
 # ── HTTP load test with oha (real network path) ─────────────────────────────
 
-OHA_RESULTS=""
-if command -v oha &>/dev/null; then
-    log "Running HTTP load test with oha against real server..."
+log "Starting server on 127.0.0.1:${OHA_PORT} for the real-TCP load phase..."
+OHA_STATE_DIR="${SCRATCH}/oha-state"
+SERVER_LOG="${SCRATCH}/server.log"
+mkdir -p "$OHA_STATE_DIR"
 
-    # Start server in background
-    OHA_PORT=19999
-    OHA_STATE_DIR=$(mktemp -d)
-    AKSH_SYSTEM_TOKEN="aksh-system-token" \
-        "$REPO/target/release/preloop-server" serve \
-        --listen "127.0.0.1:${OHA_PORT}" \
-        --state-dir "$OHA_STATE_DIR" \
-        2>/dev/null &
-    SERVER_PID=$!
+AKSH_SYSTEM_TOKEN="$SYSTEM_TOKEN" "$SERVER_BIN" serve \
+    --listen "127.0.0.1:${OHA_PORT}" \
+    --state-dir "$OHA_STATE_DIR" \
+    >"$SERVER_LOG" 2>&1 &
+SERVER_PID=$!
 
-    # Wait for server to be ready
-    for i in $(seq 1 30); do
-        if curl -sf "http://127.0.0.1:${OHA_PORT}/healthz" >/dev/null 2>&1; then
-            break
-        fi
-        sleep 0.2
-    done
-
-    if curl -sf "http://127.0.0.1:${OHA_PORT}/healthz" >/dev/null 2>&1; then
-        log "Server ready on port $OHA_PORT, running oha..."
-
-        # Run oha with JSON output for the submission endpoint
-        OHA_RESULTS=$(oha -z 10s -c 32 --no-tui -j \
-            -m POST \
-            -H "Authorization: Bearer aksh-system-token" \
-            -H "Content-Type: application/json" \
-            -d '{"workflow_yaml":"on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n","event":"push","repository":"bench/oha"}' \
-            "http://127.0.0.1:${OHA_PORT}/api/v1/runs" 2>/dev/null || echo "{}")
-
-        # Also test GET polling
-        OHA_POLL_RESULTS=$(oha -z 5s -c 16 --no-tui -j \
-            -H "Authorization: Bearer aksh-system-token" \
-            "http://127.0.0.1:${OHA_PORT}/api/v1/runs?limit=20" 2>/dev/null || echo "{}")
-
-        log "oha complete"
-    else
-        log "Server failed to start for oha test, skipping"
+server_ready=0
+for _ in $(seq 1 100); do
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+        break
     fi
+    if curl -sf -o /dev/null "http://127.0.0.1:${OHA_PORT}/healthz"; then
+        server_ready=1
+        break
+    fi
+    sleep 0.2
+done
 
-    # Cleanup
-    kill $SERVER_PID 2>/dev/null || true
-    wait $SERVER_PID 2>/dev/null || true
-    rm -rf "$OHA_STATE_DIR"
+if [ "$server_ready" -ne 1 ]; then
+    cat "$SERVER_LOG" >&2
+    die "server never became ready on 127.0.0.1:${OHA_PORT}; see log above"
 fi
+log "Server ready, running oha..."
+
+SUBMIT_BODY='{"workflow_yaml":"on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n","event":"push","repository":"bench/oha"}'
+
+oha -z "$OHA_SUBMIT_WINDOW" -c "$OHA_CONNECTIONS" --no-tui "${OHA_JSON_ARGS[@]}" \
+    -m POST \
+    -H "Authorization: Bearer ${SYSTEM_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d "$SUBMIT_BODY" \
+    "http://127.0.0.1:${OHA_PORT}/api/v1/runs" >"$OHA_SUBMIT_JSON" \
+    || die "oha submission run failed (exit $?); see ${OHA_SUBMIT_JSON}"
+
+oha -z "$OHA_POLL_WINDOW" -c "$OHA_POLL_CONNECTIONS" --no-tui "${OHA_JSON_ARGS[@]}" \
+    -H "Authorization: Bearer ${SYSTEM_TOKEN}" \
+    "http://127.0.0.1:${OHA_PORT}/api/v1/runs?limit=20" >"$OHA_POLL_JSON" \
+    || die "oha polling run failed (exit $?); see ${OHA_POLL_JSON}"
+
+log "oha complete; validating JSON and response codes..."
+
+# Validate structure and success counts, then emit metrics. Anything short of a
+# parsable payload with at least one 2xx and no >=4xx response aborts the run.
+oha_metrics() {
+    python3 - "$1" "$2" <<'PYEOF'
+import json
+import sys
+
+path, prefix = sys.argv[1], sys.argv[2]
+
+with open(path) as handle:
+    raw = handle.read()
+if not raw.strip():
+    sys.exit(f"{path}: oha produced no output")
+try:
+    data = json.loads(raw)
+except json.JSONDecodeError as err:
+    sys.exit(f"{path}: oha output is not valid JSON: {err}")
+
+summary = data.get("summary")
+if not isinstance(summary, dict):
+    sys.exit(f"{path}: oha JSON has no 'summary' object")
+for key in ("requestsPerSec", "average", "total", "successRate"):
+    if not isinstance(summary.get(key), (int, float)):
+        sys.exit(f"{path}: oha summary is missing numeric '{key}'")
+
+codes = data.get("statusCodeDistribution")
+if not isinstance(codes, dict) or not codes:
+    sys.exit(f"{path}: oha JSON has no 'statusCodeDistribution'")
+try:
+    counted = {int(code): int(count) for code, count in codes.items()}
+except (TypeError, ValueError) as err:
+    sys.exit(f"{path}: unparsable statusCodeDistribution {codes}: {err}")
+
+errors = data.get("errorDistribution") or {}
+succeeded = sum(n for code, n in counted.items() if 200 <= code < 300)
+rejected = sum(n for code, n in counted.items() if code >= 400)
+
+if succeeded == 0:
+    sys.exit(
+        f"{path}: oha recorded 0 successful (2xx) responses; "
+        f"codes={counted} errors={errors}"
+    )
+if rejected:
+    sys.exit(f"{path}: oha recorded {rejected} responses >= 400; codes={counted}")
+
+percentiles = data.get("latencyPercentiles") or {}
+
+
+def ms(value):
+    return float(value) * 1000.0
+
+
+print(f"METRIC {prefix}_rps={summary['requestsPerSec']:.0f}")
+print(f"METRIC {prefix}_mean_ms={ms(summary['average']):.2f}")
+print(f"METRIC {prefix}_success_responses={succeeded}")
+print(f"METRIC {prefix}_success_rate={float(summary['successRate']):.4f}")
+# `summary.total` is the wall-clock duration of the load window in seconds, not
+# a request count.
+print(f"METRIC {prefix}_window_s={float(summary['total']):.2f}")
+print(f"METRIC {prefix}_deadline_aborted={int(errors.get('aborted due to deadline', 0))}")
+for label in ("p50", "p90", "p95", "p99"):
+    if label in percentiles:
+        print(f"METRIC {prefix}_{label}_ms={ms(percentiles[label]):.2f}")
+PYEOF
+}
+
+oha_metrics "$OHA_SUBMIT_JSON" http >>"$METRICS_RAW" \
+    || die "oha submission results failed validation"
+oha_metrics "$OHA_POLL_JSON" http_poll >>"$METRICS_RAW" \
+    || die "oha polling results failed validation"
+
+kill "$SERVER_PID" 2>/dev/null || true
+wait "$SERVER_PID" 2>/dev/null || true
+SERVER_PID=""
 
 # ── emit metrics ─────────────────────────────────────────────────────────────
 
-# Re-emit from the loadtest binary output
-echo "$METRIC_OUTPUT"
+cat "$METRICS_RAW"
 
-# Add build time as a metric
-echo "METRIC build_secs=${build_secs}"
+python3 - "$METRICS_RAW" "$METRICS_FILE" <<'PYEOF'
+import json
+import re
+import sys
 
-# Parse oha results if available
-if [ -n "$OHA_RESULTS" ] && [ "$OHA_RESULTS" != "{}" ]; then
-    OHA_RPS=$(echo "$OHA_RESULTS" | python3 -c "
-import sys, json
-try:
-    d = json.load(sys.stdin)
-    print(round(d.get('summary', {}).get('requestsPerSec', 0), 0))
-except: print(0)
-" 2>/dev/null || echo 0)
-    OHA_P50=$(echo "$OHA_RESULTS" | python3 -c "
-import sys, json
-try:
-    d = json.load(sys.stdin)
-    # percentiles stored under responseTimePercentiles or similar
-    percs = d.get('latencyPercentiles', {})
-    p50 = percs.get('p50', 0)
-    print(round(p50 * 1000, 2))
-except: print(0)
-" 2>/dev/null || echo 0)
-    echo "METRIC http_rps=${OHA_RPS}"
-    echo "METRIC http_p50_ms=${OHA_P50}"
-fi
+raw_path, out_path = sys.argv[1], sys.argv[2]
+pattern = re.compile(r"^METRIC\s+(\S+)=(\S+)$")
+metrics = {}
+
+with open(raw_path) as handle:
+    for line in handle:
+        line = line.strip()
+        if not line:
+            continue
+        match = pattern.match(line)
+        if match is None:
+            sys.exit(f"unparsable METRIC line: {line!r}")
+        key, value = match.groups()
+        try:
+            # Integers stay exact: the permutation seed and response counts do
+            # not survive a float round trip.
+            metrics[key] = int(value)
+        except ValueError:
+            try:
+                metrics[key] = float(value)
+            except ValueError:
+                metrics[key] = value
+
+if not metrics:
+    sys.exit("no metrics were parsed")
+
+with open(out_path, "w") as handle:
+    json.dump(metrics, handle, indent=2, sort_keys=True)
+print(f"[harness] Metrics saved to {out_path}", file=sys.stderr)
+PYEOF
 
 # ── generate HTML report ─────────────────────────────────────────────────────
 
-log "Generating HTML report..."
-
-# Collect all metrics into JSON
-python3 - "$RESULTS_DIR" "$AGENT_CI_DATA" "$OHA_RESULTS" "$FLAMEGRAPH_SVG" <<'PYEOF'
-import sys, json, os
-from pathlib import Path
+log "Generating HTML dashboard..."
+python3 - "$METRICS_FILE" "$ENVIRONMENT_FILE" "$OHA_SUBMIT_JSON" "$OHA_POLL_JSON" \
+    "$AGENT_CI_DATA" "$FLAMEGRAPH_SVG" "$HARNESS_REPORT" <<'PYEOF'
+import json
+import os
+import sys
 from datetime import datetime
+from html import escape
 
-results_dir = Path(sys.argv[1])
-agent_ci_path = sys.argv[2]
-oha_raw = sys.argv[3] if len(sys.argv) > 3 else ""
-flamegraph_path = sys.argv[4] if len(sys.argv) > 4 else ""
+(
+    metrics_path,
+    environment_path,
+    oha_submit_path,
+    oha_poll_path,
+    agent_ci_path,
+    flamegraph_path,
+    report_path,
+) = sys.argv[1:8]
 
-# Parse metrics from stdin (re-read from the metrics emitted to stdout)
-# We'll just read the METRIC lines from the loadtest output
-metrics = {}
 
-# Read metrics from the metrics file if it was already generated
-# Otherwise use what's piped in
-report_path = results_dir / "report.html"
+def load(path, required=True):
+    if not os.path.exists(path):
+        if required:
+            sys.exit(f"missing required input: {path}")
+        return None
+    with open(path) as handle:
+        return json.load(handle)
 
-# Read agent-ci data
-agent_ci = {}
-if os.path.exists(agent_ci_path):
-    with open(agent_ci_path) as f:
-        agent_ci = json.load(f)
 
-# Parse oha results
-oha_data = {}
-if oha_raw and oha_raw != "{}":
-    try:
-        oha_data = json.loads(oha_raw)
-    except:
-        pass
+metrics = load(metrics_path)
+environment = load(environment_path)
+oha_submit = load(oha_submit_path)
+oha_poll = load(oha_poll_path)
+agent_ci = load(agent_ci_path, required=False) or {}
+flamegraph_rel = (
+    os.path.basename(flamegraph_path) if os.path.exists(flamegraph_path) else None
+)
 
-# Read flamegraph if exists
-flamegraph_svg = ""
-if flamegraph_path and os.path.exists(flamegraph_path):
-    with open(flamegraph_path) as f:
-        flamegraph_svg = f.read()
+# Warm editorial palette, shared with the curated report.html write-up so the
+# machine-generated dashboard reads as part of the same document family.
+CSS = """
+:root {
+  --paper: oklch(96% 0.018 82);
+  --paper-deep: oklch(91% 0.026 78);
+  --ink: oklch(25% 0.025 55);
+  --muted: oklch(49% 0.035 65);
+  --accent: oklch(53% 0.16 35);
+  --accent-deep: oklch(38% 0.11 35);
+  --olive: oklch(48% 0.075 105);
+  --signal: oklch(62% 0.13 75);
+  --surface: oklch(98% 0.012 84);
+  --border: oklch(79% 0.035 73);
+  --rule: oklch(69% 0.05 68);
+  --mono: 'JetBrains Mono', 'SF Mono', 'Cascadia Code', monospace;
+  --serif: 'Alegreya', Georgia, serif;
+  --sans: 'Source Sans 3', 'Helvetica Neue', sans-serif;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: var(--sans);
+  background: var(--paper); color: var(--ink); line-height: 1.68;
+  padding: clamp(1.5rem, 4vw, 4.5rem) clamp(1rem, 5vw, 5rem);
+  max-width: 1380px; margin: 0 auto;
+}
+h1 { font-family: var(--serif); font-size: clamp(2.4rem, 6vw, 4.4rem); font-weight: 600;
+     letter-spacing: -0.04em; line-height: 0.98; max-width: 16ch; margin-bottom: 0.6rem; }
+h2 { color: var(--accent-deep); font-family: var(--serif); font-size: clamp(1.6rem, 3vw, 2.3rem);
+     font-weight: 600; letter-spacing: -0.02em; margin: 3.5rem 0 1rem;
+     border-bottom: 1px solid var(--rule); padding-bottom: 0.6rem; }
+h3 { font-family: var(--serif); font-size: 1.3rem; font-weight: 600; margin: 2rem 0 0.5rem; }
+.subtitle { color: var(--muted); font-size: 1rem; max-width: 78ch; margin-bottom: 0.6rem; }
+.subtitle strong { color: var(--ink); font-weight: 600; }
+a { color: var(--accent-deep); text-underline-offset: 0.18em; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+        gap: 0.9rem; margin: 1.5rem 0 2rem; }
+.card { background: var(--surface); border: 1px solid var(--border);
+        border-top: 2px solid var(--accent); border-radius: 2px; padding: 1.3rem 1.4rem 1.1rem; }
+.card h4 { margin: 0 0 0.4rem; font-size: 0.72rem; color: var(--muted);
+           text-transform: uppercase; letter-spacing: 0.11em; }
+.card .value { font-size: 1.8rem; font-weight: 600; color: var(--accent-deep);
+               font-family: var(--mono); }
+.card .unit { font-size: 0.78rem; color: var(--muted); }
+.card .delta { font-size: 0.82rem; margin-top: 0.25rem; color: var(--signal); }
+table { width: 100%; border-collapse: collapse; margin: 1.2rem 0; background: var(--surface);
+        border: 1px solid var(--border); border-radius: 2px; overflow: hidden; }
+th, td { padding: 0.65rem 0.85rem; text-align: left; border-bottom: 1px solid var(--border);
+         font-size: 0.92rem; }
+th { background: var(--paper-deep); color: var(--accent-deep); font-weight: 600;
+     font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.09em; }
+td { font-family: var(--mono); }
+tr:hover td { background: oklch(94% 0.022 78); }
+.pass { color: var(--olive); font-weight: 600; }
+.fail { color: var(--accent); font-weight: 600; }
+.methodology { background: var(--surface); border: 1px solid var(--border); border-radius: 2px;
+               padding: 1.4rem 1.5rem; font-size: 0.94rem; margin: 1.1rem 0; }
+.methodology code, .subtitle code, td code, p code {
+  background: var(--paper-deep); padding: 0.15em 0.4em; border-radius: 2px;
+  font-family: var(--mono); font-size: 0.85em; }
+.methodology ul { padding-left: 1.4rem; }
+.note { border-left: 3px solid var(--signal); background: var(--surface);
+        padding: 0.8rem 1.1rem; margin: 1.1rem 0; font-size: 0.92rem; }
+footer { color: var(--muted); font-size: 0.8rem; text-align: center; margin-top: 3.5rem; }
+"""
 
-# Generate the HTML report
+
+def value(key):
+    return metrics.get(key)
+
+
+def fmt(key, digits=0, missing="&mdash;"):
+    raw = value(key)
+    if raw is None:
+        return missing
+    if isinstance(raw, str):
+        return escape(raw)
+    return f"{raw:,.{digits}f}"
+
+
+def card(title, key, unit, digits=0):
+    spread = value(f"{key}_spread_pct")
+    samples = value(f"{key}_samples")
+    detail = ""
+    if spread is not None and samples is not None:
+        detail = (
+            f'<div class="delta">spread {spread:.1f}% over '
+            f'{int(float(samples))} sample(s)</div>'
+        )
+    return (
+        f'<div class="card"><h4>{escape(title)}</h4>'
+        f'<div class="value">{fmt(key, digits)}</div>'
+        f'<div class="unit">{escape(unit)}</div>{detail}</div>'
+    )
+
+
+def stat_row(label, key, digits=0, unit=""):
+    if value(key) is None:
+        return ""
+    suffix = f" {escape(unit)}" if unit else ""
+    return (
+        f"<tr><td>{escape(label)}</td>"
+        f"<td>{fmt(key, digits)}{suffix}</td>"
+        f"<td>{fmt(f'{key}_min', digits)}</td>"
+        f"<td>{fmt(f'{key}_max', digits)}</td>"
+        f"<td>{fmt(f'{key}_spread_pct', 1)}%</td>"
+        f"<td>{fmt(f'{key}_samples', 0)}</td></tr>"
+    )
+
+
+STAT_HEAD = (
+    "<tr><th>Measurement</th><th>Median</th><th>Min</th><th>Max</th>"
+    "<th>Spread</th><th>Samples</th></tr>"
+)
+
+host = environment["host"]
+tools = environment["tools"]
+repo = environment["repo"]
+settings = environment["settings"]
+
+parts = []
+parts.append("<h2>Run Provenance</h2>")
+parts.append(
+    '<p class="subtitle">Recorded before measuring, so every number below is '
+    "attributable to a specific host, toolchain, and tool set.</p>"
+)
+provenance_rows = [
+    (
+        "Host",
+        f"{escape(host['cpu'])} &middot; {escape(host['logical_cpus'])} logical CPUs",
+    ),
+    (
+        "OS",
+        f"{escape(host['os'])} {escape(host['kernel'])} ({escape(host['arch'])})",
+    ),
+    (
+        "Repository",
+        f"commit {escape(repo['commit'])}, {repo['uncommitted_files']} uncommitted file(s)",
+    ),
+    ("Toolchain", f"{escape(tools['rustc'])} &middot; {escape(tools['cargo'])}"),
+    (
+        "Load generator",
+        f"{escape(tools['oha'])} via <code>{escape(settings['oha_json_flag'])}</code>",
+    ),
+    ("Trials per measurement", str(settings["trials"])),
+    (
+        "oha windows",
+        f"POST {settings['oha_submit_window']} @ c={settings['oha_submit_connections']}, "
+        f"GET {settings['oha_poll_window']} @ c={settings['oha_poll_connections']}",
+    ),
+    ("Benchmark build profile", str(value("bench_profile") or "unknown")),
+    ("Permutation seed", str(value("bench_seed"))),
+]
+parts.append("<table><tr><th>Field</th><th>Value</th></tr>")
+for name, detail in provenance_rows:
+    parts.append(f"<tr><td>{escape(name)}</td><td>{detail}</td></tr>")
+parts.append("</table>")
+
+parts.append("<h2>Summary</h2>")
+parts.append('<div class="grid">')
+parts.append(card("Server Peak RPS", "server_rps", "requests/sec (in-process)"))
+parts.append(card("HTTP RPS (oha)", "http_rps", "submissions/sec over real TCP"))
+parts.append(
+    card("Sequential Latency", "server_sequential_latency_ms", "ms/request", digits=2)
+)
+parts.append(card("Cold Boot", "cold_boot_ms", "ms (AppState::new)", digits=1))
+parts.append(card("Parser (simple)", "parse_simple_us", "µs/parse", digits=1))
+parts.append(card("Expr Eval", "expr_eval_us", "µs/eval", digits=2))
+parts.append(card("Mixed Contention", "contention_mixed_rps", "ops/sec @ 32 threads"))
+parts.append("</div>")
+
+parts.append("<h2>Server Load (in-process router)</h2>")
+parts.append(
+    "<p>Requests go straight to the axum router through "
+    "<code>tower::ServiceExt::oneshot</code>, so these numbers isolate handler "
+    "and state-management cost from kernel networking.</p>"
+)
+parts.append(f"<table>{STAT_HEAD}")
+for concurrency in (4, 16, 64, 128):
+    parts.append(
+        stat_row(f"Concurrency {concurrency} — RPS", f"server_rps_c{concurrency}")
+    )
+    parts.append(
+        stat_row(
+            f"Concurrency {concurrency} — avg latency",
+            f"server_avg_ms_c{concurrency}",
+            digits=2,
+            unit="ms",
+        )
+    )
+parts.append(stat_row("Sequential — RPS", "server_sequential_rps"))
+parts.append(stat_row("Matrix 4-shard (c=16) — RPS", "server_matrix_rps"))
+parts.append(stat_row("Complex DAG (sequential) — RPS", "server_complex_dag_rps"))
+parts.append(stat_row("GET /runs polling — RPS", "server_poll_rps"))
+parts.append("</table>")
+
+error_cells = []
+for concurrency in (4, 16, 64, 128):
+    errors = value(f"server_errors_c{concurrency}")
+    if errors is not None:
+        state = "pass" if float(errors) == 0 else "fail"
+        error_cells.append(
+            f"<tr><td>Concurrency {concurrency}</td>"
+            f'<td class="{state}">{int(float(errors))}</td></tr>'
+        )
+if error_cells:
+    parts.append("<h3>Rejected submissions</h3>")
+    parts.append(
+        "<table><tr><th>Sweep level</th><th>Non-2xx responses</th></tr>"
+        + "".join(error_cells)
+        + "</table>"
+    )
+
+parts.append("<h2>Real HTTP Path (oha)</h2>")
+submit_summary = oha_submit["summary"]
+poll_summary = oha_poll["summary"]
+parts.append(
+    "<table><tr><th>Metric</th><th>POST /api/v1/runs</th><th>GET /api/v1/runs</th></tr>"
+)
+
+
+def http_row(label, submit_key, poll_key, digits=2):
+    return (
+        f"<tr><td>{escape(label)}</td><td>{fmt(submit_key, digits)}</td>"
+        f"<td>{fmt(poll_key, digits)}</td></tr>"
+    )
+
+
+parts.append(http_row("Requests/sec", "http_rps", "http_poll_rps", digits=0))
+parts.append(
+    http_row(
+        "Successful (2xx) responses",
+        "http_success_responses",
+        "http_poll_success_responses",
+        digits=0,
+    )
+)
+parts.append(http_row("Success rate", "http_success_rate", "http_poll_success_rate", 4))
+parts.append(http_row("Mean latency (ms)", "http_mean_ms", "http_poll_mean_ms"))
+parts.append(http_row("P50 latency (ms)", "http_p50_ms", "http_poll_p50_ms"))
+parts.append(http_row("P95 latency (ms)", "http_p95_ms", "http_poll_p95_ms"))
+parts.append(http_row("P99 latency (ms)", "http_p99_ms", "http_poll_p99_ms"))
+parts.append(http_row("Load window (s)", "http_window_s", "http_poll_window_s"))
+parts.append(
+    http_row(
+        "Aborted at deadline",
+        "http_deadline_aborted",
+        "http_poll_deadline_aborted",
+        digits=0,
+    )
+)
+parts.append("</table>")
+parts.append(
+    '<div class="note"><strong>Reading these figures:</strong> '
+    "<code>summary.total</code> in oha's JSON is the duration of the load window "
+    "in seconds, not a request count, so the request count above is the sum of "
+    "oha's 2xx status-code distribution. Requests still in flight when the "
+    "<code>-z</code> deadline fires are reported separately as "
+    '"aborted at deadline" and are not counted as failures.</div>'
+)
+parts.append(
+    f"<p>Status codes — POST: <code>{escape(json.dumps(oha_submit.get('statusCodeDistribution', {})))}</code>"
+    f", GET: <code>{escape(json.dumps(oha_poll.get('statusCodeDistribution', {})))}</code>. "
+    f"Raw payloads: <code>{escape(os.path.basename(oha_submit_path))}</code>, "
+    f"<code>{escape(os.path.basename(oha_poll_path))}</code>.</p>"
+)
+
+parts.append("<h2>Parser, Expressions, Protocol</h2>")
+parts.append(f"<table>{STAT_HEAD}")
+parts.append(stat_row("Parse simple", "parse_simple_us", 1, "µs"))
+parts.append(stat_row("Parse matrix + expand", "parse_matrix_us", 1, "µs"))
+parts.append(stat_row("Parse complex DAG + expand", "parse_complex_us", 1, "µs"))
+parts.append(stat_row("Expression eval", "expr_eval_us", 2, "µs"))
+parts.append(stat_row("Expression eval throughput", "expr_evals_per_sec", 0, "evals/s"))
+parts.append(stat_row("Expression validate", "expr_validate_us", 2, "µs"))
+parts.append(stat_row("Serialize expanded jobs", "serde_expanded_ser_us", 1, "µs"))
+parts.append(stat_row("Deserialize expanded jobs", "serde_expanded_de_us", 1, "µs"))
+parts.append(stat_row("AppState::new (cold boot)", "cold_boot_ms", 1, "ms"))
+parts.append("</table>")
+evaluated = value("expr_evaluated_count")
+battery = value("expr_battery_size")
+if evaluated is not None and battery is not None:
+    parts.append(
+        f"<p>Expression preflight: {int(float(evaluated))} of "
+        f"{int(float(battery))} battery entries evaluate successfully; the "
+        "remainder need filesystem context (<code>hashFiles</code>) and are "
+        "reported rather than silently ignored.</p>"
+    )
+
+parts.append("<h2>Workspace Snapshots</h2>")
+parts.append(
+    "<p>Each trial starts from a brand new server state directory, so the cold "
+    "figure is genuinely uncached; warm figures are the submissions that follow "
+    "within the same trial.</p>"
+)
+snapshot_rows = []
+for label in ("small", "medium", "large", "xlarge"):
+    cold = value(f"snapshot_{label}_cold_ms")
+    if cold is None:
+        continue
+    snapshot_rows.append(
+        f"<tr><td>{label}</td><td>{fmt(f'snapshot_{label}_files', 0)}</td>"
+        f"<td>{fmt(f'snapshot_{label}_cold_ms', 1)}</td>"
+        f"<td>{fmt(f'snapshot_{label}_cold_ms_spread_pct', 1)}%</td>"
+        f"<td>{fmt(f'snapshot_{label}_warm_ms', 1)}</td>"
+        f"<td>{fmt(f'snapshot_{label}_warm_ms_spread_pct', 1)}%</td></tr>"
+    )
+parts.append(
+    "<table><tr><th>Size</th><th>Files</th><th>Cold median (ms)</th>"
+    "<th>Cold spread</th><th>Warm median (ms)</th><th>Warm spread</th></tr>"
+    + "".join(snapshot_rows)
+    + "</table>"
+)
+
+parts.append("<h2>Mixed Contention</h2>")
+parts.append(
+    "<p>32 workers issuing a 70/30 submission/poll mix for 5 seconds against a "
+    "server created fresh for each trial.</p>"
+)
+parts.append(f"<table>{STAT_HEAD}")
+parts.append(stat_row("Mixed ops/sec", "contention_mixed_rps"))
+parts.append(stat_row("Submissions per trial", "contention_submits"))
+parts.append(stat_row("Polls per trial", "contention_polls"))
+parts.append("</table>")
+contention_errors = value("contention_errors")
+if contention_errors is not None:
+    state = "pass" if float(contention_errors) == 0 else "fail"
+    parts.append(
+        f'<p>Rejected requests: <span class="{state}">'
+        f"{int(float(contention_errors))}</span></p>"
+    )
+
+if agent_ci.get("primary"):
+    parts.append("<h2>Preloop vs Agent-CI</h2>")
+    parts.append(
+        f"<p>Prior five-repo benchmark ({escape(str(agent_ci.get('date', 'undated run')))}). "
+        "Wall-clock seconds for a full workflow execution; not produced by this "
+        "harness run.</p>"
+    )
+    parts.append(
+        "<table><tr><th>Repository</th><th>System</th><th>Cold (s)</th>"
+        "<th>Warm (s)</th><th>Status</th><th>CLI RSS (MiB)</th></tr>"
+    )
+    for row in agent_ci["primary"]:
+        state = "pass" if row.get("cold") == "pass" else "fail"
+        rss = row.get("cli_max_rss_mib") or []
+        parts.append(
+            f"<tr><td>{escape(str(row.get('repository', '')))}</td>"
+            f"<td>{escape(str(row.get('system', '')))}</td>"
+            f"<td>{row.get('cold_s') if row.get('cold_s') is not None else '&mdash;'}</td>"
+            f"<td>{row.get('warm_s') if row.get('warm_s') is not None else '&mdash;'}</td>"
+            f'<td class="{state}">{escape(str(row.get("cold")))}/'
+            f'{escape(str(row.get("warm")))}</td>'
+            f"<td>{escape(' / '.join(f'{v:.1f}' for v in rss)) if rss else '&mdash;'}</td></tr>"
+        )
+    parts.append("</table>")
+
+if flamegraph_rel:
+    parts.append("<h2>Flamegraph</h2>")
+    parts.append(
+        f'<p>Standalone SVG: <a href="{escape(flamegraph_rel)}">{escape(flamegraph_rel)}</a>. '
+        "Linked rather than inlined to keep this dashboard small.</p>"
+    )
+
+parts.append("<h2>Methodology</h2>")
+parts.append(
+    """<div class="methodology">
+<h3>Repeatability</h3>
+<p>Every quantity is sampled over independent trials. Each trial builds its own
+<code>AppState</code> on a fresh temporary state directory, and inside the
+concurrency sweep every level gets its own server, so no measurement inherits a
+run list or object cache from an earlier phase. Tables report the median with
+min, max, and relative spread, so run-to-run noise is visible instead of being
+folded into a single headline number.</p>
+
+<h3>Concurrency sweep order</h3>
+<p>The sweep order is a seeded permutation that is mirrored on odd trials, so
+each level occupies early and late sweep positions equally often across a trial
+pair. The previous ascending-only sweep charged all machine warm-up to the
+lowest concurrency level and all thermal drift to the highest.</p>
+
+<h3>Failure handling</h3>
+<p>The harness fails closed: a missing tool, an <code>oha</code> flag the
+installed build rejects, a server that never answers <code>/healthz</code>,
+unparsable <code>METRIC</code> output, malformed JSON, zero successful responses,
+or any response at or above HTTP 400 aborts the run. No phase degrades into an
+empty section.</p>
+
+<h3>Surfaces</h3>
+<ul>
+<li><strong>Server load:</strong> sequential baseline, concurrency sweep at
+4/16/64/128 with 50 requests per worker, matrix and complex-DAG workflows, and a
+polling phase seeded to a fixed run-list length.</li>
+<li><strong>Real HTTP:</strong> <code>oha</code> against a live server on a
+loopback port with an isolated state directory and its own system token.</li>
+<li><strong>Snapshots:</strong> deterministic Git repositories from 100 to 10,000
+files; cold measured on fresh state, warm on the submissions that follow.</li>
+<li><strong>Parser / expressions / protocol:</strong> in-process loops with
+<code>std::hint::black_box</code>; the expression battery is preflighted so a
+uniformly failing evaluator cannot masquerade as a fast one.</li>
+<li><strong>Cold boot:</strong> repeated <code>AppState::new</code> on fresh
+temporary directories.</li>
+</ul>
+</div>"""
+)
+
 html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Preloop Performance Report — {datetime.now().strftime('%Y-%m-%d %H:%M')}</title>
+<title>Preloop Performance Dashboard — {datetime.now().strftime('%Y-%m-%d %H:%M')}</title>
 <style>
-:root {{
-  --bg: #0d1117; --fg: #c9d1d9; --accent: #58a6ff; --green: #3fb950;
-  --red: #f85149; --yellow: #d29922; --surface: #161b22; --border: #30363d;
-  --mono: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
-}}
-* {{ margin: 0; padding: 0; box-sizing: border-box; }}
-body {{
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
-  background: var(--bg); color: var(--fg); line-height: 1.6; padding: 2rem;
-  max-width: 1400px; margin: 0 auto;
-}}
-h1 {{ color: var(--accent); font-size: 1.8rem; margin-bottom: 0.5rem; }}
-h2 {{ color: var(--accent); font-size: 1.3rem; margin: 2rem 0 1rem; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }}
-h3 {{ color: var(--fg); font-size: 1.1rem; margin: 1.5rem 0 0.5rem; }}
-.subtitle {{ color: #8b949e; font-size: 0.9rem; margin-bottom: 2rem; }}
-.grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; }}
-.card {{
-  background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
-  padding: 1.2rem; transition: border-color 0.2s;
-}}
-.card:hover {{ border-color: var(--accent); }}
-.card h3 {{ margin-top: 0; font-size: 0.9rem; color: #8b949e; text-transform: uppercase; letter-spacing: 0.05em; }}
-.card .value {{ font-size: 2rem; font-weight: 700; color: var(--green); font-family: var(--mono); }}
-.card .unit {{ font-size: 0.8rem; color: #8b949e; }}
-.card.warn .value {{ color: var(--yellow); }}
-.card.bad .value {{ color: var(--red); }}
-table {{
-  width: 100%; border-collapse: collapse; margin: 1rem 0;
-  background: var(--surface); border-radius: 8px; overflow: hidden;
-}}
-th, td {{ padding: 0.7rem 1rem; text-align: left; border-bottom: 1px solid var(--border); }}
-th {{ background: #1c2128; color: var(--accent); font-weight: 600; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.04em; }}
-td {{ font-family: var(--mono); font-size: 0.9rem; }}
-tr:hover td {{ background: #1c2128; }}
-.pass {{ color: var(--green); }} .fail {{ color: var(--red); }}
-.section {{ margin: 2rem 0; }}
-.flamegraph-container {{ background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; overflow-x: auto; }}
-.flamegraph-container svg {{ width: 100%; height: auto; }}
-.log-entry {{ background: var(--surface); border-left: 3px solid var(--accent); padding: 0.8rem 1rem; margin: 0.5rem 0; border-radius: 0 4px 4px 0; }}
-.log-entry .timestamp {{ color: #8b949e; font-size: 0.8rem; }}
-.log-entry .detail {{ font-family: var(--mono); font-size: 0.85rem; margin-top: 0.3rem; }}
-.bar-chart {{ display: flex; align-items: end; gap: 4px; height: 120px; padding: 0.5rem 0; }}
-.bar {{ background: var(--accent); border-radius: 3px 3px 0 0; min-width: 40px; position: relative; transition: background 0.2s; }}
-.bar:hover {{ background: var(--green); }}
-.bar-label {{ position: absolute; bottom: -20px; left: 50%; transform: translateX(-50%); font-size: 0.7rem; color: #8b949e; white-space: nowrap; }}
-.bar-value {{ position: absolute; top: -20px; left: 50%; transform: translateX(-50%); font-size: 0.7rem; color: var(--fg); font-family: var(--mono); white-space: nowrap; }}
-.methodology {{ background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; font-size: 0.9rem; }}
-.methodology code {{ background: #1c2128; padding: 0.2em 0.4em; border-radius: 3px; font-family: var(--mono); font-size: 0.85em; }}
+@import url('https://fonts.googleapis.com/css2?family=Alegreya:wght@500;600;700&family=Source+Sans+3:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
+{CSS}
 </style>
 </head>
 <body>
-<h1>Preloop Performance Report</h1>
-<p class="subtitle">Generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} &middot; Apple M4 Max &middot; macOS arm64</p>
-
-<div id="metrics-summary"></div>
-<div id="server-load"></div>
-<div id="parser-bench"></div>
-<div id="expression-bench"></div>
-<div id="snapshot-bench"></div>
-<div id="contention-bench"></div>
-<div id="agent-ci-comparison"></div>
-<div id="flamegraph-section"></div>
-<div id="implementation-log"></div>
-<div id="methodology"></div>
-
-<script>
-// Metrics will be injected by the shell harness
-const METRICS = {{{{METRICS_PLACEHOLDER}}}};
-const AGENT_CI = {json.dumps(agent_ci)};
-const OHA_DATA = {json.dumps(oha_data)};
-
-function card(title, value, unit, cls) {{
-  return '<div class="card ' + (cls||'') + '"><h3>' + title + '</h3><div class="value">' + value + '</div><div class="unit">' + unit + '</div></div>';
-}}
-
-function fmt(v, d) {{ return v ? Number(v).toFixed(d||0) : '—'; }}
-
-// Summary cards
-let summary = '<h2>Summary</h2><div class="grid">';
-summary += card('Server Peak RPS', fmt(METRICS.server_rps), 'requests/sec');
-summary += card('Sequential Latency', fmt(METRICS.server_sequential_latency_ms, 2), 'ms/request');
-summary += card('Cold Boot', fmt(METRICS.cold_boot_median_ms, 1), 'ms (AppState::new)');
-summary += card('Parser (simple)', fmt(METRICS.parse_simple_us, 1), 'µs/parse');
-summary += card('Expr Eval', fmt(METRICS.expr_eval_us, 2), 'µs/eval');
-summary += card('Mixed Contention', fmt(METRICS.contention_mixed_rps), 'ops/sec @ 32 threads');
-if (METRICS.http_rps) summary += card('HTTP RPS (oha)', fmt(METRICS.http_rps), 'req/sec (real TCP)');
-summary += '</div>';
-document.getElementById('metrics-summary').innerHTML = summary;
-
-// Server load details
-let sl = '<h2>Server Load Test</h2>';
-sl += '<p>In-process axum router (tower::ServiceExt::oneshot) — zero network overhead, pure handler throughput.</p>';
-sl += '<table><tr><th>Concurrency</th><th>RPS</th><th>Avg Latency</th><th>Errors</th></tr>';
-for (let c of [4, 16, 64, 128]) {{
-  let rps = METRICS['server_rps_c' + c];
-  let lat = METRICS['server_avg_ms_c' + c];
-  let err = METRICS['server_errors_c' + c];
-  if (rps !== undefined) {{
-    sl += '<tr><td>' + c + '</td><td>' + fmt(rps) + '</td><td>' + fmt(lat, 2) + ' ms</td><td>' + fmt(err) + '</td></tr>';
-  }}
-}}
-sl += '</table>';
-sl += '<table><tr><th>Workload</th><th>RPS</th></tr>';
-sl += '<tr><td>Simple (sequential)</td><td>' + fmt(METRICS.server_sequential_rps) + '</td></tr>';
-sl += '<tr><td>Matrix 4-shard (c=16)</td><td>' + fmt(METRICS.server_matrix_rps) + '</td></tr>';
-sl += '<tr><td>Complex DAG (sequential)</td><td>' + fmt(METRICS.server_complex_dag_rps) + '</td></tr>';
-sl += '<tr><td>GET /runs polling</td><td>' + fmt(METRICS.server_poll_rps) + '</td></tr>';
-sl += '</table>';
-if (OHA_DATA.summary) {{
-  sl += '<h3>Real HTTP (oha, 10s, 32 connections)</h3>';
-  sl += '<table><tr><th>Metric</th><th>Value</th></tr>';
-  let s = OHA_DATA.summary || {{}};
-  sl += '<tr><td>Requests/sec</td><td>' + fmt(s.requestsPerSec, 1) + '</td></tr>';
-  sl += '<tr><td>Total requests</td><td>' + fmt(s.total) + '</td></tr>';
-  sl += '<tr><td>Slowest</td><td>' + fmt((s.slowest||0)*1000, 2) + ' ms</td></tr>';
-  sl += '<tr><td>Fastest</td><td>' + fmt((s.fastest||0)*1000, 2) + ' ms</td></tr>';
-  sl += '<tr><td>Average</td><td>' + fmt((s.average||0)*1000, 2) + ' ms</td></tr>';
-  sl += '</table>';
-}}
-document.getElementById('server-load').innerHTML = sl;
-
-// Parser benchmark
-let pb = '<h2>Parser Benchmark</h2>';
-pb += '<p>1000 iterations each: parse YAML → typed model → matrix expansion → DAG.</p>';
-pb += '<table><tr><th>Workflow</th><th>Time (µs/iter)</th></tr>';
-pb += '<tr><td>Simple (1 job, 1 step)</td><td>' + fmt(METRICS.parse_simple_us, 1) + '</td></tr>';
-pb += '<tr><td>Matrix (4 shards)</td><td>' + fmt(METRICS.parse_matrix_us, 1) + '</td></tr>';
-pb += '<tr><td>Complex DAG (4 jobs, needs chain)</td><td>' + fmt(METRICS.parse_complex_us, 1) + '</td></tr>';
-pb += '</table>';
-document.getElementById('parser-bench').innerHTML = pb;
-
-// Expression benchmark
-let eb = '<h2>Expression Evaluator</h2>';
-eb += '<p>20 expression battery × 5000 iterations = 100K evaluations.</p>';
-eb += '<table><tr><th>Metric</th><th>Value</th></tr>';
-eb += '<tr><td>Eval time</td><td>' + fmt(METRICS.expr_eval_us, 2) + ' µs/eval</td></tr>';
-eb += '<tr><td>Throughput</td><td>' + fmt(METRICS.expr_evals_per_sec) + ' evals/sec</td></tr>';
-eb += '<tr><td>Validate (parse-only)</td><td>' + fmt(METRICS.expr_validate_us, 2) + ' µs/expr</td></tr>';
-eb += '</table>';
-document.getElementById('expression-bench').innerHTML = eb;
-
-// Snapshot benchmark
-let sb = '<h2>Workspace Snapshot Benchmark</h2>';
-sb += '<p>git-based workspace snapshot creation at varying project sizes. Cold = no cache, Warm = with object cache.</p>';
-sb += '<table><tr><th>Size</th><th>Files</th><th>Cold (ms)</th><th>Warm (ms)</th></tr>';
-for (let [label, count] of [['small', 100], ['medium', 1000], ['large', 5000], ['xlarge', 10000]]) {{
-  let cold = METRICS['snapshot_' + label + '_cold_ms'];
-  let warm = METRICS['snapshot_' + label + '_warm_ms'];
-  if (cold !== undefined) {{
-    sb += '<tr><td>' + label + '</td><td>' + count + '</td><td>' + fmt(cold, 1) + '</td><td>' + fmt(warm, 1) + '</td></tr>';
-  }}
-}}
-sb += '</table>';
-document.getElementById('snapshot-bench').innerHTML = sb;
-
-// Contention benchmark
-let cb = '<h2>Mutex Contention (Mixed Workload)</h2>';
-cb += '<p>32 concurrent workers, 70% submissions / 30% polls, 5 seconds sustained.</p>';
-cb += '<table><tr><th>Metric</th><th>Value</th></tr>';
-cb += '<tr><td>Mixed ops/sec</td><td>' + fmt(METRICS.contention_mixed_rps) + '</td></tr>';
-cb += '<tr><td>Total submissions</td><td>' + fmt(METRICS.contention_submits) + '</td></tr>';
-cb += '<tr><td>Total polls</td><td>' + fmt(METRICS.contention_polls) + '</td></tr>';
-cb += '<tr><td>Errors</td><td>' + fmt(METRICS.contention_errors) + '</td></tr>';
-cb += '</table>';
-document.getElementById('contention-bench').innerHTML = cb;
-
-// Agent-CI comparison
-if (AGENT_CI.primary) {{
-  let ac = '<h2>Preloop vs Agent-CI Comparison</h2>';
-  ac += '<p>Five-repo benchmark from {agent_ci.get("date", "prior run")}. Wall-clock seconds for full workflow execution.</p>';
-  ac += '<table><tr><th>Repository</th><th>System</th><th>Cold (s)</th><th>Warm (s)</th><th>Status</th><th>CLI RSS (MiB)</th></tr>';
-  for (let row of AGENT_CI.primary) {{
-    let cls = row.cold === 'pass' ? 'pass' : row.cold === 'fail' ? 'fail' : '';
-    ac += '<tr><td>' + row.repository + '</td><td>' + row.system + '</td>';
-    ac += '<td>' + (row.cold_s !== null ? fmt(row.cold_s, 2) : '—') + '</td>';
-    ac += '<td>' + (row.warm_s !== null ? fmt(row.warm_s, 2) : '—') + '</td>';
-    ac += '<td class="' + cls + '">' + row.cold + '/' + row.warm + '</td>';
-    ac += '<td>' + (row.cli_max_rss_mib ? row.cli_max_rss_mib.map(v => fmt(v, 1)).join(' / ') : '—') + '</td></tr>';
-  }}
-  ac += '</table>';
-  ac += '<h3>Key Observations</h3><ul>';
-  ac += '<li>Preloop CLI RSS: ~20 MiB (thin client). Agent-CI: 280-380 MiB (bundled runtime).</li>';
-  ac += '<li>Preloop warm wins: ripgrep (11s vs 14.5s), testcontainers-go (7.4s vs 10.5s).</li>';
-  ac += '<li>Agent-CI wins on setup-heavy: Vite (38.7s vs 92.5s), Flask (9.9s vs 131s).</li>';
-  ac += '<li>Cold boot penalty: Preloop pays VM boot + apt install on first run.</li>';
-  ac += '</ul>';
-  document.getElementById('agent-ci-comparison').innerHTML = ac;
-}}
-
-// Flamegraph
-if ({json.dumps(bool(flamegraph_svg))}) {{
-  document.getElementById('flamegraph-section').innerHTML =
-    '<h2>Flamegraph</h2><div class="flamegraph-container">{flamegraph_svg.replace(chr(10), "").replace("'", "\\'")[:100000] if flamegraph_svg else ""}</div>';
-}}
-
-// Implementation log
-let il = '<h2>Implementation Log</h2>';
-il += '<div class="log-entry"><div class="timestamp">Phase 1: Baseline Measurement</div>';
-il += '<div class="detail">Established baseline metrics across all performance surfaces: server throughput, parser speed, expression evaluation, snapshot creation, mutex contention, and cold boot time.</div></div>';
-il += '<div class="log-entry"><div class="timestamp">Benchmark Surfaces</div>';
-il += '<div class="detail">';
-il += '<strong>Server Load:</strong> Tested at concurrency 4/16/64/128 with simple, matrix, and complex DAG workflows. ';
-il += 'Mixed workload (70% writes, 30% reads) sustained for 5 seconds at 32 threads.<br>';
-il += '<strong>Snapshotting:</strong> Benchmarked git-based workspace snapshots from 100 to 10,000 files. ';
-il += 'Measures both cold (no object cache) and warm (cached) paths.<br>';
-il += '<strong>Parser:</strong> Workflow YAML parsing + matrix expansion + DAG construction.<br>';
-il += '<strong>Expressions:</strong> 20-expression battery evaluated 5000× each.<br>';
-il += '<strong>Protocol:</strong> Serialization/deserialization of expanded job plans.<br>';
-il += '<strong>Cold Boot:</strong> AppState::new() which generates RSA keypairs and OIDC material.';
-il += '</div></div>';
-il += '<div class="log-entry"><div class="timestamp">Architecture Notes</div>';
-il += '<div class="detail">';
-il += 'The server uses <code>Arc&lt;Mutex&lt;InnerState&gt;&gt;</code> for all mutable state. ';
-il += 'Under high concurrency, this single mutex is the primary contention point. ';
-il += 'Every workflow submission acquires the lock to: parse YAML, expand matrix, build job messages, queue jobs, emit events. ';
-il += 'GET /runs also acquires the lock to read run state.<br><br>';
-il += 'Potential optimization paths:<br>';
-il += '• Split InnerState into read-heavy (runs, jobs) and write-heavy (queue, sessions) behind separate locks<br>';
-il += '• Use RwLock for read-dominated paths (run listing, status polling)<br>';
-il += '• Move YAML parsing and matrix expansion outside the lock<br>';
-il += '• Pre-compute workflow expansions on submission, cache by content hash<br>';
-il += '• Snapshot: parallel git operations, object cache warming strategies';
-il += '</div></div>';
-
-document.getElementById('implementation-log').innerHTML = il;
-
-// Methodology
-document.getElementById('methodology').innerHTML = `
-<h2>Methodology</h2>
-<div class="methodology">
-<h3>Server Load Test</h3>
-<p>Uses <code>tower::ServiceExt::oneshot</code> to send requests directly to the axum router,
-bypassing TCP/TLS. This measures pure handler + state management throughput without
-network overhead. Concurrency is achieved via <code>tokio::spawn</code>.</p>
-<p>HTTP test via <code>oha</code> (if available) provides real-network-path numbers for comparison.</p>
-
-<h3>Snapshot Benchmark</h3>
-<p>Creates deterministic Git repositories with 100–10,000 files, then measures
-<code>create_workspace_snapshot()</code> through the <code>POST /api/v1/runs</code> endpoint.
-Cold = fresh state directory, Warm = reusing the object cache from a prior snapshot.</p>
-
-<h3>Parser Benchmark</h3>
-<p>Direct calls to <code>parse_workflow()</code> and <code>expand_jobs()</code> with
-<code>std::hint::black_box</code> to prevent dead-code elimination. 1000 iterations each.</p>
-
-<h3>Expression Evaluator</h3>
-<p>20 representative expressions covering comparisons, string functions, format(),
-JSON operations, status checks, and boolean logic. Each evaluated 5000 times against
-a realistic context (github, matrix, needs, steps, runner).</p>
-
-<h3>Mutex Contention</h3>
-<p>32 concurrent workers sending a 70/30 mix of POST submissions and GET polls for
-5 seconds. This simulates a busy server handling multiple CI pipelines simultaneously
-and reveals <code>Arc&lt;Mutex&lt;InnerState&gt;&gt;</code> contention.</p>
-
-<h3>Agent-CI Comparison</h3>
-<p>Prior benchmark data from five real-world repositories (ripgrep, flask, vite, chi,
-testcontainers-go). Preloop runs workflows in SmolVM guests; Agent-CI runs natively.
-Both measure wall-clock time for the full workflow lifecycle.</p>
-</div>`;
-
-</script>
+<h1>Preloop Performance Dashboard</h1>
+<p class="subtitle">Machine-generated by <code>autoresearch.sh</code> on
+{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} &middot;
+{escape(host['cpu'])} &middot; {escape(host['os'])} {escape(host['arch'])}</p>
+<p class="subtitle">This file is overwritten on every run. The curated
+write-up lives in <code>report.html</code> and
+<code>implementation-report.html</code> and is not generated by this harness.</p>
+{''.join(parts)}
+<footer>preloop-loadtest + oha {escape(tools['oha'])} &middot; metrics in
+<code>{escape(os.path.basename(metrics_path))}</code> &middot; environment in
+<code>{escape(os.path.basename(environment_path))}</code></footer>
 </body>
-</html>"""
+</html>
+"""
 
-with open(report_path, 'w') as f:
-    f.write(html)
-
-print(f"Report written to {report_path}", file=sys.stderr)
+with open(report_path, "w") as handle:
+    handle.write(html)
+print(f"[harness] Dashboard written to {report_path}", file=sys.stderr)
 PYEOF
 
-# ── inject metrics into HTML report ──────────────────────────────────────────
-
-# Parse METRIC lines into JSON and inject into the HTML
-python3 - "$METRIC_OUTPUT" "$REPORT_HTML" <<'INJECT_PYEOF'
-import sys, json, re
-
-metric_text = sys.argv[1]
-report_path = sys.argv[2]
-
-metrics = {}
-for line in metric_text.strip().split('\n'):
-    m = re.match(r'^METRIC\s+(\S+)=(\S+)', line)
-    if m:
-        key, val = m.group(1), m.group(2)
-        try:
-            metrics[key] = float(val)
-        except ValueError:
-            metrics[key] = val
-
-# Save metrics JSON
-metrics_path = report_path.replace('report.html', 'metrics.json')
-with open(metrics_path, 'w') as f:
-    json.dump(metrics, f, indent=2)
-
-# Inject into HTML
-with open(report_path) as f:
-    html = f.read()
-
-html = html.replace('{{METRICS_PLACEHOLDER}}', json.dumps(metrics))
-
-with open(report_path, 'w') as f:
-    f.write(html)
-
-print(f"Metrics injected into {report_path}", file=sys.stderr)
-print(f"Metrics saved to {metrics_path}", file=sys.stderr)
-INJECT_PYEOF
-
-log "HTML report: ${REPORT_HTML}"
+log "HTML dashboard: ${HARNESS_REPORT}"
+log "Metrics: ${METRICS_FILE}"
 log "Done."
