@@ -84,10 +84,15 @@ rust_out
 /goal
  # Conformance capture artifacts (timestamped runs, crypto material)                                                                             
 /benchmarks/compatibility/conformance/
-
+benchmarks/real-world/externals
 # Real-world benchmark raw run data (keep reports, drop logs/zips)
 benchmarks/real-world/results/aksh-runs/**/logs/
 benchmarks/real-world/results/aksh-runs/**/logs.zip
 
 # Scratch bench scripts at root
 /bench-cache.* 
+.connectionData
+.commandcode/
+experiments/mitm/golden-fresh/
+benchmarks/real-world/results/aksh-runs/
+benchmarks/compatibility/runner/behavior/*-new.jsonl
