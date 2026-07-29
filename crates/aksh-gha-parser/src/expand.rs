@@ -806,7 +806,7 @@ fn expand_matrix(
             let value = eval_expression(expression, &expression_context(&IndexMap::new(), inputs))
                 .map_err(|error| ParserError::InvalidExpression(error.to_string()))?;
             if value.is_null() {
-                return Ok(vec![IndexMap::new()]);
+                return Ok(vec![]);
             }
             serde_json::from_value(value).map_err(|error| {
                 ParserError::InvalidExpression(format!(
