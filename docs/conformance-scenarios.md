@@ -64,6 +64,35 @@ a unique workflow fixture basename matching the directory name because the offic
 | 34 | `34-container-with-checkout` | checkout inside a job container | yes |
 | 35 | `35-container-lifecycle` | lifecycle and continue-on-error | yes |
 | 36 | `36-docker-action` | `docker://` action references | yes |
+| 101 | `101-dynamic-matrix-dataflow` | dynamic matrix expansion via fromJson step outputs | pending |
+| 102 | `102-mask-and-secret-propagation` | add-mask redaction and multiline env/output commands | pending |
+| 103 | `103-composite-nested-post` | composite action step tree and post execution order | pending |
+| 104 | `104-job-defaults-env-cascade` | defaults.run scoping and env precedence cascade | pending |
+| 105 | `105-concurrency-cancellation-group` | concurrency locks and mid-flight cancellation signals | pending |
+| 107 | `107-continue-on-error-status-funcs` | continue-on-error and status functions (always/failure) | pending |
+| 108 | `108-workflow-dispatch-inputs` | workflow_dispatch schema defaults and input context | pending |
+| 109 | `109-log-streaming-backpressure` | high-frequency streaming, ANSI codes, long lines | pending |
+| 110 | `110-environment-deployment-url` | environment deployment lifecycle with dynamic URL outputs | pending |
+| 111 | `111-github-state-post-execution` | GITHUB_STATE persistence across post step execution | pending |
+| 112 | `112-service-container-health-ports` | service container health check polling and port bindings | pending |
+| 113 | `113-artifact-v4-multi-pattern` | artifact v4 multi-pattern glob include/exclude and download | pending |
+| 114 | `114-step-timeout-graceful-kill` | step timeout enforcement and signal escalation | pending |
+| 115 | `115-cache-v2-restore-fallback` | cache v2 key miss and restore-keys prefix fallback | pending |
+| 101 | `101-dynamic-matrix-dataflow` | dynamic matrix expansion via fromJson step outputs | yes |
+| 102 | `102-mask-and-secret-propagation` | add-mask redaction and multiline env/output commands | yes |
+| 103 | `103-composite-nested-post` | composite action step tree and post execution order | yes |
+| 104 | `104-job-defaults-env-cascade` | defaults.run scoping and env precedence cascade | yes |
+| 105 | `105-concurrency-cancellation-group` | concurrency locks and mid-flight cancellation signals | yes |
+| 107 | `107-continue-on-error-status-funcs` | continue-on-error and status functions (always/failure) | yes |
+| 108 | `108-workflow-dispatch-inputs` | workflow_dispatch schema defaults and input context | yes |
+| 109 | `109-log-streaming-backpressure` | high-frequency streaming, ANSI codes, long lines | yes |
+| 110 | `110-environment-deployment-url` | environment deployment lifecycle with dynamic URL outputs | yes |
+| 111 | `111-github-state-post-execution` | GITHUB_STATE persistence across post step execution | yes |
+| 112 | `112-service-container-health-ports` | service container health check polling and port bindings | yes |
+| 113 | `113-artifact-v4-multi-pattern` | artifact v4 multi-pattern glob include/exclude and download | yes |
+| 114 | `114-step-timeout-graceful-kill` | step timeout enforcement and signal escalation | yes |
+| 115 | `115-cache-v2-restore-fallback` | cache v2 key miss and restore-keys prefix fallback | yes |
+| 163 | `163-reusable-caller` | local reusable workflows, input types, output mapping | yes |
 
 ## Files generated
 
@@ -75,6 +104,8 @@ For each scenario `NN-name`:
 `13-composite-action` also includes `actions/greet/action.yml` as the helper composite-action
 fixture to copy into the recording repository at `.github/actions/greet/action.yml` before official
 recording.
+`163-reusable-caller` also includes `workflows/reusable.yml` as the helper reusable workflow
+fixture to copy into the recording repository at `.github/workflows/reusable.yml`.
 
 ## Recording official goldens
 

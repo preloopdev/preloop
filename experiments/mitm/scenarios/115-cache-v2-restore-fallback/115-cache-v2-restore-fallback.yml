@@ -1,0 +1,16 @@
+name: 115-cache-v2-restore-fallback
+on: workflow_dispatch
+jobs:
+  cache-test:
+    runs-on: self-hosted
+    steps:
+      - id: generate-files
+        run: echo "data" > cache-file.txt
+
+      - uses: actions/cache@v4
+        with:
+          path: cache-file.txt
+          key: cache-v2-${{ runner.os }}-exact-unique-key-1
+          restore-keys: |
+            cache-v2-${{ runner.os }}-exact-
+            cache-v2-${{ runner.os }}-

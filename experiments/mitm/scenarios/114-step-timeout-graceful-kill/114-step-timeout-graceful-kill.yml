@@ -1,0 +1,15 @@
+name: 114-step-timeout-graceful-kill
+on: workflow_dispatch
+jobs:
+  timeout-test:
+    runs-on: self-hosted
+    steps:
+      - name: Hanging step
+        timeout-minutes: 1
+        run: |
+          trap 'echo "SIGINT received"' INT
+          sleep 120
+
+      - name: Post-timeout cleanup
+        if: always()
+        run: echo "Executed post-timeout cleanup"
