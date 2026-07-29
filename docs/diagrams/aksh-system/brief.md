@@ -31,7 +31,7 @@ Audience: maintainers, contributors, infrastructure engineers, and users evaluat
 ## Assumptions
 
 1. The modern broker + Twirp path is the primary runtime path; AzDO endpoints remain runner-compatible and are shown where they clarify the shared protocol surface.
-2. `actions/runner` compatibility targets v2.336.0 in current repository status, while the checked conformance golden baseline remains v2.335.1.
+2. `actions/runner` compatibility and the checked conformance golden baseline both target v2.336.0.
 3. “Official runner” and `aksh-runner` are alternative clients of the same control plane; diagrams do not imply that both execute the same job simultaneously.
 4. Default run/queue/session state is in memory. Cache, artifact, action, blob, and OIDC key material are file-backed under `.aksh/`; deployment-specific backend traits may replace those defaults.
 5. The Preloop VM diagram describes the optional product/orchestrator layer present in this workspace. aksh itself remains execution-agnostic and works with external runners.
