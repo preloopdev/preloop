@@ -1,0 +1,101 @@
+name: bench-cache-vite
+
+on:
+  push:
+  pull_request:
+
+# Benchmark workflow simulating a Vite project's cache patterns.
+# Measures cache restore/save timing with realistic data sizes.
+# First run: cold (miss), second run: warm (hit).
+
+jobs:
+  vite-bench:
+    runs-on: self-hosted
+    steps:
+      - name: create simulated node_modules
+        run: |
+          # Simulate a realistic pnpm node_modules tree
+          # Typical Vite project: ~50-200 MB of dependencies
+          mkdir -p node_modules/.pnpm
+          # Create ~100 MB of realistic package content
+          for i in $(seq 1 500); do
+            dd if=/dev/urandom of=node_modules/.pnpm/pkg-$i.bin bs=1024 count=200 2>/dev/null
+          done
+          # Create package structure
+          mkdir -p node_modules/vite/dist node_modules/react/dist node_modules/typescript/lib
+          for dir in node_modules/vite node_modules/react node_modules/typescript; do
+            dd if=/dev/urandom of=$dir/index.js bs=1024 count=50 2>/dev/null
+            echo '{"name":"'"$dir"'","version":"5.0.0"}' > $dir/package.json
+          done
+          echo "node_modules size: $(du -sh node_modules | cut -f1)"
+
+      - name: create simulated .vite cache
+        run: |
+          # Simulate Vite's transform cache
+          mkdir -p node_modules/.vite/deps
+          for i in $(seq 1 200); do
+            dd if=/dev/urandom of=node_modules/.vite/deps/chunk-$i.js bs=1024 count=10 2>/dev/null
+          done
+          echo ".vite cache size: $(du -sh node_modules/.vite | cut -f1)"
+
+      - name: save node_modules cache
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: bench-vite-node-modules-${{ github.run_id }}
+
+      - name: save .vite cache
+        uses: actions/cache@v4
+        with:
+          path: node_modules/.vite
+          key: bench-vite-deps-${{ github.run_id }}
+
+      - name: simulate build (touch outputs)
+        run: |
+          mkdir -p dist
+          echo "build output" > dist/index.html
+
+      - name: verify cache was saved
+        run: |
+          echo "=== Cache bench: Vite patterns ==="
+          echo "node_modules: $(find node_modules -type f | wc -l) files, $(du -sh node_modules | cut -f1)"
+          echo ".vite cache: $(find node_modules/.vite -type f 2>/dev/null | wc -l) files"
+          echo "Cache keys:"
+          echo "  node_modules: bench-vite-node-modules-${{ github.run_id }}"
+          echo "  .vite deps: bench-vite-deps-${{ github.run_id }}"
+
+  vite-bench-restore:
+    runs-on: self-hosted
+    needs: vite-bench
+    steps:
+      - name: verify cache restore timing
+        run: |
+          echo "=== Cache restore benchmark ==="
+          echo "This job tests cache hit behavior."
+          echo "The restore step in the next job should hit the cache."
+
+      - name: restore node_modules (expect hit)
+        id: restore-nm
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: bench-vite-node-modules-${{ github.run_id }}
+
+      - name: restore .vite cache (expect hit)
+        id: restore-vite
+        uses: actions/cache@v4
+        with:
+          path: node_modules/.vite
+          key: bench-vite-deps-${{ github.run_id }}
+
+      - name: verify restored content
+        run: |
+          echo "node_modules cache-hit: ${{ steps.restore-nm.outputs.cache-hit }}"
+          echo ".vite cache-hit: ${{ steps.restore-vite.outputs.cache-hit }}"
+          if [ -d node_modules ] && [ "$(find node_modules -type f | wc -l)" -gt 10 ]; then
+            echo "node_modules RESTORE OK: $(find node_modules -type f | wc -l) files"
+          else
+            echo "ERROR: node_modules restore failed"
+            exit 1
+          fi
+          echo "=== Benchmark complete ==="
