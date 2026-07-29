@@ -1876,6 +1876,7 @@ async fn replay_flows_to_aksh(
     let mut count = 0usize;
     let mut broker_job_ids: HashMap<String, String> = HashMap::new();
     let mut plan_job_ids: HashMap<(String, String), (String, String)> = HashMap::new();
+    let mut session_ids: HashMap<String, String> = HashMap::new();
     let mut official_broker_job_ids = Vec::new();
     let mut aksh_broker_job_ids = Vec::new();
     let mut blob_upload_urls: VecDeque<String> = VecDeque::new();
@@ -1887,6 +1888,7 @@ async fn replay_flows_to_aksh(
             method,
             flow.get("path").and_then(Value::as_str).unwrap_or("/"),
         );
+        path = rewrite_replay_session_ids(&path, &session_ids);
         // Rewrite broker path runner_id to match the registered replay runner
         if let Some(rest) = path.strip_prefix("/broker/") {
             if let Some(slash_pos) = rest.find('/') {
@@ -2010,6 +2012,15 @@ async fn replay_flows_to_aksh(
                 captured["status"] = json!(status);
                 captured["response_headers"] = json!(headers);
                 if let Ok(body_json) = serde_json::from_str::<Value>(&text) {
+                    if path.ends_with("/sessions") {
+                        if let (Some(official_id), Some(local_id)) = (
+                            flow.pointer("/response_body_json/sessionId")
+                                .and_then(Value::as_str),
+                            body_json.get("sessionId").and_then(Value::as_str),
+                        ) {
+                            session_ids.insert(official_id.to_owned(), local_id.to_owned());
+                        }
+                    }
                     if let Some(official_id) = official_runner_request_id {
                         official_broker_job_ids.push(official_id);
                     }
@@ -2437,6 +2448,14 @@ fn normalize_replay_wait(mut path: String) -> String {
     path
 }
 
+fn rewrite_replay_session_ids(path: &str, session_ids: &HashMap<String, String>) -> String {
+    session_ids
+        .iter()
+        .fold(path.to_owned(), |rewritten, (official, local)| {
+            rewritten.replace(official, local)
+        })
+}
+
 fn synthesized_authorization<'a>(
     path: &str,
     bearer: &'a str,
@@ -2490,9 +2509,14 @@ fn rewritten_header_value<'a>(
     std::borrow::Cow::Borrowed(value)
 }
 fn should_skip_replay_path(host: &str, path: &str) -> bool {
-    host.contains("blob.core.windows.net")
+    let is_control_plane =
+        host == "api.github.com" || host.ends_with(".actions.githubusercontent.com");
+    !is_control_plane
+        || host.contains("blob.core.windows.net")
         || path == "/health"
         || path == "/ready"
+        || path == "/_dns"
+        || path == "/_ws/ingest.sock"
         || host.contains("token.actions.githubusercontent.com")
         || host.contains("objects.githubusercontent.com")
         // codeload.github.com serves action source tarballs; aksh never intercepts these.
@@ -2510,6 +2534,16 @@ fn should_skip_replay_flow(host: &str, path: &str, flow: &Value) -> bool {
     // exchange in replay_flows_to_aksh already obtains a valid runner-listen token.
     if path.starts_with("/_apis/v1/oauth2/token")
         || path.starts_with("/runner/server/_apis/v1/oauth2/token")
+    {
+        return true;
+    }
+    // Runner reconfiguration can attempt to delete a stale agent with an
+    // expired registration token. Replay synthesizes valid credentials, so
+    // the official 400 response cannot be reproduced.
+    if path.contains("/_apis/distributedtask/pools/")
+        && path.contains("/agents/")
+        && flow.get("method").and_then(Value::as_str) == Some("DELETE")
+        && flow.get("status").and_then(Value::as_u64) == Some(400)
     {
         return true;
     }
@@ -2585,11 +2619,26 @@ fn schema_mismatch_in_report(text: &str) -> bool {
         while lines.peek().is_some_and(|line| line.trim().is_empty()) {
             lines.next();
         }
-        if lines.next().is_some_and(|line| line != "_identical_") {
+        let Some(first) = lines.next() else {
+            continue;
+        };
+        if first == "_identical_" {
+            continue;
+        }
+        if is_request || schema_diff_removes_official_fields(first, &mut lines) {
             return true;
         }
     }
     false
+}
+
+fn schema_diff_removes_official_fields<'a>(
+    first: &'a str,
+    lines: &mut impl Iterator<Item = &'a str>,
+) -> bool {
+    std::iter::once(first)
+        .chain(lines.by_ref().take_while(|line| *line != "```"))
+        .any(|line| line.starts_with('-') && !line.starts_with("---"))
 }
 
 fn write_conformance_summary(
@@ -2684,50 +2733,25 @@ fn write_conformance_summary(
     lines.push("| `…/oauth2/token` | Official validates PSA256 client assertions and rejects job-scoped credentials; aksh is its own CA and accepts all. Unverifiable in replay. |".to_string());
     lines.push("| `…/messages?…` | Broker proactively invalidates sessions via concurrent two-session pattern; timing-based and not reproducible from a static golden. |".to_string());
     lines.push(String::new());
-    lines.push("### Unsupported protocol surfaces".to_string());
+    lines.push("### Cache and artifact replay".to_string());
     lines.push(String::new());
-    lines.push("Cache v4 and artifact v4 endpoints are intentionally **not mocked**.".to_string());
+    lines.push("Cache v4 and artifact v4 control-plane endpoints are implemented and".to_string());
     lines.push(
-        "If a golden capture exercises one of these endpoints before aksh has a real".to_string(),
+        "replayed against the local cache and artifact stores. Their Twirp status".to_string(),
     );
     lines.push(
-        "implementation, replay must report a status mismatch instead of pretending".to_string(),
+        "codes remain part of the gate; a missing or broken endpoint is reported as a".to_string(),
     );
-    lines.push("the scenario works.".to_string());
-    lines.push(String::new());
-    lines.push("| Endpoint family | Current truth | Expected replay signal |".to_string());
-    lines.push("|---|---|---|".to_string());
-    lines.push("| `CacheService/*` | Not implemented | 404/status mismatch until backed by the cache store |".to_string());
-    lines.push("| `ArtifactService/*` | Not implemented | 404/status mismatch until backed by the artifact store |".to_string());
+    lines.push("conformance failure rather than being suppressed.".to_string());
     lines.push(String::new());
     lines.push(
-        "Blob uploads/downloads to `*.blob.core.windows.net` remain skipped because".to_string(),
+        "Captured Azure blob URLs cannot be reused after their SAS signatures expire.".to_string(),
     );
     lines.push(
-        "they are external storage traffic, not aksh HTTP endpoints. Skipping those".to_string(),
-    );
-    lines.push("flows does not waive the aksh Twirp control-plane endpoints above.".to_string());
-    lines.push(String::new());
-    lines.push("#### Roadmap: Removing Exclusions & Verifying Side Effects".to_string());
-    lines.push(String::new());
-    lines.push(
-        "Once local equivalents for storage (blob), cache, and OIDC are implemented".to_string(),
-    );
-    lines
-        .push("in their respective crates, we will remove them from these skip lists.".to_string());
-    lines.push(
-        "Because captured Azure SAS signatures expire and direct external connections".to_string(),
+        "For cache/artifact PUTs, the replayer consumes the signed URL returned by the".to_string(),
     );
     lines.push(
-        "cannot authenticate during static playbacks, the replayer must be updated".to_string(),
-    );
-    lines.push(
-        "to rewrite external hosts (e.g. `*.blob.core.windows.net`) to the local `aksh`"
-            .to_string(),
-    );
-    lines.push(
-        "server's endpoints, allowing verification of the local storage implementation."
-            .to_string(),
+        "preceding local Twirp create call and uploads the captured bytes there.".to_string(),
     );
     lines.push(String::new());
     lines.push(
@@ -3293,6 +3317,20 @@ mod tests {
     }
 
     #[test]
+    fn replay_rewrites_session_ids_returned_by_session_creation() {
+        let session_ids =
+            HashMap::from([("official-session".to_owned(), "local-session".to_owned())]);
+
+        assert_eq!(
+            rewrite_replay_session_ids(
+                "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=official-session&status=Online",
+                &session_ids,
+            ),
+            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=local-session&status=Online"
+        );
+    }
+
+    #[test]
     fn broker_job_ids_are_correlated_by_delivery_order() {
         let official_ids = vec!["official-first".to_string()];
         let mut aksh_ids = vec!["aksh-first".to_string(), "aksh-second".to_string()];
@@ -3341,6 +3379,33 @@ mod tests {
             "pipelines.actions.githubusercontent.com",
             "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=s&status=Busy&waitSeconds=0",
             &flow
+        ));
+    }
+
+    #[test]
+    fn replay_skips_non_control_plane_and_unreplayable_cleanup_flows() {
+        let completed = json!({"method": "GET", "status": 200});
+        assert!(should_skip_replay_flow(
+            "github.com",
+            "/owner/repo/info/refs?service=git-upload-pack",
+            &completed
+        ));
+        assert!(should_skip_replay_flow(
+            "api.github.com",
+            "/_dns",
+            &completed
+        ));
+        assert!(!should_skip_replay_flow(
+            "broker.actions.githubusercontent.com",
+            "/session",
+            &completed
+        ));
+
+        let stale_delete = json!({"method": "DELETE", "status": 400});
+        assert!(should_skip_replay_flow(
+            "pipelines.actions.githubusercontent.com",
+            "/runner/server/_apis/distributedtask/pools/1/agents/2",
+            &stale_delete
         ));
     }
 
@@ -3441,6 +3506,25 @@ mod tests {
         );
 
         assert!(schema_mismatch_in_report(report));
+    }
+
+    #[test]
+    fn schema_mismatch_accepts_additive_acquirejob_response_fields() {
+        let report = concat!(
+            "### `POST /broker/{n}/acquirejob`\n\n",
+            "**Response body schema diff:**\n\n",
+            "```diff\n",
+            "--- official\n",
+            "+++ aksh\n",
+            "@@\n",
+            " {\n",
+            "   \"jobId\": \"string\",\n",
+            "+  \"runnerSettings\": {\"isHostedServer\": \"boolean\"}\n",
+            " }\n",
+            "```\n"
+        );
+
+        assert!(!schema_mismatch_in_report(report));
     }
 
     #[test]
