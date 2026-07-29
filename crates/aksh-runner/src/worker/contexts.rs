@@ -454,15 +454,21 @@ impl JobContext {
             let mut secrets_map = serde_json::Map::new();
             for (key, val) in vars {
                 // `system.*` variables are runner/server plumbing — the job
-                // runtime token, the debug-worker token — not workflow
-                // secrets. Surfacing them here would hand untrusted workflow
-                // YAML the very credentials it is meant to be fenced off
-                // from, via `${{ secrets['system.preloop.debug_worker_token'] }}`.
+                // token, the endpoint URLs — not workflow secrets. Surfacing
+                // them here would hand untrusted workflow YAML the very
+                // credentials it is meant to be fenced off from, via
+                // `${{ secrets['system.github.token'] }}`.
                 // Real GitHub Actions does not expose them either. Every
                 // legitimate consumer reads these straight out of the raw
                 // `variables` map by exact key, so nothing is starved; log
                 // masking is applied independently in `new`, so they stay
                 // redacted regardless.
+                //
+                // This is defence in depth, not the only defence: a credential
+                // that must not reach workflow code is not shipped as a job
+                // variable at all, because the official runner has no such
+                // filter. The debug-worker token is fetched over
+                // `POST /api/v1/debug/worker-token` for exactly that reason.
                 //
                 // Prefix-matched rather than allowlisted deliberately, so a
                 // future `system.*` credential is fenced off by default
