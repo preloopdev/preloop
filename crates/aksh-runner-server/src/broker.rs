@@ -644,6 +644,10 @@ pub(crate) async fn broker_acquire_job(
                 "ConnectivityChecks".to_owned(),
                 serde_json::json!([format!("{}/check", public_base_url())]).to_string(),
             );
+            endpoint.data.insert(
+                "ConnectivityAndDNSChecks".to_owned(),
+                serde_json::json!([format!("{}/check", public_base_url())]).to_string(),
+            );
             endpoint.data.insert("ServerId".to_owned(), String::new());
             endpoint.data.insert("ServerName".to_owned(), String::new());
             endpoint.data.insert(
@@ -659,17 +663,8 @@ pub(crate) async fn broker_acquire_job(
     // Run-service payloads use the DTO default; internal request IDs remain in
     // `job_requests` and broker lookup maps for renew/complete bookkeeping.
     message.request_id = 0;
-    let mut payload = serde_json::to_value(&message)
+    let payload = serde_json::to_value(&message)
         .map_err(|error| ApiError::internal(format!("serialize broker job payload: {error}")))?;
-    let object = payload
-        .as_object_mut()
-        .ok_or_else(|| ApiError::internal("broker job payload must serialize as an object"))?;
-    object.insert(
-        "runnerSettings".to_owned(),
-        serde_json::to_value(azdo::RunnerServerSettings::default()).map_err(|error| {
-            ApiError::internal(format!("serialize runner server settings: {error}"))
-        })?,
-    );
     Ok(Json(payload))
 }
 
