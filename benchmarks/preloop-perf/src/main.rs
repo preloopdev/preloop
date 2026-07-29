@@ -4,19 +4,42 @@
 //! workspace snapshotting under load. Emits `METRIC name=value` lines to
 //! stdout for the autoresearch harness.
 //!
+//! ## Methodology
+//!
+//! Every measured quantity is sampled over independent *trials*. Each trial
+//! builds its own `AppState` on a fresh temporary state directory, so a trial
+//! never observes state accumulated by an earlier trial or by an earlier phase.
+//! For each quantity the benchmark reports the median plus the observed
+//! min/max/relative spread, so a reader can tell a real regression from
+//! workstation noise instead of trusting a single sample.
+//!
+//! The concurrency sweep order is permuted per trial from a fixed seed and
+//! mirrored on odd trials, so each concurrency level occupies early and late
+//! sweep positions equally often across a trial pair. That cancels the
+//! machine-warm-up drift the old ascending-only sweep silently folded into the
+//! highest concurrency level.
+//!
+//! Environment knobs (all optional):
+//!   PRELOOP_BENCH_TRIALS  — trials per quantity (default 3, must be >= 1)
+//!   PRELOOP_BENCH_SEED    — permutation seed for the concurrency sweep
+//!
 //! Subcommands:
 //!   server-load   — concurrent workflow submissions + polling through the
 //!                   in-process axum router (zero network overhead).
 //!   parser        — parse + expand a matrix workflow N times.
 //!   expressions   — evaluate a battery of expressions N times.
 //!   snapshot      — create workspace snapshots for varying project sizes.
+//!   cold-boot     — repeated `AppState::new` on fresh state directories.
+//!   contention    — sustained mixed read/write workload.
+//!   serde         — protocol serialization round trip.
 //!   all           — run every benchmark and emit all metrics.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use axum::body::{to_bytes, Body};
 use axum::http::{Method, Request, StatusCode};
 use axum::Router;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -118,6 +141,70 @@ const EXPRESSION_BATTERY: &[&str] = &[
     "runner.os == 'Linux'",
 ];
 
+/// Battery entries allowed to fail the evaluation preflight: they need
+/// filesystem context the benchmark deliberately does not set up.
+const EXPRESSION_MAY_FAIL: &[&str] = &["hashFiles('**/*.rs')"];
+
+// ── measurement configuration ───────────────────────────────────────────────
+
+const DEFAULT_TRIALS: usize = 3;
+const DEFAULT_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+
+const CONCURRENCY_LEVELS: [usize; 4] = [4, 16, 64, 128];
+const REQUESTS_PER_WORKER: usize = 50;
+const SEQUENTIAL_REQUESTS: usize = 100;
+const MATRIX_CONCURRENCY: usize = 16;
+const MATRIX_REQUESTS_PER_WORKER: usize = 50;
+const COMPLEX_REQUESTS: usize = 100;
+/// Runs submitted before the polling phase, so `GET /api/v1/runs` always reads a
+/// list of a known, fixed size instead of whatever earlier phases left behind.
+const POLL_SEED_RUNS: usize = 200;
+const POLL_REQUESTS: usize = 500;
+const CONTENTION_CONCURRENCY: usize = 32;
+const CONTENTION_DURATION: Duration = Duration::from_secs(5);
+const PARSER_ITERATIONS: usize = 1000;
+const EXPRESSION_ITERATIONS: usize = 5000;
+const SERDE_ITERATIONS: usize = 5000;
+const COLD_BOOT_ITERATIONS: usize = 5;
+/// Warm snapshot submissions measured per trial, after the cold one.
+const SNAPSHOT_WARM_REPEATS: usize = 2;
+const SNAPSHOT_SIZES: [(&str, usize, usize); 4] = [
+    ("small", 100, 256),
+    ("medium", 1_000, 1024),
+    ("large", 5_000, 2048),
+    ("xlarge", 10_000, 1024),
+];
+
+/// Resolved measurement configuration, read once at startup so every benchmark
+/// in an `all` run uses identical settings.
+#[derive(Clone, Copy, Debug)]
+struct BenchConfig {
+    trials: usize,
+    seed: u64,
+}
+
+impl BenchConfig {
+    fn from_env() -> Result<Self> {
+        let trials = env_u64("PRELOOP_BENCH_TRIALS", DEFAULT_TRIALS as u64)? as usize;
+        if trials == 0 {
+            bail!("PRELOOP_BENCH_TRIALS must be >= 1");
+        }
+        let seed = env_u64("PRELOOP_BENCH_SEED", DEFAULT_SEED)?;
+        Ok(Self { trials, seed })
+    }
+}
+
+fn env_u64(key: &str, default: u64) -> Result<u64> {
+    match std::env::var(key) {
+        Ok(raw) => raw
+            .trim()
+            .parse()
+            .with_context(|| format!("{key} must be an unsigned integer, got {raw:?}")),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(err) => Err(err).with_context(|| format!("reading {key}")),
+    }
+}
+
 // ── helpers ─────────────────────────────────────────────────────────────────
 
 async fn make_app(state_dir: &Path) -> Result<(Router, aksh_runner_server::AppState)> {
@@ -127,6 +214,14 @@ async fn make_app(state_dir: &Path) -> Result<(Router, aksh_runner_server::AppSt
     let shutdown = CancellationToken::new();
     let app = aksh_runner_server::app_with_test_api(state.clone(), shutdown, "test-token");
     Ok((app, state))
+}
+
+/// Fresh router on a fresh state directory. The returned `TempDir` must outlive
+/// the router: dropping it deletes the state the server is reading.
+async fn fresh_app() -> Result<(Router, aksh_runner_server::AppState, tempfile::TempDir)> {
+    let dir = tempfile::tempdir().context("creating temp state dir")?;
+    let (app, state) = make_app(dir.path()).await?;
+    Ok((app, state, dir))
 }
 
 async fn request(app: &Router, method: Method, uri: &str, body: Value) -> (StatusCode, Value) {
@@ -151,276 +246,456 @@ async fn request(app: &Router, method: Method, uri: &str, body: Value) -> (Statu
     (status, value)
 }
 
+fn submission(workflow: &str, repository: &str) -> Value {
+    json!({
+        "workflow_yaml": workflow,
+        "event": "push",
+        "repository": repository,
+    })
+}
+
+/// Submit one run and fail closed on any non-success status. Sequential phases
+/// use this so a server that starts rejecting submissions can never be reported
+/// as "fast".
+async fn submit_run(app: &Router, body: Value) -> Result<()> {
+    let (status, response) = request(app, Method::POST, "/api/v1/runs", body).await;
+    if !status.is_success() {
+        bail!("POST /api/v1/runs returned {status}: {response}");
+    }
+    Ok(())
+}
+
+async fn submit_sequential(
+    app: &Router,
+    workflow: &str,
+    repository: &str,
+    count: usize,
+) -> Result<Duration> {
+    let start = Instant::now();
+    for _ in 0..count {
+        submit_run(app, submission(workflow, repository)).await?;
+    }
+    Ok(start.elapsed())
+}
+
 fn metric(name: &str, value: f64, digits: u32) {
     let factor = 10f64.powi(digits as i32);
     println!("METRIC {}={}", name, (value * factor).round() / factor);
 }
 
+/// Emit a metric whose value is not a rounded float (counts, seeds, labels).
+fn metric_text(name: &str, value: &str) {
+    println!("METRIC {name}={value}");
+}
+
+fn sorted(samples: &[f64]) -> Vec<f64> {
+    let mut out = samples.to_vec();
+    out.sort_by(f64::total_cmp);
+    out
+}
+
+fn median_of_sorted(sorted: &[f64]) -> f64 {
+    let mid = sorted.len() / 2;
+    if sorted.len() % 2 == 1 {
+        sorted[mid]
+    } else {
+        (sorted[mid - 1] + sorted[mid]) / 2.0
+    }
+}
+
+/// Emit repeated-measurement statistics for `name`.
+///
+/// `name` keeps the plain metric key and carries the **median**, so existing
+/// consumers stay valid; `name_min` / `name_max` / `name_spread_pct` describe
+/// run-to-run stability and `name_samples` records how many samples backed it.
+fn metric_stats(name: &str, samples: &[f64], digits: u32) {
+    assert!(
+        !samples.is_empty(),
+        "metric {name} was emitted without samples"
+    );
+    let ordered = sorted(samples);
+    let median = median_of_sorted(&ordered);
+    let min = ordered[0];
+    let max = ordered[ordered.len() - 1];
+    metric(name, median, digits);
+    metric(&format!("{name}_min"), min, digits);
+    metric(&format!("{name}_max"), max, digits);
+    let spread_pct = if median > 0.0 {
+        (max - min) / median * 100.0
+    } else {
+        0.0
+    };
+    metric(&format!("{name}_spread_pct"), spread_pct, 1);
+    metric_text(&format!("{name}_samples"), &ordered.len().to_string());
+}
+
+/// Deterministic xorshift64* — enough for reproducible small permutations
+/// without pulling `rand` into the benchmark's dependency set.
+fn next_rand(state: &mut u64) -> u64 {
+    let mut x = *state;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *state = x;
+    x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+}
+
+/// Concurrency sweep order for `trial`.
+///
+/// Trials `2k` and `2k+1` share one seeded permutation, with the odd trial
+/// running it in reverse. Across a trial pair every level therefore occupies
+/// mirrored sweep positions, so residual machine warm-up (page cache, CPU
+/// boost, thermals) cannot accumulate onto whichever level ran last.
+fn sweep_order(seed: u64, trial: usize) -> Vec<usize> {
+    let mut levels = CONCURRENCY_LEVELS.to_vec();
+    let mut state = seed ^ (trial as u64 / 2).wrapping_mul(DEFAULT_SEED);
+    if state == 0 {
+        state = DEFAULT_SEED;
+    }
+    for i in (1..levels.len()).rev() {
+        let j = (next_rand(&mut state) % (i as u64 + 1)) as usize;
+        levels.swap(i, j);
+    }
+    if trial % 2 == 1 {
+        levels.reverse();
+    }
+    levels
+}
+
 // ── server load benchmark ───────────────────────────────────────────────────
 
-async fn bench_server_load(state_dir: &Path) -> Result<()> {
-    eprintln!("[loadtest] === Server Load Benchmark ===");
+/// One concurrency-level measurement.
+struct SweepSample {
+    rps: f64,
+    avg_latency_ms: f64,
+    errors: u64,
+}
 
-    let (app, _state) = make_app(state_dir).await?;
-    let app = Arc::new(app);
-
-    // Warmup: a few submissions to prime internal state
-    for _ in 0..3 {
-        let (status, _) = request(
-            &app,
-            Method::POST,
-            "/api/v1/runs",
-            json!({
-                "workflow_yaml": SIMPLE_WORKFLOW,
-                "event": "push",
-                "repository": "bench/repo"
-            }),
-        )
-        .await;
-        assert!(status.is_success(), "warmup failed: {status}");
-    }
-
-    // ── Phase 1: Sequential baseline ────────────────────────────────────
-    let sequential_count = 100;
-    let start = Instant::now();
-    for _ in 0..sequential_count {
-        let (status, _) = request(
-            &app,
-            Method::POST,
-            "/api/v1/runs",
-            json!({
-                "workflow_yaml": SIMPLE_WORKFLOW,
-                "event": "push",
-                "repository": "bench/repo"
-            }),
-        )
-        .await;
-        assert!(status.is_success());
-    }
-    let sequential_elapsed = start.elapsed();
-    let sequential_rps = sequential_count as f64 / sequential_elapsed.as_secs_f64();
-    let sequential_latency_ms = sequential_elapsed.as_secs_f64() * 1000.0 / sequential_count as f64;
-    eprintln!(
-        "[loadtest]   sequential: {sequential_count} reqs in {:.1}ms = {sequential_rps:.0} rps, {sequential_latency_ms:.2}ms/req",
-        sequential_elapsed.as_secs_f64() * 1000.0
-    );
-
-    // ── Phase 2: Concurrent submissions (the main metric) ───────────────
-    // Sweep concurrency levels: 4, 16, 64, 128
-    let mut best_rps = 0.0f64;
-    let mut best_concurrency = 0usize;
-
-    for concurrency in [4, 16, 64, 128] {
-        let requests_per_worker = 50;
-        let total_requests = concurrency * requests_per_worker;
-        let success_count = Arc::new(AtomicU64::new(0));
-        let error_count = Arc::new(AtomicU64::new(0));
-        let total_latency_us = Arc::new(AtomicU64::new(0));
-
-        let start = Instant::now();
-        let mut handles = Vec::new();
-
-        for _ in 0..concurrency {
-            let app = app.clone();
-            let success = success_count.clone();
-            let errors = error_count.clone();
-            let latency = total_latency_us.clone();
-
-            handles.push(tokio::spawn(async move {
-                for _ in 0..requests_per_worker {
-                    let req_start = Instant::now();
-                    let (status, _) = request(
-                        &app,
-                        Method::POST,
-                        "/api/v1/runs",
-                        json!({
-                            "workflow_yaml": SIMPLE_WORKFLOW,
-                            "event": "push",
-                            "repository": "bench/repo"
-                        }),
-                    )
-                    .await;
-                    let elapsed = req_start.elapsed();
-                    latency.fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
-                    if status.is_success() {
-                        success.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        errors.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }));
-        }
-
-        for handle in handles {
-            handle.await?;
-        }
-
-        let elapsed = start.elapsed();
-        let successes = success_count.load(Ordering::Relaxed);
-        let errs = error_count.load(Ordering::Relaxed);
-        let rps = total_requests as f64 / elapsed.as_secs_f64();
-        let avg_latency_ms =
-            total_latency_us.load(Ordering::Relaxed) as f64 / 1000.0 / total_requests as f64;
-
-        eprintln!(
-            "[loadtest]   c={concurrency}: {total_requests} reqs in {:.1}ms = {rps:.0} rps, avg {avg_latency_ms:.2}ms, ok={successes} err={errs}",
-            elapsed.as_secs_f64() * 1000.0
-        );
-
-        if rps > best_rps {
-            best_rps = rps;
-            best_concurrency = concurrency;
-        }
-
-        metric(&format!("server_rps_c{concurrency}"), rps, 0);
-        metric(&format!("server_avg_ms_c{concurrency}"), avg_latency_ms, 2);
-        metric(&format!("server_errors_c{concurrency}"), errs as f64, 0);
-    }
-
-    // ── Phase 3: Matrix workflow concurrent submissions ─────────────────
-    let matrix_concurrency = 16;
-    let matrix_requests = 50;
-    let total_matrix = matrix_concurrency * matrix_requests;
-    let start = Instant::now();
-    let mut handles = Vec::new();
+async fn measure_concurrency_level(app: Arc<Router>, concurrency: usize) -> Result<SweepSample> {
+    let total_requests = concurrency * REQUESTS_PER_WORKER;
     let success_count = Arc::new(AtomicU64::new(0));
+    let error_count = Arc::new(AtomicU64::new(0));
+    let total_latency_us = Arc::new(AtomicU64::new(0));
 
-    for _ in 0..matrix_concurrency {
+    let start = Instant::now();
+    let mut handles = Vec::with_capacity(concurrency);
+
+    for _ in 0..concurrency {
         let app = app.clone();
         let success = success_count.clone();
+        let errors = error_count.clone();
+        let latency = total_latency_us.clone();
+
         handles.push(tokio::spawn(async move {
-            for _ in 0..matrix_requests {
+            for _ in 0..REQUESTS_PER_WORKER {
+                let req_start = Instant::now();
                 let (status, _) = request(
                     &app,
                     Method::POST,
                     "/api/v1/runs",
-                    json!({
-                        "workflow_yaml": MATRIX_WORKFLOW,
-                        "event": "push",
-                        "repository": "bench/matrix-repo"
-                    }),
+                    submission(SIMPLE_WORKFLOW, "bench/repo"),
                 )
                 .await;
+                let elapsed = req_start.elapsed();
+                latency.fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
                 if status.is_success() {
                     success.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    errors.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }));
     }
+
     for handle in handles {
         handle.await?;
     }
-    let matrix_elapsed = start.elapsed();
-    let matrix_rps = total_matrix as f64 / matrix_elapsed.as_secs_f64();
-    eprintln!(
-        "[loadtest]   matrix c={matrix_concurrency}: {total_matrix} reqs in {:.1}ms = {matrix_rps:.0} rps",
-        matrix_elapsed.as_secs_f64() * 1000.0
-    );
 
-    // ── Phase 4: Complex DAG workflow submissions ───────────────────────
-    let complex_count = 100;
-    let start = Instant::now();
-    for _ in 0..complex_count {
-        let (status, _) = request(
-            &app,
-            Method::POST,
-            "/api/v1/runs",
-            json!({
-                "workflow_yaml": COMPLEX_WORKFLOW,
-                "event": "push",
-                "repository": "bench/complex-repo",
-                "ref": "refs/heads/main",
-                "sha": "abc123"
-            }),
-        )
-        .await;
-        assert!(status.is_success());
+    let elapsed = start.elapsed();
+    let successes = success_count.load(Ordering::Relaxed);
+    let errors = error_count.load(Ordering::Relaxed);
+    if successes + errors != total_requests as u64 {
+        bail!(
+            "c={concurrency}: accounted {} of {total_requests} requests",
+            successes + errors
+        );
     }
-    let complex_elapsed = start.elapsed();
-    let complex_rps = complex_count as f64 / complex_elapsed.as_secs_f64();
+
+    Ok(SweepSample {
+        rps: total_requests as f64 / elapsed.as_secs_f64(),
+        avg_latency_ms: total_latency_us.load(Ordering::Relaxed) as f64
+            / 1000.0
+            / total_requests as f64,
+        errors,
+    })
+}
+
+async fn bench_server_load(cfg: BenchConfig) -> Result<()> {
     eprintln!(
-        "[loadtest]   complex-dag: {complex_count} reqs in {:.1}ms = {complex_rps:.0} rps",
-        complex_elapsed.as_secs_f64() * 1000.0
+        "[loadtest] === Server Load Benchmark ({} trial(s)) ===",
+        cfg.trials
     );
 
-    // ── Phase 5: GET /api/v1/runs polling under load ────────────────────
-    let poll_count = 500;
-    let start = Instant::now();
-    for _ in 0..poll_count {
-        let (status, _) = request(&app, Method::GET, "/api/v1/runs?limit=50", Value::Null).await;
-        assert!(status.is_success());
+    let mut sequential_rps = Vec::new();
+    let mut sequential_latency_ms = Vec::new();
+    let mut level_rps: BTreeMap<usize, Vec<f64>> = BTreeMap::new();
+    let mut level_latency_ms: BTreeMap<usize, Vec<f64>> = BTreeMap::new();
+    let mut level_errors: BTreeMap<usize, u64> = BTreeMap::new();
+    let mut best_rps = Vec::new();
+    let mut best_concurrency_wins: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut matrix_rps = Vec::new();
+    let mut complex_rps = Vec::new();
+    let mut poll_rps = Vec::new();
+
+    for trial in 0..cfg.trials {
+        let order = sweep_order(cfg.seed, trial);
+        eprintln!(
+            "[loadtest]  -- trial {}/{}, sweep order {order:?}",
+            trial + 1,
+            cfg.trials
+        );
+
+        // ── Phase 1: Sequential baseline ────────────────────────────────
+        // Fresh state, plus a small warmup that primes lazily-built internals
+        // without being counted.
+        {
+            let (app, _state, _dir) = fresh_app().await?;
+            for _ in 0..3 {
+                submit_run(&app, submission(SIMPLE_WORKFLOW, "bench/warmup")).await?;
+            }
+            let elapsed =
+                submit_sequential(&app, SIMPLE_WORKFLOW, "bench/repo", SEQUENTIAL_REQUESTS).await?;
+            let rps = SEQUENTIAL_REQUESTS as f64 / elapsed.as_secs_f64();
+            let latency_ms = elapsed.as_secs_f64() * 1000.0 / SEQUENTIAL_REQUESTS as f64;
+            eprintln!(
+                "[loadtest]   sequential: {SEQUENTIAL_REQUESTS} reqs in {:.1}ms = {rps:.0} rps, {latency_ms:.2}ms/req",
+                elapsed.as_secs_f64() * 1000.0
+            );
+            sequential_rps.push(rps);
+            sequential_latency_ms.push(latency_ms);
+        }
+
+        // ── Phase 2: Concurrent submissions (the primary metric) ────────
+        // Each level gets its own server, so sweep position cannot leak run
+        // list growth into the next level's numbers.
+        let mut trial_best = (0.0f64, 0usize);
+        for &concurrency in &order {
+            let (app, _state, _dir) = fresh_app().await?;
+            let app = Arc::new(app);
+            for _ in 0..3 {
+                submit_run(&app, submission(SIMPLE_WORKFLOW, "bench/warmup")).await?;
+            }
+
+            let sample = measure_concurrency_level(app, concurrency).await?;
+            eprintln!(
+                "[loadtest]   c={concurrency}: {} reqs = {:.0} rps, avg {:.2}ms, err={}",
+                concurrency * REQUESTS_PER_WORKER,
+                sample.rps,
+                sample.avg_latency_ms,
+                sample.errors
+            );
+
+            level_rps.entry(concurrency).or_default().push(sample.rps);
+            level_latency_ms
+                .entry(concurrency)
+                .or_default()
+                .push(sample.avg_latency_ms);
+            *level_errors.entry(concurrency).or_default() += sample.errors;
+
+            if sample.rps > trial_best.0 {
+                trial_best = (sample.rps, concurrency);
+            }
+        }
+        best_rps.push(trial_best.0);
+        *best_concurrency_wins.entry(trial_best.1).or_default() += 1;
+
+        // ── Phase 3: Matrix workflow concurrent submissions ─────────────
+        {
+            let (app, _state, _dir) = fresh_app().await?;
+            let app = Arc::new(app);
+            let total = MATRIX_CONCURRENCY * MATRIX_REQUESTS_PER_WORKER;
+            let errors = Arc::new(AtomicU64::new(0));
+            let start = Instant::now();
+            let mut handles = Vec::with_capacity(MATRIX_CONCURRENCY);
+            for _ in 0..MATRIX_CONCURRENCY {
+                let app = app.clone();
+                let errors = errors.clone();
+                handles.push(tokio::spawn(async move {
+                    for _ in 0..MATRIX_REQUESTS_PER_WORKER {
+                        let (status, _) = request(
+                            &app,
+                            Method::POST,
+                            "/api/v1/runs",
+                            submission(MATRIX_WORKFLOW, "bench/matrix-repo"),
+                        )
+                        .await;
+                        if !status.is_success() {
+                            errors.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }));
+            }
+            for handle in handles {
+                handle.await?;
+            }
+            let elapsed = start.elapsed();
+            let errors = errors.load(Ordering::Relaxed);
+            if errors > 0 {
+                bail!("matrix phase: {errors} of {total} submissions were rejected");
+            }
+            let rps = total as f64 / elapsed.as_secs_f64();
+            eprintln!(
+                "[loadtest]   matrix c={MATRIX_CONCURRENCY}: {total} reqs in {:.1}ms = {rps:.0} rps",
+                elapsed.as_secs_f64() * 1000.0
+            );
+            matrix_rps.push(rps);
+        }
+
+        // ── Phase 4: Complex DAG workflow submissions ───────────────────
+        {
+            let (app, _state, _dir) = fresh_app().await?;
+            let start = Instant::now();
+            for _ in 0..COMPLEX_REQUESTS {
+                submit_run(
+                    &app,
+                    json!({
+                        "workflow_yaml": COMPLEX_WORKFLOW,
+                        "event": "push",
+                        "repository": "bench/complex-repo",
+                        "ref": "refs/heads/main",
+                        "sha": "abc123"
+                    }),
+                )
+                .await?;
+            }
+            let elapsed = start.elapsed();
+            let rps = COMPLEX_REQUESTS as f64 / elapsed.as_secs_f64();
+            eprintln!(
+                "[loadtest]   complex-dag: {COMPLEX_REQUESTS} reqs in {:.1}ms = {rps:.0} rps",
+                elapsed.as_secs_f64() * 1000.0
+            );
+            complex_rps.push(rps);
+        }
+
+        // ── Phase 5: GET /api/v1/runs polling ───────────────────────────
+        // Seeded to a fixed list length so poll throughput is comparable across
+        // trials and across harness runs.
+        {
+            let (app, _state, _dir) = fresh_app().await?;
+            submit_sequential(&app, SIMPLE_WORKFLOW, "bench/poll-repo", POLL_SEED_RUNS).await?;
+            let start = Instant::now();
+            for _ in 0..POLL_REQUESTS {
+                let (status, _) =
+                    request(&app, Method::GET, "/api/v1/runs?limit=50", Value::Null).await;
+                if !status.is_success() {
+                    bail!("GET /api/v1/runs returned {status}");
+                }
+            }
+            let elapsed = start.elapsed();
+            let rps = POLL_REQUESTS as f64 / elapsed.as_secs_f64();
+            eprintln!(
+                "[loadtest]   polling ({POLL_SEED_RUNS} runs seeded): {POLL_REQUESTS} GETs in {:.1}ms = {rps:.0} rps",
+                elapsed.as_secs_f64() * 1000.0
+            );
+            poll_rps.push(rps);
+        }
     }
-    let poll_elapsed = start.elapsed();
-    let poll_rps = poll_count as f64 / poll_elapsed.as_secs_f64();
-    eprintln!(
-        "[loadtest]   polling: {poll_count} GETs in {:.1}ms = {poll_rps:.0} rps",
-        poll_elapsed.as_secs_f64() * 1000.0
-    );
 
-    // Emit primary and secondary metrics
-    metric("server_rps", best_rps, 0);
-    metric("server_best_concurrency", best_concurrency as f64, 0);
-    metric("server_sequential_rps", sequential_rps, 0);
-    metric("server_sequential_latency_ms", sequential_latency_ms, 2);
-    metric("server_matrix_rps", matrix_rps, 0);
-    metric("server_complex_dag_rps", complex_rps, 0);
-    metric("server_poll_rps", poll_rps, 0);
+    for (&concurrency, samples) in &level_rps {
+        metric_stats(&format!("server_rps_c{concurrency}"), samples, 0);
+    }
+    for (&concurrency, samples) in &level_latency_ms {
+        metric_stats(&format!("server_avg_ms_c{concurrency}"), samples, 2);
+    }
+    for (&concurrency, errors) in &level_errors {
+        metric_text(
+            &format!("server_errors_c{concurrency}"),
+            &errors.to_string(),
+        );
+    }
+
+    metric_stats("server_rps", &best_rps, 0);
+    metric_stats("server_sequential_rps", &sequential_rps, 0);
+    metric_stats("server_sequential_latency_ms", &sequential_latency_ms, 2);
+    metric_stats("server_matrix_rps", &matrix_rps, 0);
+    metric_stats("server_complex_dag_rps", &complex_rps, 0);
+    metric_stats("server_poll_rps", &poll_rps, 0);
+
+    // The winning concurrency level can differ between trials; report the level
+    // that won most often rather than pretending one level always wins.
+    let (best_concurrency, wins) = best_concurrency_wins
+        .iter()
+        .max_by_key(|(_, wins)| **wins)
+        .map(|(level, wins)| (*level, *wins))
+        .context("no concurrency level was measured")?;
+    metric_text("server_best_concurrency", &best_concurrency.to_string());
+    metric_text("server_best_concurrency_wins", &wins.to_string());
+
+    let total_errors: u64 = level_errors.values().sum();
+    if total_errors > 0 {
+        bail!("concurrency sweep recorded {total_errors} rejected submissions: {level_errors:?}");
+    }
 
     Ok(())
 }
 
 // ── parser benchmark ────────────────────────────────────────────────────────
 
-fn bench_parser() -> Result<()> {
-    eprintln!("[loadtest] === Parser Benchmark ===");
+fn bench_parser(cfg: BenchConfig) -> Result<()> {
+    eprintln!(
+        "[loadtest] === Parser Benchmark ({} trial(s)) ===",
+        cfg.trials
+    );
 
-    let iterations = 1000;
+    let mut simple_us = Vec::new();
+    let mut matrix_us = Vec::new();
+    let mut complex_us = Vec::new();
 
-    // Simple workflow parse
-    let start = Instant::now();
-    for _ in 0..iterations {
-        let wf =
-            aksh_gha_parser::parse_workflow(SIMPLE_WORKFLOW).expect("simple workflow must parse");
-        std::hint::black_box(&wf);
+    for _ in 0..cfg.trials {
+        let start = Instant::now();
+        for _ in 0..PARSER_ITERATIONS {
+            let wf = aksh_gha_parser::parse_workflow(SIMPLE_WORKFLOW)
+                .context("simple workflow must parse")?;
+            std::hint::black_box(&wf);
+        }
+        simple_us.push(start.elapsed().as_micros() as f64 / PARSER_ITERATIONS as f64);
+
+        let start = Instant::now();
+        for _ in 0..PARSER_ITERATIONS {
+            let wf = aksh_gha_parser::parse_workflow(MATRIX_WORKFLOW)
+                .context("matrix workflow must parse")?;
+            let expanded = aksh_gha_parser::expand_jobs(&wf);
+            std::hint::black_box(&expanded);
+        }
+        matrix_us.push(start.elapsed().as_micros() as f64 / PARSER_ITERATIONS as f64);
+
+        let start = Instant::now();
+        for _ in 0..PARSER_ITERATIONS {
+            let wf = aksh_gha_parser::parse_workflow(COMPLEX_WORKFLOW)
+                .context("complex workflow must parse")?;
+            let expanded = aksh_gha_parser::expand_jobs(&wf);
+            std::hint::black_box(&expanded);
+        }
+        complex_us.push(start.elapsed().as_micros() as f64 / PARSER_ITERATIONS as f64);
     }
-    let simple_us = start.elapsed().as_micros() as f64 / iterations as f64;
 
-    // Matrix workflow parse + expand
-    let start = Instant::now();
-    for _ in 0..iterations {
-        let wf =
-            aksh_gha_parser::parse_workflow(MATRIX_WORKFLOW).expect("matrix workflow must parse");
-        let expanded = aksh_gha_parser::expand_jobs(&wf);
-        std::hint::black_box(&expanded);
-    }
-    let matrix_us = start.elapsed().as_micros() as f64 / iterations as f64;
+    eprintln!(
+        "[loadtest]   simple / matrix / complex medians: {:.1} / {:.1} / {:.1} µs/iter",
+        median_of_sorted(&sorted(&simple_us)),
+        median_of_sorted(&sorted(&matrix_us)),
+        median_of_sorted(&sorted(&complex_us))
+    );
 
-    // Complex DAG workflow parse + expand
-    let start = Instant::now();
-    for _ in 0..iterations {
-        let wf =
-            aksh_gha_parser::parse_workflow(COMPLEX_WORKFLOW).expect("complex workflow must parse");
-        let expanded = aksh_gha_parser::expand_jobs(&wf);
-        std::hint::black_box(&expanded);
-    }
-    let complex_us = start.elapsed().as_micros() as f64 / iterations as f64;
-
-    eprintln!("[loadtest]   simple parse: {simple_us:.1} µs/iter");
-    eprintln!("[loadtest]   matrix parse+expand: {matrix_us:.1} µs/iter");
-    eprintln!("[loadtest]   complex parse+expand: {complex_us:.1} µs/iter");
-
-    metric("parse_simple_us", simple_us, 1);
-    metric("parse_matrix_us", matrix_us, 1);
-    metric("parse_complex_us", complex_us, 1);
+    metric_stats("parse_simple_us", &simple_us, 1);
+    metric_stats("parse_matrix_us", &matrix_us, 1);
+    metric_stats("parse_complex_us", &complex_us, 1);
 
     Ok(())
 }
 
 // ── expression evaluator benchmark ──────────────────────────────────────────
 
-fn bench_expressions() -> Result<()> {
-    eprintln!("[loadtest] === Expression Evaluator Benchmark ===");
-
+fn expression_context() -> aksh_gha_expressions::Context {
     let mut ctx = aksh_gha_expressions::Context::new();
     ctx.insert(
         "github",
@@ -449,147 +724,155 @@ fn bench_expressions() -> Result<()> {
         json!({"test": {"outcome": "success", "outputs": {}}}),
     );
     ctx.insert("runner", json!({"os": "Linux", "arch": "X64"}));
+    ctx
+}
 
-    let iterations = 5000;
-
-    // Evaluate each expression
-    let start = Instant::now();
-    for _ in 0..iterations {
-        for expr in EXPRESSION_BATTERY {
-            // hashFiles needs working directory context — skip if it errors
-            let _ = aksh_gha_expressions::eval_expression(expr, &ctx);
-        }
-    }
-    let total_evals = iterations * EXPRESSION_BATTERY.len();
-    let elapsed = start.elapsed();
-    let per_eval_us = elapsed.as_micros() as f64 / total_evals as f64;
-    let evals_per_sec = total_evals as f64 / elapsed.as_secs_f64();
-
+fn bench_expressions(cfg: BenchConfig) -> Result<()> {
     eprintln!(
-        "[loadtest]   {total_evals} evals in {:.1}ms = {per_eval_us:.2} µs/eval = {evals_per_sec:.0} evals/s",
-        elapsed.as_secs_f64() * 1000.0
+        "[loadtest] === Expression Evaluator Benchmark ({} trial(s)) ===",
+        cfg.trials
     );
 
-    // Validate expressions (parse-only, no eval)
-    let start = Instant::now();
-    for _ in 0..iterations {
-        for expr in EXPRESSION_BATTERY {
-            let _ = aksh_gha_expressions::validate_expression(expr);
+    let ctx = expression_context();
+
+    // Preflight: an evaluator that errored on every input would make the timing
+    // loop measure the error path and look *fast*. Fail closed on anything
+    // outside the documented filesystem-dependent exceptions.
+    let mut evaluated = 0usize;
+    for expr in EXPRESSION_BATTERY {
+        match aksh_gha_expressions::eval_expression(expr, &ctx) {
+            Ok(_) => evaluated += 1,
+            Err(err) if EXPRESSION_MAY_FAIL.contains(expr) => {
+                eprintln!("[loadtest]   skipped (needs filesystem context): {expr} — {err}");
+            }
+            Err(err) => bail!("expression battery entry failed to evaluate: {expr}: {err}"),
         }
     }
-    let validate_elapsed = start.elapsed();
-    let validate_us = validate_elapsed.as_micros() as f64 / total_evals as f64;
+    metric_text("expr_evaluated_count", &evaluated.to_string());
+    metric_text("expr_battery_size", &EXPRESSION_BATTERY.len().to_string());
 
-    eprintln!("[loadtest]   validate: {validate_us:.2} µs/expr");
+    let total_evals = EXPRESSION_ITERATIONS * EXPRESSION_BATTERY.len();
+    let mut per_eval_us = Vec::new();
+    let mut evals_per_sec = Vec::new();
+    let mut validate_us = Vec::new();
 
-    metric("expr_eval_us", per_eval_us, 2);
-    metric("expr_evals_per_sec", evals_per_sec, 0);
-    metric("expr_validate_us", validate_us, 2);
+    for _ in 0..cfg.trials {
+        let start = Instant::now();
+        for _ in 0..EXPRESSION_ITERATIONS {
+            for expr in EXPRESSION_BATTERY {
+                std::hint::black_box(aksh_gha_expressions::eval_expression(expr, &ctx).is_ok());
+            }
+        }
+        let elapsed = start.elapsed();
+        per_eval_us.push(elapsed.as_micros() as f64 / total_evals as f64);
+        evals_per_sec.push(total_evals as f64 / elapsed.as_secs_f64());
+
+        let start = Instant::now();
+        for _ in 0..EXPRESSION_ITERATIONS {
+            for expr in EXPRESSION_BATTERY {
+                std::hint::black_box(aksh_gha_expressions::validate_expression(expr).is_ok());
+            }
+        }
+        validate_us.push(start.elapsed().as_micros() as f64 / total_evals as f64);
+    }
+
+    eprintln!(
+        "[loadtest]   {total_evals} evals/trial: median {:.2} µs/eval, validate {:.2} µs/expr",
+        median_of_sorted(&sorted(&per_eval_us)),
+        median_of_sorted(&sorted(&validate_us))
+    );
+
+    metric_stats("expr_eval_us", &per_eval_us, 2);
+    metric_stats("expr_evals_per_sec", &evals_per_sec, 0);
+    metric_stats("expr_validate_us", &validate_us, 2);
 
     Ok(())
 }
 
 // ── snapshot benchmark ──────────────────────────────────────────────────────
 
-async fn bench_snapshots(_state_dir: &Path) -> Result<()> {
-    eprintln!("[loadtest] === Snapshot Benchmark ===");
+fn run_git(args: &[&str], cwd: &Path) -> Result<()> {
+    let status = std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_AUTHOR_DATE", "2024-01-01T00:00:00Z")
+        .env("GIT_COMMITTER_DATE", "2024-01-01T00:00:00Z")
+        .status()
+        .with_context(|| format!("spawning git {args:?}"))?;
+    if !status.success() {
+        bail!("git {args:?} failed with {status}");
+    }
+    Ok(())
+}
 
-    // Create test workspaces of varying sizes
-    for (label, file_count, file_size_bytes) in [
-        ("small", 100, 256),
-        ("medium", 1_000, 1024),
-        ("large", 5_000, 2048),
-        ("xlarge", 10_000, 1024),
-    ] {
-        let workspace = tempfile::tempdir()?;
-        let ws_path = workspace.path();
+/// Deterministic git workspace with `file_count` files of `file_size_bytes`.
+fn build_workspace(file_count: usize, file_size_bytes: usize) -> Result<tempfile::TempDir> {
+    let workspace = tempfile::tempdir().context("creating temp workspace")?;
+    let ws_path = workspace.path();
 
-        // Initialize git repo
-        let status = std::process::Command::new("git")
-            .args(["init", "--quiet"])
-            .current_dir(ws_path)
-            .status()?;
-        assert!(status.success(), "git init failed");
+    run_git(&["init", "--quiet"], ws_path)?;
+    run_git(&["config", "user.email", "bench@preloop.dev"], ws_path)?;
+    run_git(&["config", "user.name", "Benchmark"], ws_path)?;
 
-        // Configure git user
-        for args in [
-            &["config", "user.email", "bench@preloop.dev"][..],
-            &["config", "user.name", "Benchmark"],
-        ] {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(ws_path)
-                .status()?;
+    let content: Vec<u8> = (0..file_size_bytes).map(|i| (i % 256) as u8).collect();
+    let dirs = (file_count as f64).sqrt() as usize;
+    for i in 0..file_count {
+        let dir_idx = i % dirs.max(1);
+        let dir = ws_path.join(format!("dir-{dir_idx:04}"));
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join(format!("file-{i:06}.txt")), &content)?;
+    }
+
+    run_git(&["add", "--all"], ws_path)?;
+    run_git(&["commit", "-m", "initial", "--quiet"], ws_path)?;
+    Ok(workspace)
+}
+
+async fn bench_snapshots(cfg: BenchConfig) -> Result<()> {
+    eprintln!(
+        "[loadtest] === Snapshot Benchmark ({} trial(s)) ===",
+        cfg.trials
+    );
+
+    for (label, file_count, file_size_bytes) in SNAPSHOT_SIZES {
+        // The workspace is deterministic input, not the measured subject, so it
+        // is built once. The *cache* is what must be reset: every trial gets a
+        // brand new server state directory, so "cold" really is cold.
+        let workspace = build_workspace(file_count, file_size_bytes)?;
+        let ws_path = workspace.path().to_path_buf();
+        let repository = format!("bench/snap-{label}");
+
+        let mut cold_ms = Vec::new();
+        let mut warm_ms = Vec::new();
+
+        for trial in 0..cfg.trials {
+            let snap_state = tempfile::tempdir().context("creating snapshot state dir")?;
+            let (_, state) = make_app(snap_state.path()).await?;
+            let mut state_with_ws = state.clone();
+            state_with_ws.local_workspace = Some(ws_path.clone());
+            let shutdown = CancellationToken::new();
+            let app = aksh_runner_server::app_with_test_api(state_with_ws, shutdown, "test-token");
+
+            for iteration in 0..(1 + SNAPSHOT_WARM_REPEATS) {
+                let start = Instant::now();
+                submit_run(&app, submission(SIMPLE_WORKFLOW, &repository)).await?;
+                let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                if iteration == 0 {
+                    cold_ms.push(elapsed_ms);
+                } else {
+                    warm_ms.push(elapsed_ms);
+                }
+                eprintln!(
+                    "[loadtest]   {label} ({file_count} files, {file_size_bytes}B) trial {} {}: {elapsed_ms:.1}ms",
+                    trial + 1,
+                    if iteration == 0 { "cold" } else { "warm" }
+                );
+            }
         }
 
-        // Generate deterministic files
-        let content: Vec<u8> = (0..file_size_bytes).map(|i| (i % 256) as u8).collect();
-        let dirs = (file_count as f64).sqrt() as usize;
-        for i in 0..file_count {
-            let dir_idx = i % dirs.max(1);
-            let dir = ws_path.join(format!("dir-{dir_idx:04}"));
-            std::fs::create_dir_all(&dir)?;
-            std::fs::write(dir.join(format!("file-{i:06}.txt")), &content)?;
-        }
-
-        // Initial commit
-        std::process::Command::new("git")
-            .args(["add", "--all"])
-            .current_dir(ws_path)
-            .env("GIT_AUTHOR_DATE", "2024-01-01T00:00:00Z")
-            .env("GIT_COMMITTER_DATE", "2024-01-01T00:00:00Z")
-            .status()?;
-        std::process::Command::new("git")
-            .args(["commit", "-m", "initial", "--quiet"])
-            .current_dir(ws_path)
-            .env("GIT_AUTHOR_DATE", "2024-01-01T00:00:00Z")
-            .env("GIT_COMMITTER_DATE", "2024-01-01T00:00:00Z")
-            .status()?;
-
-        // Measure snapshot creation (cold — no cache)
-        let snap_state = tempfile::tempdir()?;
-        let state = aksh_runner_server::AppState::new(snap_state.path().to_path_buf())
-            .await
-            .context("creating AppState for snapshot bench")?;
-        // Set local_workspace on the state so submit_run triggers snapshot
-        let mut state_with_ws = state.clone();
-        state_with_ws.local_workspace = Some(ws_path.to_path_buf());
-        let shutdown = CancellationToken::new();
-        let app = aksh_runner_server::app_with_test_api(state_with_ws, shutdown, "test-token");
-
-        let iterations = 3;
-        let mut times_ms = Vec::new();
-
-        for _i in 0..iterations {
-            let start = Instant::now();
-            let (status, _) = request(
-                &app,
-                Method::POST,
-                "/api/v1/runs",
-                json!({
-                    "workflow_yaml": SIMPLE_WORKFLOW,
-                    "event": "push",
-                    "repository": format!("bench/snap-{label}")
-                }),
-            )
-            .await;
-            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-            times_ms.push(elapsed_ms);
-            eprintln!(
-                "[loadtest]   {label} ({file_count} files, {file_size_bytes}B each) iter {}: {elapsed_ms:.1}ms status={status}",
-                _i + 1
-            );
-        }
-
-        let cold_ms = times_ms[0];
-        let warm_ms = if times_ms.len() > 1 {
-            times_ms[1..].iter().sum::<f64>() / (times_ms.len() - 1) as f64
-        } else {
-            cold_ms
-        };
-
-        metric(&format!("snapshot_{label}_cold_ms"), cold_ms, 1);
-        metric(&format!("snapshot_{label}_warm_ms"), warm_ms, 1);
+        metric_stats(&format!("snapshot_{label}_cold_ms"), &cold_ms, 1);
+        metric_stats(&format!("snapshot_{label}_warm_ms"), &warm_ms, 1);
+        metric_text(&format!("snapshot_{label}_files"), &file_count.to_string());
     }
 
     Ok(())
@@ -597,201 +880,233 @@ async fn bench_snapshots(_state_dir: &Path) -> Result<()> {
 
 // ── cold boot benchmark ────────────────────────────────────────────────────
 
-async fn bench_cold_boot(_state_dir: &Path) -> Result<()> {
-    eprintln!("[loadtest] === Cold Boot Benchmark ===");
+async fn bench_cold_boot(cfg: BenchConfig) -> Result<()> {
+    eprintln!(
+        "[loadtest] === Cold Boot Benchmark ({} trial(s) x {COLD_BOOT_ITERATIONS}) ===",
+        cfg.trials
+    );
 
-    let iterations = 5;
     let mut times_ms = Vec::new();
-
-    for _ in 0..iterations {
-        let temp = tempfile::tempdir()?;
-        let start = Instant::now();
-        let state = aksh_runner_server::AppState::new(temp.path().to_path_buf()).await?;
-        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-        times_ms.push(elapsed_ms);
-        std::hint::black_box(&state);
+    for _ in 0..cfg.trials {
+        for _ in 0..COLD_BOOT_ITERATIONS {
+            let temp = tempfile::tempdir().context("creating temp state dir")?;
+            let start = Instant::now();
+            let state = aksh_runner_server::AppState::new(temp.path().to_path_buf())
+                .await
+                .context("creating AppState")?;
+            times_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+            std::hint::black_box(&state);
+        }
     }
 
-    times_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let median = times_ms[times_ms.len() / 2];
-    let min = times_ms[0];
-    let max = times_ms[times_ms.len() - 1];
+    let ordered = sorted(&times_ms);
+    eprintln!(
+        "[loadtest]   AppState::new: min={:.1}ms median={:.1}ms max={:.1}ms over {} samples",
+        ordered[0],
+        median_of_sorted(&ordered),
+        ordered[ordered.len() - 1],
+        ordered.len()
+    );
 
-    eprintln!("[loadtest]   AppState::new: min={min:.1}ms median={median:.1}ms max={max:.1}ms");
-
-    metric("cold_boot_median_ms", median, 1);
-    metric("cold_boot_min_ms", min, 1);
+    metric_stats("cold_boot_ms", &times_ms, 1);
+    // Historical key names kept so existing dashboards keep resolving.
+    metric("cold_boot_median_ms", median_of_sorted(&ordered), 1);
+    metric("cold_boot_min_ms", ordered[0], 1);
 
     Ok(())
 }
 
 // ── mutex contention benchmark ──────────────────────────────────────────────
 
-async fn bench_contention(state_dir: &Path) -> Result<()> {
-    eprintln!("[loadtest] === Mutex Contention Benchmark ===");
-
-    let (app, _state) = make_app(state_dir).await?;
-    let app = Arc::new(app);
-
-    // Simulate a realistic mixed workload: submissions + polls + run lookups
-    // all hitting the same Arc<Mutex<InnerState>> concurrently.
-    let duration = Duration::from_secs(5);
-    let concurrency = 32;
-
-    let total_ops = Arc::new(AtomicU64::new(0));
-    let submit_ops = Arc::new(AtomicU64::new(0));
-    let poll_ops = Arc::new(AtomicU64::new(0));
-    let error_ops = Arc::new(AtomicU64::new(0));
-
-    let start = Instant::now();
-    let mut handles = Vec::new();
-
-    for worker_id in 0..concurrency {
-        let app = app.clone();
-        let total = total_ops.clone();
-        let submits = submit_ops.clone();
-        let polls = poll_ops.clone();
-        let errors = error_ops.clone();
-        let deadline = start + duration;
-
-        handles.push(tokio::spawn(async move {
-            let mut i = 0u64;
-            while Instant::now() < deadline {
-                i += 1;
-                // Alternate between submissions and polls with 70/30 split
-                if i % 10 < 7 {
-                    let (status, _) = request(
-                        &app,
-                        Method::POST,
-                        "/api/v1/runs",
-                        json!({
-                            "workflow_yaml": SIMPLE_WORKFLOW,
-                            "event": "push",
-                            "repository": format!("bench/contention-{worker_id}")
-                        }),
-                    )
-                    .await;
-                    if status.is_success() {
-                        submits.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        errors.fetch_add(1, Ordering::Relaxed);
-                    }
-                } else {
-                    let (status, _) =
-                        request(&app, Method::GET, "/api/v1/runs?limit=20", Value::Null).await;
-                    if status.is_success() {
-                        polls.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        errors.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                total.fetch_add(1, Ordering::Relaxed);
-            }
-        }));
-    }
-
-    for handle in handles {
-        handle.await?;
-    }
-
-    let elapsed = start.elapsed();
-    let total = total_ops.load(Ordering::Relaxed);
-    let submits = submit_ops.load(Ordering::Relaxed);
-    let polls = poll_ops.load(Ordering::Relaxed);
-    let errs = error_ops.load(Ordering::Relaxed);
-    let mixed_rps = total as f64 / elapsed.as_secs_f64();
-
+async fn bench_contention(cfg: BenchConfig) -> Result<()> {
     eprintln!(
-        "[loadtest]   mixed workload c={concurrency} for {:.1}s: {total} ops = {mixed_rps:.0} ops/s (submits={submits}, polls={polls}, errors={errs})",
-        elapsed.as_secs_f64()
+        "[loadtest] === Mutex Contention Benchmark ({} trial(s)) ===",
+        cfg.trials
     );
 
-    metric("contention_mixed_rps", mixed_rps, 0);
-    metric("contention_submits", submits as f64, 0);
-    metric("contention_polls", polls as f64, 0);
-    metric("contention_errors", errs as f64, 0);
+    let mut mixed_rps = Vec::new();
+    let mut submit_totals = Vec::new();
+    let mut poll_totals = Vec::new();
+    let mut error_total = 0u64;
+
+    for _ in 0..cfg.trials {
+        // Fresh server per trial: a run list carried over from a previous trial
+        // would make later polls progressively more expensive.
+        let (app, _state, _dir) = fresh_app().await?;
+        let app = Arc::new(app);
+
+        let total_ops = Arc::new(AtomicU64::new(0));
+        let submit_ops = Arc::new(AtomicU64::new(0));
+        let poll_ops = Arc::new(AtomicU64::new(0));
+        let error_ops = Arc::new(AtomicU64::new(0));
+
+        let start = Instant::now();
+        let mut handles = Vec::with_capacity(CONTENTION_CONCURRENCY);
+
+        for worker_id in 0..CONTENTION_CONCURRENCY {
+            let app = app.clone();
+            let total = total_ops.clone();
+            let submits = submit_ops.clone();
+            let polls = poll_ops.clone();
+            let errors = error_ops.clone();
+            let deadline = start + CONTENTION_DURATION;
+
+            handles.push(tokio::spawn(async move {
+                let mut i = 0u64;
+                while Instant::now() < deadline {
+                    i += 1;
+                    // Alternate between submissions and polls with a 70/30 split.
+                    if i % 10 < 7 {
+                        let (status, _) = request(
+                            &app,
+                            Method::POST,
+                            "/api/v1/runs",
+                            submission(SIMPLE_WORKFLOW, &format!("bench/contention-{worker_id}")),
+                        )
+                        .await;
+                        if status.is_success() {
+                            submits.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            errors.fetch_add(1, Ordering::Relaxed);
+                        }
+                    } else {
+                        let (status, _) =
+                            request(&app, Method::GET, "/api/v1/runs?limit=20", Value::Null).await;
+                        if status.is_success() {
+                            polls.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            errors.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    total.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.await?;
+        }
+
+        let elapsed = start.elapsed();
+        let total = total_ops.load(Ordering::Relaxed);
+        let submits = submit_ops.load(Ordering::Relaxed);
+        let polls = poll_ops.load(Ordering::Relaxed);
+        let errors = error_ops.load(Ordering::Relaxed);
+        let rps = total as f64 / elapsed.as_secs_f64();
+
+        eprintln!(
+            "[loadtest]   mixed c={CONTENTION_CONCURRENCY} for {:.1}s: {total} ops = {rps:.0} ops/s (submits={submits}, polls={polls}, errors={errors})",
+            elapsed.as_secs_f64()
+        );
+
+        mixed_rps.push(rps);
+        submit_totals.push(submits as f64);
+        poll_totals.push(polls as f64);
+        error_total += errors;
+    }
+
+    metric_stats("contention_mixed_rps", &mixed_rps, 0);
+    metric_stats("contention_submits", &submit_totals, 0);
+    metric_stats("contention_polls", &poll_totals, 0);
+    metric_text("contention_errors", &error_total.to_string());
+
+    if error_total > 0 {
+        bail!("mixed contention workload recorded {error_total} rejected requests");
+    }
 
     Ok(())
 }
 
 // ── protocol serialization benchmark ────────────────────────────────────────
 
-fn bench_protocol_serde() -> Result<()> {
-    eprintln!("[loadtest] === Protocol Serialization Benchmark ===");
+fn bench_protocol_serde(cfg: BenchConfig) -> Result<()> {
+    eprintln!(
+        "[loadtest] === Protocol Serialization Benchmark ({} trial(s)) ===",
+        cfg.trials
+    );
 
-    // Build a representative AgentJobRequestMessage via the parser pipeline
     let wf = aksh_gha_parser::parse_workflow(COMPLEX_WORKFLOW)?;
     let expanded = aksh_gha_parser::expand_jobs(&wf)?;
-
-    // Serialize/deserialize the expanded jobs
-    let iterations = 5000;
     let payload = serde_json::to_string(&expanded)?;
     let payload_size = payload.len();
 
-    let start = Instant::now();
-    for _ in 0..iterations {
-        let bytes = serde_json::to_string(&expanded).unwrap();
-        std::hint::black_box(&bytes);
-    }
-    let ser_us = start.elapsed().as_micros() as f64 / iterations as f64;
+    let mut ser_us = Vec::new();
+    let mut de_us = Vec::new();
 
-    let start = Instant::now();
-    for _ in 0..iterations {
-        let _: Value = serde_json::from_str(&payload).unwrap();
+    for _ in 0..cfg.trials {
+        let start = Instant::now();
+        for _ in 0..SERDE_ITERATIONS {
+            let bytes = serde_json::to_string(&expanded)?;
+            std::hint::black_box(&bytes);
+        }
+        ser_us.push(start.elapsed().as_micros() as f64 / SERDE_ITERATIONS as f64);
+
+        let start = Instant::now();
+        for _ in 0..SERDE_ITERATIONS {
+            let value: Value = serde_json::from_str(&payload)?;
+            std::hint::black_box(&value);
+        }
+        de_us.push(start.elapsed().as_micros() as f64 / SERDE_ITERATIONS as f64);
     }
-    let de_us = start.elapsed().as_micros() as f64 / iterations as f64;
 
     eprintln!(
-        "[loadtest]   expanded jobs ({payload_size} bytes): ser={ser_us:.1}µs de={de_us:.1}µs"
+        "[loadtest]   expanded jobs ({payload_size} bytes): ser={:.1}µs de={:.1}µs (medians)",
+        median_of_sorted(&sorted(&ser_us)),
+        median_of_sorted(&sorted(&de_us))
     );
 
-    metric("serde_expanded_ser_us", ser_us, 1);
-    metric("serde_expanded_de_us", de_us, 1);
-    metric("serde_payload_bytes", payload_size as f64, 0);
+    metric_stats("serde_expanded_ser_us", &ser_us, 1);
+    metric_stats("serde_expanded_de_us", &de_us, 1);
+    metric_text("serde_payload_bytes", &payload_size.to_string());
 
     Ok(())
 }
 
 // ── entrypoint ──────────────────────────────────────────────────────────────
 
+/// Emit the knobs and build facts a reader needs to reproduce the numbers.
+fn emit_run_provenance(cfg: BenchConfig) -> Result<()> {
+    metric_text("bench_trials", &cfg.trials.to_string());
+    metric_text("bench_seed", &cfg.seed.to_string());
+    metric_text(
+        "bench_profile",
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        },
+    );
+    let parallelism = std::thread::available_parallelism()
+        .context("querying available parallelism")?
+        .get();
+    metric_text("bench_available_parallelism", &parallelism.to_string());
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let subcommand = args.get(1).map(String::as_str).unwrap_or("all");
+    let cfg = BenchConfig::from_env()?;
 
-    let state_dir = tempfile::tempdir().context("creating temp state dir")?;
+    emit_run_provenance(cfg)?;
 
     match subcommand {
-        "server-load" => {
-            bench_server_load(state_dir.path()).await?;
-        }
-        "parser" => {
-            bench_parser()?;
-        }
-        "expressions" => {
-            bench_expressions()?;
-        }
-        "snapshot" => {
-            bench_snapshots(state_dir.path()).await?;
-        }
-        "cold-boot" => {
-            bench_cold_boot(state_dir.path()).await?;
-        }
-        "contention" => {
-            bench_contention(state_dir.path()).await?;
-        }
-        "serde" => {
-            bench_protocol_serde()?;
-        }
+        "server-load" => bench_server_load(cfg).await?,
+        "parser" => bench_parser(cfg)?,
+        "expressions" => bench_expressions(cfg)?,
+        "snapshot" => bench_snapshots(cfg).await?,
+        "cold-boot" => bench_cold_boot(cfg).await?,
+        "contention" => bench_contention(cfg).await?,
+        "serde" => bench_protocol_serde(cfg)?,
         "all" => {
-            // Run everything, emit all metrics
-            bench_cold_boot(state_dir.path()).await?;
-            bench_parser()?;
-            bench_expressions()?;
-            bench_protocol_serde()?;
-            bench_server_load(state_dir.path()).await?;
-            bench_contention(state_dir.path()).await?;
-            bench_snapshots(state_dir.path()).await?;
+            bench_cold_boot(cfg).await?;
+            bench_parser(cfg)?;
+            bench_expressions(cfg)?;
+            bench_protocol_serde(cfg)?;
+            bench_server_load(cfg).await?;
+            bench_contention(cfg).await?;
+            bench_snapshots(cfg).await?;
         }
         other => {
             eprintln!("Unknown subcommand: {other}");
