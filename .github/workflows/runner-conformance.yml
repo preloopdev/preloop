@@ -1,0 +1,59 @@
+name: runner-conformance
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "30 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  runner-light:
+    name: Runner light conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate runner status responses
+        run: python3 benchmarks/real-world/runner-conformance.py --mode light
+      - name: Upload light report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runner-light-conformance
+          path: benchmarks/compatibility/runner/behavior/RUNNER-CONFORMANCE-REPORT.md
+          if-no-files-found: error
+
+  # The deep profile needs the repository's pre-packed smolVM machines,
+  # macOS/ARM64 host, gh credentials, and official runner cache. It runs on
+  # every pull request so runner regressions block review. A missing or failed
+  # infrastructure prerequisite must fail this job rather than silently
+  # degrading to the light profile.
+  runner-deep:
+    name: Runner deep conformance
+    if: github.event_name == 'pull_request' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, smolvm]
+    timeout-minutes: 180
+    env:
+      GH_REPO: ${{ vars.RUNNER_CONFORMANCE_REPO || 'preloopdev/aksh-conformance' }}
+      GH_TOKEN: ${{ secrets.RUNNER_CONFORMANCE_TOKEN }}
+      HOST_WORKSPACE: ${{ vars.RUNNER_CONFORMANCE_HOST_WORKSPACE || '/Users/bnjoroge/macos-runners' }}
+      AKSH_RUNNER_HOST: ${{ github.workspace }}/target/aarch64-unknown-linux-musl/release/preloop-runner
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build current PR runner for smolVM
+        run: cargo zigbuild -p aksh-runner --release --target aarch64-unknown-linux-musl
+      - name: Run deep runner conformance
+        run: |
+          bash ./benchmarks/real-world/batch-conformance.sh both '10[1-9]-*' '110-*'
+          python3 benchmarks/real-world/runner-conformance.py --mode deep
+      - name: Upload deep report and captures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runner-deep-conformance
+          path: |
+            benchmarks/compatibility/runner/behavior/RUNNER-CONFORMANCE-REPORT.md
+            benchmarks/compatibility/runner/behavior/conformance-*.jsonl
+            benchmarks/compatibility/runner/behavior/vm-*.log
+          if-no-files-found: error
