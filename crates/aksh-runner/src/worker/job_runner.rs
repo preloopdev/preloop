@@ -518,7 +518,9 @@ pub async fn run_job(
                 job_name,
                 &workspace,
                 debug_paused.clone(),
-            ) {
+            )
+            .await
+            {
                 Ok(client) => {
                     info!("Pause-on-failure enabled — a failed step will hold this VM open");
                     Some(client)
@@ -859,7 +861,7 @@ fn spawn_renew_loop(
 /// the run id, a job message without a control endpoint, an unusable
 /// transport — and collapsing them into `None` made "pause-on-failure did
 /// nothing" impossible to diagnose from the job log.
-fn build_debug_pause_client(
+async fn build_debug_pause_client(
     job_message: &serde_json::Value,
     job_id: &str,
     job_name: &str,
@@ -875,26 +877,24 @@ fn build_debug_pause_client(
     let agent_job_id = job_id
         .parse::<uuid::Uuid>()
         .map_err(|error| anyhow::anyhow!("job id `{job_id}` is not an agent job GUID: {error}"))?;
-    let (service_url, _runtime_token) = extract_service_endpoint(job_message)
+    let (service_url, runtime_token) = extract_service_endpoint(job_message)
         .ok_or_else(|| anyhow::anyhow!("job message has no SystemVssConnection endpoint"))?;
-    // The runtime token is scoped to job reporting and is revoked at job
-    // completion — exactly when a pause needs to keep talking to the server.
-    // The debug-worker token is minted for that longer window.
-    let token = job_message
-        .get("variables")
-        .and_then(|v| v.get("system.preloop.debug_worker_token"))
-        .and_then(|v| v.get("value").or(Some(v)))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("job message carries no debug-worker token"))?
-        .to_owned();
-    Ok(super::debug_pause::DebugPauseClient::new(
+    // The debug-worker token is fetched, not read from the job message: the
+    // official runner republishes every secret variable as `secrets.*`, so
+    // anything delivered that way is readable by the workflow being debugged.
+    // The runtime token authenticates the exchange and nothing else — it is
+    // scoped to job reporting and revoked at job completion, exactly when a
+    // pause still needs to talk to the server, so the credential it buys is
+    // minted for that longer window.
+    Ok(super::debug_pause::DebugPauseClient::acquire(
         &service_url,
-        token,
+        &runtime_token,
         run_id,
         aksh_gha_protocol::JobId(job_id.to_owned()),
         agent_job_id,
         job_name.to_owned(),
-    )?
+    )
+    .await?
     .with_pause_flag(paused)
     .with_workspace(
         Some(workspace.to_owned()),

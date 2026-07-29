@@ -627,7 +627,11 @@ pub async fn run_steps(
 
             let mut outcome =
                 execute_step(&step.step_type, &mut step_ctx, workspace, exec_cancel_rx).await;
-            if resolved_display_name.contains("${{ format(") {
+            // F029: If the display name still contains unresolved expressions
+            // after the pre-execution evaluation (e.g. `${{ needs.*.result }}`
+            // or `${{ format(...) }}`), try to fix it now that the step has
+            // executed and contexts may have been populated.
+            if resolved_display_name.contains("${{") {
                 if let Some(group_line) = step_ctx
                     .log_content()
                     .lines()

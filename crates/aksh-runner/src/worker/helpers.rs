@@ -67,13 +67,14 @@ pub fn iso_now() -> String {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
     let secs = now.as_secs();
-    let millis = now.subsec_millis();
-    time_to_iso8601(secs, millis)
+    let nanos = now.subsec_nanos();
+    time_to_iso8601(secs, nanos)
 }
 
-/// Convert unix timestamp to ISO 8601 string (UTC).
-pub(crate) fn time_to_iso8601(secs: u64, millis: u32) -> String {
-    // Simple UTC ISO 8601 formatter without chrono dependency
+/// Convert unix timestamp to ISO 8601 string (UTC) with 100-nanosecond
+/// precision (7 decimal places), matching the official C# runner's
+/// `DateTime.UtcNow.ToString("O")` format.
+pub(crate) fn time_to_iso8601(secs: u64, nanos: u32) -> String {
     let days = secs / 86400;
     let time_secs = secs % 86400;
     let hours = time_secs / 3600;
@@ -83,7 +84,9 @@ pub(crate) fn time_to_iso8601(secs: u64, millis: u32) -> String {
     // Days since epoch to y/m/d (civil_from_days algorithm)
     let (y, m, d) = civil_from_days(days as i64);
 
-    format!("{y:04}-{m:02}-{d:02}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z")
+    // 100-nanosecond ticks: nanos / 100, giving 7-digit fractional seconds.
+    let ticks = nanos / 100;
+    format!("{y:04}-{m:02}-{d:02}T{hours:02}:{minutes:02}:{seconds:02}.{ticks:07}Z")
 }
 
 /// Convert days since Unix epoch to (year, month, day).
