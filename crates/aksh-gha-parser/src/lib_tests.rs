@@ -306,6 +306,114 @@ jobs:
 }
 
 #[test]
+fn undeclared_permissions_resolve_to_the_restricted_default() {
+    let workflow = parse_workflow(
+        r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo build
+"#,
+    )
+    .unwrap();
+
+    let jobs = expand_jobs(&workflow).unwrap();
+    assert_eq!(
+        jobs[0].permissions, None,
+        "nothing declared must stay distinguishable from an empty declaration"
+    );
+    assert_eq!(
+        *effective_token_permissions(jobs[0].permissions.as_ref()),
+        BTreeMap::from([
+            ("contents".to_owned(), "read".to_owned()),
+            ("metadata".to_owned(), "read".to_owned()),
+            ("packages".to_owned(), "read".to_owned()),
+        ]),
+        "an undeclared block is the restricted default, not everything"
+    );
+    assert!(
+        DEFAULT_TOKEN_PERMISSIONS
+            .iter()
+            .all(|&(_, level)| level == "read"),
+        "the default policy must never hand out a write scope"
+    );
+}
+
+#[test]
+fn empty_permissions_block_is_not_widened_to_the_default() {
+    let workflow = parse_workflow(
+        r#"
+on: push
+permissions: {}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo build
+"#,
+    )
+    .unwrap();
+
+    let jobs = expand_jobs(&workflow).unwrap();
+    assert_eq!(jobs[0].permissions, Some(BTreeMap::new()));
+    assert!(
+        effective_token_permissions(jobs[0].permissions.as_ref()).is_empty(),
+        "`permissions: {{}}` withholds every scope and must not gain the default back"
+    );
+}
+
+#[test]
+fn job_permissions_replace_workflow_permissions_entirely() {
+    let workflow = parse_workflow(
+        r#"
+on: push
+permissions: write-all
+jobs:
+  narrow:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: none
+    steps:
+      - run: echo narrow
+  inherited:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo inherited
+"#,
+    )
+    .unwrap();
+
+    let jobs = expand_jobs(&workflow).unwrap();
+    let by_id = |id: &str| {
+        jobs.iter()
+            .find(|job| job.id.0 == id)
+            .and_then(|job| job.permissions.clone())
+            .unwrap()
+    };
+
+    assert_eq!(
+        by_id("narrow"),
+        BTreeMap::from([
+            ("contents".to_owned(), "read".to_owned()),
+            ("packages".to_owned(), "none".to_owned()),
+        ]),
+        "a job block replaces the workflow block instead of merging into it"
+    );
+
+    let inherited = by_id("inherited");
+    assert_eq!(inherited.len(), PERMISSION_SCOPES.len());
+    assert!(
+        PERMISSION_SCOPES
+            .iter()
+            .all(|scope| inherited.get(*scope).map(String::as_str) == Some("write")),
+        "`write-all` expands to every known scope: {inherited:?}"
+    );
+}
+
+#[test]
 fn reusable_oidc_permission_requires_caller_grant() {
     let caller = parse_workflow(
         r#"
