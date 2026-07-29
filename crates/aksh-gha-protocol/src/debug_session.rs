@@ -293,6 +293,31 @@ pub struct OpenSessionResponse {
     pub session_id: String,
 }
 
+/// Worker → server: exchange the job runtime token for this job's
+/// debug-worker credential.
+///
+/// The debug-worker token is deliberately *not* delivered in the job message.
+/// The official runner projects every `isSecret` variable into the `secrets`
+/// context, so anything shipped that way is readable from workflow YAML as
+/// `${{ secrets['…'] }}` — which would hand untrusted steps the very
+/// credential the debug privilege split exists to withhold.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerTokenRequest {
+    /// AzDO job GUID the worker is executing.
+    ///
+    /// Stated explicitly rather than inferred so the server can reject a
+    /// mismatch against the job named by the presented runtime token, instead
+    /// of silently issuing for whichever job the token happened to name.
+    pub agent_job_id: uuid::Uuid,
+}
+
+/// Server → worker: the debug-worker credential for exactly one job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerTokenResponse {
+    /// Bearer token accepted only on this job's debug-session routes.
+    pub token: String,
+}
+
 /// Controller → server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerdictRequest {
