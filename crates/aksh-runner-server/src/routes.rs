@@ -410,6 +410,16 @@ pub(crate) fn build_app(
         // Live debug sessions. Worker-facing routes are runner-authenticated;
         // controller-facing routes are native-authenticated. Both live on the
         // native surface so `/_apis/...` stays byte-identical.
+        //
+        // The credential those worker routes need is not in the job message —
+        // an official runner would republish it as `${{ secrets[...] }}` — so
+        // the worker exchanges its job runtime token for it here first.
+        .route(
+            "/api/v1/debug/worker-token",
+            post(crate::debug_sessions::issue_worker_token).route_layer(
+                middleware::from_fn_with_state(shared.clone(), require_job_runtime_bearer),
+            ),
+        )
         .route(
             "/api/v1/debug/sessions",
             post(crate::debug_sessions::open_session).route_layer(middleware::from_fn_with_state(
@@ -687,6 +697,7 @@ pub(crate) fn build_app(
         // Cache: /twirp-blob/cache/{token}
         // Artifact: /twirp-blob/artifact/{token}  (download URL appends .zip for content-type detection)
         .route("/twirp-blob/:kind/:token", put(blob_put).get(blob_get))
+        .layer(DefaultBodyLimit::max(512 * 1024 * 1024)) // 512 MB for blob uploads
         .route_layer(middleware::from_fn_with_state(
             shared.clone(),
             require_results_bearer,
