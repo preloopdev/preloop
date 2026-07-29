@@ -1340,3 +1340,34 @@ jobs:
     let expanded = expand_jobs(&parsed).unwrap();
     assert_eq!(expanded.len(), 1);
 }
+
+#[test]
+fn dynamic_matrix_expansion_unresolved_expression() {
+    let yaml = r#"
+name: 101-dynamic-matrix-dataflow
+on: workflow_dispatch
+jobs:
+  setup:
+    runs-on: self-hosted
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - id: set-matrix
+        run: echo 'matrix={"include":[{"os":"ubuntu-latest","node":"18"},{"os":"ubuntu-latest","node":"20"}]}' >> $GITHUB_OUTPUT
+
+  build:
+    needs: setup
+    runs-on: self-hosted
+    strategy:
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+    steps:
+      - run: echo "Node version ${{ matrix.node }}"
+"#;
+    let parsed = parse_workflow(yaml).unwrap();
+    let expanded = expand_jobs(&parsed).unwrap();
+    println!(
+        "Expanded jobs: {:?}",
+        expanded.iter().map(|j| &j.id.0).collect::<Vec<_>>()
+    );
+    assert_eq!(expanded.len(), 1);
+}
