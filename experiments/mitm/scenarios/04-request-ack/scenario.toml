@@ -3,7 +3,7 @@ duration_seconds_max = 300
 
 [[steps]]
 kind = "submit_workflow"
-path = "workflow.yml"
+path = "04-request-ack.yml"
 
 [[steps]]
 kind = "wait_for_event"
