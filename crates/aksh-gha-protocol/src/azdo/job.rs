@@ -294,7 +294,16 @@ impl Serialize for TaskStep {
         if let Some(condition) = &self.condition {
             map.serialize_entry("condition", condition)?;
         }
-        map.serialize_entry("continueOnError", &self.continue_on_error)?;
+        let continue_on_error = self.continue_on_error.map(|value| {
+            serde_json::json!({
+                "type": 5,
+                "file": 1,
+                "line": 0,
+                "col": 0,
+                "bool": value
+            })
+        });
+        map.serialize_entry("continueOnError", &continue_on_error)?;
         if let Some(working_directory) = &self.working_directory {
             map.serialize_entry("workingDirectory", working_directory)?;
         }
@@ -350,7 +359,10 @@ impl<'de> Deserialize<'de> for TaskStep {
                 .and_then(|v| serde_json::from_value(v.clone()).ok()),
             env,
             inputs,
-            continue_on_error: obj.get("continueOnError").and_then(|v| v.as_bool()),
+            continue_on_error: obj.get("continueOnError").and_then(|v| {
+                v.as_bool()
+                    .or_else(|| v.get("bool").and_then(serde_json::Value::as_bool))
+            }),
             working_directory: obj
                 .get("workingDirectory")
                 .and_then(|v| v.as_str())
@@ -433,6 +445,8 @@ impl Serialize for SerializedActionReference<'_> {
         };
 
         let is_self = reference.path.is_some();
+        let is_container_registry =
+            reference.reference_type.as_deref() == Some("containerRegistry");
         let field_count = 1
             + usize::from(reference.name.is_some() || is_self)
             + usize::from(reference.version.is_some())
@@ -447,6 +461,10 @@ impl Serialize for SerializedActionReference<'_> {
             map.serialize_entry("repositoryType", "self")?;
             if let Some(path) = &reference.path {
                 map.serialize_entry("path", path)?;
+            }
+        } else if is_container_registry {
+            if let Some(image) = &reference.name {
+                map.serialize_entry("image", image)?;
             }
         } else {
             if let Some(name) = &reference.name {
@@ -596,7 +614,11 @@ pub(crate) fn find_expression_end(s: &str) -> Option<usize> {
 pub struct TaskReference {
     #[serde(rename = "id", skip_serializing_if = "Option::is_none")]
     pub id: Option<uuid::Uuid>,
-    #[serde(rename = "name", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "name",
+        alias = "image",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub name: Option<String>,
     #[serde(rename = "path", skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
