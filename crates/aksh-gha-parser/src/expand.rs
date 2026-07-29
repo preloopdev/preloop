@@ -1,5 +1,6 @@
 //! Workflow job expansion.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -145,6 +146,61 @@ fn non_empty_services(services: Option<serde_json::Value>) -> Option<serde_json:
     }
 }
 
+/// Every permission scope a workflow `permissions:` block can name, in workflow
+/// (kebab-case) spelling. `read-all` and `write-all` expand to all of them.
+pub const PERMISSION_SCOPES: [&str; 14] = [
+    "actions",
+    "attestations",
+    "checks",
+    "contents",
+    "deployments",
+    "discussions",
+    "id-token",
+    "issues",
+    "packages",
+    "pages",
+    "pull-requests",
+    "repository-projects",
+    "security-events",
+    "statuses",
+];
+
+/// `GITHUB_TOKEN` permissions for a job whose workflow declares no
+/// `permissions:` block at all.
+///
+/// GitHub's restricted default, and exactly what the official runner prints in
+/// its `GITHUB_TOKEN Permissions` setup group for such a workflow. This is the
+/// single source of truth for the `system.github.token.permissions` runner
+/// variable and the GitHub App installation-token request, so a job is never
+/// told it holds authority its token does not carry — nor handed authority it
+/// was never told about.
+pub const DEFAULT_TOKEN_PERMISSIONS: [(&str, &str); 3] = [
+    ("contents", "read"),
+    ("metadata", "read"),
+    ("packages", "read"),
+];
+
+/// Effective `GITHUB_TOKEN` permissions for a job, given its resolved
+/// [`JobPlan::permissions`].
+///
+/// `None` means neither the job nor its workflow said anything, so
+/// [`DEFAULT_TOKEN_PERMISSIONS`] applies. `Some` is authoritative *even when
+/// empty*: `permissions: {}` withholds every scope, and widening that back to
+/// the default would grant a job more than it asked for.
+pub fn effective_token_permissions(
+    declared: Option<&BTreeMap<String, String>>,
+) -> Cow<'_, BTreeMap<String, String>> {
+    match declared {
+        Some(declared) => Cow::Borrowed(declared),
+        None => Cow::Owned(
+            DEFAULT_TOKEN_PERMISSIONS
+                .iter()
+                .map(|&(scope, level)| (scope.to_owned(), level.to_owned()))
+                .collect(),
+        ),
+    }
+}
+
 /// Resolve the effective permissions map from workflow/job YAML.
 ///
 /// `permissions: read-all` → all scopes set to `read`.
@@ -164,25 +220,8 @@ fn resolve_permissions(
                 "write-all" => "write",
                 _ => return Some(std::collections::BTreeMap::new()),
             };
-            // GitHub's known permission scopes.
-            let scopes = [
-                "actions",
-                "attestations",
-                "checks",
-                "contents",
-                "deployments",
-                "id-token",
-                "issues",
-                "discussions",
-                "packages",
-                "pages",
-                "pull-requests",
-                "repository-projects",
-                "security-events",
-                "statuses",
-            ];
             Some(
-                scopes
+                PERMISSION_SCOPES
                     .into_iter()
                     .map(|s| (s.to_owned(), level.to_owned()))
                     .collect(),
