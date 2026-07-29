@@ -3,7 +3,7 @@ duration_seconds_max = 600
 
 [[steps]]
 kind = "submit_workflow"
-path = "workflow-a.yml"
+path = "05-multi-job-a.yml"
 
 [[steps]]
 kind = "wait_for_event"
@@ -16,7 +16,7 @@ n = 5
 
 [[steps]]
 kind = "submit_workflow"
-path = "workflow-b.yml"
+path = "05-multi-job-b.yml"
 
 [[steps]]
 kind = "wait_for_event"
