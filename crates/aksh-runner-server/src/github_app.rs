@@ -2,9 +2,17 @@
 //!
 //! The server mints a short-lived, permission-scoped installation token for
 //! each dispatched job so workflow code sees a `GITHUB_TOKEN` carrying the same
-//! authority a hosted Actions job would get. Every part of this is optional:
-//! with no App configured the caller falls back to a PAT and then to the local
-//! HMAC JWT.
+//! authority a hosted Actions job would get. Every token is scoped to the run's
+//! repository and to an explicit permission set; neither field is ever omitted,
+//! because GitHub reads an omitted field as "everything this installation can
+//! reach".
+//!
+//! Configuring the App is optional — with none configured the caller uses
+//! `AKSH_GITHUB_TOKEN` and then the local HMAC JWT. A *failed* mint is
+//! different: falling through to the PAT would swap a repository-scoped,
+//! `permissions:`-bounded token for an unscoped one, so what happens then is an
+//! explicit operator choice ([`MintFailurePolicy`]) that defaults to no GitHub
+//! authority at all.
 //!
 //! Only the runner's `GITHUB_TOKEN` is affected. The `AccessToken` in
 //! `endpoint.authorization.parameters` stays the local HMAC JWT, because that
@@ -46,9 +54,81 @@ const INSTALLATIONS_PER_PAGE: usize = 100;
 /// Workflow permission scopes with no GitHub App counterpart. `id-token`
 /// controls Actions OIDC issuance and `models` controls GitHub Models access;
 /// both are runtime-only, and forwarding either makes the installation-token
-/// request fail with HTTP 422 — which would silently downgrade the job to a
-/// broader fallback credential.
+/// request fail with HTTP 422 — which would push the job onto whatever
+/// [`MintFailurePolicy`] allows instead of the token it asked for.
 const ACTIONS_ONLY_SCOPES: [&str; 2] = ["id-token", "models"];
+
+/// The narrowest scope GitHub will issue an installation token for.
+///
+/// `Metadata: read` is granted to every GitHub App and cannot be revoked, so
+/// requesting only it is always accepted. It is the floor used when a workflow
+/// withholds every scope, because an empty `permissions` object is not a
+/// documented way to ask for an empty token and cannot be relied on to narrow
+/// one.
+const MINIMUM_PERMISSION: (&str, &str) = ("metadata", "read");
+
+/// Environment variable selecting the [`MintFailurePolicy`].
+const MINT_FAILURE_ENV: &str = "AKSH_GITHUB_APP_MINT_FAILURE";
+
+/// What a job's `GITHUB_TOKEN` becomes when installation-token minting fails.
+///
+/// `AKSH_GITHUB_TOKEN` is a static PAT: it ignores `permissions:`, is not
+/// scoped to one repository, and on many deployments is far broader than any
+/// App installation. Reaching for it automatically would turn a transient mint
+/// failure — a rate limit, a revoked key, a repository the App was never
+/// installed on — into a silent privilege escalation for every job in the run.
+/// So the default keeps the job on the local HMAC JWT, which carries no GitHub
+/// authority whatsoever, and the PAT is used only when an operator names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MintFailurePolicy {
+    /// Leave the job on the local HMAC JWT. The default.
+    LocalJwt,
+    /// Reject the run so the misconfiguration surfaces immediately.
+    Error,
+    /// Fall back to `AKSH_GITHUB_TOKEN`, accepting its broader authority.
+    Pat,
+}
+
+impl MintFailurePolicy {
+    /// Read the policy from `AKSH_GITHUB_APP_MINT_FAILURE`.
+    fn from_env() -> anyhow::Result<Self> {
+        Self::parse(env_non_empty(MINT_FAILURE_ENV).as_deref())
+    }
+
+    /// [`Self::from_env`] against an explicit value, so the mapping is testable
+    /// without mutating process-wide environment state.
+    fn parse(raw: Option<&str>) -> anyhow::Result<Self> {
+        let Some(raw) = raw else {
+            return Ok(Self::LocalJwt);
+        };
+        match raw.to_ascii_lowercase().as_str() {
+            "local" => Ok(Self::LocalJwt),
+            "error" => Ok(Self::Error),
+            "pat" => Ok(Self::Pat),
+            _ => bail!("{MINT_FAILURE_ENV}={raw} is not one of `local`, `error`, `pat`"),
+        }
+    }
+}
+
+/// Resolve the `GITHUB_TOKEN` a job gets after its mint failed.
+///
+/// `Ok(None)` leaves the job on the local HMAC JWT. `Err` means the run must be
+/// rejected outright. `pat` is `AKSH_GITHUB_TOKEN`; it is only ever consulted
+/// under [`MintFailurePolicy::Pat`], so no policy but that one can widen a
+/// job's authority past what the App would have granted.
+pub(crate) fn fallback_token(
+    policy: MintFailurePolicy,
+    pat: Option<String>,
+) -> anyhow::Result<Option<String>> {
+    match policy {
+        MintFailurePolicy::LocalJwt => Ok(None),
+        MintFailurePolicy::Error => Err(anyhow!(
+            "{MINT_FAILURE_ENV}=error: refusing to dispatch a job whose \
+             GitHub App installation token could not be minted"
+        )),
+        MintFailurePolicy::Pat => Ok(pat),
+    }
+}
 
 /// GitHub App credentials for minting installation tokens.
 #[derive(Clone)]
@@ -57,6 +137,8 @@ pub(crate) struct GitHubAppCredentials {
     pub app_id: String,
     /// App private key, used to sign the App JWT with RS256.
     pub private_key: rsa::RsaPrivateKey,
+    /// What each job's token becomes if minting fails.
+    pub mint_failure: MintFailurePolicy,
     /// Lowercased account login to installation id.
     ///
     /// Only the installation id is cached, never a token: token scope follows
@@ -64,6 +146,24 @@ pub(crate) struct GitHubAppCredentials {
     /// mid-job or outlive a revoked installation. Discovery is the expensive
     /// call, so caching it leaves one API request per job in steady state.
     installation_cache: Arc<RwLock<HashMap<String, u64>>>,
+}
+
+#[cfg(test)]
+impl GitHubAppCredentials {
+    /// Credentials with no installation discovered yet, for tests that drive
+    /// the dispatch path without a real App.
+    pub(crate) fn for_tests(
+        app_id: &str,
+        private_key: rsa::RsaPrivateKey,
+        mint_failure: MintFailurePolicy,
+    ) -> Self {
+        Self {
+            app_id: app_id.to_owned(),
+            private_key,
+            mint_failure,
+            installation_cache: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
 }
 
 /// Read GitHub App credentials from the environment.
@@ -74,6 +174,9 @@ pub(crate) struct GitHubAppCredentials {
 /// unreadable or malformed *is* fatal: the operator plainly meant to configure
 /// an App, and starting without one would silently downgrade every job token.
 pub(crate) fn load_from_env() -> anyhow::Result<Option<GitHubAppCredentials>> {
+    // Parsed before the not-configured early return so a typo is a startup
+    // error rather than a surprise the first time a mint fails in production.
+    let mint_failure = MintFailurePolicy::from_env()?;
     let app_id = env_non_empty("AKSH_GITHUB_APP_ID");
     let key_source = PRIVATE_KEY_ENV
         .iter()
@@ -106,46 +209,53 @@ pub(crate) fn load_from_env() -> anyhow::Result<Option<GitHubAppCredentials>> {
     };
     let private_key = parse_private_key(&pem)
         .with_context(|| format!("parsing the GitHub App private key from {source}"))?;
-    debug!(app_id, source, "GitHub App token minting enabled");
+    debug!(
+        app_id,
+        source,
+        mint_failure = ?mint_failure,
+        "GitHub App token minting enabled"
+    );
     Ok(Some(GitHubAppCredentials {
         app_id,
         private_key,
+        mint_failure,
         installation_cache: Arc::new(RwLock::new(HashMap::new())),
     }))
 }
 
-/// Mint an installation token for `owner`, scoped to `permissions`.
+/// Mint an installation token for `repository`, scoped to `permissions`.
+///
+/// `repository` is an `owner/repo` slug: the owner selects the installation and
+/// the repository bounds the token. `permissions` is the job's *effective*
+/// permission set, already resolved against
+/// [`aksh_gha_parser::DEFAULT_TOKEN_PERMISSIONS`] — this function does not
+/// invent a default, so no caller can accidentally request everything.
 ///
 /// Resolves (and caches) the installation id for the account, then mints a
 /// fresh token. Never panics and never touches `AppState::inner`, so it is
 /// safe to call from the dispatch path.
 pub(crate) async fn get_or_mint_token(
     creds: &GitHubAppCredentials,
-    owner: &str,
-    permissions: Option<&BTreeMap<String, String>>,
+    repository: &str,
+    permissions: &BTreeMap<String, String>,
 ) -> anyhow::Result<String> {
-    mint_for_owner(&api_base(), creds, owner, permissions).await
+    mint_for_repository(&api_base(), creds, repository, permissions).await
 }
 
 /// [`get_or_mint_token`] against an explicit API base.
-async fn mint_for_owner(
+async fn mint_for_repository(
     api_base: &str,
     creds: &GitHubAppCredentials,
-    owner: &str,
-    permissions: Option<&BTreeMap<String, String>>,
+    repository: &str,
+    permissions: &BTreeMap<String, String>,
 ) -> anyhow::Result<String> {
-    // Callers hold repository slugs far more often than bare logins, so accept
-    // either `owner` or `owner/repo`.
-    let owner = owner.split('/').next().unwrap_or(owner).trim();
-    if owner.is_empty() {
-        bail!("cannot mint a GitHub App token without a repository owner");
-    }
+    let (owner, repo) = split_repository(repository)?;
     let app_jwt = sign_app_jwt(&creds.app_id, &creds.private_key)?;
     let installation_id = installation_id_for(api_base, creds, &app_jwt, owner).await?;
     let (token, expires_at) =
-        mint_installation_token(api_base, &app_jwt, installation_id, permissions).await?;
+        mint_installation_token(api_base, &app_jwt, installation_id, repo, permissions).await?;
     debug!(
-        owner,
+        repository,
         installation_id,
         expires_in_secs = expires_at
             .duration_since(SystemTime::now())
@@ -154,6 +264,26 @@ async fn mint_for_owner(
         "minted GitHub App installation token"
     );
     Ok(token)
+}
+
+/// Split an `owner/repo` slug into its two parts.
+///
+/// Anything else is an error. Without a repository name the token cannot be
+/// repository-scoped, and GitHub's unscoped default reaches *every* repository
+/// the installation can see — so a run whose `repository` is not a real slug
+/// (a pure local-workspace submission, say) must fail here and be handled by
+/// [`MintFailurePolicy`] rather than be handed cross-repository authority.
+fn split_repository(repository: &str) -> anyhow::Result<(&str, &str)> {
+    let mut segments = repository.split('/');
+    let owner = segments.next().unwrap_or_default().trim();
+    let repo = segments.next().unwrap_or_default().trim();
+    if owner.is_empty() || repo.is_empty() || segments.next().is_some() {
+        bail!(
+            "cannot mint a repository-scoped GitHub App token for {repository:?}: \
+             expected an `owner/repo` slug"
+        );
+    }
+    Ok((owner, repo))
 }
 
 /// Sign a JWT authenticating as the GitHub App itself (RS256).
@@ -232,20 +362,26 @@ pub(crate) async fn find_installation(
     ))
 }
 
-/// Exchange an App JWT for an installation token scoped to `permissions`.
+/// Exchange an App JWT for a token scoped to `repository` and `permissions`.
+///
+/// `repository` is a bare repository name, not a slug — the installation
+/// already fixes the owner.
 pub(crate) async fn mint_installation_token(
     api_base: &str,
     app_jwt: &str,
     installation_id: u64,
-    permissions: Option<&BTreeMap<String, String>>,
+    repository: &str,
+    permissions: &BTreeMap<String, String>,
 ) -> anyhow::Result<(String, SystemTime)> {
     let url = format!("{api_base}/app/installations/{installation_id}/access_tokens");
-    let body = match permissions {
-        // Omitting `permissions` grants the installation's full permission
-        // set, which is what Actions does for a workflow that declares none.
-        None => json!({}),
-        Some(permissions) => json!({ "permissions": installation_permissions(permissions) }),
-    };
+    // Both fields are always present. Omitting `repositories` grants access to
+    // every repository the installation can reach, and omitting `permissions`
+    // grants the installation's entire permission set; either omission hands a
+    // job authority far past its `permissions:` block.
+    let body = json!({
+        "repositories": [repository],
+        "permissions": installation_permissions(permissions),
+    });
     let response = CLIENT
         .post(&url)
         .header("User-Agent", "aksh")
@@ -323,16 +459,26 @@ fn installation_id_override() -> anyhow::Result<Option<u64>> {
 /// scope; the installation-token API uses snake_case names, has no `none`
 /// level, and rejects any key it does not recognise. Withheld and
 /// Actions-only scopes are therefore dropped rather than forwarded.
+///
+/// Dropping every scope leaves nothing to send, and an empty `permissions`
+/// object cannot be trusted to mean "no permissions" — so the result falls back
+/// to [`MINIMUM_PERMISSION`], the narrowest token GitHub will issue, instead of
+/// a body GitHub might read as a request for everything.
 fn installation_permissions(
     permissions: &BTreeMap<String, String>,
 ) -> serde_json::Map<String, serde_json::Value> {
-    permissions
+    let scoped: serde_json::Map<String, serde_json::Value> = permissions
         .iter()
         .filter(|(scope, level)| {
             !level.eq_ignore_ascii_case("none") && !ACTIONS_ONLY_SCOPES.contains(&scope.as_str())
         })
         .map(|(scope, level)| (scope.replace('-', "_"), json!(level.to_ascii_lowercase())))
-        .collect()
+        .collect();
+    if scoped.is_empty() {
+        let (scope, level) = MINIMUM_PERMISSION;
+        return std::iter::once((scope.to_owned(), json!(level))).collect();
+    }
+    scoped
 }
 
 /// Parse a GitHub App private key in either PKCS#1 or PKCS#8 PEM form.
@@ -452,6 +598,94 @@ mod tests {
     }
 
     #[test]
+    fn withholding_every_scope_requests_the_narrowest_token() {
+        // `permissions: {}`, and a block whose every entry is dropped, must
+        // both land on the minimum rather than an empty object GitHub could
+        // read as "grant the installation's full set".
+        for permissions in [
+            BTreeMap::new(),
+            BTreeMap::from([
+                ("contents".to_owned(), "none".to_owned()),
+                ("id-token".to_owned(), "write".to_owned()),
+                ("models".to_owned(), "read".to_owned()),
+            ]),
+        ] {
+            assert_eq!(
+                serde_json::Value::Object(installation_permissions(&permissions)),
+                json!({ "metadata": "read" }),
+                "a withheld permission set must never widen the token"
+            );
+        }
+    }
+
+    #[test]
+    fn only_owner_slash_repository_can_be_scoped() {
+        assert_eq!(
+            split_repository("Preloop/preloop").expect("a slug splits"),
+            ("Preloop", "preloop")
+        );
+        assert_eq!(
+            split_repository(" preloop / preloop ").expect("padding is trimmed"),
+            ("preloop", "preloop")
+        );
+        for rejected in ["", "preloop", "preloop/", "/preloop", "a/b/c", "/"] {
+            assert!(
+                split_repository(rejected).is_err(),
+                "{rejected:?} cannot be repository-scoped and must not mint"
+            );
+        }
+    }
+
+    #[test]
+    fn mint_failure_policy_defaults_to_no_github_authority() {
+        assert_eq!(
+            MintFailurePolicy::parse(None).expect("unset is valid"),
+            MintFailurePolicy::LocalJwt,
+            "an operator who never opted in must not get the PAT"
+        );
+        assert_eq!(
+            MintFailurePolicy::parse(Some("LOCAL")).expect("case-insensitive"),
+            MintFailurePolicy::LocalJwt
+        );
+        assert_eq!(
+            MintFailurePolicy::parse(Some("error")).expect("error is valid"),
+            MintFailurePolicy::Error
+        );
+        assert_eq!(
+            MintFailurePolicy::parse(Some("pat")).expect("pat is valid"),
+            MintFailurePolicy::Pat
+        );
+        // A typo must not silently degrade to some other policy.
+        assert!(MintFailurePolicy::parse(Some("fallback")).is_err());
+    }
+
+    #[test]
+    fn only_the_pat_policy_can_reach_the_pat() {
+        let pat = || Some("github_pat_broad".to_owned());
+        assert_eq!(
+            fallback_token(MintFailurePolicy::LocalJwt, pat()).expect("local never errors"),
+            None,
+            "the default must ignore an available PAT"
+        );
+        assert_eq!(
+            fallback_token(MintFailurePolicy::Pat, pat()).expect("pat never errors"),
+            pat(),
+            "an explicit opt-in gets the PAT"
+        );
+        assert_eq!(
+            fallback_token(MintFailurePolicy::Pat, None).expect("pat never errors"),
+            None,
+            "opting in without a PAT set still falls to the local JWT"
+        );
+        let refused = fallback_token(MintFailurePolicy::Error, pat())
+            .expect_err("the error policy must reject the run");
+        assert!(
+            refused.to_string().contains(MINT_FAILURE_ENV),
+            "the refusal must name the setting that caused it: {refused}"
+        );
+    }
+
+    #[test]
     fn private_key_accepts_pkcs1_pkcs8_and_escaped_newlines() {
         use rsa::pkcs1::EncodeRsaPrivateKey;
         use rsa::pkcs8::EncodePrivateKey;
@@ -562,6 +796,7 @@ mod tests {
         let creds = GitHubAppCredentials {
             app_id: "424".to_owned(),
             private_key: test_key(),
+            mint_failure: MintFailurePolicy::LocalJwt,
             installation_cache: Arc::new(RwLock::new(HashMap::new())),
         };
         let permissions = BTreeMap::from([
@@ -570,15 +805,29 @@ mod tests {
             ("packages".to_owned(), "none".to_owned()),
         ]);
 
-        // A repository slug must resolve the same account as a bare login.
-        let scoped = mint_for_owner(&api_base, &creds, "preloop/preloop", Some(&permissions))
+        let declared = mint_for_repository(&api_base, &creds, "preloop/preloop", &permissions)
             .await
             .expect("mint a scoped token");
-        let unscoped = mint_for_owner(&api_base, &creds, "preloop", None)
+        // A second repository under the same account reuses the cached
+        // installation but must be scoped to *its own* repository, and a job
+        // that declared nothing gets the restricted policy default rather than
+        // the App's full grant.
+        let defaulted = mint_for_repository(
+            &api_base,
+            &creds,
+            "Preloop/other-repo",
+            &aksh_gha_parser::effective_token_permissions(None),
+        )
+        .await
+        .expect("mint a policy-default token");
+        assert_eq!(declared, "ghs_stub_installation_token");
+        assert_eq!(defaulted, "ghs_stub_installation_token");
+
+        // A bare owner cannot be repository-scoped, so it must never reach the
+        // API at all.
+        mint_for_repository(&api_base, &creds, "preloop", &permissions)
             .await
-            .expect("mint a default-scope token");
-        assert_eq!(scoped, "ghs_stub_installation_token");
-        assert_eq!(unscoped, "ghs_stub_installation_token");
+            .expect_err("a bare owner must not mint");
 
         let calls = calls.lock().expect("stub state");
         assert_eq!(
@@ -593,13 +842,23 @@ mod tests {
         );
         assert_eq!(
             calls.mint_bodies[0],
-            json!({ "permissions": { "contents": "read", "pull_requests": "write" } }),
-            "declared scopes are snake_cased and `none` is withheld"
+            json!({
+                "repositories": ["preloop"],
+                "permissions": { "contents": "read", "pull_requests": "write" },
+            }),
+            "the body is scoped to the one repository, snake_cased, `none` withheld"
         );
         assert_eq!(
             calls.mint_bodies[1],
-            json!({}),
-            "no declared permissions leaves the installation default in place"
+            json!({
+                "repositories": ["other-repo"],
+                "permissions": {
+                    "contents": "read",
+                    "metadata": "read",
+                    "packages": "read",
+                },
+            }),
+            "an undeclared permission block is policy-derived, never the App's full grant"
         );
         for authorization in &calls.mint_authorizations {
             let jwt = authorization
