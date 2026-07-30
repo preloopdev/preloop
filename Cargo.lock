@@ -1839,6 +1839,7 @@ dependencies = [
  "aksh-runner-server",
  "anyhow",
  "async-trait",
+ "futures",
  "preloop-vm",
  "reqwest",
  "serde",
