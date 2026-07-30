@@ -624,15 +624,28 @@ pub(crate) async fn broker_acquire_job(
         )
     };
     if let Some(token_request) = github_token_request {
-        if let Some(token) = mint_dispatch_github_token(&shared, &token_request).await? {
+        if let Some(minted) = mint_dispatch_github_token(&shared, &token_request).await? {
             message.variables.insert(
                 "system.github.token".to_owned(),
-                aksh_gha_protocol::azdo::VariableValue::secret(token.clone()),
+                aksh_gha_protocol::azdo::VariableValue::secret(minted.token.clone()),
             );
             message.variables.insert(
                 "github_token".to_owned(),
-                aksh_gha_protocol::azdo::VariableValue::secret(token),
+                aksh_gha_protocol::azdo::VariableValue::secret(minted.token),
             );
+            // Restate what the token carries when the installation could not
+            // grant everything. The message was built with the requested set,
+            // and leaving it would print authority the token does not have in
+            // the runner's `GITHUB_TOKEN Permissions` group — sending anyone
+            // debugging the resulting 403 to the wrong place.
+            if let Some(effective) = minted.effective_permissions {
+                message.variables.insert(
+                    "system.github.token.permissions".to_owned(),
+                    aksh_gha_protocol::azdo::VariableValue::new(
+                        aksh_gha_parser::job_builder::token_permissions_wire_json(&effective),
+                    ),
+                );
+            }
         }
         let mut inner = shared.state.inner.lock().await;
         inner.github_token_requests.remove(&request_id);
@@ -690,10 +703,18 @@ pub(crate) async fn broker_acquire_job(
     Ok(Json(payload))
 }
 
+/// A dispatched job's `GITHUB_TOKEN` and, when the App installation could not
+/// grant everything requested, the set the token actually carries.
+#[derive(Debug)]
+pub(crate) struct MintedGitHubToken {
+    pub(crate) token: String,
+    pub(crate) effective_permissions: Option<BTreeMap<String, String>>,
+}
+
 pub(crate) async fn mint_dispatch_github_token(
     shared: &Arc<SharedState>,
     request: &GitHubTokenRequest,
-) -> Result<Option<String>, ApiError> {
+) -> Result<Option<MintedGitHubToken>, ApiError> {
     let Some(app) = &shared.state.github_app else {
         return Ok(None);
     };
@@ -705,7 +726,10 @@ pub(crate) async fn mint_dispatch_github_token(
     )
     .await
     {
-        Ok(token) => Ok(Some(token)),
+        Ok((token, effective_permissions)) => Ok(Some(MintedGitHubToken {
+            token,
+            effective_permissions,
+        })),
         Err(error) => {
             let fallback = crate::github_app::fallback_token(
                 app.mint_failure,
@@ -728,7 +752,10 @@ pub(crate) async fn mint_dispatch_github_token(
                     "GitHub App token minting failed; job retains local runtime token: {error:#}"
                 );
             }
-            Ok(fallback)
+            Ok(fallback.map(|token| MintedGitHubToken {
+                token,
+                effective_permissions: None,
+            }))
         }
     }
 }
