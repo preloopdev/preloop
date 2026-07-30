@@ -4158,6 +4158,97 @@ async fn app_token_mint_failure_follows_the_configured_policy() {
     }
 }
 
+#[tokio::test]
+async fn app_only_server_fetches_webhook_workflows_with_installation_token() {
+    use crate::github_app::{GitHubAppCredentials, MintFailurePolicy};
+    use axum::extract::Path;
+    use axum::http::HeaderMap;
+    use axum::routing::{get, post};
+    use rsa::RsaPrivateKey;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap();
+    let api_base = format!("http://{}", listener.local_addr().unwrap());
+    let download_url = format!("{api_base}/raw/ci.yml");
+    let stub = Router::new()
+        .route(
+            "/app/installations",
+            get(|| async {
+                Json(json!([{
+                    "id": 4242,
+                    "account": {"login": "preloopdev"}
+                }]))
+            }),
+        )
+        .route(
+            "/app/installations/:installation_id/access_tokens",
+            post(|Path(installation_id): Path<u64>| async move {
+                assert_eq!(installation_id, 4242);
+                Json(json!({
+                    "token": "ghs_app_only_workflow_token",
+                    "expires_at": "2999-01-01T00:00:00Z"
+                }))
+            }),
+        )
+        .route(
+            "/repos/preloopdev/preloop/contents/.github/workflows",
+            get(move |headers: HeaderMap| {
+                let download_url = download_url.clone();
+                async move {
+                    assert_eq!(
+                        headers
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok()),
+                        Some("Bearer ghs_app_only_workflow_token")
+                    );
+                    Json(json!([{
+                        "name": "ci.yml",
+                        "type": "file",
+                        "download_url": download_url
+                    }]))
+                }
+            }),
+        )
+        .route(
+            "/raw/ci.yml",
+            get(|headers: HeaderMap| async move {
+                assert_eq!(
+                    headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok()),
+                    Some("Bearer ghs_app_only_workflow_token")
+                );
+                "on: push\njobs:\n  test:\n    runs-on: self-hosted\n    steps:\n      - run: true\n"
+            }),
+        );
+    tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state.github_app = Some(GitHubAppCredentials::for_tests(
+        "424",
+        RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap(),
+        MintFailurePolicy::LocalJwt,
+    ));
+    let shared = Arc::new(SharedState {
+        state,
+        shutdown: CancellationToken::new(),
+    });
+
+    let workflows = crate::github::fetch_workflows_at(
+        &shared,
+        "preloopdev/preloop",
+        "refs/heads/main",
+        &api_base,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(workflows.len(), 1);
+    assert!(workflows["ci.yml"].contains("runs-on: self-hosted"));
+}
+
 // Non-asserting helper for tests that need to inspect an error response.
 async fn try_req(app: &Router, method: Method, uri: &str, body: Value) -> (StatusCode, Value) {
     let mut builder = Request::builder().method(method).uri(uri);

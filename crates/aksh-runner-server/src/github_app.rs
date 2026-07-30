@@ -242,6 +242,15 @@ pub(crate) async fn get_or_mint_token(
     mint_for_repository(&api_base(), creds, repository, permissions).await
 }
 
+pub(crate) async fn get_or_mint_token_at(
+    api_base: &str,
+    creds: &GitHubAppCredentials,
+    repository: &str,
+    permissions: &BTreeMap<String, String>,
+) -> anyhow::Result<String> {
+    mint_for_repository(api_base, creds, repository, permissions).await
+}
+
 /// [`get_or_mint_token`] against an explicit API base.
 async fn mint_for_repository(
     api_base: &str,
