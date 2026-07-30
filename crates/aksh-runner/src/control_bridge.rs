@@ -97,7 +97,11 @@ pub fn loopback_address(origin: &str) -> Option<SocketAddr> {
         ),
     };
     let host = host.trim_start_matches('[').trim_end_matches(']');
-    let ip: std::net::IpAddr = host.parse().ok()?;
+    let ip: std::net::IpAddr = if host.eq_ignore_ascii_case("localhost") {
+        std::net::Ipv4Addr::LOCALHOST.into()
+    } else {
+        host.parse().ok()?
+    };
     ip.is_loopback().then(|| SocketAddr::new(ip, port))
 }
 
@@ -168,6 +172,14 @@ mod tests {
         assert_eq!(
             loopback_address("http://[::1]:9090"),
             Some("[::1]:9090".parse().unwrap())
+        );
+        assert_eq!(
+            loopback_address("http://localhost:9090"),
+            Some("127.0.0.1:9090".parse().unwrap())
+        );
+        assert_eq!(
+            loopback_address("https://LOCALHOST"),
+            Some("127.0.0.1:443".parse().unwrap())
         );
     }
 
