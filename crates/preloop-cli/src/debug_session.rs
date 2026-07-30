@@ -815,6 +815,26 @@ fn sync_workspace(session: &DebugSession, force: bool) -> Result<String> {
         return Ok(session.source_revision.clone());
     }
 
+    // Refuse to overwrite or delete edits made inside the VM. Check every
+    // host-side change before mutating the guest: checking only present files
+    // would let a host deletion silently destroy a guest edit.
+    let conflicts = guest_modified(
+        machine,
+        guest_workspace,
+        &sync_candidates(&modified, &deleted),
+    )?;
+    if !conflicts.is_empty() && !force {
+        println!("  Cannot sync — these files changed on BOTH sides:");
+        for path in &conflicts {
+            println!("    {path}");
+        }
+        println!();
+        println!("  Syncing would overwrite or delete the VM copy.");
+        println!("  Keep the host version:  :retry --sync --force");
+        println!("  Inspect the VM version: git diff -- <path>");
+        anyhow::bail!("sync aborted on {} conflicting file(s)", conflicts.len());
+    }
+
     // Deletions first, and in one call: a stale file left behind can shadow the
     // fix just as effectively as a missing one.
     if !deleted.is_empty() {
@@ -826,22 +846,6 @@ fn sync_workspace(session: &DebugSession, force: bool) -> Result<String> {
     }
 
     if !modified.is_empty() {
-        // Refuse to clobber edits made inside the VM. `tar -x` is
-        // last-writer-wins, so without this check a fix typed into the guest
-        // is destroyed silently by a sync of the same path from the host.
-        let conflicts = guest_modified(machine, guest_workspace, &modified)?;
-        if !conflicts.is_empty() && !force {
-            println!("  Cannot sync — these files changed on BOTH sides:");
-            for path in &conflicts {
-                println!("    {path}");
-            }
-            println!();
-            println!("  Syncing would overwrite the VM copy with the host copy.");
-            println!("  Keep the host version:  :retry --sync --force");
-            println!("  Inspect the VM version: git diff -- <path>");
-            anyhow::bail!("sync aborted on {} conflicting file(s)", conflicts.len());
-        }
-
         let archive = std::env::temp_dir().join(format!("preloop-sync-{}.tar", std::process::id()));
         let list = std::env::temp_dir().join(format!("preloop-sync-{}.list", std::process::id()));
         let mut list_contents = Vec::new();
@@ -908,6 +912,15 @@ fn sync_workspace(session: &DebugSession, force: bool) -> Result<String> {
     }
 
     Ok(next_revision(&session.source_revision))
+}
+
+fn sync_candidates(modified: &[String], deleted: &[String]) -> Vec<String> {
+    let mut candidates = Vec::with_capacity(modified.len() + deleted.len());
+    candidates.extend_from_slice(modified);
+    candidates.extend_from_slice(deleted);
+    candidates.sort();
+    candidates.dedup();
+    candidates
 }
 
 /// Bring source edits made inside the VM back to the host.
@@ -1455,6 +1468,15 @@ mod tests {
         // sequence, so the payload stays a single literal argument.
         assert_eq!(shell_quote("it's"), r"'it'\''s'");
         assert_eq!(shell_quote("'; rm -rf /; '"), r"''\''; rm -rf /; '\'''");
+    }
+
+    #[test]
+    fn sync_conflict_candidates_include_host_deletions() {
+        let candidates = sync_candidates(
+            &["src/changed.rs".into()],
+            &["src/deleted.rs".into(), "src/changed.rs".into()],
+        );
+        assert_eq!(candidates, ["src/changed.rs", "src/deleted.rs"]);
     }
 
     #[test]
