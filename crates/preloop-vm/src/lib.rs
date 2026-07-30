@@ -451,7 +451,21 @@ impl VmProvider for SmolVmProvider {
                 spec.name.as_str().into(),
                 "--rosetta".into(),
             ];
-            let _ = self.exclusive("update", &update_args).await;
+            if let Err(error) = self.exclusive("update", &update_args).await {
+                let _ = self
+                    .concurrent(
+                        "delete",
+                        &[
+                            "machine".into(),
+                            "delete".into(),
+                            "--name".into(),
+                            spec.name.as_str().into(),
+                            "-f".into(),
+                        ],
+                    )
+                    .await;
+                return Err(error);
+            }
         }
         Ok(())
     }

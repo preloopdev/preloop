@@ -52,6 +52,11 @@ for arg in "$@"; do
   printf '%s\n' "$arg" >> "$args"
 done
 
+if [ "${1-}:${2-}" = "machine:update" ] && [ -f "$0.fail-update" ]; then
+  printf 'rosetta unavailable\n' >&2
+  exit 42
+fi
+
 case "${1-}:${2-}" in
   machine:create)
     exit 0
@@ -463,5 +468,29 @@ esac
         spec.network = NetworkPolicy::Unrestricted;
         provider.create(&spec).await.unwrap();
         assert_eq!(captured_env(&executable), "SMOLVM_EGRESS_FLOOR=");
+    }
+
+    #[tokio::test]
+    async fn rosetta_update_failure_is_returned_and_partial_machine_is_deleted() {
+        let (_directory, executable) = fake_smolvm();
+        fs::write(executable.with_extension("fail-update"), "").unwrap();
+        let provider = SmolVmProvider::new(executable.clone());
+        let mut spec = valid_spec(MachineName::new("test-rosetta").unwrap());
+        spec.rosetta = true;
+
+        let error = provider.create(&spec).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            VmError::Command {
+                operation: "update",
+                exit_code: 42,
+                ..
+            }
+        ));
+        assert_eq!(
+            captured_args(&executable),
+            ["machine", "delete", "--name", "test-rosetta", "-f"]
+        );
     }
 }
