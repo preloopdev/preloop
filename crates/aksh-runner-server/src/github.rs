@@ -164,6 +164,12 @@ async fn send_github_check_request(
     Ok(val)
 }
 
+fn run_details_url(run_id: RunId) -> Option<String> {
+    std::env::var("AKSH_PUBLIC_URL")
+        .ok()
+        .map(|base| format!("{}/runs/{run_id}", base.trim_end_matches('/')))
+}
+
 /// Report a queued check run to GitHub or simulate it locally.
 pub(crate) async fn report_check_run_queued(
     shared: &Arc<SharedState>,
@@ -176,9 +182,7 @@ pub(crate) async fn report_check_run_queued(
     let mut check_run_id = None;
 
     if let Some(token) = &token {
-        let details_url = std::env::var("AKSH_PUBLIC_URL")
-            .ok()
-            .map(|base| format!("{}/api/v1/runs/{}", base.trim_end_matches('/'), run_id));
+        let details_url = run_details_url(run_id);
 
         let mut body = serde_json::json!({
             "name": job_id.to_string(),
@@ -242,9 +246,7 @@ pub(crate) async fn report_check_run_in_progress(
 
     let token = resolve_check_run_token(shared, &repo).await;
     if let Some(token) = &token {
-        let details_url = std::env::var("AKSH_PUBLIC_URL")
-            .ok()
-            .map(|base| format!("{}/api/v1/runs/{}", base.trim_end_matches('/'), run_id));
+        let details_url = run_details_url(run_id);
 
         let mut body = serde_json::json!({
             "status": "in_progress",
@@ -346,9 +348,7 @@ pub(crate) async fn report_check_run_completed(
 
     let token = resolve_check_run_token(shared, &repo).await;
     if let Some(token) = &token {
-        let details_url = std::env::var("AKSH_PUBLIC_URL")
-            .ok()
-            .map(|base| format!("{}/api/v1/runs/{}", base.trim_end_matches('/'), run_id));
+        let details_url = run_details_url(run_id);
 
         let summary = if global_issues.is_empty() {
             format!("Job completed with status: {}", conclusion)
