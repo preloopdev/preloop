@@ -432,7 +432,7 @@ pub(crate) async fn submit_run_inner(
     // snapshot redirect are all pure computations.  Moving them here
     // shrinks the critical section from O(jobs × build_cost) to
     // O(jobs × map_insert).
-    let base_url = public_base_url();
+    let base_url = runner_base_url();
     let normalized_github = aksh_gha_parser::job_builder::normalize_github_context(&github);
     let secrets_exposed: BTreeMap<String, String> = submission
         .secrets

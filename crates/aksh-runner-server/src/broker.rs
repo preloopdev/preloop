@@ -34,7 +34,21 @@ pub(crate) fn execution_status_from_runner_result(result: &str) -> Option<Execut
 }
 
 pub(crate) fn broker_run_service_url(runner_id: i64) -> String {
-    format!("{}/broker/{runner_id}/", public_base_url())
+    format!("{}/broker/{runner_id}/", runner_base_url())
+}
+
+/// Runner-facing base URL: the origin embedded in connectionData, broker
+/// endpoint data, Twirp signed URLs, and job-message variables. Defaults to
+/// `AKSH_RUNNER_URL`, falling back to `AKSH_PUBLIC_URL` for standalone
+/// `aksh-runner-server` deployments. `preloop serve` pins this to the loopback
+/// listen origin so in-VM runners and their jobs reach the host exclusively
+/// via the mounted control socket and in-guest loopback bridge, never the
+/// public tunnel.
+pub(crate) fn runner_base_url() -> String {
+    std::env::var("AKSH_RUNNER_URL")
+        .unwrap_or_else(|_| public_base_url())
+        .trim_end_matches('/')
+        .to_owned()
 }
 
 pub(crate) fn public_base_url() -> String {
@@ -72,14 +86,14 @@ pub(crate) fn normalize_oidc_issuer(value: String) -> anyhow::Result<String> {
 /// `{public_base_url}/oidc` when not explicitly configured.
 pub(crate) fn oidc_issuer_url(inner: &InnerState) -> String {
     if inner.oidc_issuer.is_empty() {
-        format!("{}/oidc", public_base_url())
+        format!("{}/oidc", runner_base_url())
     } else {
         inner.oidc_issuer.clone()
     }
 }
 
 pub(crate) fn websocket_base_url() -> String {
-    let base = public_base_url();
+    let base = runner_base_url();
     if let Some(rest) = base.strip_prefix("https://") {
         format!("wss://{rest}")
     } else if let Some(rest) = base.strip_prefix("http://") {
@@ -90,7 +104,7 @@ pub(crate) fn websocket_base_url() -> String {
 }
 
 pub(crate) fn runner_server_url() -> String {
-    format!("{}/runner/server", public_base_url())
+    format!("{}/runner/server", runner_base_url())
 }
 
 /// Return server-enforced runner settings.
@@ -678,24 +692,24 @@ pub(crate) async fn broker_acquire_job(
             );
             endpoint
                 .data
-                .insert("ResultsServiceUrl".to_owned(), public_base_url());
+                .insert("ResultsServiceUrl".to_owned(), runner_base_url());
             endpoint
                 .data
                 .insert("PipelinesServiceUrl".to_owned(), runner_server_url());
             endpoint
                 .data
-                .insert("CacheServerUrl".to_owned(), public_base_url());
+                .insert("CacheServerUrl".to_owned(), runner_base_url());
             endpoint.data.insert(
                 "FeedStreamUrl".to_owned(),
                 format!("{}/ws/live-logs/{}", websocket_base_url(), message.job_id),
             );
             endpoint.data.insert(
                 "ConnectivityChecks".to_owned(),
-                serde_json::json!([format!("{}/check", public_base_url())]).to_string(),
+                serde_json::json!([format!("{}/check", runner_base_url())]).to_string(),
             );
             endpoint.data.insert(
                 "ConnectivityAndDNSChecks".to_owned(),
-                serde_json::json!([format!("{}/check", public_base_url())]).to_string(),
+                serde_json::json!([format!("{}/check", runner_base_url())]).to_string(),
             );
             endpoint.data.insert("ServerId".to_owned(), String::new());
             endpoint.data.insert("ServerName".to_owned(), String::new());
