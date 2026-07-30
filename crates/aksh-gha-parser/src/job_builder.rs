@@ -731,17 +731,27 @@ fn populate_runner_variables(variables: &mut BTreeMap<String, VariableValue>, pl
     // from the same policy the installation token is minted against, so the
     // runner's `GITHUB_TOKEN Permissions` group never overstates the token.
     let permissions = crate::effective_token_permissions(plan.permissions.as_ref());
-    let pascal: serde_json::Map<String, serde_json::Value> = permissions
-        .iter()
-        .map(|(scope, level)| (pascal_case(scope), serde_json::Value::String(level.clone())))
-        .collect();
-    let perms_json = serde_json::Value::Object(pascal).to_string();
+    let perms_json = token_permissions_wire_json(&permissions);
     variables
         .entry("system.github.token.permissions".to_owned())
         .or_insert_with(|| VariableValue::new(perms_json));
     variables
         .entry("system.github.token".to_owned())
         .or_insert_with(|| VariableValue::secret(String::new()));
+}
+
+/// Render a permission map in the wire format's PascalCase spelling.
+///
+/// Exported so the dispatch path can restate the permissions a token *actually*
+/// carries after the App installation narrowed them, using the same spelling
+/// the runner's `GITHUB_TOKEN Permissions` group prints. Two renderers would
+/// drift, and the group would then disagree with itself between runs.
+pub fn token_permissions_wire_json(permissions: &BTreeMap<String, String>) -> String {
+    let pascal: serde_json::Map<String, serde_json::Value> = permissions
+        .iter()
+        .map(|(scope, level)| (pascal_case(scope), serde_json::Value::String(level.clone())))
+        .collect();
+    serde_json::Value::Object(pascal).to_string()
 }
 
 /// `pull-requests` → `PullRequests`, the wire spelling of a permission scope.
