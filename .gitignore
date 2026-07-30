@@ -72,7 +72,6 @@ benchmarks/compatibility/server/protocol/captures/**/flow.*.bin
 # Benchmark capture artifacts — keep metadata (summary.json, jobs.json, github-run-id.txt)
 # but drop large flows, runner logs, certs, and per-runner capture dirs.
 benchmarks/real-world/results/**/flows.jsonl
-.runner-watch/golden
 benchmarks/real-world/results/public-runs
 benchmarks/real-world/results/**/vm-mitm/
 benchmarks/real-world/results/**/vm-mitm-conf/
