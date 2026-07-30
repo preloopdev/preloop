@@ -1,0 +1,35 @@
+name: release-golden
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  build-and-publish-golden:
+    name: Build & Publish Golden MicroVM Artifact
+    runs-on: self-hosted
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Preloop binaries
+        run: cargo build -p preloop-cli -p aksh-runner-server
+
+      - name: Pack Golden MicroVM Artifact
+        run: |
+          ./target/debug/preloop plan || true
+          mkdir -p dist
+          if [ -f ~/.preloop/vms/preloop-runner-base.smolmachine ]; then
+            cp ~/.preloop/vms/preloop-runner-base.smolmachine dist/preloop-ubuntu-24.04-aarch64.smolmachine
+          fi
+
+      - name: Upload Golden Artifact to Release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload ${{ github.event.release.tag_name }} dist/preloop-ubuntu-24.04-aarch64.smolmachine --clobber
