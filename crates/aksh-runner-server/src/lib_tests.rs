@@ -4158,6 +4158,111 @@ async fn app_token_mint_failure_follows_the_configured_policy() {
     }
 }
 
+/// By the time `acquirejob` mints, the poll has already dequeued the job,
+/// flipped the run to `InProgress` and pinned the request to the session. A
+/// refusal under the `error` policy is a permanent configuration fault, so if
+/// the 502 left the claim in place the runner would re-acquire forever and the
+/// run would hang until the 600s disconnect reaper mopped it up.
+#[tokio::test]
+async fn a_dispatch_refused_by_the_mint_policy_fails_its_run_without_the_reaper() {
+    use crate::github_app::{GitHubAppCredentials, MintFailurePolicy};
+
+    // `local-workspace-only` carries no `owner/repo` slug, so the mint fails
+    // before it signs anything or opens a socket.
+    let private_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state.github_app = Some(GitHubAppCredentials::for_tests(
+        "424",
+        private_key,
+        MintFailurePolicy::Error,
+    ));
+    let app = app(state.clone(), CancellationToken::new());
+    let runner_token = state
+        .local_jwt(json!({
+            "sub": "aksh-runner-listen-1",
+            "scp": "ActionsRuntime.RunnerListen",
+        }))
+        .unwrap();
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "local-workspace-only"
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    let session = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/runner/server/session",
+        json!({}),
+        &runner_token,
+    )
+    .await;
+    let session_id = session["sessionId"].as_str().unwrap();
+    let job_ref = request_json_with_bearer(
+        &app,
+        Method::GET,
+        &format!("/runner/server/message?sessionId={session_id}&status=Online&waitSeconds=0"),
+        Value::Null,
+        &runner_token,
+    )
+    .await;
+    let body: Value = serde_json::from_str(job_ref["body"].as_str().unwrap()).unwrap();
+    let runner_request_id = body["runner_request_id"].as_str().unwrap();
+    {
+        let inner = state.inner.lock().await;
+        assert_eq!(
+            inner.runs.get(&run_id).unwrap().status,
+            ExecutionStatus::InProgress,
+            "the poll must claim the job before the mint is attempted"
+        );
+    }
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/broker/1/acquirejob")
+                .header(header::AUTHORIZATION, format!("Bearer {runner_token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"jobMessageId": runner_request_id, "billingOwnerId": "local", "runnerOS": "Linux"})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+    let inner = state.inner.lock().await;
+    let run = inner.runs.get(&run_id).unwrap();
+    assert_eq!(run.status, ExecutionStatus::Failure);
+    assert!(run.jobs.values().all(|status| status.is_terminal()));
+    let request_id = *inner.job_requests.keys().next().unwrap();
+    assert_eq!(
+        inner.job_requests[&request_id].result,
+        Some(ExecutionStatus::Failure)
+    );
+    assert!(
+        !inner
+            .session_active_requests
+            .values()
+            .any(|rid| *rid == request_id),
+        "the session must be free to take the next job"
+    );
+    assert!(!inner.inflight_requests.contains_key(&request_id));
+}
+
 #[tokio::test]
 async fn app_only_server_fetches_webhook_workflows_with_installation_token() {
     use crate::github_app::{GitHubAppCredentials, MintFailurePolicy};
@@ -4245,6 +4350,89 @@ async fn app_only_server_fetches_webhook_workflows_with_installation_token() {
 
     assert_eq!(workflows.len(), 1);
     assert!(workflows["ci.yml"].contains("runs-on: self-hosted"));
+}
+
+#[tokio::test]
+async fn app_only_server_resolves_pull_request_changed_files_with_installation_token() {
+    use crate::github_app::{GitHubAppCredentials, MintFailurePolicy};
+    use axum::extract::{Path, Query};
+    use axum::http::HeaderMap;
+    use axum::routing::{get, post};
+    use rsa::RsaPrivateKey;
+    use std::collections::HashMap;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}", listener.local_addr().unwrap());
+    let stub = Router::new()
+        .route(
+            "/app/installations",
+            get(|| async {
+                Json(json!([{
+                    "id": 4242,
+                    "account": {"login": "preloopdev"}
+                }]))
+            }),
+        )
+        .route(
+            "/app/installations/:installation_id/access_tokens",
+            post(
+                |Path(installation_id): Path<u64>, body: Json<Value>| async move {
+                    assert_eq!(installation_id, 4242);
+                    // Listing pull request files is refused by a token scoped
+                    // only to `contents`, so the mint must ask for the
+                    // pull-request scope rather than reuse the inventory token.
+                    assert_eq!(body.0["permissions"]["pull_requests"], json!("read"));
+                    Json(json!({
+                        "token": "ghs_app_only_pr_files_token",
+                        "expires_at": "2999-01-01T00:00:00Z"
+                    }))
+                },
+            ),
+        )
+        .route(
+            "/repos/preloopdev/preloop/pulls/7/files",
+            get(
+                |headers: HeaderMap, Query(query): Query<HashMap<String, String>>| async move {
+                    assert_eq!(
+                        headers
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok()),
+                        Some("Bearer ghs_app_only_pr_files_token")
+                    );
+                    // Paging terminates on an empty page, so only the first one
+                    // carries files.
+                    if query.get("page").map(String::as_str) == Some("1") {
+                        Json(json!([{"filename": "src/main.rs"}, {"filename": "docs/readme.md"}]))
+                    } else {
+                        Json(json!([]))
+                    }
+                },
+            ),
+        );
+    tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state.github_app = Some(GitHubAppCredentials::for_tests(
+        "424",
+        RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap(),
+        MintFailurePolicy::LocalJwt,
+    ));
+    let shared = Arc::new(SharedState {
+        state,
+        shutdown: CancellationToken::new(),
+    });
+
+    let changed =
+        crate::github::resolve_pr_changed_files_at(&shared, "preloopdev/preloop", 7, &api_base)
+            .await
+            .unwrap();
+
+    assert_eq!(
+        changed,
+        Some(vec!["src/main.rs".to_owned(), "docs/readme.md".to_owned()]),
+        "an App-only deployment must reach the changed-files lookup so `paths:` filters stay evaluable"
+    );
 }
 
 // Non-asserting helper for tests that need to inspect an error response.
