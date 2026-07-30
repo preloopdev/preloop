@@ -175,11 +175,18 @@ pub(crate) async fn report_check_run_queued(
     let mut check_run_id = None;
 
     if let Some(token) = &token {
-        let body = serde_json::json!({
+        let details_url = std::env::var("AKSH_PUBLIC_URL")
+            .ok()
+            .map(|base| format!("{}/api/v1/runs/{}", base.trim_end_matches('/'), run_id));
+
+        let mut body = serde_json::json!({
             "name": job_id.to_string(),
             "head_sha": sha,
             "status": "queued",
         });
+        if let Some(url) = details_url {
+            body["details_url"] = serde_json::json!(url);
+        }
 
         match send_github_check_request(token, repo, reqwest::Method::POST, "check-runs", body)
             .await
@@ -234,9 +241,16 @@ pub(crate) async fn report_check_run_in_progress(
 
     let token = resolve_check_run_token(shared, &repo).await;
     if let Some(token) = &token {
-        let body = serde_json::json!({
+        let details_url = std::env::var("AKSH_PUBLIC_URL")
+            .ok()
+            .map(|base| format!("{}/api/v1/runs/{}", base.trim_end_matches('/'), run_id));
+
+        let mut body = serde_json::json!({
             "status": "in_progress",
         });
+        if let Some(url) = details_url {
+            body["details_url"] = serde_json::json!(url);
+        }
 
         let path = format!("check-runs/{}", check_run_id);
         if let Err(e) =
@@ -331,6 +345,10 @@ pub(crate) async fn report_check_run_completed(
 
     let token = resolve_check_run_token(shared, &repo).await;
     if let Some(token) = &token {
+        let details_url = std::env::var("AKSH_PUBLIC_URL")
+            .ok()
+            .map(|base| format!("{}/api/v1/runs/{}", base.trim_end_matches('/'), run_id));
+
         let summary = if global_issues.is_empty() {
             format!("Job completed with status: {}", conclusion)
         } else {
@@ -345,6 +363,9 @@ pub(crate) async fn report_check_run_completed(
             "status": "completed",
             "conclusion": conclusion,
         });
+        if let Some(url) = details_url {
+            body["details_url"] = serde_json::json!(url);
+        }
 
         if !annotations.is_empty() || !global_issues.is_empty() {
             body["output"] = serde_json::json!({
