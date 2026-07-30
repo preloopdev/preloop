@@ -20,6 +20,18 @@ fn server_url() -> String {
     std::env::var("AKSH_URL").unwrap_or_else(|_| "http://127.0.0.1:9090".to_owned())
 }
 
+fn detect_host_ip() -> String {
+    for interface in ["en0", "en1", "en2", "eth0"] {
+        if let Ok(output) = std::process::Command::new("ipconfig").args(["getifaddr", interface]).output() {
+            let ip = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            if !ip.is_empty() {
+                return ip;
+            }
+        }
+    }
+    "127.0.0.1".to_owned()
+}
+
 fn should_send_local_workspace_header(url: &str, uses_default_transport: bool) -> bool {
     if uses_default_transport {
         return true;
@@ -466,8 +478,8 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
         .unwrap_or_else(|| format!("http://127.0.0.1:{}", listen.port()));
     std::env::set_var("AKSH_PUBLIC_URL", &public_url);
 
-    // Local runner pool connects directly on loopback to bypass Cloudflare WAF checks on public URL
-    let local_server_url = format!("http://127.0.0.1:{}", listen.port());
+    // Local runner pool connects via host LAN IP so smolvm guest microVMs can reach host control plane directly
+    let local_server_url = format!("http://{}:{}", detect_host_ip(), listen.port());
 
     // Resolve GitHub credentials before `AppState::new` reads the environment.
     // Both `github_app::load_from_env` and the webhook-secret lookup happen
