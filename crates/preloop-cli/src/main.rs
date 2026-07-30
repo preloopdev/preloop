@@ -54,6 +54,16 @@ fn should_send_local_workspace_header(url: &str, uses_default_transport: bool) -
             .is_ok_and(|address| address.is_loopback())
 }
 
+fn mounted_control_origin(public_url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(public_url).ok()?;
+    let host = parsed.host_str()?;
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    loopback.then(|| public_url.trim_end_matches('/').to_owned())
+}
+
 fn api_token() -> Option<String> {
     std::env::var("AKSH_TOKEN")
         .or_else(|_| std::env::var("AKSH_SYSTEM_TOKEN"))
@@ -553,6 +563,7 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
         .or_else(|| std::env::var("PRELOOP_PUBLIC_URL").ok())
         .unwrap_or_else(|| format!("http://127.0.0.1:{}", listen.port()));
     std::env::set_var("AKSH_PUBLIC_URL", &public_url);
+    let control_origin = mounted_control_origin(&public_url);
 
     // Local runner pool connects via host LAN IP so smolvm guest microVMs can reach host control plane directly
     let local_server_url = format!("http://{}:{}", detect_host_ip(), listen.port());
@@ -592,7 +603,7 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
     let mut pool = match local_runner_pool_config(
         &home,
         local_server_url,
-        public_url,
+        control_origin,
         queue_depth,
         next_job_runs_on,
     ) {
@@ -677,7 +688,7 @@ async fn wait_for_engine_socket(socket: &std::path::Path) -> anyhow::Result<()> 
 fn local_runner_pool_config(
     home: &std::path::Path,
     server_url: String,
-    control_origin: String,
+    control_origin: Option<String>,
     queue_depth: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     next_job_runs_on: std::sync::Arc<std::sync::RwLock<Vec<String>>>,
 ) -> anyhow::Result<RunnerPoolConfig> {
@@ -725,7 +736,7 @@ fn local_runner_pool_config(
         runner_bundle,
         runner_binary_name: "preloop-runner".into(),
         server_url,
-        control_origin: Some(control_origin),
+        control_origin,
         control_socket: Some(home.join("preloop.sock")),
         registration_token_env: "AKSH_SYSTEM_TOKEN".into(),
         labels: vec![
@@ -1656,5 +1667,18 @@ mod tests {
             "http://127.0.0.1:9090",
             true
         ));
+    }
+
+    #[test]
+    fn mounted_socket_routes_only_loopback_advertised_origins() {
+        assert_eq!(
+            mounted_control_origin("http://127.0.0.1:9090/").as_deref(),
+            Some("http://127.0.0.1:9090")
+        );
+        assert_eq!(
+            mounted_control_origin("http://localhost:9090").as_deref(),
+            Some("http://localhost:9090")
+        );
+        assert_eq!(mounted_control_origin("https://aksh.preloop.dev"), None);
     }
 }
