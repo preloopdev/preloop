@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 mod debug_session;
+mod github_auth;
 
 fn server_url() -> String {
     std::env::var("AKSH_URL").unwrap_or_else(|_| "http://127.0.0.1:9090".to_owned())
@@ -96,9 +97,51 @@ enum Command {
     /// Attach to a job paused at a failed step: inspect, fix, retry.
     Debug(debug_session::DebugArgs),
 
-    /// Internal persistent control plane and local runner pool.
+    /// Run the control plane and microVM runner pool in the foreground.
+    ///
+    /// This is the self-hosting entry point: it serves the GitHub webhook and
+    /// Checks endpoints and provisions a microVM per queued job. Point a
+    /// tunnel or reverse proxy at `--listen` to receive events from GitHub.
+    Serve(ServeArgs),
+
+    /// Former name for `serve`. Retained because `ensure_engine_running`
+    /// spawns it by name, and to keep existing supervisor units working.
     #[command(hide = true)]
     Engine,
+}
+
+#[derive(Debug, Default, clap::Args)]
+struct ServeArgs {
+    /// Address to bind. Overrides PRELOOP_LISTEN.
+    #[arg(long, value_name = "ADDR")]
+    listen: Option<String>,
+
+    /// Externally reachable base URL. Overrides PRELOOP_PUBLIC_URL.
+    ///
+    /// Must be the address GitHub and any remote runners can reach — a
+    /// loopback URL here is only correct when everything is on this host.
+    #[arg(long, value_name = "URL")]
+    public_url: Option<String>,
+
+    /// GitHub App id.
+    #[arg(long, value_name = "ID")]
+    github_app_id: Option<String>,
+
+    /// Path to the GitHub App private key PEM.
+    #[arg(long, value_name = "PATH")]
+    github_app_key: Option<PathBuf>,
+
+    /// Installation id. Skips installation discovery when supplied.
+    #[arg(long, value_name = "ID")]
+    github_app_installation_id: Option<u64>,
+
+    /// Shared secret for verifying `X-Hub-Signature-256`.
+    #[arg(long, value_name = "SECRET")]
+    webhook_secret: Option<String>,
+
+    /// Persist the supplied GitHub credentials so later runs reuse them.
+    #[arg(long)]
+    save: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -203,8 +246,12 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
-    if matches!(cli.command, Command::Engine) {
-        return cmd_engine().await;
+    // Both run the daemon in this process, so neither may bootstrap another
+    // one underneath itself.
+    match cli.command {
+        Command::Serve(args) => return cmd_engine(args).await,
+        Command::Engine => return cmd_engine(ServeArgs::default()).await,
+        _ => {}
     }
     ensure_engine_running().await?;
 
@@ -219,7 +266,9 @@ async fn main() -> anyhow::Result<()> {
         Command::Debug(args) => {
             debug_session::run(args, build_client(), server_url(), api_token()).await
         }
-        Command::Engine => unreachable!("engine handled before client startup"),
+        Command::Serve(_) | Command::Engine => {
+            unreachable!("daemon commands handled before client startup")
+        }
     }
 }
 
@@ -336,17 +385,68 @@ fn set_private_file_permissions(_path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn cmd_engine() -> anyhow::Result<()> {
+/// Merge stored and command-line GitHub credentials into the environment the
+/// server reads, optionally persisting them, and report the effective state.
+///
+/// Precedence, widest to narrowest: existing environment, then `--flags`, then
+/// the stored file. The environment stays authoritative so a container that
+/// injects secrets is never overridden by a file left behind by `--save`.
+fn resolve_github_auth(args: &ServeArgs, state_dir: &std::path::Path) -> anyhow::Result<()> {
+    let mut auth = github_auth::StoredAuth::load(state_dir)?;
+
+    let private_key_pem = args
+        .github_app_key
+        .as_ref()
+        .map(|path| {
+            std::fs::read_to_string(path)
+                .with_context(|| format!("reading GitHub App key {}", path.display()))
+        })
+        .transpose()?;
+
+    let from_flags = github_auth::StoredAuth {
+        app_id: args.github_app_id.clone(),
+        installation_id: args.github_app_installation_id,
+        private_key_pem,
+        webhook_secret: args.webhook_secret.clone(),
+    };
+    let supplied = from_flags != github_auth::StoredAuth::default();
+    auth.overlay(from_flags);
+
+    if args.save {
+        if !supplied {
+            anyhow::bail!("--save needs at least one GitHub credential flag to save");
+        }
+        let path = auth.save(state_dir)?;
+        eprintln!("[preloop] saved GitHub credentials to {}", path.display());
+    }
+
+    auth.apply();
+    eprintln!("[preloop] {}", github_auth::StoredAuth::report());
+    Ok(())
+}
+
+async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
     let home = preloop_home();
     let state_dir = home.join("state");
     let socket = home.join("preloop.sock");
-    let listen: std::net::SocketAddr = std::env::var("PRELOOP_LISTEN")
-        .unwrap_or_else(|_| "127.0.0.1:9090".to_owned())
+    let listen: std::net::SocketAddr = args
+        .listen
+        .clone()
+        .or_else(|| std::env::var("PRELOOP_LISTEN").ok())
+        .unwrap_or_else(|| "127.0.0.1:9090".to_owned())
         .parse()
-        .context("PRELOOP_LISTEN must be a socket address")?;
-    let public_url = std::env::var("PRELOOP_PUBLIC_URL")
-        .unwrap_or_else(|_| format!("http://127.0.0.1:{}", listen.port()));
+        .context("--listen / PRELOOP_LISTEN must be a socket address")?;
+    let public_url = args
+        .public_url
+        .clone()
+        .or_else(|| std::env::var("PRELOOP_PUBLIC_URL").ok())
+        .unwrap_or_else(|| format!("http://127.0.0.1:{}", listen.port()));
     std::env::set_var("AKSH_PUBLIC_URL", &public_url);
+
+    // Resolve GitHub credentials before `AppState::new` reads the environment.
+    // Both `github_app::load_from_env` and the webhook-secret lookup happen
+    // inside `serve`, so anything published after that call is ignored.
+    resolve_github_auth(&args, &state_dir)?;
 
     // Shared with the runner pool so it can size provisioning to the work
     // actually waiting, not just to whether it has an idle runner left.
