@@ -664,8 +664,8 @@ fn bench_parser(cfg: BenchConfig) -> Result<()> {
         for _ in 0..PARSER_ITERATIONS {
             let wf = aksh_gha_parser::parse_workflow(MATRIX_WORKFLOW)
                 .context("matrix workflow must parse")?;
-            let expanded = aksh_gha_parser::expand_jobs(&wf)
-                .context("matrix workflow must expand")?;
+            let expanded =
+                aksh_gha_parser::expand_jobs(&wf).context("matrix workflow must expand")?;
             std::hint::black_box(&expanded);
         }
         matrix_us.push(start.elapsed().as_micros() as f64 / PARSER_ITERATIONS as f64);
@@ -674,8 +674,8 @@ fn bench_parser(cfg: BenchConfig) -> Result<()> {
         for _ in 0..PARSER_ITERATIONS {
             let wf = aksh_gha_parser::parse_workflow(COMPLEX_WORKFLOW)
                 .context("complex workflow must parse")?;
-            let expanded = aksh_gha_parser::expand_jobs(&wf)
-                .context("complex workflow must expand")?;
+            let expanded =
+                aksh_gha_parser::expand_jobs(&wf).context("complex workflow must expand")?;
             std::hint::black_box(&expanded);
         }
         complex_us.push(start.elapsed().as_micros() as f64 / PARSER_ITERATIONS as f64);
