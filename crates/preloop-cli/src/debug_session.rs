@@ -564,21 +564,40 @@ async fn repl(ctx: &Api, mut session: DebugSession) -> Result<ReplOutcome> {
         let flags: Vec<&str> = parts.collect();
         match head {
             "retry" => {
-                let sync = flags.contains(&"--sync");
-                let revision = if sync {
-                    match sync_workspace(&session, flags.contains(&"--force")) {
-                        Ok(revision) => Some(revision),
-                        Err(error) => {
-                            println!("  sync failed: {error:#}");
-                            continue;
-                        }
-                    }
-                } else {
-                    None
-                };
                 let revert = match choose_revert(&session, &flags) {
                     Some(policy) => policy,
                     None => continue,
+                };
+                let sync = flags.contains(&"--sync");
+               let (revert_for_verdict, revision) = if sync {
+                   if revert != RevertPolicy::None {
+                       if let (Some(machine), Some(workspace), Some(commit)) = (
+                           session.machine.as_deref(),
+                           session.workspace.as_deref(),
+                           session.snapshot_commit.as_deref(),
+                       ) {
+                           let selected = select_for_policy(&session.attempt_changes, revert);
+                           if !selected.is_empty() {
+                               let paths: Vec<String> = selected.iter().map(|s| shell_quote(s)).collect();
+                               let cmd = format!("cd {}; git checkout {} -- {}", shell_quote(workspace), shell_quote(commit), paths.join(" "));
+                               let _ = guest_check(machine, &cmd);
+                        }
+                    }
+                        }
+                    match sync_workspace(&session, flags.contains(&"--force")) {
+                       Ok(revision) => {
+                           session.source_revision = revision.clone();
+                           (RevertPolicy::None, Some(revision))
+                       }
+                        Err(error) => {
+                            println!("  sync failed: {error:#}");
+                            continue;
+                       }
+                   }
+               } else if session.source_revision != "original" {
+                   (revert, Some(session.source_revision.clone()))
+                } else {
+                   (revert, None)
                 };
                 let from_arg = flags
                     .iter()
@@ -590,10 +609,10 @@ async fn repl(ctx: &Api, mut session: DebugSession) -> Result<ReplOutcome> {
                         Err(error) => {
                             println!("  retry-from failed: {error:#}");
                             continue;
-                        }
+                       }
                     };
 
-                ctx.verdict(&session.session_id, Verdict::Retry, revert, revision, retry_from)
+               ctx.verdict(&session.session_id, Verdict::Retry, revert_for_verdict, revision, retry_from)
                     .await?;
                 if let Some(from) = retry_from {
                     let name = session
@@ -642,7 +661,10 @@ async fn repl(ctx: &Api, mut session: DebugSession) -> Result<ReplOutcome> {
                 }
             }
             "sync" => match sync_workspace(&session, flags.contains(&"--force")) {
-                Ok(revision) => println!("  workspace now at {revision}"),
+               Ok(revision) => {
+                   session.source_revision = revision.clone();
+                   println!("  workspace now at {revision}");
+               }
                 Err(error) => println!("  sync failed: {error:#}"),
             },
             "detach" => {
@@ -1057,25 +1079,37 @@ fn host_changes(host: &std::path::Path) -> Result<(Vec<String>, Vec<String>)> {
             })
             .collect()
     };
-    let deleted = parse_paths(git(&[
-        "diff",
-        "--name-only",
-        "--diff-filter=D",
-        "-z",
-        "HEAD",
-    ])?)?;
-
-    let tracked = parse_paths(git(&[
-        "diff",
-        "--name-only",
-        "--diff-filter=d",
-        "-z",
-        "HEAD",
-    ])?)?;
+    let mut deleted = Vec::new();
+    let mut modified = Vec::new();
+    let name_status_bytes = git(&["diff", "--name-status", "-z", "HEAD"])?;
+    let mut chunks = name_status_bytes
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty());
+    while let Some(status_raw) = chunks.next() {
+        let status_str = String::from_utf8_lossy(status_raw);
+        let status_code = status_str.chars().next().unwrap_or(' ');
+        if status_code == 'R' || status_code == 'C' {
+            let old_path = String::from_utf8(chunks.next().unwrap_or(&[]).to_vec())?;
+            let new_path = String::from_utf8(chunks.next().unwrap_or(&[]).to_vec())?;
+            if status_code == 'R' {
+                deleted.push(old_path);
+            }
+            modified.push(new_path);
+        } else {
+            let path = String::from_utf8(chunks.next().unwrap_or(&[]).to_vec())?;
+            if status_code == 'D' {
+                deleted.push(path);
+            } else {
+                modified.push(path);
+            }
+        }
+    }
     let untracked = parse_paths(git(&["ls-files", "--others", "--exclude-standard", "-z"])?)?;
-    let mut modified: Vec<String> = tracked.into_iter().chain(untracked).collect();
+    modified.extend(untracked);
     modified.sort();
     modified.dedup();
+    deleted.sort();
+    deleted.dedup();
 
     Ok((modified, deleted))
 }
@@ -1085,6 +1119,21 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
+fn select_for_policy(
+    changes: &[aksh_gha_protocol::debug_session::WorkspaceChange],
+    policy: RevertPolicy,
+) -> Vec<&str> {
+    use aksh_gha_protocol::debug_session::ChangeCategory;
+    changes
+        .iter()
+        .filter(|c| match policy {
+            RevertPolicy::None => false,
+            RevertPolicy::Untracked => c.category == ChangeCategory::Untracked,
+            RevertPolicy::All => true,
+        })
+        .map(|c| c.path.as_str())
+        .collect()
+}
 /// `original` → `repair-1` → `repair-2`, so each attempt is attributable to
 /// the tree it ran against.
 fn next_revision(current: &str) -> String {
