@@ -10,7 +10,7 @@ on:
 jobs:
   runner-light:
     name: Runner light conformance
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -32,7 +32,7 @@ jobs:
   runner-deep:
     name: Runner deep conformance
     if: github.event_name == 'pull_request' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: [self-hosted, smolvm]
+    runs-on: self-hosted
     timeout-minutes: 180
     env:
       GH_REPO: ${{ vars.RUNNER_CONFORMANCE_REPO || 'preloopdev/aksh-conformance' }}

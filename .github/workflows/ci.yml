@@ -34,7 +34,7 @@ on:
 
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     timeout-minutes: 30
     steps:
       # action download works — client-side batch resolve + codeload fallback
@@ -59,7 +59,7 @@ jobs:
 
   # Bounded property-test profile
   property-tests-fast:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     timeout-minutes: 30
     if: github.event_name != 'schedule'
     steps:
@@ -164,7 +164,7 @@ jobs:
 
   # Intensive scheduled / manual profile
   property-tests-intensive:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     timeout-minutes: 120
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.profile == 'intensive')
     steps:
