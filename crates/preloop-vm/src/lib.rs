@@ -277,11 +277,7 @@ impl SmolVmProvider {
     }
 
     fn command(&self) -> Command {
-        let mut cmd = Command::new(&self.binary);
-        if std::env::var_os("SMOLVM_EGRESS_FLOOR").is_none() {
-            cmd.env("SMOLVM_EGRESS_FLOOR", "strict");
-        }
-        cmd
+        Command::new(&self.binary)
     }
 
     async fn checked(
@@ -289,7 +285,25 @@ impl SmolVmProvider {
         operation: &'static str,
         args: &[String],
     ) -> Result<ExecOutput, VmError> {
+        self.checked_with_network(operation, args, None).await
+    }
+
+    async fn checked_with_network(
+        &self,
+        operation: &'static str,
+        args: &[String],
+        network: Option<&NetworkPolicy>,
+    ) -> Result<ExecOutput, VmError> {
         let mut command = self.command();
+        match network {
+            Some(NetworkPolicy::PublicOnly) => {
+                command.env("SMOLVM_EGRESS_FLOOR", "strict");
+            }
+            Some(_) => {
+                command.env_remove("SMOLVM_EGRESS_FLOOR");
+            }
+            None => {}
+        }
         command
             .args(args)
             .stdin(Stdio::null())
@@ -345,6 +359,17 @@ impl SmolVmProvider {
     ) -> Result<ExecOutput, VmError> {
         let _guard = self.lifecycle_lock.write().await;
         self.checked(operation, args).await
+    }
+
+    async fn exclusive_with_network(
+        &self,
+        operation: &'static str,
+        args: &[String],
+        network: &NetworkPolicy,
+    ) -> Result<ExecOutput, VmError> {
+        let _guard = self.lifecycle_lock.write().await;
+        self.checked_with_network(operation, args, Some(network))
+            .await
     }
 
     /// Run an operation that only touches one already-defined machine.
@@ -416,7 +441,8 @@ impl VmProvider for SmolVmProvider {
                 format!("{}:{}", mount.host.display(), mount.guest.display()),
             ]);
         }
-        self.exclusive("create", &args).await?;
+        self.exclusive_with_network("create", &args, &spec.network)
+            .await?;
         if spec.rosetta {
             let update_args = vec![
                 "machine".into(),
