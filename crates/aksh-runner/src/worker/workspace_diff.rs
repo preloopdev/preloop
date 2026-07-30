@@ -47,7 +47,13 @@ pub fn diff_workspace(workspace: &Path, snapshot_commit: &str) -> Result<Workspa
     // descending into `target/`.
     let untracked = git(
         workspace,
-        &["ls-files", "--others", "--exclude-standard", "-z"],
+        &[
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "--directory",
+            "-z",
+        ],
     )?;
     for path in untracked.split('\0').filter(|s| !s.is_empty()) {
         changes.push(WorkspaceChange {
@@ -780,12 +786,12 @@ mod tests {
         let change = diff
             .changes
             .iter()
-            .find(|c| c.path.starts_with("build/"))
+            .find(|c| c.path == "build/")
             .expect("untracked junk must be detected");
         assert_eq!(change.category, ChangeCategory::Untracked);
 
         revert_paths(&fixture.path, &fixture.commit, &diff.changes).unwrap();
-        assert!(!fixture.path.join("build/stale").exists());
+        assert!(!fixture.path.join("build").exists());
     }
 
     #[test]
