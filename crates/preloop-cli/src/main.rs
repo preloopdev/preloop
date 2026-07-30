@@ -290,7 +290,17 @@ struct ShellArgs {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    // `fmt::init()` alone filters to ERROR when `RUST_LOG` is unset, which hid
+    // a runner pool that failed to provision 77 times in a row: every
+    // provisioning fault logs at `warn` or `info`, so the operator saw a server
+    // that accepted webhooks and silently never ran anything. Default to `info`
+    // and let `RUST_LOG` override as usual.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 
     let cli = Cli::parse();
     // Both run the daemon in this process, so neither may bootstrap another
