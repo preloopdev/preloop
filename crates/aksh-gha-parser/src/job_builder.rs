@@ -65,6 +65,74 @@ fn job_outputs_token(outputs: &BTreeMap<String, String>) -> Option<Value> {
     }))
 }
 
+fn template_string_token(raw: &str) -> Value {
+    let location = || json!({"file": 1, "line": 1, "col": 1});
+    let trimmed = raw.trim();
+    if let Some(expression) = trimmed
+        .strip_prefix("${{")
+        .and_then(|value| value.strip_suffix("}}").map(str::trim))
+    {
+        return json!({
+            "type": 3,
+            "file": 1,
+            "line": 1,
+            "col": 1,
+            "expr": expression,
+        });
+    }
+    if !raw.contains("${{") {
+        let mut token = location();
+        token["type"] = json!(0);
+        token["lit"] = json!(raw);
+        return token;
+    }
+
+    let mut format_string = String::new();
+    let mut expressions = Vec::new();
+    let mut remaining = raw;
+    while let Some(start) = remaining.find("${{") {
+        append_format_literal(&mut format_string, &remaining[..start]);
+        let expression_source = &remaining[start + 3..];
+        let Some(end) = crate::eval::find_expression_end(expression_source) else {
+            let mut token = location();
+            token["type"] = json!(0);
+            token["lit"] = json!(raw);
+            return token;
+        };
+        format_string.push('{');
+        format_string.push_str(&expressions.len().to_string());
+        format_string.push('}');
+        expressions.push(expression_source[..end].trim().to_owned());
+        remaining = &expression_source[end + 2..];
+    }
+    append_format_literal(&mut format_string, remaining);
+
+    let mut expression = format!("format('{format_string}'");
+    for argument in expressions {
+        expression.push_str(", ");
+        expression.push_str(&argument);
+    }
+    expression.push(')');
+    json!({
+        "type": 3,
+        "file": 1,
+        "line": 1,
+        "col": 1,
+        "expr": expression,
+    })
+}
+
+fn append_format_literal(target: &mut String, literal: &str) {
+    for character in literal.chars() {
+        match character {
+            '\'' => target.push_str("''"),
+            '{' => target.push_str("{{"),
+            '}' => target.push_str("}}"),
+            _ => target.push(character),
+        }
+    }
+}
+
 fn template_token(value: &Value) -> Value {
     let location = || json!({"file": 1, "line": 1, "col": 1});
     match value {
@@ -102,27 +170,7 @@ fn template_token(value: &Value) -> Value {
                 "seq": seq,
             })
         }
-        Value::String(raw) => {
-            let expression = raw
-                .trim()
-                .strip_prefix("${{")
-                .and_then(|value| value.strip_suffix("}}").map(str::trim));
-            match expression {
-                Some(expr) => json!({
-                    "type": 3,
-                    "file": 1,
-                    "line": 1,
-                    "col": 1,
-                    "expr": expr,
-                }),
-                None => {
-                    let mut token = location();
-                    token["type"] = json!(0);
-                    token["lit"] = json!(raw);
-                    token
-                }
-            }
-        }
+        Value::String(raw) => template_string_token(raw),
         Value::Bool(value) => {
             let mut token = location();
             token["type"] = json!(0);
@@ -1007,6 +1055,18 @@ jobs:
         assert!(services["map"]
             .as_array()
             .is_some_and(|map| !map.is_empty()));
+    }
+
+    #[test]
+    fn mixed_container_strings_use_format_expression_tokens() {
+        let token = template_token(&serde_json::json!(
+            "ghcr.io/acme/${{ matrix.image }}:${{ matrix.tag }}"
+        ));
+        assert_eq!(token["type"], 3);
+        assert_eq!(
+            token["expr"],
+            "format('ghcr.io/acme/{0}:{1}', matrix.image, matrix.tag)"
+        );
     }
 
     #[test]

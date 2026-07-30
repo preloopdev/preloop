@@ -22,7 +22,10 @@ fn server_url() -> String {
 
 fn detect_host_ip() -> String {
     for interface in ["en0", "en1", "en2", "eth0"] {
-        if let Ok(output) = std::process::Command::new("ipconfig").args(["getifaddr", interface]).output() {
+        if let Ok(output) = std::process::Command::new("ipconfig")
+            .args(["getifaddr", interface])
+            .output()
+        {
             let ip = String::from_utf8_lossy(&output.stdout).trim().to_owned();
             if !ip.is_empty() {
                 return ip;
@@ -56,11 +59,11 @@ fn api_token() -> Option<String> {
         .or_else(|_| std::env::var("AKSH_SYSTEM_TOKEN"))
         .ok()
         .or_else(|| {
-        std::fs::read_to_string(preloop_home().join("engine.token"))
-            .ok()
-            .map(|token| token.trim().to_owned())
-            .filter(|token| !token.is_empty())
-    })
+            std::fs::read_to_string(preloop_home().join("engine.token"))
+                .ok()
+                .map(|token| token.trim().to_owned())
+                .filter(|token| !token.is_empty())
+        })
 }
 
 fn build_client() -> reqwest::Client {
@@ -123,6 +126,25 @@ enum Command {
     /// spawns it by name, and to keep existing supervisor units working.
     #[command(hide = true)]
     Engine,
+
+    /// Build a fresh packed microVM artifact for release automation.
+    #[command(hide = true)]
+    BuildGolden(BuildGoldenArgs),
+}
+
+#[derive(Debug, Parser)]
+struct BuildGoldenArgs {
+    /// Directory containing the Linux preloop-runner binary.
+    #[arg(long)]
+    runner_bundle: PathBuf,
+
+    /// Destination path for the packed artifact.
+    #[arg(long)]
+    output: PathBuf,
+
+    /// OCI base image to pack.
+    #[arg(long, default_value = "ubuntu:24.04")]
+    base_image: String,
 }
 
 #[derive(Debug, Default, clap::Args)]
@@ -266,6 +288,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Serve(args) => return cmd_engine(args).await,
         Command::Engine => return cmd_engine(ServeArgs::default()).await,
+        Command::BuildGolden(args) => return cmd_build_golden(args).await,
         _ => {}
     }
     ensure_engine_running().await?;
@@ -281,10 +304,63 @@ async fn main() -> anyhow::Result<()> {
         Command::Debug(args) => {
             debug_session::run(args, build_client(), server_url(), api_token()).await
         }
-        Command::Serve(_) | Command::Engine => {
+        Command::Serve(_) | Command::Engine | Command::BuildGolden(_) => {
             unreachable!("daemon commands handled before client startup")
         }
     }
+}
+
+async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
+    const TOKEN_ENV: &str = "PRELOOP_GOLDEN_BUILD_TOKEN";
+    std::env::set_var(TOKEN_ENV, "artifact-build-only");
+    let runner_bundle = std::fs::canonicalize(&args.runner_bundle).with_context(|| {
+        format!(
+            "runner bundle does not exist: {}",
+            args.runner_bundle.display()
+        )
+    })?;
+    let output = if args.output.is_absolute() {
+        args.output
+    } else {
+        std::env::current_dir()?.join(args.output)
+    };
+    let config = RunnerPoolConfig {
+        size: 1,
+        use_fork: false,
+        name_prefix: "preloop-release-golden".into(),
+        base_image: args.base_image,
+        workspace: None,
+        artifact_stem: output.clone(),
+        runner_bundle,
+        runner_binary_name: "preloop-runner".into(),
+        server_url: "http://127.0.0.1:1".into(),
+        control_origin: None,
+        control_socket: None,
+        registration_token_env: TOKEN_ENV.into(),
+        labels: vec![
+            "self-hosted".into(),
+            "Linux".into(),
+            std::env::consts::ARCH.into(),
+        ],
+        cpus: RUNNER_CPUS,
+        memory_mib: RUNNER_MEMORY_MIB,
+        storage_gib: 20,
+        debug_dir: None,
+        runner_key_dir: None,
+        pending_jobs: None,
+        preload_images: Vec::new(),
+        next_job_runs_on: None,
+    };
+    RunnerPool::new(std::sync::Arc::new(SmolVmProvider::default()), config)?
+        .rebuild_artifact()
+        .await?;
+    anyhow::ensure!(
+        output.is_file(),
+        "golden build did not create {}",
+        output.display()
+    );
+    println!("{}", output.display());
+    Ok(())
 }
 
 async fn ensure_engine_running() -> anyhow::Result<()> {
@@ -513,8 +589,13 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
     }
 
     let shutdown = tokio_util::sync::CancellationToken::new();
-    let mut pool = match local_runner_pool_config(&home, local_server_url, queue_depth, next_job_runs_on)
-    {
+    let mut pool = match local_runner_pool_config(
+        &home,
+        local_server_url,
+        public_url,
+        queue_depth,
+        next_job_runs_on,
+    ) {
         Ok(config) => {
             let pool_shutdown = shutdown.clone();
             Some(tokio::spawn(async move {
@@ -596,6 +677,7 @@ async fn wait_for_engine_socket(socket: &std::path::Path) -> anyhow::Result<()> 
 fn local_runner_pool_config(
     home: &std::path::Path,
     server_url: String,
+    control_origin: String,
     queue_depth: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     next_job_runs_on: std::sync::Arc<std::sync::RwLock<Vec<String>>>,
 ) -> anyhow::Result<RunnerPoolConfig> {
@@ -637,10 +719,13 @@ fn local_runner_pool_config(
         base_image: std::env::var("PRELOOP_RUNNER_BASE_IMAGE")
             .unwrap_or_else(|_| "ubuntu:24.04".into()),
         workspace: None,
-        artifact_stem: home.join("vms").join(format!("preloop-ubuntu-24.04-{}", std::env::consts::ARCH)),
+        artifact_stem: home
+            .join("vms")
+            .join(format!("preloop-ubuntu-24.04-{}", std::env::consts::ARCH)),
         runner_bundle,
         runner_binary_name: "preloop-runner".into(),
         server_url,
+        control_origin: Some(control_origin),
         control_socket: Some(home.join("preloop.sock")),
         registration_token_env: "AKSH_SYSTEM_TOKEN".into(),
         labels: vec![

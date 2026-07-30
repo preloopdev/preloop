@@ -316,6 +316,58 @@ async fn selected_jobs_runs_transitive_needs_closure_without_independent_jobs() 
 }
 
 #[tokio::test]
+async fn selected_reusable_call_runs_all_inlined_children() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": r#"
+on: push
+jobs:
+  call:
+    uses: ./.github/workflows/callee.yml
+  unrelated:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo unrelated
+"#,
+            "event": "push",
+            "repository": "owner/repo",
+            "selected_jobs": ["call"],
+            "reusable_workflows": {
+                ".github/workflows/callee.yml": r#"
+on: workflow_call
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo build
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo test
+"#
+            }
+        }),
+    )
+    .await;
+
+    let inner = state.inner.lock().await;
+    let run = inner.runs.values().next().unwrap();
+    let base_ids: BTreeSet<String> = run.job_base_ids.values().cloned().collect();
+    assert_eq!(
+        base_ids,
+        BTreeSet::from(["call/build".to_owned(), "call/test".to_owned()])
+    );
+}
+
+#[tokio::test]
 async fn selected_jobs_empty_runs_all_workflow_jobs() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
@@ -4008,10 +4060,7 @@ async fn app_token_mint_failure_follows_the_configured_policy() {
     // so the mint fails before it signs anything or opens a socket.
     let private_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
 
-    for (policy, expected) in [
-        (MintFailurePolicy::LocalJwt, StatusCode::OK),
-        (MintFailurePolicy::Error, StatusCode::BAD_GATEWAY),
-    ] {
+    for policy in [MintFailurePolicy::LocalJwt, MintFailurePolicy::Error] {
         let temp = tempfile::tempdir().unwrap();
         let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
         state.github_app = Some(GitHubAppCredentials::for_tests(
@@ -4019,7 +4068,8 @@ async fn app_token_mint_failure_follows_the_configured_policy() {
             private_key.clone(),
             policy,
         ));
-        let app = app(state.clone(), CancellationToken::new());
+        let shutdown = CancellationToken::new();
+        let app = app(state.clone(), shutdown.clone());
 
         let (status, _) = try_req(
             &app,
@@ -4032,14 +4082,32 @@ async fn app_token_mint_failure_follows_the_configured_policy() {
             }),
         )
         .await;
-        assert_eq!(status, expected, "policy {policy:?}");
-
-        let queued = state.inner.lock().await.queue.len();
+        assert_eq!(status, StatusCode::OK, "policy {policy:?}");
+        let request = {
+            let inner = state.inner.lock().await;
+            assert_eq!(inner.queue.len(), 1);
+            inner
+                .github_token_requests
+                .values()
+                .next()
+                .cloned()
+                .expect("App-backed job defers a token request")
+        };
+        let shared = Arc::new(SharedState {
+            state: state.clone(),
+            shutdown,
+        });
+        let mint = crate::broker::mint_dispatch_github_token(&shared, &request).await;
         match policy {
             // The job still runs; it just has no GitHub credential.
-            MintFailurePolicy::LocalJwt => assert_eq!(queued, 1),
-            // Refusal happens before any state is mutated.
-            MintFailurePolicy::Error => assert_eq!(queued, 0),
+            MintFailurePolicy::LocalJwt => assert!(matches!(mint, Ok(None))),
+            // Refusal happens when the broker is about to dispatch the job.
+            MintFailurePolicy::Error => assert_eq!(
+                mint.expect_err("error policy must refuse dispatch")
+                    .into_response()
+                    .status(),
+                StatusCode::BAD_GATEWAY
+            ),
             MintFailurePolicy::Pat => unreachable!("covered by a github_app unit test"),
         }
     }
@@ -9311,7 +9379,7 @@ async fn replay_results_are_pruned_to_the_retention_window() {
         plans.push(plan);
     }
 
-    crate::blob_store::prune_replay_results(temp.path()).await;
+    crate::blob_store::prune_replay_results(temp.path(), &std::collections::BTreeSet::new()).await;
 
     let surviving: Vec<_> = plans.iter().filter(|plan| plan.exists()).collect();
     assert_eq!(
@@ -9332,8 +9400,28 @@ async fn replay_results_are_pruned_to_the_retention_window() {
 }
 
 #[tokio::test]
+async fn replay_result_pruning_preserves_active_plans() {
+    let temp = tempfile::tempdir().unwrap();
+    let results = temp.path().join("replay").join("results");
+    for index in 0..=crate::blob_store::REPLAY_PLANS_RETAINED {
+        let plan = results.join(format!("plan-{index:03}"));
+        std::fs::create_dir_all(&plan).unwrap();
+        filetime::set_file_mtime(
+            &plan,
+            filetime::FileTime::from_unix_time(1_700_000_000 + index as i64, 0),
+        )
+        .unwrap();
+    }
+    let active = BTreeSet::from(["plan-000".to_owned()]);
+
+    crate::blob_store::prune_replay_results(temp.path(), &active).await;
+
+    assert!(results.join("plan-000").exists());
+}
+
+#[tokio::test]
 async fn pruning_replay_results_is_a_no_op_without_a_replay_directory() {
     let temp = tempfile::tempdir().unwrap();
-    crate::blob_store::prune_replay_results(temp.path()).await;
+    crate::blob_store::prune_replay_results(temp.path(), &std::collections::BTreeSet::new()).await;
     assert!(!temp.path().join("replay").exists());
 }

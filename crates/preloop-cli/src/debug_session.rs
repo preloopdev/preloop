@@ -154,7 +154,7 @@ pub async fn run(
         return Ok(());
     }
 
-    repl(&ctx, session).await
+    repl(&ctx, session).await.map(|_| ())
 }
 
 struct Api {
@@ -222,8 +222,7 @@ pub async fn prompt_at_failure(
         }
         match answer.trim() {
             "d" | "" => {
-                repl(&api, session).await?;
-                return Ok(true);
+                return Ok(matches!(repl(&api, session).await?, ReplOutcome::Resumed));
             }
             "r" => {
                 api.verdict(
@@ -530,7 +529,13 @@ fn strip_ansi(line: &str) -> String {
     out.trim_end().to_owned()
 }
 
-async fn repl(ctx: &Api, mut session: DebugSession) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplOutcome {
+    Resumed,
+    Detached,
+}
+
+async fn repl(ctx: &Api, mut session: DebugSession) -> Result<ReplOutcome> {
     let prompt = format!("{}$ ", session.job_name);
     loop {
         print!("{prompt}");
@@ -542,7 +547,7 @@ async fn repl(ctx: &Api, mut session: DebugSession) -> Result<()> {
             println!();
             println!("Detached — the job stays paused and the VM stays up.");
             print_reattach(&session);
-            return Ok(());
+            return Ok(ReplOutcome::Detached);
         }
         let line = line.trim();
         if line.is_empty() {
@@ -610,7 +615,7 @@ async fn repl(ctx: &Api, mut session: DebugSession) -> Result<()> {
                     );
                 }
                 println!("  The job resumes. Watch it with: preloop status");
-                return Ok(());
+                return Ok(ReplOutcome::Resumed);
             }
             "continue" => {
                 ctx.verdict(
@@ -623,13 +628,13 @@ async fn repl(ctx: &Api, mut session: DebugSession) -> Result<()> {
                 .await?;
                 println!("  Failure accepted; remaining steps will run.");
                 println!("  The run is reported as failed-but-continued, not as a pass.");
-                return Ok(());
+                return Ok(ReplOutcome::Resumed);
             }
             "abort" => {
                 ctx.verdict(&session.session_id, Verdict::Abort, RevertPolicy::None, None, None)
                     .await?;
                 println!("  Run aborted. Cleanup steps will run.");
-                return Ok(());
+                return Ok(ReplOutcome::Resumed);
             }
             "export" => {
                 if let Err(error) = export_from_guest(&session, !flags.contains(&"--patch-only")) {
@@ -643,7 +648,7 @@ async fn repl(ctx: &Api, mut session: DebugSession) -> Result<()> {
             "detach" => {
                 println!("Detached — the job stays paused and the VM stays up.");
                 print_reattach(&session);
-                return Ok(());
+                return Ok(ReplOutcome::Detached);
             }
             "status" => {
                 session = ctx.get(&session.session_id).await?;
@@ -839,8 +844,12 @@ fn sync_workspace(session: &DebugSession, force: bool) -> Result<String> {
 
         let archive = std::env::temp_dir().join(format!("preloop-sync-{}.tar", std::process::id()));
         let list = std::env::temp_dir().join(format!("preloop-sync-{}.list", std::process::id()));
-        std::fs::write(&list, format!("{}\n", modified.join("\n")))
-            .context("staging the sync file list")?;
+        let mut list_contents = Vec::new();
+        for path in &modified {
+            list_contents.extend_from_slice(path.as_bytes());
+            list_contents.push(0);
+        }
+        std::fs::write(&list, list_contents).context("staging the sync file list")?;
 
         // tar carries mode bits, so a synced `check.sh` keeps its +x. Losing
         // that would fail the retry for a reason unrelated to the fix.
@@ -848,6 +857,8 @@ fn sync_workspace(session: &DebugSession, force: bool) -> Result<String> {
             .current_dir(&host)
             .arg("-cf")
             .arg(&archive)
+            .arg("--null")
+            .arg("--verbatim-files-from")
             .arg("-T")
             .arg(&list)
             .output()
@@ -915,11 +926,17 @@ fn export_from_guest(session: &DebugSession, apply: bool) -> Result<()> {
         .as_deref()
         .context("this session has no VM recorded")?;
 
-    // `git add -N` so files created in the VM appear in the diff too.
+    // Use a temporary index so `git add -N` can expose untracked files in the
+    // patch without changing the guest workspace's real index.
     let output = std::process::Command::new("smolvm")
         .args(["machine", "exec", "--name", machine, "--", "sh", "-lc"])
         .arg(format!(
-            "cd {} && git add -N . >/dev/null 2>&1; git diff --binary HEAD",
+            "cd {} && \
+             index=$(mktemp /var/tmp/preloop-export-index.XXXXXX) && \
+             trap 'rm -f \"$index\"' EXIT && \
+             GIT_INDEX_FILE=\"$index\" git read-tree HEAD && \
+             GIT_INDEX_FILE=\"$index\" git add -N . >/dev/null 2>&1 && \
+             GIT_INDEX_FILE=\"$index\" git diff --binary HEAD",
             shell_quote(guest_workspace)
         ))
         .output()
@@ -1001,7 +1018,7 @@ fn guest_modified(
 /// Gitignored paths never appear, so build output is excluded by construction
 /// and a warm `target/` is never walked.
 fn host_changes(host: &std::path::Path) -> Result<(Vec<String>, Vec<String>)> {
-    let git = |args: &[&str]| -> Result<String> {
+    let git = |args: &[&str]| -> Result<Vec<u8>> {
         let output = std::process::Command::new("git")
             .current_dir(host)
             .args(args)
@@ -1014,23 +1031,36 @@ fn host_changes(host: &std::path::Path) -> Result<(Vec<String>, Vec<String>)> {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        Ok(output.stdout)
     };
 
-    let deleted: Vec<String> = git(&["diff", "--name-only", "--diff-filter=D", "HEAD"])?
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(str::to_owned)
-        .collect();
+    let parse_paths = |bytes: Vec<u8>| -> Result<Vec<String>> {
+        bytes
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| {
+                String::from_utf8(path.to_vec())
+                    .context("Git returned a changed path that is not valid UTF-8")
+            })
+            .collect()
+    };
+    let deleted = parse_paths(git(&[
+        "diff",
+        "--name-only",
+        "--diff-filter=D",
+        "-z",
+        "HEAD",
+    ])?)?;
 
-    let tracked = git(&["diff", "--name-only", "--diff-filter=d", "HEAD"])?;
-    let untracked = git(&["ls-files", "--others", "--exclude-standard"])?;
-    let mut modified: Vec<String> = tracked
-        .lines()
-        .chain(untracked.lines())
-        .filter(|line| !line.is_empty())
-        .map(str::to_owned)
-        .collect();
+    let tracked = parse_paths(git(&[
+        "diff",
+        "--name-only",
+        "--diff-filter=d",
+        "-z",
+        "HEAD",
+    ])?)?;
+    let untracked = parse_paths(git(&["ls-files", "--others", "--exclude-standard", "-z"])?)?;
+    let mut modified: Vec<String> = tracked.into_iter().chain(untracked).collect();
     modified.sort();
     modified.dedup();
 
