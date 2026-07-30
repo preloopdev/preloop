@@ -26,14 +26,14 @@ jobs:
           if-no-files-found: error
 
   # The deep profile needs the repository's pre-packed smolVM machines,
-  # macOS/ARM64 host, gh credentials, and official runner cache. It runs on
-  # every pull request so runner regressions block review. A missing or failed
-  # infrastructure prerequisite must fail this job rather than silently
-  # degrading to the light profile.
+  # macOS/ARM64 host, gh credentials, and official runner cache. The host-only
+  # variable is also the explicit opt-in: webhook CI runs inside disposable
+  # Linux guests and must not try to launch nested host smolVMs. Once enabled,
+  # a missing or failed prerequisite fails instead of degrading to light.
   runner-deep:
     name: Runner deep conformance
-    if: github.event_name == 'pull_request' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: self-hosted
+    if: (github.event_name == 'pull_request' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && vars.RUNNER_CONFORMANCE_HOST_WORKSPACE != ''
+    runs-on: [self-hosted, macOS, ARM64, smolvm-host]
     timeout-minutes: 180
     env:
       GH_REPO: ${{ vars.RUNNER_CONFORMANCE_REPO || 'preloopdev/aksh-conformance' }}
