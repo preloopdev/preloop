@@ -46,7 +46,8 @@ jobs:
         run: cargo zigbuild -p aksh-runner --release --target aarch64-unknown-linux-musl
       - name: Run deep runner conformance
         run: |
-          bash ./benchmarks/real-world/batch-conformance.sh both '10[1-9]-*' '110-*'
+          rm -f benchmarks/compatibility/runner/behavior/conformance-{aksh,official}.jsonl
+          bash ./benchmarks/real-world/batch-conformance.sh both '10[1-9]-*' '11[0-5]-*'
           python3 benchmarks/real-world/runner-conformance.py --mode deep
       - name: Upload deep report and captures
         if: always()

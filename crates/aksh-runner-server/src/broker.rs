@@ -604,18 +604,40 @@ pub(crate) async fn broker_acquire_job(
     Json(request): Json<BrokerAcquireJobRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     authenticated_runner_id(&shared, &headers, Some(runner_id))?;
-    let inner = shared.state.inner.lock().await;
-    let request_id = inner
-        .agent_job_requests
-        .get(&request.job_message_id)
-        .copied()
-        .ok_or_else(|| ApiError::not_found("broker job message not found"))?;
-    ensure_broker_request_owner(&inner, request_id, runner_id)?;
-    let mut message = inner
-        .broker_messages
-        .get(&request_id)
-        .cloned()
-        .ok_or_else(|| ApiError::not_found("broker job payload not found"))?;
+    let (request_id, mut message, github_token_request) = {
+        let inner = shared.state.inner.lock().await;
+        let request_id = inner
+            .agent_job_requests
+            .get(&request.job_message_id)
+            .copied()
+            .ok_or_else(|| ApiError::not_found("broker job message not found"))?;
+        ensure_broker_request_owner(&inner, request_id, runner_id)?;
+        let message = inner
+            .broker_messages
+            .get(&request_id)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("broker job payload not found"))?;
+        (
+            request_id,
+            message,
+            inner.github_token_requests.get(&request_id).cloned(),
+        )
+    };
+    if let Some(token_request) = github_token_request {
+        if let Some(token) = mint_dispatch_github_token(&shared, &token_request).await? {
+            message.variables.insert(
+                "system.github.token".to_owned(),
+                aksh_gha_protocol::azdo::VariableValue::secret(token.clone()),
+            );
+            message.variables.insert(
+                "github_token".to_owned(),
+                aksh_gha_protocol::azdo::VariableValue::secret(token),
+            );
+        }
+        let mut inner = shared.state.inner.lock().await;
+        inner.github_token_requests.remove(&request_id);
+        inner.broker_messages.insert(request_id, message.clone());
+    }
     message.message_type = Some(azdo::message_type::RUNNER_JOB_REQUEST.to_owned());
     let run_service_url = broker_run_service_url(runner_id);
     for endpoint in &mut message.resources.endpoints {
@@ -666,6 +688,43 @@ pub(crate) async fn broker_acquire_job(
     let payload = serde_json::to_value(&message)
         .map_err(|error| ApiError::internal(format!("serialize broker job payload: {error}")))?;
     Ok(Json(payload))
+}
+
+pub(crate) async fn mint_dispatch_github_token(
+    shared: &Arc<SharedState>,
+    request: &GitHubTokenRequest,
+) -> Result<Option<String>, ApiError> {
+    let Some(app) = &shared.state.github_app else {
+        return Ok(None);
+    };
+    match crate::github_app::get_or_mint_token(app, &request.repository, &request.permissions).await
+    {
+        Ok(token) => Ok(Some(token)),
+        Err(error) => {
+            let fallback = crate::github_app::fallback_token(
+                app.mint_failure,
+                std::env::var("AKSH_GITHUB_TOKEN").ok(),
+            )
+            .map_err(|refusal| {
+                ApiError::bad_gateway(format!(
+                    "GitHub App token minting failed for {}: {error:#} ({refusal})",
+                    request.repository
+                ))
+            })?;
+            if fallback.is_some() {
+                warn!(
+                    repository = %request.repository,
+                    "GitHub App token minting failed; using configured PAT fallback: {error:#}"
+                );
+            } else {
+                warn!(
+                    repository = %request.repository,
+                    "GitHub App token minting failed; job retains local runtime token: {error:#}"
+                );
+            }
+            Ok(fallback)
+        }
+    }
 }
 
 pub(crate) async fn broker_renew_job(

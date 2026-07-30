@@ -484,7 +484,7 @@ pub async fn run_steps(
                 _ => None,
             };
 
-            let file_command_paths = {
+            let (file_command_paths, file_command_init_error) = {
                 let temp_dir = std::path::Path::new(workspace)
                     .parent()
                     .unwrap_or(std::path::Path::new("."))
@@ -498,7 +498,7 @@ pub async fn run_steps(
                         for (k, v) in super::file_commands::file_command_env(&paths) {
                             step_ctx.env.insert(k, v);
                         }
-                        paths
+                        (paths, None)
                     }
                     Err(e) => {
                         // Route through normal failure path so DAP completion,
@@ -514,15 +514,18 @@ pub async fn run_steps(
                             .unwrap_or(std::path::Path::new("."))
                             .join("_temp")
                             .join("_broken");
-                        super::file_commands::FileCommandPaths {
-                            env_file: temp_dir.join("e"),
-                            path_file: temp_dir.join("p"),
-                            output_file: temp_dir.join("o"),
-                            state_file: temp_dir.join("s"),
-                            summary_file: temp_dir.join("sm"),
-                            artifacts_file: temp_dir.join("a"),
-                            artifacts_list_file: temp_dir.join("al"),
-                        }
+                        (
+                            super::file_commands::FileCommandPaths {
+                                env_file: temp_dir.join("e"),
+                                path_file: temp_dir.join("p"),
+                                output_file: temp_dir.join("o"),
+                                state_file: temp_dir.join("s"),
+                                summary_file: temp_dir.join("sm"),
+                                artifacts_file: temp_dir.join("a"),
+                                artifacts_list_file: temp_dir.join("al"),
+                            },
+                            Some(e),
+                        )
                     }
                 }
             };
@@ -625,8 +628,12 @@ pub async fn run_steps(
                 step_cancel_rx
             };
 
-            let mut outcome =
-                execute_step(&step.step_type, &mut step_ctx, workspace, exec_cancel_rx).await;
+            let mut outcome = match file_command_init_error {
+                Some(error) => Err(error),
+                None => {
+                    execute_step(&step.step_type, &mut step_ctx, workspace, exec_cancel_rx).await
+                }
+            };
             // F029: If the display name still contains unresolved expressions
             // after the pre-execution evaluation (e.g. `${{ needs.*.result }}`
             // or `${{ format(...) }}`), try to fix it now that the step has

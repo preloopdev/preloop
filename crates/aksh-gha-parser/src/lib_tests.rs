@@ -453,6 +453,43 @@ jobs:
 }
 
 #[test]
+fn reusable_permissions_cannot_exceed_caller_permissions() {
+    let caller = parse_workflow(
+        r#"
+on: push
+permissions:
+  contents: read
+jobs:
+  call:
+    uses: ./.github/workflows/reusable.yml
+"#,
+    )
+    .unwrap();
+    let reusable = BTreeMap::from([(
+        ".github/workflows/reusable.yml".to_owned(),
+        r#"
+on: workflow_call
+permissions:
+  contents: write
+  issues: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo build
+"#
+        .to_owned(),
+    )]);
+
+    let jobs = expand_jobs_with_reusables(&caller, &reusable).unwrap().jobs;
+
+    assert_eq!(
+        jobs[0].permissions,
+        Some(BTreeMap::from([("contents".to_owned(), "read".to_owned())]))
+    );
+}
+
+#[test]
 fn reusable_workflow_secrets_inherit_flag() {
     let caller = parse_workflow(
         r#"

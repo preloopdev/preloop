@@ -23,11 +23,12 @@ unset all_proxy ALL_PROXY http_proxy https_proxy HTTP_PROXY HTTPS_PROXY \
       no_proxy NO_PROXY 2>/dev/null || true
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-AKSH_BIN="$SCRIPT_DIR/target/release/preloop-server"
-RUNNER_DIR="${RUNNER_DIR:-$HOME/mitm-proxy/experiments/mitm/.cache/runner-official}"
-AKSH_PORT=9090
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+AKSH_BIN="$REPO_ROOT/target/release/preloop-server"
+RUNNER_DIR="${RUNNER_DIR:-$HOME/.cache/actions-runner/current}"
+AKSH_PORT="${AKSH_PORT:-9090}"
 # Clients use port 80 via pfctl redirect (runner strips non-default HTTP ports)
-CLIENT_URL="http://127.0.0.1:80"
+CLIENT_URL="${CLIENT_URL:-http://127.0.0.1:80}"
 STATE_DIR="$(mktemp -d /tmp/aksh-bench-XXXXXX)"
 LOG="$STATE_DIR/aksh.log"
 AKSH_PID=""
@@ -60,7 +61,7 @@ except Exception:
 
 # ── preflight ─────────────────────────────────────────────────────────────────
 
-[ -f "$AKSH_BIN" ]           || die "aksh binary not found: $AKSH_BIN — build: cd ~/rust-runner-server && cargo build --release"
+[ -f "$AKSH_BIN" ]           || die "server binary not found: $AKSH_BIN — run: cargo build --release -p aksh-runner-server"
 [ -f "$RUNNER_DIR/run.sh" ]  || die "runner not found: $RUNNER_DIR"
 
 lsof -i :"$AKSH_PORT" -sTCP:LISTEN >/dev/null 2>&1 \
@@ -71,7 +72,7 @@ lsof -i :"$AKSH_PORT" -sTCP:LISTEN >/dev/null 2>&1 \
 
 # ── start aksh ───────────────────────────────────────────────────────────────
 
-AKSH_PUBLIC_URL="http://127.0.0.1:80" RUST_LOG=info "$AKSH_BIN" serve \
+AKSH_PUBLIC_URL="$CLIENT_URL" RUST_LOG=info "$AKSH_BIN" serve \
     --listen "127.0.0.1:${AKSH_PORT}" \
     --state-dir "$STATE_DIR/state" \
     >> "$LOG" 2>&1 &
@@ -84,14 +85,14 @@ until grep -q "listening" "$LOG" 2>/dev/null; do
     [ $retries -gt 50 ] && { echo "aksh startup timeout" >&2; cat "$LOG" >&2; exit 1; }
     sleep 0.2
 done
-# Probe redirect: port 80 must reach aksh
+# Probe the same origin the runner will use.
 python3 -c "
 import urllib.request
 try:
-    urllib.request.urlopen('http://127.0.0.1:80/_apis/connectionData?connectOptions=0&lastChangeId=0&lastChangeId64=0', timeout=3)
+    urllib.request.urlopen('${CLIENT_URL}/_apis/connectionData?connectOptions=0&lastChangeId=0&lastChangeId64=0', timeout=3)
 except Exception as e:
-    import sys; print('ERROR: port-80 redirect not reachable:', e, file=sys.stderr); sys.exit(1)
-" || die "pfctl redirect not active; run: sudo ./scripts/e2e-setup.sh"
+    import sys; print('ERROR: runner origin not reachable:', e, file=sys.stderr); sys.exit(1)
+" || die "runner origin unavailable: $CLIENT_URL"
 
 # ── configure runner (skip if already configured for this URL) ───────────────
 

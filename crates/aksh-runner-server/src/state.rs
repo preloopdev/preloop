@@ -532,6 +532,8 @@ pub(crate) struct InnerState {
     pub(crate) runner_rsa_public_keys: BTreeMap<i64, AgentRsaPublicKey>,
     pub(crate) inflight_messages: BTreeMap<String, BTreeMap<i64, azdo::TaskAgentMessage>>,
     pub(crate) broker_messages: BTreeMap<i64, azdo::AgentJobRequestMessage>,
+    /// Short-lived GitHub App credentials still to mint at broker acquisition.
+    pub(crate) github_token_requests: BTreeMap<i64, GitHubTokenRequest>,
     pub(crate) runner_client_ids: BTreeMap<String, i64>,
     pub(crate) cancellation_queue: VecDeque<QueuedCancellation>,
     pub(crate) pending_caches: BTreeMap<i64, PendingCache>,

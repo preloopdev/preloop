@@ -533,8 +533,7 @@ pub async fn run_job(
         } else {
             None
         };
-        debug_was_active = debug_client.is_some();
-        super::steps_runner::run_steps(
+        let result = super::steps_runner::run_steps(
             &ordered_steps,
             &mut job_ctx,
             &workspace,
@@ -549,7 +548,11 @@ pub async fn run_job(
                 .and_then(|v| v.as_str()),
         )
         .await
-        .map_err(|e| anyhow::anyhow!("{e}"))
+        .map_err(|e| anyhow::anyhow!("{e}"));
+        debug_was_active = debug_client
+            .as_ref()
+            .is_some_and(|client| client.resolved_session());
+        result
     };
 
     // Once execution has finished, completion wins over a concurrent renewal failure.

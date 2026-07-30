@@ -398,42 +398,8 @@ pub(crate) async fn mint_installation_token(
         .await
         .with_context(|| format!("POST {url} response body"))?;
     if !status.is_success() {
-        if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
-            let mut fallback_perms = BTreeMap::new();
-            fallback_perms.insert("contents".to_owned(), "read".to_owned());
-            fallback_perms.insert("metadata".to_owned(), "read".to_owned());
-            let fallback_body = json!({
-                "repositories": [repository],
-                "permissions": installation_permissions(&fallback_perms),
-            });
-            if let Ok(res) = CLIENT
-                .post(&url)
-                .header("User-Agent", "aksh")
-                .header("Authorization", format!("Bearer {app_jwt}"))
-                .header("Accept", "application/vnd.github+json")
-                .json(&fallback_body)
-                .send()
-                .await
-            {
-                if res.status().is_success() {
-                    if let Ok(text) = res.text().await {
-                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
-                            if let Some(token) = val.get("token").and_then(|v| v.as_str()) {
-                                let raw_expiry = val
-                                    .get("expires_at")
-                                    .and_then(serde_json::Value::as_str)
-                                    .unwrap_or_default();
-                                let expires_at = chrono::DateTime::parse_from_rfc3339(raw_expiry)
-                                    .map(|dt| dt.into())
-                                    .unwrap_or_else(|_| SystemTime::now() + std::time::Duration::from_secs(3600));
-                                return Ok((token.to_owned(), expires_at));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        bail!("POST {url} failed with {status}: {payload}");
+        let message: String = payload.chars().take(1024).collect();
+        return Err(anyhow!("GitHub returned {status}: {message}"));
     }
     let payload: serde_json::Value = serde_json::from_str(&payload)
         .with_context(|| format!("POST {url} returned a non-JSON body"))?;

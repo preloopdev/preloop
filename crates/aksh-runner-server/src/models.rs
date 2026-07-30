@@ -103,6 +103,12 @@ pub(crate) struct QueuedJob {
     pub(crate) matrix: BTreeMap<String, serde_json::Value>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct GitHubTokenRequest {
+    pub(crate) repository: String,
+    pub(crate) permissions: BTreeMap<String, String>,
+}
+
 /// Runner metadata used by dispatch matching.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RunnerCapabilities {
