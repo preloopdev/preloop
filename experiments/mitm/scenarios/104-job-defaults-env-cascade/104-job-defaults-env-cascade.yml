@@ -1,0 +1,28 @@
+name: 104-job-defaults-env-cascade
+on: workflow_dispatch
+env:
+  VAR: "workflow"
+  OVERRIDDEN: "workflow-orig"
+
+defaults:
+  run:
+    shell: bash
+    working-directory: ./
+
+jobs:
+  override-job:
+    runs-on: self-hosted
+    env:
+      VAR: "job"
+      OVERRIDDEN: "job-override"
+    defaults:
+      run:
+        working-directory: /tmp
+    steps:
+      - name: Step level override
+        env:
+          VAR: "step"
+        run: |
+          test "$VAR" = "step"
+          test "$OVERRIDDEN" = "job-override"
+          test "$PWD" = "/tmp"

@@ -1,0 +1,177 @@
+name: bench-cache-pnpm
+
+on:
+  push:
+  pull_request:
+
+# Benchmark workflow simulating a pnpm monorepo's cache patterns.
+# Measures pnpm store cache restore/save timing.
+# The pnpm store is the primary cache target — it holds verified
+# package tarballs that the package manager integrity-checks on restore.
+
+jobs:
+  pnpm-bench:
+    runs-on: self-hosted
+    steps:
+      - name: create simulated pnpm store
+        run: |
+          # Simulate a realistic pnpm content-addressable store
+          # Typical pnpm store for a mid-size project: 50-300 MB
+          STORE_DIR=".pnpm-store/v3/files"
+          mkdir -p "$STORE_DIR"
+
+          # Create ~80 MB of package content (simulating resolved packages)
+          for i in $(seq 1 400); do
+            # Each "package" is a tarball-like blob
+            subdir="$STORE_DIR/$(printf '%02x' $((i % 256)))/$(printf '%02x' $((i / 256 % 256)))"
+            mkdir -p "$subdir"
+            dd if=/dev/urandom of="$subdir/content-$i.bin" bs=1024 count=200 2>/dev/null
+          done
+
+          echo "pnpm store size: $(du -sh .pnpm-store | cut -f1)"
+          echo "pnpm store files: $(find .pnpm-store -type f | wc -l)"
+
+      - name: create simulated lockfile
+        run: |
+          # Create a realistic pnpm-lock.yaml
+          cat > pnpm-lock.yaml << 'EOF'
+          lockfileVersion: '9.0'
+
+          settings:
+            autoInstallPeers: true
+            excludeLinksFromLockfile: false
+
+          importers:
+            .:
+              dependencies:
+                react: ^18.2.0
+                react-dom: ^18.2.0
+              devDependencies:
+                typescript: ^5.3.0
+                vite: ^5.0.0
+                vitest: ^1.0.0
+
+          packages:
+            react@18.2.0:
+              resolution: {integrity: sha512-test}
+            react-dom@18.2.0:
+              resolution: {integrity: sha512-test}
+            typescript@5.3.0:
+              resolution: {integrity: sha512-test}
+            vite@5.0.0:
+              resolution: {integrity: sha512-test}
+            vitest@1.0.0:
+              resolution: {integrity: sha512-test}
+          EOF
+
+      - name: save pnpm store cache
+        uses: actions/cache@v4
+        with:
+          path: .pnpm-store
+          key: bench-pnpm-store-${{ hashFiles('pnpm-lock.yaml') }}-${{ github.run_id }}
+
+      - name: create simulated node_modules
+        run: |
+          # Simulate installed node_modules (what pnpm creates from store)
+          mkdir -p node_modules/.pnpm
+          for i in $(seq 1 200); do
+            mkdir -p "node_modules/.pnpm/pkg@$i/node_modules/pkg"
+            echo '{"name":"pkg","version":"1.0.0"}' > "node_modules/.pnpm/pkg@$i/node_modules/pkg/package.json"
+          done
+          echo "node_modules size: $(du -sh node_modules | cut -f1)"
+
+      - name: save node_modules cache
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: bench-pnpm-modules-${{ hashFiles('pnpm-lock.yaml') }}-${{ github.run_id }}
+
+      - name: verify benchmark state
+        run: |
+          echo "=== Cache bench: pnpm patterns ==="
+          echo "pnpm store: $(find .pnpm-store -type f | wc -l) files, $(du -sh .pnpm-store | cut -f1)"
+          echo "node_modules: $(find node_modules -type f | wc -l) files, $(du -sh node_modules | cut -f1)"
+          echo "lockfile hash: $(sha256sum pnpm-lock.yaml | cut -d' ' -f1)"
+          echo "Cache keys:"
+          echo "  store: bench-pnpm-store-<hash>-${{ github.run_id }}"
+          echo "  modules: bench-pnpm-modules-<hash>-${{ github.run_id }}"
+
+  pnpm-bench-restore:
+    runs-on: self-hosted
+    needs: pnpm-bench
+    steps:
+      - name: create lockfile (same hash as save)
+        run: |
+          cat > pnpm-lock.yaml << 'EOF'
+          lockfileVersion: '9.0'
+
+          settings:
+            autoInstallPeers: true
+            excludeLinksFromLockfile: false
+
+          importers:
+            .:
+              dependencies:
+                react: ^18.2.0
+                react-dom: ^18.2.0
+              devDependencies:
+                typescript: ^5.3.0
+                vite: ^5.0.0
+                vitest: ^1.0.0
+
+          packages:
+            react@18.2.0:
+              resolution: {integrity: sha512-test}
+            react-dom@18.2.0:
+              resolution: {integrity: sha512-test}
+            typescript@5.3.0:
+              resolution: {integrity: sha512-test}
+            vite@5.0.0:
+              resolution: {integrity: sha512-test}
+            vitest@1.0.0:
+              resolution: {integrity: sha512-test}
+          EOF
+
+      - name: restore pnpm store (expect hit)
+        id: restore-store
+        uses: actions/cache@v4
+        with:
+          path: .pnpm-store
+          key: bench-pnpm-store-${{ hashFiles('pnpm-lock.yaml') }}-${{ github.run_id }}
+
+      - name: restore node_modules (expect hit)
+        id: restore-modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: bench-pnpm-modules-${{ hashFiles('pnpm-lock.yaml') }}-${{ github.run_id }}
+
+      - name: verify restored content
+        run: |
+          echo "=== Cache restore benchmark: pnpm ==="
+          echo "pnpm store cache-hit: ${{ steps.restore-store.outputs.cache-hit }}"
+          echo "node_modules cache-hit: ${{ steps.restore-modules.outputs.cache-hit }}"
+
+          STORE_OK="false"
+          MODULES_OK="false"
+
+          if [ -d .pnpm-store ] && [ "$(find .pnpm-store -type f | wc -l)" -gt 10 ]; then
+            echo "pnpm store RESTORE OK: $(find .pnpm-store -type f | wc -l) files"
+            STORE_OK="true"
+          else
+            echo "ERROR: pnpm store restore failed"
+          fi
+
+          if [ -d node_modules ] && [ "$(find node_modules -type f | wc -l)" -gt 10 ]; then
+            echo "node_modules RESTORE OK: $(find node_modules -type f | wc -l) files"
+            MODULES_OK="true"
+          else
+            echo "ERROR: node_modules restore failed"
+          fi
+
+          if [ "$STORE_OK" = "true" ] && [ "$MODULES_OK" = "true" ]; then
+            echo "=== Benchmark complete: all caches restored ==="
+          else
+            echo "=== Benchmark FAILED: cache miss ==="
+            exit 1
+          fi

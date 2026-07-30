@@ -1,18 +1,38 @@
 use super::*;
 
+const LOCAL_JWT_LIFETIME: Duration = Duration::from_secs(2999);
+
+/// A debug credential is acquired before the first step and remains in use
+/// through both the six-hour GitHub job limit and this server's four-hour
+/// pause-credit window. Keep a small allowance for setup and transport around
+/// those two bounded intervals.
+pub(crate) const DEBUG_WORKER_TOKEN_LIFETIME: Duration =
+    Duration::from_secs((6 + 4) * 60 * 60 + 5 * 60);
+
 impl AppState {
-    pub(crate) fn local_jwt(&self, mut claims: serde_json::Value) -> Result<String, ApiError> {
+    pub(crate) fn local_jwt(&self, claims: serde_json::Value) -> Result<String, ApiError> {
+        self.local_jwt_with_lifetime(claims, LOCAL_JWT_LIFETIME)
+    }
+
+    fn local_jwt_with_lifetime(
+        &self,
+        mut claims: serde_json::Value,
+        lifetime: Duration,
+    ) -> Result<String, ApiError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| ApiError::bad_request(format!("system clock before epoch: {error}")))?
             .as_secs();
+        let expires_at = now
+            .checked_add(lifetime.as_secs())
+            .ok_or_else(|| ApiError::bad_request("JWT expiration exceeds u64"))?;
         let claims = claims
             .as_object_mut()
             .ok_or_else(|| ApiError::bad_request("JWT claims must be an object"))?;
         claims.insert("iss".to_owned(), json!("https://aksh.local"));
         claims.insert("iat".to_owned(), json!(now));
         claims.insert("nbf".to_owned(), json!(now));
-        claims.insert("exp".to_owned(), json!(now + 2999));
+        claims.insert("exp".to_owned(), json!(expires_at));
         let header = json!({
             "alg": "HS256",
             "typ": "JWT",
@@ -84,11 +104,84 @@ impl AppState {
             .ok()
     }
 
+    /// Agent job UUID a runtime token was minted for.
+    ///
+    /// The counterpart to [`Self::runner_id_from_token`]: a job runtime token
+    /// names exactly one job, so any surface a worker calls can authorize
+    /// against the job rather than merely against token validity.
+    pub(crate) fn job_uuid_from_token(&self, token: &str) -> Option<uuid::Uuid> {
+        let payload = self.verify_local_jwt_claims(token)?;
+        // `scp` is `Actions.Results:{plan_id}:{job_id}`; `sub` is the job on
+        // its own. Require both to agree so a token minted for a different
+        // surface cannot be replayed here.
+        let subject_job = payload
+            .get("sub")?
+            .as_str()?
+            .strip_prefix("aksh-job-")?
+            .parse::<uuid::Uuid>()
+            .ok()?;
+        let scope_job = payload
+            .get("scp")?
+            .as_str()?
+            .strip_prefix("Actions.Results:")?
+            .rsplit(':')
+            .next()?
+            .parse::<uuid::Uuid>()
+            .ok()?;
+        (subject_job == scope_job).then_some(subject_job)
+    }
+
+    /// Agent job UUID a debug-worker token was minted for.
+    ///
+    /// Distinct from [`Self::job_uuid_from_token`]: the runtime token is
+    /// handed to workflow code as `GITHUB_TOKEN`, so accepting it on debug
+    /// surfaces would let an untrusted step forge session requests for its own
+    /// job. This token never leaves the trusted runner process.
+    pub(crate) fn job_uuid_from_debug_token(&self, token: &str) -> Option<uuid::Uuid> {
+        let payload = self.verify_local_jwt_claims(token)?;
+        // `scp` is `DebugWorker:{plan_id}:{job_id}`; `sub` is the job on its
+        // own. Require both to agree so a token minted for a different surface
+        // cannot be replayed here.
+        let subject_job = payload
+            .get("sub")?
+            .as_str()?
+            .strip_prefix("aksh-debug-worker-")?
+            .parse::<uuid::Uuid>()
+            .ok()?;
+        let scope_job = payload
+            .get("scp")?
+            .as_str()?
+            .strip_prefix("DebugWorker:")?
+            .rsplit(':')
+            .next()?
+            .parse::<uuid::Uuid>()
+            .ok()?;
+        (subject_job == scope_job).then_some(subject_job)
+    }
+
     pub(crate) fn mint_runtime_token(&self, plan_id: &str, job_id: &uuid::Uuid) -> String {
         self.local_jwt(json!({
             "sub": format!("aksh-job-{job_id}"),
             "scp": format!("Actions.Results:{plan_id}:{job_id}"),
         }))
+        .expect("fixed local JWT claims must serialize")
+    }
+
+    /// Mint the token the runner process uses to speak for a job's debug
+    /// session, kept separate from the runtime token that workflow code sees.
+    ///
+    /// Reached only through [`crate::debug_sessions::issue_worker_token`], and
+    /// never as a job variable: the official runner copies every secret
+    /// variable into the `secrets` context, so a job message is a publication
+    /// channel to the workflow being debugged.
+    pub(crate) fn mint_debug_worker_token(&self, plan_id: &str, job_id: &uuid::Uuid) -> String {
+        self.local_jwt_with_lifetime(
+            json!({
+                "sub": format!("aksh-debug-worker-{job_id}"),
+                "scp": format!("DebugWorker:{plan_id}:{job_id}"),
+            }),
+            DEBUG_WORKER_TOKEN_LIFETIME,
+        )
         .expect("fixed local JWT claims must serialize")
     }
 }
@@ -107,6 +200,18 @@ pub struct AppState {
     pub(crate) inner: Arc<Mutex<InnerState>>,
     pub(crate) events: broadcast::Sender<NdjsonEvent>,
     pub(crate) message_notify: Arc<Notify>,
+    /// Atomic counter for pre-allocating request IDs outside the dispatch
+    /// lock.  Monotonically increases; the inner counter is no longer the
+    /// source of truth once this is in use.
+    pub(crate) next_request_id: Arc<std::sync::atomic::AtomicI64>,
+    /// Jobs accepted and still waiting for a runner, refreshed whenever one
+    /// is claimed. A supervising runner pool reads it to decide whether the
+    /// work already queued outruns the runners it has left.
+    pub queue_depth: Arc<std::sync::atomic::AtomicUsize>,
+    /// `runs-on` labels of the job at the front of the dispatch queue,
+    /// refreshed after each claim so a co-hosted runner pool can select the
+    /// right golden before the next fork.
+    pub next_job_runs_on: Arc<std::sync::RwLock<Vec<String>>>,
     pub(crate) cache: CacheStore,
     pub(crate) artifacts: ArtifactStore,
     /// Optional GitHub App Webhook Secret for signature verification.
@@ -124,6 +229,11 @@ pub struct AppState {
     pub runner_version_deprecated: bool,
     /// Optional cron scheduler (active when `--enable-scheduler` is set).
     pub scheduler: Option<Arc<crate::scheduler::Scheduler>>,
+    /// GitHub App credentials for minting installation tokens.
+    ///
+    /// `None` when no App is configured, in which case job tokens fall back to
+    /// `AKSH_GITHUB_TOKEN` and then to the local HMAC JWT.
+    pub(crate) github_app: Option<crate::github_app::GitHubAppCredentials>,
 }
 
 #[derive(Debug, Clone)]
@@ -174,15 +284,28 @@ impl AppState {
         let cache = CacheStore::new(state_dir.join("cache")).await?;
         let artifacts = ArtifactStore::new(state_dir.join("artifacts")).await?;
         let (events, _) = broadcast::channel(1024);
-        let keypair = AgentRsaKeypair::generate()
-            .map_err(|e| anyhow::anyhow!("Failed to generate RSA keypair: {}", e))?;
-        let oidc_keypair = load_or_generate_oidc_keypair(&state_dir)?;
+        let oidc_state_dir = state_dir.clone();
+        let keypair_handle = tokio::task::spawn_blocking(AgentRsaKeypair::generate);
+        let oidc_handle =
+            tokio::task::spawn_blocking(move || load_or_generate_oidc_keypair(&oidc_state_dir));
+        #[cfg(not(test))]
+        let hmac_handle = {
+            let hmac_state_dir = state_dir.clone();
+            tokio::task::spawn_blocking(move || load_or_generate_hmac_key(&hmac_state_dir))
+        };
+        #[cfg(not(test))]
+        let (keypair_result, oidc_result, hmac_result) =
+            tokio::join!(keypair_handle, oidc_handle, hmac_handle);
+        #[cfg(test)]
+        let (keypair_result, oidc_result) = tokio::join!(keypair_handle, oidc_handle);
+        let keypair = keypair_result??;
+        let oidc_keypair = oidc_result??;
         let system_token =
             env::var("AKSH_SYSTEM_TOKEN").unwrap_or_else(|_| DEFAULT_AKSH_SYSTEM_TOKEN.to_owned());
         #[cfg(test)]
         let local_jwt_key = TEST_LOCAL_JWT_KEY.to_vec();
         #[cfg(not(test))]
-        let local_jwt_key = load_or_generate_hmac_key(&state_dir)?;
+        let local_jwt_key = hmac_result??;
         let registry_path = state_dir.join("artifact_v2_registry.json");
         let (registry, next_id) = if registry_path.exists() {
             if let Ok(content) = std::fs::read_to_string(&registry_path) {
@@ -219,10 +342,14 @@ impl AppState {
                 )
             })
             .unwrap_or(false);
+        let github_app = crate::github_app::load_from_env()?;
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
             events,
             message_notify: Arc::new(Notify::new()),
+            next_request_id: Arc::new(std::sync::atomic::AtomicI64::new(1)),
+            queue_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            next_job_runs_on: Arc::new(std::sync::RwLock::new(Vec::new())),
             cache,
             artifacts,
             webhook_secret,
@@ -232,6 +359,7 @@ impl AppState {
             local_jwt_key,
             runner_version_deprecated,
             scheduler: None,
+            github_app,
         })
     }
 
@@ -427,6 +555,8 @@ pub(crate) struct InnerState {
     pub(crate) runner_rsa_public_keys: BTreeMap<i64, AgentRsaPublicKey>,
     pub(crate) inflight_messages: BTreeMap<String, BTreeMap<i64, azdo::TaskAgentMessage>>,
     pub(crate) broker_messages: BTreeMap<i64, azdo::AgentJobRequestMessage>,
+    /// Short-lived GitHub App credentials still to mint at broker acquisition.
+    pub(crate) github_token_requests: BTreeMap<i64, GitHubTokenRequest>,
     pub(crate) runner_client_ids: BTreeMap<String, i64>,
     pub(crate) cancellation_queue: VecDeque<QueuedCancellation>,
     pub(crate) pending_caches: BTreeMap<i64, PendingCache>,
@@ -454,7 +584,6 @@ pub(crate) struct InnerState {
     pub(crate) next_cache_id: i64,
     pub(crate) next_message_id: i64,
     pub(crate) next_log_id: usize,
-    pub(crate) next_request_id: i64,
     pub(crate) flows_file: Option<std::fs::File>,
     pub(crate) next_flow_index: usize,
     /// Sessions created via the AzDO distributedtask path (full encrypted message format).
@@ -491,4 +620,6 @@ pub(crate) struct InnerState {
     pub(crate) run_concurrency: BTreeMap<RunId, aksh_gha_parser::Concurrency>,
     /// Which concurrency key a holder currently occupies (for release).
     pub(crate) holder_keys: BTreeMap<RunId, Vec<(String, String)>>,
+    /// Live debug sessions holding paused jobs open.
+    pub(crate) debug_sessions: crate::debug_sessions::DebugSessionRegistry,
 }

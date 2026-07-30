@@ -1,0 +1,16 @@
+name: 113-artifact-v4-multi-pattern
+on: workflow_dispatch
+jobs:
+  upload:
+    runs-on: self-hosted
+    steps:
+      - run: |
+          mkdir -p dist/js
+          echo "console.log(1);" > dist/js/app.js
+          echo "sourcemap" > dist/js/app.js.map
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-assets
+          path: |
+            dist/**
+            !dist/**/*.map

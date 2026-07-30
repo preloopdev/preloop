@@ -9,20 +9,71 @@ use preloop_orchestrator::{RunnerPool, RunnerPoolConfig};
 use preloop_vm::SmolVmProvider;
 use rand::RngCore;
 use std::collections::HashSet;
+use std::io::Read;
 use std::path::PathBuf;
 use std::time::Duration;
+
+mod debug_session;
+mod github_auth;
 
 fn server_url() -> String {
     std::env::var("AKSH_URL").unwrap_or_else(|_| "http://127.0.0.1:9090".to_owned())
 }
 
+fn detect_host_ip() -> String {
+    for interface in ["en0", "en1", "en2", "eth0"] {
+        if let Ok(output) = std::process::Command::new("ipconfig")
+            .args(["getifaddr", interface])
+            .output()
+        {
+            let ip = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            if !ip.is_empty() {
+                return ip;
+            }
+        }
+    }
+    "127.0.0.1".to_owned()
+}
+
+fn should_send_local_workspace_header(url: &str, uses_default_transport: bool) -> bool {
+    if uses_default_transport {
+        return true;
+    }
+
+    // An explicit loopback URL is still a local engine invocation. Do not
+    // trust a host path for an arbitrary remote server.
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+fn mounted_control_origin(public_url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(public_url).ok()?;
+    let host = parsed.host_str()?;
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    loopback.then(|| public_url.trim_end_matches('/').to_owned())
+}
+
 fn api_token() -> Option<String> {
-    std::env::var("AKSH_TOKEN").ok().or_else(|| {
-        std::fs::read_to_string(preloop_home().join("engine.token"))
-            .ok()
-            .map(|token| token.trim().to_owned())
-            .filter(|token| !token.is_empty())
-    })
+    std::env::var("AKSH_TOKEN")
+        .or_else(|_| std::env::var("AKSH_SYSTEM_TOKEN"))
+        .ok()
+        .or_else(|| {
+            std::fs::read_to_string(preloop_home().join("engine.token"))
+                .ok()
+                .map(|token| token.trim().to_owned())
+                .filter(|token| !token.is_empty())
+        })
 }
 
 fn build_client() -> reqwest::Client {
@@ -71,9 +122,73 @@ enum Command {
     /// Open a shell in a preserved VM.
     Shell(ShellArgs),
 
-    /// Internal persistent control plane and local runner pool.
+    /// Attach to a job paused at a failed step: inspect, fix, retry.
+    Debug(debug_session::DebugArgs),
+
+    /// Run the control plane and microVM runner pool in the foreground.
+    ///
+    /// This is the self-hosting entry point: it serves the GitHub webhook and
+    /// Checks endpoints and provisions a microVM per queued job. Point a
+    /// tunnel or reverse proxy at `--listen` to receive events from GitHub.
+    Serve(ServeArgs),
+
+    /// Former name for `serve`. Retained because `ensure_engine_running`
+    /// spawns it by name, and to keep existing supervisor units working.
     #[command(hide = true)]
     Engine,
+
+    /// Build a fresh packed microVM artifact for release automation.
+    #[command(hide = true)]
+    BuildGolden(BuildGoldenArgs),
+}
+
+#[derive(Debug, Parser)]
+struct BuildGoldenArgs {
+    /// Directory containing the Linux preloop-runner binary.
+    #[arg(long)]
+    runner_bundle: PathBuf,
+
+    /// Destination path for the packed artifact.
+    #[arg(long)]
+    output: PathBuf,
+
+    /// OCI base image to pack.
+    #[arg(long, default_value = "ubuntu:24.04")]
+    base_image: String,
+}
+
+#[derive(Debug, Default, clap::Args)]
+struct ServeArgs {
+    /// Address to bind. Overrides PRELOOP_LISTEN.
+    #[arg(long, value_name = "ADDR")]
+    listen: Option<String>,
+
+    /// Externally reachable base URL. Overrides PRELOOP_PUBLIC_URL.
+    ///
+    /// Must be the address GitHub and any remote runners can reach — a
+    /// loopback URL here is only correct when everything is on this host.
+    #[arg(long, value_name = "URL")]
+    public_url: Option<String>,
+
+    /// GitHub App id.
+    #[arg(long, value_name = "ID")]
+    github_app_id: Option<String>,
+
+    /// Path to the GitHub App private key PEM.
+    #[arg(long, value_name = "PATH")]
+    github_app_key: Option<PathBuf>,
+
+    /// Installation id. Skips installation discovery when supplied.
+    #[arg(long, value_name = "ID")]
+    github_app_installation_id: Option<u64>,
+
+    /// Shared secret for verifying `X-Hub-Signature-256`.
+    #[arg(long, value_name = "SECRET")]
+    webhook_secret: Option<String>,
+
+    /// Persist the supplied GitHub credentials so later runs reuse them.
+    #[arg(long)]
+    save: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -94,7 +209,19 @@ struct RunArgs {
     #[arg(long)]
     base: Option<String>,
 
-    /// Keep the failed job VM alive for `preloop shell`.
+    /// Tear down on failure instead of pausing for debugging.
+    ///
+    /// Pausing is the default in a terminal: a failed step holds its microVM
+    /// open so you can fix and retry from that step. Non-interactive runs
+    /// (`--detach`, pipes, CI) never pause, so nothing hangs.
+    #[arg(long)]
+    no_debug: bool,
+
+    /// Keep the failed job VM alive even when nothing can attach interactively.
+    ///
+    /// Pausing already implies this for an interactive run. Pass it to hold a
+    /// VM open for a later `preloop shell` from a detached or piped run, which
+    /// otherwise tears down because there is nobody to answer the pause.
     #[arg(long)]
     preserve_on_failure: bool,
 
@@ -163,11 +290,26 @@ struct ShellArgs {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    // `fmt::init()` alone filters to ERROR when `RUST_LOG` is unset, which hid
+    // a runner pool that failed to provision 77 times in a row: every
+    // provisioning fault logs at `warn` or `info`, so the operator saw a server
+    // that accepted webhooks and silently never ran anything. Default to `info`
+    // and let `RUST_LOG` override as usual.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 
     let cli = Cli::parse();
-    if matches!(cli.command, Command::Engine) {
-        return cmd_engine().await;
+    // Both run the daemon in this process, so neither may bootstrap another
+    // one underneath itself.
+    match cli.command {
+        Command::Serve(args) => return cmd_engine(args).await,
+        Command::Engine => return cmd_engine(ServeArgs::default()).await,
+        Command::BuildGolden(args) => return cmd_build_golden(args).await,
+        _ => {}
     }
     ensure_engine_running().await?;
 
@@ -179,8 +321,66 @@ async fn main() -> anyhow::Result<()> {
         Command::Cancel(args) => cmd_cancel(args).await,
         Command::Secret(args) => cmd_secret(args).await,
         Command::Shell(args) => cmd_shell(args).await,
-        Command::Engine => unreachable!("engine handled before client startup"),
+        Command::Debug(args) => {
+            debug_session::run(args, build_client(), server_url(), api_token()).await
+        }
+        Command::Serve(_) | Command::Engine | Command::BuildGolden(_) => {
+            unreachable!("daemon commands handled before client startup")
+        }
     }
+}
+
+async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
+    const TOKEN_ENV: &str = "PRELOOP_GOLDEN_BUILD_TOKEN";
+    std::env::set_var(TOKEN_ENV, "artifact-build-only");
+    let runner_bundle = std::fs::canonicalize(&args.runner_bundle).with_context(|| {
+        format!(
+            "runner bundle does not exist: {}",
+            args.runner_bundle.display()
+        )
+    })?;
+    let output = if args.output.is_absolute() {
+        args.output
+    } else {
+        std::env::current_dir()?.join(args.output)
+    };
+    let config = RunnerPoolConfig {
+        size: 1,
+        use_fork: false,
+        name_prefix: "preloop-release-golden".into(),
+        base_image: args.base_image,
+        workspace: None,
+        artifact_stem: output.clone(),
+        runner_bundle,
+        runner_binary_name: "preloop-runner".into(),
+        server_url: "http://127.0.0.1:1".into(),
+        control_origin: None,
+        control_socket: None,
+        registration_token_env: TOKEN_ENV.into(),
+        labels: vec![
+            "self-hosted".into(),
+            "Linux".into(),
+            std::env::consts::ARCH.into(),
+        ],
+        cpus: RUNNER_CPUS,
+        memory_mib: RUNNER_MEMORY_MIB,
+        storage_gib: 20,
+        debug_dir: None,
+        runner_key_dir: None,
+        pending_jobs: None,
+        preload_images: Vec::new(),
+        next_job_runs_on: None,
+    };
+    RunnerPool::new(std::sync::Arc::new(SmolVmProvider::default()), config)?
+        .rebuild_artifact()
+        .await?;
+    anyhow::ensure!(
+        output.is_file(),
+        "golden build did not create {}",
+        output.display()
+    );
+    println!("{}", output.display());
+    Ok(())
 }
 
 async fn ensure_engine_running() -> anyhow::Result<()> {
@@ -191,13 +391,13 @@ async fn ensure_engine_running() -> anyhow::Result<()> {
     let client = build_client();
     let url = server_url();
 
-    if client
+    let mut health_req = client
         .get(format!("{url}/healthz"))
-        .timeout(Duration::from_millis(500))
-        .send()
-        .await
-        .is_ok()
-    {
+        .timeout(Duration::from_millis(500));
+    if let Some(token) = api_token() {
+        health_req = health_req.bearer_auth(token);
+    }
+    if health_req.send().await.is_ok() {
         return Ok(());
     }
 
@@ -221,8 +421,7 @@ async fn ensure_engine_running() -> anyhow::Result<()> {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        std::fs::write(&token_path, &token)?;
-        set_private_file_permissions(&token_path)?;
+        write_private_file(&token_path, token.as_bytes())?;
         token
     };
 
@@ -232,10 +431,18 @@ async fn ensure_engine_running() -> anyhow::Result<()> {
     cmd.arg("engine");
     cmd.env("AKSH_SYSTEM_TOKEN", token);
     cmd.env("PRELOOP_HOME", &preloop_dir);
+    if std::env::var_os("RUST_LOG").is_none() {
+        cmd.env("RUST_LOG", "info,preloop=debug,aksh=debug");
+    }
+
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(preloop_dir.join("engine.log"))?;
 
     cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::null());
-    cmd.stderr(std::process::Stdio::null());
+    cmd.stdout(log_file.try_clone()?);
+    cmd.stderr(log_file);
 
     let mut child = cmd
         .spawn()
@@ -288,22 +495,137 @@ fn set_private_file_permissions(_path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn cmd_engine() -> anyhow::Result<()> {
+fn write_private_file(path: &std::path::Path, contents: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("create private file {}", path.display()))?;
+    set_private_file_permissions(path)?;
+    file.write_all(contents)
+        .with_context(|| format!("write private file {}", path.display()))?;
+    Ok(())
+}
+
+fn prepare_engine_token(
+    home: &std::path::Path,
+    configured: Option<String>,
+) -> anyhow::Result<String> {
+    std::fs::create_dir_all(home)
+        .with_context(|| format!("create PRELOOP_HOME {}", home.display()))?;
+    set_private_directory_permissions(home)?;
+
+    let token_path = home.join("engine.token");
+    if let Some(token) = configured {
+        anyhow::ensure!(!token.trim().is_empty(), "AKSH_SYSTEM_TOKEN is empty");
+        write_private_file(&token_path, token.as_bytes())?;
+        return Ok(token);
+    }
+    if let Ok(existing) = std::fs::read_to_string(&token_path) {
+        let token = existing.trim().to_owned();
+        anyhow::ensure!(!token.is_empty(), "{} is empty", token_path.display());
+        set_private_file_permissions(&token_path)?;
+        return Ok(token);
+    }
+
+    let mut bytes = [0_u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let token = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    write_private_file(&token_path, token.as_bytes())?;
+    Ok(token)
+}
+
+/// Merge stored and command-line GitHub credentials into the environment the
+/// server reads, optionally persisting them, and report the effective state.
+///
+/// Precedence, widest to narrowest: existing environment, then `--flags`, then
+/// the stored file. The environment stays authoritative so a container that
+/// injects secrets is never overridden by a file left behind by `--save`.
+fn resolve_github_auth(args: &ServeArgs, state_dir: &std::path::Path) -> anyhow::Result<()> {
+    let mut auth = github_auth::StoredAuth::load(state_dir)?;
+
+    let private_key_pem = args
+        .github_app_key
+        .as_ref()
+        .map(|path| {
+            std::fs::read_to_string(path)
+                .with_context(|| format!("reading GitHub App key {}", path.display()))
+        })
+        .transpose()?;
+
+    let from_flags = github_auth::StoredAuth {
+        app_id: args.github_app_id.clone(),
+        installation_id: args.github_app_installation_id,
+        private_key_pem,
+        webhook_secret: args.webhook_secret.clone(),
+    };
+    let supplied = from_flags != github_auth::StoredAuth::default();
+    auth.overlay(from_flags);
+
+    if args.save {
+        if !supplied {
+            anyhow::bail!("--save needs at least one GitHub credential flag to save");
+        }
+        let path = auth.save(state_dir)?;
+        eprintln!("[preloop] saved GitHub credentials to {}", path.display());
+    }
+
+    auth.apply();
+    eprintln!("[preloop] {}", github_auth::StoredAuth::report());
+    Ok(())
+}
+
+async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
     let home = preloop_home();
     let state_dir = home.join("state");
     let socket = home.join("preloop.sock");
-    let listen: std::net::SocketAddr = std::env::var("PRELOOP_LISTEN")
-        .unwrap_or_else(|_| "127.0.0.1:9090".to_owned())
-        .parse()
-        .context("PRELOOP_LISTEN must be a socket address")?;
-    let public_url = std::env::var("PRELOOP_PUBLIC_URL")
-        .unwrap_or_else(|_| format!("http://127.0.0.1:{}", listen.port()));
-    std::env::set_var("AKSH_PUBLIC_URL", &public_url);
 
+    // Ensure AKSH_SYSTEM_TOKEN and engine.token stay synchronized.
+    let token = prepare_engine_token(&home, std::env::var("AKSH_SYSTEM_TOKEN").ok())?;
+    std::env::set_var("AKSH_SYSTEM_TOKEN", &token);
+    let listen: std::net::SocketAddr = args
+        .listen
+        .clone()
+        .or_else(|| std::env::var("PRELOOP_LISTEN").ok())
+        .unwrap_or_else(|| "0.0.0.0:9090".to_owned())
+        .parse()
+        .context("--listen / PRELOOP_LISTEN must be a socket address")?;
+    let public_url = args
+        .public_url
+        .clone()
+        .or_else(|| std::env::var("PRELOOP_PUBLIC_URL").ok())
+        .unwrap_or_else(|| format!("http://127.0.0.1:{}", listen.port()));
+    std::env::set_var("AKSH_PUBLIC_URL", &public_url);
+    let control_origin = mounted_control_origin(&public_url);
+
+    // Local runner pool connects via host LAN IP so smolvm guest microVMs can reach host control plane directly
+    let local_server_url = format!("http://{}:{}", detect_host_ip(), listen.port());
+
+    // Resolve GitHub credentials before `AppState::new` reads the environment.
+    // Both `github_app::load_from_env` and the webhook-secret lookup happen
+    // inside `serve`, so anything published after that call is ignored.
+    resolve_github_auth(&args, &state_dir)?;
+
+    // Shared with the runner pool so it can size provisioning to the work
+    // actually waiting, not just to whether it has an idle runner left.
+    let queue_depth = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let next_job_runs_on = std::sync::Arc::new(std::sync::RwLock::new(Vec::new()));
     let mut server = tokio::spawn(aksh_runner_server::serve(
         aksh_runner_server::ServerConfig {
             listen,
             unix_socket: Some(socket.clone()),
+            queue_depth: Some(queue_depth.clone()),
+            next_job_runs_on: Some(next_job_runs_on.clone()),
             state_dir,
             record_flows: None,
             tls: aksh_runner_server::TlsMode::None,
@@ -313,13 +635,21 @@ async fn cmd_engine() -> anyhow::Result<()> {
             enable_scheduler: false,
         },
     ));
+    // Keep the server in the race so a bind failure surfaces its own error
+    // instead of a generic socket-wait timeout.
     tokio::select! {
         result = &mut server => return result?,
         result = wait_for_engine_socket(&socket) => result?,
     }
 
     let shutdown = tokio_util::sync::CancellationToken::new();
-    let mut pool = match local_runner_pool_config(&home, public_url) {
+    let mut pool = match local_runner_pool_config(
+        &home,
+        local_server_url,
+        control_origin,
+        queue_depth,
+        next_job_runs_on,
+    ) {
         Ok(config) => {
             let pool_shutdown = shutdown.clone();
             Some(tokio::spawn(async move {
@@ -401,34 +731,163 @@ async fn wait_for_engine_socket(socket: &std::path::Path) -> anyhow::Result<()> 
 fn local_runner_pool_config(
     home: &std::path::Path,
     server_url: String,
+    control_origin: Option<String>,
+    queue_depth: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    next_job_runs_on: std::sync::Arc<std::sync::RwLock<Vec<String>>>,
 ) -> anyhow::Result<RunnerPoolConfig> {
+    let control_bridge = home.join("control-bridge");
+    std::fs::create_dir_all(&control_bridge)?;
+    set_private_directory_permissions(&control_bridge)?;
     let runner_bundle = std::env::var_os("PRELOOP_RUNNER_BUNDLE")
         .map(PathBuf::from)
-        .or_else(|| std::env::current_exe().ok()?.parent().map(|dir| dir.join("preloop-runner")))
-        .filter(|path| path.join("aksh-runner").is_file())
-        .context("Linux runner bundle unavailable; set PRELOOP_RUNNER_BUNDLE to a directory containing aksh-runner")?;
+        .filter(|path| linux_runner_bundle(path))
+        .or_else(|| {
+            let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+            let target_dir = exe_dir.parent()?;
+            // Prefer Linux guest binaries when the CLI itself is a macOS
+            // development build. The runner executes inside Linux VMs.
+            let candidates = [
+                target_dir.join("aarch64-unknown-linux-gnu/debug"),
+                target_dir.join("aarch64-unknown-linux-musl/debug"),
+                target_dir.join("aarch64-unknown-linux-gnu/release"),
+                target_dir.join("aarch64-unknown-linux-musl/release"),
+                exe_dir.join("preloop-runner"),
+                exe_dir.to_path_buf(),
+            ];
+            candidates
+                .into_iter()
+                .find(|directory| directory.join("preloop-runner").is_file())
+        })
+        .filter(|path| linux_runner_bundle(path))
+        .context("Linux runner bundle unavailable; run `just build-preloop` to build target/aarch64-unknown-linux-gnu/debug/preloop-runner")?;
     Ok(RunnerPoolConfig {
         size: std::env::var("PRELOOP_RUNNER_POOL_SIZE")
             .ok()
             .and_then(|value| value.parse().ok())
-            .unwrap_or(2),
+            .unwrap_or_else(|| host_runner_pool_size(RUNNER_CPUS)),
+        use_fork: std::env::var("PRELOOP_USE_FORK")
+            .ok()
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(true),
         name_prefix: "preloop-runner".into(),
         base_image: std::env::var("PRELOOP_RUNNER_BASE_IMAGE")
             .unwrap_or_else(|_| "ubuntu:24.04".into()),
-        artifact_stem: home.join("vms/preloop-runner-base"),
+        workspace: None,
+        artifact_stem: home
+            .join("vms")
+            .join(format!("preloop-ubuntu-24.04-{}", std::env::consts::ARCH)),
         runner_bundle,
-        runner_binary_name: "aksh-runner".into(),
+        runner_binary_name: "preloop-runner".into(),
         server_url,
+        control_origin,
+        control_socket: Some(home.join("preloop.sock")),
         registration_token_env: "AKSH_SYSTEM_TOKEN".into(),
         labels: vec![
             "self-hosted".into(),
             "Linux".into(),
             std::env::consts::ARCH.into(),
         ],
-        cpus: 4,
-        memory_mib: 4096,
+        cpus: RUNNER_CPUS,
+        memory_mib: RUNNER_MEMORY_MIB,
         storage_gib: 20,
+        debug_dir: Some(home.join("state").join("debug")),
+        runner_key_dir: Some(home.join("runner-keys")),
+        // Warm the golden with the images this project's workflows declare,
+        // so `container:`/`services:` jobs do not re-pull on every run.
+        preload_images: preloop_orchestrator::environment::scan_workflow_images(
+            &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        ),
+        pending_jobs: Some(queue_depth),
+        next_job_runs_on: Some(next_job_runs_on),
     })
+}
+
+/// vCPUs given to each runner VM.
+const RUNNER_CPUS: u16 = 4;
+/// Memory given to each runner VM, in MiB. SmolVM balloons this, so an idle
+/// runner commits far less than its ceiling.
+const RUNNER_MEMORY_MIB: u32 = 4096;
+
+/// Resident memory an idle runner VM actually holds, in MiB.
+///
+/// Measured at ~390 MiB for a forked runner sitting on its long poll, against a
+/// 4096 MiB ceiling: SmolVM balloons the guest, so the ceiling says nothing
+/// about the cost of keeping one warm.
+const IDLE_RUNNER_MIB: u64 = 400;
+
+/// Share of host memory this is willing to hold in idle runners.
+const IDLE_MEMORY_SHARE: u64 = 8;
+
+/// Most runners to keep warm, however large the host.
+const WARM_POOL_CAP: usize = 8;
+
+/// How many runners to keep warm.
+///
+/// Two different resources set the bounds, and conflating them under-sized the
+/// pool. Running jobs are CPU-bound, so `parallelism / cpus_per_runner` is what
+/// the host can execute at once. Warm runners are *idle*, consuming memory and
+/// almost no CPU, and their job is to absorb a fan-out without anyone waiting
+/// on a VM build — which costs ~500 ms under load and shows up as a cliff the
+/// moment a matrix is one job wider than the pool.
+///
+/// So the warm set is allowed past the CPU budget, bounded by the memory we are
+/// willing to leave parked and never below what the host can actually run.
+/// Capped at `WARM_POOL_CAP` so a very large machine does not sit on dozens of
+/// idle VMs. Set
+/// `PRELOOP_RUNNER_POOL_SIZE` to override.
+fn host_runner_pool_size(cpus_per_runner: u16) -> usize {
+    let parallelism = std::thread::available_parallelism().map_or(2, |value| value.get());
+    let by_cpu = (parallelism / usize::from(cpus_per_runner.max(1))).max(1);
+    let by_memory = host_memory_mib()
+        .map(|total| (total / IDLE_MEMORY_SHARE / IDLE_RUNNER_MIB) as usize)
+        .unwrap_or(by_cpu);
+    // Not `clamp`: on a host with more CPU budget than the cap its lower bound
+    // would exceed its upper bound and panic.
+    let target = by_cpu.saturating_mul(2).min(by_memory).min(WARM_POOL_CAP);
+    target.max(by_cpu.min(WARM_POOL_CAP)).max(1)
+}
+
+/// Total physical memory in MiB, or `None` when it cannot be determined.
+#[cfg(target_os = "macos")]
+fn host_memory_mib() -> Option<u64> {
+    let output = std::process::Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()?;
+    let bytes: u64 = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .ok()?;
+    Some(bytes / (1024 * 1024))
+}
+
+/// Total physical memory in MiB, or `None` when it cannot be determined.
+#[cfg(target_os = "linux")]
+fn host_memory_mib() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kib: u64 = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    Some(kib / 1024)
+}
+
+/// Total physical memory in MiB, or `None` when it cannot be determined.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn host_memory_mib() -> Option<u64> {
+    None
+}
+
+fn linux_runner_bundle(path: &std::path::Path) -> bool {
+    let binary = path.join("preloop-runner");
+    let Ok(mut file) = std::fs::File::open(binary) else {
+        return false;
+    };
+    let mut magic = [0_u8; 4];
+    file.read_exact(&mut magic).is_ok() && magic == *b"\x7fELF"
 }
 
 async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
@@ -444,6 +903,8 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
                 name.to_owned(),
                 aksh_gha_protocol::SecretString::new(value.to_owned()),
             );
+        } else {
+            anyhow::bail!("invalid --secret format `{secret}`: expected NAME=VALUE");
         }
     }
 
@@ -455,13 +916,26 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         workflow_path: Some(workflow_path.display().to_string()),
         local_workspace: None,
         secrets,
+        selected_jobs: args.job.into_iter().collect(),
+        base_ref: args.base,
+        // On by default where it can be acted on: a paused job blocks until a
+        // controller answers, so pausing a piped or detached run would hang
+        // something with no way to respond. `--preserve-on-failure` is the
+        // escape hatch for exactly that case — hold the VM for a later
+        // `preloop shell` without anyone attached now.
+        preserve_on_failure: !args.no_debug
+            && (args.preserve_on_failure
+                || (!args.detach && std::io::IsTerminal::is_terminal(&std::io::stdin()))),
         ..Default::default()
     };
 
     let client = build_client();
     let url = server_url();
-    let mut request = client.post(format!("{url}/api/v1/runs")).json(&submission);
-    if std::env::var("AKSH_URL").is_err() {
+    // Secrets redact on plain serialization; sending them is opt-in.
+    let mut request = client
+        .post(format!("{url}/api/v1/runs"))
+        .json(&submission.to_request_json()?);
+    if should_send_local_workspace_header(&url, std::env::var("AKSH_URL").is_err()) {
         let workspace = std::fs::canonicalize(".")?;
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(workspace.as_os_str().to_string_lossy().as_bytes());
@@ -509,8 +983,32 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
 
         let mut stream = events_response.bytes_stream();
         let mut pending = String::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
+        let mut paused: Option<aksh_gha_protocol::debug_session::DebugSession> = None;
+        loop {
+            // The server holds this stream open until the run is terminal, and
+            // a job paused at a failed step never gets there. Watching only the
+            // stream would sit silently forever with the answer one poll away,
+            // so race the next chunk against a check for a paused session.
+            let chunk = tokio::select! {
+                biased;
+                chunk = stream.next() => match chunk {
+                    Some(chunk) => chunk?,
+                    None => break,
+                },
+                () = tokio::time::sleep(Duration::from_millis(750)) => {
+                    paused = debug_session::paused_for_run(
+                        &client,
+                        &url,
+                        api_token(),
+                        accepted.run_id,
+                    )
+                    .await;
+                    if paused.is_some() {
+                        break;
+                    }
+                    continue;
+                }
+            };
             pending.push_str(&String::from_utf8_lossy(&chunk));
             while let Some(newline) = pending.find('\n') {
                 let line = pending[..newline].trim().to_owned();
@@ -519,21 +1017,38 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
                     update_run_status(&mut final_status, render_event(&line));
                 }
             }
-            if final_status.is_some_and(|status| is_terminal_status(&status)) {
+            if final_status.is_some_and(ExecutionStatus::is_terminal) {
                 break;
             }
         }
-        if !final_status.is_some_and(|status| is_terminal_status(&status))
+
+        if let Some(session) = paused {
+            match debug_session::prompt_at_failure(&client, &url, api_token(), session).await {
+                // Resumed: reconnect and keep reporting the run.
+                Ok(true) => continue,
+                Ok(false) => break,
+                Err(error) => {
+                    eprintln!("debug session error: {error:#}");
+                    break;
+                }
+            }
+        }
+
+        if !final_status.is_some_and(ExecutionStatus::is_terminal)
             && !pending.trim().is_empty()
             && seen_events.insert(pending.trim().to_owned())
         {
             update_run_status(&mut final_status, render_event(pending.trim()));
         }
 
-        if final_status.is_some_and(|status| is_terminal_status(&status)) {
+        if final_status.is_some_and(ExecutionStatus::is_terminal) {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // The server holds `events.ndjson` open until the run is terminal, so
+        // reaching here means the stream dropped early. Retry promptly rather
+        // than adding a fixed poll interval to every run's wall clock.
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
     if let Some(status) = final_status {
@@ -551,19 +1066,9 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn is_terminal_status(status: &ExecutionStatus) -> bool {
-    matches!(
-        status,
-        ExecutionStatus::Success
-            | ExecutionStatus::Failure
-            | ExecutionStatus::Cancelled
-            | ExecutionStatus::Skipped
-    )
-}
-
 fn update_run_status(current: &mut Option<ExecutionStatus>, next: Option<ExecutionStatus>) {
     if let Some(status) = next {
-        if is_terminal_status(&status) || current.is_none() {
+        if status.is_terminal() || current.is_none() {
             *current = Some(status);
         }
     }
@@ -851,9 +1356,96 @@ async fn cmd_secret(args: SecretArgs) -> anyhow::Result<()> {
 }
 
 async fn cmd_shell(args: ShellArgs) -> anyhow::Result<()> {
-    let run_ref = args.run_ref.as_deref().unwrap_or("last-failed");
-    println!("preloop shell: {run_ref}");
-    anyhow::bail!("")
+    let debug_dir = preloop_home().join("state").join("debug");
+
+    // Find the preserved VM. If a run_ref is given, treat it as a machine
+    // name prefix; otherwise pick the first (usually only) marker.
+    let machine_name = if let Some(run_ref) = &args.run_ref {
+        let path = debug_dir.join(run_ref);
+        if path.is_file() {
+            run_ref.clone()
+        } else {
+            // Try matching as a prefix (e.g. "0" → "preloop-runner-0")
+            find_debug_machine(&debug_dir, Some(run_ref))?
+        }
+    } else {
+        find_debug_machine(&debug_dir, None)?
+    };
+
+    let marker = debug_dir.join(&machine_name);
+    eprintln!("[preloop] Connecting to preserved VM: {machine_name}");
+    eprintln!("[preloop] Exit the shell to release the VM.");
+
+    // Claim the session before starting so the orchestrator stops counting down.
+    let _ = std::fs::write(&marker, preloop_orchestrator::DEBUG_MARKER_ACTIVE);
+
+    // Spawn a background task to touch the marker every 15 seconds,
+    // keeping the orchestrator's 10-minute timeout alive.
+    let heartbeat_marker = marker.clone();
+    let heartbeat = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            if std::fs::write(&heartbeat_marker, preloop_orchestrator::DEBUG_MARKER_ACTIVE).is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    // Run smolvm machine shell interactively.
+    let status = std::process::Command::new("smolvm")
+        .args(["machine", "shell", "--name", &machine_name])
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .context("failed to run smolvm machine shell")?;
+
+    heartbeat.abort();
+
+    // Remove the marker so the orchestrator cleans up the VM.
+    let _ = std::fs::remove_file(&marker);
+    eprintln!("[preloop] Shell exited — VM will be cleaned up.");
+
+    if !status.success() {
+        anyhow::bail!("shell exited with {status}");
+    }
+    Ok(())
+}
+
+fn find_debug_machine(
+    debug_dir: &std::path::Path,
+    prefix: Option<&String>,
+) -> anyhow::Result<String> {
+    let entries: Vec<String> = std::fs::read_dir(debug_dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Some(prefix) = prefix {
+                if name.contains(prefix) {
+                    Some(name)
+                } else {
+                    None
+                }
+            } else {
+                Some(name)
+            }
+        })
+        .collect();
+
+    match entries.len() {
+        0 => anyhow::bail!(
+            "no preserved VMs found. Run with --preserve-on-failure to keep failed job VMs alive"
+        ),
+        1 => Ok(entries.into_iter().next().unwrap()),
+        _ => anyhow::bail!(
+            "multiple preserved VMs found: {}. Specify one with: preloop shell <name>",
+            entries.join(", ")
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -861,8 +1453,61 @@ mod tests {
     use super::*;
     use clap::error::ErrorKind;
 
+    #[test]
+    fn first_serve_token_creates_private_home_and_file() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("missing").join(".preloop");
+        assert!(!home.exists());
+
+        let token = prepare_engine_token(&home, None).unwrap();
+
+        assert_eq!(token.len(), 64);
+        assert_eq!(
+            std::fs::read_to_string(home.join("engine.token")).unwrap(),
+            token
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(&home).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(home.join("engine.token"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(std::iter::once("preloop").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn warm_pool_tracks_host_capacity_within_bounds() {
+        let parallelism = std::thread::available_parallelism().map_or(2, |value| value.get());
+
+        // `cpus_per_runner = 0` would divide by zero; it is read as one core.
+        for cpus in [0_u16, 1, 2, 4, 64, u16::MAX] {
+            let by_cpu = (parallelism / usize::from(cpus.max(1))).max(1);
+            let size = host_runner_pool_size(cpus);
+
+            assert!(size >= 1, "a host must always keep a runner warm");
+            assert!(size <= WARM_POOL_CAP, "{size} exceeds the warm pool cap");
+            assert!(
+                size >= by_cpu.min(WARM_POOL_CAP),
+                "warm pool {size} starves the {by_cpu} jobs this host can run at once"
+            );
+            assert!(
+                size <= by_cpu.saturating_mul(2).max(1),
+                "warm pool {size} parks more than twice the CPU budget of {by_cpu}"
+            );
+        }
     }
 
     #[test]
@@ -875,7 +1520,7 @@ mod tests {
         assert!(args.job.is_none());
         assert!(args.event.is_none());
         assert!(args.base.is_none());
-        assert!(!args.preserve_on_failure);
+        assert!(!args.no_debug, "pausing on failure is the default");
         assert!(args.secrets.is_empty());
     }
 
@@ -891,7 +1536,7 @@ mod tests {
             "pull_request",
             "--base",
             "main",
-            "--preserve-on-failure",
+            "--no-debug",
             "--secret",
             "TOKEN=abc",
             "--secret",
@@ -905,7 +1550,7 @@ mod tests {
         assert_eq!(args.job.unwrap(), "test");
         assert_eq!(args.event.unwrap(), "pull_request");
         assert_eq!(args.base.unwrap(), "main");
-        assert!(args.preserve_on_failure);
+        assert!(args.no_debug);
         assert_eq!(args.secrets, vec!["TOKEN=abc", "KEY=xyz"]);
     }
 
@@ -1072,5 +1717,42 @@ mod tests {
             panic!("expected Cancel");
         };
         assert_eq!(args.run_id.as_deref(), Some("run-42"));
+    }
+
+    #[test]
+    fn local_engine_url_keeps_workspace_checkout_offline() {
+        assert!(
+            should_send_local_workspace_header("http://127.0.0.1:19090", false),
+            "an explicit loopback engine URL still targets the local engine"
+        );
+    }
+
+    #[test]
+    fn remote_engine_url_does_not_send_host_workspace_path() {
+        assert!(!should_send_local_workspace_header(
+            "https://ci.example.test",
+            false
+        ));
+    }
+
+    #[test]
+    fn default_engine_transport_sends_workspace_path() {
+        assert!(should_send_local_workspace_header(
+            "http://127.0.0.1:9090",
+            true
+        ));
+    }
+
+    #[test]
+    fn mounted_socket_routes_only_loopback_advertised_origins() {
+        assert_eq!(
+            mounted_control_origin("http://127.0.0.1:9090/").as_deref(),
+            Some("http://127.0.0.1:9090")
+        );
+        assert_eq!(
+            mounted_control_origin("http://localhost:9090").as_deref(),
+            Some("http://localhost:9090")
+        );
+        assert_eq!(mounted_control_origin("https://aksh.preloop.dev"), None);
     }
 }

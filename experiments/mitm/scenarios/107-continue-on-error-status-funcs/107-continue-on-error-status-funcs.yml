@@ -1,0 +1,24 @@
+name: 107-continue-on-error-status-funcs
+on: workflow_dispatch
+jobs:
+  status-check:
+    runs-on: self-hosted
+    steps:
+      - id: step1
+        run: exit 1
+        continue-on-error: true
+
+      - id: step2
+        if: success()
+        run: echo "Runs because step1 continued on error"
+
+      - id: step3
+        run: exit 1
+
+      - id: step4
+        if: failure()
+        run: echo "Runs because step3 failed"
+
+      - id: step5
+        if: always()
+        run: echo "Always runs"

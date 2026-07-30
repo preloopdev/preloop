@@ -237,7 +237,13 @@ pub(crate) async fn next_message_broker_ref(
         }
 
         let runner = inner.runner_capabilities_for_session(&session_id);
-        let Some(queued) = take_matching_job(&mut inner.queue, &runner) else {
+        let claimed = take_matching_job(&mut inner.queue, &runner);
+        shared
+            .state
+            .queue_depth
+            .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
+        runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
+        let Some(queued) = claimed else {
             drop(inner);
             if wait_seconds == 0 {
                 return Ok((StatusCode::OK, Json(json!({}))).into_response());
@@ -532,7 +538,13 @@ pub(crate) async fn next_message_broker_ref_root(
                 None
             } else {
                 let runner = inner.runner_capabilities_for_session(&session_id);
-                if let Some(queued) = take_matching_job(&mut inner.queue, &runner) {
+                let claimed = take_matching_job(&mut inner.queue, &runner);
+                shared
+                    .state
+                    .queue_depth
+                    .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
+                runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
+                if let Some(queued) = claimed {
                     if let Some(run) = inner.runs.get_mut(&queued.run_id) {
                         run.status = ExecutionStatus::InProgress;
                         run.jobs
@@ -592,18 +604,67 @@ pub(crate) async fn broker_acquire_job(
     Json(request): Json<BrokerAcquireJobRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     authenticated_runner_id(&shared, &headers, Some(runner_id))?;
-    let inner = shared.state.inner.lock().await;
-    let request_id = inner
-        .agent_job_requests
-        .get(&request.job_message_id)
-        .copied()
-        .ok_or_else(|| ApiError::not_found("broker job message not found"))?;
-    ensure_broker_request_owner(&inner, request_id, runner_id)?;
-    let mut message = inner
-        .broker_messages
-        .get(&request_id)
-        .cloned()
-        .ok_or_else(|| ApiError::not_found("broker job payload not found"))?;
+    let (request_id, mut message, github_token_request) = {
+        let inner = shared.state.inner.lock().await;
+        let request_id = inner
+            .agent_job_requests
+            .get(&request.job_message_id)
+            .copied()
+            .ok_or_else(|| ApiError::not_found("broker job message not found"))?;
+        ensure_broker_request_owner(&inner, request_id, runner_id)?;
+        let message = inner
+            .broker_messages
+            .get(&request_id)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("broker job payload not found"))?;
+        (
+            request_id,
+            message,
+            inner.github_token_requests.get(&request_id).cloned(),
+        )
+    };
+    if let Some(token_request) = github_token_request {
+        // The polling path has already dequeued this job, marked the run
+        // `InProgress` and pinned the request to this session, so bubbling the
+        // mint refusal out as a 502 would leave nothing holding the claim: the
+        // runner re-acquires, fails identically, and the run sits `InProgress`
+        // until the 600s disconnect reaper notices. A refusal under the `error`
+        // policy is a configuration fault that no retry can clear, so the claim
+        // is failed terminally instead of being returned to the queue.
+        let minted = match mint_dispatch_github_token(&shared, &token_request).await {
+            Ok(minted) => minted,
+            Err(error) => {
+                fail_unclaimable_request(&shared, request_id).await;
+                return Err(error);
+            }
+        };
+        if let Some(minted) = minted {
+            message.variables.insert(
+                "system.github.token".to_owned(),
+                aksh_gha_protocol::azdo::VariableValue::secret(minted.token.clone()),
+            );
+            message.variables.insert(
+                "github_token".to_owned(),
+                aksh_gha_protocol::azdo::VariableValue::secret(minted.token),
+            );
+            // Restate what the token carries when the installation could not
+            // grant everything. The message was built with the requested set,
+            // and leaving it would print authority the token does not have in
+            // the runner's `GITHUB_TOKEN Permissions` group — sending anyone
+            // debugging the resulting 403 to the wrong place.
+            if let Some(effective) = minted.effective_permissions {
+                message.variables.insert(
+                    "system.github.token.permissions".to_owned(),
+                    aksh_gha_protocol::azdo::VariableValue::new(
+                        aksh_gha_parser::job_builder::token_permissions_wire_json(&effective),
+                    ),
+                );
+            }
+        }
+        let mut inner = shared.state.inner.lock().await;
+        inner.github_token_requests.remove(&request_id);
+        inner.broker_messages.insert(request_id, message.clone());
+    }
     message.message_type = Some(azdo::message_type::RUNNER_JOB_REQUEST.to_owned());
     let run_service_url = broker_run_service_url(runner_id);
     for endpoint in &mut message.resources.endpoints {
@@ -632,6 +693,10 @@ pub(crate) async fn broker_acquire_job(
                 "ConnectivityChecks".to_owned(),
                 serde_json::json!([format!("{}/check", public_base_url())]).to_string(),
             );
+            endpoint.data.insert(
+                "ConnectivityAndDNSChecks".to_owned(),
+                serde_json::json!([format!("{}/check", public_base_url())]).to_string(),
+            );
             endpoint.data.insert("ServerId".to_owned(), String::new());
             endpoint.data.insert("ServerName".to_owned(), String::new());
             endpoint.data.insert(
@@ -647,18 +712,110 @@ pub(crate) async fn broker_acquire_job(
     // Run-service payloads use the DTO default; internal request IDs remain in
     // `job_requests` and broker lookup maps for renew/complete bookkeeping.
     message.request_id = 0;
-    let mut payload = serde_json::to_value(&message)
+    let payload = serde_json::to_value(&message)
         .map_err(|error| ApiError::internal(format!("serialize broker job payload: {error}")))?;
-    let object = payload
-        .as_object_mut()
-        .ok_or_else(|| ApiError::internal("broker job payload must serialize as an object"))?;
-    object.insert(
-        "runnerSettings".to_owned(),
-        serde_json::to_value(azdo::RunnerServerSettings::default()).map_err(|error| {
-            ApiError::internal(format!("serialize runner server settings: {error}"))
-        })?,
-    );
     Ok(Json(payload))
+}
+
+/// A dispatched job's `GITHUB_TOKEN` and, when the App installation could not
+/// grant everything requested, the set the token actually carries.
+#[derive(Debug)]
+pub(crate) struct MintedGitHubToken {
+    pub(crate) token: String,
+    pub(crate) effective_permissions: Option<BTreeMap<String, String>>,
+}
+
+/// Release a claimed request that can never be dispatched, using the same
+/// bookkeeping `broker_complete_job` performs so the run summary, the session
+/// slot and the concurrency release all behave as they do for a
+/// runner-reported failure.
+async fn fail_unclaimable_request(shared: &Arc<SharedState>, request_id: i64) {
+    let run_job = {
+        let mut inner = shared.state.inner.lock().await;
+        // Nothing will consume the deferred token request now, and leaving it
+        // behind keeps the job's requested permissions alive for a request that
+        // is already terminal.
+        inner.github_token_requests.remove(&request_id);
+        if let Some(record) = inner.job_requests.get_mut(&request_id) {
+            record.result = Some(ExecutionStatus::Failure);
+            record.locked_until = agent_request_locked_until();
+        }
+        inner
+            .session_active_requests
+            .retain(|_, &mut rid| rid != request_id);
+        inner.inflight_requests.remove(&request_id).or_else(|| {
+            job_request_tuple(&inner, request_id).map(|(_, run_id, job_id)| (run_id, job_id))
+        })
+    };
+    if let Some((run_id, job_id)) = run_job {
+        let completion = JobCompletion {
+            run_id,
+            job_id,
+            status: ExecutionStatus::Failure,
+            outputs: aksh_gha_protocol::OutputMap::new(),
+        };
+        // The caller is already returning the mint failure to the runner, so a
+        // secondary bookkeeping error must not mask it.
+        if let Err(error) = complete_job_inner(shared.clone(), completion).await {
+            warn!(
+                request_id,
+                status = %error.into_response().status(),
+                "failing an undispatchable job did not complete its run"
+            );
+        }
+    }
+    // Let a long-polling runner pick up a successor immediately rather than
+    // waiting out its poll window behind a job that will never run.
+    shared.state.message_notify.notify_waiters();
+}
+
+pub(crate) async fn mint_dispatch_github_token(
+    shared: &Arc<SharedState>,
+    request: &GitHubTokenRequest,
+) -> Result<Option<MintedGitHubToken>, ApiError> {
+    let Some(app) = &shared.state.github_app else {
+        return Ok(None);
+    };
+    match crate::github_app::get_or_mint_token_declared(
+        app,
+        &request.repository,
+        &request.permissions,
+        request.declared,
+    )
+    .await
+    {
+        Ok((token, effective_permissions)) => Ok(Some(MintedGitHubToken {
+            token,
+            effective_permissions,
+        })),
+        Err(error) => {
+            let fallback = crate::github_app::fallback_token(
+                app.mint_failure,
+                std::env::var("AKSH_GITHUB_TOKEN").ok(),
+            )
+            .map_err(|refusal| {
+                ApiError::bad_gateway(format!(
+                    "GitHub App token minting failed for {}: {error:#} ({refusal})",
+                    request.repository
+                ))
+            })?;
+            if fallback.is_some() {
+                warn!(
+                    repository = %request.repository,
+                    "GitHub App token minting failed; using configured PAT fallback: {error:#}"
+                );
+            } else {
+                warn!(
+                    repository = %request.repository,
+                    "GitHub App token minting failed; job retains local runtime token: {error:#}"
+                );
+            }
+            Ok(fallback.map(|token| MintedGitHubToken {
+                token,
+                effective_permissions: None,
+            }))
+        }
+    }
 }
 
 pub(crate) async fn broker_renew_job(

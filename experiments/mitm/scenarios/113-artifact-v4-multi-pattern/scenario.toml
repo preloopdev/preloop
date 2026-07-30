@@ -1,0 +1,16 @@
+description = "Artifact v4 upload with multi-line glob include/exclude patterns and download"
+duration_seconds_max = 300
+
+[[steps]]
+kind = "submit_workflow"
+path = "113-artifact-v4-multi-pattern.yml"
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_assigned"
+timeout = 120
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_completed"
+timeout = 240

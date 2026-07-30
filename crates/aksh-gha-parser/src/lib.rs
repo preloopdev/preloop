@@ -15,7 +15,10 @@ mod models;
 mod trigger;
 mod yaml;
 
-pub use expand::{expand_jobs, expand_jobs_with_reusables, expand_jobs_with_reusables_and_shas};
+pub use expand::{
+    effective_token_permissions, expand_jobs, expand_jobs_with_reusables,
+    expand_jobs_with_reusables_and_shas, DEFAULT_TOKEN_PERMISSIONS, PERMISSION_SCOPES,
+};
 pub use models::*;
 pub use yaml::{parse_action_metadata, parse_workflow};
 
