@@ -423,7 +423,7 @@ impl Scheduler {
             _ => None,
         };
         let workflows = match crate::github::fetch_workflows(
-            &None,
+            &shared,
             &repository,
             &format!("refs/heads/{default_branch}"),
         )

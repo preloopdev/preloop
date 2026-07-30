@@ -403,11 +403,22 @@ pub(crate) async fn report_check_run_completed(
 
 /// Fetch workflows helper.
 pub(crate) async fn fetch_workflows(
-    local_workspace: &Option<PathBuf>,
+    shared: &Arc<SharedState>,
     repo: &str,
     git_ref: &str,
 ) -> anyhow::Result<BTreeMap<String, String>> {
-    if let Some(base_path) = local_workspace {
+    let api_base = std::env::var("AKSH_GITHUB_API_URL")
+        .unwrap_or_else(|_| "https://api.github.com".to_owned());
+    fetch_workflows_at(shared, repo, git_ref, &api_base).await
+}
+
+pub(crate) async fn fetch_workflows_at(
+    shared: &Arc<SharedState>,
+    repo: &str,
+    git_ref: &str,
+    api_base: &str,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    if let Some(base_path) = &shared.state.local_workspace {
         let workflows_dir = base_path.join(".github/workflows");
         let mut workflows = BTreeMap::new();
         if workflows_dir.exists() {
@@ -428,9 +439,16 @@ pub(crate) async fn fetch_workflows(
         }
         Ok(workflows)
     } else {
-        let token = std::env::var("AKSH_GITHUB_TOKEN").ok();
+        let token = if let Some(app) = &shared.state.github_app {
+            let permissions = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
+            Some(
+                crate::github_app::get_or_mint_token_at(api_base, app, repo, &permissions).await?,
+            )
+        } else {
+            std::env::var("AKSH_GITHUB_TOKEN").ok()
+        };
         if let Some(token) = &token {
-            fetch_remote_workflows(token, repo, git_ref).await
+            fetch_remote_workflows(token, repo, git_ref, api_base).await
         } else {
             // Default fallback to current workspace root if nothing is configured
             let workflows_dir = PathBuf::from(".").join(".github/workflows");
@@ -460,11 +478,14 @@ async fn fetch_remote_workflows(
     token: &str,
     repo: &str,
     git_ref: &str,
+    api_base: &str,
 ) -> anyhow::Result<BTreeMap<String, String>> {
     let client = crate::shared_http::CLIENT.clone();
     let url = format!(
-        "https://api.github.com/repos/{}/contents/.github/workflows?ref={}",
-        repo, git_ref
+        "{}/repos/{}/contents/.github/workflows?ref={}",
+        api_base.trim_end_matches('/'),
+        repo,
+        git_ref
     );
     let response = client
         .get(&url)
@@ -715,16 +736,13 @@ pub(crate) async fn handle_github_webhook(
         } else {
             &effective.git_ref
         };
-        let workflows =
-            match fetch_workflows(&shared.state.local_workspace, &repo_full_name, workflow_ref)
-                .await
-            {
+        let workflows = match fetch_workflows(&shared, &repo_full_name, workflow_ref).await {
                 Ok(w) => w,
                 Err(e) => {
                     error!("Failed to fetch workflows for {}: {:?}", effective.event, e);
                     continue;
                 }
-            };
+        };
         let resolved_sha = match &effective.sha {
             Some(sha) => sha.clone(),
             None => match resolve_ref_sha(
