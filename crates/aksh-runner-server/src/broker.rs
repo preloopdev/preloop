@@ -624,7 +624,21 @@ pub(crate) async fn broker_acquire_job(
         )
     };
     if let Some(token_request) = github_token_request {
-        if let Some(minted) = mint_dispatch_github_token(&shared, &token_request).await? {
+        // The polling path has already dequeued this job, marked the run
+        // `InProgress` and pinned the request to this session, so bubbling the
+        // mint refusal out as a 502 would leave nothing holding the claim: the
+        // runner re-acquires, fails identically, and the run sits `InProgress`
+        // until the 600s disconnect reaper notices. A refusal under the `error`
+        // policy is a configuration fault that no retry can clear, so the claim
+        // is failed terminally instead of being returned to the queue.
+        let minted = match mint_dispatch_github_token(&shared, &token_request).await {
+            Ok(minted) => minted,
+            Err(error) => {
+                fail_unclaimable_request(&shared, request_id).await;
+                return Err(error);
+            }
+        };
+        if let Some(minted) = minted {
             message.variables.insert(
                 "system.github.token".to_owned(),
                 aksh_gha_protocol::azdo::VariableValue::secret(minted.token.clone()),
@@ -709,6 +723,50 @@ pub(crate) async fn broker_acquire_job(
 pub(crate) struct MintedGitHubToken {
     pub(crate) token: String,
     pub(crate) effective_permissions: Option<BTreeMap<String, String>>,
+}
+
+/// Release a claimed request that can never be dispatched, using the same
+/// bookkeeping `broker_complete_job` performs so the run summary, the session
+/// slot and the concurrency release all behave as they do for a
+/// runner-reported failure.
+async fn fail_unclaimable_request(shared: &Arc<SharedState>, request_id: i64) {
+    let run_job = {
+        let mut inner = shared.state.inner.lock().await;
+        // Nothing will consume the deferred token request now, and leaving it
+        // behind keeps the job's requested permissions alive for a request that
+        // is already terminal.
+        inner.github_token_requests.remove(&request_id);
+        if let Some(record) = inner.job_requests.get_mut(&request_id) {
+            record.result = Some(ExecutionStatus::Failure);
+            record.locked_until = agent_request_locked_until();
+        }
+        inner
+            .session_active_requests
+            .retain(|_, &mut rid| rid != request_id);
+        inner.inflight_requests.remove(&request_id).or_else(|| {
+            job_request_tuple(&inner, request_id).map(|(_, run_id, job_id)| (run_id, job_id))
+        })
+    };
+    if let Some((run_id, job_id)) = run_job {
+        let completion = JobCompletion {
+            run_id,
+            job_id,
+            status: ExecutionStatus::Failure,
+            outputs: aksh_gha_protocol::OutputMap::new(),
+        };
+        // The caller is already returning the mint failure to the runner, so a
+        // secondary bookkeeping error must not mask it.
+        if let Err(error) = complete_job_inner(shared.clone(), completion).await {
+            warn!(
+                request_id,
+                status = %error.into_response().status(),
+                "failing an undispatchable job did not complete its run"
+            );
+        }
+    }
+    // Let a long-polling runner pick up a successor immediately rather than
+    // waiting out its poll window behind a job that will never run.
+    shared.state.message_notify.notify_waiters();
 }
 
 pub(crate) async fn mint_dispatch_github_token(
