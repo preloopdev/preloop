@@ -287,35 +287,139 @@ def port_free() -> bool:
         return probe.connect_ex((host, int(port))) != 0
 
 
-def foreign_engine_pids() -> list[int]:
-    # BSD pgrep has no `\s`; match the literal argv fragment instead.
-    result = run(["pgrep", "-f", "preloop engine"])
+# `serve` is the documented command and `engine` is the hidden alias that
+# `ensure_engine_running` spawns; both start the same daemon and both own
+# `preloop-runner-*` VMs. Matching only the alias made this scan report "no
+# engine" against an operator's live `preloop serve`, after which the cleanup
+# below deleted that engine's warm pool mid-job. `preloop-server` is the
+# standalone control-plane binary, matched for the same reason. BSD pgrep
+# speaks POSIX ERE, so the space class is spelled the long way and `\s` is out.
+ENGINE_ARGV_PATTERN = r"preloop(-server)?[[:space:]]+(serve|engine)"
+
+
+def parse_pgrep_pids(result: subprocess.CompletedProcess) -> "list[int] | None":
+    """PIDs from a `pgrep` result, or None when the answer cannot be trusted.
+
+    pgrep exits 1 for "nothing matched" but 2 or 3 for a usage or system error,
+    and folding those into an empty list is indistinguishable from "the host is
+    idle" — the exact confusion that authorises deleting a live pool. Anything
+    unexpected, a bad status or a field that is not a PID, is reported as
+    unknown so callers refuse instead of guessing.
+    """
+    if result.returncode == 1:
+        return []
+    if result.returncode != 0:
+        return None
     pids = []
-    for line in result.stdout.split():
-        try:
-            pid = int(line)
-        except ValueError:
-            continue
+    for field in result.stdout.split():
+        if not field.isdigit():
+            return None
+        pid = int(field)
         if pid != os.getpid():
             pids.append(pid)
     return pids
 
 
-def stop_foreign_engines() -> None:
-    """Any other engine shares the `preloop-runner-*` VM namespace with us."""
-    pids = foreign_engine_pids()
-    if not pids:
-        return
-    log(f"stopping conflicting preloop engine(s): {pids}")
+def engine_pids() -> "list[int] | None":
+    """Every preloop engine on the host, or None when the scan itself failed."""
+    try:
+        return parse_pgrep_pids(run(["pgrep", "-f", ENGINE_ARGV_PATTERN]))
+    except OSError:
+        return None
+
+
+def bench_port_pids() -> "list[int] | None":
+    """Whoever is listening on the harness's own port, or None if unknowable."""
+    if shutil.which("lsof") is None:
+        return None
+    port = LISTEN.rsplit(":", 1)[-1]
+    result = run(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"])
+    if result.returncode not in (0, 1):
+        return None
+    pids = []
+    for field in result.stdout.split():
+        if not field.isdigit():
+            return None
+        pids.append(int(field))
+    return pids
+
+
+def classify_engines(pids, listening) -> "tuple[list[int], list[int]]":
+    """Split live engines into this harness's leftovers and everyone else's.
+
+    Ownership is decided by the benchmark's own listen port, not by the command
+    line: a crashed run leaves an engine holding that port and the harness has
+    to be able to clear it or it stays wedged forever, while an engine anywhere
+    else is somebody's real pool. When the port's owners cannot be listed every
+    engine counts as foreign — erring that way costs a refused run, erring the
+    other way costs a deleted pool.
+    """
+    owned = set(listening or ())
+    ours = sorted(pid for pid in pids if pid in owned)
+    foreign = sorted(pid for pid in pids if pid not in owned)
+    return ours, foreign
+
+
+def live_pids(pids) -> list[int]:
+    live = []
     for pid in pids:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            pass
+        live.append(pid)
+    return live
+
+
+def require_sole_engine(action: str) -> None:
+    """Abort unless this harness is provably the only engine on the host.
+
+    Everything guarded by this deletes `preloop-runner-*` VMs by prefix, and
+    that prefix is the whole runner pool of any engine that happens to be up —
+    the benchmark cannot tell one engine's VMs from another's. An inconclusive
+    scan therefore counts as "an engine is running": refusing costs a rerun,
+    proceeding costs somebody's in-flight jobs.
+    """
+    pids = engine_pids()
+    if pids is None:
+        die(
+            f"refusing to {action}: cannot determine whether a preloop engine is running "
+            "(process scan failed), and the cleanup would delete every preloop-runner-* VM"
+        )
+    if pids:
+        die(
+            f"refusing to {action}: preloop engine(s) {pids} are running and own "
+            "preloop-runner-* VMs; stop them and retry"
+        )
+
+
+def reclaim_bench_engines() -> None:
+    """Clear this harness's own leftover engine and refuse to run beside any other."""
+    pids = engine_pids()
+    if pids is None:
+        die("cannot determine whether a preloop engine is running (process scan failed)")
+    ours, foreign = classify_engines(pids, bench_port_pids())
+    if foreign:
+        die(
+            f"preloop engine(s) {foreign} are running and are not this benchmark's own "
+            f"engine on {LISTEN}. The benchmark deletes every preloop-runner-* VM on the "
+            "host, which would destroy their runner pool, so it will not run beside them; "
+            "stop them and retry"
+        )
+    if not ours:
+        return
+    log(f"stopping leftover benchmark engine(s): {ours}")
+    for pid in ours:
         try:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
     deadline = time.time() + 30
-    while time.time() < deadline and foreign_engine_pids():
+    while time.time() < deadline and live_pids(ours):
         time.sleep(0.2)
-    for pid in foreign_engine_pids():
+    for pid in live_pids(ours):
         try:
             os.kill(pid, signal.SIGKILL)
         except ProcessLookupError:
@@ -324,6 +428,7 @@ def stop_foreign_engines() -> None:
 
 
 def delete_bench_machines() -> None:
+    require_sole_engine("delete the preloop-runner-* VMs")
     result = run(["smolvm", "machine", "ls", "--json"])
     if result.returncode != 0:
         return
@@ -359,9 +464,11 @@ def purge_orphan_vm_dirs() -> None:
     SmolVM keeps its machine registry in SQLite but resolves `machine status`
     from the on-disk VM directory. A killed engine can leave a directory (and a
     live `_boot-vm` process) whose registry row is gone, and every later
-    provision then fails with a status/delete disagreement. Nothing but this
-    harness owns `preloop-runner-*`, so orphans are always safe to reap.
+    provision then fails with a status/delete disagreement. `preloop-runner-*`
+    is shared with any other engine on the host, so orphans are only safe to
+    reap once no engine is left to own them.
     """
+    require_sole_engine("purge preloop-runner-* VM directories")
     reap_orphan_vm_processes()
     for directory in smolvm_vm_dirs():
         marker = directory / "name"
@@ -674,7 +781,7 @@ def main() -> int:
     ensure_fixture()
     host_script = ensure_host_baseline()
 
-    stop_foreign_engines()
+    reclaim_bench_engines()
     delete_bench_machines()
     if not port_free():
         die(f"{LISTEN} is occupied; set PRELOOP_BENCH_LISTEN to a free port")
