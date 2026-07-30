@@ -40,7 +40,10 @@ fn should_send_local_workspace_header(url: &str, uses_default_transport: bool) -
 }
 
 fn api_token() -> Option<String> {
-    std::env::var("AKSH_TOKEN").ok().or_else(|| {
+    std::env::var("AKSH_TOKEN")
+        .or_else(|_| std::env::var("AKSH_SYSTEM_TOKEN"))
+        .ok()
+        .or_else(|| {
         std::fs::read_to_string(preloop_home().join("engine.token"))
             .ok()
             .map(|token| token.trim().to_owned())
@@ -430,21 +433,30 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
     let state_dir = home.join("state");
     let socket = home.join("preloop.sock");
 
-    // Ensure AKSH_SYSTEM_TOKEN is set so both control plane and runner pool agree.
-    if std::env::var("AKSH_SYSTEM_TOKEN").is_err() {
-        let token_path = home.join("engine.token");
-        let token = if let Ok(existing) = std::fs::read_to_string(&token_path) {
-            existing.trim().to_owned()
-        } else {
-            "preloop-system-token".to_owned()
-        };
-        std::env::set_var("AKSH_SYSTEM_TOKEN", token);
-    }
+    // Ensure AKSH_SYSTEM_TOKEN and engine.token stay synchronized.
+    let token_path = home.join("engine.token");
+    let _token = if let Ok(env_tok) = std::env::var("AKSH_SYSTEM_TOKEN") {
+        let _ = std::fs::write(&token_path, &env_tok);
+        let _ = set_private_file_permissions(&token_path);
+        env_tok
+    } else if let Ok(existing) = std::fs::read_to_string(&token_path) {
+        let t = existing.trim().to_owned();
+        std::env::set_var("AKSH_SYSTEM_TOKEN", &t);
+        t
+    } else {
+        let mut bytes = [0_u8; 32];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        let t = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let _ = std::fs::write(&token_path, &t);
+        let _ = set_private_file_permissions(&token_path);
+        std::env::set_var("AKSH_SYSTEM_TOKEN", &t);
+        t
+    };
     let listen: std::net::SocketAddr = args
         .listen
         .clone()
         .or_else(|| std::env::var("PRELOOP_LISTEN").ok())
-        .unwrap_or_else(|| "127.0.0.1:9090".to_owned())
+        .unwrap_or_else(|| "0.0.0.0:9090".to_owned())
         .parse()
         .context("--listen / PRELOOP_LISTEN must be a socket address")?;
     let public_url = args
@@ -453,6 +465,9 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
         .or_else(|| std::env::var("PRELOOP_PUBLIC_URL").ok())
         .unwrap_or_else(|| format!("http://127.0.0.1:{}", listen.port()));
     std::env::set_var("AKSH_PUBLIC_URL", &public_url);
+
+    // Local runner pool connects directly on loopback to bypass Cloudflare WAF checks on public URL
+    let local_server_url = format!("http://127.0.0.1:{}", listen.port());
 
     // Resolve GitHub credentials before `AppState::new` reads the environment.
     // Both `github_app::load_from_env` and the webhook-secret lookup happen
@@ -486,7 +501,7 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
     }
 
     let shutdown = tokio_util::sync::CancellationToken::new();
-    let mut pool = match local_runner_pool_config(&home, public_url, queue_depth, next_job_runs_on)
+    let mut pool = match local_runner_pool_config(&home, local_server_url, queue_depth, next_job_runs_on)
     {
         Ok(config) => {
             let pool_shutdown = shutdown.clone();
