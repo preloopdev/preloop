@@ -721,7 +721,7 @@ pub(crate) fn redirect_primary_checkout(
             .is_some_and(|name| name.eq_ignore_ascii_case("actions/checkout"));
         if !is_checkout
             || step.inputs.keys().any(|key| {
-                ["repository", "ref", "token", "github-server-url"]
+                ["repository", "ref", "github-server-url"]
                     .iter()
                     .any(|reserved| key.eq_ignore_ascii_case(reserved))
             })
