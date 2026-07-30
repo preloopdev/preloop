@@ -242,6 +242,7 @@ impl DebugSessionRegistry {
             session_id,
             version,
             banked,
+            source_revision,
             agent_lease,
             agent_events,
             agent_audit,
@@ -253,6 +254,7 @@ impl DebugSessionRegistry {
                     id,
                     old.session.version + 1,
                     old.session.paused_seconds,
+                    old.session.source_revision,
                     old.agent_lease,
                     old.agent_events,
                     old.agent_audit,
@@ -263,6 +265,7 @@ impl DebugSessionRegistry {
                 format!("dbg_{}", uuid::Uuid::new_v4().simple()),
                 1,
                 0,
+                "original".to_owned(),
                 None,
                 Vec::new(),
                 Vec::new(),
@@ -287,7 +290,7 @@ impl DebugSessionRegistry {
             // remember to sanitize it.
             workspace: req.workspace.filter(|path| plausible_workspace(path)),
             snapshot_commit: req.snapshot_commit,
-            source_revision: "original".to_owned(),
+            source_revision,
             controller: None,
             created_at_ms: now
                 .duration_since(UNIX_EPOCH)
@@ -1375,7 +1378,7 @@ mod tests {
                 verdict: Verdict::Retry,
                 revert: Default::default(),
                 controller: None,
-                source_revision: None,
+                source_revision: Some("repair-1".to_owned()),
                 retry_from_step: None,
             },
         );
@@ -1384,6 +1387,7 @@ mod tests {
         // Retry fails again: same session id, banked time carried forward.
         let second = registry.open(7, test_open_request(run_id, job_id), at(60));
         assert_eq!(second.session_id, first.session_id);
+        assert_eq!(second.source_revision, "repair-1");
         // Version is monotonic across the whole session lifetime, not just
         // across opens: open(1) → verdict(2) → reopen(3).
         assert_eq!(second.version, 3);
