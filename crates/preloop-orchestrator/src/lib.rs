@@ -75,7 +75,7 @@ fn runner_volumes(config: &RunnerPoolConfig) -> Vec<VolumeMount> {
 }
 async fn download_prebaked_golden(payload: &Path) -> bool {
     let default_url = format!(
-        "https://github.com/preloopdev/preloop/releases/download/v{}/preloop-ubuntu-24.04-{}.smolmachine",
+        "https://github.com/preloopdev/preloop/releases/download/v{}/preloop-ubuntu-24.04-{}",
         env!("CARGO_PKG_VERSION"),
         std::env::consts::ARCH
     );
@@ -564,9 +564,7 @@ impl RunnerPoolConfig {
     }
 
     fn artifact_payload(&self) -> PathBuf {
-        let mut value = self.artifact_stem.as_os_str().to_owned();
-        value.push(".smolmachine");
-        PathBuf::from(value)
+        self.artifact_stem.clone()
     }
 }
 
@@ -1566,9 +1564,7 @@ async fn hold_for_debugging(name: &MachineName, debug_dir: &Path, shutdown: &Can
 
 /// Return the runner artifact payload generated for an output stem.
 pub fn artifact_payload(stem: &Path) -> PathBuf {
-    let mut value = stem.as_os_str().to_owned();
-    value.push(".smolmachine");
-    PathBuf::from(value)
+    stem.to_path_buf()
 }
 
 #[cfg(test)]

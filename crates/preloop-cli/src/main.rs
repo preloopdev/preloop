@@ -610,7 +610,7 @@ fn local_runner_pool_config(
         base_image: std::env::var("PRELOOP_RUNNER_BASE_IMAGE")
             .unwrap_or_else(|_| "ubuntu:24.04".into()),
         workspace: None,
-        artifact_stem: home.join("vms/preloop-runner-base"),
+        artifact_stem: home.join("vms").join(format!("preloop-ubuntu-24.04-{}", std::env::consts::ARCH)),
         runner_bundle,
         runner_binary_name: "preloop-runner".into(),
         server_url,
