@@ -579,6 +579,7 @@ async fn get_pr_changed_files(
     token: &str,
     repo: &str,
     pr_number: u64,
+    api_base: &str,
 ) -> anyhow::Result<Vec<String>> {
     let client = crate::shared_http::CLIENT.clone();
     let mut page = 1;
@@ -591,8 +592,11 @@ async fn get_pr_changed_files(
 
     loop {
         let url = format!(
-            "https://api.github.com/repos/{}/pulls/{}/files?per_page=100&page={}",
-            repo, pr_number, page
+            "{}/repos/{}/pulls/{}/files?per_page=100&page={}",
+            api_base.trim_end_matches('/'),
+            repo,
+            pr_number,
+            page
         );
         let response = client
             .get(&url)
@@ -619,6 +623,38 @@ async fn get_pr_changed_files(
     }
 
     Ok(all_files)
+}
+
+/// Changed files for a pull request, or `None` when nothing can authenticate
+/// the lookup.
+///
+/// A webhook payload never carries the full file list, so `paths:` and
+/// `paths-ignore:` can only be evaluated against this call. Consulting
+/// `AKSH_GITHUB_TOKEN` alone would leave an App-only deployment — the
+/// documented way to run this server — permanently unable to answer, and every
+/// path-filtered workflow would be rejected as unevaluable rather than queued.
+/// So the App is tried first, exactly as the workflow inventory does.
+///
+/// The workflow-inventory token is not reused: it is scoped to
+/// `contents: read`, and listing pull request files needs `pull_requests`.
+pub(crate) async fn resolve_pr_changed_files_at(
+    shared: &Arc<SharedState>,
+    repo: &str,
+    pr_number: u64,
+    api_base: &str,
+) -> anyhow::Result<Option<Vec<String>>> {
+    let token = if let Some(app) = &shared.state.github_app {
+        let permissions = BTreeMap::from([("pull_requests".to_owned(), "read".to_owned())]);
+        Some(crate::github_app::get_or_mint_token_at(api_base, app, repo, &permissions).await?)
+    } else {
+        std::env::var("AKSH_GITHUB_TOKEN").ok()
+    };
+    let Some(token) = token else {
+        return Ok(None);
+    };
+    get_pr_changed_files(&token, repo, pr_number, api_base)
+        .await
+        .map(Some)
 }
 
 /// Route handler for GitHub App Webhooks.
@@ -677,7 +713,7 @@ pub(crate) async fn handle_github_webhook(
         .and_then(|v| v.as_str())
         .unwrap_or("local/repo")
         .to_owned();
-    let changed_paths = if matches!(
+    let (changed_paths, changed_paths_known) = if matches!(
         event_name,
         "pull_request" | "pull_request_target" | "pull_request_review"
     ) {
@@ -689,24 +725,31 @@ pub(crate) async fn handle_github_webhook(
                     .and_then(|pr| pr.get("number"))
             })
             .and_then(|value| value.as_u64());
-        match (std::env::var("AKSH_GITHUB_TOKEN").ok(), pr_number) {
-            (Some(token), Some(number)) => get_pr_changed_files(&token, &repo_full_name, number)
-                .await
-                .map_err(|error| {
-                    error!(?error, "failed to resolve pull request changed files");
-                    StatusCode::BAD_GATEWAY
-                })?,
-            _ => changed_paths_from_payload(&payload_val),
+        let api_base = std::env::var("AKSH_GITHUB_API_URL")
+            .unwrap_or_else(|_| "https://api.github.com".to_owned());
+        let fetched = match pr_number {
+            Some(number) => {
+                resolve_pr_changed_files_at(&shared, &repo_full_name, number, &api_base)
+                    .await
+                    .map_err(|error| {
+                        error!(?error, "failed to resolve pull request changed files");
+                        StatusCode::BAD_GATEWAY
+                    })?
+            }
+            None => None,
+        };
+        match fetched {
+            // The list came from the API, so a `paths:` filter that matches
+            // nothing is a real "no match" rather than a missing answer.
+            Some(files) => (files, true),
+            None => (
+                changed_paths_from_payload(&payload_val),
+                payload_val.get("paths").is_some() || payload_val.get("commits").is_some(),
+            ),
         }
     } else {
-        changed_paths_from_payload(&payload_val)
+        (changed_paths_from_payload(&payload_val), true)
     };
-    let changed_paths_known = !matches!(
-        event_name,
-        "pull_request" | "pull_request_target" | "pull_request_review"
-    ) || std::env::var("AKSH_GITHUB_TOKEN").is_ok()
-        || payload_val.get("paths").is_some()
-        || payload_val.get("commits").is_some();
 
     let mut triggered_runs = Vec::new();
 
