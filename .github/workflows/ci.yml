@@ -2,6 +2,7 @@ name: ci
 
 on:
   push:
+    branches: [main]
   pull_request:
   schedule:
     # Nightly intensive property profile at 02:00 UTC
