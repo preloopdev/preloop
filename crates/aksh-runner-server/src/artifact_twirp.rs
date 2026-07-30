@@ -86,7 +86,7 @@ pub(crate) async fn twirp_artifact_v2_create(
             .artifact_v2_pending
             .insert(token.clone(), ArtifactV2Pending { registry_key });
     }
-    let upload_url = format!("{}/twirp-blob/artifact/{token}", public_base_url());
+    let upload_url = format!("{}/twirp-blob/artifact/{token}", runner_base_url());
     info!(token, name = request.name, "artifact v2 create");
     Ok(Json(json!({ "ok": true, "signed_upload_url": upload_url })))
 }
@@ -233,7 +233,7 @@ pub(crate) async fn twirp_artifact_v2_get_signed_url(
     .ok_or_else(|| ApiError::not_found("artifact not found"))?;
 
     // URL must end in .zip so the toolkit's streamExtract detects it as a zip.
-    let signed_url = format!("{}/twirp-blob/artifact/{blob_token}.zip", public_base_url());
+    let signed_url = format!("{}/twirp-blob/artifact/{blob_token}.zip", runner_base_url());
     Ok(Json(json!({ "signed_url": signed_url })))
 }
 

@@ -202,4 +202,59 @@ The microVM orchestrator requires the cross-compiled Linux ARM64 runner binary a
   ```sh
   cargo zigbuild -p aksh-runner --target aarch64-unknown-linux-gnu
   ```
-- **Disk Space Management**: Rust build target directories can grow up to 30+ GB. Ensure at least 20 GB of free disk space is available to prevent `No space left on device (os error 28)` failures during job log and artifact storage.
+-
+### 8.5 Skipping CI Runs
+
+To suppress CI for a push, include any of these labels anywhere in a commit message within the push batch (not just the head commit):
+
+- `[skip ci]`
+- `[ci skip]`
+- `[no ci]`
+- `[skip actions]`
+- `[actions skip]`
+- `***NO_CI***`
+
+Example:
+```sh
+git commit -m "docs: update readme [skip ci]"
+git push
+```
+
+If **any** commit in a push batch contains a skip label, the entire push is suppressed — no jobs are queued and no check runs are created. This matches official GitHub Actions behavior.
+
+### 8.6 Guest Network Isolation, Origin Routing & the Tunnel Hairpin
+
+Runner VMs run under `NetworkPolicy::PublicOnly` — guest egress can reach the public internet but the hypervisor's egress floor deliberately refuses guest→host private addresses (loopback or LAN IP; verified: guest curl domehan the host LAN URL hangs indefinitely). Guests reach the control plane through exactly one sanctioned path:
+
+1. **Runner transport** — the runner's own control-plane HTTP (connectionData, long-poll, broker) rides the mounted unix socket `/run/preloop-control/engine.sock` when `PRELOOP_CONTROL_SOCKET`/`PRELOOP_CONTROL_ORIGIN` are set (always set by the orchestrator when a control socket is configured).
+2. **Job-side programs** (`actions/checkout`'s git, `curl`, Node actions) only know URLs. The runner binds the advertised origin *inside the guest on loopback* and splices each accepted connection onto the socket (`aksh-runner/src/control_bridge.rs`). Blast radius: one host endpoint.
+
+#### The advertised origin decides everything
+
+The bridge only binds when the advertised origin is a loopback address the guest can bind. This makes `--public-url` carry a third, hidden role beyond in-VM runner config and GitHub check-run `details_url`: it selects the transport for *all* guest-side traffic.
+
+| `--public-url` | Runner transport | Job-side traffic | Tunnel dependency |
+|---|---|---|---|
+| `http://127.0.0.1:9090` (dev) | socket | loopback bridge → socket | none |
+| `http://<lan-ip>:9090` | socket | **blackholes** (LAN IP refused by egress floor) | — |
+| `https://aksh.preloop.dev` (prod) | **public internet → Cloudflare → argo tunnel → host** | same hairpin | **hard dependency** |
+
+Consequences:
+
+- With the production hostname, *everything* guests do — registration, long-poll, artifact uploads, checkout fetches — physically leaves the host, traverses Cloudflare, and returns through the tunnel. A tunnel outage therefore breaks *local* CI: observed as `530 / error code: 1033` from in-VM `connectionData` fetches and as `actions/upload-artifact` timeouts (`runner-light` failure during the 2026-07-30 tunnel transition).
+- The hostname also has to keep resolving publicly; `aksh.preloop.dev` TLS and DNS are load-bearing for local jobs in this mode.
+
+#### Resolution: the runner-facing origin is split from the public URL
+
+`preloop serve` now publishes two origins:
+
+- **`AKSH_PUBLIC_URL`** (`--public-url`) — GitHub-facing only. Used for check-run `details_url` links and anything GitHub must reach. No guest ever dials it.
+- **`AKSH_RUNNER_URL`** — every URL handed to runners and their jobs (connectionData `brokerUrl`, endpoint data `ResultsServiceUrl`/`CacheServerUrl`, Twirp signed blob/cache URLs, `system.github.launch_endpoint`, OIDC issuer, live-log ws feed). `serve` pins it to `http://127.0.0.1:<port>` by default, which routes over the mounted unix socket (`PRELOOP_CONTROL_SOCKET`) for the runner itself and via the in-guest loopback bridge (`control_bridge.rs`) for job-side TCP programs.
+
+Consequences:
+
+- Job traffic never crosses the tunnel regardless of `--public-url`; the tunnel is load-bearing only for *GitHub→host* webhook delivery and check-run links — where it belongs.
+- A tunnel outage degrades webhook delivery/check-run UX, not in-VM CI execution.
+- **Remote runners** (runner on another machine, not the local smolvm pool): set `AKSH_RUNNER_URL=http://<host-reachable>:9090` — but note in-VM runners cannot reach LAN addresses under `PublicOnly` egress, so this override only works for runners outside the VM pool.
+
+A host-side reverse proxy cannot solve the hairpin by itself — the guest resolves public names over public DNS and `PublicOnly` egress means packets leave the host before a proxy could intercept them. Origin separation is the fix; DNS-pinning the public hostname to guest loopback with a local CA achieves the same effect at strictly higher complexity.
