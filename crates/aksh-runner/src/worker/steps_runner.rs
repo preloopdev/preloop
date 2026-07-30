@@ -1120,11 +1120,10 @@ pub async fn run_steps(
         // Replay an earlier range, now that this attempt has been reported.
         if let Some(target) = jump_to {
             let context_name = step.context_name.clone();
-            // Clear results for the range about to re-run so their conditions
-            // evaluate against a clean slate.
-            for summary in job_step_summaries.iter().take(idx + 1).skip(target) {
-                step_ctx.job.steps.shift_remove(&summary.context_name);
-            }
+            // Clear every runner-managed per-step value for the range about to
+            // re-run. Restoring only the target snapshot leaves saveState and
+            // annotations from later steps visible during their second pass.
+            clear_replayed_step_state(step_ctx.job, &job_step_summaries, target, idx);
             // Restore the snapshot captured before the *target* step, not
             // the current step. Without this, the target step's prior
             // GITHUB_ENV/GITHUB_PATH/state writes remain and are doubled.
@@ -1258,6 +1257,19 @@ pub async fn run_steps(
     } else {
         "Succeeded".to_string()
     })
+}
+
+fn clear_replayed_step_state(
+    job: &mut JobContext,
+    summaries: &[aksh_gha_protocol::debug_session::StepSummary],
+    target: usize,
+    end: usize,
+) {
+    for summary in summaries.iter().take(end + 1).skip(target) {
+        job.steps.shift_remove(&summary.context_name);
+        job.state.remove(&summary.context_name);
+        job.step_annotations.remove(&summary.context_name);
+    }
 }
 
 fn should_run_step(step: &Step, job: &JobContext) -> Result<bool> {
