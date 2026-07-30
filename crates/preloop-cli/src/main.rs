@@ -20,21 +20,6 @@ fn server_url() -> String {
     std::env::var("AKSH_URL").unwrap_or_else(|_| "http://127.0.0.1:9090".to_owned())
 }
 
-fn detect_host_ip() -> String {
-    for interface in ["en0", "en1", "en2", "eth0"] {
-        if let Ok(output) = std::process::Command::new("ipconfig")
-            .args(["getifaddr", interface])
-            .output()
-        {
-            let ip = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            if !ip.is_empty() {
-                return ip;
-            }
-        }
-    }
-    "127.0.0.1".to_owned()
-}
-
 fn should_send_local_workspace_header(url: &str, uses_default_transport: bool) -> bool {
     if uses_default_transport {
         return true;
@@ -606,10 +591,21 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
         .or_else(|| std::env::var("PRELOOP_PUBLIC_URL").ok())
         .unwrap_or_else(|| format!("http://127.0.0.1:{}", listen.port()));
     std::env::set_var("AKSH_PUBLIC_URL", &public_url);
-    let control_origin = mounted_control_origin(&public_url);
 
-    // Local runner pool connects via host LAN IP so smolvm guest microVMs can reach host control plane directly
-    let local_server_url = format!("http://{}:{}", detect_host_ip(), listen.port());
+    // Runner-facing origin is always the loopback listen address: in-VM
+    // runners reach it over the mounted control socket, and their job-side
+    // programs through the in-guest loopback bridge — never over the public
+    // network. The public URL stays strictly GitHub-facing (check-run
+    // details links). Runners on other machines need AKSH_RUNNER_URL to
+    // point at a host-reachable address instead.
+    if std::env::var("AKSH_RUNNER_URL").is_err() {
+        std::env::set_var(
+            "AKSH_RUNNER_URL",
+            format!("http://127.0.0.1:{}", listen.port()),
+        );
+    }
+    let runner_url = std::env::var("AKSH_RUNNER_URL").unwrap();
+    let control_origin = mounted_control_origin(&runner_url);
 
     // Resolve GitHub credentials before `AppState::new` reads the environment.
     // Both `github_app::load_from_env` and the webhook-secret lookup happen
@@ -645,7 +641,7 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
     let shutdown = tokio_util::sync::CancellationToken::new();
     let mut pool = match local_runner_pool_config(
         &home,
-        local_server_url,
+        runner_url,
         control_origin,
         queue_depth,
         next_job_runs_on,

@@ -30,14 +30,14 @@ pub(crate) async fn connection_data(
         .into_response();
     }
 
-    let service_root = public_base_url();
+    let service_root = runner_base_url();
     let runner_root = runner_server_url();
     let body = serde_json::json!({
         "deploymentId": DEPLOYMENT_ID,
         "deploymentType": "hosted",
         "instanceId": INSTANCE_ID,
         "serverUrlV2": runner_root,
-        "brokerUrl": public_base_url(),
+        "brokerUrl": runner_base_url(),
         "resultsServiceUrl": runner_root,
         "locationServiceData": {
             "lastChangeId": 1,
@@ -135,7 +135,7 @@ fn resource_svc(name: &str, id: &str, area: &str, location: &str) -> serde_json:
         "toolId": area,
         "locationMappings": [
             {"accessMappingMoniker": "ScaleUnitMapping", "location": runner_server_url()},
-            {"accessMappingMoniker": "PublicAccessMapping", "location": public_base_url()}
+            {"accessMappingMoniker": "PublicAccessMapping", "location": runner_base_url()}
         ],
         "serviceOwner": SVC_OWNER,
         "resourceVersion": 1,
@@ -158,7 +158,7 @@ fn svc(name: &str, id: &str, location: &str) -> serde_json::Value {
         "toolId": name,
         "locationMappings": [
             {"accessMappingMoniker": "ScaleUnitMapping", "location": runner_server_url()},
-            {"accessMappingMoniker": "PublicAccessMapping", "location": public_base_url()}
+            {"accessMappingMoniker": "PublicAccessMapping", "location": runner_base_url()}
         ],
         "serviceOwner": SVC_OWNER,
         "resourceVersion": 6,
