@@ -119,6 +119,7 @@ esac
             network: NetworkPolicy::Disabled,
             volumes: Vec::new(),
             sockets: Vec::new(),
+            rosetta: false,
         }
     }
 
@@ -157,6 +158,7 @@ esac
                 host: host_socket.clone(),
                 guest: PathBuf::from("/run/preloop-engine.sock"),
             }],
+            rosetta: false,
         };
 
         SmolVmProvider::new(&executable)
