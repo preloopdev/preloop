@@ -43,24 +43,44 @@ pub fn diff_workspace(workspace: &Path, snapshot_commit: &str) -> Result<Workspa
     )?;
     changes.extend(parse_name_status(&tracked));
 
-    // Untracked but not ignored. `--exclude-standard` is what keeps this from
-    // descending into `target/`.
-    let untracked = git(
-        workspace,
-        &[
+    // Untracked but not ignored, listed twice because neither form alone is a
+    // complete undo log. `--exclude-standard` is what keeps both out of
+    // `target/`.
+    //
+    // The plain listing names individual files, so debris dropped inside a
+    // directory that already existed before the step stays visible — with only
+    // `--directory` that directory reports as the same single entry before and
+    // after, and the new files are never attributed to the attempt.
+    //
+    // The `--directory` listing names wholly-new directories, which the plain
+    // listing cannot express: it reports the files beneath them but never the
+    // directory itself, so `mkdir build && cd build` leaves `build/` behind and
+    // the retry fails on a directory that already exists. An empty created
+    // directory has no files at all and is invisible without it.
+    //
+    // Union, deduplicated: reverting a directory removes its contents too, and
+    // the removal path treats an already-gone path as the desired end state.
+    let mut seen = std::collections::BTreeSet::new();
+    for args in [
+        ["ls-files", "--others", "--exclude-standard", "-z"].as_slice(),
+        [
             "ls-files",
             "--others",
             "--exclude-standard",
             "--directory",
             "-z",
-        ],
-    )?;
-    for path in untracked.split('\0').filter(|s| !s.is_empty()) {
-        changes.push(WorkspaceChange {
-            path: path.to_owned(),
-            status: ChangeStatus::Added,
-            category: ChangeCategory::Untracked,
-        });
+        ]
+        .as_slice(),
+    ] {
+        for path in git(workspace, args)?.split('\0').filter(|s| !s.is_empty()) {
+            if seen.insert(path.to_owned()) {
+                changes.push(WorkspaceChange {
+                    path: path.to_owned(),
+                    status: ChangeStatus::Added,
+                    category: ChangeCategory::Untracked,
+                });
+            }
+        }
     }
 
     let mut counts = std::collections::BTreeMap::new();
@@ -879,11 +899,44 @@ mod tests {
         let after = fixture.diff();
 
         let attributed = changes_since(&baseline, &after);
-        let paths: Vec<&str> = attributed.iter().map(|c| c.path.as_str()).collect();
-        assert_eq!(paths, vec!["build/"]);
+        let mut paths: Vec<&str> = attributed.iter().map(|c| c.path.as_str()).collect();
+        paths.sort();
+        // The directory itself and the file under it: removing the directory
+        // is what unblocks a retry that runs `mkdir build`.
+        assert_eq!(paths, vec!["build/", "build/stale"]);
         assert!(
             !paths.contains(&"lib.rs"),
             "a pre-existing edit must never be attributed to the failed attempt"
+        );
+    }
+
+    /// A directory that already existed when the step began reports as one
+    /// unchanged entry under `--directory`, so debris created inside it is
+    /// invisible unless the file listing is kept alongside it.
+    #[test]
+    fn debris_inside_a_pre_existing_untracked_directory_is_attributed() {
+        let fixture = Fixture::new();
+        std::fs::create_dir_all(fixture.path.join("scratch")).unwrap();
+        std::fs::write(fixture.path.join("scratch/kept"), "before the step\n").unwrap();
+        let baseline = fixture.diff();
+
+        // The failed step drops a file into the directory that was already there.
+        std::fs::write(fixture.path.join("scratch/debris"), "from the attempt\n").unwrap();
+        let after = fixture.diff();
+
+        let attributed = changes_since(&baseline, &after);
+        let paths: Vec<&str> = attributed.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["scratch/debris"],
+            "only the file the attempt created is its to undo"
+        );
+
+        revert_paths(&fixture.path, &fixture.commit, &attributed).unwrap();
+        assert!(!fixture.path.join("scratch/debris").exists());
+        assert!(
+            fixture.path.join("scratch/kept").exists(),
+            "a file that predates the step must survive the revert"
         );
     }
 
