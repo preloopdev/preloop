@@ -11,6 +11,7 @@ use aksh_gha_protocol::RUNNER_BUSY_SENTINEL;
 /// `VmProvider` implementation can model the handshake this pool relies on.
 pub use aksh_gha_protocol::RUNNER_BUSY_SENTINEL as RUNNER_BUSY_LINE;
 
+use futures::StreamExt as _;
 use preloop_vm::{
     MachineName, MachineSpec, MachineState, NetworkPolicy, OutputChunk, SecretSource,
     SmolVmProvider, SocketMount, VmError, VmProvider, VolumeMount,
@@ -22,6 +23,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+use tokio::io::AsyncWriteExt as _;
 use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -104,18 +106,43 @@ async fn download_prebaked_golden(payload: &Path) -> bool {
         None => return false,
     };
 
-    let bytes = match response.bytes().await {
-        Ok(b) => b,
+    let mut file = match tokio::fs::File::create(&tmp_payload).await {
+        Ok(file) => file,
         Err(_) => return false,
     };
 
-    if std::fs::write(&tmp_payload, &bytes).is_err() {
-        let _ = std::fs::remove_file(&tmp_payload);
-        return false;
+    // The body is copied chunk by chunk rather than through `bytes()`. A golden
+    // carries the apt baseline, the Node externals and the VM's storage volume,
+    // so it runs to hundreds of megabytes; buffering it whole would peak at the
+    // full image size on a host that has not yet built anything, and the OOM
+    // killer arriving here takes out the very process that would otherwise fall
+    // back to building locally.
+    let mut stream = response.bytes_stream();
+    let mut streamed = true;
+    while let Some(chunk) = stream.next().await {
+        let Ok(chunk) = chunk else {
+            streamed = false;
+            break;
+        };
+        if file.write_all(&chunk).await.is_err() {
+            streamed = false;
+            break;
+        }
     }
 
-    if std::fs::rename(&tmp_payload, payload).is_err() {
-        let _ = std::fs::remove_file(&tmp_payload);
+    // `write_all` only queues work on a `tokio::fs::File`; the flush is what
+    // surfaces a failed write-back. Skipping it would let a short write reach
+    // the rename below and publish a truncated image that only fails much
+    // later, when a VM tries to boot it.
+    if !streamed || file.flush().await.is_err() {
+        drop(file);
+        let _ = tokio::fs::remove_file(&tmp_payload).await;
+        return false;
+    }
+    drop(file);
+
+    if tokio::fs::rename(&tmp_payload, payload).await.is_err() {
+        let _ = tokio::fs::remove_file(&tmp_payload).await;
         return false;
     }
 
@@ -2080,5 +2107,95 @@ chmod +x "$destination/bin/node"
         .expect_err("runner failure must propagate");
         assert!(error.to_string().contains("run-failure"));
         assert!(!error.to_string().contains("delete-failure"));
+    }
+}
+
+#[cfg(test)]
+mod golden_download_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt as _;
+    use tokio::net::TcpListener;
+
+    /// `download_prebaked_golden` takes its URL from the process environment,
+    /// which every test in this binary shares, so two of them pointing at
+    /// different servers would otherwise interleave.
+    static GOLDEN_URL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Answers exactly one request with `head` followed by `body`, then closes
+    /// the connection. Closing is what lets a deliberately short body reach the
+    /// client as a stream error rather than a hang.
+    async fn serve_once(head: String, body: Vec<u8>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let _ = socket.write_all(head.as_bytes()).await;
+            let _ = socket.write_all(&body).await;
+            let _ = socket.shutdown().await;
+        });
+        format!("http://{address}/golden")
+    }
+
+    fn leftovers(directory: &Path) -> Vec<String> {
+        std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".tmp-golden-"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn streamed_download_lands_at_the_payload_path_byte_for_byte() {
+        let _serialized = GOLDEN_URL.lock().await;
+        let directory = tempfile::tempdir().unwrap();
+        let payload = directory.path().join("golden.smolmachine");
+
+        // Larger than any single chunk hyper will hand back, so the loop has to
+        // append across iterations to reproduce the body.
+        let body: Vec<u8> = (0..4_u32 * 1024 * 1024).map(|i| i as u8).collect();
+        let url = serve_once(
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()),
+            body.clone(),
+        )
+        .await;
+        std::env::set_var("PRELOOP_GOLDEN_URL", &url);
+
+        let downloaded = download_prebaked_golden(&payload).await;
+
+        std::env::remove_var("PRELOOP_GOLDEN_URL");
+        assert!(downloaded);
+        assert_eq!(std::fs::read(&payload).unwrap(), body);
+        assert!(leftovers(directory.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn truncated_download_reports_failure_and_leaves_nothing_behind() {
+        let _serialized = GOLDEN_URL.lock().await;
+        let directory = tempfile::tempdir().unwrap();
+        let payload = directory.path().join("golden.smolmachine");
+
+        // Promising more than is sent makes the connection close mid-body, the
+        // shape a dropped release download actually takes.
+        let body = vec![0xAB_u8; 64 * 1024];
+        let url = serve_once(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                body.len() + 4096
+            ),
+            body,
+        )
+        .await;
+        std::env::set_var("PRELOOP_GOLDEN_URL", &url);
+
+        let downloaded = download_prebaked_golden(&payload).await;
+
+        std::env::remove_var("PRELOOP_GOLDEN_URL");
+        // The caller reads `false` as "build the golden locally", so a partial
+        // file surviving here would be booted as if it were complete.
+        assert!(!downloaded);
+        assert!(!payload.exists());
+        assert!(leftovers(directory.path()).is_empty());
     }
 }

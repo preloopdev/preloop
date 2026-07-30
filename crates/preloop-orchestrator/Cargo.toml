@@ -14,6 +14,7 @@ aksh-runner-server = { path = "../aksh-runner-server" }
 aksh-gha-parser = { path = "../aksh-gha-parser" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+futures = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -27,4 +28,4 @@ reqwest = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util", "net"] }
