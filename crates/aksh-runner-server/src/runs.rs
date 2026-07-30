@@ -182,6 +182,7 @@ pub(crate) async fn submit_run_inner(
         &submission.reusable_workflow_shas,
     )?;
     let mut jobs = expanded.jobs;
+    let reusable_calls = expanded.reusable_calls;
     if !submission.dispatch_inputs.is_empty() {
         for job in &mut jobs {
             job.inputs = submission.dispatch_inputs.clone();
@@ -201,8 +202,32 @@ pub(crate) async fn submit_run_inner(
             .collect();
         // Reject the whole selection if any id is unknown. Silently dropping a
         // typo would run a subset of the requested jobs and report success.
-        let known: std::collections::BTreeSet<&str> =
+        let mut selected = std::collections::BTreeSet::new();
+        let mut known: std::collections::BTreeSet<&str> =
             pairs.iter().map(|(id, _)| id.as_str()).collect();
+        for requested in &submission.selected_jobs {
+            let mut matched_reusable = false;
+            for caller in reusable_calls.keys().filter(|caller| {
+                caller.as_str() == requested
+                    || caller
+                        .strip_prefix(requested)
+                        .is_some_and(|suffix| suffix.starts_with(" ("))
+            }) {
+                matched_reusable = true;
+                selected.extend(
+                    pairs
+                        .iter()
+                        .map(|(id, _)| id)
+                        .filter(|id| id.starts_with(&format!("{caller}/")))
+                        .cloned(),
+                );
+            }
+            if matched_reusable {
+                known.insert(requested);
+            } else {
+                selected.insert(requested.clone());
+            }
+        }
         let unknown: Vec<&str> = submission
             .selected_jobs
             .iter()
@@ -217,7 +242,10 @@ pub(crate) async fn submit_run_inner(
             )));
         }
         let graph = aksh_gha_parser::dag::needs_graph_from_pairs(&pairs);
-        let closure = aksh_gha_parser::dag::dependency_closure(&graph, &submission.selected_jobs);
+        let closure = aksh_gha_parser::dag::dependency_closure(
+            &graph,
+            &selected.into_iter().collect::<Vec<_>>(),
+        );
         let before = jobs.len();
         jobs.retain(|job| closure.contains(&job.base_id));
         tracing::info!(
@@ -228,7 +256,6 @@ pub(crate) async fn submit_run_inner(
         );
     }
 
-    let reusable_calls = expanded.reusable_calls;
     let run_id = RunId::new();
     let repository_owner = submission
         .repository
@@ -368,78 +395,16 @@ pub(crate) async fn submit_run_inner(
         None
     };
 
-    // Resolve the real GitHub credential for each job *before* taking the
-    // dispatch lock: an installation-token round-trip must never stall every
-    // other run behind `state.inner`. A job with no entry here falls back to
-    // the local HMAC JWT minted inside the loop. With an App configured that is
-    // the *only* alternative to a real installation token, unless
-    // `AKSH_GITHUB_APP_MINT_FAILURE` explicitly says otherwise; the PAT is the
-    // primary credential only when no App is configured at all.
+    // PATs are static and can be embedded now. GitHub App installation tokens
+    // are deliberately minted later, when the broker dispatches each job, so
+    // downstream jobs cannot sit in the queue until a short-lived token
+    // expires.
     let mut github_tokens: BTreeMap<JobId, String> = BTreeMap::new();
-    if let Some(app) = &shared.state.github_app {
-        for job in &jobs {
-            // The full slug, not just the owner: the owner selects the
-            // installation, the repository bounds the token. Permissions are
-            // resolved to the job's effective set here so the mint request
-            // always states them outright — an absent `permissions:` block
-            // must mean the restricted default, never the App's full grant.
-            let permissions =
-                aksh_gha_parser::effective_token_permissions(job.permissions.as_ref());
-            match crate::github_app::get_or_mint_token(app, &submission.repository, &permissions)
-                .await
-            {
-                Ok(token) => {
-                    info!(
-                        %run_id,
-                        job = %job.id,
-                        repository = %submission.repository,
-                        "Minted GitHub App installation token for job"
-                    );
-                    github_tokens.insert(job.id.clone(), token);
-                }
-                Err(error) => {
-                    // Never silently widen scope: only an explicit
-                    // `AKSH_GITHUB_APP_MINT_FAILURE=pat` reaches for the PAT,
-                    // and `=error` refuses the run outright.
-                    let fallback = crate::github_app::fallback_token(
-                        app.mint_failure,
-                        std::env::var("AKSH_GITHUB_TOKEN").ok(),
-                    )
-                    .map_err(|refusal| {
-                        ApiError::bad_gateway(format!(
-                            "GitHub App token minting failed for job {} in {}: \
-                             {error:#} ({refusal})",
-                            job.id, submission.repository
-                        ))
-                    })?;
-                    match fallback {
-                        Some(pat) => {
-                            warn!(
-                                %run_id,
-                                job = %job.id,
-                                repository = %submission.repository,
-                                "GitHub App token minting failed; using the \
-                                 AKSH_GITHUB_TOKEN PAT as configured by \
-                                 AKSH_GITHUB_APP_MINT_FAILURE=pat, which ignores \
-                                 `permissions:`: {error:#}"
-                            );
-                            github_tokens.insert(job.id.clone(), pat);
-                        }
-                        None => warn!(
-                            %run_id,
-                            job = %job.id,
-                            repository = %submission.repository,
-                            "GitHub App token minting failed; the job keeps the \
-                             local HMAC JWT and cannot reach the GitHub API: \
-                             {error:#}"
-                        ),
-                    }
-                }
-            }
+    if shared.state.github_app.is_none() {
+        if let Ok(pat) = std::env::var("AKSH_GITHUB_TOKEN") {
+            info!(%run_id, "Using AKSH_GITHUB_TOKEN PAT for run jobs");
+            github_tokens.extend(jobs.iter().map(|job| (job.id.clone(), pat.clone())));
         }
-    } else if let Ok(pat) = std::env::var("AKSH_GITHUB_TOKEN") {
-        info!(%run_id, "Using AKSH_GITHUB_TOKEN PAT for run jobs");
-        github_tokens.extend(jobs.iter().map(|job| (job.id.clone(), pat.clone())));
     }
 
     // Reserve the workflow run number before pre-building messages. The
@@ -484,6 +449,7 @@ pub(crate) async fn submit_run_inner(
         id_token_granted: bool,
         oidc_ctx: OidcJobContext,
         job_request: Option<TaskAgentJobRequestRecord>,
+        github_token_request: Option<GitHubTokenRequest>,
     }
 
     let mut prebuilt: Vec<PrebuiltJob> = Vec::with_capacity(jobs.len());
@@ -545,6 +511,7 @@ pub(crate) async fn submit_run_inner(
                     job_workflow_sha: None,
                 },
                 job_request: None,
+                github_token_request: None,
             });
             continue;
         }
@@ -699,6 +666,15 @@ pub(crate) async fn submit_run_inner(
             timeout_triggered: false,
             debug_token_issued: false,
         };
+        let github_token_request = shared
+            .state
+            .github_app
+            .as_ref()
+            .map(|_| GitHubTokenRequest {
+                repository: submission.repository.clone(),
+                permissions: aksh_gha_parser::effective_token_permissions(job.permissions.as_ref())
+                    .into_owned(),
+            });
 
         prebuilt.push(PrebuiltJob {
             job,
@@ -709,6 +685,7 @@ pub(crate) async fn submit_run_inner(
             id_token_granted,
             oidc_ctx,
             job_request: Some(job_request),
+            github_token_request,
         });
     }
 
@@ -807,6 +784,9 @@ pub(crate) async fn submit_run_inner(
                 .timeline_requests
                 .insert(job_request.timeline_id, pb.request_id);
             inner.job_requests.insert(pb.request_id, job_request);
+            if let Some(request) = pb.github_token_request {
+                inner.github_token_requests.insert(pb.request_id, request);
+            }
 
             let queued_job = QueuedJob {
                 run_id,
@@ -1597,9 +1577,10 @@ fn live_run_events(
                 let event =
                     match tokio::time::timeout(EVENT_STREAM_IDLE_TIMEOUT, receiver.recv()).await {
                         Ok(Ok(event)) => event,
-                        // A lagging consumer missed events; the snapshot it gets on
-                        // reconnect is authoritative, so keep tailing from here.
-                        Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                        // A lagging consumer has an incomplete stream. End it
+                        // so the client reconnects and receives a fresh,
+                        // authoritative snapshot before tailing again.
+                        Ok(Err(broadcast::error::RecvError::Lagged(_))) => return None,
                         Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => return None,
                     };
                 if event.run_id() != run_id {

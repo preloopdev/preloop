@@ -696,8 +696,12 @@ pub(crate) fn build_app(
         // Azure Block Blob compat blob store — upload (PUT) and download (GET).
         // Cache: /twirp-blob/cache/{token}
         // Artifact: /twirp-blob/artifact/{token}  (download URL appends .zip for content-type detection)
-        .route("/twirp-blob/:kind/:token", put(blob_put).get(blob_get))
-        .layer(DefaultBodyLimit::max(512 * 1024 * 1024)) // 512 MB for blob uploads
+        .route(
+            "/twirp-blob/:kind/:token",
+            put(blob_put)
+                .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
+                .get(blob_get),
+        )
         .route_layer(middleware::from_fn_with_state(
             shared.clone(),
             require_results_bearer,

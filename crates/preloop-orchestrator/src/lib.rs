@@ -203,12 +203,12 @@ pub fn loopback_hosts() -> &'static str {
     LOOPBACK_HOSTS
 }
 
-fn node_externals() -> Vec<Vec<String>> {
+fn node_externals_at(runner_root: &str) -> Vec<Vec<String>> {
     [vec![
         "sh".to_owned(),
         "-c".to_owned(),
         format!(
-            "RUNNER_EXTERNALS={RUNNER_ROOT}/externals && \
+            "RUNNER_EXTERNALS={runner_root}/externals && \
              mkdir -p \"$RUNNER_EXTERNALS\" && \
              for entry in 'node20 v20.19.0' 'node24 v24.3.0'; do \
                set -- $entry; \
@@ -221,8 +221,8 @@ fn node_externals() -> Vec<Vec<String>> {
                TEMP=$(mktemp -d \"$RUNNER_EXTERNALS/.$NAME.XXXXXX\") && \
                 ARCH=$(uname -m); \
                 if [ \"$ARCH\" = \"aarch64\" ] || [ \"$ARCH\" = \"arm64\" ]; then NODE_ARCH=linux-arm64; else NODE_ARCH=linux-x64; fi; \
-                curl -fsSL \"https://nodejs.org/dist/$VERSION/node-$VERSION-$NODE_ARCH.tar.gz\" \\\
-                 | tar -xz --strip-components=1 -C \"$TEMP\" && \
+                curl -fsSL \"https://nodejs.org/dist/$VERSION/node-$VERSION-$NODE_ARCH.tar.gz\" | \
+                 tar -xz --strip-components=1 -C \"$TEMP\" && \
                if [ ! -f \"$TEMP/bin/node\" ]; then \
                  echo \"ERROR: $NAME tarball missing bin/node\" >&2; \
                  rm -rf \"$TEMP\"; exit 1; \
@@ -236,6 +236,10 @@ fn node_externals() -> Vec<Vec<String>> {
     ]]
     .into_iter()
     .collect()
+}
+
+fn node_externals() -> Vec<Vec<String>> {
+    node_externals_at(RUNNER_ROOT)
 }
 
 fn base_install_commands() -> Vec<Vec<String>> {
@@ -364,7 +368,11 @@ fn guest_env_prefix(config: &RunnerPoolConfig, name: &MachineName) -> Vec<String
     if config.control_socket.is_some() {
         env.push(format!(
             "PRELOOP_CONTROL_ORIGIN={}",
-            config.server_url.trim_end_matches('/')
+            config
+                .control_origin
+                .as_deref()
+                .unwrap_or(&config.server_url)
+                .trim_end_matches('/')
         ));
         env.push(format!("PRELOOP_CONTROL_SOCKET={GUEST_CONTROL_SOCKET}"));
     }
@@ -400,6 +408,9 @@ pub struct RunnerPoolConfig {
     pub runner_binary_name: String,
     /// Guest-visible control-plane URL.
     pub server_url: String,
+    /// Origin used in advertised job URLs routed through `control_socket`.
+    /// Registration may use a different guest-reachable address.
+    pub control_origin: Option<String>,
     /// Host Unix socket used for runner control-plane traffic.
     pub control_socket: Option<PathBuf>,
     /// Host environment variable containing the registration credential.
@@ -733,7 +744,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // Local control-plane sockets therefore use an image-backed golden VM;
         // remote TCP pools can retain the packed-artifact path.
         if self.config.control_socket.is_none() {
-            self.prepare_artifact().await?;
+            self.prepare_artifact(true).await?;
         }
         self.remove_stale_machines().await?;
 
@@ -815,7 +826,19 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         Ok(())
     }
 
-    async fn prepare_artifact(&self) -> Result<(), OrchestratorError> {
+    /// Build a fresh packed runner artifact without downloading or reusing an
+    /// existing release asset.
+    pub async fn rebuild_artifact(&self) -> Result<(), OrchestratorError> {
+        let payload = self.config.artifact_payload();
+        match std::fs::remove_file(&payload) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        self.prepare_artifact(false).await
+    }
+
+    async fn prepare_artifact(&self, allow_download: bool) -> Result<(), OrchestratorError> {
         let payload = self.config.artifact_payload();
         if payload.is_file() {
             return Ok(());
@@ -823,7 +846,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         if let Some(parent) = self.config.artifact_stem.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        if download_prebaked_golden(&payload).await {
+        if allow_download && download_prebaked_golden(&payload).await {
             return Ok(());
         }
 
@@ -882,11 +905,15 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
 struct ReadyRunner {
     name: MachineName,
     run: Vec<String>,
-    /// Environment fingerprint of the golden this runner was forked from.
-    /// A spare built for one environment must not serve a job needing
-    /// another, so a mismatch discards it rather than running the job on
-    /// the wrong base image.
+    environment: RunnerEnvironment,
+}
+
+#[derive(Debug, Clone)]
+struct RunnerEnvironment {
+    /// Fingerprint of the golden this runner was forked from.
     fingerprint: Option<String>,
+    /// Base image this runner actually booted from.
+    base: String,
 }
 
 /// Handles every slot in the pool shares.
@@ -908,9 +935,8 @@ struct SlotPlan<'a> {
     generation: u64,
     /// Fork base, when the pool has one.
     golden: Option<&'a MachineName>,
-    /// Environment fingerprint of `golden`, recorded on the replacement so a
-    /// later iteration can tell whether the spare still matches the work.
-    fingerprint: Option<String>,
+    /// Environment selected for the replacement.
+    environment: RunnerEnvironment,
     /// Runners across the whole pool that are registered and unclaimed.
     idle: &'a AtomicUsize,
     /// Keypairs generated ahead of time for runner registration.
@@ -969,7 +995,7 @@ async fn run_slot<P: VmProvider + 'static>(
     let mut spare: Option<ReadyRunner> = None;
 
     while !shutdown.is_cancelled() {
-        let (golden, fingerprint) = if config.use_fork {
+        let (golden, environment) = if config.use_fork {
             // Read the `runs-on` labels of the next queued job so the pool
             // can select the correct base-image golden before forking.
             let env_base = match &config.next_job_runs_on {
@@ -983,7 +1009,7 @@ async fn run_slot<P: VmProvider + 'static>(
                 }
                 None => config.base_image.clone(),
             };
-            let env_spec = EnvironmentSpec::new(env_base, Vec::new());
+            let env_spec = EnvironmentSpec::new(env_base.clone(), Vec::new());
             let fingerprint = env_spec.fingerprint.clone();
 
             let selected = match golden_registry
@@ -1006,23 +1032,37 @@ async fn run_slot<P: VmProvider + 'static>(
             {
                 Ok(name) => Some(name),
                 Err(error) => {
-                    warn!(%error, %fingerprint, "failed to prepare environment golden; falling back to default");
-                    let default_fingerprint =
-                        EnvironmentSpec::new(config.base_image.clone(), Vec::new()).fingerprint;
-                    golden_registry.get(&default_fingerprint).await
+                    warn!(%error, %fingerprint, "failed to prepare requested environment golden; leaving job queued");
+                    tokio::select! {
+                        _ = shutdown.cancelled() => break,
+                        _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                    }
+                    continue;
                 }
             };
-            (selected, Some(fingerprint))
+            (
+                selected,
+                RunnerEnvironment {
+                    fingerprint: Some(fingerprint),
+                    base: env_base,
+                },
+            )
         } else {
             // create-per-runner path: no golden, provision fresh each time.
-            (None, None)
+            (
+                None,
+                RunnerEnvironment {
+                    fingerprint: None,
+                    base: config.base_image.clone(),
+                },
+            )
         };
 
         // A spare forked from a different environment would run the job on
         // the wrong base image. Discard it and provision against the golden
         // this iteration actually selected.
         if let Some(ready) = spare.take() {
-            if ready.fingerprint == fingerprint {
+            if ready.environment.fingerprint == environment.fingerprint {
                 spare = Some(ready);
             } else {
                 warn!(
@@ -1044,7 +1084,7 @@ async fn run_slot<P: VmProvider + 'static>(
                     generation,
                     golden.as_ref(),
                     &keys,
-                    fingerprint.clone(),
+                    environment.clone(),
                 )
                 .await
                 {
@@ -1071,7 +1111,7 @@ async fn run_slot<P: VmProvider + 'static>(
                 slot,
                 generation,
                 golden: golden.as_ref(),
-                fingerprint: fingerprint.clone(),
+                environment: environment.clone(),
                 idle: &idle,
                 keys: &keys,
                 building: &building,
@@ -1108,14 +1148,14 @@ async fn provision_slot<P: VmProvider + 'static>(
     generation: u64,
     golden: Option<&MachineName>,
     keys: &Arc<KeyPool>,
-    fingerprint: Option<String>,
+    environment: RunnerEnvironment,
 ) -> Result<ReadyRunner, OrchestratorError> {
     let name = MachineName::new(format!("{}-{slot}-{generation}", config.name_prefix))?;
-    match provision_runner(provider, config, &name, golden, keys).await {
+    match provision_runner(provider, config, &name, golden, keys, &environment.base).await {
         Ok(run) => Ok(ReadyRunner {
             name,
             run,
-            fingerprint,
+            environment,
         }),
         Err(error) => {
             if let Err(cleanup) = provider.delete(&name).await {
@@ -1127,6 +1167,42 @@ async fn provision_slot<P: VmProvider + 'static>(
             }
             Err(error)
         }
+    }
+}
+
+fn runner_environment_labels(base: &str) -> Vec<String> {
+    let normalized = base.to_ascii_lowercase();
+    if normalized.contains("22.04") {
+        vec!["ubuntu-22.04".to_owned()]
+    } else if normalized.contains("24.04") {
+        vec!["ubuntu-24.04".to_owned(), "ubuntu-latest".to_owned()]
+    } else {
+        Vec::new()
+    }
+}
+
+async fn wait_for_environment_change(
+    config: &RunnerPoolConfig,
+    current_base: &str,
+    claimed: Arc<std::sync::atomic::AtomicBool>,
+) {
+    let Some(next_job_runs_on) = &config.next_job_runs_on else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    loop {
+        if claimed.load(Ordering::Acquire) {
+            std::future::pending::<()>().await;
+            return;
+        }
+        let labels = next_job_runs_on
+            .read()
+            .map(|labels| labels.clone())
+            .unwrap_or_default();
+        if !labels.is_empty() && EnvironmentSpec::default_base(&labels) != current_base {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -1149,20 +1225,21 @@ async fn run_one_runner<P: VmProvider + 'static>(
     let ReadyRunner {
         name,
         run,
-        fingerprint: _,
+        environment,
     } = runner;
     let name = &name;
     let SlotPlan {
         slot,
         generation: next_generation,
         golden,
-        fingerprint,
+        environment: successor_environment,
         idle,
         keys,
         building,
     } = plan;
 
     let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
+    let claimed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let run_provider = provider.clone();
     let run_name = name.clone();
     idle.fetch_add(1, Ordering::AcqRel);
@@ -1173,11 +1250,13 @@ async fn run_one_runner<P: VmProvider + 'static>(
     // runner that exits without taking a job (shutdown, transient failure)
     // drops the sender, and this yields `None` without provisioning anything.
     let pending_jobs = config.pending_jobs.as_deref();
+    let successor_claimed = claimed.clone();
     let build_successor = async {
         if busy_rx.await.is_err() {
             idle.fetch_sub(1, Ordering::AcqRel);
             return None;
         }
+        successor_claimed.store(true, Ordering::Release);
         // Booting a VM costs real CPU, and it would be spent alongside the job
         // that just started, so build exactly as many replacements as the
         // backlog needs and no more.
@@ -1202,7 +1281,7 @@ async fn run_one_runner<P: VmProvider + 'static>(
             next_generation,
             golden,
             keys,
-            fingerprint,
+            successor_environment,
         )
         .await
         {
@@ -1221,6 +1300,13 @@ async fn run_one_runner<P: VmProvider + 'static>(
             // the VM so deletion cannot wait indefinitely on a live listener.
             run_task.abort();
             let _ = run_task.await;
+            (provider.stop(name).await.map_err(OrchestratorError::from), None)
+        },
+        _ = wait_for_environment_change(config, &environment.base, claimed) => {
+            run_task.abort();
+            let _ = run_task.await;
+            idle.fetch_sub(1, Ordering::AcqRel);
+            info!(machine = name.as_str(), environment = %environment.base, "replacing idle runner for queued environment");
             (provider.stop(name).await.map_err(OrchestratorError::from), None)
         },
         pair = async {
@@ -1382,6 +1468,7 @@ async fn provision_runner<P: VmProvider + 'static>(
     name: &MachineName,
     golden: Option<&MachineName>,
     keys: &Arc<KeyPool>,
+    environment_base: &str,
 ) -> Result<Vec<String>, OrchestratorError> {
     if let Some(golden) = golden {
         // Fork from the already-booted golden VM — instant CoW clone.
@@ -1420,7 +1507,16 @@ async fn provision_runner<P: VmProvider + 'static>(
     }
 
     let runner = format!("/opt/preloop/bin/{}", config.runner_binary_name);
-    let labels = config.labels.join(",");
+    let mut labels = config.labels.clone();
+    for label in runner_environment_labels(environment_base) {
+        if !labels
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&label))
+        {
+            labels.push(label);
+        }
+    }
+    let labels = labels.join(",");
     let mut configure = guest_env_prefix(config, name);
     configure.extend([
         runner.clone(),
@@ -1576,6 +1672,8 @@ mod lifecycle_tests {
     use async_trait::async_trait;
     use preloop_vm::{ExecOutput, OutputChunk};
     use std::collections::HashMap;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::process::Command;
     use tokio::sync::Mutex;
 
     #[derive(Debug)]
@@ -1634,6 +1732,82 @@ mod lifecycle_tests {
         }
     }
 
+    #[test]
+    fn node_external_archives_are_piped_into_tar() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        let root = temp.path().join("runner");
+        std::fs::create_dir_all(&bin).unwrap();
+
+        let curl = bin.join("curl");
+        std::fs::write(&curl, "#!/bin/sh\nprintf archive\n").unwrap();
+        std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let tar = bin.join("tar");
+        std::fs::write(
+            &tar,
+            r#"#!/bin/sh
+input=$(cat)
+[ "$input" = archive ] || exit 41
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = -C ]; then
+    shift
+    destination=$1
+  fi
+  shift
+done
+mkdir -p "$destination/bin"
+printf '#!/bin/sh\nexit 0\n' > "$destination/bin/node"
+chmod +x "$destination/bin/node"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&tar, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let command = node_externals_at(root.to_str().unwrap()).pop().unwrap();
+        let status = Command::new(&command[0])
+            .args(&command[1..])
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .status()
+            .unwrap();
+
+        assert!(status.success());
+        assert!(root.join("externals/node20/bin/node").is_file());
+        assert!(root.join("externals/node24/bin/node").is_file());
+    }
+
+    #[test]
+    fn mounted_control_socket_uses_advertised_origin() {
+        let mut config = test_config(true);
+        config.server_url = "http://192.168.1.20:9090".to_owned();
+        config.control_origin = Some("http://127.0.0.1:9090".to_owned());
+        let name = MachineName::new("runner").unwrap();
+
+        let env = guest_env_prefix(&config, &name);
+
+        assert!(env.contains(&"PRELOOP_CONTROL_ORIGIN=http://127.0.0.1:9090".to_owned()));
+        assert!(!env.contains(&"PRELOOP_CONTROL_ORIGIN=http://192.168.1.20:9090".to_owned()));
+    }
+
+    #[test]
+    fn runner_labels_bind_to_selected_ubuntu_environment() {
+        assert_eq!(
+            runner_environment_labels("ubuntu:22.04"),
+            vec!["ubuntu-22.04"]
+        );
+        assert_eq!(
+            runner_environment_labels("ubuntu:24.04"),
+            vec!["ubuntu-24.04", "ubuntu-latest"]
+        );
+    }
+
     fn test_config(control_socket: bool) -> RunnerPoolConfig {
         RunnerPoolConfig {
             size: 1,
@@ -1645,6 +1819,7 @@ mod lifecycle_tests {
             runner_bundle: PathBuf::from("/tmp"),
             runner_binary_name: "runner".to_owned(),
             server_url: "https://runner.test".to_owned(),
+            control_origin: None,
             control_socket: control_socket.then(|| PathBuf::from("/tmp/engine.sock")),
             registration_token_env: "LIFECYCLE_TEST_TOKEN".to_owned(),
             labels: vec!["test".to_owned()],
@@ -1806,7 +1981,10 @@ mod lifecycle_tests {
             1,
             golden,
             &Arc::new(KeyPool::new()),
-            None,
+            RunnerEnvironment {
+                fingerprint: None,
+                base: config.base_image.clone(),
+            },
         )
         .await
         .expect_err("provisioning failure must propagate");
@@ -1872,7 +2050,10 @@ mod lifecycle_tests {
             1,
             None,
             &Arc::new(KeyPool::new()),
-            None,
+            RunnerEnvironment {
+                fingerprint: None,
+                base: config.base_image.clone(),
+            },
         )
         .await
         .expect("provisioning succeeds");
@@ -1886,7 +2067,10 @@ mod lifecycle_tests {
                 slot: 0,
                 generation: 2,
                 golden: None,
-                fingerprint: None,
+                environment: RunnerEnvironment {
+                    fingerprint: None,
+                    base: config.base_image.clone(),
+                },
                 idle: &idle,
                 keys: &Arc::new(KeyPool::new()),
                 building: &AtomicUsize::new(0),

@@ -703,7 +703,16 @@ pub(crate) async fn complete_job_inner(
         // Off the completion path on purpose: this is housekeeping, and the
         // runner is waiting on this response before its slot can turn over.
         let state_dir = shared.state.state_dir.clone();
-        tokio::spawn(async move { prune_replay_results(&state_dir).await });
+        let active_plans = {
+            let inner = shared.state.inner.lock().await;
+            inner
+                .job_requests
+                .values()
+                .filter(|request| request.result.is_none())
+                .map(|request| request.plan_id.clone())
+                .collect()
+        };
+        tokio::spawn(async move { prune_replay_results(&state_dir, &active_plans).await });
     }
     Ok(Json(record))
 }

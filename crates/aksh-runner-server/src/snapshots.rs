@@ -240,14 +240,21 @@ async fn create_workspace_snapshot_inner(
         &cached_objects,
     );
     update_refs.args(["update-ref", "--stdin"]);
-    let update_input =
-        format!("update {SNAPSHOT_REF} {commit_sha}\nsymref-update HEAD {SNAPSHOT_REF}\n");
+    let update_input = format!("update {SNAPSHOT_REF} {commit_sha}\n");
     run_git_with_stdin(
         &mut update_refs,
         update_input.as_bytes(),
-        "publish snapshot refs",
+        "publish snapshot ref",
     )
     .await?;
+    let mut update_head = snapshot_git_command(
+        workspace,
+        staging_repository,
+        staging_index,
+        &cached_objects,
+    );
+    update_head.args(["symbolic-ref", "HEAD", SNAPSHOT_REF]);
+    run_git(&mut update_head, "publish snapshot HEAD").await?;
 
     let alternate_file = staging_repository.join("objects/info/alternates");
     tokio::fs::create_dir_all(alternate_file.parent().expect("alternates parent"))

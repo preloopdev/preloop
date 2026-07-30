@@ -327,6 +327,7 @@ impl Fixture {
             runner_bundle: bundle,
             runner_binary_name: "preloop-runner".to_owned(),
             server_url: "https://preloop.example".to_owned(),
+            control_origin: None,
             control_socket: None,
             registration_token_env: token_env.clone(),
             labels: vec!["self-hosted".to_owned(), "linux".to_owned()],

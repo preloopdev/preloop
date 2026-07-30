@@ -17,15 +17,18 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build Preloop binaries
-        run: cargo build -p preloop-cli -p aksh-runner-server
+        run: |
+          cargo build --release -p preloop-cli -p aksh-runner-server
+          cargo zigbuild --release -p aksh-runner --target aarch64-unknown-linux-gnu
 
       - name: Pack Golden MicroVM Artifact
         run: |
-          ./target/debug/preloop plan || true
           mkdir -p dist
-          if [ -f ~/.preloop/vms/preloop-ubuntu-24.04-aarch64 ]; then
-            cp ~/.preloop/vms/preloop-ubuntu-24.04-aarch64 dist/preloop-ubuntu-24.04-aarch64
-          fi
+          rm -f dist/preloop-ubuntu-24.04-aarch64
+          ./target/release/preloop build-golden \
+            --runner-bundle target/aarch64-unknown-linux-gnu/release \
+            --output dist/preloop-ubuntu-24.04-aarch64
+          test -s dist/preloop-ubuntu-24.04-aarch64
 
       - name: Upload Golden Artifact to Release
         if: github.event_name == 'release'

@@ -126,6 +126,8 @@ pub struct DebugPauseClient {
     /// runner cancels a job the server is still holding open — the failure
     /// looks like a spontaneous timeout mid-debug-session.
     paused: Arc<AtomicBool>,
+    /// True only after a session received a controller verdict.
+    resolved: Arc<AtomicBool>,
 }
 
 impl DebugPauseClient {
@@ -183,6 +185,7 @@ impl DebugPauseClient {
             snapshot_commit: None,
             revision: Arc::new(AtomicU32::new(0)),
             paused: Arc::new(AtomicBool::new(false)),
+            resolved: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -210,6 +213,7 @@ impl DebugPauseClient {
             snapshot_commit: None,
             revision: Arc::new(AtomicU32::new(0)),
             paused: Arc::new(AtomicBool::new(false)),
+            resolved: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -217,6 +221,12 @@ impl DebugPauseClient {
     pub fn with_pause_flag(mut self, paused: Arc<AtomicBool>) -> Self {
         self.paused = paused;
         self
+    }
+
+    /// Whether a live session opened and received an explicit controller
+    /// verdict. Failed opens and abandoned polls must still preserve the VM.
+    pub fn resolved_session(&self) -> bool {
+        self.resolved.load(Ordering::SeqCst)
     }
 
     /// Attach workspace provenance so a controller can diff against the
@@ -269,6 +279,9 @@ impl DebugPauseClient {
         self.paused.store(true, Ordering::SeqCst);
         let decision = self.await_verdict(&session_id).await;
         self.paused.store(false, Ordering::SeqCst);
+        if decision.is_some() {
+            self.resolved.store(true, Ordering::SeqCst);
+        }
 
         if decision.as_ref().map(|d| d.verdict) == Some(Verdict::Retry) {
             self.revision.fetch_add(1, Ordering::SeqCst);
