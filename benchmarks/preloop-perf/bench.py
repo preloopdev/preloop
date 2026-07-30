@@ -618,7 +618,8 @@ def api_run() -> dict:
     stamps = LOG_TIMESTAMP.findall(logs)
     if len(stamps) < 2:
         die(f"run {run_id} produced no parseable job log timestamps")
-    job_ms = (iso_ms(stamps[-1]) - iso_ms(stamps[0])) * 1000.0
+    timestamp_ms = [iso_ms(stamp) for stamp in stamps]
+    job_ms = (max(timestamp_ms) - min(timestamp_ms)) * 1000.0
 
     submit_ms = (t_submitted - t0) * 1000.0
     total_ms = (t_done - t0) * 1000.0
