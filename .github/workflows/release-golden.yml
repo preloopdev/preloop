@@ -23,8 +23,8 @@ jobs:
         run: |
           ./target/debug/preloop plan || true
           mkdir -p dist
-          if [ -f ~/.preloop/vms/preloop-runner-base.smolmachine ]; then
-            cp ~/.preloop/vms/preloop-runner-base.smolmachine dist/preloop-ubuntu-24.04-aarch64.smolmachine
+          if [ -f ~/.preloop/vms/preloop-ubuntu-24.04-aarch64 ]; then
+            cp ~/.preloop/vms/preloop-ubuntu-24.04-aarch64 dist/preloop-ubuntu-24.04-aarch64
           fi
 
       - name: Upload Golden Artifact to Release
@@ -32,4 +32,4 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload ${{ github.event.release.tag_name }} dist/preloop-ubuntu-24.04-aarch64.smolmachine --clobber
+          gh release upload ${{ github.event.release.tag_name }} dist/preloop-ubuntu-24.04-aarch64 --clobber
