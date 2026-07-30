@@ -37,7 +37,6 @@ just test-ci                                         # fmt-check + clippy + test
 # Run H1 E2E tests locally against aksh-runner-server
 just runner-e2e fixtures/golden/simple-echo.yml
 
-# Run H2 diff comparison against golden scenario captures
-just conform-runner 01-register-and-idle             # Diff against official target
-just conform-local 01-register-and-idle              # Diff against aksh target
+# Replay and diff every committed official-runner flow
+just conform
 ```

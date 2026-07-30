@@ -40,7 +40,7 @@ async function runScenario(backend) {
     // 1. Start aksh-runner-server
     console.log("Starting aksh-runner-server...");
     const serverProc = spawn(
-        path.join(AKSH_RUNNER_DIR, "aksh-runner-server"),
+        path.join(AKSH_RUNNER_DIR, "preloop-server"),
         ["serve", "--listen", "0.0.0.0:9090", "--state-dir", tempStateDir],
         {
             stdio: "pipe",

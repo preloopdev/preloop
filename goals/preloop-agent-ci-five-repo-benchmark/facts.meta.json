@@ -1,0 +1,16 @@
+{
+  "goalSlug": "preloop-agent-ci-five-repo-benchmark",
+  "facts": [
+    { "id": "repo-selection", "text": "The benchmark uses five public repositories pinned to immutable commits.", "comment": null, "recommendedAutomatedVerification": true, "automatedVerification": true },
+    { "id": "workload-diversity", "text": "The repositories cover Rust, Python, JavaScript or TypeScript, Go, and a container-heavy or monorepo-style CI workload.", "comment": null, "recommendedAutomatedVerification": true, "automatedVerification": true },
+    { "id": "same-inputs", "text": "Each system runs the same pinned workflow inputs, with documented adaptations only where a platform requires them.", "comment": null, "recommendedAutomatedVerification": true, "automatedVerification": true },
+    { "id": "repetition-design", "text": "Each repository receives three cold-start runs and five warm runs on each system.", "comment": null, "recommendedAutomatedVerification": true, "automatedVerification": true },
+    { "id": "phase-timing", "text": "The benchmark records timestamps for submission, parsing, scheduling, VM boot or resume, runner registration, job acquisition, checkout, action preparation, workload steps, result delivery, and teardown.", "comment": null, "recommendedAutomatedVerification": true, "automatedVerification": true },
+    { "id": "resource-metrics", "text": "The benchmark records CPU, memory, storage, network transfer, VM count, and peak resource usage where each platform exposes them.", "comment": null, "recommendedAutomatedVerification": true, "automatedVerification": true },
+    { "id": "outcome-metrics", "text": "Every run records success or failure, failing phase, retry count, cancellation state, and whether the produced result matches the expected CI outcome.", "comment": null, "recommendedAutomatedVerification": true, "automatedVerification": true },
+    { "id": "agent-ci-overhead", "text": "Agent CI orchestration and controller overhead are measured separately from workload execution time.", "comment": null, "recommendedAutomatedVerification": true, "automatedVerification": true },
+    { "id": "reproducible-artifacts", "text": "Each benchmark record links the repository commit, workflow file, system configuration, runner image, tool versions, raw events, and summarized timings.", "comment": null, "recommendedAutomatedVerification": true, "automatedVerification": true },
+    { "id": "comparison-report", "text": "The final report compares cold latency, warm latency, phase distributions, throughput, reliability, resource cost, and fidelity across Preloop and Agent CI.", "comment": null, "recommendedAutomatedVerification": false, "automatedVerification": false },
+    { "id": "secret-boundary", "text": "Agent CI credentials, repository tokens, and other secrets stay outside the repository and are redacted from benchmark artifacts.", "comment": null, "recommendedAutomatedVerification": true, "automatedVerification": true }
+  ]
+}

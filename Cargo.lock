@@ -105,6 +105,7 @@ version = "0.2.0"
 dependencies = [
  "glob",
  "indexmap",
+ "parking_lot",
  "proptest",
  "serde_json",
  "sha2",
@@ -156,6 +157,7 @@ dependencies = [
  "aksh-gha-parser",
  "aksh-gha-protocol",
  "anyhow",
+ "axum",
  "base64",
  "bytes",
  "chrono",
@@ -220,6 +222,7 @@ dependencies = [
  "chrono-tz",
  "clap",
  "cron",
+ "filetime",
  "futures",
  "hmac",
  "hyper",
@@ -229,6 +232,7 @@ dependencies = [
  "rand 0.8.6",
  "rcgen",
  "reqwest",
+ "rsa",
  "rustls",
  "serde",
  "serde_json",
@@ -1799,6 +1803,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",
@@ -1806,16 +1811,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "preloop-loadtest"
+version = "0.1.0"
+dependencies = [
+ "aksh-gha-expressions",
+ "aksh-gha-parser",
+ "aksh-gha-protocol",
+ "aksh-runner-server",
+ "anyhow",
+ "axum",
+ "hyper",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "uuid",
+]
+
+[[package]]
 name = "preloop-orchestrator"
 version = "0.21.0"
 dependencies = [
  "aksh-gha-parser",
+ "aksh-gha-protocol",
  "aksh-runner-server",
  "anyhow",
  "async-trait",
+ "futures",
  "preloop-vm",
+ "reqwest",
  "serde",
  "serde_json",
+ "serde_yaml",
+ "sha2",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",

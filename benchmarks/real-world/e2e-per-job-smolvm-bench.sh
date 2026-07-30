@@ -206,11 +206,11 @@ run_aksh_server_mode() {
   local server_url="http://${host_ip}:${server_external_port}"
 
   # Use host-native binaries (macOS), not the linux-musl cross-compiled ones
-  local server_bin="$HOST_WORKSPACE/target/release/aksh-runner-server"
+  local server_bin="$HOST_WORKSPACE/target/release/preloop-server"
   local client_bin="$HOST_WORKSPACE/target/release/aksh-runner-client"
 
   # Kill stale processes
-  pkill -f aksh-runner-server 2>/dev/null || true
+  pkill -f preloop-server 2>/dev/null || true
   pkill -f "python3.*tcp-proxy" 2>/dev/null || true
   sleep 0.5
 

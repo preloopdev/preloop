@@ -11,6 +11,9 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --de
 
 ENV PATH="/root/.cargo/bin:${PATH}"
 
+# Externals
+COPY externals /workspace/externals
+
 # aksh-runner binary
 COPY aksh-runner /opt/aksh/aksh-runner
 RUN chmod +x /opt/aksh/aksh-runner

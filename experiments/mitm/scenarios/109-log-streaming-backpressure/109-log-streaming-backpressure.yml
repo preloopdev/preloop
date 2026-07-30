@@ -1,0 +1,17 @@
+name: 109-log-streaming-backpressure
+on: workflow_dispatch
+jobs:
+  stress-logs:
+    runs-on: self-hosted
+    steps:
+      - run: |
+          python3 -c '
+          import sys
+          for i in range(5000):
+              sys.stdout.write(f"\033[31mLog line {i}\033[0m: " + "A" * 50 + "\n")
+          '
+      - run: |
+          python3 -c '
+          import sys
+          sys.stdout.write("B" * 8192)
+          '

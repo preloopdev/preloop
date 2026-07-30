@@ -5,8 +5,8 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-SERVER="$REPO/target/release/aksh-runner-server"
-RUNNER="$REPO/target/release/aksh-runner"
+SERVER="$REPO/target/release/preloop-server"
+RUNNER="$REPO/target/release/preloop-runner"
 PORT=9192
 BASE="http://127.0.0.1:$PORT"
 SYSTEM_TOKEN="${AKSH_SYSTEM_TOKEN:-aksh-system-token}"

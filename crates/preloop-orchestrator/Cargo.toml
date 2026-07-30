@@ -9,14 +9,23 @@ description = "Job scheduling and VM lifecycle orchestration for Preloop CI"
 
 [dependencies]
 preloop-vm = { path = "../preloop-vm" }
+aksh-gha-protocol = { path = "../aksh-gha-protocol" }
 aksh-runner-server = { path = "../aksh-runner-server" }
 aksh-gha-parser = { path = "../aksh-gha-parser" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+futures = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+sha2 = "0.10"
 uuid = { workspace = true }
+reqwest = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util", "net"] }

@@ -1,0 +1,16 @@
+description = "Workflow dispatch input schema, default fallbacks, and context hydration"
+duration_seconds_max = 300
+
+[[steps]]
+kind = "submit_workflow"
+path = "108-workflow-dispatch-inputs.yml"
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_assigned"
+timeout = 120
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_completed"
+timeout = 240

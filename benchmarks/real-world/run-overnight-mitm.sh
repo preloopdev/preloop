@@ -31,7 +31,7 @@ done < <(
 for scenario in "${scenarios[@]}"; do
   number="${scenario%%-*}"
   [ "$number" -lt "$START_AT" ] && continue
-  echo "=== MITM capture: $scenario ($MODE) repo=${GH_REPO:-Bnjoroge1/aksh-conformance} ==="
-  GH_REPO="${GH_REPO:-Bnjoroge1/aksh-conformance}" \
+  echo "=== MITM capture: $scenario ($MODE) repo=${GH_REPO:-preloopdev/aksh-conformance} ==="
+  GH_REPO="${GH_REPO:-preloopdev/aksh-conformance}" \
     "$SCRIPT_DIR/runner-flow-capture.sh" "$scenario" "$MODE" "$JOB_COUNT"
 done
