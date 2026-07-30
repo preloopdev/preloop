@@ -3,7 +3,7 @@ on: workflow_dispatch
 
 jobs:
   docker-action-host:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     steps:
       - name: Run docker:// action (alpine)
         uses: docker://alpine:3.20
@@ -24,7 +24,7 @@ jobs:
           docker run --rm golden-test | grep -q built
 
   docker-action-in-container:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     container: ubuntu:24.04
     steps:
       - name: Verify inside container

@@ -1,0 +1,131 @@
+name: bench-cache-curl
+
+on:
+  push:
+  pull_request:
+
+# Direct cache API benchmark using curl.
+# Bypasses actions/cache (requires Node.js 24) by calling the Twirp
+# cache endpoints directly. Measures raw cache restore/save latency.
+
+jobs:
+  cache-save:
+    runs-on: self-hosted
+    steps:
+      - name: create test content (500 KB)
+        run: |
+          mkdir -p /tmp/cache-test
+          dd if=/dev/urandom of=/tmp/cache-test/payload.bin bs=1024 count=512 2>/dev/null
+          echo "Created 500 KB test payload"
+          ls -lh /tmp/cache-test/payload.bin
+
+      - name: archive and upload via cache API
+        run: |
+          # Archive the test content
+          cd /tmp
+          tar czf cache-payload.tar.gz -C /tmp/cache-test .
+
+          ARCHIVE_SIZE=$(stat -f%z cache-payload.tar.gz 2>/dev/null || stat -c%s cache-payload.tar.gz)
+          echo "Archive size: $ARCHIVE_SIZE bytes"
+
+          # Get the cache service URL from the runner's environment
+          CACHE_URL="${ACTIONS_CACHE_SERVICE_URL:-http://127.0.0.1:9090}"
+          RUNTIME_TOKEN="${GITHUB_TOKEN:-}"
+          KEY="bench-curl-test-${RUN_ID:-$$}"
+          VERSION="v1"
+
+          echo "Cache URL: $CACHE_URL"
+          echo "Key: $KEY"
+
+          # Step 1: Create cache entry
+          CREATE_RESP=$(curl -s -X POST "$CACHE_URL/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $RUNTIME_TOKEN" \
+            -d "{\"key\":\"$KEY\",\"version\":\"$VERSION\",\"scope\":\"test\",\"repository\":\"bench\"}")
+
+          echo "Create response: $CREATE_RESP"
+
+          UPLOAD_URL=$(echo "$CREATE_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('signed_upload_url',''))" 2>/dev/null)
+
+          if [ -z "$UPLOAD_URL" ]; then
+            echo "Cache entry already exists or create failed — skipping upload"
+          else
+            # Step 2: Upload the archive
+            UPLOAD_START=$(python3 -c "import time; print(time.time())")
+            curl -s -X PUT "$UPLOAD_URL" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary @cache-payload.tar.gz
+            UPLOAD_END=$(python3 -c "import time; print(time.time())")
+            UPLOAD_MS=$(python3 -c "print(int(($UPLOAD_END - $UPLOAD_START) * 1000))")
+            echo "Upload time: ${UPLOAD_MS}ms"
+
+            # Step 3: Finalize
+            FINALIZE_RESP=$(curl -s -X POST "$CACHE_URL/twirp/github.actions.results.api.v1.CacheService/FinalizeCacheEntry" \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer $RUNTIME_TOKEN" \
+              -d "{\"key\":\"$KEY\",\"version\":\"$VERSION\",\"scope\":\"test\",\"repository\":\"bench\"}")
+            echo "Finalize response: $FINALIZE_RESP"
+          fi
+
+      - name: restore cache via API
+        run: |
+          CACHE_URL="${ACTIONS_CACHE_SERVICE_URL:-http://127.0.0.1:9090}"
+          RUNTIME_TOKEN="${GITHUB_TOKEN:-}"
+          KEY="bench-curl-test-${RUN_ID:-$$}"
+          VERSION="v1"
+
+          # Clear local copy
+          rm -rf /tmp/cache-test-restored
+          mkdir -p /tmp/cache-test-restored
+
+          # Request download URL
+          RESTORE_START=$(python3 -c "import time; print(time.time())")
+          DL_RESP=$(curl -s -X POST "$CACHE_URL/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadUrl" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $RUNTIME_TOKEN" \
+            -d "{\"key\":\"$KEY\",\"version\":\"$VERSION\",\"restoreKeys\":[],\"scope\":\"test\",\"repository\":\"bench\"}")
+          RESTORE_END=$(python3 -c "import time; print(time.time())")
+          RESTORE_MS=$(python3 -c "print(int(($RESTORE_END - $RESTORE_START) * 1000))")
+
+          echo "Restore response: $DL_RESP"
+          echo "Restore lookup time: ${RESTORE_MS}ms"
+
+          DL_URL=$(echo "$DL_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('signed_download_url',''))" 2>/dev/null)
+          MATCHED_KEY=$(echo "$DL_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('matched_key',''))" 2>/dev/null)
+
+          if [ -n "$DL_URL" ] && [ "$DL_URL" != "" ]; then
+            echo "Cache HIT — matched key: $MATCHED_KEY"
+
+            # Download the archive
+            DOWNLOAD_START=$(python3 -c "import time; print(time.time())")
+            curl -s -o /tmp/cache-restored.tar.gz "$DL_URL"
+            DOWNLOAD_END=$(python3 -c "import time; print(time.time())")
+            DOWNLOAD_MS=$(python3 -c "print(int(($DOWNLOAD_END - $DOWNLOAD_START) * 1000))")
+
+            RESTORED_SIZE=$(stat -f%z /tmp/cache-restored.tar.gz 2>/dev/null || stat -c%s /tmp/cache-restored.tar.gz)
+            echo "Download time: ${DOWNLOAD_MS}ms"
+            echo "Downloaded size: $RESTORED_SIZE bytes"
+
+            # Extract
+            EXTRACT_START=$(python3 -c "import time; print(time.time())")
+            tar xzf /tmp/cache-restored.tar.gz -C /tmp/cache-test-restored
+            EXTRACT_END=$(python3 -c "import time; print(time.time())")
+            EXTRACT_MS=$(python3 -c "print(int(($EXTRACT_END - $EXTRACT_START) * 1000))")
+            echo "Extract time: ${EXTRACT_MS}ms"
+
+            # Verify
+            if [ -f /tmp/cache-test-restored/payload.bin ]; then
+              echo "=== CACHE BENCH RESULT ==="
+              echo "  lookup: ${RESTORE_MS}ms"
+              echo "  download: ${DOWNLOAD_MS}ms"
+              echo "  extract: ${EXTRACT_MS}ms"
+              echo "  total: $((RESTORE_MS + DOWNLOAD_MS + EXTRACT_MS))ms"
+              echo "  size: $RESTORED_SIZE bytes"
+              echo "  ========================"
+            else
+              echo "ERROR: extracted files not found"
+              exit 1
+            fi
+          else
+            echo "Cache MISS — no cached entry found"
+          fi

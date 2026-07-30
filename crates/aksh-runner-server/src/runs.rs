@@ -74,7 +74,7 @@ pub(crate) async fn submit_run_inner(
     mut submission: WorkflowSubmission,
 ) -> Result<RunAccepted, ApiError> {
     let workflow = parse_workflow(&submission.workflow_yaml)?;
-    crate::remote_workflows::resolve_remote_workflows(&mut submission).await?;
+    crate::remote_workflows::resolve_remote_workflows(&mut submission, &workflow).await?;
     if submission.event == "workflow_dispatch" {
         workflow.apply_workflow_dispatch_inputs(&mut submission.payload)?;
         if submission.dispatch_inputs.is_empty() {
@@ -182,12 +182,80 @@ pub(crate) async fn submit_run_inner(
         &submission.reusable_workflow_shas,
     )?;
     let mut jobs = expanded.jobs;
+    let reusable_calls = expanded.reusable_calls;
     if !submission.dispatch_inputs.is_empty() {
         for job in &mut jobs {
             job.inputs = submission.dispatch_inputs.clone();
         }
     }
-    let reusable_calls = expanded.reusable_calls;
+
+    // Filter to selected jobs and their transitive needs: closure.
+    if !submission.selected_jobs.is_empty() {
+        let pairs: Vec<(String, Vec<String>)> = jobs
+            .iter()
+            .map(|job| {
+                (
+                    job.base_id.clone(),
+                    job.needs.iter().map(|n| n.0.clone()).collect(),
+                )
+            })
+            .collect();
+        // Reject the whole selection if any id is unknown. Silently dropping a
+        // typo would run a subset of the requested jobs and report success.
+        let mut selected = std::collections::BTreeSet::new();
+        let mut known: std::collections::BTreeSet<&str> =
+            pairs.iter().map(|(id, _)| id.as_str()).collect();
+        for requested in &submission.selected_jobs {
+            let mut matched_reusable = false;
+            for caller in reusable_calls.keys().filter(|caller| {
+                caller.as_str() == requested
+                    || caller
+                        .strip_prefix(requested)
+                        .is_some_and(|suffix| suffix.starts_with(" ("))
+            }) {
+                matched_reusable = true;
+                selected.extend(
+                    pairs
+                        .iter()
+                        .map(|(id, _)| id)
+                        .filter(|id| id.starts_with(&format!("{caller}/")))
+                        .cloned(),
+                );
+            }
+            if matched_reusable {
+                known.insert(requested);
+            } else {
+                selected.insert(requested.clone());
+            }
+        }
+        let unknown: Vec<&str> = submission
+            .selected_jobs
+            .iter()
+            .map(String::as_str)
+            .filter(|id| !known.contains(id))
+            .collect();
+        if !unknown.is_empty() {
+            return Err(ApiError::bad_request(format!(
+                "unknown job(s) in selected_jobs: {}. available jobs: {}",
+                unknown.join(", "),
+                known.into_iter().collect::<Vec<_>>().join(", ")
+            )));
+        }
+        let graph = aksh_gha_parser::dag::needs_graph_from_pairs(&pairs);
+        let closure = aksh_gha_parser::dag::dependency_closure(
+            &graph,
+            &selected.into_iter().collect::<Vec<_>>(),
+        );
+        let before = jobs.len();
+        jobs.retain(|job| closure.contains(&job.base_id));
+        tracing::info!(
+            selected = ?submission.selected_jobs,
+            before,
+            after = jobs.len(),
+            "filtered jobs to dependency closure"
+        );
+    }
+
     let run_id = RunId::new();
     let repository_owner = submission
         .repository
@@ -239,7 +307,7 @@ pub(crate) async fn submit_run_inner(
         "branch"
     };
 
-    let github = json!({
+    let mut github = json!({
         "ref": submission.git_ref,
         "sha": sha,
         "repository": submission.repository,
@@ -256,7 +324,7 @@ pub(crate) async fn submit_run_inner(
         "actor": "aksh-system",
         "workflow": workflow.name.clone().unwrap_or_default(),
         "head_ref": "",
-        "base_ref": "",
+        "base_ref": submission.base_ref.as_deref().unwrap_or(""),
         "event_name": submission.event,
         "server_url": "https://github.com",
         "api_url": "https://api.github.com",
@@ -265,14 +333,6 @@ pub(crate) async fn submit_run_inner(
         "ref_protected": false,
         "ref_type": ref_type,
         "secret_source": "Actions",
-        // Public-repository workflow_dispatch defaults observed from the
-        // official runner setup log. The worker uses this context to emit the
-        // same GITHUB_TOKEN Permissions group before user steps.
-        "token_permissions": {
-            "contents": "read",
-            "metadata": "read",
-            "packages": "read"
-        },
         "event": submission.payload,
         "workflow_ref": workflow_ref,
         "workflow_sha": sha,
@@ -335,33 +395,314 @@ pub(crate) async fn submit_run_inner(
         None
     };
 
-    {
+    // PATs are static and can be embedded now. GitHub App installation tokens
+    // are deliberately minted later, when the broker dispatches each job, so
+    // downstream jobs cannot sit in the queue until a short-lived token
+    // expires.
+    let mut github_tokens: BTreeMap<JobId, String> = BTreeMap::new();
+    if shared.state.github_app.is_none() {
+        if let Ok(pat) = std::env::var("AKSH_GITHUB_TOKEN") {
+            info!(%run_id, "Using AKSH_GITHUB_TOKEN PAT for run jobs");
+            github_tokens.extend(jobs.iter().map(|job| (job.id.clone(), pat.clone())));
+        }
+    }
+
+    // Reserve the workflow run number before pre-building messages. The
+    // message builder consumes the GitHub context, so delaying this counter
+    // update until after pre-building would expose "1" for every run.
+    let run_number = {
         let mut inner = shared.state.inner.lock().await;
-        let run_number = {
-            let counter = inner
-                .workflow_run_counters
-                .entry(workflow_path.clone())
-                .or_insert(0);
-            *counter += 1;
-            *counter
-        };
-        let created_at = chrono::Utc::now();
-        let event = submission.event.clone();
-        let mut github = github;
-        if let Some(object) = github.as_object_mut() {
-            object.insert(
-                "run_number".to_owned(),
-                serde_json::json!(run_number.to_string()),
+        let counter = inner
+            .workflow_run_counters
+            .entry(workflow_path.clone())
+            .or_insert(0);
+        *counter += 1;
+        *counter
+    };
+    if let Some(object) = github.as_object_mut() {
+        object.insert(
+            "run_number".to_owned(),
+            serde_json::json!(run_number.to_string()),
+        );
+    }
+
+    // ── Pre-build job messages outside the lock ─────────────────────────
+    //
+    // Condition evaluation, build_agent_job_message, token minting, and
+    // snapshot redirect are all pure computations.  Moving them here
+    // shrinks the critical section from O(jobs × build_cost) to
+    // O(jobs × map_insert).
+    let base_url = public_base_url();
+    let normalized_github = aksh_gha_parser::job_builder::normalize_github_context(&github);
+    let secrets_exposed: BTreeMap<String, String> = submission
+        .secrets
+        .iter()
+        .map(|(k, v)| (k.clone(), v.expose().to_owned()))
+        .collect();
+
+    struct PrebuiltJob {
+        job: aksh_gha_protocol::JobPlan,
+        agent_msg: Option<aksh_gha_protocol::azdo::AgentJobRequestMessage>,
+        request_id: i64,
+        condition_context: aksh_gha_expressions::Context,
+        skipped: bool,
+        id_token_granted: bool,
+        oidc_ctx: OidcJobContext,
+        job_request: Option<TaskAgentJobRequestRecord>,
+        github_token_request: Option<GitHubTokenRequest>,
+    }
+
+    let mut prebuilt: Vec<PrebuiltJob> = Vec::with_capacity(jobs.len());
+    let mut pre_statuses: BTreeMap<JobId, ExecutionStatus> = BTreeMap::new();
+    let mut pre_job_base_ids: BTreeMap<JobId, String> = BTreeMap::new();
+    let mut pre_job_needs: BTreeMap<JobId, Vec<JobId>> = BTreeMap::new();
+    let mut pre_job_fail_fast: BTreeMap<String, bool> = BTreeMap::new();
+    let mut pre_job_continue_on_error: BTreeMap<String, bool> = BTreeMap::new();
+    let mut pre_initially_skipped: Vec<(RunId, JobId)> = Vec::new();
+
+    for job in jobs {
+        pre_job_base_ids.insert(job.id.clone(), job.base_id.clone());
+        pre_job_needs.insert(job.id.clone(), job.needs.clone());
+        pre_job_fail_fast.insert(job.base_id.clone(), job.fail_fast);
+        pre_job_continue_on_error.insert(job.id.to_string(), job.continue_on_error);
+        pre_statuses.insert(job.id.clone(), ExecutionStatus::Queued);
+
+        let condition_context = build_context(
+            &github,
+            &BTreeMap::new(),
+            &submission.vars,
+            &indexmap::IndexMap::new(),
+            &serde_json::json!({}),
+            &BTreeMap::new(),
+            &job.inputs,
+        );
+
+        // Evaluate condition for root jobs (no needs) outside the lock.
+        let mut skipped = false;
+        if job.needs.is_empty() {
+            let condition = aksh_gha_expressions::effective_condition(job.if_condition.as_deref());
+            let should_run = aksh_gha_expressions::eval_bool(&condition, &condition_context)
+                .map_err(|error| {
+                    ApiError::bad_request(format!(
+                        "failed to evaluate condition for job `{}`: {error}",
+                        job.id
+                    ))
+                })?;
+            if !should_run {
+                pre_statuses.insert(job.id.clone(), ExecutionStatus::Skipped);
+                pre_initially_skipped.push((run_id, job.id.clone()));
+                skipped = true;
+            }
+        }
+
+        if skipped {
+            // Still need to record the prebuilt entry so the index stays
+            // aligned, but we skip the expensive message build.
+            prebuilt.push(PrebuiltJob {
+                job,
+                agent_msg: None,
+                request_id: 0,
+                condition_context,
+                skipped: true,
+                id_token_granted: false,
+                oidc_ctx: OidcJobContext {
+                    environment: None,
+                    job_workflow_ref: None,
+                    job_workflow_sha: None,
+                },
+                job_request: None,
+                github_token_request: None,
+            });
+            continue;
+        }
+
+        // Heavy work: build the agent message outside the lock.
+        let mut agent_msg =
+            aksh_gha_parser::job_builder::build_agent_job_message_with_normalized_context(
+                &job,
+                &normalized_github,
+                &job.env,
+                &secrets_exposed,
+                &submission.vars,
+            )
+            .map_err(|e| ApiError::bad_request(format!("failed to build job message: {e}")))?;
+
+        agent_msg.preloop_preserve_on_failure = submission.preserve_on_failure.then_some(true);
+
+        // Pre-allocate request ID atomically (no lock needed).
+        let request_id = shared
+            .state
+            .next_request_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        agent_msg.request_id = request_id;
+
+        // Mint tokens outside the lock (HMAC computation).
+        let runtime_token = shared
+            .state
+            .mint_runtime_token(&agent_msg.plan.plan_id, &agent_msg.job_id);
+
+        if let Some(snapshot) = workspace_snapshot.as_ref() {
+            let redirected =
+                redirect_primary_checkout(&mut agent_msg, snapshot, &base_url, &runtime_token);
+            if redirected > 0 {
+                info!(
+                    %run_id,
+                    job = %job.id,
+                    %redirected,
+                    commit = %snapshot.commit_sha,
+                    "Redirected primary checkout to local workspace snapshot"
+                );
+                agent_msg.aksh_snapshot_commit = Some(snapshot.commit_sha.clone());
+            }
+        }
+
+        let id_token_granted = job.oidc_id_token_granted;
+        if id_token_granted {
+            let oidc_url = format!(
+                "{}/runner/server/_apis/distributedtask/hubs/actions/plans/{}/jobs/{}/oidctoken?api-version=2.0",
+                base_url,
+                agent_msg.plan.plan_id,
+                agent_msg.job_id,
+            );
+            for endpoint in &mut agent_msg.resources.endpoints {
+                if endpoint.name.eq_ignore_ascii_case("SystemVssConnection") {
+                    endpoint
+                        .data
+                        .insert("GenerateIdTokenUrl".to_owned(), oidc_url.clone());
+                }
+            }
+        }
+
+        let github_token = github_tokens
+            .remove(&job.id)
+            .unwrap_or_else(|| runtime_token.clone());
+        agent_msg.variables.insert(
+            "system.github.token".to_owned(),
+            aksh_gha_protocol::azdo::VariableValue::secret(github_token.clone()),
+        );
+        agent_msg.variables.insert(
+            "github_token".to_owned(),
+            aksh_gha_protocol::azdo::VariableValue::secret(github_token),
+        );
+        agent_msg.variables.insert(
+            "actions_runner_allow_artifacts_file".to_owned(),
+            aksh_gha_protocol::azdo::VariableValue::new("false"),
+        );
+        agent_msg.variables.insert(
+            "actions_self_repository".to_owned(),
+            aksh_gha_protocol::azdo::VariableValue::new("true"),
+        );
+        // The debug-worker token is deliberately not a job variable. An
+        // official runner copies every `isSecret` variable into the `secrets`
+        // context, so shipping it here would publish it to workflow YAML as
+        // `${{ secrets['system.preloop.debug_worker_token'] }}`. The worker
+        // acquires it instead over `POST /api/v1/debug/worker-token`, which
+        // authenticates against this job's runtime token.
+        agent_msg.variables.insert(
+            "system.github.launch_endpoint".to_owned(),
+            aksh_gha_protocol::azdo::VariableValue::new(base_url.clone()),
+        );
+        agent_msg.variables.insert(
+            "system.github.results_endpoint".to_owned(),
+            aksh_gha_protocol::azdo::VariableValue::new(base_url.clone()),
+        );
+        agent_msg.variables.insert(
+            "system.orchestrationId".to_owned(),
+            aksh_gha_protocol::azdo::VariableValue::new(format!(
+                "{}.{}.{}",
+                agent_msg.plan.plan_id, job.base_id, agent_msg.job_name
+            )),
+        );
+        agent_msg.file_table = vec![workflow_path.clone()];
+        if let Some(aksh_gha_protocol::azdo::PipelineContextData::Dict(job_dict)) =
+            agent_msg.context_data.get_mut("job")
+        {
+            job_dict.insert(
+                "check_run_id".to_owned(),
+                aksh_gha_protocol::azdo::PipelineContextData::Number(0.0),
+            );
+            job_dict.insert(
+                "workflow_ref".to_owned(),
+                aksh_gha_protocol::azdo::PipelineContextData::String(workflow_ref.clone()),
+            );
+            job_dict.insert(
+                "workflow_sha".to_owned(),
+                aksh_gha_protocol::azdo::PipelineContextData::String(sha.clone()),
+            );
+            job_dict.insert(
+                "workflow_repository".to_owned(),
+                aksh_gha_protocol::azdo::PipelineContextData::String(submission.repository.clone()),
+            );
+            job_dict.insert(
+                "workflow_file_path".to_owned(),
+                aksh_gha_protocol::azdo::PipelineContextData::String(workflow_path.clone()),
             );
         }
-        let mut statuses = BTreeMap::new();
+        agent_msg.enable_debugger = submission.enable_debugger;
+        agent_msg.debugger_welcome_message = submission.debugger_welcome_message.clone();
+        if submission.enable_debugger || submission.preserve_on_failure {
+            agent_msg.aksh_debug_run_id = Some(run_id.to_string());
+            agent_msg.aksh_debug_transport = Some("local".to_string());
+        }
+
+        let oidc_ctx = OidcJobContext {
+            environment: job.oidc_environment.clone(),
+            job_workflow_ref: job.oidc_job_workflow_ref.clone(),
+            job_workflow_sha: job.workflow_sha.clone(),
+        };
+
+        let job_request = TaskAgentJobRequestRecord {
+            request_id,
+            run_id,
+            job_id: job.id.clone(),
+            agent_job_id: agent_msg.job_id,
+            plan_id: agent_msg.plan.plan_id.clone(),
+            plan_type: agent_msg.plan.plan_type.clone(),
+            timeline_id: agent_msg.timeline.id,
+            result: None,
+            locked_until: agent_request_locked_until(),
+            started_at: None,
+            last_renewed_at: None,
+            timeout_triggered: false,
+            debug_token_issued: false,
+        };
+        let github_token_request = shared
+            .state
+            .github_app
+            .as_ref()
+            .map(|_| GitHubTokenRequest {
+                repository: submission.repository.clone(),
+                permissions: aksh_gha_parser::effective_token_permissions(job.permissions.as_ref())
+                    .into_owned(),
+                declared: job.permissions.is_some(),
+            });
+
+        prebuilt.push(PrebuiltJob {
+            job,
+            agent_msg: Some(agent_msg),
+            request_id,
+            condition_context,
+            skipped: false,
+            id_token_granted,
+            oidc_ctx,
+            job_request: Some(job_request),
+            github_token_request,
+        });
+    }
+
+    {
+        let mut inner = shared.state.inner.lock().await;
+        let created_at = chrono::Utc::now();
+        let event = submission.event.clone();
+        let github = github;
+        let mut statuses = pre_statuses;
         let mut ready_jobs = 0usize;
-        let mut job_base_ids = BTreeMap::new();
-        let mut job_needs = BTreeMap::new();
-        let mut job_fail_fast = BTreeMap::new();
-        let mut job_continue_on_error = BTreeMap::new();
+        let job_base_ids = pre_job_base_ids;
+        let job_needs = pre_job_needs;
+        let job_fail_fast = pre_job_fail_fast;
+        let job_continue_on_error = pre_job_continue_on_error;
         let mut ready_by_base: BTreeMap<String, u64> = BTreeMap::new();
-        let mut initially_skipped = Vec::new();
+        let initially_skipped = pre_initially_skipped;
         let mut built_jobs: Vec<QueuedJob> = Vec::new();
         if empty_workflow_concurrency_group {
             let queued_jobs = 0;
@@ -370,7 +711,7 @@ pub(crate) async fn submit_run_inner(
                 RunRecord {
                     run_id,
                     run_name,
-                    submission,
+                    submission: Arc::new(submission),
                     jobs: BTreeMap::new(),
                     job_outputs: BTreeMap::new(),
                     job_base_ids: BTreeMap::new(),
@@ -413,183 +754,40 @@ pub(crate) async fn submit_run_inner(
                 queued_jobs,
             });
         }
-        for job in jobs {
-            job_base_ids.insert(job.id.clone(), job.base_id.clone());
-            job_needs.insert(job.id.clone(), job.needs.clone());
-            job_fail_fast.insert(job.base_id.clone(), job.fail_fast);
-            job_continue_on_error.insert(job.id.to_string(), job.continue_on_error);
-            statuses.insert(job.id.clone(), ExecutionStatus::Queued);
-            let condition_context = build_context(
-                &github,
-                &BTreeMap::new(),
-                &submission.vars,
-                &indexmap::IndexMap::new(),
-                &serde_json::json!({}),
-                &BTreeMap::new(),
-                &job.inputs,
-            );
-            if job.needs.is_empty() {
-                let condition =
-                    aksh_gha_expressions::effective_condition(job.if_condition.as_deref());
-                let should_run = aksh_gha_expressions::eval_bool(&condition, &condition_context)
-                    .map_err(|error| {
-                        ApiError::bad_request(format!(
-                            "failed to evaluate condition for job `{}`: {error}",
-                            job.id
-                        ))
-                    })?;
-                if !should_run {
-                    statuses.insert(job.id.clone(), ExecutionStatus::Skipped);
-                    initially_skipped.push((run_id, job.id.clone()));
-                    continue;
-                }
+        // ── Install pre-built jobs under the lock (map inserts only) ────
+        for pb in prebuilt {
+            if pb.skipped {
+                continue;
             }
-            let mut agent_msg = aksh_gha_parser::job_builder::build_agent_job_message(
-                &job,
-                &github,
-                &job.env,
-                &submission
-                    .secrets
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.expose().to_owned()))
-                    .collect(),
-                &submission.vars,
-            )
-            .map_err(|e| ApiError::bad_request(format!("failed to build job message: {e}")))?;
+            let job = &pb.job;
+            let agent_msg = pb.agent_msg.expect("non-skipped job must have agent_msg");
+            let job_request = pb
+                .job_request
+                .expect("non-skipped job must have job_request");
 
-            if let Some(snapshot) = workspace_snapshot.as_ref() {
-                let redirected =
-                    redirect_primary_checkout(&mut agent_msg, snapshot, &public_base_url());
-                if redirected > 0 {
-                    info!(
-                        %run_id,
-                        job = %job.id,
-                        %redirected,
-                        commit = %snapshot.commit_sha,
-                        "Redirected primary checkout to local workspace snapshot"
-                    );
-                }
-            }
-
-            let id_token_granted = job.oidc_id_token_granted;
             inner
                 .id_token_grants
-                .insert((run_id, job.id.clone()), id_token_granted);
-            inner.oidc_job_contexts.insert(
-                (run_id, job.id.clone()),
-                OidcJobContext {
-                    environment: job.oidc_environment.clone(),
-                    job_workflow_ref: job.oidc_job_workflow_ref.clone(),
-                    job_workflow_sha: job.workflow_sha.clone(),
-                },
-            );
-            inner.next_request_id += 1;
-            let request_id = inner.next_request_id;
-            agent_msg.request_id = request_id;
-            if id_token_granted {
-                let oidc_url = format!(
-                    "{}/runner/server/_apis/distributedtask/hubs/actions/plans/{}/jobs/{}/oidctoken?api-version=2.0",
-                    public_base_url(),
-                    agent_msg.plan.plan_id,
-                    agent_msg.job_id,
-                );
-                for endpoint in &mut agent_msg.resources.endpoints {
-                    if endpoint.name.eq_ignore_ascii_case("SystemVssConnection") {
-                        endpoint
-                            .data
-                            .insert("GenerateIdTokenUrl".to_owned(), oidc_url.clone());
-                    }
-                }
-            }
-            // Mint a dynamic JWT for the job and inject it as GITHUB_TOKEN.
-            let token = shared
-                .state
-                .mint_runtime_token(&agent_msg.plan.plan_id, &agent_msg.job_id);
-            agent_msg.variables.insert(
-                "system.github.token".to_owned(),
-                aksh_gha_protocol::azdo::VariableValue::secret(token.clone()),
-            );
-            agent_msg.variables.insert(
-                "github_token".to_owned(),
-                aksh_gha_protocol::azdo::VariableValue::secret(token.clone()),
-            );
-            agent_msg.variables.insert(
-                "system.github.launch_endpoint".to_owned(),
-                aksh_gha_protocol::azdo::VariableValue::new(public_base_url()),
-            );
-            agent_msg.variables.insert(
-                "system.github.results_endpoint".to_owned(),
-                aksh_gha_protocol::azdo::VariableValue::new(public_base_url()),
-            );
-            agent_msg.variables.insert(
-                "system.orchestrationId".to_owned(),
-                aksh_gha_protocol::azdo::VariableValue::new(format!(
-                    "{}.{}.{}",
-                    agent_msg.plan.plan_id, job.base_id, agent_msg.job_name
-                )),
-            );
+                .insert((run_id, job.id.clone()), pb.id_token_granted);
+            inner
+                .oidc_job_contexts
+                .insert((run_id, job.id.clone()), pb.oidc_ctx);
 
-            agent_msg.file_table = vec![workflow_path.clone()];
-            if let Some(aksh_gha_protocol::azdo::PipelineContextData::Dict(job_dict)) =
-                agent_msg.context_data.get_mut("job")
-            {
-                job_dict.insert(
-                    "check_run_id".to_owned(),
-                    aksh_gha_protocol::azdo::PipelineContextData::Number(0.0),
-                );
-                job_dict.insert(
-                    "workflow_ref".to_owned(),
-                    aksh_gha_protocol::azdo::PipelineContextData::String(workflow_ref.clone()),
-                );
-                job_dict.insert(
-                    "workflow_sha".to_owned(),
-                    aksh_gha_protocol::azdo::PipelineContextData::String(sha.clone()),
-                );
-                job_dict.insert(
-                    "workflow_repository".to_owned(),
-                    aksh_gha_protocol::azdo::PipelineContextData::String(
-                        submission.repository.clone(),
-                    ),
-                );
-                job_dict.insert(
-                    "workflow_file_path".to_owned(),
-                    aksh_gha_protocol::azdo::PipelineContextData::String(workflow_path.clone()),
-                );
-            }
-
-            agent_msg.enable_debugger = submission.enable_debugger;
-            agent_msg.debugger_welcome_message = submission.debugger_welcome_message.clone();
-            if submission.enable_debugger {
-                agent_msg.aksh_debug_run_id = Some(run_id.to_string());
-                agent_msg.aksh_debug_transport = Some("local".to_string());
-            }
             inner
                 .inflight_requests
-                .insert(request_id, (run_id, job.id.clone()));
-            let job_request = TaskAgentJobRequestRecord {
-                request_id,
-                run_id,
-                job_id: job.id.clone(),
-                agent_job_id: agent_msg.job_id,
-                plan_id: agent_msg.plan.plan_id.clone(),
-                plan_type: agent_msg.plan.plan_type.clone(),
-                timeline_id: agent_msg.timeline.id,
-                result: None,
-                locked_until: agent_request_locked_until(),
-                started_at: None,
-                last_renewed_at: None,
-                timeout_triggered: false,
-            };
+                .insert(job_request.request_id, (run_id, job.id.clone()));
             inner
                 .plan_requests
-                .insert(job_request.plan_id.clone(), request_id);
+                .insert(job_request.plan_id.clone(), pb.request_id);
             inner
                 .agent_job_requests
-                .insert(job_request.agent_job_id, request_id);
+                .insert(job_request.agent_job_id, pb.request_id);
             inner
                 .timeline_requests
-                .insert(job_request.timeline_id, request_id);
-            inner.job_requests.insert(request_id, job_request);
+                .insert(job_request.timeline_id, pb.request_id);
+            inner.job_requests.insert(pb.request_id, job_request);
+            if let Some(request) = pb.github_token_request {
+                inner.github_token_requests.insert(pb.request_id, request);
+            }
 
             let queued_job = QueuedJob {
                 run_id,
@@ -597,7 +795,7 @@ pub(crate) async fn submit_run_inner(
                 base_id: job.base_id.clone(),
                 needs: job.needs.clone(),
                 if_condition: job.if_condition.clone(),
-                condition_context,
+                condition_context: pb.condition_context,
                 max_parallel: job.max_parallel,
                 runs_on: job.runs_on.clone(),
                 runner_group: job.runner_group.clone(),
@@ -613,8 +811,6 @@ pub(crate) async fn submit_run_inner(
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect(),
             };
-            job_base_ids.insert(job.id.clone(), job.base_id.clone());
-            job_fail_fast.insert(job.base_id.clone(), job.fail_fast);
             built_jobs.push(queued_job);
         }
 
@@ -648,7 +844,7 @@ pub(crate) async fn submit_run_inner(
                         RunRecord {
                             run_id,
                             run_name,
-                            submission,
+                            submission: Arc::new(submission),
                             jobs: statuses,
                             job_outputs: BTreeMap::new(),
                             job_base_ids,
@@ -708,7 +904,7 @@ pub(crate) async fn submit_run_inner(
                 RunRecord {
                     run_id,
                     run_name,
-                    submission,
+                    submission: Arc::new(submission),
                     jobs: statuses,
                     job_outputs: BTreeMap::new(),
                     job_base_ids,
@@ -760,7 +956,7 @@ pub(crate) async fn submit_run_inner(
             RunRecord {
                 run_id,
                 run_name: run_name.clone(),
-                submission: submission.clone(),
+                submission: Arc::new(submission.clone()),
                 jobs: statuses.clone(),
                 job_outputs: BTreeMap::new(),
                 job_base_ids: job_base_ids.clone(),
@@ -935,7 +1131,7 @@ pub(crate) async fn submit_run_inner(
         // the local status map and is installed below with the final record.
         if let Some(provisional) = inner.runs.get(&run_id) {
             for (job_id, status) in &provisional.jobs {
-                if concurrency::is_terminal(*status) {
+                if status.is_terminal() {
                     statuses.insert(job_id.clone(), *status);
                 }
             }
@@ -959,7 +1155,7 @@ pub(crate) async fn submit_run_inner(
             RunRecord {
                 run_id,
                 run_name,
-                submission,
+                submission: Arc::new(submission),
                 jobs: statuses,
                 job_outputs: BTreeMap::new(),
                 job_base_ids,
@@ -1123,6 +1319,63 @@ pub(crate) async fn get_run(
     }
 
     Ok(Json(run))
+}
+
+/// Browser-safe status page linked from GitHub Check Runs.
+///
+/// This deliberately projects only execution metadata. The native run response
+/// remains bearer-protected because it contains the submitted event payload and
+/// secret names.
+pub(crate) async fn get_public_run(
+    State(shared): State<Arc<SharedState>>,
+    Path(run_id): Path<RunId>,
+) -> Result<axum::response::Html<String>, ApiError> {
+    let inner = shared.state.inner.lock().await;
+    let run = inner
+        .runs
+        .get(&run_id)
+        .ok_or_else(|| ApiError::not_found("run not found"))?;
+
+    let jobs = run
+        .jobs
+        .iter()
+        .map(|(job, status)| {
+            format!(
+                "<li><code>{}</code> <strong>{}</strong></li>",
+                escape_html(&job.0),
+                escape_html(&status_string(*status))
+            )
+        })
+        .collect::<String>();
+    let status = escape_html(&status_string(run.status));
+    let workflow = escape_html(&run.workflow_path_str);
+    let id = escape_html(&run.run_id.to_string());
+    let html = format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+         <meta name=\"robots\" content=\"noindex,nofollow\">\
+         <title>Preloop run {id}</title></head><body>\
+         <main><h1>Preloop run</h1><p><code>{id}</code></p>\
+         <p>Workflow: <code>{workflow}</code></p>\
+         <p>Status: <strong>{status}</strong></p><h2>Jobs</h2><ul>{jobs}</ul>\
+         </main></body></html>"
+    );
+    Ok(axum::response::Html(html))
+}
+
+fn escape_html(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
 }
 
 #[derive(Debug, Deserialize)]
@@ -1300,41 +1553,166 @@ pub(crate) async fn rerun_run(
         inner
             .runs
             .get(&run_id)
-            .map(|run| run.submission.clone())
+            .map(|run| (*run.submission).clone())
             .ok_or_else(|| ApiError::not_found("run not found"))?
     };
     submit_run_inner(&shared, submission).await.map(Json)
 }
 
+/// Upper bound on how long an event stream waits for the next event.
+///
+/// A run that stalls must not pin a connection forever; clients reconnect and
+/// re-receive the snapshot, so closing here costs only a round trip.
+const EVENT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// NDJSON event feed for a run: a snapshot of everything so far, then live
+/// events until the run reaches a terminal status.
+///
+/// Holding the response open is what keeps `preloop run` off a poll timer —
+/// snapshot-and-close forced clients to re-request on an interval, which added
+/// that interval to every run's wall clock.
 pub(crate) async fn run_events(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
 ) -> Result<Response, ApiError> {
-    let inner = shared.state.inner.lock().await;
-    let run = inner
-        .runs
-        .get(&run_id)
-        .ok_or_else(|| ApiError::not_found("run not found"))?;
-    let mut out = event_to_ndjson(&NdjsonEvent::RunStatus {
-        run_id,
-        status: run.status,
-        reason: None,
-    })?;
-    for (job_id, status) in &run.jobs {
-        out.push_str(&event_to_ndjson(&NdjsonEvent::JobStatus {
+    // Subscribe before snapshotting so nothing emitted in between is lost. The
+    // overlap can replay a line the snapshot already carried; clients
+    // de-duplicate, and applying a status twice is idempotent.
+    let receiver = shared.state.events.subscribe();
+
+    let (snapshot, settled) = {
+        let inner = shared.state.inner.lock().await;
+        let run = inner
+            .runs
+            .get(&run_id)
+            .ok_or_else(|| ApiError::not_found("run not found"))?;
+        let mut out = event_to_ndjson(&NdjsonEvent::RunStatus {
             run_id,
-            job_id: job_id.clone(),
-            status: *status,
+            status: run.status,
             reason: None,
-        })?);
-    }
-    if let Some(events) = inner.timeline_events.get(&run_id) {
-        for event in events {
-            out.push_str(&event_to_ndjson(event)?);
+        })?;
+        for (job_id, status) in &run.jobs {
+            out.push_str(&event_to_ndjson(&NdjsonEvent::JobStatus {
+                run_id,
+                job_id: job_id.clone(),
+                status: *status,
+                reason: None,
+            })?);
         }
-    }
+        if let Some(events) = inner.timeline_events.get(&run_id) {
+            for event in events {
+                out.push_str(&event_to_ndjson(event)?);
+            }
+        }
+        (out, run.status.is_terminal())
+    };
+
+    let body = if settled {
+        Body::from(snapshot)
+    } else {
+        let head = stream::once(async move { Ok::<Bytes, std::io::Error>(Bytes::from(snapshot)) });
+        Body::from_stream(head.chain(live_run_events(run_id, receiver)))
+    };
+
     Ok(Response::builder()
         .header("content-type", "application/x-ndjson")
-        .body(Body::from(out))
+        .body(body)
         .expect("static response builder"))
+}
+
+/// Live tail of a run's events, ending once the run status turns terminal.
+fn live_run_events(
+    run_id: RunId,
+    receiver: broadcast::Receiver<NdjsonEvent>,
+) -> impl stream::Stream<Item = Result<Bytes, std::io::Error>> {
+    stream::unfold(
+        (receiver, false),
+        move |(mut receiver, finished)| async move {
+            if finished {
+                return None;
+            }
+            // One deadline for the whole filtering loop, not one per `recv`.
+            // The broadcast channel carries every run's events, so a per-`recv`
+            // timeout is refreshed by traffic belonging to other runs and then
+            // discarded by the run-id check below; on a busy server a stalled
+            // run would hold its connection open forever. Anchoring the
+            // deadline before the loop keeps "idle" meaning "nothing delivered
+            // to *this* client", which is what the bound is for, and it reads
+            // more directly than tracking whether the last event matched.
+            let deadline = tokio::time::Instant::now() + EVENT_STREAM_IDLE_TIMEOUT;
+            loop {
+                let event = match tokio::time::timeout_at(deadline, receiver.recv()).await {
+                    Ok(Ok(event)) => event,
+                    // A lagging consumer has an incomplete stream. End it
+                    // so the client reconnects and receives a fresh,
+                    // authoritative snapshot before tailing again.
+                    Ok(Err(broadcast::error::RecvError::Lagged(_))) => return None,
+                    Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => return None,
+                };
+                if event.run_id() != run_id {
+                    continue;
+                }
+                let Ok(line) = event_to_ndjson(&event) else {
+                    continue;
+                };
+                let finished = event.terminal_run_status().is_some();
+                return Some((Ok(Bytes::from(line)), (receiver, finished)));
+            }
+        },
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::FutureExt;
+
+    /// The broadcast channel fans out every run's events, so a stalled run's
+    /// stream sees — and discards — traffic it must not treat as liveness.
+    /// Before the deadline was hoisted out of the filtering loop, that traffic
+    /// refreshed the idle bound and the connection leaked for as long as the
+    /// server stayed busy.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_run_event_stream_ends_on_its_idle_deadline_despite_other_run_traffic() {
+        let stalled = RunId::new();
+        let noisy = RunId::new();
+        let (sender, receiver) = broadcast::channel(64);
+        let stream = live_run_events(stalled, receiver);
+        tokio::pin!(stream);
+
+        let started = tokio::time::Instant::now();
+        // Emit for the other run more often than the idle bound while the clock
+        // walks past it, which is the busy-server shape that hid the leak.
+        let mut ended = false;
+        for _ in 0..30 {
+            sender
+                .send(NdjsonEvent::RunStatus {
+                    run_id: noisy,
+                    status: ExecutionStatus::InProgress,
+                    reason: None,
+                })
+                .expect("stream holds the receiver alive");
+            // Polled rather than awaited on purpose: awaiting would let the
+            // paused clock auto-advance to the next timer, which would end the
+            // stream even under the per-event timeout this test rules out.
+            match stream.next().now_or_never() {
+                None => {}
+                Some(None) => {
+                    ended = true;
+                    break;
+                }
+                Some(Some(_)) => panic!("another run's event must not be yielded to this stream"),
+            }
+            tokio::time::advance(EVENT_STREAM_IDLE_TIMEOUT / 3).await;
+        }
+
+        assert!(
+            ended,
+            "stalled stream stayed open while other runs kept the channel busy"
+        );
+        assert!(
+            started.elapsed() < EVENT_STREAM_IDLE_TIMEOUT * 2,
+            "stream outlived its idle deadline by more than a full bound"
+        );
+    }
 }

@@ -1,0 +1,16 @@
+description = "Dynamic secret masking via add-mask and multiline environment/output commands"
+duration_seconds_max = 300
+
+[[steps]]
+kind = "submit_workflow"
+path = "102-mask-and-secret-propagation.yml"
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_assigned"
+timeout = 120
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_completed"
+timeout = 240

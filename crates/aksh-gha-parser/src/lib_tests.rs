@@ -306,6 +306,114 @@ jobs:
 }
 
 #[test]
+fn undeclared_permissions_resolve_to_the_restricted_default() {
+    let workflow = parse_workflow(
+        r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo build
+"#,
+    )
+    .unwrap();
+
+    let jobs = expand_jobs(&workflow).unwrap();
+    assert_eq!(
+        jobs[0].permissions, None,
+        "nothing declared must stay distinguishable from an empty declaration"
+    );
+    assert_eq!(
+        *effective_token_permissions(jobs[0].permissions.as_ref()),
+        BTreeMap::from([
+            ("contents".to_owned(), "read".to_owned()),
+            ("metadata".to_owned(), "read".to_owned()),
+            ("packages".to_owned(), "read".to_owned()),
+        ]),
+        "an undeclared block is the restricted default, not everything"
+    );
+    assert!(
+        DEFAULT_TOKEN_PERMISSIONS
+            .iter()
+            .all(|&(_, level)| level == "read"),
+        "the default policy must never hand out a write scope"
+    );
+}
+
+#[test]
+fn empty_permissions_block_is_not_widened_to_the_default() {
+    let workflow = parse_workflow(
+        r#"
+on: push
+permissions: {}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo build
+"#,
+    )
+    .unwrap();
+
+    let jobs = expand_jobs(&workflow).unwrap();
+    assert_eq!(jobs[0].permissions, Some(BTreeMap::new()));
+    assert!(
+        effective_token_permissions(jobs[0].permissions.as_ref()).is_empty(),
+        "`permissions: {{}}` withholds every scope and must not gain the default back"
+    );
+}
+
+#[test]
+fn job_permissions_replace_workflow_permissions_entirely() {
+    let workflow = parse_workflow(
+        r#"
+on: push
+permissions: write-all
+jobs:
+  narrow:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: none
+    steps:
+      - run: echo narrow
+  inherited:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo inherited
+"#,
+    )
+    .unwrap();
+
+    let jobs = expand_jobs(&workflow).unwrap();
+    let by_id = |id: &str| {
+        jobs.iter()
+            .find(|job| job.id.0 == id)
+            .and_then(|job| job.permissions.clone())
+            .unwrap()
+    };
+
+    assert_eq!(
+        by_id("narrow"),
+        BTreeMap::from([
+            ("contents".to_owned(), "read".to_owned()),
+            ("packages".to_owned(), "none".to_owned()),
+        ]),
+        "a job block replaces the workflow block instead of merging into it"
+    );
+
+    let inherited = by_id("inherited");
+    assert_eq!(inherited.len(), PERMISSION_SCOPES.len());
+    assert!(
+        PERMISSION_SCOPES
+            .iter()
+            .all(|scope| inherited.get(*scope).map(String::as_str) == Some("write")),
+        "`write-all` expands to every known scope: {inherited:?}"
+    );
+}
+
+#[test]
 fn reusable_oidc_permission_requires_caller_grant() {
     let caller = parse_workflow(
         r#"
@@ -341,6 +449,43 @@ jobs:
     assert_eq!(
         jobs[0].oidc_job_workflow_ref.as_deref(),
         Some("./.github/workflows/reusable.yml")
+    );
+}
+
+#[test]
+fn reusable_permissions_cannot_exceed_caller_permissions() {
+    let caller = parse_workflow(
+        r#"
+on: push
+permissions:
+  contents: read
+jobs:
+  call:
+    uses: ./.github/workflows/reusable.yml
+"#,
+    )
+    .unwrap();
+    let reusable = BTreeMap::from([(
+        ".github/workflows/reusable.yml".to_owned(),
+        r#"
+on: workflow_call
+permissions:
+  contents: write
+  issues: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo build
+"#
+        .to_owned(),
+    )]);
+
+    let jobs = expand_jobs_with_reusables(&caller, &reusable).unwrap().jobs;
+
+    assert_eq!(
+        jobs[0].permissions,
+        Some(BTreeMap::from([("contents".to_owned(), "read".to_owned())]))
     );
 }
 
@@ -1230,5 +1375,36 @@ jobs:
 "#;
     let parsed = parse_workflow(yaml).unwrap();
     let expanded = expand_jobs(&parsed).unwrap();
+    assert_eq!(expanded.len(), 1);
+}
+
+#[test]
+fn dynamic_matrix_expansion_unresolved_expression() {
+    let yaml = r#"
+name: 101-dynamic-matrix-dataflow
+on: workflow_dispatch
+jobs:
+  setup:
+    runs-on: self-hosted
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - id: set-matrix
+        run: echo 'matrix={"include":[{"os":"ubuntu-latest","node":"18"},{"os":"ubuntu-latest","node":"20"}]}' >> $GITHUB_OUTPUT
+
+  build:
+    needs: setup
+    runs-on: self-hosted
+    strategy:
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+    steps:
+      - run: echo "Node version ${{ matrix.node }}"
+"#;
+    let parsed = parse_workflow(yaml).unwrap();
+    let expanded = expand_jobs(&parsed).unwrap();
+    println!(
+        "Expanded jobs: {:?}",
+        expanded.iter().map(|j| &j.id.0).collect::<Vec<_>>()
+    );
     assert_eq!(expanded.len(), 1);
 }

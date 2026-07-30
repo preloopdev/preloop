@@ -393,6 +393,7 @@ pub async fn run_broker_loop(
                                 }
                                 let job = acquire_job_from_ref(&body, http, &token).await?;
                                 if let Some(job_msg) = job {
+                                    announce_busy();
                                     let running = job_dispatcher::spawn_job(
                                         job_msg,
                                         runner_root,
@@ -744,6 +745,18 @@ fn parse_message_body(
     }
 
     serde_json::from_str(body_str).context("parsing plaintext body")
+}
+
+/// Tell a supervising orchestrator that this single-use runner is now spoken
+/// for, so it can build the replacement while the job runs instead of after.
+///
+/// Written straight to stdout rather than through `tracing` so it survives any
+/// log filter and stays trivially greppable in the process output stream.
+fn announce_busy() {
+    use std::io::Write as _;
+    let mut stdout = std::io::stdout().lock();
+    let _ = writeln!(stdout, "{}", aksh_gha_protocol::RUNNER_BUSY_SENTINEL);
+    let _ = stdout.flush();
 }
 
 /// Acquire a full job from a RunnerJobRequest reference via run-service.

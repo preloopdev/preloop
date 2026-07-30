@@ -327,7 +327,7 @@ pub async fn run_job(
             .as_ref()
             .map(|rpt| rpt.access_token.clone())
             .unwrap_or_default();
-        Some(super::live_logs::LiveLogQueue::connect(feed_url, token).await)
+        Some(super::live_logs::LiveLogQueue::connect(feed_url, token))
     } else {
         None
     };
@@ -401,11 +401,36 @@ pub async fn run_job(
         }
     });
 
-    // Spawn job-timeout timer that trips cancel and sets the timed_out flag
+    // Spawn job-timeout timer that trips cancel and sets the timed_out flag.
+    //
+    // Ticked rather than slept in one shot, so seconds spent paused at a failed
+    // step do not count. Each tick measures real elapsed time instead of
+    // assuming a full second passed, so a starved or oversubscribed executor
+    // cannot stretch the budget. The server suspends its own copy of this
+    // clock; if only one side did, the other would cancel a job
+    // mid-debug-session and the user would see a timeout with no explanation.
+    let debug_paused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let timeout_tx = job_cancel_tx.clone();
     let timeout_flag = timed_out.clone();
+    let timer_paused = debug_paused.clone();
     let timeout_handle = tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(job_timeout_minutes * 60)).await;
+        let budget = std::time::Duration::from_secs(job_timeout_minutes * 60);
+        let deadline = tokio::time::Instant::now() + budget;
+        let mut paused_total = std::time::Duration::ZERO;
+        let tick = std::time::Duration::from_secs(1);
+        let mut last_check = tokio::time::Instant::now();
+        loop {
+            tokio::time::sleep(tick).await;
+            let now = tokio::time::Instant::now();
+            let elapsed_tick = now - last_check;
+            last_check = now;
+            if timer_paused.load(std::sync::atomic::Ordering::SeqCst) {
+                paused_total += elapsed_tick;
+            }
+            if now >= deadline + paused_total {
+                break;
+            }
+        }
         warn!("Job timeout ({job_timeout_minutes} minutes) reached — cancelling");
         timeout_flag.store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = timeout_tx.send(true);
@@ -466,10 +491,49 @@ pub async fn run_job(
         }
     }
 
+    // Whether a live pause-on-failure session was armed for this job. A live
+    // session already held the VM open and reported itself, so the
+    // post-mortem marker below must not fire a second time for the same
+    // failure.
+    let mut debug_was_active = false;
     let job_result = if let Err(e) = debugger_result {
         Err(e)
     } else {
-        super::steps_runner::run_steps(
+        // Live pause-on-failure. Reuses the existing per-run opt-in rather
+        // than adding a second flag meaning nearly the same thing: both say
+        // "do not throw this failure away". When a session opens, the worker
+        // blocks in the step loop and the post-mortem marker path below never
+        // fires,  the live session supersedes it.
+        // Every way this can come up empty is reported. Silently falling back
+        // to "no debugging" is the one outcome a user cannot diagnose: they
+        // asked for a pause, the job died, and nothing said why.
+        let debug_client = if job_message
+            .get("preloopPreserveOnFailure")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            match build_debug_pause_client(
+                &job_message,
+                job_id,
+                job_name,
+                &workspace,
+                debug_paused.clone(),
+            )
+            .await
+            {
+                Ok(client) => {
+                    info!("Pause-on-failure enabled — a failed step will hold this VM open");
+                    Some(client)
+                }
+                Err(error) => {
+                    warn!(%error, "pause-on-failure requested but unavailable — a failed step will fail normally");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let result = super::steps_runner::run_steps(
             &ordered_steps,
             &mut job_ctx,
             &workspace,
@@ -478,9 +542,17 @@ pub async fn run_job(
             reporting.as_deref(),
             job_container_spec.as_ref(),
             &service_specs,
+            debug_client.as_ref(),
+            job_message
+                .get("akshSnapshotCommit")
+                .and_then(|v| v.as_str()),
         )
         .await
-        .map_err(|e| anyhow::anyhow!("{e}"))
+        .map_err(|e| anyhow::anyhow!("{e}"));
+        debug_was_active = debug_client
+            .as_ref()
+            .is_some_and(|client| client.resolved_session());
+        result
     };
 
     // Once execution has finished, completion wins over a concurrent renewal failure.
@@ -624,6 +696,27 @@ pub async fn run_job(
         return Err(e);
     }
 
+    // Preloop: signal the orchestrator to hold this VM open for debugging.
+    // Gated on the per-run opt-in carried in the job message, so preservation
+    // is a property of the run rather than of the engine that happens to be up.
+    // Cancellation is not a failure — preserving it would pin a pool slot on
+    // every Ctrl-C.
+    let preserve_requested = job_message
+        .get("preloopPreserveOnFailure")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if preserve_requested && conclusion.eq_ignore_ascii_case("failed") && !debug_was_active {
+        if let Some(path) = std::env::var_os("PRELOOP_FAILURE_MARKER") {
+            let path = std::path::PathBuf::from(path);
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(error) = std::fs::write(&path, &conclusion) {
+                warn!(path = %path.display(), %error, "failed to write Preloop failure marker");
+            }
+        }
+    }
+
     info!("Job {job_name} finished with result: {conclusion}");
     Ok(())
 }
@@ -697,10 +790,14 @@ fn spawn_renew_loop(
                 // Probe in parallel, non-blocking. The resulting status text
                 // is also sent in completejob telemetry by the official
                 // runner (the probes themselves are not step output).
-                let inner = http.inner_client();
                 let (broker_result, run_result, ws_result, token_result) = tokio::join!(
-                    async { inner.get(&broker_health).send().await },
-                    async { inner.get(&run_health).send().await },
+                    async {
+                        http.client_for(&broker_health)
+                            .get(&broker_health)
+                            .send()
+                            .await
+                    },
+                    async { http.client_for(&run_health).get(&run_health).send().await },
                     async {
                         // WebSocket upgrade probe — matching official runner headers exactly.
                         // Official sends: Authorization, Connection: Upgrade, Upgrade: websocket,
@@ -709,7 +806,7 @@ fn spawn_renew_loop(
                         let mut nonce = [0u8; 16];
                         rand::Rng::fill(&mut rand::thread_rng(), &mut nonce);
                         let ws_key = base64::engine::general_purpose::STANDARD.encode(nonce);
-                        inner
+                        http.client_for(&results_ws)
                             .get(&results_ws)
                             .header("Authorization", format!("Bearer {}", rpt.access_token))
                             .header("Connection", "Upgrade")
@@ -719,7 +816,7 @@ fn spawn_renew_loop(
                             .send()
                             .await
                     },
-                    async { inner.get(&token_ready).send().await },
+                    async { http.client_for(&token_ready).get(&token_ready).send().await },
                 );
                 let status_text = |result: &Result<reqwest::Response, reqwest::Error>| match result
                 {
@@ -759,6 +856,56 @@ fn spawn_renew_loop(
             }
         }
     })
+}
+
+/// Build the pause-on-failure client, naming whichever prerequisite is absent.
+///
+/// Each of these is a distinct operational fault — a server that did not send
+/// the run id, a job message without a control endpoint, an unusable
+/// transport — and collapsing them into `None` made "pause-on-failure did
+/// nothing" impossible to diagnose from the job log.
+async fn build_debug_pause_client(
+    job_message: &serde_json::Value,
+    job_id: &str,
+    job_name: &str,
+    workspace: &str,
+    paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<super::debug_pause::DebugPauseClient> {
+    let run_id = job_message
+        .get("akshDebugRunId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("job message carries no akshDebugRunId"))?
+        .parse::<aksh_gha_protocol::RunId>()
+        .map_err(|error| anyhow::anyhow!("akshDebugRunId is not a run id: {error}"))?;
+    let agent_job_id = job_id
+        .parse::<uuid::Uuid>()
+        .map_err(|error| anyhow::anyhow!("job id `{job_id}` is not an agent job GUID: {error}"))?;
+    let (service_url, runtime_token) = extract_service_endpoint(job_message)
+        .ok_or_else(|| anyhow::anyhow!("job message has no SystemVssConnection endpoint"))?;
+    // The debug-worker token is fetched, not read from the job message: the
+    // official runner republishes every secret variable as `secrets.*`, so
+    // anything delivered that way is readable by the workflow being debugged.
+    // The runtime token authenticates the exchange and nothing else — it is
+    // scoped to job reporting and revoked at job completion, exactly when a
+    // pause still needs to talk to the server, so the credential it buys is
+    // minted for that longer window.
+    Ok(super::debug_pause::DebugPauseClient::acquire(
+        &service_url,
+        &runtime_token,
+        run_id,
+        aksh_gha_protocol::JobId(job_id.to_owned()),
+        agent_job_id,
+        job_name.to_owned(),
+    )
+    .await?
+    .with_pause_flag(paused)
+    .with_workspace(
+        Some(workspace.to_owned()),
+        job_message
+            .get("akshSnapshotCommit")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+    ))
 }
 
 fn renew_backoff(attempt: u32) -> Duration {

@@ -84,7 +84,7 @@ impl ActionsResolveClient {
         // ordinary protocol failures and must not be treated as partial data.
         let response = match self
             .http
-            .inner_client()
+            .client_for(&url)
             .post(&url)
             .bearer_auth(token)
             .header("Accept", "application/json")
@@ -174,7 +174,7 @@ impl ActionsResolveClient {
         if let Some(t) = token {
             let resp = self
                 .http
-                .inner_client()
+                .client_for(url)
                 .get(url)
                 .header("Authorization", format!("Bearer {t}"))
                 .header("User-Agent", "aksh-runner")
@@ -223,7 +223,7 @@ impl ActionsDownloadClient {
         if let Some(t) = token {
             let resp = self
                 .http
-                .inner_client()
+                .client_for(url)
                 .get(url)
                 .header("Authorization", format!("Bearer {t}"))
                 .send()
