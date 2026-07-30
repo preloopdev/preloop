@@ -27,7 +27,10 @@
 //! key into the golden image would give every fork the same one.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use aksh_gha_protocol::crypto::AgentRsaKeypair;
 use tokio::sync::Mutex;
@@ -41,6 +44,7 @@ const BUFFER: usize = 2;
 #[derive(Debug, Default)]
 pub(crate) struct KeyPool {
     ready: Mutex<Vec<String>>,
+    refilling: AtomicBool,
 }
 
 impl KeyPool {
@@ -63,21 +67,47 @@ impl KeyPool {
 
     /// Bring the buffer back up to size without blocking the caller.
     pub(crate) fn spawn_refill(self: &Arc<Self>) {
+        if !self.claim_refill() {
+            return;
+        }
         let pool = Arc::clone(self);
         tokio::spawn(async move {
             loop {
                 if pool.ready.lock().await.len() >= BUFFER {
+                    pool.release_refill().await;
                     return;
                 }
                 let Ok(Ok(key)) = tokio::task::spawn_blocking(generate).await else {
                     warn!(
                         "pre-generating a runner keypair failed; runners will generate their own"
                     );
+                    pool.refilling.store(false, Ordering::Release);
                     return;
                 };
-                pool.ready.lock().await.push(key);
+                let mut ready = pool.ready.lock().await;
+                if ready.len() < BUFFER {
+                    ready.push(key);
+                }
             }
         });
+    }
+
+    fn claim_refill(&self) -> bool {
+        self.refilling
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Relinquish the producer role without losing a concurrent `take`.
+    ///
+    /// A consumer may observe `refilling = true` just before this task finds a
+    /// full buffer. Release first, then recheck capacity: either this task or
+    /// that consumer will claim and start the replacement refill.
+    async fn release_refill(self: &Arc<Self>) {
+        self.refilling.store(false, Ordering::Release);
+        if self.ready.lock().await.len() < BUFFER {
+            self.spawn_refill();
+        }
     }
 }
 
@@ -157,14 +187,18 @@ mod tests {
     #[tokio::test]
     async fn pool_hands_out_importable_keypairs() {
         let pool = Arc::new(KeyPool::new());
-        pool.spawn_refill();
-        // Wait on the buffer rather than calling `take`, which would spawn a
-        // fresh refill on every poll and drown the blocking pool in 2048-bit
-        // keygens — roughly 1.5s each in a debug build.
+        for _ in 0..64 {
+            pool.spawn_refill();
+        }
+        // Concurrent refill requests still elect exactly one producer. Wait
+        // for it to finish so an overfill cannot hide behind an early pop.
         let key = tokio::time::timeout(std::time::Duration::from_secs(60), async {
             loop {
-                if let Some(key) = pool.ready.lock().await.pop() {
-                    return key;
+                if !pool.refilling.load(Ordering::Acquire) {
+                    let mut ready = pool.ready.lock().await;
+                    if ready.len() == BUFFER {
+                        return ready.pop().unwrap();
+                    }
                 }
                 tokio::task::yield_now().await;
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
