@@ -54,16 +54,38 @@ pub struct LiveLogQueue {
 }
 
 impl LiveLogQueue {
-    /// Connect to the live console feed and return a queue even if the initial
-    /// WebSocket connection fails. Failed live streaming must not fail the job.
-    pub async fn connect(feed_url: String, access_token: String) -> Arc<Self> {
-        let ws = WebSocketSender::connect(feed_url, access_token).await;
+    /// Return a live-log queue immediately and connect to the console feed in
+    /// the background.
+    ///
+    /// Live console streaming is best-effort: the durable step-log blobs are
+    /// the source of truth. Dialing the feed inline put up to
+    /// `RETRIES * (CONNECT_TIMEOUT + backoff)` in front of the job's first
+    /// step, so an unreachable feed endpoint delayed every job by ~1s. Lines
+    /// produced before the socket is up stay queued and go out on the first
+    /// drain after it connects.
+    pub fn connect(feed_url: String, access_token: String) -> Arc<Self> {
         let (shutdown_tx, _) = watch::channel(false);
-        Arc::new(Self {
+        let queue = Arc::new(Self {
             lines: Mutex::new(VecDeque::new()),
-            ws: tokio::sync::Mutex::new(ws),
+            ws: tokio::sync::Mutex::new(None),
             shutdown_tx,
-        })
+        });
+        let connecting = Arc::clone(&queue);
+        tokio::spawn(async move {
+            let mut shutdown_rx = connecting.shutdown_tx.subscribe();
+            let sender = tokio::select! {
+                sender = WebSocketSender::connect(feed_url, access_token) => sender,
+                _ = shutdown_rx.changed() => return,
+            };
+            let Some(sender) = sender else { return };
+            // The drain task tears the socket down on shutdown; installing a
+            // freshly dialed one afterwards would leak a live connection.
+            if *connecting.shutdown_tx.borrow() {
+                return;
+            }
+            *connecting.ws.lock().await = Some(sender);
+        });
+        queue
     }
 
     /// Build a queue with no WebSocket, used by tests and degraded live-log mode.
@@ -139,6 +161,12 @@ impl LiveLogQueue {
     }
 
     async fn drain_once(&self, limit: usize) {
+        // Lines produced while the WebSocket handshake is in flight must stay
+        // queued. Dequeuing before a sender exists loses the beginning of
+        // every fast step even when the connection eventually succeeds.
+        if self.ws.lock().await.is_none() {
+            return;
+        }
         let batch = self.dequeue(limit);
         self.send_grouped(batch).await;
     }
@@ -280,7 +308,11 @@ async fn connect_websocket(
             Ok(Err(error)) => debug!(%error, attempt, "live log websocket connect failed"),
             Err(_) => debug!(attempt, "live log websocket connect timed out"),
         }
-        random_backoff().await;
+        // Only back off when another attempt follows; sleeping after the last
+        // failure just delays the caller's fall back to blob-only logging.
+        if attempt + 1 < RETRIES {
+            random_backoff().await;
+        }
     }
     None
 }
@@ -460,6 +492,18 @@ mod tests {
         assert_eq!(tail.len(), 200);
         assert_eq!(tail[0].line_number, 51);
         assert_eq!(tail.last().unwrap().line_number, 250);
+    }
+
+    #[tokio::test]
+    async fn drain_keeps_lines_queued_until_socket_connects() {
+        let queue = LiveLogQueue::disconnected();
+        queue.enqueue("step", "first", 1);
+
+        queue.drain_once(DRAIN_LIMIT).await;
+
+        let lines = queue.dequeue(DRAIN_LIMIT);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].line, "first");
     }
 
     #[test]

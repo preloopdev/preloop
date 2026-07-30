@@ -15,6 +15,14 @@ use crate::JobPlan;
 use aksh_gha_expressions::Context;
 use serde_json::{json, Value};
 
+fn runner_condition(condition: &str) -> String {
+    let trimmed = condition.trim();
+    trimmed
+        .strip_prefix("${{")
+        .and_then(|value| value.strip_suffix("}}"))
+        .map_or_else(|| condition.to_owned(), |value| value.trim().to_owned())
+}
+
 fn job_outputs_token(outputs: &BTreeMap<String, String>) -> Option<Value> {
     if outputs.is_empty() {
         return None;
@@ -56,7 +64,137 @@ fn job_outputs_token(outputs: &BTreeMap<String, String>) -> Option<Value> {
         "map": map,
     }))
 }
-fn normalized_github_context(github: &Value) -> Value {
+
+fn template_string_token(raw: &str) -> Value {
+    let location = || json!({"file": 1, "line": 1, "col": 1});
+    let trimmed = raw.trim();
+    if let Some(expression_source) = trimmed.strip_prefix("${{") {
+        if let Some(end) = crate::eval::find_expression_end(expression_source) {
+            if end + 2 == expression_source.len() {
+                return json!({
+                    "type": 3,
+                    "file": 1,
+                    "line": 1,
+                    "col": 1,
+                    "expr": expression_source[..end].trim(),
+                });
+            }
+        }
+    }
+    if !raw.contains("${{") {
+        let mut token = location();
+        token["type"] = json!(0);
+        token["lit"] = json!(raw);
+        return token;
+    }
+
+    let mut format_string = String::new();
+    let mut expressions = Vec::new();
+    let mut remaining = raw;
+    while let Some(start) = remaining.find("${{") {
+        append_format_literal(&mut format_string, &remaining[..start]);
+        let expression_source = &remaining[start + 3..];
+        let Some(end) = crate::eval::find_expression_end(expression_source) else {
+            let mut token = location();
+            token["type"] = json!(0);
+            token["lit"] = json!(raw);
+            return token;
+        };
+        format_string.push('{');
+        format_string.push_str(&expressions.len().to_string());
+        format_string.push('}');
+        expressions.push(expression_source[..end].trim().to_owned());
+        remaining = &expression_source[end + 2..];
+    }
+    append_format_literal(&mut format_string, remaining);
+
+    let mut expression = format!("format('{format_string}'");
+    for argument in expressions {
+        expression.push_str(", ");
+        expression.push_str(&argument);
+    }
+    expression.push(')');
+    json!({
+        "type": 3,
+        "file": 1,
+        "line": 1,
+        "col": 1,
+        "expr": expression,
+    })
+}
+
+fn append_format_literal(target: &mut String, literal: &str) {
+    for character in literal.chars() {
+        match character {
+            '\'' => target.push_str("''"),
+            '{' => target.push_str("{{"),
+            '}' => target.push_str("}}"),
+            _ => target.push(character),
+        }
+    }
+}
+
+fn template_token(value: &Value) -> Value {
+    let location = || json!({"file": 1, "line": 1, "col": 1});
+    match value {
+        Value::Object(object) => {
+            let map = object
+                .iter()
+                .map(|(key, value)| {
+                    json!({
+                        "Key": {
+                            "type": 0,
+                            "file": 1,
+                            "line": 1,
+                            "col": 1,
+                            "lit": key,
+                        },
+                        "Value": template_token(value),
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "type": 2,
+                "file": 1,
+                "line": 1,
+                "col": 1,
+                "map": map,
+            })
+        }
+        Value::Array(values) => {
+            let seq = values.iter().map(template_token).collect::<Vec<_>>();
+            json!({
+                "type": 1,
+                "file": 1,
+                "line": 1,
+                "col": 1,
+                "seq": seq,
+            })
+        }
+        Value::String(raw) => template_string_token(raw),
+        Value::Bool(value) => {
+            let mut token = location();
+            token["type"] = json!(0);
+            token["lit"] = json!(value.to_string());
+            token
+        }
+        Value::Number(value) => {
+            let mut token = location();
+            token["type"] = json!(0);
+            token["lit"] = json!(value.to_string());
+            token
+        }
+        Value::Null => {
+            let mut token = location();
+            token["type"] = json!(0);
+            token["lit"] = json!("");
+            token
+        }
+    }
+}
+
+/// Normalize the server-supplied GitHub context for runner job messages.
+pub fn normalize_github_context(github: &Value) -> Value {
     let mut object = match github {
         Value::Object(value) => value.clone(),
         _ => serde_json::Map::new(),
@@ -147,9 +285,29 @@ pub fn build_agent_job_message(
     secrets: &BTreeMap<String, String>,
     vars: &BTreeMap<String, String>,
 ) -> Result<AgentJobRequestMessage, String> {
+    let github_context = normalize_github_context(github);
+    build_agent_job_message_with_normalized_context(
+        plan,
+        &github_context,
+        global_env,
+        secrets,
+        vars,
+    )
+}
+
+/// Build a job message using a context already normalized for runner wire data.
+///
+/// Callers constructing multiple messages for one submission can normalize the
+/// immutable GitHub context once and reuse it across matrix jobs.
+pub fn build_agent_job_message_with_normalized_context(
+    plan: &JobPlan,
+    github_context: &Value,
+    global_env: &BTreeMap<String, String>,
+    secrets: &BTreeMap<String, String>,
+    vars: &BTreeMap<String, String>,
+) -> Result<AgentJobRequestMessage, String> {
     let timeline_id = uuid::Uuid::new_v4();
     let job_id = uuid::Uuid::new_v4();
-    let github_context = normalized_github_context(github);
 
     // Build expression evaluation context
     let strategy = plan
@@ -165,7 +323,7 @@ pub fn build_agent_job_message(
     );
 
     let expr_context = build_context(
-        &github_context,
+        github_context,
         &plan.env,
         vars,
         &plan.matrix,
@@ -185,7 +343,7 @@ pub fn build_agent_job_message(
     }
 
     let job_expr_context = build_context(
-        &github_context,
+        github_context,
         &plan.env,
         vars,
         &plan.matrix,
@@ -311,7 +469,7 @@ pub fn build_agent_job_message(
     let mut context_data = BTreeMap::new();
     context_data.insert(
         "github".to_owned(),
-        PipelineContextData::from_json(&github_context),
+        PipelineContextData::from_json(github_context),
     );
     let inputs_ctx = plan
         .inputs
@@ -408,7 +566,7 @@ pub fn build_agent_job_message(
         defaults: Vec::new(),
         environment_variables: Vec::new(),
         snapshot: None,
-        condition: plan.if_condition.clone(),
+        condition: plan.if_condition.as_deref().map(runner_condition),
         variables,
         mask_hints,
         resources,
@@ -417,22 +575,25 @@ pub fn build_agent_job_message(
         retry_count: None,
         pre_job_timeout: None,
         job_timeout: None,
-        job_container: plan.container.clone(),
-        job_service_containers: non_empty_services(plan.services.clone()),
+        job_container: plan.container.as_ref().map(template_token),
+        job_service_containers: non_empty_services(plan.services.as_ref()),
         job_outputs: job_outputs_token(&plan.job_outputs),
         enable_debugger: false,
         debugger_tunnel: None,
         debugger_welcome_message: None,
         aksh_debug_run_id: None,
         aksh_debug_transport: None,
+        preloop_preserve_on_failure: None,
+        aksh_snapshot_commit: None,
     })
 }
 
 /// Omit empty `services: {}` to match `EmitDefaultValue=false` behavior.
-fn non_empty_services(services: Option<serde_json::Value>) -> Option<serde_json::Value> {
-    match &services {
+fn non_empty_services(services: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    match services {
         Some(serde_json::Value::Object(m)) if m.is_empty() => None,
-        _ => services,
+        Some(value) => Some(template_token(value)),
+        None => None,
     }
 }
 
@@ -552,10 +713,6 @@ fn populate_runner_variables(variables: &mut BTreeMap<String, VariableValue>, pl
         ("system.github.launch_endpoint", ""),
         ("system.github.results_endpoint", ""),
         ("system.github.results_upload_with_sdk", "true"),
-        (
-            "system.github.token.permissions",
-            r#"{"Contents":"read","Metadata":"read","Packages":"read"}"#,
-        ),
         ("system.orchestrationId", ""),
         ("system.phaseDisplayName", plan.name.as_str()),
         ("system.runnerEnvironment", "self-hosted"),
@@ -569,9 +726,45 @@ fn populate_runner_variables(variables: &mut BTreeMap<String, VariableValue>, pl
     variables
         .entry("github_token".to_owned())
         .or_insert_with(|| VariableValue::secret(String::new()));
+    // The permissions the job's GITHUB_TOKEN actually carries, in the wire
+    // format's PascalCase spelling (e.g. "Contents", "PullRequests"). Derived
+    // from the same policy the installation token is minted against, so the
+    // runner's `GITHUB_TOKEN Permissions` group never overstates the token.
+    let permissions = crate::effective_token_permissions(plan.permissions.as_ref());
+    let perms_json = token_permissions_wire_json(&permissions);
+    variables
+        .entry("system.github.token.permissions".to_owned())
+        .or_insert_with(|| VariableValue::new(perms_json));
     variables
         .entry("system.github.token".to_owned())
         .or_insert_with(|| VariableValue::secret(String::new()));
+}
+
+/// Render a permission map in the wire format's PascalCase spelling.
+///
+/// Exported so the dispatch path can restate the permissions a token *actually*
+/// carries after the App installation narrowed them, using the same spelling
+/// the runner's `GITHUB_TOKEN Permissions` group prints. Two renderers would
+/// drift, and the group would then disagree with itself between runs.
+pub fn token_permissions_wire_json(permissions: &BTreeMap<String, String>) -> String {
+    let pascal: serde_json::Map<String, serde_json::Value> = permissions
+        .iter()
+        .map(|(scope, level)| (pascal_case(scope), serde_json::Value::String(level.clone())))
+        .collect();
+    serde_json::Value::Object(pascal).to_string()
+}
+
+/// `pull-requests` → `PullRequests`, the wire spelling of a permission scope.
+fn pascal_case(scope: &str) -> String {
+    let mut pascal = String::with_capacity(scope.len());
+    for part in scope.split('-') {
+        let mut chars = part.chars();
+        if let Some(first) = chars.next() {
+            pascal.extend(first.to_uppercase());
+            pascal.push_str(chars.as_str());
+        }
+    }
+    pascal
 }
 
 /// Build a `TaskStep` from a `StepPlan`.
@@ -606,7 +799,8 @@ fn build_task_step(step: &crate::StepPlan, context: &Context) -> TaskStep {
     // the same as GitHub's default `success()`.
     let condition = Some(
         step.if_condition
-            .clone()
+            .as_deref()
+            .map(runner_condition)
             .unwrap_or_else(|| "success()".to_owned()),
     );
 
@@ -632,7 +826,15 @@ fn build_task_step(step: &crate::StepPlan, context: &Context) -> TaskStep {
         script: run,
         reference: step.uses.as_ref().map(|uses| {
             let is_local = uses.starts_with("./") || uses.starts_with(".\\");
-            if is_local {
+            if let Some(image) = uses.strip_prefix("docker://") {
+                aksh_gha_protocol::azdo::TaskReference {
+                    id: None,
+                    name: Some(image.to_owned()),
+                    path: None,
+                    version: None,
+                    reference_type: Some("containerRegistry".to_owned()),
+                }
+            } else if is_local {
                 aksh_gha_protocol::azdo::TaskReference {
                     id: None,
                     name: None,
@@ -723,6 +925,73 @@ jobs:
     }
 
     #[test]
+    fn docker_action_uses_official_container_registry_reference() {
+        let workflow = parse_workflow(
+            r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker://alpine:3.20
+        with:
+          args: echo hello
+"#,
+        )
+        .unwrap();
+        let plan = &crate::expand_jobs(&workflow).unwrap()[0];
+        let message = build_agent_job_message(
+            plan,
+            &serde_json::json!({"event_name": "push"}),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        let step = serde_json::to_value(&message.steps[0]).unwrap();
+        assert_eq!(
+            step["reference"],
+            serde_json::json!({"type": "containerRegistry", "image": "alpine:3.20"})
+        );
+    }
+
+    #[test]
+    fn wrapped_conditions_are_unwrapped_for_the_official_runner() {
+        let workflow = parse_workflow(
+            r#"
+on: push
+jobs:
+  build:
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    steps:
+      - if: ${{ secrets['system.preloop.debug_worker_token'] != '' }}
+        run: exit 23
+"#,
+        )
+        .unwrap();
+        let plan = &crate::expand_jobs(&workflow).unwrap()[0];
+        let message = build_agent_job_message(
+            plan,
+            &serde_json::json!({"event_name": "push"}),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            message.condition.as_deref(),
+            Some("github.event_name == 'push'")
+        );
+        assert_eq!(
+            message.steps[0].condition.as_deref(),
+            Some("secrets['system.preloop.debug_worker_token'] != ''")
+        );
+    }
+
+    #[test]
     fn build_message_with_matrix() {
         let yaml = r#"
 on: push
@@ -751,6 +1020,76 @@ jobs:
 
         // Matrix should be in context data
         assert!(msg.context_data.contains_key("matrix"));
+    }
+
+    #[test]
+    fn container_specs_use_official_template_tokens() {
+        let literal = template_token(&serde_json::json!("node:20"));
+        assert_eq!(literal["type"], 0);
+        assert_eq!(literal["lit"], "node:20");
+
+        let workflow = parse_workflow(
+            r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: alpine:3.20
+      env:
+        MODE: test
+    services:
+      redis:
+        image: redis:7-alpine
+    steps:
+      - run: echo hello
+"#,
+        )
+        .unwrap();
+        let plan = &crate::expand_jobs(&workflow).unwrap()[0];
+        let message = build_agent_job_message(
+            plan,
+            &serde_json::json!({"event_name": "push"}),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        let container = message.job_container.as_ref().unwrap();
+        assert_eq!(container["type"], 2);
+        assert!(container["map"]
+            .as_array()
+            .is_some_and(|map| !map.is_empty()));
+        let services = message.job_service_containers.as_ref().unwrap();
+        assert_eq!(services["type"], 2);
+        assert!(services["map"]
+            .as_array()
+            .is_some_and(|map| !map.is_empty()));
+    }
+
+    #[test]
+    fn mixed_container_strings_use_format_expression_tokens() {
+        let token = template_token(&serde_json::json!(
+            "ghcr.io/acme/${{ matrix.image }}:${{ matrix.tag }}"
+        ));
+        assert_eq!(token["type"], 3);
+        assert_eq!(
+            token["expr"],
+            "format('ghcr.io/acme/{0}:{1}', matrix.image, matrix.tag)"
+        );
+    }
+
+    #[test]
+    fn expression_prefixed_container_strings_use_format_tokens() {
+        let token = template_token(&serde_json::json!(
+            "${{ matrix.registry }}/acme:${{ matrix.tag }}"
+        ));
+        assert_eq!(token["type"], 3);
+        assert_eq!(
+            token["expr"],
+            "format('{0}/acme:{1}', matrix.registry, matrix.tag)"
+        );
     }
 
     #[test]

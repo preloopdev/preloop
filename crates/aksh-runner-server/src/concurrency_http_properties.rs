@@ -790,7 +790,7 @@ pub(crate) mod http_sequences {
 
                 // INV-3: Terminal runs have no entries in dispatch/concurrency queues.
                 for (run_id, run) in &inner.runs {
-                    if is_terminal_status(run.status) {
+                    if run.status.is_terminal() {
                         let in_queue = inner.queue.iter().any(|j| &j.run_id == run_id);
                         let in_pending = inner.pending_jobs.iter().any(|j| &j.run_id == run_id);
                         let in_blocked = inner

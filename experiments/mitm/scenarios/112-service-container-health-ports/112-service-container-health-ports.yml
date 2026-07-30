@@ -1,0 +1,15 @@
+name: 112-service-container-health-ports
+on: workflow_dispatch
+jobs:
+  service-job:
+    runs-on: self-hosted
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: secretpassword
+        ports:
+          - 5432:5432
+        options: --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 5
+    steps:
+      - run: PGPASSWORD=secretpassword psql -h 127.0.0.1 -U postgres -c "SELECT 1;"

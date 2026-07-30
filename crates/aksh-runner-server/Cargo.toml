@@ -31,6 +31,7 @@ hmac.workspace = true
 sha2.workspace = true
 sha1.workspace = true
 rand.workspace = true
+rsa.workspace = true
 reqwest.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
@@ -49,8 +50,17 @@ chrono.workspace = true
 chrono-tz.workspace = true
 
 serde_yaml.workspace = true
+
+[[bin]]
+name = "preloop-server"
+path = "src/main.rs"
+
 [dev-dependencies]
 tempfile.workspace = true
 tower.workspace = true
 proptest.workspace = true
 aksh-runner = { path = "../aksh-runner" }
+filetime = "0.2.29"
+# Timer-driven behaviour (stream idle bounds) has to be exercised on a paused
+# clock; real sleeps would make those tests slow and flaky under load.
+tokio = { workspace = true, features = ["test-util"] }

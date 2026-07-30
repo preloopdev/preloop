@@ -155,7 +155,51 @@ Push a commit or open a pull request. `aksh` will:
    # Or: export AKSH_GITHUB_APP_PRIVATE_KEY_PATH=/secure/path/aksh-app.pem
    ```
 
-   When these values are set, aksh signs a GitHub App JWT, exchanges it for a per-job installation access token, and applies each workflow/job `permissions:` declaration to the token supplied to the official runner. If no App configuration is present, `AKSH_GITHUB_TOKEN` remains the job-token fallback.
+   When these values are set, aksh signs a GitHub App JWT and exchanges it for a per-job installation access token scoped to the run's repository and to that job's effective `permissions:`. A job declaring no `permissions:` gets GitHub's restricted default (`contents`, `metadata`, `packages` at `read`), never the installation's full grant. If no App configuration is present at all, `AKSH_GITHUB_TOKEN` is the job token. If an App *is* configured but minting fails, `AKSH_GITHUB_APP_MINT_FAILURE` decides — `local` (the default) keeps the job on the local HMAC JWT rather than silently widening its authority to the PAT. See [GitHub Tokens](./github-tokens.md).
 
 6. **Confirm delivery and job credential use**:
    Push a commit or open a pull request. aksh verifies the webhook and queues matching jobs. The installed App's scoped token is supplied to the runner job. Remote workflow retrieval and GitHub Check Run reporting currently continue to use `AKSH_GITHUB_TOKEN`; configure `AKSH_LOCAL_WORKSPACE` for offline workflow loading, or provide that token for those server-side GitHub API calls.
+
+---
+
+## 8. Operational Deployment & Troubleshooting Guide
+
+This section documents operational best practices, lessons learned, and real-world failure modes encountered during live deployments.
+
+### 8.1 `--public-url` Dual Purpose
+
+The `--public-url` parameter supplied to `preloop serve` serves two distinct purposes:
+1. **In-VM Control Plane Endpoint**: Tells the ephemeral runner microVM inside SmolVM where to connect back to the control plane.
+2. **GitHub Check Run Links**: Forms the base URL for the `details_url` field sent to GitHub when registering check runs on PRs and commits (e.g. `https://aksh.preloop.dev/runs/<run_id>`).
+
+**Pitfall**: Setting `--public-url` to a local LAN IP (e.g. `http://192.168.1.221:9090`) during local testing will cause GitHub check runs to be registered with non-routable local IP links on GitHub PRs. Always keep `--public-url https://aksh.preloop.dev` in production deployments.
+
+### 8.2 Cloudflare Tunnel Configuration & Error 1033
+
+When routing public webhooks and check status requests through Cloudflare Tunnels (`aksh.preloop.dev`):
+- **Error 1033 (`Argo Tunnel error`)**: Occurs when Cloudflare's edge cannot communicate with the local `cloudflared` process, or when port `9090` is down or un-routable.
+- **Correct Tunnel Target**: The production named tunnel `aksh-prod` (`16cc97ea-e9d5-4723-875a-6de90f880b07`) must be run with explicit local target port 9090:
+  ```sh
+  cloudflared tunnel --url http://127.0.0.1:9090 run 16cc97ea-e9d5-4723-875a-6de90f880b07
+  ```
+- **Port Mismatches**: Running an unconfigured token or pointing `cloudflared` to a different port (e.g., `8787` or `8080`) breaks webhook delivery and causes in-VM runner artifact uploads to time out with HTTP 530.
+
+### 8.3 GitHub App Scope Clamping & HTTP 422 Handling
+
+GitHub App token minting is strictly all-or-nothing:
+- Requesting any scope ungranted by the GitHub App installation causes GitHub's API to return `HTTP 422 Unprocessable Entity`.
+- **Automatic Clamping**: For unrequested default scopes (e.g. `packages: read`), `aksh` automatically clamps token requests to the installation's granted intersection (`contents: read`, `metadata: read`).
+- **Explicit Permissions**: Workflows declaring explicit `permissions:` blocks that exceed installation grants will intentionally fail loudly so missing permissions are never silently ignored.
+
+### 8.4 Cross-Compiled Runner Bundle & `cargo clean`
+
+The microVM orchestrator requires the cross-compiled Linux ARM64 runner binary at `target/aarch64-unknown-linux-gnu/debug/preloop-runner`:
+- Running `cargo clean` removes this binary, causing `preloop serve` to log:
+  ```text
+  WARN preloop: local runner pool unavailable... error=Linux runner bundle unavailable
+  ```
+- **Recovery**: Rebuild the runner bundle with `cargo zigbuild` before starting the server:
+  ```sh
+  cargo zigbuild -p aksh-runner --target aarch64-unknown-linux-gnu
+  ```
+- **Disk Space Management**: Rust build target directories can grow up to 30+ GB. Ensure at least 20 GB of free disk space is available to prevent `No space left on device (os error 28)` failures during job log and artifact storage.

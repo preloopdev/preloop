@@ -13,13 +13,20 @@ pub struct ServerConfig {
     pub record_flows: Option<PathBuf>,
     /// TLS mode (default: no TLS).
     pub tls: TlsMode,
+    /// Shared counter published with the number of jobs still queued after
+    /// each claim. Supply one to let a co-hosted runner pool scale to demand.
+    pub queue_depth: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    /// Shared list, refreshed after each claim, of the `runs-on` labels of
+    /// the job at the front of the dispatch queue. Supply one to let a
+    /// co-hosted runner pool select the correct base-image golden.
+    pub next_job_runs_on: Option<Arc<std::sync::RwLock<Vec<String>>>>,
     /// Enable privileged local/CI simulation endpoints.
     pub enable_test_api: bool,
     /// Bearer token required by privileged simulation endpoints.
     pub test_api_token: Option<String>,
     /// OIDC issuer URL. Defaults to `{public_base_url}/oidc`.
     ///
-    /// This must identify an issuer controlled by the aksh deployment. Setting
+    /// This must identify an issuer controlled by the preloop deployment. Setting
     /// GitHub's hosted issuer does not make locally signed tokens GitHub-trusted.
     pub oidc_issuer: Option<String>,
     /// Enable the cron scheduler for schedule-triggered workflows.
@@ -76,12 +83,35 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
         }
     }
 
+    // Drop sessions whose worker stopped polling before reading pause credit,
+    // and sessions whose job has since ended. Either way a crashed or finished
+    // job must not go on suspending a timeout.
+    let active_request_ids: std::collections::BTreeSet<i64> =
+        active_reqs.iter().map(|(id, ..)| *id).collect();
+    // Pause credit outlives the sessions that earned it: the registry retires
+    // it with the job request, not with the session. The sweep below therefore
+    // cannot retroactively bill a job for time it spent legitimately paused —
+    // which is what used to cancel a job one tick after it resumed.
+    let paused_credits: std::collections::BTreeMap<i64, Duration> = active_reqs
+        .iter()
+        .map(|(id, ..)| (*id, inner.debug_sessions.paused_for_request(*id, now)))
+        .collect();
+    crate::debug_sessions::sweep(&mut inner.debug_sessions, now, &active_request_ids);
+
     for (request_id, run_id, job_id, started_at, last_renewed_at, timeout_triggered) in active_reqs
     {
         // 1. Check Timeout Enforcement
         if let Some(started_at) = started_at {
             if !timeout_triggered {
-                let elapsed = now.duration_since(started_at).unwrap_or_default();
+                // Time spent paused at a failed step is debugging, not
+                // execution. Without this subtraction a `timeout-minutes: 10`
+                // job is cancelled ten minutes into a debug session, through a
+                // path no client can see.
+                let paused = paused_credits.get(&request_id).copied().unwrap_or_default();
+                let elapsed = now
+                    .duration_since(started_at)
+                    .unwrap_or_default()
+                    .saturating_sub(paused);
                 let job_timeout = inner
                     .broker_messages
                     .get(&request_id)
@@ -184,6 +214,12 @@ async fn run_background_reaper(shared: Arc<SharedState>) {
 /// Start the server and block until shutdown.
 pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     let mut state = AppState::new(config.state_dir.clone()).await?;
+    if let Some(queue_depth) = config.queue_depth.clone() {
+        state.queue_depth = queue_depth;
+    }
+    if let Some(next_job_runs_on) = config.next_job_runs_on.clone() {
+        state.next_job_runs_on = next_job_runs_on;
+    }
     if !config.listen.ip().is_loopback() && state.system_token == DEFAULT_AKSH_SYSTEM_TOKEN {
         anyhow::bail!(
             "AKSH_SYSTEM_TOKEN must be explicitly configured when listening beyond loopback"
