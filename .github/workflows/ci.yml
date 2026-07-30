@@ -37,6 +37,10 @@ jobs:
   rust:
     runs-on: self-hosted
     timeout-minutes: 30
+    env:
+      # A 4 GiB disposable runner can otherwise start several memory-heavy
+      # test links together and have ld killed by the guest OOM killer.
+      CARGO_BUILD_JOBS: "1"
     steps:
       # action download works — client-side batch resolve + codeload fallback
       - uses: actions/checkout@v4
