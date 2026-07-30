@@ -207,8 +207,8 @@ pub(crate) fn action_download_ticket(
     }
 
     let key = format!("{repo_part}@{git_ref}");
-    let public_url = public_base_url();
-    let url = format!("{public_url}/api/v1/actions/download/{owner}/{repo}/{git_ref}");
+    let runner_url = runner_base_url();
+    let url = format!("{runner_url}/api/v1/actions/download/{owner}/{repo}/{git_ref}");
     Some((
         key,
         json!({

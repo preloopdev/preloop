@@ -228,7 +228,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     let oidc_issuer = normalize_oidc_issuer(
         config
             .oidc_issuer
-            .unwrap_or_else(|| format!("{}/oidc", public_base_url())),
+            .unwrap_or_else(|| format!("{}/oidc", runner_base_url())),
     )?;
     {
         let mut inner = state.inner.lock().await;
