@@ -14,6 +14,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 /// File name under the state directory.
@@ -91,9 +92,38 @@ impl StoredAuth {
         let file = path(state_dir);
         let body =
             serde_json::to_string_pretty(self).context("serializing GitHub App credentials")?;
-        std::fs::write(&file, body).with_context(|| format!("writing {}", file.display()))?;
-        // Contains a private key. Narrow the mode before returning, not after
-        // some later caller has had a chance to observe a world-readable file.
+        let temporary = state_dir.join(format!(".{FILE}.{:016x}.tmp", rand::random::<u64>()));
+        let write_result = (|| -> Result<()> {
+            let mut options = std::fs::OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+            }
+            let mut handle = options
+                .open(&temporary)
+                .with_context(|| format!("creating {}", temporary.display()))?;
+            crate::set_private_file_permissions(&temporary)?;
+            handle
+                .write_all(body.as_bytes())
+                .with_context(|| format!("writing {}", temporary.display()))?;
+            handle
+                .sync_all()
+                .with_context(|| format!("syncing {}", temporary.display()))?;
+            #[cfg(windows)]
+            if file.exists() {
+                std::fs::remove_file(&file)
+                    .with_context(|| format!("replacing {}", file.display()))?;
+            }
+            std::fs::rename(&temporary, &file)
+                .with_context(|| format!("replacing {}", file.display()))?;
+            Ok(())
+        })();
+        if write_result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        write_result?;
         crate::set_private_file_permissions(&file)?;
         Ok(file)
     }
@@ -297,6 +327,23 @@ mod tests {
             "group/other bits set on {}",
             file.display()
         );
+    }
+
+    #[test]
+    fn saving_replaces_credentials_without_leaving_temporary_files() {
+        let dir = tempfile::tempdir().unwrap();
+        sample().save(dir.path()).unwrap();
+        let mut rotated = sample();
+        rotated.webhook_secret = Some("rotated".into());
+
+        rotated.save(dir.path()).unwrap();
+
+        assert_eq!(StoredAuth::load(dir.path()).unwrap(), rotated);
+        let entries = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, [std::ffi::OsString::from(FILE)]);
     }
 
     #[test]
