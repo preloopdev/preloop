@@ -9219,6 +9219,14 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
             "timeoutInMinutes": null
         }
     ]));
+    let mut token_only = checkout_test_message(json!([{
+        "id": "00000000-0000-0000-0000-000000000013",
+        "name": "token-only checkout",
+        "reference": {"name": "actions/checkout", "version": "v4", "type": "repository"},
+        "inputs": {"token": "submodule-token", "fetch-depth": "0"},
+        "continueOnError": false,
+        "timeoutInMinutes": null
+    }]));
     let original_explicit = message.steps[1].inputs.clone();
     let original_non_checkout = message.steps[2].inputs.clone();
     assert!(message.snapshot.is_none());
@@ -9257,6 +9265,24 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
     assert!(
         message.snapshot.is_none(),
         "snapshot wire field must remain untouched"
+    );
+
+    assert_eq!(
+        redirect_primary_checkout(
+            &mut token_only,
+            &WorkspaceSnapshot {
+                commit_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                repository: "snapshots/22222222-2222-4222-8222-222222222222".to_owned(),
+            },
+            "http://127.0.0.1:9090",
+            "local-runtime-jwt",
+        ),
+        1,
+        "a token-only primary checkout still targets the local snapshot"
+    );
+    assert_eq!(
+        token_only.steps[0].inputs.get("token"),
+        Some(&"local-runtime-jwt".to_owned())
     );
 }
 
