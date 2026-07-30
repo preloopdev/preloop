@@ -68,17 +68,18 @@ fn job_outputs_token(outputs: &BTreeMap<String, String>) -> Option<Value> {
 fn template_string_token(raw: &str) -> Value {
     let location = || json!({"file": 1, "line": 1, "col": 1});
     let trimmed = raw.trim();
-    if let Some(expression) = trimmed
-        .strip_prefix("${{")
-        .and_then(|value| value.strip_suffix("}}").map(str::trim))
-    {
-        return json!({
-            "type": 3,
-            "file": 1,
-            "line": 1,
-            "col": 1,
-            "expr": expression,
-        });
+    if let Some(expression_source) = trimmed.strip_prefix("${{") {
+        if let Some(end) = crate::eval::find_expression_end(expression_source) {
+            if end + 2 == expression_source.len() {
+                return json!({
+                    "type": 3,
+                    "file": 1,
+                    "line": 1,
+                    "col": 1,
+                    "expr": expression_source[..end].trim(),
+                });
+            }
+        }
     }
     if !raw.contains("${{") {
         let mut token = location();
@@ -1066,6 +1067,18 @@ jobs:
         assert_eq!(
             token["expr"],
             "format('ghcr.io/acme/{0}:{1}', matrix.image, matrix.tag)"
+        );
+    }
+
+    #[test]
+    fn expression_prefixed_container_strings_use_format_tokens() {
+        let token = template_token(&serde_json::json!(
+            "${{ matrix.registry }}/acme:${{ matrix.tag }}"
+        ));
+        assert_eq!(token["type"], 3);
+        assert_eq!(
+            token["expr"],
+            "format('{0}/acme:{1}', matrix.registry, matrix.tag)"
         );
     }
 
