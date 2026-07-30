@@ -4166,9 +4166,7 @@ async fn app_only_server_fetches_webhook_workflows_with_installation_token() {
     use axum::routing::{get, post};
     use rsa::RsaPrivateKey;
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api_base = format!("http://{}", listener.local_addr().unwrap());
     let download_url = format!("{api_base}/raw/ci.yml");
     let stub = Router::new()
@@ -5026,6 +5024,27 @@ async fn the_debug_worker_token_exchange_is_narrowly_authorized() {
     assert_eq!(
         refused(runtime_token, asking_for_itself).await,
         StatusCode::CONFLICT
+    );
+}
+
+#[tokio::test]
+async fn debug_worker_token_outlives_job_and_pause_windows() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let token = state.mint_debug_worker_token("plan", &uuid::Uuid::new_v4());
+    let claims = state
+        .verify_local_jwt_claims(&token)
+        .expect("fresh debug-worker token verifies");
+    let issued_at = claims["iat"].as_u64().expect("iat is numeric");
+    let expires_at = claims["exp"].as_u64().expect("exp is numeric");
+
+    assert_eq!(
+        expires_at - issued_at,
+        crate::state::DEBUG_WORKER_TOKEN_LIFETIME.as_secs()
+    );
+    assert!(
+        expires_at - issued_at > (6 + 4) * 60 * 60,
+        "credential must cover the job limit and maximum pause credit"
     );
 }
 
