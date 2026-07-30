@@ -2,6 +2,7 @@ name: runner-conformance
 
 on:
   push:
+    branches: [main]
   pull_request:
   schedule:
     - cron: "30 3 * * *"
