@@ -1045,7 +1045,8 @@ fn bench_protocol_serde(cfg: BenchConfig) -> Result<()> {
 
         let start = Instant::now();
         for _ in 0..SERDE_ITERATIONS {
-            let value: Value = serde_json::from_str(&payload)?;
+            let value: Vec<aksh_gha_protocol::JobPlan> = serde_json::from_str(&payload)
+                .context("expanded protocol payload must deserialize into job plans")?;
             std::hint::black_box(&value);
         }
         de_us.push(start.elapsed().as_micros() as f64 / SERDE_ITERATIONS as f64);
