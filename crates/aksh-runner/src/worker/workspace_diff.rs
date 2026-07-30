@@ -880,7 +880,7 @@ mod tests {
 
         let attributed = changes_since(&baseline, &after);
         let paths: Vec<&str> = attributed.iter().map(|c| c.path.as_str()).collect();
-        assert_eq!(paths, vec!["build/stale"]);
+        assert_eq!(paths, vec!["build/"]);
         assert!(
             !paths.contains(&"lib.rs"),
             "a pre-existing edit must never be attributed to the failed attempt"
