@@ -29,3 +29,6 @@ reqwest = { workspace = true }
 rand = { workspace = true }
 futures-util = "0.3"
 aksh-gha-protocol = { path = "../aksh-gha-protocol" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

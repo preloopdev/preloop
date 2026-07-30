@@ -1,0 +1,10 @@
+name: nested-setup
+description: Nested setup composite action with state
+runs:
+  using: composite
+  steps:
+    - name: Main step
+      run: |
+        echo "Running main composite step"
+        echo "STATE_VAL=active" >> $GITHUB_STATE
+      shell: bash

@@ -11,10 +11,10 @@ VM_PREFIX="${VM_PREFIX:-bench-aksh}"
 HOST_IP="${HOST_IP:-$(ipconfig getifaddr en1 2>/dev/null || echo 127.0.0.1)}"
 SERVER_PORT="${SERVER_PORT:-9191}"
 SERVER_URL="http://${HOST_IP}:${SERVER_PORT}"
-SERVER_BIN="${SERVER_BIN:-$ROOT/target/release/aksh-runner-server}"
+SERVER_BIN="${SERVER_BIN:-$ROOT/target/release/preloop-server}"
 CLIENT_BIN="${CLIENT_BIN:-$ROOT/target/release/aksh-runner-client}"
 OFFICIAL_SRC="${OFFICIAL_SRC:-/opt/runners/actions-runner}"
-AKSH_RUNNER="${AKSH_RUNNER:-/workspace/target/aarch64-unknown-linux-musl/release/aksh-runner}"
+AKSH_RUNNER="${AKSH_RUNNER:-/workspace/target/aarch64-unknown-linux-musl/release/preloop-runner}"
 MITM_PORT="${MITM_PORT:-18081}"
 OUT_ROOT="${RESULTS_ROOT:-$ROOT/benchmarks/compatibility/runner/protocol-local}"
 WORKFLOW="$ROOT/benchmarks/real-world/overnight-workflows/$SCENARIO"
@@ -32,7 +32,7 @@ ensure_vms() {
   done
 }
 start_server() {
-  pkill -x aksh-runner-server >/dev/null 2>&1 || true
+  pkill -x preloop-server >/dev/null 2>&1 || true
   sleep .3
   STATE_DIR="$(mktemp -d /tmp/aksh-local-state.XXXXXX)"
   RUST_LOG=info AKSH_SYSTEM_TOKEN="$SYSTEM_TOKEN" AKSH_PUBLIC_URL="$SERVER_URL" "$SERVER_BIN" serve --listen "0.0.0.0:$SERVER_PORT" --state-dir "$STATE_DIR" >/tmp/aksh-local-server.log 2>&1 &

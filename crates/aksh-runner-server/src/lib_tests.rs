@@ -3,6 +3,7 @@ use axum::body::{to_bytes, Body};
 use axum::http::{Method, Request, StatusCode};
 use serde_json::Value;
 use sha1::{Digest, Sha1};
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
 use std::path::Path as FsPath;
@@ -15,6 +16,179 @@ const TEST_API_TOKEN: &str = "property-test-token";
 
 fn app(state: AppState, shutdown: CancellationToken) -> Router {
     app_with_test_api(state, shutdown, TEST_API_TOKEN)
+}
+
+/// `preserve_on_failure` is a property of the run, carried to the runner on the
+/// job message. It must be absent unless asked for, so the default wire shape
+/// stays byte-identical to what an official runner expects.
+#[tokio::test]
+async fn preserve_on_failure_reaches_the_job_message_only_when_requested() {
+    for (requested, expected) in [(true, Some(true)), (false, None)] {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+                "event": "push",
+                "repository": "owner/repo",
+                "preserve_on_failure": requested
+            }),
+        )
+        .await;
+
+        let inner = state.inner.lock().await;
+        let queued = inner.queue.front().expect("job should be queued");
+        assert_eq!(
+            queued.message.preloop_preserve_on_failure, expected,
+            "preserve_on_failure={requested}"
+        );
+
+        // Absent means absent on the wire, not `false`.
+        let wire = serde_json::to_value(&queued.message).unwrap();
+        assert_eq!(
+            wire.get("preloopPreserveOnFailure")
+                .and_then(Value::as_bool),
+            expected,
+            "wire shape for preserve_on_failure={requested}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn prebuilt_messages_preserve_monotonic_workflow_run_numbers() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let workflow =
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+
+    let first = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": workflow,
+            "event": "push",
+            "repository": "owner/repo"
+        }),
+    )
+    .await;
+    let second = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": workflow,
+            "event": "push",
+            "repository": "owner/repo"
+        }),
+    )
+    .await;
+
+    assert_eq!(first["run_number"], 1);
+    assert_eq!(second["run_number"], 2);
+}
+
+#[tokio::test]
+async fn run_apis_never_return_submitted_secret_values() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "secrets": {
+                "NPM_TOKEN": "npm_LIVE_CREDENTIAL",
+                "DEPLOY_KEY": "deploy_LIVE_CREDENTIAL"
+            }
+        }),
+    )
+    .await;
+    let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+
+    // The server must still receive the real values: they are what the job runs with.
+    {
+        let inner = state.inner.lock().await;
+        let run = inner.runs.get(&run_id.parse::<RunId>().unwrap()).unwrap();
+        assert_eq!(
+            run.submission.secrets["NPM_TOKEN"].expose(),
+            "npm_LIVE_CREDENTIAL"
+        );
+    }
+
+    // ...but no run-facing response may echo them back.
+    for uri in [
+        format!("/api/v1/runs/{run_id}"),
+        "/api/v1/runs?limit=50".to_owned(),
+    ] {
+        let body = request_json(&app, Method::GET, &uri, Value::Null)
+            .await
+            .to_string();
+        assert!(
+            !body.contains("npm_LIVE_CREDENTIAL") && !body.contains("deploy_LIVE_CREDENTIAL"),
+            "{uri} leaked a secret value: {body}"
+        );
+        assert!(
+            body.contains("NPM_TOKEN"),
+            "{uri} should still expose secret names: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn public_run_page_needs_no_token_and_exposes_no_submission_secrets() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state, CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "workflow_path": "<script>alert(1)</script>",
+            "event": "push",
+            "repository": "owner/repo",
+            "secrets": {"NPM_TOKEN": "npm_LIVE_CREDENTIAL"}
+        }),
+    )
+    .await;
+    let run_id = accepted["run_id"].as_str().unwrap();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/runs/{run_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains(run_id));
+    assert!(body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+    assert!(!body.contains("npm_LIVE_CREDENTIAL"));
+    assert!(!body.contains("NPM_TOKEN"));
 }
 
 #[tokio::test]
@@ -76,6 +250,199 @@ jobs:
             .filter(|status| **status == ExecutionStatus::Cancelled)
             .count(),
         2
+    );
+}
+
+fn selected_jobs_workflow() -> &'static str {
+    r#"
+on: push
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo lint
+  build:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo build
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo test
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo docs
+"#
+}
+
+#[tokio::test]
+async fn selected_jobs_rejects_unknown_id_without_creating_run() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let (status, body) = try_req(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": selected_jobs_workflow(),
+            "event": "push",
+            "repository": "owner/repo",
+            "selected_jobs": ["tset"]
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].as_str().unwrap().contains("tset"));
+    assert!(state.inner.lock().await.runs.is_empty());
+}
+
+#[tokio::test]
+async fn selected_jobs_rejects_partial_typo_without_running_valid_subset() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let (status, body) = try_req(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": selected_jobs_workflow(),
+            "event": "push",
+            "repository": "owner/repo",
+            "selected_jobs": ["build", "tset"]
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a typo must reject the whole selection, not run a subset: {body}"
+    );
+    assert!(body["error"].as_str().unwrap().contains("tset"));
+    assert!(state.inner.lock().await.runs.is_empty());
+}
+
+#[tokio::test]
+async fn selected_jobs_runs_transitive_needs_closure_without_independent_jobs() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": selected_jobs_workflow(),
+            "event": "push",
+            "repository": "owner/repo",
+            "selected_jobs": ["test"]
+        }),
+    )
+    .await;
+
+    let inner = state.inner.lock().await;
+    assert_eq!(inner.runs.len(), 1);
+    let run = inner.runs.values().next().unwrap();
+    let base_ids: BTreeSet<String> = run.job_base_ids.values().cloned().collect();
+    assert_eq!(
+        base_ids,
+        BTreeSet::from(["lint".to_owned(), "build".to_owned(), "test".to_owned(),])
+    );
+    assert!(!base_ids.contains("docs"));
+}
+
+#[tokio::test]
+async fn selected_reusable_call_runs_all_inlined_children() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": r#"
+on: push
+jobs:
+  call:
+    uses: ./.github/workflows/callee.yml
+  unrelated:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo unrelated
+"#,
+            "event": "push",
+            "repository": "owner/repo",
+            "selected_jobs": ["call"],
+            "reusable_workflows": {
+                ".github/workflows/callee.yml": r#"
+on: workflow_call
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo build
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo test
+"#
+            }
+        }),
+    )
+    .await;
+
+    let inner = state.inner.lock().await;
+    let run = inner.runs.values().next().unwrap();
+    let base_ids: BTreeSet<String> = run.job_base_ids.values().cloned().collect();
+    assert_eq!(
+        base_ids,
+        BTreeSet::from(["call/build".to_owned(), "call/test".to_owned()])
+    );
+}
+
+#[tokio::test]
+async fn selected_jobs_empty_runs_all_workflow_jobs() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": selected_jobs_workflow(),
+            "event": "push",
+            "repository": "owner/repo",
+            "selected_jobs": []
+        }),
+    )
+    .await;
+
+    let inner = state.inner.lock().await;
+    assert_eq!(inner.runs.len(), 1);
+    let run = inner.runs.values().next().unwrap();
+    let base_ids: BTreeSet<String> = run.job_base_ids.values().cloned().collect();
+    assert_eq!(
+        base_ids,
+        BTreeSet::from([
+            "lint".to_owned(),
+            "build".to_owned(),
+            "test".to_owned(),
+            "docs".to_owned(),
+        ])
     );
 }
 
@@ -1987,9 +2354,19 @@ jobs:
     );
     assert!(acquired["variables"]["system.github.token"]["value"].is_string());
     assert_eq!(
+        acquired["variables"]["actions_runner_allow_artifacts_file"]["value"],
+        "false"
+    );
+    assert_eq!(
+        acquired["variables"]["actions_self_repository"]["value"],
+        "true"
+    );
+    assert!(acquired.get("runnerSettings").is_none());
+    assert_eq!(
         acquired["resources"]["endpoints"][0]["url"],
         "http://127.0.0.1:9090/broker/1/"
     );
+    assert!(acquired["resources"]["endpoints"][0]["data"]["ConnectivityAndDNSChecks"].is_string());
     assert!(acquired["plan"]["planId"].is_string());
     assert!(acquired["jobId"].is_string());
     assert!(acquired["steps"].is_array());
@@ -3576,36 +3953,6 @@ async fn full_runner_lifecycle_register_session_poll_complete() {
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
-    // Non-asserting helper
-    async fn try_req(app: &Router, method: Method, uri: &str, body: Value) -> (StatusCode, Value) {
-        let mut builder = Request::builder().method(method).uri(uri);
-        if uri.starts_with("/api/v1/")
-            || uri.starts_with("/_apis/")
-            || uri.starts_with("/runner/server/_apis/")
-            || uri.starts_with("/broker/")
-            || uri.starts_with("/twirp/")
-        {
-            builder = builder.header(header::AUTHORIZATION, "Bearer aksh-system-token");
-        } else if uri.starts_with("/internal/test/") {
-            builder = builder.header(header::AUTHORIZATION, format!("Bearer {TEST_API_TOKEN}"));
-        } else if uri.starts_with("/api/v3/actions/runner-registration") {
-            builder = builder.header(header::AUTHORIZATION, "RemoteAuth aksh-registration-token");
-        }
-        let request = if body.is_null() {
-            builder.body(Body::empty()).unwrap()
-        } else {
-            builder
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap()
-        };
-        let response = app.clone().oneshot(request).await.unwrap();
-        let status = response.status();
-        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let val = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-        (status, val)
-    }
-
     // 1. connectionData
     let (s, conn) = try_req(
         &app,
@@ -3693,6 +4040,429 @@ async fn full_runner_lifecycle_register_session_poll_complete() {
     )
     .await;
     assert_eq!(final_run["status"], "success");
+}
+
+/// The runner prints its `GITHUB_TOKEN Permissions` group from this variable, so
+/// it must state what the job's token actually carries: the restricted default
+/// when the workflow declares nothing (matching the official runner's setup
+/// log), and nothing at all when the workflow withholds everything.
+#[tokio::test]
+async fn the_wire_token_permissions_match_the_declared_policy() {
+    for (declaration, expected) in [
+        (
+            "",
+            r#"{"Contents":"read","Metadata":"read","Packages":"read"}"#,
+        ),
+        ("permissions: {}\n", "{}"),
+        (
+            "permissions:\n  contents: read\n  pull-requests: write\n",
+            r#"{"Contents":"read","PullRequests":"write"}"#,
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": format!(
+                    "on: push\n{declaration}jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
+                ),
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+
+        let inner = state.inner.lock().await;
+        let queued = inner.queue.front().expect("job should be queued");
+        assert_eq!(
+            queued
+                .message
+                .variables
+                .get("system.github.token.permissions")
+                .and_then(|variable| variable.value.as_deref()),
+            Some(expected),
+            "wire permissions for {declaration:?}"
+        );
+    }
+}
+
+/// A failed installation-token mint must never silently reach for the broad
+/// `AKSH_GITHUB_TOKEN` PAT: that would swap a repository-scoped,
+/// `permissions:`-bounded token for an unscoped one. Only
+/// `AKSH_GITHUB_APP_MINT_FAILURE` decides, and its default leaves the job on the
+/// local HMAC JWT, which carries no GitHub authority at all.
+#[tokio::test]
+async fn app_token_mint_failure_follows_the_configured_policy() {
+    use crate::github_app::{GitHubAppCredentials, MintFailurePolicy};
+
+    // A key is needed to populate the credentials but is never exercised: a
+    // `repository` with no `owner/repo` slug cannot be scoped to a repository,
+    // so the mint fails before it signs anything or opens a socket.
+    let private_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+
+    for policy in [MintFailurePolicy::LocalJwt, MintFailurePolicy::Error] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        state.github_app = Some(GitHubAppCredentials::for_tests(
+            "424",
+            private_key.clone(),
+            policy,
+        ));
+        let shutdown = CancellationToken::new();
+        let app = app(state.clone(), shutdown.clone());
+
+        let (status, _) = try_req(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+                "event": "push",
+                "repository": "local-workspace-only"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "policy {policy:?}");
+        let request = {
+            let inner = state.inner.lock().await;
+            assert_eq!(inner.queue.len(), 1);
+            inner
+                .github_token_requests
+                .values()
+                .next()
+                .cloned()
+                .expect("App-backed job defers a token request")
+        };
+        let shared = Arc::new(SharedState {
+            state: state.clone(),
+            shutdown,
+        });
+        let mint = crate::broker::mint_dispatch_github_token(&shared, &request).await;
+        match policy {
+            // The job still runs; it just has no GitHub credential.
+            MintFailurePolicy::LocalJwt => assert!(matches!(mint, Ok(None))),
+            // Refusal happens when the broker is about to dispatch the job.
+            MintFailurePolicy::Error => assert_eq!(
+                mint.expect_err("error policy must refuse dispatch")
+                    .into_response()
+                    .status(),
+                StatusCode::BAD_GATEWAY
+            ),
+            MintFailurePolicy::Pat => unreachable!("covered by a github_app unit test"),
+        }
+    }
+}
+
+/// By the time `acquirejob` mints, the poll has already dequeued the job,
+/// flipped the run to `InProgress` and pinned the request to the session. A
+/// refusal under the `error` policy is a permanent configuration fault, so if
+/// the 502 left the claim in place the runner would re-acquire forever and the
+/// run would hang until the 600s disconnect reaper mopped it up.
+#[tokio::test]
+async fn a_dispatch_refused_by_the_mint_policy_fails_its_run_without_the_reaper() {
+    use crate::github_app::{GitHubAppCredentials, MintFailurePolicy};
+
+    // `local-workspace-only` carries no `owner/repo` slug, so the mint fails
+    // before it signs anything or opens a socket.
+    let private_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state.github_app = Some(GitHubAppCredentials::for_tests(
+        "424",
+        private_key,
+        MintFailurePolicy::Error,
+    ));
+    let app = app(state.clone(), CancellationToken::new());
+    let runner_token = state
+        .local_jwt(json!({
+            "sub": "aksh-runner-listen-1",
+            "scp": "ActionsRuntime.RunnerListen",
+        }))
+        .unwrap();
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "local-workspace-only"
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    let session = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/runner/server/session",
+        json!({}),
+        &runner_token,
+    )
+    .await;
+    let session_id = session["sessionId"].as_str().unwrap();
+    let job_ref = request_json_with_bearer(
+        &app,
+        Method::GET,
+        &format!("/runner/server/message?sessionId={session_id}&status=Online&waitSeconds=0"),
+        Value::Null,
+        &runner_token,
+    )
+    .await;
+    let body: Value = serde_json::from_str(job_ref["body"].as_str().unwrap()).unwrap();
+    let runner_request_id = body["runner_request_id"].as_str().unwrap();
+    {
+        let inner = state.inner.lock().await;
+        assert_eq!(
+            inner.runs.get(&run_id).unwrap().status,
+            ExecutionStatus::InProgress,
+            "the poll must claim the job before the mint is attempted"
+        );
+    }
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/broker/1/acquirejob")
+                .header(header::AUTHORIZATION, format!("Bearer {runner_token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"jobMessageId": runner_request_id, "billingOwnerId": "local", "runnerOS": "Linux"})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+    let inner = state.inner.lock().await;
+    let run = inner.runs.get(&run_id).unwrap();
+    assert_eq!(run.status, ExecutionStatus::Failure);
+    assert!(run.jobs.values().all(|status| status.is_terminal()));
+    let request_id = *inner.job_requests.keys().next().unwrap();
+    assert_eq!(
+        inner.job_requests[&request_id].result,
+        Some(ExecutionStatus::Failure)
+    );
+    assert!(
+        !inner
+            .session_active_requests
+            .values()
+            .any(|rid| *rid == request_id),
+        "the session must be free to take the next job"
+    );
+    assert!(!inner.inflight_requests.contains_key(&request_id));
+}
+
+#[tokio::test]
+async fn app_only_server_fetches_webhook_workflows_with_installation_token() {
+    use crate::github_app::{GitHubAppCredentials, MintFailurePolicy};
+    use axum::extract::Path;
+    use axum::http::HeaderMap;
+    use axum::routing::{get, post};
+    use rsa::RsaPrivateKey;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}", listener.local_addr().unwrap());
+    let download_url = format!("{api_base}/raw/ci.yml");
+    let stub = Router::new()
+        .route(
+            "/app/installations",
+            get(|| async {
+                Json(json!([{
+                    "id": 4242,
+                    "account": {"login": "preloopdev"}
+                }]))
+            }),
+        )
+        .route(
+            "/app/installations/:installation_id/access_tokens",
+            post(|Path(installation_id): Path<u64>| async move {
+                assert_eq!(installation_id, 4242);
+                Json(json!({
+                    "token": "ghs_app_only_workflow_token",
+                    "expires_at": "2999-01-01T00:00:00Z"
+                }))
+            }),
+        )
+        .route(
+            "/repos/preloopdev/preloop/contents/.github/workflows",
+            get(move |headers: HeaderMap| {
+                let download_url = download_url.clone();
+                async move {
+                    assert_eq!(
+                        headers
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok()),
+                        Some("Bearer ghs_app_only_workflow_token")
+                    );
+                    Json(json!([{
+                        "name": "ci.yml",
+                        "type": "file",
+                        "download_url": download_url
+                    }]))
+                }
+            }),
+        )
+        .route(
+            "/raw/ci.yml",
+            get(|headers: HeaderMap| async move {
+                assert_eq!(
+                    headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok()),
+                    Some("Bearer ghs_app_only_workflow_token")
+                );
+                "on: push\njobs:\n  test:\n    runs-on: self-hosted\n    steps:\n      - run: true\n"
+            }),
+        );
+    tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state.github_app = Some(GitHubAppCredentials::for_tests(
+        "424",
+        RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap(),
+        MintFailurePolicy::LocalJwt,
+    ));
+    let shared = Arc::new(SharedState {
+        state,
+        shutdown: CancellationToken::new(),
+    });
+
+    let workflows = crate::github::fetch_workflows_at(
+        &shared,
+        "preloopdev/preloop",
+        "refs/heads/main",
+        &api_base,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(workflows.len(), 1);
+    assert!(workflows["ci.yml"].contains("runs-on: self-hosted"));
+}
+
+#[tokio::test]
+async fn app_only_server_resolves_pull_request_changed_files_with_installation_token() {
+    use crate::github_app::{GitHubAppCredentials, MintFailurePolicy};
+    use axum::extract::{Path, Query};
+    use axum::http::HeaderMap;
+    use axum::routing::{get, post};
+    use rsa::RsaPrivateKey;
+    use std::collections::HashMap;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}", listener.local_addr().unwrap());
+    let stub = Router::new()
+        .route(
+            "/app/installations",
+            get(|| async {
+                Json(json!([{
+                    "id": 4242,
+                    "account": {"login": "preloopdev"}
+                }]))
+            }),
+        )
+        .route(
+            "/app/installations/:installation_id/access_tokens",
+            post(
+                |Path(installation_id): Path<u64>, body: Json<Value>| async move {
+                    assert_eq!(installation_id, 4242);
+                    // Listing pull request files is refused by a token scoped
+                    // only to `contents`, so the mint must ask for the
+                    // pull-request scope rather than reuse the inventory token.
+                    assert_eq!(body.0["permissions"]["pull_requests"], json!("read"));
+                    Json(json!({
+                        "token": "ghs_app_only_pr_files_token",
+                        "expires_at": "2999-01-01T00:00:00Z"
+                    }))
+                },
+            ),
+        )
+        .route(
+            "/repos/preloopdev/preloop/pulls/7/files",
+            get(
+                |headers: HeaderMap, Query(query): Query<HashMap<String, String>>| async move {
+                    assert_eq!(
+                        headers
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok()),
+                        Some("Bearer ghs_app_only_pr_files_token")
+                    );
+                    // Paging terminates on an empty page, so only the first one
+                    // carries files.
+                    if query.get("page").map(String::as_str) == Some("1") {
+                        Json(json!([{"filename": "src/main.rs"}, {"filename": "docs/readme.md"}]))
+                    } else {
+                        Json(json!([]))
+                    }
+                },
+            ),
+        );
+    tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state.github_app = Some(GitHubAppCredentials::for_tests(
+        "424",
+        RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap(),
+        MintFailurePolicy::LocalJwt,
+    ));
+    let shared = Arc::new(SharedState {
+        state,
+        shutdown: CancellationToken::new(),
+    });
+
+    let changed =
+        crate::github::resolve_pr_changed_files_at(&shared, "preloopdev/preloop", 7, &api_base)
+            .await
+            .unwrap();
+
+    assert_eq!(
+        changed,
+        Some(vec!["src/main.rs".to_owned(), "docs/readme.md".to_owned()]),
+        "an App-only deployment must reach the changed-files lookup so `paths:` filters stay evaluable"
+    );
+}
+
+// Non-asserting helper for tests that need to inspect an error response.
+async fn try_req(app: &Router, method: Method, uri: &str, body: Value) -> (StatusCode, Value) {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if uri.starts_with("/api/v1/")
+        || uri.starts_with("/_apis/")
+        || uri.starts_with("/runner/server/_apis/")
+        || uri.starts_with("/broker/")
+        || uri.starts_with("/twirp/")
+    {
+        builder = builder.header(header::AUTHORIZATION, "Bearer aksh-system-token");
+    } else if uri.starts_with("/internal/test/") {
+        builder = builder.header(header::AUTHORIZATION, format!("Bearer {TEST_API_TOKEN}"));
+    } else if uri.starts_with("/api/v3/actions/runner-registration") {
+        builder = builder.header(header::AUTHORIZATION, "RemoteAuth aksh-registration-token");
+    }
+    let request = if body.is_null() {
+        builder.body(Body::empty()).unwrap()
+    } else {
+        builder
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let val = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, val)
 }
 
 async fn request_json(app: &Router, method: Method, uri: &str, body: Value) -> Value {
@@ -3836,6 +4606,1077 @@ async fn job_timeout_enforcement_cancels_job() {
         assert_eq!(inner.cancellation_queue.len(), 1);
         assert_eq!(inner.cancellation_queue[0].run_id, run_id);
     }
+}
+
+/// A paused debug session must suspend job-timeout enforcement.
+///
+/// Prerequisite covered separately by
+/// `preserve_on_failure_carries_the_run_id_for_the_debug_session`.
+///
+/// Without this the server reaper cancels a debug session out from under the
+/// user — and `timeout-minutes: 10` is a completely ordinary thing to write,
+/// so the failure would be common and would look like a crash.
+#[tokio::test]
+async fn debug_session_suspends_job_timeout() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown,
+    });
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: \"false\"\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "preserve_on_failure": true
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    let _msg = request_json(
+        &app,
+        Method::GET,
+        "/runner/server/_apis/v1/Message/1?sessionId=default",
+        Value::Null,
+    )
+    .await;
+
+    let (request_id, agent_job_id, worker_token) = {
+        let inner = state.inner.lock().await;
+        let (id, record) = inner.job_requests.iter().next().unwrap();
+        (
+            *id,
+            record.agent_job_id,
+            state.mint_debug_worker_token(&record.plan_id, &record.agent_job_id),
+        )
+    };
+
+    // The worker fails a step and opens a session. It authenticates with the
+    // job debug-worker token — not a runner listen token, and deliberately not
+    // the runtime token the job itself can read as GITHUB_TOKEN.
+    let opened = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/api/v1/debug/sessions",
+        json!({
+            "run_id": run_id,
+            "job_id": "build",
+            "agent_job_id": agent_job_id,
+            "job_name": "build",
+            "step": {
+                "index": 0,
+                "total": 1,
+                "context_name": "__run",
+                "display_name": "Run false",
+                "command": "false",
+                "exit_code": 1,
+                "elapsed_ms": 20,
+                "diagnostics": []
+            }
+        }),
+        &worker_token,
+    )
+    .await;
+    let session_id = opened["session_id"].as_str().unwrap().to_owned();
+
+    // Backdate the job and its pause by the same amount, inside the pause
+    // credit ceiling, so every elapsed second is debugging rather than
+    // execution.
+    {
+        let mut inner = state.inner.lock().await;
+        let past = SystemTime::now() - Duration::from_secs(10_000);
+        inner.job_requests.get_mut(&request_id).unwrap().started_at = Some(past);
+        inner
+            .debug_sessions
+            .backdate_pause_for_test(&session_id, past);
+    }
+
+    reap_once(&shared).await;
+
+    {
+        let inner = state.inner.lock().await;
+        assert!(
+            !inner
+                .job_requests
+                .get(&request_id)
+                .unwrap()
+                .timeout_triggered,
+            "a paused job must not time out — the clock is suspended while debugging"
+        );
+        assert!(inner.cancellation_queue.is_empty());
+    }
+
+    // A controller lists the session and sees the failure.
+    let listed = request_json(&app, Method::GET, "/api/v1/debug/sessions", Value::Null).await;
+    assert_eq!(listed["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["sessions"][0]["state"], "paused");
+    assert_eq!(listed["sessions"][0]["step"]["display_name"], "Run false");
+
+    // An agent acquires the lease and receives a structured failure event.
+    let lease = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/agent/debug/sessions/{session_id}/lease"),
+        json!({
+            "controller": "test-agent",
+            "capabilities": ["job.retry_from"]
+        }),
+    )
+    .await;
+    assert_eq!(lease["controller"], "test-agent");
+    assert_eq!(
+        lease["capabilities"],
+        json!(["step.retry", "job.retry_from", "job.abort"])
+    );
+
+    let events = request_json(
+        &app,
+        Method::GET,
+        &format!("/api/v1/agent/debug/sessions/{session_id}/events?after=0"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(events["events"][0]["event"], "step_failed");
+
+    // The agent retries from the first step; the worker's long poll picks it
+    // up through the same verdict state machine as the human CLI.
+    let operation = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/agent/debug/sessions/{session_id}/operations"),
+        json!({
+            "request_id": "agent-retry-1",
+            "expected_version": 1,
+            "lease_id": lease["lease_id"],
+            "operation": {
+                "operation": "retry_from",
+                "step_index": 0
+            }
+        }),
+    )
+    .await;
+    assert_eq!(operation["status"], "retrying");
+    assert_eq!(operation["prev_version"], 1);
+    assert_eq!(operation["new_version"], 2);
+
+    let audit = request_json(
+        &app,
+        Method::GET,
+        &format!("/api/v1/agent/debug/sessions/{session_id}/audit"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(audit[0]["request_id"], "agent-retry-1");
+
+    let delivered = request_json_with_bearer(
+        &app,
+        Method::GET,
+        &format!("/api/v1/debug/sessions/{session_id}/verdict?wait=0"),
+        Value::Null,
+        &worker_token,
+    )
+    .await;
+    assert_eq!(delivered["verdict"], "retry");
+    assert_eq!(delivered["retry_from_step"], 0);
+
+    // Delivering the verdict banks the paused interval and restarts the clock.
+    // Suspension is not amnesty: push the start back so that *executing* time
+    // alone exceeds the timeout, and the reaper must act.
+    {
+        let mut inner = state.inner.lock().await;
+        let banked = inner
+            .debug_sessions
+            .paused_for_request(request_id, SystemTime::now());
+        assert!(
+            banked >= Duration::from_secs(9_500),
+            "the pause should have banked its full duration, got {banked:?}"
+        );
+        inner.job_requests.get_mut(&request_id).unwrap().started_at =
+            Some(SystemTime::now() - Duration::from_secs(21_700) - banked);
+    }
+
+    reap_once(&shared).await;
+    {
+        let inner = state.inner.lock().await;
+        assert!(
+            inner
+                .job_requests
+                .get(&request_id)
+                .unwrap()
+                .timeout_triggered,
+            "execution time still counts once the session resumes"
+        );
+    }
+}
+
+/// Status of a bearer-authenticated request, for asserting rejections.
+async fn request_status_with_bearer(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    body: Value,
+    bearer: &str,
+) -> StatusCode {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+    let request = if body.is_null() {
+        builder.body(Body::empty()).unwrap()
+    } else {
+        builder = builder.header(header::CONTENT_TYPE, "application/json");
+        builder.body(Body::from(body.to_string())).unwrap()
+    };
+    app.clone().oneshot(request).await.unwrap().status()
+}
+
+/// One job's debug-worker token must not reach another job's debug session.
+///
+/// Token validity alone used to authorize every worker route, so any live job
+/// could open a session on another job's behalf — suspending its timeout — and
+/// could drain its verdict, since taking a verdict consumes it.
+#[tokio::test]
+async fn a_job_token_cannot_touch_another_jobs_debug_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: \"false\"\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "preserve_on_failure": true
+        }),
+    )
+    .await;
+    let run_id: RunId = {
+        let inner = state.inner.lock().await;
+        inner.job_requests.values().next().unwrap().run_id
+    };
+
+    request_json(
+        &app,
+        Method::GET,
+        "/runner/server/_apis/v1/Message/1?sessionId=default",
+        Value::Null,
+    )
+    .await;
+
+    let (agent_job_id, victim_token, attacker_token) = {
+        let inner = state.inner.lock().await;
+        let record = inner.job_requests.values().next().unwrap();
+        (
+            record.agent_job_id,
+            state.mint_debug_worker_token(&record.plan_id, &record.agent_job_id),
+            // A token for some other live job, minted the same way.
+            state.mint_debug_worker_token(&record.plan_id, &uuid::Uuid::new_v4()),
+        )
+    };
+
+    let open_body = json!({
+        "run_id": run_id,
+        "job_id": "build",
+        "agent_job_id": agent_job_id,
+        "job_name": "build",
+        "step": {
+            "index": 0,
+            "total": 1,
+            "context_name": "__run",
+            "display_name": "Run false",
+            "command": "false",
+            "exit_code": 1,
+            "elapsed_ms": 20,
+            "diagnostics": []
+        }
+    });
+
+    // Opening a session for a job you are not is refused outright.
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::POST,
+            "/api/v1/debug/sessions",
+            open_body.clone(),
+            &attacker_token,
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+
+    let opened = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/api/v1/debug/sessions",
+        open_body,
+        &victim_token,
+    )
+    .await;
+    let session_id = opened["session_id"].as_str().unwrap().to_owned();
+
+    // A controller queues a verdict for the paused worker.
+    request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/debug/sessions/{session_id}/verdict"),
+        json!({ "verdict": "continue", "controller": "cli" }),
+    )
+    .await;
+
+    // The other job cannot steal it, and cannot close the session either.
+    // Reported as 404 so session ids are not probeable.
+    for (method, path, body) in [
+        (
+            Method::GET,
+            format!("/api/v1/debug/sessions/{session_id}/verdict?wait=0"),
+            Value::Null,
+        ),
+        (
+            Method::POST,
+            format!("/api/v1/debug/sessions/{session_id}/close"),
+            json!({ "state": "aborted" }),
+        ),
+    ] {
+        assert_eq!(
+            request_status_with_bearer(&app, method, &path, body, &attacker_token).await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    // The verdict is still there for its rightful owner.
+    let delivered = request_json_with_bearer(
+        &app,
+        Method::GET,
+        &format!("/api/v1/debug/sessions/{session_id}/verdict?wait=0"),
+        Value::Null,
+        &victim_token,
+    )
+    .await;
+    assert_eq!(delivered["verdict"], "continue");
+}
+
+/// A runner listen token is not a worker token.
+#[tokio::test]
+async fn the_debug_surface_rejects_a_non_job_token() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::GET,
+            "/api/v1/debug/sessions/dbg_whatever/verdict?wait=0",
+            Value::Null,
+            "not-a-token",
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // A job runtime token is not enough either. That token is handed to the
+    // job as GITHUB_TOKEN, so any `run:` step can read it; accepting it here
+    // would let untrusted workflow code drive its own debug session.
+    let runtime_token = state.mint_runtime_token("plan", &uuid::Uuid::new_v4());
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::GET,
+            "/api/v1/debug/sessions/dbg_whatever/verdict?wait=0",
+            Value::Null,
+            &runtime_token,
+        )
+        .await,
+        StatusCode::UNAUTHORIZED,
+        "GITHUB_TOKEN must not reach the debug surface"
+    );
+}
+
+/// The debug-worker credential must never be a job variable.
+///
+/// Official runner v2.336.0 builds its `secrets` context from every `isSecret`
+/// variable in the job message, replacing only `system.github.token` with
+/// `GITHUB_TOKEN`. A secret variable is therefore a publication channel to the
+/// workflow being debugged: `${{ secrets['system.preloop.debug_worker_token'] }}`
+/// would have handed a `run:` step the credential that drives debug sessions.
+/// The Rust runner's own `system.*` filter is no defence — the server does not
+/// choose which runner claims the job.
+///
+/// So the assertion is on the message, not on any runner's projection of it.
+#[tokio::test]
+async fn the_job_message_never_carries_the_debug_worker_token() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: \"false\"\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "preserve_on_failure": true,
+            "secrets": {"NPM_TOKEN": "npm_LIVE_CREDENTIAL"}
+        }),
+    )
+    .await;
+
+    let wire = {
+        let inner = state.inner.lock().await;
+        let queued = inner.queue.front().expect("job should be queued");
+        serde_json::to_value(&queued.message).unwrap()
+    };
+
+    assert!(
+        !wire.to_string().contains("debug_worker_token"),
+        "the debug credential must not ship anywhere on the job message"
+    );
+
+    // Rebuild the official runner's secrets projection over the real message.
+    let variables = wire["variables"]
+        .as_object()
+        .expect("job message variables");
+    let official_secrets: BTreeSet<&str> = variables
+        .iter()
+        .filter(|(key, value)| {
+            value["isSecret"].as_bool().unwrap_or(false)
+                && !key.eq_ignore_ascii_case("system.github.token")
+        })
+        .map(|(key, _)| key.as_str())
+        .collect();
+
+    // Non-vacuous: the projection does surface the run's own secrets, so its
+    // silence about the debug credential means absence rather than a broken
+    // filter.
+    assert!(
+        official_secrets.contains("NPM_TOKEN"),
+        "the projection must be the real one: {official_secrets:?}"
+    );
+    assert!(
+        !official_secrets
+            .iter()
+            .any(|key| key.contains("debug_worker_token")),
+        "an official-style secrets context must not see a debug credential: {official_secrets:?}"
+    );
+}
+
+/// Open a debug session as a worker would, for exchange tests.
+fn open_session_body(run_id: RunId, agent_job_id: uuid::Uuid) -> Value {
+    json!({
+        "run_id": run_id,
+        "job_id": "build",
+        "agent_job_id": agent_job_id,
+        "job_name": "build",
+        "step": {
+            "index": 0,
+            "total": 1,
+            "context_name": "__run",
+            "display_name": "Run false",
+            "command": "false",
+            "exit_code": 1,
+            "elapsed_ms": 20,
+            "diagnostics": []
+        }
+    })
+}
+
+/// The exchange that replaces the removed variable is as narrow as the
+/// credential it issues.
+///
+/// The runtime token is the only job-scoped credential a worker already holds,
+/// so it is what authenticates here — but it is also exported to steps as
+/// `ACTIONS_RUNTIME_TOKEN`, so the exchange has to be worth nothing to a step
+/// that replays it. Hence: exactly one issuance per job request, spent by the
+/// worker during job setup before any step runs.
+#[tokio::test]
+async fn the_debug_worker_token_exchange_is_narrowly_authorized() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: \"false\"\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "preserve_on_failure": true
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    let (agent_job_id, plan_id) = {
+        let inner = state.inner.lock().await;
+        let (_, record) = inner.job_requests.iter().next().unwrap();
+        (record.agent_job_id, record.plan_id.clone())
+    };
+    let runtime_token = state.mint_runtime_token(&plan_id, &agent_job_id);
+    let asking_for_itself = json!({ "agent_job_id": agent_job_id });
+    let exchange = "/api/v1/debug/worker-token";
+
+    let refused = |bearer: String, body: Value| {
+        let app = app.clone();
+        async move { request_status_with_bearer(&app, Method::POST, exchange, body, &bearer).await }
+    };
+
+    assert_eq!(
+        refused("not-a-token".to_owned(), asking_for_itself.clone()).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        refused(state.system_token.clone(), asking_for_itself.clone()).await,
+        StatusCode::UNAUTHORIZED,
+        "the native admin credential is not a job identity"
+    );
+    // A debug-worker token cannot mint its own successor: its `sub` names a
+    // debug worker, not a job, so it is not a runtime token.
+    assert_eq!(
+        refused(
+            state.mint_debug_worker_token(&plan_id, &agent_job_id),
+            asking_for_itself.clone()
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // Neither direction of a job mismatch is allowed: not another job's token
+    // asking for this job, nor this job's token asking for another.
+    let stranger = uuid::Uuid::new_v4();
+    assert_eq!(
+        refused(
+            state.mint_runtime_token(&plan_id, &stranger),
+            asking_for_itself.clone()
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        refused(runtime_token.clone(), json!({ "agent_job_id": stranger })).await,
+        StatusCode::FORBIDDEN
+    );
+
+    // The job's own runtime token succeeds, and buys a *different* credential.
+    let issued = request_json_with_bearer(
+        &app,
+        Method::POST,
+        exchange,
+        asking_for_itself.clone(),
+        &runtime_token,
+    )
+    .await;
+    let worker_token = issued["token"].as_str().expect("issued token").to_owned();
+    assert_ne!(worker_token, runtime_token);
+
+    // What it buys is precisely what the session surface demands, and what the
+    // runtime token is still refused for.
+    let opened = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/api/v1/debug/sessions",
+        open_session_body(run_id, agent_job_id),
+        &worker_token,
+    )
+    .await;
+    assert!(opened["session_id"].as_str().is_some());
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::POST,
+            "/api/v1/debug/sessions",
+            open_session_body(run_id, agent_job_id),
+            &runtime_token,
+        )
+        .await,
+        StatusCode::UNAUTHORIZED,
+        "the exchange must not have widened what a runtime token can reach"
+    );
+
+    // One shot. A step that later finds `ACTIONS_RUNTIME_TOKEN` in its
+    // environment has nothing left to spend.
+    assert_eq!(
+        refused(runtime_token, asking_for_itself).await,
+        StatusCode::CONFLICT
+    );
+}
+
+#[tokio::test]
+async fn debug_worker_token_outlives_job_and_pause_windows() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let token = state.mint_debug_worker_token("plan", &uuid::Uuid::new_v4());
+    let claims = state
+        .verify_local_jwt_claims(&token)
+        .expect("fresh debug-worker token verifies");
+    let issued_at = claims["iat"].as_u64().expect("iat is numeric");
+    let expires_at = claims["exp"].as_u64().expect("exp is numeric");
+
+    assert_eq!(
+        expires_at - issued_at,
+        crate::state::DEBUG_WORKER_TOKEN_LIFETIME.as_secs()
+    );
+    assert!(
+        expires_at - issued_at > (6 + 4) * 60 * 60,
+        "credential must cover the job limit and maximum pause credit"
+    );
+}
+
+/// No pause-on-failure opt-in, no debug credential at all.
+///
+/// The runner only builds a pause client for a run that asked for one, so
+/// issuing outside that case would grow the credential's blast radius to every
+/// job on the server for no behavioural gain.
+#[tokio::test]
+async fn the_exchange_refuses_a_run_that_never_asked_to_pause() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo"
+        }),
+    )
+    .await;
+
+    let (agent_job_id, plan_id) = {
+        let inner = state.inner.lock().await;
+        let (_, record) = inner.job_requests.iter().next().unwrap();
+        (record.agent_job_id, record.plan_id.clone())
+    };
+
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::POST,
+            "/api/v1/debug/worker-token",
+            json!({ "agent_job_id": agent_job_id }),
+            &state.mint_runtime_token(&plan_id, &agent_job_id),
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+/// A completed job cannot acquire a debug credential.
+#[tokio::test]
+async fn the_exchange_refuses_a_job_that_is_no_longer_running() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: \"false\"\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "preserve_on_failure": true
+        }),
+    )
+    .await;
+
+    let (agent_job_id, plan_id) = {
+        let mut inner = state.inner.lock().await;
+        let (_, record) = inner.job_requests.iter_mut().next().unwrap();
+        record.result = Some(ExecutionStatus::Failure);
+        (record.agent_job_id, record.plan_id.clone())
+    };
+
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::POST,
+            "/api/v1/debug/worker-token",
+            json!({ "agent_job_id": agent_job_id }),
+            &state.mint_runtime_token(&plan_id, &agent_job_id),
+        )
+        .await,
+        StatusCode::NOT_FOUND
+    );
+}
+
+/// Pause credit is finite: past the ceiling the job times out normally.
+///
+/// Otherwise a worker that keeps polling opts its job out of `timeout-minutes`
+/// altogether, and holds its microVM for as long as it likes.
+#[tokio::test]
+async fn pause_credit_runs_out_and_the_job_times_out() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown,
+    });
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: \"false\"\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "preserve_on_failure": true
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    request_json(
+        &app,
+        Method::GET,
+        "/runner/server/_apis/v1/Message/1?sessionId=default",
+        Value::Null,
+    )
+    .await;
+
+    let (request_id, agent_job_id, worker_token) = {
+        let inner = state.inner.lock().await;
+        let (id, record) = inner.job_requests.iter().next().unwrap();
+        (
+            *id,
+            record.agent_job_id,
+            state.mint_debug_worker_token(&record.plan_id, &record.agent_job_id),
+        )
+    };
+
+    let opened = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/api/v1/debug/sessions",
+        json!({
+            "run_id": run_id,
+            "job_id": "build",
+            "agent_job_id": agent_job_id,
+            "job_name": "build",
+            "step": {
+                "index": 0,
+                "total": 1,
+                "context_name": "__run",
+                "display_name": "Run false",
+                "command": "false",
+                "exit_code": 1,
+                "elapsed_ms": 20,
+                "diagnostics": []
+            }
+        }),
+        &worker_token,
+    )
+    .await;
+    let session_id = opened["session_id"].as_str().unwrap().to_owned();
+
+    // The worker is still polling — `worker_seen_at` is fresh, so the
+    // abandonment sweep does not apply. Only the credit ceiling can end this.
+    let ceiling = crate::debug_sessions::MAX_PAUSE_CREDIT;
+    {
+        let mut inner = state.inner.lock().await;
+        let past = SystemTime::now() - ceiling - Duration::from_secs(22_000);
+        inner.job_requests.get_mut(&request_id).unwrap().started_at = Some(past);
+        inner
+            .debug_sessions
+            .backdate_pause_for_test(&session_id, past);
+    }
+
+    reap_once(&shared).await;
+
+    let inner = state.inner.lock().await;
+    assert!(
+        inner
+            .job_requests
+            .get(&request_id)
+            .unwrap()
+            .timeout_triggered,
+        "pause credit must be finite — an endless pause is an endless job"
+    );
+}
+
+/// Resuming a job must not hand its paused time back to the reaper.
+///
+/// The credit lived in the session record, and closing the session dropped it,
+/// so the subtraction that kept the job alive while paused disappeared the
+/// instant it resumed. A job paused for hours was then cancelled on the very
+/// next reaper tick, reported as an ordinary timeout, with the debugging time
+/// billed as execution and nothing in any client able to explain it.
+#[tokio::test]
+async fn resuming_a_job_does_not_rebill_the_time_it_spent_paused() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown,
+    });
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: \"false\"\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "preserve_on_failure": true
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    request_json(
+        &app,
+        Method::GET,
+        "/runner/server/_apis/v1/Message/1?sessionId=default",
+        Value::Null,
+    )
+    .await;
+
+    let (request_id, agent_job_id, worker_token) = {
+        let inner = state.inner.lock().await;
+        let (id, record) = inner.job_requests.iter().next().unwrap();
+        (
+            *id,
+            record.agent_job_id,
+            state.mint_debug_worker_token(&record.plan_id, &record.agent_job_id),
+        )
+    };
+
+    let opened = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/api/v1/debug/sessions",
+        json!({
+            "run_id": run_id,
+            "job_id": "build",
+            "agent_job_id": agent_job_id,
+            "job_name": "build",
+            "step": {
+                "index": 0,
+                "total": 1,
+                "context_name": "__run",
+                "display_name": "Run false",
+                "command": "false",
+                "exit_code": 1,
+                "elapsed_ms": 20,
+                "diagnostics": []
+            }
+        }),
+        &worker_token,
+    )
+    .await;
+    let session_id = opened["session_id"].as_str().unwrap().to_owned();
+
+    // 22_000s since the job started, 10_000 of them paused: 12_000s of
+    // execution against the default 21_600s timeout. Inside the budget only if
+    // the pause is subtracted.
+    {
+        let mut inner = state.inner.lock().await;
+        let now = SystemTime::now();
+        inner.job_requests.get_mut(&request_id).unwrap().started_at =
+            Some(now - Duration::from_secs(22_000));
+        inner
+            .debug_sessions
+            .backdate_pause_for_test(&session_id, now - Duration::from_secs(10_000));
+    }
+
+    // The controller says continue and the worker closes the session: from here
+    // on nothing in the registry holds this request open.
+    let closed = request_json_with_bearer(
+        &app,
+        Method::POST,
+        &format!("/api/v1/debug/sessions/{session_id}/close"),
+        json!({ "state": "resumed" }),
+        &worker_token,
+    )
+    .await;
+    assert_eq!(closed["ok"], true);
+
+    {
+        let inner = state.inner.lock().await;
+        assert!(
+            inner.debug_sessions.list().is_empty(),
+            "the session is closed, so the credit cannot be coming from a live one"
+        );
+        assert!(
+            inner
+                .debug_sessions
+                .paused_for_request(request_id, SystemTime::now())
+                >= Duration::from_secs(9_500),
+            "the closed session's pause must still be credited to its request"
+        );
+    }
+
+    reap_once(&shared).await;
+
+    let inner = state.inner.lock().await;
+    assert!(
+        !inner
+            .job_requests
+            .get(&request_id)
+            .unwrap()
+            .timeout_triggered,
+        "a resumed job must be billed for execution only — 12_000s of it here"
+    );
+    assert!(inner.cancellation_queue.is_empty());
+    // And the reaper's own sweep does not confiscate it either: the request is
+    // still active, so the credit has to survive the tick.
+    assert!(
+        inner
+            .debug_sessions
+            .paused_for_request(request_id, SystemTime::now())
+            >= Duration::from_secs(9_500),
+        "a reaper tick must not reset an active request's pause credit"
+    );
+}
+
+/// An empty long poll must never be mistaken for a decision.
+#[tokio::test]
+async fn verdict_poll_timeout_is_not_an_abort() {
+    verdict_poll_timeout_is_not_an_abort_impl().await;
+}
+
+/// The worker addresses its debug session by run id, so `preserve_on_failure`
+/// must carry one.
+///
+/// This was silently missing at first: the field was only populated for DAP
+/// runs, so the live-pause path constructed no client and fell through to the
+/// old post-mortem behaviour with no error anywhere.
+#[tokio::test]
+async fn preserve_on_failure_carries_the_run_id_for_the_debug_session() {
+    for (preserve, expect_run_id) in [(true, true), (false, false)] {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+                "event": "push",
+                "repository": "owner/repo",
+                "preserve_on_failure": preserve
+            }),
+        )
+        .await;
+        let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+
+        let queued = {
+            let inner = state.inner.lock().await;
+            inner.queue.front().cloned().unwrap()
+        };
+        assert_eq!(
+            queued.message.aksh_debug_run_id.as_deref() == Some(run_id.as_str()),
+            expect_run_id,
+            "preserve_on_failure={preserve} must {} carry the run id",
+            if expect_run_id { "" } else { "not" }
+        );
+
+        // The wire shape stays clean when debugging was not requested.
+        let encoded = serde_json::to_value(&queued.message).unwrap();
+        assert_eq!(
+            encoded.get("akshDebugRunId").is_some(),
+            expect_run_id,
+            "absent means absent on the wire"
+        );
+    }
+}
+
+async fn verdict_poll_timeout_is_not_an_abort_impl() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+
+    request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: \"false\"\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "preserve_on_failure": true
+        }),
+    )
+    .await;
+    let _msg = request_json(
+        &app,
+        Method::GET,
+        "/runner/server/_apis/v1/Message/1?sessionId=default",
+        Value::Null,
+    )
+    .await;
+    let (run_id, agent_job_id, worker_token) = {
+        let inner = state.inner.lock().await;
+        let record = inner.job_requests.values().next().unwrap();
+        (
+            record.run_id,
+            record.agent_job_id,
+            state.mint_debug_worker_token(&record.plan_id, &record.agent_job_id),
+        )
+    };
+
+    let opened = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/api/v1/debug/sessions",
+        json!({
+            "run_id": run_id,
+            "job_id": "build",
+            "agent_job_id": agent_job_id,
+            "job_name": "build",
+            "step": {
+                "index": 0, "total": 1, "context_name": "__run",
+                "display_name": "Run false", "elapsed_ms": 5, "diagnostics": []
+            }
+        }),
+        &worker_token,
+    )
+    .await;
+    let session_id = opened["session_id"].as_str().unwrap();
+
+    let polled = request_json_with_bearer(
+        &app,
+        Method::GET,
+        &format!("/api/v1/debug/sessions/{session_id}/verdict?wait=0"),
+        Value::Null,
+        &worker_token,
+    )
+    .await;
+    assert!(
+        polled.get("verdict").is_none() || polled["verdict"].is_null(),
+        "an expired poll must carry no verdict, got {polled}"
+    );
+
+    // The session is still open and still holding the job.
+    let listed = request_json(&app, Method::GET, "/api/v1/debug/sessions", Value::Null).await;
+    assert_eq!(listed["sessions"].as_array().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -7302,6 +9143,81 @@ async fn workspace_snapshot_captures_git_state_without_mutating_source() {
 }
 
 #[tokio::test]
+async fn terminal_run_discards_workspace_snapshot_but_preserves_object_cache() {
+    let temp = tempfile::tempdir().unwrap();
+    let (state_dir, workspace) = create_snapshot_fixture(temp.path());
+    let mut state = AppState::new(state_dir.clone()).await.unwrap();
+    state.local_workspace = Some(workspace);
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = submit_yaml(
+        &app,
+        r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo snapshot
+"#,
+        "owner/repo",
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let repository = state_dir.join("snapshots").join(run_id.to_string());
+    let object_cache = state_dir.join("snapshot-object-cache");
+    assert!(
+        repository.is_dir(),
+        "submission should create the run snapshot"
+    );
+    assert!(
+        object_cache.is_dir(),
+        "submission should create the shared object cache"
+    );
+
+    let job_id = {
+        let inner = state.inner.lock().await;
+        inner
+            .runs
+            .get(&run_id)
+            .and_then(|run| run.jobs.keys().next())
+            .cloned()
+            .expect("submitted run should have one dispatchable job")
+    };
+    complete_via_api(&app, &run_id.to_string(), &job_id.to_string()).await;
+
+    assert_eq!(
+        get_run_json(&app, &run_id.to_string()).await["status"],
+        "success"
+    );
+    assert!(
+        !repository.exists(),
+        "terminal completion should remove the run's workspace snapshot"
+    );
+    assert!(
+        object_cache.is_dir(),
+        "terminal completion must preserve the shared snapshot object cache"
+    );
+}
+
+#[tokio::test]
+async fn discard_workspace_snapshot_is_idempotent_when_repository_absent() {
+    let temp = tempfile::tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let snapshots = state_dir.join("snapshots");
+    let object_cache = state_dir.join("snapshot-object-cache");
+    fs::create_dir_all(&snapshots).unwrap();
+    fs::create_dir_all(&object_cache).unwrap();
+    let run_id: RunId = "55555555-5555-4555-8555-555555555555".parse().unwrap();
+
+    discard_workspace_snapshot(&state_dir, run_id).await;
+    discard_workspace_snapshot(&state_dir, run_id).await;
+
+    assert!(!snapshots.join(run_id.to_string()).exists());
+    assert!(object_cache.is_dir());
+}
+
+#[tokio::test]
 async fn workspace_snapshots_reuse_large_base_objects_and_materialize_changes() {
     let temp = tempfile::tempdir().unwrap();
     let state_dir = temp.path().join("state");
@@ -7491,6 +9407,14 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
             "timeoutInMinutes": null
         }
     ]));
+    let mut token_only = checkout_test_message(json!([{
+        "id": "00000000-0000-0000-0000-000000000013",
+        "name": "token-only checkout",
+        "reference": {"name": "actions/checkout", "version": "v4", "type": "repository"},
+        "inputs": {"token": "submodule-token", "fetch-depth": "0"},
+        "continueOnError": false,
+        "timeoutInMinutes": null
+    }]));
     let original_explicit = message.steps[1].inputs.clone();
     let original_non_checkout = message.steps[2].inputs.clone();
     assert!(message.snapshot.is_none());
@@ -7502,6 +9426,7 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
             repository: "snapshots/11111111-1111-4111-8111-111111111111".to_owned(),
         },
         "http://127.0.0.1:9090",
+        "local-runtime-jwt",
     );
 
     assert_eq!(redirected, 1);
@@ -7518,6 +9443,9 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
         primary.get("github-server-url"),
         Some(&"http://127.0.0.1:9090".to_owned())
     );
+    // Pinned so snapshot checkout keeps working when GITHUB_TOKEN carries a
+    // GitHub App installation token or PAT the snapshot endpoint cannot verify.
+    assert_eq!(primary.get("token"), Some(&"local-runtime-jwt".to_owned()));
     assert_eq!(primary.get("path"), Some(&"source".to_owned()));
     assert_eq!(primary.get("fetch-depth"), Some(&"0".to_owned()));
     assert_eq!(message.steps[1].inputs, original_explicit);
@@ -7525,6 +9453,24 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
     assert!(
         message.snapshot.is_none(),
         "snapshot wire field must remain untouched"
+    );
+
+    assert_eq!(
+        redirect_primary_checkout(
+            &mut token_only,
+            &WorkspaceSnapshot {
+                commit_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                repository: "snapshots/22222222-2222-4222-8222-222222222222".to_owned(),
+            },
+            "http://127.0.0.1:9090",
+            "local-runtime-jwt",
+        ),
+        1,
+        "a token-only primary checkout still targets the local snapshot"
+    );
+    assert_eq!(
+        token_only.steps[0].inputs.get("token"),
+        Some(&"local-runtime-jwt".to_owned())
     );
 }
 
@@ -7776,4 +9722,75 @@ jobs:
         ),
         b"tracked unstaged change\n"
     );
+}
+
+/// Uploaded job logs must stay bounded, and pruning must not cost a run its
+/// logs: `get_run_logs` prefers the blob and falls back to the in-memory
+/// blocks, so an evicted plan degrades instead of disappearing.
+#[tokio::test]
+async fn replay_results_are_pruned_to_the_retention_window() {
+    let temp = tempfile::tempdir().unwrap();
+    let results = temp.path().join("replay").join("results");
+
+    // One directory per execution plan, oldest first so mtime ordering is
+    // unambiguous rather than dependent on filesystem timestamp resolution.
+    let total = crate::blob_store::REPLAY_PLANS_RETAINED + 8;
+    let mut plans = Vec::new();
+    for index in 0..total {
+        let plan = results.join(format!("plan-{index:03}"));
+        std::fs::create_dir_all(&plan).unwrap();
+        std::fs::write(plan.join("job-logs.txt"), format!("log {index}")).unwrap();
+        filetime::set_file_mtime(
+            &plan,
+            filetime::FileTime::from_unix_time(1_700_000_000 + index as i64, 0),
+        )
+        .unwrap();
+        plans.push(plan);
+    }
+
+    crate::blob_store::prune_replay_results(temp.path(), &std::collections::BTreeSet::new()).await;
+
+    let surviving: Vec<_> = plans.iter().filter(|plan| plan.exists()).collect();
+    assert_eq!(
+        surviving.len(),
+        crate::blob_store::REPLAY_PLANS_RETAINED,
+        "retention window must bound the directory"
+    );
+    assert!(
+        plans[total - 1].exists(),
+        "the most recent plan must survive"
+    );
+    assert!(!plans[0].exists(), "the oldest plan must be evicted");
+    assert_eq!(
+        std::fs::read_to_string(plans[total - 1].join("job-logs.txt")).unwrap(),
+        format!("log {}", total - 1),
+        "surviving logs must be intact"
+    );
+}
+
+#[tokio::test]
+async fn replay_result_pruning_preserves_active_plans() {
+    let temp = tempfile::tempdir().unwrap();
+    let results = temp.path().join("replay").join("results");
+    for index in 0..=crate::blob_store::REPLAY_PLANS_RETAINED {
+        let plan = results.join(format!("plan-{index:03}"));
+        std::fs::create_dir_all(&plan).unwrap();
+        filetime::set_file_mtime(
+            &plan,
+            filetime::FileTime::from_unix_time(1_700_000_000 + index as i64, 0),
+        )
+        .unwrap();
+    }
+    let active = BTreeSet::from(["plan-000".to_owned()]);
+
+    crate::blob_store::prune_replay_results(temp.path(), &active).await;
+
+    assert!(results.join("plan-000").exists());
+}
+
+#[tokio::test]
+async fn pruning_replay_results_is_a_no_op_without_a_replay_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    crate::blob_store::prune_replay_results(temp.path(), &std::collections::BTreeSet::new()).await;
+    assert!(!temp.path().join("replay").exists());
 }

@@ -423,7 +423,7 @@ impl Scheduler {
             _ => None,
         };
         let workflows = match crate::github::fetch_workflows(
-            &None,
+            &shared,
             &repository,
             &format!("refs/heads/{default_branch}"),
         )
@@ -722,6 +722,9 @@ async fn cron_loop(
             filter_branch: None,
             dispatch_inputs: Default::default(),
             dispatch_inputs_stringified: Default::default(),
+            selected_jobs: vec![],
+            base_ref: None,
+            preserve_on_failure: false,
         };
         let (run_id, error) = match submit_run_inner(&shared, submission).await {
             Ok(accepted) => {

@@ -10,7 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TEMPLATE="${TEMPLATE:-/private/tmp/bench-runner.smolmachine}"
 OFFICIAL_RUNNER_HOST="${OFFICIAL_RUNNER_HOST:-$HOME/cachingv4}"
-AKSH_SERVER_BIN="$REPO_ROOT/target/aarch64-unknown-linux-musl/release/aksh-runner-server"
+AKSH_SERVER_BIN="$REPO_ROOT/target/aarch64-unknown-linux-musl/release/preloop-server"
 GH_REPO="${GH_REPO:-preloopdev/aksh-conformance-sample}"
 RESULTS_DIR="$REPO_ROOT/benchmarks/compatibility/server/behavior"
 
@@ -44,13 +44,13 @@ run_scenario() {
     smolvm machine update --name "$vm" --rosetta >/dev/null 2>&1
     smolvm machine start --name "$vm" >/dev/null 2>&1
     smolvm machine exec --name "$vm" -- bash -lc 'mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc 2>/dev/null || true; if [ -x /usr/bin/rosetta-wrapper ] && [ -x /mnt/rosetta/rosetta ]; then echo ":rosetta:M::\\x7fELF\\x02\\x01\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x02\\x00\\x3e\\x00:\\xff\\xff\\xff\\xff\\xff\\xfe\\xfe\\x00\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xfe\\xff\\xff\\xff:/usr/bin/rosetta-wrapper:F" > /proc/sys/fs/binfmt_misc/register 2>/dev/null || true; fi' >/dev/null 2>&1 || true
-    smolvm machine cp "$AKSH_SERVER_BIN" "$vm:/usr/local/bin/aksh-runner-server" >/dev/null 2>&1
+    smolvm machine cp "$AKSH_SERVER_BIN" "$vm:/usr/local/bin/preloop-server" >/dev/null 2>&1
 
     local output
     output=$(smolvm machine exec --name "$vm" -- bash -lc "
         set -u
-        chmod +x /usr/local/bin/aksh-runner-server
-        RUST_LOG=info AKSH_PUBLIC_URL=http://127.0.0.1 aksh-runner-server serve --listen 0.0.0.0:80 > /tmp/server.log 2>&1 &
+        chmod +x /usr/local/bin/preloop-server
+        RUST_LOG=info AKSH_PUBLIC_URL=http://127.0.0.1 preloop-server serve --listen 0.0.0.0:80 > /tmp/server.log 2>&1 &
         server_pid=\$!
         sleep 2
         if ! wget -qO- http://127.0.0.1/healthz >/dev/null; then

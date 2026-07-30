@@ -44,8 +44,6 @@ pub(crate) async fn create_workspace_snapshot(
             workspace.display()
         ))
     })?;
-    ensure_git_worktree(&workspace).await?;
-
     let snapshots_dir = state_dir.join("snapshots");
     tokio::fs::create_dir_all(&snapshots_dir)
         .await
@@ -121,23 +119,25 @@ async fn create_workspace_snapshot_inner(
     final_repository: &FsPath,
     run_id: RunId,
 ) -> Result<String, ApiError> {
-    run_git(
-        Command::new("git")
-            .args(["init", "--bare", "--quiet"])
-            .arg(staging_repository),
-        "initialize snapshot repository",
-    )
-    .await?;
-
-    let common_dir_output = run_git(
-        Command::new("git")
-            .arg("-C")
-            .arg(workspace)
-            .args(["rev-parse", "--git-common-dir"]),
-        "resolve source Git common directory",
-    )
-    .await?;
-    let common_dir = output_path(&common_dir_output, workspace)?;
+    // Creating the staging repository does not depend on anything we learn
+    // from the workspace, so pay for both spawns at once. Every millisecond
+    // here sits directly in `POST /api/v1/runs`.
+    //
+    // `--template=` skips copying the sample hooks and description into a
+    // repository that only ever serves one fetch.
+    let mut init_command = Command::new("git");
+    init_command
+        .args(["init", "--bare", "--quiet", "--template="])
+        .arg(staging_repository);
+    let (init, probe) = tokio::join!(
+        run_git(&mut init_command, "initialize snapshot repository"),
+        probe_workspace(workspace),
+    );
+    init?;
+    let WorkspaceRevision {
+        common_dir,
+        source_head,
+    } = probe?;
     let source_objects = common_dir.join("objects");
     if !source_objects.is_dir() {
         return Err(ApiError::bad_request(format!(
@@ -145,24 +145,35 @@ async fn create_workspace_snapshot_inner(
             source_objects.display()
         )));
     }
-    let cached_objects = ensure_object_cache(state_dir, workspace, &common_dir).await?;
+    let cache =
+        ensure_object_cache(state_dir, workspace, &common_dir, source_head.as_deref()).await?;
+    let ObjectCache {
+        objects: cached_objects,
+        index: cache_index,
+        refreshed: cache_refreshed,
+    } = cache;
 
-    let source_head = Command::new("git")
-        .arg("-C")
-        .arg(workspace)
-        .args(["rev-parse", "--verify", "HEAD"])
-        .output()
-        .await
-        .map_err(|error| ApiError::internal(format!("failed to resolve source HEAD: {error}")))?;
-
-    if source_head.status.success() {
-        let head = output_text(&source_head, "resolve source HEAD")?;
+    // `git add --all` has to decide, for every path, whether the working tree
+    // still matches the index. With a cold index it re-hashes the whole tree;
+    // with the previous run's stat data it only re-hashes what changed. On a
+    // 6000-file workspace that is 156 ms versus 16 ms.
+    //
+    // The reuse is safe because the index is reset to HEAD immediately after:
+    // `--reset` takes every entry's object id from the tree (so every blob it
+    // names is reachable from HEAD and lives in the object cache) and keeps
+    // stat data only where the path is unchanged. The persisted index
+    // contributes cached stat information and nothing else. Plain `read-tree`
+    // would drop that stat data and put us back on the slow path.
+    if let Some(head) = source_head.as_deref() {
+        if cache_index.is_file() {
+            let _ = tokio::fs::copy(&cache_index, staging_index).await;
+        }
         run_snapshot_git(
             workspace,
             staging_repository,
             staging_index,
             &cached_objects,
-            ["read-tree", head.as_str()],
+            ["read-tree", "--reset", head],
             "seed snapshot index",
         )
         .await?;
@@ -191,6 +202,10 @@ async fn create_workspace_snapshot_inner(
     .await?;
     let tree = output_text(&tree_output, "write snapshot tree")?;
 
+    // Best effort: the index is a cache, so a failed hand-off only costs the
+    // next submission its stat data.
+    persist_snapshot_index(staging_index, &cache_index).await;
+
     let mut commit = snapshot_git_command(
         workspace,
         staging_repository,
@@ -218,24 +233,28 @@ async fn create_workspace_snapshot_inner(
         )));
     }
 
-    run_snapshot_git(
+    let mut update_refs = snapshot_git_command(
         workspace,
         staging_repository,
         staging_index,
         &cached_objects,
-        ["update-ref", SNAPSHOT_REF, commit_sha.as_str()],
+    );
+    update_refs.args(["update-ref", "--stdin"]);
+    let update_input = format!("update {SNAPSHOT_REF} {commit_sha}\n");
+    run_git_with_stdin(
+        &mut update_refs,
+        update_input.as_bytes(),
         "publish snapshot ref",
     )
     .await?;
-    run_snapshot_git(
+    let mut update_head = snapshot_git_command(
         workspace,
         staging_repository,
         staging_index,
         &cached_objects,
-        ["symbolic-ref", "HEAD", SNAPSHOT_REF],
-        "set snapshot default ref",
-    )
-    .await?;
+    );
+    update_head.args(["symbolic-ref", "HEAD", SNAPSHOT_REF]);
+    run_git(&mut update_head, "publish snapshot HEAD").await?;
 
     let alternate_file = staging_repository.join("objects/info/alternates");
     tokio::fs::create_dir_all(alternate_file.parent().expect("alternates parent"))
@@ -254,14 +273,24 @@ async fn create_workspace_snapshot_inner(
         })?;
 
     // Prove that the synthetic commit is fully connected through the persisted
-    // cache without decompressing and re-hashing every historical blob on every
-    // submission. Git clone/fetch validate incoming objects; connectivity-only
-    // catches a missing alternate object while keeping warm snapshots bounded by
-    // the current tree rather than total repository history.
-    let mut fsck = Command::new("git");
-    fsck.env("GIT_DIR", staging_repository)
-        .args(["fsck", "--connectivity-only", "--no-dangling"]);
-    run_git(&mut fsck, "verify incremental snapshot repository").await?;
+    // cache, without decompressing and re-hashing every historical blob. Git
+    // clone/fetch validate incoming objects; connectivity-only catches an
+    // alternate that is missing an object the new tree needs.
+    //
+    // Only a clone or fetch can change what the alternate holds, and the
+    // objects this run wrote live in the staging repository itself, so a run
+    // that reused the cache untouched is already covered by the check that ran
+    // when those objects landed. Re-verifying every submission cost ~30 % of
+    // snapshot time for a result that cannot have changed.
+    if cache_refreshed {
+        let mut fsck = Command::new("git");
+        fsck.env("GIT_DIR", staging_repository).args([
+            "fsck",
+            "--connectivity-only",
+            "--no-dangling",
+        ]);
+        run_git(&mut fsck, "verify incremental snapshot repository").await?;
+    }
 
     tokio::fs::rename(staging_repository, final_repository)
         .await
@@ -273,22 +302,71 @@ async fn create_workspace_snapshot_inner(
     Ok(commit_sha)
 }
 
-async fn ensure_git_worktree(workspace: &FsPath) -> Result<(), ApiError> {
-    let output = run_git(
-        Command::new("git")
-            .arg("-C")
-            .arg(workspace)
-            .args(["rev-parse", "--is-inside-work-tree"]),
-        "validate local Git workspace",
-    )
-    .await?;
-    if output.stdout != b"true\n" && output.stdout != b"true\r\n" {
+/// What one `git rev-parse` tells us about the source workspace.
+struct WorkspaceRevision {
+    /// Canonical `.git` common directory backing the worktree.
+    common_dir: PathBuf,
+    /// Current `HEAD` commit, absent when the branch is unborn.
+    source_head: Option<String>,
+}
+
+/// Validate the workspace and resolve its common directory and `HEAD` in a
+/// single `git` invocation.
+///
+/// Process spawns dominate snapshot creation, so the three questions the
+/// snapshot needs are asked together rather than one process each.
+async fn probe_workspace(workspace: &FsPath) -> Result<WorkspaceRevision, ApiError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args([
+            "rev-parse",
+            "--is-inside-work-tree",
+            "--git-common-dir",
+            "HEAD",
+        ])
+        .output()
+        .await
+        .map_err(|error| {
+            ApiError::internal(format!("failed to inspect local Git workspace: {error}"))
+        })?;
+    // An unborn HEAD makes `rev-parse` exit non-zero after it has already
+    // printed the answers that do resolve, so the lines are parsed either way.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines().map(str::trim);
+
+    if lines.next() != Some("true") {
         return Err(ApiError::bad_request(format!(
             "local workspace is not a Git worktree: {}",
             workspace.display()
         )));
     }
-    Ok(())
+    let common_dir = lines
+        .next()
+        .filter(|line| !line.is_empty())
+        .ok_or_else(|| {
+            ApiError::internal(format!(
+                "git produced no Git common directory for {}: {}",
+                workspace.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        })?;
+    let common_dir = output_path_text(common_dir, workspace)?;
+    let source_head = if output.status.success() {
+        let head = lines
+            .next()
+            .filter(|line| !line.is_empty())
+            .ok_or_else(|| {
+                ApiError::internal("git produced no source HEAD for the local workspace")
+            })?;
+        Some(head.to_owned())
+    } else {
+        None
+    };
+    Ok(WorkspaceRevision {
+        common_dir,
+        source_head,
+    })
 }
 
 fn snapshot_git_command(
@@ -350,8 +428,8 @@ fn output_text(output: &std::process::Output, operation: &str) -> Result<String,
     Ok(value.to_owned())
 }
 
-fn output_path(output: &std::process::Output, workspace: &FsPath) -> Result<PathBuf, ApiError> {
-    let path = PathBuf::from(output_text(output, "resolve source Git common directory")?);
+fn output_path_text(value: &str, workspace: &FsPath) -> Result<PathBuf, ApiError> {
+    let path = PathBuf::from(value);
     let path = if path.is_absolute() {
         path
     } else {
@@ -365,11 +443,55 @@ fn output_path(output: &std::process::Output, workspace: &FsPath) -> Result<Path
     })
 }
 
+async fn run_git_with_stdin(
+    command: &mut Command,
+    input: &[u8],
+    operation: &str,
+) -> Result<std::process::Output, ApiError> {
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| ApiError::internal(format!("failed to {operation}: {error}")))?;
+    let mut stdin = child.stdin.take().ok_or_else(|| {
+        ApiError::internal(format!("failed to {operation}: Git stdin was not piped"))
+    })?;
+    stdin
+        .write_all(input)
+        .await
+        .map_err(|error| ApiError::internal(format!("failed to {operation}: {error}")))?;
+    drop(stdin);
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|error| ApiError::internal(format!("failed to {operation}: {error}")))?;
+    if !output.status.success() {
+        return Err(ApiError::internal(format!(
+            "failed to {operation}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(output)
+}
+
+/// Result of pointing a snapshot at the persistent object cache.
+struct ObjectCache {
+    /// Object directory to expose as the snapshot's alternate.
+    objects: PathBuf,
+    /// Persisted index carrying this workspace's cached stat data.
+    index: PathBuf,
+    /// Whether this call added objects to the cache.
+    refreshed: bool,
+}
+
 async fn ensure_object_cache(
     state_dir: &FsPath,
     workspace: &FsPath,
     common_dir: &FsPath,
-) -> Result<PathBuf, ApiError> {
+    source_head: Option<&str>,
+) -> Result<ObjectCache, ApiError> {
     use sha2::Digest;
 
     let identity = common_dir.to_string_lossy();
@@ -381,7 +503,11 @@ async fn ensure_object_cache(
         ApiError::internal(format!("failed to create snapshot object cache: {error}"))
     })?;
     let _guard = acquire_cache_lock(&lock).await?;
+    let mut last_head = repository.as_os_str().to_os_string();
+    last_head.push(".last-head");
+    let last_head = PathBuf::from(last_head);
 
+    let mut cloned = false;
     if !repository.is_dir() {
         let staging = root.join(format!("{key}.{}.tmp", uuid::Uuid::new_v4()));
         let mut clone = Command::new("git");
@@ -399,7 +525,7 @@ async fn ensure_object_cache(
             .args(["config", "gc.auto", "0"]);
         run_git(&mut disable_gc, "disable snapshot cache auto-gc").await?;
         match tokio::fs::rename(&staging, &repository).await {
-            Ok(()) => {}
+            Ok(()) => cloned = true,
             Err(error) if repository.is_dir() => {
                 let _ = tokio::fs::remove_dir_all(&staging).await;
                 let _ = error;
@@ -411,24 +537,107 @@ async fn ensure_object_cache(
                 )));
             }
         }
+    }
+
+    let mut refreshed = cloned;
+    if cloned {
+        record_cache_head(&last_head, source_head).await?;
     } else {
         // Fetch only adds immutable objects and atomically updates refs. Auto
         // GC is disabled, so active run alternates cannot lose base objects.
-        let mut fetch = Command::new("git");
-        fetch
-            .env("GIT_DIR", &repository)
-            .args(["fetch", "--quiet", "--force", "--prune"])
-            .arg(workspace)
-            .args(["+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"]);
-        run_git(&mut fetch, "refresh snapshot object cache").await?;
+        let cached_head = match tokio::fs::read_to_string(&last_head).await {
+            Ok(value) => Some(value.trim().to_owned()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(ApiError::internal(format!(
+                    "failed to read snapshot object cache HEAD: {error}"
+                )));
+            }
+        };
+        // An unborn HEAD gives nothing to compare, so always refresh.
+        if source_head.is_none() || cached_head.as_deref() != source_head {
+            let mut fetch = Command::new("git");
+            fetch
+                .env("GIT_DIR", &repository)
+                .args(["fetch", "--quiet", "--force", "--prune"])
+                .arg(workspace)
+                .args(["+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"]);
+            run_git(&mut fetch, "refresh snapshot object cache").await?;
+            record_cache_head(&last_head, source_head).await?;
+            refreshed = true;
+        }
     }
 
-    std::fs::canonicalize(repository.join("objects")).map_err(|error| {
+    let objects = std::fs::canonicalize(repository.join("objects")).map_err(|error| {
         ApiError::internal(format!("failed to resolve snapshot object cache: {error}"))
+    })?;
+    let mut index = repository.as_os_str().to_owned();
+    index.push(".index");
+    Ok(ObjectCache {
+        objects,
+        index: PathBuf::from(index),
+        refreshed,
     })
 }
 
+/// Persist the workspace HEAD the cache was last synced to.
+///
+/// An unborn HEAD has nothing to record; clearing the marker keeps the next
+/// call on the always-fetch path.
+async fn record_cache_head(marker: &FsPath, source_head: Option<&str>) -> Result<(), ApiError> {
+    let result = match source_head {
+        Some(head) => tokio::fs::write(marker, format!("{head}\n")).await,
+        None => match tokio::fs::remove_file(marker).await {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        },
+    };
+    result.map_err(|error| {
+        ApiError::internal(format!(
+            "failed to record snapshot object cache HEAD: {error}"
+        ))
+    })
+}
+
+/// Hand this run's index to the next one, atomically.
+///
+/// Concurrent submissions for the same workspace simply race to publish; the
+/// index holds only stat data, so either winner is correct.
+async fn persist_snapshot_index(staging_index: &FsPath, destination: &FsPath) {
+    let Some(parent) = destination.parent() else {
+        return;
+    };
+    let staged = parent.join(format!("{}.tmp", uuid::Uuid::new_v4()));
+    if tokio::fs::copy(staging_index, &staged).await.is_err()
+        || tokio::fs::rename(&staged, destination).await.is_err()
+    {
+        let _ = tokio::fs::remove_file(&staged).await;
+    }
+}
+
 struct CacheLock(PathBuf);
+
+/// Drop a finished run's snapshot repository.
+///
+/// The repository exists so the run's checkouts can fetch the workspace; once
+/// every job is terminal nothing can ask for it again, and a re-run captures a
+/// fresh snapshot. Keeping them made the state directory grow without bound —
+/// enough matrix runs filled the disk and the engine began failing blob writes
+/// with HTTP 500. The persistent object cache is untouched: it is shared and
+/// is what makes the next snapshot cheap.
+pub(crate) async fn discard_workspace_snapshot(state_dir: &FsPath, run_id: RunId) {
+    let repository = state_dir.join("snapshots").join(run_id.to_string());
+    match tokio::fs::remove_dir_all(&repository).await {
+        Ok(()) => debug!(%run_id, "Discarded finished run's workspace snapshot"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => warn!(
+            %run_id,
+            path = %repository.display(),
+            %error,
+            "Failed to discard workspace snapshot"
+        ),
+    }
+}
 
 impl Drop for CacheLock {
     fn drop(&mut self) {
@@ -491,10 +700,17 @@ fn state_dir_exclusion(state_dir: &FsPath, workspace: &FsPath) -> Result<Option<
 }
 
 /// Rewrite default primary checkout steps to fetch the local snapshot.
+///
+/// `runtime_token` is pinned onto the step so the checkout authenticates to
+/// [`snapshot_git_http`] with the local HMAC job JWT it expects. Without it the
+/// step would fall back to `${{ github.token }}`, which carries a GitHub App
+/// installation token or PAT whenever one is configured — neither of which
+/// [`authorize_snapshot_token`] can verify.
 pub(crate) fn redirect_primary_checkout(
     message: &mut aksh_gha_protocol::azdo::AgentJobRequestMessage,
     snapshot: &WorkspaceSnapshot,
     github_server_url: &str,
+    runtime_token: &str,
 ) -> usize {
     let mut redirected = 0;
     for step in &mut message.steps {
@@ -505,7 +721,7 @@ pub(crate) fn redirect_primary_checkout(
             .is_some_and(|name| name.eq_ignore_ascii_case("actions/checkout"));
         if !is_checkout
             || step.inputs.keys().any(|key| {
-                ["repository", "ref", "token", "github-server-url"]
+                ["repository", "ref", "github-server-url"]
                     .iter()
                     .any(|reserved| key.eq_ignore_ascii_case(reserved))
             })
@@ -518,6 +734,8 @@ pub(crate) fn redirect_primary_checkout(
             .insert("ref".to_owned(), snapshot.commit_sha.clone());
         step.inputs
             .insert("github-server-url".to_owned(), github_server_url.to_owned());
+        step.inputs
+            .insert("token".to_owned(), runtime_token.to_owned());
         redirected += 1;
     }
     redirected

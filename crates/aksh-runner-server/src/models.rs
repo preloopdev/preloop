@@ -32,7 +32,7 @@ pub(crate) struct LogMetadata {
 pub(crate) struct RunRecord {
     pub(crate) run_id: RunId,
     pub(crate) run_name: Option<String>,
-    pub(crate) submission: WorkflowSubmission,
+    pub(crate) submission: Arc<WorkflowSubmission>,
     pub(crate) jobs: BTreeMap<JobId, ExecutionStatus>,
     pub(crate) status: ExecutionStatus,
     pub(crate) job_outputs: BTreeMap<JobId, BTreeMap<String, serde_json::Value>>,
@@ -72,6 +72,15 @@ pub(crate) struct TaskAgentJobRequestRecord {
     pub(crate) started_at: Option<std::time::SystemTime>,
     pub(crate) last_renewed_at: Option<std::time::SystemTime>,
     pub(crate) timeout_triggered: bool,
+    /// Whether this job request has already spent its one debug-worker token
+    /// exchange.
+    ///
+    /// The exchange authenticates with the job runtime token, which the runner
+    /// also exports to steps as `ACTIONS_RUNTIME_TOKEN`. A worker acquires the
+    /// credential during job setup, before the first step runs, so consuming
+    /// the exchange closes the window in which workflow code could replay that
+    /// token to mint a debug credential of its own.
+    pub(crate) debug_token_issued: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +101,17 @@ pub(crate) struct QueuedJob {
     pub(crate) concurrency: Option<aksh_gha_parser::Concurrency>,
     /// Matrix values for this expansion (for concurrency expression eval).
     pub(crate) matrix: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GitHubTokenRequest {
+    pub(crate) repository: String,
+    pub(crate) permissions: BTreeMap<String, String>,
+    /// Whether the workflow wrote its own `permissions:` block.
+    ///
+    /// A declared set must be minted verbatim or fail visibly; the implicit
+    /// default may be narrowed to what the App installation actually grants.
+    pub(crate) declared: bool,
 }
 
 /// Runner metadata used by dispatch matching.

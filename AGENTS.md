@@ -41,6 +41,8 @@ just dogfood    # E2E with real runner
 
 - `docs/architecture.md` — crate map + module map
 - `docs/fidelity-gap.md` — protocol gaps and conformance status
+- `docs/preloop-performance-engineering.md` — perf campaign record: harness, measurements, rejected ideas, and the cold-start blocker
+- `docs/smolvm-packed-socket-handoff.md` — fork implementation brief and upstream issue for packed-machine socket publication
 - `CONTRIBUTING.md` — dev workflow and compatibility checklist
 - `fixtures/workflows/dogfood.yml` — local self-hosted validation workflow
 - `.runner-watch/golden/v2.335.1/` — protocol golden captures (prior baseline)
@@ -54,3 +56,4 @@ just dogfood    # E2E with real runner
 - **Composability is the goal.** Any runner should work with any server. Never introduce protocol divergences.
 - **Local CI is mandatory.** After every large chunk of work or task, run `just test-ci` to validate the changes and dogfood the workflow.
 - **Drop-in workflows.** Users should be able to run their workflows in local CI unmodified.
+

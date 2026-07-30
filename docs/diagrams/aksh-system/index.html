@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>aksh — system diagrams</title>
+  <meta name="description" content="Ten editable technical diagrams explaining the aksh GitHub Actions control plane, runner, data plane, security, Preloop capacity, conformance, and DAP debugging.">
+  <style>
+    :root {
+      color-scheme: light;
+      --paper: oklch(97.4% 0.012 84);
+      --sheet: oklch(99% 0.006 84);
+      --ink: oklch(28% 0.012 67);
+      --muted: oklch(49% 0.014 67);
+      --rule: oklch(78% 0.014 67);
+      --blue: oklch(55% 0.19 255);
+      --blue-wash: oklch(94% 0.04 255);
+      --red: oklch(52% 0.16 28);
+      --space-xs: .5rem;
+      --space-sm: .75rem;
+      --space-md: 1rem;
+      --space-lg: 1.5rem;
+      --space-xl: 2rem;
+      --space-2xl: 3rem;
+      --space-3xl: 4rem;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: var(--paper);
+      color: var(--ink);
+      font-family: ui-serif, Charter, "Bitstream Charter", Georgia, serif;
+      line-height: 1.55;
+    }
+    a { color: inherit; text-decoration-thickness: 1px; text-underline-offset: .2em; }
+    a:hover { color: var(--blue); }
+    a:focus-visible { outline: 3px solid var(--blue); outline-offset: 4px; border-radius: 3px; }
+    header, main, footer { width: min(94vw, 112rem); margin-inline: auto; }
+    header {
+      display: grid;
+      grid-template-columns: minmax(0, 1.4fr) minmax(18rem, .6fr);
+      gap: var(--space-3xl);
+      align-items: end;
+      padding-block: clamp(3rem, 8vw, 8rem) var(--space-3xl);
+      border-bottom: 1px solid var(--ink);
+    }
+    .eyebrow, .index, .links, nav {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .eyebrow { color: var(--blue); font-size: .78rem; letter-spacing: .12em; text-transform: uppercase; }
+    h1 { margin: var(--space-md) 0 0; font-size: clamp(3.2rem, 8vw, 8.6rem); line-height: .86; letter-spacing: -.065em; font-weight: 600; }
+    .intro { max-width: 44ch; margin: 0; font-size: clamp(1.05rem, 1.8vw, 1.45rem); color: var(--muted); }
+    nav { display: flex; flex-wrap: wrap; gap: .6rem 1.1rem; margin-top: var(--space-xl); font-size: .82rem; }
+    main { padding-block: var(--space-3xl); }
+    article {
+      display: grid;
+      grid-template-columns: minmax(13rem, 20rem) minmax(0, 1fr);
+      gap: clamp(2rem, 5vw, 6rem);
+      padding-block: clamp(3rem, 7vw, 7rem);
+      border-bottom: 1px solid var(--rule);
+      scroll-margin-top: 1rem;
+    }
+    .index { color: var(--blue); font-size: .8rem; letter-spacing: .08em; }
+    h2 { margin: var(--space-sm) 0 var(--space-md); font-size: clamp(1.7rem, 3vw, 3.4rem); line-height: 1; letter-spacing: -.035em; }
+    .caption { max-width: 34ch; margin: 0; color: var(--muted); }
+    .links { display: flex; flex-wrap: wrap; gap: .55rem 1rem; margin-top: var(--space-lg); font-size: .78rem; }
+    figure { margin: 0; min-width: 0; }
+    figure a { display: block; text-decoration: none; }
+    figure img {
+      display: block;
+      width: 100%;
+      height: auto;
+      border: 1px solid var(--ink);
+      border-radius: 1rem;
+      background: var(--sheet);
+      box-shadow: 0 1.5rem 4rem color-mix(in oklch, var(--ink) 10%, transparent);
+      transition: transform 180ms cubic-bezier(.22,1,.36,1), box-shadow 180ms cubic-bezier(.22,1,.36,1);
+    }
+    figure a:hover img { transform: translateY(-3px); box-shadow: 0 2rem 5rem color-mix(in oklch, var(--ink) 14%, transparent); }
+    .meta {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: var(--space-lg);
+      padding-block: var(--space-3xl);
+    }
+    .meta section { border-top: 1px solid var(--ink); padding-top: var(--space-md); }
+    .meta h2 { font-size: 1.2rem; letter-spacing: 0; }
+    .meta p { max-width: 42ch; color: var(--muted); }
+    footer { display: flex; justify-content: space-between; gap: var(--space-xl); padding-block: var(--space-xl) var(--space-3xl); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .78rem; color: var(--muted); }
+    @media (max-width: 58rem) {
+      header, article { grid-template-columns: 1fr; }
+      header { gap: var(--space-xl); }
+      article { gap: var(--space-xl); }
+      .caption { max-width: 65ch; }
+      .meta { grid-template-columns: 1fr; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      figure img { transition: none; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <div class="eyebrow">Architecture field guide · 2026</div>
+      <h1>aksh,<br>explained.</h1>
+    </div>
+    <div>
+      <p class="intro">Ten mechanism-level diagrams for the Rust control plane that runs unmodified GitHub Actions workflows against official or native runners.</p>
+      <nav aria-label="Diagram index">
+        <a href="#d00">System</a><a href="#d01">Compiler</a><a href="#d02">Scheduler</a><a href="#d03">Runner</a><a href="#d04">Steps</a><a href="#d05">Results</a><a href="#d06">Security</a><a href="#d07">VMs</a><a href="#d08">Conformance</a><a href="#d09">DAP</a>
+      </nav>
+    </div>
+  </header>
+  <main>
+    <article id="d00"><div><div class="index">00 / SYSTEM</div><h2>From workflow to feedback</h2><p class="caption">The protocol-compatible surface remains the source of truth while tools consume an additive native projection.</p><div class="links"><a href="00-system-map.svg">SVG</a><a href="00-system-map.png">PNG</a><a href="00-system-map.excalidraw">EDITABLE</a></div></div><figure><a href="00-system-map.svg"><img src="00-system-map.svg" alt="aksh system map"></a></figure></article>
+    <article id="d01"><div><div class="index">01 / COMPILER</div><h2>YAML becomes concrete jobs</h2><p class="caption">Normalization, trigger matching, matrix and reusable expansion, DAG validation, expressions, then runner wire messages.</p><div class="links"><a href="01-workflow-compilation.svg">SVG</a><a href="01-workflow-compilation.png">PNG</a><a href="01-workflow-compilation.excalidraw">EDITABLE</a></div></div><figure><a href="01-workflow-compilation.svg"><img src="01-workflow-compilation.svg" alt="workflow compilation pipeline"></a></figure></article>
+    <article id="d02"><div><div class="index">02 / SCHEDULER</div><h2>Gates before leases</h2><p class="caption">Needs and concurrency decide readiness; acquire, renew, and complete govern runner ownership.</p><div class="links"><a href="02-scheduling-broker.svg">SVG</a><a href="02-scheduling-broker.png">PNG</a><a href="02-scheduling-broker.excalidraw">EDITABLE</a></div></div><figure><a href="02-scheduling-broker.svg"><img src="02-scheduling-broker.svg" alt="scheduling and broker lease lifecycle"></a></figure></article>
+    <article id="d03"><div><div class="index">03 / RUNNER</div><h2>Listener isolates Worker</h2><p class="caption">The session-owning Listener stays alive; one disposable child receives NDJSON, executes, reports, and exits.</p><div class="links"><a href="03-runner-lifecycle.svg">SVG</a><a href="03-runner-lifecycle.png">PNG</a><a href="03-runner-lifecycle.excalidraw">EDITABLE</a></div></div><figure><a href="03-runner-lifecycle.svg"><img src="03-runner-lifecycle.svg" alt="runner Listener and Worker lifecycle"></a></figure></article>
+    <article id="d04"><div><div class="index">04 / STEPS</div><h2>One job, three step phases</h2><p class="caption">Pre, main, and reverse-order post execution share context while status and live logs flow independently.</p><div class="links"><a href="04-step-execution-reporting.svg">SVG</a><a href="04-step-execution-reporting.png">PNG</a><a href="04-step-execution-reporting.excalidraw">EDITABLE</a></div></div><figure><a href="04-step-execution-reporting.svg"><img src="04-step-execution-reporting.svg" alt="step execution and reporting"></a></figure></article>
+    <article id="d05"><div><div class="index">05 / DATA PLANE</div><h2>Native protocols, local stores</h2><p class="caption">AzDO, Twirp, and blob requests terminate in file-backed cache and artifact stores plus live projections.</p><div class="links"><a href="05-results-data-plane.svg">SVG</a><a href="05-results-data-plane.png">PNG</a><a href="05-results-data-plane.excalidraw">EDITABLE</a></div></div><figure><a href="05-results-data-plane.svg"><img src="05-results-data-plane.svg" alt="results, logs, cache, and artifacts"></a></figure></article>
+    <article id="d06"><div><div class="index">06 / SECURITY</div><h2>Credentials protect distinct hops</h2><p class="caption">Webhook HMAC, runner RSA/OAuth/AES, redacted secret types, and OIDC RS256/JWKS are separate trust mechanisms.</p><div class="links"><a href="06-security-identity.svg">SVG</a><a href="06-security-identity.png">PNG</a><a href="06-security-identity.excalidraw">EDITABLE</a></div></div><figure><a href="06-security-identity.svg"><img src="06-security-identity.svg" alt="identity and secret boundaries"></a></figure></article>
+    <article id="d07"><div><div class="index">07 / PRELOOP</div><h2>Fork, run once, replace</h2><p class="caption">The optional VM supervisor turns label-aware demand into disposable capacity without changing the runner protocol.</p><div class="links"><a href="07-preloop-vm-lifecycle.svg">SVG</a><a href="07-preloop-vm-lifecycle.png">PNG</a><a href="07-preloop-vm-lifecycle.excalidraw">EDITABLE</a></div></div><figure><a href="07-preloop-vm-lifecycle.svg"><img src="07-preloop-vm-lifecycle.svg" alt="Preloop disposable VM lifecycle"></a></figure></article>
+    <article id="d08"><div><div class="index">08 / CONFORMANCE</div><h2>The official wire is the oracle</h2><p class="caption">Captured traffic is materialized, normalized, replayed, and compared on stable behavior rather than volatile local values.</p><div class="links"><a href="08-protocol-conformance.svg">SVG</a><a href="08-protocol-conformance.png">PNG</a><a href="08-protocol-conformance.excalidraw">EDITABLE</a></div></div><figure><a href="08-protocol-conformance.svg"><img src="08-protocol-conformance.svg" alt="protocol conformance capture and replay"></a></figure></article>
+    <article id="d09"><div><div class="index">09 / DEBUGGING</div><h2>A real workflow, paused</h2><p class="caption">Standard DAP messages control the step loop through an adaptive transport bridge and masked synthetic source view.</p><div class="links"><a href="09-dap-debugging.svg">SVG</a><a href="09-dap-debugging.png">PNG</a><a href="09-dap-debugging.excalidraw">EDITABLE</a></div></div><figure><a href="09-dap-debugging.svg"><img src="09-dap-debugging.svg" alt="step-level DAP debugging"></a></figure></article>
+    <div class="meta">
+      <section><div class="index">BRIEF</div><h2>Design and scope</h2><p>Read the mechanism claims, audience, and shared visual language.</p><a href="brief.md">Open diagram brief</a></section>
+      <section><div class="index">ASSUMPTIONS</div><h2>What the scenes abstract</h2><p>Version baselines, storage defaults, runner alternatives, and deployment-dependent choices are explicit.</p><a href="brief.md#assumptions">Open assumptions</a></section>
+      <section><div class="index">QA</div><h2>Three visual review passes</h2><p>Render dimensions, route corrections, accessibility, and final checks are recorded.</p><a href="visual-qa.md">Open visual QA</a></section>
+    </div>
+  </main>
+  <footer><span>aksh system diagrams</span><span>SVG · PNG · Excalidraw</span></footer>
+</body>
+</html>
