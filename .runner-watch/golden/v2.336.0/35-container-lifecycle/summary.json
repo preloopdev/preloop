@@ -1,0 +1,12 @@
+{
+  "backend": "official",
+  "scenario": "35-container-lifecycle",
+  "started_at": "2026-07-28T19:15:25Z",
+  "ended_at": "2026-07-28T19:15:54Z",
+  "status": "ok",
+  "runner_exit_code": 0,
+  "flows_count": 63,
+  "runner_version": "2.336.0",
+  "runner_server_ref": "992ccbbbf9afcde477c38c316e053b1af457ad40",
+  "mitmproxy_version": "Mitmproxy: 12.2.3"
+}
