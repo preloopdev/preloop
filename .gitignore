@@ -96,3 +96,5 @@ benchmarks/real-world/results/aksh-runs/**/logs.zip
 experiments/mitm/golden-fresh/
 benchmarks/real-world/results/aksh-runs/
 benchmarks/compatibility/runner/behavior/*-new.jsonl
+# Scratch runner roots from local pool experiments
+/runners/
