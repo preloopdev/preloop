@@ -61,3 +61,6 @@ tower.workspace = true
 proptest.workspace = true
 aksh-runner = { path = "../aksh-runner" }
 filetime = "0.2.29"
+# Timer-driven behaviour (stream idle bounds) has to be exercised on a paused
+# clock; real sleeps would make those tests slow and flaky under load.
+tokio = { workspace = true, features = ["test-util"] }
