@@ -256,12 +256,12 @@ def compare_scenarios(left: SideCapture, right: SideCapture) -> dict:
 # ─── Runner/Server Orchestration (Local) ──────────────────────────────────────
 
 def start_aksh_server(port: int, state_dir: Path) -> subprocess.Popen:
-    print(f"Starting aksh-runner-server serve on port {port}...")
+    print(f"Starting preloop-server serve on port {port}...")
     state_dir.mkdir(parents=True, exist_ok=True)
-    # We want to run aksh-runner-server from target/release/aksh-runner-server
-    server_bin = Path("target/release/aksh-runner-server")
+    # We want to run aksh-runner-server from target/release/preloop-server
+    server_bin = Path("target/release/preloop-server")
     if not server_bin.exists():
-        server_bin = Path("target/debug/aksh-runner-server")
+        server_bin = Path("target/debug/preloop-server")
     if not server_bin.exists():
         raise FileNotFoundError("Could not find aksh-runner-server binary.")
     
@@ -317,9 +317,9 @@ def start_runner(runner_type: str, server_url: str, runner_dir: Path, state_dir:
         return p
     else:
         # Configure aksh-runner
-        runner_bin = Path("target/release/aksh-runner")
+        runner_bin = Path("target/release/preloop-runner")
         if not runner_bin.exists():
-            runner_bin = Path("target/debug/aksh-runner")
+            runner_bin = Path("target/debug/preloop-runner")
         if not runner_bin.exists():
             raise FileNotFoundError("Could not find aksh-runner binary.")
         # config

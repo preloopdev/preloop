@@ -229,17 +229,6 @@ pub fn cancelled_reason() -> Option<String> {
     Some("concurrency_cancelled".to_owned())
 }
 
-/// Whether a status is non-terminal for concurrency release purposes.
-pub fn is_terminal(status: ExecutionStatus) -> bool {
-    matches!(
-        status,
-        ExecutionStatus::Success
-            | ExecutionStatus::Failure
-            | ExecutionStatus::Cancelled
-            | ExecutionStatus::Skipped
-    )
-}
-
 /// Whether a job status is still awaiting assignment (queued or concurrency-pending).
 pub fn is_awaiting_execution(status: ExecutionStatus) -> bool {
     matches!(status, ExecutionStatus::Queued | ExecutionStatus::Pending)
@@ -248,11 +237,16 @@ pub fn is_awaiting_execution(status: ExecutionStatus) -> bool {
 /// Helper: all jobs of a holder are terminal?
 pub fn holder_is_terminal(holder: &Holder, jobs: &BTreeMap<JobId, ExecutionStatus>) -> bool {
     match holder {
-        Holder::Run(_) => jobs.values().all(|s| is_terminal(*s)),
-        Holder::Job { job_id, .. } => jobs.get(job_id).copied().is_some_and(is_terminal),
-        Holder::JobSet { job_ids, .. } => job_ids
-            .iter()
-            .all(|id| jobs.get(id).copied().is_some_and(is_terminal)),
+        Holder::Run(_) => jobs.values().all(|status| status.is_terminal()),
+        Holder::Job { job_id, .. } => jobs
+            .get(job_id)
+            .copied()
+            .is_some_and(ExecutionStatus::is_terminal),
+        Holder::JobSet { job_ids, .. } => job_ids.iter().all(|id| {
+            jobs.get(id)
+                .copied()
+                .is_some_and(ExecutionStatus::is_terminal)
+        }),
     }
 }
 
@@ -552,7 +546,7 @@ mod properties {
 
             // Test Run holder — terminal iff ALL jobs in the map are terminal
             let run_holder = Holder::Run(run_id_from(run_n));
-            let run_expected = jobs.values().all(|s| is_terminal(*s));
+            let run_expected = jobs.values().all(|status| status.is_terminal());
             prop_assert_eq!(
                 holder_is_terminal(&run_holder, &jobs),
                 run_expected,
@@ -566,11 +560,11 @@ mod properties {
                     run_id: run_id_from(run_n),
                     job_id: jid.clone(),
                 };
-                let job_expected = is_terminal(status);
+                let job_expected = status.is_terminal();
                 prop_assert_eq!(
                     holder_is_terminal(&job_holder, &jobs),
                     job_expected,
-                    "Job holder terminality must equal is_terminal(job_status)"
+                    "Job holder terminality must equal job_status.is_terminal()"
                 );
             }
 
@@ -581,7 +575,7 @@ mod properties {
                 job_ids: member_ids.clone(),
             };
             let jobset_expected = member_ids.iter().all(|id| {
-                jobs.get(id).copied().is_some_and(is_terminal)
+                jobs.get(id).copied().is_some_and(ExecutionStatus::is_terminal)
             });
             prop_assert_eq!(
                 holder_is_terminal(&jobset_holder, &jobs),

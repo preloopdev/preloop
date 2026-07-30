@@ -40,7 +40,7 @@ pub fn resolve_string(input: &str, context: &Context) -> Result<String, String> 
     Ok(result)
 }
 
-fn find_expression_end(input: &str) -> Option<usize> {
+pub(crate) fn find_expression_end(input: &str) -> Option<usize> {
     // Mirror the single-quoted string rules of `aksh-gha-expressions`'s lexer:
     // only `'` opens/closes a string, doubled `''` is an escaped quote, and
     // backslash is treated as an ordinary character (no C-style escapes).

@@ -87,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
             println!();
             println!("Use with:");
             println!(
-                "  aksh-runner-server serve --tls-cert {} --tls-key {}",
+                "  preloop-server serve --tls-cert {} --tls-key {}",
                 cert_path.display(),
                 key_path.display()
             );
@@ -112,6 +112,8 @@ async fn main() -> anyhow::Result<()> {
                 _ => unreachable!("clap ensures mutual exclusion"),
             };
             serve(ServerConfig {
+                queue_depth: None,
+                next_job_runs_on: None,
                 listen,
                 unix_socket,
                 state_dir,

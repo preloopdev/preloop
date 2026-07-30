@@ -120,6 +120,18 @@ fn decode_hex(hex: &str) -> Result<Vec<u8>, &'static str> {
     Ok(bytes)
 }
 
+async fn resolve_check_run_token(shared: &Arc<SharedState>, repo: &str) -> Option<String> {
+    if let Some(app_creds) = &shared.state.github_app {
+        let mut permissions = std::collections::BTreeMap::new();
+        permissions.insert("checks".to_owned(), "write".to_owned());
+        if let Ok(token) = crate::github_app::get_or_mint_token(app_creds, repo, &permissions).await
+        {
+            return Some(token);
+        }
+    }
+    std::env::var("AKSH_GITHUB_TOKEN").ok()
+}
+
 async fn send_github_check_request(
     token: &str,
     repo: &str,
@@ -152,6 +164,12 @@ async fn send_github_check_request(
     Ok(val)
 }
 
+fn run_details_url(run_id: RunId) -> Option<String> {
+    std::env::var("AKSH_PUBLIC_URL")
+        .ok()
+        .map(|base| format!("{}/runs/{run_id}", base.trim_end_matches('/')))
+}
+
 /// Report a queued check run to GitHub or simulate it locally.
 pub(crate) async fn report_check_run_queued(
     shared: &Arc<SharedState>,
@@ -160,15 +178,20 @@ pub(crate) async fn report_check_run_queued(
     job_id: &JobId,
     run_id: RunId,
 ) {
-    let token = std::env::var("AKSH_GITHUB_TOKEN").ok();
+    let token = resolve_check_run_token(shared, repo).await;
     let mut check_run_id = None;
 
     if let Some(token) = &token {
-        let body = serde_json::json!({
+        let details_url = run_details_url(run_id);
+
+        let mut body = serde_json::json!({
             "name": job_id.to_string(),
             "head_sha": sha,
             "status": "queued",
         });
+        if let Some(url) = details_url {
+            body["details_url"] = serde_json::json!(url);
+        }
 
         match send_github_check_request(token, repo, reqwest::Method::POST, "check-runs", body)
             .await
@@ -221,11 +244,16 @@ pub(crate) async fn report_check_run_in_progress(
         (repo, check_run_id)
     };
 
-    let token = std::env::var("AKSH_GITHUB_TOKEN").ok();
+    let token = resolve_check_run_token(shared, &repo).await;
     if let Some(token) = &token {
-        let body = serde_json::json!({
+        let details_url = run_details_url(run_id);
+
+        let mut body = serde_json::json!({
             "status": "in_progress",
         });
+        if let Some(url) = details_url {
+            body["details_url"] = serde_json::json!(url);
+        }
 
         let path = format!("check-runs/{}", check_run_id);
         if let Err(e) =
@@ -318,8 +346,10 @@ pub(crate) async fn report_check_run_completed(
         _ => "failure",
     };
 
-    let token = std::env::var("AKSH_GITHUB_TOKEN").ok();
+    let token = resolve_check_run_token(shared, &repo).await;
     if let Some(token) = &token {
+        let details_url = run_details_url(run_id);
+
         let summary = if global_issues.is_empty() {
             format!("Job completed with status: {}", conclusion)
         } else {
@@ -334,6 +364,9 @@ pub(crate) async fn report_check_run_completed(
             "status": "completed",
             "conclusion": conclusion,
         });
+        if let Some(url) = details_url {
+            body["details_url"] = serde_json::json!(url);
+        }
 
         if !annotations.is_empty() || !global_issues.is_empty() {
             body["output"] = serde_json::json!({
@@ -370,11 +403,22 @@ pub(crate) async fn report_check_run_completed(
 
 /// Fetch workflows helper.
 pub(crate) async fn fetch_workflows(
-    local_workspace: &Option<PathBuf>,
+    shared: &Arc<SharedState>,
     repo: &str,
     git_ref: &str,
 ) -> anyhow::Result<BTreeMap<String, String>> {
-    if let Some(base_path) = local_workspace {
+    let api_base = std::env::var("AKSH_GITHUB_API_URL")
+        .unwrap_or_else(|_| "https://api.github.com".to_owned());
+    fetch_workflows_at(shared, repo, git_ref, &api_base).await
+}
+
+pub(crate) async fn fetch_workflows_at(
+    shared: &Arc<SharedState>,
+    repo: &str,
+    git_ref: &str,
+    api_base: &str,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    if let Some(base_path) = &shared.state.local_workspace {
         let workflows_dir = base_path.join(".github/workflows");
         let mut workflows = BTreeMap::new();
         if workflows_dir.exists() {
@@ -395,9 +439,14 @@ pub(crate) async fn fetch_workflows(
         }
         Ok(workflows)
     } else {
-        let token = std::env::var("AKSH_GITHUB_TOKEN").ok();
+        let token = if let Some(app) = &shared.state.github_app {
+            let permissions = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
+            Some(crate::github_app::get_or_mint_token_at(api_base, app, repo, &permissions).await?)
+        } else {
+            std::env::var("AKSH_GITHUB_TOKEN").ok()
+        };
         if let Some(token) = &token {
-            fetch_remote_workflows(token, repo, git_ref).await
+            fetch_remote_workflows(token, repo, git_ref, api_base).await
         } else {
             // Default fallback to current workspace root if nothing is configured
             let workflows_dir = PathBuf::from(".").join(".github/workflows");
@@ -427,11 +476,14 @@ async fn fetch_remote_workflows(
     token: &str,
     repo: &str,
     git_ref: &str,
+    api_base: &str,
 ) -> anyhow::Result<BTreeMap<String, String>> {
     let client = crate::shared_http::CLIENT.clone();
     let url = format!(
-        "https://api.github.com/repos/{}/contents/.github/workflows?ref={}",
-        repo, git_ref
+        "{}/repos/{}/contents/.github/workflows?ref={}",
+        api_base.trim_end_matches('/'),
+        repo,
+        git_ref
     );
     let response = client
         .get(&url)
@@ -527,6 +579,7 @@ async fn get_pr_changed_files(
     token: &str,
     repo: &str,
     pr_number: u64,
+    api_base: &str,
 ) -> anyhow::Result<Vec<String>> {
     let client = crate::shared_http::CLIENT.clone();
     let mut page = 1;
@@ -539,8 +592,11 @@ async fn get_pr_changed_files(
 
     loop {
         let url = format!(
-            "https://api.github.com/repos/{}/pulls/{}/files?per_page=100&page={}",
-            repo, pr_number, page
+            "{}/repos/{}/pulls/{}/files?per_page=100&page={}",
+            api_base.trim_end_matches('/'),
+            repo,
+            pr_number,
+            page
         );
         let response = client
             .get(&url)
@@ -567,6 +623,38 @@ async fn get_pr_changed_files(
     }
 
     Ok(all_files)
+}
+
+/// Changed files for a pull request, or `None` when nothing can authenticate
+/// the lookup.
+///
+/// A webhook payload never carries the full file list, so `paths:` and
+/// `paths-ignore:` can only be evaluated against this call. Consulting
+/// `AKSH_GITHUB_TOKEN` alone would leave an App-only deployment — the
+/// documented way to run this server — permanently unable to answer, and every
+/// path-filtered workflow would be rejected as unevaluable rather than queued.
+/// So the App is tried first, exactly as the workflow inventory does.
+///
+/// The workflow-inventory token is not reused: it is scoped to
+/// `contents: read`, and listing pull request files needs `pull_requests`.
+pub(crate) async fn resolve_pr_changed_files_at(
+    shared: &Arc<SharedState>,
+    repo: &str,
+    pr_number: u64,
+    api_base: &str,
+) -> anyhow::Result<Option<Vec<String>>> {
+    let token = if let Some(app) = &shared.state.github_app {
+        let permissions = BTreeMap::from([("pull_requests".to_owned(), "read".to_owned())]);
+        Some(crate::github_app::get_or_mint_token_at(api_base, app, repo, &permissions).await?)
+    } else {
+        std::env::var("AKSH_GITHUB_TOKEN").ok()
+    };
+    let Some(token) = token else {
+        return Ok(None);
+    };
+    get_pr_changed_files(&token, repo, pr_number, api_base)
+        .await
+        .map(Some)
 }
 
 /// Route handler for GitHub App Webhooks.
@@ -625,7 +713,7 @@ pub(crate) async fn handle_github_webhook(
         .and_then(|v| v.as_str())
         .unwrap_or("local/repo")
         .to_owned();
-    let changed_paths = if matches!(
+    let (changed_paths, changed_paths_known) = if matches!(
         event_name,
         "pull_request" | "pull_request_target" | "pull_request_review"
     ) {
@@ -637,24 +725,31 @@ pub(crate) async fn handle_github_webhook(
                     .and_then(|pr| pr.get("number"))
             })
             .and_then(|value| value.as_u64());
-        match (std::env::var("AKSH_GITHUB_TOKEN").ok(), pr_number) {
-            (Some(token), Some(number)) => get_pr_changed_files(&token, &repo_full_name, number)
-                .await
-                .map_err(|error| {
-                    error!(?error, "failed to resolve pull request changed files");
-                    StatusCode::BAD_GATEWAY
-                })?,
-            _ => changed_paths_from_payload(&payload_val),
+        let api_base = std::env::var("AKSH_GITHUB_API_URL")
+            .unwrap_or_else(|_| "https://api.github.com".to_owned());
+        let fetched = match pr_number {
+            Some(number) => {
+                resolve_pr_changed_files_at(&shared, &repo_full_name, number, &api_base)
+                    .await
+                    .map_err(|error| {
+                        error!(?error, "failed to resolve pull request changed files");
+                        StatusCode::BAD_GATEWAY
+                    })?
+            }
+            None => None,
+        };
+        match fetched {
+            // The list came from the API, so a `paths:` filter that matches
+            // nothing is a real "no match" rather than a missing answer.
+            Some(files) => (files, true),
+            None => (
+                changed_paths_from_payload(&payload_val),
+                payload_val.get("paths").is_some() || payload_val.get("commits").is_some(),
+            ),
         }
     } else {
-        changed_paths_from_payload(&payload_val)
+        (changed_paths_from_payload(&payload_val), true)
     };
-    let changed_paths_known = !matches!(
-        event_name,
-        "pull_request" | "pull_request_target" | "pull_request_review"
-    ) || std::env::var("AKSH_GITHUB_TOKEN").is_ok()
-        || payload_val.get("paths").is_some()
-        || payload_val.get("commits").is_some();
 
     let mut triggered_runs = Vec::new();
 
@@ -682,16 +777,13 @@ pub(crate) async fn handle_github_webhook(
         } else {
             &effective.git_ref
         };
-        let workflows =
-            match fetch_workflows(&shared.state.local_workspace, &repo_full_name, workflow_ref)
-                .await
-            {
-                Ok(w) => w,
-                Err(e) => {
-                    error!("Failed to fetch workflows for {}: {:?}", effective.event, e);
-                    continue;
-                }
-            };
+        let workflows = match fetch_workflows(&shared, &repo_full_name, workflow_ref).await {
+            Ok(w) => w,
+            Err(e) => {
+                error!("Failed to fetch workflows for {}: {:?}", effective.event, e);
+                continue;
+            }
+        };
         let resolved_sha = match &effective.sha {
             Some(sha) => sha.clone(),
             None => match resolve_ref_sha(
@@ -822,6 +914,9 @@ pub(crate) async fn handle_github_webhook(
                 filter_branch,
                 dispatch_inputs,
                 dispatch_inputs_stringified,
+                selected_jobs: vec![],
+                base_ref: None,
+                preserve_on_failure: false,
             };
 
             // Call submit_run_inner — it performs the authoritative trigger match.

@@ -657,7 +657,7 @@ pub(crate) fn cancel_holder(
             }
             // If all jobs cancelled, mark run cancelled when appropriate.
             if let Some(run) = inner.runs.get_mut(run_id) {
-                if run.jobs.values().all(|s| concurrency::is_terminal(*s)) {
+                if run.jobs.values().all(|status| status.is_terminal()) {
                     run.status = summarize_run(run.jobs.values().copied());
                 }
             }
@@ -751,11 +751,7 @@ pub(crate) fn dependency_decision(run: &RunRecord, job: &QueuedJob) -> Dependenc
         .iter()
         .flat_map(|need| matching_need_statuses(run, need))
         .collect::<Vec<_>>();
-    if direct_statuses.is_empty()
-        || direct_statuses
-            .iter()
-            .any(|status| !is_terminal_status(*status))
-    {
+    if direct_statuses.is_empty() || direct_statuses.iter().any(|status| !status.is_terminal()) {
         return DependencyDecision::Wait;
     }
     let statuses = ancestor_statuses(run, job);
@@ -817,16 +813,6 @@ pub(crate) fn ancestor_statuses(run: &RunRecord, job: &QueuedJob) -> Vec<Executi
         }
     }
     statuses
-}
-
-pub(crate) fn is_terminal_status(status: ExecutionStatus) -> bool {
-    matches!(
-        status,
-        ExecutionStatus::Success
-            | ExecutionStatus::Failure
-            | ExecutionStatus::Skipped
-            | ExecutionStatus::Cancelled
-    )
 }
 
 /// Check if a job's `runs-on` labels match a runner's registered labels.
@@ -1101,6 +1087,19 @@ pub(crate) fn summarize_run(statuses: impl Iterator<Item = ExecutionStatus>) -> 
     } else {
         ExecutionStatus::Success
     }
+}
+
+/// Refresh the shared next-job labels from the front of the dispatch queue.
+///
+/// Called after every claim so a co-hosted runner pool can select the correct
+/// base-image golden before provisioning the next runner.
+pub(crate) fn sync_next_job_labels(inner: &InnerState, shared: &std::sync::RwLock<Vec<String>>) {
+    let labels = inner
+        .queue
+        .front()
+        .map(|job| job.runs_on.clone())
+        .unwrap_or_default();
+    let _ = shared.write().map(|mut guard| *guard = labels);
 }
 
 #[cfg(test)]

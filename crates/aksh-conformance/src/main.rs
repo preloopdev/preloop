@@ -70,7 +70,7 @@ enum CommandKind {
     #[command(name = "runner-e2e")]
     RunnerE2e {
         /// Path to the runner executable.
-        #[arg(long, default_value = "target/release/aksh-runner")]
+        #[arg(long, default_value = "target/release/preloop-runner")]
         runner_bin: PathBuf,
         /// Path to the GHA workflow file to run.
         #[arg(long)]
@@ -521,13 +521,15 @@ async fn run_runner_e2e(
         anyhow::bail!("workflow file not found: {}", workflow.display());
     }
 
-    let server_bin = if std::path::Path::new("target/release/aksh-runner-server").exists() {
-        "target/release/aksh-runner-server"
+    let server_bin = if std::path::Path::new("target/release/preloop-server").exists() {
+        "target/release/preloop-server"
     } else {
-        "target/debug/aksh-runner-server"
+        "target/debug/preloop-server"
     };
     if !std::path::Path::new(server_bin).exists() {
-        anyhow::bail!("server binary not found: please build aksh-runner-server");
+        anyhow::bail!(
+            "server binary not found at {server_bin}: build it with `cargo build -p aksh-runner-server`"
+        );
     }
 
     let client_bin = if std::path::Path::new("target/release/aksh-runner-client").exists() {
@@ -549,13 +551,13 @@ async fn run_runner_e2e(
     // Pre-seed any private action references locally before starting the server
     preseed_private_actions(&workflow, &state_dir)?;
 
-    // Start server in background on port 9191
+    // Start server in background on port 9090
     let mut server_cmd = Command::new(server_bin);
     server_cmd
-        .env("AKSH_PUBLIC_URL", "http://127.0.0.1:9191")
+        .env("AKSH_PUBLIC_URL", "http://127.0.0.1:9090")
         .arg("serve")
         .arg("--listen")
-        .arg("127.0.0.1:9191")
+        .arg("127.0.0.1:9090")
         .arg("--state-dir")
         .arg(state_dir.to_str().unwrap());
 
@@ -573,7 +575,7 @@ async fn run_runner_e2e(
         .expect("HTTP client");
     let mut ready = false;
     for _ in 0..30 {
-        if client.get("http://127.0.0.1:9191/").send().await.is_ok() {
+        if client.get("http://127.0.0.1:9090/").send().await.is_ok() {
             ready = true;
             break;
         }
@@ -581,7 +583,7 @@ async fn run_runner_e2e(
     }
     if !ready {
         let _ = server.kill().await;
-        anyhow::bail!("aksh-runner-server failed to start on port 9191");
+        anyhow::bail!("aksh-runner-server failed to start on port 9090");
     }
 
     // Configure the runner
@@ -591,7 +593,7 @@ async fn run_runner_e2e(
         .arg("configure")
         .args([
             "--url",
-            "http://127.0.0.1:9191",
+            "http://127.0.0.1:9090",
             "--token",
             "dummy-token",
             "--name",
@@ -626,7 +628,7 @@ async fn run_runner_e2e(
 
     // Submit workflow
     let submit_output = Command::new(client_bin)
-        .args(["--server", "http://127.0.0.1:9191", "submit", "-W"])
+        .args(["--server", "http://127.0.0.1:9090", "submit", "-W"])
         .arg(&submit_workflow_path)
         .output()
         .await?;
@@ -645,7 +647,7 @@ async fn run_runner_e2e(
 
     // Loop runner until the run reaches a terminal status (handles multi-job workflows).
     let terminal = ["completed", "success", "failed", "cancelled"];
-    let run_status_url = format!("http://127.0.0.1:9191/api/v1/runs/{}", run_id);
+    let run_status_url = format!("http://127.0.0.1:9090/api/v1/runs/{}", run_id);
     let native_api_token =
         std::env::var("AKSH_SYSTEM_TOKEN").unwrap_or_else(|_| "aksh-system-token".to_owned());
     let mut run_status = "unknown".to_string();

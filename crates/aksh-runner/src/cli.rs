@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 /// Rust reimplementation of the GitHub Actions runner.
 #[derive(Debug, Parser)]
-#[command(name = "aksh-runner")]
+#[command(name = "preloop-runner")]
 #[command(version = concat!(env!("CARGO_PKG_VERSION"), " (protocol-compat 2.335.1)"))]
 #[command(about = "GitHub Actions runner — Rust implementation")]
 pub struct Cli {

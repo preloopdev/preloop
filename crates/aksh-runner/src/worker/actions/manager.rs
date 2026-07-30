@@ -50,7 +50,7 @@ pub async fn download_action(
     let bytes = if let Some(token) = auth_token {
         // Authenticated download (GitHub codeload or private actions)
         let resp = client
-            .inner_client()
+            .client_for(&url)
             .get(&url)
             .header("Authorization", format!("Bearer {token}"))
             .header("User-Agent", "aksh-runner")

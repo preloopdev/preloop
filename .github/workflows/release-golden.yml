@@ -1,0 +1,40 @@
+name: release-golden
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  build-and-publish-golden:
+    name: Build & Publish Golden MicroVM Artifact
+    runs-on: self-hosted
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Preloop binaries
+        run: |
+          cargo build --release -p preloop-cli -p aksh-runner-server
+          cargo zigbuild --release -p aksh-runner --target aarch64-unknown-linux-gnu
+
+      - name: Pack Golden MicroVM Artifact
+        run: |
+          mkdir -p dist
+          rm -f dist/preloop-ubuntu-24.04-aarch64
+          ./target/release/preloop build-golden \
+            --runner-bundle target/aarch64-unknown-linux-gnu/release \
+            --output dist/preloop-ubuntu-24.04-aarch64
+          test -s dist/preloop-ubuntu-24.04-aarch64
+
+      - name: Upload Golden Artifact to Release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload ${{ github.event.release.tag_name }} dist/preloop-ubuntu-24.04-aarch64 --clobber

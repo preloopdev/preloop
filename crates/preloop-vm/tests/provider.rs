@@ -27,8 +27,8 @@ fn machine_names_accept_dns_like_names_and_reject_invalid_boundaries() {
 mod unix {
     use super::*;
     use preloop_vm::{
-        ExecOutput, MachineSpec, MachineState, NetworkPolicy, SmolVmProvider, VmProvider,
-        VolumeMount,
+        ExecOutput, MachineSpec, MachineState, NetworkPolicy, SmolVmProvider, SocketMount,
+        VmProvider, VolumeMount,
     };
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -45,9 +45,17 @@ set -eu
 
 args="$0.args"
 : > "$args"
+printf 'SMOLVM_EGRESS_FLOOR=%s\n' "${SMOLVM_EGRESS_FLOOR-}" > "$0.env"
+env_file="$0.env"
+printf 'SMOLVM_EGRESS_FLOOR=%s\n' "${SMOLVM_EGRESS_FLOOR-}" > "$env_file"
 for arg in "$@"; do
   printf '%s\n' "$arg" >> "$args"
 done
+
+if [ "${1-}:${2-}" = "machine:update" ] && [ -f "$0.fail-update" ]; then
+  printf 'rosetta unavailable\n' >&2
+  exit 42
+fi
 
 case "${1-}:${2-}" in
   machine:create)
@@ -99,6 +107,13 @@ esac
             .collect()
     }
 
+    fn captured_env(executable: &Path) -> String {
+        fs::read_to_string(executable.with_extension("env"))
+            .unwrap_or_default()
+            .trim()
+            .to_owned()
+    }
+
     fn valid_spec(name: MachineName) -> MachineSpec {
         MachineSpec {
             name,
@@ -108,16 +123,20 @@ esac
             storage_gib: 10,
             network: NetworkPolicy::Disabled,
             volumes: Vec::new(),
+            sockets: Vec::new(),
+            rosetta: false,
         }
     }
 
     #[tokio::test]
-    async fn create_emits_exact_network_and_volume_arguments() {
+    async fn create_emits_exact_network_volume_and_socket_arguments() {
         let (directory, executable) = fake_smolvm();
         let host_rw = directory.path().join("workspace");
         let host_ro = directory.path().join("cache");
+        let host_socket = directory.path().join("engine.sock");
         fs::create_dir_all(&host_rw).unwrap();
         fs::create_dir_all(&host_ro).unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(&host_socket).unwrap();
         let spec = MachineSpec {
             name: MachineName::new("ci-01").unwrap(),
             image: "ghcr.io/acme/runner:latest".to_owned(),
@@ -140,6 +159,11 @@ esac
                     read_only: true,
                 },
             ],
+            sockets: vec![SocketMount {
+                host: host_socket.clone(),
+                guest: PathBuf::from("/run/preloop-engine.sock"),
+            }],
+            rosetta: false,
         };
 
         SmolVmProvider::new(&executable)
@@ -174,6 +198,8 @@ esac
                 format!("{}:/workspace", host_rw.display()),
                 "--volume".to_owned(),
                 format!("{}:/cache:ro", host_ro.display()),
+                "--mount-socket".to_owned(),
+                format!("{}:/run/preloop-engine.sock", host_socket.display()),
             ]
         );
     }
@@ -232,6 +258,78 @@ esac
         assert!(matches!(
             SmolVmProvider::new(&executable).create(&spec).await,
             Err(VmError::InvalidSpec(message)) if message.starts_with("volume source does not exist:")
+        ));
+        assert!(!executable.with_extension("args").exists());
+
+        let (_directory, executable) = fake_smolvm();
+        let mut spec = valid_spec(MachineName::new("valid").unwrap());
+        spec.sockets.push(SocketMount {
+            host: PathBuf::from("relative/socket"),
+            guest: PathBuf::from("/run/engine.sock"),
+        });
+        assert!(matches!(
+            SmolVmProvider::new(&executable).create(&spec).await,
+            Err(VmError::InvalidSpec(message)) if message == "socket paths must be absolute"
+        ));
+        assert!(!executable.with_extension("args").exists());
+
+        let (directory, executable) = fake_smolvm();
+        let host_socket = directory.path().join("engine.sock");
+        fs::write(&host_socket, b"socket").unwrap();
+        let mut spec = valid_spec(MachineName::new("valid").unwrap());
+        spec.sockets.push(SocketMount {
+            host: host_socket,
+            guest: PathBuf::from("relative/guest.sock"),
+        });
+        assert!(matches!(
+            SmolVmProvider::new(&executable).create(&spec).await,
+            Err(VmError::InvalidSpec(message)) if message == "socket paths must be absolute"
+        ));
+        assert!(!executable.with_extension("args").exists());
+
+        let (directory, executable) = fake_smolvm();
+        let mut spec = valid_spec(MachineName::new("valid").unwrap());
+        spec.sockets.push(SocketMount {
+            host: directory.path().join("missing.sock"),
+            guest: PathBuf::from("/run/engine.sock"),
+        });
+        assert!(matches!(
+            SmolVmProvider::new(&executable).create(&spec).await,
+            Err(VmError::InvalidSpec(message)) if message.starts_with("socket source does not exist:")
+        ));
+        assert!(!executable.with_extension("args").exists());
+
+        // A socket mount is a hole in the guest boundary: an ordinary file that
+        // merely exists must not be accepted in place of a real endpoint.
+        let (directory, executable) = fake_smolvm();
+        let regular_file = directory.path().join("not-a-socket");
+        fs::write(&regular_file, b"socket").unwrap();
+        let mut spec = valid_spec(MachineName::new("valid").unwrap());
+        spec.sockets.push(SocketMount {
+            host: regular_file,
+            guest: PathBuf::from("/run/engine.sock"),
+        });
+        assert!(matches!(
+            SmolVmProvider::new(&executable).create(&spec).await,
+            Err(VmError::InvalidSpec(message)) if message.starts_with("socket source is not a Unix socket:")
+        ));
+        assert!(!executable.with_extension("args").exists());
+
+        // Nor may the named path be a symlink that could be repointed at a
+        // privileged endpoint (for example a container runtime socket).
+        let (directory, executable) = fake_smolvm();
+        let real_socket = directory.path().join("real.sock");
+        let link = directory.path().join("link.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&real_socket).unwrap();
+        std::os::unix::fs::symlink(&real_socket, &link).unwrap();
+        let mut spec = valid_spec(MachineName::new("valid").unwrap());
+        spec.sockets.push(SocketMount {
+            host: link,
+            guest: PathBuf::from("/run/engine.sock"),
+        });
+        assert!(matches!(
+            SmolVmProvider::new(&executable).create(&spec).await,
+            Err(VmError::InvalidSpec(message)) if message.starts_with("socket source must not be a symlink:")
         ));
         assert!(!executable.with_extension("args").exists());
     }
@@ -349,6 +447,50 @@ esac
                 "echo".to_owned(),
                 hostile,
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn public_only_sets_smolvm_egress_floor_strict() {
+        let (_directory, executable) = fake_smolvm();
+        let provider = SmolVmProvider::new(executable.clone());
+        let mut spec = valid_spec(MachineName::new("test-floor").unwrap());
+        spec.network = NetworkPolicy::PublicOnly;
+        provider.create(&spec).await.unwrap();
+        assert_eq!(captured_env(&executable), "SMOLVM_EGRESS_FLOOR=strict");
+    }
+
+    #[tokio::test]
+    async fn unrestricted_removes_smolvm_egress_floor() {
+        let (_directory, executable) = fake_smolvm();
+        let provider = SmolVmProvider::new(executable.clone());
+        let mut spec = valid_spec(MachineName::new("test-unrestricted").unwrap());
+        spec.network = NetworkPolicy::Unrestricted;
+        provider.create(&spec).await.unwrap();
+        assert_eq!(captured_env(&executable), "SMOLVM_EGRESS_FLOOR=");
+    }
+
+    #[tokio::test]
+    async fn rosetta_update_failure_is_returned_and_partial_machine_is_deleted() {
+        let (_directory, executable) = fake_smolvm();
+        fs::write(executable.with_extension("fail-update"), "").unwrap();
+        let provider = SmolVmProvider::new(executable.clone());
+        let mut spec = valid_spec(MachineName::new("test-rosetta").unwrap());
+        spec.rosetta = true;
+
+        let error = provider.create(&spec).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            VmError::Command {
+                operation: "update",
+                exit_code: 42,
+                ..
+            }
+        ));
+        assert_eq!(
+            captured_args(&executable),
+            ["machine", "delete", "--name", "test-rosetta", "-f"]
         );
     }
 }

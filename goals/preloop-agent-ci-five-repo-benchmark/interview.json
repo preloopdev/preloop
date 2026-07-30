@@ -1,0 +1,57 @@
+{
+  "stage": "interview",
+  "title": "Preloop versus Agent CI benchmark",
+  "goalSlug": "preloop-agent-ci-five-repo-benchmark",
+  "questions": [
+    {
+      "id": "comparison",
+      "prompt": "What should the comparison run on Agent CI?",
+      "description": "The recommended design runs the same pinned workflow revision on Preloop and Agent CI, using equivalent runner labels and collecting both timing and outcome data.",
+      "answerMode": "single-custom",
+      "recommendedAnswer": "Run the same pinned workflow revision on both systems and compare end-to-end and phase timings.",
+      "recommendedOptionIds": ["same-workflow"],
+      "options": [
+        { "id": "same-workflow", "label": "Same workflow on both" },
+        { "id": "agent-only", "label": "Agent CI as controller only" },
+        { "id": "custom", "label": "Custom comparison topology" }
+      ],
+      "required": true
+    },
+    {
+      "id": "repetitions",
+      "prompt": "How many repetitions should each repository receive?",
+      "description": "The recommendation separates cold-start behavior from warm-run behavior so VM boot/resume effects are visible without making the campaign unnecessarily large.",
+      "answerMode": "single-custom",
+      "recommendedAnswer": "Three cold-start runs and five warm runs per system and repository, with failures retained rather than retried away.",
+      "recommendedOptionIds": ["3-cold-5-warm"],
+      "options": [
+        { "id": "3-cold-5-warm", "label": "3 cold + 5 warm" },
+        { "id": "single", "label": "One representative run" },
+        { "id": "5-each", "label": "Five runs of each class" }
+      ],
+      "required": true
+    },
+    {
+      "id": "repositories",
+      "prompt": "Are public repositories at pinned revisions acceptable?",
+      "description": "The benchmark needs reproducible source and workflow inputs. The recommended selection is five public small-to-medium repositories spanning Rust, Python, JavaScript/TypeScript, Go, and a container-heavy or monorepo-style CI workload.",
+      "answerMode": "single-custom",
+      "recommendedAnswer": "Use public repositories at pinned commits; select five diverse projects with no private credentials required beyond Agent CI access.",
+      "recommendedOptionIds": ["public-pinned"],
+      "options": [
+        { "id": "public-pinned", "label": "Public pinned revisions" },
+        { "id": "provided", "label": "Use repositories I provide" },
+        { "id": "mixed", "label": "Mix public and private repositories" }
+      ],
+      "required": true
+    },
+    {
+      "id": "agent-ci-access",
+      "prompt": "What Agent CI access and execution surface should the goal assume?",
+      "description": "The benchmark plan will keep credentials out of the repository and record setup prerequisites explicitly.",
+      "answerMode": "text",
+      "recommendedAnswer": "Use the Agent CI account, CLI, or API credentials already available in the environment; do not commit or print secrets.",
+      "required": true
+    }
+  ]
+}

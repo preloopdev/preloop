@@ -2,6 +2,7 @@ name: ci
 
 on:
   push:
+    branches: [main]
   pull_request:
   schedule:
     # Nightly intensive property profile at 02:00 UTC
@@ -20,7 +21,9 @@ on:
 # PR / push: fast profile — 256 cases for pure/model/runner, 64 for HTTP.
 # Scheduled / manual intensive: release mode, 10k cases, 100k shrink iters.
 #
-# Live GitHub or privileged official-runner probes are NEVER run in PR CI.
+# The regular Linux jobs never run live GitHub or privileged official-runner
+# probes. `runner-conformance.yml` runs the privileged deep runner probe on the
+# dedicated smolVM self-hosted pool for every pull request.
 # The differential harness dry-run (credential-free) runs in both profiles.
 #
 # Sleep-guard: each property-test job mechanically scans new test files for
@@ -32,8 +35,12 @@ on:
 
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     timeout-minutes: 30
+    env:
+      # A 4 GiB disposable runner can otherwise start several memory-heavy
+      # test links together and have ld killed by the guest OOM killer.
+      CARGO_BUILD_JOBS: "1"
     steps:
       # action download works — client-side batch resolve + codeload fallback
       - uses: actions/checkout@v4
@@ -57,7 +64,7 @@ jobs:
 
   # Bounded property-test profile
   property-tests-fast:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     timeout-minutes: 30
     if: github.event_name != 'schedule'
     steps:
@@ -162,7 +169,7 @@ jobs:
 
   # Intensive scheduled / manual profile
   property-tests-intensive:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     timeout-minutes: 120
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.profile == 'intensive')
     steps:
