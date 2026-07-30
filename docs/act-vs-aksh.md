@@ -287,75 +287,51 @@ and acquirejob response schemas.
 
 ## 6. Performance
 
-### 6.1 Agent CI Scenario Benchmark Results (39 Golden Scenarios)
+### 6.1 Scenario Benchmark Comparison (39 Golden Scenarios)
 
-Measured running `agent-ci v0.17.1` on Apple M4 Max against the 39 scenario workflow YAML files (`experiments/mitm/scenarios/`):
+Both `act v0.2.89` and `agent-ci v0.17.1` measured on the same Apple M4 Max host against the 39 scenario workflow YAML files (`experiments/mitm/scenarios/`):
 
-| # | Scenario | Workflow File | Status | Time | Peak RSS | Result / Failure Reason |
-|---|---|---|:---:|:---:|:---:|---|
-| 1 | `02-trivial-job` | `02-trivial-job.yml` | ✅ PASS | 10.34s | 140.9 MB | Status:    ✓ 1 passed (1 total) |
-| 2 | `03-cancellation` | `03-cancellation.yml` | ✅ PASS | 69.59s | 141.2 MB | Status:    ✓ 1 passed (1 total) |
-| 3 | `04-request-ack` | `04-request-ack.yml` | ✅ PASS | 10.36s | 140.6 MB | Status:    ✓ 1 passed (1 total) |
-| 4 | `05-multi-job` | `05-multi-job-a.yml` | ✅ PASS | 10.14s | 140.8 MB | Status:    ✓ 1 passed (1 total) |
-| 5 | `05-multi-job` | `05-multi-job-b.yml` | ✅ PASS | 10.13s | 140.9 MB | Status:    ✓ 1 passed (1 total) |
-| 6 | `06-multi-step` | `06-multi-step.yml` | ✅ PASS | 10.60s | 142.4 MB | Status:    ✓ 1 passed (1 total) |
-| 7 | `07-step-failure` | `07-step-failure.yml` | ❌ FAIL | 9.85s | 143.2 MB | Status:    ✗ 1 failed, 0 passed (1 total) |
-| 8 | `08-job-outputs-needs` | `08-job-outputs-needs.yml` | ✅ PASS | 20.24s | 144.9 MB | Status:    ✓ 2 passed (2 total) |
-| 9 | `09-matrix-fan-out` | `09-matrix-fan-out.yml` | ❌ FAIL | 42.05s | 145.8 MB | Status:    ✗ 1 failed, 2 passed (3 total) |
-| 10 | `10-uses-checkout` | `10-uses-checkout.yml` | ✅ PASS | 10.15s | 147.3 MB | Status:    ✓ 1 passed (1 total) |
-| 11 | `101-dynamic-matrix-dataflow` | `101-dynamic-matrix-dataflow.yml` | ✅ PASS | 19.82s | 145.0 MB | Status:    ✓ 2 passed (2 total) |
-| 12 | `102-mask-and-secret-propagation` | `102-mask-and-secret-propagation.yml` | ✅ PASS | 10.36s | 141.9 MB | Status:    ✓ 1 passed (1 total) |
-| 13 | `103-composite-nested-post` | `103-composite-nested-post.yml` | ❌ FAIL | 10.21s | 142.4 MB | Status:    ✗ 1 failed, 0 passed (1 total) |
-| 14 | `104-job-defaults-env-cascade` | `104-job-defaults-env-cascade.yml` | ✅ PASS | 10.33s | 143.1 MB | Status:    ✓ 1 passed (1 total) |
-| 15 | `105-concurrency-cancellation-group` | `105-concurrency-cancellation-group.yml` | ✅ PASS | 69.69s | 142.9 MB | Status:    ✓ 1 passed (1 total) |
-| 16 | `107-continue-on-error-status-funcs` | `107-continue-on-error-status-funcs.yml` | ❌ FAIL | 9.96s | 143.2 MB | Status:    ✗ 1 failed, 0 passed (1 total) |
-| 17 | `108-workflow-dispatch-inputs` | `108-workflow-dispatch-inputs.yml` | ✅ PASS | 10.47s | 143.5 MB | Status:    ✓ 1 passed (1 total) |
-| 18 | `109-log-streaming-backpressure` | `109-log-streaming-backpressure.yml` | ✅ PASS | 10.83s | 146.9 MB | Status:    ✓ 1 passed (1 total) |
-| 19 | `11-cache-roundtrip` | `11-cache-roundtrip.yml` | ✅ PASS | 11.47s | 155.1 MB | Status:    ✓ 1 passed (1 total) |
-| 20 | `110-environment-deployment-url` | `110-environment-deployment-url.yml` | ✅ PASS | 10.36s | 142.2 MB | Status:    ✓ 1 passed (1 total) |
-| 21 | `111-github-state-post-execution` | `111-github-state-post-execution.yml` | ✅ PASS | 28.13s | 141.2 MB | Status:    ✓ 1 passed (1 total) |
-| 22 | `112-service-container-health-ports` | `112-service-container-health-ports.yml` | ❌ FAIL | 47.81s | 147.1 MB | Status:    ✗ 1 failed, 0 passed (1 total) |
-| 23 | `113-artifact-v4-multi-pattern` | `113-artifact-v4-multi-pattern.yml` | ✅ PASS | 22.27s | 151.2 MB | Status:    ✓ 1 passed (1 total) |
-| 24 | `114-step-timeout-graceful-kill` | `114-step-timeout-graceful-kill.yml` | ✅ PASS | 130.18s | 144.6 MB | Status:    ✓ 1 passed (1 total) |
-| 25 | `115-cache-v2-restore-fallback` | `115-cache-v2-restore-fallback.yml` | ✅ PASS | 44.77s | 145.6 MB | Status:    ✓ 1 passed (1 total) |
-| 26 | `12-artifact` | `12-artifact.yml` | ✅ PASS | 40.45s | 149.8 MB | Status:    ✓ 1 passed (1 total) |
-| 27 | `13-composite-action` | `13-composite-action.yml` | ❌ FAIL | 10.37s | 142.3 MB | Status:    ✗ 1 failed, 0 passed (1 total) |
-| 28 | `14-annotations` | `14-annotations.yml` | ❌ FAIL | 10.47s | 141.2 MB | Status:    ✗ 1 failed, 0 passed (1 total) |
-| 29 | `15-oidc-id-token` | `15-oidc-id-token.yml` | ❌ FAIL | 10.89s | 141.4 MB | Status:    ✗ 1 failed, 0 passed (1 total) |
-| 30 | `16-container-job` | `16-container-job.yml` | ✅ PASS | 21.42s | 152.1 MB | Status:    ✓ 1 passed (1 total) |
-| 31 | `163-reusable-caller` | `163-reusable-caller.yml` | ❌ FAIL | 0.65s | 85.8 MB | [Agent CI] Fatal error: Error: Reusable workflow file not... |
-| 32 | `17-service-container` | `17-service-container.yml` | ❌ FAIL | 2.79s | 142.1 MB | (node:8339) [DEP0205] DeprecationWarning: `module.registe... |
-| 33 | `30-container-job-basic` | `30-container-job-basic.yml` | ✅ PASS | 11.95s | 149.1 MB | Status:    ✓ 1 passed (1 total) |
-| 34 | `31-container-with-services` | `31-container-with-services.yml` | ✅ PASS | 16.61s | 151.2 MB | Status:    ✓ 1 passed (1 total) |
-| 35 | `32-services-no-container` | `32-services-no-container.yml` | ❌ FAIL | 3.11s | 142.3 MB | (node:76591) [DEP0205] DeprecationWarning: `module.regist... |
-| 36 | `33-container-env-options` | `33-container-env-options.yml` | ❌ FAIL | 9.94s | 150.5 MB | (node:97866) [DEP0205] DeprecationWarning: `module.regist... |
-| 37 | `34-container-with-checkout` | `34-container-with-checkout.yml` | ❌ FAIL | 38.68s | 143.7 MB | The process '/usr/bin/git' failed with exit code 128 |
-| 38 | `35-container-lifecycle` | `35-container-lifecycle.yml` | ❌ FAIL | 12.60s | 150.1 MB | Status:    ✗ 1 failed, 0 passed (1 total) |
-| 39 | `36-docker-action` | `36-docker-action.yml` | ❌ FAIL | 13.78s | 152.5 MB | Status:    ✗ 2 failed, 0 passed (2 total) |
-
-
-Both measured on the same host: Apple M4 Max, 16 cores, 128 GB RAM, macOS.
-act v0.2.89 with OrbStack Docker and `catthehacker/ubuntu:act-latest` (2.29 GB).
-aksh with SmolVM microVMs. Trimmed mean of 9 warm runs.
-
-| Workload | aksh (SmolVM) | act (Docker) | agent-ci (Docker + runner) | Host baseline |
-|---|---|---|---|---|
-| Single job (warm) | **318 ms** | 549 ms | 4,294 ms | 327 ms |
-| Single job (cold) | **318 ms** | 584 ms | 4,139 ms | — |
-| 4-shard matrix (warm) | **401 ms** | 834 ms | 8,134 ms | 550–630 ms |
-| 4-shard matrix (cold) | **401 ms** | 1,358 ms | 8,133 ms | — |
-
-| Resource | act | agent-ci | aksh |
-|---|---|---|---|
-| Process/engine RSS | 31 MB | 123 MB (Node.js) | 27 MB |
-| Per-job isolation RSS | 2.3 MB (container) | 131 MB idle, ~390 MB after job (microVM) |
-| Binary size | 29 MB (Go) | — |
-| Runtime image | 2.29 GB (Docker) | — |
-
-aksh trades higher per-job memory (microVM vs container) for stronger isolation
-and faster execution. SmolVM fork-based warm pool amortizes VM startup.
-
----
+| # | Scenario | File | act Status | act Time | agent-ci Status | agent-ci Time | Notes / Differences |
+|---|---|---|:---:|:---:|:---:|:---:|---|
+| 1 | `02-trivial-job` | `02-trivial-job.yml` | ✅ PASS | 0.45s | ✅ PASS | 10.34s | both passed |
+| 2 | `03-cancellation` | `03-cancellation.yml` | ✅ PASS | 60.57s | ✅ PASS | 69.59s | both passed |
+| 3 | `04-request-ack` | `04-request-ack.yml` | ✅ PASS | 0.45s | ✅ PASS | 10.36s | both passed |
+| 4 | `05-multi-job` | `05-multi-job-a.yml` | ✅ PASS | 0.45s | ✅ PASS | 10.14s | both passed |
+| 5 | `05-multi-job` | `05-multi-job-b.yml` | ✅ PASS | 0.39s | ✅ PASS | 10.13s | both passed |
+| 6 | `06-multi-step` | `06-multi-step.yml` | ✅ PASS | 0.51s | ✅ PASS | 10.60s | both passed |
+| 7 | `07-step-failure` | `07-step-failure.yml` | ❌ FAIL | 0.46s | ❌ FAIL | 9.85s | both failed (intentional error / OIDC / reusable ref) |
+| 8 | `08-job-outputs-needs` | `08-job-outputs-needs.yml` | ✅ PASS | 0.79s | ✅ PASS | 20.24s | both passed |
+| 9 | `09-matrix-fan-out` | `09-matrix-fan-out.yml` | ❌ FAIL | 20.70s | ❌ FAIL | 42.05s | both failed (intentional error / OIDC / reusable ref) |
+| 10 | `10-uses-checkout` | `10-uses-checkout.yml` | ✅ PASS | 0.49s | ✅ PASS | 10.15s | both passed |
+| 11 | `101-dynamic-matrix-dataflow` | `101-dynamic-matrix-dataflow.yml` | ✅ PASS | 0.95s | ✅ PASS | 19.82s | both passed |
+| 12 | `102-mask-and-secret-propagation` | `102-mask-and-secret-propagation.yml` | ✅ PASS | 0.45s | ✅ PASS | 10.36s | both passed |
+| 13 | `103-composite-nested-post` | `103-composite-nested-post.yml` | ❌ FAIL | 0.45s | ❌ FAIL | 10.21s | both failed (intentional error / OIDC / reusable ref) |
+| 14 | `104-job-defaults-env-cascade` | `104-job-defaults-env-cascade.yml` | ✅ PASS | 0.38s | ✅ PASS | 10.33s | both passed |
+| 15 | `105-concurrency-cancellation-group` | `105-concurrency-cancellation-group.yml` | ✅ PASS | 60.48s | ✅ PASS | 69.69s | both passed |
+| 16 | `107-continue-on-error-status-funcs` | `107-continue-on-error-status-funcs.yml` | ❌ FAIL | 0.61s | ❌ FAIL | 9.96s | both failed (intentional error / OIDC / reusable ref) |
+| 17 | `108-workflow-dispatch-inputs` | `108-workflow-dispatch-inputs.yml` | ✅ PASS | 0.40s | ✅ PASS | 10.47s | both passed |
+| 18 | `109-log-streaming-backpressure` | `109-log-streaming-backpressure.yml` | ✅ PASS | 0.48s | ✅ PASS | 10.83s | both passed |
+| 19 | `11-cache-roundtrip` | `11-cache-roundtrip.yml` | ❌ FAIL | 30.01s | ✅ PASS | 11.47s | agent-ci passed (artifacts/cache), act failed |
+| 20 | `110-environment-deployment-url` | `110-environment-deployment-url.yml` | ✅ PASS | 0.45s | ✅ PASS | 10.36s | both passed |
+| 21 | `111-github-state-post-execution` | `111-github-state-post-execution.yml` | ✅ PASS | 0.43s | ✅ PASS | 28.13s | both passed |
+| 22 | `112-service-container-health-ports` | `112-service-container-health-ports.yml` | ❌ FAIL | 3.78s | ❌ FAIL | 47.81s | both failed (intentional error / OIDC / reusable ref) |
+| 23 | `113-artifact-v4-multi-pattern` | `113-artifact-v4-multi-pattern.yml` | ❌ FAIL | 1.45s | ✅ PASS | 22.27s | agent-ci passed (artifacts/cache), act failed |
+| 24 | `114-step-timeout-graceful-kill` | `114-step-timeout-graceful-kill.yml` | ❌ FAIL | 30.01s | ✅ PASS | 130.18s | agent-ci passed (artifacts/cache), act failed |
+| 25 | `115-cache-v2-restore-fallback` | `115-cache-v2-restore-fallback.yml` | ✅ PASS | 23.30s | ✅ PASS | 44.77s | both passed |
+| 26 | `12-artifact` | `12-artifact.yml` | ❌ FAIL | 1.57s | ✅ PASS | 40.45s | agent-ci passed (artifacts/cache), act failed |
+| 27 | `13-composite-action` | `13-composite-action.yml` | ❌ FAIL | 0.39s | ❌ FAIL | 10.37s | both failed (intentional error / OIDC / reusable ref) |
+| 28 | `14-annotations` | `14-annotations.yml` | ❌ FAIL | 0.34s | ❌ FAIL | 10.47s | both failed (intentional error / OIDC / reusable ref) |
+| 29 | `15-oidc-id-token` | `15-oidc-id-token.yml` | ❌ FAIL | 0.34s | ❌ FAIL | 10.89s | both failed (intentional error / OIDC / reusable ref) |
+| 30 | `16-container-job` | `16-container-job.yml` | ✅ PASS | 0.44s | ✅ PASS | 21.42s | both passed |
+| 31 | `163-reusable-caller` | `163-reusable-caller.yml` | ❌ FAIL | 0.03s | ❌ FAIL | 0.65s | both failed (intentional error / OIDC / reusable ref) |
+| 32 | `17-service-container` | `17-service-container.yml` | ✅ PASS | 16.18s | ❌ FAIL | 2.79s | act passed, agent-ci failed |
+| 33 | `30-container-job-basic` | `30-container-job-basic.yml` | ✅ PASS | 0.62s | ✅ PASS | 11.95s | both passed |
+| 34 | `31-container-with-services` | `31-container-with-services.yml` | ✅ PASS | 11.16s | ✅ PASS | 16.61s | both passed |
+| 35 | `32-services-no-container` | `32-services-no-container.yml` | ❌ FAIL | 0.45s | ❌ FAIL | 3.11s | both failed (intentional error / OIDC / reusable ref) |
+| 36 | `33-container-env-options` | `33-container-env-options.yml` | ✅ PASS | 0.83s | ❌ FAIL | 9.94s | act passed, agent-ci failed |
+| 37 | `34-container-with-checkout` | `34-container-with-checkout.yml` | ❌ FAIL | 7.93s | ❌ FAIL | 38.68s | both failed (intentional error / OIDC / reusable ref) |
+| 38 | `35-container-lifecycle` | `35-container-lifecycle.yml` | ✅ PASS | 2.40s | ❌ FAIL | 12.60s | act passed, agent-ci failed |
+| 39 | `36-docker-action` | `36-docker-action.yml` | ✅ PASS | 2.36s | ❌ FAIL | 13.78s | act passed, agent-ci failed |
 
 ## 7. Isolation & Security
 

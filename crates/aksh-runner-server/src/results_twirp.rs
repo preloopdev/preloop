@@ -123,7 +123,7 @@ pub(crate) async fn twirp_get_job_logs_signed_blob_url(
         "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
         "logs_url": format!(
             "{}/replay/results/{}/{}/job-logs.txt?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig=dummy",
-            public_base_url(), request.workflow_run_backend_id, request.workflow_job_run_backend_id
+            runner_base_url(), request.workflow_run_backend_id, request.workflow_job_run_backend_id
         )
     }))
 }
@@ -134,7 +134,7 @@ pub(crate) async fn twirp_get_job_diag_logs_signed_blob_url(
     let token = uuid::Uuid::new_v4();
     Json(json!({
         "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
-        "diag_logs_url": format!("{}/twirp-blob/diag/{token}?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig=dummy", public_base_url()),
+        "diag_logs_url": format!("{}/twirp-blob/diag/{token}?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig=dummy", runner_base_url()),
     }))
 }
 
@@ -145,7 +145,7 @@ pub(crate) async fn twirp_get_step_logs_signed_blob_url(
         "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
         "logs_url": format!(
             "{}/replay/results/{}/{}/step-{}.txt?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig=dummy",
-            public_base_url(), request.workflow_run_backend_id, request.workflow_job_run_backend_id, request.step_backend_id
+            runner_base_url(), request.workflow_run_backend_id, request.workflow_job_run_backend_id, request.step_backend_id
         ),
         "soft_size_limit": "1048576"
     }))
@@ -165,7 +165,7 @@ pub(crate) async fn twirp_get_step_summary_signed_blob_url(
         "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
         "summary_url": format!(
             "{}/replay/results/{}/{}/step-{}-summary.md?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig=dummy",
-            public_base_url(), request.workflow_run_backend_id, request.workflow_job_run_backend_id, request.step_backend_id
+            runner_base_url(), request.workflow_run_backend_id, request.workflow_job_run_backend_id, request.step_backend_id
         ),
         "soft_size_limit": "1048576"
     }))
@@ -382,7 +382,7 @@ pub(crate) async fn twirp_cache_v2_create(
             "message": "cache upload already reserved"
         })));
     }
-    let upload_url = format!("{}/twirp-blob/cache/{token}", public_base_url());
+    let upload_url = format!("{}/twirp-blob/cache/{token}", runner_base_url());
     info!(token, "cache v2 create entry");
     Ok(Json(
         json!({ "ok": true, "signed_upload_url": upload_url, "message": "" }),
@@ -530,7 +530,7 @@ pub(crate) async fn twirp_cache_v2_get_dl_url(
             .cache_v2_dl_tokens
             .insert(dl_token.clone(), (entry.key.clone(), entry.version.clone()));
     }
-    let download_url = format!("{}/twirp-blob/cache/{dl_token}", public_base_url());
+    let download_url = format!("{}/twirp-blob/cache/{dl_token}", runner_base_url());
     let matched_key = entry
         .key
         .split_once('\0')
