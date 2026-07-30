@@ -85,15 +85,11 @@ fn range_retry_clears_state_and_annotations_for_every_replayed_step() {
 
     for index in 1..=3 {
         assert!(!job.state.contains_key(&format!("step_{index}")));
-        assert!(!job
-            .step_annotations
-            .contains_key(&format!("step_{index}")));
+        assert!(!job.step_annotations.contains_key(&format!("step_{index}")));
     }
     for index in [0, 4] {
         assert!(job.state.contains_key(&format!("step_{index}")));
-        assert!(job
-            .step_annotations
-            .contains_key(&format!("step_{index}")));
+        assert!(job.step_annotations.contains_key(&format!("step_{index}")));
     }
 }
 
