@@ -1,18 +1,38 @@
 use super::*;
 
+const LOCAL_JWT_LIFETIME: Duration = Duration::from_secs(2999);
+
+/// A debug credential is acquired before the first step and remains in use
+/// through both the six-hour GitHub job limit and this server's four-hour
+/// pause-credit window. Keep a small allowance for setup and transport around
+/// those two bounded intervals.
+pub(crate) const DEBUG_WORKER_TOKEN_LIFETIME: Duration =
+    Duration::from_secs((6 + 4) * 60 * 60 + 5 * 60);
+
 impl AppState {
-    pub(crate) fn local_jwt(&self, mut claims: serde_json::Value) -> Result<String, ApiError> {
+    pub(crate) fn local_jwt(&self, claims: serde_json::Value) -> Result<String, ApiError> {
+        self.local_jwt_with_lifetime(claims, LOCAL_JWT_LIFETIME)
+    }
+
+    fn local_jwt_with_lifetime(
+        &self,
+        mut claims: serde_json::Value,
+        lifetime: Duration,
+    ) -> Result<String, ApiError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| ApiError::bad_request(format!("system clock before epoch: {error}")))?
             .as_secs();
+        let expires_at = now
+            .checked_add(lifetime.as_secs())
+            .ok_or_else(|| ApiError::bad_request("JWT expiration exceeds u64"))?;
         let claims = claims
             .as_object_mut()
             .ok_or_else(|| ApiError::bad_request("JWT claims must be an object"))?;
         claims.insert("iss".to_owned(), json!("https://aksh.local"));
         claims.insert("iat".to_owned(), json!(now));
         claims.insert("nbf".to_owned(), json!(now));
-        claims.insert("exp".to_owned(), json!(now + 2999));
+        claims.insert("exp".to_owned(), json!(expires_at));
         let header = json!({
             "alg": "HS256",
             "typ": "JWT",
@@ -155,10 +175,13 @@ impl AppState {
     /// variable into the `secrets` context, so a job message is a publication
     /// channel to the workflow being debugged.
     pub(crate) fn mint_debug_worker_token(&self, plan_id: &str, job_id: &uuid::Uuid) -> String {
-        self.local_jwt(json!({
-            "sub": format!("aksh-debug-worker-{job_id}"),
-            "scp": format!("DebugWorker:{plan_id}:{job_id}"),
-        }))
+        self.local_jwt_with_lifetime(
+            json!({
+                "sub": format!("aksh-debug-worker-{job_id}"),
+                "scp": format!("DebugWorker:{plan_id}:{job_id}"),
+            }),
+            DEBUG_WORKER_TOKEN_LIFETIME,
+        )
         .expect("fixed local JWT claims must serialize")
     }
 }
