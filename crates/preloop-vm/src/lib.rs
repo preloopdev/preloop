@@ -131,6 +131,9 @@ pub struct MachineSpec {
     pub volumes: Vec<VolumeMount>,
     /// Narrowly scoped host Unix sockets.
     pub sockets: Vec<SocketMount>,
+    /// Enable Rosetta 2 x86_64 translation on Apple Silicon.
+    #[serde(default)]
+    pub rosetta: bool,
 }
 
 /// Observable VM state.
@@ -413,7 +416,18 @@ impl VmProvider for SmolVmProvider {
                 format!("{}:{}", mount.host.display(), mount.guest.display()),
             ]);
         }
-        self.exclusive("create", &args).await.map(|_| ())
+        self.exclusive("create", &args).await?;
+        if spec.rosetta {
+            let update_args = vec![
+                "machine".into(),
+                "update".into(),
+                "--name".into(),
+                spec.name.as_str().into(),
+                "--rosetta".into(),
+            ];
+            let _ = self.exclusive("update", &update_args).await;
+        }
+        Ok(())
     }
 
     async fn start(&self, name: &MachineName) -> Result<(), VmError> {
