@@ -23,31 +23,32 @@ struct GithubCommitResponse {
 /// not already supplied by a caller (local workflows and test fixtures).
 pub(crate) async fn resolve_remote_workflows(
     submission: &mut WorkflowSubmission,
+    root_workflow: &aksh_gha_parser::Workflow,
 ) -> Result<(), ApiError> {
-    let client = reqwest::Client::builder()
-        .user_agent("aksh-runner-server")
-        .build()
-        .map_err(|error| ApiError::internal(format!("build GitHub client: {error}")))?;
+    if !root_workflow.jobs.values().any(|job| job.uses.is_some()) {
+        return Ok(());
+    }
+
+    let mut client = None;
     let token = std::env::var("AKSH_GITHUB_TOKEN").ok();
-    let mut queue = vec![(submission.workflow_yaml.clone(), 0usize)];
+    let mut queue = vec![(root_workflow.clone(), 0usize)];
     let mut visited = std::collections::BTreeSet::new();
-    while let Some((workflow_yaml, depth)) = queue.pop() {
+    while let Some((workflow, depth)) = queue.pop() {
         if depth >= MAX_REUSABLE_WORKFLOW_DEPTH {
             return Err(ApiError::bad_request(
                 "nested reusable workflow depth exceeded",
             ));
         }
-        let workflow = aksh_gha_parser::parse_workflow(&workflow_yaml)?;
         for job in workflow.jobs.values() {
             let Some(reference) = job.uses.as_deref() else {
                 continue;
             };
             if reference.starts_with("./") {
                 continue;
-            }
+            };
             if let Some(contents) = submission.reusable_workflows.get(reference).cloned() {
                 if visited.insert(reference.to_owned()) {
-                    queue.push((contents, depth + 1));
+                    queue.push((aksh_gha_parser::parse_workflow(&contents)?, depth + 1));
                 }
                 continue;
             }
@@ -59,6 +60,12 @@ pub(crate) async fn resolve_remote_workflows(
             if !visited.insert(reference.to_owned()) {
                 continue;
             }
+            let client = client.get_or_insert(
+                reqwest::Client::builder()
+                    .user_agent("aksh-runner-server")
+                    .build()
+                    .map_err(|error| ApiError::internal(format!("build GitHub client: {error}")))?,
+            );
             let mut request = client
                 .get(format!(
                     "https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={git_ref}"
@@ -110,7 +117,7 @@ pub(crate) async fn resolve_remote_workflows(
             submission
                 .reusable_workflow_shas
                 .insert(reference.to_owned(), commit.sha);
-            queue.push((contents, depth + 1));
+            queue.push((aksh_gha_parser::parse_workflow(&contents)?, depth + 1));
         }
     }
     Ok(())

@@ -12,8 +12,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SERVER_PORT="${AKSH_PORT:-9191}"
 SERVER_URL="http://127.0.0.1:${SERVER_PORT}"
-SERVER_BIN="$REPO_ROOT/target/release/aksh-runner-server"
-RUNNER_BIN="$REPO_ROOT/target/aarch64-unknown-linux-musl/release/aksh-runner"
+SERVER_BIN="$REPO_ROOT/target/release/preloop-server"
+RUNNER_BIN="$REPO_ROOT/target/aarch64-unknown-linux-musl/release/preloop-runner"
 MAX_JOBS="${MAX_JOBS:-3}"
 
 red()   { printf '\033[1;31m%s\033[0m\n' "$*"; }
@@ -31,7 +31,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 cleanup() {
-    pkill -f "aksh-runner-server.*${SERVER_PORT}" 2>/dev/null || true
+    pkill -f "preloop-server.*${SERVER_PORT}" 2>/dev/null || true
     # Clean up any test VMs
     for vm in $(smolvm machine ls --json 2>/dev/null | python3 -c 'import sys,json; [print(m["name"]) for m in json.load(sys.stdin) if m["name"].startswith("e2e-job-")]' 2>/dev/null); do
         smolvm machine stop --name "$vm" 2>/dev/null || true
@@ -42,7 +42,7 @@ trap cleanup EXIT
 
 # Start server
 info "Starting aksh server on port $SERVER_PORT..."
-pkill -f "aksh-runner-server.*${SERVER_PORT}" 2>/dev/null || true
+pkill -f "preloop-server.*${SERVER_PORT}" 2>/dev/null || true
 sleep 1
 RUST_LOG=info AKSH_PUBLIC_URL="$SERVER_URL" "$SERVER_BIN" serve --listen "0.0.0.0:${SERVER_PORT}" > /tmp/aksh-e2e-server.log 2>&1 &
 sleep 2

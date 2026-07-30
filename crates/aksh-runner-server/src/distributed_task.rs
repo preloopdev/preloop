@@ -63,7 +63,13 @@ pub(crate) async fn next_message(
         }
 
         let runner = inner.runner_capabilities_for_session(&session_id);
-        let Some(queued) = take_matching_job(&mut inner.queue, &runner) else {
+        let claimed = take_matching_job(&mut inner.queue, &runner);
+        shared
+            .state
+            .queue_depth
+            .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
+        runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
+        let Some(queued) = claimed else {
             drop(inner);
             if wait_seconds == 0 {
                 return (StatusCode::OK, Json(None));
@@ -277,7 +283,7 @@ pub(crate) async fn complete_job_compat(
     .await
 }
 
-/// GET /_apis/v1/AgentRequest/:pool_id/:request_id — query a job request lease/result.
+/// GET /_apis/v1/AgentRequest/:pool_id/:request_id to query a job request lease/result.
 ///
 /// The official listener calls this when another job arrives while the previous
 /// worker process may still be unwinding. Returning a completed `result` lets it
@@ -480,7 +486,7 @@ pub(crate) async fn complete_job_inner(
     shared: Arc<SharedState>,
     completion: JobCompletion,
 ) -> Result<Json<RunRecord>, ApiError> {
-    if !is_terminal_status(completion.status) {
+    if !completion.status.is_terminal() {
         return Err(ApiError::bad_request(
             "job completion status must be terminal",
         ));
@@ -496,7 +502,7 @@ pub(crate) async fn complete_job_inner(
             .get(&completion.job_id)
             .copied()
             .ok_or_else(|| ApiError::bad_request("job does not belong to run"))?;
-        if is_terminal_status(prior) && prior != ExecutionStatus::Cancelled {
+        if prior.is_terminal() && prior != ExecutionStatus::Cancelled {
             return Ok(Json(run.clone()));
         }
         let tolerated = run
@@ -692,5 +698,21 @@ pub(crate) async fn complete_job_inner(
             reason: None,
         })
         .await;
+    if record.status.is_terminal() {
+        discard_workspace_snapshot(&shared.state.state_dir, completion.run_id).await;
+        // Off the completion path on purpose: this is housekeeping, and the
+        // runner is waiting on this response before its slot can turn over.
+        let state_dir = shared.state.state_dir.clone();
+        let active_plans = {
+            let inner = shared.state.inner.lock().await;
+            inner
+                .job_requests
+                .values()
+                .filter(|request| request.result.is_none())
+                .map(|request| request.plan_id.clone())
+                .collect()
+        };
+        tokio::spawn(async move { prune_replay_results(&state_dir, &active_plans).await });
+    }
     Ok(Json(record))
 }

@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
@@ -69,6 +70,15 @@ pub struct VolumeMount {
     pub read_only: bool,
 }
 
+/// Host Unix socket exposed at a fixed guest path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SocketMount {
+    /// Host socket path.
+    pub host: PathBuf,
+    /// Absolute guest socket path.
+    pub guest: PathBuf,
+}
+
 /// Explicit VM egress policy. Networking is disabled unless selected here.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum NetworkPolicy {
@@ -77,6 +87,10 @@ pub enum NetworkPolicy {
     Disabled,
     /// Unrestricted outbound networking.
     Unrestricted,
+    /// Full outbound networking with the egress hard-floor enabled: loopback,
+    /// RFC 1918, link-local / cloud metadata, CGNAT, and IPv6 private ranges
+    /// are denied. Enforced by `SMOLVM_EGRESS_FLOOR=strict` in the provider.
+    PublicOnly,
     /// Restrict outbound traffic to these host names and CIDRs.
     Restricted {
         /// DNS host names allowed for egress.
@@ -84,6 +98,18 @@ pub enum NetworkPolicy {
         /// IP address ranges allowed for egress.
         cidrs: Vec<String>,
     },
+}
+
+/// Where a guest environment value is resolved from, at launch time.
+///
+/// SmolVM never persists the value itself, only this reference, so a secret
+/// stays out of the machine record and out of any packed artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SecretSource {
+    /// Read from a host environment variable of this name.
+    HostEnv(String),
+    /// Read from this absolute host file.
+    HostFile(PathBuf),
 }
 
 /// Persistent VM configuration.
@@ -103,6 +129,11 @@ pub struct MachineSpec {
     pub network: NetworkPolicy,
     /// Narrowly scoped host mounts.
     pub volumes: Vec<VolumeMount>,
+    /// Narrowly scoped host Unix sockets.
+    pub sockets: Vec<SocketMount>,
+    /// Enable Rosetta 2 x86_64 translation on Apple Silicon.
+    #[serde(default)]
+    pub rosetta: bool,
 }
 
 /// Observable VM state.
@@ -179,6 +210,10 @@ pub trait VmProvider: Send + Sync {
     async fn create(&self, spec: &MachineSpec) -> Result<(), VmError>;
     /// Start an existing machine.
     async fn start(&self, name: &MachineName) -> Result<(), VmError>;
+    /// Start an existing machine as a forkable base (CoW memory + disks).
+    async fn start_forkable(&self, name: &MachineName) -> Result<(), VmError>;
+    /// Fork a running forkable machine into a new clone with CoW memory and disks.
+    async fn fork(&self, golden: &MachineName, clone: &MachineName) -> Result<(), VmError>;
     /// Stop an existing machine.
     async fn stop(&self, name: &MachineName) -> Result<(), VmError>;
     /// Delete a machine and its mutable overlay.
@@ -189,12 +224,12 @@ pub trait VmProvider: Send + Sync {
     async fn list(&self) -> Result<Vec<MachineName>, VmError>;
     /// Execute a guest command and return bounded output.
     async fn exec(&self, name: &MachineName, argv: &[String]) -> Result<ExecOutput, VmError>;
-    /// Execute with guest environment values resolved from named host variables.
+    /// Execute with guest environment values resolved from the host at launch.
     async fn exec_with_secret_env(
         &self,
         name: &MachineName,
         argv: &[String],
-        secrets: &[(String, String)],
+        secrets: &[(String, SecretSource)],
     ) -> Result<ExecOutput, VmError>;
     /// Execute while forwarding output fragments to the caller.
     async fn exec_stream(
@@ -214,6 +249,9 @@ pub trait VmProvider: Send + Sync {
 pub struct SmolVmProvider {
     binary: PathBuf,
     capture_limit: usize,
+    /// Serializes operations that build or replace a machine's base against
+    /// everything else. See [`SmolVmProvider::exclusive`].
+    lifecycle_lock: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl Default for SmolVmProvider {
@@ -228,6 +266,7 @@ impl SmolVmProvider {
         Self {
             binary: binary.into(),
             capture_limit: DEFAULT_CAPTURE_LIMIT,
+            lifecycle_lock: Arc::new(tokio::sync::RwLock::new(())),
         }
     }
 
@@ -246,7 +285,25 @@ impl SmolVmProvider {
         operation: &'static str,
         args: &[String],
     ) -> Result<ExecOutput, VmError> {
+        self.checked_with_network(operation, args, None).await
+    }
+
+    async fn checked_with_network(
+        &self,
+        operation: &'static str,
+        args: &[String],
+        network: Option<&NetworkPolicy>,
+    ) -> Result<ExecOutput, VmError> {
         let mut command = self.command();
+        match network {
+            Some(NetworkPolicy::PublicOnly) => {
+                command.env("SMOLVM_EGRESS_FLOOR", "strict");
+            }
+            Some(_) => {
+                command.env_remove("SMOLVM_EGRESS_FLOOR");
+            }
+            None => {}
+        }
         command
             .args(args)
             .stdin(Stdio::null())
@@ -292,6 +349,47 @@ impl SmolVmProvider {
         }
         Ok(result)
     }
+
+    /// Run an operation that constructs or replaces a machine's base image,
+    /// excluding every other lifecycle operation for its duration.
+    async fn exclusive(
+        &self,
+        operation: &'static str,
+        args: &[String],
+    ) -> Result<ExecOutput, VmError> {
+        let _guard = self.lifecycle_lock.write().await;
+        self.checked(operation, args).await
+    }
+
+    async fn exclusive_with_network(
+        &self,
+        operation: &'static str,
+        args: &[String],
+        network: &NetworkPolicy,
+    ) -> Result<ExecOutput, VmError> {
+        let _guard = self.lifecycle_lock.write().await;
+        self.checked_with_network(operation, args, Some(network))
+            .await
+    }
+
+    /// Run an operation that only touches one already-defined machine.
+    ///
+    /// These run concurrently with each other: a pool replenishing several
+    /// slots at once issues a delete and a fork per slot, and serializing them
+    /// made the whole refill wait one VM operation at a time. Forking four
+    /// clones from the same golden — including the first forks, which trigger
+    /// the base freeze — measured 101-119 ms concurrently against 271-283 ms
+    /// serially, with every clone usable and no failures across three trials.
+    /// They stay excluded from base construction, so a golden cannot be
+    /// replaced underneath a fork.
+    async fn concurrent(
+        &self,
+        operation: &'static str,
+        args: &[String],
+    ) -> Result<ExecOutput, VmError> {
+        let _guard = self.lifecycle_lock.read().await;
+        self.checked(operation, args).await
+    }
 }
 
 #[async_trait]
@@ -320,6 +418,7 @@ impl VmProvider for SmolVmProvider {
         match &spec.network {
             NetworkPolicy::Disabled => {}
             NetworkPolicy::Unrestricted => args.push("--net".into()),
+            NetworkPolicy::PublicOnly => args.push("--net".into()),
             NetworkPolicy::Restricted { hosts, cidrs } => {
                 for host in hosts {
                     args.extend(["--allow-host".into(), host.clone()]);
@@ -336,11 +435,43 @@ impl VmProvider for SmolVmProvider {
             }
             args.extend(["--volume".into(), value]);
         }
-        self.checked("create", &args).await.map(|_| ())
+        for mount in &spec.sockets {
+            args.extend([
+                "--mount-socket".into(),
+                format!("{}:{}", mount.host.display(), mount.guest.display()),
+            ]);
+        }
+        self.exclusive_with_network("create", &args, &spec.network)
+            .await?;
+        if spec.rosetta {
+            let update_args = vec![
+                "machine".into(),
+                "update".into(),
+                "--name".into(),
+                spec.name.as_str().into(),
+                "--rosetta".into(),
+            ];
+            if let Err(error) = self.exclusive("update", &update_args).await {
+                let _ = self
+                    .concurrent(
+                        "delete",
+                        &[
+                            "machine".into(),
+                            "delete".into(),
+                            "--name".into(),
+                            spec.name.as_str().into(),
+                            "-f".into(),
+                        ],
+                    )
+                    .await;
+                return Err(error);
+            }
+        }
+        Ok(())
     }
 
     async fn start(&self, name: &MachineName) -> Result<(), VmError> {
-        self.checked(
+        self.exclusive(
             "start",
             &[
                 "machine".into(),
@@ -353,8 +484,39 @@ impl VmProvider for SmolVmProvider {
         .map(|_| ())
     }
 
+    async fn start_forkable(&self, name: &MachineName) -> Result<(), VmError> {
+        self.exclusive(
+            "start_forkable",
+            &[
+                "machine".into(),
+                "start".into(),
+                "--name".into(),
+                name.as_str().into(),
+                "--forkable".into(),
+            ],
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn fork(&self, golden: &MachineName, clone: &MachineName) -> Result<(), VmError> {
+        self.concurrent(
+            "fork",
+            &[
+                "machine".into(),
+                "fork".into(),
+                "--golden".into(),
+                golden.as_str().into(),
+                "--name".into(),
+                clone.as_str().into(),
+            ],
+        )
+        .await
+        .map(|_| ())
+    }
+
     async fn stop(&self, name: &MachineName) -> Result<(), VmError> {
-        self.checked(
+        self.concurrent(
             "stop",
             &[
                 "machine".into(),
@@ -368,7 +530,7 @@ impl VmProvider for SmolVmProvider {
     }
 
     async fn delete(&self, name: &MachineName) -> Result<(), VmError> {
-        self.checked(
+        self.concurrent(
             "delete",
             &[
                 "machine".into(),
@@ -389,7 +551,7 @@ impl VmProvider for SmolVmProvider {
             "--name".into(),
             name.as_str().into(),
         ];
-        match self.checked("status", &args).await {
+        match self.concurrent("status", &args).await {
             Ok(output) => {
                 let text = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
                 Ok(if text.contains("running") {
@@ -411,7 +573,7 @@ impl VmProvider for SmolVmProvider {
 
     async fn list(&self) -> Result<Vec<MachineName>, VmError> {
         let output = self
-            .checked("list", &["machine".into(), "ls".into(), "--json".into()])
+            .concurrent("list", &["machine".into(), "ls".into(), "--json".into()])
             .await?;
         let values: serde_json::Value = serde_json::from_slice(&output.stdout)
             .map_err(|error| VmError::Protocol(error.to_string()))?;
@@ -443,7 +605,7 @@ impl VmProvider for SmolVmProvider {
         &self,
         name: &MachineName,
         argv: &[String],
-        secrets: &[(String, String)],
+        secrets: &[(String, SecretSource)],
     ) -> Result<ExecOutput, VmError> {
         if argv.is_empty() {
             return Err(VmError::InvalidSpec("guest command is empty".into()));
@@ -454,21 +616,35 @@ impl VmProvider for SmolVmProvider {
             "--name".into(),
             name.as_str().into(),
         ];
-        for (guest, host) in secrets {
-            if guest.is_empty()
-                || host.is_empty()
-                || !guest
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-                || !host
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-            {
+        for (guest, source) in secrets {
+            if !is_env_identifier(guest) {
                 return Err(VmError::InvalidSpec(
                     "secret environment names must be non-empty ASCII identifiers".into(),
                 ));
             }
-            args.extend(["--secret-env".into(), format!("{guest}={host}")]);
+            match source {
+                SecretSource::HostEnv(host) => {
+                    if !is_env_identifier(host) {
+                        return Err(VmError::InvalidSpec(
+                            "secret environment names must be non-empty ASCII identifiers".into(),
+                        ));
+                    }
+                    args.extend(["--secret-env".into(), format!("{guest}={host}")]);
+                }
+                SecretSource::HostFile(path) => {
+                    // SmolVM resolves the path itself; a relative one would be
+                    // read against its working directory, not the caller's.
+                    if !path.is_absolute() {
+                        return Err(VmError::InvalidSpec(
+                            "secret file paths must be absolute".into(),
+                        ));
+                    }
+                    args.extend([
+                        "--secret-file".into(),
+                        format!("{guest}={}", path.display()),
+                    ]);
+                }
+            }
         }
         args.push("--".into());
         args.extend_from_slice(argv);
@@ -542,7 +718,7 @@ impl VmProvider for SmolVmProvider {
                 "pack output path must be absolute".into(),
             ));
         }
-        self.checked(
+        self.exclusive(
             "pack",
             &[
                 "pack".into(),
@@ -556,6 +732,14 @@ impl VmProvider for SmolVmProvider {
         .await
         .map(|_| ())
     }
+}
+
+/// Whether a name is usable as a shell environment variable identifier.
+fn is_env_identifier(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 fn validate_spec(spec: &MachineSpec) -> Result<(), VmError> {
@@ -579,7 +763,49 @@ fn validate_spec(spec: &MachineSpec) -> Result<(), VmError> {
             )));
         }
     }
+    for mount in &spec.sockets {
+        if !mount.host.is_absolute() || !mount.guest.is_absolute() {
+            return Err(VmError::InvalidSpec("socket paths must be absolute".into()));
+        }
+        validate_socket_source(&mount.host)?;
+    }
     Ok(())
+}
+
+/// A socket mount punches a hole in the guest boundary, so the host path must
+/// be exactly what the caller named: a real socket, reached without traversing
+/// a symlink that could be repointed at another endpoint.
+#[cfg(unix)]
+fn validate_socket_source(host: &Path) -> Result<(), VmError> {
+    use std::os::unix::fs::FileTypeExt;
+
+    let symlink_meta = std::fs::symlink_metadata(host).map_err(|error| {
+        VmError::InvalidSpec(format!(
+            "socket source does not exist: {} ({error})",
+            host.display()
+        ))
+    })?;
+    if symlink_meta.file_type().is_symlink() {
+        return Err(VmError::InvalidSpec(format!(
+            "socket source must not be a symlink: {}",
+            host.display()
+        )));
+    }
+    if !symlink_meta.file_type().is_socket() {
+        return Err(VmError::InvalidSpec(format!(
+            "socket source is not a Unix socket: {}",
+            host.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_socket_source(host: &Path) -> Result<(), VmError> {
+    Err(VmError::InvalidSpec(format!(
+        "socket mounts require Unix: {}",
+        host.display()
+    )))
 }
 
 async fn read_bounded(

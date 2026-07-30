@@ -66,7 +66,7 @@ and their impact on aksh.
 Runner-side deltas for v2.336.0 are implemented where they map cleanly onto aksh.
 Remaining gaps: full `BackgroundStepCoordinator` / cancel-control steps (#4482),
 worker-wait parity (#4553), and structured download telemetry vs info logs.
-Goldens remain on v2.335.1 until re-recorded.
+The committed conformance corpus is recorded from the official v2.336.0 runner.
 
 ---
 
@@ -130,24 +130,22 @@ those details.
 
 ## 1. Current fidelity scorecard
 
-**Evidence basis (latest, 2026-07-18):** runner-watch conformance replay of all 11 golden
-scenarios against aksh. All 11 pass: status codes match, request/response body schemas
-match on all conformance-checked endpoints (acquirejob response, all request bodies).
+**Evidence basis (latest, 2026-07-28):** runner-watch conformance replay of all 24
+official-runner v2.336.0 golden scenarios against aksh. All 24 pass: status codes,
+request body schemas, and acquirejob response schemas match on every
+conformance-checked endpoint. `benchmarks/conformance/check_corpus.py` fails closed
+when any scenario definition lacks a non-empty, version-matched capture.
 
 **Evidence basis (live E2E, 2026-07-10):** official `actions/runner` v2.335.1 run against both
 GitHub Actions and aksh server in independent smolVMs. 12 conformance scenarios tested.
 Job-level match: 11/12 (92%). Full match (job + step): 6/12 (50%).
 See `benchmarks/real-world/results/server-compare/COMPARISON-REPORT.md` for details.
 
-- Golden scenarios: 11 scenarios, all passing conformance replay
-  - `01-register-and-idle`, `06-multi-step`, `07-step-failure`, `08-job-outputs-needs`,
-    `09-matrix-fan-out`, `10-uses-checkout`, `11-cache-roundtrip`, `12-artifact`,
-    `13-composite-action`, `14-annotations`, `15-oidc-id-token`
-- Tests: 740 passing (49 protocol + 87 parser + 31 expressions + 164 server + 30 runner-watch + 325 runner + 48 dap + 6 cache/artifacts)
+- Golden scenarios: all 24 definitions under `experiments/mitm/scenarios/`, all
+  passing conformance replay.
 
 Rough completeness against "100% faithful control plane (v2.336.0)": **~95%**
-(v2.336.0 runner deltas mostly in; goldens still v2.335.1; BackgroundStepCoordinator incomplete).
-Protocol-level conformance baseline remains v2.335.1 goldens until re-recorded.
+(v2.336.0 runner deltas and protocol corpus current; BackgroundStepCoordinator incomplete).
 Expression evaluator is feature-complete. Concurrency
 groups are fully implemented with property tests. The Rust runner handles the full
 step lifecycle including pre/post steps, condition evaluation, file commands,
@@ -213,12 +211,12 @@ deprecation warnings, job-level annotations, and background step control-flow.
 
 ---
 
-## 1a. v2.335.1 conformance replay status (2026-07-18)
+## 1a. v2.336.0 conformance replay status (2026-07-28)
 
 ### 1a.1 What the conformance replay proves
 
-runner-watch replays all 11 golden scenarios against aksh and compares wire output.
-**All 11 scenarios pass**: status codes match, request body schemas match, and
+runner-watch replays all 24 golden scenarios against aksh and compares wire output.
+**All 24 scenarios pass**: status codes match, request body schemas match, and
 acquirejob response body schemas match for all conformance-checked endpoints.
 
 The conformance gate checks:
@@ -232,17 +230,30 @@ Body-value diffs (different URLs, IDs, tokens) are expected and not gated.
 
 | Scenario | Flows | Status | Notes |
 | --- | ---: | --- | --- |
-| `01-register-and-idle` | 12 | ✅ pass | Registration + session; golden filtered to idle flows |
-| `06-multi-step` | ~50 | ✅ pass | Multi-step script workflow with environment variables |
-| `07-step-failure` | ~31 | ✅ pass | Step that exits non-zero |
-| `08-job-outputs-needs` | ~60 | ✅ pass | Job outputs + needs chain |
-| `09-matrix-fan-out` | ~80 | ✅ pass | Matrix expansion with 3 variants |
-| `10-uses-checkout` | ~35 | ✅ pass | Repository action (actions/checkout) |
-| `11-cache-roundtrip` | ~45 | ✅ pass | Cache save/restore with expression-based key |
-| `12-artifact` | ~40 | ✅ pass | Artifact upload/download |
-| `13-composite-action` | ~35 | ✅ pass | Local composite action (uses: ./) |
-| `14-annotations` | ~35 | ✅ pass | Warning/error annotations |
-| `15-oidc-id-token` | ~25 | ✅ pass | OIDC token minting (RS256 JWT) |
+| `01-register-and-idle` | 40 | ✅ pass | Registration + idle session |
+| `02-trivial-job` | 59 | ✅ pass | Minimal broker job lifecycle |
+| `03-cancellation` | 272 | ✅ pass | Cancellation control flow |
+| `04-request-ack` | 66 | ✅ pass | Explicit request acknowledgement |
+| `05-multi-job` | 100 | ✅ pass | Multiple jobs in one workflow |
+| `06-multi-step` | 52 | ✅ pass | Multi-step scripts and environment |
+| `07-step-failure` | 54 | ✅ pass | Failure and conditional execution |
+| `08-job-outputs-needs` | 82 | ✅ pass | Job outputs + needs chain |
+| `09-matrix-fan-out` | 113 | ✅ pass | Matrix fan-out |
+| `10-uses-checkout` | 63 | ✅ pass | Repository action resolution |
+| `11-cache-roundtrip` | 69 | ✅ pass | Cache save/restore and blob handoff |
+| `12-artifact` | 74 | ✅ pass | Artifact upload/download |
+| `13-composite-action` | 64 | ✅ pass | Local composite action |
+| `14-annotations` | 51 | ✅ pass | Workflow command annotations |
+| `15-oidc-id-token` | 53 | ✅ pass | OIDC token minting |
+| `16-container-job` | 60 | ✅ pass | Job container wire shape |
+| `17-service-container` | 59 | ✅ pass | Service container wire shape |
+| `30-container-job-basic` | 72 | ✅ pass | Basic container job |
+| `31-container-with-services` | 78 | ✅ pass | Container + service topology |
+| `32-services-no-container` | 70 | ✅ pass | Host job + services |
+| `33-container-env-options` | 87 | ✅ pass | Container env/options tokens |
+| `34-container-with-checkout` | 117 | ✅ pass | Checkout in a job container |
+| `35-container-lifecycle` | 63 | ✅ pass | Lifecycle and continue-on-error token |
+| `36-docker-action` | 70 | ✅ pass | `docker://` action references |
 
 ### 1a.3 Remaining body-value diffs (not gated)
 
@@ -408,7 +419,7 @@ Paths are in this repo. Updated 2026-07-18 after deep source review.
 - `runner-watch`
   - ✅ Records/diffs upstream runner releases and emits `.runner-watch/delta.json`.
   - ✅ Generates protocol-sync specs under `.runner-watch/specs/v{version}/`.
-  - ✅ Replays v2.335.1 golden captures into aksh: all 11 scenarios pass.
+  - ✅ Replays the complete v2.336.0 corpus into aksh: all 24 scenarios pass.
 ### 3a. Concurrency & cancellation audit (2026-07-13, resolved 2026-07-18)
 
 Findings from a source audit of aksh vs official runner v2.335.1 sources (local mirror:

@@ -1,6 +1,6 @@
-//! Shared domain and wire models for aksh's GitHub Actions control plane.
+//! Shared domain and wire models for preloop's GitHub Actions control plane.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
 
@@ -18,8 +18,19 @@ pub mod crypto;
 /// Shared secret-masking logic (longest-first, exclusion-aware).
 pub mod masking;
 
+/// Live debug-session DTOs for the native `/api/v1/debug/...` surface.
+pub mod debug_session;
+
 /// Protocol version exposed by this crate's runner-compatible DTOs.
-pub const PROTOCOL_VERSION: &str = "2026-06-25.aksh.v1";
+pub const PROTOCOL_VERSION: &str = "2026-06-25.preloop.v1";
+
+/// Line a runner prints on stdout the moment it accepts a job.
+///
+/// An ephemeral runner is single-use, so the orchestrator supervising it can
+/// start building its replacement as soon as the current one is spoken for
+/// rather than waiting for the job to end. This is a private channel between
+/// our runner and our orchestrator; it never crosses the GitHub wire protocol.
+pub const RUNNER_BUSY_SENTINEL: &str = "::preloop-runner::job-acquired";
 
 /// Stable identifier for a workflow run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -131,7 +142,7 @@ impl<'de> Deserialize<'de> for SecretString {
 /// Redaction-safe map of secret names to values.
 pub type SecretMap = BTreeMap<String, SecretString>;
 
-/// Incoming workflow submission.
+/// Complete workflow request submitted to the control plane.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WorkflowSubmission {
     /// YAML workflow contents.
@@ -143,8 +154,8 @@ pub struct WorkflowSubmission {
     pub payload: serde_json::Value,
     /// Repository slug or local identifier.
     pub repository: String,
-    /// Git ref for the run.
     #[serde(default = "default_ref")]
+    /// Git ref for the run.
     pub git_ref: String,
     /// Repository-relative path of the submitted workflow file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -216,12 +227,51 @@ pub struct WorkflowSubmission {
     /// Branch used for trigger filtering, independent of `git_ref`.
     #[serde(default)]
     pub filter_branch: Option<String>,
-    /// Typed workflow_dispatch inputs.
     #[serde(default)]
+    /// Typed workflow_dispatch inputs.
     pub dispatch_inputs: BTreeMap<String, serde_json::Value>,
     /// String-valued workflow_dispatch inputs for `github.event.inputs`.
     #[serde(default)]
     pub dispatch_inputs_stringified: BTreeMap<String, String>,
+    /// Run only these jobs (by YAML key) and their transitive `needs:`
+    /// dependencies. An empty list means run all jobs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selected_jobs: Vec<String>,
+    /// Explicit base ref for the run (populates `github.base_ref`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_ref: Option<String>,
+    /// Keep the failed job VM alive for interactive debugging.
+    #[serde(default)]
+    pub preserve_on_failure: bool,
+}
+
+impl WorkflowSubmission {
+    /// Serialize for transmission to the control plane, exposing secret values.
+    ///
+    /// [`SecretString`] redacts on `Serialize` so that a submission embedded in
+    /// server state (for example `RunRecord`) can never leak secrets through an
+    /// API response. Sending secrets is the one legitimate exception, so it is
+    /// opt-in at the call site rather than a property of the type.
+    pub fn to_request_json(&self) -> Result<serde_json::Value, serde_json::Error> {
+        let mut value = serde_json::to_value(self)?;
+        if self.secrets.is_empty() {
+            return Ok(value);
+        }
+        let exposed = self
+            .secrets
+            .iter()
+            .map(|(name, secret)| {
+                (
+                    name.clone(),
+                    serde_json::Value::String(secret.expose().to_owned()),
+                )
+            })
+            .collect();
+        if let Some(object) = value.as_object_mut() {
+            object.insert("secrets".to_owned(), serde_json::Value::Object(exposed));
+        }
+        Ok(value)
+    }
 }
 
 fn default_ref() -> String {
@@ -239,7 +289,7 @@ fn default_actor() -> String {
 /// Result returned after accepting a workflow run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunAccepted {
-    /// New run id.
+    /// Run this status refers to.
     pub run_id: RunId,
     /// Monotonic run number for this workflow path.
     pub run_number: u64,
@@ -251,26 +301,36 @@ pub struct RunAccepted {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionStatus {
-    /// Object exists but has not started.
+    /// Accepted and waiting for a runner.
     Queued,
     /// Object is waiting on a concurrency group (not runnable yet).
     Pending,
-    /// Object is currently running.
+    /// A runner has picked the job up.
     InProgress,
-    /// Object completed successfully.
+    /// Finished successfully.
     Success,
-    /// Object completed with a failure.
+    /// Finished with a failure.
     Failure,
     /// Object was skipped by condition or dependency.
     Skipped,
-    /// Object was cancelled.
+    /// Cancelled before completion.
     Cancelled,
+}
+
+impl ExecutionStatus {
+    /// Whether the run or job has reached a final state and will not change.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Success | Self::Failure | Self::Skipped | Self::Cancelled
+        )
+    }
 }
 
 /// A parsed and expanded job ready to send to a runner.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobPlan {
-    /// Expanded job id.
+    /// Stable job identifier within the run.
     pub id: JobId,
     /// Original workflow job id before matrix suffixing.
     pub base_id: String,
@@ -339,6 +399,11 @@ pub struct JobPlan {
     /// Effective `id-token: write` permission after reusable-workflow reduction.
     #[serde(default)]
     pub oidc_id_token_granted: bool,
+    /// Effective job permissions (job-level overrides workflow-level).
+    /// Keys are GitHub permission names (`contents`, `issues`, `pull-requests`, …),
+    /// values are `read`, `write`, or `none`. `None` means default permissions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<BTreeMap<String, String>>,
     /// Resolved deployment environment used for OIDC claims.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oidc_environment: Option<String>,
@@ -358,6 +423,41 @@ pub struct JobPlan {
 
 fn default_fail_fast() -> bool {
     true
+}
+
+/// Pull one OCI image reference out of a raw `container:`/service value.
+///
+/// Both accept either a bare string (`container: node:20`) or a mapping with an
+/// `image:` key. Values are un-evaluated workflow source, so anything still
+/// holding a `${{ }}` expression is skipped: its value is not known until the
+/// job runs, and pulling a guess wastes the work it was meant to save.
+pub fn oci_image_ref(value: &serde_json::Value) -> Option<String> {
+    let raw = match value {
+        serde_json::Value::String(image) => image.as_str(),
+        serde_json::Value::Object(map) => map.get("image")?.as_str()?,
+        _ => return None,
+    }
+    .trim();
+    if raw.is_empty() || raw.contains("${{") {
+        return None;
+    }
+    Some(raw.to_owned())
+}
+
+impl JobPlan {
+    /// Every OCI image this job needs, from `container:` and `services:`.
+    ///
+    /// Sorted and deduplicated so the result is stable across declaration order.
+    pub fn container_images(&self) -> Vec<String> {
+        let mut images = BTreeSet::new();
+        if let Some(image) = self.container.as_ref().and_then(oci_image_ref) {
+            images.insert(image);
+        }
+        if let Some(serde_json::Value::Object(services)) = &self.services {
+            images.extend(services.values().filter_map(oci_image_ref));
+        }
+        images.into_iter().collect()
+    }
 }
 
 /// A workflow step after normalization.
@@ -430,13 +530,13 @@ impl RunnerJobMessage {
 /// Runner registration request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunnerRegistrationRequest {
-    /// Runner name.
+    /// Runner display name.
     pub name: String,
-    /// Runner labels.
     #[serde(default)]
+    /// Labels this runner advertises for `runs-on` matching.
     pub labels: Vec<String>,
-    /// Ephemeral runner flag.
     #[serde(default)]
+    /// Whether the runner retires after a single job.
     pub ephemeral: bool,
     /// Runner RSA public key material (XML/JWK/PEM depending on client).
     #[serde(default)]
@@ -457,8 +557,8 @@ pub struct RunnerRegistrationRequest {
     pub runner_group_name: Option<String>,
 }
 
-/// Registered runner state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// A runner registered with the control plane.
 pub struct RegisteredRunner {
     /// Numeric id used by GitHub runner APIs.
     pub id: i64,
@@ -528,16 +628,16 @@ pub struct JobCompletion {
 pub enum NdjsonEvent {
     /// Run was accepted.
     RunAccepted {
-        /// Run id.
+        /// Run the event refers to.
         run_id: RunId,
-        /// Number of queued jobs.
+        /// Jobs still queued for this run.
         queued_jobs: usize,
     },
-    /// Job status changed.
+    /// A job changed execution status.
     JobStatus {
-        /// Run id.
+        /// Run the event refers to.
         run_id: RunId,
-        /// Job id.
+        /// Job the event refers to.
         job_id: JobId,
         /// New status.
         status: ExecutionStatus,
@@ -556,16 +656,16 @@ pub enum NdjsonEvent {
     },
     /// Annotation was emitted.
     Annotation {
-        /// Run id.
+        /// Run the annotation belongs to.
         run_id: RunId,
-        /// Job id.
+        /// Job the annotation belongs to.
         job_id: JobId,
-        /// Annotation level.
+        /// Annotation severity.
         level: AnnotationLevel,
-        /// Message.
+        /// Human-readable annotation text.
         message: String,
-        /// Optional file path.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Source file the annotation points at, when known.
         file: Option<String>,
         /// Optional start line number.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -608,6 +708,31 @@ pub enum NdjsonEvent {
         #[serde(default)]
         outputs: BTreeMap<String, String>,
     },
+}
+
+impl NdjsonEvent {
+    /// Run this event belongs to.
+    pub fn run_id(&self) -> RunId {
+        match self {
+            Self::RunAccepted { run_id, .. }
+            | Self::JobStatus { run_id, .. }
+            | Self::Log { run_id, .. }
+            | Self::Annotation { run_id, .. }
+            | Self::RunStatus { run_id, .. }
+            | Self::JobCompleted { run_id, .. } => *run_id,
+        }
+    }
+
+    /// Final run-level status carried by this event, if any.
+    ///
+    /// Only a terminal `RunStatus` closes an event stream: job-level terminals
+    /// still leave sibling jobs running.
+    pub fn terminal_run_status(&self) -> Option<ExecutionStatus> {
+        match self {
+            Self::RunStatus { status, .. } if status.is_terminal() => Some(*status),
+            _ => None,
+        }
+    }
 }
 
 /// Annotation severity.
@@ -665,6 +790,72 @@ mod tests {
         assert_eq!(serde_json::to_string(&secret).unwrap(), "\"<redacted>\"");
         assert_eq!(secret.expose(), "super-secret");
     }
+
+    #[test]
+    fn workflow_submission_redacts_secrets_on_plain_serialization() {
+        let submission = submission_with_secrets();
+
+        // Anything that embeds a submission in server state (RunRecord) and
+        // serializes it must never emit the real values.
+        let json = serde_json::to_string(&submission).unwrap();
+
+        assert!(
+            !json.contains("actual-value") && !json.contains("another-secret"),
+            "plain serialization leaked a secret value: {json}"
+        );
+        assert!(json.contains("<redacted>"), "expected redaction marker");
+
+        #[derive(Serialize)]
+        struct Nested {
+            submission: WorkflowSubmission,
+        }
+        let nested = serde_json::to_string(&Nested { submission }).unwrap();
+        assert!(
+            !nested.contains("actual-value") && !nested.contains("another-secret"),
+            "nested serialization leaked a secret value: {nested}"
+        );
+    }
+
+    #[test]
+    fn workflow_submission_request_json_exposes_secrets_for_the_wire() {
+        let submission = submission_with_secrets();
+
+        let value = submission.to_request_json().unwrap();
+
+        assert_eq!(value["secrets"]["TOKEN"], "actual-value");
+        assert_eq!(value["secrets"]["KEY"], "another-secret");
+        assert!(
+            !value.to_string().contains("<redacted>"),
+            "request JSON still contains a redaction marker"
+        );
+
+        // The server recovers the real values from the request body.
+        let deserialized: WorkflowSubmission = serde_json::from_value(value).unwrap();
+        assert_eq!(deserialized.secrets["TOKEN"].expose(), "actual-value");
+        assert_eq!(deserialized.secrets["KEY"].expose(), "another-secret");
+    }
+
+    #[test]
+    fn workflow_submission_request_json_matches_plain_shape_without_secrets() {
+        let submission = WorkflowSubmission::default();
+
+        assert_eq!(
+            submission.to_request_json().unwrap(),
+            serde_json::to_value(&submission).unwrap()
+        );
+    }
+
+    fn submission_with_secrets() -> WorkflowSubmission {
+        let mut submission = WorkflowSubmission::default();
+        submission
+            .secrets
+            .insert("TOKEN".to_owned(), SecretString::new("actual-value"));
+        submission
+            .secrets
+            .insert("KEY".to_owned(), SecretString::new("another-secret"));
+        submission
+    }
+
     #[test]
     fn annotation_event_serializes_optional_source_fields() {
         let event = NdjsonEvent::Annotation {

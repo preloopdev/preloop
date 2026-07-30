@@ -1,0 +1,11 @@
+name: 110-environment-deployment-url
+on: workflow_dispatch
+jobs:
+  deploy:
+    runs-on: self-hosted
+    environment:
+      name: staging
+      url: ${{ steps.set-url.outputs.app_url }}
+    steps:
+      - id: set-url
+        run: echo "app_url=https://staging-pr-123.internal.net" >> $GITHUB_OUTPUT

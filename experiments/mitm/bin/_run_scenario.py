@@ -70,10 +70,16 @@ def match_event(event: str, flows: list[dict]) -> bool:
     return False
 
 
-def wait_for_event(event: str, capture_dir: Path, timeout: int) -> bool:
+def wait_for_event(
+    event: str, capture_dir: Path, timeout: int, after_flow_index: int = 0
+) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
-        flows = load_flows(capture_dir)
+        flows = [
+            flow
+            for flow in load_flows(capture_dir)
+            if flow.get("flow_index", 0) > after_flow_index
+        ]
         if match_event(event, flows):
             return True
         time.sleep(2)
@@ -134,8 +140,23 @@ def submit_workflow_runner_server(workflow_path: str, mitm_dir: Path) -> str | N
 def cancel_workflow_official(run_id: str):
     owner = os.environ["GITHUB_OWNER"]
     repo = os.environ["GITHUB_REPO"]
+    gh_env = os.environ.copy()
+    for key in (
+        "GITHUB_TOKEN",
+        "https_proxy",
+        "HTTPS_PROXY",
+        "http_proxy",
+        "HTTP_PROXY",
+        "all_proxy",
+        "ALL_PROXY",
+    ):
+        gh_env.pop(key, None)
     log(f"cancelling run {run_id}")
-    subprocess.run(["gh", "run", "cancel", run_id, "-R", f"{owner}/{repo}"], check=True)
+    subprocess.run(
+        ["gh", "run", "cancel", run_id, "-R", f"{owner}/{repo}"],
+        check=True,
+        env=gh_env,
+    )
 
 
 def cancel_workflow_runner_server(run_id: str):
@@ -223,6 +244,7 @@ def main():
     capture_dir = Path(args.capture_dir)
     mitm_dir = Path(args.mitm_dir)
     last_run_id = None
+    event_cursor = 0
     deadline = time.time() + duration
 
     for i, step in enumerate(steps):
@@ -240,9 +262,16 @@ def main():
             event = step.get("event", "")
             timeout = step.get("timeout", 60)
             log(f"step {i}: waiting for event '{event}' (timeout {timeout}s)")
-            ok = wait_for_event(event, capture_dir, timeout)
+            ok = wait_for_event(event, capture_dir, timeout, event_cursor)
             if ok:
                 log(f"step {i}: event '{event}' matched", "ok")
+                event_cursor = max(
+                    (
+                        flow.get("flow_index", 0)
+                        for flow in load_flows(capture_dir)
+                    ),
+                    default=event_cursor,
+                )
             else:
                 log(f"step {i}: event '{event}' timed out", "err")
                 sys.exit(10)

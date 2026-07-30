@@ -11,5 +11,5 @@ compatibility gate.
 4. Submit the same workflow fixture to upstream `runner.server` and aksh.
 5. Compare expanded jobs, contexts, logs, annotations, cache hits/misses,
    artifact upload/download, outputs, failure states, cancellation, and reruns.
-6. Record any deliberate aksh differences in `docs/reference/runner-server.md`
+6. Record any deliberate aksh differences in `docs/fidelity-gap.md`
    before accepting the fixture.

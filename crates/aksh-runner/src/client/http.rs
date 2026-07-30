@@ -52,44 +52,116 @@ fn is_transient_status(status: reqwest::StatusCode) -> bool {
 #[derive(Clone)]
 pub struct HttpClient {
     inner: reqwest::Client,
+    control: Option<ControlTransport>,
+}
+
+#[derive(Clone)]
+struct ControlTransport {
+    origin: reqwest::Url,
+    client: reqwest::Client,
+}
+
+fn build_reqwest_client(ca_pem: Option<&[u8]>, socket: Option<&Path>) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(100))
+        .connect_timeout(Duration::from_secs(30))
+        .user_agent(format!(
+            "aksh-runner/{} (protocol-compat {})",
+            crate::VERSION,
+            crate::PROTOCOL_COMPAT_VERSION
+        ));
+    if let Some(pem) = ca_pem {
+        builder = builder.add_root_certificate(reqwest::Certificate::from_pem(pem)?);
+    }
+    if let Some(socket) = socket {
+        #[cfg(unix)]
+        {
+            builder = builder.unix_socket(socket);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = socket;
+            anyhow::bail!("Preloop control sockets require Unix");
+        }
+    }
+    Ok(builder.build()?)
+}
+
+fn same_origin(left: &reqwest::Url, right: &reqwest::Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
 }
 
 impl HttpClient {
     /// Create a new HTTP client, optionally trusting an extra CA bundle.
+    ///
+    /// The control transport, if any, is read from `PRELOOP_CONTROL_SOCKET` /
+    /// `PRELOOP_CONTROL_ORIGIN`, which the orchestrator sets on the runner
+    /// process. Use [`HttpClient::with_control`] to configure it explicitly.
     pub fn new(ca_bundle: Option<&Path>) -> Result<Self> {
-        let mut builder = reqwest::Client::builder()
-            .timeout(Duration::from_secs(100))
-            .connect_timeout(Duration::from_secs(30))
-            .user_agent(format!(
-                "aksh-runner/{} (protocol-compat {})",
-                crate::VERSION,
-                crate::PROTOCOL_COMPAT_VERSION
-            ));
+        let socket = std::env::var_os("PRELOOP_CONTROL_SOCKET").map(std::path::PathBuf::from);
+        let origin = std::env::var("PRELOOP_CONTROL_ORIGIN").ok();
+        let control = match (socket, origin) {
+            (None, None) => None,
+            (Some(socket), Some(origin)) => Some((socket, origin)),
+            _ => anyhow::bail!(
+                "PRELOOP_CONTROL_SOCKET and PRELOOP_CONTROL_ORIGIN must be set together"
+            ),
+        };
+        Self::with_control(
+            ca_bundle,
+            control.as_ref().map(|(s, o)| (s.as_path(), o.as_str())),
+        )
+    }
+
+    /// Create a client with an explicit control-plane transport.
+    ///
+    /// `control` is a `(unix socket, origin URL)` pair; requests to that origin
+    /// are routed over the socket and everything else uses ordinary networking.
+    pub fn with_control(ca_bundle: Option<&Path>, control: Option<(&Path, &str)>) -> Result<Self> {
         let env_ca = std::env::var("SSL_CERT_FILE")
             .ok()
             .map(std::path::PathBuf::from);
         let ca_path = ca_bundle.or(env_ca.as_deref());
+        let ca_pem = ca_path
+            .map(|path| {
+                std::fs::read(path).with_context(|| format!("reading CA bundle {}", path.display()))
+            })
+            .transpose()?;
 
-        if let Some(path) = ca_path {
-            let pem = std::fs::read(path)
-                .with_context(|| format!("reading CA bundle {}", path.display()))?;
-            let cert = reqwest::Certificate::from_pem(&pem)?;
-            builder = builder.add_root_certificate(cert);
-        }
-
-        let client = builder.build()?;
-        Ok(Self { inner: client })
+        let inner = build_reqwest_client(ca_pem.as_deref(), None)?;
+        let control = control
+            .map(|(socket, origin)| {
+                let origin = reqwest::Url::parse(origin)
+                    .with_context(|| format!("invalid control origin `{origin}`"))?;
+                if origin.host_str().is_none() {
+                    anyhow::bail!("control origin must include a host");
+                }
+                anyhow::Ok(ControlTransport {
+                    origin,
+                    client: build_reqwest_client(ca_pem.as_deref(), Some(socket))?,
+                })
+            })
+            .transpose()?;
+        Ok(Self { inner, control })
     }
 
-    /// Expose the underlying reqwest::Client for cases that need direct HTTP control.
-    pub fn inner_client(&self) -> &reqwest::Client {
+    /// Select the transport for a URL, routing only the configured local
+    /// control-plane origin through its mounted Unix socket.
+    pub fn client_for(&self, url: &str) -> &reqwest::Client {
+        if let Some(control) = &self.control {
+            if reqwest::Url::parse(url).is_ok_and(|url| same_origin(&url, &control.origin)) {
+                return &control.client;
+            }
+        }
         &self.inner
     }
 
     /// GET request returning JSON.
     pub async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
         let resp = self
-            .inner
+            .client_for(url)
             .get(url)
             .header(ACCEPT, "application/json")
             .send()
@@ -112,7 +184,7 @@ impl HttpClient {
         auth: &str,
     ) -> Result<T> {
         let resp = self
-            .inner
+            .client_for(url)
             .get(url)
             .header(ACCEPT, "application/json")
             .header(AUTHORIZATION, auth)
@@ -137,7 +209,7 @@ impl HttpClient {
         accept: &str,
     ) -> Result<T> {
         let resp = self
-            .inner
+            .client_for(url)
             .get(url)
             .header(ACCEPT, accept)
             .header(AUTHORIZATION, auth)
@@ -157,7 +229,7 @@ impl HttpClient {
     /// GET request returning raw bytes.
     pub async fn get_bytes(&self, url: &str) -> Result<bytes::Bytes> {
         let resp = self
-            .inner
+            .client_for(url)
             .get(url)
             .send()
             .await
@@ -190,7 +262,7 @@ impl HttpClient {
                 tokio::time::sleep(delay).await;
             }
             let resp = match self
-                .inner
+                .client_for(url)
                 .post(url)
                 .header(CONTENT_TYPE, "application/json")
                 .header(ACCEPT, "application/json")
@@ -233,7 +305,7 @@ impl HttpClient {
         content_type: &str,
     ) -> Result<T> {
         let resp = self
-            .inner
+            .client_for(url)
             .post(url)
             .header(CONTENT_TYPE, content_type)
             .header(ACCEPT, accept)
@@ -257,7 +329,7 @@ impl HttpClient {
         form: &[(&str, &str)],
     ) -> Result<T> {
         let resp = self
-            .inner
+            .client_for(url)
             .post(url)
             .form(form)
             .header(ACCEPT, "application/json")
@@ -293,7 +365,7 @@ impl HttpClient {
         token: &str,
     ) -> Result<T> {
         let resp = self
-            .inner
+            .client_for(url)
             .patch(url)
             .header(CONTENT_TYPE, "application/json")
             .header(ACCEPT, "application/json")
@@ -315,7 +387,7 @@ impl HttpClient {
     /// DELETE with bearer auth.
     pub async fn delete_with_token(&self, url: &str, token: &str) -> Result<()> {
         let resp = self
-            .inner
+            .client_for(url)
             .delete(url)
             .header(AUTHORIZATION, format!("Bearer {token}"))
             .send()
@@ -338,7 +410,7 @@ impl HttpClient {
         header_value: &str,
     ) -> Result<()> {
         let resp = self
-            .inner
+            .client_for(url)
             .delete(url)
             .header(AUTHORIZATION, format!("Bearer {token}"))
             .header(header_name, header_value)
@@ -367,7 +439,7 @@ impl HttpClient {
                 tokio::time::sleep(delay).await;
             }
             let resp = match self
-                .inner
+                .client_for(url)
                 .put(url)
                 .header(CONTENT_TYPE, content_type)
                 .header("x-ms-blob-type", "BlockBlob")
@@ -415,7 +487,7 @@ impl HttpClient {
                 tokio::time::sleep(delay).await;
             }
             let resp = match self
-                .inner
+                .client_for(url)
                 .put(url)
                 .header(CONTENT_TYPE, content_type)
                 .header(AUTHORIZATION, format!("Bearer {token}"))
@@ -452,7 +524,7 @@ impl HttpClient {
         timeout: Duration,
     ) -> Result<Option<T>> {
         let resp = self
-            .inner
+            .client_for(url)
             .get(url)
             .header(ACCEPT, "application/json")
             .header(AUTHORIZATION, auth)
@@ -671,5 +743,59 @@ mod tests {
                 assert_eq!(body, "signed url expired");
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn control_origin_routes_only_matching_requests_over_unix_socket() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket_path = directory.path().join("engine.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let unix_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await.unwrap();
+            let body = r#"{"transport":"unix"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        // The control origin is never contacted over TCP, so bind a real
+        // listener for it and assert it stays untouched. A second listener on
+        // its own port is an unambiguously different origin — deriving one by
+        // swapping in `localhost` is flaky wherever that resolves to `::1`.
+        let (control_url, mut control_request) =
+            serve_once("200 OK", r#"{"transport":"tcp"}"#).await;
+        let (public_url, public_request) = serve_once("200 OK", r#"{"transport":"tcp"}"#).await;
+        assert_ne!(control_url, public_url);
+
+        let client = HttpClient::with_control(None, Some((socket_path.as_path(), &control_url)))
+            .expect("client with control transport");
+        let unix: serde_json::Value = client
+            .get_json(&format!("{control_url}/control"))
+            .await
+            .expect("control-origin request");
+        let tcp: serde_json::Value = client
+            .get_json(&format!("{public_url}/other"))
+            .await
+            .expect("public-origin request");
+
+        assert_eq!(unix["transport"], "unix");
+        assert_eq!(tcp["transport"], "tcp");
+        let request = public_request.await.unwrap();
+        assert!(request.starts_with("GET /other HTTP/1.1"));
+        unix_task.await.unwrap();
+
+        // The control origin's TCP listener must never have been used. Its
+        // accept task is still parked, so poll without blocking on it.
+        assert!(
+            matches!(
+                control_request.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ),
+            "control-origin request bypassed the Unix socket"
+        );
     }
 }
