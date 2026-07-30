@@ -67,6 +67,86 @@ const ACTIONS_ONLY_SCOPES: [&str; 2] = ["id-token", "models"];
 /// one.
 const MINIMUM_PERMISSION: (&str, &str) = ("metadata", "read");
 
+/// A mint GitHub refused, carrying the status so callers can tell an
+/// ungrantable permission set (422) from a transport or credential fault.
+///
+/// Downcast rather than string-matched: the retry below must never fire on a
+/// rate limit or a revoked key, and matching GitHub's prose would do exactly
+/// that the first time the wording changed.
+#[derive(Debug)]
+pub(crate) struct MintRejected {
+    pub(crate) status: reqwest::StatusCode,
+    pub(crate) message: String,
+}
+
+impl std::fmt::Display for MintRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "GitHub returned {}: {}", self.status, self.message)
+    }
+}
+
+impl std::error::Error for MintRejected {}
+
+/// Rank a permission level so a request can be narrowed to what is granted.
+///
+/// Unknown levels rank above `admin` so they are never silently treated as
+/// weaker than something the installation actually holds.
+fn permission_rank(level: &str) -> u8 {
+    match level.to_ascii_lowercase().as_str() {
+        "none" => 0,
+        "read" => 1,
+        "write" => 2,
+        "admin" => 3,
+        _ => u8::MAX,
+    }
+}
+
+/// Narrow `requested` to what `granted` actually allows.
+///
+/// Scopes the installation does not hold are dropped, and a level above the
+/// granted one is lowered to it. This only ever *removes* authority, so it
+/// cannot turn a mint into a privilege escalation — the concern that makes the
+/// PAT fallback an explicit operator choice.
+///
+/// Applied only to the implicit default permission set. A workflow that wrote
+/// `permissions:` asked for something specific, and quietly handing it a
+/// weaker token would make the resulting 403 impossible to explain.
+fn clamp_to_grants(
+    requested: &BTreeMap<String, String>,
+    granted: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    requested
+        .iter()
+        .filter_map(|(scope, level)| {
+            let granted_level = granted.get(&scope.replace('-', "_"))?;
+            let level = if permission_rank(level) > permission_rank(granted_level) {
+                granted_level
+            } else {
+                level
+            };
+            Some((scope.clone(), level.clone()))
+        })
+        .collect()
+}
+
+/// Scopes in `requested` the installation does not hold, for error messages.
+fn ungranted_scopes(
+    requested: &BTreeMap<String, String>,
+    granted: &BTreeMap<String, String>,
+) -> Vec<String> {
+    requested
+        .iter()
+        .filter(|(scope, level)| {
+            !level.eq_ignore_ascii_case("none")
+                && !ACTIONS_ONLY_SCOPES.contains(&scope.as_str())
+                && granted
+                    .get(&scope.replace('-', "_"))
+                    .is_none_or(|granted| permission_rank(level) > permission_rank(granted))
+        })
+        .map(|(scope, level)| format!("{scope}: {level}"))
+        .collect()
+}
+
 /// Environment variable selecting the [`MintFailurePolicy`].
 const MINT_FAILURE_ENV: &str = "AKSH_GITHUB_APP_MINT_FAILURE";
 
@@ -239,7 +319,22 @@ pub(crate) async fn get_or_mint_token(
     repository: &str,
     permissions: &BTreeMap<String, String>,
 ) -> anyhow::Result<String> {
-    mint_for_repository(&api_base(), creds, repository, permissions).await
+    mint_for_repository(&api_base(), creds, repository, permissions, false).await
+}
+
+/// [`get_or_mint_token`], told whether the workflow declared `permissions:`.
+///
+/// A declared set is minted verbatim and fails loudly when the installation
+/// cannot grant it. An undeclared set is this server's own default, so it is
+/// narrowed to the installation's grants rather than failing a job that never
+/// asked for the missing scope.
+pub(crate) async fn get_or_mint_token_declared(
+    creds: &GitHubAppCredentials,
+    repository: &str,
+    permissions: &BTreeMap<String, String>,
+    declared: bool,
+) -> anyhow::Result<String> {
+    mint_for_repository(&api_base(), creds, repository, permissions, declared).await
 }
 
 pub(crate) async fn get_or_mint_token_at(
@@ -248,7 +343,7 @@ pub(crate) async fn get_or_mint_token_at(
     repository: &str,
     permissions: &BTreeMap<String, String>,
 ) -> anyhow::Result<String> {
-    mint_for_repository(api_base, creds, repository, permissions).await
+    mint_for_repository(api_base, creds, repository, permissions, false).await
 }
 
 /// [`get_or_mint_token`] against an explicit API base.
@@ -257,12 +352,46 @@ async fn mint_for_repository(
     creds: &GitHubAppCredentials,
     repository: &str,
     permissions: &BTreeMap<String, String>,
+    declared: bool,
 ) -> anyhow::Result<String> {
     let (owner, repo) = split_repository(repository)?;
     let app_jwt = sign_app_jwt(&creds.app_id, &creds.private_key)?;
     let installation_id = installation_id_for(api_base, creds, &app_jwt, owner).await?;
-    let (token, expires_at) =
-        mint_installation_token(api_base, &app_jwt, installation_id, repo, permissions).await?;
+    let attempt =
+        mint_installation_token(api_base, &app_jwt, installation_id, repo, permissions).await;
+    // GitHub rejects the *whole* request when one scope is ungranted, so a
+    // default set that happens to name a scope this installation lacks would
+    // otherwise cost the job its GitHub authority entirely — the job then
+    // checks out with the local HMAC JWT and fails on a 401 that says nothing
+    // about permissions.
+    let unprocessable = attempt.as_ref().err().is_some_and(|error| {
+        error
+            .downcast_ref::<MintRejected>()
+            .is_some_and(|rejected| rejected.status == reqwest::StatusCode::UNPROCESSABLE_ENTITY)
+    });
+    let (token, expires_at) = if unprocessable {
+        let granted = installation_grants(api_base, &app_jwt, installation_id).await?;
+        let missing = ungranted_scopes(permissions, &granted);
+        if declared {
+            return Err(attempt.unwrap_err()).with_context(|| {
+                format!(
+                    "the GitHub App installation on {owner} does not grant [{}] required by this \
+                     workflow's `permissions:` block; grant them to the App installation",
+                    missing.join(", ")
+                )
+            });
+        }
+        let clamped = clamp_to_grants(permissions, &granted);
+        warn!(
+            repository,
+            installation_id,
+            ungranted = %missing.join(", "),
+            "installation cannot grant every default token scope; minting with the granted subset"
+        );
+        mint_installation_token(api_base, &app_jwt, installation_id, repo, &clamped).await?
+    } else {
+        attempt?
+    };
     debug!(
         repository,
         installation_id,
@@ -273,6 +402,44 @@ async fn mint_for_repository(
         "minted GitHub App installation token"
     );
     Ok(token)
+}
+
+/// Permission scopes this installation currently holds, keyed snake_case.
+async fn installation_grants(
+    api_base: &str,
+    app_jwt: &str,
+    installation_id: u64,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    let url = format!("{api_base}/app/installations/{installation_id}");
+    let response = CLIENT
+        .get(&url)
+        .header("User-Agent", "aksh")
+        .header("Authorization", format!("Bearer {app_jwt}"))
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    let status = response.status();
+    let payload = response
+        .text()
+        .await
+        .with_context(|| format!("GET {url} response body"))?;
+    if !status.is_success() {
+        let message: String = payload.chars().take(1024).collect();
+        bail!("GET {url} failed with {status}: {message}");
+    }
+    let payload: serde_json::Value = serde_json::from_str(&payload)
+        .with_context(|| format!("GET {url} returned a non-JSON body"))?;
+    Ok(payload
+        .get("permissions")
+        .and_then(serde_json::Value::as_object)
+        .map(|granted| {
+            granted
+                .iter()
+                .filter_map(|(scope, level)| Some((scope.clone(), level.as_str()?.to_owned())))
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
 /// Split an `owner/repo` slug into its two parts.
@@ -408,7 +575,7 @@ pub(crate) async fn mint_installation_token(
         .with_context(|| format!("POST {url} response body"))?;
     if !status.is_success() {
         let message: String = payload.chars().take(1024).collect();
-        return Err(anyhow!("GitHub returned {status}: {message}"));
+        return Err(MintRejected { status, message }.into());
     }
     let payload: serde_json::Value = serde_json::from_str(&payload)
         .with_context(|| format!("POST {url} returned a non-JSON body"))?;
@@ -815,9 +982,10 @@ mod tests {
             ("packages".to_owned(), "none".to_owned()),
         ]);
 
-        let declared = mint_for_repository(&api_base, &creds, "preloop/preloop", &permissions)
-            .await
-            .expect("mint a scoped token");
+        let declared =
+            mint_for_repository(&api_base, &creds, "preloop/preloop", &permissions, true)
+                .await
+                .expect("mint a scoped token");
         // A second repository under the same account reuses the cached
         // installation but must be scoped to *its own* repository, and a job
         // that declared nothing gets the restricted policy default rather than
@@ -827,6 +995,7 @@ mod tests {
             &creds,
             "Preloop/other-repo",
             &aksh_gha_parser::effective_token_permissions(None),
+            false,
         )
         .await
         .expect("mint a policy-default token");
@@ -835,7 +1004,7 @@ mod tests {
 
         // A bare owner cannot be repository-scoped, so it must never reach the
         // API at all.
-        mint_for_repository(&api_base, &creds, "preloop", &permissions)
+        mint_for_repository(&api_base, &creds, "preloop", &permissions, true)
             .await
             .expect_err("a bare owner must not mint");
 
@@ -882,5 +1051,84 @@ mod tests {
             .expect("JSON claims");
             assert_eq!(claims["iss"], "424", "must authenticate as the App itself");
         }
+    }
+
+    fn granted() -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("checks".to_owned(), "write".to_owned()),
+            ("contents".to_owned(), "read".to_owned()),
+            ("metadata".to_owned(), "read".to_owned()),
+            ("pull_requests".to_owned(), "read".to_owned()),
+        ])
+    }
+
+    /// The observed production failure: the default set names `packages`, the
+    /// installation was never granted it, and GitHub rejects the whole request
+    /// — costing the job every scope it *could* have had.
+    #[test]
+    fn clamping_drops_ungranted_scopes_and_lowers_excessive_levels() {
+        let requested = BTreeMap::from([
+            ("contents".to_owned(), "read".to_owned()),
+            ("metadata".to_owned(), "read".to_owned()),
+            ("packages".to_owned(), "read".to_owned()),
+            ("pull-requests".to_owned(), "write".to_owned()),
+        ]);
+
+        let clamped = clamp_to_grants(&requested, &granted());
+
+        assert_eq!(
+            clamped,
+            BTreeMap::from([
+                ("contents".to_owned(), "read".to_owned()),
+                ("metadata".to_owned(), "read".to_owned()),
+                // Kebab-case survives so `installation_permissions` still owns
+                // the wire spelling; the level drops write -> read.
+                ("pull-requests".to_owned(), "read".to_owned()),
+            ]),
+            "an ungranted scope is dropped and an over-broad level is lowered"
+        );
+    }
+
+    /// Clamping may only ever remove authority.
+    #[test]
+    fn clamping_never_widens_a_request() {
+        let requested = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
+        let clamped = clamp_to_grants(&requested, &granted());
+        assert_eq!(
+            clamped, requested,
+            "a request narrower than the grant is left untouched, never raised to it"
+        );
+        assert!(
+            !clamped.contains_key("checks"),
+            "a scope the workflow never asked for must not appear because it is granted"
+        );
+    }
+
+    #[test]
+    fn ungranted_scopes_names_only_what_is_actually_missing() {
+        let requested = BTreeMap::from([
+            ("contents".to_owned(), "read".to_owned()),
+            ("packages".to_owned(), "read".to_owned()),
+            ("pull-requests".to_owned(), "write".to_owned()),
+            // Withheld and Actions-only scopes are never sent, so neither can
+            // be the reason a mint was refused.
+            ("issues".to_owned(), "none".to_owned()),
+            ("id-token".to_owned(), "write".to_owned()),
+        ]);
+
+        let mut missing = ungranted_scopes(&requested, &granted());
+        missing.sort();
+
+        assert_eq!(missing, ["packages: read", "pull-requests: write"]);
+    }
+
+    #[test]
+    fn permission_levels_order_from_none_to_admin() {
+        assert!(permission_rank("none") < permission_rank("read"));
+        assert!(permission_rank("read") < permission_rank("write"));
+        assert!(permission_rank("write") < permission_rank("admin"));
+        // An unrecognised level must never look weaker than a real grant, or
+        // clamping would keep it instead of narrowing to what is held.
+        assert!(permission_rank("something-new") > permission_rank("admin"));
     }
 }
