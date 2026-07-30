@@ -274,8 +274,7 @@ impl VmProvider for RecordingVmProvider {
     }
 
     async fn pack(&self, name: &MachineName, output: &Path) -> Result<(), VmError> {
-        let mut payload = output.as_os_str().to_owned();
-        payload.push(".smolmachine");
+        let payload = output.to_path_buf();
         fs::write(&payload, b"immutable-runner-artifact").map_err(|_| provider_error("pack"))?;
         let mut state = self.state.lock().await;
         state.pack_calls += 1;
