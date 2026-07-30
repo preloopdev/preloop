@@ -1011,7 +1011,7 @@ fn guest_modified(
     let output = std::process::Command::new("smolvm")
         .args(["machine", "exec", "--name", machine, "--", "sh", "-lc"])
         .arg(format!(
-            "cd {} && git status --porcelain -- {} 2>/dev/null || true",
+            "cd {} && git --literal-pathspecs status --porcelain -- {} 2>/dev/null || true",
             shell_quote(guest_workspace),
             quoted.join(" ")
         ))
