@@ -1631,16 +1631,24 @@ fn live_run_events(
             if finished {
                 return None;
             }
+            // One deadline for the whole filtering loop, not one per `recv`.
+            // The broadcast channel carries every run's events, so a per-`recv`
+            // timeout is refreshed by traffic belonging to other runs and then
+            // discarded by the run-id check below; on a busy server a stalled
+            // run would hold its connection open forever. Anchoring the
+            // deadline before the loop keeps "idle" meaning "nothing delivered
+            // to *this* client", which is what the bound is for, and it reads
+            // more directly than tracking whether the last event matched.
+            let deadline = tokio::time::Instant::now() + EVENT_STREAM_IDLE_TIMEOUT;
             loop {
-                let event =
-                    match tokio::time::timeout(EVENT_STREAM_IDLE_TIMEOUT, receiver.recv()).await {
-                        Ok(Ok(event)) => event,
-                        // A lagging consumer has an incomplete stream. End it
-                        // so the client reconnects and receives a fresh,
-                        // authoritative snapshot before tailing again.
-                        Ok(Err(broadcast::error::RecvError::Lagged(_))) => return None,
-                        Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => return None,
-                    };
+                let event = match tokio::time::timeout_at(deadline, receiver.recv()).await {
+                    Ok(Ok(event)) => event,
+                    // A lagging consumer has an incomplete stream. End it
+                    // so the client reconnects and receives a fresh,
+                    // authoritative snapshot before tailing again.
+                    Ok(Err(broadcast::error::RecvError::Lagged(_))) => return None,
+                    Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => return None,
+                };
                 if event.run_id() != run_id {
                     continue;
                 }
@@ -1652,4 +1660,59 @@ fn live_run_events(
             }
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::FutureExt;
+
+    /// The broadcast channel fans out every run's events, so a stalled run's
+    /// stream sees — and discards — traffic it must not treat as liveness.
+    /// Before the deadline was hoisted out of the filtering loop, that traffic
+    /// refreshed the idle bound and the connection leaked for as long as the
+    /// server stayed busy.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_run_event_stream_ends_on_its_idle_deadline_despite_other_run_traffic() {
+        let stalled = RunId::new();
+        let noisy = RunId::new();
+        let (sender, receiver) = broadcast::channel(64);
+        let stream = live_run_events(stalled, receiver);
+        tokio::pin!(stream);
+
+        let started = tokio::time::Instant::now();
+        // Emit for the other run more often than the idle bound while the clock
+        // walks past it, which is the busy-server shape that hid the leak.
+        let mut ended = false;
+        for _ in 0..30 {
+            sender
+                .send(NdjsonEvent::RunStatus {
+                    run_id: noisy,
+                    status: ExecutionStatus::InProgress,
+                    reason: None,
+                })
+                .expect("stream holds the receiver alive");
+            // Polled rather than awaited on purpose: awaiting would let the
+            // paused clock auto-advance to the next timer, which would end the
+            // stream even under the per-event timeout this test rules out.
+            match stream.next().now_or_never() {
+                None => {}
+                Some(None) => {
+                    ended = true;
+                    break;
+                }
+                Some(Some(_)) => panic!("another run's event must not be yielded to this stream"),
+            }
+            tokio::time::advance(EVENT_STREAM_IDLE_TIMEOUT / 3).await;
+        }
+
+        assert!(
+            ended,
+            "stalled stream stayed open while other runs kept the channel busy"
+        );
+        assert!(
+            started.elapsed() < EVENT_STREAM_IDLE_TIMEOUT * 2,
+            "stream outlived its idle deadline by more than a full bound"
+        );
+    }
 }
