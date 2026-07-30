@@ -446,11 +446,22 @@ esac
     }
 
     #[tokio::test]
-    async fn provider_sets_smolvm_egress_floor_strict_environment_variable() {
+    async fn public_only_sets_smolvm_egress_floor_strict() {
         let (_directory, executable) = fake_smolvm();
         let provider = SmolVmProvider::new(executable.clone());
-        let spec = valid_spec(MachineName::new("test-floor").unwrap());
+        let mut spec = valid_spec(MachineName::new("test-floor").unwrap());
+        spec.network = NetworkPolicy::PublicOnly;
         provider.create(&spec).await.unwrap();
         assert_eq!(captured_env(&executable), "SMOLVM_EGRESS_FLOOR=strict");
+    }
+
+    #[tokio::test]
+    async fn unrestricted_removes_smolvm_egress_floor() {
+        let (_directory, executable) = fake_smolvm();
+        let provider = SmolVmProvider::new(executable.clone());
+        let mut spec = valid_spec(MachineName::new("test-unrestricted").unwrap());
+        spec.network = NetworkPolicy::Unrestricted;
+        provider.create(&spec).await.unwrap();
+        assert_eq!(captured_env(&executable), "SMOLVM_EGRESS_FLOOR=");
     }
 }
