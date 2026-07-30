@@ -147,6 +147,51 @@ async fn run_apis_never_return_submitted_secret_values() {
 }
 
 #[tokio::test]
+async fn public_run_page_needs_no_token_and_exposes_no_submission_secrets() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state, CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "workflow_path": "<script>alert(1)</script>",
+            "event": "push",
+            "repository": "owner/repo",
+            "secrets": {"NPM_TOKEN": "npm_LIVE_CREDENTIAL"}
+        }),
+    )
+    .await;
+    let run_id = accepted["run_id"].as_str().unwrap();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/runs/{run_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains(run_id));
+    assert!(body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+    assert!(!body.contains("npm_LIVE_CREDENTIAL"));
+    assert!(!body.contains("NPM_TOKEN"));
+}
+
+#[tokio::test]
 async fn matrix_max_parallel_and_fail_fast_are_enforced() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();

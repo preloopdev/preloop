@@ -1320,6 +1320,63 @@ pub(crate) async fn get_run(
     Ok(Json(run))
 }
 
+/// Browser-safe status page linked from GitHub Check Runs.
+///
+/// This deliberately projects only execution metadata. The native run response
+/// remains bearer-protected because it contains the submitted event payload and
+/// secret names.
+pub(crate) async fn get_public_run(
+    State(shared): State<Arc<SharedState>>,
+    Path(run_id): Path<RunId>,
+) -> Result<axum::response::Html<String>, ApiError> {
+    let inner = shared.state.inner.lock().await;
+    let run = inner
+        .runs
+        .get(&run_id)
+        .ok_or_else(|| ApiError::not_found("run not found"))?;
+
+    let jobs = run
+        .jobs
+        .iter()
+        .map(|(job, status)| {
+            format!(
+                "<li><code>{}</code> <strong>{}</strong></li>",
+                escape_html(&job.0),
+                escape_html(&status_string(*status))
+            )
+        })
+        .collect::<String>();
+    let status = escape_html(&status_string(run.status));
+    let workflow = escape_html(&run.workflow_path_str);
+    let id = escape_html(&run.run_id.to_string());
+    let html = format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+         <meta name=\"robots\" content=\"noindex,nofollow\">\
+         <title>Preloop run {id}</title></head><body>\
+         <main><h1>Preloop run</h1><p><code>{id}</code></p>\
+         <p>Workflow: <code>{workflow}</code></p>\
+         <p>Status: <strong>{status}</strong></p><h2>Jobs</h2><ul>{jobs}</ul>\
+         </main></body></html>"
+    );
+    Ok(axum::response::Html(html))
+}
+
+fn escape_html(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct ListRunsQuery {
     #[serde(default)]
