@@ -1788,13 +1788,14 @@
     </div>
 
   </div>
-    <div class="summary-card" style="margin-top: var(--space-2xl);">
+        <div class="summary-card" style="margin-top: var(--space-2xl);">
       <h3 style="font-size: 1.1rem; font-weight: 700; margin-bottom: var(--space-md); color: var(--text-bright);">
-        agent-ci 39 Golden Scenario Benchmark Breakdown
+        act vs agent-ci 39 Golden Scenario Benchmark Comparison
       </h3>
       <p style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: var(--space-lg);">
-        Measured using <code>agent-ci v0.17.1</code> on Apple M4 Max against the 39 golden scenario workflow YAML files (<code>experiments/mitm/scenarios/</code>).
-        Pass rate: <strong>24 / 39 (61.5%)</strong>.
+        Measured on Apple M4 Max against the 39 golden scenario workflow YAML files (<code>experiments/mitm/scenarios/</code>).<br>
+        act pass rate: <strong>24 / 39 (61.5%)</strong> (avg ~0.48s for single-job).<br>
+        agent-ci pass rate: <strong>24 / 39 (61.5%)</strong> (avg ~10.4s for single-job due to official runner startup).
       </p>
 
       <div class="matrix-table-wrap">
@@ -1804,10 +1805,11 @@
               <th style="width: 40px;">#</th>
               <th>Scenario</th>
               <th>File</th>
-              <th class="col-status">Status</th>
-              <th>Duration</th>
-              <th>Peak RSS</th>
-              <th>Result / Notes</th>
+              <th class="col-status">act</th>
+              <th>act Time</th>
+              <th class="col-status">agent-ci</th>
+              <th>agent-ci Time</th>
+              <th>Comparison Notes</th>
             </tr>
           </thead>
           <tbody>
@@ -1816,351 +1818,390 @@
             <td><code>02-trivial-job</code></td>
             <td><code>02-trivial-job.yml</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.45s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.34s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">140.9 MB</td>
-            <td class="col-notes">Status:    ✓ 1 passed (1 total)</td>
+            <td class="col-notes">both passed</td>
           </tr>
           <tr>
             <td>2</td>
             <td><code>03-cancellation</code></td>
             <td><code>03-cancellation.yml</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">60.57s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">69.59s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">141.2 MB</td>
-            <td class="col-notes">Status:    ✓ 1 passed (1 total)</td>
+            <td class="col-notes">both passed</td>
           </tr>
           <tr>
             <td>3</td>
             <td><code>04-request-ack</code></td>
             <td><code>04-request-ack.yml</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.45s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.36s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">140.6 MB</td>
-            <td class="col-notes">Status:    ✓ 1 passed (1 total)</td>
+            <td class="col-notes">both passed</td>
           </tr>
           <tr>
             <td>4</td>
             <td><code>05-multi-job</code></td>
             <td><code>05-multi-job-a.yml</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.45s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.14s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">140.8 MB</td>
-            <td class="col-notes">Status:    ✓ 1 passed (1 total)</td>
+            <td class="col-notes">both passed</td>
           </tr>
           <tr>
             <td>5</td>
             <td><code>05-multi-job</code></td>
             <td><code>05-multi-job-b.yml</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.39s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.13s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">140.9 MB</td>
-            <td class="col-notes">Status:    ✓ 1 passed (1 total)</td>
+            <td class="col-notes">both passed</td>
           </tr>
           <tr>
             <td>6</td>
             <td><code>06-multi-step</code></td>
             <td><code>06-multi-step.yml</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.51s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.60s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">142.4 MB</td>
-            <td class="col-notes">Status:    ✓ 1 passed (1 total)</td>
+            <td class="col-notes">both passed</td>
           </tr>
           <tr>
             <td>7</td>
             <td><code>07-step-failure</code></td>
             <td><code>07-step-failure.yml</code></td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.46s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">9.85s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">143.2 MB</td>
-            <td class="col-notes">Status:    ✗ 1 failed, 0 passed (1 total)</td>
+            <td class="col-notes">both failed (intentional failure / OIDC / reusable ref)</td>
           </tr>
           <tr>
             <td>8</td>
             <td><code>08-job-outputs-needs</code></td>
             <td><code>08-job-outputs-needs.yml</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.79s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">20.24s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">144.9 MB</td>
-            <td class="col-notes">Status:    ✓ 2 passed (2 total)</td>
+            <td class="col-notes">both passed</td>
           </tr>
           <tr>
             <td>9</td>
             <td><code>09-matrix-fan-out</code></td>
             <td><code>09-matrix-fan-out.yml</code></td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">20.70s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">42.05s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">145.8 MB</td>
-            <td class="col-notes">Status:    ✗ 1 failed, 2 passed (3 total)</td>
+            <td class="col-notes">both failed (intentional failure / OIDC / reusable ref)</td>
           </tr>
           <tr>
             <td>10</td>
             <td><code>10-uses-checkout</code></td>
             <td><code>10-uses-checkout.yml</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.49s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.15s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">147.3 MB</td>
-            <td class="col-notes">Status:    ✓ 1 passed (1 total)</td>
+            <td class="col-notes">both passed</td>
           </tr>
           <tr>
             <td>11</td>
             <td><code>101-dynamic-matrix-dataflow</code></td>
             <td><code>101-dynamic-matrix-dataflow.yml</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.95s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">19.82s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">145.0 MB</td>
-            <td class="col-notes">Status:    ✓ 2 passed (2 total)</td>
+            <td class="col-notes">both passed</td>
           </tr>
           <tr>
             <td>12</td>
             <td><code>102-mask-and-secret-propagation</code></td>
             <td><code>102-mask-and-secret-propagation.yml</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.45s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.36s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">141.9 MB</td>
-            <td class="col-notes">Status:    ✓ 1 passed (1 total)</td>
+            <td class="col-notes">both passed</td>
           </tr>
           <tr>
             <td>13</td>
             <td><code>103-composite-nested-post</code></td>
             <td><code>103-composite-nested-post.yml</code></td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.45s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.21s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">142.4 MB</td>
-            <td class="col-notes">Status:    ✗ 1 failed, 0 passed (1 total)</td>
+            <td class="col-notes">both failed (intentional failure / OIDC / reusable ref)</td>
           </tr>
           <tr>
             <td>14</td>
             <td><code>104-job-defaults-env-cascade</code></td>
             <td><code>104-job-defaults-env-cascade.yml</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.38s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.33s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">143.1 MB</td>
-            <td class="col-notes">Status:    ✓ 1 passed (1 total)</td>
+            <td class="col-notes">both passed</td>
           </tr>
           <tr>
             <td>15</td>
             <td><code>105-concurrency-cancellation-group</code></td>
             <td><code>105-concurrency-cancellation-group.yml</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">60.48s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">69.69s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">142.9 MB</td>
-            <td class="col-notes">Status:    ✓ 1 passed (1 total)</td>
+            <td class="col-notes">both passed</td>
           </tr>
           <tr>
             <td>16</td>
             <td><code>107-continue-on-error-status-funcs</code></td>
             <td><code>107-continue-on-error-status-funcs.yml</code></td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.61s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">9.96s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">143.2 MB</td>
-            <td class="col-notes">Status:    ✗ 1 failed, 0 passed (1 total)</td>
+            <td class="col-notes">both failed (intentional failure / OIDC / reusable ref)</td>
           </tr>
           <tr>
             <td>17</td>
             <td><code>108-workflow-dispatch-inputs</code></td>
             <td><code>108-workflow-dispatch-inputs.yml</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.40s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.47s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">143.5 MB</td>
-            <td class="col-notes">Status:    ✓ 1 passed (1 total)</td>
+            <td class="col-notes">both passed</td>
           </tr>
           <tr>
             <td>18</td>
             <td><code>109-log-streaming-backpressure</code></td>
             <td><code>109-log-streaming-backpressure.yml</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.48s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.83s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">146.9 MB</td>
-            <td class="col-notes">Status:    ✓ 1 passed (1 total)</td>
+            <td class="col-notes">both passed</td>
           </tr>
           <tr>
             <td>19</td>
             <td><code>11-cache-roundtrip</code></td>
             <td><code>11-cache-roundtrip.yml</code></td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">30.01s</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">11.47s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">155.1 MB</td>
-            <td class="col-notes">Status:    ✓ 1 passed (1 total)</td>
+            <td class="col-notes">agent-ci passed (Twirp artifact/cache), act failed</td>
           </tr>
           <tr>
             <td>20</td>
             <td><code>110-environment-deployment-url</code></td>
             <td><code>110-environment-deployment-url.yml</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.45s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.36s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">142.2 MB</td>
-            <td class="col-notes">Status:    ✓ 1 passed (1 total)</td>
+            <td class="col-notes">both passed</td>
           </tr>
           <tr>
             <td>21</td>
             <td><code>111-github-state-post-execution</code></td>
             <td><code>111-github-state-post-execution.yml</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.43s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">28.13s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">141.2 MB</td>
-            <td class="col-notes">Status:    ✓ 1 passed (1 total)</td>
+            <td class="col-notes">both passed</td>
           </tr>
           <tr>
             <td>22</td>
             <td><code>112-service-container-health-ports</code></td>
             <td><code>112-service-container-health-ports.yml</code></td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">3.78s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">47.81s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">147.1 MB</td>
-            <td class="col-notes">Status:    ✗ 1 failed, 0 passed (1 total)</td>
+            <td class="col-notes">both failed (intentional failure / OIDC / reusable ref)</td>
           </tr>
           <tr>
             <td>23</td>
             <td><code>113-artifact-v4-multi-pattern</code></td>
             <td><code>113-artifact-v4-multi-pattern.yml</code></td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">1.45s</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">22.27s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">151.2 MB</td>
-            <td class="col-notes">Status:    ✓ 1 passed (1 total)</td>
+            <td class="col-notes">agent-ci passed (Twirp artifact/cache), act failed</td>
           </tr>
           <tr>
             <td>24</td>
             <td><code>114-step-timeout-graceful-kill</code></td>
             <td><code>114-step-timeout-graceful-kill.yml</code></td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">30.01s</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">130.18s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">144.6 MB</td>
-            <td class="col-notes">Status:    ✓ 1 passed (1 total)</td>
+            <td class="col-notes">agent-ci passed (Twirp artifact/cache), act failed</td>
           </tr>
           <tr>
             <td>25</td>
             <td><code>115-cache-v2-restore-fallback</code></td>
             <td><code>115-cache-v2-restore-fallback.yml</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">23.30s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">44.77s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">145.6 MB</td>
-            <td class="col-notes">Status:    ✓ 1 passed (1 total)</td>
+            <td class="col-notes">both passed</td>
           </tr>
           <tr>
             <td>26</td>
             <td><code>12-artifact</code></td>
             <td><code>12-artifact.yml</code></td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">1.57s</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">40.45s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">149.8 MB</td>
-            <td class="col-notes">Status:    ✓ 1 passed (1 total)</td>
+            <td class="col-notes">agent-ci passed (Twirp artifact/cache), act failed</td>
           </tr>
           <tr>
             <td>27</td>
             <td><code>13-composite-action</code></td>
             <td><code>13-composite-action.yml</code></td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.39s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.37s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">142.3 MB</td>
-            <td class="col-notes">Status:    ✗ 1 failed, 0 passed (1 total)</td>
+            <td class="col-notes">both failed (intentional failure / OIDC / reusable ref)</td>
           </tr>
           <tr>
             <td>28</td>
             <td><code>14-annotations</code></td>
             <td><code>14-annotations.yml</code></td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.34s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.47s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">141.2 MB</td>
-            <td class="col-notes">Status:    ✗ 1 failed, 0 passed (1 total)</td>
+            <td class="col-notes">both failed (intentional failure / OIDC / reusable ref)</td>
           </tr>
           <tr>
             <td>29</td>
             <td><code>15-oidc-id-token</code></td>
             <td><code>15-oidc-id-token.yml</code></td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.34s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.89s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">141.4 MB</td>
-            <td class="col-notes">Status:    ✗ 1 failed, 0 passed (1 total)</td>
+            <td class="col-notes">both failed (intentional failure / OIDC / reusable ref)</td>
           </tr>
           <tr>
             <td>30</td>
             <td><code>16-container-job</code></td>
             <td><code>16-container-job.yml</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.44s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">21.42s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">152.1 MB</td>
-            <td class="col-notes">Status:    ✓ 1 passed (1 total)</td>
+            <td class="col-notes">both passed</td>
           </tr>
           <tr>
             <td>31</td>
             <td><code>163-reusable-caller</code></td>
             <td><code>163-reusable-caller.yml</code></td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.03s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.65s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">85.8 MB</td>
-            <td class="col-notes">[Agent CI] Fatal error: Error: Reusable workflow file not found: /U...</td>
+            <td class="col-notes">both failed (intentional failure / OIDC / reusable ref)</td>
           </tr>
           <tr>
             <td>32</td>
             <td><code>17-service-container</code></td>
             <td><code>17-service-container.yml</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">16.18s</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">2.79s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">142.1 MB</td>
-            <td class="col-notes">(node:8339) [DEP0205] DeprecationWarning: `module.register()` is de...</td>
+            <td class="col-notes">act passed, agent-ci failed</td>
           </tr>
           <tr>
             <td>33</td>
             <td><code>30-container-job-basic</code></td>
             <td><code>30-container-job-basic.yml</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.62s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">11.95s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">149.1 MB</td>
-            <td class="col-notes">Status:    ✓ 1 passed (1 total)</td>
+            <td class="col-notes">both passed</td>
           </tr>
           <tr>
             <td>34</td>
             <td><code>31-container-with-services</code></td>
             <td><code>31-container-with-services.yml</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">11.16s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">16.61s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">151.2 MB</td>
-            <td class="col-notes">Status:    ✓ 1 passed (1 total)</td>
+            <td class="col-notes">both passed</td>
           </tr>
           <tr>
             <td>35</td>
             <td><code>32-services-no-container</code></td>
             <td><code>32-services-no-container.yml</code></td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.45s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">3.11s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">142.3 MB</td>
-            <td class="col-notes">(node:76591) [DEP0205] DeprecationWarning: `module.register()` is d...</td>
+            <td class="col-notes">both failed (intentional failure / OIDC / reusable ref)</td>
           </tr>
           <tr>
             <td>36</td>
             <td><code>33-container-env-options</code></td>
             <td><code>33-container-env-options.yml</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.83s</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">9.94s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">150.5 MB</td>
-            <td class="col-notes">(node:97866) [DEP0205] DeprecationWarning: `module.register()` is d...</td>
+            <td class="col-notes">act passed, agent-ci failed</td>
           </tr>
           <tr>
             <td>37</td>
             <td><code>34-container-with-checkout</code></td>
             <td><code>34-container-with-checkout.yml</code></td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">7.93s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">38.68s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">143.7 MB</td>
-            <td class="col-notes">The process '/usr/bin/git' failed with exit code 128</td>
+            <td class="col-notes">both failed (intentional failure / OIDC / reusable ref)</td>
           </tr>
           <tr>
             <td>38</td>
             <td><code>35-container-lifecycle</code></td>
             <td><code>35-container-lifecycle.yml</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">2.40s</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">12.60s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">150.1 MB</td>
-            <td class="col-notes">Status:    ✗ 1 failed, 0 passed (1 total)</td>
+            <td class="col-notes">act passed, agent-ci failed</td>
           </tr>
           <tr>
             <td>39</td>
             <td><code>36-docker-action</code></td>
             <td><code>36-docker-action.yml</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">2.36s</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">13.78s</td>
-            <td style="font-family: var(--font-mono); font-size: 0.78rem;">152.5 MB</td>
-            <td class="col-notes">Status:    ✗ 2 failed, 0 passed (2 total)</td>
+            <td class="col-notes">act passed, agent-ci failed</td>
           </tr>
           </tbody>
         </table>
