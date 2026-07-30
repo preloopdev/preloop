@@ -73,7 +73,55 @@ fn runner_volumes(config: &RunnerPoolConfig) -> Vec<VolumeMount> {
     }
     volumes
 }
+async fn download_prebaked_golden(payload: &Path) -> bool {
+    let default_url = format!(
+        "https://github.com/preloopdev/preloop/releases/download/v{}/preloop-ubuntu-24.04-{}.smolmachine",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::ARCH
+    );
+    let url = std::env::var("PRELOOP_GOLDEN_URL").unwrap_or(default_url);
 
+    info!(url = %url, target = %payload.display(), "Attempting to download pre-baked golden microVM image");
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(600))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    let response = match client.get(&url).send().await {
+        Ok(res) if res.status().is_success() => res,
+        _ => {
+            info!("Pre-baked golden image release not found; will build locally");
+            return false;
+        }
+    };
+
+    let tmp_payload = match payload.parent() {
+        Some(parent) => parent.join(format!(".tmp-golden-{}", uuid::Uuid::new_v4())),
+        None => return false,
+    };
+
+    let bytes = match response.bytes().await {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+
+    if std::fs::write(&tmp_payload, &bytes).is_err() {
+        let _ = std::fs::remove_file(&tmp_payload);
+        return false;
+    }
+
+    if std::fs::rename(&tmp_payload, payload).is_err() {
+        let _ = std::fs::remove_file(&tmp_payload);
+        return false;
+    }
+
+    info!(target = %payload.display(), "Downloaded pre-baked golden microVM image successfully");
+    true
+}
 /// Packages the golden image carries.
 ///
 /// Tracks the apt package list of GitHub's `ubuntu-latest` runner image, which
@@ -775,6 +823,9 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         }
         if let Some(parent) = self.config.artifact_stem.parent() {
             std::fs::create_dir_all(parent)?;
+        }
+        if download_prebaked_golden(&payload).await {
+            return Ok(());
         }
 
         let name = MachineName::new(format!("{}-builder", self.config.name_prefix))?;
