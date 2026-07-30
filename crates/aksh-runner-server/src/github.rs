@@ -124,7 +124,8 @@ async fn resolve_check_run_token(shared: &Arc<SharedState>, repo: &str) -> Optio
     if let Some(app_creds) = &shared.state.github_app {
         let mut permissions = std::collections::BTreeMap::new();
         permissions.insert("checks".to_owned(), "write".to_owned());
-        if let Ok(token) = crate::github_app::get_or_mint_token(app_creds, repo, &permissions).await {
+        if let Ok(token) = crate::github_app::get_or_mint_token(app_creds, repo, &permissions).await
+        {
             return Some(token);
         }
     }

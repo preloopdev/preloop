@@ -230,7 +230,10 @@ pub(crate) const REPLAY_PLANS_RETAINED: usize = 64;
 /// Retention is by modification time rather than by run, because blobs are
 /// keyed by execution plan and a run's plan ids are not recoverable once its
 /// records are gone.
-pub(crate) async fn prune_replay_results(state_dir: &std::path::Path) {
+pub(crate) async fn prune_replay_results(
+    state_dir: &std::path::Path,
+    active_plans: &std::collections::BTreeSet<String>,
+) {
     let root = state_dir.join("replay").join("results");
     let plans = match collect_plan_directories(&root).await {
         Ok(plans) => plans,
@@ -244,7 +247,14 @@ pub(crate) async fn prune_replay_results(state_dir: &std::path::Path) {
         return;
     }
 
-    let mut plans = plans;
+    let mut plans: Vec<_> = plans
+        .into_iter()
+        .filter(|(path, _)| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_none_or(|plan| !active_plans.contains(plan))
+        })
+        .collect();
     // Newest first, so everything past the retention window is the tail.
     plans.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
     for (path, _) in plans.into_iter().skip(REPLAY_PLANS_RETAINED) {

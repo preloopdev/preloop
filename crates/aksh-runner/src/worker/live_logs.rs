@@ -161,6 +161,12 @@ impl LiveLogQueue {
     }
 
     async fn drain_once(&self, limit: usize) {
+        // Lines produced while the WebSocket handshake is in flight must stay
+        // queued. Dequeuing before a sender exists loses the beginning of
+        // every fast step even when the connection eventually succeeds.
+        if self.ws.lock().await.is_none() {
+            return;
+        }
         let batch = self.dequeue(limit);
         self.send_grouped(batch).await;
     }
@@ -486,6 +492,18 @@ mod tests {
         assert_eq!(tail.len(), 200);
         assert_eq!(tail[0].line_number, 51);
         assert_eq!(tail.last().unwrap().line_number, 250);
+    }
+
+    #[tokio::test]
+    async fn drain_keeps_lines_queued_until_socket_connects() {
+        let queue = LiveLogQueue::disconnected();
+        queue.enqueue("step", "first", 1);
+
+        queue.drain_once(DRAIN_LIMIT).await;
+
+        let lines = queue.dequeue(DRAIN_LIMIT);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].line, "first");
     }
 
     #[test]

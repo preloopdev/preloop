@@ -236,6 +236,26 @@ fn resolve_permissions(
     }
 }
 
+fn intersect_permissions(
+    called: Option<&BTreeMap<String, String>>,
+    caller: Option<&BTreeMap<String, String>>,
+) -> BTreeMap<String, String> {
+    let called = effective_token_permissions(called);
+    let caller = effective_token_permissions(caller);
+    called
+        .iter()
+        .filter_map(|(scope, called_level)| {
+            let caller_level = caller.get(scope)?;
+            let level = match (called_level.as_str(), caller_level.as_str()) {
+                ("write", "write") => "write",
+                ("write" | "read", "write" | "read") => "read",
+                _ => return None,
+            };
+            Some((scope.clone(), level.to_owned()))
+        })
+        .collect()
+}
+
 fn id_token_granted(permissions: Option<&Value>) -> bool {
     match permissions {
         Some(Value::String(value)) => value == "write-all",
@@ -592,6 +612,8 @@ fn expand_jobs_with_reusables_internal(
                 expand_matrix(job_id, job.strategy.matrix.as_ref(), Some(&resolved_inputs))?;
             for matrix in matrices {
                 let expanded_job_id = matrix_expand::expanded_job_id(job_id, &matrix);
+                let caller_permissions =
+                    resolve_permissions(job.permissions.as_ref(), workflow.permissions.as_ref());
                 let mut called_plans = expand_jobs_with_reusables_internal(
                     &called,
                     reusable_workflows,
@@ -635,6 +657,10 @@ fn expand_jobs_with_reusables_internal(
                     called_plan.oidc_id_token_granted &= id_token_granted(
                         job.permissions.as_ref().or(workflow.permissions.as_ref()),
                     );
+                    called_plan.permissions = Some(intersect_permissions(
+                        called_plan.permissions.as_ref(),
+                        caller_permissions.as_ref(),
+                    ));
                     called_plan.oidc_job_workflow_ref = Some(uses.clone());
                     called_plan.matrix.extend(matrix.clone());
                 }
