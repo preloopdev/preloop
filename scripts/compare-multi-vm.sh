@@ -7,7 +7,7 @@ RUNNERS="${2:?number of runner VMs}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TEMPLATE="${TEMPLATE:-/private/tmp/bench-runner.smolmachine}"
 RUNNER_HOST="${OFFICIAL_RUNNER_HOST:-$HOME/cachingv4}"
-BIN="$ROOT/target/aarch64-unknown-linux-musl/release/aksh-runner-server"
+BIN="$ROOT/target/aarch64-unknown-linux-musl/release/preloop-server"
 RESULT="$ROOT/benchmarks/compatibility/server/behavior/$SCENARIO/aksh-multi"
 PAYLOAD="$ROOT/benchmarks/compatibility/server/behavior/payload-$SCENARIO.json"
 mkdir -p "$RESULT/diag"
@@ -26,11 +26,11 @@ smolvm machine create --name "$SERVER" --from "$TEMPLATE" --net-backend virtio-n
 smolvm machine update --name "$SERVER" --rosetta >/dev/null
 smolvm machine start --name "$SERVER" >/dev/null
 smolvm machine exec --name "$SERVER" -- bash -lc 'mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc 2>/dev/null || true; if [ -x /usr/bin/rosetta-wrapper ] && [ -x /mnt/rosetta/rosetta ]; then echo ":rosetta:M::\\x7fELF\\x02\\x01\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x02\\x00\\x3e\\x00:\\xff\\xff\\xff\\xff\\xff\\xfe\\xfe\\x00\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xfe\\xff\\xff\\xff:/usr/bin/rosetta-wrapper:F" > /proc/sys/fs/binfmt_misc/register 2>/dev/null || true; fi' >/dev/null 2>&1 || true
-smolvm machine cp "$BIN" "$SERVER:/usr/local/bin/aksh-runner-server" >/dev/null
+smolvm machine cp "$BIN" "$SERVER:/usr/local/bin/preloop-server" >/dev/null
 SERVER_IP=$(smolvm machine exec --name "$SERVER" -- bash -lc "hostname -I | cut -d' ' -f1")
 smolvm machine exec --name "$SERVER" -- bash -lc "
-  chmod +x /usr/local/bin/aksh-runner-server
-  RUST_LOG=info AKSH_PUBLIC_URL=http://$SERVER_IP aksh-runner-server serve --listen 0.0.0.0:80 > /tmp/server.log 2>&1 &
+  chmod +x /usr/local/bin/preloop-server
+  RUST_LOG=info AKSH_PUBLIC_URL=http://$SERVER_IP preloop-server serve --listen 0.0.0.0:80 > /tmp/server.log 2>&1 &
   sleep 2
   wget -qO- http://127.0.0.1/healthz >/dev/null
   RESULT=\$(wget -qO- --post-file=/workspace/benchmarks/compatibility/server/behavior/payload-$SCENARIO.json \\

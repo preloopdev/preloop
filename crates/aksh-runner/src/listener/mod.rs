@@ -10,6 +10,7 @@ use tracing::info;
 
 use crate::cli::{GlobalArgs, ProtocolPath, RunArgs};
 use crate::client::http::HttpClient;
+use crate::control_bridge;
 use crate::settings::RunnerConfig;
 
 /// Run the listener (main loop of `aksh-runner run`).
@@ -22,6 +23,11 @@ pub async fn run_listener(args: RunArgs, global: &GlobalArgs) -> Result<()> {
         "Starting runner '{}' (agent {}, pool {})",
         config.settings.agent_name, config.settings.agent_id, config.settings.pool_id
     );
+
+    // Held for the lifetime of the listener so job subprocesses — `git` inside
+    // `actions/checkout`, Node actions, `curl` in a step — can reach the
+    // control plane at the origin it advertises.
+    let _control_bridge = control_bridge::spawn_from_env().await;
 
     let http = HttpClient::new(global.ca_bundle.as_deref())?;
 

@@ -29,7 +29,7 @@ WEBHOOK_SECRET="conformance-test-secret"
 TEST_API_TOKEN="conformance-test-api-token"
 AKSH_LOCAL_WORKSPACE="$TEMP_DIR/workspace" \
 AKSH_WEBHOOK_SECRET="$WEBHOOK_SECRET" \
-"$PROJECT_ROOT/target/debug/aksh-runner-server" serve \
+"$PROJECT_ROOT/target/debug/preloop-server" serve \
   --listen 127.0.0.1:9199 \
   --state-dir "$TEMP_DIR/server-state" \
   --enable-test-api \

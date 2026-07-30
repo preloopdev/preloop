@@ -57,7 +57,7 @@ for sc in $SCENARIOS; do
         if [ -d "$LATEST" ] && [ "$STATUS" = "ok" ] && [ "$FLOWS_COUNT" -gt 0 ]; then
             DEST="$GOLDEN_DIR/$sc"
             rm -rf "$DEST"
-            cp -r "$LATEST" "$DEST"
+            cp -rL "$LATEST" "$DEST"
             echo "golden saved: $DEST"
             PASS=$((PASS + 1))
         else

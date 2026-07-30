@@ -1,5 +1,6 @@
 //! Workflow job expansion.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -145,6 +146,116 @@ fn non_empty_services(services: Option<serde_json::Value>) -> Option<serde_json:
     }
 }
 
+/// Every permission scope a workflow `permissions:` block can name, in workflow
+/// (kebab-case) spelling. `read-all` and `write-all` expand to all of them.
+pub const PERMISSION_SCOPES: [&str; 14] = [
+    "actions",
+    "attestations",
+    "checks",
+    "contents",
+    "deployments",
+    "discussions",
+    "id-token",
+    "issues",
+    "packages",
+    "pages",
+    "pull-requests",
+    "repository-projects",
+    "security-events",
+    "statuses",
+];
+
+/// `GITHUB_TOKEN` permissions for a job whose workflow declares no
+/// `permissions:` block at all.
+///
+/// GitHub's restricted default, and exactly what the official runner prints in
+/// its `GITHUB_TOKEN Permissions` setup group for such a workflow. This is the
+/// single source of truth for the `system.github.token.permissions` runner
+/// variable and the GitHub App installation-token request, so a job is never
+/// told it holds authority its token does not carry — nor handed authority it
+/// was never told about.
+pub const DEFAULT_TOKEN_PERMISSIONS: [(&str, &str); 3] = [
+    ("contents", "read"),
+    ("metadata", "read"),
+    ("packages", "read"),
+];
+
+/// Effective `GITHUB_TOKEN` permissions for a job, given its resolved
+/// [`JobPlan::permissions`].
+///
+/// `None` means neither the job nor its workflow said anything, so
+/// [`DEFAULT_TOKEN_PERMISSIONS`] applies. `Some` is authoritative *even when
+/// empty*: `permissions: {}` withholds every scope, and widening that back to
+/// the default would grant a job more than it asked for.
+pub fn effective_token_permissions(
+    declared: Option<&BTreeMap<String, String>>,
+) -> Cow<'_, BTreeMap<String, String>> {
+    match declared {
+        Some(declared) => Cow::Borrowed(declared),
+        None => Cow::Owned(
+            DEFAULT_TOKEN_PERMISSIONS
+                .iter()
+                .map(|&(scope, level)| (scope.to_owned(), level.to_owned()))
+                .collect(),
+        ),
+    }
+}
+
+/// Resolve the effective permissions map from workflow/job YAML.
+///
+/// `permissions: read-all` → all scopes set to `read`.
+/// `permissions: write-all` → all scopes set to `write`.
+/// `permissions: {}` → empty map (no permissions).
+/// `permissions: { contents: read, issues: write }` → explicit map.
+/// Job-level overrides workflow-level entirely (not merged).
+fn resolve_permissions(
+    job_permissions: Option<&Value>,
+    workflow_permissions: Option<&Value>,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    let effective = job_permissions.or(workflow_permissions)?;
+    match effective {
+        Value::String(value) => {
+            let level = match value.as_str() {
+                "read-all" => "read",
+                "write-all" => "write",
+                _ => return Some(std::collections::BTreeMap::new()),
+            };
+            Some(
+                PERMISSION_SCOPES
+                    .into_iter()
+                    .map(|s| (s.to_owned(), level.to_owned()))
+                    .collect(),
+            )
+        }
+        Value::Object(map) => Some(
+            map.iter()
+                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned())))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+fn intersect_permissions(
+    called: Option<&BTreeMap<String, String>>,
+    caller: Option<&BTreeMap<String, String>>,
+) -> BTreeMap<String, String> {
+    let called = effective_token_permissions(called);
+    let caller = effective_token_permissions(caller);
+    called
+        .iter()
+        .filter_map(|(scope, called_level)| {
+            let caller_level = caller.get(scope)?;
+            let level = match (called_level.as_str(), caller_level.as_str()) {
+                ("write", "write") => "write",
+                ("write" | "read", "write" | "read") => "read",
+                _ => return None,
+            };
+            Some((scope.clone(), level.to_owned()))
+        })
+        .collect()
+}
+
 fn id_token_granted(permissions: Option<&Value>) -> bool {
     match permissions {
         Some(Value::String(value)) => value == "write-all",
@@ -270,6 +381,7 @@ fn job_plan_from_job(
             .map(|(k, v)| (k.clone(), v.as_str().unwrap_or(&v.to_string()).to_string()))
             .collect(),
         oidc_id_token_granted: id_token_granted(job.permissions.as_ref().or(workflow_permissions)),
+        permissions: resolve_permissions(job.permissions.as_ref(), workflow_permissions),
         oidc_environment,
         oidc_job_workflow_ref: None,
         concurrency_group,
@@ -500,6 +612,8 @@ fn expand_jobs_with_reusables_internal(
                 expand_matrix(job_id, job.strategy.matrix.as_ref(), Some(&resolved_inputs))?;
             for matrix in matrices {
                 let expanded_job_id = matrix_expand::expanded_job_id(job_id, &matrix);
+                let caller_permissions =
+                    resolve_permissions(job.permissions.as_ref(), workflow.permissions.as_ref());
                 let mut called_plans = expand_jobs_with_reusables_internal(
                     &called,
                     reusable_workflows,
@@ -543,6 +657,10 @@ fn expand_jobs_with_reusables_internal(
                     called_plan.oidc_id_token_granted &= id_token_granted(
                         job.permissions.as_ref().or(workflow.permissions.as_ref()),
                     );
+                    called_plan.permissions = Some(intersect_permissions(
+                        called_plan.permissions.as_ref(),
+                        caller_permissions.as_ref(),
+                    ));
                     called_plan.oidc_job_workflow_ref = Some(uses.clone());
                     called_plan.matrix.extend(matrix.clone());
                 }
@@ -714,7 +832,7 @@ fn expand_matrix(
             let value = eval_expression(expression, &expression_context(&IndexMap::new(), inputs))
                 .map_err(|error| ParserError::InvalidExpression(error.to_string()))?;
             if value.is_null() {
-                return Ok(vec![IndexMap::new()]);
+                return Ok(vec![]);
             }
             serde_json::from_value(value).map_err(|error| {
                 ParserError::InvalidExpression(format!(

@@ -301,10 +301,9 @@ Exit code 0 iff run Succeeded (or `--expect failed` for failure-shape scenarios 
 
 ```
 build-runner:     cargo build --release -p aksh-runner
-runner-e2e WF:    cargo run -p aksh-conformance -- runner-e2e --runner-bin target/release/aksh-runner --workflow {{WF}}
-conform-runner S: cargo run -p aksh-conformance -- runner-diff --scenario {{S}} --target github
-conform-local S:  cargo run -p aksh-conformance -- runner-diff --scenario {{S}} --target aksh
-bench-runner:     ./scripts/bench-runner.sh
+runner-e2e WF: cargo run -p aksh-conformance -- runner-e2e --runner-bin target/release/aksh-runner --workflow {{WF}}
+conform:       ./benchmarks/conformance/run.sh
+bench-runner:  ./scripts/bench-runner.sh
 ```
 
 ## Critical files & anchors

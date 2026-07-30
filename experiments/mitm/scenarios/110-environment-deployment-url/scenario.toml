@@ -1,0 +1,16 @@
+description = "Environment deployments with dynamic URL outputs from step execution"
+duration_seconds_max = 300
+
+[[steps]]
+kind = "submit_workflow"
+path = "110-environment-deployment-url.yml"
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_assigned"
+timeout = 120
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_completed"
+timeout = 240

@@ -1,0 +1,107 @@
+name: bench-cache-all-sizes
+
+on:
+  push:
+  pull_request:
+
+# Single-job cache benchmark: tests 4 sizes sequentially.
+# Measures upload, lookup, download, extract for each size.
+# First run = miss (save), second run = hit (restore).
+
+jobs:
+  bench:
+    runs-on: self-hosted
+    steps:
+      - name: benchmark cache at 4 sizes
+        run: |
+          CACHE_URL="${ACTIONS_CACHE_SERVICE_URL:-http://127.0.0.1:9090}"
+          TOKEN="${GITHUB_TOKEN:-}"
+          RUN_ID="${GITHUB_RUN_ID:-bench$$}"
+
+          echo "=== CACHE BENCHMARK ==="
+          echo "run_id=$RUN_ID"
+          echo ""
+
+          for SIZE_NAME in "500KB:512" "5MB:5120" "25MB:25600" "100MB:102400"; do
+            IFS=':' read -r LABEL KB_COUNT <<< "$SIZE_NAME"
+            KEY="bench-${LABEL}-${RUN_ID}"
+
+            # Create payload
+            rm -rf /tmp/cache-data /tmp/restored
+            mkdir -p /tmp/cache-data /tmp/restored
+            dd if=/dev/urandom of=/tmp/cache-data/payload.bin bs=1024 count=$KB_COUNT 2>/dev/null
+
+            # Archive
+            ARCHIVE_START=$(python3 -c "import time;print(time.time())")
+            cd /tmp && tar czf cache-payload.tar.gz -C /tmp/cache-data .
+            ARCHIVE_MS=$(python3 -c "print(int((time.time()-$ARCHIVE_START)*1000))")
+            ARCHIVE_SIZE=$(stat -c%s /tmp/cache-payload.tar.gz 2>/dev/null || stat -f%z /tmp/cache-payload.tar.gz)
+
+            # === SAVE (CREATE + UPLOAD + FINALIZE) ===
+            # Create
+            C_START=$(python3 -c "import time;print(time.time())")
+            RESP=$(curl -s -X POST "$CACHE_URL/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry" \
+              -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
+              -d "{\"key\":\"$KEY\",\"version\":\"v1\",\"scope\":\"bench\",\"repository\":\"size\"}")
+            C_MS=$(python3 -c "print(int((time.time()-$C_START)*1000))")
+            URL=$(echo "$RESP" | python3 -c "import sys,json;print(json.load(sys.stdin).get('signed_upload_url',''))" 2>/dev/null)
+
+            if [ -n "$URL" ]; then
+              # Upload
+              U_START=$(python3 -c "import time;print(time.time())")
+              curl -s -X PUT "$URL" -H "Content-Type: application/octet-stream" --data-binary @cache-payload.tar.gz
+              U_MS=$(python3 -c "print(int((time.time()-$U_START)*1000))")
+
+              # Finalize
+              F_START=$(python3 -c "import time;print(time.time())")
+              curl -s -X POST "$CACHE_URL/twirp/github.actions.results.api.v1.CacheService/FinalizeCacheEntry" \
+                -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
+                -d "{\"key\":\"$KEY\",\"version\":\"v1\",\"scope\":\"bench\",\"repository\":\"size\"}" > /dev/null
+              F_MS=$(python3 -c "print(int((time.time()-$F_START)*1000))")
+
+              SAVE_TOTAL=$((C_MS + U_MS + F_MS))
+              echo "CACHE_BENCH size=$LABEL phase=save archive_bytes=$ARCHIVE_SIZE archive_ms=$ARCHIVE_MS create_ms=$C_MS upload_ms=$U_MS finalize_ms=$F_MS total_ms=$SAVE_TOTAL"
+            else
+              echo "CACHE_BENCH size=$LABEL phase=save status=already_exists create_ms=$C_MS"
+              SAVE_TOTAL=$C_MS
+            fi
+
+            # === RESTORE (LOOKUP + DOWNLOAD + EXTRACT) ===
+            # Clear local copy
+            rm -rf /tmp/restored
+            mkdir -p /tmp/restored
+
+            # Lookup
+            L_START=$(python3 -c "import time;print(time.time())")
+            RESP=$(curl -s -X POST "$CACHE_URL/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadUrl" \
+              -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
+              -d "{\"key\":\"$KEY\",\"version\":\"v1\",\"restoreKeys\":[],\"scope\":\"bench\",\"repository\":\"size\"}")
+            L_MS=$(python3 -c "print(int((time.time()-$L_START)*1000))")
+            OK=$(echo "$RESP" | python3 -c "import sys,json;print(json.load(sys.stdin).get('ok',''))" 2>/dev/null)
+            URL=$(echo "$RESP" | python3 -c "import sys,json;print(json.load(sys.stdin).get('signed_download_url',''))" 2>/dev/null)
+            MATCHED=$(echo "$RESP" | python3 -c "import sys,json;print(json.load(sys.stdin).get('matched_key',''))" 2>/dev/null)
+
+            if [ "$OK" = "True" ] && [ -n "$URL" ]; then
+              # Download
+              D_START=$(python3 -c "import time;print(time.time())")
+              curl -s -o /tmp/restored.tar.gz "$URL"
+              D_MS=$(python3 -c "print(int((time.time()-$D_START)*1000))")
+              DLOADED_SIZE=$(stat -c%s /tmp/restored.tar.gz 2>/dev/null || stat -f%z /tmp/restored.tar.gz)
+
+              # Extract
+              E_START=$(python3 -c "import time;print(time.time())")
+              tar xzf /tmp/restored.tar.gz -C /tmp/restored
+              E_MS=$(python3 -c "print(int((time.time()-$E_START)*1000))")
+
+              RESTORE_TOTAL=$((L_MS + D_MS + E_MS))
+              echo "CACHE_BENCH size=$LABEL phase=restore outcome=hit lookup_ms=$L_MS download_ms=$D_MS extract_ms=$E_MS total_ms=$RESTORE_TOTAL restored_bytes=$DLOADED_SIZE matched_key=$MATCHED"
+            else
+              echo "CACHE_BENCH size=$LABEL phase=restore outcome=miss lookup_ms=$L_MS"
+            fi
+
+            # Clean up for next iteration
+            rm -rf /tmp/cache-data /tmp/restored /tmp/cache-payload.tar.gz
+            echo ""
+          done
+
+          echo "=== BENCHMARK COMPLETE ==="

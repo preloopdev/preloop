@@ -217,6 +217,7 @@ pub(crate) fn build_app(
 
     let router = Router::new()
         .route("/healthz", get(healthz))
+        .route("/runs/:run_id", get(get_public_run))
         .route("/.well-known/openid-configuration", get(oidc_discovery))
         .route("/.well-known/jwks", get(oidc_jwks))
         .route("/.well-known/jwks.json", get(oidc_jwks))
@@ -405,6 +406,92 @@ pub(crate) fn build_app(
             post(register_dap_port).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_runner_bearer,
+            )),
+        )
+        // Live debug sessions. Worker-facing routes are runner-authenticated;
+        // controller-facing routes are native-authenticated. Both live on the
+        // native surface so `/_apis/...` stays byte-identical.
+        //
+        // The credential those worker routes need is not in the job message —
+        // an official runner would republish it as `${{ secrets[...] }}` — so
+        // the worker exchanges its job runtime token for it here first.
+        .route(
+            "/api/v1/debug/worker-token",
+            post(crate::debug_sessions::issue_worker_token).route_layer(
+                middleware::from_fn_with_state(shared.clone(), require_job_runtime_bearer),
+            ),
+        )
+        .route(
+            "/api/v1/debug/sessions",
+            post(crate::debug_sessions::open_session).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_worker_bearer,
+            )),
+        )
+        .route(
+            "/api/v1/debug/sessions/:session_id/verdict",
+            get(crate::debug_sessions::poll_verdict).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_worker_bearer,
+            )),
+        )
+        .route(
+            "/api/v1/debug/sessions/:session_id/close",
+            post(crate::debug_sessions::close_session).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_worker_bearer,
+            )),
+        )
+        .route(
+            "/api/v1/debug/sessions",
+            get(crate::debug_sessions::list_sessions).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_native_bearer,
+            )),
+        )
+        .route(
+            "/api/v1/debug/sessions/:session_id",
+            get(crate::debug_sessions::get_session).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_native_bearer,
+            )),
+        )
+        .route(
+            "/api/v1/debug/sessions/:session_id/verdict",
+            post(crate::debug_sessions::post_verdict).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_native_bearer,
+            )),
+        )
+        // Structured agent debugging surface. It is deliberately separate
+        // from the human CLI verbs, but both mutate the same session state.
+        .route(
+            "/api/v1/agent/debug/sessions/:session_id/lease",
+            post(crate::debug_sessions::agent_acquire_lease)
+                .delete(crate::debug_sessions::agent_release_lease)
+                .route_layer(middleware::from_fn_with_state(
+                    shared.clone(),
+                    require_native_bearer,
+                )),
+        )
+        .route(
+            "/api/v1/agent/debug/sessions/:session_id/events",
+            get(crate::debug_sessions::agent_events).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_native_bearer,
+            )),
+        )
+        .route(
+            "/api/v1/agent/debug/sessions/:session_id/operations",
+            post(crate::debug_sessions::agent_operation).route_layer(
+                middleware::from_fn_with_state(shared.clone(), require_native_bearer),
+            ),
+        )
+        .route(
+            "/api/v1/agent/debug/sessions/:session_id/audit",
+            get(crate::debug_sessions::agent_audit).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_native_bearer,
             )),
         )
         // Archive tickets are bearerless in the official runner protocol.
@@ -610,7 +697,12 @@ pub(crate) fn build_app(
         // Azure Block Blob compat blob store — upload (PUT) and download (GET).
         // Cache: /twirp-blob/cache/{token}
         // Artifact: /twirp-blob/artifact/{token}  (download URL appends .zip for content-type detection)
-        .route("/twirp-blob/:kind/:token", put(blob_put).get(blob_get))
+        .route(
+            "/twirp-blob/:kind/:token",
+            put(blob_put)
+                .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
+                .get(blob_get),
+        )
         .route_layer(middleware::from_fn_with_state(
             shared.clone(),
             require_results_bearer,

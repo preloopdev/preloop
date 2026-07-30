@@ -3,7 +3,7 @@ on: workflow_dispatch
 
 jobs:
   container-basic:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     container: node:20-bookworm
     steps:
       - name: Node version

@@ -1,0 +1,24 @@
+name: 108-workflow-dispatch-inputs
+on:
+  workflow_dispatch:
+    inputs:
+      logLevel:
+        description: 'Log level'
+        required: true
+        default: 'warning'
+        type: choice
+        options: ['info', 'warning', 'debug']
+      tags:
+        description: 'Test run tags'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  inspect-inputs:
+    runs-on: self-hosted
+    steps:
+      - run: |
+          echo "Log level: ${{ inputs.logLevel }}"
+          echo "Tags: ${{ inputs.tags }}"
+          echo "Event input: ${{ github.event.inputs.logLevel }}"
