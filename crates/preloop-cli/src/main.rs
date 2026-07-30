@@ -429,6 +429,17 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
     let home = preloop_home();
     let state_dir = home.join("state");
     let socket = home.join("preloop.sock");
+
+    // Ensure AKSH_SYSTEM_TOKEN is set so both control plane and runner pool agree.
+    if std::env::var("AKSH_SYSTEM_TOKEN").is_err() {
+        let token_path = home.join("engine.token");
+        let token = if let Ok(existing) = std::fs::read_to_string(&token_path) {
+            existing.trim().to_owned()
+        } else {
+            "preloop-system-token".to_owned()
+        };
+        std::env::set_var("AKSH_SYSTEM_TOKEN", token);
+    }
     let listen: std::net::SocketAddr = args
         .listen
         .clone()
