@@ -54,6 +54,49 @@ fn status_check_function_detection_ignores_string_literals() {
     ));
 }
 
+#[test]
+fn range_retry_clears_state_and_annotations_for_every_replayed_step() {
+    use aksh_gha_protocol::debug_session::StepSummary;
+    use std::collections::HashMap;
+
+    let mut job = JobContext::new(
+        "job".into(),
+        "Job".into(),
+        serde_json::json!({}),
+        serde_json::json!({}),
+    );
+    let summaries = (0..5)
+        .map(|index| StepSummary {
+            index,
+            context_name: format!("step_{index}"),
+            display_name: format!("Step {index}"),
+        })
+        .collect::<Vec<_>>();
+    for summary in &summaries {
+        job.state.insert(
+            summary.context_name.clone(),
+            HashMap::from([("saved".into(), summary.index.to_string())]),
+        );
+        job.step_annotations
+            .insert(summary.context_name.clone(), Vec::new());
+    }
+
+    clear_replayed_step_state(&mut job, &summaries, 1, 3);
+
+    for index in 1..=3 {
+        assert!(!job.state.contains_key(&format!("step_{index}")));
+        assert!(!job
+            .step_annotations
+            .contains_key(&format!("step_{index}")));
+    }
+    for index in [0, 4] {
+        assert!(job.state.contains_key(&format!("step_{index}")));
+        assert!(job
+            .step_annotations
+            .contains_key(&format!("step_{index}")));
+    }
+}
+
 #[tokio::test]
 async fn run_steps_marks_condition_error_as_failure() {
     let dir = TempDir::new().unwrap();
