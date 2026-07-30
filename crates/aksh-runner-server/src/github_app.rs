@@ -319,7 +319,11 @@ pub(crate) async fn get_or_mint_token(
     repository: &str,
     permissions: &BTreeMap<String, String>,
 ) -> anyhow::Result<String> {
-    mint_for_repository(&api_base(), creds, repository, permissions, false).await
+    Ok(
+        mint_for_repository(&api_base(), creds, repository, permissions, false)
+            .await?
+            .0,
+    )
 }
 
 /// [`get_or_mint_token`], told whether the workflow declared `permissions:`.
@@ -328,12 +332,16 @@ pub(crate) async fn get_or_mint_token(
 /// cannot grant it. An undeclared set is this server's own default, so it is
 /// narrowed to the installation's grants rather than failing a job that never
 /// asked for the missing scope.
+///
+/// The second element is the set the token *actually* carries, present only
+/// when narrowing occurred. Callers must restate it to the job: a token that
+/// silently holds less than the job was told is a 403 with no explanation.
 pub(crate) async fn get_or_mint_token_declared(
     creds: &GitHubAppCredentials,
     repository: &str,
     permissions: &BTreeMap<String, String>,
     declared: bool,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, Option<BTreeMap<String, String>>)> {
     mint_for_repository(&api_base(), creds, repository, permissions, declared).await
 }
 
@@ -343,7 +351,11 @@ pub(crate) async fn get_or_mint_token_at(
     repository: &str,
     permissions: &BTreeMap<String, String>,
 ) -> anyhow::Result<String> {
-    mint_for_repository(api_base, creds, repository, permissions, false).await
+    Ok(
+        mint_for_repository(api_base, creds, repository, permissions, false)
+            .await?
+            .0,
+    )
 }
 
 /// [`get_or_mint_token`] against an explicit API base.
@@ -353,7 +365,7 @@ async fn mint_for_repository(
     repository: &str,
     permissions: &BTreeMap<String, String>,
     declared: bool,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, Option<BTreeMap<String, String>>)> {
     let (owner, repo) = split_repository(repository)?;
     let app_jwt = sign_app_jwt(&creds.app_id, &creds.private_key)?;
     let installation_id = installation_id_for(api_base, creds, &app_jwt, owner).await?;
@@ -369,6 +381,7 @@ async fn mint_for_repository(
             .downcast_ref::<MintRejected>()
             .is_some_and(|rejected| rejected.status == reqwest::StatusCode::UNPROCESSABLE_ENTITY)
     });
+    let mut narrowed = None;
     let (token, expires_at) = if unprocessable {
         let granted = installation_grants(api_base, &app_jwt, installation_id).await?;
         let missing = ungranted_scopes(permissions, &granted);
@@ -386,9 +399,14 @@ async fn mint_for_repository(
             repository,
             installation_id,
             ungranted = %missing.join(", "),
-            "installation cannot grant every default token scope; minting with the granted subset"
+            "the GitHub App installation does not grant [{}]; this job's GITHUB_TOKEN will not \
+             carry them. Grant them to the installation if your workflows need them",
+            missing.join(", ")
         );
-        mint_installation_token(api_base, &app_jwt, installation_id, repo, &clamped).await?
+        let minted =
+            mint_installation_token(api_base, &app_jwt, installation_id, repo, &clamped).await?;
+        narrowed = Some(clamped);
+        minted
     } else {
         attempt?
     };
@@ -401,7 +419,7 @@ async fn mint_for_repository(
             .unwrap_or(0),
         "minted GitHub App installation token"
     );
-    Ok(token)
+    Ok((token, narrowed))
 }
 
 /// Permission scopes this installation currently holds, keyed snake_case.
@@ -999,8 +1017,12 @@ mod tests {
         )
         .await
         .expect("mint a policy-default token");
-        assert_eq!(declared, "ghs_stub_installation_token");
-        assert_eq!(defaulted, "ghs_stub_installation_token");
+        assert_eq!(declared.0, "ghs_stub_installation_token");
+        assert_eq!(defaulted.0, "ghs_stub_installation_token");
+        assert!(
+            declared.1.is_none() && defaulted.1.is_none(),
+            "a mint GitHub accepted was never narrowed, so there is nothing to restate"
+        );
 
         // A bare owner cannot be repository-scoped, so it must never reach the
         // API at all.
