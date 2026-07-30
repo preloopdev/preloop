@@ -175,7 +175,7 @@ pub fn revert_paths(
         .map(|c| c.path.as_str())
         .collect();
     if !restore.is_empty() {
-        let mut args = vec!["checkout", snapshot_commit, "--"];
+        let mut args = vec!["--literal-pathspecs", "checkout", snapshot_commit, "--"];
         args.extend(restore.iter().copied());
         git(workspace, &args).context("restoring tracked files from the workspace snapshot")?;
         reverted += restore.len();
@@ -197,6 +197,7 @@ pub fn revert_paths(
         // a renamed file is exactly that, and discarding it is the whole point:
         // the file itself is deleted immediately below.
         let mut args = vec![
+            "--literal-pathspecs",
             "rm",
             "--cached",
             "--force",
@@ -960,6 +961,39 @@ mod tests {
             std::fs::read_to_string(fixture.path.join("lib.rs")).unwrap(),
             "regenerated\n",
             "unselected tracked change must survive"
+        );
+    }
+
+    #[test]
+    fn revert_treats_git_pathspec_magic_as_a_literal_filename() {
+        let fixture = Fixture::new();
+        let literal = ":(glob)*";
+        std::fs::write(fixture.path.join(literal), "original literal\n").unwrap();
+        fixture.git(&["add", "--", literal]);
+        fixture.git(&["commit", "-qm", "add literal pathspec"]);
+        let snapshot = super::git(&fixture.path, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_owned();
+
+        std::fs::write(fixture.path.join(literal), "changed literal\n").unwrap();
+        std::fs::write(fixture.path.join("notes.md"), "unselected change\n").unwrap();
+        let selected = [WorkspaceChange {
+            path: literal.into(),
+            status: ChangeStatus::Modified,
+            category: ChangeCategory::Tracked,
+        }];
+
+        revert_paths(&fixture.path, &snapshot, &selected).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(fixture.path.join(literal)).unwrap(),
+            "original literal\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.path.join("notes.md")).unwrap(),
+            "unselected change\n",
+            "literal revert must not expand the filename as a pathspec"
         );
     }
 }
