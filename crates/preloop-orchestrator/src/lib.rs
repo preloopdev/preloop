@@ -689,6 +689,7 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
                 guest: PathBuf::from(GUEST_CONTROL_SOCKET),
             })
             .collect(),
+        rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
     };
     provider.create(&spec).await?;
     provider.start_forkable(golden).await?;
@@ -839,6 +840,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             network: NetworkPolicy::PublicOnly,
             volumes: Vec::new(),
             sockets: Vec::new(),
+            rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
         };
         self.provider.create(&spec).await?;
         self.provider.start(&name).await?;
@@ -1408,6 +1410,7 @@ async fn provision_runner<P: VmProvider + 'static>(
                     guest: PathBuf::from(GUEST_CONTROL_SOCKET),
                 })
                 .collect(),
+            rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
         };
         provider.create(&spec).await?;
         provider.start(name).await?;
