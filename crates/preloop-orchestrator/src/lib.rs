@@ -555,9 +555,9 @@ impl GoldenRegistry {
 impl RunnerPoolConfig {
     /// Validate configuration before changing machine state.
     pub fn validate(&self) -> Result<(), OrchestratorError> {
-        if self.size == 0 || self.size > 64 {
+        if self.size > 64 {
             return Err(OrchestratorError::Config(
-                "runner pool size must be between 1 and 64".into(),
+                "runner pool size must be between 0 and 64".into(),
             ));
         }
         MachineName::new(format!("{}-0", self.name_prefix))?;
@@ -805,6 +805,15 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         let keys = Arc::new(KeyPool::new());
         keys.spawn_refill();
         let building = Arc::new(AtomicUsize::new(0));
+
+        // On-demand mode: size=0 means no warm pool. Fork runners only when
+        // jobs arrive, capped by the host's CPU budget.
+        if self.config.size == 0 {
+            return self
+                .run_on_demand(shutdown, golden_registry, resolver, idle, keys, building)
+                .await;
+        }
+
         for slot in 0..self.config.size {
             let provider = self.provider.clone();
             let config = self.config.clone();
@@ -846,6 +855,104 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
 
         while slots.join_next().await.is_some() {}
         // Clean up every environment-specific golden fork base.
+        for golden in golden_registry.all_names().await {
+            let _ = self.provider.delete(&golden).await;
+        }
+        self.remove_stale_machines().await?;
+        Ok(())
+    }
+
+    /// On-demand mode: no warm pool. Fork a runner only when the server
+    /// has queued work, capped at `nproc / cpus_per_runner` concurrent
+    /// runners so the host CPU is not over-committed.
+    async fn run_on_demand(
+        &self,
+        shutdown: CancellationToken,
+        golden_registry: Arc<GoldenRegistry>,
+        _resolver: Arc<EnvironmentResolver>,
+        idle: Arc<AtomicUsize>,
+        keys: Arc<KeyPool>,
+        building: Arc<AtomicUsize>,
+    ) -> Result<(), OrchestratorError> {
+        let max_concurrent = {
+            let parallelism = std::thread::available_parallelism().map_or(2, |value| value.get());
+            (parallelism / usize::from(self.config.cpus.max(1))).max(1)
+        };
+        info!(max_concurrent, "on-demand runner pool (size=0)");
+
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+        let mut slots = JoinSet::new();
+        let mut next_slot: usize = 0;
+
+        loop {
+            // Wait until the server has queued at least one job.
+            let pending = self.config.pending_jobs.as_deref();
+            loop {
+                if shutdown.is_cancelled() {
+                    break;
+                }
+                let queued = pending.map_or(0, |p| p.load(Ordering::Acquire));
+                if queued > 0 {
+                    break;
+                }
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                }
+            }
+            if shutdown.is_cancelled() {
+                break;
+            }
+
+            // Acquire a concurrency permit (blocks if max_concurrent reached).
+            let permit = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => break,
+                permit = semaphore.clone().acquire_owned() => {
+                    permit.expect("semaphore is never closed")
+                }
+            };
+
+            let slot = next_slot;
+            next_slot = next_slot.wrapping_add(1);
+            let provider = self.provider.clone();
+            let config = self.config.clone();
+            let slot_shutdown = shutdown.child_token();
+            let slot_registry = golden_registry.clone();
+            let slot_handles = PoolHandles {
+                idle: idle.clone(),
+                keys: keys.clone(),
+                building: building.clone(),
+            };
+
+            slots.spawn(async move {
+                let _permit = permit; // held until this task exits
+                let result = run_on_demand_slot(
+                    provider,
+                    config,
+                    slot,
+                    slot_shutdown,
+                    slot_registry,
+                    slot_handles,
+                )
+                .await;
+                if let Err(error) = &result {
+                    warn!(slot, %error, "on-demand runner failed");
+                }
+                result
+            });
+
+            // Reap any finished tasks without blocking.
+            while let Some(result) = slots.try_join_next() {
+                if let Ok(Err(error)) = result {
+                    warn!(%error, "on-demand runner slot error");
+                }
+            }
+        }
+
+        // Drain remaining runners on shutdown.
+        while slots.join_next().await.is_some() {}
         for golden in golden_registry.all_names().await {
             let _ = self.provider.delete(&golden).await;
         }
@@ -1004,6 +1111,112 @@ impl Drop for Reservation<'_> {
         self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
+
+/// Single-shot on-demand runner: provision, run exactly one job, clean up.
+async fn run_on_demand_slot<P: VmProvider + 'static>(
+    provider: Arc<P>,
+    config: RunnerPoolConfig,
+    slot: usize,
+    shutdown: CancellationToken,
+    golden_registry: Arc<GoldenRegistry>,
+    handles: PoolHandles,
+) -> Result<(), OrchestratorError> {
+    // Resolve the golden for the queued job's environment.
+    let (golden, environment) = if config.use_fork {
+        let env_base = match &config.next_job_runs_on {
+            Some(lock) => {
+                let labels = lock.read().map(|g| g.clone()).unwrap_or_default();
+                if labels.is_empty() {
+                    config.base_image.clone()
+                } else {
+                    EnvironmentSpec::default_base(&labels)
+                }
+            }
+            None => config.base_image.clone(),
+        };
+        let env_spec = EnvironmentSpec::new(env_base.clone(), Vec::new());
+        let fingerprint = env_spec.fingerprint.clone();
+        let selected = golden_registry
+            .get_or_prepare(&fingerprint, {
+                let provider = provider.clone();
+                let config = config.clone();
+                let name_prefix = golden_registry.name_prefix().to_owned();
+                let fp = fingerprint.clone();
+                async move {
+                    let name = MachineName::new(format!(
+                        "{}-golden-{}",
+                        name_prefix,
+                        &fp[..12.min(fp.len())]
+                    ))?;
+                    prepare_golden_for_env(&provider, &config, &name, &env_spec).await?;
+                    Ok(name)
+                }
+            })
+            .await
+            .map_err(|error| {
+                warn!(%error, %fingerprint, "failed to prepare golden for on-demand runner");
+                error
+            })?;
+        (
+            Some(selected),
+            RunnerEnvironment {
+                fingerprint: Some(fingerprint),
+                base: env_base,
+            },
+        )
+    } else {
+        (
+            None,
+            RunnerEnvironment {
+                fingerprint: None,
+                base: config.base_image.clone(),
+            },
+        )
+    };
+
+    // Provision a single-use runner.
+    let generation = 1_u64;
+    let runner = provision_slot(
+        &provider,
+        &config,
+        slot,
+        generation,
+        golden.as_ref(),
+        &handles.keys,
+        environment.clone(),
+    )
+    .await?;
+
+    // Run exactly one job — no successor pre-provisioning.
+    let result = run_one_runner(
+        provider.clone(),
+        &config,
+        runner,
+        shutdown,
+        SlotPlan {
+            slot,
+            generation: generation + 1,
+            golden: golden.as_ref(),
+            environment,
+            idle: &handles.idle,
+            keys: &handles.keys,
+            building: &handles.building,
+        },
+    )
+    .await;
+
+    // Discard any successor that was pre-built (on-demand does not keep warm
+    // runners around).
+    match result {
+        Ok(Some(successor)) => {
+            let _ = provider.delete(&successor.name).await;
+            Ok(())
+        }
+        Ok(None) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 async fn run_slot<P: VmProvider + 'static>(
     provider: Arc<P>,
     config: RunnerPoolConfig,
