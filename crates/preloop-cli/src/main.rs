@@ -411,8 +411,7 @@ async fn ensure_engine_running() -> anyhow::Result<()> {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        std::fs::write(&token_path, &token)?;
-        set_private_file_permissions(&token_path)?;
+        write_private_file(&token_path, token.as_bytes())?;
         token
     };
 
@@ -486,6 +485,56 @@ fn set_private_file_permissions(_path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn write_private_file(path: &std::path::Path, contents: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("create private file {}", path.display()))?;
+    set_private_file_permissions(path)?;
+    file.write_all(contents)
+        .with_context(|| format!("write private file {}", path.display()))?;
+    Ok(())
+}
+
+fn prepare_engine_token(
+    home: &std::path::Path,
+    configured: Option<String>,
+) -> anyhow::Result<String> {
+    std::fs::create_dir_all(home)
+        .with_context(|| format!("create PRELOOP_HOME {}", home.display()))?;
+    set_private_directory_permissions(home)?;
+
+    let token_path = home.join("engine.token");
+    if let Some(token) = configured {
+        anyhow::ensure!(!token.trim().is_empty(), "AKSH_SYSTEM_TOKEN is empty");
+        write_private_file(&token_path, token.as_bytes())?;
+        return Ok(token);
+    }
+    if let Ok(existing) = std::fs::read_to_string(&token_path) {
+        let token = existing.trim().to_owned();
+        anyhow::ensure!(!token.is_empty(), "{} is empty", token_path.display());
+        set_private_file_permissions(&token_path)?;
+        return Ok(token);
+    }
+
+    let mut bytes = [0_u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let token = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    write_private_file(&token_path, token.as_bytes())?;
+    Ok(token)
+}
+
 /// Merge stored and command-line GitHub credentials into the environment the
 /// server reads, optionally persisting them, and report the effective state.
 ///
@@ -532,24 +581,8 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
     let socket = home.join("preloop.sock");
 
     // Ensure AKSH_SYSTEM_TOKEN and engine.token stay synchronized.
-    let token_path = home.join("engine.token");
-    let _token = if let Ok(env_tok) = std::env::var("AKSH_SYSTEM_TOKEN") {
-        let _ = std::fs::write(&token_path, &env_tok);
-        let _ = set_private_file_permissions(&token_path);
-        env_tok
-    } else if let Ok(existing) = std::fs::read_to_string(&token_path) {
-        let t = existing.trim().to_owned();
-        std::env::set_var("AKSH_SYSTEM_TOKEN", &t);
-        t
-    } else {
-        let mut bytes = [0_u8; 32];
-        rand::thread_rng().fill_bytes(&mut bytes);
-        let t = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
-        let _ = std::fs::write(&token_path, &t);
-        let _ = set_private_file_permissions(&token_path);
-        std::env::set_var("AKSH_SYSTEM_TOKEN", &t);
-        t
-    };
+    let token = prepare_engine_token(&home, std::env::var("AKSH_SYSTEM_TOKEN").ok())?;
+    std::env::set_var("AKSH_SYSTEM_TOKEN", &token);
     let listen: std::net::SocketAddr = args
         .listen
         .clone()
@@ -1409,6 +1442,37 @@ fn find_debug_machine(
 mod tests {
     use super::*;
     use clap::error::ErrorKind;
+
+    #[test]
+    fn first_serve_token_creates_private_home_and_file() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("missing").join(".preloop");
+        assert!(!home.exists());
+
+        let token = prepare_engine_token(&home, None).unwrap();
+
+        assert_eq!(token.len(), 64);
+        assert_eq!(
+            std::fs::read_to_string(home.join("engine.token")).unwrap(),
+            token
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(&home).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(home.join("engine.token"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(std::iter::once("preloop").chain(args.iter().copied()))
