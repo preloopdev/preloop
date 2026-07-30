@@ -120,6 +120,17 @@ fn decode_hex(hex: &str) -> Result<Vec<u8>, &'static str> {
     Ok(bytes)
 }
 
+async fn resolve_check_run_token(shared: &Arc<SharedState>, repo: &str) -> Option<String> {
+    if let Some(app_creds) = &shared.state.github_app {
+        let mut permissions = std::collections::BTreeMap::new();
+        permissions.insert("checks".to_owned(), "write".to_owned());
+        if let Ok(token) = crate::github_app::get_or_mint_token(app_creds, repo, &permissions).await {
+            return Some(token);
+        }
+    }
+    std::env::var("AKSH_GITHUB_TOKEN").ok()
+}
+
 async fn send_github_check_request(
     token: &str,
     repo: &str,
@@ -160,7 +171,7 @@ pub(crate) async fn report_check_run_queued(
     job_id: &JobId,
     run_id: RunId,
 ) {
-    let token = std::env::var("AKSH_GITHUB_TOKEN").ok();
+    let token = resolve_check_run_token(shared, repo).await;
     let mut check_run_id = None;
 
     if let Some(token) = &token {
@@ -221,7 +232,7 @@ pub(crate) async fn report_check_run_in_progress(
         (repo, check_run_id)
     };
 
-    let token = std::env::var("AKSH_GITHUB_TOKEN").ok();
+    let token = resolve_check_run_token(shared, &repo).await;
     if let Some(token) = &token {
         let body = serde_json::json!({
             "status": "in_progress",
@@ -318,7 +329,7 @@ pub(crate) async fn report_check_run_completed(
         _ => "failure",
     };
 
-    let token = std::env::var("AKSH_GITHUB_TOKEN").ok();
+    let token = resolve_check_run_token(shared, &repo).await;
     if let Some(token) = &token {
         let summary = if global_issues.is_empty() {
             format!("Job completed with status: {}", conclusion)
