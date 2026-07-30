@@ -697,7 +697,13 @@ pub(crate) async fn mint_dispatch_github_token(
     let Some(app) = &shared.state.github_app else {
         return Ok(None);
     };
-    match crate::github_app::get_or_mint_token(app, &request.repository, &request.permissions).await
+    match crate::github_app::get_or_mint_token_declared(
+        app,
+        &request.repository,
+        &request.permissions,
+        request.declared,
+    )
+    .await
     {
         Ok(token) => Ok(Some(token)),
         Err(error) => {

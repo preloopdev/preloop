@@ -107,6 +107,11 @@ pub(crate) struct QueuedJob {
 pub(crate) struct GitHubTokenRequest {
     pub(crate) repository: String,
     pub(crate) permissions: BTreeMap<String, String>,
+    /// Whether the workflow wrote its own `permissions:` block.
+    ///
+    /// A declared set must be minted verbatim or fail visibly; the implicit
+    /// default may be narrowed to what the App installation actually grants.
+    pub(crate) declared: bool,
 }
 
 /// Runner metadata used by dispatch matching.

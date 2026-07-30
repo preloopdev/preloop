@@ -674,6 +674,7 @@ pub(crate) async fn submit_run_inner(
                 repository: submission.repository.clone(),
                 permissions: aksh_gha_parser::effective_token_permissions(job.permissions.as_ref())
                     .into_owned(),
+                declared: job.permissions.is_some(),
             });
 
         prebuilt.push(PrebuiltJob {
