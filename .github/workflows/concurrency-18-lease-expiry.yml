@@ -2,7 +2,7 @@ name: concurrency-18-lease-expiry
 on: workflow_dispatch
 jobs:
   lease-holder:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     timeout-minutes: 3
     concurrency:
       group: lease-expiry-18
