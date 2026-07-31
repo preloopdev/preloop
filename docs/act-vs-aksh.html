@@ -1788,14 +1788,17 @@
     </div>
 
   </div>
-        <div class="summary-card" style="margin-top: var(--space-2xl);">
+                                    <div class="summary-card" style="margin-top: var(--space-2xl);">
       <h3 style="font-size: 1.1rem; font-weight: 700; margin-bottom: var(--space-md); color: var(--text-bright);">
-        act vs agent-ci 39 Golden Scenario Benchmark Comparison
+        3-Way Golden Scenario Benchmark &amp; Behavioral Fidelity (39 Workflows)
       </h3>
       <p style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: var(--space-lg);">
         Measured on Apple M4 Max against the 39 golden scenario workflow YAML files (<code>experiments/mitm/scenarios/</code>).<br>
-        act pass rate: <strong>24 / 39 (61.5%)</strong> (avg ~0.48s for single-job).<br>
-        agent-ci pass rate: <strong>24 / 39 (61.5%)</strong> (avg ~10.4s for single-job due to official runner startup).
+        <strong>Behavioral Fidelity</strong> (Correct local outcome matching GitHub Actions intent):<br>
+        • <strong>Preloop</strong> (Rust + SmolVM microVMs): <strong>31 / 39 (79.5%)</strong> correct behavior (26/39 passed, single-job avg ~366&ndash;480ms).<br>
+        • <strong>act</strong> (Go + Docker): <strong>29 / 39 (74.4%)</strong> correct behavior (24/39 passed, single-job avg ~0.48s).<br>
+        • <strong>agent-ci</strong> (TS + Docker + official runner): <strong>29 / 39 (74.4%)</strong> correct behavior (24/39 passed, single-job avg ~10.4s).<br>
+        <em>Note: Scenarios 07, 09, 103, 107, and 14 contain intentional <code>exit 1</code> steps. Reporting <code>Failure</code> is the correct local behavior.</em>
       </p>
 
       <div class="matrix-table-wrap">
@@ -1809,7 +1812,9 @@
               <th>act Time</th>
               <th class="col-status">agent-ci</th>
               <th>agent-ci Time</th>
-              <th>Comparison Notes</th>
+              <th class="col-status">Preloop</th>
+              <th>Preloop Time</th>
+              <th>Workflow Classification</th>
             </tr>
           </thead>
           <tbody>
@@ -1821,7 +1826,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.45s</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.34s</td>
-            <td class="col-notes">both passed</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">366ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
           </tr>
           <tr>
             <td>2</td>
@@ -1831,7 +1838,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">60.57s</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">69.59s</td>
-            <td class="col-notes">both passed</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">60.46s</td>
+            <td class="col-notes"><span style='color: var(--blue);'>⏳ Sleep / Timeout Test</span></td>
           </tr>
           <tr>
             <td>3</td>
@@ -1841,7 +1850,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.45s</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.36s</td>
-            <td class="col-notes">both passed</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">519ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
           </tr>
           <tr>
             <td>4</td>
@@ -1851,7 +1862,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.45s</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.14s</td>
-            <td class="col-notes">both passed</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">431ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
           </tr>
           <tr>
             <td>5</td>
@@ -1861,7 +1874,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.39s</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.13s</td>
-            <td class="col-notes">both passed</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">485ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
           </tr>
           <tr>
             <td>6</td>
@@ -1871,7 +1886,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.51s</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.60s</td>
-            <td class="col-notes">both passed</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">447ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
           </tr>
           <tr>
             <td>7</td>
@@ -1881,7 +1898,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.46s</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">9.85s</td>
-            <td class="col-notes">both failed (intentional failure / OIDC / reusable ref)</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">447ms</td>
+            <td class="col-notes"><span style='color: var(--yellow);'>⚠️ Intentional Failure</span></td>
           </tr>
           <tr>
             <td>8</td>
@@ -1891,7 +1910,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.79s</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">20.24s</td>
-            <td class="col-notes">both passed</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">824ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
           </tr>
           <tr>
             <td>9</td>
@@ -1901,7 +1922,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">20.70s</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">42.05s</td>
-            <td class="col-notes">both failed (intentional failure / OIDC / reusable ref)</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">458ms</td>
+            <td class="col-notes"><span style='color: var(--yellow);'>⚠️ Intentional Failure</span></td>
           </tr>
           <tr>
             <td>10</td>
@@ -1911,7 +1934,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.49s</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.15s</td>
-            <td class="col-notes">both passed</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">730ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
           </tr>
           <tr>
             <td>11</td>
@@ -1921,7 +1946,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.95s</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">19.82s</td>
-            <td class="col-notes">both passed</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">480ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
           </tr>
           <tr>
             <td>12</td>
@@ -1931,7 +1958,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.45s</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.36s</td>
-            <td class="col-notes">both passed</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">400ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
           </tr>
           <tr>
             <td>13</td>
@@ -1941,7 +1970,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.45s</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.21s</td>
-            <td class="col-notes">both failed (intentional failure / OIDC / reusable ref)</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">693ms</td>
+            <td class="col-notes"><span style='color: var(--yellow);'>⚠️ Intentional Failure</span></td>
           </tr>
           <tr>
             <td>14</td>
@@ -1951,7 +1982,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.38s</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.33s</td>
-            <td class="col-notes">both passed</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">433ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
           </tr>
           <tr>
             <td>15</td>
@@ -1961,7 +1994,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">60.48s</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">69.69s</td>
-            <td class="col-notes">both passed</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">60.55s</td>
+            <td class="col-notes"><span style='color: var(--blue);'>⏳ Sleep / Timeout Test</span></td>
           </tr>
           <tr>
             <td>16</td>
@@ -1971,7 +2006,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.61s</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">9.96s</td>
-            <td class="col-notes">both failed (intentional failure / OIDC / reusable ref)</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">466ms</td>
+            <td class="col-notes"><span style='color: var(--yellow);'>⚠️ Intentional Failure</span></td>
           </tr>
           <tr>
             <td>17</td>
@@ -1981,7 +2018,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.40s</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.47s</td>
-            <td class="col-notes">both passed</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">380ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
           </tr>
           <tr>
             <td>18</td>
@@ -1991,7 +2030,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.48s</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.83s</td>
-            <td class="col-notes">both passed</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">606ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
           </tr>
           <tr>
             <td>19</td>
@@ -2001,7 +2042,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">30.01s</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">11.47s</td>
-            <td class="col-notes">agent-ci passed (Twirp artifact/cache), act failed</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">679ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
           </tr>
           <tr>
             <td>20</td>
@@ -2011,7 +2054,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.45s</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.36s</td>
-            <td class="col-notes">both passed</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">378ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
           </tr>
           <tr>
             <td>21</td>
@@ -2021,7 +2066,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.43s</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">28.13s</td>
-            <td class="col-notes">both passed</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">376ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
           </tr>
           <tr>
             <td>22</td>
@@ -2031,7 +2078,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">3.78s</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">47.81s</td>
-            <td class="col-notes">both failed (intentional failure / OIDC / reusable ref)</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">12.28s</td>
+            <td class="col-notes">Normal (Success expected)</td>
           </tr>
           <tr>
             <td>23</td>
@@ -2041,7 +2090,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">1.45s</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">22.27s</td>
-            <td class="col-notes">agent-ci passed (Twirp artifact/cache), act failed</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">755ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
           </tr>
           <tr>
             <td>24</td>
@@ -2051,7 +2102,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">30.01s</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">130.18s</td>
-            <td class="col-notes">agent-ci passed (Twirp artifact/cache), act failed</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">120.45s</td>
+            <td class="col-notes"><span style='color: var(--blue);'>⏳ Sleep / Timeout Test</span></td>
           </tr>
           <tr>
             <td>25</td>
@@ -2061,7 +2114,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">23.30s</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">44.77s</td>
-            <td class="col-notes">both passed</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">784ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
           </tr>
           <tr>
             <td>26</td>
@@ -2071,7 +2126,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">1.57s</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">40.45s</td>
-            <td class="col-notes">agent-ci passed (Twirp artifact/cache), act failed</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">799ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
           </tr>
           <tr>
             <td>27</td>
@@ -2081,7 +2138,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.39s</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.37s</td>
-            <td class="col-notes">both failed (intentional failure / OIDC / reusable ref)</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">742ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
           </tr>
           <tr>
             <td>28</td>
@@ -2091,7 +2150,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.34s</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.47s</td>
-            <td class="col-notes">both failed (intentional failure / OIDC / reusable ref)</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">454ms</td>
+            <td class="col-notes"><span style='color: var(--yellow);'>⚠️ Intentional Failure</span></td>
           </tr>
           <tr>
             <td>29</td>
@@ -2101,7 +2162,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.34s</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.89s</td>
-            <td class="col-notes">both failed (intentional failure / OIDC / reusable ref)</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">358ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
           </tr>
           <tr>
             <td>30</td>
@@ -2111,7 +2174,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.44s</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">21.42s</td>
-            <td class="col-notes">both passed</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">12.80s</td>
+            <td class="col-notes">Normal (Success expected)</td>
           </tr>
           <tr>
             <td>31</td>
@@ -2121,7 +2186,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.03s</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.65s</td>
-            <td class="col-notes">both failed (intentional failure / OIDC / reusable ref)</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">18ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
           </tr>
           <tr>
             <td>32</td>
@@ -2131,7 +2198,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">16.18s</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">2.79s</td>
-            <td class="col-notes">act passed, agent-ci failed</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">20.42s</td>
+            <td class="col-notes">Normal (Success expected)</td>
           </tr>
           <tr>
             <td>33</td>
@@ -2141,7 +2210,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.62s</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">11.95s</td>
-            <td class="col-notes">both passed</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">11.96s</td>
+            <td class="col-notes">Normal (Success expected)</td>
           </tr>
           <tr>
             <td>34</td>
@@ -2151,7 +2222,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">11.16s</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">16.61s</td>
-            <td class="col-notes">both passed</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">30.00s</td>
+            <td class="col-notes">Normal (Success expected)</td>
           </tr>
           <tr>
             <td>35</td>
@@ -2161,7 +2234,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.45s</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">3.11s</td>
-            <td class="col-notes">both failed (intentional failure / OIDC / reusable ref)</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">30.00s</td>
+            <td class="col-notes">Normal (Success expected)</td>
           </tr>
           <tr>
             <td>36</td>
@@ -2171,7 +2246,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.83s</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">9.94s</td>
-            <td class="col-notes">act passed, agent-ci failed</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">2.12s</td>
+            <td class="col-notes">Normal (Success expected)</td>
           </tr>
           <tr>
             <td>37</td>
@@ -2181,7 +2258,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">7.93s</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">38.68s</td>
-            <td class="col-notes">both failed (intentional failure / OIDC / reusable ref)</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">30.00s</td>
+            <td class="col-notes">Normal (Success expected)</td>
           </tr>
           <tr>
             <td>38</td>
@@ -2191,7 +2270,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">2.40s</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">12.60s</td>
-            <td class="col-notes">act passed, agent-ci failed</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">30.00s</td>
+            <td class="col-notes">Normal (Success expected)</td>
           </tr>
           <tr>
             <td>39</td>
@@ -2201,7 +2282,9 @@
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">2.36s</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td style="font-family: var(--font-mono); font-size: 0.78rem;">13.78s</td>
-            <td class="col-notes">act passed, agent-ci failed</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">3.12s</td>
+            <td class="col-notes">Normal (Success expected)</td>
           </tr>
           </tbody>
         </table>
