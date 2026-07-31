@@ -286,7 +286,7 @@ impl SmolVmProvider {
         operation: &'static str,
         args: &[String],
     ) -> Result<ExecOutput, VmError> {
-        self.checked_with_network(operation, args, None).await
+        self.checked_with_network(operation, args, None, None).await
     }
 
     async fn checked_with_network(
@@ -294,6 +294,7 @@ impl SmolVmProvider {
         operation: &'static str,
         args: &[String],
         network: Option<&NetworkPolicy>,
+        staging_dir: Option<&Path>,
     ) -> Result<ExecOutput, VmError> {
         let mut command = self.command();
         match network {
@@ -304,6 +305,9 @@ impl SmolVmProvider {
                 command.env_remove("SMOLVM_EGRESS_FLOOR");
             }
             None => {}
+        }
+        if let Some(staging_dir) = staging_dir {
+            command.env("SMOLVM_PACK_STAGING", staging_dir);
         }
         command
             .args(args)
@@ -362,6 +366,17 @@ impl SmolVmProvider {
         self.checked(operation, args).await
     }
 
+    async fn exclusive_with_staging(
+        &self,
+        operation: &'static str,
+        args: &[String],
+        staging_dir: &Path,
+    ) -> Result<ExecOutput, VmError> {
+        let _guard = self.lifecycle_lock.write().await;
+        self.checked_with_network(operation, args, None, Some(staging_dir))
+            .await
+    }
+
     async fn exclusive_with_network(
         &self,
         operation: &'static str,
@@ -369,7 +384,7 @@ impl SmolVmProvider {
         network: &NetworkPolicy,
     ) -> Result<ExecOutput, VmError> {
         let _guard = self.lifecycle_lock.write().await;
-        self.checked_with_network(operation, args, Some(network))
+        self.checked_with_network(operation, args, Some(network), None)
             .await
     }
 
@@ -721,7 +736,8 @@ impl VmProvider for SmolVmProvider {
                 "pack output path must be absolute".into(),
             ));
         }
-        self.exclusive(
+        let staging_dir = output.parent().expect("absolute output has a parent");
+        self.exclusive_with_staging(
             "pack",
             &[
                 "pack".into(),
@@ -731,6 +747,7 @@ impl VmProvider for SmolVmProvider {
                 "-o".into(),
                 output.display().to_string(),
             ],
+            staging_dir,
         )
         .await
         .map(|_| ())
