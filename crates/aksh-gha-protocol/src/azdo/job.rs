@@ -260,6 +260,9 @@ impl Serialize for TaskStep {
         let mut inputs = self.inputs.clone();
         if let Some(script) = &self.script {
             inputs.insert("script".to_owned(), script.clone());
+            if let Some(wd) = &self.working_directory {
+                inputs.insert("workingDirectory".to_owned(), wd.clone());
+            }
         }
 
         let field_count = 7

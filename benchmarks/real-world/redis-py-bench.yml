@@ -1,0 +1,38 @@
+name: redis-py Container CI
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  ci:
+    name: redis-py Container CI
+    runs-on: self-hosted
+    timeout-minutes: 60
+    container:
+      image: python:3.12-slim
+    services:
+      redis:
+        image: redis:7-alpine
+    steps:
+      - name: Runtime versions
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          python --version
+          pip --version
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          apt-get install --yes --no-install-recommends build-essential
+      - name: Install dependencies
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          pip install --disable-pip-version-check -r dev_requirements.txt
+          pip install --disable-pip-version-check -e .
+      - name: Verify service
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          python -c 'import redis; client = redis.Redis.from_url("redis://redis:6379"); client.ping()'
+      - name: Test
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          pytest -q tests --redis-url redis://redis:6379

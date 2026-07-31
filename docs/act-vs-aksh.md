@@ -289,49 +289,57 @@ and acquirejob response schemas.
 
 ### 6.1 Scenario Benchmark Comparison (39 Golden Scenarios)
 
-Both `act v0.2.89` and `agent-ci v0.17.1` measured on the same Apple M4 Max host against the 39 scenario workflow YAML files (`experiments/mitm/scenarios/`):
+All three tools measured on the same Apple M4 Max host against the 39 scenario workflow YAML files (`experiments/mitm/scenarios/`).
+Each Preloop job ran in its own isolated SmolVM microVM forked from the warm runner base image.
 
-| # | Scenario | File | act Status | act Time | agent-ci Status | agent-ci Time | Notes / Differences |
-|---|---|---|:---:|:---:|:---:|:---:|---|
-| 1 | `02-trivial-job` | `02-trivial-job.yml` | ✅ PASS | 0.45s | ✅ PASS | 10.34s | both passed |
-| 2 | `03-cancellation` | `03-cancellation.yml` | ✅ PASS | 60.57s | ✅ PASS | 69.59s | both passed |
-| 3 | `04-request-ack` | `04-request-ack.yml` | ✅ PASS | 0.45s | ✅ PASS | 10.36s | both passed |
-| 4 | `05-multi-job` | `05-multi-job-a.yml` | ✅ PASS | 0.45s | ✅ PASS | 10.14s | both passed |
-| 5 | `05-multi-job` | `05-multi-job-b.yml` | ✅ PASS | 0.39s | ✅ PASS | 10.13s | both passed |
-| 6 | `06-multi-step` | `06-multi-step.yml` | ✅ PASS | 0.51s | ✅ PASS | 10.60s | both passed |
-| 7 | `07-step-failure` | `07-step-failure.yml` | ❌ FAIL | 0.46s | ❌ FAIL | 9.85s | both failed (intentional error / OIDC / reusable ref) |
-| 8 | `08-job-outputs-needs` | `08-job-outputs-needs.yml` | ✅ PASS | 0.79s | ✅ PASS | 20.24s | both passed |
-| 9 | `09-matrix-fan-out` | `09-matrix-fan-out.yml` | ❌ FAIL | 20.70s | ❌ FAIL | 42.05s | both failed (intentional error / OIDC / reusable ref) |
-| 10 | `10-uses-checkout` | `10-uses-checkout.yml` | ✅ PASS | 0.49s | ✅ PASS | 10.15s | both passed |
-| 11 | `101-dynamic-matrix-dataflow` | `101-dynamic-matrix-dataflow.yml` | ✅ PASS | 0.95s | ✅ PASS | 19.82s | both passed |
-| 12 | `102-mask-and-secret-propagation` | `102-mask-and-secret-propagation.yml` | ✅ PASS | 0.45s | ✅ PASS | 10.36s | both passed |
-| 13 | `103-composite-nested-post` | `103-composite-nested-post.yml` | ❌ FAIL | 0.45s | ❌ FAIL | 10.21s | both failed (intentional error / OIDC / reusable ref) |
-| 14 | `104-job-defaults-env-cascade` | `104-job-defaults-env-cascade.yml` | ✅ PASS | 0.38s | ✅ PASS | 10.33s | both passed |
-| 15 | `105-concurrency-cancellation-group` | `105-concurrency-cancellation-group.yml` | ✅ PASS | 60.48s | ✅ PASS | 69.69s | both passed |
-| 16 | `107-continue-on-error-status-funcs` | `107-continue-on-error-status-funcs.yml` | ❌ FAIL | 0.61s | ❌ FAIL | 9.96s | both failed (intentional error / OIDC / reusable ref) |
-| 17 | `108-workflow-dispatch-inputs` | `108-workflow-dispatch-inputs.yml` | ✅ PASS | 0.40s | ✅ PASS | 10.47s | both passed |
-| 18 | `109-log-streaming-backpressure` | `109-log-streaming-backpressure.yml` | ✅ PASS | 0.48s | ✅ PASS | 10.83s | both passed |
-| 19 | `11-cache-roundtrip` | `11-cache-roundtrip.yml` | ❌ FAIL | 30.01s | ✅ PASS | 11.47s | agent-ci passed (artifacts/cache), act failed |
-| 20 | `110-environment-deployment-url` | `110-environment-deployment-url.yml` | ✅ PASS | 0.45s | ✅ PASS | 10.36s | both passed |
-| 21 | `111-github-state-post-execution` | `111-github-state-post-execution.yml` | ✅ PASS | 0.43s | ✅ PASS | 28.13s | both passed |
-| 22 | `112-service-container-health-ports` | `112-service-container-health-ports.yml` | ❌ FAIL | 3.78s | ❌ FAIL | 47.81s | both failed (intentional error / OIDC / reusable ref) |
-| 23 | `113-artifact-v4-multi-pattern` | `113-artifact-v4-multi-pattern.yml` | ❌ FAIL | 1.45s | ✅ PASS | 22.27s | agent-ci passed (artifacts/cache), act failed |
-| 24 | `114-step-timeout-graceful-kill` | `114-step-timeout-graceful-kill.yml` | ❌ FAIL | 30.01s | ✅ PASS | 130.18s | agent-ci passed (artifacts/cache), act failed |
-| 25 | `115-cache-v2-restore-fallback` | `115-cache-v2-restore-fallback.yml` | ✅ PASS | 23.30s | ✅ PASS | 44.77s | both passed |
-| 26 | `12-artifact` | `12-artifact.yml` | ❌ FAIL | 1.57s | ✅ PASS | 40.45s | agent-ci passed (artifacts/cache), act failed |
-| 27 | `13-composite-action` | `13-composite-action.yml` | ❌ FAIL | 0.39s | ❌ FAIL | 10.37s | both failed (intentional error / OIDC / reusable ref) |
-| 28 | `14-annotations` | `14-annotations.yml` | ❌ FAIL | 0.34s | ❌ FAIL | 10.47s | both failed (intentional error / OIDC / reusable ref) |
-| 29 | `15-oidc-id-token` | `15-oidc-id-token.yml` | ❌ FAIL | 0.34s | ❌ FAIL | 10.89s | both failed (intentional error / OIDC / reusable ref) |
-| 30 | `16-container-job` | `16-container-job.yml` | ✅ PASS | 0.44s | ✅ PASS | 21.42s | both passed |
-| 31 | `163-reusable-caller` | `163-reusable-caller.yml` | ❌ FAIL | 0.03s | ❌ FAIL | 0.65s | both failed (intentional error / OIDC / reusable ref) |
-| 32 | `17-service-container` | `17-service-container.yml` | ✅ PASS | 16.18s | ❌ FAIL | 2.79s | act passed, agent-ci failed |
-| 33 | `30-container-job-basic` | `30-container-job-basic.yml` | ✅ PASS | 0.62s | ✅ PASS | 11.95s | both passed |
-| 34 | `31-container-with-services` | `31-container-with-services.yml` | ✅ PASS | 11.16s | ✅ PASS | 16.61s | both passed |
-| 35 | `32-services-no-container` | `32-services-no-container.yml` | ❌ FAIL | 0.45s | ❌ FAIL | 3.11s | both failed (intentional error / OIDC / reusable ref) |
-| 36 | `33-container-env-options` | `33-container-env-options.yml` | ✅ PASS | 0.83s | ❌ FAIL | 9.94s | act passed, agent-ci failed |
-| 37 | `34-container-with-checkout` | `34-container-with-checkout.yml` | ❌ FAIL | 7.93s | ❌ FAIL | 38.68s | both failed (intentional error / OIDC / reusable ref) |
-| 38 | `35-container-lifecycle` | `35-container-lifecycle.yml` | ✅ PASS | 2.40s | ❌ FAIL | 12.60s | act passed, agent-ci failed |
-| 39 | `36-docker-action` | `36-docker-action.yml` | ✅ PASS | 2.36s | ❌ FAIL | 13.78s | act passed, agent-ci failed |
+**Behavioral Fidelity Summary** (Correct local outcome matching GitHub Actions intent):
+- **Preloop (aksh)**: **31 / 39 (79.5%)** correct behavior (26/39 passed)
+- **act**: **29 / 39 (74.4%)** correct behavior (24/39 passed)
+- **agent-ci**: **29 / 39 (74.4%)** correct behavior (24/39 passed)
+
+*Note*: Scenarios 07, 09, 103, 107, and 14 contain intentional `exit 1` / error steps. Reporting **Failure** is the correct local behavior for these workflows.
+
+| # | Scenario | File | act Status | act Time | agent-ci Status | agent-ci Time | Preloop Status | Preloop Time | Workflow Classification |
+|---|---|---|:---:|:---:|:---:|:---:|:---:|:---:|---|
+| 1 | `02-trivial-job` | `02-trivial-job.yml` | ✅ PASS | 0.45s | ✅ PASS | 10.34s | ✅ PASS | 366ms | Normal (Success expected) |
+| 2 | `03-cancellation` | `03-cancellation.yml` | ✅ PASS | 60.57s | ✅ PASS | 69.59s | ✅ PASS | 60.46s | ⏳ Sleep / Timeout Test |
+| 3 | `04-request-ack` | `04-request-ack.yml` | ✅ PASS | 0.45s | ✅ PASS | 10.36s | ✅ PASS | 519ms | Normal (Success expected) |
+| 4 | `05-multi-job` | `05-multi-job-a.yml` | ✅ PASS | 0.45s | ✅ PASS | 10.14s | ✅ PASS | 431ms | Normal (Success expected) |
+| 5 | `05-multi-job` | `05-multi-job-b.yml` | ✅ PASS | 0.39s | ✅ PASS | 10.13s | ✅ PASS | 485ms | Normal (Success expected) |
+| 6 | `06-multi-step` | `06-multi-step.yml` | ✅ PASS | 0.51s | ✅ PASS | 10.60s | ✅ PASS | 447ms | Normal (Success expected) |
+| 7 | `07-step-failure` | `07-step-failure.yml` | ❌ FAIL | 0.46s | ❌ FAIL | 9.85s | ❌ FAIL | 447ms | ⚠️ Intentional Failure |
+| 8 | `08-job-outputs-needs` | `08-job-outputs-needs.yml` | ✅ PASS | 0.79s | ✅ PASS | 20.24s | ✅ PASS | 824ms | Normal (Success expected) |
+| 9 | `09-matrix-fan-out` | `09-matrix-fan-out.yml` | ❌ FAIL | 20.70s | ❌ FAIL | 42.05s | ❌ FAIL | 458ms | ⚠️ Intentional Failure |
+| 10 | `10-uses-checkout` | `10-uses-checkout.yml` | ✅ PASS | 0.49s | ✅ PASS | 10.15s | ✅ PASS | 730ms | Normal (Success expected) |
+| 11 | `101-dynamic-matrix-dataflow` | `101-dynamic-matrix-dataflow.yml` | ✅ PASS | 0.95s | ✅ PASS | 19.82s | ✅ PASS | 480ms | Normal (Success expected) |
+| 12 | `102-mask-and-secret-propagation` | `102-mask-and-secret-propagation.yml` | ✅ PASS | 0.45s | ✅ PASS | 10.36s | ✅ PASS | 400ms | Normal (Success expected) |
+| 13 | `103-composite-nested-post` | `103-composite-nested-post.yml` | ❌ FAIL | 0.45s | ❌ FAIL | 10.21s | ❌ FAIL | 693ms | ⚠️ Intentional Failure |
+| 14 | `104-job-defaults-env-cascade` | `104-job-defaults-env-cascade.yml` | ✅ PASS | 0.38s | ✅ PASS | 10.33s | ✅ PASS | 433ms | Normal (Success expected) |
+| 15 | `105-concurrency-cancellation-group` | `105-concurrency-cancellation-group.yml` | ✅ PASS | 60.48s | ✅ PASS | 69.69s | ✅ PASS | 60.55s | ⏳ Sleep / Timeout Test |
+| 16 | `107-continue-on-error-status-funcs` | `107-continue-on-error-status-funcs.yml` | ❌ FAIL | 0.61s | ❌ FAIL | 9.96s | ❌ FAIL | 466ms | ⚠️ Intentional Failure |
+| 17 | `108-workflow-dispatch-inputs` | `108-workflow-dispatch-inputs.yml` | ✅ PASS | 0.40s | ✅ PASS | 10.47s | ✅ PASS | 380ms | Normal (Success expected) |
+| 18 | `109-log-streaming-backpressure` | `109-log-streaming-backpressure.yml` | ✅ PASS | 0.48s | ✅ PASS | 10.83s | ✅ PASS | 606ms | Normal (Success expected) |
+| 19 | `11-cache-roundtrip` | `11-cache-roundtrip.yml` | ❌ FAIL | 30.01s | ✅ PASS | 11.47s | ✅ PASS | 679ms | Normal (Success expected) |
+| 20 | `110-environment-deployment-url` | `110-environment-deployment-url.yml` | ✅ PASS | 0.45s | ✅ PASS | 10.36s | ✅ PASS | 378ms | Normal (Success expected) |
+| 21 | `111-github-state-post-execution` | `111-github-state-post-execution.yml` | ✅ PASS | 0.43s | ✅ PASS | 28.13s | ✅ PASS | 376ms | Normal (Success expected) |
+| 22 | `112-service-container-health-ports` | `112-service-container-health-ports.yml` | ❌ FAIL | 3.78s | ❌ FAIL | 47.81s | ❌ FAIL | 12.28s | Normal (Success expected) |
+| 23 | `113-artifact-v4-multi-pattern` | `113-artifact-v4-multi-pattern.yml` | ❌ FAIL | 1.45s | ✅ PASS | 22.27s | ✅ PASS | 755ms | Normal (Success expected) |
+| 24 | `114-step-timeout-graceful-kill` | `114-step-timeout-graceful-kill.yml` | ❌ FAIL | 30.01s | ✅ PASS | 130.18s | ✅ PASS | 120.45s | ⏳ Sleep / Timeout Test |
+| 25 | `115-cache-v2-restore-fallback` | `115-cache-v2-restore-fallback.yml` | ✅ PASS | 23.30s | ✅ PASS | 44.77s | ✅ PASS | 784ms | Normal (Success expected) |
+| 26 | `12-artifact` | `12-artifact.yml` | ❌ FAIL | 1.57s | ✅ PASS | 40.45s | ✅ PASS | 799ms | Normal (Success expected) |
+| 27 | `13-composite-action` | `13-composite-action.yml` | ❌ FAIL | 0.39s | ❌ FAIL | 10.37s | ❌ FAIL | 742ms | Normal (Success expected) |
+| 28 | `14-annotations` | `14-annotations.yml` | ❌ FAIL | 0.34s | ❌ FAIL | 10.47s | ❌ FAIL | 454ms | ⚠️ Intentional Failure |
+| 29 | `15-oidc-id-token` | `15-oidc-id-token.yml` | ❌ FAIL | 0.34s | ❌ FAIL | 10.89s | ✅ PASS | 358ms | Normal (Success expected) |
+| 30 | `16-container-job` | `16-container-job.yml` | ✅ PASS | 0.44s | ✅ PASS | 21.42s | ✅ PASS | 12.80s | Normal (Success expected) |
+| 31 | `163-reusable-caller` | `163-reusable-caller.yml` | ❌ FAIL | 0.03s | ❌ FAIL | 0.65s | ❌ FAIL | 18ms | Normal (Success expected) |
+| 32 | `17-service-container` | `17-service-container.yml` | ✅ PASS | 16.18s | ❌ FAIL | 2.79s | ✅ PASS | 20.42s | Normal (Success expected) |
+| 33 | `30-container-job-basic` | `30-container-job-basic.yml` | ✅ PASS | 0.62s | ✅ PASS | 11.95s | ✅ PASS | 11.96s | Normal (Success expected) |
+| 34 | `31-container-with-services` | `31-container-with-services.yml` | ✅ PASS | 11.16s | ✅ PASS | 16.61s | ❌ FAIL | 30.00s | Normal (Success expected) |
+| 35 | `32-services-no-container` | `32-services-no-container.yml` | ❌ FAIL | 0.45s | ❌ FAIL | 3.11s | ❌ FAIL | 30.00s | Normal (Success expected) |
+| 36 | `33-container-env-options` | `33-container-env-options.yml` | ✅ PASS | 0.83s | ❌ FAIL | 9.94s | ✅ PASS | 2.12s | Normal (Success expected) |
+| 37 | `34-container-with-checkout` | `34-container-with-checkout.yml` | ❌ FAIL | 7.93s | ❌ FAIL | 38.68s | ❌ FAIL | 30.00s | Normal (Success expected) |
+| 38 | `35-container-lifecycle` | `35-container-lifecycle.yml` | ✅ PASS | 2.40s | ❌ FAIL | 12.60s | ❌ FAIL | 30.00s | Normal (Success expected) |
+| 39 | `36-docker-action` | `36-docker-action.yml` | ✅ PASS | 2.36s | ❌ FAIL | 13.78s | ❌ FAIL | 3.12s | Normal (Success expected) |
 
 ## 7. Isolation & Security
 
