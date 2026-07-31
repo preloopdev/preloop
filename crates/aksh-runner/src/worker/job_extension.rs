@@ -498,6 +498,16 @@ pub fn build_step_list(steps: &[serde_json::Value], job_message: &serde_json::Va
                     let working_dir = inputs
                         .get("workingDirectory")
                         .cloned()
+                        .or_else(|| {
+                            step.get("workingDirectory")
+                                .and_then(|v| v.as_str())
+                                .map(String::from)
+                        })
+                        .or_else(|| {
+                            step.get("working-directory")
+                                .and_then(|v| v.as_str())
+                                .map(String::from)
+                        })
                         .or_else(|| default_working_dir.clone());
                     StepType::Script {
                         script,
@@ -557,14 +567,20 @@ pub fn build_step_list(steps: &[serde_json::Value], job_message: &serde_json::Va
                 .unwrap_or("")
                 .to_string();
             if !run.is_empty() {
-                let shell = step.get("shell").and_then(|v| v.as_str()).map(String::from);
+                let shell = step
+                    .get("shell")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .or_else(|| default_shell.clone());
+                let working_directory = step
+                    .get("working-directory")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .or_else(|| default_working_dir.clone());
                 StepType::Script {
                     script: run,
                     shell,
-                    working_directory: step
-                        .get("working-directory")
-                        .and_then(|v| v.as_str())
-                        .map(String::from),
+                    working_directory,
                 }
             } else {
                 StepType::Script {
