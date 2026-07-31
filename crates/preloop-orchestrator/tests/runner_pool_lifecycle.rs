@@ -320,6 +320,7 @@ impl Fixture {
         let config = RunnerPoolConfig {
             size: 1,
             use_fork: false,
+            use_packed_artifact: false,
             name_prefix: format!("pool-{label}-{id}"),
             base_image: "ghcr.io/preloop/base:latest".to_owned(),
             workspace: None,
