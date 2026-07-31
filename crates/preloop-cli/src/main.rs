@@ -639,30 +639,30 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
     }
 
     let shutdown = tokio_util::sync::CancellationToken::new();
-    let mut pool = if env_flag("PRELOOP_RUNNER_POOL_ENABLED", true) {
-        match local_runner_pool_config(
-            &home,
-            runner_url,
-            control_origin,
-            queue_depth,
-            next_job_runs_on,
-        ) {
-            Ok(config) => {
-                let pool_shutdown = shutdown.clone();
-                Some(tokio::spawn(async move {
-                    RunnerPool::new(std::sync::Arc::new(SmolVmProvider::default()), config)?
-                        .run(pool_shutdown)
-                        .await
-                }))
+    let pool_enabled = env_flag("PRELOOP_RUNNER_POOL_ENABLED", false);
+    let mut pool = match local_runner_pool_config(
+        &home,
+        runner_url,
+        control_origin,
+        queue_depth,
+        next_job_runs_on,
+        pool_enabled,
+    ) {
+        Ok(config) => {
+            if !pool_enabled {
+                tracing::info!("local runner pool disabled; provisioning one VM per queued job");
             }
-            Err(error) => {
-                tracing::warn!(%error, "local runner pool unavailable; control plane remains available");
-                None
-            }
+            let pool_shutdown = shutdown.clone();
+            Some(tokio::spawn(async move {
+                RunnerPool::new(std::sync::Arc::new(SmolVmProvider::default()), config)?
+                    .run(pool_shutdown)
+                    .await
+            }))
         }
-    } else {
-        tracing::info!("local runner pool disabled by PRELOOP_RUNNER_POOL_ENABLED");
-        None
+        Err(error) => {
+            tracing::warn!(%error, "local runner provisioning unavailable; control plane remains available");
+            None
+        }
     };
 
     if let Some(pool_task) = pool.as_mut() {
@@ -735,6 +735,7 @@ fn local_runner_pool_config(
     control_origin: Option<String>,
     queue_depth: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     next_job_runs_on: std::sync::Arc<std::sync::RwLock<Vec<String>>>,
+    pool_enabled: bool,
 ) -> anyhow::Result<RunnerPoolConfig> {
     let control_bridge = home.join("control-bridge");
     std::fs::create_dir_all(&control_bridge)?;
@@ -762,11 +763,19 @@ fn local_runner_pool_config(
         .filter(|path| linux_runner_bundle(path))
         .context("Linux runner bundle unavailable; run `just build-preloop` to build target/aarch64-unknown-linux-gnu/debug/preloop-runner")?;
     Ok(RunnerPoolConfig {
-        size: std::env::var("PRELOOP_RUNNER_POOL_SIZE")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or_else(|| host_runner_pool_size(RUNNER_CPUS)),
-        use_fork: env_flag("PRELOOP_USE_FORK", true),
+        // Size zero is the deliberate low-memory mode: keep the local
+        // supervisor alive, but build a runner only when a job is queued.
+        size: if pool_enabled {
+            std::env::var("PRELOOP_RUNNER_POOL_SIZE")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or_else(|| host_runner_pool_size(RUNNER_CPUS))
+        } else {
+            0
+        },
+        // A fork base is useful only when the warm-pool mode is enabled. The
+        // low-memory path boots and tears down a socket-backed VM per job.
+        use_fork: pool_enabled && env_flag("PRELOOP_USE_FORK", true),
         name_prefix: "preloop-runner".into(),
         base_image: std::env::var("PRELOOP_RUNNER_BASE_IMAGE")
             .unwrap_or_else(|_| "ubuntu:24.04".into()),
