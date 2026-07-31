@@ -763,6 +763,7 @@ fn local_runner_pool_config(
         })
         .filter(|path| linux_runner_bundle(path))
         .context("Linux runner bundle unavailable; run `just build-preloop` to build target/aarch64-unknown-linux-gnu/debug/preloop-runner")?;
+    let use_packed_artifact = env_flag("PRELOOP_USE_PACKED_GOLDEN", false);
     Ok(RunnerPoolConfig {
         // Size zero is the deliberate low-memory mode: keep the local
         // supervisor alive, but build a runner only when a job is queued.
@@ -774,10 +775,11 @@ fn local_runner_pool_config(
         } else {
             0
         },
-        // A fork base is useful only when the warm-pool mode is enabled. The
-        // low-memory path boots and tears down a socket-backed VM per job.
-        use_fork: pool_enabled && env_flag("PRELOOP_USE_FORK", true),
-        use_packed_artifact: env_flag("PRELOOP_USE_PACKED_GOLDEN", false),
+        // Forking is safe only when the warm pool has a prepared packed
+        // artifact. A live OCI golden does not carry post-create filesystem
+        // mutations into SmolVM forks.
+        use_packed_artifact,
+        use_fork: pool_enabled && use_packed_artifact && env_flag("PRELOOP_USE_FORK", true),
         name_prefix: "preloop-runner".into(),
         base_image: std::env::var("PRELOOP_RUNNER_BASE_IMAGE")
             .unwrap_or_else(|_| "ubuntu:24.04".into()),
