@@ -1,0 +1,23 @@
+name: Docker Compose Container CI
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  ci:
+    name: Docker Compose Container CI
+    runs-on: self-hosted
+    timeout-minutes: 60
+    container:
+      image: docker:27-cli
+      options: --volume /var/run/docker.sock:/var/run/docker.sock
+    steps:
+      - name: Runtime versions
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          docker version
+          docker buildx version
+      - name: Unit test image
+        run: cd "$GITHUB_WORKSPACE" && docker buildx bake test
+      - name: Build CLI image
+        run: cd "$GITHUB_WORKSPACE" && docker buildx bake binary
