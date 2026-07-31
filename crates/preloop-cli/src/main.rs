@@ -639,25 +639,30 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
     }
 
     let shutdown = tokio_util::sync::CancellationToken::new();
-    let mut pool = match local_runner_pool_config(
-        &home,
-        runner_url,
-        control_origin,
-        queue_depth,
-        next_job_runs_on,
-    ) {
-        Ok(config) => {
-            let pool_shutdown = shutdown.clone();
-            Some(tokio::spawn(async move {
-                RunnerPool::new(std::sync::Arc::new(SmolVmProvider::default()), config)?
-                    .run(pool_shutdown)
-                    .await
-            }))
+    let mut pool = if env_flag("PRELOOP_RUNNER_POOL_ENABLED", true) {
+        match local_runner_pool_config(
+            &home,
+            runner_url,
+            control_origin,
+            queue_depth,
+            next_job_runs_on,
+        ) {
+            Ok(config) => {
+                let pool_shutdown = shutdown.clone();
+                Some(tokio::spawn(async move {
+                    RunnerPool::new(std::sync::Arc::new(SmolVmProvider::default()), config)?
+                        .run(pool_shutdown)
+                        .await
+                }))
+            }
+            Err(error) => {
+                tracing::warn!(%error, "local runner pool unavailable; control plane remains available");
+                None
+            }
         }
-        Err(error) => {
-            tracing::warn!(%error, "local runner pool unavailable; control plane remains available");
-            None
-        }
+    } else {
+        tracing::info!("local runner pool disabled by PRELOOP_RUNNER_POOL_ENABLED");
+        None
     };
 
     if let Some(pool_task) = pool.as_mut() {
@@ -761,10 +766,7 @@ fn local_runner_pool_config(
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or_else(|| host_runner_pool_size(RUNNER_CPUS)),
-        use_fork: std::env::var("PRELOOP_USE_FORK")
-            .ok()
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(true),
+        use_fork: env_flag("PRELOOP_USE_FORK", true),
         name_prefix: "preloop-runner".into(),
         base_image: std::env::var("PRELOOP_RUNNER_BASE_IMAGE")
             .unwrap_or_else(|_| "ubuntu:24.04".into()),
@@ -884,6 +886,21 @@ fn linux_runner_bundle(path: &std::path::Path) -> bool {
     };
     let mut magic = [0_u8; 4];
     file.read_exact(&mut magic).is_ok() && magic == *b"\x7fELF"
+}
+
+fn env_flag(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| parse_flag(&value))
+        .unwrap_or(default)
+}
+
+fn parse_flag(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
@@ -1504,6 +1521,19 @@ mod tests {
                 "warm pool {size} parks more than twice the CPU budget of {by_cpu}"
             );
         }
+    }
+
+    #[test]
+    fn env_flag_accepts_common_boolean_values() {
+        for value in ["1", "true", "yes", "on", " TRUE "] {
+            assert_eq!(parse_flag(value), Some(true));
+        }
+        for value in ["0", "false", "no", "off", " OFF "] {
+            assert_eq!(parse_flag(value), Some(false));
+        }
+        assert_eq!(parse_flag("maybe"), None);
+        assert!(env_flag("__PRELOOP_TEST_FLAG_UNSET__", true));
+        assert!(!env_flag("__PRELOOP_TEST_FLAG_UNSET__", false));
     }
 
     #[test]
