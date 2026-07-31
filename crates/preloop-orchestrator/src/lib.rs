@@ -285,7 +285,8 @@ fn base_install_commands() -> Vec<Vec<String>> {
               apt-get install -y -qq {DOCKER_PACKAGES} && \
               mkdir -p {DOCKER_DATA_ROOT} /etc/docker && \
               printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\"}}\\n' > /etc/docker/daemon.json \
-              || true)"
+              || true) && \
+             apt-get clean && rm -rf /var/lib/apt/lists/*"
         ),
     ]]
     .into_iter()
@@ -1062,7 +1063,10 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             image: self.config.base_image.clone(),
             cpus: self.config.cpus,
             memory_mib: self.config.memory_mib,
-            storage_gib: self.config.storage_gib,
+            // Packing exports a second copy of the guest filesystem before
+            // producing the artifact. Give the one-shot builder headroom
+            // without increasing the storage allocated to job VMs.
+            storage_gib: self.config.storage_gib.max(40),
             network: NetworkPolicy::PublicOnly,
             volumes: Vec::new(),
             sockets: Vec::new(),
@@ -1075,9 +1079,22 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             return Err(error);
         }
         self.provider.stop(&name).await?;
-        self.provider
-            .pack(&name, &self.config.artifact_stem)
-            .await?;
+        let temporary = payload
+            .parent()
+            .map(|parent| parent.join(format!(".tmp-golden-{}", uuid::Uuid::new_v4())))
+            .ok_or_else(|| {
+                OrchestratorError::Config(format!(
+                    "golden artifact path has no parent: {}",
+                    payload.display()
+                ))
+            })?;
+        if let Err(error) = self.provider.pack(&name, &temporary).await {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error.into());
+        }
+        std::fs::rename(&temporary, &payload).inspect_err(|_| {
+            let _ = std::fs::remove_file(&temporary);
+        })?;
         self.provider.delete(&name).await?;
         if !payload.is_file() {
             return Err(OrchestratorError::Config(format!(
