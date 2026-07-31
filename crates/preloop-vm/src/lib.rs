@@ -308,6 +308,10 @@ impl SmolVmProvider {
         }
         if let Some(staging_dir) = staging_dir {
             command.env("SMOLVM_PACK_STAGING", staging_dir);
+            // smolvm-pack uses tempfile::tempdir() while assembling the
+            // archive. Keep that scratch space beside the output instead of
+            // falling back to a small host /tmp tmpfs.
+            command.env("TMPDIR", staging_dir);
         }
         command
             .args(args)
