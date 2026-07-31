@@ -48,6 +48,7 @@ args="$0.args"
 printf 'SMOLVM_EGRESS_FLOOR=%s\n' "${SMOLVM_EGRESS_FLOOR-}" > "$0.env"
 env_file="$0.env"
 printf 'SMOLVM_EGRESS_FLOOR=%s\n' "${SMOLVM_EGRESS_FLOOR-}" > "$env_file"
+printf 'TMPDIR=%s\n' "${TMPDIR-}" > "$0.tmpdir"
 for arg in "$@"; do
   printf '%s\n' "$arg" >> "$args"
 done
@@ -109,6 +110,13 @@ esac
 
     fn captured_env(executable: &Path) -> String {
         fs::read_to_string(executable.with_extension("env"))
+            .unwrap_or_default()
+            .trim()
+            .to_owned()
+    }
+
+    fn captured_tmpdir(executable: &Path) -> String {
+        fs::read_to_string(executable.with_extension("tmpdir"))
             .unwrap_or_default()
             .trim()
             .to_owned()
@@ -406,6 +414,10 @@ esac
                 "-o".to_owned(),
                 output.display().to_string(),
             ]
+        );
+        assert_eq!(
+            captured_tmpdir(&executable),
+            format!("TMPDIR={}", output.parent().unwrap().display())
         );
 
         let (_directory, relative_executable) = fake_smolvm();
