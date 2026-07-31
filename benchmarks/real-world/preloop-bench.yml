@@ -1,0 +1,23 @@
+name: Preloop CI
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  ci:
+    name: Preloop CI
+    runs-on: self-hosted
+    timeout-minutes: 60
+    steps:
+      - name: Runtime versions
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          rustc --version
+          cargo --version
+          git --version
+      - name: Format check
+        run: cd "$GITHUB_WORKSPACE" && cargo fmt --all --check
+      - name: Check
+        run: cd "$GITHUB_WORKSPACE" && cargo metadata --no-deps --format-version 1 >/dev/null
+      - name: Workspace smoke
+        run: cd "$GITHUB_WORKSPACE" && test -f Cargo.toml && test -d crates

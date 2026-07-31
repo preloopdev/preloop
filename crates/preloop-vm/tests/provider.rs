@@ -451,12 +451,15 @@ esac
     }
 
     #[tokio::test]
-    async fn public_only_sets_smolvm_egress_floor_strict() {
+    async fn public_only_selects_virtio_net_and_sets_smolvm_egress_floor_strict() {
         let (_directory, executable) = fake_smolvm();
         let provider = SmolVmProvider::new(executable.clone());
         let mut spec = valid_spec(MachineName::new("test-floor").unwrap());
         spec.network = NetworkPolicy::PublicOnly;
         provider.create(&spec).await.unwrap();
+        assert!(captured_args(&executable)
+            .windows(2)
+            .any(|args| args == ["--net-backend", "virtio-net"]));
         assert_eq!(captured_env(&executable), "SMOLVM_EGRESS_FLOOR=strict");
     }
 
