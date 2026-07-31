@@ -332,6 +332,7 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
     let config = RunnerPoolConfig {
         size: 1,
         use_fork: false,
+        use_packed_artifact: false,
         name_prefix: "preloop-release-golden".into(),
         base_image: args.base_image,
         workspace: None,
@@ -776,6 +777,7 @@ fn local_runner_pool_config(
         // A fork base is useful only when the warm-pool mode is enabled. The
         // low-memory path boots and tears down a socket-backed VM per job.
         use_fork: pool_enabled && env_flag("PRELOOP_USE_FORK", true),
+        use_packed_artifact: env_flag("PRELOOP_USE_PACKED_GOLDEN", false),
         name_prefix: "preloop-runner".into(),
         base_image: std::env::var("PRELOOP_RUNNER_BASE_IMAGE")
             .unwrap_or_else(|_| "ubuntu:24.04".into()),

@@ -403,7 +403,7 @@ impl VmProvider for SmolVmProvider {
             "--name".into(),
             spec.name.as_str().into(),
         ];
-        if spec.image.ends_with(".smolmachine") {
+        if spec.image.ends_with(".smolmachine") || Path::new(&spec.image).is_file() {
             args.extend(["--from".into(), spec.image.clone()]);
         } else {
             args.extend(["--image".into(), spec.image.clone()]);

@@ -421,6 +421,10 @@ pub struct RunnerPoolConfig {
     /// When enabled, a single "golden" VM boots once and each runner slot
     /// clones from it with CoW memory and disks.
     pub use_fork: bool,
+    /// Create runners from the prepared packed artifact instead of the base
+    /// OCI image. The caller must provide a SmolVM build that preserves
+    /// explicitly supplied socket mappings for packed-machine creation.
+    pub use_packed_artifact: bool,
     /// Prefix used for owned SmolVM names.
     pub name_prefix: String,
     /// Base OCI image used for one-time tool installation.
@@ -770,6 +774,59 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
     Ok(())
 }
 
+/// Prepare a forkable golden from the dependency-prepared packed artifact.
+///
+/// Socket mappings are supplied by the local machine definition, never read
+/// from the artifact. SmolVM must preserve those explicit mappings on its
+/// `machine create --from` path for local control-plane routing to work.
+async fn prepare_packed_golden<P: VmProvider + 'static>(
+    provider: &Arc<P>,
+    config: &RunnerPoolConfig,
+    golden: &MachineName,
+) -> Result<(), OrchestratorError> {
+    if provider.status(golden).await? != MachineState::Missing {
+        provider.delete(golden).await?;
+    }
+    let spec = MachineSpec {
+        name: golden.clone(),
+        image: config.artifact_payload().display().to_string(),
+        cpus: config.cpus,
+        memory_mib: config.memory_mib,
+        storage_gib: config.storage_gib,
+        network: NetworkPolicy::PublicOnly,
+        volumes: runner_volumes(config),
+        sockets: config
+            .control_socket
+            .iter()
+            .map(|host| SocketMount {
+                host: host.clone(),
+                guest: PathBuf::from(GUEST_CONTROL_SOCKET),
+            })
+            .collect(),
+        rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
+    };
+    provider.create(&spec).await?;
+    provider.start(golden).await?;
+    if let Err(error) = await_guest_ready(provider.as_ref(), golden).await {
+        let _ = provider.delete(golden).await;
+        return Err(error);
+    }
+    if let Err(error) = preload_images(provider.as_ref(), golden, &config.preload_images).await {
+        warn!(
+            machine = golden.as_str(),
+            %error, "image preload failed; jobs will pull at run time"
+        );
+    }
+    provider.stop(golden).await?;
+    provider.start_forkable(golden).await?;
+    info!(
+        machine = golden.as_str(),
+        artifact = %config.artifact_payload().display(),
+        "packed golden fork base ready"
+    );
+    Ok(())
+}
+
 impl<P: VmProvider + 'static> RunnerPool<P> {
     /// Construct a runner pool.
     pub fn new(provider: Arc<P>, config: RunnerPoolConfig) -> Result<Self, OrchestratorError> {
@@ -779,10 +836,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
 
     /// Prepare the immutable runner image once, then supervise all slots until cancellation.
     pub async fn run(&self, shutdown: CancellationToken) -> Result<(), OrchestratorError> {
-        // SmolVM currently drops socket mounts from `machine create --from`.
-        // Local control-plane sockets therefore use an image-backed golden VM;
-        // remote TCP pools can retain the packed-artifact path.
-        if self.config.control_socket.is_none() {
+        if self.config.use_packed_artifact || self.config.control_socket.is_none() {
             self.prepare_artifact(true).await?;
         }
         self.remove_stale_machines().await?;
@@ -797,10 +851,13 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             let default_environment =
                 EnvironmentSpec::new(self.config.base_image.clone(), Vec::new());
             let golden = MachineName::new(format!("{}-golden", golden_registry.name_prefix))?;
-            if let Err(error) =
+            let result = if self.config.use_packed_artifact {
+                prepare_packed_golden(&self.provider, &self.config, &golden).await
+            } else {
                 prepare_golden_for_env(&self.provider, &self.config, &golden, &default_environment)
                     .await
-            {
+            };
+            if let Err(error) = result {
                 warn!(%error, "golden fork base unavailable; falling back to create-per-runner");
             } else {
                 golden_registry
@@ -1726,15 +1783,13 @@ async fn provision_runner<P: VmProvider + 'static>(
         // Fork from the already-booted golden VM — instant CoW clone.
         provider.fork(golden, name).await?;
     } else {
-        // Socket mounts are currently ignored by SmolVM's packed-artifact
-        // create path, so local pools fall back to the base image directly.
-        let uses_control_socket = config.control_socket.is_some();
+        let uses_packed_artifact = config.use_packed_artifact;
         let spec = MachineSpec {
             name: name.clone(),
-            image: if uses_control_socket {
-                config.base_image.clone()
-            } else {
+            image: if uses_packed_artifact {
                 config.artifact_payload().display().to_string()
+            } else {
+                config.base_image.clone()
             },
             cpus: config.cpus,
             memory_mib: config.memory_mib,
@@ -1753,7 +1808,7 @@ async fn provision_runner<P: VmProvider + 'static>(
         };
         provider.create(&spec).await?;
         provider.start(name).await?;
-        if uses_control_socket {
+        if !uses_packed_artifact {
             install_base_dependencies(provider.as_ref(), name).await?;
         }
     }
@@ -2064,6 +2119,7 @@ chmod +x "$destination/bin/node"
         RunnerPoolConfig {
             size: 1,
             use_fork: false,
+            use_packed_artifact: false,
             name_prefix: "lifecycle-test".to_owned(),
             base_image: "base-image".to_owned(),
             workspace: None,
