@@ -702,6 +702,10 @@ async fn preload_images<P: VmProvider>(
 }
 
 /// Prepare a running forkable golden VM with the requested environment.
+///
+/// SmolVM takes the forkable RAM/disk snapshot when `start --forkable` runs.
+/// Provision the guest while it is a normal machine, then restart it as the
+/// fork base so package and external-runtime writes are inherited by clones.
 async fn prepare_golden_for_env<P: VmProvider + 'static>(
     provider: &Arc<P>,
     config: &RunnerPoolConfig,
@@ -730,7 +734,7 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
         rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
     };
     provider.create(&spec).await?;
-    provider.start_forkable(golden).await?;
+    provider.start(golden).await?;
     if let Err(error) = await_guest_ready(provider.as_ref(), golden).await {
         let _ = provider.delete(golden).await;
         return Err(error);
@@ -753,6 +757,14 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
             machine = golden.as_str(),
             %error, "image preload failed; jobs will pull at run time"
         );
+    }
+    if let Err(error) = provider.stop(golden).await {
+        let _ = provider.delete(golden).await;
+        return Err(error.into());
+    }
+    if let Err(error) = provider.start_forkable(golden).await {
+        let _ = provider.delete(golden).await;
+        return Err(error.into());
     }
     info!(machine = golden.as_str(), "golden fork base ready");
     Ok(())
