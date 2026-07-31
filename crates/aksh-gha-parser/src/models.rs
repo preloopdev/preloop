@@ -218,6 +218,9 @@ impl Workflow {
         let Some(definitions) = config.get("inputs").and_then(Value::as_object) else {
             return Ok(());
         };
+        if payload.is_null() {
+            *payload = Value::Object(serde_json::Map::new());
+        }
         let inputs = payload
             .as_object_mut()
             .ok_or_else(|| {
