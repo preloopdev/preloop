@@ -458,6 +458,41 @@ async fn artifact_preparation_runs_once_and_reuses_payload_on_next_run() {
 }
 
 #[tokio::test]
+async fn fork_golden_is_marked_forkable_after_guest_provisioning() {
+    let fixture = Fixture::new("fork-golden", true);
+    let mut config = fixture.config.clone();
+    config.use_fork = true;
+    config.control_socket = Some(fixture.root.join("engine.sock"));
+    let provider = Arc::new(RecordingVmProvider::with_machines(
+        &[],
+        vec![RunAction::Wait],
+    ));
+    let pool = RunnerPool::new(provider.clone(), config).unwrap();
+    run_until_cancelled(pool, &provider, CancellationToken::new(), 1).await;
+
+    let events = provider.snapshot().await.events;
+    let golden = format!("{}-golden", fixture.config.name_prefix);
+    let golden_starts = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            matches!(event, Event::Start(name) if name == &golden).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(golden_starts.len(), 2);
+    let first_start = golden_starts[0];
+    let stop = events
+        .iter()
+        .position(|event| matches!(event, Event::Stop(name) if name == &golden))
+        .expect("golden stopped before forkable restart");
+    assert!(first_start < stop);
+    assert!(events[first_start + 1..stop]
+        .iter()
+        .any(|event| matches!(event, Event::Exec(name, _) if name == &golden)));
+    assert!(stop < golden_starts[1]);
+}
+
+#[tokio::test]
 async fn configure_passes_secret_environment_mapping_without_token_value() {
     let fixture = Fixture::new("secret", true);
     let provider = Arc::new(RecordingVmProvider::with_machines(
