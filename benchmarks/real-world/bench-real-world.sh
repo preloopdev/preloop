@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # bench-real-world.sh — Benchmark real-world repos with aksh/official runner
-# Usage: ./bench-real-world.sh <serde|axum|bat> [aksh|official|both] [runs]
+# Overnight set: preloop, agent-ci, act, redis-py, docker-compose.
+# Usage: ./bench-real-world.sh <preloop|agent-ci|act|redis-py|docker-compose> [aksh|official|both] [runs]
 set -euo pipefail
 
-REPO="${1:?Usage: $0 <serde|axum|bat> [aksh|official|both] [runs]}"
+REPO="${1:?Usage: $0 <preloop|agent-ci|act|redis-py|docker-compose> [aksh|official|both] [runs]}"
 MODE="${2:-aksh}"
 RUNS="${3:-1}"
 
