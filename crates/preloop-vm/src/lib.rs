@@ -89,7 +89,8 @@ pub enum NetworkPolicy {
     Unrestricted,
     /// Full outbound networking with the egress hard-floor enabled: loopback,
     /// RFC 1918, link-local / cloud metadata, CGNAT, and IPv6 private ranges
-    /// are denied. Enforced by `SMOLVM_EGRESS_FLOOR=strict` in the provider.
+    /// are denied. Enforced by the virtio-net backend with
+    /// `SMOLVM_EGRESS_FLOOR=strict` in the provider.
     PublicOnly,
     /// Restrict outbound traffic to these host names and CIDRs.
     Restricted {
@@ -418,7 +419,9 @@ impl VmProvider for SmolVmProvider {
         match &spec.network {
             NetworkPolicy::Disabled => {}
             NetworkPolicy::Unrestricted => args.push("--net".into()),
-            NetworkPolicy::PublicOnly => args.push("--net".into()),
+            NetworkPolicy::PublicOnly => {
+                args.extend(["--net".into(), "--net-backend".into(), "virtio-net".into()]);
+            }
             NetworkPolicy::Restricted { hosts, cidrs } => {
                 for host in hosts {
                     args.extend(["--allow-host".into(), host.clone()]);
