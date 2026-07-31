@@ -1,0 +1,27 @@
+name: Act Project
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  ci:
+    name: Act Project CI
+    runs-on: self-hosted
+    timeout-minutes: 60
+    env:
+      ACT_ACTOR: nektos/act
+      ACT_OWNER: nektos
+      ACT_REPOSITORY: nektos/act
+    container: golang:1.25-bookworm
+    steps:
+      - name: Runtime versions
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          go version
+          git --version
+      - name: Build
+        run: cd "$GITHUB_WORKSPACE" && go build ./...
+      - name: Test (ARM64-compatible packages)
+        run: cd "$GITHUB_WORKSPACE" && go test ./pkg/exprparser ./pkg/filecollector
+      - name: Vet
+        run: cd "$GITHUB_WORKSPACE" && go vet ./...
