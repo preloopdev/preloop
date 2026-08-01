@@ -20,10 +20,15 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream, UnixStream};
 use tracing::{debug, info, warn};
+
+/// Number of consecutive upstream connect failures before the bridge exits.
+const UPSTREAM_FAILURE_THRESHOLD: u32 = 10;
 
 /// Environment variable naming the mounted control-plane socket.
 pub const CONTROL_SOCKET_ENV: &str = "PRELOOP_CONTROL_SOCKET";
@@ -108,6 +113,7 @@ pub fn loopback_address(origin: &str) -> Option<SocketAddr> {
 async fn spawn(address: SocketAddr, socket: PathBuf) -> std::io::Result<ControlBridge> {
     let listener = TcpListener::bind(address).await?;
     let address = listener.local_addr()?;
+    let consecutive_failures = Arc::new(AtomicU32::new(0));
     let task = tokio::spawn(async move {
         loop {
             let (client, peer) = match listener.accept().await {
@@ -117,10 +123,24 @@ async fn spawn(address: SocketAddr, socket: PathBuf) -> std::io::Result<ControlB
                     continue;
                 }
             };
+            let n = consecutive_failures.load(Ordering::Relaxed);
+            if n >= UPSTREAM_FAILURE_THRESHOLD {
+                warn!(
+                    "control bridge exiting: upstream socket unreachable after {n} consecutive failures"
+                );
+                break;
+            }
             let socket = socket.clone();
+            let failures = Arc::clone(&consecutive_failures);
             tokio::spawn(async move {
-                if let Err(error) = splice(client, &socket).await {
-                    debug!(%peer, %error, "control bridge connection ended");
+                match splice(client, &socket).await {
+                    Ok(()) => {
+                        failures.store(0, Ordering::Relaxed);
+                    }
+                    Err(error) => {
+                        failures.fetch_add(1, Ordering::Relaxed);
+                        debug!(%peer, %error, "control bridge connection ended");
+                    }
                 }
             });
         }
@@ -214,5 +234,46 @@ mod tests {
         let mut response = Vec::new();
         client.read_to_end(&mut response).await.unwrap();
         assert_eq!(response, b"pong");
+    }
+
+    #[tokio::test]
+    async fn bridge_exits_after_consecutive_upstream_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("control.sock");
+
+        // Create a unix listener so the bridge can start, then immediately
+        // drop it so subsequent connects fail.
+        let server = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        drop(server);
+        std::fs::remove_file(&socket_path).unwrap();
+
+        let bridge = spawn("127.0.0.1:0".parse().unwrap(), socket_path)
+            .await
+            .unwrap();
+        let addr = bridge.address();
+
+        // Open enough connections to exceed the threshold. Each will fail
+        // on UnixStream::connect, incrementing the counter.
+        for _ in 0..UPSTREAM_FAILURE_THRESHOLD + 5 {
+            // The bridge may have already exited; ignore connect failures.
+            if let Ok(mut c) = TcpStream::connect(addr).await {
+                let _ = c.write_all(b"x").await;
+                // Give the spawned splice task time to run and fail.
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+
+        // Wait for the bridge task to notice the threshold and exit.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            if bridge.task.is_finished() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            bridge.task.is_finished(),
+            "bridge task did not exit after threshold"
+        );
     }
 }
