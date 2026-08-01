@@ -15,6 +15,7 @@ use std::time::Duration;
 
 mod debug_session;
 mod github_auth;
+mod update;
 
 fn server_url() -> String {
     std::env::var("AKSH_URL").unwrap_or_else(|_| "http://127.0.0.1:9090".to_owned())
@@ -109,6 +110,9 @@ enum Command {
 
     /// Attach to a job paused at a failed step: inspect, fix, retry.
     Debug(debug_session::DebugArgs),
+
+    /// Poll GitHub Releases and atomically install the matching binary.
+    Update(update::UpdateArgs),
 
     /// Run the control plane and microVM runner pool in the foreground.
     ///
@@ -294,6 +298,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve(args) => return cmd_engine(args).await,
         Command::Engine => return cmd_engine(ServeArgs::default()).await,
         Command::BuildGolden(args) => return cmd_build_golden(args).await,
+        Command::Update(args) => return update::run(args).await,
         _ => {}
     }
     ensure_engine_running().await?;
@@ -309,10 +314,14 @@ async fn main() -> anyhow::Result<()> {
         Command::Debug(args) => {
             debug_session::run(args, build_client(), server_url(), api_token()).await
         }
-        Command::Serve(_) | Command::Engine | Command::BuildGolden(_) => {
+        Command::Update(_) | Command::Serve(_) | Command::Engine | Command::BuildGolden(_) => {
             unreachable!("daemon commands handled before client startup")
         }
     }
+}
+
+fn systemd_socket_activation_requested() -> bool {
+    cfg!(target_os = "linux") && std::env::var_os("LISTEN_FDS").is_some()
 }
 
 async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
@@ -620,6 +629,7 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
     let mut server = tokio::spawn(aksh_runner_server::serve(
         aksh_runner_server::ServerConfig {
             listen,
+            systemd_socket_activation: systemd_socket_activation_requested(),
             unix_socket: Some(socket.clone()),
             queue_depth: Some(queue_depth.clone()),
             next_job_runs_on: Some(next_job_runs_on.clone()),
