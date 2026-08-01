@@ -74,6 +74,7 @@ similar = "2.5"
 cron = "0.12"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
+utoipa = { version = "5", features = ["uuid", "chrono"] }
 
 command-group = { version = "5", features = ["with-tokio"] }
 flate2 = "1"
