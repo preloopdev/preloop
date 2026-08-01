@@ -5865,6 +5865,10 @@ jobs:
     // 6. Verify that a run was triggered and check runs are queued
     let inner = state.inner.lock().await;
     assert_eq!(inner.runs.len(), 1);
+    assert_eq!(
+        state.queue_depth.load(std::sync::atomic::Ordering::Acquire),
+        1
+    );
     let (_, run_record) = inner.runs.iter().next().unwrap();
     assert_eq!(run_record.submission.event, "push");
     assert_eq!(run_record.submission.repository, "owner/repo");
