@@ -1176,6 +1176,14 @@ pub(crate) async fn submit_run_inner(
                 conclusion: None,
             },
         );
+        // The on-demand runner supervisor uses this atomic as its wake-up
+        // signal. Refresh it when submission makes work runnable; updating it
+        // only after a runner claims a job leaves a size-zero pool asleep
+        // forever on the first webhook-created run.
+        shared
+            .state
+            .queue_depth
+            .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
         let cancel_count = inner.cancellation_queue.len();
         drop(inner);
         if ready_jobs > 0 || cancel_count > 0 {
