@@ -669,6 +669,8 @@ pub(crate) async fn complete_job_inner(
             .await;
     }
     for (run_id, job_id) in scheduling.skipped {
+        github::report_check_run_completed(&shared, run_id, &job_id, ExecutionStatus::Skipped)
+            .await;
         shared
             .state
             .emit(NdjsonEvent::JobStatus {
@@ -680,6 +682,8 @@ pub(crate) async fn complete_job_inner(
             .await;
     }
     for (run_id, job_id) in scheduling.failed {
+        github::report_check_run_completed(&shared, run_id, &job_id, ExecutionStatus::Failure)
+            .await;
         shared
             .state
             .emit(NdjsonEvent::JobStatus {
