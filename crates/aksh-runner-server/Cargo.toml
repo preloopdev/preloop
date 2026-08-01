@@ -50,6 +50,7 @@ chrono.workspace = true
 chrono-tz.workspace = true
 
 serde_yaml.workspace = true
+utoipa.workspace = true
 
 [[bin]]
 name = "preloop-server"
