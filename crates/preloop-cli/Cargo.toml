@@ -7,6 +7,9 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Preloop CI command-line interface"
 
+[package.metadata.dist]
+dist = true
+
 [[bin]]
 name = "preloop"
 path = "src/main.rs"
@@ -29,6 +32,13 @@ reqwest = { workspace = true }
 rand = { workspace = true }
 futures-util = "0.3"
 aksh-gha-protocol = { path = "../aksh-gha-protocol" }
+self-replace = { workspace = true }
+semver = { workspace = true }
+sha2 = { workspace = true }
+tar = { workspace = true }
+flate2 = { workspace = true }
+zip = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
