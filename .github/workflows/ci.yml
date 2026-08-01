@@ -3,6 +3,7 @@ name: ci
 on:
   push:
     branches: [main]
+    # Keep push-triggered checks observable while the self-hosted pool boots.
   pull_request:
   schedule:
     # Nightly intensive property profile at 02:00 UTC
