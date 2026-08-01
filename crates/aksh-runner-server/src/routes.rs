@@ -1,4 +1,5 @@
 use super::*;
+use utoipa::OpenApi;
 
 /// Build the production server router without simulation endpoints.
 pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
@@ -217,7 +218,17 @@ pub(crate) fn build_app(
 
     let router = Router::new()
         .route("/healthz", get(healthz))
-        .route("/runs/:run_id", get(get_public_run))
+        .route(
+            "/runs/:run_id",
+            get(get_public_run).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_native_bearer,
+            )),
+        )
+        .route(
+            "/openapi.json",
+            get(|| async { axum::Json(crate::openapi::ApiDoc::openapi()) }),
+        )
         .route("/.well-known/openid-configuration", get(oidc_discovery))
         .route("/.well-known/jwks", get(oidc_jwks))
         .route("/.well-known/jwks.json", get(oidc_jwks))
