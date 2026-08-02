@@ -115,6 +115,7 @@ async fn main() -> anyhow::Result<()> {
                 queue_depth: None,
                 next_job_runs_on: None,
                 listen,
+                systemd_socket_activation: false,
                 unix_socket,
                 state_dir,
                 record_flows,

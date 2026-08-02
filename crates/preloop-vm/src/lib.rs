@@ -126,6 +126,8 @@ pub struct MachineSpec {
     pub memory_mib: u32,
     /// Persistent storage in GiB.
     pub storage_gib: u32,
+    /// Root overlay size in GiB. `None` keeps the provider default.
+    pub overlay_gib: Option<u32>,
     /// Guest network policy.
     pub network: NetworkPolicy,
     /// Narrowly scoped host mounts.
@@ -286,7 +288,7 @@ impl SmolVmProvider {
         operation: &'static str,
         args: &[String],
     ) -> Result<ExecOutput, VmError> {
-        self.checked_with_network(operation, args, None).await
+        self.checked_with_network(operation, args, None, None).await
     }
 
     async fn checked_with_network(
@@ -294,6 +296,7 @@ impl SmolVmProvider {
         operation: &'static str,
         args: &[String],
         network: Option<&NetworkPolicy>,
+        staging_dir: Option<&Path>,
     ) -> Result<ExecOutput, VmError> {
         let mut command = self.command();
         match network {
@@ -304,6 +307,13 @@ impl SmolVmProvider {
                 command.env_remove("SMOLVM_EGRESS_FLOOR");
             }
             None => {}
+        }
+        if let Some(staging_dir) = staging_dir {
+            command.env("SMOLVM_PACK_STAGING", staging_dir);
+            // smolvm-pack uses tempfile::tempdir() while assembling the
+            // archive. Keep that scratch space beside the output instead of
+            // falling back to a small host /tmp tmpfs.
+            command.env("TMPDIR", staging_dir);
         }
         command
             .args(args)
@@ -362,6 +372,17 @@ impl SmolVmProvider {
         self.checked(operation, args).await
     }
 
+    async fn exclusive_with_staging(
+        &self,
+        operation: &'static str,
+        args: &[String],
+        staging_dir: &Path,
+    ) -> Result<ExecOutput, VmError> {
+        let _guard = self.lifecycle_lock.write().await;
+        self.checked_with_network(operation, args, None, Some(staging_dir))
+            .await
+    }
+
     async fn exclusive_with_network(
         &self,
         operation: &'static str,
@@ -369,7 +390,7 @@ impl SmolVmProvider {
         network: &NetworkPolicy,
     ) -> Result<ExecOutput, VmError> {
         let _guard = self.lifecycle_lock.write().await;
-        self.checked_with_network(operation, args, Some(network))
+        self.checked_with_network(operation, args, Some(network), None)
             .await
     }
 
@@ -403,10 +424,30 @@ impl VmProvider for SmolVmProvider {
             "--name".into(),
             spec.name.as_str().into(),
         ];
-        if spec.image.ends_with(".smolmachine") {
+        // `.smolmachine` packs and other local files go through `--from`.
+        // Docker-save OCI archives (`.tar`) are image inputs, not packs:
+        // smolvm's `--image` accepts them and sets up virtiofs mounts the
+        // same way it does for registry images, while `--from` machines do
+        // not (bare rootfs directories lose mounts entirely).
+        let is_pack = spec.image.ends_with(".smolmachine")
+            || (Path::new(&spec.image).is_file() && !spec.image.ends_with(".tar"));
+        if is_pack {
             args.extend(["--from".into(), spec.image.clone()]);
         } else {
             args.extend(["--image".into(), spec.image.clone()]);
+            // A bare rootfs directory carries no OCI metadata, so the image
+            // defines no entrypoint/CMD and `machine start` refuses to run a
+            // detached workload. Everything this provider does runs through
+            // `machine exec` anyway, so pin a harmless keep-alive workload
+            // for directory images. Registry images keep their own CMD.
+            if Path::new(&spec.image).is_dir() {
+                args.extend([
+                    "--".into(),
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "sleep infinity".into(),
+                ]);
+            }
         }
         args.extend([
             "--cpus".into(),
@@ -416,6 +457,9 @@ impl VmProvider for SmolVmProvider {
             "--storage".into(),
             spec.storage_gib.to_string(),
         ]);
+        if let Some(overlay_gib) = spec.overlay_gib {
+            args.extend(["--overlay".into(), overlay_gib.to_string()]);
+        }
         match &spec.network {
             NetworkPolicy::Disabled => {}
             NetworkPolicy::Unrestricted => args.push("--net".into()),
@@ -721,7 +765,17 @@ impl VmProvider for SmolVmProvider {
                 "pack output path must be absolute".into(),
             ));
         }
-        self.exclusive(
+        let staging_dir = output.parent().expect("absolute output has a parent");
+        // smolvm 1.7.2 rejects `-o <name>.smolmachine` and writes the packed
+        // VM data as `<output>.smolmachine` alongside an ELF launcher stub at
+        // `<output>`. Strip the extension so the output path names the stub
+        // and the caller picks up the `<output>.smolmachine` sidecar.
+        let output = if output.extension().is_some_and(|ext| ext == "smolmachine") {
+            output.with_extension("")
+        } else {
+            output.to_path_buf()
+        };
+        self.exclusive_with_staging(
             "pack",
             &[
                 "pack".into(),
@@ -731,6 +785,7 @@ impl VmProvider for SmolVmProvider {
                 "-o".into(),
                 output.display().to_string(),
             ],
+            staging_dir,
         )
         .await
         .map(|_| ())

@@ -1,0 +1,11 @@
+[Unit]
+Description=Poll for Preloop releases
+
+[Timer]
+OnBootSec=10m
+OnUnitActiveSec=1h
+RandomizedDelaySec=30m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,850 @@
+{
+  "repo": "astral-sh/uv",
+  "run_id": "30680325919",
+  "workflow_name": "CI",
+  "workflow_path": ".github/workflows/ci.yml",
+  "event": "pull_request",
+  "head_sha": "1ddf5b709ad49bba88e6607af0d2a1bbe0c03ff5",
+  "conclusion": "success",
+  "created_at": "2026-08-01T02:35:55Z",
+  "jobs": [
+    {
+      "name": "plan / plan",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Plan",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Run actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+          "number": 6,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 7,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "check-fmt / prettier",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run npx prettier@3.9.0 --check .",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Run actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+          "number": 6,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 7,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "check-fmt / python",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install uv",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run uvx ruff format --diff .",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Install uv",
+          "number": 7,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Run actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+          "number": 8,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 9,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "check-fmt / rust",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install Rustfmt",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run cargo fmt --all --check",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Run actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+          "number": 8,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 9,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "check-zizmor / zizmor",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run zizmorcore/zizmor-action@6599ee8b7a49aef6a770f63d261d214911a7ce02",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Run zizmorcore/zizmor-action@6599ee8b7a49aef6a770f63d261d214911a7ce02",
+          "number": 5,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Run actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+          "number": 6,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 7,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "check-docs / mkdocs",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4",
+          "number": 5,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Generate reference documentation",
+          "number": 6,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Build docs",
+          "number": 7,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Run Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4",
+          "number": 11,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Run actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1",
+          "number": 12,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Run astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9",
+          "number": 13,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Run actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+          "number": 14,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 15,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "check-release / dist plan",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install dist",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run dist plan",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Run actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+          "number": 8,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 9,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "check-lint / ruff",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install uv",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run uvx ruff check .",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Install uv",
+          "number": 7,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Run actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+          "number": 8,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 9,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "check-lint / readme",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run python scripts/transform_readme.py --target pypi",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Run actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1",
+          "number": 7,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Run actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+          "number": 8,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 9,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "check-lint / cargo shear",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install cargo shear",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run cargo shear --deny-warnings",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Run actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+          "number": 8,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 9,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "check-lint / ty",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install uv",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run uvx ty check python/uv",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Check scrolls",
+          "number": 5,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Install uv",
+          "number": 9,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Run actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+          "number": 10,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 11,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "check-lint / typos",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run crate-ci/typos@bee27e3a4fd1ea2111cf90ab89cd076c870fce14",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Run actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+          "number": 6,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 7,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "check-lock / uv lockfiles",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install uv",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Check project lockfile",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Check script lockfiles",
+          "number": 5,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Install uv",
+          "number": 9,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Run actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+          "number": 10,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 11,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "check-lint / validate-pyproject",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install uv",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Validate pyproject and uv schema",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Install uv",
+          "number": 7,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Run actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+          "number": 8,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 9,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "check-lint / shellcheck",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install shellcheck",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run shellcheck",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Run actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+          "number": 8,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 9,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "check-publish",
+      "conclusion": "skipped",
+      "status": "completed",
+      "steps": []
+    },
+    {
+      "name": "build-docker",
+      "conclusion": "skipped",
+      "status": "completed",
+      "steps": []
+    },
+    {
+      "name": "build-release-binaries",
+      "conclusion": "skipped",
+      "status": "completed",
+      "steps": []
+    },
+    {
+      "name": "check-generated-files",
+      "conclusion": "skipped",
+      "status": "completed",
+      "steps": []
+    },
+    {
+      "name": "test",
+      "conclusion": "skipped",
+      "status": "completed",
+      "steps": []
+    },
+    {
+      "name": "bench",
+      "conclusion": "skipped",
+      "status": "completed",
+      "steps": []
+    },
+    {
+      "name": "review",
+      "conclusion": "skipped",
+      "status": "completed",
+      "steps": []
+    },
+    {
+      "name": "build-dev-binaries",
+      "conclusion": "skipped",
+      "status": "completed",
+      "steps": []
+    },
+    {
+      "name": "test-ecosystem",
+      "conclusion": "skipped",
+      "status": "completed",
+      "steps": []
+    },
+    {
+      "name": "test-windows-trampolines",
+      "conclusion": "skipped",
+      "status": "completed",
+      "steps": []
+    },
+    {
+      "name": "test-integration",
+      "conclusion": "skipped",
+      "status": "completed",
+      "steps": []
+    },
+    {
+      "name": "check-lint / hawk",
+      "conclusion": "skipped",
+      "status": "completed",
+      "steps": []
+    },
+    {
+      "name": "check-lint / clippy on windows",
+      "conclusion": "skipped",
+      "status": "completed",
+      "steps": []
+    },
+    {
+      "name": "test-system",
+      "conclusion": "skipped",
+      "status": "completed",
+      "steps": []
+    },
+    {
+      "name": "test-smoke",
+      "conclusion": "skipped",
+      "status": "completed",
+      "steps": []
+    },
+    {
+      "name": "check-lint / clippy on linux",
+      "conclusion": "skipped",
+      "status": "completed",
+      "steps": []
+    },
+    {
+      "name": "test uv publish",
+      "conclusion": "skipped",
+      "status": "completed",
+      "steps": []
+    },
+    {
+      "name": "all required jobs passed",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Check required jobs passed",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    }
+  ]
+}

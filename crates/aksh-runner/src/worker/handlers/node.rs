@@ -244,16 +244,16 @@ pub async fn run_node_action(
     }
 
     // Apply defaults from manifest inputs, evaluating any ${{ }} expressions.
-    // Defaults are read with `as_str()` — matching the official runner, which
-    // treats all YAML scalars as strings.  Typed JSON coercion (e.g. YAML
-    // octal `0755` → Number 493 → "493") would diverge from GitHub.
     if let Some(manifest_inputs) = &manifest.inputs {
         let expr_ctx = ctx.job.build_expression_context();
         for (key, input_def) in manifest_inputs {
             let env_key = format!("INPUT_{}", key.to_uppercase().replace(' ', "_"));
-            if let Some(default) = input_def.get("default").and_then(|v| v.as_str()) {
+            let default = input_def
+                .get("default")
+                .and_then(super::factory::input_default_string);
+            if let Some(default) = default {
                 env.entry(env_key).or_insert_with(|| {
-                    crate::worker::template::evaluate_template(default, &expr_ctx)
+                    crate::worker::template::evaluate_template(&default, &expr_ctx)
                         .unwrap_or_else(|_| default.to_string())
                 });
             }

@@ -1,0 +1,13 @@
+Evaluating plan.if
+Evaluating: success()
+Result: true
+Evaluating plan.plan.if
+Evaluating: success()
+Result: true
+Requested labels: depot-ubuntu-24.04
+Job defined at: astral-sh/uv/.github/workflows/plan.yml@refs/pull/20876/merge
+Reusable workflow chain:
+astral-sh/uv/.github/workflows/ci.yml@refs/pull/20876/merge (81742a27ad62bb1dd1289a164f1776508279c756)
+-> astral-sh/uv/.github/workflows/plan.yml@refs/pull/20876/merge (81742a27ad62bb1dd1289a164f1776508279c756)
+Waiting for a runner to pick up this job...
+Job is about to start running on the runner: depot-dj2gs6x50c
