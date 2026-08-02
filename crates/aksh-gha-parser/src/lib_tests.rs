@@ -102,6 +102,64 @@ jobs:
 }
 
 #[test]
+fn push_branches_and_tags_are_or_filter_axes() {
+    // Real-world shape (sharkdp/bat CICD): a branch push must match even
+    // though the `tags` axis is present and inapplicable.
+    let workflow = parse_workflow(
+        r#"
+on:
+  push:
+    branches: [master]
+    tags: ['*']
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+"#,
+    )
+    .unwrap();
+
+    // Branch push to master: branch axis matches, tag axis inapplicable.
+    assert!(workflow
+        .on
+        .matches_with_context("push", Some("master"), None, &[], None, &[]));
+    // Tag push v1.2: tag axis matches, branch axis inapplicable.
+    assert!(workflow
+        .on
+        .matches_with_context("push", None, Some("v1.2"), &[], None, &[]));
+    // Branch push to a non-matching branch: neither axis matches.
+    assert!(!workflow
+        .on
+        .matches_with_context("push", Some("dev"), None, &[], None, &[]));
+}
+
+#[test]
+fn push_with_only_branches_skips_tag_pushes() {
+    let workflow = parse_workflow(
+        r#"
+on:
+  push:
+    branches: [master]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+"#,
+    )
+    .unwrap();
+
+    assert!(workflow
+        .on
+        .matches_with_context("push", Some("master"), None, &[], None, &[]));
+    // Tag pushes do not match a branches-only workflow.
+    assert!(!workflow
+        .on
+        .matches_with_context("push", None, Some("v1.2"), &[], None, &[]));
+}
+
+#[test]
 fn parses_and_expands_opencode_test_workflow_fixture() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

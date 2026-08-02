@@ -1,0 +1,66 @@
+﻿2026-07-17T07:43:04.9692693Z Current runner version: '2.335.1'
+Runner name: 'garm4-low-24-bifo1eqcerid'
+Runner group name: 'default'
+Machine name: 'garm4-low-24-bifo1eqcerid'
+##[group]GITHUB_TOKEN Permissions
+Contents: read
+Metadata: read
+PullRequests: read
+##[endgroup]
+Secret source: Actions
+Prepare workflow directory
+Prepare all required actions
+Getting action download info
+Download action repository 'dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706' (SHA:7b450fff21473bca461d4b92ce414b9d0420d706)
+Complete job name: changes
+##[group]Run dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706
+with:
+filters: src:
+  - '.github/workflows/**'
+  - '3rdparty/**'
+  - '**/appinfo/**'
+  - '**/lib/**'
+  - '**/templates/**'
+  - '**/tests/**'
+  - 'vendor/**'
+  - 'vendor-bin/**'
+  - '.php-cs-fixer.dist.php'
+  - 'composer.json'
+  - 'composer.lock'
+  - '**.php'
+
+token: ***
+list-files: none
+initial-fetch-depth: 100
+predicate-quantifier: some
+##[endgroup]
+##[group]Fetching list of changed files for PR#62157 from GitHub API
+Invoking listFiles(pull_number: 62157, per_page: 100)
+Received 12 items
+[modified] core/src/components/UnifiedSearch/SearchResult.vue
+[modified] core/src/components/UnifiedSearch/SearchableList.vue
+[modified] core/src/components/UnifiedSearch/UnifiedSearchInput.vue
+[modified] core/src/components/UnifiedSearch/UnifiedSearchModal.vue
+[added] core/src/tests/components/SearchResult.spec.ts
+[added] core/src/tests/components/SearchableList.spec.ts
+[modified] core/src/tests/components/UnifiedSearch.spec.ts
+[added] core/src/tests/components/UnifiedSearchInput.spec.ts
+[modified] core/src/tests/components/UnifiedSearchModal.spec.ts
+[modified] core/src/views/UnifiedSearch.vue
+[modified] dist/core-unified-search.js
+[modified] dist/core-unified-search.js.map
+##[endgroup]
+Detected 12 changed files
+Results:
+##[group]Filter src = true
+Matching files:
+core/src/tests/components/SearchResult.spec.ts [added]
+core/src/tests/components/SearchableList.spec.ts [added]
+core/src/tests/components/UnifiedSearch.spec.ts [modified]
+core/src/tests/components/UnifiedSearchInput.spec.ts [added]
+core/src/tests/components/UnifiedSearchModal.spec.ts [modified]
+##[endgroup]
+Changes output set to ["src"]
+Evaluate and set job outputs
+Set output 'src'
+Cleaning up orphan processes

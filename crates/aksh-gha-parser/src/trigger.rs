@@ -68,40 +68,40 @@ impl Trigger {
                                 return false;
                             }
                         }
-                        // branches filter
-                        if let Some(branches) = obj.get("branches") {
-                            if let Some(branch) = branch {
-                                if !matches_filter(branches, branch) {
-                                    return false;
-                                }
-                            } else {
+                        // Branches and tags are OR-filter axes on `push`
+                        // (GitHub: "The workflow will run for pushes to
+                        // matching branches or pushes of matching tags"). A
+                        // branch push is filtered only by the branch axis; a
+                        // tag push only by the tag axis. When either axis is
+                        // present and the push does not belong to it, the
+                        // other axis still decides — `push: {branches:
+                        // [main], tags: ['v*']}` must run for a push to
+                        // `main`. An axis is "present" when its positive or
+                        // ignore filter is defined; with no axis defined the
+                        // push runs unconditionally.
+                        let branch_axis =
+                            obj.get("branches").is_some() || obj.get("branches-ignore").is_some();
+                        let tag_axis =
+                            obj.get("tags").is_some() || obj.get("tags-ignore").is_some();
+                        if branch_axis || tag_axis {
+                            let branch_ok = branch_axis
+                                && branch.is_some()
+                                && obj
+                                    .get("branches")
+                                    .is_none_or(|filters| matches_filter(filters, branch.unwrap()))
+                                && obj
+                                    .get("branches-ignore")
+                                    .is_none_or(|ignore| !matches_filter(ignore, branch.unwrap()));
+                            let tag_ok = tag_axis
+                                && tag.is_some()
+                                && obj
+                                    .get("tags")
+                                    .is_none_or(|filters| matches_filter(filters, tag.unwrap()))
+                                && obj
+                                    .get("tags-ignore")
+                                    .is_none_or(|ignore| !matches_filter(ignore, tag.unwrap()));
+                            if !branch_ok && !tag_ok {
                                 return false;
-                            }
-                        }
-                        // branches-ignore
-                        if let Some(ignore) = obj.get("branches-ignore") {
-                            if let Some(branch) = branch {
-                                if matches_filter(ignore, branch) {
-                                    return false;
-                                }
-                            }
-                        }
-                        // tags filter
-                        if let Some(tags) = obj.get("tags") {
-                            if let Some(tag) = tag {
-                                if !matches_filter(tags, tag) {
-                                    return false;
-                                }
-                            } else {
-                                return false;
-                            }
-                        }
-                        // tags-ignore
-                        if let Some(ignore) = obj.get("tags-ignore") {
-                            if let Some(tag) = tag {
-                                if matches_filter(ignore, tag) {
-                                    return false;
-                                }
                             }
                         }
                         // A `paths` filter requires at least one known changed
