@@ -1,0 +1,98 @@
+﻿2026-08-01T04:10:36.5748338Z Current runner version: '2.336.0'
+##[group]Runner Image Provisioner
+Hosted Compute Agent
+Version: 20260707.563
+Commit: 02667638d2b423fbc733a8e32a88b44996a3ba6e
+Build Date: 2026-07-07T19:33:50Z
+Worker ID: {82747b2d-898a-492c-9757-e1af2cfa7b3c}
+Azure Region: eastus
+##[endgroup]
+##[group]Operating System
+Ubuntu
+24.04.4
+LTS
+##[endgroup]
+##[group]Runner Image
+Image: ubuntu-24.04
+Version: 20260720.247.2
+Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260720.247/images/ubuntu/Ubuntu2404-Readme.md
+Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260720.247
+##[endgroup]
+##[group]GITHUB_TOKEN Permissions
+Actions: write
+ArtifactMetadata: write
+Attestations: write
+Checks: write
+CodeQuality: write
+Contents: write
+CopilotRequests: write
+Deployments: write
+Discussions: write
+Drives: write
+Issues: write
+Metadata: read
+Models: read
+Packages: write
+Pages: write
+PullRequests: write
+RepositoryProjects: write
+SecurityEvents: write
+Statuses: write
+VulnerabilityAlerts: read
+##[endgroup]
+Secret source: Actions
+Prepare workflow directory
+Prepare all required actions
+Complete job name: all-jobs
+##[group]Run jq --exit-status 'all(.result == "success")' <<< '{
+jq --exit-status 'all(.result == "success")' <<< '{
+"crate_metadata": {
+"result": "success",
+"outputs": {
+"name": "bat",
+"version": "0.26.1",
+"maintainer": "David Peter <mail@david-peter.de>",
+"homepage": "https://github.com/sharkdp/bat",
+"msrv": "1.88"
+}
+},
+"lint": {
+"result": "success",
+"outputs": {}
+},
+"min_version": {
+"result": "success",
+"outputs": {}
+},
+"license_checks": {
+"result": "success",
+"outputs": {}
+},
+"test_with_new_syntaxes_and_themes": {
+"result": "success",
+"outputs": {}
+},
+"test_with_system_config": {
+"result": "success",
+"outputs": {}
+},
+"documentation": {
+"result": "success",
+"outputs": {}
+},
+"cargo-audit": {
+"result": "success",
+"outputs": {}
+},
+"build": {
+"result": "success",
+"outputs": {}
+}
+}'
+shell: /usr/bin/bash -e {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+##[endgroup]
+true
+Cleaning up orphan processes

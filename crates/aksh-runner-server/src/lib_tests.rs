@@ -6602,6 +6602,67 @@ async fn submit_yaml(app: &Router, yaml: &str, repo: &str) -> Value {
     .await
 }
 
+#[tokio::test]
+async fn workflow_steps_update_prefers_runner_reported_step_names() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = submit_yaml(
+        &app,
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+        "local/aksh",
+    )
+    .await;
+    let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+
+    // The server leaves the broker-message display name empty for steps
+    // without an explicit `name:`; the runner reports the rendered name
+    // ("Run echo hi") in WorkflowStepsUpdate and that must win, not the
+    // empty lookup result.
+    let (plan_id, agent_job_id) = {
+        let inner = state.inner.lock().await;
+        let request = inner
+            .job_requests
+            .values()
+            .find(|request| request.run_id.0.to_string() == run_id)
+            .expect("submitted run must have a job request");
+        (request.plan_id.clone(), request.agent_job_id.to_string())
+    };
+
+    let response = request_json(
+        &app,
+        Method::POST,
+        "/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate",
+        json!({
+            "workflow_run_backend_id": plan_id,
+            "workflow_job_run_backend_id": agent_job_id,
+            "steps": [{
+                "external_id": uuid::Uuid::new_v4().to_string(),
+                "number": 2,
+                "name": "Run echo hi",
+                "status": 6,
+                "conclusion": 2
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(response["ok"], true);
+
+    let run = get_run_json(&app, &run_id).await;
+    let steps = run["jobs_list"][0]["steps"].as_array().unwrap();
+    assert!(
+        steps.iter().any(|step| step["name"] == "Run echo hi"),
+        "runner-reported step name must appear in the run record: {steps:?}"
+    );
+    assert!(
+        steps
+            .iter()
+            .all(|step| !step["name"].as_str().unwrap_or("").is_empty()),
+        "no step may have an empty name in the run record: {steps:?}"
+    );
+}
+
 async fn get_run_json(app: &Router, run_id: &str) -> Value {
     request_json(
         app,
@@ -9147,6 +9208,65 @@ async fn workspace_snapshot_captures_git_state_without_mutating_source() {
 }
 
 #[tokio::test]
+async fn snapshot_before_sha_tracks_working_tree_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    git_fixture_command(&workspace, &["init", "-b", "main"]);
+    git_fixture_command(&workspace, &["config", "user.name", "Snapshot Test"]);
+    git_fixture_command(
+        &workspace,
+        &["config", "user.email", "snapshot@example.test"],
+    );
+    fs::write(workspace.join("file.txt"), "one\n").unwrap();
+    git_fixture_command(&workspace, &["add", "file.txt"]);
+    git_fixture_command(&workspace, &["commit", "-m", "c0"]);
+    fs::write(workspace.join("file.txt"), "two\n").unwrap();
+    git_fixture_command(&workspace, &["add", "file.txt"]);
+    git_fixture_command(&workspace, &["commit", "-m", "c1"]);
+
+    let head = String::from_utf8(git_fixture_output(&workspace, &["rev-parse", "HEAD"]))
+        .unwrap()
+        .trim()
+        .to_owned();
+    let head_parent = String::from_utf8(git_fixture_output(&workspace, &["rev-parse", "HEAD^"]))
+        .unwrap()
+        .trim()
+        .to_owned();
+
+    // Clean tree: the change under test is the last commit, so the diff base
+    // is HEAD^ (an equal-tree HEAD..S would be empty).
+    let clean_run: RunId = "66666666-6666-4666-8666-666666666666".parse().unwrap();
+    let clean = create_workspace_snapshot(&state_dir, &workspace, clean_run)
+        .await
+        .expect("clean-tree snapshot should succeed");
+    assert_eq!(
+        clean.before_sha.as_deref(),
+        Some(head_parent.as_str()),
+        "clean tree must diff against HEAD^"
+    );
+
+    // Dirty tree: the change under test is the uncommitted edit, so the diff
+    // base is HEAD itself.
+    fs::write(workspace.join("file.txt"), "three (uncommitted)\n").unwrap();
+    let dirty_run: RunId = "77777777-7777-4777-8777-777777777777".parse().unwrap();
+    let dirty = create_workspace_snapshot(&state_dir, &workspace, dirty_run)
+        .await
+        .expect("dirty-tree snapshot should succeed");
+    assert_ne!(
+        dirty.commit_sha, clean.commit_sha,
+        "uncommitted edit must produce a distinct snapshot commit"
+    );
+    assert_eq!(
+        dirty.before_sha.as_deref(),
+        Some(head.as_str()),
+        "dirty tree must diff against HEAD"
+    );
+}
+
+#[tokio::test]
 async fn terminal_run_discards_workspace_snapshot_but_preserves_object_cache() {
     let temp = tempfile::tempdir().unwrap();
     let (state_dir, workspace) = create_snapshot_fixture(temp.path());
@@ -9428,6 +9548,8 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
         &WorkspaceSnapshot {
             commit_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
             repository: "snapshots/11111111-1111-4111-8111-111111111111".to_owned(),
+            default_branch: Some("main".to_owned()),
+            before_sha: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
         },
         "http://127.0.0.1:9090",
         "local-runtime-jwt",
@@ -9465,6 +9587,8 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
             &WorkspaceSnapshot {
                 commit_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
                 repository: "snapshots/22222222-2222-4222-8222-222222222222".to_owned(),
+                default_branch: Some("main".to_owned()),
+                before_sha: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
             },
             "http://127.0.0.1:9090",
             "local-runtime-jwt",

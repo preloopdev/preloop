@@ -347,6 +347,12 @@ pub struct JobPlan {
     /// Matrix values for this expansion.
     #[serde(default)]
     pub matrix: IndexMap<String, serde_json::Value>,
+    /// 1-based index of this matrix cell within its base job, when the job
+    /// expanded from a matrix. GitHub encodes it in `system.orchestrationId`
+    /// (`build._1`, `build._2`, …) which the official runner emits as a
+    /// User-Agent product token; `__default` is used when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matrix_index: Option<usize>,
     /// Job-level environment.
     #[serde(default)]
     pub env: BTreeMap<String, String>,

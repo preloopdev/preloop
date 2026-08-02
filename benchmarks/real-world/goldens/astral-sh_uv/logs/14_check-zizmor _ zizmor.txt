@@ -1,0 +1,2671 @@
+﻿2026-08-01T02:36:42.5848679Z Current runner version: '2.336.0'
+##[group]Runner Image Provisioner
+Hosted Compute Agent
+Version: 20260707.563
+Commit: 02667638d2b423fbc733a8e32a88b44996a3ba6e
+Build Date: 2026-07-07T19:33:50Z
+Worker ID: {a6732858-5672-43fd-a1a8-2e488cf54a6d}
+Azure Region: eastus2
+##[endgroup]
+##[group]Operating System
+Ubuntu
+24.04.4
+LTS
+##[endgroup]
+##[group]Runner Image
+Image: ubuntu-24.04
+Version: 20260720.247.2
+Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260720.247/images/ubuntu/Ubuntu2404-Readme.md
+Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260720.247
+##[endgroup]
+##[group]GITHUB_TOKEN Permissions
+Metadata: read
+SecurityEvents: read
+##[endgroup]
+Secret source: None
+Prepare workflow directory
+Prepare all required actions
+Getting action download info
+Download action repository 'actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0' (SHA:9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0)
+Download action repository 'zizmorcore/zizmor-action@6599ee8b7a49aef6a770f63d261d214911a7ce02' (SHA:6599ee8b7a49aef6a770f63d261d214911a7ce02)
+Getting action download info
+Download action repository 'github/codeql-action@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a' (SHA:54f647b7e1bb85c95cddabcd46b0c578ec92bc1a)
+Uses: astral-sh/uv/.github/workflows/check-zizmor.yml@refs/pull/20876/merge (81742a27ad62bb1dd1289a164f1776508279c756)
+Complete job name: check-zizmor / zizmor
+##[group]Run actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+with:
+persist-credentials: false
+repository: astral-sh/uv
+token: ***
+ssh-strict: true
+ssh-user: git
+clean: true
+sparse-checkout-cone-mode: true
+fetch-depth: 1
+fetch-tags: false
+show-progress: true
+lfs: false
+submodules: false
+set-safe-directory: true
+allow-unsafe-pr-checkout: false
+##[endgroup]
+Syncing repository: astral-sh/uv
+##[group]Getting Git version info
+Working directory is '/home/runner/work/uv/uv'
+[command]/usr/bin/git version
+git version 2.54.0
+##[endgroup]
+Temporarily overriding HOME='/home/runner/work/_temp/4d4d37ce-68e8-4f2e-9032-393b27d55cff' before making global git config changes
+Adding repository directory to the temporary git global config as a safe directory
+[command]/usr/bin/git config --global --add safe.directory /home/runner/work/uv/uv
+Deleting the contents of '/home/runner/work/uv/uv'
+##[group]Determining repository object format
+##[endgroup]
+##[group]Initializing the repository
+[command]/usr/bin/git init /home/runner/work/uv/uv
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /home/runner/work/uv/uv/.git/
+[command]/usr/bin/git remote add origin https://github.com/astral-sh/uv
+##[endgroup]
+##[group]Disabling automatic garbage collection
+[command]/usr/bin/git config --local gc.auto 0
+##[endgroup]
+##[group]Setting up auth
+Removing SSH command configuration
+[command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Removing HTTP extra header
+[command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Removing includeIf entries pointing to credentials config files
+[command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+[command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+[command]/usr/bin/git config --file /home/runner/work/_temp/git-credentials-874d19d8-a6bd-4040-b71c-559d720b42d9.config http.https://github.com/.extraheader AUTHORIZATION: basic ***
+[command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/uv/uv/.git.path /home/runner/work/_temp/git-credentials-874d19d8-a6bd-4040-b71c-559d720b42d9.config
+[command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/uv/uv/.git/worktrees/*.path /home/runner/work/_temp/git-credentials-874d19d8-a6bd-4040-b71c-559d720b42d9.config
+[command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-874d19d8-a6bd-4040-b71c-559d720b42d9.config
+[command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-874d19d8-a6bd-4040-b71c-559d720b42d9.config
+##[endgroup]
+##[group]Fetching the repository
+[command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +81742a27ad62bb1dd1289a164f1776508279c756:refs/remotes/pull/20876/merge
+From https://github.com/astral-sh/uv
+* [new ref]         81742a27ad62bb1dd1289a164f1776508279c756 -> pull/20876/merge
+##[endgroup]
+##[group]Determining the checkout info
+##[endgroup]
+[command]/usr/bin/git sparse-checkout disable
+[command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+##[group]Checking out the ref
+[command]/usr/bin/git checkout --progress --force refs/remotes/pull/20876/merge
+Note: switching to 'refs/remotes/pull/20876/merge'.
+You are in 'detached HEAD' state. You can look around, make experimental
+changes and commit them, and you can discard any commits you make in this
+state without impacting any branches by switching back to a branch.
+If you want to create a new branch to retain commits you create, you may
+do so (now or later) by using -c with the switch command. Example:
+git switch -c <new-branch-name>
+Or undo this operation with:
+git switch -
+Turn off this advice by setting config variable advice.detachedHead to false
+HEAD is now at 81742a2 Merge 1ddf5b709ad49bba88e6607af0d2a1bbe0c03ff5 into 79bbface771210df216b738e9bdc7df95e5a9e6b
+##[endgroup]
+[command]/usr/bin/git log -1 --format=%H
+81742a27ad62bb1dd1289a164f1776508279c756
+##[group]Removing auth
+Removing SSH command configuration
+[command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Removing HTTP extra header
+[command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Removing includeIf entries pointing to credentials config files
+[command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+includeif.gitdir:/home/runner/work/uv/uv/.git.path
+includeif.gitdir:/home/runner/work/uv/uv/.git/worktrees/*.path
+includeif.gitdir:/github/workspace/.git.path
+includeif.gitdir:/github/workspace/.git/worktrees/*.path
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/uv/uv/.git.path
+/home/runner/work/_temp/git-credentials-874d19d8-a6bd-4040-b71c-559d720b42d9.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/uv/uv/.git.path /home/runner/work/_temp/git-credentials-874d19d8-a6bd-4040-b71c-559d720b42d9.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/uv/uv/.git/worktrees/*.path
+/home/runner/work/_temp/git-credentials-874d19d8-a6bd-4040-b71c-559d720b42d9.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/uv/uv/.git/worktrees/*.path /home/runner/work/_temp/git-credentials-874d19d8-a6bd-4040-b71c-559d720b42d9.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git.path
+/github/runner_temp/git-credentials-874d19d8-a6bd-4040-b71c-559d720b42d9.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-874d19d8-a6bd-4040-b71c-559d720b42d9.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git/worktrees/*.path
+/github/runner_temp/git-credentials-874d19d8-a6bd-4040-b71c-559d720b42d9.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-874d19d8-a6bd-4040-b71c-559d720b42d9.config
+[command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+Removing credentials config '/home/runner/work/_temp/git-credentials-874d19d8-a6bd-4040-b71c-559d720b42d9.config'
+##[endgroup]
+##[group]Run zizmorcore/zizmor-action@6599ee8b7a49aef6a770f63d261d214911a7ce02
+with:
+inputs: .
+collect: default
+online-audits: true
+persona: regular
+version: latest
+token: ***
+advanced-security: true
+color: true
+annotations: false
+fail-on-no-inputs: true
+##[endgroup]
+##[start-action display=Run zizmor;id=__zizmorcore_zizmor-action.run-zizmor]
+##[group]Run "${GITHUB_ACTION_PATH}/action.sh"
+"${GITHUB_ACTION_PATH}/action.sh"
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+GHA_ZIZMOR_INPUTS: .
+GHA_ZIZMOR_COLLECT: default
+GHA_ZIZMOR_ONLINE_AUDITS: true
+GHA_ZIZMOR_PERSONA: regular
+GHA_ZIZMOR_MIN_SEVERITY: 
+GHA_ZIZMOR_MIN_CONFIDENCE: 
+GHA_ZIZMOR_VERSION: latest
+GHA_ZIZMOR_TOKEN: ***
+GHA_ZIZMOR_ADVANCED_SECURITY: true
+GHA_ZIZMOR_COLOR: true
+GHA_ZIZMOR_ANNOTATIONS: false
+GHA_ZIZMOR_CONFIG: 
+GHA_ZIZMOR_FAIL_ON_NO_INPUTS: true
+##[endgroup]
+##[group]Pulling zizmor image
+ghcr.io/zizmorcore/zizmor@sha256:5800c8d5e83263d68a8874989b0eb3939e177540e9395de48158d24656141ee9: Pulling from zizmorcore/zizmor
+a66283bef834: Pulling fs layer
+f1dc41da0ac6: Pulling fs layer
+2e3139e176fe: Pulling fs layer
+c920184a3208: Pulling fs layer
+9201e51fe8c1: Pulling fs layer
+69cbafd2417b: Pulling fs layer
+7fc117d2446a: Pulling fs layer
+8d99fd8fea9c: Pulling fs layer
+5f460b97a17e: Pulling fs layer
+cdea145aa115: Pulling fs layer
+5747d22823f1: Pulling fs layer
+b9577d2f474b: Pulling fs layer
+c920184a3208: Waiting
+9201e51fe8c1: Waiting
+69cbafd2417b: Waiting
+7fc117d2446a: Waiting
+8d99fd8fea9c: Waiting
+5f460b97a17e: Waiting
+cdea145aa115: Waiting
+5747d22823f1: Waiting
+b9577d2f474b: Waiting
+2e3139e176fe: Download complete
+a66283bef834: Verifying Checksum
+f1dc41da0ac6: Download complete
+c920184a3208: Verifying Checksum
+c920184a3208: Download complete
+a66283bef834: Pull complete
+69cbafd2417b: Verifying Checksum
+69cbafd2417b: Download complete
+9201e51fe8c1: Verifying Checksum
+9201e51fe8c1: Download complete
+7fc117d2446a: Verifying Checksum
+7fc117d2446a: Download complete
+5f460b97a17e: Verifying Checksum
+5f460b97a17e: Download complete
+8d99fd8fea9c: Verifying Checksum
+8d99fd8fea9c: Download complete
+5747d22823f1: Verifying Checksum
+5747d22823f1: Download complete
+cdea145aa115: Verifying Checksum
+cdea145aa115: Download complete
+b9577d2f474b: Verifying Checksum
+b9577d2f474b: Download complete
+f1dc41da0ac6: Pull complete
+2e3139e176fe: Pull complete
+c920184a3208: Pull complete
+9201e51fe8c1: Pull complete
+69cbafd2417b: Pull complete
+7fc117d2446a: Pull complete
+8d99fd8fea9c: Pull complete
+5f460b97a17e: Pull complete
+cdea145aa115: Pull complete
+5747d22823f1: Pull complete
+b9577d2f474b: Pull complete
+Digest: sha256:5800c8d5e83263d68a8874989b0eb3939e177540e9395de48158d24656141ee9
+Status: Downloaded newer image for ghcr.io/zizmorcore/zizmor@sha256:5800c8d5e83263d68a8874989b0eb3939e177540e9395de48158d24656141ee9
+ghcr.io/zizmorcore/zizmor:latest@sha256:5800c8d5e83263d68a8874989b0eb3939e177540e9395de48158d24656141ee9
+##[endgroup]
+INFO zizmor: 🌈 zizmor v1.27.0
+INFO audit: zizmor: 🌈 completed ./.github/workflows/bench.yml
+INFO audit: zizmor: 🌈 completed ./.github/workflows/build-dev-binaries.yml
+INFO audit: zizmor: 🌈 completed ./.github/workflows/build-docker.yml
+INFO audit: zizmor: 🌈 completed ./.github/workflows/build-release-binaries.yml
+INFO audit: zizmor: 🌈 completed ./.github/workflows/check-docs.yml
+INFO audit: zizmor: 🌈 completed ./.github/workflows/check-fmt.yml
+INFO audit: zizmor: 🌈 completed ./.github/workflows/check-generated-files.yml
+INFO audit: zizmor: 🌈 completed ./.github/workflows/check-lint.yml
+INFO audit: zizmor: 🌈 completed ./.github/workflows/check-lock.yml
+INFO audit: zizmor: 🌈 completed ./.github/workflows/check-publish.yml
+INFO audit: zizmor: 🌈 completed ./.github/workflows/check-release.yml
+INFO audit: zizmor: 🌈 completed ./.github/workflows/check-zizmor.yml
+INFO audit: zizmor: 🌈 completed ./.github/workflows/ci.yml
+INFO audit: zizmor: 🌈 completed ./.github/workflows/diagnose-workflow-failure.yml
+INFO audit: zizmor: 🌈 completed ./.github/workflows/issue-triage.yml
+INFO audit: zizmor: 🌈 completed ./.github/workflows/plan.yml
+INFO audit: zizmor: 🌈 completed ./.github/workflows/promote-pull-request.yml
+INFO audit: zizmor: 🌈 completed ./.github/workflows/publish-crates.yml
+INFO audit: zizmor: 🌈 completed ./.github/workflows/publish-docs.yml
+INFO audit: zizmor: 🌈 completed ./.github/workflows/publish-mirror.yml
+INFO audit: zizmor: 🌈 completed ./.github/workflows/publish-pypi.yml
+INFO audit: zizmor: 🌈 completed ./.github/workflows/publish-versions.yml
+INFO audit: zizmor: 🌈 completed ./.github/workflows/pull-request-conflicts.yml
+INFO audit: zizmor: 🌈 completed ./.github/workflows/pull-request-labels.yml
+INFO audit: zizmor: 🌈 completed ./.github/workflows/pull-request-security-review.yml
+INFO audit: zizmor: 🌈 completed ./.github/workflows/rebase-conflicted-pull-request.yml
+INFO audit: zizmor: 🌈 completed ./.github/workflows/release-prepare.yml
+INFO audit: zizmor: 🌈 completed ./.github/workflows/release.yml
+INFO audit: zizmor: 🌈 completed ./.github/workflows/reproduce-bug.yml
+INFO audit: zizmor: 🌈 completed ./.github/workflows/sync-python-releases.yml
+INFO audit: zizmor: 🌈 completed ./.github/workflows/sync-uv-dev.yml
+INFO audit: zizmor: 🌈 completed ./.github/workflows/test-ecosystem.yml
+INFO audit: zizmor: 🌈 completed ./.github/workflows/test-integration.yml
+INFO audit: zizmor: 🌈 completed ./.github/workflows/test-smoke.yml
+INFO audit: zizmor: 🌈 completed ./.github/workflows/test-system.yml
+INFO audit: zizmor: 🌈 completed ./.github/workflows/test-windows-trampolines.yml
+INFO audit: zizmor: 🌈 completed ./.github/workflows/test.yml
+{
+"$schema": "https://docs.oasis-open.org/sarif/sarif/v2.1.0/os/schemas/sarif-schema-2.1.0.json",
+"runs": [
+{
+"invocations": [
+{
+"executionSuccessful": true
+}
+],
+"results": [
+{
+"codeFlows": [
+{
+"threadFlows": [
+{
+"locations": [
+{
+"importance": "essential",
+"location": {
+"logicalLocations": [
+{
+"properties": {
+"symbolic": {
+"annotation": "this reusable workflow",
+"feature_kind": {
+"Subfeature": {
+"after": 0,
+"fragment": {
+"Raw": "./.github/workflows/check-docs.yml"
+}
+}
+},
+"key": {
+"Local": {
+"verbatim_path": "./.github/workflows/ci.yml"
+}
+},
+"kind": "Primary",
+"route": {
+"route": [
+{
+"Key": "jobs"
+},
+{
+"Key": "check-docs"
+},
+{
+"Key": "uses"
+}
+]
+}
+}
+}
+}
+],
+"message": {
+"text": "this reusable workflow"
+},
+"physicalLocation": {
+"artifactLocation": {
+"uri": ".github/workflows/ci.yml"
+},
+"region": {
+"endColumn": 45,
+"endLine": 43,
+"snippet": {
+"text": "./.github/workflows/check-docs.yml"
+},
+"sourceLanguage": "yaml",
+"startColumn": 11,
+"startLine": 43
+}
+}
+}
+},
+{
+"importance": "important",
+"location": {
+"logicalLocations": [
+{
+"properties": {
+"symbolic": {
+"annotation": "inherits all parent secrets",
+"feature_kind": "Normal",
+"key": {
+"Local": {
+"verbatim_path": "./.github/workflows/ci.yml"
+}
+},
+"kind": "Related",
+"route": {
+"route": [
+{
+"Key": "jobs"
+},
+{
+"Key": "check-docs"
+},
+{
+"Key": "secrets"
+}
+]
+}
+}
+}
+}
+],
+"message": {
+"text": "inherits all parent secrets"
+},
+"physicalLocation": {
+"artifactLocation": {
+"uri": ".github/workflows/ci.yml"
+},
+"region": {
+"endColumn": 21,
+"endLine": 44,
+"snippet": {
+"text": "    secrets: inherit"
+},
+"sourceLanguage": "yaml",
+"startColumn": 5,
+"startLine": 44
+}
+}
+}
+}
+]
+}
+]
+}
+],
+"kind": "fail",
+"level": "warning",
+"locations": [
+{
+"logicalLocations": [
+{
+"properties": {
+"symbolic": {
+"annotation": "this reusable workflow",
+"feature_kind": {
+"Subfeature": {
+"after": 0,
+"fragment": {
+"Raw": "./.github/workflows/check-docs.yml"
+}
+}
+},
+"key": {
+"Local": {
+"verbatim_path": "./.github/workflows/ci.yml"
+}
+},
+"kind": "Primary",
+"route": {
+"route": [
+{
+"Key": "jobs"
+},
+{
+"Key": "check-docs"
+},
+{
+"Key": "uses"
+}
+]
+}
+}
+}
+}
+],
+"message": {
+"text": "this reusable workflow"
+},
+"physicalLocation": {
+"artifactLocation": {
+"uri": ".github/workflows/ci.yml"
+},
+"region": {
+"endColumn": 45,
+"endLine": 43,
+"snippet": {
+"text": "./.github/workflows/check-docs.yml"
+},
+"sourceLanguage": "yaml",
+"startColumn": 11,
+"startLine": 43
+}
+}
+}
+],
+"message": {
+"text": "secrets unconditionally inherited by called workflow: this reusable workflow"
+},
+"properties": {
+"zizmor/confidence": "High",
+"zizmor/persona": "Regular",
+"zizmor/severity": "Medium"
+},
+"ruleId": "zizmor/secrets-inherit"
+},
+{
+"codeFlows": [
+{
+"threadFlows": [
+{
+"locations": [
+{
+"importance": "essential",
+"location": {
+"logicalLocations": [
+{
+"properties": {
+"symbolic": {
+"annotation": "this reusable workflow",
+"feature_kind": {
+"Subfeature": {
+"after": 0,
+"fragment": {
+"Raw": "./.github/workflows/test-integration.yml"
+}
+}
+},
+"key": {
+"Local": {
+"verbatim_path": "./.github/workflows/ci.yml"
+}
+},
+"kind": "Primary",
+"route": {
+"route": [
+{
+"Key": "jobs"
+},
+{
+"Key": "test-integration"
+},
+{
+"Key": "uses"
+}
+]
+}
+}
+}
+}
+],
+"message": {
+"text": "this reusable workflow"
+},
+"physicalLocation": {
+"artifactLocation": {
+"uri": ".github/workflows/ci.yml"
+},
+"region": {
+"endColumn": 51,
+"endLine": 113,
+"snippet": {
+"text": "./.github/workflows/test-integration.yml"
+},
+"sourceLanguage": "yaml",
+"startColumn": 11,
+"startLine": 113
+}
+}
+}
+},
+{
+"importance": "important",
+"location": {
+"logicalLocations": [
+{
+"properties": {
+"symbolic": {
+"annotation": "inherits all parent secrets",
+"feature_kind": "Normal",
+"key": {
+"Local": {
+"verbatim_path": "./.github/workflows/ci.yml"
+}
+},
+"kind": "Related",
+"route": {
+"route": [
+{
+"Key": "jobs"
+},
+{
+"Key": "test-integration"
+},
+{
+"Key": "secrets"
+}
+]
+}
+}
+}
+}
+],
+"message": {
+"text": "inherits all parent secrets"
+},
+"physicalLocation": {
+"artifactLocation": {
+"uri": ".github/workflows/ci.yml"
+},
+"region": {
+"endColumn": 21,
+"endLine": 114,
+"snippet": {
+"text": "    secrets: inherit"
+},
+"sourceLanguage": "yaml",
+"startColumn": 5,
+"startLine": 114
+}
+}
+}
+}
+]
+}
+]
+}
+],
+"kind": "fail",
+"level": "warning",
+"locations": [
+{
+"logicalLocations": [
+{
+"properties": {
+"symbolic": {
+"annotation": "this reusable workflow",
+"feature_kind": {
+"Subfeature": {
+"after": 0,
+"fragment": {
+"Raw": "./.github/workflows/test-integration.yml"
+}
+}
+},
+"key": {
+"Local": {
+"verbatim_path": "./.github/workflows/ci.yml"
+}
+},
+"kind": "Primary",
+"route": {
+"route": [
+{
+"Key": "jobs"
+},
+{
+"Key": "test-integration"
+},
+{
+"Key": "uses"
+}
+]
+}
+}
+}
+}
+],
+"message": {
+"text": "this reusable workflow"
+},
+"physicalLocation": {
+"artifactLocation": {
+"uri": ".github/workflows/ci.yml"
+},
+"region": {
+"endColumn": 51,
+"endLine": 113,
+"snippet": {
+"text": "./.github/workflows/test-integration.yml"
+},
+"sourceLanguage": "yaml",
+"startColumn": 11,
+"startLine": 113
+}
+}
+}
+],
+"message": {
+"text": "secrets unconditionally inherited by called workflow: this reusable workflow"
+},
+"properties": {
+"zizmor/confidence": "High",
+"zizmor/persona": "Regular",
+"zizmor/severity": "Medium"
+},
+"ruleId": "zizmor/secrets-inherit"
+},
+{
+"codeFlows": [
+{
+"threadFlows": [
+{
+"locations": [
+{
+"importance": "essential",
+"location": {
+"logicalLocations": [
+{
+"properties": {
+"symbolic": {
+"annotation": "this reusable workflow",
+"feature_kind": {
+"Subfeature": {
+"after": 0,
+"fragment": {
+"Raw": "./.github/workflows/build-release-binaries.yml"
+}
+}
+},
+"key": {
+"Local": {
+"verbatim_path": "./.github/workflows/ci.yml"
+}
+},
+"kind": "Primary",
+"route": {
+"route": [
+{
+"Key": "jobs"
+},
+{
+"Key": "build-release-binaries"
+},
+{
+"Key": "uses"
+}
+]
+}
+}
+}
+}
+],
+"message": {
+"text": "this reusable workflow"
+},
+"physicalLocation": {
+"artifactLocation": {
+"uri": ".github/workflows/ci.yml"
+},
+"region": {
+"endColumn": 57,
+"endLine": 141,
+"snippet": {
+"text": "./.github/workflows/build-release-binaries.yml"
+},
+"sourceLanguage": "yaml",
+"startColumn": 11,
+"startLine": 141
+}
+}
+}
+},
+{
+"importance": "important",
+"location": {
+"logicalLocations": [
+{
+"properties": {
+"symbolic": {
+"annotation": "inherits all parent secrets",
+"feature_kind": "Normal",
+"key": {
+"Local": {
+"verbatim_path": "./.github/workflows/ci.yml"
+}
+},
+"kind": "Related",
+"route": {
+"route": [
+{
+"Key": "jobs"
+},
+{
+"Key": "build-release-binaries"
+},
+{
+"Key": "secrets"
+}
+]
+}
+}
+}
+}
+],
+"message": {
+"text": "inherits all parent secrets"
+},
+"physicalLocation": {
+"artifactLocation": {
+"uri": ".github/workflows/ci.yml"
+},
+"region": {
+"endColumn": 21,
+"endLine": 142,
+"snippet": {
+"text": "    secrets: inherit"
+},
+"sourceLanguage": "yaml",
+"startColumn": 5,
+"startLine": 142
+}
+}
+}
+}
+]
+}
+]
+}
+],
+"kind": "fail",
+"level": "warning",
+"locations": [
+{
+"logicalLocations": [
+{
+"properties": {
+"symbolic": {
+"annotation": "this reusable workflow",
+"feature_kind": {
+"Subfeature": {
+"after": 0,
+"fragment": {
+"Raw": "./.github/workflows/build-release-binaries.yml"
+}
+}
+},
+"key": {
+"Local": {
+"verbatim_path": "./.github/workflows/ci.yml"
+}
+},
+"kind": "Primary",
+"route": {
+"route": [
+{
+"Key": "jobs"
+},
+{
+"Key": "build-release-binaries"
+},
+{
+"Key": "uses"
+}
+]
+}
+}
+}
+}
+],
+"message": {
+"text": "this reusable workflow"
+},
+"physicalLocation": {
+"artifactLocation": {
+"uri": ".github/workflows/ci.yml"
+},
+"region": {
+"endColumn": 57,
+"endLine": 141,
+"snippet": {
+"text": "./.github/workflows/build-release-binaries.yml"
+},
+"sourceLanguage": "yaml",
+"startColumn": 11,
+"startLine": 141
+}
+}
+}
+],
+"message": {
+"text": "secrets unconditionally inherited by called workflow: this reusable workflow"
+},
+"properties": {
+"zizmor/confidence": "High",
+"zizmor/persona": "Regular",
+"zizmor/severity": "Medium"
+},
+"ruleId": "zizmor/secrets-inherit"
+},
+{
+"codeFlows": [
+{
+"threadFlows": [
+{
+"locations": [
+{
+"importance": "essential",
+"location": {
+"logicalLocations": [
+{
+"properties": {
+"symbolic": {
+"annotation": "this reusable workflow",
+"feature_kind": {
+"Subfeature": {
+"after": 0,
+"fragment": {
+"Raw": "./.github/workflows/build-docker.yml"
+}
+}
+},
+"key": {
+"Local": {
+"verbatim_path": "./.github/workflows/ci.yml"
+}
+},
+"kind": "Primary",
+"route": {
+"route": [
+{
+"Key": "jobs"
+},
+{
+"Key": "build-docker"
+},
+{
+"Key": "uses"
+}
+]
+}
+}
+}
+}
+],
+"message": {
+"text": "this reusable workflow"
+},
+"physicalLocation": {
+"artifactLocation": {
+"uri": ".github/workflows/ci.yml"
+},
+"region": {
+"endColumn": 47,
+"endLine": 147,
+"snippet": {
+"text": "./.github/workflows/build-docker.yml"
+},
+"sourceLanguage": "yaml",
+"startColumn": 11,
+"startLine": 147
+}
+}
+}
+},
+{
+"importance": "important",
+"location": {
+"logicalLocations": [
+{
+"properties": {
+"symbolic": {
+"annotation": "inherits all parent secrets",
+"feature_kind": "Normal",
+"key": {
+"Local": {
+"verbatim_path": "./.github/workflows/ci.yml"
+}
+},
+"kind": "Related",
+"route": {
+"route": [
+{
+"Key": "jobs"
+},
+{
+"Key": "build-docker"
+},
+{
+"Key": "secrets"
+}
+]
+}
+}
+}
+}
+],
+"message": {
+"text": "inherits all parent secrets"
+},
+"physicalLocation": {
+"artifactLocation": {
+"uri": ".github/workflows/ci.yml"
+},
+"region": {
+"endColumn": 21,
+"endLine": 150,
+"snippet": {
+"text": "    secrets: inherit"
+},
+"sourceLanguage": "yaml",
+"startColumn": 5,
+"startLine": 150
+}
+}
+}
+}
+]
+}
+]
+}
+],
+"kind": "fail",
+"level": "warning",
+"locations": [
+{
+"logicalLocations": [
+{
+"properties": {
+"symbolic": {
+"annotation": "this reusable workflow",
+"feature_kind": {
+"Subfeature": {
+"after": 0,
+"fragment": {
+"Raw": "./.github/workflows/build-docker.yml"
+}
+}
+},
+"key": {
+"Local": {
+"verbatim_path": "./.github/workflows/ci.yml"
+}
+},
+"kind": "Primary",
+"route": {
+"route": [
+{
+"Key": "jobs"
+},
+{
+"Key": "build-docker"
+},
+{
+"Key": "uses"
+}
+]
+}
+}
+}
+}
+],
+"message": {
+"text": "this reusable workflow"
+},
+"physicalLocation": {
+"artifactLocation": {
+"uri": ".github/workflows/ci.yml"
+},
+"region": {
+"endColumn": 47,
+"endLine": 147,
+"snippet": {
+"text": "./.github/workflows/build-docker.yml"
+},
+"sourceLanguage": "yaml",
+"startColumn": 11,
+"startLine": 147
+}
+}
+}
+],
+"message": {
+"text": "secrets unconditionally inherited by called workflow: this reusable workflow"
+},
+"properties": {
+"zizmor/confidence": "High",
+"zizmor/persona": "Regular",
+"zizmor/severity": "Medium"
+},
+"ruleId": "zizmor/secrets-inherit"
+},
+{
+"codeFlows": [
+{
+"threadFlows": [
+{
+"locations": [
+{
+"importance": "essential",
+"location": {
+"logicalLocations": [
+{
+"properties": {
+"symbolic": {
+"annotation": "this reusable workflow",
+"feature_kind": {
+"Subfeature": {
+"after": 0,
+"fragment": {
+"Raw": "./.github/workflows/bench.yml"
+}
+}
+},
+"key": {
+"Local": {
+"verbatim_path": "./.github/workflows/ci.yml"
+}
+},
+"kind": "Primary",
+"route": {
+"route": [
+{
+"Key": "jobs"
+},
+{
+"Key": "bench"
+},
+{
+"Key": "uses"
+}
+]
+}
+}
+}
+}
+],
+"message": {
+"text": "this reusable workflow"
+},
+"physicalLocation": {
+"artifactLocation": {
+"uri": ".github/workflows/ci.yml"
+},
+"region": {
+"endColumn": 40,
+"endLine": 160,
+"snippet": {
+"text": "./.github/workflows/bench.yml"
+},
+"sourceLanguage": "yaml",
+"startColumn": 11,
+"startLine": 160
+}
+}
+}
+},
+{
+"importance": "important",
+"location": {
+"logicalLocations": [
+{
+"properties": {
+"symbolic": {
+"annotation": "inherits all parent secrets",
+"feature_kind": "Normal",
+"key": {
+"Local": {
+"verbatim_path": "./.github/workflows/ci.yml"
+}
+},
+"kind": "Related",
+"route": {
+"route": [
+{
+"Key": "jobs"
+},
+{
+"Key": "bench"
+},
+{
+"Key": "secrets"
+}
+]
+}
+}
+}
+}
+],
+"message": {
+"text": "inherits all parent secrets"
+},
+"physicalLocation": {
+"artifactLocation": {
+"uri": ".github/workflows/ci.yml"
+},
+"region": {
+"endColumn": 21,
+"endLine": 161,
+"snippet": {
+"text": "    secrets: inherit"
+},
+"sourceLanguage": "yaml",
+"startColumn": 5,
+"startLine": 161
+}
+}
+}
+}
+]
+}
+]
+}
+],
+"kind": "fail",
+"level": "warning",
+"locations": [
+{
+"logicalLocations": [
+{
+"properties": {
+"symbolic": {
+"annotation": "this reusable workflow",
+"feature_kind": {
+"Subfeature": {
+"after": 0,
+"fragment": {
+"Raw": "./.github/workflows/bench.yml"
+}
+}
+},
+"key": {
+"Local": {
+"verbatim_path": "./.github/workflows/ci.yml"
+}
+},
+"kind": "Primary",
+"route": {
+"route": [
+{
+"Key": "jobs"
+},
+{
+"Key": "bench"
+},
+{
+"Key": "uses"
+}
+]
+}
+}
+}
+}
+],
+"message": {
+"text": "this reusable workflow"
+},
+"physicalLocation": {
+"artifactLocation": {
+"uri": ".github/workflows/ci.yml"
+},
+"region": {
+"endColumn": 40,
+"endLine": 160,
+"snippet": {
+"text": "./.github/workflows/bench.yml"
+},
+"sourceLanguage": "yaml",
+"startColumn": 11,
+"startLine": 160
+}
+}
+}
+],
+"message": {
+"text": "secrets unconditionally inherited by called workflow: this reusable workflow"
+},
+"properties": {
+"zizmor/confidence": "High",
+"zizmor/persona": "Regular",
+"zizmor/severity": "Medium"
+},
+"ruleId": "zizmor/secrets-inherit"
+},
+{
+"codeFlows": [
+{
+"threadFlows": [
+{
+"locations": [
+{
+"importance": "essential",
+"location": {
+"logicalLocations": [
+{
+"properties": {
+"symbolic": {
+"annotation": "this reusable workflow",
+"feature_kind": {
+"Subfeature": {
+"after": 0,
+"fragment": {
+"Raw": "./.github/workflows/build-release-binaries.yml"
+}
+}
+},
+"key": {
+"Local": {
+"verbatim_path": "./.github/workflows/release.yml"
+}
+},
+"kind": "Primary",
+"route": {
+"route": [
+{
+"Key": "jobs"
+},
+{
+"Key": "build-release-binaries"
+},
+{
+"Key": "uses"
+}
+]
+}
+}
+}
+}
+],
+"message": {
+"text": "this reusable workflow"
+},
+"physicalLocation": {
+"artifactLocation": {
+"uri": ".github/workflows/release.yml"
+},
+"region": {
+"endColumn": 57,
+"endLine": 120,
+"snippet": {
+"text": "./.github/workflows/build-release-binaries.yml"
+},
+"sourceLanguage": "yaml",
+"startColumn": 11,
+"startLine": 120
+}
+}
+}
+},
+{
+"importance": "important",
+"location": {
+"logicalLocations": [
+{
+"properties": {
+"symbolic": {
+"annotation": "inherits all parent secrets",
+"feature_kind": "Normal",
+"key": {
+"Local": {
+"verbatim_path": "./.github/workflows/release.yml"
+}
+},
+"kind": "Related",
+"route": {
+"route": [
+{
+"Key": "jobs"
+},
+{
+"Key": "build-release-binaries"
+},
+{
+"Key": "secrets"
+}
+]
+}
+}
+}
+}
+],
+"message": {
+"text": "inherits all parent secrets"
+},
+"physicalLocation": {
+"artifactLocation": {
+"uri": ".github/workflows/release.yml"
+},
+"region": {
+"endColumn": 21,
+"endLine": 123,
+"snippet": {
+"text": "    secrets: inherit"
+},
+"sourceLanguage": "yaml",
+"startColumn": 5,
+"startLine": 123
+}
+}
+}
+}
+]
+}
+]
+}
+],
+"kind": "fail",
+"level": "warning",
+"locations": [
+{
+"logicalLocations": [
+{
+"properties": {
+"symbolic": {
+"annotation": "this reusable workflow",
+"feature_kind": {
+"Subfeature": {
+"after": 0,
+"fragment": {
+"Raw": "./.github/workflows/build-release-binaries.yml"
+}
+}
+},
+"key": {
+"Local": {
+"verbatim_path": "./.github/workflows/release.yml"
+}
+},
+"kind": "Primary",
+"route": {
+"route": [
+{
+"Key": "jobs"
+},
+{
+"Key": "build-release-binaries"
+},
+{
+"Key": "uses"
+}
+]
+}
+}
+}
+}
+],
+"message": {
+"text": "this reusable workflow"
+},
+"physicalLocation": {
+"artifactLocation": {
+"uri": ".github/workflows/release.yml"
+},
+"region": {
+"endColumn": 57,
+"endLine": 120,
+"snippet": {
+"text": "./.github/workflows/build-release-binaries.yml"
+},
+"sourceLanguage": "yaml",
+"startColumn": 11,
+"startLine": 120
+}
+}
+}
+],
+"message": {
+"text": "secrets unconditionally inherited by called workflow: this reusable workflow"
+},
+"properties": {
+"zizmor/confidence": "High",
+"zizmor/persona": "Regular",
+"zizmor/severity": "Medium"
+},
+"ruleId": "zizmor/secrets-inherit"
+},
+{
+"codeFlows": [
+{
+"threadFlows": [
+{
+"locations": [
+{
+"importance": "essential",
+"location": {
+"logicalLocations": [
+{
+"properties": {
+"symbolic": {
+"annotation": "this reusable workflow",
+"feature_kind": {
+"Subfeature": {
+"after": 0,
+"fragment": {
+"Raw": "./.github/workflows/build-docker.yml"
+}
+}
+},
+"key": {
+"Local": {
+"verbatim_path": "./.github/workflows/release.yml"
+}
+},
+"kind": "Primary",
+"route": {
+"route": [
+{
+"Key": "jobs"
+},
+{
+"Key": "build-docker"
+},
+{
+"Key": "uses"
+}
+]
+}
+}
+}
+}
+],
+"message": {
+"text": "this reusable workflow"
+},
+"physicalLocation": {
+"artifactLocation": {
+"uri": ".github/workflows/release.yml"
+},
+"region": {
+"endColumn": 47,
+"endLine": 130,
+"snippet": {
+"text": "./.github/workflows/build-docker.yml"
+},
+"sourceLanguage": "yaml",
+"startColumn": 11,
+"startLine": 130
+}
+}
+}
+},
+{
+"importance": "important",
+"location": {
+"logicalLocations": [
+{
+"properties": {
+"symbolic": {
+"annotation": "inherits all parent secrets",
+"feature_kind": "Normal",
+"key": {
+"Local": {
+"verbatim_path": "./.github/workflows/release.yml"
+}
+},
+"kind": "Related",
+"route": {
+"route": [
+{
+"Key": "jobs"
+},
+{
+"Key": "build-docker"
+},
+{
+"Key": "secrets"
+}
+]
+}
+}
+}
+}
+],
+"message": {
+"text": "inherits all parent secrets"
+},
+"physicalLocation": {
+"artifactLocation": {
+"uri": ".github/workflows/release.yml"
+},
+"region": {
+"endColumn": 21,
+"endLine": 133,
+"snippet": {
+"text": "    secrets: inherit"
+},
+"sourceLanguage": "yaml",
+"startColumn": 5,
+"startLine": 133
+}
+}
+}
+}
+]
+}
+]
+}
+],
+"kind": "fail",
+"level": "warning",
+"locations": [
+{
+"logicalLocations": [
+{
+"properties": {
+"symbolic": {
+"annotation": "this reusable workflow",
+"feature_kind": {
+"Subfeature": {
+"after": 0,
+"fragment": {
+"Raw": "./.github/workflows/build-docker.yml"
+}
+}
+},
+"key": {
+"Local": {
+"verbatim_path": "./.github/workflows/release.yml"
+}
+},
+"kind": "Primary",
+"route": {
+"route": [
+{
+"Key": "jobs"
+},
+{
+"Key": "build-docker"
+},
+{
+"Key": "uses"
+}
+]
+}
+}
+}
+}
+],
+"message": {
+"text": "this reusable workflow"
+},
+"physicalLocation": {
+"artifactLocation": {
+"uri": ".github/workflows/release.yml"
+},
+"region": {
+"endColumn": 47,
+"endLine": 130,
+"snippet": {
+"text": "./.github/workflows/build-docker.yml"
+},
+"sourceLanguage": "yaml",
+"startColumn": 11,
+"startLine": 130
+}
+}
+}
+],
+"message": {
+"text": "secrets unconditionally inherited by called workflow: this reusable workflow"
+},
+"properties": {
+"zizmor/confidence": "High",
+"zizmor/persona": "Regular",
+"zizmor/severity": "Medium"
+},
+"ruleId": "zizmor/secrets-inherit"
+},
+{
+"codeFlows": [
+{
+"threadFlows": [
+{
+"locations": [
+{
+"importance": "essential",
+"location": {
+"logicalLocations": [
+{
+"properties": {
+"symbolic": {
+"annotation": "this reusable workflow",
+"feature_kind": {
+"Subfeature": {
+"after": 0,
+"fragment": {
+"Raw": "./.github/workflows/publish-pypi.yml"
+}
+}
+},
+"key": {
+"Local": {
+"verbatim_path": "./.github/workflows/release.yml"
+}
+},
+"kind": "Primary",
+"route": {
+"route": [
+{
+"Key": "jobs"
+},
+{
+"Key": "publish-pypi"
+},
+{
+"Key": "uses"
+}
+]
+}
+}
+}
+}
+],
+"message": {
+"text": "this reusable workflow"
+},
+"physicalLocation": {
+"artifactLocation": {
+"uri": ".github/workflows/release.yml"
+},
+"region": {
+"endColumn": 47,
+"endLine": 283,
+"snippet": {
+"text": "./.github/workflows/publish-pypi.yml"
+},
+"sourceLanguage": "yaml",
+"startColumn": 11,
+"startLine": 283
+}
+}
+}
+},
+{
+"importance": "important",
+"location": {
+"logicalLocations": [
+{
+"properties": {
+"symbolic": {
+"annotation": "inherits all parent secrets",
+"feature_kind": "Normal",
+"key": {
+"Local": {
+"verbatim_path": "./.github/workflows/release.yml"
+}
+},
+"kind": "Related",
+"route": {
+"route": [
+{
+"Key": "jobs"
+},
+{
+"Key": "publish-pypi"
+},
+{
+"Key": "secrets"
+}
+]
+}
+}
+}
+}
+],
+"message": {
+"text": "inherits all parent secrets"
+},
+"physicalLocation": {
+"artifactLocation": {
+"uri": ".github/workflows/release.yml"
+},
+"region": {
+"endColumn": 21,
+"endLine": 286,
+"snippet": {
+"text": "    secrets: inherit"
+},
+"sourceLanguage": "yaml",
+"startColumn": 5,
+"startLine": 286
+}
+}
+}
+}
+]
+}
+]
+}
+],
+"kind": "fail",
+"level": "warning",
+"locations": [
+{
+"logicalLocations": [
+{
+"properties": {
+"symbolic": {
+"annotation": "this reusable workflow",
+"feature_kind": {
+"Subfeature": {
+"after": 0,
+"fragment": {
+"Raw": "./.github/workflows/publish-pypi.yml"
+}
+}
+},
+"key": {
+"Local": {
+"verbatim_path": "./.github/workflows/release.yml"
+}
+},
+"kind": "Primary",
+"route": {
+"route": [
+{
+"Key": "jobs"
+},
+{
+"Key": "publish-pypi"
+},
+{
+"Key": "uses"
+}
+]
+}
+}
+}
+}
+],
+"message": {
+"text": "this reusable workflow"
+},
+"physicalLocation": {
+"artifactLocation": {
+"uri": ".github/workflows/release.yml"
+},
+"region": {
+"endColumn": 47,
+"endLine": 283,
+"snippet": {
+"text": "./.github/workflows/publish-pypi.yml"
+},
+"sourceLanguage": "yaml",
+"startColumn": 11,
+"startLine": 283
+}
+}
+}
+],
+"message": {
+"text": "secrets unconditionally inherited by called workflow: this reusable workflow"
+},
+"properties": {
+"zizmor/confidence": "High",
+"zizmor/persona": "Regular",
+"zizmor/severity": "Medium"
+},
+"ruleId": "zizmor/secrets-inherit"
+},
+{
+"codeFlows": [
+{
+"threadFlows": [
+{
+"locations": [
+{
+"importance": "essential",
+"location": {
+"logicalLocations": [
+{
+"properties": {
+"symbolic": {
+"annotation": "this reusable workflow",
+"feature_kind": {
+"Subfeature": {
+"after": 0,
+"fragment": {
+"Raw": "./.github/workflows/publish-crates.yml"
+}
+}
+},
+"key": {
+"Local": {
+"verbatim_path": "./.github/workflows/release.yml"
+}
+},
+"kind": "Primary",
+"route": {
+"route": [
+{
+"Key": "jobs"
+},
+{
+"Key": "publish-crates"
+},
+{
+"Key": "uses"
+}
+]
+}
+}
+}
+}
+],
+"message": {
+"text": "this reusable workflow"
+},
+"physicalLocation": {
+"artifactLocation": {
+"uri": ".github/workflows/release.yml"
+},
+"region": {
+"endColumn": 49,
+"endLine": 299,
+"snippet": {
+"text": "./.github/workflows/publish-crates.yml"
+},
+"sourceLanguage": "yaml",
+"startColumn": 11,
+"startLine": 299
+}
+}
+}
+},
+{
+"importance": "important",
+"location": {
+"logicalLocations": [
+{
+"properties": {
+"symbolic": {
+"annotation": "inherits all parent secrets",
+"feature_kind": "Normal",
+"key": {
+"Local": {
+"verbatim_path": "./.github/workflows/release.yml"
+}
+},
+"kind": "Related",
+"route": {
+"route": [
+{
+"Key": "jobs"
+},
+{
+"Key": "publish-crates"
+},
+{
+"Key": "secrets"
+}
+]
+}
+}
+}
+}
+],
+"message": {
+"text": "inherits all parent secrets"
+},
+"physicalLocation": {
+"artifactLocation": {
+"uri": ".github/workflows/release.yml"
+},
+"region": {
+"endColumn": 21,
+"endLine": 302,
+"snippet": {
+"text": "    secrets: inherit"
+},
+"sourceLanguage": "yaml",
+"startColumn": 5,
+"startLine": 302
+}
+}
+}
+}
+]
+}
+]
+}
+],
+"kind": "fail",
+"level": "warning",
+"locations": [
+{
+"logicalLocations": [
+{
+"properties": {
+"symbolic": {
+"annotation": "this reusable workflow",
+"feature_kind": {
+"Subfeature": {
+"after": 0,
+"fragment": {
+"Raw": "./.github/workflows/publish-crates.yml"
+}
+}
+},
+"key": {
+"Local": {
+"verbatim_path": "./.github/workflows/release.yml"
+}
+},
+"kind": "Primary",
+"route": {
+"route": [
+{
+"Key": "jobs"
+},
+{
+"Key": "publish-crates"
+},
+{
+"Key": "uses"
+}
+]
+}
+}
+}
+}
+],
+"message": {
+"text": "this reusable workflow"
+},
+"physicalLocation": {
+"artifactLocation": {
+"uri": ".github/workflows/release.yml"
+},
+"region": {
+"endColumn": 49,
+"endLine": 299,
+"snippet": {
+"text": "./.github/workflows/publish-crates.yml"
+},
+"sourceLanguage": "yaml",
+"startColumn": 11,
+"startLine": 299
+}
+}
+}
+],
+"message": {
+"text": "secrets unconditionally inherited by called workflow: this reusable workflow"
+},
+"properties": {
+"zizmor/confidence": "High",
+"zizmor/persona": "Regular",
+"zizmor/severity": "Medium"
+},
+"ruleId": "zizmor/secrets-inherit"
+},
+{
+"codeFlows": [
+{
+"threadFlows": [
+{
+"locations": [
+{
+"importance": "essential",
+"location": {
+"logicalLocations": [
+{
+"properties": {
+"symbolic": {
+"annotation": "this reusable workflow",
+"feature_kind": {
+"Subfeature": {
+"after": 0,
+"fragment": {
+"Raw": "./.github/workflows/publish-docs.yml"
+}
+}
+},
+"key": {
+"Local": {
+"verbatim_path": "./.github/workflows/release.yml"
+}
+},
+"kind": "Primary",
+"route": {
+"route": [
+{
+"Key": "jobs"
+},
+{
+"Key": "publish-docs"
+},
+{
+"Key": "uses"
+}
+]
+}
+}
+}
+}
+],
+"message": {
+"text": "this reusable workflow"
+},
+"physicalLocation": {
+"artifactLocation": {
+"uri": ".github/workflows/release.yml"
+},
+"region": {
+"endColumn": 47,
+"endLine": 384,
+"snippet": {
+"text": "./.github/workflows/publish-docs.yml"
+},
+"sourceLanguage": "yaml",
+"startColumn": 11,
+"startLine": 384
+}
+}
+}
+},
+{
+"importance": "important",
+"location": {
+"logicalLocations": [
+{
+"properties": {
+"symbolic": {
+"annotation": "inherits all parent secrets",
+"feature_kind": "Normal",
+"key": {
+"Local": {
+"verbatim_path": "./.github/workflows/release.yml"
+}
+},
+"kind": "Related",
+"route": {
+"route": [
+{
+"Key": "jobs"
+},
+{
+"Key": "publish-docs"
+},
+{
+"Key": "secrets"
+}
+]
+}
+}
+}
+}
+],
+"message": {
+"text": "inherits all parent secrets"
+},
+"physicalLocation": {
+"artifactLocation": {
+"uri": ".github/workflows/release.yml"
+},
+"region": {
+"endColumn": 21,
+"endLine": 387,
+"snippet": {
+"text": "    secrets: inherit"
+},
+"sourceLanguage": "yaml",
+"startColumn": 5,
+"startLine": 387
+}
+}
+}
+}
+]
+}
+]
+}
+],
+"kind": "fail",
+"level": "warning",
+"locations": [
+{
+"logicalLocations": [
+{
+"properties": {
+"symbolic": {
+"annotation": "this reusable workflow",
+"feature_kind": {
+"Subfeature": {
+"after": 0,
+"fragment": {
+"Raw": "./.github/workflows/publish-docs.yml"
+}
+}
+},
+"key": {
+"Local": {
+"verbatim_path": "./.github/workflows/release.yml"
+}
+},
+"kind": "Primary",
+"route": {
+"route": [
+{
+"Key": "jobs"
+},
+{
+"Key": "publish-docs"
+},
+{
+"Key": "uses"
+}
+]
+}
+}
+}
+}
+],
+"message": {
+"text": "this reusable workflow"
+},
+"physicalLocation": {
+"artifactLocation": {
+"uri": ".github/workflows/release.yml"
+},
+"region": {
+"endColumn": 47,
+"endLine": 384,
+"snippet": {
+"text": "./.github/workflows/publish-docs.yml"
+},
+"sourceLanguage": "yaml",
+"startColumn": 11,
+"startLine": 384
+}
+}
+}
+],
+"message": {
+"text": "secrets unconditionally inherited by called workflow: this reusable workflow"
+},
+"properties": {
+"zizmor/confidence": "High",
+"zizmor/persona": "Regular",
+"zizmor/severity": "Medium"
+},
+"ruleId": "zizmor/secrets-inherit"
+},
+{
+"codeFlows": [
+{
+"threadFlows": [
+{
+"locations": [
+{
+"importance": "essential",
+"location": {
+"logicalLocations": [
+{
+"properties": {
+"symbolic": {
+"annotation": "this reusable workflow",
+"feature_kind": {
+"Subfeature": {
+"after": 0,
+"fragment": {
+"Raw": "./.github/workflows/publish-versions.yml"
+}
+}
+},
+"key": {
+"Local": {
+"verbatim_path": "./.github/workflows/release.yml"
+}
+},
+"kind": "Primary",
+"route": {
+"route": [
+{
+"Key": "jobs"
+},
+{
+"Key": "publish-versions"
+},
+{
+"Key": "uses"
+}
+]
+}
+}
+}
+}
+],
+"message": {
+"text": "this reusable workflow"
+},
+"physicalLocation": {
+"artifactLocation": {
+"uri": ".github/workflows/release.yml"
+},
+"region": {
+"endColumn": 51,
+"endLine": 394,
+"snippet": {
+"text": "./.github/workflows/publish-versions.yml"
+},
+"sourceLanguage": "yaml",
+"startColumn": 11,
+"startLine": 394
+}
+}
+}
+},
+{
+"importance": "important",
+"location": {
+"logicalLocations": [
+{
+"properties": {
+"symbolic": {
+"annotation": "inherits all parent secrets",
+"feature_kind": "Normal",
+"key": {
+"Local": {
+"verbatim_path": "./.github/workflows/release.yml"
+}
+},
+"kind": "Related",
+"route": {
+"route": [
+{
+"Key": "jobs"
+},
+{
+"Key": "publish-versions"
+},
+{
+"Key": "secrets"
+}
+]
+}
+}
+}
+}
+],
+"message": {
+"text": "inherits all parent secrets"
+},
+"physicalLocation": {
+"artifactLocation": {
+"uri": ".github/workflows/release.yml"
+},
+"region": {
+"endColumn": 21,
+"endLine": 397,
+"snippet": {
+"text": "    secrets: inherit"
+},
+"sourceLanguage": "yaml",
+"startColumn": 5,
+"startLine": 397
+}
+}
+}
+}
+]
+}
+]
+}
+],
+"kind": "fail",
+"level": "warning",
+"locations": [
+{
+"logicalLocations": [
+{
+"properties": {
+"symbolic": {
+"annotation": "this reusable workflow",
+"feature_kind": {
+"Subfeature": {
+"after": 0,
+"fragment": {
+"Raw": "./.github/workflows/publish-versions.yml"
+}
+}
+},
+"key": {
+"Local": {
+"verbatim_path": "./.github/workflows/release.yml"
+}
+},
+"kind": "Primary",
+"route": {
+"route": [
+{
+"Key": "jobs"
+},
+{
+"Key": "publish-versions"
+},
+{
+"Key": "uses"
+}
+]
+}
+}
+}
+}
+],
+"message": {
+"text": "this reusable workflow"
+},
+"physicalLocation": {
+"artifactLocation": {
+"uri": ".github/workflows/release.yml"
+},
+"region": {
+"endColumn": 51,
+"endLine": 394,
+"snippet": {
+"text": "./.github/workflows/publish-versions.yml"
+},
+"sourceLanguage": "yaml",
+"startColumn": 11,
+"startLine": 394
+}
+}
+}
+],
+"message": {
+"text": "secrets unconditionally inherited by called workflow: this reusable workflow"
+},
+"properties": {
+"zizmor/confidence": "High",
+"zizmor/persona": "Regular",
+"zizmor/severity": "Medium"
+},
+"ruleId": "zizmor/secrets-inherit"
+},
+{
+"codeFlows": [
+{
+"threadFlows": [
+{
+"locations": [
+{
+"importance": "essential",
+"location": {
+"logicalLocations": [
+{
+"properties": {
+"symbolic": {
+"annotation": "this reusable workflow",
+"feature_kind": {
+"Subfeature": {
+"after": 0,
+"fragment": {
+"Raw": "./.github/workflows/publish-mirror.yml"
+}
+}
+},
+"key": {
+"Local": {
+"verbatim_path": "./.github/workflows/release.yml"
+}
+},
+"kind": "Primary",
+"route": {
+"route": [
+{
+"Key": "jobs"
+},
+{
+"Key": "publish-mirror"
+},
+{
+"Key": "uses"
+}
+]
+}
+}
+}
+}
+],
+"message": {
+"text": "this reusable workflow"
+},
+"physicalLocation": {
+"artifactLocation": {
+"uri": ".github/workflows/release.yml"
+},
+"region": {
+"endColumn": 49,
+"endLine": 404,
+"snippet": {
+"text": "./.github/workflows/publish-mirror.yml"
+},
+"sourceLanguage": "yaml",
+"startColumn": 11,
+"startLine": 404
+}
+}
+}
+},
+{
+"importance": "important",
+"location": {
+"logicalLocations": [
+{
+"properties": {
+"symbolic": {
+"annotation": "inherits all parent secrets",
+"feature_kind": "Normal",
+"key": {
+"Local": {
+"verbatim_path": "./.github/workflows/release.yml"
+}
+},
+"kind": "Related",
+"route": {
+"route": [
+{
+"Key": "jobs"
+},
+{
+"Key": "publish-mirror"
+},
+{
+"Key": "secrets"
+}
+]
+}
+}
+}
+}
+],
+"message": {
+"text": "inherits all parent secrets"
+},
+"physicalLocation": {
+"artifactLocation": {
+"uri": ".github/workflows/release.yml"
+},
+"region": {
+"endColumn": 21,
+"endLine": 407,
+"snippet": {
+"text": "    secrets: inherit"
+},
+"sourceLanguage": "yaml",
+"startColumn": 5,
+"startLine": 407
+}
+}
+}
+}
+]
+}
+]
+}
+],
+"kind": "fail",
+"level": "warning",
+"locations": [
+{
+"logicalLocations": [
+{
+"properties": {
+"symbolic": {
+"annotation": "this reusable workflow",
+"feature_kind": {
+"Subfeature": {
+"after": 0,
+"fragment": {
+"Raw": "./.github/workflows/publish-mirror.yml"
+}
+}
+},
+"key": {
+"Local": {
+"verbatim_path": "./.github/workflows/release.yml"
+}
+},
+"kind": "Primary",
+"route": {
+"route": [
+{
+"Key": "jobs"
+},
+{
+"Key": "publish-mirror"
+},
+{
+"Key": "uses"
+}
+]
+}
+}
+}
+}
+],
+"message": {
+"text": "this reusable workflow"
+},
+"physicalLocation": {
+"artifactLocation": {
+"uri": ".github/workflows/release.yml"
+},
+"region": {
+"endColumn": 49,
+"endLine": 404,
+"snippet": {
+"text": "./.github/workflows/publish-mirror.yml"
+},
+"sourceLanguage": "yaml",
+"startColumn": 11,
+"startLine": 404
+}
+}
+}
+],
+"message": {
+"text": "secrets unconditionally inherited by called workflow: this reusable workflow"
+},
+"properties": {
+"zizmor/confidence": "High",
+"zizmor/persona": "Regular",
+"zizmor/severity": "Medium"
+},
+"ruleId": "zizmor/secrets-inherit"
+}
+],
+"tool": {
+"driver": {
+"downloadUri": "https://github.com/zizmorcore/zizmor",
+"informationUri": "https://docs.zizmor.sh",
+"name": "zizmor",
+"rules": [
+{
+"help": {
+"markdown": "`secrets-inherit`: secrets unconditionally inherited by called workflow\n\nDocs: <https://docs.zizmor.sh/audits/#secrets-inherit>",
+"text": "secrets unconditionally inherited by called workflow"
+},
+"helpUri": "https://docs.zizmor.sh/audits/#secrets-inherit",
+"id": "zizmor/secrets-inherit",
+"name": "secrets-inherit",
+"properties": {
+"tags": [
+"security"
+]
+}
+}
+],
+"semanticVersion": "1.27.0",
+"version": "1.27.0"
+}
+}
+}
+],
+"version": "2.1.0"
+}::debug::zizmor exited with code 0
+##[end-action id=__zizmorcore_zizmor-action.run-zizmor;outcome=success;conclusion=success;duration_ms=6351]
+##[start-action display=Upload SARIF file to GitHub Advanced Security;id=__zizmorcore_zizmor-action.__github_codeql-action]
+##[group]Run github/codeql-action/upload-sarif@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a
+with:
+sarif_file: /home/runner/work/_temp/zizmor
+category: zizmor
+checkout_path: /home/runner/work/uv/uv
+token: ***
+matrix: null
+wait-for-processing: true
+##[endgroup]
+Post-processing sarif files: ["/home/runner/work/_temp/zizmor"]
+Validating /home/runner/work/_temp/zizmor
+Adding fingerprints to SARIF file. See https://docs.github.com/en/code-security/reference/code-scanning/sarif-support-for-code-scanning#data-for-preventing-duplicated-alerts for more information.
+##[group]Uploading code scanning results
+Uploading results
+Successfully uploaded results
+##[endgroup]
+##[group]Waiting for processing to finish
+Analysis upload status is complete.
+##[endgroup]
+##[end-action id=__zizmorcore_zizmor-action.__github_codeql-action;outcome=success;conclusion=success;duration_ms=6508]
+Post job cleanup.
+##[start-action display=Upload SARIF file to GitHub Advanced Security;id=__d178e428-caf7-4365-83dc-4e9feab63d24.__github_codeql-action]
+Post job cleanup.
+##[group]Uploading combined SARIF debug artifact
+##[endgroup]
+##[end-action id=__d178e428-caf7-4365-83dc-4e9feab63d24.__github_codeql-action;outcome=success;conclusion=success;duration_ms=258]
+Post job cleanup.
+[command]/usr/bin/git version
+git version 2.54.0
+Temporarily overriding HOME='/home/runner/work/_temp/b1b87e28-badb-47dc-b1bf-fd7994cfb5a0' before making global git config changes
+Adding repository directory to the temporary git global config as a safe directory
+[command]/usr/bin/git config --global --add safe.directory /home/runner/work/uv/uv
+Removing SSH command configuration
+[command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Removing HTTP extra header
+[command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Removing includeIf entries pointing to credentials config files
+[command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+[command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+Cleaning up orphan processes
