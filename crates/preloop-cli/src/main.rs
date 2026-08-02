@@ -351,6 +351,7 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         server_url: "http://127.0.0.1:1".into(),
         control_origin: None,
         control_socket: None,
+        control_upstream: None,
         registration_token_env: TOKEN_ENV.into(),
         labels: vec![
             "self-hosted".into(),
@@ -360,6 +361,9 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         cpus: RUNNER_CPUS,
         memory_mib: RUNNER_MEMORY_MIB,
         storage_gib: 20,
+        overlay_gib: std::env::var("PRELOOP_RUNNER_OVERLAY_GB")
+            .ok()
+            .and_then(|v| v.parse().ok()),
         debug_dir: None,
         runner_key_dir: None,
         pending_jobs: None,
@@ -608,6 +612,11 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
     // network. The public URL stays strictly GitHub-facing (check-run
     // details links). Runners on other machines need AKSH_RUNNER_URL to
     // point at a host-reachable address instead.
+    // When the control upstream is set, the VM reaches the server over
+    // virtio-net TCP at that address. `AKSH_RUNNER_URL` stays loopback so
+    // the server advertises loopback URLs in job messages — the in-guest
+    // bridge makes them work.
+    let control_upstream = std::env::var("PRELOOP_CONTROL_UPSTREAM").ok();
     if std::env::var("AKSH_RUNNER_URL").is_err() {
         std::env::set_var(
             "AKSH_RUNNER_URL",
@@ -655,6 +664,7 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
         &home,
         runner_url,
         control_origin,
+        control_upstream,
         queue_depth,
         next_job_runs_on,
         pool_enabled,
@@ -744,6 +754,7 @@ fn local_runner_pool_config(
     home: &std::path::Path,
     server_url: String,
     control_origin: Option<String>,
+    control_upstream: Option<String>,
     queue_depth: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     next_job_runs_on: std::sync::Arc<std::sync::RwLock<Vec<String>>>,
     pool_enabled: bool,
@@ -774,6 +785,30 @@ fn local_runner_pool_config(
         .filter(|path| linux_runner_bundle(path))
         .context("Linux runner bundle unavailable; run `just build-preloop` to build target/aarch64-unknown-linux-gnu/debug/preloop-runner")?;
     let use_packed_artifact = env_flag("PRELOOP_USE_PACKED_GOLDEN", false);
+    // The mounted control socket only makes sense when the runner URL is
+    // loopback (the VM reaches the host through the socket relay). With
+    // `AKSH_RUNNER_URL` pointing at a host-reachable LAN address — the
+    // "runners on other machines" mode — there is no relay, and the runner
+    // talks to the control plane over plain TCP instead. The orchestrator
+    // gates both the socket mount and the guest env on this field, so leaving
+    // it `None` is what switches the transport.
+    let control_socket = control_origin.as_ref().map(|_| home.join("preloop.sock"));
+    // When a TCP upstream is configured, skip the socket mount — the
+    // guest control bridge will forward via TCP instead of vsock.
+    let control_socket = if control_upstream.is_some() {
+        None
+    } else {
+        control_socket
+    };
+    // A custom base image (`.smolmachine` artifact or any non-stock OCI
+    // reference) serves every queued job itself, so environment-based runner
+    // replacement has nothing to switch to: the job's implied stock base
+    // (`ubuntu:24.04` from `ubuntu-latest` labels) will always differ from
+    // the configured image and idle runners would be replaced forever.
+    let custom_base = !matches!(
+        std::env::var("PRELOOP_RUNNER_BASE_IMAGE").as_deref(),
+        Ok("ubuntu:24.04") | Ok("ubuntu:22.04") | Err(_)
+    );
     Ok(RunnerPoolConfig {
         // Size zero is the deliberate low-memory mode: keep the local
         // supervisor alive, but build a runner only when a job is queued.
@@ -801,16 +836,16 @@ fn local_runner_pool_config(
         runner_binary_name: "preloop-runner".into(),
         server_url,
         control_origin,
-        control_socket: Some(home.join("preloop.sock")),
+        control_socket,
+        control_upstream,
         registration_token_env: "AKSH_SYSTEM_TOKEN".into(),
-        labels: vec![
-            "self-hosted".into(),
-            "Linux".into(),
-            std::env::consts::ARCH.into(),
-        ],
+        labels: runner_pool_labels(),
         cpus: RUNNER_CPUS,
         memory_mib: RUNNER_MEMORY_MIB,
         storage_gib: 20,
+        overlay_gib: std::env::var("PRELOOP_RUNNER_OVERLAY_GB")
+            .ok()
+            .and_then(|v| v.parse().ok()),
         debug_dir: Some(home.join("state").join("debug")),
         runner_key_dir: Some(home.join("runner-keys")),
         // Warm the golden with the images this project's workflows declare,
@@ -819,8 +854,32 @@ fn local_runner_pool_config(
             &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         ),
         pending_jobs: Some(queue_depth),
-        next_job_runs_on: Some(next_job_runs_on),
+        next_job_runs_on: (!custom_base).then_some(next_job_runs_on),
     })
+}
+
+/// Base runner labels plus any extras from `PRELOOP_RUNNER_LABELS`.
+///
+/// The scheduler matches `runs-on` labels against what a runner declares, so
+/// a non-x86 host can still volunteer for X64-pinned workflows by declaring
+/// the extra label explicitly. Comma-separated; empty entries are ignored.
+fn runner_pool_labels() -> Vec<String> {
+    let mut labels = vec![
+        "self-hosted".to_owned(),
+        "Linux".to_owned(),
+        std::env::consts::ARCH.to_owned(),
+    ];
+    if let Ok(extra) = std::env::var("PRELOOP_RUNNER_LABELS") {
+        for label in extra.split(',').map(str::trim).filter(|l| !l.is_empty()) {
+            if !labels
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(label))
+            {
+                labels.push(label.to_owned());
+            }
+        }
+    }
+    labels
 }
 
 /// vCPUs given to each runner VM.
@@ -1557,6 +1616,81 @@ mod tests {
         assert_eq!(parse_flag("maybe"), None);
         assert!(env_flag("__PRELOOP_TEST_FLAG_UNSET__", true));
         assert!(!env_flag("__PRELOOP_TEST_FLAG_UNSET__", false));
+    }
+
+    #[test]
+    fn runner_pool_labels_includes_base_and_extra_labels() {
+        unsafe {
+            std::env::set_var("PRELOOP_RUNNER_LABELS", "X64,linux, custom ");
+        }
+        let labels = runner_pool_labels();
+        unsafe {
+            std::env::remove_var("PRELOOP_RUNNER_LABELS");
+        }
+        assert!(labels.iter().any(|l| l == "self-hosted"));
+        assert!(labels.iter().any(|l| l == "Linux"));
+        assert!(labels.iter().any(|l| l == std::env::consts::ARCH));
+        // X64 appended; `linux` dropped (case-insensitive duplicate of the
+        // base label); `custom` trimmed and appended.
+        assert!(labels.iter().any(|l| l == "X64"));
+        assert!(!labels.iter().any(|l| l == "linux"));
+        assert!(labels.iter().any(|l| l == "custom"));
+        assert_eq!(labels.len(), 5);
+        // Empty extras add nothing.
+        unsafe {
+            std::env::set_var("PRELOOP_RUNNER_LABELS", ", ,");
+        }
+        let labels = runner_pool_labels();
+        unsafe {
+            std::env::remove_var("PRELOOP_RUNNER_LABELS");
+        }
+        assert_eq!(labels.len(), 3);
+    }
+
+    #[test]
+    fn custom_base_image_disables_environment_replacement() {
+        let home = tempfile::tempdir().unwrap();
+        // The config resolves a Linux guest runner bundle; fabricate one so
+        // the construction reaches the base-image decision.
+        let bundle = tempfile::tempdir().unwrap();
+        std::fs::write(
+            bundle.path().join("preloop-runner"),
+            [0x7f, b'E', b'L', b'F'],
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var("PRELOOP_RUNNER_BUNDLE", bundle.path());
+        }
+        let queue_depth = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let next_job_runs_on =
+            std::sync::Arc::new(std::sync::RwLock::new(vec!["ubuntu-latest".to_owned()]));
+        let config = |base: &str| {
+            unsafe {
+                std::env::set_var("PRELOOP_RUNNER_BASE_IMAGE", base);
+            }
+            let config = local_runner_pool_config(
+                home.path(),
+                "http://127.0.0.1:9090".to_owned(),
+                None,
+                None,
+                queue_depth.clone(),
+                next_job_runs_on.clone(),
+                false,
+            )
+            .unwrap();
+            unsafe {
+                std::env::remove_var("PRELOOP_RUNNER_BASE_IMAGE");
+            }
+            config
+        };
+        // Stock base: environment-based replacement stays enabled.
+        assert!(config("ubuntu:24.04").next_job_runs_on.is_some());
+        // Custom base (artifact): disabled, so idle runners are never
+        // replaced by the job's implied stock base.
+        assert!(config("/tmp/custom.smolmachine").next_job_runs_on.is_none());
+        unsafe {
+            std::env::remove_var("PRELOOP_RUNNER_BUNDLE");
+        }
     }
 
     #[test]
