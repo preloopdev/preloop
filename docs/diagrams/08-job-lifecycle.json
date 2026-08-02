@@ -1,0 +1,890 @@
+[
+  {
+    "type": "cameraUpdate",
+    "width": 1500,
+    "height": 1350,
+    "x": 0,
+    "y": 0
+  },
+  {
+    "type": "text",
+    "id": "title",
+    "x": 480,
+    "y": 25,
+    "text": "Preloop \u2014 End-to-End Job Lifecycle",
+    "fontSize": 28,
+    "strokeColor": "#1e1e1e"
+  },
+  {
+    "type": "text",
+    "id": "subtitle",
+    "x": 410,
+    "y": 60,
+    "text": "Sequence flow from workflow submission to completion & live SSE logs (23 steps)",
+    "fontSize": 15,
+    "strokeColor": "#757575"
+  },
+  {
+    "type": "rectangle",
+    "id": "head_user",
+    "x": 60,
+    "y": 110,
+    "width": 220,
+    "height": 70,
+    "backgroundColor": "#a5d8ff",
+    "fillStyle": "solid",
+    "strokeColor": "#4a9eed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "User / CLI\nlocal execution client",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "head_parser",
+    "x": 350,
+    "y": 110,
+    "width": 220,
+    "height": 70,
+    "backgroundColor": "#d0bfff",
+    "fillStyle": "solid",
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "Parser\naksh-gha-parser",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "head_server",
+    "x": 640,
+    "y": 110,
+    "width": 220,
+    "height": 70,
+    "backgroundColor": "#fff3bf",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "Server / Queue\naksh-runner-server",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "head_listener",
+    "x": 930,
+    "y": 110,
+    "width": 220,
+    "height": 70,
+    "backgroundColor": "#ffd8a8",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "Listener\naks-runner run",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "head_worker",
+    "x": 1220,
+    "y": 110,
+    "width": 220,
+    "height": 70,
+    "backgroundColor": "#eebefa",
+    "fillStyle": "solid",
+    "strokeColor": "#a21caf",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "Worker / Storage\naks-runner worker",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "life_user",
+    "x": 170,
+    "y": 185,
+    "width": 0,
+    "height": 1100,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        1095
+      ]
+    ],
+    "strokeColor": "#b0b0b0",
+    "strokeWidth": 1.5,
+    "strokeStyle": "dashed"
+  },
+  {
+    "type": "arrow",
+    "id": "life_parser",
+    "x": 460,
+    "y": 185,
+    "width": 0,
+    "height": 1100,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        1095
+      ]
+    ],
+    "strokeColor": "#b0b0b0",
+    "strokeWidth": 1.5,
+    "strokeStyle": "dashed"
+  },
+  {
+    "type": "arrow",
+    "id": "life_server",
+    "x": 750,
+    "y": 185,
+    "width": 0,
+    "height": 1100,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        1095
+      ]
+    ],
+    "strokeColor": "#b0b0b0",
+    "strokeWidth": 1.5,
+    "strokeStyle": "dashed"
+  },
+  {
+    "type": "arrow",
+    "id": "life_listener",
+    "x": 1040,
+    "y": 185,
+    "width": 0,
+    "height": 1100,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        1095
+      ]
+    ],
+    "strokeColor": "#b0b0b0",
+    "strokeWidth": 1.5,
+    "strokeStyle": "dashed"
+  },
+  {
+    "type": "arrow",
+    "id": "life_worker",
+    "x": 1330,
+    "y": 185,
+    "width": 0,
+    "height": 1100,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        1095
+      ]
+    ],
+    "strokeColor": "#b0b0b0",
+    "strokeWidth": 1.5,
+    "strokeStyle": "dashed"
+  },
+  {
+    "type": "arrow",
+    "id": "step_1",
+    "x": 170,
+    "y": 210,
+    "width": 290,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        290,
+        0
+      ]
+    ],
+    "strokeColor": "#4a9eed",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "label": {
+      "text": "1. preloop run -f wf.yml",
+      "fontSize": 13
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "step_2",
+    "x": 460,
+    "y": 255,
+    "width": 60,
+    "height": 30,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        40,
+        0
+      ],
+      [
+        40,
+        25
+      ],
+      [
+        0,
+        25
+      ]
+    ],
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "label": {
+      "text": "2. parse_workflow() (yaml.rs)",
+      "fontSize": 13
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "step_3",
+    "x": 460,
+    "y": 300,
+    "width": 60,
+    "height": 30,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        40,
+        0
+      ],
+      [
+        40,
+        25
+      ],
+      [
+        0,
+        25
+      ]
+    ],
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "label": {
+      "text": "3. trigger match (trigger.rs)",
+      "fontSize": 13
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "step_4",
+    "x": 460,
+    "y": 345,
+    "width": 60,
+    "height": 30,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        40,
+        0
+      ],
+      [
+        40,
+        25
+      ],
+      [
+        0,
+        25
+      ]
+    ],
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "label": {
+      "text": "4. expand & matrix (expand.rs)",
+      "fontSize": 13
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "step_5",
+    "x": 460,
+    "y": 390,
+    "width": 60,
+    "height": 30,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        40,
+        0
+      ],
+      [
+        40,
+        25
+      ],
+      [
+        0,
+        25
+      ]
+    ],
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "label": {
+      "text": "5. build DAG (dag.rs)",
+      "fontSize": 13
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "step_6",
+    "x": 460,
+    "y": 435,
+    "width": 60,
+    "height": 30,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        40,
+        0
+      ],
+      [
+        40,
+        25
+      ],
+      [
+        0,
+        25
+      ]
+    ],
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "label": {
+      "text": "6. ${{ }} eval (eval.rs)",
+      "fontSize": 13
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "step_7",
+    "x": 460,
+    "y": 480,
+    "width": 290,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        290,
+        0
+      ]
+    ],
+    "strokeColor": "#15803d",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "label": {
+      "text": "7. POST /api/v1/runs (DTOs)",
+      "fontSize": 13
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "step_8",
+    "x": 750,
+    "y": 525,
+    "width": 60,
+    "height": 30,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        40,
+        0
+      ],
+      [
+        40,
+        25
+      ],
+      [
+        0,
+        25
+      ]
+    ],
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "label": {
+      "text": "8. auth & concurrency gate",
+      "fontSize": 13
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "step_9",
+    "x": 750,
+    "y": 570,
+    "width": 60,
+    "height": 30,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        40,
+        0
+      ],
+      [
+        40,
+        25
+      ],
+      [
+        0,
+        25
+      ]
+    ],
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "label": {
+      "text": "9. RunId, status=Queued",
+      "fontSize": 13
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "step_10",
+    "x": 750,
+    "y": 615,
+    "width": -580,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        -580,
+        0
+      ]
+    ],
+    "strokeColor": "#15803d",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "label": {
+      "text": "10. 200 OK + RunId",
+      "fontSize": 13
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "step_11",
+    "x": 750,
+    "y": 660,
+    "width": 290,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        290,
+        0
+      ]
+    ],
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "label": {
+      "text": "11. notify: job available",
+      "fontSize": 13
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "step_12",
+    "x": 1040,
+    "y": 705,
+    "width": -290,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        -290,
+        0
+      ]
+    ],
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "label": {
+      "text": "12. POST /runner/session",
+      "fontSize": 13
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "step_13",
+    "x": 750,
+    "y": 750,
+    "width": 290,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        290,
+        0
+      ]
+    ],
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "label": {
+      "text": "13. sessionToken & AES key",
+      "fontSize": 13
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "step_14",
+    "x": 1040,
+    "y": 795,
+    "width": -290,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        -290,
+        0
+      ]
+    ],
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "label": {
+      "text": "14. GET /runner/message (long-poll 60s)",
+      "fontSize": 13
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "step_15",
+    "x": 750,
+    "y": 840,
+    "width": 290,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        290,
+        0
+      ]
+    ],
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "label": {
+      "text": "15. TaskAgentMessage (AES)",
+      "fontSize": 13
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "step_16",
+    "x": 1040,
+    "y": 885,
+    "width": 290,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        290,
+        0
+      ]
+    ],
+    "strokeColor": "#a21caf",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "label": {
+      "text": "16. ack & spawn worker (stdin NDJSON)",
+      "fontSize": 13
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "step_17",
+    "x": 1330,
+    "y": 930,
+    "width": 60,
+    "height": 30,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        40,
+        0
+      ],
+      [
+        40,
+        25
+      ],
+      [
+        0,
+        25
+      ]
+    ],
+    "strokeColor": "#a21caf",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "label": {
+      "text": "17. download action tarballs",
+      "fontSize": 13
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "step_18",
+    "x": 1330,
+    "y": 975,
+    "width": 60,
+    "height": 30,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        40,
+        0
+      ],
+      [
+        40,
+        25
+      ],
+      [
+        0,
+        25
+      ]
+    ],
+    "strokeColor": "#a21caf",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "label": {
+      "text": "18. cached actions",
+      "fontSize": 13
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "step_19",
+    "x": 1330,
+    "y": 1020,
+    "width": 60,
+    "height": 30,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        40,
+        0
+      ],
+      [
+        40,
+        25
+      ],
+      [
+        0,
+        25
+      ]
+    ],
+    "strokeColor": "#a21caf",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "label": {
+      "text": "19. run steps sequentially",
+      "fontSize": 13
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "step_20",
+    "x": 1330,
+    "y": 1065,
+    "width": 60,
+    "height": 30,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        40,
+        0
+      ],
+      [
+        40,
+        25
+      ],
+      [
+        0,
+        25
+      ]
+    ],
+    "strokeColor": "#15803d",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "label": {
+      "text": "20. live log lines (NDJSON)",
+      "fontSize": 13
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "step_21",
+    "x": 1330,
+    "y": 1110,
+    "width": -1160,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        -1160,
+        0
+      ]
+    ],
+    "strokeColor": "#15803d",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "label": {
+      "text": "21. SSE -> live log tail",
+      "fontSize": 13
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "step_22",
+    "x": 1330,
+    "y": 1155,
+    "width": -580,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        -580,
+        0
+      ]
+    ],
+    "strokeColor": "#a21caf",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "label": {
+      "text": "22. completejob (Twirp)",
+      "fontSize": 13
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "step_23",
+    "x": 750,
+    "y": 1200,
+    "width": -580,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        -580,
+        0
+      ]
+    ],
+    "strokeColor": "#15803d",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "label": {
+      "text": "23. final status & artifacts",
+      "fontSize": 13
+    }
+  }
+]
