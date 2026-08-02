@@ -694,8 +694,26 @@ fn expand_jobs_with_reusables_internal(
         }
 
         let matrixes = expand_matrix(job_id, job.strategy.matrix.as_ref(), inputs)?;
+        // A matrix expression that depends on `needs` outputs is only
+        // evaluable after its upstream jobs finish; GitHub defers the fan-out
+        // to runtime and keeps a single DAG node in the meantime. Expanding
+        // it now evaluates against an empty needs context and yields no
+        // cells, which would drop the job entirely and break `needs`
+        // validation for every dependent. Keep one deferred cell so the node
+        // (and its `if:` gating, which is what decides skip vs dispatch in
+        // the common case) survives; runtime fan-out is not yet implemented.
+        let deferred_matrix = matrixes.is_empty()
+            && matches!(
+                &job.strategy.matrix,
+                Some(MatrixValue::Expression(expression)) if expression.contains("needs.")
+            );
         let matrix_count = matrixes.len();
-        for (matrix_index, matrix) in matrixes.into_iter().enumerate() {
+        let matrix_cells: Vec<IndexMap<String, Value>> = if deferred_matrix {
+            vec![IndexMap::new()]
+        } else {
+            matrixes
+        };
+        for (matrix_index, matrix) in matrix_cells.into_iter().enumerate() {
             let oidc_environment = oidc_environment(job.environment.as_ref(), &matrix);
             let expanded_id = matrix_expand::expanded_job_id(job_id, &matrix);
             let mut env = global_env.clone();
