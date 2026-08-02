@@ -1736,7 +1736,7 @@ async fn replay_flows_to_aksh(
     fs::create_dir_all(&baseline_dir)?;
     let native_token =
         std::env::var("AKSH_SYSTEM_TOKEN").unwrap_or_else(|_| "aksh-system-token".to_owned());
-    materialize_replay_state(golden_dir, scenario_root, aksh_url, &client).await?;
+    let run_ids = materialize_replay_state(golden_dir, scenario_root, aksh_url, &client).await?;
     // Pre-flight: register a replay runner with an RSA keypair, then exchange a
     // signed client_assertion for a runner-listen token.  Broker endpoints require
     // a JWT whose sub is "aksh-runner-listen-{numeric_id}" — the system token
@@ -2088,6 +2088,22 @@ async fn replay_flows_to_aksh(
     let summary = serde_json::to_string_pretty(&json!({"status":"captured", "flows": count}))?;
     fs::write(out_dir.join("summary.json"), &summary)?;
     fs::write(baseline_dir.join("summary.json"), &summary)?;
+    // Cancel the scenario's runs once every captured flow has been replayed.
+    // A golden capture can end before the official run finished dispatching
+    // (scenario 101's needs-dependent dynamic matrix), leaving extra queued
+    // jobs behind. Uncancelled, those jobs leak into the next scenario's
+    // acquire and misalign every subsequent replay (the checker's OIDC
+    // plan/job mapping in particular ends up pointing at the wrong run).
+    for run_id in &run_ids {
+        let _ = client
+            .post(format!(
+                "{}/api/v1/runs/{run_id}/cancel",
+                aksh_url.trim_end_matches('/')
+            ))
+            .bearer_auth(&native_token)
+            .send()
+            .await;
+    }
     Ok(baseline_dir)
 }
 
@@ -2334,7 +2350,7 @@ async fn materialize_replay_state(
     scenario_root: &Path,
     aksh_url: &str,
     client: &reqwest::Client,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<String>> {
     let flows_path = golden_dir.join("flows.jsonl");
     let flows = fs::read_to_string(&flows_path)?;
     let broker_job_count = flows
@@ -2355,7 +2371,7 @@ async fn materialize_replay_state(
         })
         .count();
     if broker_job_count == 0 {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let native_api_token =
@@ -2364,9 +2380,10 @@ async fn materialize_replay_state(
     // Idle scenarios have no submit_workflow steps — skip job creation.
     // The replay will use the golden capture's message responses directly.
     if submissions.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let mut queued_jobs = 0_u64;
+    let mut run_ids = Vec::new();
     for submit_body in submissions {
         let accepted = client
             .post(format!("{}/api/v1/runs", aksh_url.trim_end_matches('/')))
@@ -2377,17 +2394,33 @@ async fn materialize_replay_state(
             .error_for_status()?
             .json::<Value>()
             .await?;
+        if let Some(run_id) = accepted.get("run_id").and_then(Value::as_str) {
+            run_ids.push(run_id.to_owned());
+        }
         queued_jobs += accepted
             .get("queued_jobs")
             .and_then(Value::as_u64)
             .unwrap_or(0);
     }
+    // A golden capture can be truncated mid-run (e.g. scenario 101's
+    // needs-dependent dynamic matrix: GitHub queues the deferred matrix job
+    // only after the upstream job completes, and the capture ended before
+    // that dispatch). The `replay.lenient-job-count` marker (a
+    // `replay-lenient-job-count` file in the golden scenario directory)
+    // downgrades the strict equality to a subset check: aksh must queue at
+    // least everything the golden delivered — queueing MORE is aksh being
+    // more complete, not a regression.
+    let lenient = golden_dir.join("replay-lenient-job-count").is_file();
     ensure!(
-        queued_jobs == broker_job_count as u64,
+        if lenient {
+            queued_jobs >= broker_job_count as u64
+        } else {
+            queued_jobs == broker_job_count as u64
+        },
         "replay scenario queued {queued_jobs} jobs but golden capture delivers {broker_job_count}"
     );
 
-    Ok(())
+    Ok(run_ids)
 }
 
 fn normalize_request_path(_method: &str, path: &str) -> String {

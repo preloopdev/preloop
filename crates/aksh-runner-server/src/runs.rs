@@ -319,9 +319,51 @@ pub(crate) async fn submit_run_inner(
     } else {
         "branch"
     };
+    // A pull_request submission is a synthetic PR: GitHub presents the
+    // event with `github.ref = refs/pull/<number>/merge`, not the base
+    // branch ref. Workflows gate on this (e.g. uv's plan computes
+    // `on_main_branch` from `github.ref == refs/heads/main`); leaking the
+    // base branch ref makes them treat the PR as a main-branch push and
+    // enable every main-only gate.
+    let github_ref = if submission.event == "pull_request" {
+        let number = submission
+            .payload
+            .get("number")
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| {
+                submission
+                    .payload
+                    .get("pull_request")
+                    .and_then(|pr| pr.get("number"))
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .unwrap_or(1);
+        format!("refs/pull/{number}/merge")
+    } else {
+        submission.git_ref.clone()
+    };
+    let (pr_head_ref, pr_base_ref) = if submission.event == "pull_request" {
+        let pr = submission.payload.get("pull_request");
+        let head = pr
+            .and_then(|pr| pr.get("head"))
+            .and_then(|head| head.get("ref"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let base = pr
+            .and_then(|pr| pr.get("base"))
+            .and_then(|base| base.get("ref"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        (head.to_owned(), base.to_owned())
+    } else {
+        (
+            String::new(),
+            submission.base_ref.clone().unwrap_or_default(),
+        )
+    };
 
     let mut github = json!({
-        "ref": submission.git_ref,
+        "ref": github_ref,
         "sha": sha,
         "repository": submission.repository,
         "repository_owner": repository_owner,
@@ -336,8 +378,8 @@ pub(crate) async fn submit_run_inner(
         "actor_id": "0",
         "actor": "aksh-system",
         "workflow": workflow.name.clone().unwrap_or_default(),
-        "head_ref": "",
-        "base_ref": submission.base_ref.as_deref().unwrap_or(""),
+        "head_ref": pr_head_ref,
+        "base_ref": pr_base_ref,
         "event_name": submission.event,
         "server_url": "https://github.com",
         "api_url": "https://api.github.com",
@@ -457,6 +499,30 @@ pub(crate) async fn submit_run_inner(
                 );
                 payload.insert("after".to_owned(), serde_json::json!(snapshot.commit_sha));
                 payload.insert("ref".to_owned(), serde_json::json!(submission.git_ref));
+            } else if submission.event == "pull_request" {
+                // Same synthetic-push shape for PR-family events: the head
+                // commit the runner checks out is the snapshot commit, and
+                // `base.sha` is the base its changes are measured against
+                // (the workspace HEAD when the tree is dirty, HEAD^ when
+                // clean — see `WorkspaceSnapshot::before_sha`). Changed-file
+                // actions (`dorny/paths-filter`, `tj-actions/changed-files`)
+                // diff these two SHAs; without the refresh they would diff
+                // the caller-supplied head against itself and see nothing.
+                let base_sha = snapshot
+                    .before_sha
+                    .clone()
+                    .unwrap_or_else(|| "0000000000000000000000000000000000000000".to_owned());
+                if let Some(pr) = payload
+                    .get_mut("pull_request")
+                    .and_then(|v| v.as_object_mut())
+                {
+                    if let Some(base) = pr.get_mut("base").and_then(|v| v.as_object_mut()) {
+                        base.insert("sha".to_owned(), serde_json::json!(base_sha));
+                    }
+                    if let Some(head) = pr.get_mut("head").and_then(|v| v.as_object_mut()) {
+                        head.insert("sha".to_owned(), serde_json::json!(snapshot.commit_sha));
+                    }
+                }
             }
         }
         // The github context was built before the snapshot existed; refresh
