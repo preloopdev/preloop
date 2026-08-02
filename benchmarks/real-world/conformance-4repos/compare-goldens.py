@@ -220,8 +220,11 @@ def main():
     args = ap.parse_args()
 
     report = []
-    for repo, cells in (("bat", ["official", "aksh"]), ("vite", ["official", "aksh"]),
-                        ("uv", ["official", "aksh"]), ("nextcloud", ["official", "aksh"])):
+    # `c` is the preloop production path: aksh runner in per-job smolVMs
+    # against the local engine. `official`/`aksh` are the older host-runner
+    # cells from conformance-4repos.sh.
+    for repo, cells in (("bat", ["official", "aksh", "c"]), ("vite", ["official", "aksh", "c"]),
+                        ("uv", ["official", "aksh", "c"]), ("nextcloud", ["official", "aksh", "c"])):
         if args.repo != "all" and repo != args.repo:
             continue
         for cell in cells:

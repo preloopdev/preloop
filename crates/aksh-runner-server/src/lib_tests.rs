@@ -6688,6 +6688,26 @@ async fn complete_via_api(app: &Router, run_id: &str, job_id: &str) {
     .await;
 }
 
+async fn complete_via_api_with_outputs(
+    app: &Router,
+    run_id: &str,
+    job_id: &str,
+    outputs: serde_json::Value,
+) {
+    request_json(
+        app,
+        Method::POST,
+        "/internal/test/jobs/complete",
+        json!({
+            "run_id": run_id,
+            "job_id": job_id,
+            "status": "success",
+            "outputs": outputs,
+        }),
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn workflow_concurrency_serializes_runs_fifo() {
     let temp = tempfile::tempdir().unwrap();
@@ -8605,6 +8625,116 @@ jobs:
         Some(concurrency::Holder::JobSet { run_id: holder_run, .. }) if holder_run == run_id
     ));
 }
+
+/// uv-ci shape: a reusable `plan` produces outputs; a caller job gates on
+/// `needs.plan.outputs.X == 'true'` and calls another reusable. When the
+/// plan completes with the output false, the gated caller's inner jobs must
+/// be skipped (not left queued forever).
+#[tokio::test]
+async fn reusable_caller_gated_on_plan_outputs_is_skipped() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": r#"
+on: push
+jobs:
+  plan:
+    uses: ./.github/workflows/plan.yml
+  gated:
+    needs: plan
+    if: ${{ needs.plan.outputs.flag == 'true' }}
+    uses: ./.github/workflows/callee.yml
+"#,
+            "event": "push",
+            "repository": "owner/repo",
+            "reusable_workflows": {
+                ".github/workflows/plan.yml": r#"
+on:
+  workflow_call:
+    outputs:
+      flag:
+        value: ${{ jobs.p.outputs.flag }}
+jobs:
+  p:
+    runs-on: ubuntu-latest
+    outputs:
+      flag: "false"
+    steps:
+      - run: echo "flag=false" >> $GITHUB_OUTPUT
+"#,
+                ".github/workflows/callee.yml": r#"
+on: workflow_call
+jobs:
+  inner:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo inner
+"#,
+            }
+        }),
+    )
+    .await;
+    let run: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let plan_job = {
+        let inner = state.inner.lock().await;
+        inner.runs[&run]
+            .jobs
+            .keys()
+            .find(|id| id.0.starts_with("plan/"))
+            .unwrap()
+            .clone()
+    };
+    // Complete the plan with its output resolved to "false".
+    complete_via_api_with_outputs(
+        &app,
+        &run.to_string(),
+        &plan_job.0,
+        serde_json::json!({"flag": "false"}),
+    )
+    .await;
+    {
+        let inner = state.inner.lock().await;
+        let gated = inner.runs[&run]
+            .jobs
+            .iter()
+            .find(|(id, _)| id.0.starts_with("gated/"))
+            .unwrap();
+        assert_eq!(
+            *gated.1,
+            ExecutionStatus::Queued,
+            "gated reusable caller stays queued until a runner claims it"
+        );
+        let gated_id = gated.0.clone();
+        assert!(
+            inner
+                .queue
+                .iter()
+                .any(|job| job.run_id == run && job.job_id == gated_id),
+            "gated caller's inner job must be promoted to the dispatch queue \
+             once the plan completes"
+        );
+    }
+    // A claim pops the job from the queue.
+    let claimed = state
+        .inner
+        .lock()
+        .await
+        .queue
+        .iter()
+        .find(|job| job.run_id == run)
+        .cloned()
+        .unwrap();
+    let gated_id = claimed.job_id.clone();
+    complete_via_api(&app, &run.to_string(), &gated_id.0).await;
+    let inner = state.inner.lock().await;
+    assert_eq!(inner.runs[&run].jobs[&gated_id], ExecutionStatus::Success);
+}
+
 #[tokio::test]
 async fn c02_jobset_resolves_matrix_contexts_on_caller_job() {
     let temp = tempfile::tempdir().unwrap();
@@ -9539,6 +9669,26 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
         "continueOnError": false,
         "timeoutInMinutes": null
     }]));
+    let mut empty_ref = checkout_test_message(json!([{
+        "id": "00000000-0000-0000-0000-000000000014",
+        "name": "empty-ref checkout",
+        "reference": {"name": "actions/checkout", "version": "v4", "type": "repository"},
+        // An expression that resolved to nothing means "default branch" —
+        // the local snapshot IS the default, so the redirect must apply.
+        "inputs": {"ref": "", "fetch-depth": "0"},
+        "continueOnError": false,
+        "timeoutInMinutes": null
+    }]));
+    let mut expr_ref = checkout_test_message(json!([{
+        "id": "00000000-0000-0000-0000-000000000015",
+        "name": "expression-ref checkout",
+        "reference": {"name": "actions/checkout", "version": "v4", "type": "repository"},
+        // Template refs are never evaluated server-side; they mean the
+        // default branch locally, so the redirect must apply.
+        "inputs": {"ref": "${{ inputs.head-sha }}", "fetch-depth": "0"},
+        "continueOnError": false,
+        "timeoutInMinutes": null
+    }]));
     let original_explicit = message.steps[1].inputs.clone();
     let original_non_checkout = message.steps[2].inputs.clone();
     assert!(message.snapshot.is_none());
@@ -9599,6 +9749,40 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
     assert_eq!(
         token_only.steps[0].inputs.get("token"),
         Some(&"local-runtime-jwt".to_owned())
+    );
+    assert_eq!(
+        redirect_primary_checkout(
+            &mut empty_ref,
+            &WorkspaceSnapshot {
+                commit_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                repository: "snapshots/33333333-3333-4333-8333-333333333333".to_owned(),
+                default_branch: Some("main".to_owned()),
+                before_sha: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
+            },
+            "http://127.0.0.1:9090",
+            "local-runtime-jwt",
+        ),
+        1,
+        "an empty `ref` input is GitHub's default-branch semantics and must be redirected to the snapshot"
+    );
+    assert_eq!(
+        empty_ref.steps[0].inputs.get("ref"),
+        Some(&"0123456789abcdef0123456789abcdef01234567".to_owned())
+    );
+    assert_eq!(
+        redirect_primary_checkout(
+            &mut expr_ref,
+            &WorkspaceSnapshot {
+                commit_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                repository: "snapshots/44444444-4444-4444-8444-444444444444".to_owned(),
+                default_branch: Some("main".to_owned()),
+                before_sha: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
+            },
+            "http://127.0.0.1:9090",
+            "local-runtime-jwt",
+        ),
+        1,
+        "a template `ref` input must be redirected to the snapshot"
     );
 }
 

@@ -166,22 +166,23 @@ async fn create_workspace_snapshot_inner(
         )));
     }
     // A shallow workspace ends its history at the commits listed in its
-    // `shallow` file. The snapshot commit parents onto the workspace HEAD
-    // (below), so `git fsck --connectivity-only` on the staging repository
-    // would walk past that boundary into commits the workspace never fetched
-    // and report broken links. Mirror the boundary so fsck knows where the
-    // history legitimately ends and checkout clones carry the same shallow
-    // depth (e.g. `HEAD^` remains resolvable for changed-file diffing).
+    // `shallow` file; commits behind those roots were never fetched, so
+    // their objects do not exist anywhere local. The staging repository must
+    // serve a *complete* graph: a shallow-mirrored repo advertises refs
+    // whose ancestry crosses the boundary, and a plain full fetch from it is
+    // rejected by git ("shallow roots are not allowed to be updated"),
+    // leaving the client with a broken object store and unusable
+    // merge-base/diff walks. Instead, graft every shallow root to a
+    // parentless copy (`git replace --graft`), which pack-objects honors
+    // when serving. Clients then receive the boundary commit with no parents
+    // and never see a shallow edge; `HEAD^` and the snapshot parent chain
+    // stay resolvable for changed-file diffing.
     if source_head.is_some() {
         let source_shallow = common_dir.join("shallow");
         if source_shallow.is_file() {
-            if let Err(error) =
-                tokio::fs::copy(&source_shallow, staging_repository.join("shallow")).await
-            {
-                return Err(ApiError::internal(format!(
-                    "failed to mirror workspace shallow boundary: {error}"
-                )));
-            }
+            // Grafting happens after the object cache is wired (below); keep
+            // the shallow root list here so the graft loop can read it once.
+            let _ = std::fs::read_to_string(&source_shallow);
         }
     }
     let cache =
@@ -191,6 +192,187 @@ async fn create_workspace_snapshot_inner(
         index: cache_index,
         refreshed: cache_refreshed,
     } = cache;
+
+    // A shallow workspace ends its history at the commits listed in its
+    // `shallow` file; commits behind those roots were never fetched, so
+    // their objects do not exist anywhere local. The staging repository must
+    // serve a *complete* graph: a shallow-mirrored repo advertises refs
+    // whose ancestry crosses the boundary, and a plain full fetch from it is
+    // rejected by git ("shallow roots are not allowed to be updated"),
+    // leaving the client with a broken object store and unusable
+    // merge-base/diff walks. Instead, graft every shallow root to a
+    // parentless copy (`git replace --graft`), which pack-objects honors
+    // when serving. Clients then receive the boundary commit with no parents
+    // and never see a shallow edge; `HEAD^` and the snapshot parent chain
+    // stay resolvable for changed-file diffing.
+    // A shallow workspace ends its history at the commits listed in its
+    // `shallow` file; commits behind those roots were never fetched, so
+    // their objects do not exist anywhere local. The staging repository must
+    // serve a *complete* graph: advertising refs whose ancestry crosses the
+    // boundary makes git reject the client's full fetch ("shallow roots are
+    // not allowed to be updated") and leaves the client's object store
+    // broken for merge-base/diff walks. `git replace` does not help — the
+    // server-side pack generation deliberately ignores replace refs. So
+    // rewrite the reachable history: every shallow root becomes a
+    // parentless copy and every descendant is re-created with rewritten
+    // parent links, producing a self-contained, fsck-clean repository.
+    // Clients receive the boundary commits with no parents and never see a
+    // shallow edge; `HEAD^` and the snapshot parent chain stay resolvable
+    // for changed-file diffing. Returns the original→rewritten mapping for
+    // the shas the submission exposes (snapshot parent, before/after base).
+    let mut history_rewrite: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    if source_head.is_some() {
+        let source_shallow = common_dir.join("shallow");
+        if source_shallow.is_file() {
+            let shallow_roots = std::fs::read_to_string(&source_shallow).map_err(|error| {
+                ApiError::internal(format!("failed to read workspace shallow file: {error}"))
+            })?;
+            let shallow_roots = shallow_roots
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>();
+            if !shallow_roots.is_empty() {
+                // The shallow file stops `rev-list` at the boundary; the
+                // walk fails on the missing objects without it.
+                let staging_shallow = staging_repository.join("shallow");
+                tokio::fs::copy(&source_shallow, &staging_shallow)
+                    .await
+                    .map_err(|error| {
+                        ApiError::internal(format!(
+                            "failed to stage workspace shallow file: {error}"
+                        ))
+                    })?;
+                let rev_list = run_snapshot_git(
+                    workspace,
+                    staging_repository,
+                    staging_index,
+                    &cached_objects,
+                    [
+                        "rev-list",
+                        "--reverse",
+                        source_head.as_deref().expect("checked above"),
+                    ],
+                    "list shallow history",
+                )
+                .await?;
+                for sha in output_text(&rev_list, "list shallow history")?.lines() {
+                    let sha = sha.trim();
+                    if sha.is_empty() {
+                        continue;
+                    }
+                    let raw = {
+                        let mut cat = snapshot_git_command(
+                            workspace,
+                            staging_repository,
+                            staging_index,
+                            &cached_objects,
+                        );
+                        cat.args(["cat-file", "commit", sha]);
+                        let output = cat.output().await.map_err(|error| {
+                            ApiError::internal(format!("read commit {sha}: {error}"))
+                        })?;
+                        if !output.status.success() {
+                            return Err(ApiError::internal(format!(
+                                "failed to read commit {sha}: {}",
+                                String::from_utf8_lossy(&output.stderr).trim()
+                            )));
+                        }
+                        String::from_utf8_lossy(&output.stdout).into_owned()
+                    };
+                    let (header, body) = raw.split_once("\n\n").unwrap_or((raw.as_str(), ""));
+                    let mut parents = Vec::new();
+                    let mut author: Option<(String, String, String)> = None;
+                    let mut committer: Option<(String, String, String)> = None;
+                    let mut tree: Option<String> = None;
+                    let mut header_lines = header.lines().peekable();
+                    while let Some(line) = header_lines.next() {
+                        if let Some(value) = line.strip_prefix("tree ") {
+                            tree = Some(value.trim().to_owned());
+                        } else if let Some(value) = line.strip_prefix("parent ") {
+                            let parent = value.trim();
+                            if let Some(rewritten) = history_rewrite.get(parent) {
+                                parents.push(rewritten.clone());
+                            }
+                            // An unmapped parent is behind the shallow
+                            // boundary: drop it (this commit is a shallow
+                            // root and becomes parentless).
+                        } else if let Some(value) = line.strip_prefix("author ") {
+                            author = Some(parse_ident(value));
+                        } else if let Some(value) = line.strip_prefix("committer ") {
+                            committer = Some(parse_ident(value));
+                        } else if line.starts_with("gpgsig") {
+                            // Skip the signature and its indented
+                            // continuation lines.
+                            while header_lines
+                                .peek()
+                                .is_some_and(|next| next.starts_with(' '))
+                            {
+                                header_lines.next();
+                            }
+                        }
+                        // Other headers (e.g. `encoding`) are kept implicitly
+                        // by regenerating the commit from the tree, parents,
+                        // and ident below; they are not re-emitted.
+                    }
+                    let tree = tree
+                        .ok_or_else(|| ApiError::internal(format!("commit {sha} has no tree")))?;
+                    let mut commit_tree = snapshot_git_command(
+                        workspace,
+                        staging_repository,
+                        staging_index,
+                        &cached_objects,
+                    );
+                    if let Some((name, email, date)) = author {
+                        commit_tree
+                            .env("GIT_AUTHOR_NAME", name)
+                            .env("GIT_AUTHOR_EMAIL", email)
+                            .env("GIT_AUTHOR_DATE", date);
+                    }
+                    if let Some((name, email, date)) = committer {
+                        commit_tree
+                            .env("GIT_COMMITTER_NAME", name)
+                            .env("GIT_COMMITTER_EMAIL", email)
+                            .env("GIT_COMMITTER_DATE", date);
+                    }
+                    let mut args = vec!["commit-tree".to_owned(), tree];
+                    for parent in &parents {
+                        args.push("-p".to_owned());
+                        args.push(parent.clone());
+                    }
+                    commit_tree.args(args);
+                    let mut child = commit_tree
+                        .stdin(std::process::Stdio::piped())
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped())
+                        .spawn()
+                        .map_err(|error| {
+                            ApiError::internal(format!("spawn commit-tree: {error}"))
+                        })?;
+                    AsyncWriteExt::write_all(
+                        child.stdin.as_mut().expect("stdin is piped"),
+                        body.as_bytes(),
+                    )
+                    .await
+                    .map_err(|error| ApiError::internal(format!("write commit body: {error}")))?;
+                    let output = child
+                        .wait_with_output()
+                        .await
+                        .map_err(|error| ApiError::internal(format!("run commit-tree: {error}")))?;
+                    if !output.status.success() {
+                        return Err(ApiError::internal(format!(
+                            "failed to rewrite commit {sha}: {}",
+                            String::from_utf8_lossy(&output.stderr).trim()
+                        )));
+                    }
+                    let rewritten = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                    history_rewrite.insert(sha.to_owned(), rewritten);
+                }
+                let _ = tokio::fs::remove_file(&staging_shallow).await;
+            }
+        }
+    }
 
     // `git add --all` has to decide, for every path, whether the working tree
     // still matches the index. With a cold index it re-hashes the whole tree;
@@ -251,10 +433,15 @@ async fn create_workspace_snapshot_inner(
     //     `HEAD..S` would be empty and changed-file actions would see nothing).
     // `None` (unborn HEAD, or an initial commit with a clean tree) falls
     // through to the null-SHA "initial push" base downstream.
+    let rewrite = |sha: &Option<String>| {
+        sha.as_deref()
+            .and_then(|value| history_rewrite.get(value).cloned())
+            .or_else(|| sha.clone())
+    };
     let before_sha = if Some(tree.as_str()) != source_tree.as_deref() {
-        source_head.clone()
+        rewrite(&source_head)
     } else {
-        parent_sha.clone()
+        rewrite(&parent_sha)
     };
 
     // Best effort: the index is a cache, so a failed hand-off only costs the
@@ -280,12 +467,12 @@ async fn create_workspace_snapshot_inner(
     // ref; an orphan root commit leaves them nothing to diff and they fail.
     // The parent object is always present: the object cache holds every
     // committed object from the workspace (see `ensure_object_cache`).
-    if let Some(head) = source_head.as_deref() {
+    if let Some(head) = rewrite(&source_head) {
         commit.args([
             "commit-tree",
             tree.as_str(),
             "-p",
-            head,
+            head.as_str(),
             "-m",
             "aksh workspace snapshot",
         ]);
@@ -396,22 +583,26 @@ async fn create_workspace_snapshot_inner(
             &cached_objects,
         );
         publish.args(["update-ref", "--stdin"]);
-        let publish_input = refs
-            .lines()
-            .filter_map(|line| {
-                let (name, object) = line.split_once(' ')?;
-                if object.len() != 40 {
-                    return None;
-                }
-                let is_default_branch = default_branch.as_deref()
-                    == Some(name.strip_prefix("refs/heads/").unwrap_or(name));
-                if is_default_branch {
-                    Some(format!("update {name} {commit_sha}\n"))
-                } else {
-                    Some(format!("update {name} {object}\n"))
-                }
-            })
-            .collect::<String>();
+        let mut publish_input = String::new();
+        for line in refs.lines() {
+            let Some((name, object)) = line.split_once(' ') else {
+                continue;
+            };
+            if object.len() != 40 {
+                continue;
+            }
+            let is_default_branch =
+                default_branch.as_deref() == Some(name.strip_prefix("refs/heads/").unwrap_or(name));
+            if is_default_branch {
+                publish_input.push_str(&format!("update {name} {commit_sha}\n"));
+            } else {
+                let published = history_rewrite
+                    .get(object)
+                    .cloned()
+                    .unwrap_or_else(|| object.to_owned());
+                publish_input.push_str(&format!("update {name} {published}\n"));
+            }
+        }
         if !publish_input.is_empty() {
             run_git_with_stdin(
                 &mut publish,
@@ -862,6 +1053,40 @@ async fn acquire_cache_lock(path: &FsPath) -> Result<CacheLock, ApiError> {
     }
 }
 
+/// Split a git ident header (`Name <email> 1234567890 +0000`) into the
+/// (name, email, date) parts `commit-tree` expects through its env vars.
+fn parse_ident(value: &str) -> (String, String, String) {
+    let value = value.trim();
+    let name;
+    let email;
+    let date;
+    match value.rfind('<') {
+        Some(angle) => {
+            name = value[..angle].trim().to_owned();
+            let tail = &value[angle + 1..];
+            match tail.find('>') {
+                Some(end) => {
+                    email = format!("<{}>", &tail[..end]);
+                    date = tail[end + 1..].trim().to_owned();
+                }
+                None => {
+                    email = String::new();
+                    date = tail.trim().to_owned();
+                }
+            }
+        }
+        None => {
+            // Unusual ident without angle brackets; take the last token as
+            // the date and everything before as the name.
+            let mut parts = value.rsplitn(2, ' ');
+            date = parts.next().unwrap_or("").to_owned();
+            name = parts.next().unwrap_or("").to_owned();
+            email = String::new();
+        }
+    }
+    (name, email, date)
+}
+
 fn state_dir_exclusion(state_dir: &FsPath, workspace: &FsPath) -> Result<Option<String>, ApiError> {
     let state_dir = std::fs::canonicalize(state_dir).map_err(|error| {
         ApiError::internal(format!(
@@ -905,17 +1130,34 @@ pub(crate) fn redirect_primary_checkout(
             .as_ref()
             .and_then(|reference| reference.name.as_deref())
             .is_some_and(|name| name.eq_ignore_ascii_case("actions/checkout"));
-        if !is_checkout
-            || step.inputs.keys().any(|key| {
-                ["repository", "ref", "github-server-url"]
-                    .iter()
-                    .any(|reserved| key.eq_ignore_ascii_case(reserved))
+        // A checkout whose `repository`/`ref`/`github-server-url` input is a
+        // literal, non-empty value points at a specific remote target and
+        // must not be rewritten. Empty values and template expressions (e.g.
+        // `ref: ${{ inputs.head-sha }}`) are GitHub's "default branch"
+        // semantics — the server never evaluates step expressions, and the
+        // snapshot IS the local default — so the redirect still applies.
+        // Skipping them sent the checkout to the real GitHub host, where the
+        // unauthenticated fetch failed.
+        let explicitly_set = |name: &str| {
+            step.inputs.iter().any(|(key, value)| {
+                let value = value.as_str().trim();
+                key.eq_ignore_ascii_case(name) && !value.is_empty() && !value.contains("${{")
             })
+        };
+        if !is_checkout
+            || ["repository", "ref", "github-server-url"]
+                .iter()
+                .any(|reserved| explicitly_set(reserved))
         {
             continue;
         }
         step.inputs
             .insert("repository".to_owned(), snapshot.repository.clone());
+        // The snapshot commit SHA. `actions/checkout` treats a bare SHA as a
+        // commit ref (it derives `commit` from it, so the fetch lands on the
+        // snapshot). A branch ref instead leaves the action's `commit` empty,
+        // which skips the targeted refetch and breaks checkout entirely when
+        // the all-refs fetch is rejected (shallow-mirrored snapshots).
         step.inputs
             .insert("ref".to_owned(), snapshot.commit_sha.clone());
         step.inputs
