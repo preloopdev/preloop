@@ -126,6 +126,8 @@ pub struct MachineSpec {
     pub memory_mib: u32,
     /// Persistent storage in GiB.
     pub storage_gib: u32,
+    /// Root overlay size in GiB. `None` keeps the provider default.
+    pub overlay_gib: Option<u32>,
     /// Guest network policy.
     pub network: NetworkPolicy,
     /// Narrowly scoped host mounts.
@@ -435,6 +437,9 @@ impl VmProvider for SmolVmProvider {
             "--storage".into(),
             spec.storage_gib.to_string(),
         ]);
+        if let Some(overlay_gib) = spec.overlay_gib {
+            args.extend(["--overlay".into(), overlay_gib.to_string()]);
+        }
         match &spec.network {
             NetworkPolicy::Disabled => {}
             NetworkPolicy::Unrestricted => args.push("--net".into()),

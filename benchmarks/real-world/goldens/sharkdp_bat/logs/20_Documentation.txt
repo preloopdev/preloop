@@ -1,0 +1,1187 @@
+﻿2026-08-01T04:01:33.0074322Z Current runner version: '2.336.0'
+##[group]Runner Image Provisioner
+Hosted Compute Agent
+Version: 20260707.563
+Commit: 02667638d2b423fbc733a8e32a88b44996a3ba6e
+Build Date: 2026-07-07T19:33:50Z
+Worker ID: {2d9d0ed5-3797-4083-888f-aa163514871f}
+Azure Region: westus
+##[endgroup]
+##[group]Operating System
+Ubuntu
+24.04.4
+LTS
+##[endgroup]
+##[group]Runner Image
+Image: ubuntu-24.04
+Version: 20260720.247.2
+Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260720.247/images/ubuntu/Ubuntu2404-Readme.md
+Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260720.247
+##[endgroup]
+##[group]GITHUB_TOKEN Permissions
+Actions: write
+ArtifactMetadata: write
+Attestations: write
+Checks: write
+CodeQuality: write
+Contents: write
+CopilotRequests: write
+Deployments: write
+Discussions: write
+Drives: write
+Issues: write
+Metadata: read
+Models: read
+Packages: write
+Pages: write
+PullRequests: write
+RepositoryProjects: write
+SecurityEvents: write
+Statuses: write
+VulnerabilityAlerts: read
+##[endgroup]
+Secret source: Actions
+Prepare workflow directory
+Prepare all required actions
+Getting action download info
+Download action repository 'actions/checkout@v6' (SHA:d23441a48e516b6c34aea4fa41551a30e30af803)
+Download action repository 'dtolnay/rust-toolchain@stable' (SHA:4cda84d5c5c54efe2404f9d843567869ab1699d4)
+Complete job name: Documentation
+##[group]Run actions/checkout@v6
+with:
+repository: sharkdp/bat
+token: ***
+ssh-strict: true
+ssh-user: git
+persist-credentials: true
+clean: true
+sparse-checkout-cone-mode: true
+fetch-depth: 1
+fetch-tags: false
+show-progress: true
+lfs: false
+submodules: false
+set-safe-directory: true
+allow-unsafe-pr-checkout: false
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+##[endgroup]
+Syncing repository: sharkdp/bat
+##[group]Getting Git version info
+Working directory is '/home/runner/work/bat/bat'
+[command]/usr/bin/git version
+git version 2.54.0
+##[endgroup]
+Temporarily overriding HOME='/home/runner/work/_temp/ea0fd7a7-cc33-4627-a1da-24cea2abd76b' before making global git config changes
+Adding repository directory to the temporary git global config as a safe directory
+[command]/usr/bin/git config --global --add safe.directory /home/runner/work/bat/bat
+Deleting the contents of '/home/runner/work/bat/bat'
+##[group]Determining repository object format
+##[endgroup]
+##[group]Initializing the repository
+[command]/usr/bin/git init /home/runner/work/bat/bat
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /home/runner/work/bat/bat/.git/
+[command]/usr/bin/git remote add origin https://github.com/sharkdp/bat
+##[endgroup]
+##[group]Disabling automatic garbage collection
+[command]/usr/bin/git config --local gc.auto 0
+##[endgroup]
+##[group]Setting up auth
+Removing SSH command configuration
+[command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Removing HTTP extra header
+[command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Removing includeIf entries pointing to credentials config files
+[command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+[command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+[command]/usr/bin/git config --file /home/runner/work/_temp/git-credentials-9310818b-ee6a-4e19-a77a-54b56624fe24.config http.https://github.com/.extraheader AUTHORIZATION: basic ***
+[command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/bat/bat/.git.path /home/runner/work/_temp/git-credentials-9310818b-ee6a-4e19-a77a-54b56624fe24.config
+[command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/bat/bat/.git/worktrees/*.path /home/runner/work/_temp/git-credentials-9310818b-ee6a-4e19-a77a-54b56624fe24.config
+[command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-9310818b-ee6a-4e19-a77a-54b56624fe24.config
+[command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-9310818b-ee6a-4e19-a77a-54b56624fe24.config
+##[endgroup]
+##[group]Fetching the repository
+[command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +2ba8db9c14e5794572f5ea338c2b90404c9769cb:refs/remotes/origin/master
+From https://github.com/sharkdp/bat
+* [new ref]         2ba8db9c14e5794572f5ea338c2b90404c9769cb -> origin/master
+[command]/usr/bin/git branch --list --remote origin/master
+origin/master
+[command]/usr/bin/git rev-parse refs/remotes/origin/master
+2ba8db9c14e5794572f5ea338c2b90404c9769cb
+##[endgroup]
+##[group]Determining the checkout info
+##[endgroup]
+[command]/usr/bin/git sparse-checkout disable
+[command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+##[group]Checking out the ref
+[command]/usr/bin/git checkout --progress --force -B master refs/remotes/origin/master
+Reset branch 'master'
+branch 'master' set up to track 'origin/master'.
+##[endgroup]
+[command]/usr/bin/git log -1 --format=%H
+2ba8db9c14e5794572f5ea338c2b90404c9769cb
+##[group]Run dtolnay/rust-toolchain@stable
+with:
+toolchain: stable
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+##[endgroup]
+##[start-action display=Run : parse toolchain version;id=__dtolnay_rust-toolchain.parse]
+##[group]Run : parse toolchain version
+: parse toolchain version
+if [[ -z $toolchain ]]; then
+# GitHub does not enforce `required: true` inputs itself. https://github.com/actions/runner/issues/1070
+echo "'toolchain' is a required input" >&2
+exit 1
+elif [[ $toolchain =~ ^stable' '[0-9]+' '(year|month|week|day)s?' 'ago$ ]]; then
+if [[ Linux == macOS ]]; then
+echo "toolchain=1.$((($(date -v-$(sed 's/stable \([0-9]*\) \(.\).*/\1\2/' <<< $toolchain) +%s)/60/60/24-16569)/7/6))" >> $GITHUB_OUTPUT
+else
+echo "toolchain=1.$((($(date --date "${toolchain#stable }" +%s)/60/60/24-16569)/7/6))" >> $GITHUB_OUTPUT
+fi
+elif [[ $toolchain =~ ^stable' 'minus' '[0-9]+' 'releases?$ ]]; then
+echo "toolchain=1.$((($(date +%s)/60/60/24-16569)/7/6-${toolchain//[^0-9]/}))" >> $GITHUB_OUTPUT
+elif [[ $toolchain =~ ^1\.[0-9]+$ ]]; then
+echo "toolchain=1.$((i=${toolchain#1.}, c=($(date +%s)/60/60/24-16569)/7/6, i+9*i*(10*i<=c)+90*i*(100*i<=c)))" >> $GITHUB_OUTPUT
+else
+echo "toolchain=$toolchain" >> $GITHUB_OUTPUT
+fi
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+toolchain: stable
+##[endgroup]
+##[end-action id=__dtolnay_rust-toolchain.parse;outcome=success;conclusion=success;duration_ms=24]
+##[start-action display=Run : construct rustup command line;id=__dtolnay_rust-toolchain.flags]
+##[group]Run : construct rustup command line
+: construct rustup command line
+echo "targets=$(for t in ${targets//,/ }; do echo -n ' --target' $t; done)" >> $GITHUB_OUTPUT
+echo "components=$(for c in ${components//,/ }; do echo -n ' --component' $c; done)" >> $GITHUB_OUTPUT
+echo "downgrade=" >> $GITHUB_OUTPUT
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+targets: 
+components: 
+##[endgroup]
+##[end-action id=__dtolnay_rust-toolchain.flags;outcome=success;conclusion=success;duration_ms=15]
+##[start-action display=Run : set $CARGO_HOME;id=__dtolnay_rust-toolchain.__run]
+##[group]Run : set $CARGO_HOME
+: set $CARGO_HOME
+echo CARGO_HOME=${CARGO_HOME:-"$HOME/.cargo"} >> $GITHUB_ENV
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+##[endgroup]
+##[end-action id=__dtolnay_rust-toolchain.__run;outcome=success;conclusion=success;duration_ms=14]
+##[start-action display=Run : install rustup if needed;id=__dtolnay_rust-toolchain.__run_2]
+##[group]Run : install rustup if needed
+: install rustup if needed
+if ! command -v rustup &>/dev/null; then
+curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused --location --silent --show-error --fail https://sh.rustup.rs | sh -s -- --default-toolchain none -y
+echo "$CARGO_HOME/bin" >> $GITHUB_PATH
+fi
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+CARGO_HOME: /home/runner/.cargo
+##[endgroup]
+##[end-action id=__dtolnay_rust-toolchain.__run_2;outcome=success;conclusion=success;duration_ms=16]
+##[start-action display=Run : install rustup if needed on windows;id=__dtolnay_rust-toolchain.__run_3]
+##[end-action id=__dtolnay_rust-toolchain.__run_3;outcome=skipped;conclusion=skipped;duration_ms=0]
+##[start-action display=rustup toolchain install stable;id=__dtolnay_rust-toolchain.__run_4]
+##[group]Run rustup toolchain install stable --profile minimal --no-self-update
+rustup toolchain install stable --profile minimal --no-self-update
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+CARGO_HOME: /home/runner/.cargo
+RUSTUP_PERMIT_COPY_RENAME: 1
+##[endgroup]
+info: syncing channel updates for stable-x86_64-unknown-linux-gnu
+stable-x86_64-unknown-linux-gnu unchanged - rustc 1.97.1 (8bab26f4f 2026-07-14)
+##[end-action id=__dtolnay_rust-toolchain.__run_4;outcome=success;conclusion=success;duration_ms=667]
+##[start-action display=Run rustup default stable;id=__dtolnay_rust-toolchain.__run_5]
+##[group]Run rustup default stable
+rustup default stable
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+CARGO_HOME: /home/runner/.cargo
+##[endgroup]
+info: using existing install for stable-x86_64-unknown-linux-gnu
+info: default toolchain set to stable-x86_64-unknown-linux-gnu
+stable-x86_64-unknown-linux-gnu unchanged - rustc 1.97.1 (8bab26f4f 2026-07-14)
+##[end-action id=__dtolnay_rust-toolchain.__run_5;outcome=success;conclusion=success;duration_ms=29]
+##[start-action display=Run : create cachekey;id=__dtolnay_rust-toolchain.rustc-version]
+##[group]Run : create cachekey
+: create cachekey
+DATE=$(rustc +stable --version --verbose | sed -ne 's/^commit-date: \(20[0-9][0-9]\)-\([01][0-9]\)-\([0-3][0-9]\)$/\1\2\3/p')
+HASH=$(rustc +stable --version --verbose | sed -ne 's/^commit-hash: //p')
+echo "cachekey=$(echo $DATE$HASH | head -c12)" >> $GITHUB_OUTPUT
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+CARGO_HOME: /home/runner/.cargo
+##[endgroup]
+##[end-action id=__dtolnay_rust-toolchain.rustc-version;outcome=success;conclusion=success;duration_ms=46]
+##[start-action display=Run : disable incremental compilation;id=__dtolnay_rust-toolchain.__run_6]
+##[group]Run : disable incremental compilation
+: disable incremental compilation
+if [ -z "${CARGO_INCREMENTAL+set}" ]; then
+echo CARGO_INCREMENTAL=0 >> $GITHUB_ENV
+fi
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+CARGO_HOME: /home/runner/.cargo
+##[endgroup]
+##[end-action id=__dtolnay_rust-toolchain.__run_6;outcome=success;conclusion=success;duration_ms=14]
+##[start-action display=Run : enable colors in Cargo output;id=__dtolnay_rust-toolchain.__run_7]
+##[group]Run : enable colors in Cargo output
+: enable colors in Cargo output
+if [ -z "${CARGO_TERM_COLOR+set}" ]; then
+echo CARGO_TERM_COLOR=always >> $GITHUB_ENV
+fi
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+CARGO_HOME: /home/runner/.cargo
+CARGO_INCREMENTAL: 0
+##[endgroup]
+##[end-action id=__dtolnay_rust-toolchain.__run_7;outcome=success;conclusion=success;duration_ms=15]
+##[start-action display=Run : enable Cargo sparse registry;id=__dtolnay_rust-toolchain.__run_8]
+##[group]Run : enable Cargo sparse registry
+: enable Cargo sparse registry
+# implemented in 1.66, stabilized in 1.68, made default in 1.70
+if [ -z "${CARGO_REGISTRIES_CRATES_IO_PROTOCOL+set}" -o -f "/home/runner/work/_temp"/.implicit_cargo_registries_crates_io_protocol ]; then
+if rustc +stable --version --verbose | grep -q '^release: 1\.6[89]\.'; then
+touch "/home/runner/work/_temp"/.implicit_cargo_registries_crates_io_protocol || true
+echo CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse >> $GITHUB_ENV
+elif rustc +stable --version --verbose | grep -q '^release: 1\.6[67]\.'; then
+touch "/home/runner/work/_temp"/.implicit_cargo_registries_crates_io_protocol || true
+echo CARGO_REGISTRIES_CRATES_IO_PROTOCOL=git >> $GITHUB_ENV
+fi
+fi
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+CARGO_HOME: /home/runner/.cargo
+CARGO_INCREMENTAL: 0
+CARGO_TERM_COLOR: always
+##[endgroup]
+##[end-action id=__dtolnay_rust-toolchain.__run_8;outcome=success;conclusion=success;duration_ms=41]
+##[start-action display=Run : work around spurious network errors in curl 8.0;id=__dtolnay_rust-toolchain.__run_9]
+##[group]Run : work around spurious network errors in curl 8.0
+: work around spurious network errors in curl 8.0
+# https://rust-lang.zulipchat.com/#narrow/stream/246057-t-cargo/topic/timeout.20investigation
+if rustc +stable --version --verbose | grep -q '^release: 1\.7[01]\.'; then
+echo CARGO_HTTP_MULTIPLEXING=false >> $GITHUB_ENV
+fi
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+CARGO_HOME: /home/runner/.cargo
+CARGO_INCREMENTAL: 0
+CARGO_TERM_COLOR: always
+##[endgroup]
+##[end-action id=__dtolnay_rust-toolchain.__run_9;outcome=success;conclusion=success;duration_ms=29]
+##[start-action display=Run rustc +stable --version --verbose;id=__dtolnay_rust-toolchain.__run_10]
+##[group]Run rustc +stable --version --verbose
+rustc +stable --version --verbose
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+CARGO_HOME: /home/runner/.cargo
+CARGO_INCREMENTAL: 0
+CARGO_TERM_COLOR: always
+##[endgroup]
+rustc 1.97.1 (8bab26f4f 2026-07-14)
+binary: rustc
+commit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452
+commit-date: 2026-07-14
+host: x86_64-unknown-linux-gnu
+release: 1.97.1
+LLVM version: 22.1.6
+##[end-action id=__dtolnay_rust-toolchain.__run_10;outcome=success;conclusion=success;duration_ms=28]
+##[group]Run cargo doc --locked --no-deps --document-private-items --all-features
+cargo doc --locked --no-deps --document-private-items --all-features
+shell: /usr/bin/bash -e {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+CARGO_HOME: /home/runner/.cargo
+CARGO_INCREMENTAL: 0
+CARGO_TERM_COLOR: always
+RUSTDOCFLAGS: -D warnings
+##[endgroup]
+Updating crates.io index
+Downloading crates ...
+Downloaded wild v2.2.1
+Downloaded terminal_size v0.4.4
+Downloaded adler2 v2.0.1
+Downloaded bisync v0.3.0
+Downloaded unicode-bom v2.0.3
+Downloaded utf8parse v0.2.2
+Downloaded termcolor v1.4.1
+Downloaded terminal-colorsaurus v1.0.3
+Downloaded block-buffer v0.10.4
+Downloaded clap_lex v1.1.0
+Downloaded crypto-common v0.1.7
+Downloaded execute v0.3.0
+Downloaded ansi_colours v1.2.3
+Downloaded bit-vec v0.8.0
+Downloaded cfg-if v1.0.4
+Downloaded darling_macro v0.23.0
+Downloaded document-features v0.2.12
+Downloaded equivalent v1.0.2
+Downloaded terminal-trx v0.2.6
+Downloaded version_check v0.9.5
+Downloaded bit-set v0.8.0
+Downloaded xterm-color v1.0.2
+Downloaded anstyle-query v1.1.5
+Downloaded bincode v1.3.3
+Downloaded bisync_macros v0.2.3
+Downloaded colorchoice v1.0.5
+Downloaded convert_case v0.10.0
+Downloaded yaml-rust v0.4.5
+Downloaded anstyle v1.0.14
+Downloaded execute-command-macro-impl v0.3.0
+Downloaded time-macros v0.2.27
+Downloaded anstream v1.0.0
+Downloaded anstyle-parse v1.0.0
+Downloaded zmij v1.0.21
+Downloaded anyhow v1.0.103
+Downloaded thiserror-impl v2.0.18
+Downloaded crossbeam-utils v0.8.21
+Downloaded allocator-api2 v0.2.21
+Downloaded bitflags v1.3.2
+Downloaded walkdir v2.5.0
+Downloaded tempfile v3.27.0
+Downloaded stable_deref_trait v1.2.1
+Downloaded unsafe-libyaml v0.2.11
+Downloaded bytemuck v1.25.0
+Downloaded toml v1.1.2+spec-1.1.0
+Downloaded bytes v1.11.1
+Downloaded arc-swap v1.9.1
+Downloaded clircle v0.6.1
+Downloaded execute-command-tokens v0.3.0
+Downloaded gix-bitmap v0.3.3
+Downloaded gix-command v0.9.1
+Downloaded serde_core v1.0.228
+Downloaded base64 v0.22.1
+Downloaded gix-packetline v0.22.0
+Downloaded time-core v0.1.8
+Downloaded defmt-macros v1.1.0
+Downloaded gix-sec v0.14.2
+Downloaded nonempty v0.12.0
+Downloaded clru v0.6.3
+Downloaded crossbeam-channel v0.5.15
+Downloaded errno v0.3.14
+Downloaded etcetera v0.11.0
+Downloaded defmt-parser v1.0.0
+Downloaded execute-command-macro v0.3.0
+Downloaded same-file v1.0.6
+Downloaded scopeguard v1.2.0
+Downloaded tinyvec_macros v0.1.1
+Downloaded cpufeatures v0.2.17
+Downloaded rustc_version v0.4.1
+Downloaded typenum v1.20.0
+Downloaded crossbeam-deque v0.8.6
+Downloaded dashmap v6.2.1
+Downloaded defmt v1.1.0
+Downloaded gix-chunk v0.7.3
+Downloaded serde_spanned v1.1.1
+Downloaded shell-escape v0.1.5
+Downloaded std_prelude v0.2.12
+Downloaded toml_writer v1.1.1+spec-1.1.0
+Downloaded console v0.16.3
+Downloaded derive_more v2.1.1
+Downloaded gix-config-value v0.19.0
+Downloaded hash32 v0.3.1
+Downloaded strsim v0.11.1
+Downloaded gix-actor v0.41.2
+Downloaded itoa v1.0.18
+Downloaded percent-encoding v2.3.2
+Downloaded sha1 v0.10.6
+Downloaded gix-shallow v0.13.0
+Downloaded unicode-segmentation v1.13.3
+Downloaded ident_case v1.0.1
+Downloaded toml_datetime v1.1.1+spec-1.1.0
+Downloaded content_inspector v0.2.4
+Downloaded digest v0.10.7
+Downloaded either v1.15.0
+Downloaded faster-hex v0.10.0
+Downloaded fastrand v2.4.1
+Downloaded gix-trace v0.1.21
+Downloaded lock_api v0.4.14
+Downloaded simd-adler32 v0.3.9
+Downloaded thiserror v2.0.18
+Downloaded darling v0.23.0
+Downloaded gix-revwalk v0.34.0
+Downloaded signal-hook-mio v0.2.5
+Downloaded bugreport v0.6.0
+Downloaded gix-attributes v0.34.0
+Downloaded gix-glob v0.27.0
+Downloaded path_abs v0.5.1
+Downloaded gix-pathspec v0.19.0
+Downloaded gix-revision v0.48.0
+Downloaded bitflags v2.11.1
+Downloaded deranged v0.5.8
+Downloaded gix-fs v0.22.0
+Downloaded powerfmt v0.2.0
+Downloaded proc-macro2 v1.0.107
+Downloaded textwrap v0.16.2
+Downloaded byteorder v1.5.0
+Downloaded bytesize v2.4.2
+Downloaded crc32fast v1.5.0
+Downloaded crossbeam-epoch v0.9.20
+Downloaded unicode-ident v1.0.24
+Downloaded gix-imara-diff v0.2.4
+Downloaded gix-features v0.49.0
+Downloaded tinyvec v1.11.0
+Downloaded num-conv v0.2.1
+Downloaded clap v4.6.1
+Downloaded gix-path v0.12.3
+Downloaded darling_core v0.23.0
+Downloaded nu-ansi-term v0.50.3
+Downloaded parking_lot_core v0.9.12
+Downloaded semver v1.0.28
+Downloaded smallvec v1.15.1
+Downloaded toml_parser v1.1.2+spec-1.1.0
+Downloaded gix-object v0.63.0
+Downloaded once_cell v1.21.4
+Downloaded gix-odb v0.83.0
+Downloaded aho-corasick v1.1.4
+Downloaded gix-transport v0.58.0
+Downloaded log v0.4.29
+Downloaded cc v1.2.62
+Downloaded regex v1.13.1
+Downloaded prodash v31.0.0
+Downloaded miniz_oxide v0.8.9
+Downloaded gix-config v0.59.0
+Downloaded mio v1.2.0
+Downloaded winnow v1.0.2
+Downloaded derive_more-impl v2.1.1
+Downloaded unicode-normalization v0.1.25
+Downloaded crossterm v0.29.0
+Downloaded zlib-rs v0.6.3
+Downloaded gix-pack v0.73.0
+Downloaded hashbrown v0.16.1
+Downloaded sysinfo v0.33.1
+Downloaded clap_builder v4.6.0
+Downloaded hashbrown v0.17.1
+Downloaded itertools v0.14.0
+Downloaded fancy-regex v0.16.2
+Downloaded time v0.3.47
+Downloaded unicode-width v0.2.2
+Downloaded quick-xml v0.41.0
+Downloaded gix v0.86.0
+Downloaded syn v2.0.117
+Downloaded bstr v1.12.1
+Downloaded regex-syntax v0.8.11
+Downloaded serde_with v3.21.0
+Downloaded minus v5.7.2
+Downloaded syntect v5.3.0
+Downloaded serde_with_macros v3.21.0
+Downloaded sha1-checked v0.10.0
+Downloaded regex-automata v0.4.16
+Downloaded serde_yaml v0.9.34+deprecated
+Downloaded rayon v1.12.0
+Downloaded ryu v1.0.23
+Downloaded encoding_rs v0.8.35
+Downloaded libc v0.2.186
+Downloaded shell-words v1.1.1
+Downloaded gix-error v0.2.5
+Downloaded onig v6.5.3
+Downloaded filetime v0.2.29
+Downloaded memchr v2.8.0
+Downloaded gix-traverse v0.60.0
+Downloaded hashbrown v0.14.5
+Downloaded fnv v1.0.7
+Downloaded rustversion v1.0.22
+Downloaded generic-array v0.14.7
+Downloaded gix-quote v0.7.2
+Downloaded rgb v0.8.53
+Downloaded gix-refspec v0.44.0
+Downloaded globset v0.4.18
+Downloaded signal-hook-registry v1.4.8
+Downloaded gix-zlib v0.1.0
+Downloaded git-version v0.3.9
+Downloaded gix-hashtable v0.16.0
+Downloaded foldhash v0.2.0
+Downloaded gix-discover v0.54.0
+Downloaded gix-ignore v0.22.0
+Downloaded gix-utils v0.3.5
+Downloaded quote v1.0.47
+Downloaded proc-macro-error2 v2.0.1
+Downloaded shlex v1.3.0
+Downloaded gix-submodule v0.33.0
+Downloaded proc-macro-error-attr2 v2.0.0
+Downloaded rayon-core v1.13.0
+Downloaded gix-worktree v0.55.0
+Downloaded prettyplease v0.2.37
+Downloaded is_terminal_polyfill v1.70.2
+Downloaded litrs v1.0.0
+Downloaded serde_derive v1.0.228
+Downloaded gix-diff v0.66.0
+Downloaded gix-tempfile v24.0.0
+Downloaded gix-validate v0.11.3
+Downloaded serde v1.0.228
+Downloaded linked-hash-map v0.5.6
+Downloaded signal-hook v0.3.18
+Downloaded gix-protocol v0.64.0
+Downloaded gix-filter v0.33.0
+Downloaded grep-cli v0.1.12
+Downloaded pkg-config v0.3.33
+Downloaded flate2 v1.1.9
+Downloaded onig_sys v69.9.3
+Downloaded jiff v0.2.29
+Downloaded gix-index v0.54.0
+Downloaded gix-date v0.15.6
+Downloaded gix-worktree-stream v0.35.0
+Downloaded gix-ref v0.66.0
+Downloaded gix-lock v24.0.0
+Downloaded git-version-macro v0.3.9
+Downloaded getrandom v0.4.2
+Downloaded gix-commitgraph v0.38.0
+Downloaded plist v1.10.0
+Downloaded gix-hash v0.26.0
+Downloaded heapless v0.8.0
+Downloaded gix-url v0.37.0
+Downloaded find-msvc-tools v0.1.9
+Downloaded memmap2 v0.9.11
+Downloaded indexmap v2.14.0
+Downloaded rustix v1.1.4
+Downloaded jiff-static v0.2.29
+Downloaded serde_json v1.0.149
+Downloaded parking_lot v0.12.5
+Downloaded linux-raw-sys v0.12.1
+Compiling proc-macro2 v1.0.107
+Compiling unicode-ident v1.0.24
+Compiling quote v1.0.47
+Checking memchr v2.8.0
+Compiling libc v0.2.186
+Checking cfg-if v1.0.4
+Checking aho-corasick v1.1.4
+Checking regex-syntax v0.8.11
+Compiling thiserror v2.0.18
+Compiling syn v2.0.117
+Compiling getrandom v0.4.2
+Compiling parking_lot_core v0.9.12
+Checking tinyvec_macros v0.1.1
+Checking smallvec v1.15.1
+Checking scopeguard v1.2.0
+Checking regex-automata v0.4.16
+Checking lock_api v0.4.14
+Checking tinyvec v1.11.0
+Checking gix-trace v0.1.21
+Checking fastrand v2.4.1
+Checking unicode-normalization v0.1.25
+Checking once_cell v1.21.4
+Compiling crc32fast v1.5.0
+Checking parking_lot v0.12.5
+Checking bitflags v2.11.1
+Checking same-file v1.0.6
+Checking prodash v31.0.0
+Checking walkdir v2.5.0
+Compiling version_check v0.9.5
+Checking typenum v1.20.0
+Compiling generic-array v0.14.7
+Checking equivalent v1.0.2
+Checking byteorder v1.5.0
+Checking allocator-api2 v0.2.21
+Checking bstr v1.12.1
+Compiling heapless v0.8.0
+Checking foldhash v0.2.0
+Checking gix-validate v0.11.3
+Checking gix-utils v0.3.5
+Checking gix-error v0.2.5
+Checking hash32 v0.3.1
+Checking stable_deref_trait v1.2.1
+Checking block-buffer v0.10.4
+Checking crypto-common v0.1.7
+Checking itoa v1.0.18
+Checking digest v0.10.7
+Checking hashbrown v0.17.1
+Checking cpufeatures v0.2.17
+Compiling crossbeam-utils v0.8.21
+Checking faster-hex v0.10.0
+Checking sha1 v0.10.6
+Checking sha1-checked v0.10.0
+Compiling rustix v1.1.4
+Checking linux-raw-sys v0.12.1
+Checking jiff v0.2.29
+Checking memmap2 v0.9.11
+Compiling thiserror-impl v2.0.18
+Checking hashbrown v0.14.5
+Checking dashmap v6.2.1
+Checking gix-chunk v0.7.3
+Checking nonempty v0.12.0
+Checking gix-quote v0.7.2
+Compiling serde_core v1.0.228
+Compiling strsim v0.11.1
+Checking gix-path v0.12.3
+Checking gix-features v0.49.0
+Compiling serde v1.0.228
+Checking gix-hash v0.26.0
+Checking tempfile v3.27.0
+Checking gix-fs v0.22.0
+Checking gix-hashtable v0.16.0
+Checking gix-glob v0.27.0
+Checking gix-commitgraph v0.38.0
+Checking gix-tempfile v24.0.0
+Checking unicode-bom v2.0.3
+Checking gix-lock v24.0.0
+Compiling ident_case v1.0.1
+Compiling crossbeam-epoch v0.9.20
+Checking log v0.4.29
+Checking gix-date v0.15.6
+Compiling darling_core v0.23.0
+Checking gix-actor v0.41.2
+Checking gix-object v0.63.0
+Checking gix-revwalk v0.34.0
+Checking gix-attributes v0.34.0
+Checking gix-sec v0.14.2
+Compiling utf8parse v0.2.2
+Compiling shlex v1.3.0
+Compiling find-msvc-tools v0.1.9
+Checking shell-words v1.1.1
+Compiling cc v1.2.62
+Checking gix-command v0.9.1
+Compiling anstyle-parse v1.0.0
+Checking gix-ref v0.66.0
+Checking gix-packetline v0.22.0
+Compiling darling_macro v0.23.0
+Checking errno v0.3.14
+Compiling anstyle-query v1.1.5
+Compiling pkg-config v0.3.33
+Compiling is_terminal_polyfill v1.70.2
+Compiling rayon-core v1.13.0
+Compiling rustversion v1.0.22
+Checking fnv v1.0.7
+Compiling signal-hook v0.3.18
+Checking percent-encoding v2.3.2
+Compiling anstyle v1.0.14
+Compiling unicode-segmentation v1.13.3
+Compiling colorchoice v1.0.5
+Compiling onig_sys v69.9.3
+Compiling anstream v1.0.0
+Compiling convert_case v0.10.0
+Checking gix-url v0.37.0
+Compiling darling v0.23.0
+Checking signal-hook-registry v1.4.8
+Checking crossbeam-deque v0.8.6
+Compiling terminal_size v0.4.4
+Checking gix-traverse v0.60.0
+Checking mio v1.2.0
+Checking gix-config-value v0.19.0
+Checking gix-bitmap v0.3.3
+Checking hashbrown v0.16.1
+Checking filetime v0.2.29
+Checking zlib-rs v0.6.3
+Checking either v1.15.0
+Compiling prettyplease v0.2.37
+Compiling clap_lex v1.1.0
+Compiling zmij v1.0.21
+Compiling winnow v1.0.2
+Compiling anyhow v1.0.103
+Checking powerfmt v0.2.0
+Compiling toml_parser v1.1.2+spec-1.1.0
+Checking deranged v0.5.8
+Checking gix-zlib v0.1.0
+Compiling indexmap v2.14.0
+Compiling clap_builder v4.6.0
+Checking clru v0.6.3
+Checking gix-index v0.54.0
+Compiling derive_more-impl v2.1.1
+Compiling serde_with_macros v3.21.0
+Compiling serde_spanned v1.1.1
+Compiling toml_datetime v1.1.1+spec-1.1.0
+Checking gix-revision v0.48.0
+Checking gix-ignore v0.22.0
+Compiling serde_derive v1.0.228
+Checking encoding_rs v0.8.35
+Checking num-conv v0.2.1
+Compiling serde_json v1.0.149
+Checking simd-adler32 v0.3.9
+Compiling execute-command-tokens v0.3.0
+Compiling bisync_macros v0.2.3
+Checking adler2 v2.0.1
+Checking time-core v0.1.8
+Compiling toml_writer v1.1.1+spec-1.1.0
+Compiling litrs v1.0.0
+Checking unicode-width v0.2.2
+Checking bit-vec v0.8.0
+Checking bit-set v0.8.0
+Compiling document-features v0.2.12
+Compiling toml v1.1.2+spec-1.1.0
+Checking time v0.3.47
+Checking miniz_oxide v0.8.9
+Checking bisync v0.3.0
+Compiling itertools v0.14.0
+Checking gix-filter v0.33.0
+Compiling execute-command-macro-impl v0.3.0
+Checking gix-worktree v0.55.0
+Checking gix-refspec v0.44.0
+Compiling regex v1.13.1
+Compiling serde_with v3.21.0
+Checking arc-swap v1.9.1
+Compiling clap v4.6.1
+Checking derive_more v2.1.1
+Checking signal-hook-mio v0.2.5
+Checking rayon v1.12.0
+Checking gix-pack v0.73.0
+Checking gix-pathspec v0.19.0
+Checking gix-config v0.59.0
+Checking gix-transport v0.58.0
+Checking gix-shallow v0.13.0
+Compiling git-version-macro v0.3.9
+Checking gix-imara-diff v0.2.4
+Checking quick-xml v0.41.0
+Checking bytemuck v1.25.0
+Compiling bugreport v0.6.0
+Checking base64 v0.22.1
+Checking linked-hash-map v0.5.6
+Checking yaml-rust v0.4.5
+Compiling bat v0.26.1 (/home/runner/work/bat/bat)
+Checking plist v1.10.0
+Checking sysinfo v0.33.1
+Checking gix-diff v0.66.0
+Checking rgb v0.8.53
+Checking gix-submodule v0.33.0
+Checking git-version v0.3.9
+Checking gix-protocol v0.64.0
+Checking gix-odb v0.83.0
+Checking crossterm v0.29.0
+Checking onig v6.5.3
+Checking execute-command-macro v0.3.0
+Checking flate2 v1.1.9
+Checking fancy-regex v0.16.2
+Checking textwrap v0.16.2
+Checking bincode v1.3.3
+Checking gix-discover v0.54.0
+Checking globset v0.4.18
+Checking crossbeam-channel v0.5.15
+Checking terminal-trx v0.2.6
+Checking std_prelude v0.2.12
+Checking termcolor v1.4.1
+Checking ryu v1.0.23
+Checking unsafe-libyaml v0.2.11
+Checking shell-escape v0.1.5
+Checking xterm-color v1.0.2
+Checking execute v0.3.0
+Checking terminal-colorsaurus v1.0.3
+Checking minus v5.7.2
+Checking grep-cli v0.1.12
+Checking path_abs v0.5.1
+Checking syntect v5.3.0
+Checking gix v0.86.0
+Checking serde_yaml v0.9.34+deprecated
+Checking ansi_colours v1.2.3
+Checking console v0.16.3
+Checking etcetera v0.11.0
+Checking clircle v0.6.1
+Checking content_inspector v0.2.4
+Checking wild v2.2.1
+Checking bytesize v2.4.2
+Checking semver v1.0.28
+Checking nu-ansi-term v0.50.3
+Documenting bat v0.26.1 (/home/runner/work/bat/bat)
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 33.81s
+Generated /home/runner/work/bat/bat/target/doc/bat/index.html
+##[group]Run man $(find . -name bat.1)
+man $(find . -name bat.1)
+shell: /usr/bin/bash -e {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+CARGO_HOME: /home/runner/.cargo
+CARGO_INCREMENTAL: 0
+CARGO_TERM_COLOR: always
+##[endgroup]
+BAT(1)                      General Commands Manual                     BAT(1)
+NAME
+bat - a cat(1) clone with syntax highlighting and Git integration.
+USAGE
+bat [OPTIONS] [FILE]...
+bat cache [CACHE-OPTIONS] [--build|--clear]
+DESCRIPTION
+bat  prints  the syntax-highlighted content of a collection of FILEs to
+the terminal. If no FILE is specified, or when FILE is  '-',  it  reads
+from standard input.
+bat  supports  a  large number of programming and markup languages.  It
+also communicates with git(1) to show modifications with respect to the
+git index.  bat automatically pipes its output through a pager (by  de‐
+fault: less).
+Whenever  the  output  of  bat goes to a non-interactive terminal, i.e.
+when the output is piped into another process or into a file, bat  will
+act  as  a drop-in replacement for cat(1) and fall back to printing the
+plain file contents, unless an explicit style is requested.
+OPTIONS
+General remarks: Command-line options like '-l'/'--language' that  take
+values   can   be  specified  as  either  '--language  value',  '--lan‐
+guage=value', '-l value' or '-lvalue'.
+-A, --show-all
+Show non-printable characters like space, tab  or  newline.  Use
+'--tabs' to control the width of the tab-placeholders.
+--nonprintable-notation <notation>
+Specify  how  to  display  non-printable  characters  when using
+--show-all.
+Possible values:
+caret  Use character sequences like ^G, ^J, ^@, ..  to  identify
+non-printable characters
+unicode
+Use special Unicode code points to identify non-printable
+characters
+--binary <behavior>
+How to treat binary content.
+Possible values:
+no-printing
+Do not print any binary content (default)
+as-text
+Treat binary content as normal text
+--completion <SHELL>
+Show  shell  completion  for  a certain shell.  Possible values:
+bash, fish, zsh, ps1
+-p, --plain
+Only show plain style, no decorations.  This  is  an  alias  for
+'--style=plain'.  When  '-p' is used twice ('-pp'), it also dis‐
+ables  automatic  paging  (alias   for   '--style=plain   --pag‐
+ing=never').
+-l, --language <language>
+Explicitly  set  the  language for syntax highlighting. The lan‐
+guage can be specified as a name (like 'C++' or 'LaTeX') or pos‐
+sible  file  extension  (like  'cpp',  'hpp'   or   'md').   Use
+'--list-languages' to show all supported language names and file
+extensions.
+-H, --highlight-line <N:M>...
+Highlight  the specified line ranges with a different background
+color. For example:
+--highlight-line 40
+highlights line 40
+--highlight-line 30:40
+highlights lines 30 to 40
+--highlight-line :40
+highlights lines 1 to 40
+--highlight-line 40:
+highlights lines 40 to the end of the file
+--highlight-line 30:+10
+highlights lines 30 to 40
+--file-name <name>...
+Specify the name to display for a file. Useful when piping  data
+to bat from STDIN when bat does not otherwise know the filename.
+Note  that the provided file name is also used for syntax detec‐
+tion.
+-d, --diff
+Only show lines that have been added/removed/modified  with  re‐
+spect  to  the  Git index. Use '--diff-context=N' to control how
+much context you want to see.
+--diff-context <N>...
+Include N lines of context around  added/removed/modified  lines
+when using '--diff'.
+--tabs <T>
+Set  the  tab  width  to T spaces. Use a width of 0 to pass tabs
+through directly
+--wrap <mode>
+Specify the text-wrapping mode (*auto*, never, character, word).
+The '--terminal-width' option can be used in addition to control
+the output width. In word mode, lines are broken  at  whitespace
+boundaries.  If  a  single  word  exceeds the terminal width, it
+falls back to character wrapping.
+-S, --chop-long-lines
+Truncate  all  lines  longer  than  screen  width.   Alias   for
+'--wrap=never'.
+--terminal-width <width>
+Explicitly  set the width of the terminal instead of determining
+it automatically. If prefixed with '+' or '-', the value will be
+treated as an offset to the actual  terminal  width.  See  also:
+'--wrap'.
+-n, --number
+Only  show  line numbers, no other decorations. This is an alias
+for '--style=numbers'
+--color <when>
+Specify when to use colored output. The automatic mode only  en‐
+ables  colors  if  an interactive terminal is detected. Possible
+values: *auto*, never, always.
+--italic-text <when>
+Specify when to use ANSI sequences for italic text in  the  out‐
+put. Possible values: always, *never*.
+--decorations <when>
+Specify when to use the decorations that have been specified via
+'--style'. The automatic mode only enables decorations if an in‐
+teractive  terminal is detected. The always mode will show deco‐
+rations even when piping output. Possible values: *auto*, never,
+always.
+-f, --force-colorization
+Alias for '--decorations=always --color=always'. This is  useful
+if  the  output of bat is piped to another program, but you want
+to keep the colorization/decorations.
+--paging <when>
+Specify when to use the pager. To disable the pager, use '--pag‐
+ing=never' or its alias, -P. To disable the  pager  permanently,
+set  BAT_PAGER  to  an  empty  string. To control which pager is
+used, see the '--pager' option. Possible values: *auto*,  never,
+always.
+--pager <command>
+Determine  which  pager  is  used. This option will override the
+PAGER and BAT_PAGER environment variables. The default pager  is
+'less'.  If you provide '--pager=builtin', use the built-in 'mi‐
+nus' pager. To control when the pager is used, see  the  '--pag‐
+ing' option.  Example: '--pager "less -RF"'.
+Note: By default, if the pager is set to 'less' (and no command-
+line  options are specified), 'bat' will pass the following com‐
+mand line  options  to  the  pager:  '-R'/'--RAW-CONTROL-CHARS',
+'-F'/'--quit-if-one-screen'  and  '-X'/'--no-init'. The last op‐
+tion ('-X') is only used for 'less' versions older than 530. The
+'-R' option is needed to interpret ANSI  colors  correctly.  The
+second  option  ('-F') instructs less to exit immediately if the
+output size is smaller than the vertical size of  the  terminal.
+This  is  convenient  for small files because you do not have to
+press 'q' to quit the pager. The third option ('-X')  is  needed
+to fix a bug with the '--quit-if-one-screen' feature in old ver‐
+sions  of 'less'. Unfortunately, it also breaks mouse-wheel sup‐
+port in 'less'. If you want to enable mouse-wheel  scrolling  on
+older  versions of 'less', you can pass just '-R' (as in the ex‐
+ample above, this will disable the quit-if-one-screen  feature).
+For less 530 or newer, it should work out of the box.
+-m, --map-syntax <glob-pattern:syntax-name>...
+Map  a glob pattern to an existing syntax name. The glob pattern
+is matched on the full path and the filename.  For  example,  to
+highlight   *.build   files  with  the  Python  syntax,  use  -m
+'*.build:Python'. To highlight files named '.myignore' with  the
+Git Ignore syntax, use -m '.myignore:Git Ignore'.  Note that the
+right-hand  side  is the *name* of the syntax, not a file exten‐
+sion.
+--ignored-suffix <ignored-suffix>
+Ignore extension.  For  example:  'bat  --ignored-suffix  ".dev"
+my_file.json.dev' will use JSON syntax, and ignore '.dev'
+--theme <theme>
+Set  the theme for syntax highlighting. Use --list-themes to see
+all  available  themes.   To  set  a  default  theme,  add   the
+--theme="..."  option  to  the  configuration file or export the
+BAT_THEME environment variable (e.g.: export BAT_THEME="...").
+Special values:
+auto (default)
+Picks a dark or light theme depending on  the  terminal's
+colors.   Use --theme-light and --theme-dark to customize
+the selected theme.
+auto:always
+Variation of auto where where the terminal's  colors  are
+detected even when the output is redirected.
+auto:system (macOS only)
+Variation of auto where the color scheme is detected from
+the system-wide preference instead.
+dark   Use the dark theme specified by --theme-dark.
+light  Use the light theme specified by --theme-light.
+--theme-dark <theme>
+Sets the theme name for syntax highlighting used when the termi‐
+nal  uses  a  dark  background.  To set a default theme, add the
+--theme-dark="..." option to the configuration  file  or  export
+the    BAT_THEME_DARK    environment   variable   (e.g.   export
+BAT_THEME_DARK="...").  This option  only  has  an  effect  when
+--theme option is set to auto or dark.
+--theme-light <theme>
+Sets the theme name for syntax highlighting used when the termi‐
+nal  uses  a  light background.  To set a default theme, add the
+--theme-light="..." option to the configuration file  or  export
+the    BAT_THEME_LIGHT   environment   variable   (e.g.   export
+BAT_THEME_LIGHT="...").  This option only  has  an  effect  when
+--theme option is set to auto or light.
+--list-themes
+Display a list of supported themes for syntax highlighting.
+-s, --squeeze-blank
+Squeeze consecutive empty lines into a single empty line.
+--squeeze-limit <squeeze-limit>
+Set the maximum number of consecutive empty lines to be printed.
+--strip-ansi <when>
+Specify  when to strip ANSI escape sequences from the input. The
+automatic mode will remove escape sequences  unless  the  syntax
+highlighting  language is plain text. Possible values: auto, al‐
+ways, *never*.
+--style <style-components>
+Configure which elements (line numbers, file headers, grid  bor‐
+ders,  Git modifications, ..) to display in addition to the file
+contents. The argument is a comma-separated list  of  components
+to  display (e.g. 'numbers,changes,grid') or a pre-defined style
+('full').  To set a default style, add the '--style=".."' option
+to the configuration file or export  the  BAT_STYLE  environment
+variable (e.g.: export BAT_STYLE="..").
+When  styles are specified in multiple places, the "nearest" set
+of styles take precedence.  The command-line arguments  are  the
+highest  priority,  followed  by the BAT_STYLE environment vari‐
+able, and then the configuration file. If any set of styles con‐
+sists entirely of components prefixed with "+" or "-",  it  will
+modify the previous set of styles instead of replacing them.
+By default, the following components are enabled: changes, grid,
+header-filename, numbers, snip
+Possible  values: *default*, full, auto, plain, changes, header,
+header-filename, header-filesize, grid, rule, numbers, snip.
+-r, --line-range <N:M>...
+Only print the specified range of lines for each file. For exam‐
+ple:
+--line-range 30:40
+prints lines 30 to 40
+--line-range :40
+prints lines 1 to 40
+--line-range 40:
+prints lines 40 to the end of the file
+--line-range 30:+10
+prints lines 30 to 40
+-L, --list-languages
+Display a list of supported languages for syntax highlighting.
+-u, --unbuffered
+Enable unbuffered input reading. When this flag is set, bat will
+display data as soon as it is available, without waiting  for  a
+complete line. This is useful for streaming use cases like 'tail
+-f  logfile | bat -u --paging=never'. Note that line numbers are
+automatically disabled in unbuffered mode, and syntax highlight‐
+ing may be imperfect on partial lines.
+--no-custom-assets
+Do not load custom assets.
+--config-dir
+Show bat's configuration directory.
+--cache-dir
+Show bat's cache directory.
+--diagnostic
+Show diagnostic information for bug reports.
+--quiet-empty
+Do not produce any output when the input is empty (e.g. an empty
+file or empty stdin). This is useful in scripts where silent be‐
+havior is preferred for empty input.
+--acknowledgements
+Show acknowledgements.
+--set-terminal-title
+Sets terminal title to filenames when using a pager.
+-h, --help
+Print this help message.
+-V, --version
+Show version information.
+POSITIONAL ARGUMENTS
+<FILE>...
+Files to print and concatenate. Use a dash ('-') or no  argument
+at all to read from standard input.
+SUBCOMMANDS
+cache - Modify the syntax-definition and theme cache.
+FILES
+bat  can  also be customized with a configuration file. The location of
+the file is dependent on your operating system. To get the default path
+for your system, call:
+bat --config-file
+Alternatively, you can use the BAT_CONFIG_PATH environment variable  to
+point bat to a non-default location of the configuration file.
+To generate a default configuration file, call:
+bat --generate-config-file
+These are related options:
+--config-file
+Show path to the configuration file.
+--generate-config-file
+Generates a default configuration file.
+--no-config
+Do not use the configuration file.
+ADDING CUSTOM LANGUAGES
+bat  supports  Sublime  Text .sublime-syntax language files, and can be
+customized to add additional languages to your local  installation.  To
+do  this,  add  the  .sublime-syntax language files to `$(bat --config-
+dir)/syntaxes` and run `bat cache --build`.
+Example:
+mkdir -p "$(bat --config-dir)/syntaxes"
+cd "$(bat --config-dir)/syntaxes"
+# Put new '.sublime-syntax' language definition files
+# in this folder (or its subdirectories), for example:
+git clone https://github.com/tellnobody1/sublime-purescript-syntax
+# And then build the cache.
+bat cache --build
+Once the cache is built, the new  language  will  be  visible  in  `bat
+--list-languages`.
+If  you  ever  want  to  remove the custom languages, you can clear the
+cache with `bat cache --clear`.
+ADDING CUSTOM THEMES
+Similarly to custom  languages,  bat  supports  Sublime  Text  .tmTheme
+themes.   These  can  be installed to `$(bat --config-dir)/themes`, and
+are added to the cache with `bat cache --build`.
+INPUT PREPROCESSOR
+Much like less(1)  does,  bat  supports  input  preprocessors  via  the
+LESSOPEN  and  LESSCLOSE  environment  variables.  In addition, bat at‐
+tempts to be as compatible with less's preprocessor  implementation  as
+possible.
+To use the preprocessor, call:
+bat --lessopen
+Alternatively, the preprocessor may be enabled by default by adding the
+'--lessopen' option to the configuration file.
+To  temporarily  disable  the preprocessor if it is enabled by default,
+call:
+bat --no-lessopen
+These are related options:
+--lessopen
+Enable the $LESSOPEN preprocessor.
+--no-lessopen
+Disable  the  $LESSOPEN  preprocessor  if   enabled   (overrides
+--lessopen)
+For more information, see the "INPUT PREPROCESSOR" section of less(1).
+MORE INFORMATION
+For more information and up-to-date documentation, visit the bat repo:
+https://github.com/sharkdp/bat
+BAT(1)
+Post job cleanup.
+[command]/usr/bin/git version
+git version 2.54.0
+Temporarily overriding HOME='/home/runner/work/_temp/ac79f5f8-1ac6-4bff-9d00-e5ad7dc150af' before making global git config changes
+Adding repository directory to the temporary git global config as a safe directory
+[command]/usr/bin/git config --global --add safe.directory /home/runner/work/bat/bat
+Removing SSH command configuration
+[command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Removing HTTP extra header
+[command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Removing includeIf entries pointing to credentials config files
+[command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+includeif.gitdir:/home/runner/work/bat/bat/.git.path
+includeif.gitdir:/home/runner/work/bat/bat/.git/worktrees/*.path
+includeif.gitdir:/github/workspace/.git.path
+includeif.gitdir:/github/workspace/.git/worktrees/*.path
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/bat/bat/.git.path
+/home/runner/work/_temp/git-credentials-9310818b-ee6a-4e19-a77a-54b56624fe24.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/bat/bat/.git.path /home/runner/work/_temp/git-credentials-9310818b-ee6a-4e19-a77a-54b56624fe24.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/bat/bat/.git/worktrees/*.path
+/home/runner/work/_temp/git-credentials-9310818b-ee6a-4e19-a77a-54b56624fe24.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/bat/bat/.git/worktrees/*.path /home/runner/work/_temp/git-credentials-9310818b-ee6a-4e19-a77a-54b56624fe24.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git.path
+/github/runner_temp/git-credentials-9310818b-ee6a-4e19-a77a-54b56624fe24.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-9310818b-ee6a-4e19-a77a-54b56624fe24.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git/worktrees/*.path
+/github/runner_temp/git-credentials-9310818b-ee6a-4e19-a77a-54b56624fe24.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-9310818b-ee6a-4e19-a77a-54b56624fe24.config
+[command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+Removing credentials config '/home/runner/work/_temp/git-credentials-9310818b-ee6a-4e19-a77a-54b56624fe24.config'
+Cleaning up orphan processes
