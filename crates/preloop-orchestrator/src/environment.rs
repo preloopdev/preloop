@@ -120,7 +120,11 @@ impl ToolchainLayer {
                 vec![
                     "sh".into(),
                     "-c".into(),
-                    "printf '%s\\n' 'export PATH=\"$HOME/.cargo/bin:$PATH\"' > /etc/profile.d/rustup.sh".into(),
+                    // Run steps execute with `bash --noprofile --norc`, so
+                    // profile.d PATH exports are never sourced. Symlink the
+                    // cargo binaries into /usr/local/bin so they are on the
+                    // default system PATH for every step shell.
+                    "ln -sf $HOME/.cargo/bin/cargo /usr/local/bin/cargo; ln -sf $HOME/.cargo/bin/rustc /usr/local/bin/rustc; ln -sf $HOME/.cargo/bin/rustup /usr/local/bin/rustup".into(),
                 ],
             ],
             Self::Python(version) => {
@@ -160,6 +164,12 @@ impl EnvironmentSpec {
     /// Build a normalized environment specification and compute its fingerprint.
     pub fn new(base: String, toolchains: Vec<ToolchainLayer>) -> Self {
         Self::from_parts(base, toolchains)
+    }
+
+    /// Replace the base image, recomputing the fingerprint.
+    pub fn with_base(mut self, base: String) -> Self {
+        self.base = base;
+        Self::from_parts(self.base.clone(), self.toolchains.clone())
     }
 
     /// Select the default Ubuntu image from GitHub runner labels.
@@ -207,6 +217,37 @@ impl EnvironmentResolver {
     /// Construct a resolver using `default_base` when it is non-empty.
     pub fn new(default_base: String) -> Self {
         Self { default_base }
+    }
+
+    /// Resolve environment requirements from workspace toolchain files only.
+    ///
+    /// Used by the runner pool, which knows the workspace but not the full
+    /// job plan. Reads `rust-toolchain.toml`, `.nvmrc`, `.python-version`,
+    /// and `go.mod` so the golden is pre-baked with the project's toolchains.
+    pub fn resolve_workspace(&self, workspace: Option<&Path>) -> EnvironmentSpec {
+        let mut detected = BTreeSet::new();
+        if let Some(workspace) = workspace {
+            if let Some(version) = first_existing_line(workspace, &[".nvmrc", ".node-version"]) {
+                detected.insert(ToolchainLayer::Node(strip_node_prefix(version)));
+            }
+            let rust_version = read_rust_toolchain_toml(workspace)
+                .or_else(|| first_existing_line(workspace, &["rust-toolchain"]));
+            if let Some(version) = rust_version {
+                detected.insert(ToolchainLayer::Rust(version));
+            }
+            if let Some(version) = first_existing_line(workspace, &[".python-version"]) {
+                detected.insert(ToolchainLayer::Python(version));
+            }
+            if let Some(version) = read_go_mod(workspace) {
+                detected.insert(ToolchainLayer::Go(version));
+            }
+        }
+        let base = if self.default_base.trim().is_empty() {
+            "ubuntu:24.04".into()
+        } else {
+            self.default_base.clone()
+        };
+        EnvironmentSpec::new(base, detected.into_iter().collect())
     }
 
     /// Resolve environment requirements from a job plan and optional workspace.
@@ -416,6 +457,7 @@ mod tests {
             runs_on,
             needs: Vec::new(),
             matrix: Default::default(),
+            matrix_index: None,
             env: BTreeMap::new(),
             steps,
             if_condition: None,
@@ -507,6 +549,43 @@ mod tests {
         );
         assert_eq!(spec.base, "ubuntu:22.04");
         fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn resolve_workspace_detects_toolchains_without_job_plan() {
+        let path = std::env::temp_dir().join(format!("preloop-workspace-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&path).unwrap();
+        fs::write(
+            path.join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"1.97\"\ncomponents = [\"rustfmt\", \"clippy\"]\n",
+        )
+        .unwrap();
+        fs::write(path.join(".nvmrc"), "22\n").unwrap();
+
+        let spec = EnvironmentResolver::new("ubuntu:24.04".into()).resolve_workspace(Some(&path));
+        let expected = BTreeSet::from([
+            ToolchainLayer::Rust("1.97".into()),
+            ToolchainLayer::Node("22".into()),
+        ]);
+        assert_eq!(
+            spec.toolchains.iter().cloned().collect::<BTreeSet<_>>(),
+            expected
+        );
+        assert_eq!(spec.base, "ubuntu:24.04");
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn with_base_recomputes_fingerprint() {
+        let spec = EnvironmentSpec::new(
+            "ubuntu:24.04".into(),
+            vec![ToolchainLayer::Rust("1.97".into())],
+        );
+        let original_fingerprint = spec.fingerprint.clone();
+        let rebased = spec.clone().with_base("ubuntu:22.04".into());
+        assert_eq!(rebased.base, "ubuntu:22.04");
+        assert_eq!(rebased.toolchains, spec.toolchains);
+        assert_ne!(rebased.fingerprint, original_fingerprint);
     }
 
     #[test]

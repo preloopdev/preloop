@@ -48,6 +48,7 @@ args="$0.args"
 printf 'SMOLVM_EGRESS_FLOOR=%s\n' "${SMOLVM_EGRESS_FLOOR-}" > "$0.env"
 env_file="$0.env"
 printf 'SMOLVM_EGRESS_FLOOR=%s\n' "${SMOLVM_EGRESS_FLOOR-}" > "$env_file"
+printf 'TMPDIR=%s\n' "${TMPDIR-}" > "$0.tmpdir"
 for arg in "$@"; do
   printf '%s\n' "$arg" >> "$args"
 done
@@ -114,6 +115,13 @@ esac
             .to_owned()
     }
 
+    fn captured_tmpdir(executable: &Path) -> String {
+        fs::read_to_string(executable.with_extension("tmpdir"))
+            .unwrap_or_default()
+            .trim()
+            .to_owned()
+    }
+
     fn valid_spec(name: MachineName) -> MachineSpec {
         MachineSpec {
             name,
@@ -121,6 +129,7 @@ esac
             cpus: 2,
             memory_mib: 256,
             storage_gib: 10,
+            overlay_gib: None,
             network: NetworkPolicy::Disabled,
             volumes: Vec::new(),
             sockets: Vec::new(),
@@ -143,6 +152,7 @@ esac
             cpus: 4,
             memory_mib: 512,
             storage_gib: 20,
+            overlay_gib: Some(30),
             network: NetworkPolicy::Restricted {
                 hosts: vec!["example.com".to_owned(), "api.example.com".to_owned()],
                 cidrs: vec!["10.0.0.0/8".to_owned(), "2001:db8::/32".to_owned()],
@@ -186,6 +196,8 @@ esac
                 "512".to_owned(),
                 "--storage".to_owned(),
                 "20".to_owned(),
+                "--overlay".to_owned(),
+                "30".to_owned(),
                 "--allow-host".to_owned(),
                 "example.com".to_owned(),
                 "--allow-host".to_owned(),
@@ -396,6 +408,9 @@ esac
 
         provider.pack(&name, &output).await.unwrap();
 
+        // The `.smolmachine` extension is stripped: smolvm 1.7.2 writes the
+        // packed data as `<output>.smolmachine` beside the ELF stub at
+        // `<output>` and rejects an explicit `.smolmachine` output name.
         assert_eq!(
             captured_args(&executable),
             vec![
@@ -404,8 +419,12 @@ esac
                 "--from-vm".to_owned(),
                 "runner".to_owned(),
                 "-o".to_owned(),
-                output.display().to_string(),
+                directory.path().join("runner").display().to_string(),
             ]
+        );
+        assert_eq!(
+            captured_tmpdir(&executable),
+            format!("TMPDIR={}", output.parent().unwrap().display())
         );
 
         let (_directory, relative_executable) = fake_smolvm();

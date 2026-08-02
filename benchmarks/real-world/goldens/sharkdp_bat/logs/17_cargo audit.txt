@@ -1,0 +1,833 @@
+﻿2026-08-01T04:01:32.5155940Z Current runner version: '2.336.0'
+##[group]Runner Image Provisioner
+Hosted Compute Agent
+Version: 20260707.563
+Commit: 02667638d2b423fbc733a8e32a88b44996a3ba6e
+Build Date: 2026-07-07T19:33:50Z
+Worker ID: {38116dfe-667b-456a-940b-bc6cd5b2098b}
+Azure Region: westus
+##[endgroup]
+##[group]Operating System
+Ubuntu
+24.04.4
+LTS
+##[endgroup]
+##[group]Runner Image
+Image: ubuntu-24.04
+Version: 20260720.247.2
+Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260720.247/images/ubuntu/Ubuntu2404-Readme.md
+Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260720.247
+##[endgroup]
+##[group]GITHUB_TOKEN Permissions
+Actions: write
+ArtifactMetadata: write
+Attestations: write
+Checks: write
+CodeQuality: write
+Contents: write
+CopilotRequests: write
+Deployments: write
+Discussions: write
+Drives: write
+Issues: write
+Metadata: read
+Models: read
+Packages: write
+Pages: write
+PullRequests: write
+RepositoryProjects: write
+SecurityEvents: write
+Statuses: write
+VulnerabilityAlerts: read
+##[endgroup]
+Secret source: Actions
+Prepare workflow directory
+Prepare all required actions
+Getting action download info
+Download action repository 'actions/checkout@v6' (SHA:d23441a48e516b6c34aea4fa41551a30e30af803)
+Complete job name: cargo audit
+##[group]Run cargo install cargo-audit --locked
+cargo install cargo-audit --locked
+shell: /usr/bin/bash -e {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+##[endgroup]
+Updating crates.io index
+Downloading crates ...
+Downloaded cargo-audit v0.22.2
+Installing cargo-audit v0.22.2
+Updating crates.io index
+Updating crates.io index
+Downloading crates ...
+Downloaded adler2 v2.0.1
+Downloaded abscissa_derive v0.9.0
+Downloaded auditable-extract v0.3.5
+Downloaded compression-core v0.4.32
+Downloaded gix-chunk v0.7.2
+Downloaded cfg_aliases v0.2.1
+Downloaded futures-task v0.3.32
+Downloaded anstyle-query v1.1.5
+Downloaded auditable-info v0.10.0
+Downloaded byteorder v1.5.0
+Downloaded abscissa_core v0.9.0
+Downloaded displaydoc v0.2.5
+Downloaded gix-date v0.15.4
+Downloaded arrayvec v0.7.6
+Downloaded autocfg v1.5.0
+Downloaded anstream v1.0.0
+Downloaded colorchoice v1.0.5
+Downloaded addr2line v0.25.1
+Downloaded binfarce v0.2.1
+Downloaded bitflags v2.11.1
+Downloaded camino v1.2.2
+Downloaded cargo-lock v11.0.1
+Downloaded compression-codecs v0.4.38
+Downloaded eyre v0.6.12
+Downloaded allocator-api2 v0.2.21
+Downloaded cmake v0.1.58
+Downloaded getrandom v0.4.2
+Downloaded gix-config v0.57.0
+Downloaded backtrace v0.3.76
+Downloaded crossbeam-channel v0.5.15
+Downloaded block-buffer v0.10.4
+Downloaded atomic-waker v1.1.2
+Downloaded gix-revwalk v0.32.0
+Downloaded clap_builder v4.6.0
+Downloaded aho-corasick v1.1.4
+Downloaded rand_core v0.9.5
+Downloaded anstyle-parse v1.0.0
+Downloaded base64 v0.22.1
+Downloaded clap_derive v4.6.1
+Downloaded simd-adler32 v0.3.9
+Downloaded arc-swap v1.9.1
+Downloaded rustls-native-certs v0.8.3
+Downloaded cfg-if v1.0.4
+Downloaded icu_normalizer_data v2.1.1
+Downloaded icu_provider v2.1.1
+Downloaded indexmap v2.14.0
+Downloaded toml_writer v1.1.1+spec-1.1.0
+Downloaded gix-lock v23.0.0
+Downloaded gix-shallow v0.12.1
+Downloaded crc32fast v1.5.0
+Downloaded hashbrown v0.16.1
+Downloaded gix-worktree-stream v0.33.0
+Downloaded gix-pack v0.71.0
+Downloaded gix-ref v0.64.0
+Downloaded bstr v1.12.1
+Downloaded color-eyre v0.6.5
+Downloaded crossbeam-epoch v0.9.18
+Downloaded gix-hashtable v0.15.1
+Downloaded gix-quote v0.7.2
+Downloaded gix-revision v0.46.0
+Downloaded time-macros v0.2.27
+Downloaded fs_extra v1.3.0
+Downloaded futures-io v0.3.32
+Downloaded gix-index v0.52.0
+Downloaded gix-url v0.36.1
+Downloaded hashbrown v0.17.1
+Downloaded gix-submodule v0.31.0
+Downloaded crypto-common v0.1.7
+Downloaded hashbrown v0.15.5
+Downloaded getrandom v0.2.17
+Downloaded canonical-path v2.0.2
+Downloaded cvss v2.2.0
+Downloaded either v1.15.0
+Downloaded gix-negotiate v0.32.0
+Downloaded gix-trace v0.1.20
+Downloaded indenter v0.3.4
+Downloaded lazy_static v1.5.0
+Downloaded memmap2 v0.9.10
+Downloaded crossbeam-utils v0.8.21
+Downloaded form_urlencoded v1.2.2
+Downloaded gix-features v0.48.1
+Downloaded percent-encoding v2.3.2
+Downloaded heck v0.5.0
+Downloaded fnv v1.0.7
+Downloaded futures-sink v0.3.32
+Downloaded platforms v3.10.0
+Downloaded auditable-serde v0.9.0
+Downloaded display-error-chain v0.2.2
+Downloaded filetime v0.2.28
+Downloaded futures-core v0.3.32
+Downloaded gix-transport v0.57.1
+Downloaded gix-worktree v0.53.0
+Downloaded itoa v1.0.18
+Downloaded nonempty v0.12.0
+Downloaded hash32 v0.3.1
+Downloaded fastrand v2.4.1
+Downloaded foldhash v0.2.0
+Downloaded ipnet v2.12.0
+Downloaded gix-pathspec v0.18.1
+Downloaded openssl-probe v0.2.1
+Downloaded cpufeatures v0.2.17
+Downloaded proc-macro2 v1.0.106
+Downloaded deranged v0.5.8
+Downloaded equivalent v1.0.2
+Downloaded faster-hex v0.10.0
+Downloaded getrandom v0.3.4
+Downloaded gix-actor v0.41.1
+Downloaded gix-discover v0.52.0
+Downloaded gix-hash v0.25.1
+Downloaded gix-worktree-state v0.31.0
+Downloaded http-body-util v0.1.3
+Downloaded icu_properties_data v2.1.2
+Downloaded parking_lot v0.12.5
+Downloaded ppv-lite86 v0.2.21
+Downloaded semver v1.0.28
+Downloaded serde_core v1.0.228
+Downloaded yoke v0.8.2
+Downloaded yoke-derive v0.8.2
+Downloaded zeroize v1.8.2
+Downloaded cc v1.2.62
+Downloaded clap_lex v1.1.0
+Downloaded flate2 v1.1.9
+Downloaded gix-credentials v0.38.1
+Downloaded gix-diff v0.64.0
+Downloaded gix-object v0.61.0
+Downloaded gix-refspec v0.42.0
+Downloaded gix-tempfile v23.0.0
+Downloaded gix-validate v0.11.2
+Downloaded home v0.5.12
+Downloaded hyper-rustls v0.27.9
+Downloaded icu_collections v2.1.1
+Downloaded io-close v0.3.7
+Downloaded jobserver v0.1.34
+Downloaded log v0.4.29
+Downloaded once_cell v1.21.4
+Downloaded tempfile v3.27.0
+Downloaded writeable v0.6.3
+Downloaded gix-glob v0.26.1
+Downloaded http-body v1.0.1
+Downloaded gix-prompt v0.15.1
+Downloaded rustc-demangle v0.1.27
+Downloaded gix-commitgraph v0.37.1
+Downloaded clru v0.6.3
+Downloaded quinn-udp v0.5.14
+Downloaded toml v1.1.2+spec-1.1.0
+Downloaded gix-protocol v0.62.0
+Downloaded gix-traverse v0.58.0
+Downloaded gix-utils v0.3.3
+Downloaded ident_case v1.0.1
+Downloaded maybe-async v0.2.10
+Downloaded owo-colors v4.3.0
+Downloaded strsim v0.11.1
+Downloaded time-core v0.1.8
+Downloaded synstructure v0.13.2
+Downloaded uluru v3.1.0
+Downloaded utf8_iter v1.0.4
+Downloaded aws-lc-rs v1.16.3
+Downloaded borsh v1.6.1
+Downloaded serde_spanned v1.1.1
+Downloaded gix-filter v0.31.0
+Downloaded mime v0.3.17
+Downloaded tinyvec_macros v0.1.1
+Downloaded try-lock v0.2.5
+Downloaded clap v4.6.1
+Downloaded gimli v0.32.3
+Downloaded gix v0.84.0
+Downloaded gix-ignore v0.21.1
+Downloaded gix-packetline v0.21.4
+Downloaded lru-slab v0.1.2
+Downloaded toml-span v0.7.1
+Downloaded gix-bitmap v0.3.2
+Downloaded tower-layer v0.3.3
+Downloaded gix-sec v0.14.1
+Downloaded gix-error v0.2.4
+Downloaded rayon-core v1.13.0
+Downloaded bytes v1.11.1
+Downloaded regex v1.12.3
+Downloaded async-compression v0.4.42
+Downloaded encoding_rs v0.8.35
+Downloaded matchers v0.2.0
+Downloaded pin-project-lite v0.2.17
+Downloaded anstyle v1.0.14
+Downloaded slab v0.4.12
+Downloaded tower-service v0.3.3
+Downloaded idna_adapter v1.2.1
+Downloaded is_terminal_polyfill v1.70.2
+Downloaded thread_local v1.1.9
+Downloaded smallvec v1.15.1
+Downloaded smol_str v0.3.2
+Downloaded tinyvec v1.11.0
+Downloaded tracing-core v0.1.36
+Downloaded errno v0.3.14
+Downloaded generic-array v0.14.7
+Downloaded tracing-subscriber v0.3.23
+Downloaded termcolor v1.4.1
+Downloaded toml_datetime v0.7.5+spec-1.1.0
+Downloaded dunce v1.0.5
+Downloaded kstring v2.0.2
+Downloaded lock_api v0.4.14
+Downloaded rustc-hash v2.1.2
+Downloaded gix-attributes v0.33.1
+Downloaded rustix v1.1.4
+Downloaded futures-channel v0.3.32
+Downloaded regex-automata v0.4.14
+Downloaded zerofrom-derive v0.1.7
+Downloaded find-msvc-tools v0.1.9
+Downloaded untrusted v0.9.0
+Downloaded gix-command v0.9.1
+Downloaded crossbeam-deque v0.8.6
+Downloaded fixedbitset v0.5.7
+Downloaded fs-err v3.3.0
+Downloaded nu-ansi-term v0.50.3
+Downloaded serde_derive v1.0.228
+Downloaded toml_datetime v1.1.1+spec-1.1.0
+Downloaded gix-config-value v0.18.1
+Downloaded num-conv v0.2.1
+Downloaded wait-timeout v0.2.1
+Downloaded want v0.3.1
+Downloaded wasmparser v0.247.0
+Downloaded shell-words v1.1.1
+Downloaded digest v0.10.7
+Downloaded futures-util v0.3.32
+Downloaded utf8parse v0.2.2
+Downloaded potential_utf v0.1.5
+Downloaded powerfmt v0.2.0
+Downloaded httparse v1.10.1
+Downloaded rustversion v1.0.22
+Downloaded scopeguard v1.2.0
+Downloaded tame-index v0.26.3
+Downloaded thiserror v2.0.18
+Downloaded tracing-log v0.2.0
+Downloaded winnow v1.0.2
+Downloaded foldhash v0.1.5
+Downloaded rayon v1.12.0
+Downloaded miniz_oxide v0.8.9
+Downloaded quitters v0.1.0
+Downloaded sha1 v0.10.6
+Downloaded subtle v2.6.1
+Downloaded sync_wrapper v1.0.2
+Downloaded version_check v0.9.5
+Downloaded walkdir v2.5.0
+Downloaded zerofrom v0.1.7
+Downloaded zerotrie v0.2.4
+Downloaded zerovec-derive v0.11.3
+Downloaded gix-path v0.12.1
+Downloaded litemap v0.8.2
+Downloaded rand_chacha v0.9.0
+Downloaded rustsec v0.33.0
+Downloaded stable_deref_trait v1.2.1
+Downloaded syn v2.0.117
+Downloaded toml v0.9.12+spec-1.1.0
+Downloaded toml_parser v1.1.2+spec-1.1.0
+Downloaded tracing-attributes v0.1.31
+Downloaded http v1.4.0
+Downloaded rustc-stable-hash v0.1.2
+Downloaded thiserror-impl v2.0.18
+Downloaded zmij v1.0.21
+Downloaded icu_properties v2.1.2
+Downloaded parking_lot_core v0.9.12
+Downloaded prodash v31.0.0
+Downloaded quinn-proto v0.11.14
+Downloaded rustls-pki-types v1.14.1
+Downloaded twox-hash v2.1.2
+Downloaded reqwest v0.13.3
+Downloaded rustls-platform-verifier v0.7.0
+Downloaded serde v1.0.228
+Downloaded serde_json v1.0.149
+Downloaded shlex v1.3.0
+Downloaded tokio-rustls v0.26.4
+Downloaded heapless v0.8.0
+Downloaded rand v0.9.4
+Downloaded icu_locale_core v2.1.1
+Downloaded tinystr v0.8.3
+Downloaded topological-sort v0.2.2
+Downloaded gix-odb v0.81.0
+Downloaded icu_normalizer v2.1.1
+Downloaded unicode-ident v1.0.24
+Downloaded zerovec v0.11.6
+Downloaded secrecy v0.10.3
+Downloaded socket2 v0.6.3
+Downloaded url v2.5.8
+Downloaded static_assertions v1.1.0
+Downloaded gix-fs v0.21.2
+Downloaded quinn v0.11.9
+Downloaded typenum v1.20.0
+Downloaded memchr v2.8.0
+Downloaded regex-syntax v0.8.10
+Downloaded unicode-bom v2.0.3
+Downloaded jiff-static v0.2.28
+Downloaded mio v1.2.0
+Downloaded same-file v1.0.6
+Downloaded tower v0.5.3
+Downloaded h2 v0.4.14
+Downloaded hyper v1.9.0
+Downloaded hyper-util v0.1.20
+Downloaded winnow v0.7.15
+Downloaded unicode-normalization v0.1.25
+Downloaded idna v1.1.0
+Downloaded rustls-webpki v0.103.13
+Downloaded sharded-slab v0.1.7
+Downloaded tower-http v0.6.10
+Downloaded tokio-util v0.7.18
+Downloaded zerocopy v0.8.48
+Downloaded wasmparser v0.207.0
+Downloaded time v0.3.47
+Downloaded zlib-rs v0.6.3
+Downloaded quote v1.0.45
+Downloaded object v0.37.3
+Downloaded rustls v0.23.40
+Downloaded ring v0.17.14
+Downloaded object v0.39.1
+Downloaded tracing v0.1.44
+Downloaded aws-lc-sys v0.40.0
+Downloaded petgraph v0.8.3
+Downloaded jiff v0.2.28
+Downloaded libc v0.2.186
+Downloaded sha1-checked v0.10.0
+Downloaded tokio v1.52.3
+Downloaded linux-raw-sys v0.12.1
+Compiling proc-macro2 v1.0.106
+Compiling quote v1.0.45
+Compiling unicode-ident v1.0.24
+Compiling libc v0.2.186
+Compiling memchr v2.8.0
+Compiling cfg-if v1.0.4
+Compiling regex-syntax v0.8.10
+Compiling syn v2.0.117
+Compiling aho-corasick v1.1.4
+Compiling smallvec v1.15.1
+Compiling once_cell v1.21.4
+Compiling bytes v1.11.1
+Compiling regex-automata v0.4.14
+Compiling bstr v1.12.1
+Compiling stable_deref_trait v1.2.1
+Compiling thiserror v2.0.18
+Compiling thiserror-impl v2.0.18
+Compiling crossbeam-utils v0.8.21
+Compiling crc32fast v1.5.0
+Compiling gix-trace v0.1.20
+Compiling tinyvec_macros v0.1.1
+Compiling tinyvec v1.11.0
+Compiling gix-validate v0.11.2
+Compiling fastrand v2.4.1
+Compiling parking_lot_core v0.9.12
+Compiling bitflags v2.11.1
+Compiling gix-path v0.12.1
+Compiling unicode-normalization v0.1.25
+Compiling scopeguard v1.2.0
+Compiling itoa v1.0.18
+Compiling lock_api v0.4.14
+Compiling gix-utils v0.3.3
+Compiling crossbeam-channel v0.5.15
+Compiling parking_lot v0.12.5
+Compiling same-file v1.0.6
+Compiling equivalent v1.0.2
+Compiling foldhash v0.2.0
+Compiling allocator-api2 v0.2.21
+Compiling walkdir v2.5.0
+Compiling prodash v31.0.0
+Compiling zlib-rs v0.6.3
+Compiling gix-error v0.2.4
+Compiling version_check v0.9.5
+Compiling generic-array v0.14.7
+Compiling hashbrown v0.17.1
+Compiling typenum v1.20.0
+Compiling heapless v0.8.0
+Compiling byteorder v1.5.0
+Compiling serde_core v1.0.228
+Compiling hash32 v0.3.1
+Compiling gix-features v0.48.1
+Compiling crypto-common v0.1.7
+Compiling block-buffer v0.10.4
+Compiling digest v0.10.7
+Compiling faster-hex v0.10.0
+Compiling synstructure v0.13.2
+Compiling cpufeatures v0.2.17
+Compiling sha1 v0.10.6
+Compiling jiff v0.2.28
+Compiling sha1-checked v0.10.0
+Compiling zerofrom-derive v0.1.7
+Compiling gix-hash v0.25.1
+Compiling zerofrom v0.1.7
+Compiling yoke-derive v0.8.2
+Compiling pin-project-lite v0.2.17
+Compiling rustix v1.1.4
+Compiling yoke v0.8.2
+Compiling gix-hashtable v0.15.1
+Compiling linux-raw-sys v0.12.1
+Compiling jobserver v0.1.34
+Compiling zerovec-derive v0.11.3
+Compiling gix-date v0.15.4
+Compiling find-msvc-tools v0.1.9
+Compiling gix-actor v0.41.1
+Compiling gix-object v0.61.0
+Compiling shlex v1.3.0
+Compiling cc v1.2.62
+Compiling zerovec v0.11.6
+Compiling displaydoc v0.2.5
+Compiling memmap2 v0.9.10
+Compiling getrandom v0.4.2
+Compiling serde v1.0.228
+Compiling cmake v0.1.58
+Compiling serde_derive v1.0.228
+Compiling fs_extra v1.3.0
+Compiling dunce v1.0.5
+Compiling futures-core v0.3.32
+Compiling aws-lc-sys v0.40.0
+Compiling socket2 v0.6.3
+Compiling mio v1.2.0
+Compiling zeroize v1.8.2
+Compiling tokio v1.52.3
+Compiling tempfile v3.27.0
+Compiling tinystr v0.8.3
+Compiling gix-fs v0.21.2
+Compiling gix-chunk v0.7.2
+Compiling simd-adler32 v0.3.9
+Compiling adler2 v2.0.1
+Compiling writeable v0.6.3
+Compiling futures-sink v0.3.32
+Compiling percent-encoding v2.3.2
+Compiling litemap v0.8.2
+Compiling icu_locale_core v2.1.1
+Compiling miniz_oxide v0.8.9
+Compiling gix-tempfile v23.0.0
+Compiling zerotrie v0.2.4
+Compiling potential_utf v0.1.5
+Compiling gix-quote v0.7.2
+Compiling tracing-core v0.1.36
+Compiling icu_properties_data v2.1.2
+Compiling aws-lc-rs v1.16.3
+Compiling nonempty v0.12.0
+Compiling icu_normalizer_data v2.1.1
+Compiling icu_provider v2.1.1
+Compiling icu_collections v2.1.1
+Compiling http v1.4.0
+Compiling tracing-attributes v0.1.31
+Compiling slab v0.4.12
+Compiling fnv v1.0.7
+Compiling tracing v0.1.44
+Compiling gix-commitgraph v0.37.1
+Compiling rustls-pki-types v1.14.1
+Compiling gix-glob v0.26.1
+Compiling indexmap v2.14.0
+Compiling gix-revwalk v0.32.0
+Compiling icu_normalizer v2.1.1
+Compiling icu_properties v2.1.2
+Compiling http-body v1.0.1
+Compiling gix-lock v23.0.0
+Compiling tokio-util v0.7.18
+Compiling untrusted v0.9.0
+Compiling futures-task v0.3.32
+Compiling httparse v1.10.1
+Compiling rustls v0.23.40
+Compiling futures-io v0.3.32
+Compiling idna_adapter v1.2.1
+Compiling futures-util v0.3.32
+Compiling try-lock v0.2.5
+Compiling utf8_iter v1.0.4
+Compiling log v0.4.29
+Compiling subtle v2.6.1
+Compiling tower-service v0.3.3
+Compiling unicode-bom v2.0.3
+Compiling atomic-waker v1.1.2
+Compiling h2 v0.4.14
+Compiling idna v1.1.0
+Compiling want v0.3.1
+Compiling flate2 v1.1.9
+Compiling form_urlencoded v1.2.2
+Compiling futures-channel v0.3.32
+Compiling gix-config-value v0.18.1
+Compiling shell-words v1.1.1
+Compiling compression-core v0.4.32
+Compiling static_assertions v1.1.0
+Compiling kstring v2.0.2
+Compiling compression-codecs v0.4.38
+Compiling gix-command v0.9.1
+Compiling hyper v1.9.0
+Compiling url v2.5.8
+Compiling sync_wrapper v1.0.2
+Compiling gix-sec v0.14.1
+Compiling encoding_rs v0.8.35
+Compiling openssl-probe v0.2.1
+Compiling base64 v0.22.1
+Compiling tower-layer v0.3.3
+Compiling ipnet v2.12.0
+Compiling tower v0.5.3
+Compiling hyper-util v0.1.20
+Compiling rustls-native-certs v0.8.3
+Compiling async-compression v0.4.42
+Compiling gix-attributes v0.33.1
+Compiling http-body-util v0.1.3
+Compiling semver v1.0.28
+Compiling zmij v1.0.21
+Compiling rustversion v1.0.22
+Compiling tower-http v0.6.10
+Compiling gix-ref v0.64.0
+Compiling gix-url v0.36.1
+Compiling gix-packetline v0.21.4
+Compiling winnow v1.0.2
+Compiling serde_json v1.0.149
+Compiling mime v0.3.17
+Compiling toml_parser v1.1.2+spec-1.1.0
+Compiling gix-prompt v0.15.1
+Compiling gix-revision v0.46.0
+Compiling gix-traverse v0.58.0
+Compiling serde_spanned v1.1.1
+Compiling gix-bitmap v0.3.2
+Compiling hashbrown v0.16.1
+Compiling crossbeam-epoch v0.9.18
+Compiling filetime v0.2.28
+Compiling object v0.37.3
+Compiling utf8parse v0.2.2
+Compiling arrayvec v0.7.6
+Compiling autocfg v1.5.0
+Compiling toml_writer v1.1.1+spec-1.1.0
+Compiling rayon-core v1.13.0
+Compiling uluru v3.1.0
+Compiling anstyle-parse v1.0.0
+Compiling gix-index v0.52.0
+Compiling fs-err v3.3.0
+Compiling crossbeam-deque v0.8.6
+Compiling clru v0.6.3
+Compiling gix-refspec v0.42.0
+Compiling gix-credentials v0.38.1
+Compiling arc-swap v1.9.1
+Compiling gix-ignore v0.21.1
+Compiling toml_datetime v0.7.5+spec-1.1.0
+Compiling colorchoice v1.0.5
+Compiling anstyle v1.0.14
+Compiling eyre v0.6.12
+Compiling winnow v0.7.15
+Compiling anstyle-query v1.1.5
+Compiling is_terminal_polyfill v1.70.2
+Compiling gimli v0.32.3
+Compiling owo-colors v4.3.0
+Compiling foldhash v0.1.5
+Compiling camino v1.2.2
+Compiling hashbrown v0.15.5
+Compiling toml v0.9.12+spec-1.1.0
+Compiling anstream v1.0.0
+Compiling addr2line v0.25.1
+Compiling gix-worktree v0.53.0
+Compiling gix-pack v0.71.0
+Compiling gix-config v0.57.0
+Compiling gix-filter v0.31.0
+Compiling gix-pathspec v0.18.1
+Compiling gix-shallow v0.12.1
+Compiling gix-negotiate v0.32.0
+Compiling wasmparser v0.207.0
+Compiling maybe-async v0.2.10
+Compiling regex v1.12.3
+Compiling io-close v0.3.7
+Compiling powerfmt v0.2.0
+Compiling binfarce v0.2.1
+Compiling fixedbitset v0.5.7
+Compiling clap_lex v1.1.0
+Compiling heck v0.5.0
+Compiling lazy_static v1.5.0
+Compiling rustc-demangle v0.1.27
+Compiling either v1.15.0
+Compiling strsim v0.11.1
+Compiling indenter v0.3.4
+Compiling topological-sort v0.2.2
+Compiling auditable-serde v0.9.0
+Compiling clap_builder v4.6.0
+Compiling rayon v1.12.0
+Compiling backtrace v0.3.76
+Compiling sharded-slab v0.1.7
+Compiling clap_derive v4.6.1
+Compiling petgraph v0.8.3
+Compiling auditable-extract v0.3.5
+Compiling deranged v0.5.8
+Compiling gix-worktree-state v0.31.0
+Compiling gix-submodule v0.31.0
+Compiling gix-odb v0.81.0
+Compiling gix-discover v0.52.0
+Compiling tracing-log v0.2.0
+Compiling smol_str v0.3.2
+Compiling gix-diff v0.64.0
+Compiling toml_datetime v1.1.1+spec-1.1.0
+Compiling matchers v0.2.0
+Compiling toml-span v0.7.1
+Compiling thread_local v1.1.9
+Compiling ident_case v1.0.1
+Compiling time-core v0.1.8
+Compiling object v0.39.1
+Compiling nu-ansi-term v0.50.3
+Compiling twox-hash v2.1.2
+Compiling num-conv v0.2.1
+Compiling rustc-stable-hash v0.1.2
+Compiling time v0.3.47
+Compiling tracing-subscriber v0.3.23
+Compiling abscissa_derive v0.9.0
+Compiling toml v1.1.2+spec-1.1.0
+Compiling color-eyre v0.6.5
+Compiling cargo-lock v11.0.1
+Compiling auditable-info v0.10.0
+Compiling clap v4.6.1
+Compiling quitters v0.1.0
+Compiling platforms v3.10.0
+Compiling cvss v2.2.0
+Compiling secrecy v0.10.3
+Compiling wasmparser v0.247.0
+Compiling wait-timeout v0.2.1
+Compiling canonical-path v2.0.2
+Compiling termcolor v1.4.1
+Compiling home v0.5.12
+Compiling abscissa_core v0.9.0
+Compiling display-error-chain v0.2.2
+Compiling rustls-webpki v0.103.13
+Compiling tokio-rustls v0.26.4
+Compiling rustls-platform-verifier v0.7.0
+Compiling hyper-rustls v0.27.9
+Compiling reqwest v0.13.3
+Compiling gix-transport v0.57.1
+Compiling tame-index v0.26.3
+Compiling gix-protocol v0.62.0
+Compiling gix v0.84.0
+Compiling rustsec v0.33.0
+Compiling cargo-audit v0.22.2
+Finished `release` profile [optimized] target(s) in 2m 51s
+Installing /home/runner/.cargo/bin/cargo-audit
+Installed package `cargo-audit v0.22.2` (executable `cargo-audit`)
+##[group]Run actions/checkout@v6
+with:
+repository: sharkdp/bat
+token: ***
+ssh-strict: true
+ssh-user: git
+persist-credentials: true
+clean: true
+sparse-checkout-cone-mode: true
+fetch-depth: 1
+fetch-tags: false
+show-progress: true
+lfs: false
+submodules: false
+set-safe-directory: true
+allow-unsafe-pr-checkout: false
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+##[endgroup]
+Syncing repository: sharkdp/bat
+##[group]Getting Git version info
+Working directory is '/home/runner/work/bat/bat'
+[command]/usr/bin/git version
+git version 2.54.0
+##[endgroup]
+Temporarily overriding HOME='/home/runner/work/_temp/76129679-e748-43f4-8a75-5de8a03bf43a' before making global git config changes
+Adding repository directory to the temporary git global config as a safe directory
+[command]/usr/bin/git config --global --add safe.directory /home/runner/work/bat/bat
+Deleting the contents of '/home/runner/work/bat/bat'
+##[group]Determining repository object format
+##[endgroup]
+##[group]Initializing the repository
+[command]/usr/bin/git init /home/runner/work/bat/bat
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /home/runner/work/bat/bat/.git/
+[command]/usr/bin/git remote add origin https://github.com/sharkdp/bat
+##[endgroup]
+##[group]Disabling automatic garbage collection
+[command]/usr/bin/git config --local gc.auto 0
+##[endgroup]
+##[group]Setting up auth
+Removing SSH command configuration
+[command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Removing HTTP extra header
+[command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Removing includeIf entries pointing to credentials config files
+[command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+[command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+[command]/usr/bin/git config --file /home/runner/work/_temp/git-credentials-f20be37c-a6f0-48ff-9a3d-8b7b5f139560.config http.https://github.com/.extraheader AUTHORIZATION: basic ***
+[command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/bat/bat/.git.path /home/runner/work/_temp/git-credentials-f20be37c-a6f0-48ff-9a3d-8b7b5f139560.config
+[command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/bat/bat/.git/worktrees/*.path /home/runner/work/_temp/git-credentials-f20be37c-a6f0-48ff-9a3d-8b7b5f139560.config
+[command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-f20be37c-a6f0-48ff-9a3d-8b7b5f139560.config
+[command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-f20be37c-a6f0-48ff-9a3d-8b7b5f139560.config
+##[endgroup]
+##[group]Fetching the repository
+[command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +2ba8db9c14e5794572f5ea338c2b90404c9769cb:refs/remotes/origin/master
+From https://github.com/sharkdp/bat
+* [new ref]         2ba8db9c14e5794572f5ea338c2b90404c9769cb -> origin/master
+[command]/usr/bin/git branch --list --remote origin/master
+origin/master
+[command]/usr/bin/git rev-parse refs/remotes/origin/master
+2ba8db9c14e5794572f5ea338c2b90404c9769cb
+##[endgroup]
+##[group]Determining the checkout info
+##[endgroup]
+[command]/usr/bin/git sparse-checkout disable
+[command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+##[group]Checking out the ref
+[command]/usr/bin/git checkout --progress --force -B master refs/remotes/origin/master
+Reset branch 'master'
+branch 'master' set up to track 'origin/master'.
+##[endgroup]
+[command]/usr/bin/git log -1 --format=%H
+2ba8db9c14e5794572f5ea338c2b90404c9769cb
+##[group]Run cargo audit
+cargo audit
+shell: /usr/bin/bash -e {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+##[endgroup]
+Fetching advisory database from `https://github.com/RustSec/advisory-db.git`
+Loaded 1177 security advisories (from /home/runner/.cargo/advisory-db)
+Updating crates.io index
+Scanning Cargo.lock for vulnerabilities (317 crate dependencies)
+warning: 2 allowed warnings found
+Crate:     bincode
+Version:   1.3.3
+Warning:   unmaintained
+Title:     Bincode is unmaintained
+Date:      2025-12-16
+ID:        RUSTSEC-2025-0141
+URL:       https://rustsec.org/advisories/RUSTSEC-2025-0141
+Crate:     proc-macro-error2
+Version:   2.0.1
+Warning:   unmaintained
+Title:     proc-macro-error2 is unmaintained
+Date:      2026-06-07
+ID:        RUSTSEC-2026-0173
+URL:       https://rustsec.org/advisories/RUSTSEC-2026-0173
+Post job cleanup.
+[command]/usr/bin/git version
+git version 2.54.0
+Temporarily overriding HOME='/home/runner/work/_temp/5b7d2c16-5181-43d1-9895-df7032d54126' before making global git config changes
+Adding repository directory to the temporary git global config as a safe directory
+[command]/usr/bin/git config --global --add safe.directory /home/runner/work/bat/bat
+Removing SSH command configuration
+[command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Removing HTTP extra header
+[command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Removing includeIf entries pointing to credentials config files
+[command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+includeif.gitdir:/home/runner/work/bat/bat/.git.path
+includeif.gitdir:/home/runner/work/bat/bat/.git/worktrees/*.path
+includeif.gitdir:/github/workspace/.git.path
+includeif.gitdir:/github/workspace/.git/worktrees/*.path
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/bat/bat/.git.path
+/home/runner/work/_temp/git-credentials-f20be37c-a6f0-48ff-9a3d-8b7b5f139560.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/bat/bat/.git.path /home/runner/work/_temp/git-credentials-f20be37c-a6f0-48ff-9a3d-8b7b5f139560.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/bat/bat/.git/worktrees/*.path
+/home/runner/work/_temp/git-credentials-f20be37c-a6f0-48ff-9a3d-8b7b5f139560.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/bat/bat/.git/worktrees/*.path /home/runner/work/_temp/git-credentials-f20be37c-a6f0-48ff-9a3d-8b7b5f139560.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git.path
+/github/runner_temp/git-credentials-f20be37c-a6f0-48ff-9a3d-8b7b5f139560.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-f20be37c-a6f0-48ff-9a3d-8b7b5f139560.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git/worktrees/*.path
+/github/runner_temp/git-credentials-f20be37c-a6f0-48ff-9a3d-8b7b5f139560.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-f20be37c-a6f0-48ff-9a3d-8b7b5f139560.config
+[command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+Removing credentials config '/home/runner/work/_temp/git-credentials-f20be37c-a6f0-48ff-9a3d-8b7b5f139560.config'
+Cleaning up orphan processes
