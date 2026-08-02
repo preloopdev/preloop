@@ -66,7 +66,11 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
     let http = HttpClient::new(global.ca_bundle.as_deref())?;
 
     // Step 1: Runner registration — get OAuth token and service URL
-    let registration = register_runner(&http, &args.url, &args.token).await?;
+    let mut registration = register_runner(&http, &args.url, &args.token).await?;
+    // In TCP upstream mode the server returns loopback URLs in the service_url
+    // but the runner must reach it via the upstream LAN address during
+    // configure (the loopback bridge is not yet running). Rewrite transparently.
+    registration.service_url = http.rewrite_url(&registration.service_url).into_owned();
     info!(
         "Registration successful, service URL: {}",
         registration.service_url

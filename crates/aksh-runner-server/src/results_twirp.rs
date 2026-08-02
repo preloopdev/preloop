@@ -73,10 +73,19 @@ pub(crate) async fn twirp_workflow_steps_update(
                         let external_id_str = step["external_id"].as_str().unwrap_or("");
                         let step_uuid = uuid::Uuid::parse_str(external_id_str).ok();
 
-                        // Find the step name using step_uuid from our cloned map
-                        let name = step_uuid
-                            .and_then(|suuid| step_names.get(&suuid).cloned())
-                            .unwrap_or_else(|| step["name"].as_str().unwrap_or("").to_owned());
+                        // The runner reports the rendered display name in the
+                        // update payload ("Run actions/checkout@v4", "Set up
+                        // job") — the same string GitHub's UI shows. Prefer it
+                        // over the broker-message name, which the server
+                        // leaves empty for steps without an explicit `name:`
+                        // (an empty lookup result previously won and steps
+                        // showed as `''` in run records).
+                        let name = step["name"]
+                            .as_str()
+                            .filter(|name| !name.is_empty())
+                            .map(str::to_owned)
+                            .or_else(|| step_uuid.and_then(|suuid| step_names.get(&suuid).cloned()))
+                            .unwrap_or_default();
 
                         let conclusion_num = step["conclusion"].as_u64().unwrap_or(0);
                         let status_num = step["status"].as_u64().unwrap_or(0);

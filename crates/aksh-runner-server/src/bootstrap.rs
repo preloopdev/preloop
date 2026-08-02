@@ -5,6 +5,8 @@ use super::*;
 pub struct ServerConfig {
     /// Address to bind.
     pub listen: SocketAddr,
+    /// Consume the TCP listener passed by systemd socket activation.
+    pub systemd_socket_activation: bool,
     /// Optional Unix domain socket path to bind.
     pub unix_socket: Option<PathBuf>,
     /// State directory for cache/artifacts and future durable state.
@@ -342,7 +344,13 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
                     }
                 });
             }
-            let listener = TcpListener::bind(config.listen).await?;
+            let listener = if config.systemd_socket_activation {
+                preloop_socket_activation::take_tcp_listener()?.ok_or_else(|| {
+                    anyhow::anyhow!("systemd socket activation requested but LISTEN_FDS is unset")
+                })?
+            } else {
+                TcpListener::bind(config.listen).await?
+            };
             info!(listen = %config.listen, scheme = "http", "aksh runner server listening");
             axum::serve(listener, router)
                 .with_graceful_shutdown(shutdown_signal(shutdown))
