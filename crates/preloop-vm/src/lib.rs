@@ -424,10 +424,30 @@ impl VmProvider for SmolVmProvider {
             "--name".into(),
             spec.name.as_str().into(),
         ];
-        if spec.image.ends_with(".smolmachine") || Path::new(&spec.image).is_file() {
+        // `.smolmachine` packs and other local files go through `--from`.
+        // Docker-save OCI archives (`.tar`) are image inputs, not packs:
+        // smolvm's `--image` accepts them and sets up virtiofs mounts the
+        // same way it does for registry images, while `--from` machines do
+        // not (bare rootfs directories lose mounts entirely).
+        let is_pack = spec.image.ends_with(".smolmachine")
+            || (Path::new(&spec.image).is_file() && !spec.image.ends_with(".tar"));
+        if is_pack {
             args.extend(["--from".into(), spec.image.clone()]);
         } else {
             args.extend(["--image".into(), spec.image.clone()]);
+            // A bare rootfs directory carries no OCI metadata, so the image
+            // defines no entrypoint/CMD and `machine start` refuses to run a
+            // detached workload. Everything this provider does runs through
+            // `machine exec` anyway, so pin a harmless keep-alive workload
+            // for directory images. Registry images keep their own CMD.
+            if Path::new(&spec.image).is_dir() {
+                args.extend([
+                    "--".into(),
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "sleep infinity".into(),
+                ]);
+            }
         }
         args.extend([
             "--cpus".into(),
@@ -746,6 +766,15 @@ impl VmProvider for SmolVmProvider {
             ));
         }
         let staging_dir = output.parent().expect("absolute output has a parent");
+        // smolvm 1.7.2 rejects `-o <name>.smolmachine` and writes the packed
+        // VM data as `<output>.smolmachine` alongside an ELF launcher stub at
+        // `<output>`. Strip the extension so the output path names the stub
+        // and the caller picks up the `<output>.smolmachine` sidecar.
+        let output = if output.extension().is_some_and(|ext| ext == "smolmachine") {
+            output.with_extension("")
+        } else {
+            output.to_path_buf()
+        };
         self.exclusive_with_staging(
             "pack",
             &[

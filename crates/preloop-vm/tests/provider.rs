@@ -408,6 +408,9 @@ esac
 
         provider.pack(&name, &output).await.unwrap();
 
+        // The `.smolmachine` extension is stripped: smolvm 1.7.2 writes the
+        // packed data as `<output>.smolmachine` beside the ELF stub at
+        // `<output>` and rejects an explicit `.smolmachine` output name.
         assert_eq!(
             captured_args(&executable),
             vec![
@@ -416,7 +419,7 @@ esac
                 "--from-vm".to_owned(),
                 "runner".to_owned(),
                 "-o".to_owned(),
-                output.display().to_string(),
+                directory.path().join("runner").display().to_string(),
             ]
         );
         assert_eq!(

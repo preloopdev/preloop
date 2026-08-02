@@ -3,7 +3,7 @@
 pub mod environment;
 mod keys;
 
-use crate::environment::{EnvironmentResolver, EnvironmentSpec};
+use crate::environment::{EnvironmentResolver, EnvironmentSpec, ToolchainLayer};
 use crate::keys::{KeyPool, StagedKey};
 use aksh_gha_protocol::RUNNER_BUSY_SENTINEL;
 
@@ -864,11 +864,12 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         let golden_registry = Arc::new(GoldenRegistry::new(self.config.name_prefix.clone()));
 
         // If fork mode is enabled, prepare a golden fork base VM for the
-        // default (base-image-only) environment. Its fingerprint is the
-        // canonical hash of the base image with an empty toolchain list.
+        // workspace's default environment (base image plus any toolchains
+        // detected from version files like rust-toolchain.toml).
         if self.config.use_fork {
-            let default_environment =
-                EnvironmentSpec::new(self.config.base_image.clone(), Vec::new());
+            let default_environment = resolver
+                .resolve_workspace(self.config.workspace.as_deref())
+                .with_base(self.config.base_image.clone());
             let golden = MachineName::new(format!("{}-golden", golden_registry.name_prefix))?;
             let result = if self.config.use_packed_artifact {
                 prepare_packed_golden(&self.provider, &self.config, &golden).await
@@ -957,7 +958,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         &self,
         shutdown: CancellationToken,
         golden_registry: Arc<GoldenRegistry>,
-        _resolver: Arc<EnvironmentResolver>,
+        resolver: Arc<EnvironmentResolver>,
         idle: Arc<AtomicUsize>,
         keys: Arc<KeyPool>,
         building: Arc<AtomicUsize>,
@@ -1008,6 +1009,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             let config = self.config.clone();
             let slot_shutdown = shutdown.child_token();
             let slot_registry = golden_registry.clone();
+            let slot_resolver = resolver.clone();
             let slot_handles = PoolHandles {
                 idle: idle.clone(),
                 keys: keys.clone(),
@@ -1022,6 +1024,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     slot,
                     slot_shutdown,
                     slot_registry,
+                    slot_resolver,
                     slot_handles,
                 )
                 .await;
@@ -1097,6 +1100,20 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             let _ = self.provider.delete(&name).await;
             return Err(error);
         }
+        // Bake the workspace's toolchains (rust-toolchain.toml, .nvmrc, etc.)
+        // into the artifact so every runner forked from it carries them
+        // pre-installed, instead of installing per job.
+        let toolchains = EnvironmentResolver::new(self.config.base_image.clone())
+            .resolve_workspace(self.config.workspace.as_deref())
+            .toolchains;
+        for layer in &toolchains {
+            for command in layer.install_commands() {
+                if let Err(error) = self.provider.exec(&name, &command).await {
+                    let _ = self.provider.delete(&name).await;
+                    return Err(error.into());
+                }
+            }
+        }
         self.provider.stop(&name).await?;
         let temporary = payload
             .parent()
@@ -1111,9 +1128,16 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             let _ = std::fs::remove_file(&temporary);
             return Err(error.into());
         }
-        std::fs::rename(&temporary, &payload).inspect_err(|_| {
+        // smolvm pack writes two files: `<output>` (ELF executable stub) and
+        // `<output>.smolmachine` (the packed VM data). The latter is the
+        // artifact consumed by `machine create --from`; the stub is only a
+        // launcher and is discarded.
+        let sidecar = PathBuf::from(format!("{}.smolmachine", temporary.display()));
+        std::fs::rename(&sidecar, &payload).inspect_err(|_| {
             let _ = std::fs::remove_file(&temporary);
+            let _ = std::fs::remove_file(&sidecar);
         })?;
+        let _ = std::fs::remove_file(&temporary);
         self.provider.delete(&name).await?;
         if !payload.is_file() {
             return Err(OrchestratorError::Config(format!(
@@ -1153,6 +1177,9 @@ struct RunnerEnvironment {
     fingerprint: Option<String>,
     /// Base image this runner actually booted from.
     base: String,
+    /// Toolchains this runner must carry (installed after boot when the
+    /// runner is created fresh rather than forked from a prepared golden).
+    toolchains: Vec<ToolchainLayer>,
 }
 
 /// Handles every slot in the pool shares.
@@ -1224,6 +1251,7 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
     slot: usize,
     shutdown: CancellationToken,
     golden_registry: Arc<GoldenRegistry>,
+    environment_resolver: Arc<EnvironmentResolver>,
     handles: PoolHandles,
 ) -> Result<(), OrchestratorError> {
     // Resolve the golden for the queued job's environment.
@@ -1239,8 +1267,11 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
             }
             None => config.base_image.clone(),
         };
-        let env_spec = EnvironmentSpec::new(env_base.clone(), Vec::new());
+        let env_spec = environment_resolver
+            .resolve_workspace(config.workspace.as_deref())
+            .with_base(env_base.clone());
         let fingerprint = env_spec.fingerprint.clone();
+        let toolchains = env_spec.toolchains.clone();
         let selected = golden_registry
             .get_or_prepare(&fingerprint, {
                 let provider = provider.clone();
@@ -1267,14 +1298,19 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
             RunnerEnvironment {
                 fingerprint: Some(fingerprint),
                 base: env_base,
+                toolchains,
             },
         )
     } else {
+        let env_spec = environment_resolver
+            .resolve_workspace(config.workspace.as_deref())
+            .with_base(config.base_image.clone());
         (
             None,
             RunnerEnvironment {
                 fingerprint: None,
-                base: config.base_image.clone(),
+                base: env_spec.base.clone(),
+                toolchains: env_spec.toolchains,
             },
         )
     };
@@ -1328,7 +1364,7 @@ async fn run_slot<P: VmProvider + 'static>(
     slot: usize,
     shutdown: CancellationToken,
     golden_registry: Arc<GoldenRegistry>,
-    _environment_resolver: Arc<EnvironmentResolver>,
+    environment_resolver: Arc<EnvironmentResolver>,
     handles: PoolHandles,
 ) -> Result<(), OrchestratorError> {
     let PoolHandles {
@@ -1354,8 +1390,15 @@ async fn run_slot<P: VmProvider + 'static>(
                 }
                 None => config.base_image.clone(),
             };
-            let env_spec = EnvironmentSpec::new(env_base.clone(), Vec::new());
+            // Resolve toolchains from the workspace (rust-toolchain.toml,
+            // .nvmrc, etc.) so the golden carries the project's toolchain
+            // pre-installed. Base image still comes from the queued job's
+            // `runs-on` labels; `with_base` recomputes the fingerprint.
+            let env_spec = environment_resolver
+                .resolve_workspace(config.workspace.as_deref())
+                .with_base(env_base.clone());
             let fingerprint = env_spec.fingerprint.clone();
+            let toolchains = env_spec.toolchains.clone();
 
             let selected = match golden_registry
                 .get_or_prepare(&fingerprint, {
@@ -1390,15 +1433,21 @@ async fn run_slot<P: VmProvider + 'static>(
                 RunnerEnvironment {
                     fingerprint: Some(fingerprint),
                     base: env_base,
+                    toolchains,
                 },
             )
         } else {
             // create-per-runner path: no golden, provision fresh each time.
+            // Toolchains are installed per runner after boot.
+            let env_spec = environment_resolver
+                .resolve_workspace(config.workspace.as_deref())
+                .with_base(config.base_image.clone());
             (
                 None,
                 RunnerEnvironment {
                     fingerprint: None,
-                    base: config.base_image.clone(),
+                    base: env_spec.base.clone(),
+                    toolchains: env_spec.toolchains,
                 },
             )
         };
@@ -1496,7 +1545,17 @@ async fn provision_slot<P: VmProvider + 'static>(
     environment: RunnerEnvironment,
 ) -> Result<ReadyRunner, OrchestratorError> {
     let name = MachineName::new(format!("{}-{slot}-{generation}", config.name_prefix))?;
-    match provision_runner(provider, config, &name, golden, keys, &environment.base).await {
+    match provision_runner(
+        provider,
+        config,
+        &name,
+        golden,
+        keys,
+        &environment.base,
+        &environment.toolchains,
+    )
+    .await
+    {
         Ok(run) => Ok(ReadyRunner {
             name,
             run,
@@ -1814,10 +1873,12 @@ async fn provision_runner<P: VmProvider + 'static>(
     golden: Option<&MachineName>,
     keys: &Arc<KeyPool>,
     environment_base: &str,
+    toolchains: &[ToolchainLayer],
 ) -> Result<Vec<String>, OrchestratorError> {
     if let Some(golden) = golden {
         // Fork from the already-booted golden VM instant CoW clone.
         provider.fork(golden, name).await?;
+        // The golden carries the toolchains pre-installed; nothing to do.
     } else {
         let uses_packed_artifact = config.use_packed_artifact;
         let spec = MachineSpec {
@@ -1847,6 +1908,13 @@ async fn provision_runner<P: VmProvider + 'static>(
         provider.start(name).await?;
         if !uses_packed_artifact {
             install_base_dependencies(provider.as_ref(), name).await?;
+            for layer in toolchains {
+                for command in layer.install_commands() {
+                    if let Err(error) = provider.exec(name, &command).await {
+                        return Err(error.into());
+                    }
+                }
+            }
         }
     }
 
@@ -2354,6 +2422,7 @@ chmod +x "$destination/bin/node"
             RunnerEnvironment {
                 fingerprint: None,
                 base: config.base_image.clone(),
+                toolchains: Vec::new(),
             },
         )
         .await
@@ -2423,6 +2492,7 @@ chmod +x "$destination/bin/node"
             RunnerEnvironment {
                 fingerprint: None,
                 base: config.base_image.clone(),
+                toolchains: Vec::new(),
             },
         )
         .await
@@ -2440,6 +2510,7 @@ chmod +x "$destination/bin/node"
                 environment: RunnerEnvironment {
                     fingerprint: None,
                     base: config.base_image.clone(),
+                    toolchains: Vec::new(),
                 },
                 idle: &idle,
                 keys: &Arc::new(KeyPool::new()),
