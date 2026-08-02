@@ -1,0 +1,243 @@
+﻿2026-07-31T11:06:20.9341368Z Current runner version: '2.336.0'
+##[group]Runner Image Provisioner
+Hosted Compute Agent
+Version: 20260624.560
+Commit: 925d229a51159bc391ae97e54a2dd1fe20af789d
+Build Date: 2026-06-24T18:26:47Z
+Worker ID: {631c3a29-3ec6-4054-856d-43c50921a1a6}
+Azure Region: eastus
+##[endgroup]
+##[group]VM Image
+- OS: Linux (x64)
+- Source: Docker
+- Name: ubuntu:24.04
+- Version: 20260629.59.1
+##[endgroup]
+##[group]GITHUB_TOKEN Permissions
+Metadata: read
+##[endgroup]
+Secret source: None
+Prepare workflow directory
+Prepare all required actions
+Getting action download info
+Download action repository 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' (SHA:3d3c42e5aac5ba805825da76410c181273ba90b1)
+Download action repository 'tj-actions/changed-files@9426d40962ed5378910ee2e21d5f8c6fcbf2dd96' (SHA:9426d40962ed5378910ee2e21d5f8c6fcbf2dd96)
+Complete job name: Get changed files
+##[group]Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+with:
+fetch-depth: 50
+persist-credentials: false
+repository: vitejs/vite
+token: ***
+ssh-strict: true
+ssh-user: git
+clean: true
+sparse-checkout-cone-mode: true
+fetch-tags: false
+show-progress: true
+lfs: false
+submodules: false
+set-safe-directory: true
+allow-unsafe-pr-checkout: false
+env:
+NODE_OPTIONS: --max-old-space-size=6144
+PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+VITEST_SEGFAULT_RETRY: 3
+##[endgroup]
+Syncing repository: vitejs/vite
+##[group]Getting Git version info
+Working directory is '/home/runner/work/vite/vite'
+[command]/usr/bin/git version
+git version 2.54.0
+##[endgroup]
+Temporarily overriding HOME='/home/runner/work/_temp/2666aefb-3ec6-455d-874d-3f8ea62b9c10' before making global git config changes
+Adding repository directory to the temporary git global config as a safe directory
+[command]/usr/bin/git config --global --add safe.directory /home/runner/work/vite/vite
+Deleting the contents of '/home/runner/work/vite/vite'
+##[group]Determining repository object format
+##[endgroup]
+##[group]Initializing the repository
+[command]/usr/bin/git init /home/runner/work/vite/vite
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /home/runner/work/vite/vite/.git/
+[command]/usr/bin/git remote add origin https://github.com/vitejs/vite
+##[endgroup]
+##[group]Disabling automatic garbage collection
+[command]/usr/bin/git config --local gc.auto 0
+##[endgroup]
+##[group]Setting up auth
+Removing SSH command configuration
+[command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Removing HTTP extra header
+[command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Removing includeIf entries pointing to credentials config files
+[command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+[command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+[command]/usr/bin/git config --file /home/runner/work/_temp/git-credentials-5af55f7f-d72a-4e83-8bae-32deb358f26b.config http.https://github.com/.extraheader AUTHORIZATION: basic ***
+[command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/vite/vite/.git.path /home/runner/work/_temp/git-credentials-5af55f7f-d72a-4e83-8bae-32deb358f26b.config
+[command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/vite/vite/.git/worktrees/*.path /home/runner/work/_temp/git-credentials-5af55f7f-d72a-4e83-8bae-32deb358f26b.config
+[command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-5af55f7f-d72a-4e83-8bae-32deb358f26b.config
+[command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-5af55f7f-d72a-4e83-8bae-32deb358f26b.config
+##[endgroup]
+##[group]Fetching the repository
+[command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=50 origin +a04293af5b021b2f960999042c5b850bc3d54e12:refs/remotes/pull/23114/merge
+From https://github.com/vitejs/vite
+* [new ref]         a04293af5b021b2f960999042c5b850bc3d54e12 -> pull/23114/merge
+##[endgroup]
+##[group]Determining the checkout info
+##[endgroup]
+[command]/usr/bin/git sparse-checkout disable
+[command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+##[group]Checking out the ref
+[command]/usr/bin/git checkout --progress --force refs/remotes/pull/23114/merge
+Note: switching to 'refs/remotes/pull/23114/merge'.
+You are in 'detached HEAD' state. You can look around, make experimental
+changes and commit them, and you can discard any commits you make in this
+state without impacting any branches by switching back to a branch.
+If you want to create a new branch to retain commits you create, you may
+do so (now or later) by using -c with the switch command. Example:
+git switch -c <new-branch-name>
+Or undo this operation with:
+git switch -
+Turn off this advice by setting config variable advice.detachedHead to false
+HEAD is now at a04293a Merge 214636edf9b1483698fc749792179f115a4fdc75 into e6b6b167afa0a80548829d1f24a0712f9194389a
+##[endgroup]
+[command]/usr/bin/git log -1 --format=%H
+a04293af5b021b2f960999042c5b850bc3d54e12
+##[group]Removing auth
+Removing SSH command configuration
+[command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Removing HTTP extra header
+[command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Removing includeIf entries pointing to credentials config files
+[command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+includeif.gitdir:/home/runner/work/vite/vite/.git.path
+includeif.gitdir:/home/runner/work/vite/vite/.git/worktrees/*.path
+includeif.gitdir:/github/workspace/.git.path
+includeif.gitdir:/github/workspace/.git/worktrees/*.path
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/vite/vite/.git.path
+/home/runner/work/_temp/git-credentials-5af55f7f-d72a-4e83-8bae-32deb358f26b.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/vite/vite/.git.path \/home\/runner\/work\/_temp\/git\-credentials\-5af55f7f\-d72a\-4e83\-8bae\-32deb358f26b\.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/vite/vite/.git/worktrees/*.path
+/home/runner/work/_temp/git-credentials-5af55f7f-d72a-4e83-8bae-32deb358f26b.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/vite/vite/.git/worktrees/*.path \/home\/runner\/work\/_temp\/git\-credentials\-5af55f7f\-d72a\-4e83\-8bae\-32deb358f26b\.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git.path
+/github/runner_temp/git-credentials-5af55f7f-d72a-4e83-8bae-32deb358f26b.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git.path \/github\/runner_temp\/git\-credentials\-5af55f7f\-d72a\-4e83\-8bae\-32deb358f26b\.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git/worktrees/*.path
+/github/runner_temp/git-credentials-5af55f7f-d72a-4e83-8bae-32deb358f26b.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git/worktrees/*.path \/github\/runner_temp\/git\-credentials\-5af55f7f\-d72a\-4e83\-8bae\-32deb358f26b\.config
+[command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+Removing credentials config '/home/runner/work/_temp/git-credentials-5af55f7f-d72a-4e83-8bae-32deb358f26b.config'
+##[endgroup]
+##[group]Run tj-actions/changed-files@9426d40962ed5378910ee2e21d5f8c6fcbf2dd96
+with:
+files: docs/**
+.github/**
+!.github/workflows/ci.yml
+packages/create-vite/template**
+**.md
+
+separator:  
+include_all_old_new_renamed_files: false
+old_new_separator: ,
+old_new_files_separator:  
+files_from_source_file_separator: 
+
+files_separator: 
+
+files_yaml_from_source_file_separator: 
+
+files_ignore_yaml_from_source_file_separator: 
+
+files_ignore_separator: 
+
+files_ignore_from_source_file_separator: 
+
+path: .
+quotepath: true
+diff_relative: true
+dir_names: false
+dir_names_exclude_current_dir: false
+dir_names_include_files_separator: 
+
+dir_names_deleted_files_include_only_deleted_dirs: false
+json: false
+escape_json: true
+safe_output: true
+fetch_depth: 25
+skip_initial_fetch: false
+fetch_additional_submodule_history: false
+since_last_remote_commit: false
+write_output_files: false
+output_dir: .github/outputs
+output_renamed_files_as_deleted_and_added: false
+recover_deleted_files: false
+recover_files_separator: 
+
+recover_files_ignore_separator: 
+
+token: ***
+api_url: https://api.github.com
+use_rest_api: false
+fail_on_initial_diff_error: false
+fail_on_submodule_diff_error: false
+negation_patterns_first: false
+matrix: false
+exclude_submodules: false
+exclude_symlinks: false
+skip_same_sha: false
+fetch_missing_history_max_retries: 20
+use_posix_path_separator: false
+tags_pattern: *
+env:
+NODE_OPTIONS: --max-old-space-size=6144
+PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+VITEST_SEGFAULT_RETRY: 3
+##[endgroup]
+##[group]changed-files
+Using local .git directory
+Running on a pull_request (synchronize) event...
+Repository is shallow, fetching more history...
+Completed fetching more history.
+Retrieving changes between 7ac6f7f590747bbdab9958e2c016e3dd04f10542 (main) → 214636edf9b1483698fc749792179f115a4fdc75 (perf/pure-css-chunk-lookup)
+All Done!
+##[endgroup]
+##[group]changed-files-patterns
+All Done!
+##[endgroup]
+Post job cleanup.
+[command]/usr/bin/git version
+git version 2.54.0
+Copying '/home/runner/.gitconfig' to '/home/runner/work/_temp/58a01f7d-6f85-4db5-be1d-b250d208b54b/.gitconfig'
+Temporarily overriding HOME='/home/runner/work/_temp/58a01f7d-6f85-4db5-be1d-b250d208b54b' before making global git config changes
+Adding repository directory to the temporary git global config as a safe directory
+[command]/usr/bin/git config --global --add safe.directory /home/runner/work/vite/vite
+Removing SSH command configuration
+[command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Removing HTTP extra header
+[command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Removing includeIf entries pointing to credentials config files
+[command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+[command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+Evaluate and set job outputs
+Set output 'should_skip'
+Cleaning up orphan processes

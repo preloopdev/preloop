@@ -1,0 +1,58 @@
+﻿2026-08-01T02:38:38.4740600Z Current runner version: '2.336.0'
+##[group]Runner Image Provisioner
+Hosted Compute Agent
+Version: 20260707.563
+Commit: 02667638d2b423fbc733a8e32a88b44996a3ba6e
+Build Date: 2026-07-07T19:33:50Z
+Worker ID: {11c1d70b-ae24-46ab-80b9-e356c9d112dc}
+Azure Region: westus3
+##[endgroup]
+##[group]VM Image
+- OS: Linux (x64)
+- Source: Docker
+- Name: ubuntu:24.04
+- Version: 20260728.2.1
+##[endgroup]
+##[group]GITHUB_TOKEN Permissions
+Metadata: read
+##[endgroup]
+Secret source: None
+Prepare workflow directory
+Prepare all required actions
+Complete job name: all required jobs passed
+##[group]Run failing=$(echo "$NEEDS_JSON" | jq -r 'to_entries[] | select(.value.result != "success" and .value.result != "skipped") | "\(.key): \(.value.result)"')
+failing=$(echo "$NEEDS_JSON" | jq -r 'to_entries[] | select(.value.result != "success" and .value.result != "skipped") | "\(.key): \(.value.result)"')
+if [ -n "$failing" ]; then
+echo "$failing"
+exit 1
+fi
+shell: /usr/bin/bash -e {0}
+env:
+NEEDS_JSON: {
+  "check-fmt": {
+    "result": "success",
+    "outputs": {}
+  },
+  "check-lint": {
+    "result": "success",
+    "outputs": {}
+  },
+  "check-docs": {
+    "result": "success",
+    "outputs": {}
+  },
+  "check-generated-files": {
+    "result": "skipped",
+    "outputs": {}
+  },
+  "test": {
+    "result": "skipped",
+    "outputs": {}
+  },
+  "build-dev-binaries": {
+    "result": "skipped",
+    "outputs": {}
+  }
+}
+##[endgroup]
+Cleaning up orphan processes
