@@ -8,6 +8,7 @@ use futures_util::StreamExt;
 use preloop_orchestrator::{RunnerPool, RunnerPoolConfig};
 use preloop_vm::SmolVmProvider;
 use rand::RngCore;
+use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::io::Read;
 use std::path::PathBuf;
@@ -193,6 +194,10 @@ struct RunArgs {
     /// Simulate a trigger event (push, pull_request, merge_group, …).
     #[arg(long)]
     event: Option<String>,
+
+    /// Event payload JSON file (webhook body) for the simulated trigger.
+    #[arg(long, value_name = "PATH")]
+    payload: Option<PathBuf>,
 
     /// Base ref for pull_request or merge_group events.
     #[arg(long)]
@@ -785,6 +790,14 @@ fn local_runner_pool_config(
         .filter(|path| linux_runner_bundle(path))
         .context("Linux runner bundle unavailable; run `just build-preloop` to build target/aarch64-unknown-linux-gnu/debug/preloop-runner")?;
     let use_packed_artifact = env_flag("PRELOOP_USE_PACKED_GOLDEN", false);
+    // The workspace is scanned for toolchain version files (rust-toolchain.toml,
+    // .nvmrc, etc.) so the golden can be built with the project's toolchains
+    // pre-installed instead of installing them per job. PRELOOP_WORKSPACE
+    // overrides the current directory for daemon-style deployments.
+    let workspace = std::env::var_os("PRELOOP_WORKSPACE")
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
     // The mounted control socket only makes sense when the runner URL is
     // loopback (the VM reaches the host through the socket relay). With
     // `AKSH_RUNNER_URL` pointing at a host-reachable LAN address — the
@@ -828,7 +841,7 @@ fn local_runner_pool_config(
         name_prefix: "preloop-runner".into(),
         base_image: std::env::var("PRELOOP_RUNNER_BASE_IMAGE")
             .unwrap_or_else(|_| "ubuntu:24.04".into()),
-        workspace: None,
+        workspace: Some(workspace),
         artifact_stem: home
             .join("vms")
             .join(format!("preloop-ubuntu-24.04-{}", std::env::consts::ARCH)),
@@ -991,6 +1004,43 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         .with_context(|| format!("failed to read workflow: {}", workflow_path.display()))?;
     let event = args.event.as_deref().unwrap_or("push");
 
+    // Hand local reusable workflows (`uses: ./.github/workflows/…`) to the
+    // server the same way the native client does: everything under the
+    // workspace `.github/workflows/`, keyed repository-relative, minus the
+    // submitted workflow itself.
+    let mut reusable_workflows = BTreeMap::new();
+    if let Ok(current_dir) = std::env::current_dir() {
+        let workflows_dir = current_dir.join(".github").join("workflows");
+        if let Ok(entries) = std::fs::read_dir(&workflows_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !matches!(
+                    path.extension().and_then(|ext| ext.to_str()),
+                    Some("yml" | "yaml")
+                ) || same_file_path(&path, &workflow_path)
+                {
+                    continue;
+                }
+                let Some(relative) = path.strip_prefix(&current_dir).ok() else {
+                    continue;
+                };
+                let yaml = std::fs::read_to_string(&path)
+                    .with_context(|| format!("read reusable workflow {}", path.display()))?;
+                reusable_workflows.insert(relative.to_string_lossy().into_owned(), yaml);
+            }
+        }
+    }
+
+    let payload = match args.payload.as_deref() {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("failed to read payload: {}", path.display()))?;
+            serde_json::from_str(&text)
+                .with_context(|| format!("parse payload {}: not valid JSON", path.display()))?
+        }
+        None => serde_json::json!({}),
+    };
+
     let mut secrets = aksh_gha_protocol::SecretMap::default();
     for secret in &args.secrets {
         if let Some((name, value)) = secret.split_once('=') {
@@ -1006,11 +1056,13 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     let submission = WorkflowSubmission {
         workflow_yaml,
         event: event.to_owned(),
+        payload,
         repository: detect_repository(),
         git_ref: detect_git_ref(),
         workflow_path: Some(workflow_path.display().to_string()),
         local_workspace: None,
         secrets,
+        reusable_workflows,
         selected_jobs: args.job.into_iter().collect(),
         base_ref: args.base,
         // On by default where it can be acted on: a paused job blocks until a
@@ -1159,6 +1211,13 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn same_file_path(left: &std::path::Path, right: &std::path::Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
 }
 
 fn update_run_status(current: &mut Option<ExecutionStatus>, next: Option<ExecutionStatus>) {

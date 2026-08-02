@@ -274,8 +274,13 @@ impl VmProvider for RecordingVmProvider {
     }
 
     async fn pack(&self, name: &MachineName, output: &Path) -> Result<(), VmError> {
-        let payload = output.to_path_buf();
-        fs::write(&payload, b"immutable-runner-artifact").map_err(|_| provider_error("pack"))?;
+        // Mirror the smolvm 1.7.2 pack contract: `<output>` is an ELF
+        // launcher stub and `<output>.smolmachine` carries the packed VM
+        // data. The orchestrator consumes the sidecar; the stub is discarded.
+        let stub = output.to_path_buf();
+        let sidecar = PathBuf::from(format!("{}.smolmachine", output.display()));
+        fs::write(&stub, b"elf-launcher-stub").map_err(|_| provider_error("pack"))?;
+        fs::write(&sidecar, b"immutable-runner-artifact").map_err(|_| provider_error("pack"))?;
         let mut state = self.state.lock().await;
         state.pack_calls += 1;
         state.events.push(Event::Pack(name.as_str().to_owned()));
