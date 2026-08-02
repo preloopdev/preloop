@@ -1,0 +1,7 @@
+Requested labels: ubuntu-latest-low
+Job defined at: nextcloud/server/.github/workflows/phpunit-sqlite.yml@refs/pull/62157/merge
+Waiting for a runner to pick up this job...
+Job is about to start running on the runner: garm4-low-24-bifo1eqcerid
+Evaluating changes.if
+Evaluating: success()
+Result: true

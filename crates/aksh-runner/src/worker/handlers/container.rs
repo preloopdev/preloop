@@ -197,8 +197,11 @@ fn evaluated_inputs(
                 if inputs.contains_key(key) {
                     continue;
                 }
-                if let Some(default) = input_def.get("default").and_then(|v| v.as_str()) {
-                    let evaluated = crate::worker::template::evaluate_template(default, &expr_ctx)
+                if let Some(default) = input_def
+                    .get("default")
+                    .and_then(super::factory::input_default_string)
+                {
+                    let evaluated = crate::worker::template::evaluate_template(&default, &expr_ctx)
                         .unwrap_or_else(|_| default.to_string());
                     inputs.insert(key.clone(), evaluated);
                 }

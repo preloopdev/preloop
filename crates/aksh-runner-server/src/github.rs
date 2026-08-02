@@ -944,6 +944,20 @@ pub(crate) async fn handle_github_webhook(
                                 run_id,
                             )
                             .await;
+                            // If the job was already resolved at submission
+                            // time (e.g. skipped due to unsatisfiable
+                            // dependencies), report completion immediately so
+                            // the GitHub check does not stay queued forever.
+                            let status = {
+                                let inner = shared.state.inner.lock().await;
+                                inner
+                                    .runs
+                                    .get(&run_id)
+                                    .and_then(|r| r.jobs.get(&job_id).copied())
+                            };
+                            if let Some(status) = status.filter(|s| s.is_terminal()) {
+                                report_check_run_completed(&shared, run_id, &job_id, status).await;
+                            }
                         }
                     }
                     triggered_runs.push(accepted);

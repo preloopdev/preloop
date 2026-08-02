@@ -3,7 +3,7 @@
 pub mod environment;
 mod keys;
 
-use crate::environment::{EnvironmentResolver, EnvironmentSpec};
+use crate::environment::{EnvironmentResolver, EnvironmentSpec, ToolchainLayer};
 use crate::keys::{KeyPool, StagedKey};
 use aksh_gha_protocol::RUNNER_BUSY_SENTINEL;
 
@@ -279,13 +279,14 @@ fn base_install_commands() -> Vec<Vec<String>> {
         format!(
             "apt-get update -qq && \
              DEBIAN_FRONTEND=noninteractive \
-             apt-get install -y -qq --no-install-recommends {BASE_PACKAGES} && \
-             printf '{LOOPBACK_HOSTS}' > /etc/hosts && \
+             apt-get install -y -qq --no-install-recommends {BASE_PACKAGES} \
+             && printf '{LOOPBACK_HOSTS}' > /etc/hosts && \
              (DEBIAN_FRONTEND=noninteractive \
               apt-get install -y -qq {DOCKER_PACKAGES} && \
               mkdir -p {DOCKER_DATA_ROOT} /etc/docker && \
               printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\"}}\\n' > /etc/docker/daemon.json \
-              || true)"
+              || true) && \
+             apt-get clean && rm -rf /var/lib/apt/lists/*"
         ),
     ]]
     .into_iter()
@@ -305,7 +306,7 @@ fn base_install_commands() -> Vec<Vec<String>> {
 /// can carry a `[dockerd] <defunct>` entry from its golden: a name match sees
 /// the zombie, concludes Docker is up, and leaves the runner with no daemon.
 /// A stale `/var/run/docker.pid` naming that same pid blocks startup outright,
-/// and is only removed once `docker info` has failed -- so it is stale by
+/// and is only removed once `docker info` has failed  so it is stale by
 /// definition.
 fn docker_start_command() -> Vec<String> {
     vec![
@@ -402,6 +403,16 @@ fn guest_env_prefix(config: &RunnerPoolConfig, name: &MachineName) -> Vec<String
                 .trim_end_matches('/')
         ));
         env.push(format!("PRELOOP_CONTROL_SOCKET={GUEST_CONTROL_SOCKET}"));
+    } else if let Some(upstream) = &config.control_upstream {
+        env.push(format!(
+            "PRELOOP_CONTROL_ORIGIN={}",
+            config
+                .control_origin
+                .as_deref()
+                .unwrap_or(&config.server_url)
+                .trim_end_matches('/')
+        ));
+        env.push(format!("PRELOOP_CONTROL_UPSTREAM={upstream}"));
     }
     if config.debug_dir.is_some() {
         env.push(format!("PRELOOP_FAILURE_MARKER={GUEST_FAILURE_MARKER}"));
@@ -421,6 +432,10 @@ pub struct RunnerPoolConfig {
     /// When enabled, a single "golden" VM boots once and each runner slot
     /// clones from it with CoW memory and disks.
     pub use_fork: bool,
+    /// Create runners from the prepared packed artifact instead of the base
+    /// OCI image. The caller must provide a SmolVM build that preserves
+    /// explicitly supplied socket mappings for packed-machine creation.
+    pub use_packed_artifact: bool,
     /// Prefix used for owned SmolVM names.
     pub name_prefix: String,
     /// Base OCI image used for one-time tool installation.
@@ -440,6 +455,10 @@ pub struct RunnerPoolConfig {
     pub control_origin: Option<String>,
     /// Host Unix socket used for runner control-plane traffic.
     pub control_socket: Option<PathBuf>,
+    /// TCP address the guest control bridge forwards to when the socket is
+    /// unavailable. The bridge binds `control_origin` inside the VM and
+    /// proxies accepted connections to this address over virtio-net TCP.
+    pub control_upstream: Option<String>,
     /// Host environment variable containing the registration credential.
     pub registration_token_env: String,
     /// Runner labels advertised to the scheduler.
@@ -450,6 +469,8 @@ pub struct RunnerPoolConfig {
     pub memory_mib: u32,
     /// Storage per runner in GiB.
     pub storage_gib: u32,
+    /// Root overlay size per runner in GiB; `None` keeps the provider default.
+    pub overlay_gib: Option<u32>,
     /// Directory for debug session markers (e.g. `~/.preloop/state/debug`).
     ///
     /// When set, a runner whose job requested `preserve_on_failure` and then
@@ -702,6 +723,10 @@ async fn preload_images<P: VmProvider>(
 }
 
 /// Prepare a running forkable golden VM with the requested environment.
+///
+/// SmolVM takes the forkable RAM/disk snapshot when `start --forkable` runs.
+/// Provision the guest while it is a normal machine, then restart it as the
+/// fork base so package and external-runtime writes are inherited by clones.
 async fn prepare_golden_for_env<P: VmProvider + 'static>(
     provider: &Arc<P>,
     config: &RunnerPoolConfig,
@@ -717,6 +742,7 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
         cpus: config.cpus,
         memory_mib: config.memory_mib,
         storage_gib: config.storage_gib,
+        overlay_gib: config.overlay_gib,
         network: NetworkPolicy::PublicOnly,
         volumes: runner_volumes(config),
         sockets: config
@@ -730,7 +756,7 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
         rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
     };
     provider.create(&spec).await?;
-    provider.start_forkable(golden).await?;
+    provider.start(golden).await?;
     if let Err(error) = await_guest_ready(provider.as_ref(), golden).await {
         let _ = provider.delete(golden).await;
         return Err(error);
@@ -754,7 +780,69 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
             %error, "image preload failed; jobs will pull at run time"
         );
     }
+    if let Err(error) = provider.stop(golden).await {
+        let _ = provider.delete(golden).await;
+        return Err(error.into());
+    }
+    if let Err(error) = provider.start_forkable(golden).await {
+        let _ = provider.delete(golden).await;
+        return Err(error.into());
+    }
     info!(machine = golden.as_str(), "golden fork base ready");
+    Ok(())
+}
+
+/// Prepare a forkable golden from the dependency-prepared packed artifact.
+///
+/// Socket mappings are supplied by the local machine definition, never read
+/// from the artifact. SmolVM must preserve those explicit mappings on its
+/// `machine create --from` path for local control-plane routing to work.
+async fn prepare_packed_golden<P: VmProvider + 'static>(
+    provider: &Arc<P>,
+    config: &RunnerPoolConfig,
+    golden: &MachineName,
+) -> Result<(), OrchestratorError> {
+    if provider.status(golden).await? != MachineState::Missing {
+        provider.delete(golden).await?;
+    }
+    let spec = MachineSpec {
+        name: golden.clone(),
+        image: config.artifact_payload().display().to_string(),
+        cpus: config.cpus,
+        memory_mib: config.memory_mib,
+        storage_gib: config.storage_gib,
+        overlay_gib: config.overlay_gib,
+        network: NetworkPolicy::PublicOnly,
+        volumes: runner_volumes(config),
+        sockets: config
+            .control_socket
+            .iter()
+            .map(|host| SocketMount {
+                host: host.clone(),
+                guest: PathBuf::from(GUEST_CONTROL_SOCKET),
+            })
+            .collect(),
+        rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
+    };
+    provider.create(&spec).await?;
+    provider.start(golden).await?;
+    if let Err(error) = await_guest_ready(provider.as_ref(), golden).await {
+        let _ = provider.delete(golden).await;
+        return Err(error);
+    }
+    if let Err(error) = preload_images(provider.as_ref(), golden, &config.preload_images).await {
+        warn!(
+            machine = golden.as_str(),
+            %error, "image preload failed; jobs will pull at run time"
+        );
+    }
+    provider.stop(golden).await?;
+    provider.start_forkable(golden).await?;
+    info!(
+        machine = golden.as_str(),
+        artifact = %config.artifact_payload().display(),
+        "packed golden fork base ready"
+    );
     Ok(())
 }
 
@@ -767,10 +855,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
 
     /// Prepare the immutable runner image once, then supervise all slots until cancellation.
     pub async fn run(&self, shutdown: CancellationToken) -> Result<(), OrchestratorError> {
-        // SmolVM currently drops socket mounts from `machine create --from`.
-        // Local control-plane sockets therefore use an image-backed golden VM;
-        // remote TCP pools can retain the packed-artifact path.
-        if self.config.control_socket.is_none() {
+        if self.config.use_packed_artifact || self.config.control_socket.is_none() {
             self.prepare_artifact(true).await?;
         }
         self.remove_stale_machines().await?;
@@ -779,16 +864,20 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         let golden_registry = Arc::new(GoldenRegistry::new(self.config.name_prefix.clone()));
 
         // If fork mode is enabled, prepare a golden fork base VM for the
-        // default (base-image-only) environment. Its fingerprint is the
-        // canonical hash of the base image with an empty toolchain list.
+        // workspace's default environment (base image plus any toolchains
+        // detected from version files like rust-toolchain.toml).
         if self.config.use_fork {
-            let default_environment =
-                EnvironmentSpec::new(self.config.base_image.clone(), Vec::new());
+            let default_environment = resolver
+                .resolve_workspace(self.config.workspace.as_deref())
+                .with_base(self.config.base_image.clone());
             let golden = MachineName::new(format!("{}-golden", golden_registry.name_prefix))?;
-            if let Err(error) =
+            let result = if self.config.use_packed_artifact {
+                prepare_packed_golden(&self.provider, &self.config, &golden).await
+            } else {
                 prepare_golden_for_env(&self.provider, &self.config, &golden, &default_environment)
                     .await
-            {
+            };
+            if let Err(error) = result {
                 warn!(%error, "golden fork base unavailable; falling back to create-per-runner");
             } else {
                 golden_registry
@@ -869,7 +958,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         &self,
         shutdown: CancellationToken,
         golden_registry: Arc<GoldenRegistry>,
-        _resolver: Arc<EnvironmentResolver>,
+        resolver: Arc<EnvironmentResolver>,
         idle: Arc<AtomicUsize>,
         keys: Arc<KeyPool>,
         building: Arc<AtomicUsize>,
@@ -920,6 +1009,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             let config = self.config.clone();
             let slot_shutdown = shutdown.child_token();
             let slot_registry = golden_registry.clone();
+            let slot_resolver = resolver.clone();
             let slot_handles = PoolHandles {
                 idle: idle.clone(),
                 keys: keys.clone(),
@@ -934,6 +1024,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     slot,
                     slot_shutdown,
                     slot_registry,
+                    slot_resolver,
                     slot_handles,
                 )
                 .await;
@@ -993,7 +1084,11 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             image: self.config.base_image.clone(),
             cpus: self.config.cpus,
             memory_mib: self.config.memory_mib,
-            storage_gib: self.config.storage_gib,
+            // Packing exports a second copy of the guest filesystem before
+            // producing the artifact. Give the one-shot builder headroom
+            // without increasing the storage allocated to job VMs.
+            storage_gib: self.config.storage_gib.max(40),
+            overlay_gib: self.config.overlay_gib,
             network: NetworkPolicy::PublicOnly,
             volumes: Vec::new(),
             sockets: Vec::new(),
@@ -1005,10 +1100,44 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             let _ = self.provider.delete(&name).await;
             return Err(error);
         }
+        // Bake the workspace's toolchains (rust-toolchain.toml, .nvmrc, etc.)
+        // into the artifact so every runner forked from it carries them
+        // pre-installed, instead of installing per job.
+        let toolchains = EnvironmentResolver::new(self.config.base_image.clone())
+            .resolve_workspace(self.config.workspace.as_deref())
+            .toolchains;
+        for layer in &toolchains {
+            for command in layer.install_commands() {
+                if let Err(error) = self.provider.exec(&name, &command).await {
+                    let _ = self.provider.delete(&name).await;
+                    return Err(error.into());
+                }
+            }
+        }
         self.provider.stop(&name).await?;
-        self.provider
-            .pack(&name, &self.config.artifact_stem)
-            .await?;
+        let temporary = payload
+            .parent()
+            .map(|parent| parent.join(format!(".tmp-golden-{}", uuid::Uuid::new_v4())))
+            .ok_or_else(|| {
+                OrchestratorError::Config(format!(
+                    "golden artifact path has no parent: {}",
+                    payload.display()
+                ))
+            })?;
+        if let Err(error) = self.provider.pack(&name, &temporary).await {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error.into());
+        }
+        // smolvm pack writes two files: `<output>` (ELF executable stub) and
+        // `<output>.smolmachine` (the packed VM data). The latter is the
+        // artifact consumed by `machine create --from`; the stub is only a
+        // launcher and is discarded.
+        let sidecar = PathBuf::from(format!("{}.smolmachine", temporary.display()));
+        std::fs::rename(&sidecar, &payload).inspect_err(|_| {
+            let _ = std::fs::remove_file(&temporary);
+            let _ = std::fs::remove_file(&sidecar);
+        })?;
+        let _ = std::fs::remove_file(&temporary);
         self.provider.delete(&name).await?;
         if !payload.is_file() {
             return Err(OrchestratorError::Config(format!(
@@ -1048,6 +1177,9 @@ struct RunnerEnvironment {
     fingerprint: Option<String>,
     /// Base image this runner actually booted from.
     base: String,
+    /// Toolchains this runner must carry (installed after boot when the
+    /// runner is created fresh rather than forked from a prepared golden).
+    toolchains: Vec<ToolchainLayer>,
 }
 
 /// Handles every slot in the pool shares.
@@ -1119,6 +1251,7 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
     slot: usize,
     shutdown: CancellationToken,
     golden_registry: Arc<GoldenRegistry>,
+    environment_resolver: Arc<EnvironmentResolver>,
     handles: PoolHandles,
 ) -> Result<(), OrchestratorError> {
     // Resolve the golden for the queued job's environment.
@@ -1134,8 +1267,11 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
             }
             None => config.base_image.clone(),
         };
-        let env_spec = EnvironmentSpec::new(env_base.clone(), Vec::new());
+        let env_spec = environment_resolver
+            .resolve_workspace(config.workspace.as_deref())
+            .with_base(env_base.clone());
         let fingerprint = env_spec.fingerprint.clone();
+        let toolchains = env_spec.toolchains.clone();
         let selected = golden_registry
             .get_or_prepare(&fingerprint, {
                 let provider = provider.clone();
@@ -1162,14 +1298,19 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
             RunnerEnvironment {
                 fingerprint: Some(fingerprint),
                 base: env_base,
+                toolchains,
             },
         )
     } else {
+        let env_spec = environment_resolver
+            .resolve_workspace(config.workspace.as_deref())
+            .with_base(config.base_image.clone());
         (
             None,
             RunnerEnvironment {
                 fingerprint: None,
-                base: config.base_image.clone(),
+                base: env_spec.base.clone(),
+                toolchains: env_spec.toolchains,
             },
         )
     };
@@ -1223,7 +1364,7 @@ async fn run_slot<P: VmProvider + 'static>(
     slot: usize,
     shutdown: CancellationToken,
     golden_registry: Arc<GoldenRegistry>,
-    _environment_resolver: Arc<EnvironmentResolver>,
+    environment_resolver: Arc<EnvironmentResolver>,
     handles: PoolHandles,
 ) -> Result<(), OrchestratorError> {
     let PoolHandles {
@@ -1249,8 +1390,15 @@ async fn run_slot<P: VmProvider + 'static>(
                 }
                 None => config.base_image.clone(),
             };
-            let env_spec = EnvironmentSpec::new(env_base.clone(), Vec::new());
+            // Resolve toolchains from the workspace (rust-toolchain.toml,
+            // .nvmrc, etc.) so the golden carries the project's toolchain
+            // pre-installed. Base image still comes from the queued job's
+            // `runs-on` labels; `with_base` recomputes the fingerprint.
+            let env_spec = environment_resolver
+                .resolve_workspace(config.workspace.as_deref())
+                .with_base(env_base.clone());
             let fingerprint = env_spec.fingerprint.clone();
+            let toolchains = env_spec.toolchains.clone();
 
             let selected = match golden_registry
                 .get_or_prepare(&fingerprint, {
@@ -1285,15 +1433,21 @@ async fn run_slot<P: VmProvider + 'static>(
                 RunnerEnvironment {
                     fingerprint: Some(fingerprint),
                     base: env_base,
+                    toolchains,
                 },
             )
         } else {
             // create-per-runner path: no golden, provision fresh each time.
+            // Toolchains are installed per runner after boot.
+            let env_spec = environment_resolver
+                .resolve_workspace(config.workspace.as_deref())
+                .with_base(config.base_image.clone());
             (
                 None,
                 RunnerEnvironment {
                     fingerprint: None,
-                    base: config.base_image.clone(),
+                    base: env_spec.base.clone(),
+                    toolchains: env_spec.toolchains,
                 },
             )
         };
@@ -1391,7 +1545,17 @@ async fn provision_slot<P: VmProvider + 'static>(
     environment: RunnerEnvironment,
 ) -> Result<ReadyRunner, OrchestratorError> {
     let name = MachineName::new(format!("{}-{slot}-{generation}", config.name_prefix))?;
-    match provision_runner(provider, config, &name, golden, keys, &environment.base).await {
+    match provision_runner(
+        provider,
+        config,
+        &name,
+        golden,
+        keys,
+        &environment.base,
+        &environment.toolchains,
+    )
+    .await
+    {
         Ok(run) => Ok(ReadyRunner {
             name,
             run,
@@ -1709,24 +1873,25 @@ async fn provision_runner<P: VmProvider + 'static>(
     golden: Option<&MachineName>,
     keys: &Arc<KeyPool>,
     environment_base: &str,
+    toolchains: &[ToolchainLayer],
 ) -> Result<Vec<String>, OrchestratorError> {
     if let Some(golden) = golden {
-        // Fork from the already-booted golden VM — instant CoW clone.
+        // Fork from the already-booted golden VM instant CoW clone.
         provider.fork(golden, name).await?;
+        // The golden carries the toolchains pre-installed; nothing to do.
     } else {
-        // Socket mounts are currently ignored by SmolVM's packed-artifact
-        // create path, so local pools fall back to the base image directly.
-        let uses_control_socket = config.control_socket.is_some();
+        let uses_packed_artifact = config.use_packed_artifact;
         let spec = MachineSpec {
             name: name.clone(),
-            image: if uses_control_socket {
-                config.base_image.clone()
-            } else {
+            image: if uses_packed_artifact {
                 config.artifact_payload().display().to_string()
+            } else {
+                config.base_image.clone()
             },
             cpus: config.cpus,
             memory_mib: config.memory_mib,
             storage_gib: config.storage_gib,
+            overlay_gib: config.overlay_gib,
             network: NetworkPolicy::PublicOnly,
             volumes: runner_volumes(config),
             sockets: config
@@ -1741,8 +1906,15 @@ async fn provision_runner<P: VmProvider + 'static>(
         };
         provider.create(&spec).await?;
         provider.start(name).await?;
-        if uses_control_socket {
+        if !uses_packed_artifact {
             install_base_dependencies(provider.as_ref(), name).await?;
+            for layer in toolchains {
+                for command in layer.install_commands() {
+                    if let Err(error) = provider.exec(name, &command).await {
+                        return Err(error.into());
+                    }
+                }
+            }
         }
     }
 
@@ -1758,11 +1930,19 @@ async fn provision_runner<P: VmProvider + 'static>(
     }
     let labels = labels.join(",");
     let mut configure = guest_env_prefix(config, name);
+    // During configure the control bridge is not yet running, so the
+    // runner must reach the server directly. When a TCP upstream is
+    // configured, use that address for registration instead of the
+    // loopback origin.
+    let registration_url = config
+        .control_upstream
+        .as_deref()
+        .unwrap_or(&config.server_url);
     configure.extend([
         runner.clone(),
         "configure".into(),
         "--url".into(),
-        config.server_url.clone(),
+        registration_url.to_owned(),
         "--name".into(),
         name.as_str().into(),
         "--labels".into(),
@@ -2037,6 +2217,21 @@ chmod +x "$destination/bin/node"
     }
 
     #[test]
+    fn tcp_upstream_sets_origin_and_upstream_without_socket() {
+        let mut config = test_config(false);
+        config.server_url = "http://127.0.0.1:9090".to_owned();
+        config.control_origin = Some("http://127.0.0.1:9090".to_owned());
+        config.control_upstream = Some("http://10.0.0.161:9090".to_owned());
+        let name = MachineName::new("runner").unwrap();
+
+        let env = guest_env_prefix(&config, &name);
+
+        assert!(env.contains(&"PRELOOP_CONTROL_ORIGIN=http://127.0.0.1:9090".to_owned()));
+        assert!(env.contains(&"PRELOOP_CONTROL_UPSTREAM=http://10.0.0.161:9090".to_owned()));
+        assert!(!env.iter().any(|v| v.starts_with("PRELOOP_CONTROL_SOCKET")));
+    }
+
+    #[test]
     fn runner_labels_bind_to_selected_ubuntu_environment() {
         assert_eq!(
             runner_environment_labels("ubuntu:22.04"),
@@ -2052,6 +2247,7 @@ chmod +x "$destination/bin/node"
         RunnerPoolConfig {
             size: 1,
             use_fork: false,
+            use_packed_artifact: false,
             name_prefix: "lifecycle-test".to_owned(),
             base_image: "base-image".to_owned(),
             workspace: None,
@@ -2061,11 +2257,13 @@ chmod +x "$destination/bin/node"
             server_url: "https://runner.test".to_owned(),
             control_origin: None,
             control_socket: control_socket.then(|| PathBuf::from("/tmp/engine.sock")),
+            control_upstream: None,
             registration_token_env: "LIFECYCLE_TEST_TOKEN".to_owned(),
             labels: vec!["test".to_owned()],
             cpus: 1,
             memory_mib: 128,
             storage_gib: 1,
+            overlay_gib: None,
             debug_dir: None,
             runner_key_dir: None,
             pending_jobs: None,
@@ -2224,6 +2422,7 @@ chmod +x "$destination/bin/node"
             RunnerEnvironment {
                 fingerprint: None,
                 base: config.base_image.clone(),
+                toolchains: Vec::new(),
             },
         )
         .await
@@ -2293,6 +2492,7 @@ chmod +x "$destination/bin/node"
             RunnerEnvironment {
                 fingerprint: None,
                 base: config.base_image.clone(),
+                toolchains: Vec::new(),
             },
         )
         .await
@@ -2310,6 +2510,7 @@ chmod +x "$destination/bin/node"
                 environment: RunnerEnvironment {
                     fingerprint: None,
                     base: config.base_image.clone(),
+                    toolchains: Vec::new(),
                 },
                 idle: &idle,
                 keys: &Arc::new(KeyPool::new()),
