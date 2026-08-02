@@ -1,0 +1,232 @@
+{
+  "repo": "nextcloud/server",
+  "run_id": "29563964561",
+  "workflow_name": "PHPUnit SQLite",
+  "workflow_path": ".github/workflows/phpunit-sqlite.yml",
+  "event": "pull_request",
+  "head_sha": "fa8cf00d67aa50abe91da6f85b999210142be98b",
+  "conclusion": "success",
+  "created_at": "2026-07-17T07:43:00Z",
+  "jobs": [
+    {
+      "name": "changes",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "SQLite (PHP 8.3)",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Initialize containers",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Checkout server",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set up php 8.3",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Enable HEIC support in ImageMagick",
+          "number": 5,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set up dependencies",
+          "number": 6,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set up Nextcloud",
+          "number": 7,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Nextcloud debug information",
+          "number": 8,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "PHPUnit database tests",
+          "number": 9,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Print logs",
+          "number": 10,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Checkout server",
+          "number": 19,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Stop containers",
+          "number": 20,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 21,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "SQLite (PHP 8.5)",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Initialize containers",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Checkout server",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set up php 8.5",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Enable HEIC support in ImageMagick",
+          "number": 5,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set up dependencies",
+          "number": 6,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set up Nextcloud",
+          "number": 7,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Nextcloud debug information",
+          "number": 8,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "PHPUnit database tests",
+          "number": 9,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Print logs",
+          "number": 10,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Checkout server",
+          "number": 19,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Stop containers",
+          "number": 20,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 21,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "phpunit-sqlite-summary",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Summary status",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    }
+  ]
+}

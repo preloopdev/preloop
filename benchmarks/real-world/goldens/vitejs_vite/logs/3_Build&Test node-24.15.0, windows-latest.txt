@@ -1,0 +1,647 @@
+﻿2026-07-31T11:06:33.5456942Z Current runner version: '2.336.0'
+##[group]Runner Image Provisioner
+Hosted Compute Agent
+Version: 20260707.563
+Commit: 02667638d2b423fbc733a8e32a88b44996a3ba6e
+Build Date: 2026-07-07T19:33:50Z
+Worker ID: {d0599a3e-3c72-4284-b46c-cc671af0f524}
+Azure Region: eastus2
+##[endgroup]
+##[group]Operating System
+Microsoft Windows Server 2025
+10.0.26100
+Datacenter
+##[endgroup]
+##[group]Runner Image
+Image: windows-2025-vs2026
+Version: 20260728.188.1
+Included Software: https://github.com/actions/runner-images/blob/win25-vs2026/20260728.188/images/windows/Windows2025-VS2026-Readme.md
+Image Release: https://github.com/actions/runner-images/releases/tag/win25-vs2026%2F20260728.188
+##[endgroup]
+##[group]GITHUB_TOKEN Permissions
+Metadata: read
+##[endgroup]
+Secret source: None
+Prepare workflow directory
+Prepare all required actions
+Getting action download info
+Download action repository 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' (SHA:3d3c42e5aac5ba805825da76410c181273ba90b1)
+Download action repository 'pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271' (SHA:0ebf47130e4866e96fce0953f49152a61190b271)
+Download action repository 'actions/setup-node@820762786026740c76f36085b0efc47a31fe5020' (SHA:820762786026740c76f36085b0efc47a31fe5020)
+Download action repository 'actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9' (SHA:55cc8345863c7cc4c66a329aec7e433d2d1c52a9)
+Complete job name: Build&Test: node-24.15.0, windows-latest
+##[group]Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+with:
+persist-credentials: false
+repository: vitejs/vite
+token: ***
+ssh-strict: true
+ssh-user: git
+clean: true
+sparse-checkout-cone-mode: true
+fetch-depth: 1
+fetch-tags: false
+show-progress: true
+lfs: false
+submodules: false
+set-safe-directory: true
+allow-unsafe-pr-checkout: false
+env:
+NODE_OPTIONS: --max-old-space-size=6144
+PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+VITEST_SEGFAULT_RETRY: 3
+##[endgroup]
+Syncing repository: vitejs/vite
+##[group]Getting Git version info
+Working directory is 'D:\a\vite\vite'
+[command]"C:\Program Files\Git\bin\git.exe" version
+git version 2.55.0.windows.3
+##[endgroup]
+Temporarily overriding HOME='D:\a\_temp\5ec3a0dc-9870-4375-8f30-7ec42e76beb7' before making global git config changes
+Adding repository directory to the temporary git global config as a safe directory
+[command]"C:\Program Files\Git\bin\git.exe" config --global --add safe.directory D:\a\vite\vite
+Deleting the contents of 'D:\a\vite\vite'
+##[group]Determining repository object format
+##[endgroup]
+##[group]Initializing the repository
+[command]"C:\Program Files\Git\bin\git.exe" init D:\a\vite\vite
+Initialized empty Git repository in D:/a/vite/vite/.git/
+[command]"C:\Program Files\Git\bin\git.exe" remote add origin https://github.com/vitejs/vite
+##[endgroup]
+##[group]Disabling automatic garbage collection
+[command]"C:\Program Files\Git\bin\git.exe" config --local gc.auto 0
+##[endgroup]
+##[group]Setting up auth
+Removing SSH command configuration
+[command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp core\.sshCommand
+[command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "sh -c \"git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :\""
+Removing HTTP extra header
+[command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "sh -c \"git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :\""
+Removing includeIf entries pointing to credentials config files
+[command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp ^includeIf\.gitdir:
+[command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "git config --local --show-origin --name-only --get-regexp remote.origin.url"
+[command]"C:\Program Files\Git\bin\git.exe" config --file D:\a\_temp\git-credentials-55944e25-5ea6-41d7-b8f1-71252b902ed6.config http.https://github.com/.extraheader "AUTHORIZATION: basic ***"
+[command]"C:\Program Files\Git\bin\git.exe" config --local includeIf.gitdir:D:/a/vite/vite/.git.path D:\a\_temp\git-credentials-55944e25-5ea6-41d7-b8f1-71252b902ed6.config
+[command]"C:\Program Files\Git\bin\git.exe" config --local includeIf.gitdir:D:/a/vite/vite/.git/worktrees/*.path D:\a\_temp\git-credentials-55944e25-5ea6-41d7-b8f1-71252b902ed6.config
+[command]"C:\Program Files\Git\bin\git.exe" config --local includeIf.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-55944e25-5ea6-41d7-b8f1-71252b902ed6.config
+[command]"C:\Program Files\Git\bin\git.exe" config --local includeIf.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-55944e25-5ea6-41d7-b8f1-71252b902ed6.config
+##[endgroup]
+##[group]Fetching the repository
+[command]"C:\Program Files\Git\bin\git.exe" -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +a04293af5b021b2f960999042c5b850bc3d54e12:refs/remotes/pull/23114/merge
+From https://github.com/vitejs/vite
+* [new ref]         a04293af5b021b2f960999042c5b850bc3d54e12 -> pull/23114/merge
+##[endgroup]
+##[group]Determining the checkout info
+##[endgroup]
+[command]"C:\Program Files\Git\bin\git.exe" sparse-checkout disable
+[command]"C:\Program Files\Git\bin\git.exe" config --local --unset-all extensions.worktreeConfig
+##[group]Checking out the ref
+[command]"C:\Program Files\Git\bin\git.exe" checkout --progress --force refs/remotes/pull/23114/merge
+Note: switching to 'refs/remotes/pull/23114/merge'.
+You are in 'detached HEAD' state. You can look around, make experimental
+changes and commit them, and you can discard any commits you make in this
+state without impacting any branches by switching back to a branch.
+If you want to create a new branch to retain commits you create, you may
+do so (now or later) by using -c with the switch command. Example:
+git switch -c <new-branch-name>
+Or undo this operation with:
+git switch -
+Turn off this advice by setting config variable advice.detachedHead to false
+HEAD is now at a04293a Merge 214636edf9b1483698fc749792179f115a4fdc75 into e6b6b167afa0a80548829d1f24a0712f9194389a
+##[endgroup]
+[command]"C:\Program Files\Git\bin\git.exe" log -1 --format=%H
+a04293af5b021b2f960999042c5b850bc3d54e12
+##[group]Removing auth
+Removing SSH command configuration
+[command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp core\.sshCommand
+[command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "sh -c \"git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :\""
+Removing HTTP extra header
+[command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "sh -c \"git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :\""
+Removing includeIf entries pointing to credentials config files
+[command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp ^includeIf\.gitdir:
+includeif.gitdir:D:/a/vite/vite/.git.path
+includeif.gitdir:D:/a/vite/vite/.git/worktrees/*.path
+includeif.gitdir:/github/workspace/.git.path
+includeif.gitdir:/github/workspace/.git/worktrees/*.path
+[command]"C:\Program Files\Git\bin\git.exe" config --local --get-all includeif.gitdir:D:/a/vite/vite/.git.path
+D:\a\_temp\git-credentials-55944e25-5ea6-41d7-b8f1-71252b902ed6.config
+[command]"C:\Program Files\Git\bin\git.exe" config --local --unset includeif.gitdir:D:/a/vite/vite/.git.path D\:\\a\\_temp\\git\-credentials\-55944e25\-5ea6\-41d7\-b8f1\-71252b902ed6\.config
+[command]"C:\Program Files\Git\bin\git.exe" config --local --get-all includeif.gitdir:D:/a/vite/vite/.git/worktrees/*.path
+D:\a\_temp\git-credentials-55944e25-5ea6-41d7-b8f1-71252b902ed6.config
+[command]"C:\Program Files\Git\bin\git.exe" config --local --unset includeif.gitdir:D:/a/vite/vite/.git/worktrees/*.path D\:\\a\\_temp\\git\-credentials\-55944e25\-5ea6\-41d7\-b8f1\-71252b902ed6\.config
+[command]"C:\Program Files\Git\bin\git.exe" config --local --get-all includeif.gitdir:/github/workspace/.git.path
+/github/runner_temp/git-credentials-55944e25-5ea6-41d7-b8f1-71252b902ed6.config
+[command]"C:\Program Files\Git\bin\git.exe" config --local --unset includeif.gitdir:/github/workspace/.git.path \/github\/runner_temp\/git\-credentials\-55944e25\-5ea6\-41d7\-b8f1\-71252b902ed6\.config
+[command]"C:\Program Files\Git\bin\git.exe" config --local --get-all includeif.gitdir:/github/workspace/.git/worktrees/*.path
+/github/runner_temp/git-credentials-55944e25-5ea6-41d7-b8f1-71252b902ed6.config
+[command]"C:\Program Files\Git\bin\git.exe" config --local --unset includeif.gitdir:/github/workspace/.git/worktrees/*.path \/github\/runner_temp\/git\-credentials\-55944e25\-5ea6\-41d7\-b8f1\-71252b902ed6\.config
+[command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "git config --local --show-origin --name-only --get-regexp remote.origin.url"
+Removing credentials config 'D:\a\_temp\git-credentials-55944e25-5ea6-41d7-b8f1-71252b902ed6.config'
+##[endgroup]
+##[group]Run pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271
+with:
+dest: ~/setup-pnpm
+run_install: null
+cache: false
+cache_dependency_path: pnpm-lock.yaml
+package_json_file: package.json
+standalone: false
+env:
+NODE_OPTIONS: --max-old-space-size=6144
+PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+VITEST_SEGFAULT_RETRY: 3
+##[endgroup]
+##[group]Running self-installer...
+(node:5336) [DEP0190] DeprecationWarning: Passing args to a child process with shell option true can lead to security vulnerabilities, as the arguments are not escaped, only concatenated.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+added 1 package, and audited 2 packages in 6s
+1 package is looking for funding
+run `npm fund` for details
+1 high severity vulnerability
+To address all issues, run:
+npm audit fix --force
+Run `npm audit` for details.
+Checking for updates...
+Switching pnpm from v11.7.0 to v10.34.5...
+.../.bin/global/v11/1354-19fb7db1365     | Progress: resolved 1, reused 0, downloaded 0, added 0
+.../.bin/global/v11/1354-19fb7db1365     |   +1 +
+.../.bin/global/v11/1354-19fb7db1365     | Progress: resolved 1, reused 0, downloaded 1, added 0
+.../.bin/global/v11/1354-19fb7db1365     | Progress: resolved 1, reused 0, downloaded 1, added 1, done
+[WARN] Detected a pnpm v10 installation layout at PNPM_HOME. The pnpm shims at PNPM_HOME have been refreshed so the new version is active, but pnpm v11 expects bins in PNPM_HOME/bin. Run "pnpm setup" to migrate your PATH to the v11 layout.
+Successfully updated pnpm to v10.34.5
+##[endgroup]
+Installation Completed!
+##[group]Run actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+with:
+node-version: 24.15.0
+cache: pnpm
+check-latest: false
+token: ***
+package-manager-cache: true
+env:
+NODE_OPTIONS: --max-old-space-size=6144
+PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+VITEST_SEGFAULT_RETRY: 3
+PNPM_HOME: C:\Users\runneradmin\setup-pnpm\node_modules\.bin
+##[endgroup]
+Attempting to download 24.15.0...
+Acquiring 24.15.0 - x64 from https://github.com/actions/node-versions/releases/download/24.15.0-24511264946/node-24.15.0-win32-x64.7z
+Extracting ...
+Adding to the cache ...
+##[group]Environment details
+node: v24.15.0
+npm: 11.12.1
+yarn: 1.22.22
+##[endgroup]
+[command]C:\Windows\system32\cmd.exe /D /S /C "C:\Users\runneradmin\setup-pnpm\node_modules\.bin\bin\pnpm.CMD store path --silent"
+D:\.pnpm-store\v10
+Cache hit for: node-cache-Windows-x64-pnpm-bcc8b0f3fee9de2eb53f8cda16b5f4906ca2c2f66661e92bce021a997500d8be
+Received 134217728 of 166127326 (80.8%), 127.7 MBs/sec
+Received 166127326 of 166127326 (100.0%), 137.2 MBs/sec
+Cache Size: ~158 MB (166127326 B)
+[command]"C:\Program Files\Git\usr\bin\tar.exe" -xf D:/a/_temp/8c854b28-0d67-4d35-b1aa-8062e572d57a/cache.tzst -P -C D:/a/vite/vite --force-local --use-compress-program "zstd -d"
+Cache restored successfully
+Cache restored from key: node-cache-Windows-x64-pnpm-bcc8b0f3fee9de2eb53f8cda16b5f4906ca2c2f66661e92bce021a997500d8be
+##[group]Run pnpm install
+pnpm install
+shell: C:\Program Files\PowerShell\7\pwsh.EXE -command ". '{0}'"
+env:
+NODE_OPTIONS: --max-old-space-size=6144
+PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+VITEST_SEGFAULT_RETRY: 3
+PNPM_HOME: C:\Users\runneradmin\setup-pnpm\node_modules\.bin
+##[endgroup]
+Scope: all 277 workspace projects
+Lockfile is up to date, resolution step is skipped
+Progress: resolved 1, reused 0, downloaded 0, added 0
+Packages: +1141
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+Progress: resolved 1141, reused 591, downloaded 0, added 0
+Progress: resolved 1141, reused 1140, downloaded 0, added 166
+Progress: resolved 1141, reused 1140, downloaded 0, added 364
+Progress: resolved 1141, reused 1140, downloaded 0, added 547
+Progress: resolved 1141, reused 1140, downloaded 0, added 717
+Progress: resolved 1141, reused 1140, downloaded 0, added 904
+Progress: resolved 1141, reused 1140, downloaded 0, added 1140
+Progress: resolved 1141, reused 1140, downloaded 0, added 1141
+Progress: resolved 1141, reused 1140, downloaded 0, added 1141, done
+devDependencies:
++ @eslint/js 9.39.5
++ @type-challenges/utils 0.1.1
++ @types/babel__core 7.20.5
++ @types/babel__preset-env 7.10.0
++ @types/convert-source-map 2.0.3
++ @types/cross-spawn 6.0.6
++ @types/etag 1.8.4
++ @types/less 3.0.8
++ @types/node 24.13.3
++ @types/picomatch 4.0.3
++ @types/stylus 0.48.43
++ @types/ws 8.18.1
++ @vitejs/release-scripts 1.8.0
++ eslint 9.39.5
++ eslint-plugin-import-x 4.17.1
++ eslint-plugin-n 18.2.2
++ eslint-plugin-regexp 3.1.1
++ execa 9.6.1
++ globals 17.7.0
++ lint-staged 17.2.0
++ oxfmt 0.60.0
++ picocolors 1.1.1
++ playwright-chromium 1.62.0
++ rolldown 1.2.1
++ rollup 4.59.0
++ simple-git-hooks 2.13.1
++ tsx 4.23.1
++ typescript 6.0.3
++ typescript-eslint 8.65.0
++ vite 8.2.0 <- packages\vite
++ vitest 4.1.10
+. postinstall$ simple-git-hooks
+. postinstall: [INFO] Successfully set the pre-commit with command: pnpm exec lint-staged --concurrent false
+. postinstall: [INFO] Successfully set all git hooks
+. postinstall: Done
+Done in 11.6s using pnpm v10.34.5
+##[group]Run echo "PLAYWRIGHT_BROWSERS_PATH=$HOME\.cache\playwright-bin" >> $env:GITHUB_ENV
+echo "PLAYWRIGHT_BROWSERS_PATH=$HOME\.cache\playwright-bin" >> $env:GITHUB_ENV
+$env:PLAYWRIGHT_VERSION="$(pnpm ls --depth 0 --json -w playwright-chromium | jq --raw-output '.[0].devDependencies["playwright-chromium"].version')"
+echo "PLAYWRIGHT_VERSION=$env:PLAYWRIGHT_VERSION" >> $env:GITHUB_ENV
+shell: C:\Program Files\PowerShell\7\pwsh.EXE -command ". '{0}'"
+env:
+NODE_OPTIONS: --max-old-space-size=6144
+PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+VITEST_SEGFAULT_RETRY: 3
+PNPM_HOME: C:\Users\runneradmin\setup-pnpm\node_modules\.bin
+##[endgroup]
+##[group]Run actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+with:
+key: Windows-playwright-bin-v1-1.62.0
+path: C:\Users\runneradmin\.cache\playwright-bin
+restore-keys: Windows-playwright-bin-v1-
+
+enableCrossOsArchive: false
+fail-on-cache-miss: false
+lookup-only: false
+save-always: false
+env:
+NODE_OPTIONS: --max-old-space-size=6144
+PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+VITEST_SEGFAULT_RETRY: 3
+PNPM_HOME: C:\Users\runneradmin\setup-pnpm\node_modules\.bin
+PLAYWRIGHT_BROWSERS_PATH: C:\Users\runneradmin\.cache\playwright-bin
+PLAYWRIGHT_VERSION: 1.62.0
+##[endgroup]
+Cache hit for: Windows-playwright-bin-v1-1.62.0
+Received 218103808 of 314352884 (69.4%), 201.4 MBs/sec
+Received 314352884 of 314352884 (100.0%), 186.9 MBs/sec
+Cache Size: ~300 MB (314352884 B)
+[command]"C:\Program Files\Git\usr\bin\tar.exe" -xf D:/a/_temp/fc560ef7-c6f4-4d5e-92d7-11533b5b3e19/cache.tzst -P -C D:/a/vite/vite --force-local --use-compress-program "zstd -d"
+Cache restored successfully
+Cache restored from key: Windows-playwright-bin-v1-1.62.0
+##[group]Run pnpm playwright install chromium
+pnpm playwright install chromium
+shell: C:\Program Files\PowerShell\7\pwsh.EXE -command ". '{0}'"
+env:
+NODE_OPTIONS: --max-old-space-size=6144
+PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+VITEST_SEGFAULT_RETRY: 3
+PNPM_HOME: C:\Users\runneradmin\setup-pnpm\node_modules\.bin
+PLAYWRIGHT_BROWSERS_PATH: C:\Users\runneradmin\.cache\playwright-bin
+PLAYWRIGHT_VERSION: 1.62.0
+##[endgroup]
+##[group]Run pnpm run build
+pnpm run build
+shell: C:\Program Files\PowerShell\7\pwsh.EXE -command ". '{0}'"
+env:
+NODE_OPTIONS: --max-old-space-size=6144
+PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+VITEST_SEGFAULT_RETRY: 3
+PNPM_HOME: C:\Users\runneradmin\setup-pnpm\node_modules\.bin
+PLAYWRIGHT_BROWSERS_PATH: C:\Users\runneradmin\.cache\playwright-bin
+PLAYWRIGHT_VERSION: 1.62.0
+##[endgroup]
+> @vitejs/vite-monorepo@ build D:\a\vite\vite
+> pnpm -r --filter='./packages/*' run build
+Scope: 3 of 277 workspace projects
+packages/create-vite build$ tsdown
+packages/vite build$ premove dist && pnpm build-bundle && pnpm build-types
+packages/create-vite build: ℹ tsdown v0.22.14 powered by rolldown v1.2.1
+packages/create-vite build: ℹ config file: D:\a\vite\vite\packages\create-vite\tsdown.config.ts 
+packages/create-vite build: ℹ entry: src/index.ts
+packages/create-vite build: ℹ target: node20
+packages/create-vite build: ℹ tsconfig: tsconfig.json
+packages/create-vite build: ℹ Build start
+packages/create-vite build: ℹ dist\index.js  46.12 kB │ gzip: 16.46 kB
+packages/create-vite build: ℹ 1 files, total: 46.12 kB
+packages/create-vite build: ✔ Build complete in 88ms
+packages/create-vite build: Done
+packages/vite build: > vite@8.2.0 build-bundle D:\a\vite\vite\packages\vite
+packages/vite build: > rolldown --config rolldown.config.ts
+packages/vite build: shimmed: postcss-load-config/src/req.js
+packages/vite build: shimmed: postcss-import/index.js
+packages/vite build: shimmed: postcss-import/lib/parse-styles.js
+packages/vite build: [log] <DIR>/client/env.mjs  chunk │ size: 0.61 kB
+packages/vite build: [log] <DIR>/client/client.mjs  chunk │ size: 38.51 kB
+packages/vite build: [log] <DIR>/client/bundledDevClient.mjs  chunk │ size: 46.37 kB
+packages/vite build: [log] <DIR>/node/internal.js               chunk │ size:     0.14 kB
+packages/vite build: [log] <DIR>/node/index.js                  chunk │ size:     2.67 kB
+packages/vite build: [log] <DIR>/node/chunks/lib.js             chunk │ size:    11.71 kB
+packages/vite build: [log] <DIR>/node/chunks/postcss-import.js  chunk │ size:    18.43 kB
+packages/vite build: [log] <DIR>/node/cli.js                    chunk │ size:    29.85 kB
+packages/vite build: [log] <DIR>/node/chunks/build.js           chunk │ size:   205.66 kB
+packages/vite build: [log] <DIR>/node/chunks/dist.js            chunk │ size:   246.60 kB
+packages/vite build: [log] <DIR>/node/chunks/node.js            chunk │ size: 1,350.28 kB
+packages/vite build: [log] <DIR>/node/module-runner.js  chunk │ size: 54.44 kB
+packages/vite build: [log]
+packages/vite build: [success] rolldown v1.2.1 Finished in 317.85 ms
+packages/vite build: > vite@8.2.0 build-types D:\a\vite\vite\packages\vite
+packages/vite build: > pnpm build-types-roll && pnpm build-types-check
+packages/vite build: > vite@8.2.0 build-types-roll D:\a\vite\vite\packages\vite
+packages/vite build: > rolldown --config rolldown.dts.config.ts
+packages/vite build: [log] <DIR>/internal.d.ts                      chunk │ size:   0.14 kB
+packages/vite build: [log] <DIR>/chunks/moduleRunnerTransport.d.ts  chunk │ size:   3.09 kB
+packages/vite build: [log] <DIR>/module-runner.d.ts                 chunk │ size:  11.51 kB
+packages/vite build: [log] <DIR>/index.d.ts                         chunk │ size: 164.71 kB
+packages/vite build: [log]
+packages/vite build: [success] rolldown v1.2.1 Finished in 494.91 ms
+packages/vite build: > vite@8.2.0 build-types-check D:\a\vite\vite\packages\vite
+packages/vite build: > tsc --project tsconfig.check.json
+packages/vite build: Done
+packages/plugin-legacy build$ tsdown
+packages/plugin-legacy build: ℹ tsdown v0.22.14 powered by rolldown v1.2.1
+packages/plugin-legacy build: ℹ config file: D:\a\vite\vite\packages\plugin-legacy\tsdown.config.ts 
+packages/plugin-legacy build: ℹ entry: src/index.ts
+packages/plugin-legacy build: ℹ target: node20
+packages/plugin-legacy build: ℹ Build start
+packages/plugin-legacy build: ℹ dist\index.js    30.28 kB │ gzip: 8.58 kB
+packages/plugin-legacy build: ℹ dist\index.d.ts   1.39 kB │ gzip: 0.55 kB
+packages/plugin-legacy build: ℹ 2 files, total: 31.66 kB
+packages/plugin-legacy build: ✔ Build complete in 1690ms
+packages/plugin-legacy build: Done
+##[group]Run pnpm run test-unit
+pnpm run test-unit
+shell: C:\Program Files\PowerShell\7\pwsh.EXE -command ". '{0}'"
+env:
+NODE_OPTIONS: --max-old-space-size=6144
+PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+VITEST_SEGFAULT_RETRY: 3
+PNPM_HOME: C:\Users\runneradmin\setup-pnpm\node_modules\.bin
+PLAYWRIGHT_BROWSERS_PATH: C:\Users\runneradmin\.cache\playwright-bin
+PLAYWRIGHT_VERSION: 1.62.0
+##[endgroup]
+> @vitejs/vite-monorepo@ test-unit D:\a\vite\vite
+> vitest run
+RUN  v4.1.10 D:/a/vite/vite
+✓ packages/vite/src/node/__tests__/utils.spec.ts (120 tests) 90ms
+stderr | packages/vite/src/node/__tests__/config.spec.ts > mergeConfig > syncs `build.rollupOptions` and `build.rolldownOptions`
+`optimizeDeps.rollupOptions` / `ssr.optimizeDeps.rollupOptions` is deprecated. Use `optimizeDeps.rolldownOptions` instead. Note that this option may be set by a plugin. Set VITE_DEPRECATION_TRACE=1 to see where it is called.
+stderr | packages/vite/src/node/__tests__/config.spec.ts > mergeConfig > syncs `server.hmr.*` to `server.ws.*`
+`server.hmr.protocol/host/port/path/clientPort/timeout/server` is deprecated. Use `server.ws.*` instead. Note that this option may be set by a plugin. Set VITE_DEPRECATION_TRACE=1 to see where it is called.
+stderr | packages/vite/src/node/ssr/__tests__/ssrTransform.spec.ts > jsx
+`transformWithEsbuild` is deprecated and will be removed in the future. Please migrate to `transformWithOxc`.
+stderr | packages/vite/src/node/__tests__/config.spec.ts > loadConfigFromFile > load default files > load vite.config.js
+(!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+- ESM syntax in a file loaded as CommonJS (vite.config.js:1:1). Use a `.mjs` extension or set `"type": "module"` in the closest package.json
+Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+stderr | packages/vite/src/node/__tests__/config.spec.ts > loadConfigFromFile > load default files > load vite.config.js
+(!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+- ESM syntax in a file loaded as CommonJS (vite.config.js:1:1). Use a `.mjs` extension or set `"type": "module"` in the closest package.json
+Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+stderr | packages/vite/src/node/__tests__/config.spec.ts > loadConfigFromFile > load default files > load vite.config.ts
+(!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+- ESM syntax in a file loaded as CommonJS (vite.config.ts:1:1). Use a `.mjs` extension or set `"type": "module"` in the closest package.json
+Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+stderr | packages/vite/src/node/__tests__/config.spec.ts > loadConfigFromFile > load default files > load vite.config.ts
+(!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+- ESM syntax in a file loaded as CommonJS (vite.config.ts:1:1). Use a `.mjs` extension or set `"type": "module"` in the closest package.json
+Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+stderr | packages/vite/src/node/__tests__/config.spec.ts > loadConfigFromFile > cjs module vars are supported in esm
+(!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+- `__dirname` (vite.config.ts:2:12). Use `import.meta.dirname` instead
+- `__filename` (vite.config.ts:3:13). Use `import.meta.filename` instead
+Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+stderr | packages/vite/src/node/__tests__/config.spec.ts > loadConfigFromFile > shebang is preserved at the top of the file
+(!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+- ESM syntax in a file loaded as CommonJS (vite.config.ts:2:1). Use a `.mjs` extension or set `"type": "module"` in the closest package.json
+Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+stderr | packages/vite/src/node/__tests__/config.spec.ts > loadConfigFromFile > injected variables follow a hashbang ending in CRLF
+(!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+- ESM syntax in a file loaded as CommonJS (vite.config.ts:2:1). Use a `.mjs` extension or set `"type": "module"` in the closest package.json
+Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+✓ packages/vite/src/node/__tests__/config.spec.ts (105 tests) 1301ms
+✓ packages/vite/src/node/ssr/__tests__/ssrTransform.spec.ts (75 tests) 1233ms
+✓ combine mappings  956ms
+stderr | packages/vite/src/node/__tests__/plugins/css.spec.ts > css modules > css module compose/from path resolutions
+A PostCSS plugin did not pass the `from` option to `postcss.parse`. This may cause imported assets to be incorrectly transformed. If you've recently added a PostCSS plugin that raised this warning, please contact the package author to fix the issue.
+✓ packages/vite/src/node/__tests__/plugins/css.spec.ts (49 tests) 291ms
+✓ packages/vite/src/node/server/__tests__/pluginContainer.spec.ts (17 tests) 331ms
+[2K
+transforming...✓ 4 modules transformed.
+rendering chunks...
+[2K
+transforming...✓ 4 modules transformed.
+rendering chunks...
+[2K
+transforming...✓ 4 modules transformed.
+rendering chunks...
+[2K
+transforming...✓ 4 modules transformed.
+rendering chunks...
+✓ packages/vite/src/node/__tests__/build.spec.ts (61 tests) 2940ms
+✓ ssrEmitAssets  488ms
+✓ packages/vite/src/node/__tests__/plugins/hooks.spec.ts (15 tests) 942ms
+stderr | packages/vite/src/node/__tests__/plugins/esbuild.spec.ts
+`transformWithEsbuild` is deprecated and will be removed in the future. Please migrate to `transformWithOxc`.
+✓ packages/vite/src/node/__tests__/plugins/esbuild.spec.ts (22 tests) 35ms
+✓ packages/vite/src/node/ssr/runtime/__tests__/server-source-maps.spec.ts (10 tests) 448ms
+✓ packages/vite/src/node/ssr/__tests__/ssrLoadModule.spec.ts (15 tests | 1 skipped) 1164ms
+✓ packages/vite/src/node/ssr/runtime/__tests__/server-runtime.spec.ts (40 tests) 2712ms
+✓ can load virtual modules as an entry point  606ms
+✓ css is loaded correctly  367ms
+✓ packages/vite/src/node/__tests__/plugins/importGlob/parse.spec.ts (24 tests) 38ms
+✓ packages/vite/src/node/__tests__/plugins/pluginFilter.spec.ts (35 tests) 14ms
+✓ packages/vite/src/node/__tests__/scan.spec.ts (13 tests) 1929ms
+✓ scan jsx-runtime  1682ms
+✓ packages/vite/src/node/__tests__/plugins/workerImportMetaUrl.spec.ts (19 tests) 27ms
+✓ packages/vite/src/node/__tests__/html.spec.ts (12 tests) 4ms
+✓ packages/vite/src/node/__tests__/assetSource.spec.ts (16 tests) 17ms
+✓ packages/vite/src/node/__tests__/http.spec.ts (8 tests) 239ms
+✓ packages/vite/src/node/__tests__/plugins/import.spec.ts (6 tests) 11ms
+✓ packages/vite/src/node/__tests__/resolve.spec.ts (14 tests) 953ms
+✓ packages/vite/src/node/__tests__/plugins/define.spec.ts (12 tests) 247ms
+✓ packages/vite/src/node/__tests__/dev.spec.ts (6 tests) 139ms
+stdout | packages/vite/src/node/__tests__/shortcuts.spec.ts > bindCLIShortcuts > rebinds shortcuts after server restart
+11:08:04 AM [vite] server restarted.
+✓ packages/vite/src/node/__tests__/shortcuts.spec.ts (3 tests) 235ms
+✓ packages/vite/src/node/__tests__/plugins/oxc.spec.ts (10 tests) 7ms
+✓ packages/vite/src/node/ssr/runtime/__tests__/server-hmr.spec.ts (3 tests) 337ms
+✓ packages/vite/src/node/ssr/runtime/__tests__/server-worker-runner.spec.ts (2 tests) 365ms
+✓ packages/create-vite/__tests__/cli.spec.ts (23 tests) 3432ms
+✓ packages/vite/src/node/__tests__/optimizer/rolldownDepPlugin.spec.ts (8 tests) 10ms
+✓ packages/vite/src/node/server/middlewares/__tests__/indexHtml.spec.ts (3 tests) 105ms
+✓ packages/vite/src/node/server/__tests__/moduleGraph.spec.ts (3 tests) 3ms
+✓ packages/vite/src/node/__tests__/environment.spec.ts (4 tests) 1692ms
+✓ dev noExternal  446ms
+✓ dev external  452ms
+✓ css  522ms
+✓ packages/vite/src/node/ssr/runtime/__tests__/server-worker-runner.invoke.spec.ts (5 tests) 282ms
+✓ packages/vite/src/shared/__tests__/forwardConsole.spec.ts (4 tests) 108ms
+stderr | packages/vite/src/node/__tests__/plugins/importGlob/fixture.spec.ts > fixture > transform
+`transformWithEsbuild` is deprecated and will be removed in the future. Please migrate to `transformWithOxc`.
+✓ packages/vite/src/node/__tests__/plugins/importGlob/fixture.spec.ts (4 tests) 100ms
+✓ packages/vite/src/node/__tests__/optimizer/discoverBeforeListen.spec.ts (1 test) 403ms
+✓ does not crash when a dep is discovered before the server starts listening  403ms
+✓ packages/vite/src/node/__tests__/plugins/importAnalysisBuild.spec.ts (5 tests) 3ms
+✓ packages/vite/src/node/__tests__/plugins/assetImportMetaUrl.spec.ts (5 tests) 7ms
+✓ packages/vite/src/node/__tests__/runnerImport.spec.ts (5 tests) 122ms
+✓ packages/vite/src/node/__tests__/env.spec.ts (8 tests) 32ms
+✓ packages/vite/src/node/server/__tests__/sourcemap.spec.ts (11 tests) 2ms
+✓ packages/vite/src/node/__tests__/plugins/dynamicImportVar/parse.spec.ts (11 tests | 2 skipped) 11ms
+✓ packages/vite/src/node/__tests__/logger.spec.ts (6 tests) 3ms
+✓ packages/plugin-legacy/src/__tests__/snippets.spec.ts (16 tests) 20ms
+✓ packages/vite/src/node/server/__tests__/watcher.spec.ts (3 tests) 102ms
+✓ packages/vite/src/node/__tests__/plugins/wasm.spec.ts (2 tests) 1ms
+✓ packages/vite/src/node/__tests__/plugins/index.spec.ts (6 tests) 474ms
+✓ packages/plugin-legacy/src/__tests__/index.spec.ts (14 tests) 2ms
+✓ packages/vite/src/node/server/__tests__/search-root.spec.ts (7 tests) 5ms
+✓ packages/vite/src/node/server/__tests__/hmr.spec.ts (2 tests) 114ms
+✓ packages/vite/src/node/__tests__/plugins/terser.spec.ts (3 tests) 563ms
+✓ basic  326ms
+✓ packages/vite/src/node/__tests__/plugins/worker.spec.ts (1 test) 161ms
+✓ packages/vite/src/node/ssr/__tests__/ssrStacktrace.spec.ts (2 tests) 107ms
+✓ packages/vite/src/node/__tests__/plugins/cssPreprocessorTeardown.spec.ts (1 test) 552ms
+✓ awaits sass-embedded worker disposal on server.close()  552ms
+✓ packages/vite/src/node/__tests__/plugins/importGlob/utils.spec.ts (7 tests) 2ms
+✓ packages/vite/src/node/__tests__/filterRegex.spec.ts (4 tests) 7ms
+✓ packages/vite/src/node/__tests__/optimizer/pluginConverter.spec.ts (1 test) 1ms
+✓ packages/vite/src/node/__tests__/plugins/modulePreloadPolyfill/modulePreloadPolyfill.spec.ts (2 tests) 99ms
+✓ packages/vite/src/node/__tests__/external.spec.ts (2 tests) 35ms
+✓ packages/vite/src/node/__tests__/plugins/license.spec.ts (2 tests) 79ms
+✓ packages/vite/src/node/__tests__/optimizer/resolve.spec.ts (1 test) 3ms
+✓ packages/vite/src/node/__tests__/constants.spec.ts (1 test) 2ms
+✓ packages/vite/src/node/__tests__/oxc.spec.ts (1 test) 1ms
+✓ packages/vite/src/node/server/middlewares/__tests__/static.spec.ts (10 tests) 2ms
+✓ packages/vite/src/node/server/middlewares/__tests__/hostCheck.spec.ts (1 test) 1ms
+✓ packages/vite/src/node/server/__tests__/transformRequest.spec.ts (4 tests) 1ms
+✓ packages/vite/src/node/ssr/runtime/__tests__/server-no-hmr.spec.ts (1 test) 27ms
+✓ packages/plugin-legacy/src/__tests__/readme.spec.ts (1 test) 1ms
+Test Files  67 passed (67)
+Tests  910 passed | 3 skipped (913)
+Start at  11:07:56
+Duration  11.61s (transform 3.51s, setup 0ms, import 7.44s, tests 24.73s, environment 12ms)
+##[group]Run pnpm run test-serve
+pnpm run test-serve
+shell: C:\Program Files\PowerShell\7\pwsh.EXE -command ". '{0}'"
+env:
+NODE_OPTIONS: --max-old-space-size=6144
+PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+VITEST_SEGFAULT_RETRY: 3
+PNPM_HOME: C:\Users\runneradmin\setup-pnpm\node_modules\.bin
+PLAYWRIGHT_BROWSERS_PATH: C:\Users\runneradmin\.cache\playwright-bin
+PLAYWRIGHT_VERSION: 1.62.0
+##[endgroup]
+> @vitejs/vite-monorepo@ test-serve D:\a\vite\vite
+> vitest run -c vitest.config.e2e.ts
+RUN  v4.1.10 D:/a/vite/vite
+stderr | playground/tsconfig-json/__tests__/tsconfig-json.spec.ts > transformWithEsbuild > merge tsconfigRaw object
+`transformWithEsbuild` is deprecated and will be removed in the future. Please migrate to `transformWithOxc`.
+(node:7928) [DEP0169] DeprecationWarning: `url.parse()` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for `url.parse()` vulnerabilities.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+stderr | app.logerror (D:\a\vite\vite\node_modules\.pnpm\express@5.2.1_ms@2.1.3\node_modules\express\lib\application.js:617:43)
+Error: Vite module runner has been closed.
+at SSRCompatModuleRunner.getModuleInformation (file:///D:/a/vite/vite/packages/vite/dist/node/module-runner.js:1203:26)
+at SSRCompatModuleRunner.cachedModule (file:///D:/a/vite/vite/packages/vite/dist/node/module-runner.js:1185:18)
+at SSRCompatModuleRunner.import (file:///D:/a/vite/vite/packages/vite/dist/node/module-runner.js:1128:34)
+at instantiateModule (file:///D:/a/vite/vite/packages/vite/dist/node/chunks/node.js:11796:29)
+at D:/a/vite/vite/playground-temp/ssr/server.js:49:23
+········································-········································-···························-············-----·······--·························--------···························-······················-------····························································································-·············································---····-··························································--·-·····-·············-·························-···········--······-···············-··--···················--·······························--·······························--·····················----------------···--------··················--···············---·····-····--··-············-·-······················--·······-···-············--·························-···························································--····················-···············------···-··································--·-···············--························-·················----····--·····--···-·······--·---·----·--·················---------····--···-----········-···-···························-····---·-····--·-·····-···-·-··································································--··························-······-··························-····---·-
+Test Files  91 passed | 17 skipped (108)
+Tests  1128 passed | 165 skipped (1293)
+Start at  11:08:09
+Duration  103.01s (transform 1.55s, setup 85.77s, import 6.71s, tests 170.63s, environment 23ms)
+##[group]Run pnpm run test-serve-bundled
+pnpm run test-serve-bundled
+shell: C:\Program Files\PowerShell\7\pwsh.EXE -command ". '{0}'"
+env:
+NODE_OPTIONS: --max-old-space-size=6144
+PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+VITEST_SEGFAULT_RETRY: 3
+PNPM_HOME: C:\Users\runneradmin\setup-pnpm\node_modules\.bin
+PLAYWRIGHT_BROWSERS_PATH: C:\Users\runneradmin\.cache\playwright-bin
+PLAYWRIGHT_VERSION: 1.62.0
+##[endgroup]
+> @vitejs/vite-monorepo@ test-serve-bundled D:\a\vite\vite
+> VITE_TEST_BUNDLED_DEV=1 vitest run -c vitest.config.e2e.ts
+RUN  v4.1.10 D:/a/vite/vite
+stderr | playground/ssr/__tests__/ssr.spec.ts
+Error: transport was disconnected, cannot call "fetchModule"
+at reviveInvokeError (file:///D:/a/vite/vite/packages/vite/dist/node/module-runner.js:554:14)
+at Object.invoke (file:///D:/a/vite/vite/packages/vite/dist/node/module-runner.js:628:11)
+at processTicksAndRejections (node:internal/process/task_queues:104:5)
+at SSRCompatModuleRunner.getModuleInformation (file:///D:/a/vite/vite/packages/vite/dist/node/module-runner.js:1208:7)
+at request (file:///D:/a/vite/vite/packages/vite/dist/node/module-runner.js:1225:83)
+at D:\a\vite\vite\playground-temp\ssr\src\app.js:1:1
+at ESModulesEvaluator.runInlinedModule (file:///D:/a/vite/vite/packages/vite/dist/node/module-runner.js:1015:3)
+at SSRCompatModuleRunner.directRequest (file:///D:/a/vite/vite/packages/vite/dist/node/module-runner.js:1268:59)
+at SSRCompatModuleRunner.directRequest (file:///D:/a/vite/vite/packages/vite/dist/node/chunks/node.js:11824:20)
+at SSRCompatModuleRunner.cachedRequest (file:///D:/a/vite/vite/packages/vite/dist/node/module-runner.js:1175:73)
+stderr | playground/tsconfig-json/__tests__/tsconfig-json.spec.ts > transformWithEsbuild > merge tsconfigRaw object
+`transformWithEsbuild` is deprecated and will be removed in the future. Please migrate to `transformWithOxc`.
+············································--···················-··--·························-·-····-·-···-···············--·-·······-··--···········-·······--··············-········································-····--·---·········---··-·-···········-··················--·····-··--·-····-···-··----------··-··············----------------·····-·-·--·-··--····-·--·····-········--···············-·-·····--····--·····------------------------------
+Test Files  56 passed | 17 skipped (73)
+Tests  333 passed | 116 skipped (449)
+Start at  11:09:53
+Duration  56.67s (transform 1.02s, setup 56.99s, import 2.28s, tests 84.68s, environment 14ms)
+##[group]Run pnpm run test-build
+pnpm run test-build
+shell: C:\Program Files\PowerShell\7\pwsh.EXE -command ". '{0}'"
+env:
+NODE_OPTIONS: --max-old-space-size=6144
+PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+VITEST_SEGFAULT_RETRY: 3
+PNPM_HOME: C:\Users\runneradmin\setup-pnpm\node_modules\.bin
+PLAYWRIGHT_BROWSERS_PATH: C:\Users\runneradmin\.cache\playwright-bin
+PLAYWRIGHT_VERSION: 1.62.0
+##[endgroup]
+> @vitejs/vite-monorepo@ test-build D:\a\vite\vite
+> VITE_TEST_BUILD=1 vitest run -c vitest.config.e2e.ts
+RUN  v4.1.10 D:/a/vite/vite
+stderr | playground/tsconfig-json/__tests__/tsconfig-json.spec.ts > transformWithEsbuild > merge tsconfigRaw object
+`transformWithEsbuild` is deprecated and will be removed in the future. Please migrate to `transformWithOxc`.
+stderr | playground/ssr-resolve/__tests__/ssr-resolve.spec.ts
+(!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+- ESM syntax in a file loaded as CommonJS (vite.config.js:1:1). Use a `.mjs` extension or set `"type": "module"` in the closest package.json
+Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+stderr | playground/ssr-resolve/__tests__/ssr-resolve.spec.ts
+(!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+- ESM syntax in a file loaded as CommonJS (vite.config.js:1:1). Use a `.mjs` extension or set `"type": "module"` in the closest package.json
+Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+-------------······------------···········--····································-··································································································································································································································-·····------·······-·····-·····-------------------------------------------------------------····--·--····---·---·------------------------------------------------------------------------··--·--·---·---················-·····---······-··························-·······-···-·-····-·-··----·······-----------·······································································-----·-----------···-·················································································---·············-···········-··-----··-·······················-······························································-···--·······················-··----··········---····························-················-----····························-································--·-·-······-·-·······-············································-···-·······················-···---------···························
+Test Files  93 passed | 14 skipped (107)
+Tests  922 passed | 282 skipped (1204)
+Start at  11:10:52
+Duration  86.77s (transform 1.68s, setup 87.70s, import 4.54s, tests 126.66s, environment 23ms)
+Post job cleanup.
+Cache hit occurred on the primary key Windows-playwright-bin-v1-1.62.0, not saving cache.
+Post job cleanup.
+Cache hit occurred on the primary key node-cache-Windows-x64-pnpm-bcc8b0f3fee9de2eb53f8cda16b5f4906ca2c2f66661e92bce021a997500d8be, not saving cache.
+Post job cleanup.
+Pruning is unnecessary.
+Post job cleanup.
+[command]"C:\Program Files\Git\bin\git.exe" version
+git version 2.55.0.windows.3
+Temporarily overriding HOME='D:\a\_temp\daee6b54-5411-4437-a1c3-93a3fcf67c07' before making global git config changes
+Adding repository directory to the temporary git global config as a safe directory
+[command]"C:\Program Files\Git\bin\git.exe" config --global --add safe.directory D:\a\vite\vite
+Removing SSH command configuration
+[command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp core\.sshCommand
+[command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "sh -c \"git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :\""
+Removing HTTP extra header
+[command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "sh -c \"git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :\""
+Removing includeIf entries pointing to credentials config files
+[command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp ^includeIf\.gitdir:
+[command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "git config --local --show-origin --name-only --get-regexp remote.origin.url"
+Cleaning up orphan processes

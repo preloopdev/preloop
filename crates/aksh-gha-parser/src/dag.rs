@@ -300,6 +300,7 @@ mod tests {
                 .map(|n| aksh_gha_protocol::JobId(n.to_string()))
                 .collect(),
             matrix: Default::default(),
+            matrix_index: None,
             env: Default::default(),
             steps: vec![],
             if_condition: None,

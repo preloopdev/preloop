@@ -1,0 +1,914 @@
+﻿2026-08-01T02:36:37.0784326Z Current runner version: '2.336.0'
+##[group]Runner Image Provisioner
+Hosted Compute Agent
+Version: 20260707.563
+Commit: 02667638d2b423fbc733a8e32a88b44996a3ba6e
+Build Date: 2026-07-07T19:33:50Z
+Worker ID: {5347788c-f549-4b1b-80d4-ea35abde0368}
+Azure Region: centralus
+##[endgroup]
+##[group]Operating System
+Ubuntu
+24.04.4
+LTS
+##[endgroup]
+##[group]Runner Image
+Image: ubuntu-24.04
+Version: 20260720.247.2
+Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260720.247/images/ubuntu/Ubuntu2404-Readme.md
+Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260720.247
+##[endgroup]
+##[group]GITHUB_TOKEN Permissions
+Metadata: read
+##[endgroup]
+Secret source: None
+Prepare workflow directory
+Prepare all required actions
+Getting action download info
+Download action repository 'actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0' (SHA:9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0)
+Download action repository 'taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9' (SHA:a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9)
+Uses: astral-sh/uv/.github/workflows/check-lint.yml@refs/pull/20876/merge (81742a27ad62bb1dd1289a164f1776508279c756)
+##[group] Inputs
+code-changed: false
+save-rust-cache: false
+##[endgroup]
+Complete job name: check-lint / cargo shear
+##[group]Run actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+with:
+persist-credentials: false
+repository: astral-sh/uv
+token: ***
+ssh-strict: true
+ssh-user: git
+clean: true
+sparse-checkout-cone-mode: true
+fetch-depth: 1
+fetch-tags: false
+show-progress: true
+lfs: false
+submodules: false
+set-safe-directory: true
+allow-unsafe-pr-checkout: false
+env:
+CARGO_INCREMENTAL: 0
+CARGO_NET_RETRY: 10
+CARGO_TERM_COLOR: always
+HAWK_VERSION: 0.1.9
+RUSTUP_MAX_RETRIES: 10
+##[endgroup]
+Syncing repository: astral-sh/uv
+##[group]Getting Git version info
+Working directory is '/home/runner/work/uv/uv'
+[command]/usr/bin/git version
+git version 2.54.0
+##[endgroup]
+Temporarily overriding HOME='/home/runner/work/_temp/a3ad84e3-3682-4308-95d7-c842f1d0fb4b' before making global git config changes
+Adding repository directory to the temporary git global config as a safe directory
+[command]/usr/bin/git config --global --add safe.directory /home/runner/work/uv/uv
+Deleting the contents of '/home/runner/work/uv/uv'
+##[group]Determining repository object format
+##[endgroup]
+##[group]Initializing the repository
+[command]/usr/bin/git init /home/runner/work/uv/uv
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /home/runner/work/uv/uv/.git/
+[command]/usr/bin/git remote add origin https://github.com/astral-sh/uv
+##[endgroup]
+##[group]Disabling automatic garbage collection
+[command]/usr/bin/git config --local gc.auto 0
+##[endgroup]
+##[group]Setting up auth
+Removing SSH command configuration
+[command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Removing HTTP extra header
+[command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Removing includeIf entries pointing to credentials config files
+[command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+[command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+[command]/usr/bin/git config --file /home/runner/work/_temp/git-credentials-04527ac8-126e-4e92-87ef-15204e1c1cfb.config http.https://github.com/.extraheader AUTHORIZATION: basic ***
+[command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/uv/uv/.git.path /home/runner/work/_temp/git-credentials-04527ac8-126e-4e92-87ef-15204e1c1cfb.config
+[command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/uv/uv/.git/worktrees/*.path /home/runner/work/_temp/git-credentials-04527ac8-126e-4e92-87ef-15204e1c1cfb.config
+[command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-04527ac8-126e-4e92-87ef-15204e1c1cfb.config
+[command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-04527ac8-126e-4e92-87ef-15204e1c1cfb.config
+##[endgroup]
+##[group]Fetching the repository
+[command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +81742a27ad62bb1dd1289a164f1776508279c756:refs/remotes/pull/20876/merge
+From https://github.com/astral-sh/uv
+* [new ref]         81742a27ad62bb1dd1289a164f1776508279c756 -> pull/20876/merge
+##[endgroup]
+##[group]Determining the checkout info
+##[endgroup]
+[command]/usr/bin/git sparse-checkout disable
+[command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+##[group]Checking out the ref
+[command]/usr/bin/git checkout --progress --force refs/remotes/pull/20876/merge
+Note: switching to 'refs/remotes/pull/20876/merge'.
+You are in 'detached HEAD' state. You can look around, make experimental
+changes and commit them, and you can discard any commits you make in this
+state without impacting any branches by switching back to a branch.
+If you want to create a new branch to retain commits you create, you may
+do so (now or later) by using -c with the switch command. Example:
+git switch -c <new-branch-name>
+Or undo this operation with:
+git switch -
+Turn off this advice by setting config variable advice.detachedHead to false
+HEAD is now at 81742a2 Merge 1ddf5b709ad49bba88e6607af0d2a1bbe0c03ff5 into 79bbface771210df216b738e9bdc7df95e5a9e6b
+##[endgroup]
+[command]/usr/bin/git log -1 --format=%H
+81742a27ad62bb1dd1289a164f1776508279c756
+##[group]Removing auth
+Removing SSH command configuration
+[command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Removing HTTP extra header
+[command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Removing includeIf entries pointing to credentials config files
+[command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+includeif.gitdir:/home/runner/work/uv/uv/.git.path
+includeif.gitdir:/home/runner/work/uv/uv/.git/worktrees/*.path
+includeif.gitdir:/github/workspace/.git.path
+includeif.gitdir:/github/workspace/.git/worktrees/*.path
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/uv/uv/.git.path
+/home/runner/work/_temp/git-credentials-04527ac8-126e-4e92-87ef-15204e1c1cfb.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/uv/uv/.git.path /home/runner/work/_temp/git-credentials-04527ac8-126e-4e92-87ef-15204e1c1cfb.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/uv/uv/.git/worktrees/*.path
+/home/runner/work/_temp/git-credentials-04527ac8-126e-4e92-87ef-15204e1c1cfb.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/uv/uv/.git/worktrees/*.path /home/runner/work/_temp/git-credentials-04527ac8-126e-4e92-87ef-15204e1c1cfb.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git.path
+/github/runner_temp/git-credentials-04527ac8-126e-4e92-87ef-15204e1c1cfb.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-04527ac8-126e-4e92-87ef-15204e1c1cfb.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git/worktrees/*.path
+/github/runner_temp/git-credentials-04527ac8-126e-4e92-87ef-15204e1c1cfb.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-04527ac8-126e-4e92-87ef-15204e1c1cfb.config
+[command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+Removing credentials config '/home/runner/work/_temp/git-credentials-04527ac8-126e-4e92-87ef-15204e1c1cfb.config'
+##[endgroup]
+##[group]Run taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9
+with:
+tool: cargo-shear@1.12.4
+checksum: true
+fallback: cargo-binstall
+env:
+CARGO_INCREMENTAL: 0
+CARGO_NET_RETRY: 10
+CARGO_TERM_COLOR: always
+HAWK_VERSION: 0.1.9
+RUSTUP_MAX_RETRIES: 10
+##[endgroup]
+##[start-action display=Run bail() {;id=__taiki-e_install-action.__run]
+##[group]Run bail() {
+bail() {
+printf '::error::install-action: %s\n' "$*"
+exit 1
+}
+# If /bin/sh is dash, environment variable containing % is not imported, but is fine
+# because it also means that it will not be exposed to subprocess.
+if /usr/bin/env | grep -Eq '^BASH_FUNC_'; then
+bail 'bash function injection via BASH_FUNC_ environment variable is not allowed for security reasons'
+fi
+if ! command -v bash >/dev/null; then
+if grep -Eq '^ID=alpine' /etc/os-release; then
+printf '::group::Install packages required for install-action (bash)\n'
+# NB: sync with apk_install in main.sh
+if command -v sudo >/dev/null; then
+sudo apk --no-cache add bash
+elif command -v doas >/dev/null; then
+doas apk --no-cache add bash
+else
+apk --no-cache add bash
+fi
+printf '::endgroup::\n'
+else
+bail 'this action requires bash'
+fi
+fi
+bash --noprofile --norc "${GITHUB_ACTION_PATH:?}/main.sh"
+shell: /usr/bin/env -u ENV -u BASH_ENV -u CDPATH -u SHELLOPTS -u BASHOPTS /bin/sh -eu {0}
+env:
+CARGO_INCREMENTAL: 0
+CARGO_NET_RETRY: 10
+CARGO_TERM_COLOR: always
+HAWK_VERSION: 0.1.9
+RUSTUP_MAX_RETRIES: 10
+INPUT_TOOL: cargo-shear@1.12.4
+INPUT_CHECKSUM: true
+INPUT_FALLBACK: cargo-binstall
+DEFAULT_GITHUB_TOKEN: ***
+ACTION_USER_AGENT: taiki-e/install-action (a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9)
+RUNNER_OS: Linux
+RUNNER_ARCH: X64
+##[endgroup]
+info: host platform: x86_64_linux
+info: installing cargo-shear@1.12.4
+info: downloading https://github.com/Boshen/cargo-shear/releases/download/v1.12.4/cargo-shear-x86_64-unknown-linux-musl.tar.gz
+info: verifying sha256 checksum for cargo-shear-x86_64-unknown-linux-musl.tar.gz
+info: cargo-shear installed at /home/runner/.cargo/bin/cargo-shear
++ cargo-shear shear --version
+Version: dev
+##[end-action id=__taiki-e_install-action.__run;outcome=success;conclusion=success;duration_ms=427]
+##[start-action display=Run Set-StrictMode -Version Latest;id=__taiki-e_install-action.__run_2]
+##[end-action id=__taiki-e_install-action.__run_2;outcome=skipped;conclusion=skipped;duration_ms=0]
+##[group]Run cargo shear --deny-warnings
+cargo shear --deny-warnings
+shell: /usr/bin/bash -e {0}
+env:
+CARGO_INCREMENTAL: 0
+CARGO_NET_RETRY: 10
+CARGO_TERM_COLOR: always
+HAWK_VERSION: 0.1.9
+RUSTUP_MAX_RETRIES: 10
+##[endgroup]
+info: syncing channel updates for 1.97.1-x86_64-unknown-linux-gnu
+info: latest update on 2026-07-16 for version 1.97.1 (8bab26f4f 2026-07-14)
+info: downloading 3 components
+Updating crates.io index
+Downloading crates ...
+Downloaded adler2 v2.0.1
+Downloaded asn1-rs-derive v0.6.0
+Downloaded cfg-if v1.0.4
+Downloaded const-random-macro v0.1.16
+Downloaded allocator-api2 v0.2.21
+Downloaded anstream v1.0.0
+Downloaded core-foundation v0.10.1
+Downloaded aes v0.8.4
+Downloaded html-escape v0.2.14
+Downloaded ambient-id v0.0.11
+Downloaded anyhow v1.0.104
+Downloaded axoupdater v0.10.0
+Downloaded asn1-rs-impl v0.2.0
+Downloaded asn1-rs v0.7.1
+Downloaded aho-corasick v1.1.4
+Downloaded assert-json-diff v2.0.2
+Downloaded axoprocess v0.2.1
+Downloaded hmac v0.13.0
+Downloaded async-recursion v1.1.1
+Downloaded is_ci v1.2.0
+Downloaded http v1.4.2
+Downloaded jobserver v0.1.35
+Downloaded homedir v0.3.6
+Downloaded is-docker v0.2.0
+Downloaded cast v0.3.0
+Downloaded color_quant v1.1.0
+Downloaded astral-pubgrub v0.6.0
+Downloaded cfg_aliases v0.2.1
+Downloaded mime v0.3.17
+Downloaded num v0.4.3
+Downloaded lru-slab v0.1.2
+Downloaded num_cpus v1.17.0
+Downloaded atomic-waker v1.1.2
+Downloaded clap_lex v1.1.0
+Downloaded anstyle-wincon v3.0.11
+Downloaded astral-reqwest-retry v0.9.1
+Downloaded approx v0.5.1
+Downloaded bitflags v1.3.2
+Downloaded bytecheck_derive v0.8.2
+Downloaded block-buffer v0.10.4
+Downloaded arrayref v0.3.9
+Downloaded block-buffer v0.12.1
+Downloaded ciborium-io v0.2.2
+Downloaded jiff-tzdb-platform v0.1.3
+Downloaded num-complex v0.4.6
+Downloaded anstyle-query v1.1.5
+Downloaded axotag v0.3.0
+Downloaded charset v0.1.5
+Downloaded clap_complete_command v0.6.1
+Downloaded assert_fs v1.1.4
+Downloaded bit-vec v0.9.1
+Downloaded async-channel v2.5.0
+Downloaded block-padding v0.3.3
+Downloaded cmov v0.5.4
+Downloaded borrow-or-share v0.2.4
+Downloaded async-broadcast v0.7.2
+Downloaded autocfg v1.5.0
+Downloaded codspeed-criterion-compat v5.0.1
+Downloaded concurrent-queue v2.5.0
+Downloaded inout v0.1.4
+Downloaded astral_async_http_range_reader v0.11.0
+Downloaded colorchoice v1.0.5
+Downloaded const-random v0.1.18
+Downloaded is-terminal v0.4.17
+Downloaded is-wsl v0.4.0
+Downloaded jni-sys v0.4.1
+Downloaded bytecheck v0.8.2
+Downloaded memoffset v0.9.1
+Downloaded secrecy v0.10.3
+Downloaded anstyle v1.0.14
+Downloaded astral-reqwest-middleware v0.5.1
+Downloaded async-trait v0.1.89
+Downloaded backon v1.6.0
+Downloaded byteorder v1.5.0
+Downloaded cbc v0.1.2
+Downloaded configparser v3.2.0
+Downloaded core-foundation v0.9.4
+Downloaded anes v0.1.6
+Downloaded assert_cmd v2.2.2
+Downloaded byteorder-lite v0.1.0
+Downloaded is_terminal_polyfill v1.70.2
+Downloaded itoa v1.0.17
+Downloaded anstyle-parse v1.0.0
+Downloaded astral-version-ranges v0.2.1
+Downloaded cargo-util v0.2.30
+Downloaded ciborium-ll v0.2.2
+Downloaded cipher v0.4.4
+Downloaded console v0.16.4
+Downloaded hermit-abi v0.5.2
+Downloaded httpdate v1.0.3
+Downloaded imagesize v0.14.0
+Downloaded indoc v2.0.7
+Downloaded litemap v0.8.1
+Downloaded matchers v0.2.0
+Downloaded mimalloc v0.1.52
+Downloaded normalize-line-endings v0.3.0
+Downloaded signature v2.2.0
+Downloaded arcstr v1.2.0
+Downloaded arrayvec v0.7.8
+Downloaded astral-tl v0.7.11
+Downloaded base64ct v1.8.3
+Downloaded clap_complete_nushell v4.6.0
+Downloaded cmake v0.1.57
+Downloaded colored v3.1.1
+Downloaded const-oid v0.9.6
+Downloaded http-body v1.0.1
+Downloaded icu_provider v2.1.1
+Downloaded smawk v0.3.2
+Downloaded boxcar v0.2.14
+Downloaded clap v4.6.3
+Downloaded clap_derive v4.6.3
+Downloaded serde-untagged v0.1.9
+Downloaded ciborium v0.2.2
+Downloaded signal-hook-registry v1.4.8
+Downloaded bitflags v2.13.1
+Downloaded camino v1.2.2
+Downloaded roxmltree v0.20.0
+Downloaded schannel v0.1.29
+Downloaded seize v0.5.1
+Downloaded tagu v0.1.6
+Downloaded target-lexicon v0.13.5
+Downloaded test-case-macros v3.3.1
+Downloaded test-log v0.2.20
+Downloaded astral-tokio-tar v0.6.3
+Downloaded astral_async_zip v0.0.20
+Downloaded axoasset v2.0.1
+Downloaded base64 v0.22.1
+Downloaded blake2 v0.11.0-rc.6
+Downloaded block2 v0.6.2
+Downloaded bumpalo v3.20.2
+Downloaded bytemuck v1.25.0
+Downloaded bytes v1.12.1
+Downloaded clap_complete v4.6.0
+Downloaded const-oid v0.10.2
+Downloaded http-content-range v0.2.4
+Downloaded jni-sys-macros v0.4.1
+Downloaded lazy_static v1.5.0
+Downloaded rustls-platform-verifier v0.7.0
+Downloaded serde_yaml v0.9.34+deprecated
+Downloaded sharded-slab v0.1.7
+Downloaded async-compression v0.4.19
+Downloaded idna_adapter v1.2.1
+Downloaded libredox v0.1.14
+Downloaded num-conv v0.2.0
+Downloaded roxmltree v0.21.1
+Downloaded tower-layer v0.3.3
+Downloaded tracing-test-macro v0.2.6
+Downloaded cc v1.2.57
+Downloaded codspeed-criterion-compat-walltime v5.0.1
+Downloaded combine v4.6.7
+Downloaded jiff-static v0.2.34
+Downloaded rkyv v0.8.17
+Downloaded serde_json v1.0.150
+Downloaded strip-ansi-escapes v0.2.1
+Downloaded tokio-util v0.7.18
+Downloaded toml v1.1.3+spec-1.1.0
+Downloaded tracing-core v0.1.36
+Downloaded tracing-test v0.2.6
+Downloaded unicode-ccc v0.4.0
+Downloaded unicode-linebreak v0.1.5
+Downloaded unicode-properties v0.1.4
+Downloaded unicode-script v0.5.8
+Downloaded wasi v0.11.1+wasi-snapshot-preview1
+Downloaded windows-collections v0.2.0
+Downloaded aws-lc-rs v1.16.2
+Downloaded clap_builder v4.6.2
+Downloaded hybrid-array v0.4.13
+Downloaded ignore v0.4.31
+Downloaded ipnet v2.12.0
+Downloaded munge v0.4.7
+Downloaded munge_macro v0.4.7
+Downloaded num-iter v0.1.45
+Downloaded siphasher v1.0.2
+Downloaded strsim v0.11.1
+Downloaded supports-hyperlinks v3.2.0
+Downloaded sync_wrapper v1.0.2
+Downloaded tracing-subscriber v0.3.23
+Downloaded wasm-bindgen v0.2.114
+Downloaded wasm-bindgen-futures v0.4.64
+Downloaded windows-numerics v0.2.0
+Downloaded junction v2.0.0
+Downloaded mime_guess v2.0.5
+Downloaded num-rational v0.4.2
+Downloaded bstr v1.12.1
+Downloaded rustix v1.1.4
+Downloaded wasip2 v1.0.4+wasi-0.2.12
+Downloaded windows-link v0.1.3
+Downloaded windows-link v0.2.1
+Downloaded zbus_names v4.3.2
+Downloaded wiremock v0.6.5
+Downloaded zerovec-derive v0.11.2
+Downloaded wit-bindgen v0.57.1
+Downloaded num-integer v0.1.46
+Downloaded miette-derive v7.6.0
+Downloaded windows_aarch64_gnullvm v0.52.6
+Downloaded codspeed v5.0.1
+Downloaded core-foundation-sys v0.8.7
+Downloaded deadpool-runtime v0.1.4
+Downloaded httparse v1.10.1
+Downloaded miow v0.6.1
+Downloaded defmt v1.1.0
+Downloaded indicatif v0.18.6
+Downloaded miniz_oxide v0.8.9
+Downloaded nu-ansi-term v0.50.3
+Downloaded version_check v0.9.5
+Downloaded heck v0.5.0
+Downloaded hyper-rustls v0.27.7
+Downloaded thiserror-impl v2.0.19
+Downloaded winnow v1.0.3
+Downloaded zlib-rs v0.6.3
+Downloaded cyclonedx-bom-macros v0.1.0
+Downloaded defmt-parser v1.0.0
+Downloaded der-parser v10.0.0
+Downloaded deranged v0.5.8
+Downloaded endi v1.1.1
+Downloaded enumflags2 v0.7.12
+Downloaded float-cmp v0.10.0
+Downloaded rancor v0.1.1
+Downloaded defmt-macros v1.1.0
+Downloaded diff v0.1.13
+Downloaded encoding_rs_io v0.1.7
+Downloaded fixedbitset v0.5.7
+Downloaded float-cmp v0.9.0
+Downloaded fnv v1.0.7
+Downloaded globwalk v0.9.1
+Downloaded gloo-timers v0.3.0
+Downloaded thread_local v1.1.9
+Downloaded memmap2 v0.9.10
+Downloaded http-body-util v0.1.4
+Downloaded lock_api v0.4.14
+Downloaded mailparse v0.16.1
+Downloaded md-5 v0.11.0
+Downloaded fluent-uri v0.4.1
+Downloaded globset v0.4.19
+Downloaded hashbrown v0.15.5
+Downloaded hex v0.4.3
+Downloaded jiff-tzdb v0.1.8
+Downloaded jni-macros v0.22.4
+Downloaded memchr v2.8.3
+Downloaded num-traits v0.2.19
+Downloaded once_cell_polyfill v1.70.2
+Downloaded reqsign v0.20.2
+Downloaded reqsign-core v3.1.0
+Downloaded reqsign-google v3.0.2
+Downloaded rusticata-macros v4.1.0
+Downloaded rustls-pki-types v1.15.0
+Downloaded writeable v0.6.2
+Downloaded zmij v1.0.21
+Downloaded zstd v0.13.3
+Downloaded zstd-safe v7.2.4
+Downloaded der v0.7.10
+Downloaded flate2 v1.1.9
+Downloaded half v2.7.1
+Downloaded image-webp v0.2.4
+Downloaded js-sys v0.3.91
+Downloaded r-efi v6.0.0
+Downloaded reqsign-file-read-tokio v3.0.2
+Downloaded rmp v0.8.15
+Downloaded rustls-platform-verifier-android v0.1.1
+Downloaded scopeguard v1.2.0
+Downloaded socket2 v0.6.3
+Downloaded h2 v0.4.15
+Downloaded hashbrown v0.14.5
+Downloaded hashbrown v0.17.1
+Downloaded rand v0.8.6
+Downloaded rand v0.9.4
+Downloaded regex v1.13.1
+Downloaded same-file v1.0.6
+Downloaded schemars_derive v1.2.1
+Downloaded csv-core v0.1.13
+Downloaded foldhash v0.1.5
+Downloaded foldhash v0.2.0
+Downloaded icu_locale_core v2.1.1
+Downloaded wasm-bindgen-macro v0.2.114
+Downloaded core_maths v0.1.1
+Downloaded goblin v0.10.7
+Downloaded icu_normalizer_data v2.1.1
+Downloaded log v0.4.29
+Downloaded minimal-lexical v0.2.1
+Downloaded objc2-encode v4.1.0
+Downloaded oid-registry v0.8.1
+Downloaded oorandom v11.1.5
+Downloaded rustls-native-certs v0.8.4
+Downloaded scroll_derive v0.13.1
+Downloaded scrypt v0.11.0
+Downloaded shell-escape v0.1.5
+Downloaded tower-service v0.3.3
+Downloaded want v0.3.1
+Downloaded wasm-bindgen-shared v0.2.114
+Downloaded hmac v0.12.1
+Downloaded icu_collections v2.1.1
+Downloaded icu_normalizer v2.1.1
+Downloaded icu_properties v2.1.2
+Downloaded once_cell v1.21.4
+Downloaded rust-ini v0.21.3
+Downloaded schemars v1.2.1
+Downloaded scroll v0.13.0
+Downloaded sha1 v0.11.0
+Downloaded tiny-keccak v2.0.2
+Downloaded tinystr v0.8.2
+Downloaded rsa v0.9.10
+Downloaded time-core v0.1.8
+Downloaded hyper-util v0.1.20
+Downloaded mio v1.2.0
+Downloaded quinn-udp v0.5.15
+Downloaded rmp-serde v1.3.1
+Downloaded rustc-hash v2.1.3
+Downloaded rustc_version v0.4.1
+Downloaded rustls-webpki v0.103.13
+Downloaded rustversion v1.0.22
+Downloaded ryu v1.0.23
+Downloaded salsa20 v0.10.2
+Downloaded tracing-tree v0.4.1
+Downloaded walkdir v2.5.0
+Downloaded which v8.0.5
+Downloaded windows_x86_64_msvc v0.52.6
+Downloaded pest_generator v2.8.6
+Downloaded proc-macro2 v1.0.107
+Downloaded r-efi v5.3.0
+Downloaded url v2.5.8
+Downloaded winapi-util v0.1.11
+Downloaded zune-jpeg v0.5.13
+Downloaded difflib v0.4.0
+Downloaded hyper v1.10.1
+Downloaded icu_properties_data v2.1.2
+Downloaded idna v1.1.0
+Downloaded indexmap v2.14.0
+Downloaded insta v1.48.0
+Downloaded iri-string v0.7.10
+Downloaded itertools v0.10.5
+Downloaded jiff-core v0.1.0
+Downloaded libm v0.2.16
+Downloaded miette v7.6.0
+Downloaded nom v7.1.3
+Downloaded num-bigint v0.4.6
+Downloaded num-bigint-dig v0.8.6
+Downloaded openssl-probe v0.2.1
+Downloaded option-ext v0.2.0
+Downloaded rustix v0.38.44
+Downloaded rustls v0.23.42
+Downloaded time-macros v0.2.27
+Downloaded tiny-skia-path v0.12.0
+Downloaded unsafe-libyaml v0.2.11
+Downloaded wasm-bindgen-macro-support v0.2.114
+Downloaded web-time v1.1.0
+Downloaded windows-future v0.2.1
+Downloaded zvariant v5.11.0
+Downloaded zvariant_derive v5.11.0
+Downloaded zvariant_utils v3.3.1
+Downloaded cpufeatures v0.2.17
+Downloaded data-encoding v2.11.0
+Downloaded data-url v0.3.2
+Downloaded deadpool v0.12.3
+Downloaded digest v0.10.7
+Downloaded digest v0.11.3
+Downloaded dirs v6.0.0
+Downloaded hkdf v0.12.4
+Downloaded itertools v0.14.0
+Downloaded jni v0.22.4
+Downloaded kurbo v0.13.0
+Downloaded markdown v1.0.0
+Downloaded moxcms v0.8.1
+Downloaded ordered-float v5.3.0
+Downloaded pathdiff v0.2.3
+Downloaded predicates v3.1.4
+Downloaded procfs v0.18.0
+Downloaded quick-error v2.0.1
+Downloaded rand_chacha v0.3.1
+Downloaded rand_chacha v0.9.0
+Downloaded reqsign-command-execute-tokio v3.0.2
+Downloaded reqsign-http-send-reqwest v4.0.2
+Downloaded serde_derive v1.0.229
+Downloaded slab v0.4.12
+Downloaded stable_deref_trait v1.2.1
+Downloaded strict-num v0.1.1
+Downloaded tokio-macros v2.7.0
+Downloaded toml_parser v1.1.2+spec-1.1.0
+Downloaded wasm-streams v0.5.0
+Downloaded wasmtimer v0.4.3
+Downloaded web-sys v0.3.91
+Downloaded weezl v0.1.12
+Downloaded widestring v1.2.1
+Downloaded image v0.25.10
+Downloaded nix v0.30.1
+Downloaded nix v0.31.3
+Downloaded objc2 v0.6.4
+Downloaded open v5.4.0
+Downloaded pest_meta v2.8.6
+Downloaded reqwest v0.13.4
+Downloaded rustybuzz v0.20.1
+Downloaded simd-adler32 v0.3.8
+Downloaded strum v0.28.0
+Downloaded tiny-skia v0.12.0
+Downloaded toml_datetime v1.1.1+spec-1.1.0
+Downloaded vte v0.14.1
+Downloaded webpki-root-certs v1.0.9
+Downloaded yoke-derive v0.8.1
+Downloaded zstd-sys v2.0.16+zstd.1.5.7
+Downloaded zune-core v0.5.1
+Downloaded libmimalloc-sys v0.1.49
+Downloaded petgraph v0.8.3
+Downloaded pico-args v0.5.0
+Downloaded portable-atomic-util v0.2.6
+Downloaded proc-macro-error-attr2 v2.0.0
+Downloaded quote v1.0.47
+Downloaded shlex v1.3.0
+Downloaded smallvec v1.15.2
+Downloaded spki v0.7.3
+Downloaded statrs v0.18.0
+Downloaded toml_writer v1.1.2+spec-1.1.0
+Downloaded tower-http v0.6.8
+Downloaded windows-core v0.61.2
+Downloaded zerocopy-derive v0.8.42
+Downloaded zerotrie v0.2.3
+Downloaded cpufeatures v0.3.0
+Downloaded crc32fast v1.5.0
+Downloaded criterion-plot v0.5.0
+Downloaded crossbeam-channel v0.5.15
+Downloaded crossbeam-deque v0.8.6
+Downloaded crossbeam-epoch v0.9.18
+Downloaded crossbeam-utils v0.8.21
+Downloaded crunchy v0.2.4
+Downloaded jiff v0.2.34
+Downloaded ordered-stream v0.2.0
+Downloaded os_str_bytes v6.6.1
+Downloaded powerfmt v0.2.0
+Downloaded predicates-core v1.0.10
+Downloaded quoted_printable v0.5.1
+Downloaded spin v0.9.8
+Downloaded strum_macros v0.28.0
+Downloaded subtle v2.6.1
+Downloaded tokio-rustls v0.26.4
+Downloaded zbus_macros v5.15.0
+Downloaded zeroize v1.9.0
+Downloaded zerovec v0.11.5
+Downloaded dirs-sys v0.5.0
+Downloaded fontconfig-parser v0.5.8
+Downloaded libc v0.2.186
+Downloaded pkcs5 v0.7.1
+Downloaded plain v0.2.3
+Downloaded png v0.18.1
+Downloaded reqsign-azure-storage v3.1.0
+Downloaded similar v3.1.1
+Downloaded slotmap v1.1.1
+Downloaded supports-color v3.0.2
+Downloaded terminal_size v0.4.4
+Downloaded termtree v0.5.1
+Downloaded test-case-core v3.3.1
+Downloaded test-log-macros v0.2.20
+Downloaded textwrap v0.16.2
+Downloaded thiserror v2.0.19
+Downloaded tokio v1.53.1
+Downloaded toml_edit v0.25.13+spec-1.1.0
+Downloaded windows_i686_gnullvm v0.52.6
+Downloaded zerofrom v0.1.6
+Downloaded test-log-core v0.2.20
+Downloaded tikv-jemallocator v0.6.1
+Downloaded windows-implement v0.60.2
+Downloaded windows_i686_gnu v0.52.6
+Downloaded windows_i686_msvc v0.52.6
+Downloaded windows_x86_64_gnu v0.52.6
+Downloaded xattr v1.6.1
+Downloaded xml-rs v0.8.28
+Downloaded xmlwriter v0.1.0
+Downloaded yansi v1.0.1
+Downloaded yasna v0.6.0
+Downloaded yoke v0.8.1
+Downloaded zerofrom-derive v0.1.6
+Downloaded diskus v0.9.0
+Downloaded dispatch2 v0.3.1
+Downloaded path-slash v0.2.1
+Downloaded pkg-config v0.3.32
+Downloaded rand_core v0.9.5
+Downloaded time v0.3.47
+Downloaded x509-parser v0.18.1
+Downloaded linux-raw-sys v0.4.15
+Downloaded parking_lot_core v0.9.12
+Downloaded poloto v19.1.2
+Downloaded potential_utf v0.1.4
+Downloaded ptr_meta v0.3.1
+Downloaded ptr_meta_derive v0.3.1
+Downloaded tracing-log v0.2.0
+Downloaded ttf-parser v0.25.1
+Downloaded typeid v1.0.3
+Downloaded typenum v1.20.1
+Downloaded uds_windows v1.2.1
+Downloaded unicase v2.9.0
+Downloaded unicode-bidi v0.3.18
+Downloaded unicode-bidi-mirroring v0.4.0
+Downloaded unicode-vo v0.1.0
+Downloaded unit-prefix v0.5.2
+Downloaded untrusted v0.9.0
+Downloaded windows-strings v0.4.2
+Downloaded crypto-common v0.2.2
+Downloaded ctrlc v3.5.2
+Downloaded dotenvy v0.15.7
+Downloaded papaya v0.2.4
+Downloaded parking v2.2.1
+Downloaded parking_lot v0.12.5
+Downloaded pem v3.0.6
+Downloaded ppv-lite86 v0.2.21
+Downloaded rayon-core v1.13.0
+Downloaded retry-policies v0.5.1
+Downloaded simplecss v0.2.2
+Downloaded svgtypes v0.16.1
+Downloaded tikv-jemalloc-sys v0.6.1+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7
+Downloaded unicode-ident v1.0.24
+Downloaded unicode-width v0.1.14
+Downloaded displaydoc v0.2.5
+Downloaded dlv-list v0.5.2
+Downloaded dunce v1.0.5
+Downloaded dyn-clone v1.0.20
+Downloaded percent-encoding v2.3.2
+Downloaded pest v2.8.6
+Downloaded pkcs1 v0.7.5
+Downloaded rand_core v0.6.4
+Downloaded serde_derive_internals v0.29.1
+Downloaded temp-env v0.3.6
+Downloaded test-case v3.3.1
+Downloaded linux-raw-sys v0.12.1
+Downloaded proc-macro-error2 v2.0.1
+Downloaded resvg v0.47.0
+Downloaded seahash v4.1.0
+Downloaded csv v1.4.0
+Downloaded priority-queue v2.7.0
+Downloaded quinn-proto v0.11.15
+Downloaded redox_syscall v0.5.15
+Downloaded redox_users v0.5.2
+Downloaded rgb v0.8.53
+Downloaded tinyvec v1.11.0
+Downloaded tinyvec_macros v0.1.1
+Downloaded tokio-stream v0.1.18
+Downloaded try-lock v0.2.5
+Downloaded ucd-trie v0.1.7
+Downloaded valuable v0.1.1
+Downloaded crypto-common v0.1.7
+Downloaded pbkdf2 v0.12.2
+Downloaded quinn v0.11.9
+Downloaded security-framework v3.7.0
+Downloaded tracing-durations-export v0.3.5
+Downloaded glob v0.3.3
+Downloaded pkcs8 v0.10.2
+Downloaded reqsign-aws-v4 v3.0.2
+Downloaded secret-service v5.1.0
+Downloaded simd_cesu8 v1.1.1
+Downloaded svg v0.18.0
+Downloaded syn v2.0.118
+Downloaded tempfile v3.27.0
+Downloaded tracing-attributes v0.1.31
+Downloaded unicode-id v0.3.6
+Downloaded utf8parse v0.2.2
+Downloaded windows-threading v0.1.0
+Downloaded env_logger v0.11.11
+Downloaded event-listener-strategy v0.5.4
+Downloaded fastrand v2.5.0
+Downloaded owo-colors v4.3.0
+Downloaded pin-project-internal v1.1.11
+Downloaded pin-project-lite v0.2.17
+Downloaded pxfm v0.1.28
+Downloaded rend v0.5.3
+Downloaded usvg v0.47.0
+Downloaded windows-version v0.1.7
+Downloaded either v1.16.0
+Downloaded enumflags2_derive v0.7.12
+Downloaded env_filter v2.0.0
+Downloaded equivalent v1.0.2
+Downloaded etcetera v0.11.0
+Downloaded event-listener v5.4.1
+Downloaded ordered-multimap v0.7.3
+Downloaded pem-rfc7468 v0.7.0
+Downloaded predicates-tree v1.0.13
+Downloaded proc-macro-crate v3.5.0
+Downloaded rcgen v0.14.8
+Downloaded ref-cast v1.0.26
+Downloaded security-framework-sys v2.17.0
+Downloaded simdutf8 v0.1.5
+Downloaded system-configuration-sys v0.6.0
+Downloaded unicode-width v0.2.2
+Downloaded unscanny v0.1.0
+Downloaded windows-interface v0.59.3
+Downloaded windows-result v0.3.4
+Downloaded zerocopy v0.8.42
+Downloaded ctutils v0.4.2
+Downloaded erased-serde v0.4.10
+Downloaded euclid v0.22.13
+Downloaded futures-macro v0.3.33
+Downloaded pin-utils v0.1.0
+Downloaded quick-xml v0.41.0
+Downloaded rkyv_derive v0.8.17
+Downloaded semver v1.0.27
+Downloaded serde v1.0.229
+Downloaded sha2 v0.10.9
+Downloaded supports-unicode v3.0.0
+Downloaded synstructure v0.13.2
+Downloaded tinytemplate v1.2.1
+Downloaded tower v0.5.3
+Downloaded uuid v1.24.0
+Downloaded wait-timeout v0.2.1
+Downloaded windows-registry v0.5.3
+Downloaded embed-manifest v1.5.0
+Downloaded errno v0.3.14
+Downloaded fdeflate v0.3.7
+Downloaded find-msvc-tools v0.1.9
+Downloaded form_urlencoded v1.2.2
+Downloaded fs_extra v1.3.0
+Downloaded futures v0.3.33
+Downloaded futures-channel v0.3.33
+Downloaded futures-io v0.3.33
+Downloaded getrandom v0.2.16
+Downloaded pin-project v1.1.11
+Downloaded pretty_assertions v1.4.1
+Downloaded self-replace v1.5.0
+Downloaded filetime v0.2.29
+Downloaded futures-sink v0.3.33
+Downloaded generic-array v0.14.7
+Downloaded getrandom v0.3.4
+Downloaded serde_repr v0.1.20
+Downloaded encode_unicode v1.0.0
+Downloaded serde_urlencoded v0.7.1
+Downloaded futures-task v0.3.33
+Downloaded futures-util v0.3.33
+Downloaded getrandom v0.4.3
+Downloaded gif v0.14.1
+Downloaded procfs-core v0.18.0
+Downloaded futures-core v0.3.33
+Downloaded portable-atomic v1.13.1
+Downloaded serde_core v1.0.229
+Downloaded windows-targets v0.52.6
+Downloaded futures-executor v0.3.33
+Downloaded purl v0.1.6
+Downloaded rayon v1.12.0
+Downloaded fontdb v0.23.0
+Downloaded futures-lite v2.6.1
+Downloaded zbus v5.15.0
+Downloaded shellexpand v3.1.2
+Downloaded utf8_iter v1.0.4
+Downloaded pest_derive v2.8.6
+Downloaded sha2 v0.11.0
+Downloaded system-configuration v0.7.0
+Downloaded cyclonedx-bom v0.8.1
+Downloaded similar v2.7.0
+Downloaded reflink-copy v0.1.30
+Downloaded ref-cast-impl v1.0.26
+Downloaded fs-err v3.3.1
+Downloaded serde_spanned v1.1.1
+Downloaded regex-syntax v0.8.11
+Downloaded windows_x86_64_gnullvm v0.52.6
+Downloaded tracing v0.1.44
+Downloaded syn v3.0.3
+Downloaded regex-automata v0.4.16
+Downloaded windows_aarch64_msvc v0.52.6
+Downloaded ring v0.17.14
+Downloaded encoding_rs v0.8.35
+Downloaded windows-sys v0.52.0
+Downloaded windows-sys v0.61.2
+Downloaded spdx v0.13.4
+Downloaded aws-lc-sys v0.39.0
+Downloaded windows v0.61.3
+Post job cleanup.
+[command]/usr/bin/git version
+git version 2.54.0
+Temporarily overriding HOME='/home/runner/work/_temp/a8626301-9af4-402f-890a-abb4fecb2a4f' before making global git config changes
+Adding repository directory to the temporary git global config as a safe directory
+[command]/usr/bin/git config --global --add safe.directory /home/runner/work/uv/uv
+Removing SSH command configuration
+[command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Removing HTTP extra header
+[command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Removing includeIf entries pointing to credentials config files
+[command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+[command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+Cleaning up orphan processes
