@@ -53,6 +53,10 @@ fn is_transient_status(status: reqwest::StatusCode) -> bool {
 pub struct HttpClient {
     inner: reqwest::Client,
     control: Option<ControlTransport>,
+    /// When set, URLs matching the origin prefix are rewritten to the upstream
+    /// prefix before sending. Used in TCP upstream mode where the server
+    /// advertises loopback URLs but the runner must reach it via a LAN address.
+    upstream_rewrite: Option<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -102,17 +106,33 @@ impl HttpClient {
     pub fn new(ca_bundle: Option<&Path>) -> Result<Self> {
         let socket = std::env::var_os("PRELOOP_CONTROL_SOCKET").map(std::path::PathBuf::from);
         let origin = std::env::var("PRELOOP_CONTROL_ORIGIN").ok();
-        let control = match (socket, origin) {
-            (None, None) => None,
-            (Some(socket), Some(origin)) => Some((socket, origin)),
-            _ => anyhow::bail!(
-                "PRELOOP_CONTROL_SOCKET and PRELOOP_CONTROL_ORIGIN must be set together"
+        let upstream = std::env::var("PRELOOP_CONTROL_UPSTREAM").ok();
+        let has_socket = socket.is_some();
+        let has_origin = origin.is_some();
+        let has_upstream = upstream.is_some();
+        let control = match (has_socket, has_origin, has_upstream) {
+            (true, true, _) => Some((socket.unwrap(), origin.clone().unwrap())),
+            (false, false, _) | (false, true, true) => None,
+            (true, false, _) | (false, true, false) => anyhow::bail!(
+                "PRELOOP_CONTROL_ORIGIN requires PRELOOP_CONTROL_SOCKET or PRELOOP_CONTROL_UPSTREAM"
             ),
         };
-        Self::with_control(
+        let mut client = Self::with_control(
             ca_bundle,
             control.as_ref().map(|(s, o)| (s.as_path(), o.as_str())),
-        )
+        )?;
+        // In TCP upstream mode, the server advertises loopback URLs but the
+        // runner must reach it at the upstream LAN address. Rewrite matching
+        // URLs transparently so configure and run both work.
+        if !has_socket {
+            if let (Some(origin), Some(upstream)) = (origin, upstream) {
+                client.upstream_rewrite = Some((
+                    origin.trim_end_matches('/').to_owned(),
+                    upstream.trim_end_matches('/').to_owned(),
+                ));
+            }
+        }
+        Ok(client)
     }
 
     /// Create a client with an explicit control-plane transport.
@@ -144,7 +164,11 @@ impl HttpClient {
                 })
             })
             .transpose()?;
-        Ok(Self { inner, control })
+        Ok(Self {
+            inner,
+            control,
+            upstream_rewrite: None,
+        })
     }
 
     /// Select the transport for a URL, routing only the configured local
@@ -156,6 +180,17 @@ impl HttpClient {
             }
         }
         &self.inner
+    }
+
+    /// Rewrite a URL if an upstream rewrite is configured, replacing the
+    /// loopback origin prefix with the upstream address.
+    pub fn rewrite_url<'a>(&self, url: &'a str) -> std::borrow::Cow<'a, str> {
+        if let Some((origin, upstream)) = &self.upstream_rewrite {
+            if url.starts_with(origin.as_str()) {
+                return std::borrow::Cow::Owned(format!("{}{}", upstream, &url[origin.len()..]));
+            }
+        }
+        std::borrow::Cow::Borrowed(url)
     }
 
     /// GET request returning JSON.
