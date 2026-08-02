@@ -1,0 +1,15 @@
+Requested labels: ubuntu-latest
+Job defined at: astral-sh/uv/.github/workflows/check-zizmor.yml@refs/pull/20876/merge
+Reusable workflow chain:
+astral-sh/uv/.github/workflows/ci.yml@refs/pull/20876/merge (81742a27ad62bb1dd1289a164f1776508279c756)
+-> astral-sh/uv/.github/workflows/check-zizmor.yml@refs/pull/20876/merge (81742a27ad62bb1dd1289a164f1776508279c756)
+Waiting for a runner to pick up this job...
+Evaluating check-zizmor.if
+Evaluating: (success() && ((needs.plan.outputs.run-checks == 'true')))
+Expanded: (true && ('true' == 'true'))
+Result: true
+Evaluating check-zizmor.zizmor.if
+Evaluating: success()
+Result: true
+Job is about to start running on the hosted runner: GitHub Actions 1002001956
+Job is waiting for a hosted runner to come online.

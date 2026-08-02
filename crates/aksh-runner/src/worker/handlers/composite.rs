@@ -96,9 +96,12 @@ fn run_composite_action_inner<'a>(
             let expr_ctx = ctx.job.build_expression_context();
             for (key, input_def) in manifest_inputs {
                 let env_key = format!("INPUT_{}", key.to_uppercase().replace(' ', "_"));
-                if let Some(default) = input_def.get("default").and_then(|v| v.as_str()) {
+                if let Some(default) = input_def
+                    .get("default")
+                    .and_then(super::factory::input_default_string)
+                {
                     input_env.entry(env_key).or_insert_with(|| {
-                        crate::worker::template::evaluate_template(default, &expr_ctx)
+                        crate::worker::template::evaluate_template(&default, &expr_ctx)
                             .unwrap_or_else(|_| default.to_string())
                     });
                 }

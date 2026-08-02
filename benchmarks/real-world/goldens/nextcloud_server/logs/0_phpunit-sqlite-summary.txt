@@ -1,0 +1,16 @@
+﻿2026-07-17T07:50:42.2593282Z Current runner version: '2.335.1'
+Runner name: 'garm4-low-24-cr6p0rawlv3n'
+Runner group name: 'default'
+Machine name: 'garm4-low-24-cr6p0rawlv3n'
+##[group]GITHUB_TOKEN Permissions
+Metadata: read
+##[endgroup]
+Secret source: Actions
+Prepare workflow directory
+Prepare all required actions
+Complete job name: phpunit-sqlite-summary
+##[group]Run if false; then exit 1; fi
+if false; then exit 1; fi
+shell: /usr/bin/bash -e {0}
+##[endgroup]
+Cleaning up orphan processes

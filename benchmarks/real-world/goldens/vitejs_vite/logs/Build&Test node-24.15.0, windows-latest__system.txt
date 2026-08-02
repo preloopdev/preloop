@@ -1,0 +1,9 @@
+Requested labels: windows-latest
+Job defined at: vitejs/vite/.github/workflows/ci.yml@refs/pull/23114/merge
+Waiting for a runner to pick up this job...
+Evaluating test.if
+Evaluating: (success() && ((needs.changed.outputs.should_skip != 'true')))
+Expanded: (true && ('false' != 'true'))
+Result: true
+Job is waiting for a hosted runner to come online.
+Job is about to start running on the hosted runner: GitHub Actions 1000425943
