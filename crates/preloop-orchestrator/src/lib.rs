@@ -279,8 +279,8 @@ fn base_install_commands() -> Vec<Vec<String>> {
         format!(
             "apt-get update -qq && \
              DEBIAN_FRONTEND=noninteractive \
-             apt-get install -y -qq --no-install-recommends {BASE_PACKAGES} && \
-             printf '{LOOPBACK_HOSTS}' > /etc/hosts && \
+             apt-get install -y -qq --no-install-recommends {BASE_PACKAGES} \
+             && printf '{LOOPBACK_HOSTS}' > /etc/hosts && \
              (DEBIAN_FRONTEND=noninteractive \
               apt-get install -y -qq {DOCKER_PACKAGES} && \
               mkdir -p {DOCKER_DATA_ROOT} /etc/docker && \
@@ -306,7 +306,7 @@ fn base_install_commands() -> Vec<Vec<String>> {
 /// can carry a `[dockerd] <defunct>` entry from its golden: a name match sees
 /// the zombie, concludes Docker is up, and leaves the runner with no daemon.
 /// A stale `/var/run/docker.pid` naming that same pid blocks startup outright,
-/// and is only removed once `docker info` has failed -- so it is stale by
+/// and is only removed once `docker info` has failed  so it is stale by
 /// definition.
 fn docker_start_command() -> Vec<String> {
     vec![
@@ -403,6 +403,16 @@ fn guest_env_prefix(config: &RunnerPoolConfig, name: &MachineName) -> Vec<String
                 .trim_end_matches('/')
         ));
         env.push(format!("PRELOOP_CONTROL_SOCKET={GUEST_CONTROL_SOCKET}"));
+    } else if let Some(upstream) = &config.control_upstream {
+        env.push(format!(
+            "PRELOOP_CONTROL_ORIGIN={}",
+            config
+                .control_origin
+                .as_deref()
+                .unwrap_or(&config.server_url)
+                .trim_end_matches('/')
+        ));
+        env.push(format!("PRELOOP_CONTROL_UPSTREAM={upstream}"));
     }
     if config.debug_dir.is_some() {
         env.push(format!("PRELOOP_FAILURE_MARKER={GUEST_FAILURE_MARKER}"));
@@ -445,6 +455,10 @@ pub struct RunnerPoolConfig {
     pub control_origin: Option<String>,
     /// Host Unix socket used for runner control-plane traffic.
     pub control_socket: Option<PathBuf>,
+    /// TCP address the guest control bridge forwards to when the socket is
+    /// unavailable. The bridge binds `control_origin` inside the VM and
+    /// proxies accepted connections to this address over virtio-net TCP.
+    pub control_upstream: Option<String>,
     /// Host environment variable containing the registration credential.
     pub registration_token_env: String,
     /// Runner labels advertised to the scheduler.
@@ -455,6 +469,8 @@ pub struct RunnerPoolConfig {
     pub memory_mib: u32,
     /// Storage per runner in GiB.
     pub storage_gib: u32,
+    /// Root overlay size per runner in GiB; `None` keeps the provider default.
+    pub overlay_gib: Option<u32>,
     /// Directory for debug session markers (e.g. `~/.preloop/state/debug`).
     ///
     /// When set, a runner whose job requested `preserve_on_failure` and then
@@ -726,6 +742,7 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
         cpus: config.cpus,
         memory_mib: config.memory_mib,
         storage_gib: config.storage_gib,
+        overlay_gib: config.overlay_gib,
         network: NetworkPolicy::PublicOnly,
         volumes: runner_volumes(config),
         sockets: config
@@ -794,6 +811,7 @@ async fn prepare_packed_golden<P: VmProvider + 'static>(
         cpus: config.cpus,
         memory_mib: config.memory_mib,
         storage_gib: config.storage_gib,
+        overlay_gib: config.overlay_gib,
         network: NetworkPolicy::PublicOnly,
         volumes: runner_volumes(config),
         sockets: config
@@ -1067,6 +1085,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             // producing the artifact. Give the one-shot builder headroom
             // without increasing the storage allocated to job VMs.
             storage_gib: self.config.storage_gib.max(40),
+            overlay_gib: self.config.overlay_gib,
             network: NetworkPolicy::PublicOnly,
             volumes: Vec::new(),
             sockets: Vec::new(),
@@ -1797,7 +1816,7 @@ async fn provision_runner<P: VmProvider + 'static>(
     environment_base: &str,
 ) -> Result<Vec<String>, OrchestratorError> {
     if let Some(golden) = golden {
-        // Fork from the already-booted golden VM — instant CoW clone.
+        // Fork from the already-booted golden VM instant CoW clone.
         provider.fork(golden, name).await?;
     } else {
         let uses_packed_artifact = config.use_packed_artifact;
@@ -1811,6 +1830,7 @@ async fn provision_runner<P: VmProvider + 'static>(
             cpus: config.cpus,
             memory_mib: config.memory_mib,
             storage_gib: config.storage_gib,
+            overlay_gib: config.overlay_gib,
             network: NetworkPolicy::PublicOnly,
             volumes: runner_volumes(config),
             sockets: config
@@ -1842,11 +1862,19 @@ async fn provision_runner<P: VmProvider + 'static>(
     }
     let labels = labels.join(",");
     let mut configure = guest_env_prefix(config, name);
+    // During configure the control bridge is not yet running, so the
+    // runner must reach the server directly. When a TCP upstream is
+    // configured, use that address for registration instead of the
+    // loopback origin.
+    let registration_url = config
+        .control_upstream
+        .as_deref()
+        .unwrap_or(&config.server_url);
     configure.extend([
         runner.clone(),
         "configure".into(),
         "--url".into(),
-        config.server_url.clone(),
+        registration_url.to_owned(),
         "--name".into(),
         name.as_str().into(),
         "--labels".into(),
@@ -2121,6 +2149,21 @@ chmod +x "$destination/bin/node"
     }
 
     #[test]
+    fn tcp_upstream_sets_origin_and_upstream_without_socket() {
+        let mut config = test_config(false);
+        config.server_url = "http://127.0.0.1:9090".to_owned();
+        config.control_origin = Some("http://127.0.0.1:9090".to_owned());
+        config.control_upstream = Some("http://10.0.0.161:9090".to_owned());
+        let name = MachineName::new("runner").unwrap();
+
+        let env = guest_env_prefix(&config, &name);
+
+        assert!(env.contains(&"PRELOOP_CONTROL_ORIGIN=http://127.0.0.1:9090".to_owned()));
+        assert!(env.contains(&"PRELOOP_CONTROL_UPSTREAM=http://10.0.0.161:9090".to_owned()));
+        assert!(!env.iter().any(|v| v.starts_with("PRELOOP_CONTROL_SOCKET")));
+    }
+
+    #[test]
     fn runner_labels_bind_to_selected_ubuntu_environment() {
         assert_eq!(
             runner_environment_labels("ubuntu:22.04"),
@@ -2146,11 +2189,13 @@ chmod +x "$destination/bin/node"
             server_url: "https://runner.test".to_owned(),
             control_origin: None,
             control_socket: control_socket.then(|| PathBuf::from("/tmp/engine.sock")),
+            control_upstream: None,
             registration_token_env: "LIFECYCLE_TEST_TOKEN".to_owned(),
             labels: vec!["test".to_owned()],
             cpus: 1,
             memory_mib: 128,
             storage_gib: 1,
+            overlay_gib: None,
             debug_dir: None,
             runner_key_dir: None,
             pending_jobs: None,
