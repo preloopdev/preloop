@@ -195,6 +195,7 @@ dependencies = [
  "aksh-gha-parser",
  "aksh-gha-protocol",
  "anyhow",
+ "base64",
  "clap",
  "reqwest",
  "serde",

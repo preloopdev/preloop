@@ -1,0 +1,2566 @@
+{
+  "repo": "sharkdp/bat",
+  "run_id": "30683114987",
+  "workflow_name": "CICD",
+  "workflow_path": ".github/workflows/CICD.yml",
+  "event": "push",
+  "head_sha": "2ba8db9c14e5794572f5ea338c2b90404c9769cb",
+  "conclusion": "success",
+  "created_at": "2026-08-01T04:01:28Z",
+  "jobs": [
+    {
+      "name": "Ensure code quality",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run dtolnay/rust-toolchain@stable",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run actions/checkout@v6",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run cargo fmt -- --check",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run cargo clippy --locked --all-targets --all-features -- -D warnings",
+          "number": 5,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Run actions/checkout@v6",
+          "number": 10,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 11,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "Run tests with system wide configuration",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Git checkout",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Prepare environment variables",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install Rust toolchain",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Build and install bat",
+          "number": 5,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run unit tests",
+          "number": 6,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Git checkout",
+          "number": 12,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 13,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "License checks",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run actions/checkout@v6",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run tests/scripts/license-checks.sh",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Run actions/checkout@v6",
+          "number": 6,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 7,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "Documentation",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Git checkout",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install Rust toolchain",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Check documentation",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Show man page",
+          "number": 5,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Git checkout",
+          "number": 10,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 11,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "cargo audit",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run cargo install cargo-audit --locked",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run actions/checkout@v6",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run cargo audit",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Run actions/checkout@v6",
+          "number": 8,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 9,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "Extract crate metadata",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run actions/checkout@v6",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Extract crate information",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Run actions/checkout@v6",
+          "number": 6,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 7,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "Run tests with updated syntaxes and themes",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Git checkout",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install Rust toolchain",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Build and install bat",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Rebuild binary assets (syntaxes and themes)",
+          "number": 5,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Build and install bat with updated assets",
+          "number": 6,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run unit tests with new syntaxes and themes",
+          "number": 7,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run ignored-by-default unit tests with new syntaxes and themes",
+          "number": 8,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Syntax highlighting regression test",
+          "number": 9,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "List of languages",
+          "number": 10,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "List of themes",
+          "number": 11,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Test custom assets",
+          "number": 12,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Git checkout",
+          "number": 24,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 25,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "Minimum supported rust version",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Checkout source code",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install rust toolchain (v1.88)",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run tests",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Checkout source code",
+          "number": 8,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 9,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "i686-unknown-linux-gnu (ubuntu-latest)",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Checkout source code",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install prerequisites",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install Rust toolchain",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install cross",
+          "number": 5,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Overwrite build command env variable",
+          "number": 6,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Show version information (Rust, cargo, GCC)",
+          "number": 7,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Build",
+          "number": 8,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set binary name & path",
+          "number": 9,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set testing options",
+          "number": 10,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run tests",
+          "number": 11,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run bat",
+          "number": 12,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Show diagnostics (bat --diagnostic)",
+          "number": 13,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig",
+          "number": 14,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,git",
+          "number": 15,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,paging",
+          "number": 16,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,git,paging",
+          "number": 17,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: minimal-application",
+          "number": 18,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Create tarball",
+          "number": 19,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Create Debian package",
+          "number": 20,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Artifact upload: tarball",
+          "number": 21,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Artifact upload: Debian package",
+          "number": 22,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Check for release",
+          "number": 23,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Publish archives and packages",
+          "number": 24,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Post Checkout source code",
+          "number": 48,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 49,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "i686-pc-windows-msvc (windows-2025)",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Checkout source code",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install prerequisites",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install Rust toolchain",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install cross",
+          "number": 5,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Overwrite build command env variable",
+          "number": 6,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Show version information (Rust, cargo, GCC)",
+          "number": 7,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Build",
+          "number": 8,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set binary name & path",
+          "number": 9,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set testing options",
+          "number": 10,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run tests",
+          "number": 11,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run bat",
+          "number": 12,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Show diagnostics (bat --diagnostic)",
+          "number": 13,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig",
+          "number": 14,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,git",
+          "number": 15,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,paging",
+          "number": 16,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,git,paging",
+          "number": 17,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: minimal-application",
+          "number": 18,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Create tarball",
+          "number": 19,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Create Debian package",
+          "number": 20,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Artifact upload: tarball",
+          "number": 21,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Artifact upload: Debian package",
+          "number": 22,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Check for release",
+          "number": 23,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Publish archives and packages",
+          "number": 24,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Post Checkout source code",
+          "number": 48,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 49,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "aarch64-unknown-linux-gnu (ubuntu-latest)",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Checkout source code",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install prerequisites",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install Rust toolchain",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install cross",
+          "number": 5,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Overwrite build command env variable",
+          "number": 6,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Show version information (Rust, cargo, GCC)",
+          "number": 7,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Build",
+          "number": 8,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set binary name & path",
+          "number": 9,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set testing options",
+          "number": 10,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run tests",
+          "number": 11,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run bat",
+          "number": 12,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Show diagnostics (bat --diagnostic)",
+          "number": 13,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig",
+          "number": 14,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,git",
+          "number": 15,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,paging",
+          "number": 16,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,git,paging",
+          "number": 17,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: minimal-application",
+          "number": 18,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Create tarball",
+          "number": 19,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Create Debian package",
+          "number": 20,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Artifact upload: tarball",
+          "number": 21,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Artifact upload: Debian package",
+          "number": 22,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Check for release",
+          "number": 23,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Publish archives and packages",
+          "number": 24,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Post Checkout source code",
+          "number": 48,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 49,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "aarch64-unknown-linux-musl (ubuntu-latest)",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Checkout source code",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install prerequisites",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install Rust toolchain",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install cross",
+          "number": 5,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Overwrite build command env variable",
+          "number": 6,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Show version information (Rust, cargo, GCC)",
+          "number": 7,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Build",
+          "number": 8,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set binary name & path",
+          "number": 9,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set testing options",
+          "number": 10,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run tests",
+          "number": 11,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run bat",
+          "number": 12,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Show diagnostics (bat --diagnostic)",
+          "number": 13,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig",
+          "number": 14,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,git",
+          "number": 15,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,paging",
+          "number": 16,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,git,paging",
+          "number": 17,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: minimal-application",
+          "number": 18,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Create tarball",
+          "number": 19,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Create Debian package",
+          "number": 20,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Artifact upload: tarball",
+          "number": 21,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Artifact upload: Debian package",
+          "number": 22,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Check for release",
+          "number": 23,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Publish archives and packages",
+          "number": 24,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Post Checkout source code",
+          "number": 48,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 49,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "arm-unknown-linux-gnueabihf (ubuntu-latest)",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Checkout source code",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install prerequisites",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install Rust toolchain",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install cross",
+          "number": 5,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Overwrite build command env variable",
+          "number": 6,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Show version information (Rust, cargo, GCC)",
+          "number": 7,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Build",
+          "number": 8,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set binary name & path",
+          "number": 9,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set testing options",
+          "number": 10,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run tests",
+          "number": 11,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run bat",
+          "number": 12,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Show diagnostics (bat --diagnostic)",
+          "number": 13,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig",
+          "number": 14,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,git",
+          "number": 15,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,paging",
+          "number": 16,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,git,paging",
+          "number": 17,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: minimal-application",
+          "number": 18,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Create tarball",
+          "number": 19,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Create Debian package",
+          "number": 20,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Artifact upload: tarball",
+          "number": 21,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Artifact upload: Debian package",
+          "number": 22,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Check for release",
+          "number": 23,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Publish archives and packages",
+          "number": 24,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Post Checkout source code",
+          "number": 48,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 49,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "x86_64-pc-windows-msvc (windows-2025)",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Checkout source code",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install prerequisites",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install Rust toolchain",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install cross",
+          "number": 5,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Overwrite build command env variable",
+          "number": 6,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Show version information (Rust, cargo, GCC)",
+          "number": 7,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Build",
+          "number": 8,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set binary name & path",
+          "number": 9,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set testing options",
+          "number": 10,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run tests",
+          "number": 11,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run bat",
+          "number": 12,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Show diagnostics (bat --diagnostic)",
+          "number": 13,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig",
+          "number": 14,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,git",
+          "number": 15,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,paging",
+          "number": 16,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,git,paging",
+          "number": 17,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: minimal-application",
+          "number": 18,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Create tarball",
+          "number": 19,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Create Debian package",
+          "number": 20,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Artifact upload: tarball",
+          "number": 21,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Artifact upload: Debian package",
+          "number": 22,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Check for release",
+          "number": 23,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Publish archives and packages",
+          "number": 24,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Post Checkout source code",
+          "number": 48,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 49,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "aarch64-pc-windows-msvc (windows-11-arm)",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Checkout source code",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install prerequisites",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install Rust toolchain",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install cross",
+          "number": 5,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Overwrite build command env variable",
+          "number": 6,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Show version information (Rust, cargo, GCC)",
+          "number": 7,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Build",
+          "number": 8,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set binary name & path",
+          "number": 9,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set testing options",
+          "number": 10,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run tests",
+          "number": 11,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run bat",
+          "number": 12,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Show diagnostics (bat --diagnostic)",
+          "number": 13,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig",
+          "number": 14,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,git",
+          "number": 15,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,paging",
+          "number": 16,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,git,paging",
+          "number": 17,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: minimal-application",
+          "number": 18,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Create tarball",
+          "number": 19,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Create Debian package",
+          "number": 20,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Artifact upload: tarball",
+          "number": 21,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Artifact upload: Debian package",
+          "number": 22,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Check for release",
+          "number": 23,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Publish archives and packages",
+          "number": 24,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Post Checkout source code",
+          "number": 48,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 49,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "x86_64-unknown-linux-gnu (ubuntu-latest)",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Checkout source code",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install prerequisites",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install Rust toolchain",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install cross",
+          "number": 5,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Overwrite build command env variable",
+          "number": 6,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Show version information (Rust, cargo, GCC)",
+          "number": 7,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Build",
+          "number": 8,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set binary name & path",
+          "number": 9,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set testing options",
+          "number": 10,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run tests",
+          "number": 11,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run bat",
+          "number": 12,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Show diagnostics (bat --diagnostic)",
+          "number": 13,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig",
+          "number": 14,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,git",
+          "number": 15,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,paging",
+          "number": 16,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,git,paging",
+          "number": 17,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: minimal-application",
+          "number": 18,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Create tarball",
+          "number": 19,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Create Debian package",
+          "number": 20,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Artifact upload: tarball",
+          "number": 21,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Artifact upload: Debian package",
+          "number": 22,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Check for release",
+          "number": 23,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Publish archives and packages",
+          "number": 24,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Post Checkout source code",
+          "number": 48,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 49,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "aarch64-apple-darwin (macos-latest)",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Checkout source code",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install prerequisites",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install Rust toolchain",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install cross",
+          "number": 5,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Overwrite build command env variable",
+          "number": 6,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Show version information (Rust, cargo, GCC)",
+          "number": 7,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Build",
+          "number": 8,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set binary name & path",
+          "number": 9,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set testing options",
+          "number": 10,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run tests",
+          "number": 11,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run bat",
+          "number": 12,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Show diagnostics (bat --diagnostic)",
+          "number": 13,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig",
+          "number": 14,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,git",
+          "number": 15,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,paging",
+          "number": 16,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,git,paging",
+          "number": 17,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: minimal-application",
+          "number": 18,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Create tarball",
+          "number": 19,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Create Debian package",
+          "number": 20,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Artifact upload: tarball",
+          "number": 21,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Artifact upload: Debian package",
+          "number": 22,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Check for release",
+          "number": 23,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Publish archives and packages",
+          "number": 24,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Post Checkout source code",
+          "number": 48,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 49,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "arm-unknown-linux-musleabihf (ubuntu-latest)",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Checkout source code",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install prerequisites",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install Rust toolchain",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install cross",
+          "number": 5,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Overwrite build command env variable",
+          "number": 6,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Show version information (Rust, cargo, GCC)",
+          "number": 7,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Build",
+          "number": 8,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set binary name & path",
+          "number": 9,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set testing options",
+          "number": 10,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run tests",
+          "number": 11,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run bat",
+          "number": 12,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Show diagnostics (bat --diagnostic)",
+          "number": 13,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig",
+          "number": 14,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,git",
+          "number": 15,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,paging",
+          "number": 16,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,git,paging",
+          "number": 17,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: minimal-application",
+          "number": 18,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Create tarball",
+          "number": 19,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Create Debian package",
+          "number": 20,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Artifact upload: tarball",
+          "number": 21,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Artifact upload: Debian package",
+          "number": 22,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Check for release",
+          "number": 23,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Publish archives and packages",
+          "number": 24,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Post Checkout source code",
+          "number": 48,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 49,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "x86_64-apple-darwin (macos-15-intel)",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Checkout source code",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install prerequisites",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install Rust toolchain",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install cross",
+          "number": 5,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Overwrite build command env variable",
+          "number": 6,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Show version information (Rust, cargo, GCC)",
+          "number": 7,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Build",
+          "number": 8,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set binary name & path",
+          "number": 9,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set testing options",
+          "number": 10,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run tests",
+          "number": 11,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run bat",
+          "number": 12,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Show diagnostics (bat --diagnostic)",
+          "number": 13,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig",
+          "number": 14,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,git",
+          "number": 15,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,paging",
+          "number": 16,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,git,paging",
+          "number": 17,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: minimal-application",
+          "number": 18,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Create tarball",
+          "number": 19,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Create Debian package",
+          "number": 20,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Artifact upload: tarball",
+          "number": 21,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Artifact upload: Debian package",
+          "number": 22,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Check for release",
+          "number": 23,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Publish archives and packages",
+          "number": 24,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Post Checkout source code",
+          "number": 48,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 49,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "i686-unknown-linux-musl (ubuntu-latest)",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Checkout source code",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install prerequisites",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install Rust toolchain",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install cross",
+          "number": 5,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Overwrite build command env variable",
+          "number": 6,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Show version information (Rust, cargo, GCC)",
+          "number": 7,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Build",
+          "number": 8,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set binary name & path",
+          "number": 9,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set testing options",
+          "number": 10,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run tests",
+          "number": 11,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run bat",
+          "number": 12,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Show diagnostics (bat --diagnostic)",
+          "number": 13,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig",
+          "number": 14,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,git",
+          "number": 15,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,paging",
+          "number": 16,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,git,paging",
+          "number": 17,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: minimal-application",
+          "number": 18,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Create tarball",
+          "number": 19,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Create Debian package",
+          "number": 20,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Artifact upload: tarball",
+          "number": 21,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Artifact upload: Debian package",
+          "number": 22,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Check for release",
+          "number": 23,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Publish archives and packages",
+          "number": 24,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Post Checkout source code",
+          "number": 48,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 49,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "x86_64-unknown-linux-musl (ubuntu-latest)",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Checkout source code",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install prerequisites",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install Rust toolchain",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install cross",
+          "number": 5,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Overwrite build command env variable",
+          "number": 6,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Show version information (Rust, cargo, GCC)",
+          "number": 7,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Build",
+          "number": 8,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set binary name & path",
+          "number": 9,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set testing options",
+          "number": 10,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run tests",
+          "number": 11,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run bat",
+          "number": 12,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Show diagnostics (bat --diagnostic)",
+          "number": 13,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig",
+          "number": 14,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,git",
+          "number": 15,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,paging",
+          "number": 16,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: regex-onig,git,paging",
+          "number": 17,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Feature check: minimal-application",
+          "number": 18,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Create tarball",
+          "number": 19,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Create Debian package",
+          "number": 20,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Artifact upload: tarball",
+          "number": 21,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Artifact upload: Debian package",
+          "number": 22,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Check for release",
+          "number": 23,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Publish archives and packages",
+          "number": 24,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Post Checkout source code",
+          "number": 48,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 49,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "all-jobs",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run jq --exit-status 'all(.result == \"success\")' <<< '{",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "Publish to Winget",
+      "conclusion": "skipped",
+      "status": "completed",
+      "steps": []
+    }
+  ]
+}

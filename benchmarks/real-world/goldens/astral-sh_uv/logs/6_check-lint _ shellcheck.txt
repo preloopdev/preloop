@@ -1,0 +1,193 @@
+﻿2026-08-01T02:36:38.6969001Z Current runner version: '2.336.0'
+##[group]Runner Image Provisioner
+Hosted Compute Agent
+Version: 20260707.563
+Commit: 02667638d2b423fbc733a8e32a88b44996a3ba6e
+Build Date: 2026-07-07T19:33:50Z
+Worker ID: {dd9ed1da-3b48-43de-b261-5665fc895cc6}
+Azure Region: westus3
+##[endgroup]
+##[group]VM Image
+- OS: Linux (x64)
+- Source: Docker
+- Name: ubuntu:24.04
+- Version: 20260728.2.1
+##[endgroup]
+##[group]GITHUB_TOKEN Permissions
+Metadata: read
+##[endgroup]
+Secret source: None
+Prepare workflow directory
+Prepare all required actions
+Getting action download info
+Download action repository 'actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0' (SHA:9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0)
+Uses: astral-sh/uv/.github/workflows/check-lint.yml@refs/pull/20876/merge (81742a27ad62bb1dd1289a164f1776508279c756)
+##[group] Inputs
+code-changed: false
+save-rust-cache: false
+##[endgroup]
+Complete job name: check-lint / shellcheck
+##[group]Run actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+with:
+persist-credentials: false
+repository: astral-sh/uv
+token: ***
+ssh-strict: true
+ssh-user: git
+clean: true
+sparse-checkout-cone-mode: true
+fetch-depth: 1
+fetch-tags: false
+show-progress: true
+lfs: false
+submodules: false
+set-safe-directory: true
+allow-unsafe-pr-checkout: false
+env:
+CARGO_INCREMENTAL: 0
+CARGO_NET_RETRY: 10
+CARGO_TERM_COLOR: always
+HAWK_VERSION: 0.1.9
+RUSTUP_MAX_RETRIES: 10
+##[endgroup]
+Syncing repository: astral-sh/uv
+##[group]Getting Git version info
+Working directory is '/home/runner/work/uv/uv'
+[command]/usr/bin/git version
+git version 2.54.0
+##[endgroup]
+Temporarily overriding HOME='/home/runner/work/_temp/f8336b8e-0030-49c9-976d-441b7c2bc839' before making global git config changes
+Adding repository directory to the temporary git global config as a safe directory
+[command]/usr/bin/git config --global --add safe.directory /home/runner/work/uv/uv
+Deleting the contents of '/home/runner/work/uv/uv'
+##[group]Determining repository object format
+##[endgroup]
+##[group]Initializing the repository
+[command]/usr/bin/git init /home/runner/work/uv/uv
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /home/runner/work/uv/uv/.git/
+[command]/usr/bin/git remote add origin https://github.com/astral-sh/uv
+##[endgroup]
+##[group]Disabling automatic garbage collection
+[command]/usr/bin/git config --local gc.auto 0
+##[endgroup]
+##[group]Setting up auth
+Removing SSH command configuration
+[command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Removing HTTP extra header
+[command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Removing includeIf entries pointing to credentials config files
+[command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+[command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+[command]/usr/bin/git config --file /home/runner/work/_temp/git-credentials-a13878c5-711e-4761-bd3d-61891b115aec.config http.https://github.com/.extraheader AUTHORIZATION: basic ***
+[command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/uv/uv/.git.path /home/runner/work/_temp/git-credentials-a13878c5-711e-4761-bd3d-61891b115aec.config
+[command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/uv/uv/.git/worktrees/*.path /home/runner/work/_temp/git-credentials-a13878c5-711e-4761-bd3d-61891b115aec.config
+[command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-a13878c5-711e-4761-bd3d-61891b115aec.config
+[command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-a13878c5-711e-4761-bd3d-61891b115aec.config
+##[endgroup]
+##[group]Fetching the repository
+[command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +81742a27ad62bb1dd1289a164f1776508279c756:refs/remotes/pull/20876/merge
+From https://github.com/astral-sh/uv
+* [new ref]         81742a27ad62bb1dd1289a164f1776508279c756 -> pull/20876/merge
+##[endgroup]
+##[group]Determining the checkout info
+##[endgroup]
+[command]/usr/bin/git sparse-checkout disable
+[command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+##[group]Checking out the ref
+[command]/usr/bin/git checkout --progress --force refs/remotes/pull/20876/merge
+Note: switching to 'refs/remotes/pull/20876/merge'.
+You are in 'detached HEAD' state. You can look around, make experimental
+changes and commit them, and you can discard any commits you make in this
+state without impacting any branches by switching back to a branch.
+If you want to create a new branch to retain commits you create, you may
+do so (now or later) by using -c with the switch command. Example:
+git switch -c <new-branch-name>
+Or undo this operation with:
+git switch -
+Turn off this advice by setting config variable advice.detachedHead to false
+HEAD is now at 81742a2 Merge 1ddf5b709ad49bba88e6607af0d2a1bbe0c03ff5 into 79bbface771210df216b738e9bdc7df95e5a9e6b
+##[endgroup]
+[command]/usr/bin/git log -1 --format=%H
+81742a27ad62bb1dd1289a164f1776508279c756
+##[group]Removing auth
+Removing SSH command configuration
+[command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Removing HTTP extra header
+[command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Removing includeIf entries pointing to credentials config files
+[command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+includeif.gitdir:/home/runner/work/uv/uv/.git.path
+includeif.gitdir:/home/runner/work/uv/uv/.git/worktrees/*.path
+includeif.gitdir:/github/workspace/.git.path
+includeif.gitdir:/github/workspace/.git/worktrees/*.path
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/uv/uv/.git.path
+/home/runner/work/_temp/git-credentials-a13878c5-711e-4761-bd3d-61891b115aec.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/uv/uv/.git.path /home/runner/work/_temp/git-credentials-a13878c5-711e-4761-bd3d-61891b115aec.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/uv/uv/.git/worktrees/*.path
+/home/runner/work/_temp/git-credentials-a13878c5-711e-4761-bd3d-61891b115aec.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/uv/uv/.git/worktrees/*.path /home/runner/work/_temp/git-credentials-a13878c5-711e-4761-bd3d-61891b115aec.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git.path
+/github/runner_temp/git-credentials-a13878c5-711e-4761-bd3d-61891b115aec.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-a13878c5-711e-4761-bd3d-61891b115aec.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git/worktrees/*.path
+/github/runner_temp/git-credentials-a13878c5-711e-4761-bd3d-61891b115aec.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-a13878c5-711e-4761-bd3d-61891b115aec.config
+[command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+Removing credentials config '/home/runner/work/_temp/git-credentials-a13878c5-711e-4761-bd3d-61891b115aec.config'
+##[endgroup]
+##[group]Run # renovate: datasource=github-releases depName=koalaman/shellcheck
+# renovate: datasource=github-releases depName=koalaman/shellcheck
+SHELLCHECK_VERSION="v0.11.0"
+curl -sSL "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" | tar -xJf -
+sudo mv "shellcheck-${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/
+shell: /usr/bin/bash -e {0}
+env:
+CARGO_INCREMENTAL: 0
+CARGO_NET_RETRY: 10
+CARGO_TERM_COLOR: always
+HAWK_VERSION: 0.1.9
+RUSTUP_MAX_RETRIES: 10
+##[endgroup]
+##[group]Run find . -name '*.sh' -type f | xargs shellcheck --shell bash --severity style
+find . -name '*.sh' -type f | xargs shellcheck --shell bash --severity style
+shell: /usr/bin/bash -e {0}
+env:
+CARGO_INCREMENTAL: 0
+CARGO_NET_RETRY: 10
+CARGO_TERM_COLOR: always
+HAWK_VERSION: 0.1.9
+RUSTUP_MAX_RETRIES: 10
+##[endgroup]
+Post job cleanup.
+[command]/usr/bin/git version
+git version 2.54.0
+Temporarily overriding HOME='/home/runner/work/_temp/02266991-4309-4b09-aea9-6972ba3578c3' before making global git config changes
+Adding repository directory to the temporary git global config as a safe directory
+[command]/usr/bin/git config --global --add safe.directory /home/runner/work/uv/uv
+Removing SSH command configuration
+[command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Removing HTTP extra header
+[command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Removing includeIf entries pointing to credentials config files
+[command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+[command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+Cleaning up orphan processes

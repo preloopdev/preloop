@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use aksh_gha_protocol::RunId;
 use anyhow::Context;
+use base64::Engine;
 use clap::{Parser, Subcommand};
 use reqwest::Url;
 use serde_json::Value;
@@ -150,9 +151,22 @@ async fn main() -> anyhow::Result<()> {
                 debugger_welcome_message,
                 inputs,
             };
-            let response = http
+            let mut request = http
                 .post(cli.server.join("/api/v1/runs")?)
-                .bearer_auth(&native_api_token)
+                .bearer_auth(&native_api_token);
+            // Hand the workspace to the server so it can snapshot the local
+            // tree and redirect default-source checkout steps to the snapshot
+            // (mirrors `preloop run`). Without this, `actions/checkout` with no
+            // `repository:` input tries to clone `github.repository` against
+            // the real GitHub host, which fails for local submissions.
+            if let Some(root) = &workspace_root {
+                let canonical = std::fs::canonicalize(root)
+                    .with_context(|| format!("resolve workspace root {}", root.display()))?;
+                let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(canonical.as_os_str().to_string_lossy().as_bytes());
+                request = request.header("x-preloop-local-workspace", encoded);
+            }
+            let response = request
                 .json(&submission)
                 .send()
                 .await?

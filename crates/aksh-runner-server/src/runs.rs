@@ -8,6 +8,19 @@ pub(crate) async fn healthz(State(shared): State<Arc<SharedState>>) -> Json<serd
     }))
 }
 
+/// GitHub's `system.orchestrationId`: `{planId}.{jobId}.{suffix}` where the
+/// suffix is the 1-based matrix cell index (`build._1`) or `__default` for
+/// plain jobs. The official runner emits the value as a User-Agent product
+/// token, so it must not contain spaces or other invalid token characters —
+/// the job display name ("Run tests with system wide configuration") would
+/// crash the worker with `FormatException`.
+fn orchestration_id(plan_id: &str, job_id: &str, matrix_index: Option<usize>) -> String {
+    match matrix_index {
+        Some(index) => format!("{plan_id}.{job_id}._{index}"),
+        None => format!("{plan_id}.{job_id}.__default"),
+    }
+}
+
 /// Interpolate `${{ ... }}` expressions in a workflow run name.
 ///
 /// A malformed expression is left untouched, matching GitHub's behavior of
@@ -395,6 +408,65 @@ pub(crate) async fn submit_run_inner(
         None
     };
 
+    // A local submission is a synthetic push/PR against the snapshot. Present
+    // the same event shape GitHub would: changed-file actions
+    // (`dorny/paths-filter`, `tj-actions/changed-files`) and `actions/checkout`
+    // read `payload.repository.default_branch` and `payload.before` to pick
+    // their diff base; without them they abort and gate the whole DAG closed.
+    if let Some(snapshot) = &workspace_snapshot {
+        if let Some(payload) = submission.payload.as_object_mut() {
+            let (owner, name) = submission
+                .repository
+                .split_once('/')
+                .map(|(owner, name)| (owner.to_owned(), name.to_owned()))
+                .unwrap_or_else(|| ("local".to_owned(), submission.repository.clone()));
+            payload.insert(
+                "repository".to_owned(),
+                serde_json::json!({
+                    "name": name,
+                    "full_name": submission.repository,
+                    "owner": { "login": owner },
+                    "default_branch": snapshot.default_branch.clone().unwrap_or_else(|| {
+                        submission
+                            .git_ref
+                            .strip_prefix("refs/heads/")
+                            .unwrap_or("main")
+                            .to_owned()
+                    }),
+                }),
+            );
+            if submission.event == "push" {
+                // `after` is the snapshot commit the runner checks out;
+                // `before` is the base its changes are measured against (the
+                // workspace HEAD when the tree is dirty, HEAD^ when clean — see
+                // `WorkspaceSnapshot::before_sha`). An absent base (unborn or
+                // initial-commit clean tree) is the null SHA, which GitHub
+                // reports as an "initial push" and actions treat as
+                // "everything changed".
+                payload.insert(
+                    "before".to_owned(),
+                    snapshot
+                        .before_sha
+                        .clone()
+                        .map(serde_json::Value::String)
+                        .unwrap_or_else(|| {
+                            serde_json::Value::String(
+                                "0000000000000000000000000000000000000000".to_owned(),
+                            )
+                        }),
+                );
+                payload.insert("after".to_owned(), serde_json::json!(snapshot.commit_sha));
+                payload.insert("ref".to_owned(), serde_json::json!(submission.git_ref));
+            }
+        }
+        // The github context was built before the snapshot existed; refresh
+        // the pieces that now describe the local tree.
+        if let Some(object) = github.as_object_mut() {
+            object.insert("event".to_owned(), submission.payload.clone());
+            object.insert("sha".to_owned(), serde_json::json!(snapshot.commit_sha));
+        }
+    }
+
     // PATs are static and can be embedded now. GitHub App installation tokens
     // are deliberately minted later, when the broker dispatches each job, so
     // downstream jobs cannot sit in the queue until a short-lived token
@@ -608,9 +680,10 @@ pub(crate) async fn submit_run_inner(
         );
         agent_msg.variables.insert(
             "system.orchestrationId".to_owned(),
-            aksh_gha_protocol::azdo::VariableValue::new(format!(
-                "{}.{}.{}",
-                agent_msg.plan.plan_id, job.base_id, agent_msg.job_name
+            aksh_gha_protocol::azdo::VariableValue::new(orchestration_id(
+                &agent_msg.plan.plan_id,
+                &job.base_id,
+                job.matrix_index,
             )),
         );
         agent_msg.file_table = vec![workflow_path.clone()];
@@ -1674,6 +1747,27 @@ fn live_run_events(
 mod tests {
     use super::*;
     use futures::FutureExt;
+
+    #[test]
+    fn orchestration_id_matches_github_format() {
+        // Plain job: `{planId}.{jobId}.__default` (golden:
+        // 49f720db-...hello.__default)
+        assert_eq!(
+            orchestration_id("49f720db-d368-4a3a-8b97-adbc8733aa79", "hello", None),
+            "49f720db-d368-4a3a-8b97-adbc8733aa79.hello.__default"
+        );
+        // Matrix cells: 1-based index suffix (golden: build._1/_2/_3)
+        assert_eq!(
+            orchestration_id("37e6d806-40ab-4d76-92bd-7f6b0c91c002", "build", Some(2)),
+            "37e6d806-40ab-4d76-92bd-7f6b0c91c002.build._2"
+        );
+        // The value must be a valid User-Agent product token: the official
+        // runner inserts it into `ProductInfoHeaderValue`, which throws
+        // FormatException on spaces (e.g. a display name like
+        // "Run tests with system wide configuration").
+        assert!(!orchestration_id("p", "j", None).contains(' '));
+        assert!(!orchestration_id("p", "j", Some(1)).contains(' '));
+    }
 
     /// The broadcast channel fans out every run's events, so a stalled run's
     /// stream sees — and discards — traffic it must not treat as liveness.

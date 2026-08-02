@@ -1,0 +1,505 @@
+﻿2026-07-31T11:06:14.6151561Z Current runner version: '2.336.0'
+##[group]Runner Image Provisioner
+Hosted Compute Agent
+Version: 20260707.563
+Commit: 02667638d2b423fbc733a8e32a88b44996a3ba6e
+Build Date: 2026-07-07T19:33:50Z
+Worker ID: {87a732fe-7fc0-4c85-9ad9-0413695ca289}
+Azure Region: westus3
+##[endgroup]
+##[group]Operating System
+Ubuntu
+24.04.4
+LTS
+##[endgroup]
+##[group]Runner Image
+Image: ubuntu-24.04
+Version: 20260720.247.2
+Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260720.247/images/ubuntu/Ubuntu2404-Readme.md
+Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260720.247
+##[endgroup]
+##[group]GITHUB_TOKEN Permissions
+Metadata: read
+##[endgroup]
+Secret source: None
+Prepare workflow directory
+Prepare all required actions
+Getting action download info
+Download action repository 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' (SHA:3d3c42e5aac5ba805825da76410c181273ba90b1)
+Download action repository 'pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271' (SHA:0ebf47130e4866e96fce0953f49152a61190b271)
+Download action repository 'actions/setup-node@820762786026740c76f36085b0efc47a31fe5020' (SHA:820762786026740c76f36085b0efc47a31fe5020)
+Complete job name: Lint: node-24, ubuntu-latest
+##[group]Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+with:
+persist-credentials: false
+repository: vitejs/vite
+token: ***
+ssh-strict: true
+ssh-user: git
+clean: true
+sparse-checkout-cone-mode: true
+fetch-depth: 1
+fetch-tags: false
+show-progress: true
+lfs: false
+submodules: false
+set-safe-directory: true
+allow-unsafe-pr-checkout: false
+env:
+NODE_OPTIONS: --max-old-space-size=6144
+PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+VITEST_SEGFAULT_RETRY: 3
+##[endgroup]
+Syncing repository: vitejs/vite
+##[group]Getting Git version info
+Working directory is '/home/runner/work/vite/vite'
+[command]/usr/bin/git version
+git version 2.54.0
+##[endgroup]
+Temporarily overriding HOME='/home/runner/work/_temp/8b70ad9a-fc4f-4362-ac1e-fd4d6762929f' before making global git config changes
+Adding repository directory to the temporary git global config as a safe directory
+[command]/usr/bin/git config --global --add safe.directory /home/runner/work/vite/vite
+Deleting the contents of '/home/runner/work/vite/vite'
+##[group]Determining repository object format
+##[endgroup]
+##[group]Initializing the repository
+[command]/usr/bin/git init /home/runner/work/vite/vite
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /home/runner/work/vite/vite/.git/
+[command]/usr/bin/git remote add origin https://github.com/vitejs/vite
+##[endgroup]
+##[group]Disabling automatic garbage collection
+[command]/usr/bin/git config --local gc.auto 0
+##[endgroup]
+##[group]Setting up auth
+Removing SSH command configuration
+[command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Removing HTTP extra header
+[command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Removing includeIf entries pointing to credentials config files
+[command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+[command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+[command]/usr/bin/git config --file /home/runner/work/_temp/git-credentials-d5c4c644-fcad-4c1c-a996-336a7ec3e7de.config http.https://github.com/.extraheader AUTHORIZATION: basic ***
+[command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/vite/vite/.git.path /home/runner/work/_temp/git-credentials-d5c4c644-fcad-4c1c-a996-336a7ec3e7de.config
+[command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/vite/vite/.git/worktrees/*.path /home/runner/work/_temp/git-credentials-d5c4c644-fcad-4c1c-a996-336a7ec3e7de.config
+[command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-d5c4c644-fcad-4c1c-a996-336a7ec3e7de.config
+[command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-d5c4c644-fcad-4c1c-a996-336a7ec3e7de.config
+##[endgroup]
+##[group]Fetching the repository
+[command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +a04293af5b021b2f960999042c5b850bc3d54e12:refs/remotes/pull/23114/merge
+From https://github.com/vitejs/vite
+* [new ref]         a04293af5b021b2f960999042c5b850bc3d54e12 -> pull/23114/merge
+##[endgroup]
+##[group]Determining the checkout info
+##[endgroup]
+[command]/usr/bin/git sparse-checkout disable
+[command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+##[group]Checking out the ref
+[command]/usr/bin/git checkout --progress --force refs/remotes/pull/23114/merge
+Note: switching to 'refs/remotes/pull/23114/merge'.
+You are in 'detached HEAD' state. You can look around, make experimental
+changes and commit them, and you can discard any commits you make in this
+state without impacting any branches by switching back to a branch.
+If you want to create a new branch to retain commits you create, you may
+do so (now or later) by using -c with the switch command. Example:
+git switch -c <new-branch-name>
+Or undo this operation with:
+git switch -
+Turn off this advice by setting config variable advice.detachedHead to false
+HEAD is now at a04293a Merge 214636edf9b1483698fc749792179f115a4fdc75 into e6b6b167afa0a80548829d1f24a0712f9194389a
+##[endgroup]
+[command]/usr/bin/git log -1 --format=%H
+a04293af5b021b2f960999042c5b850bc3d54e12
+##[group]Removing auth
+Removing SSH command configuration
+[command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Removing HTTP extra header
+[command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Removing includeIf entries pointing to credentials config files
+[command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+includeif.gitdir:/home/runner/work/vite/vite/.git.path
+includeif.gitdir:/home/runner/work/vite/vite/.git/worktrees/*.path
+includeif.gitdir:/github/workspace/.git.path
+includeif.gitdir:/github/workspace/.git/worktrees/*.path
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/vite/vite/.git.path
+/home/runner/work/_temp/git-credentials-d5c4c644-fcad-4c1c-a996-336a7ec3e7de.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/vite/vite/.git.path \/home\/runner\/work\/_temp\/git\-credentials\-d5c4c644\-fcad\-4c1c\-a996\-336a7ec3e7de\.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/vite/vite/.git/worktrees/*.path
+/home/runner/work/_temp/git-credentials-d5c4c644-fcad-4c1c-a996-336a7ec3e7de.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/vite/vite/.git/worktrees/*.path \/home\/runner\/work\/_temp\/git\-credentials\-d5c4c644\-fcad\-4c1c\-a996\-336a7ec3e7de\.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git.path
+/github/runner_temp/git-credentials-d5c4c644-fcad-4c1c-a996-336a7ec3e7de.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git.path \/github\/runner_temp\/git\-credentials\-d5c4c644\-fcad\-4c1c\-a996\-336a7ec3e7de\.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git/worktrees/*.path
+/github/runner_temp/git-credentials-d5c4c644-fcad-4c1c-a996-336a7ec3e7de.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git/worktrees/*.path \/github\/runner_temp\/git\-credentials\-d5c4c644\-fcad\-4c1c\-a996\-336a7ec3e7de\.config
+[command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+Removing credentials config '/home/runner/work/_temp/git-credentials-d5c4c644-fcad-4c1c-a996-336a7ec3e7de.config'
+##[endgroup]
+##[group]Run pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271
+with:
+dest: ~/setup-pnpm
+run_install: null
+cache: false
+cache_dependency_path: pnpm-lock.yaml
+package_json_file: package.json
+standalone: false
+env:
+NODE_OPTIONS: --max-old-space-size=6144
+PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+VITEST_SEGFAULT_RETRY: 3
+##[endgroup]
+##[group]Running self-installer...
+added 1 package, and audited 2 packages in 2s
+1 package is looking for funding
+run `npm fund` for details
+1 high severity vulnerability
+To address all issues, run:
+npm audit fix --force
+Run `npm audit` for details.
+Checking for updates...
+Switching pnpm from v11.7.0 to v10.34.5...
+.../.bin/global/v11/876-19fb7da9537      | Progress: resolved 1, reused 0, downloaded 0, added 0
+.../.bin/global/v11/876-19fb7da9537      |   +1 +
+.../.bin/global/v11/876-19fb7da9537      | Progress: resolved 1, reused 0, downloaded 1, added 1, done
+[WARN] Detected a pnpm v10 installation layout at PNPM_HOME. The pnpm shims at PNPM_HOME have been refreshed so the new version is active, but pnpm v11 expects bins in PNPM_HOME/bin. Run "pnpm setup" to migrate your PATH to the v11 layout.
+Successfully updated pnpm to v10.34.5
+##[endgroup]
+Installation Completed!
+##[group]Run actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+with:
+node-version: 24
+cache: pnpm
+check-latest: false
+token: ***
+package-manager-cache: true
+env:
+NODE_OPTIONS: --max-old-space-size=6144
+PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+VITEST_SEGFAULT_RETRY: 3
+PNPM_HOME: /home/runner/setup-pnpm/node_modules/.bin
+##[endgroup]
+Found in cache @ /opt/hostedtoolcache/node/24.18.0/x64
+##[group]Environment details
+node: v24.18.0
+npm: 11.16.0
+yarn: 1.22.22
+##[endgroup]
+[command]/home/runner/setup-pnpm/node_modules/.bin/bin/pnpm store path --silent
+/home/runner/setup-pnpm/node_modules/.bin/store/v10
+Cache hit for: node-cache-Linux-x64-pnpm-bcc8b0f3fee9de2eb53f8cda16b5f4906ca2c2f66661e92bce021a997500d8be
+Received 29360128 of 168830860 (17.4%), 28.0 MBs/sec
+Received 168830860 of 168830860 (100.0%), 80.7 MBs/sec
+Cache Size: ~161 MB (168830860 B)
+[command]/usr/bin/tar -xf /home/runner/work/_temp/8abc1d01-d95b-4520-97ce-e04277ae368b/cache.tzst -P -C /home/runner/work/vite/vite --use-compress-program unzstd
+Cache restored successfully
+Cache restored from key: node-cache-Linux-x64-pnpm-bcc8b0f3fee9de2eb53f8cda16b5f4906ca2c2f66661e92bce021a997500d8be
+##[group]Run pnpm install
+pnpm install
+shell: /usr/bin/bash -e {0}
+env:
+NODE_OPTIONS: --max-old-space-size=6144
+PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+VITEST_SEGFAULT_RETRY: 3
+PNPM_HOME: /home/runner/setup-pnpm/node_modules/.bin
+##[endgroup]
+Scope: all 277 workspace projects
+Lockfile is up to date, resolution step is skipped
+Progress: resolved 1, reused 0, downloaded 0, added 0
+Packages: +1141
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+Progress: resolved 1141, reused 517, downloaded 0, added 0
+Progress: resolved 1141, reused 1140, downloaded 0, added 1140
+Progress: resolved 1141, reused 1140, downloaded 0, added 1141
+Progress: resolved 1141, reused 1140, downloaded 0, added 1141, done
+devDependencies:
++ @eslint/js 9.39.5
++ @type-challenges/utils 0.1.1
++ @types/babel__core 7.20.5
++ @types/babel__preset-env 7.10.0
++ @types/convert-source-map 2.0.3
++ @types/cross-spawn 6.0.6
++ @types/etag 1.8.4
++ @types/less 3.0.8
++ @types/node 24.13.3
++ @types/picomatch 4.0.3
++ @types/stylus 0.48.43
++ @types/ws 8.18.1
++ @vitejs/release-scripts 1.8.0
++ eslint 9.39.5
++ eslint-plugin-import-x 4.17.1
++ eslint-plugin-n 18.2.2
++ eslint-plugin-regexp 3.1.1
++ execa 9.6.1
++ globals 17.7.0
++ lint-staged 17.2.0
++ oxfmt 0.60.0
++ picocolors 1.1.1
++ playwright-chromium 1.62.0
++ rolldown 1.2.1
++ rollup 4.59.0
++ simple-git-hooks 2.13.1
++ tsx 4.23.1
++ typescript 6.0.3
++ typescript-eslint 8.65.0
++ vite 8.2.0 <- packages/vite
++ vitest 4.1.10
+. postinstall$ simple-git-hooks
+. postinstall: [INFO] Successfully set the pre-commit with command: pnpm exec lint-staged --concurrent false
+. postinstall: [INFO] Successfully set all git hooks
+. postinstall: Done
+Done in 6.9s using pnpm v10.34.5
+##[group]Run pnpm run build
+pnpm run build
+shell: /usr/bin/bash -e {0}
+env:
+NODE_OPTIONS: --max-old-space-size=6144
+PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+VITEST_SEGFAULT_RETRY: 3
+PNPM_HOME: /home/runner/setup-pnpm/node_modules/.bin
+##[endgroup]
+> @vitejs/vite-monorepo@ build /home/runner/work/vite/vite
+> pnpm -r --filter='./packages/*' run build
+Scope: 3 of 277 workspace projects
+packages/create-vite build$ tsdown
+packages/vite build$ premove dist && pnpm build-bundle && pnpm build-types
+packages/create-vite build: ℹ tsdown v0.22.14 powered by rolldown v1.2.1
+packages/create-vite build: ℹ config file: /home/runner/work/vite/vite/packages/create-vite/tsdown.config.ts 
+packages/create-vite build: ℹ entry: src/index.ts
+packages/create-vite build: ℹ target: node20
+packages/create-vite build: ℹ tsconfig: tsconfig.json
+packages/create-vite build: ℹ Build start
+packages/create-vite build: ℹ dist/index.js  46.12 kB │ gzip: 16.46 kB
+packages/create-vite build: ℹ 1 files, total: 46.12 kB
+packages/create-vite build: ✔ Build complete in 52ms
+packages/create-vite build: Done
+packages/vite build: > vite@8.2.0 build-bundle /home/runner/work/vite/vite/packages/vite
+packages/vite build: > rolldown --config rolldown.config.ts
+packages/vite build: shimmed: postcss-load-config/src/req.js
+packages/vite build: shimmed: postcss-import/index.js
+packages/vite build: shimmed: postcss-import/lib/parse-styles.js
+packages/vite build: [log] <DIR>/client/env.mjs  chunk │ size: 0.61 kB
+packages/vite build: [log] <DIR>/client/client.mjs  chunk │ size: 38.51 kB
+packages/vite build: [log] <DIR>/client/bundledDevClient.mjs  chunk │ size: 46.37 kB
+packages/vite build: [log] <DIR>/node/internal.js               chunk │ size:     0.14 kB
+packages/vite build: [log] <DIR>/node/index.js                  chunk │ size:     2.67 kB
+packages/vite build: [log] <DIR>/node/chunks/lib.js             chunk │ size:    11.71 kB
+packages/vite build: [log] <DIR>/node/chunks/postcss-import.js  chunk │ size:    18.43 kB
+packages/vite build: [log] <DIR>/node/cli.js                    chunk │ size:    29.85 kB
+packages/vite build: [log] <DIR>/node/chunks/build.js           chunk │ size:   205.66 kB
+packages/vite build: [log] <DIR>/node/chunks/dist.js            chunk │ size:   246.60 kB
+packages/vite build: [log] <DIR>/node/chunks/node.js            chunk │ size: 1,350.47 kB
+packages/vite build: [log] <DIR>/node/module-runner.js  chunk │ size: 54.44 kB
+packages/vite build: [log]
+packages/vite build: [success] rolldown v1.2.1 Finished in 209.83 ms
+packages/vite build: > vite@8.2.0 build-types /home/runner/work/vite/vite/packages/vite
+packages/vite build: > pnpm build-types-roll && pnpm build-types-check
+packages/vite build: > vite@8.2.0 build-types-roll /home/runner/work/vite/vite/packages/vite
+packages/vite build: > rolldown --config rolldown.dts.config.ts
+packages/vite build: [log] <DIR>/internal.d.ts                      chunk │ size:   0.14 kB
+packages/vite build: [log] <DIR>/chunks/moduleRunnerTransport.d.ts  chunk │ size:   3.09 kB
+packages/vite build: [log] <DIR>/module-runner.d.ts                 chunk │ size:  11.51 kB
+packages/vite build: [log] <DIR>/index.d.ts                         chunk │ size: 164.81 kB
+packages/vite build: [log]
+packages/vite build: [success] rolldown v1.2.1 Finished in 333.28 ms
+packages/vite build: > vite@8.2.0 build-types-check /home/runner/work/vite/vite/packages/vite
+packages/vite build: > tsc --project tsconfig.check.json
+packages/vite build: Done
+packages/plugin-legacy build$ tsdown
+packages/plugin-legacy build: ℹ tsdown v0.22.14 powered by rolldown v1.2.1
+packages/plugin-legacy build: ℹ config file: /home/runner/work/vite/vite/packages/plugin-legacy/tsdown.config.ts 
+packages/plugin-legacy build: ℹ entry: src/index.ts
+packages/plugin-legacy build: ℹ target: node20
+packages/plugin-legacy build: ℹ Build start
+packages/plugin-legacy build: ℹ dist/index.js    30.28 kB │ gzip: 8.58 kB
+packages/plugin-legacy build: ℹ dist/index.d.ts   1.39 kB │ gzip: 0.55 kB
+packages/plugin-legacy build: ℹ 2 files, total: 31.66 kB
+packages/plugin-legacy build: ✔ Build complete in 1145ms
+packages/plugin-legacy build: Done
+##[group]Run pnpm run lint
+pnpm run lint
+shell: /usr/bin/bash -e {0}
+env:
+NODE_OPTIONS: --max-old-space-size=6144
+PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+VITEST_SEGFAULT_RETRY: 3
+PNPM_HOME: /home/runner/setup-pnpm/node_modules/.bin
+##[endgroup]
+> @vitejs/vite-monorepo@ lint /home/runner/work/vite/vite
+> eslint --cache . --concurrency auto
+##[group]Run pnpm format && git diff --exit-code
+pnpm format && git diff --exit-code
+shell: /usr/bin/bash -e {0}
+env:
+NODE_OPTIONS: --max-old-space-size=6144
+PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+VITEST_SEGFAULT_RETRY: 3
+PNPM_HOME: /home/runner/setup-pnpm/node_modules/.bin
+##[endgroup]
+> @vitejs/vite-monorepo@ format /home/runner/work/vite/vite
+> oxfmt
+Finished in 2569ms on 2449 files using 4 threads.
+##[group]Run pnpm run typecheck
+pnpm run typecheck
+shell: /usr/bin/bash -e {0}
+env:
+NODE_OPTIONS: --max-old-space-size=6144
+PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+VITEST_SEGFAULT_RETRY: 3
+PNPM_HOME: /home/runner/setup-pnpm/node_modules/.bin
+##[endgroup]
+> @vitejs/vite-monorepo@ typecheck /home/runner/work/vite/vite
+> tsc -p scripts && pnpm -r --parallel run typecheck
+Scope: 276 of 277 workspace projects
+packages/create-vite typecheck$ tsc
+packages/plugin-legacy typecheck$ tsc
+packages/vite typecheck$ tsc && tsc -p src/node && tsc -p src/client && tsc -p src/module-runner && tsc -p src/shared && tsc -p src/node/__tests_dts__ && tsc -p src/module-runner/__tests_dts__
+playground typecheck$ tsc
+packages/create-vite typecheck: Done
+packages/plugin-legacy typecheck: Done
+playground typecheck: Done
+packages/vite typecheck: Done
+##[group]Run pnpm run test-docs
+pnpm run test-docs
+shell: /usr/bin/bash -e {0}
+env:
+NODE_OPTIONS: --max-old-space-size=6144
+PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+VITEST_SEGFAULT_RETRY: 3
+PNPM_HOME: /home/runner/setup-pnpm/node_modules/.bin
+##[endgroup]
+> @vitejs/vite-monorepo@ test-docs /home/runner/work/vite/vite
+> pnpm run docs-build
+> @vitejs/vite-monorepo@ docs-build /home/runner/work/vite/vite
+> pnpm --filter=./docs run docs-build
+> @vitejs/monorepo-docs@ docs-build /home/runner/work/vite/vite/docs
+> vitepress build
+vitepress v2.0.0-alpha.18
+- building client + server bundles...
+llmstxt »   vitepress-plugin-llms initialized (client build) with workDir: /home/runner/work/vite/vite/docs
+llmstxt »   Build started, file collection cleared
+llmstxt »   Processing 42 markdown files from /home/runner/work/vite/vite/docs
+llmstxt »   Generating llms.txt...
+llmstxt »   Generating full documentation bundle (llms-full.txt)...
+llmstxt » ✓ Processed changes/this-environment-in-hooks.md
+llmstxt » ✓ Processed guide/backend-integration.md
+llmstxt » ✓ Processed config/dep-optimization-options.md
+llmstxt » ✓ Generated llms.txt (~1K tokens, 3.53 kB) with 42 documentation links
+llmstxt » ✓ Processed acknowledgements.md
+llmstxt » ✓ Processed changes.md
+llmstxt » ✓ Processed live.md
+llmstxt » ✓ Processed guide/build.md
+llmstxt » ✓ Processed guide/cli.md
+llmstxt » ✓ Processed config.md
+llmstxt » ✓ Processed guide/static-deploy.md
+llmstxt » ✓ Processed guide/env-and-mode.md
+llmstxt » ✓ Processed guide/api-environment-frameworks.md
+llmstxt » ✓ Processed config/build-options.md
+llmstxt » ✓ Generated llms-full.txt (~107.7K tokens, 425 kB) with 42 markdown files
+llmstxt » ✓ Processed guide/api-environment-plugins.md
+llmstxt » ✓ Processed guide/api-environment.md
+llmstxt » ✓ Processed guide/api-environment-runtimes.md
+llmstxt » ✓ Processed guide.md
+llmstxt » ✓ Processed guide/features.md
+llmstxt » ✓ Processed changes/hotupdate-hook.md
+llmstxt » ✓ Processed guide/dep-pre-bundling.md
+llmstxt » ✓ Processed guide/api-hmr.md
+llmstxt » ✓ Processed guide/api-javascript.md
+llmstxt » ✓ Processed changes/per-environment-apis.md
+llmstxt » ✓ Processed guide/performance.md
+llmstxt » ✓ Processed guide/migration.md
+llmstxt » ✓ Processed plugins.md
+llmstxt » ✓ Processed guide/philosophy.md
+llmstxt » ✓ Processed config/preview-options.md
+llmstxt » ✓ Processed releases.md
+llmstxt » ✓ Processed guide/api-plugin.md
+llmstxt » ✓ Processed config/server-options.md
+llmstxt » ✓ Processed config/shared-options.md
+llmstxt » ✓ Processed changes/shared-plugins-during-build.md
+llmstxt » ✓ Processed config/ssr-options.md
+llmstxt » ✓ Processed changes/ssr-using-modulerunner.md
+llmstxt » ✓ Processed guide/assets.md
+llmstxt » ✓ Processed guide/ssr.md
+llmstxt » ✓ Processed guide/troubleshooting.md
+llmstxt » ✓ Processed guide/api-environment-instances.md
+llmstxt » ✓ Processed guide/using-plugins.md
+llmstxt » ✓ Processed guide/why.md
+llmstxt » ✓ Processed config/worker-options.md
+[plugin builtin:vite-reporter] 
+(!) Some chunks are larger than 500 kB after minification. Consider:
+- Using dynamic import() to code-split the application
+- Use build.rolldownOptions.output.codeSplitting to improve chunking: https://rolldown.rs/reference/OutputOptions.codeSplitting
+- Adjust chunk size limit for this warning via build.chunkSizeWarningLimit.
+llmstxt »   vitepress-plugin-llms initialized (SSR build) with workDir: /home/runner/work/vite/vite/docs
+llmstxt »   Build started, file collection cleared
+llmstxt »   Skipping LLMs docs generation in SSR build
+✓ building client + server bundles...
+- rendering pages...
+✓ rendering pages...
+- generating sitemap...
+✓ generating sitemap...
+build complete in 20.83s.
+##[group]Run bash <(curl https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+bash <(curl https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+./actionlint -color -shellcheck=""
+shell: /usr/bin/bash -e {0}
+env:
+NODE_OPTIONS: --max-old-space-size=6144
+PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+VITEST_SEGFAULT_RETRY: 3
+PNPM_HOME: /home/runner/setup-pnpm/node_modules/.bin
+##[endgroup]
+% Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+Dload  Upload   Total   Spent    Left  Speed
+0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0
+0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0
+100  4059  100  4059    0     0  13580      0 --:--:-- --:--:-- --:--:-- 13575
+Start downloading actionlint v1.7.12 to /home/runner/work/vite/vite
+Detected OS=linux ext=tar.gz arch=amd64
+Downloading https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz with curl
+% Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+Dload  Upload   Total   Spent    Left  Speed
+0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0
+0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0
+actionlint
+100 2298k  100 2298k    0     0  7863k      0 --:--:-- --:--:-- --:--:-- 7863k
+Downloaded and unarchived executable: /home/runner/work/vite/vite/actionlint
+Done: 1.7.12
+installed by downloading from release page
+built with go1.26.1 compiler for linux/amd64
+Post job cleanup.
+Cache hit occurred on the primary key node-cache-Linux-x64-pnpm-bcc8b0f3fee9de2eb53f8cda16b5f4906ca2c2f66661e92bce021a997500d8be, not saving cache.
+Post job cleanup.
+Pruning is unnecessary.
+Post job cleanup.
+[command]/usr/bin/git version
+git version 2.54.0
+Temporarily overriding HOME='/home/runner/work/_temp/5da2324f-0ef1-4b51-8cf9-5f757b6de3f2' before making global git config changes
+Adding repository directory to the temporary git global config as a safe directory
+[command]/usr/bin/git config --global --add safe.directory /home/runner/work/vite/vite
+Removing SSH command configuration
+[command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Removing HTTP extra header
+[command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Removing includeIf entries pointing to credentials config files
+[command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+[command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+Cleaning up orphan processes
