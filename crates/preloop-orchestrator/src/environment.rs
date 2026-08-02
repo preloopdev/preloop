@@ -416,6 +416,7 @@ mod tests {
             runs_on,
             needs: Vec::new(),
             matrix: Default::default(),
+            matrix_index: None,
             env: BTreeMap::new(),
             steps,
             if_condition: None,

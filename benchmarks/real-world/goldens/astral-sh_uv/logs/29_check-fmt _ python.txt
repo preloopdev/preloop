@@ -1,0 +1,286 @@
+﻿2026-08-01T02:36:08.8419935Z Current runner version: '2.336.0'
+##[group]Runner Image Provisioner
+Hosted Compute Agent
+Version: 20260624.560
+Commit: 925d229a51159bc391ae97e54a2dd1fe20af789d
+Build Date: 2026-06-24T18:26:47Z
+Worker ID: {1c99dbce-faca-4706-8434-4029fcf59011}
+Azure Region: eastus
+##[endgroup]
+##[group]VM Image
+- OS: Linux (x64)
+- Source: Docker
+- Name: ubuntu:24.04
+- Version: 20260629.59.1
+##[endgroup]
+##[group]GITHUB_TOKEN Permissions
+Metadata: read
+##[endgroup]
+Secret source: None
+Prepare workflow directory
+Prepare all required actions
+Getting action download info
+Download action repository 'actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0' (SHA:9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0)
+Download action repository 'astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9' (SHA:c771a70e6277c0a99b617c7a806ffedaca235ff9)
+Uses: astral-sh/uv/.github/workflows/check-fmt.yml@refs/pull/20876/merge (81742a27ad62bb1dd1289a164f1776508279c756)
+Complete job name: check-fmt / python
+##[group]Run actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+with:
+persist-credentials: false
+repository: astral-sh/uv
+token: ***
+ssh-strict: true
+ssh-user: git
+clean: true
+sparse-checkout-cone-mode: true
+fetch-depth: 1
+fetch-tags: false
+show-progress: true
+lfs: false
+submodules: false
+set-safe-directory: true
+allow-unsafe-pr-checkout: false
+##[endgroup]
+Syncing repository: astral-sh/uv
+##[group]Getting Git version info
+Working directory is '/home/runner/work/uv/uv'
+[command]/usr/bin/git version
+git version 2.54.0
+##[endgroup]
+Temporarily overriding HOME='/home/runner/work/_temp/c0a4fb06-e37b-4a8c-90a1-689814c2fb3f' before making global git config changes
+Adding repository directory to the temporary git global config as a safe directory
+[command]/usr/bin/git config --global --add safe.directory /home/runner/work/uv/uv
+Deleting the contents of '/home/runner/work/uv/uv'
+##[group]Determining repository object format
+##[endgroup]
+##[group]Initializing the repository
+[command]/usr/bin/git init /home/runner/work/uv/uv
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /home/runner/work/uv/uv/.git/
+[command]/usr/bin/git remote add origin https://github.com/astral-sh/uv
+##[endgroup]
+##[group]Disabling automatic garbage collection
+[command]/usr/bin/git config --local gc.auto 0
+##[endgroup]
+##[group]Setting up auth
+Removing SSH command configuration
+[command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Removing HTTP extra header
+[command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Removing includeIf entries pointing to credentials config files
+[command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+[command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+[command]/usr/bin/git config --file /home/runner/work/_temp/git-credentials-c617b8a9-11c7-4bb1-8f23-2c0649533558.config http.https://github.com/.extraheader AUTHORIZATION: basic ***
+[command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/uv/uv/.git.path /home/runner/work/_temp/git-credentials-c617b8a9-11c7-4bb1-8f23-2c0649533558.config
+[command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/uv/uv/.git/worktrees/*.path /home/runner/work/_temp/git-credentials-c617b8a9-11c7-4bb1-8f23-2c0649533558.config
+[command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-c617b8a9-11c7-4bb1-8f23-2c0649533558.config
+[command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-c617b8a9-11c7-4bb1-8f23-2c0649533558.config
+##[endgroup]
+##[group]Fetching the repository
+[command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +81742a27ad62bb1dd1289a164f1776508279c756:refs/remotes/pull/20876/merge
+From https://github.com/astral-sh/uv
+* [new ref]         81742a27ad62bb1dd1289a164f1776508279c756 -> pull/20876/merge
+##[endgroup]
+##[group]Determining the checkout info
+##[endgroup]
+[command]/usr/bin/git sparse-checkout disable
+[command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+##[group]Checking out the ref
+[command]/usr/bin/git checkout --progress --force refs/remotes/pull/20876/merge
+Note: switching to 'refs/remotes/pull/20876/merge'.
+You are in 'detached HEAD' state. You can look around, make experimental
+changes and commit them, and you can discard any commits you make in this
+state without impacting any branches by switching back to a branch.
+If you want to create a new branch to retain commits you create, you may
+do so (now or later) by using -c with the switch command. Example:
+git switch -c <new-branch-name>
+Or undo this operation with:
+git switch -
+Turn off this advice by setting config variable advice.detachedHead to false
+HEAD is now at 81742a2 Merge 1ddf5b709ad49bba88e6607af0d2a1bbe0c03ff5 into 79bbface771210df216b738e9bdc7df95e5a9e6b
+##[endgroup]
+[command]/usr/bin/git log -1 --format=%H
+81742a27ad62bb1dd1289a164f1776508279c756
+##[group]Removing auth
+Removing SSH command configuration
+[command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Removing HTTP extra header
+[command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Removing includeIf entries pointing to credentials config files
+[command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+includeif.gitdir:/home/runner/work/uv/uv/.git.path
+includeif.gitdir:/home/runner/work/uv/uv/.git/worktrees/*.path
+includeif.gitdir:/github/workspace/.git.path
+includeif.gitdir:/github/workspace/.git/worktrees/*.path
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/uv/uv/.git.path
+/home/runner/work/_temp/git-credentials-c617b8a9-11c7-4bb1-8f23-2c0649533558.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/uv/uv/.git.path /home/runner/work/_temp/git-credentials-c617b8a9-11c7-4bb1-8f23-2c0649533558.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/uv/uv/.git/worktrees/*.path
+/home/runner/work/_temp/git-credentials-c617b8a9-11c7-4bb1-8f23-2c0649533558.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/uv/uv/.git/worktrees/*.path /home/runner/work/_temp/git-credentials-c617b8a9-11c7-4bb1-8f23-2c0649533558.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git.path
+/github/runner_temp/git-credentials-c617b8a9-11c7-4bb1-8f23-2c0649533558.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-c617b8a9-11c7-4bb1-8f23-2c0649533558.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git/worktrees/*.path
+/github/runner_temp/git-credentials-c617b8a9-11c7-4bb1-8f23-2c0649533558.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-c617b8a9-11c7-4bb1-8f23-2c0649533558.config
+[command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+Removing credentials config '/home/runner/work/_temp/git-credentials-c617b8a9-11c7-4bb1-8f23-2c0649533558.config'
+##[endgroup]
+##[group]Run astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+with:
+version: 0.11.33
+activate-environment: false
+no-project: false
+working-directory: /home/runner/work/uv/uv
+github-token: ***
+enable-cache: auto
+cache-dependency-glob: **/*requirements*.txt
+**/*requirements*.in
+**/*constraints*.txt
+**/*constraints*.in
+**/pyproject.toml
+**/uv.lock
+**/*.py.lock
+
+restore-cache: true
+save-cache: true
+prune-cache: false
+cache-python: false
+ignore-nothing-to-cache: false
+ignore-empty-workdir: false
+download-from-astral-mirror: true
+add-problem-matchers: true
+quiet: false
+resolution-strategy: highest
+##[endgroup]
+Fetching manifest data from https://raw.githubusercontent.com/astral-sh/versions/main/v1/uv.ndjson ...
+Downloading uv from "https://releases.astral.sh/github/uv/releases/download/0.11.33/uv-x86_64-unknown-linux-gnu.tar.gz" ...
+[command]/usr/bin/tar xz --warning=no-unknown-keyword --overwrite -C /home/runner/work/_temp/d86b1cb8-9ef3-4798-8d7f-ae34bed70ef8 -f /home/runner/work/_temp/2f753066-12a8-42c2-8475-91087f0a616d
+Added /home/runner/.local/bin to the path
+Added /opt/hostedtoolcache/uv/0.11.33/x86_64 to the path
+Set UV_PYTHON_INSTALL_DIR to /home/runner/work/_temp/uv-python-dir
+Added /home/runner/work/_temp/uv-python-dir to the path
+Set UV_CACHE_DIR to /home/runner/work/_temp/setup-uv-cache
+Successfully installed uv version 0.11.33
+Searching files using cache dependency glob: /home/runner/work/uv/uv/**/*requirements*.txt,/home/runner/work/uv/uv/**/*requirements*.in,/home/runner/work/uv/uv/**/*constraints*.txt,/home/runner/work/uv/uv/**/*constraints*.in,/home/runner/work/uv/uv/**/pyproject.toml,/home/runner/work/uv/uv/**/uv.lock,/home/runner/work/uv/uv/**/*.py.lock
+/home/runner/work/uv/uv/agents/hooks/post-edit-format.py.lock
+/home/runner/work/uv/uv/agents/scripts/agent-review-to-github-comments.py.lock
+/home/runner/work/uv/uv/crates/uv-build/pyproject.toml
+/home/runner/work/uv/uv/crates/uv-python/fetch-download-metadata.py.lock
+/home/runner/work/uv/uv/crates/uv-requirements-txt/test-data/requirements-txt/constraints-a.txt
+/home/runner/work/uv/uv/crates/uv-requirements-txt/test-data/requirements-txt/constraints-b.txt
+/home/runner/work/uv/uv/pyproject.toml
+/home/runner/work/uv/uv/scripts/benchmark/pyproject.toml
+/home/runner/work/uv/uv/scripts/benchmark/uv.lock
+/home/runner/work/uv/uv/scripts/bump-workspace-crate-versions.py.lock
+/home/runner/work/uv/uv/scripts/check-trampoline-version-consistency.py.lock
+/home/runner/work/uv/uv/scripts/create-python-mirror.py.lock
+/home/runner/work/uv/uv/scripts/generate-crate-readmes.py.lock
+/home/runner/work/uv/uv/scripts/generate-known-stdlib.py.lock
+/home/runner/work/uv/uv/scripts/publish/test_publish.py.lock
+/home/runner/work/uv/uv/scripts/registries-test.py.lock
+/home/runner/work/uv/uv/scripts/sync-python-version-constants.py.lock
+/home/runner/work/uv/uv/scripts/update-latest-changelog-section.py.lock
+/home/runner/work/uv/uv/scripts/uv-run-remote-script-test.py.lock
+/home/runner/work/uv/uv/scripts/vendor-packaging.py.lock
+/home/runner/work/uv/uv/test/ecosystem/airflow/pyproject.toml
+/home/runner/work/uv/uv/test/ecosystem/black/pyproject.toml
+/home/runner/work/uv/uv/test/ecosystem/github-wikidata-bot/pyproject.toml
+/home/runner/work/uv/uv/test/ecosystem/home-assistant-core/pyproject.toml
+/home/runner/work/uv/uv/test/ecosystem/jupyterlab/pyproject.toml
+/home/runner/work/uv/uv/test/ecosystem/packse/pyproject.toml
+/home/runner/work/uv/uv/test/ecosystem/pandas/pyproject.toml
+/home/runner/work/uv/uv/test/ecosystem/poetry/pyproject.toml
+/home/runner/work/uv/uv/test/ecosystem/pyx-external/pyproject.toml
+/home/runner/work/uv/uv/test/ecosystem/saleor/pyproject.toml
+/home/runner/work/uv/uv/test/ecosystem/semantic-kernel/pyproject.toml
+/home/runner/work/uv/uv/test/ecosystem/transformers/pyproject.toml
+/home/runner/work/uv/uv/test/ecosystem/warehouse/pyproject.toml
+/home/runner/work/uv/uv/test/packages/anyio_local/pyproject.toml
+/home/runner/work/uv/uv/test/packages/black_editable/pyproject.toml
+/home/runner/work/uv/uv/test/packages/built-by-uv/pyproject.toml
+/home/runner/work/uv/uv/test/packages/built-by-uv/uv.lock
+/home/runner/work/uv/uv/test/packages/dependent_locals/first_local/pyproject.toml
+/home/runner/work/uv/uv/test/packages/dependent_locals/second_local/pyproject.toml
+/home/runner/work/uv/uv/test/packages/deptry_reproducer/pyproject.toml
+/home/runner/work/uv/uv/test/packages/executable_file/pyproject.toml
+/home/runner/work/uv/uv/test/packages/fake-uv/pyproject.toml
+/home/runner/work/uv/uv/test/packages/flit_editable/pyproject.toml
+/home/runner/work/uv/uv/test/packages/hatchling_dynamic/pyproject.toml
+/home/runner/work/uv/uv/test/packages/hatchling_editable/pyproject.toml
+/home/runner/work/uv/uv/test/packages/keyring_test_plugin/pyproject.toml
+/home/runner/work/uv/uv/test/packages/package.name.with.dots/pyproject.toml
+/home/runner/work/uv/uv/test/packages/poetry_editable/pyproject.toml
+/home/runner/work/uv/uv/test/packages/root_editable/pyproject.toml
+/home/runner/work/uv/uv/test/packages/setuptools_editable/pyproject.toml
+/home/runner/work/uv/uv/test/requirements/airflow2-constraints.txt
+/home/runner/work/uv/uv/test/requirements/transformers/pyproject.toml
+/home/runner/work/uv/uv/test/workspaces/albatross-dependency-rainbow/pyproject.toml
+/home/runner/work/uv/uv/test/workspaces/albatross-groups-only/pyproject.toml
+/home/runner/work/uv/uv/test/workspaces/albatross-in-example/examples/bird-feeder/pyproject.toml
+/home/runner/work/uv/uv/test/workspaces/albatross-in-example/pyproject.toml
+/home/runner/work/uv/uv/test/workspaces/albatross-just-project/pyproject.toml
+/home/runner/work/uv/uv/test/workspaces/albatross-project-in-excluded/excluded/bird-feeder/pyproject.toml
+/home/runner/work/uv/uv/test/workspaces/albatross-project-in-excluded/packages/seeds/pyproject.toml
+/home/runner/work/uv/uv/test/workspaces/albatross-project-in-excluded/pyproject.toml
+/home/runner/work/uv/uv/test/workspaces/albatross-root-workspace/packages/bird-feeder/pyproject.toml
+/home/runner/work/uv/uv/test/workspaces/albatross-root-workspace/packages/seeds/pyproject.toml
+/home/runner/work/uv/uv/test/workspaces/albatross-root-workspace/pyproject.toml
+/home/runner/work/uv/uv/test/workspaces/albatross-virtual-workspace/packages/albatross/pyproject.toml
+/home/runner/work/uv/uv/test/workspaces/albatross-virtual-workspace/packages/bird-feeder/pyproject.toml
+/home/runner/work/uv/uv/test/workspaces/albatross-virtual-workspace/packages/seeds/pyproject.toml
+/home/runner/work/uv/uv/test/workspaces/albatross-virtual-workspace/pyproject.toml
+/home/runner/work/uv/uv/uv.lock
+Found 68 files to hash.
+Trying to restore cache from GitHub Actions cache with key: setup-uv-2-x86_64-unknown-linux-gnu-ubuntu-24.04-unknown-060cdd892c753aabacd45b9a36e6e866e44998dada29c78b828152dea2c56c68
+Cache hit for: setup-uv-2-x86_64-unknown-linux-gnu-ubuntu-24.04-unknown-060cdd892c753aabacd45b9a36e6e866e44998dada29c78b828152dea2c56c68
+Received 11495618 of 11495618 (100.0%), 34.9 MBs/sec
+Cache Size: ~11 MB (11495618 B)
+[command]/usr/bin/tar -xf /home/runner/work/_temp/5990f7db-1e80-4f8e-9cbd-f6ad8a40585f/cache.tzst -P -C /home/runner/work/uv/uv --use-compress-program unzstd
+Cache restored successfully
+cache restored from GitHub Actions cache with key: setup-uv-2-x86_64-unknown-linux-gnu-ubuntu-24.04-unknown-060cdd892c753aabacd45b9a36e6e866e44998dada29c78b828152dea2c56c68
+##[group]Run uvx ruff format --diff .
+uvx ruff format --diff .
+shell: /usr/bin/bash -e {0}
+env:
+UV_PYTHON_INSTALL_DIR: /home/runner/work/_temp/uv-python-dir
+UV_CACHE_DIR: /home/runner/work/_temp/setup-uv-cache
+##[endgroup]
+230 files already formatted
+Post job cleanup.
+UV_CACHE_DIR is already set to /home/runner/work/_temp/setup-uv-cache
+UV_PYTHON_INSTALL_DIR is already set to /home/runner/work/_temp/uv-python-dir
+Cache hit occurred on key setup-uv-2-x86_64-unknown-linux-gnu-ubuntu-24.04-unknown-060cdd892c753aabacd45b9a36e6e866e44998dada29c78b828152dea2c56c68, not saving cache.
+Post job cleanup.
+[command]/usr/bin/git version
+git version 2.54.0
+Temporarily overriding HOME='/home/runner/work/_temp/87aef6ba-5c07-49af-b617-819b399e1442' before making global git config changes
+Adding repository directory to the temporary git global config as a safe directory
+[command]/usr/bin/git config --global --add safe.directory /home/runner/work/uv/uv
+Removing SSH command configuration
+[command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Removing HTTP extra header
+[command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Removing includeIf entries pointing to credentials config files
+[command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+[command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+Cleaning up orphan processes

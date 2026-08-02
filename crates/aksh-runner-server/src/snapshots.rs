@@ -24,6 +24,17 @@ const MAX_GIT_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) struct WorkspaceSnapshot {
     pub(crate) commit_sha: String,
     pub(crate) repository: String,
+    /// Current branch of the source workspace (`master`, `main`, …), when
+    /// resolvable. Mirrored into the event payload as
+    /// `repository.default_branch` so changed-file actions can pick a base.
+    pub(crate) default_branch: Option<String>,
+    /// Base commit the synthetic push measures against, mirrored into push
+    /// event payloads as `before`. When the working tree carries uncommitted
+    /// edits this is the workspace `HEAD` (so `before..after` is exactly the
+    /// local delta); when the tree is clean it is `HEAD^` (so the range still
+    /// covers the last commit the user wants tested). `None` on an unborn or
+    /// initial-commit clean tree yields the null-SHA "initial push" base.
+    pub(crate) before_sha: Option<String>,
 }
 
 /// Capture `workspace` as an immutable cache-backed bare repository for `run_id`.
@@ -98,7 +109,11 @@ pub(crate) async fn create_workspace_snapshot(
         }
     }
 
-    let commit_sha = result?;
+    let SnapshotResult {
+        commit_sha,
+        default_branch,
+        before_sha,
+    } = result?;
     info!(
         %run_id,
         %commit_sha,
@@ -108,6 +123,8 @@ pub(crate) async fn create_workspace_snapshot(
     Ok(WorkspaceSnapshot {
         commit_sha,
         repository,
+        default_branch,
+        before_sha,
     })
 }
 
@@ -118,7 +135,7 @@ async fn create_workspace_snapshot_inner(
     staging_index: &FsPath,
     final_repository: &FsPath,
     run_id: RunId,
-) -> Result<String, ApiError> {
+) -> Result<SnapshotResult, ApiError> {
     // Creating the staging repository does not depend on anything we learn
     // from the workspace, so pay for both spawns at once. Every millisecond
     // here sits directly in `POST /api/v1/runs`.
@@ -137,6 +154,9 @@ async fn create_workspace_snapshot_inner(
     let WorkspaceRevision {
         common_dir,
         source_head,
+        default_branch,
+        parent_sha,
+        source_tree,
     } = probe?;
     let source_objects = common_dir.join("objects");
     if !source_objects.is_dir() {
@@ -144,6 +164,25 @@ async fn create_workspace_snapshot_inner(
             "source Git object directory does not exist: {}",
             source_objects.display()
         )));
+    }
+    // A shallow workspace ends its history at the commits listed in its
+    // `shallow` file. The snapshot commit parents onto the workspace HEAD
+    // (below), so `git fsck --connectivity-only` on the staging repository
+    // would walk past that boundary into commits the workspace never fetched
+    // and report broken links. Mirror the boundary so fsck knows where the
+    // history legitimately ends and checkout clones carry the same shallow
+    // depth (e.g. `HEAD^` remains resolvable for changed-file diffing).
+    if source_head.is_some() {
+        let source_shallow = common_dir.join("shallow");
+        if source_shallow.is_file() {
+            if let Err(error) =
+                tokio::fs::copy(&source_shallow, staging_repository.join("shallow")).await
+            {
+                return Err(ApiError::internal(format!(
+                    "failed to mirror workspace shallow boundary: {error}"
+                )));
+            }
+        }
     }
     let cache =
         ensure_object_cache(state_dir, workspace, &common_dir, source_head.as_deref()).await?;
@@ -202,6 +241,22 @@ async fn create_workspace_snapshot_inner(
     .await?;
     let tree = output_text(&tree_output, "write snapshot tree")?;
 
+    // Choose the base the synthetic push measures against. The snapshot commit
+    // `S` sits on top of the workspace `HEAD`, so `before..after` should span
+    // exactly the change under test:
+    //   * dirty tree (snapshot tree ≠ HEAD tree) → base is `HEAD`, so the range
+    //     is only the uncommitted local edits;
+    //   * clean tree (trees equal) → base is `HEAD^`, so the range still covers
+    //     the last commit the user just made and wants tested (an equal-tree
+    //     `HEAD..S` would be empty and changed-file actions would see nothing).
+    // `None` (unborn HEAD, or an initial commit with a clean tree) falls
+    // through to the null-SHA "initial push" base downstream.
+    let before_sha = if Some(tree.as_str()) != source_tree.as_deref() {
+        source_head.clone()
+    } else {
+        parent_sha.clone()
+    };
+
     // Best effort: the index is a cache, so a failed hand-off only costs the
     // next submission its stat data.
     persist_snapshot_index(staging_index, &cache_index).await;
@@ -218,13 +273,30 @@ async fn create_workspace_snapshot_inner(
         .env("GIT_AUTHOR_DATE", "1970-01-01T00:00:00Z")
         .env("GIT_COMMITTER_NAME", "aksh")
         .env("GIT_COMMITTER_EMAIL", "snapshot@aksh.local")
-        .env("GIT_COMMITTER_DATE", "1970-01-01T00:00:00Z")
-        .args([
+        .env("GIT_COMMITTER_DATE", "1970-01-01T00:00:00Z");
+    // Link the snapshot commit to the workspace HEAD so the snapshot clone
+    // carries the workspace's real history. Changed-file actions
+    // (`dorny/paths-filter`, `tj-actions/changed-files`) diff against a base
+    // ref; an orphan root commit leaves them nothing to diff and they fail.
+    // The parent object is always present: the object cache holds every
+    // committed object from the workspace (see `ensure_object_cache`).
+    if let Some(head) = source_head.as_deref() {
+        commit.args([
+            "commit-tree",
+            tree.as_str(),
+            "-p",
+            head,
+            "-m",
+            "aksh workspace snapshot",
+        ]);
+    } else {
+        commit.args([
             "commit-tree",
             tree.as_str(),
             "-m",
             "aksh workspace snapshot",
         ]);
+    }
     let commit_output = run_git(&mut commit, "create snapshot commit").await?;
     let commit_sha = output_text(&commit_output, "create snapshot commit")?;
     if commit_sha.len() != 40 || !commit_sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -292,6 +364,64 @@ async fn create_workspace_snapshot_inner(
         run_git(&mut fsck, "verify incremental snapshot repository").await?;
     }
 
+    // Advertise the workspace's own branches and tags so changed-file actions
+    // (`dorny/paths-filter`, `tj-actions/changed-files`) and `actions/checkout`
+    // with `fetch-depth: 0` can fetch a base ref (`origin/main`, tags, …).
+    // Published after fsck on purpose: fsck walks every ref, and these refs
+    // point into the cache alternate whose connectivity was already validated
+    // when the cache was cloned or fetched.
+    //
+    // The default branch ref points at the snapshot commit, not the workspace
+    // tip: the runner checks out the snapshot, so a change-file action that
+    // resolves its `head` via `origin/<branch>` must land on the same commit
+    // the runner has checked out — otherwise the diff (base..head) silently
+    // excludes the local changes the submission is meant to represent.
+    let workspace_refs = Command::new("git")
+        .env("GIT_DIR", &common_dir)
+        .args([
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/heads",
+            "refs/tags",
+        ])
+        .output()
+        .await
+        .map_err(|error| ApiError::internal(format!("failed to list workspace refs: {error}")))?;
+    if workspace_refs.status.success() {
+        let refs = String::from_utf8_lossy(&workspace_refs.stdout);
+        let mut publish = snapshot_git_command(
+            workspace,
+            staging_repository,
+            staging_index,
+            &cached_objects,
+        );
+        publish.args(["update-ref", "--stdin"]);
+        let publish_input = refs
+            .lines()
+            .filter_map(|line| {
+                let (name, object) = line.split_once(' ')?;
+                if object.len() != 40 {
+                    return None;
+                }
+                let is_default_branch = default_branch.as_deref()
+                    == Some(name.strip_prefix("refs/heads/").unwrap_or(name));
+                if is_default_branch {
+                    Some(format!("update {name} {commit_sha}\n"))
+                } else {
+                    Some(format!("update {name} {object}\n"))
+                }
+            })
+            .collect::<String>();
+        if !publish_input.is_empty() {
+            run_git_with_stdin(
+                &mut publish,
+                publish_input.as_bytes(),
+                "publish workspace refs",
+            )
+            .await?;
+        }
+    }
+
     tokio::fs::rename(staging_repository, final_repository)
         .await
         .map_err(|error| {
@@ -299,7 +429,19 @@ async fn create_workspace_snapshot_inner(
                 "failed to publish snapshot repository for run {run_id}: {error}"
             ))
         })?;
-    Ok(commit_sha)
+    Ok(SnapshotResult {
+        commit_sha,
+        default_branch,
+        before_sha,
+    })
+}
+
+/// The immutable snapshot commit plus the workspace facts needed to present
+/// the submission as a coherent GitHub event to changed-file actions.
+struct SnapshotResult {
+    commit_sha: String,
+    default_branch: Option<String>,
+    before_sha: Option<String>,
 }
 
 /// What one `git rev-parse` tells us about the source workspace.
@@ -308,6 +450,14 @@ struct WorkspaceRevision {
     common_dir: PathBuf,
     /// Current `HEAD` commit, absent when the branch is unborn.
     source_head: Option<String>,
+    /// Tree object of the current `HEAD`, absent when `HEAD` is unborn. Used
+    /// to decide whether the working tree carries uncommitted edits.
+    source_tree: Option<String>,
+    /// Current branch name, absent when `HEAD` is detached or unborn.
+    default_branch: Option<String>,
+    /// Parent of the current `HEAD`, absent on the first commit or in a
+    /// depth-1 shallow clone.
+    parent_sha: Option<String>,
 }
 
 /// Validate the workspace and resolve its common directory and `HEAD` in a
@@ -324,6 +474,7 @@ async fn probe_workspace(workspace: &FsPath) -> Result<WorkspaceRevision, ApiErr
             "--is-inside-work-tree",
             "--git-common-dir",
             "HEAD",
+            "HEAD^{tree}",
         ])
         .output()
         .await
@@ -363,9 +514,44 @@ async fn probe_workspace(workspace: &FsPath) -> Result<WorkspaceRevision, ApiErr
     } else {
         None
     };
+    // Printed on the same `rev-parse` line after `HEAD`; only meaningful when
+    // the combined call succeeded (an unborn HEAD fails and prints neither).
+    let source_tree = if output.status.success() {
+        lines
+            .next()
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+    } else {
+        None
+    };
+    // Best-effort probes: a detached or unborn HEAD, or a depth-1 shallow
+    // clone, legitimately lacks these and the snapshot works without them.
+    let default_branch = Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["symbolic-ref", "--short", "HEAD"])
+        .output()
+        .await
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|branch| !branch.is_empty() && branch != "HEAD");
+    let parent_sha = Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["rev-parse", "HEAD^"])
+        .output()
+        .await
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|sha| sha.len() == 40);
     Ok(WorkspaceRevision {
         common_dir,
         source_head,
+        source_tree,
+        default_branch,
+        parent_sha,
     })
 }
 
