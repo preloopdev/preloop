@@ -1,13 +1,83 @@
 name: release-golden
 
 on:
+  push:
+    branches: [main]
   release:
     types: [published]
   workflow_dispatch:
 
 jobs:
+  build-and-publish-linux-binaries:
+    name: Build Linux ${{ matrix.arch }} release
+    runs-on: self-hosted
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-musl
+          - arch: aarch64
+            target: aarch64-unknown-linux-musl
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Set up Zig cross toolchain
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.14.1
+
+      - name: Install cargo-zigbuild
+        run: cargo install cargo-zigbuild --locked
+
+      - name: Build release binaries
+        run: |
+          cargo zigbuild --release \
+            --target ${{ matrix.target }} \
+            -p preloop-cli \
+            -p aksh-runner-server \
+            -p aksh-runner
+          mkdir -p dist/preloop-${{ matrix.arch }}
+          cp target/${{ matrix.target }}/release/preloop \
+            target/${{ matrix.target }}/release/preloop-server \
+            target/${{ matrix.target }}/release/preloop-runner \
+            dist/preloop-${{ matrix.arch }}/
+          tar -C dist -czf \
+            dist/preloop-${{ matrix.arch }}-linux-musl.tar.gz \
+            preloop-${{ matrix.arch }}
+          sha256sum dist/preloop-${{ matrix.arch }}-linux-musl.tar.gz \
+            > dist/preloop-${{ matrix.arch }}-linux-musl.tar.gz.sha256
+
+      - name: Upload Linux binaries to release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+            "dist/preloop-${{ matrix.arch }}-linux-musl.tar.gz" \
+            "dist/preloop-${{ matrix.arch }}-linux-musl.tar.gz.sha256" \
+            --clobber
+
+      - name: Retain Linux binaries for non-release builds
+        if: github.event_name != 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: preloop-${{ matrix.arch }}-linux-musl
+          path: |
+            dist/preloop-${{ matrix.arch }}-linux-musl.tar.gz
+            dist/preloop-${{ matrix.arch }}-linux-musl.tar.gz.sha256
+
   build-and-publish-golden:
     name: Build & Publish Golden MicroVM Artifact
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
     runs-on: self-hosted
     permissions:
       contents: write

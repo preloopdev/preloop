@@ -1,0 +1,981 @@
+{
+  "repo": "vitejs/vite",
+  "run_id": "30625832507",
+  "workflow_name": "CI",
+  "workflow_path": ".github/workflows/ci.yml",
+  "event": "pull_request",
+  "head_sha": "214636edf9b1483698fc749792179f115a4fdc75",
+  "conclusion": "success",
+  "created_at": "2026-07-31T11:05:58Z",
+  "jobs": [
+    {
+      "name": "Lint: node-24, ubuntu-latest",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install pnpm",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set node version to 24",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install deps",
+          "number": 5,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Build",
+          "number": 6,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Lint",
+          "number": 7,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Check formatting",
+          "number": 8,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Typecheck",
+          "number": 9,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Test docs",
+          "number": 10,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Check workflow files",
+          "number": 11,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Set node version to 24",
+          "number": 20,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Install pnpm",
+          "number": 21,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+          "number": 22,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 23,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "Get changed files",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Checkout",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Get changed files",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Checkout",
+          "number": 6,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 7,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "Build&Test: node-22, ubuntu-latest",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Checkout",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install pnpm",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set node version to 22",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set node version to 24 for builds",
+          "number": 5,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Install deps",
+          "number": 6,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "(non-windows) Set Playwright path and Get playwright version",
+          "number": 7,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "(windows) Set Playwright path and Get playwright version",
+          "number": 8,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Cache Playwright's binary",
+          "number": 9,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install Playwright",
+          "number": 10,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Build",
+          "number": 11,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set node version to 22",
+          "number": 12,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Test unit",
+          "number": 13,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Test serve",
+          "number": 14,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Test serve (bundled dev)",
+          "number": 15,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Test build",
+          "number": 16,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Cache Playwright's binary",
+          "number": 29,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Set node version to 22",
+          "number": 30,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Install pnpm",
+          "number": 31,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Checkout",
+          "number": 32,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 33,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "Build&Test: node-20, ubuntu-latest",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Checkout",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install pnpm",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set node version to 20",
+          "number": 4,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Set node version to 24 for builds",
+          "number": 5,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install deps",
+          "number": 6,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "(non-windows) Set Playwright path and Get playwright version",
+          "number": 7,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "(windows) Set Playwright path and Get playwright version",
+          "number": 8,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Cache Playwright's binary",
+          "number": 9,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install Playwright",
+          "number": 10,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Build",
+          "number": 11,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set node version to 20",
+          "number": 12,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Test unit",
+          "number": 13,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Test serve",
+          "number": 14,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Test serve (bundled dev)",
+          "number": 15,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Test build",
+          "number": 16,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Set node version to 20",
+          "number": 28,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Cache Playwright's binary",
+          "number": 29,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Set node version to 24 for builds",
+          "number": 30,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Install pnpm",
+          "number": 31,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Checkout",
+          "number": 32,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 33,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "Build&Test: node-24, ubuntu-latest",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Checkout",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install pnpm",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set node version to 24",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set node version to 24 for builds",
+          "number": 5,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Install deps",
+          "number": 6,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "(non-windows) Set Playwright path and Get playwright version",
+          "number": 7,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "(windows) Set Playwright path and Get playwright version",
+          "number": 8,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Cache Playwright's binary",
+          "number": 9,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install Playwright",
+          "number": 10,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Build",
+          "number": 11,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set node version to 24",
+          "number": 12,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Test unit",
+          "number": 13,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Test serve",
+          "number": 14,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Test serve (bundled dev)",
+          "number": 15,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Test build",
+          "number": 16,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Cache Playwright's binary",
+          "number": 29,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Set node version to 24",
+          "number": 30,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Install pnpm",
+          "number": 31,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Checkout",
+          "number": 32,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 33,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "Build&Test: node-26, ubuntu-latest",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Checkout",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install pnpm",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set node version to 26",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set node version to 24 for builds",
+          "number": 5,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Install deps",
+          "number": 6,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "(non-windows) Set Playwright path and Get playwright version",
+          "number": 7,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "(windows) Set Playwright path and Get playwright version",
+          "number": 8,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Cache Playwright's binary",
+          "number": 9,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install Playwright",
+          "number": 10,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Build",
+          "number": 11,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set node version to 26",
+          "number": 12,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Test unit",
+          "number": 13,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Test serve",
+          "number": 14,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Test serve (bundled dev)",
+          "number": 15,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Test build",
+          "number": 16,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Cache Playwright's binary",
+          "number": 29,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Set node version to 26",
+          "number": 30,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Install pnpm",
+          "number": 31,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Checkout",
+          "number": 32,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 33,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "Build&Test: node-24, macos-latest",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Checkout",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install pnpm",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set node version to 24",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set node version to 24 for builds",
+          "number": 5,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Install deps",
+          "number": 6,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "(non-windows) Set Playwright path and Get playwright version",
+          "number": 7,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "(windows) Set Playwright path and Get playwright version",
+          "number": 8,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Cache Playwright's binary",
+          "number": 9,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install Playwright",
+          "number": 10,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Build",
+          "number": 11,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set node version to 24",
+          "number": 12,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Test unit",
+          "number": 13,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Test serve",
+          "number": 14,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Test serve (bundled dev)",
+          "number": 15,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Test build",
+          "number": 16,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Cache Playwright's binary",
+          "number": 29,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Set node version to 24",
+          "number": 30,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Install pnpm",
+          "number": 31,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Checkout",
+          "number": 32,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 33,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "Build&Test: node-24.15.0, windows-latest",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Checkout",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install pnpm",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set node version to 24.15.0",
+          "number": 4,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set node version to 24 for builds",
+          "number": 5,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Install deps",
+          "number": 6,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "(non-windows) Set Playwright path and Get playwright version",
+          "number": 7,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "(windows) Set Playwright path and Get playwright version",
+          "number": 8,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Cache Playwright's binary",
+          "number": 9,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Install Playwright",
+          "number": 10,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Build",
+          "number": 11,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Set node version to 24.15.0",
+          "number": 12,
+          "conclusion": "skipped",
+          "status": "completed"
+        },
+        {
+          "name": "Test unit",
+          "number": 13,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Test serve",
+          "number": 14,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Test serve (bundled dev)",
+          "number": 15,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Test build",
+          "number": 16,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Cache Playwright's binary",
+          "number": 29,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Set node version to 24.15.0",
+          "number": 30,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Install pnpm",
+          "number": 31,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Post Checkout",
+          "number": 32,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 33,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "Build & Test Passed or Skipped",
+      "conclusion": "success",
+      "status": "completed",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Run echo \"Build & Test Passed or Skipped\"",
+          "number": 2,
+          "conclusion": "success",
+          "status": "completed"
+        },
+        {
+          "name": "Complete job",
+          "number": 3,
+          "conclusion": "success",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "Build & Test Failed",
+      "conclusion": "skipped",
+      "status": "completed",
+      "steps": []
+    }
+  ]
+}
