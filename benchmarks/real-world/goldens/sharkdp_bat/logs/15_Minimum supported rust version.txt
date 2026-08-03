@@ -1,0 +1,1153 @@
+﻿2026-08-01T04:01:44.7164612Z Current runner version: '2.336.0'
+##[group]Runner Image Provisioner
+Hosted Compute Agent
+Version: 20260707.563
+Commit: 02667638d2b423fbc733a8e32a88b44996a3ba6e
+Build Date: 2026-07-07T19:33:50Z
+Worker ID: {0f63d282-ae4f-466a-beea-2cd86c67d88f}
+Azure Region: westcentralus
+##[endgroup]
+##[group]Operating System
+Ubuntu
+24.04.4
+LTS
+##[endgroup]
+##[group]Runner Image
+Image: ubuntu-24.04
+Version: 20260720.247.2
+Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260720.247/images/ubuntu/Ubuntu2404-Readme.md
+Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260720.247
+##[endgroup]
+##[group]GITHUB_TOKEN Permissions
+Actions: write
+ArtifactMetadata: write
+Attestations: write
+Checks: write
+CodeQuality: write
+Contents: write
+CopilotRequests: write
+Deployments: write
+Discussions: write
+Drives: write
+Issues: write
+Metadata: read
+Models: read
+Packages: write
+Pages: write
+PullRequests: write
+RepositoryProjects: write
+SecurityEvents: write
+Statuses: write
+VulnerabilityAlerts: read
+##[endgroup]
+Secret source: Actions
+Prepare workflow directory
+Prepare all required actions
+Getting action download info
+Download action repository 'actions/checkout@v6' (SHA:d23441a48e516b6c34aea4fa41551a30e30af803)
+Download action repository 'dtolnay/rust-toolchain@master' (SHA:2c7215f132e9ebf062739d9130488b56d53c060c)
+Complete job name: Minimum supported rust version
+##[group]Run actions/checkout@v6
+with:
+repository: sharkdp/bat
+token: ***
+ssh-strict: true
+ssh-user: git
+persist-credentials: true
+clean: true
+sparse-checkout-cone-mode: true
+fetch-depth: 1
+fetch-tags: false
+show-progress: true
+lfs: false
+submodules: false
+set-safe-directory: true
+allow-unsafe-pr-checkout: false
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+##[endgroup]
+Syncing repository: sharkdp/bat
+##[group]Getting Git version info
+Working directory is '/home/runner/work/bat/bat'
+[command]/usr/bin/git version
+git version 2.54.0
+##[endgroup]
+Temporarily overriding HOME='/home/runner/work/_temp/1fb437d0-69fd-4191-9c59-c99d36f47fb4' before making global git config changes
+Adding repository directory to the temporary git global config as a safe directory
+[command]/usr/bin/git config --global --add safe.directory /home/runner/work/bat/bat
+Deleting the contents of '/home/runner/work/bat/bat'
+##[group]Determining repository object format
+##[endgroup]
+##[group]Initializing the repository
+[command]/usr/bin/git init /home/runner/work/bat/bat
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /home/runner/work/bat/bat/.git/
+[command]/usr/bin/git remote add origin https://github.com/sharkdp/bat
+##[endgroup]
+##[group]Disabling automatic garbage collection
+[command]/usr/bin/git config --local gc.auto 0
+##[endgroup]
+##[group]Setting up auth
+Removing SSH command configuration
+[command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Removing HTTP extra header
+[command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Removing includeIf entries pointing to credentials config files
+[command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+[command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+[command]/usr/bin/git config --file /home/runner/work/_temp/git-credentials-c3edf9b3-25f7-41c4-8f7e-f21de7f8d9b3.config http.https://github.com/.extraheader AUTHORIZATION: basic ***
+[command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/bat/bat/.git.path /home/runner/work/_temp/git-credentials-c3edf9b3-25f7-41c4-8f7e-f21de7f8d9b3.config
+[command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/bat/bat/.git/worktrees/*.path /home/runner/work/_temp/git-credentials-c3edf9b3-25f7-41c4-8f7e-f21de7f8d9b3.config
+[command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-c3edf9b3-25f7-41c4-8f7e-f21de7f8d9b3.config
+[command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-c3edf9b3-25f7-41c4-8f7e-f21de7f8d9b3.config
+##[endgroup]
+##[group]Fetching the repository
+[command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +2ba8db9c14e5794572f5ea338c2b90404c9769cb:refs/remotes/origin/master
+From https://github.com/sharkdp/bat
+* [new ref]         2ba8db9c14e5794572f5ea338c2b90404c9769cb -> origin/master
+[command]/usr/bin/git branch --list --remote origin/master
+origin/master
+[command]/usr/bin/git rev-parse refs/remotes/origin/master
+2ba8db9c14e5794572f5ea338c2b90404c9769cb
+##[endgroup]
+##[group]Determining the checkout info
+##[endgroup]
+[command]/usr/bin/git sparse-checkout disable
+[command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+##[group]Checking out the ref
+[command]/usr/bin/git checkout --progress --force -B master refs/remotes/origin/master
+Reset branch 'master'
+branch 'master' set up to track 'origin/master'.
+##[endgroup]
+[command]/usr/bin/git log -1 --format=%H
+2ba8db9c14e5794572f5ea338c2b90404c9769cb
+##[group]Run dtolnay/rust-toolchain@master
+with:
+toolchain: 1.88
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+##[endgroup]
+##[start-action display=Run : parse toolchain version;id=__dtolnay_rust-toolchain.parse]
+##[group]Run : parse toolchain version
+: parse toolchain version
+if [[ -z $toolchain ]]; then
+# GitHub does not enforce `required: true` inputs itself. https://github.com/actions/runner/issues/1070
+echo "'toolchain' is a required input" >&2
+exit 1
+elif [[ $toolchain =~ ^stable' '[0-9]+' '(year|month|week|day)s?' 'ago$ ]]; then
+if [[ Linux == macOS ]]; then
+echo "toolchain=1.$((($(date -v-$(sed 's/stable \([0-9]*\) \(.\).*/\1\2/' <<< $toolchain) +%s)/60/60/24-16569)/7/6))" >> $GITHUB_OUTPUT
+else
+echo "toolchain=1.$((($(date --date "${toolchain#stable }" +%s)/60/60/24-16569)/7/6))" >> $GITHUB_OUTPUT
+fi
+elif [[ $toolchain =~ ^stable' 'minus' '[0-9]+' 'releases?$ ]]; then
+echo "toolchain=1.$((($(date +%s)/60/60/24-16569)/7/6-${toolchain//[^0-9]/}))" >> $GITHUB_OUTPUT
+elif [[ $toolchain =~ ^1\.[0-9]+$ ]]; then
+echo "toolchain=1.$((i=${toolchain#1.}, c=($(date +%s)/60/60/24-16569)/7/6, i+9*i*(10*i<=c)+90*i*(100*i<=c)))" >> $GITHUB_OUTPUT
+else
+echo "toolchain=$toolchain" >> $GITHUB_OUTPUT
+fi
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+toolchain: 1.88
+##[endgroup]
+##[end-action id=__dtolnay_rust-toolchain.parse;outcome=success;conclusion=success;duration_ms=34]
+##[start-action display=Run : construct rustup command line;id=__dtolnay_rust-toolchain.flags]
+##[group]Run : construct rustup command line
+: construct rustup command line
+echo "targets=$(for t in ${targets//,/ }; do echo -n ' --target' $t; done)" >> $GITHUB_OUTPUT
+echo "components=$(for c in ${components//,/ }; do echo -n ' --component' $c; done)" >> $GITHUB_OUTPUT
+echo "downgrade=" >> $GITHUB_OUTPUT
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+targets: 
+components: 
+##[endgroup]
+##[end-action id=__dtolnay_rust-toolchain.flags;outcome=success;conclusion=success;duration_ms=17]
+##[start-action display=Run : set $CARGO_HOME;id=__dtolnay_rust-toolchain.__run]
+##[group]Run : set $CARGO_HOME
+: set $CARGO_HOME
+echo CARGO_HOME=${CARGO_HOME:-"$HOME/.cargo"} >> $GITHUB_ENV
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+##[endgroup]
+##[end-action id=__dtolnay_rust-toolchain.__run;outcome=success;conclusion=success;duration_ms=16]
+##[start-action display=Run : install rustup if needed;id=__dtolnay_rust-toolchain.__run_2]
+##[group]Run : install rustup if needed
+: install rustup if needed
+if ! command -v rustup &>/dev/null; then
+curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused --location --silent --show-error --fail https://sh.rustup.rs | sh -s -- --default-toolchain none -y
+echo "$CARGO_HOME/bin" >> $GITHUB_PATH
+fi
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+CARGO_HOME: /home/runner/.cargo
+##[endgroup]
+##[end-action id=__dtolnay_rust-toolchain.__run_2;outcome=success;conclusion=success;duration_ms=17]
+##[start-action display=Run : install rustup if needed on windows;id=__dtolnay_rust-toolchain.__run_3]
+##[end-action id=__dtolnay_rust-toolchain.__run_3;outcome=skipped;conclusion=skipped;duration_ms=0]
+##[start-action display=rustup toolchain install 1.88;id=__dtolnay_rust-toolchain.__run_4]
+##[group]Run rustup toolchain install 1.88 --profile minimal --no-self-update
+rustup toolchain install 1.88 --profile minimal --no-self-update
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+CARGO_HOME: /home/runner/.cargo
+RUSTUP_PERMIT_COPY_RENAME: 1
+##[endgroup]
+info: syncing channel updates for 1.88-x86_64-unknown-linux-gnu
+info: latest update on 2025-06-26 for version 1.88.0 (6b00bc388 2025-06-23)
+info: downloading 3 components
+1.88-x86_64-unknown-linux-gnu installed - rustc 1.88.0 (6b00bc388 2025-06-23)
+##[end-action id=__dtolnay_rust-toolchain.__run_4;outcome=success;conclusion=success;duration_ms=8406]
+##[start-action display=Run rustup default 1.88;id=__dtolnay_rust-toolchain.__run_5]
+##[group]Run rustup default 1.88
+rustup default 1.88
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+CARGO_HOME: /home/runner/.cargo
+##[endgroup]
+info: using existing install for 1.88-x86_64-unknown-linux-gnu
+info: default toolchain set to 1.88-x86_64-unknown-linux-gnu
+1.88-x86_64-unknown-linux-gnu unchanged - rustc 1.88.0 (6b00bc388 2025-06-23)
+##[end-action id=__dtolnay_rust-toolchain.__run_5;outcome=success;conclusion=success;duration_ms=26]
+##[start-action display=Run : create cachekey;id=__dtolnay_rust-toolchain.rustc-version]
+##[group]Run : create cachekey
+: create cachekey
+DATE=$(rustc +1.88 --version --verbose | sed -ne 's/^commit-date: \(20[0-9][0-9]\)-\([01][0-9]\)-\([0-3][0-9]\)$/\1\2\3/p')
+HASH=$(rustc +1.88 --version --verbose | sed -ne 's/^commit-hash: //p')
+echo "cachekey=$(echo $DATE$HASH | head -c12)" >> $GITHUB_OUTPUT
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+CARGO_HOME: /home/runner/.cargo
+##[endgroup]
+##[end-action id=__dtolnay_rust-toolchain.rustc-version;outcome=success;conclusion=success;duration_ms=40]
+##[start-action display=Run : disable incremental compilation;id=__dtolnay_rust-toolchain.__run_6]
+##[group]Run : disable incremental compilation
+: disable incremental compilation
+if [ -z "${CARGO_INCREMENTAL+set}" ]; then
+echo CARGO_INCREMENTAL=0 >> $GITHUB_ENV
+fi
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+CARGO_HOME: /home/runner/.cargo
+##[endgroup]
+##[end-action id=__dtolnay_rust-toolchain.__run_6;outcome=success;conclusion=success;duration_ms=12]
+##[start-action display=Run : enable colors in Cargo output;id=__dtolnay_rust-toolchain.__run_7]
+##[group]Run : enable colors in Cargo output
+: enable colors in Cargo output
+if [ -z "${CARGO_TERM_COLOR+set}" ]; then
+echo CARGO_TERM_COLOR=always >> $GITHUB_ENV
+fi
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+CARGO_HOME: /home/runner/.cargo
+CARGO_INCREMENTAL: 0
+##[endgroup]
+##[end-action id=__dtolnay_rust-toolchain.__run_7;outcome=success;conclusion=success;duration_ms=14]
+##[start-action display=Run : enable Cargo sparse registry;id=__dtolnay_rust-toolchain.__run_8]
+##[group]Run : enable Cargo sparse registry
+: enable Cargo sparse registry
+# implemented in 1.66, stabilized in 1.68, made default in 1.70
+if [ -z "${CARGO_REGISTRIES_CRATES_IO_PROTOCOL+set}" -o -f "/home/runner/work/_temp"/.implicit_cargo_registries_crates_io_protocol ]; then
+if rustc +1.88 --version --verbose | grep -q '^release: 1\.6[89]\.'; then
+touch "/home/runner/work/_temp"/.implicit_cargo_registries_crates_io_protocol || true
+echo CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse >> $GITHUB_ENV
+elif rustc +1.88 --version --verbose | grep -q '^release: 1\.6[67]\.'; then
+touch "/home/runner/work/_temp"/.implicit_cargo_registries_crates_io_protocol || true
+echo CARGO_REGISTRIES_CRATES_IO_PROTOCOL=git >> $GITHUB_ENV
+fi
+fi
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+CARGO_HOME: /home/runner/.cargo
+CARGO_INCREMENTAL: 0
+CARGO_TERM_COLOR: always
+##[endgroup]
+##[end-action id=__dtolnay_rust-toolchain.__run_8;outcome=success;conclusion=success;duration_ms=40]
+##[start-action display=Run : work around spurious network errors in curl 8.0;id=__dtolnay_rust-toolchain.__run_9]
+##[group]Run : work around spurious network errors in curl 8.0
+: work around spurious network errors in curl 8.0
+# https://rust-lang.zulipchat.com/#narrow/stream/246057-t-cargo/topic/timeout.20investigation
+if rustc +1.88 --version --verbose | grep -q '^release: 1\.7[01]\.'; then
+echo CARGO_HTTP_MULTIPLEXING=false >> $GITHUB_ENV
+fi
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+CARGO_HOME: /home/runner/.cargo
+CARGO_INCREMENTAL: 0
+CARGO_TERM_COLOR: always
+##[endgroup]
+##[end-action id=__dtolnay_rust-toolchain.__run_9;outcome=success;conclusion=success;duration_ms=32]
+##[start-action display=Run rustc +1.88 --version --verbose;id=__dtolnay_rust-toolchain.__run_10]
+##[group]Run rustc +1.88 --version --verbose
+rustc +1.88 --version --verbose
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+CARGO_HOME: /home/runner/.cargo
+CARGO_INCREMENTAL: 0
+CARGO_TERM_COLOR: always
+##[endgroup]
+rustc 1.88.0 (6b00bc388 2025-06-23)
+binary: rustc
+commit-hash: 6b00bc3880198600130e1cf62b8f8a93494488cc
+commit-date: 2025-06-23
+host: x86_64-unknown-linux-gnu
+release: 1.88.0
+LLVM version: 20.1.5
+##[end-action id=__dtolnay_rust-toolchain.__run_10;outcome=success;conclusion=success;duration_ms=49]
+##[group]Run cargo test --locked --no-default-features --features minimal-application,bugreport,build-assets
+cargo test --locked --no-default-features --features minimal-application,bugreport,build-assets
+shell: /usr/bin/bash -e {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+CARGO_HOME: /home/runner/.cargo
+CARGO_INCREMENTAL: 0
+CARGO_TERM_COLOR: always
+##[endgroup]
+Updating crates.io index
+Downloading crates ...
+Downloaded adler2 v2.0.1
+Downloaded anstyle v1.0.14
+Downloaded ansi_colours v1.2.3
+Downloaded anstyle-query v1.1.5
+Downloaded semver v1.0.28
+Downloaded clap_lex v1.1.0
+Downloaded colorchoice v1.0.5
+Downloaded cfg_aliases v0.2.1
+Downloaded cfg-if v1.0.4
+Downloaded anstyle-parse v1.0.0
+Downloaded clircle v0.6.1
+Downloaded scopeguard v1.2.0
+Downloaded serde_spanned v1.1.1
+Downloaded convert_case v0.10.0
+Downloaded bytesize v2.4.2
+Downloaded content_inspector v0.2.4
+Downloaded serde_derive v1.0.228
+Downloaded time-core v0.1.8
+Downloaded darling_macro v0.23.0
+Downloaded assert_cmd v2.2.1
+Downloaded normalize-line-endings v0.3.0
+Downloaded crossbeam-deque v0.8.6
+Downloaded num-conv v0.2.1
+Downloaded equivalent v1.0.2
+Downloaded linked-hash-map v0.5.6
+Downloaded terminal-trx v0.2.6
+Downloaded termtree v0.5.1
+Downloaded expect-test v1.5.1
+Downloaded anyhow v1.0.103
+Downloaded same-file v1.0.6
+Downloaded itoa v1.0.18
+Downloaded ident_case v1.0.1
+Downloaded errno v0.3.14
+Downloaded utf8parse v0.2.2
+Downloaded rgb v0.8.53
+Downloaded rustc_version v0.4.1
+Downloaded predicates-tree v1.0.13
+Downloaded powerfmt v0.2.0
+Downloaded git-version-macro v0.3.9
+Downloaded fnv v1.0.7
+Downloaded termcolor v1.4.1
+Downloaded std_prelude v0.2.12
+Downloaded xterm-color v1.0.2
+Downloaded strsim v0.11.1
+Downloaded crc32fast v1.5.0
+Downloaded predicates v3.1.4
+Downloaded pkg-config v0.3.33
+Downloaded dashmap v5.5.3
+Downloaded onig v6.5.3
+Downloaded wild v2.2.1
+Downloaded wait-timeout v0.2.1
+Downloaded zmij v1.0.21
+Downloaded signal-hook-registry v1.4.8
+Downloaded tempfile v3.27.0
+Downloaded yaml-rust v0.4.5
+Downloaded quote v1.0.47
+Downloaded unicode-ident v1.0.24
+Downloaded serde_with_macros v3.21.0
+Downloaded ryu v1.0.23
+Downloaded unsafe-libyaml v0.2.11
+Downloaded textwrap v0.16.2
+Downloaded unicode-segmentation v1.13.3
+Downloaded indexmap v2.14.0
+Downloaded crossterm v0.29.0
+Downloaded serde_json v1.0.149
+Downloaded regex v1.13.1
+Downloaded winnow v1.0.2
+Downloaded time v0.3.47
+Downloaded serde_with v3.21.0
+Downloaded quick-xml v0.41.0
+Downloaded sysinfo v0.33.1
+Downloaded hashbrown v0.17.1
+Downloaded unicode-width v0.2.2
+Downloaded syn v2.0.117
+Downloaded bstr v1.12.1
+Downloaded regex-syntax v0.8.11
+Downloaded nix v0.31.3
+Downloaded rayon v1.12.0
+Downloaded itertools v0.14.0
+Downloaded rustix v1.1.4
+Downloaded hashbrown v0.14.5
+Downloaded clap_builder v4.6.0
+Downloaded aho-corasick v1.1.4
+Downloaded derive_more-impl v2.1.1
+Downloaded derive_more v2.1.1
+Downloaded onig_sys v69.9.3
+Downloaded signal-hook v0.3.18
+Downloaded mio v1.2.0
+Downloaded flate2 v1.1.9
+Downloaded base64 v0.22.1
+Downloaded prettyplease v0.2.37
+Downloaded regex-automata v0.4.16
+Downloaded memchr v2.8.0
+Downloaded crossbeam-channel v0.5.15
+Downloaded minus v5.7.2
+Downloaded serde_yaml v0.9.34+deprecated
+Downloaded rayon-core v1.13.0
+Downloaded syntect v5.3.0
+Downloaded miniz_oxide v0.8.9
+Downloaded darling_core v0.23.0
+Downloaded cc v1.2.62
+Downloaded toml v1.1.2+spec-1.1.0
+Downloaded libc v0.2.186
+Downloaded getrandom v0.4.2
+Downloaded serde_core v1.0.228
+Downloaded proc-macro2 v1.0.107
+Downloaded toml_parser v1.1.2+spec-1.1.0
+Downloaded smallvec v1.15.1
+Downloaded plist v1.10.0
+Downloaded num-traits v0.2.19
+Downloaded log v0.4.29
+Downloaded bytemuck v1.25.0
+Downloaded parking_lot_core v0.9.12
+Downloaded bitflags v2.11.1
+Downloaded path_abs v0.5.1
+Downloaded parking_lot v0.12.5
+Downloaded grep-cli v0.1.12
+Downloaded find-msvc-tools v0.1.9
+Downloaded crossbeam-utils v0.8.21
+Downloaded bincode v1.3.3
+Downloaded litrs v1.0.0
+Downloaded lazy_static v1.5.0
+Downloaded darling v0.23.0
+Downloaded bugreport v0.6.0
+Downloaded walkdir v2.5.0
+Downloaded toml_datetime v1.1.1+spec-1.1.0
+Downloaded time-macros v0.2.27
+Downloaded thiserror-impl v2.0.18
+Downloaded terminal-colorsaurus v1.0.3
+Downloaded either v1.15.0
+Downloaded toml_writer v1.1.1+spec-1.1.0
+Downloaded thiserror v2.0.18
+Downloaded encoding_rs v0.8.35
+Downloaded shlex v1.3.0
+Downloaded shell-escape v0.1.5
+Downloaded nu-ansi-term v0.50.3
+Downloaded fastrand v2.4.1
+Downloaded etcetera v0.11.0
+Downloaded lock_api v0.4.14
+Downloaded dissimilar v1.0.11
+Downloaded deranged v0.5.8
+Downloaded autocfg v1.5.0
+Downloaded crossbeam-epoch v0.9.20
+Downloaded clap v4.6.1
+Downloaded globset v0.4.18
+Downloaded anstream v1.0.0
+Downloaded signal-hook-mio v0.2.5
+Downloaded serial_test v2.0.0
+Downloaded shell-words v1.1.1
+Downloaded once_cell v1.21.4
+Downloaded simd-adler32 v0.3.9
+Downloaded serial_test_derive v2.0.0
+Downloaded serde v1.0.228
+Downloaded predicates-core v1.0.10
+Downloaded git-version v0.3.9
+Downloaded float-cmp v0.10.0
+Downloaded terminal_size v0.4.4
+Downloaded document-features v0.2.12
+Downloaded console v0.16.3
+Downloaded is_terminal_polyfill v1.70.2
+Downloaded difflib v0.4.0
+Downloaded linux-raw-sys v0.12.1
+Compiling proc-macro2 v1.0.107
+Compiling quote v1.0.47
+Compiling unicode-ident v1.0.24
+Compiling libc v0.2.186
+Compiling cfg-if v1.0.4
+Compiling memchr v2.8.0
+Compiling bitflags v2.11.1
+Compiling linux-raw-sys v0.12.1
+Compiling regex-syntax v0.8.11
+Compiling strsim v0.11.1
+Compiling syn v2.0.117
+Compiling serde_core v1.0.228
+Compiling crossbeam-utils v0.8.21
+Compiling anstyle v1.0.14
+Compiling aho-corasick v1.1.4
+Compiling once_cell v1.21.4
+Compiling rustix v1.1.4
+Compiling equivalent v1.0.2
+Compiling hashbrown v0.17.1
+Compiling utf8parse v0.2.2
+Compiling anstyle-parse v1.0.0
+Compiling regex-automata v0.4.16
+Compiling parking_lot_core v0.9.12
+Compiling ident_case v1.0.1
+Compiling is_terminal_polyfill v1.70.2
+Compiling log v0.4.29
+Compiling anstyle-query v1.1.5
+Compiling colorchoice v1.0.5
+Compiling crossbeam-epoch v0.9.20
+Compiling anstream v1.0.0
+Compiling darling_core v0.23.0
+Compiling serde_derive v1.0.228
+Compiling serde v1.0.228
+Compiling smallvec v1.15.1
+Compiling shlex v1.3.0
+Compiling either v1.15.0
+Compiling scopeguard v1.2.0
+Compiling clap_lex v1.1.0
+Compiling find-msvc-tools v0.1.9
+Compiling lock_api v0.4.14
+Compiling cc v1.2.62
+Compiling darling_macro v0.23.0
+Compiling errno v0.3.14
+Compiling signal-hook v0.3.18
+Compiling unicode-segmentation v1.13.3
+Compiling itoa v1.0.18
+Compiling pkg-config v0.3.33
+Compiling rayon-core v1.13.0
+Compiling convert_case v0.10.0
+Compiling signal-hook-registry v1.4.8
+Compiling crossbeam-deque v0.8.6
+Compiling onig_sys v69.9.3
+Compiling terminal_size v0.4.4
+Compiling darling v0.23.0
+Compiling mio v1.2.0
+Compiling thiserror v2.0.18
+Compiling crc32fast v1.5.0
+Compiling winnow v1.0.2
+Compiling autocfg v1.5.0
+Compiling same-file v1.0.6
+Compiling anyhow v1.0.103
+Compiling powerfmt v0.2.0
+Compiling zmij v1.0.21
+Compiling prettyplease v0.2.37
+Compiling num-traits v0.2.19
+Compiling deranged v0.5.8
+Compiling toml_parser v1.1.2+spec-1.1.0
+Compiling walkdir v2.5.0
+Compiling serde_with_macros v3.21.0
+Compiling clap_builder v4.6.0
+Compiling derive_more-impl v2.1.1
+Compiling parking_lot v0.12.5
+Compiling bstr v1.12.1
+Compiling regex v1.13.1
+Compiling thiserror-impl v2.0.18
+Compiling indexmap v2.14.0
+Compiling toml_datetime v1.1.1+spec-1.1.0
+Compiling serde_spanned v1.1.1
+Compiling litrs v1.0.0
+Compiling unicode-width v0.2.2
+Compiling time-core v0.1.8
+Compiling simd-adler32 v0.3.9
+Compiling toml_writer v1.1.1+spec-1.1.0
+Compiling serde_json v1.0.149
+Compiling adler2 v2.0.1
+Compiling num-conv v0.2.1
+Compiling document-features v0.2.12
+Compiling miniz_oxide v0.8.9
+Compiling toml v1.1.2+spec-1.1.0
+Compiling time v0.3.47
+Compiling derive_more v2.1.1
+Compiling clap v4.6.1
+Compiling signal-hook-mio v0.2.5
+Compiling rayon v1.12.0
+Compiling serde_with v3.21.0
+Compiling itertools v0.14.0
+Compiling git-version-macro v0.3.9
+Compiling quick-xml v0.41.0
+Compiling base64 v0.22.1
+Compiling bugreport v0.6.0
+Compiling linked-hash-map v0.5.6
+Compiling bytemuck v1.25.0
+Compiling yaml-rust v0.4.5
+Compiling rgb v0.8.53
+Compiling bat v0.26.1 (/home/runner/work/bat/bat)
+Compiling plist v1.10.0
+Compiling git-version v0.3.9
+Compiling sysinfo v0.33.1
+Compiling flate2 v1.1.9
+Compiling crossterm v0.29.0
+Compiling onig v6.5.3
+Compiling textwrap v0.16.2
+Compiling globset v0.4.18
+Compiling bincode v1.3.3
+Compiling crossbeam-channel v0.5.15
+Compiling terminal-trx v0.2.6
+Compiling std_prelude v0.2.12
+Compiling predicates-core v1.0.10
+Compiling termcolor v1.4.1
+Compiling fnv v1.0.7
+Compiling ryu v1.0.23
+Compiling shell-escape v0.1.5
+Compiling cfg_aliases v0.2.1
+Compiling unsafe-libyaml v0.2.11
+Compiling xterm-color v1.0.2
+Compiling getrandom v0.4.2
+Compiling terminal-colorsaurus v1.0.3
+Compiling nix v0.31.3
+Compiling grep-cli v0.1.12
+Compiling serde_yaml v0.9.34+deprecated
+Compiling syntect v5.3.0
+Compiling minus v5.7.2
+Compiling path_abs v0.5.1
+Compiling float-cmp v0.10.0
+Compiling ansi_colours v1.2.3
+Compiling console v0.16.3
+Compiling content_inspector v0.2.4
+Compiling encoding_rs v0.8.35
+Compiling etcetera v0.11.0
+Compiling clircle v0.6.1
+Compiling termtree v0.5.1
+Compiling bytesize v2.4.2
+Compiling wild v2.2.1
+Compiling hashbrown v0.14.5
+Compiling difflib v0.4.0
+Compiling semver v1.0.28
+Compiling shell-words v1.1.1
+Compiling nu-ansi-term v0.50.3
+Compiling assert_cmd v2.2.1
+Compiling normalize-line-endings v0.3.0
+Compiling predicates v3.1.4
+Compiling dashmap v5.5.3
+Compiling predicates-tree v1.0.13
+Compiling serial_test_derive v2.0.0
+Compiling wait-timeout v0.2.1
+Compiling fastrand v2.4.1
+Compiling lazy_static v1.5.0
+Compiling dissimilar v1.0.11
+Compiling tempfile v3.27.0
+Compiling expect-test v1.5.1
+Compiling serial_test v2.0.0
+warning: fields `git_added`, `git_removed`, and `git_modified` are never read
+--> src/printer.rs:983:9
+|
+979 | pub struct Colors {
+|            ------ fields in this struct
+...
+983 |     pub git_added: Style,
+|         ^^^^^^^^^
+984 |     pub git_removed: Style,
+|         ^^^^^^^^^^^
+985 |     pub git_modified: Style,
+|         ^^^^^^^^^^^^
+|
+= note: `Colors` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+= note: `#[warn(dead_code)]` on by default
+warning: `bat` (lib) generated 1 warning
+warning: `bat` (lib test) generated 1 warning (1 duplicate)
+Finished `test` profile [unoptimized + debuginfo] target(s) in 42.68s
+Running unittests src/lib.rs (target/debug/deps/bat-50d22af17c03f5d0)
+running 139 tests
+test assets::build_assets::acknowledgements::tests::test_append_to_acknowledgements_adds_newline_if_missing ... ok
+test assets::build_assets::acknowledgements::tests::test_normalize_license_text_with_windows_line_endings ... ok
+test assets::build_assets::acknowledgements::tests::test_normalize_license_text ... ok
+test assets::tests::syntax_detection_for_symlinked_file ... ok
+test assets::tests::syntax_detection_first_line ... ok
+test assets::tests::syntax_detection_first_line_with_utf8_bom ... ok
+test assets::tests::syntax_detection_basic ... ok
+test assets::tests::syntax_detection_hidden_file_extensions ... ok
+test assets::tests::syntax_detection_for_symlinked_file_by_target_extension ... ok
+test assets::tests::syntax_detection_invalid_utf8 ... ok
+test assets::tests::syntax_detection_ignored_suffix_falls_back_to_first_line ... ok
+test assets::tests::syntax_detection_is_case_insensitive ... ok
+test assets::tests::syntax_detection_same_for_inputkinds ... ok
+test assets::tests::syntax_detection_stdin_filename ... ok
+test assets::tests::syntax_detection_with_custom_mapping ... ok
+test config::default_config_should_include_all_lines ... ok
+test config::get_pager_executable_default ... ok
+test config::get_pager_executable_empty_config ... ok
+test config::get_pager_executable_invalid_command ... ok
+test config::get_pager_executable_name_ignoring_arguments ... ok
+test config::get_pager_executable_name_ignoring_path ... ok
+test config::get_pager_executable_with_bat_pager ... ok
+test config::default_config_should_highlight_no_lines ... ok
+test config::get_pager_executable_with_config_pager_builtin ... ok
+test config::get_pager_executable_with_config_pager_less ... ok
+test config::get_pager_executable_with_config_pager_more ... ok
+test config::get_pager_executable_with_pager_more_switches_to_less ... ok
+test input::basic ... ok
+test input::input_open_returns_initial_read_errors ... ok
+test input::non_zip_pk_prefix_is_not_treated_as_binary ... ok
+test input::unbuffered_eof_handling ... ok
+test input::unbuffered_returns_complete_lines ... ok
+test input::unbuffered_returns_partial_data ... ok
+test input::utf16le ... ok
+test input::utf16le_issue3367 ... ok
+test input::zip_magic_headers_are_treated_as_binary ... ok
+test less::test_parse_less_version_487 ... ok
+test less::test_parse_less_version_529 ... ok
+test less::test_parse_less_version_551 ... ok
+test less::test_parse_less_version_581_2 ... ok
+test less::test_parse_less_version_busybox ... ok
+test less::test_parse_less_version_invalid_utf_8 ... ok
+test less::test_parse_less_version_wrong_program ... ok
+test line_range::test_parse_context_edge_cases ... ok
+test line_range::test_parse_context_fail ... ok
+test line_range::test_parse_context_range ... ok
+test line_range::test_parse_context_single_line ... ok
+test line_range::test_parse_fail ... ok
+test line_range::test_parse_minus_edge_cases_success ... ok
+test line_range::test_parse_minus_fail ... ok
+test line_range::test_parse_minus_success ... ok
+test line_range::test_parse_full ... ok
+test line_range::test_parse_partial_max ... ok
+test line_range::test_parse_partial_min ... ok
+test line_range::test_parse_partial_relative_negative_from_back ... ok
+test line_range::test_parse_plus ... ok
+test line_range::test_parse_plus_fail ... ok
+test line_range::test_parse_plus_overflow ... ok
+test line_range::test_parse_relative_negative_from_back_partial ... ok
+test line_range::test_parse_single ... ok
+test line_range::test_ranges_3_from_back_up_to_end ... ok
+test line_range::test_ranges_absolute_bound_and_offset ... ok
+test line_range::test_ranges_advanced ... ok
+test line_range::test_ranges_all ... ok
+test line_range::test_ranges_multiple_negative_from_back ... ok
+test line_range::test_ranges_multiple_negative_offsets_to_end ... ok
+test line_range::test_ranges_none ... ok
+test line_range::test_ranges_open_high ... ok
+test line_range::test_ranges_open_low ... ok
+test line_range::test_ranges_open_up_to_3_from_end ... ok
+test assets::tests::syntax_detection_well_defined_mapping_for_duplicate_extensions ... ok
+test preprocessor::test_sanitize_for_terminal_c0_controls ... ok
+test line_range::test_ranges_simple ... ok
+test preprocessor::test_sanitize_for_terminal_idempotent_on_sanitized ... ok
+test preprocessor::test_sanitize_for_terminal_passthrough ... ok
+test preprocessor::test_sanitize_strips_ansi ... ok
+test preprocessor::test_sanitize_preserves_arabic_sharing_the_alm_lead_byte ... ok
+test preprocessor::test_sanitize_preserves_legitimate_bytes ... ok
+test preprocessor::test_sanitize_substitutes_bidi_and_zero_width ... ok
+test preprocessor::test_strip_ansi ... ok
+test preprocessor::test_sanitize_substitutes_dangerous_bytes ... ok
+test preprocessor::test_sanitize_substitutes_every_bidi_control ... ok
+test preprocessor::test_strip_ansi_8bit_c1_introducers ... ok
+test preprocessor::test_strip_overstrike ... ok
+test preprocessor::test_strip_ansi_preserves_control_bytes ... ok
+test preprocessor::test_strip_ansi_single_char_esc ... ok
+test preprocessor::test_try_parse_utf8_char ... ok
+test style::test::style_component_list_expand_negates_subcomponents ... ok
+test style::test::style_component_list_default_builds_on_auto ... ok
+test style::test::style_component_list_parse ... ok
+test style::test::style_component_list_to_components ... ok
+test style::test::style_component_list_to_components_expands_subcomponents ... ok
+test style::test::style_component_list_to_components_precedence_merges_previous_lists ... ok
+test syntax_mapping::ignored_suffixes::external_suffixes ... ok
+test style::test::style_component_list_to_components_precedence_overrides_previous_lists ... ok
+test style::test::style_component_list_to_components_removes_negated ... ok
+test syntax_mapping::ignored_suffixes::internal_suffixes ... ok
+test syntax_mapping::tests::all_fixed_builtin_mappings_can_compile ... ok
+test syntax_mapping::tests::builtin_mappings_build_is_case_sensitive ... ok
+test syntax_mapping::tests::builtin_mappings_matcher_only_compile_once ... ok
+test syntax_mapping::tests::builtin_mappings_work ... ok
+test syntax_mapping::tests::custom_mappings_override_builtin ... ok
+test syntax_mapping::tests::custom_mappings_precedence ... ok
+test syntax_mapping::tests::case_sensitive_custom_mappings_work ... ok
+test theme::tests::choosing::chooses_dark_theme_if_dark_or_unknown ... ok
+test theme::tests::choosing::chooses_default_theme_if_unknown ... ok
+test theme::tests::choosing::chooses_light_theme_if_light ... ok
+test theme::tests::color_scheme_detection::called_for_always ... ok
+test theme::tests::color_scheme_detection::called_for_auto_if_should_detect ... ok
+test theme::tests::color_scheme_detection::not_called_for_auto_if_not_should_detect ... ok
+test theme::tests::color_scheme_detection::not_called_for_dark_or_light ... ok
+test theme::tests::default_theme::default_dark_if_requested_explicitly_through_theme ... ok
+test theme::tests::default_theme::default_dark_if_unable_to_detect_color_scheme ... ok
+test theme::tests::default_theme::varies_depending_on_color_scheme ... ok
+test theme::tests::precedence::detector_is_not_called_if_theme_is_present ... ok
+test theme::tests::precedence::theme_is_preferred_over_light_or_dark_themes ... ok
+test theme::tests::theme_preference::values_roundtrip_via_display ... ok
+test syntax_mapping::tests::custom_mappings_work ... ok
+test vscreen::tests::test_escape_sequence_iterator_iterates ... ok
+test vscreen::tests::test_escape_sequence_offsets_iterator_parses_7bit_dcs_consumes_body ... ok
+test vscreen::tests::test_escape_sequence_offsets_iterator_8bit_dcs_consumes_body ... ok
+test vscreen::tests::test_escape_sequence_offsets_iterator_iterates ... ok
+test vscreen::tests::test_escape_sequence_offsets_iterator_parses_8bit_csi ... ok
+test vscreen::tests::test_escape_sequence_offsets_iterator_parses_8bit_osc_with_8bit_st ... ok
+test vscreen::tests::test_escape_sequence_offsets_iterator_parses_csi ... ok
+test vscreen::tests::test_escape_sequence_offsets_iterator_parses_csi_thats_broken ... ok
+test vscreen::tests::test_escape_sequence_offsets_iterator_parses_csi_with_parameters ... ok
+test vscreen::tests::test_escape_sequence_offsets_iterator_parses_csi_with_intermediates ... ok
+test vscreen::tests::test_escape_sequence_offsets_iterator_parses_csi_with_parameters_and_intermediates ... ok
+test vscreen::tests::test_escape_sequence_offsets_iterator_parses_nf_thats_broken ... ok
+test vscreen::tests::test_escape_sequence_offsets_iterator_parses_nf ... ok
+test vscreen::tests::test_escape_sequence_offsets_iterator_parses_osc_thats_broken ... ok
+test vscreen::tests::test_escape_sequence_offsets_iterator_parses_osc_with_bel ... ok
+test vscreen::tests::test_escape_sequence_offsets_iterator_parses_osc_with_st ... ok
+test vscreen::tests::test_escape_sequence_offsets_iterator_parses_text ... ok
+test vscreen::tests::test_sgr_attributes_do_not_leak_into_wrong_field ... ok
+test vscreen::tests::test_escape_sequence_offsets_iterator_parses_text_stops_at_esc ... ok
+test vscreen::tests::test_escape_sequence_offsets_iterator_truncated_dcs_consumes_to_eof ... ok
+test assets::tests::syntax_detection_with_extension_mapping_to_unknown ... ok
+test result: ok. 139 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.44s
+Running unittests src/bin/bat/main.rs (target/debug/deps/bat-2b17b40363f10fb5)
+running 11 tests
+test config::comments ... ok
+test config::empty ... ok
+test config::multi_line ... ok
+test config::quotes ... ok
+test config::multiple ... ok
+test clap_app::verify_app ... ok
+test config::same_file_identical_paths ... ok
+test config::same_file_different_paths ... ok
+test config::single ... ok
+test config::same_file_nonexistent ... ok
+test config::same_file_via_symlink ... ok
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+Running tests/assets.rs (target/debug/deps/assets-aca3d0dc202066a7)
+running 1 test
+test all_themes_are_present ... ignored
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+Running tests/github-actions.rs (target/debug/deps/github_actions-ebccc1358d50e510)
+running 1 test
+test all_jobs_not_missing_any_jobs ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+Running tests/integration_tests.rs (target/debug/deps/integration_tests-ae31dd1c59798dca)
+running 239 tests
+test accepts_no_custom_assets_arg ... ok
+test alias_pager_disable ... ok
+test alias_pager_disable_long_overrides_short ... ok
+test acknowledgements ... ok
+test ansi_highlight_underline ... ok
+test ansi_hyperlink_emitted_when_wrapped ... ok
+test ansi_sgr_emitted_when_wrapped ... ok
+test ansi_sgr_joins_attributes_when_wrapped ... ok
+test ansi_passthrough_emit ... ok
+test basic ... ok
+test basic_io_cycle ... ok
+test ansi_highlight_json_keys ... ok
+test bat_error_to_stderr ... ok
+test basic_set_terminal_title ... ok
+test binary_as_text ... ok
+test bom_not_stripped_in_loop_through_mode ... ok
+test bom_stripped_when_no_color_and_not_loop_through ... ok
+test binary_as_text_control_char_width ... ok
+test cache_build_blank ... ok
+test cache_clear ... ok
+test cache_help_shows_help_message ... ok
+test can_print_file_named_cache ... ok
+test can_print_file_named_cache_with_additional_argument ... ok
+test can_print_file_starting_with_cache ... ok
+test concatenate ... ok
+test concatenate_empty_between ... ok
+test bom_stripped_when_colored_output ... ok
+test concatenate_empty_both ... ok
+test concatenate_empty_first_and_last ... ok
+test concatenate_empty_first ... ok
+test concatenate_empty_last ... ok
+test concatenate_single_line ... ok
+test concatenate_single_line_empty ... ok
+test config_location_from_bat_config_dir_variable ... ok
+test concatenate_stdin ... ok
+test config_location_when_generating ... ok
+test config_location_test ... ok
+test config_read_arguments_from_file ... ok
+test diagnostic_sanity_check ... ok
+test diagnostic_works_with_invalid_config ... ok
+test disable_pager_if_disable_paging_flag_comes_after_paging ... ok
+test disable_pager_if_pp_flag_comes_after_paging ... ok
+test all_global_git_config_locations_syntax_mapping_work ... ok
+test do_not_exit_directory ... ok
+test does_not_print_unwanted_file_named_cache ... ok
+test empty_file_cycle_is_ok ... ok
+test empty_file_leads_to_empty_output_with_grid_enabled ... ok
+test empty_file_leads_to_empty_output_with_rule_enabled ... ok
+test enable_pager_if_disable_paging_flag_comes_before_paging ... ok
+test enable_pager_if_pp_flag_comes_before_paging ... ok
+test env_var_bat_pager_value_bat ... ok
+test env_var_bat_paging ... ok
+test env_var_pager_value_bat ... ok
+test fail_directory ... ok
+test fail_non_existing ... ok
+test do_not_detect_different_syntax_for_stdin_and_files ... ok
+test fallback_syntax_does_not_override_explicit_language ... ok
+test fallback_syntax_does_not_override_detected_syntax ... ok
+test file_with_invalid_utf8_filename ... ok
+test filename_multiple_err ... ok
+test filename_multiple_ok ... ok
+test filename_stdin ... ok
+test filename_stdin_binary ... ok
+test first_file_cyclic_is_ok ... ok
+test grid_overrides_rule ... ok
+test header_arg_overrides_env ... ok
+test header_basic ... ok
+test header_binary ... ok
+test fallback_syntax_is_used_when_no_syntax_is_detected ... ok
+test header_env_basic ... ok
+test header_full_binary ... ok
+test header_full_basic ... ok
+test header_full_padding_rule ... ok
+test header_full_padding ... ok
+test header_narrow_terminal ... ok
+test header_padding ... ok
+test header_narrow_terminal_with_multibyte_chars ... ok
+test header_padding_rule ... ok
+test header_very_narrow_terminal ... ok
+test do_not_panic_regression_tests ... ok
+test header_zip_file_is_binary ... ok
+test help_with_color_never ... ok
+test help_uses_valid_config ... ok
+test help_works_with_invalid_config ... ok
+test highlighting_is_skipped_on_long_lines ... ok
+test highlighting_independant_from_map_syntax_case ... ok
+test invalid_fallback_syntax_returns_error ... ok
+test line_numbers ... ok
+test line_numbers_from_cli_in_loop_through_mode ... ok
+test line_range_2_3 ... ok
+test line_range_context_around_range ... ok
+test line_range_context_around_single_line ... ok
+test ignored_suffix_arg ... ok
+test line_range_context_around_single_line_minimal ... ok
+test line_range_context_at_end_of_file ... ok
+test line_range_context_at_file_boundaries ... ok
+test line_range_context_negative_range ... ok
+test line_range_context_negative_single_line ... ok
+test line_range_context_non_numeric_range ... ok
+test line_range_context_non_numeric_single_line ... ok
+test line_range_context_very_large ... ok
+test line_range_context_zero ... ok
+test line_range_first_two ... ok
+test line_range_from_back_last_two ... ok
+test line_range_from_back_last_two_single_line_eq_sep ... ok
+test line_range_from_back_last_two_single_line_no_sep ... ok
+test line_range_last_3 ... ok
+test line_range_multiple ... ok
+test line_range_multiple_with_context ... ok
+test line_range_up_to_2_from_back ... ok
+test line_range_up_to_2_from_back_single_line_is_empty ... ok
+test ignored_suffix_enables_first_line_detection ... ok
+test line_wrapping_when_auto ... ok
+test list_themes_to_piped_output ... ok
+test list_themes_without_colors ... ok
+test long_help ... ignored
+test long_help_with_highlighting ... ok
+test list_languages ... ok
+test list_themes_with_colors ... ok
+test no_args_doesnt_break ... ok
+test map_syntax_and_ignored_suffix_work_together ... ok
+test map_syntax_target_syntax_case_insensitive ... ok
+test no_line_wrapping_when_set_to_never ... ok
+test no_line_wrapping_with_s_flag ... ok
+test no_pager_arg ... ok
+test no_broken_osc_emit_with_line_wrapping ... ok
+test no_first_line_fallback_when_mapping_to_invalid_syntax ... ok
+test no_paging_arg ... ok
+test no_paging_short_arg ... ok
+test no_strip_overstrike_for_plain_text ... ok
+test no_wrapping_with_chop_long_lines ... ok
+test numbers_ignored_from_cli_when_followed_by_plain_in_loop_through_mode ... ok
+test numbers_honored_from_cli_when_preceeded_by_plain_in_loop_through_mode ... ok
+test pager_arg_override_env_noconfig ... ok
+test pager_basic ... ok
+test no_strip_overstrike_for_other_syntax ... ok
+test pager_disable ... ok
+test pager_basic_arg ... ok
+test pager_arg_override_env_withconfig ... ok
+test pager_failed_to_parse ... ok
+test pager_env_bat_pager_override_config ... ok
+test pager_env_pager_nooverride_config ... ok
+test pager_missing_warning ... ok
+test pager_more ... ok
+test pager_most_from_bat_pager_env_var ... ok
+test pager_most_from_pager_arg ... ok
+test pager_most_from_pager_env_var ... ok
+test pager_value_bat ... ok
+test pager_most_with_arg ... ok
+test paging_does_not_override_simple_plain ... ok
+test piped_output_with_auto_style ... ok
+test pager_overwrite ... ok
+test piped_output_with_default_style_flag ... ok
+test piped_output_with_implicit_auto_style ... ok
+test piped_output_with_line_number_flag ... ok
+test piped_output_with_line_numbers_with_header_grid_style_flag ... ok
+test piped_output_with_line_numbers_style_flag ... ok
+test plain_mode_does_not_add_nonexisting_newline ... ok
+test quiet_empty_does_not_affect_non_empty_input ... ok
+test quiet_empty_suppresses_output_on_empty_stdin ... ok
+test plain_with_sized_terminal_width ... ok
+test quiet_empty_suppresses_output_on_empty_file ... ok
+test sanitize_implies_strip_ansi ... ok
+test sanitize_preserves_crlf ... ok
+test sanitize_preserves_form_feed_in_source ... ok
+test s_flag_respected_with_paging_always ... ok
+test sanitize_preserves_unicode_text ... ok
+test sanitize_strips_8bit_csi ... ok
+test sanitize_strips_osc_8_hyperlink_spoof ... ok
+test sanitize_strips_osc_clipboard_hijack ... ok
+test sanitize_strips_window_title_injection ... ok
+test sanitize_substitutes_zero_width ... ok
+test short_help ... ignored
+test sanitize_substitutes_bare_cr ... ok
+test sanitize_substitutes_bidi_controls ... ok
+test show_all_extends_tab_markers_to_next_tabstop_width_8 ... ok
+test show_all_extends_tab_markers_to_next_tabstop ... ok
+test show_all_mode ... ok
+test show_all_shows_backspace_with_caret_notation ... ok
+test show_all_with_unicode ... ok
+test show_all_with_caret_notation ... ok
+test simple_plain_does_not_override_paging ... ok
+test snip ... ok
+test short_help_with_highlighting ... ok
+test squeeze_blank ... ok
+test squeeze_blank_line_numbers ... ok
+test squeeze_limit ... ok
+test squeeze_limit_line_numbers ... ok
+test stdin ... ok
+test stdin_to_stdout_cycle ... ok
+test strip_ansi_always_strips_ansi ... ok
+test snip_at_terminal_width_one_does_not_panic ... ok
+test strip_ansi_auto_does_not_strip_ansi_when_plain_text_by_option ... ok
+test strip_ansi_auto_does_not_strip_when_plain_text_by_filename ... ok
+test strip_ansi_auto_strips_ansi_when_detected_syntax_by_filename ... ok
+test strip_ansi_does_not_affect_simple_printer ... ok
+test strip_ansi_never_does_not_strip_ansi ... ok
+test strip_ansi_auto_strips_ansi_when_provided_syntax_by_option ... ok
+test strip_ansi_does_not_strip_when_show_nonprintable ... ok
+test style_components_can_be_overidden ... ok
+test style_components_can_be_removed ... ok
+test strip_overstrike_with_syntax_highlighting ... ok
+test style_components_will_merge ... ok
+test style_components_will_merge_with_env_var ... ok
+test style_from_env_var_ignored_and_line_numbers_from_cli_in_loop_through_mode ... ok
+test tabs_4 ... ok
+test tabs_4_arg_overrides_env ... ok
+test tabs_4_arg_overrides_env_noconfig ... ok
+test tabs_4_env_overrides_config ... ok
+test tabs_4_wrapped ... ok
+test tabs_8 ... ok
+test tabs_8_wrapped ... ok
+test strip_overstrike_for_manpage_syntax ... ok
+test tabs_passthrough ... ok
+test tabs_numbers ... ok
+test tabs_passthrough_wrapped ... ok
+test tcl_shebang_detection_expect ... ok
+test tcl_shebang_detection_tclsh ... ok
+test tcl_shebang_detection_wish ... ok
+test terminal_width_arg_overrides_env ... ok
+test terminal_width_env_var_is_respected ... ok
+test theme_arg_overrides_env ... ok
+test theme_arg_overrides_env_withconfig ... ok
+test theme_env_overrides_config ... ok
+test unbuffered_flag_is_accepted ... ok
+test theme_dark_env_var_is_respected ... ok
+test theme_light_env_var_is_respected ... ok
+test unbuffered_mode_plain_output ... ok
+test unicode_wrap ... ok
+test unbuffered_mode_disables_line_numbers ... ok
+test utf16be ... ok
+test version_works_with_invalid_config ... ok
+test utf16le ... ok
+test word_wrap_breaks_at_word_boundaries ... ok
+test utf16 ... ok
+test word_wrap_short_line_no_wrap ... ok
+test word_wrap_with_line_numbers ... ok
+test wrap_never_flag_respected_with_paging_always ... ok
+test cache_build ... ok
+test result: ok. 237 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 5.84s
+Running tests/no_duplicate_extensions.rs (target/debug/deps/no_duplicate_extensions-7c9ab39363a5e518)
+running 1 test
+test no_duplicate_extensions ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+Running tests/snapshot_tests.rs (target/debug/deps/snapshot_tests-5e99bbbf562f476f)
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+Running tests/system_wide_config.rs (target/debug/deps/system_wide_config-2159a92cbf4b2889)
+running 2 tests
+test config_overrides_system_config ... ignored
+test use_systemwide_config ... ignored
+Running tests/test_pretty_printer.rs (target/debug/deps/test_pretty_printer-ec98e929a2bccd67)
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 1 test
+test syntaxes ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+Doc-tests bat
+running 5 tests
+test src/vscreen.rs - vscreen::EscapeSequenceIterator (line 674) ... ignored
+test src/vscreen.rs - vscreen::EscapeSequenceOffsetsIterator (line 353) ... ignored
+test src/theme.rs - theme::ThemePreference (line 61) ... ok
+test src/theme.rs - theme::ThemeName (line 125) ... ok
+test src/lib.rs - (line 12) ... ok
+test result: ok. 3 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 1.24s
+Post job cleanup.
+[command]/usr/bin/git version
+git version 2.54.0
+Temporarily overriding HOME='/home/runner/work/_temp/ac53c85b-3537-4d65-9240-1a2d53d11e4f' before making global git config changes
+Adding repository directory to the temporary git global config as a safe directory
+[command]/usr/bin/git config --global --add safe.directory /home/runner/work/bat/bat
+Removing SSH command configuration
+[command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Removing HTTP extra header
+[command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Removing includeIf entries pointing to credentials config files
+[command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+includeif.gitdir:/home/runner/work/bat/bat/.git.path
+includeif.gitdir:/home/runner/work/bat/bat/.git/worktrees/*.path
+includeif.gitdir:/github/workspace/.git.path
+includeif.gitdir:/github/workspace/.git/worktrees/*.path
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/bat/bat/.git.path
+/home/runner/work/_temp/git-credentials-c3edf9b3-25f7-41c4-8f7e-f21de7f8d9b3.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/bat/bat/.git.path /home/runner/work/_temp/git-credentials-c3edf9b3-25f7-41c4-8f7e-f21de7f8d9b3.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/bat/bat/.git/worktrees/*.path
+/home/runner/work/_temp/git-credentials-c3edf9b3-25f7-41c4-8f7e-f21de7f8d9b3.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/bat/bat/.git/worktrees/*.path /home/runner/work/_temp/git-credentials-c3edf9b3-25f7-41c4-8f7e-f21de7f8d9b3.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git.path
+/github/runner_temp/git-credentials-c3edf9b3-25f7-41c4-8f7e-f21de7f8d9b3.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-c3edf9b3-25f7-41c4-8f7e-f21de7f8d9b3.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git/worktrees/*.path
+/github/runner_temp/git-credentials-c3edf9b3-25f7-41c4-8f7e-f21de7f8d9b3.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-c3edf9b3-25f7-41c4-8f7e-f21de7f8d9b3.config
+[command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+Removing credentials config '/home/runner/work/_temp/git-credentials-c3edf9b3-25f7-41c4-8f7e-f21de7f8d9b3.config'
+Cleaning up orphan processes

@@ -13,6 +13,7 @@ members = [
     "crates/runner-watch",
     "crates/preloop-vm",
     "crates/preloop-orchestrator",
+    "crates/preloop-socket-activation",
     "crates/preloop-cli",
     "benchmarks/preloop-perf",
 ]
@@ -21,7 +22,7 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/preloop/preloop"
+repository = "https://github.com/preloopdev/preloop"
 rust-version = "1.97"
 
 [workspace.lints.rust]
@@ -82,8 +83,13 @@ tar = "0.4"
 glob = "0.3"
 hostname = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+self-replace = "1.5"
+semver = "1.0"
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
 strip = true
+
+[profile.dist]
+inherits = "release"

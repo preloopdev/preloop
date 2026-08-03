@@ -274,8 +274,13 @@ impl VmProvider for RecordingVmProvider {
     }
 
     async fn pack(&self, name: &MachineName, output: &Path) -> Result<(), VmError> {
-        let payload = output.to_path_buf();
-        fs::write(&payload, b"immutable-runner-artifact").map_err(|_| provider_error("pack"))?;
+        // Mirror the smolvm 1.7.2 pack contract: `<output>` is an ELF
+        // launcher stub and `<output>.smolmachine` carries the packed VM
+        // data. The orchestrator consumes the sidecar; the stub is discarded.
+        let stub = output.to_path_buf();
+        let sidecar = PathBuf::from(format!("{}.smolmachine", output.display()));
+        fs::write(&stub, b"elf-launcher-stub").map_err(|_| provider_error("pack"))?;
+        fs::write(&sidecar, b"immutable-runner-artifact").map_err(|_| provider_error("pack"))?;
         let mut state = self.state.lock().await;
         state.pack_calls += 1;
         state.events.push(Event::Pack(name.as_str().to_owned()));
@@ -320,6 +325,7 @@ impl Fixture {
         let config = RunnerPoolConfig {
             size: 1,
             use_fork: false,
+            use_packed_artifact: false,
             name_prefix: format!("pool-{label}-{id}"),
             base_image: "ghcr.io/preloop/base:latest".to_owned(),
             workspace: None,
@@ -329,11 +335,13 @@ impl Fixture {
             server_url: "https://preloop.example".to_owned(),
             control_origin: None,
             control_socket: None,
+            control_upstream: None,
             registration_token_env: token_env.clone(),
             labels: vec!["self-hosted".to_owned(), "linux".to_owned()],
             cpus: 2,
             memory_mib: 256,
             storage_gib: 10,
+            overlay_gib: None,
             debug_dir: None,
             runner_key_dir: None,
             pending_jobs: None,
@@ -455,6 +463,41 @@ async fn artifact_preparation_runs_once_and_reuses_payload_on_next_run() {
             .count(),
         1
     );
+}
+
+#[tokio::test]
+async fn fork_golden_is_marked_forkable_after_guest_provisioning() {
+    let fixture = Fixture::new("fork-golden", true);
+    let mut config = fixture.config.clone();
+    config.use_fork = true;
+    config.control_socket = Some(fixture.root.join("engine.sock"));
+    let provider = Arc::new(RecordingVmProvider::with_machines(
+        &[],
+        vec![RunAction::Wait],
+    ));
+    let pool = RunnerPool::new(provider.clone(), config).unwrap();
+    run_until_cancelled(pool, &provider, CancellationToken::new(), 1).await;
+
+    let events = provider.snapshot().await.events;
+    let golden = format!("{}-golden", fixture.config.name_prefix);
+    let golden_starts = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            matches!(event, Event::Start(name) if name == &golden).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(golden_starts.len(), 2);
+    let first_start = golden_starts[0];
+    let stop = events
+        .iter()
+        .position(|event| matches!(event, Event::Stop(name) if name == &golden))
+        .expect("golden stopped before forkable restart");
+    assert!(first_start < stop);
+    assert!(events[first_start + 1..stop]
+        .iter()
+        .any(|event| matches!(event, Event::Exec(name, _) if name == &golden)));
+    assert!(stop < golden_starts[1]);
 }
 
 #[tokio::test]

@@ -307,7 +307,9 @@ pub fn expand_jobs(workflow: &Workflow) -> Result<Vec<JobPlan>, ParserError> {
     let mut plans = Vec::new();
     let global_env = workflow.env.clone().into_strings();
     for (job_id, job) in &workflow.jobs {
-        for matrix in expand_matrix(job_id, job.strategy.matrix.as_ref(), None)? {
+        let matrixes = expand_matrix(job_id, job.strategy.matrix.as_ref(), None)?;
+        let matrix_count = matrixes.len();
+        for (matrix_index, matrix) in matrixes.into_iter().enumerate() {
             let oidc_environment = oidc_environment(job.environment.as_ref(), &matrix);
             let expanded_id = matrix_expand::expanded_job_id(job_id, &matrix);
             let mut env = global_env.clone();
@@ -317,6 +319,7 @@ pub fn expand_jobs(workflow: &Workflow) -> Result<Vec<JobPlan>, ParserError> {
                 job,
                 expanded_id,
                 matrix,
+                (matrix_count > 1).then_some(matrix_index + 1),
                 env,
                 oidc_environment,
                 workflow.permissions.as_ref(),
@@ -334,6 +337,7 @@ fn job_plan_from_job(
     job: &Job,
     expanded_id: String,
     matrix: IndexMap<String, Value>,
+    matrix_index: Option<usize>,
     env: BTreeMap<String, String>,
     oidc_environment: Option<String>,
     workflow_permissions: Option<&Value>,
@@ -360,6 +364,7 @@ fn job_plan_from_job(
         runs_on: job.runs_on.labels(),
         needs: job.needs.ids(),
         matrix,
+        matrix_index,
         env,
         steps,
         if_condition: job.if_condition.clone(),
@@ -688,7 +693,9 @@ fn expand_jobs_with_reusables_internal(
             continue;
         }
 
-        for matrix in expand_matrix(job_id, job.strategy.matrix.as_ref(), inputs)? {
+        let matrixes = expand_matrix(job_id, job.strategy.matrix.as_ref(), inputs)?;
+        let matrix_count = matrixes.len();
+        for (matrix_index, matrix) in matrixes.into_iter().enumerate() {
             let oidc_environment = oidc_environment(job.environment.as_ref(), &matrix);
             let expanded_id = matrix_expand::expanded_job_id(job_id, &matrix);
             let mut env = global_env.clone();
@@ -698,6 +705,7 @@ fn expand_jobs_with_reusables_internal(
                 job,
                 expanded_id,
                 matrix,
+                (matrix_count > 1).then_some(matrix_index + 1),
                 env,
                 oidc_environment,
                 workflow.permissions.as_ref(),
