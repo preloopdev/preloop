@@ -1,0 +1,20 @@
+[Unit]
+Description=Preloop self-hosted GitHub Actions control plane
+Requires=preloop.socket
+After=preloop.socket network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/preloop serve
+Restart=on-failure
+RestartSec=5s
+Environment=PRELOOP_HOME=/var/lib/preloop
+StateDirectory=preloop
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/usr/local/bin
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,906 @@
+﻿2026-08-01T04:01:31.6906764Z Current runner version: '2.336.0'
+##[group]Runner Image Provisioner
+Hosted Compute Agent
+Version: 20260707.563
+Commit: 02667638d2b423fbc733a8e32a88b44996a3ba6e
+Build Date: 2026-07-07T19:33:50Z
+Worker ID: {98ddf744-4126-4c79-8f28-5535e4f237c5}
+Azure Region: eastus
+##[endgroup]
+##[group]Operating System
+Ubuntu
+24.04.4
+LTS
+##[endgroup]
+##[group]Runner Image
+Image: ubuntu-24.04
+Version: 20260720.247.2
+Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260720.247/images/ubuntu/Ubuntu2404-Readme.md
+Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260720.247
+##[endgroup]
+##[group]GITHUB_TOKEN Permissions
+Actions: write
+ArtifactMetadata: write
+Attestations: write
+Checks: write
+CodeQuality: write
+Contents: write
+CopilotRequests: write
+Deployments: write
+Discussions: write
+Drives: write
+Issues: write
+Metadata: read
+Models: read
+Packages: write
+Pages: write
+PullRequests: write
+RepositoryProjects: write
+SecurityEvents: write
+Statuses: write
+VulnerabilityAlerts: read
+##[endgroup]
+Secret source: Actions
+Prepare workflow directory
+Prepare all required actions
+Getting action download info
+Download action repository 'dtolnay/rust-toolchain@stable' (SHA:4cda84d5c5c54efe2404f9d843567869ab1699d4)
+Download action repository 'actions/checkout@v6' (SHA:d23441a48e516b6c34aea4fa41551a30e30af803)
+Complete job name: Ensure code quality
+##[group]Run dtolnay/rust-toolchain@stable
+with:
+components: rustfmt,clippy
+toolchain: stable
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+##[endgroup]
+##[start-action display=Run : parse toolchain version;id=__dtolnay_rust-toolchain.parse]
+##[group]Run : parse toolchain version
+: parse toolchain version
+if [[ -z $toolchain ]]; then
+# GitHub does not enforce `required: true` inputs itself. https://github.com/actions/runner/issues/1070
+echo "'toolchain' is a required input" >&2
+exit 1
+elif [[ $toolchain =~ ^stable' '[0-9]+' '(year|month|week|day)s?' 'ago$ ]]; then
+if [[ Linux == macOS ]]; then
+echo "toolchain=1.$((($(date -v-$(sed 's/stable \([0-9]*\) \(.\).*/\1\2/' <<< $toolchain) +%s)/60/60/24-16569)/7/6))" >> $GITHUB_OUTPUT
+else
+echo "toolchain=1.$((($(date --date "${toolchain#stable }" +%s)/60/60/24-16569)/7/6))" >> $GITHUB_OUTPUT
+fi
+elif [[ $toolchain =~ ^stable' 'minus' '[0-9]+' 'releases?$ ]]; then
+echo "toolchain=1.$((($(date +%s)/60/60/24-16569)/7/6-${toolchain//[^0-9]/}))" >> $GITHUB_OUTPUT
+elif [[ $toolchain =~ ^1\.[0-9]+$ ]]; then
+echo "toolchain=1.$((i=${toolchain#1.}, c=($(date +%s)/60/60/24-16569)/7/6, i+9*i*(10*i<=c)+90*i*(100*i<=c)))" >> $GITHUB_OUTPUT
+else
+echo "toolchain=$toolchain" >> $GITHUB_OUTPUT
+fi
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+toolchain: stable
+##[endgroup]
+##[end-action id=__dtolnay_rust-toolchain.parse;outcome=success;conclusion=success;duration_ms=32]
+##[start-action display=Run : construct rustup command line;id=__dtolnay_rust-toolchain.flags]
+##[group]Run : construct rustup command line
+: construct rustup command line
+echo "targets=$(for t in ${targets//,/ }; do echo -n ' --target' $t; done)" >> $GITHUB_OUTPUT
+echo "components=$(for c in ${components//,/ }; do echo -n ' --component' $c; done)" >> $GITHUB_OUTPUT
+echo "downgrade=" >> $GITHUB_OUTPUT
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+targets: 
+components: rustfmt,clippy
+##[endgroup]
+##[end-action id=__dtolnay_rust-toolchain.flags;outcome=success;conclusion=success;duration_ms=16]
+##[start-action display=Run : set $CARGO_HOME;id=__dtolnay_rust-toolchain.__run]
+##[group]Run : set $CARGO_HOME
+: set $CARGO_HOME
+echo CARGO_HOME=${CARGO_HOME:-"$HOME/.cargo"} >> $GITHUB_ENV
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+##[endgroup]
+##[end-action id=__dtolnay_rust-toolchain.__run;outcome=success;conclusion=success;duration_ms=14]
+##[start-action display=Run : install rustup if needed;id=__dtolnay_rust-toolchain.__run_2]
+##[group]Run : install rustup if needed
+: install rustup if needed
+if ! command -v rustup &>/dev/null; then
+curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused --location --silent --show-error --fail https://sh.rustup.rs | sh -s -- --default-toolchain none -y
+echo "$CARGO_HOME/bin" >> $GITHUB_PATH
+fi
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+CARGO_HOME: /home/runner/.cargo
+##[endgroup]
+##[end-action id=__dtolnay_rust-toolchain.__run_2;outcome=success;conclusion=success;duration_ms=15]
+##[start-action display=Run : install rustup if needed on windows;id=__dtolnay_rust-toolchain.__run_3]
+##[end-action id=__dtolnay_rust-toolchain.__run_3;outcome=skipped;conclusion=skipped;duration_ms=0]
+##[start-action display=rustup toolchain install stable;id=__dtolnay_rust-toolchain.__run_4]
+##[group]Run rustup toolchain install stable --component rustfmt --component clippy --profile minimal --no-self-update
+rustup toolchain install stable --component rustfmt --component clippy --profile minimal --no-self-update
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+CARGO_HOME: /home/runner/.cargo
+RUSTUP_PERMIT_COPY_RENAME: 1
+##[endgroup]
+info: syncing channel updates for stable-x86_64-unknown-linux-gnu
+info: latest update on 2026-07-16 for version 1.97.1 (8bab26f4f 2026-07-14)
+info: component clippy is up to date
+info: component rustfmt is up to date
+stable-x86_64-unknown-linux-gnu unchanged - rustc 1.97.1 (8bab26f4f 2026-07-14)
+##[end-action id=__dtolnay_rust-toolchain.__run_4;outcome=success;conclusion=success;duration_ms=2119]
+##[start-action display=Run rustup default stable;id=__dtolnay_rust-toolchain.__run_5]
+##[group]Run rustup default stable
+rustup default stable
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+CARGO_HOME: /home/runner/.cargo
+##[endgroup]
+info: using existing install for stable-x86_64-unknown-linux-gnu
+info: default toolchain set to stable-x86_64-unknown-linux-gnu
+stable-x86_64-unknown-linux-gnu unchanged - rustc 1.97.1 (8bab26f4f 2026-07-14)
+##[end-action id=__dtolnay_rust-toolchain.__run_5;outcome=success;conclusion=success;duration_ms=29]
+##[start-action display=Run : create cachekey;id=__dtolnay_rust-toolchain.rustc-version]
+##[group]Run : create cachekey
+: create cachekey
+DATE=$(rustc +stable --version --verbose | sed -ne 's/^commit-date: \(20[0-9][0-9]\)-\([01][0-9]\)-\([0-3][0-9]\)$/\1\2\3/p')
+HASH=$(rustc +stable --version --verbose | sed -ne 's/^commit-hash: //p')
+echo "cachekey=$(echo $DATE$HASH | head -c12)" >> $GITHUB_OUTPUT
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+CARGO_HOME: /home/runner/.cargo
+##[endgroup]
+##[end-action id=__dtolnay_rust-toolchain.rustc-version;outcome=success;conclusion=success;duration_ms=68]
+##[start-action display=Run : disable incremental compilation;id=__dtolnay_rust-toolchain.__run_6]
+##[group]Run : disable incremental compilation
+: disable incremental compilation
+if [ -z "${CARGO_INCREMENTAL+set}" ]; then
+echo CARGO_INCREMENTAL=0 >> $GITHUB_ENV
+fi
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+CARGO_HOME: /home/runner/.cargo
+##[endgroup]
+##[end-action id=__dtolnay_rust-toolchain.__run_6;outcome=success;conclusion=success;duration_ms=13]
+##[start-action display=Run : enable colors in Cargo output;id=__dtolnay_rust-toolchain.__run_7]
+##[group]Run : enable colors in Cargo output
+: enable colors in Cargo output
+if [ -z "${CARGO_TERM_COLOR+set}" ]; then
+echo CARGO_TERM_COLOR=always >> $GITHUB_ENV
+fi
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+CARGO_HOME: /home/runner/.cargo
+CARGO_INCREMENTAL: 0
+##[endgroup]
+##[end-action id=__dtolnay_rust-toolchain.__run_7;outcome=success;conclusion=success;duration_ms=13]
+##[start-action display=Run : enable Cargo sparse registry;id=__dtolnay_rust-toolchain.__run_8]
+##[group]Run : enable Cargo sparse registry
+: enable Cargo sparse registry
+# implemented in 1.66, stabilized in 1.68, made default in 1.70
+if [ -z "${CARGO_REGISTRIES_CRATES_IO_PROTOCOL+set}" -o -f "/home/runner/work/_temp"/.implicit_cargo_registries_crates_io_protocol ]; then
+if rustc +stable --version --verbose | grep -q '^release: 1\.6[89]\.'; then
+touch "/home/runner/work/_temp"/.implicit_cargo_registries_crates_io_protocol || true
+echo CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse >> $GITHUB_ENV
+elif rustc +stable --version --verbose | grep -q '^release: 1\.6[67]\.'; then
+touch "/home/runner/work/_temp"/.implicit_cargo_registries_crates_io_protocol || true
+echo CARGO_REGISTRIES_CRATES_IO_PROTOCOL=git >> $GITHUB_ENV
+fi
+fi
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+CARGO_HOME: /home/runner/.cargo
+CARGO_INCREMENTAL: 0
+CARGO_TERM_COLOR: always
+##[endgroup]
+##[end-action id=__dtolnay_rust-toolchain.__run_8;outcome=success;conclusion=success;duration_ms=41]
+##[start-action display=Run : work around spurious network errors in curl 8.0;id=__dtolnay_rust-toolchain.__run_9]
+##[group]Run : work around spurious network errors in curl 8.0
+: work around spurious network errors in curl 8.0
+# https://rust-lang.zulipchat.com/#narrow/stream/246057-t-cargo/topic/timeout.20investigation
+if rustc +stable --version --verbose | grep -q '^release: 1\.7[01]\.'; then
+echo CARGO_HTTP_MULTIPLEXING=false >> $GITHUB_ENV
+fi
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+CARGO_HOME: /home/runner/.cargo
+CARGO_INCREMENTAL: 0
+CARGO_TERM_COLOR: always
+##[endgroup]
+##[end-action id=__dtolnay_rust-toolchain.__run_9;outcome=success;conclusion=success;duration_ms=28]
+##[start-action display=Run rustc +stable --version --verbose;id=__dtolnay_rust-toolchain.__run_10]
+##[group]Run rustc +stable --version --verbose
+rustc +stable --version --verbose
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+CARGO_HOME: /home/runner/.cargo
+CARGO_INCREMENTAL: 0
+CARGO_TERM_COLOR: always
+##[endgroup]
+rustc 1.97.1 (8bab26f4f 2026-07-14)
+binary: rustc
+commit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452
+commit-date: 2026-07-14
+host: x86_64-unknown-linux-gnu
+release: 1.97.1
+LLVM version: 22.1.6
+##[end-action id=__dtolnay_rust-toolchain.__run_10;outcome=success;conclusion=success;duration_ms=28]
+##[group]Run actions/checkout@v6
+with:
+repository: sharkdp/bat
+token: ***
+ssh-strict: true
+ssh-user: git
+persist-credentials: true
+clean: true
+sparse-checkout-cone-mode: true
+fetch-depth: 1
+fetch-tags: false
+show-progress: true
+lfs: false
+submodules: false
+set-safe-directory: true
+allow-unsafe-pr-checkout: false
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+CARGO_HOME: /home/runner/.cargo
+CARGO_INCREMENTAL: 0
+CARGO_TERM_COLOR: always
+##[endgroup]
+Syncing repository: sharkdp/bat
+##[group]Getting Git version info
+Working directory is '/home/runner/work/bat/bat'
+[command]/usr/bin/git version
+git version 2.54.0
+##[endgroup]
+Temporarily overriding HOME='/home/runner/work/_temp/03349c4b-1180-4e0a-961a-c83dae4db828' before making global git config changes
+Adding repository directory to the temporary git global config as a safe directory
+[command]/usr/bin/git config --global --add safe.directory /home/runner/work/bat/bat
+Deleting the contents of '/home/runner/work/bat/bat'
+##[group]Determining repository object format
+##[endgroup]
+##[group]Initializing the repository
+[command]/usr/bin/git init /home/runner/work/bat/bat
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /home/runner/work/bat/bat/.git/
+[command]/usr/bin/git remote add origin https://github.com/sharkdp/bat
+##[endgroup]
+##[group]Disabling automatic garbage collection
+[command]/usr/bin/git config --local gc.auto 0
+##[endgroup]
+##[group]Setting up auth
+Removing SSH command configuration
+[command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Removing HTTP extra header
+[command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Removing includeIf entries pointing to credentials config files
+[command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+[command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+[command]/usr/bin/git config --file /home/runner/work/_temp/git-credentials-fef981c3-0fa1-456c-935b-fe714e6318af.config http.https://github.com/.extraheader AUTHORIZATION: basic ***
+[command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/bat/bat/.git.path /home/runner/work/_temp/git-credentials-fef981c3-0fa1-456c-935b-fe714e6318af.config
+[command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/bat/bat/.git/worktrees/*.path /home/runner/work/_temp/git-credentials-fef981c3-0fa1-456c-935b-fe714e6318af.config
+[command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-fef981c3-0fa1-456c-935b-fe714e6318af.config
+[command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-fef981c3-0fa1-456c-935b-fe714e6318af.config
+##[endgroup]
+##[group]Fetching the repository
+[command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +2ba8db9c14e5794572f5ea338c2b90404c9769cb:refs/remotes/origin/master
+From https://github.com/sharkdp/bat
+* [new ref]         2ba8db9c14e5794572f5ea338c2b90404c9769cb -> origin/master
+[command]/usr/bin/git branch --list --remote origin/master
+origin/master
+[command]/usr/bin/git rev-parse refs/remotes/origin/master
+2ba8db9c14e5794572f5ea338c2b90404c9769cb
+##[endgroup]
+##[group]Determining the checkout info
+##[endgroup]
+[command]/usr/bin/git sparse-checkout disable
+[command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+##[group]Checking out the ref
+[command]/usr/bin/git checkout --progress --force -B master refs/remotes/origin/master
+Reset branch 'master'
+branch 'master' set up to track 'origin/master'.
+##[endgroup]
+[command]/usr/bin/git log -1 --format=%H
+2ba8db9c14e5794572f5ea338c2b90404c9769cb
+##[group]Run cargo fmt -- --check
+cargo fmt -- --check
+shell: /usr/bin/bash -e {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+CARGO_HOME: /home/runner/.cargo
+CARGO_INCREMENTAL: 0
+CARGO_TERM_COLOR: always
+##[endgroup]
+##[group]Run cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo clippy --locked --all-targets --all-features -- -D warnings
+shell: /usr/bin/bash -e {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+CARGO_HOME: /home/runner/.cargo
+CARGO_INCREMENTAL: 0
+CARGO_TERM_COLOR: always
+##[endgroup]
+Updating crates.io index
+Downloading crates ...
+Downloaded serial_test_derive v2.0.0
+Downloaded shell-words v1.1.1
+Downloaded sha1 v0.10.6
+Downloaded adler2 v2.0.1
+Downloaded serial_test v2.0.0
+Downloaded shell-escape v0.1.5
+Downloaded cfg-if v1.0.4
+Downloaded serde_yaml v0.9.34+deprecated
+Downloaded typenum v1.20.0
+Downloaded unicode-normalization v0.1.25
+Downloaded linked-hash-map v0.5.6
+Downloaded tinyvec_macros v0.1.1
+Downloaded crypto-common v0.1.7
+Downloaded unsafe-libyaml v0.2.11
+Downloaded sha1-checked v0.10.0
+Downloaded same-file v1.0.6
+Downloaded unicode-ident v1.0.24
+Downloaded winnow v1.0.2
+Downloaded wait-timeout v0.2.1
+Downloaded num-traits v0.2.19
+Downloaded yaml-rust v0.4.5
+Downloaded etcetera v0.11.0
+Downloaded execute-command-macro v0.3.0
+Downloaded mio v1.2.0
+Downloaded unicode-segmentation v1.13.3
+Downloaded zmij v1.0.21
+Downloaded unicode-width v0.2.2
+Downloaded version_check v0.9.5
+Downloaded xterm-color v1.0.2
+Downloaded derive_more-impl v2.1.1
+Downloaded foldhash v0.2.0
+Downloaded aho-corasick v1.1.4
+Downloaded ansi_colours v1.2.3
+Downloaded rustix v1.1.4
+Downloaded scopeguard v1.2.0
+Downloaded zlib-rs v0.6.3
+Downloaded terminal_size v0.4.4
+Downloaded ident_case v1.0.1
+Downloaded std_prelude v0.2.12
+Downloaded wild v2.2.1
+Downloaded arc-swap v1.9.1
+Downloaded walkdir v2.5.0
+Downloaded bit-set v0.8.0
+Downloaded utf8parse v0.2.2
+Downloaded defmt-macros v1.1.0
+Downloaded proc-macro-error2 v2.0.1
+Downloaded textwrap v0.16.2
+Downloaded anstyle v1.0.14
+Downloaded bitflags v1.3.2
+Downloaded clap_builder v4.6.0
+Downloaded proc-macro2 v1.0.107
+Downloaded toml_parser v1.1.2+spec-1.1.0
+Downloaded bit-vec v0.8.0
+Downloaded convert_case v0.10.0
+Downloaded bitflags v2.11.1
+Downloaded defmt-parser v1.0.0
+Downloaded assert_cmd v2.2.1
+Downloaded crc32fast v1.5.0
+Downloaded log v0.4.29
+Downloaded tempfile v3.27.0
+Downloaded unicode-bom v2.0.3
+Downloaded anstyle-parse v1.0.0
+Downloaded colorchoice v1.0.5
+Downloaded darling_macro v0.23.0
+Downloaded memmap2 v0.9.11
+Downloaded miniz_oxide v0.8.9
+Downloaded dashmap v6.2.1
+Downloaded deranged v0.5.8
+Downloaded expect-test v1.5.1
+Downloaded ryu v1.0.23
+Downloaded defmt v1.1.0
+Downloaded digest v0.10.7
+Downloaded flate2 v1.1.9
+Downloaded litrs v1.0.0
+Downloaded serde_json v1.0.149
+Downloaded filetime v0.2.29
+Downloaded serde_with_macros v3.21.0
+Downloaded execute v0.3.0
+Downloaded lock_api v0.4.14
+Downloaded signal-hook-mio v0.2.5
+Downloaded either v1.15.0
+Downloaded errno v0.3.14
+Downloaded predicates-core v1.0.10
+Downloaded getrandom v0.4.2
+Downloaded memchr v2.8.0
+Downloaded fnv v1.0.7
+Downloaded git-version v0.3.9
+Downloaded gix-worktree-stream v0.35.0
+Downloaded rustc_version v0.4.1
+Downloaded serde_spanned v1.1.1
+Downloaded clap_lex v1.1.0
+Downloaded clircle v0.6.1
+Downloaded execute-command-tokens v0.3.0
+Downloaded faster-hex v0.10.0
+Downloaded path_abs v0.5.1
+Downloaded proc-macro-error-attr2 v2.0.0
+Downloaded serde v1.0.228
+Downloaded once_cell v1.21.4
+Downloaded predicates v3.1.4
+Downloaded darling v0.23.0
+Downloaded fastrand v2.4.1
+Downloaded gix-attributes v0.34.0
+Downloaded difflib v0.4.0
+Downloaded gix-chunk v0.7.3
+Downloaded gix-command v0.9.1
+Downloaded gix-date v0.15.6
+Downloaded nonempty v0.12.0
+Downloaded signal-hook-registry v1.4.8
+Downloaded time-core v0.1.8
+Downloaded block-buffer v0.10.4
+Downloaded powerfmt v0.2.0
+Downloaded document-features v0.2.12
+Downloaded execute-command-macro-impl v0.3.0
+Downloaded anstyle-query v1.1.5
+Downloaded terminal-trx v0.2.6
+Downloaded bisync v0.3.0
+Downloaded bisync_macros v0.2.3
+Downloaded float-cmp v0.10.0
+Downloaded gix-actor v0.41.2
+Downloaded gix-lock v24.0.0
+Downloaded predicates-tree v1.0.13
+Downloaded cfg_aliases v0.2.1
+Downloaded content_inspector v0.2.4
+Downloaded cpufeatures v0.2.17
+Downloaded find-msvc-tools v0.1.9
+Downloaded percent-encoding v2.3.2
+Downloaded rgb v0.8.53
+Downloaded stable_deref_trait v1.2.1
+Downloaded strsim v0.11.1
+Downloaded generic-array v0.14.7
+Downloaded gix-bitmap v0.3.3
+Downloaded gix-config-value v0.19.0
+Downloaded autocfg v1.5.0
+Downloaded bincode v1.3.3
+Downloaded dissimilar v1.0.11
+Downloaded gix-utils v0.3.5
+Downloaded termcolor v1.4.1
+Downloaded terminal-colorsaurus v1.0.3
+Downloaded toml_writer v1.1.1+spec-1.1.0
+Downloaded gix-features v0.49.0
+Downloaded gix-sec v0.14.2
+Downloaded is_terminal_polyfill v1.70.2
+Downloaded normalize-line-endings v0.3.0
+Downloaded num-conv v0.2.1
+Downloaded termtree v0.5.1
+Downloaded derive_more v2.1.1
+Downloaded equivalent v1.0.2
+Downloaded git-version-macro v0.3.9
+Downloaded gix-commitgraph v0.38.0
+Downloaded gix-tempfile v24.0.0
+Downloaded gix-validate v0.11.3
+Downloaded hash32 v0.3.1
+Downloaded thiserror-impl v2.0.18
+Downloaded anstream v1.0.0
+Downloaded bugreport v0.6.0
+Downloaded shlex v1.3.0
+Downloaded toml_datetime v1.1.1+spec-1.1.0
+Downloaded bytesize v2.4.2
+Downloaded clru v0.6.3
+Downloaded crossbeam-deque v0.8.6
+Downloaded gix-hash v0.26.0
+Downloaded gix-hashtable v0.16.0
+Downloaded gix-quote v0.7.2
+Downloaded gix-revision v0.48.0
+Downloaded gix-shallow v0.13.0
+Downloaded gix-submodule v0.33.0
+Downloaded gix-trace v0.1.21
+Downloaded gix-url v0.37.0
+Downloaded grep-cli v0.1.12
+Downloaded lazy_static v1.5.0
+Downloaded parking_lot v0.12.5
+Downloaded parking_lot_core v0.9.12
+Downloaded quote v1.0.47
+Downloaded simd-adler32 v0.3.9
+Downloaded smallvec v1.15.1
+Downloaded thiserror v2.0.18
+Downloaded time-macros v0.2.27
+Downloaded tinyvec v1.11.0
+Downloaded toml v1.1.2+spec-1.1.0
+Downloaded allocator-api2 v0.2.21
+Downloaded anyhow v1.0.103
+Downloaded byteorder v1.5.0
+Downloaded console v0.16.3
+Downloaded crossbeam-utils v0.8.21
+Downloaded gix-discover v0.54.0
+Downloaded gix-error v0.2.5
+Downloaded gix-filter v0.33.0
+Downloaded gix-imara-diff v0.2.4
+Downloaded gix-object v0.63.0
+Downloaded gix-packetline v0.22.0
+Downloaded gix-path v0.12.3
+Downloaded gix-protocol v0.64.0
+Downloaded gix-refspec v0.44.0
+Downloaded gix-worktree v0.55.0
+Downloaded gix-zlib v0.1.0
+Downloaded globset v0.4.18
+Downloaded nu-ansi-term v0.50.3
+Downloaded onig v6.5.3
+Downloaded plist v1.10.0
+Downloaded rustversion v1.0.22
+Downloaded semver v1.0.28
+Downloaded signal-hook v0.3.18
+Downloaded bytemuck v1.25.0
+Downloaded clap v4.6.1
+Downloaded crossbeam-epoch v0.9.20
+Downloaded gix-fs v0.22.0
+Downloaded gix-traverse v0.60.0
+Downloaded itoa v1.0.18
+Downloaded pkg-config v0.3.33
+Downloaded serde_derive v1.0.228
+Downloaded base64 v0.22.1
+Downloaded bytes v1.11.1
+Downloaded cc v1.2.62
+Downloaded crossbeam-channel v0.5.15
+Downloaded dashmap v5.5.3
+Downloaded gix-diff v0.66.0
+Downloaded gix-glob v0.27.0
+Downloaded gix-ignore v0.22.0
+Downloaded gix-odb v0.83.0
+Downloaded gix-pathspec v0.19.0
+Downloaded heapless v0.8.0
+Downloaded jiff-static v0.2.29
+Downloaded gix-config v0.59.0
+Downloaded gix-ref v0.66.0
+Downloaded gix-revwalk v0.34.0
+Downloaded gix-transport v0.58.0
+Downloaded rayon v1.12.0
+Downloaded serde_core v1.0.228
+Downloaded darling_core v0.23.0
+Downloaded gix-index v0.54.0
+Downloaded gix-pack v0.73.0
+Downloaded prettyplease v0.2.37
+Downloaded prodash v31.0.0
+Downloaded rayon-core v1.13.0
+Downloaded crossterm v0.29.0
+Downloaded hashbrown v0.16.1
+Downloaded indexmap v2.14.0
+Downloaded fancy-regex v0.16.2
+Downloaded hashbrown v0.17.1
+Downloaded hashbrown v0.14.5
+Downloaded itertools v0.14.0
+Downloaded regex v1.13.1
+Downloaded sysinfo v0.33.1
+Downloaded serde_with v3.21.0
+Downloaded time v0.3.47
+Downloaded quick-xml v0.41.0
+Downloaded syn v2.0.117
+Downloaded nix v0.31.3
+Downloaded bstr v1.12.1
+Downloaded gix v0.86.0
+Downloaded regex-syntax v0.8.11
+Downloaded jiff v0.2.29
+Downloaded regex-automata v0.4.16
+Downloaded syntect v5.3.0
+Downloaded minus v5.7.2
+Downloaded onig_sys v69.9.3
+Downloaded encoding_rs v0.8.35
+Downloaded libc v0.2.186
+Downloaded linux-raw-sys v0.12.1
+Compiling proc-macro2 v1.0.107
+Compiling quote v1.0.47
+Compiling unicode-ident v1.0.24
+Compiling libc v0.2.186
+Checking memchr v2.8.0
+Checking cfg-if v1.0.4
+Checking aho-corasick v1.1.4
+Checking regex-syntax v0.8.11
+Compiling thiserror v2.0.18
+Compiling parking_lot_core v0.9.12
+Checking scopeguard v1.2.0
+Checking smallvec v1.15.1
+Checking regex-automata v0.4.16
+Compiling syn v2.0.117
+Checking lock_api v0.4.14
+Checking once_cell v1.21.4
+Compiling getrandom v0.4.2
+Checking tinyvec_macros v0.1.1
+Checking tinyvec v1.11.0
+Checking fastrand v2.4.1
+Checking gix-trace v0.1.21
+Checking parking_lot v0.12.5
+Checking unicode-normalization v0.1.25
+Compiling crc32fast v1.5.0
+Checking bitflags v2.11.1
+Checking same-file v1.0.6
+Checking prodash v31.0.0
+Checking walkdir v2.5.0
+Compiling version_check v0.9.5
+Checking typenum v1.20.0
+Compiling generic-array v0.14.7
+Checking allocator-api2 v0.2.21
+Checking bstr v1.12.1
+Compiling heapless v0.8.0
+Checking equivalent v1.0.2
+Checking foldhash v0.2.0
+Checking byteorder v1.5.0
+Checking gix-validate v0.11.3
+Checking gix-utils v0.3.5
+Checking gix-error v0.2.5
+Checking hash32 v0.3.1
+Checking stable_deref_trait v1.2.1
+Checking itoa v1.0.18
+Checking hashbrown v0.17.1
+Checking block-buffer v0.10.4
+Checking crypto-common v0.1.7
+Checking digest v0.10.7
+Checking cpufeatures v0.2.17
+Compiling crossbeam-utils v0.8.21
+Checking sha1 v0.10.6
+Checking faster-hex v0.10.0
+Checking sha1-checked v0.10.0
+Compiling rustix v1.1.4
+Checking linux-raw-sys v0.12.1
+Checking jiff v0.2.29
+Checking memmap2 v0.9.11
+Checking hashbrown v0.14.5
+Compiling thiserror-impl v2.0.18
+Checking dashmap v6.2.1
+Checking gix-chunk v0.7.3
+Checking nonempty v0.12.0
+Checking gix-quote v0.7.2
+Compiling serde_core v1.0.228
+Compiling strsim v0.11.1
+Checking unicode-bom v2.0.3
+Checking tempfile v3.27.0
+Checking gix-path v0.12.3
+Checking gix-features v0.49.0
+Compiling serde_derive v1.0.228
+Checking gix-hash v0.26.0
+Checking gix-hashtable v0.16.0
+Checking gix-fs v0.22.0
+Checking gix-date v0.15.6
+Checking gix-actor v0.41.2
+Checking gix-tempfile v24.0.0
+Checking gix-object v0.63.0
+Checking gix-lock v24.0.0
+Checking gix-glob v0.27.0
+Checking gix-commitgraph v0.38.0
+Checking gix-revwalk v0.34.0
+Compiling crossbeam-epoch v0.9.20
+Compiling ident_case v1.0.1
+Checking log v0.4.29
+Compiling darling_core v0.23.0
+Checking gix-attributes v0.34.0
+Checking gix-sec v0.14.2
+Checking shell-words v1.1.1
+Compiling find-msvc-tools v0.1.9
+Compiling shlex v1.3.0
+Compiling utf8parse v0.2.2
+Compiling serde v1.0.228
+Compiling anstyle-parse v1.0.0
+Compiling cc v1.2.62
+Checking gix-command v0.9.1
+Checking gix-ref v0.66.0
+Checking gix-packetline v0.22.0
+Checking errno v0.3.14
+Compiling is_terminal_polyfill v1.70.2
+Compiling unicode-segmentation v1.13.3
+Compiling darling_macro v0.23.0
+Checking fnv v1.0.7
+Compiling rustversion v1.0.22
+Checking percent-encoding v2.3.2
+Compiling colorchoice v1.0.5
+Compiling anstyle v1.0.14
+Compiling signal-hook v0.3.18
+Compiling rayon-core v1.13.0
+Compiling anstyle-query v1.1.5
+Compiling pkg-config v0.3.33
+Compiling anstream v1.0.0
+Checking gix-url v0.37.0
+Compiling convert_case v0.10.0
+Compiling onig_sys v69.9.3
+Compiling darling v0.23.0
+Checking signal-hook-registry v1.4.8
+Checking crossbeam-deque v0.8.6
+Compiling terminal_size v0.4.4
+Checking mio v1.2.0
+Checking gix-traverse v0.60.0
+Checking gix-config-value v0.19.0
+Checking gix-bitmap v0.3.3
+Checking hashbrown v0.16.1
+Checking filetime v0.2.29
+Compiling prettyplease v0.2.37
+Compiling zmij v1.0.21
+Compiling winnow v1.0.2
+Compiling anyhow v1.0.103
+Checking either v1.15.0
+Compiling autocfg v1.5.0
+Checking zlib-rs v0.6.3
+Checking powerfmt v0.2.0
+Compiling clap_lex v1.1.0
+Compiling clap_builder v4.6.0
+Compiling indexmap v2.14.0
+Checking gix-zlib v0.1.0
+Checking deranged v0.5.8
+Compiling num-traits v0.2.19
+Checking clru v0.6.3
+Compiling toml_parser v1.1.2+spec-1.1.0
+Checking gix-index v0.54.0
+Compiling derive_more-impl v2.1.1
+Compiling serde_with_macros v3.21.0
+Compiling serde_spanned v1.1.1
+Compiling toml_datetime v1.1.1+spec-1.1.0
+Checking gix-revision v0.48.0
+Checking gix-ignore v0.22.0
+Checking regex v1.13.1
+Checking encoding_rs v0.8.35
+Checking bit-vec v0.8.0
+Checking unicode-width v0.2.2
+Checking num-conv v0.2.1
+Compiling toml_writer v1.1.1+spec-1.1.0
+Checking time-core v0.1.8
+Compiling bisync_macros v0.2.3
+Checking simd-adler32 v0.3.9
+Compiling execute-command-tokens v0.3.0
+Checking adler2 v2.0.1
+Compiling litrs v1.0.0
+Compiling serde_json v1.0.149
+Checking miniz_oxide v0.8.9
+Compiling execute-command-macro-impl v0.3.0
+Compiling document-features v0.2.12
+Checking bisync v0.3.0
+Checking gix-filter v0.33.0
+Compiling itertools v0.14.0
+Compiling toml v1.1.2+spec-1.1.0
+Checking time v0.3.47
+Checking bit-set v0.8.0
+Checking gix-refspec v0.44.0
+Checking gix-worktree v0.55.0
+Compiling serde_with v3.21.0
+Checking arc-swap v1.9.1
+Checking derive_more v2.1.1
+Checking signal-hook-mio v0.2.5
+Checking rayon v1.12.0
+Checking gix-pack v0.73.0
+Compiling clap v4.6.1
+Checking gix-pathspec v0.19.0
+Checking gix-config v0.59.0
+Checking gix-transport v0.58.0
+Checking gix-shallow v0.13.0
+Compiling git-version-macro v0.3.9
+Checking gix-imara-diff v0.2.4
+Checking quick-xml v0.41.0
+Checking linked-hash-map v0.5.6
+Checking bytemuck v1.25.0
+Checking base64 v0.22.1
+Compiling bugreport v0.6.0
+Checking plist v1.10.0
+Compiling bat v0.26.1 (/home/runner/work/bat/bat)
+Checking rgb v0.8.53
+Checking gix-submodule v0.33.0
+Checking yaml-rust v0.4.5
+Checking git-version v0.3.9
+Checking gix-diff v0.66.0
+Checking gix-protocol v0.64.0
+Checking sysinfo v0.33.1
+Checking gix-odb v0.83.0
+Checking crossterm v0.29.0
+Checking fancy-regex v0.16.2
+Checking execute-command-macro v0.3.0
+Checking flate2 v1.1.9
+Checking textwrap v0.16.2
+Checking bincode v1.3.3
+Checking gix-discover v0.54.0
+Checking globset v0.4.18
+Checking crossbeam-channel v0.5.15
+Checking terminal-trx v0.2.6
+Checking shell-escape v0.1.5
+Checking ryu v1.0.23
+Checking unsafe-libyaml v0.2.11
+Checking predicates-core v1.0.10
+Checking xterm-color v1.0.2
+Checking std_prelude v0.2.12
+Checking termcolor v1.4.1
+Compiling cfg_aliases v0.2.1
+Compiling nix v0.31.3
+Checking grep-cli v0.1.12
+Checking path_abs v0.5.1
+Checking terminal-colorsaurus v1.0.3
+Checking serde_yaml v0.9.34+deprecated
+Checking minus v5.7.2
+Checking execute v0.3.0
+Checking gix v0.86.0
+Checking float-cmp v0.10.0
+Checking ansi_colours v1.2.3
+Checking console v0.16.3
+Checking etcetera v0.11.0
+Checking clircle v0.6.1
+Checking content_inspector v0.2.4
+Compiling assert_cmd v2.2.1
+Checking termtree v0.5.1
+Checking nu-ansi-term v0.50.3
+Checking semver v1.0.28
+Checking normalize-line-endings v0.3.0
+Checking wild v2.2.1
+Checking bytesize v2.4.2
+Checking difflib v0.4.0
+Checking onig v6.5.3
+Checking predicates-tree v1.0.13
+Checking predicates v3.1.4
+Checking dashmap v5.5.3
+Compiling serial_test_derive v2.0.0
+Checking wait-timeout v0.2.1
+Checking dissimilar v1.0.11
+Checking syntect v5.3.0
+Checking lazy_static v1.5.0
+Checking expect-test v1.5.1
+Checking serial_test v2.0.0
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 40.26s
+Post job cleanup.
+[command]/usr/bin/git version
+git version 2.54.0
+Temporarily overriding HOME='/home/runner/work/_temp/6aedf9b0-29a1-47bd-be4b-c68ec4d10100' before making global git config changes
+Adding repository directory to the temporary git global config as a safe directory
+[command]/usr/bin/git config --global --add safe.directory /home/runner/work/bat/bat
+Removing SSH command configuration
+[command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Removing HTTP extra header
+[command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Removing includeIf entries pointing to credentials config files
+[command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+includeif.gitdir:/home/runner/work/bat/bat/.git.path
+includeif.gitdir:/home/runner/work/bat/bat/.git/worktrees/*.path
+includeif.gitdir:/github/workspace/.git.path
+includeif.gitdir:/github/workspace/.git/worktrees/*.path
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/bat/bat/.git.path
+/home/runner/work/_temp/git-credentials-fef981c3-0fa1-456c-935b-fe714e6318af.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/bat/bat/.git.path /home/runner/work/_temp/git-credentials-fef981c3-0fa1-456c-935b-fe714e6318af.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/bat/bat/.git/worktrees/*.path
+/home/runner/work/_temp/git-credentials-fef981c3-0fa1-456c-935b-fe714e6318af.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/bat/bat/.git/worktrees/*.path /home/runner/work/_temp/git-credentials-fef981c3-0fa1-456c-935b-fe714e6318af.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git.path
+/github/runner_temp/git-credentials-fef981c3-0fa1-456c-935b-fe714e6318af.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-fef981c3-0fa1-456c-935b-fe714e6318af.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git/worktrees/*.path
+/github/runner_temp/git-credentials-fef981c3-0fa1-456c-935b-fe714e6318af.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-fef981c3-0fa1-456c-935b-fe714e6318af.config
+[command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+Removing credentials config '/home/runner/work/_temp/git-credentials-fef981c3-0fa1-456c-935b-fe714e6318af.config'
+Cleaning up orphan processes

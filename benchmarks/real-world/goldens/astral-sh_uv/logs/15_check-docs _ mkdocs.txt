@@ -1,0 +1,1740 @@
+﻿2026-08-01T02:36:37.7011614Z Current runner version: '2.336.0'
+##[group]Runner Image Provisioner
+Hosted Compute Agent
+Version: 20260707.563
+Commit: 02667638d2b423fbc733a8e32a88b44996a3ba6e
+Build Date: 2026-07-07T19:33:50Z
+Worker ID: {64a9d19d-a20a-46d5-9209-7513d6f43c23}
+Azure Region: westus
+##[endgroup]
+##[group]Operating System
+Ubuntu
+24.04.4
+LTS
+##[endgroup]
+##[group]Runner Image
+Image: ubuntu-24.04
+Version: 20260720.247.2
+Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260720.247/images/ubuntu/Ubuntu2404-Readme.md
+Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260720.247
+##[endgroup]
+##[group]GITHUB_TOKEN Permissions
+Metadata: read
+##[endgroup]
+Secret source: None
+Prepare workflow directory
+Prepare all required actions
+Getting action download info
+Download action repository 'actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0' (SHA:9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0)
+Download action repository 'astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9' (SHA:c771a70e6277c0a99b617c7a806ffedaca235ff9)
+Download action repository 'actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1' (SHA:ece7cb06caefa5fff74198d8649806c4678c61a1)
+Download action repository 'Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4' (SHA:c19371144df3bb44fab255c43d04cbc2ab54d1c4)
+Uses: astral-sh/uv/.github/workflows/check-docs.yml@refs/pull/20876/merge (81742a27ad62bb1dd1289a164f1776508279c756)
+Complete job name: check-docs / mkdocs
+##[group]Run actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+with:
+fetch-depth: 0
+persist-credentials: false
+repository: astral-sh/uv
+token: ***
+ssh-strict: true
+ssh-user: git
+clean: true
+sparse-checkout-cone-mode: true
+fetch-tags: false
+show-progress: true
+lfs: false
+submodules: false
+set-safe-directory: true
+allow-unsafe-pr-checkout: false
+##[endgroup]
+Syncing repository: astral-sh/uv
+##[group]Getting Git version info
+Working directory is '/home/runner/work/uv/uv'
+[command]/usr/bin/git version
+git version 2.54.0
+##[endgroup]
+Temporarily overriding HOME='/home/runner/work/_temp/4907f9b8-e681-44b0-947e-5ca528b4d4a5' before making global git config changes
+Adding repository directory to the temporary git global config as a safe directory
+[command]/usr/bin/git config --global --add safe.directory /home/runner/work/uv/uv
+Deleting the contents of '/home/runner/work/uv/uv'
+##[group]Determining repository object format
+##[endgroup]
+##[group]Initializing the repository
+[command]/usr/bin/git init /home/runner/work/uv/uv
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /home/runner/work/uv/uv/.git/
+[command]/usr/bin/git remote add origin https://github.com/astral-sh/uv
+##[endgroup]
+##[group]Disabling automatic garbage collection
+[command]/usr/bin/git config --local gc.auto 0
+##[endgroup]
+##[group]Setting up auth
+Removing SSH command configuration
+[command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Removing HTTP extra header
+[command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Removing includeIf entries pointing to credentials config files
+[command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+[command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+[command]/usr/bin/git config --file /home/runner/work/_temp/git-credentials-9d57241c-ab7d-4ec0-bd92-0caa16f71bef.config http.https://github.com/.extraheader AUTHORIZATION: basic ***
+[command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/uv/uv/.git.path /home/runner/work/_temp/git-credentials-9d57241c-ab7d-4ec0-bd92-0caa16f71bef.config
+[command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/uv/uv/.git/worktrees/*.path /home/runner/work/_temp/git-credentials-9d57241c-ab7d-4ec0-bd92-0caa16f71bef.config
+[command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-9d57241c-ab7d-4ec0-bd92-0caa16f71bef.config
+[command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-9d57241c-ab7d-4ec0-bd92-0caa16f71bef.config
+##[endgroup]
+##[group]Fetching the repository
+[command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules origin +refs/heads/*:refs/remotes/origin/* +refs/tags/*:refs/tags/* +81742a27ad62bb1dd1289a164f1776508279c756:refs/remotes/pull/20876/merge
+From https://github.com/astral-sh/uv
+* [new branch]          17929-renovate-conda-incubator-setup-miniconda-3.x -> origin/17929-renovate-conda-incubator-setup-miniconda-3.x
+* [new branch]          18442-renovate-rust-1.x -> origin/18442-renovate-rust-1.x
+* [new branch]          20421-documentation-is-incorrect-regarding-workspace-members -> origin/20421-documentation-is-incorrect-regarding-workspace-members
+* [new branch]          ag/aggressive-forking   -> origin/ag/aggressive-forking
+* [new branch]          ag/benchmark-patch      -> origin/ag/benchmark-patch
+* [new branch]          ag/change-global-allocator-and-smallvec -> origin/ag/change-global-allocator-and-smallvec
+* [new branch]          ag/local-tests          -> origin/ag/local-tests
+* [new branch]          ag/package-level-conflict -> origin/ag/package-level-conflict
+* [new branch]          ag/prototype-universal-lock -> origin/ag/prototype-universal-lock
+* [new branch]          ag/rejigger-git-source  -> origin/ag/rejigger-git-source
+* [new branch]          ag/revert-pr7446        -> origin/ag/revert-pr7446
+* [new branch]          ag/rkyv                 -> origin/ag/rkyv
+* [new branch]          annotate-requirements-sources -> origin/annotate-requirements-sources
+* [new branch]          bojan/merge-steps       -> origin/bojan/merge-steps
+* [new branch]          bojan/perf-metrics      -> origin/bojan/perf-metrics
+* [new branch]          charlie/add-py          -> origin/charlie/add-py
+* [new branch]          charlie/all-groups      -> origin/charlie/all-groups
+* [new branch]          charlie/antithesis-testing -> origin/charlie/antithesis-testing
+* [new branch]          charlie/arena           -> origin/charlie/arena
+* [new branch]          charlie/args            -> origin/charlie/args
+* [new branch]          charlie/arm-ci          -> origin/charlie/arm-ci
+* [new branch]          charlie/auto-import     -> origin/charlie/auto-import
+* [new branch]          charlie/buf             -> origin/charlie/buf
+* [new branch]          charlie/build-cache     -> origin/charlie/build-cache
+* [new branch]          charlie/cache-read-without-zero-fill -> origin/charlie/cache-read-without-zero-fill
+* [new branch]          charlie/check-hashes-ii -> origin/charlie/check-hashes-ii
+* [new branch]          charlie/closest         -> origin/charlie/closest
+* [new branch]          charlie/codex-archive-wheel-metadata -> origin/charlie/codex-archive-wheel-metadata
+* [new branch]          charlie/codex-blocking-thread-limit -> origin/charlie/codex-blocking-thread-limit
+* [new branch]          charlie/codex-bundle-cached-wheel-metadata -> origin/charlie/codex-bundle-cached-wheel-metadata
+* [new branch]          charlie/codex-compile-bytecode-per-wheel -> origin/charlie/codex-compile-bytecode-per-wheel
+* [new branch]          charlie/codex-conflict-generalization -> origin/charlie/codex-conflict-generalization
+* [new branch]          charlie/codex-fast-lock-wheel-toml -> origin/charlie/codex-fast-lock-wheel-toml
+* [new branch]          charlie/codex-fast-version-flag -> origin/charlie/codex-fast-version-flag
+* [new branch]          charlie/codex-multi-export -> origin/charlie/codex-multi-export
+* [new branch]          charlie/codex-offline-wheel-metadata-cache -> origin/charlie/codex-offline-wheel-metadata-cache
+* [new branch]          charlie/codex-packse-build-backend-platform -> origin/charlie/codex-packse-build-backend-platform
+* [new branch]          charlie/codex-packse-extra-build-dependencies -> origin/charlie/codex-packse-extra-build-dependencies
+* [new branch]          charlie/codex-packse-no-sources-editable-switch -> origin/charlie/codex-packse-no-sources-editable-switch
+* [new branch]          charlie/codex-packse-no-sources-switch -> origin/charlie/codex-packse-no-sources-switch
+* [new branch]          charlie/codex-packse-no-sources-workspace -> origin/charlie/codex-packse-no-sources-workspace
+* [new branch]          charlie/codex-packse-sync-dynamic-extras -> origin/charlie/codex-packse-sync-dynamic-extras
+* [new branch]          charlie/codex-packse-sync-override-package -> origin/charlie/codex-packse-sync-override-package
+* [new branch]          charlie/codex-perf-coalesce-prefetched-dependencies -> origin/charlie/codex-perf-coalesce-prefetched-dependencies
+* [new branch]          charlie/codex-perf-compact-index-urls -> origin/charlie/codex-perf-compact-index-urls
+* [new branch]          charlie/codex-prefetch-candidates-in-one-pass -> origin/charlie/codex-prefetch-candidates-in-one-pass
+* [new branch]          charlie/codex-prefetch-once -> origin/charlie/codex-prefetch-once
+* [new branch]          charlie/codex-prerelease-indexed -> origin/charlie/codex-prerelease-indexed
+* [new branch]          charlie/codex-prerelease-single-pass -> origin/charlie/codex-prerelease-single-pass
+* [new branch]          charlie/codex-proof-aware-phase-saving -> origin/charlie/codex-proof-aware-phase-saving
+* [new branch]          charlie/codex-simd-normalize-version-fastpath -> origin/charlie/codex-simd-normalize-version-fastpath
+* [new branch]          charlie/codex-sync-cli-dispatch -> origin/charlie/codex-sync-cli-dispatch
+* [new branch]          charlie/codex-widen-singleton-neighbors -> origin/charlie/codex-widen-singleton-neighbors
+* [new branch]          charlie/compile-bytecode-during-install -> origin/charlie/compile-bytecode-during-install
+* [new branch]          charlie/constraint      -> origin/charlie/constraint
+* [new branch]          charlie/content         -> origin/charlie/content
+* [new branch]          charlie/countme         -> origin/charlie/countme
+* [new branch]          charlie/cpython-implementation-version-marker-equivalence -> origin/charlie/cpython-implementation-version-marker-equivalence
+* [new branch]          charlie/default         -> origin/charlie/default
+* [new branch]          charlie/delocate        -> origin/charlie/delocate
+* [new branch]          charlie/derive          -> origin/charlie/derive
+* [new branch]          charlie/dirhash         -> origin/charlie/dirhash
+* [new branch]          charlie/dirhash-archives -> origin/charlie/dirhash-archives
+* [new branch]          charlie/dirhash-binaries -> origin/charlie/dirhash-binaries
+* [new branch]          charlie/dirhash-content-address -> origin/charlie/dirhash-content-address
+* [new branch]          charlie/disable-interactive-git-ssh -> origin/charlie/disable-interactive-git-ssh
+* [new branch]          charlie/disjoint        -> origin/charlie/disjoint
+* [new branch]          charlie/display         -> origin/charlie/display
+* [new branch]          charlie/dollar          -> origin/charlie/dollar
+* [new branch]          charlie/dry             -> origin/charlie/dry
+* [new branch]          charlie/dulwich         -> origin/charlie/dulwich
+* [new branch]          charlie/em              -> origin/charlie/em
+* [new branch]          charlie/enable-safe-icf -> origin/charlie/enable-safe-icf
+* [new branch]          charlie/env-everywhere  -> origin/charlie/env-everywhere
+* [new branch]          charlie/err             -> origin/charlie/err
+* [new branch]          charlie/err-pip         -> origin/charlie/err-pip
+* [new branch]          charlie/exclude-markers -> origin/charlie/exclude-markers
+* [new branch]          charlie/exclude-newer-json -> origin/charlie/exclude-newer-json
+* [new branch]          charlie/extra           -> origin/charlie/extra
+* [new branch]          charlie/extra-2         -> origin/charlie/extra-2
+* [new branch]          charlie/file-size       -> origin/charlie/file-size
+* [new branch]          charlie/final-error-output -> origin/charlie/final-error-output
+* [new branch]          charlie/fix             -> origin/charlie/fix
+* [new branch]          charlie/fix-conflicting-dependency-project-installability -> origin/charlie/fix-conflicting-dependency-project-installability
+* [new branch]          charlie/fix-interrupted-reinstall-recovery -> origin/charlie/fix-interrupted-reinstall-recovery
+* [new branch]          charlie/fix-interrupted-uninstall-recovery -> origin/charlie/fix-interrupted-uninstall-recovery
+* [new branch]          charlie/fix-post-release-range-conversion -> origin/charlie/fix-post-release-range-conversion
+* [new branch]          charlie/fix-resolver-stack-overflow -> origin/charlie/fix-resolver-stack-overflow
+* [new branch]          charlie/fix-workspace-extra-conflict-edge-markers -> origin/charlie/fix-workspace-extra-conflict-edge-markers
+* [new branch]          charlie/flake           -> origin/charlie/flake
+* [new branch]          charlie/flask           -> origin/charlie/flask
+* [new branch]          charlie/flatten-extras  -> origin/charlie/flatten-extras
+* [new branch]          charlie/fn              -> origin/charlie/fn
+* [new branch]          charlie/fork-constraints -> origin/charlie/fork-constraints
+* [new branch]          charlie/fork-markered-project-context-dependencies -> origin/charlie/fork-markered-project-context-dependencies
+* [new branch]          charlie/fork-python     -> origin/charlie/fork-python
+* [new branch]          charlie/fork-wheels     -> origin/charlie/fork-wheels
+* [new branch]          charlie/gha             -> origin/charlie/gha
+* [new branch]          charlie/git-cache       -> origin/charlie/git-cache
+* [new branch]          charlie/git-cache-val   -> origin/charlie/git-cache-val
+* [new branch]          charlie/gitingore       -> origin/charlie/gitingore
+* [new branch]          charlie/hard-error-multiple-dist-info -> origin/charlie/hard-error-multiple-dist-info
+* [new branch]          charlie/hash-req        -> origin/charlie/hash-req
+* [new branch]          charlie/incomplete      -> origin/charlie/incomplete
+* [new branch]          charlie/int             -> origin/charlie/int
+* [new branch]          charlie/invalid-version-markers-false -> origin/charlie/invalid-version-markers-false
+* [new branch]          charlie/l               -> origin/charlie/l
+* [new branch]          charlie/lazy-read-only-cache-init -> origin/charlie/lazy-read-only-cache-init
+* [new branch]          charlie/length-ii       -> origin/charlie/length-ii
+* [new branch]          charlie/license-file    -> origin/charlie/license-file
+* [new branch]          charlie/line            -> origin/charlie/line
+* [new branch]          charlie/locals          -> origin/charlie/locals
+* [new branch]          charlie/lock-script     -> origin/charlie/lock-script
+* [new branch]          charlie/logout          -> origin/charlie/logout
+* [new branch]          charlie/lower-iii       -> origin/charlie/lower-iii
+* [new branch]          charlie/ls-remote       -> origin/charlie/ls-remote
+* [new branch]          charlie/macos           -> origin/charlie/macos
+* [new branch]          charlie/marker-dont-care -> origin/charlie/marker-dont-care
+* [new branch]          charlie/marker-fork-restriction -> origin/charlie/marker-fork-restriction
+* [new branch]          charlie/marker-fork-restriction-main -> origin/charlie/marker-fork-restriction-main
+* [new branch]          charlie/marker-nodes    -> origin/charlie/marker-nodes
+* [new branch]          charlie/marker-ternary-prototype -> origin/charlie/marker-ternary-prototype
+* [new branch]          charlie/merge-hashes-2  -> origin/charlie/merge-hashes-2
+* [new branch]          charlie/metadata-free-archive-direct-sources -> origin/charlie/metadata-free-archive-direct-sources
+* [new branch]          charlie/metadata-free-conditional-source-authority -> origin/charlie/metadata-free-conditional-source-authority
+* [new branch]          charlie/metadata-free-direct-url-constraint-test -> origin/charlie/metadata-free-direct-url-constraint-test
+* [new branch]          charlie/metadata-free-dynamic-scoped-dependencies -> origin/charlie/metadata-free-dynamic-scoped-dependencies
+* [new branch]          charlie/metadata-free-git-direct-sources -> origin/charlie/metadata-free-git-direct-sources
+* [new branch]          charlie/migrate-to-editable -> origin/charlie/migrate-to-editable
+* [new branch]          charlie/native-rkyv-requirements -> origin/charlie/native-rkyv-requirements
+* [new branch]          charlie/negate          -> origin/charlie/negate
+* [new branch]          charlie/netrc-env-no-fallback -> origin/charlie/netrc-env-no-fallback
+* [new branch]          charlie/no-sources      -> origin/charlie/no-sources
+* [new branch]          charlie/normalize-python-implementation-markers -> origin/charlie/normalize-python-implementation-markers
+* [new branch]          charlie/nui             -> origin/charlie/nui
+* [new branch]          charlie/one             -> origin/charlie/one
+* [new branch]          charlie/operation-diagnostic-printer -> origin/charlie/operation-diagnostic-printer
+* [new branch]          charlie/opt             -> origin/charlie/opt
+* [new branch]          charlie/pkg-info        -> origin/charlie/pkg-info
+* [new branch]          charlie/plat            -> origin/charlie/plat
+* [new branch]          charlie/ppc             -> origin/charlie/ppc
+* [new branch]          charlie/prerelease-admission-ranges -> origin/charlie/prerelease-admission-ranges
+* [new branch]          charlie/prerelease-fixed-universe -> origin/charlie/prerelease-fixed-universe
+* [new branch]          charlie/prerelease-partial-solution-scan -> origin/charlie/prerelease-partial-solution-scan
+* [new branch]          charlie/preserve        -> origin/charlie/preserve
+* [new branch]          charlie/preserve-configured-index-settings -> origin/charlie/preserve-configured-index-settings
+* [new branch]          charlie/preserve-package-conflict-extra-forks -> origin/charlie/preserve-package-conflict-extra-forks
+* [new branch]          charlie/preserve-universal-marker-intersections -> origin/charlie/preserve-universal-marker-intersections
+* [new branch]          charlie/priority-aware-download-limiter -> origin/charlie/priority-aware-download-limiter
+* [new branch]          charlie/pubgrub         -> origin/charlie/pubgrub
+* [new branch]          charlie/pubgrub-id-map-codspeed -> origin/charlie/pubgrub-id-map-codspeed
+* [new branch]          charlie/pubgrub-niche-ids-codspeed -> origin/charlie/pubgrub-niche-ids-codspeed
+* [new branch]          charlie/py              -> origin/charlie/py
+* [new branch]          charlie/python-bytecode-compiler -> origin/charlie/python-bytecode-compiler
+* [new branch]          charlie/python-global   -> origin/charlie/python-global
+* [new branch]          charlie/refresh         -> origin/charlie/refresh
+* [new branch]          charlie/resolvo         -> origin/charlie/resolvo
+* [new branch]          charlie/reuse-no-cache-discovery-cache -> origin/charlie/reuse-no-cache-discovery-cache
+* [new branch]          charlie/revert          -> origin/charlie/revert
+* [new branch]          charlie/reverts         -> origin/charlie/reverts
+* [new branch]          charlie/rewrite-shebang -> origin/charlie/rewrite-shebang
+* [new branch]          charlie/rkyv            -> origin/charlie/rkyv
+* [new branch]          charlie/rkyv-small-string-sharing -> origin/charlie/rkyv-small-string-sharing
+* [new branch]          charlie/s               -> origin/charlie/s
+* [new branch]          charlie/scoped-pip-source-rules -> origin/charlie/scoped-pip-source-rules
+* [new branch]          charlie/script-env      -> origin/charlie/script-env
+* [new branch]          charlie/sdist           -> origin/charlie/sdist
+* [new branch]          charlie/sha             -> origin/charlie/sha
+* [new branch]          charlie/shared-locks    -> origin/charlie/shared-locks
+* [new branch]          charlie/sigterm         -> origin/charlie/sigterm
+* [new branch]          charlie/sim             -> origin/charlie/sim
+* [new branch]          charlie/simd-package-name-checks -> origin/charlie/simd-package-name-checks
+* [new branch]          charlie/sixtyfour       -> origin/charlie/sixtyfour
+* [new branch]          charlie/skip            -> origin/charlie/skip
+* [new branch]          charlie/skip-implied    -> origin/charlie/skip-implied
+* [new branch]          charlie/small           -> origin/charlie/small
+* [new branch]          charlie/ssl             -> origin/charlie/ssl
+* [new branch]          charlie/stable          -> origin/charlie/stable
+* [new branch]          charlie/star            -> origin/charlie/star
+* [new branch]          charlie/static-tags     -> origin/charlie/static-tags
+* [new branch]          charlie/stdlib-resolution-hints -> origin/charlie/stdlib-resolution-hints
+* [new branch]          charlie/stream-error    -> origin/charlie/stream-error
+* [new branch]          charlie/support-arbitrary-marker-equality -> origin/charlie/support-arbitrary-marker-equality
+* [new branch]          charlie/sync            -> origin/charlie/sync
+* [new branch]          charlie/sync-non-member -> origin/charlie/sync-non-member
+* [new branch]          charlie/sync-tool       -> origin/charlie/sync-tool
+* [new branch]          charlie/t               -> origin/charlie/t
+* [new branch]          charlie/t-update        -> origin/charlie/t-update
+* [new branch]          charlie/tag-preference  -> origin/charlie/tag-preference
+* [new branch]          charlie/target          -> origin/charlie/target
+* [new branch]          charlie/target-lock     -> origin/charlie/target-lock
+* [new branch]          charlie/test-branch     -> origin/charlie/test-branch
+* [new branch]          charlie/tls             -> origin/charlie/tls
+* [new branch]          charlie/tool-install-suffix -> origin/charlie/tool-install-suffix
+* [new branch]          charlie/transitive-prerelease-simple -> origin/charlie/transitive-prerelease-simple
+* [new branch]          charlie/universal-lock  -> origin/charlie/universal-lock
+* [new branch]          charlie/up-tool         -> origin/charlie/up-tool
+* [new branch]          charlie/update-rust-dependencies -> origin/charlie/update-rust-dependencies
+* [new branch]          charlie/ustr            -> origin/charlie/ustr
+* [new branch]          charlie/uv-integration-split-tool-tests -> origin/charlie/uv-integration-split-tool-tests
+* [new branch]          charlie/uv-tree-json    -> origin/charlie/uv-tree-json
+* [new branch]          charlie/validate-universal-root-requirements -> origin/charlie/validate-universal-root-requirements
+* [new branch]          charlie/verbose         -> origin/charlie/verbose
+* [new branch]          charlie/virtual         -> origin/charlie/virtual
+* [new branch]          charlie/wheel-variant   -> origin/charlie/wheel-variant
+* [new branch]          charlie/wheel-variant-auto -> origin/charlie/wheel-variant-auto
+* [new branch]          charlie/wheel-variant-release -> origin/charlie/wheel-variant-release
+* [new branch]          charlie/windows-executables -> origin/charlie/windows-executables
+* [new branch]          charlie/windows-trampoline-tempfile -> origin/charlie/windows-trampoline-tempfile
+* [new branch]          charlie/winsafe         -> origin/charlie/winsafe
+* [new branch]          charlie/workspace-false -> origin/charlie/workspace-false
+* [new branch]          charlie/workspace-source-locations -> origin/charlie/workspace-source-locations
+* [new branch]          charlie/zlib            -> origin/charlie/zlib
+* [new branch]          charlie/zlib-ng         -> origin/charlie/zlib-ng
+* [new branch]          charlie/zstd            -> origin/charlie/zstd
+* [new branch]          check-hash              -> origin/check-hash
+* [new branch]          claude/add-docker-integration-test-fswQu -> origin/claude/add-docker-integration-test-fswQu
+* [new branch]          claude/apply-ci-workflow-patch-bsMJR -> origin/claude/apply-ci-workflow-patch-bsMJR
+* [new branch]          claude/fix-macos-coldstart-hardlinks-2H2VR -> origin/claude/fix-macos-coldstart-hardlinks-2H2VR
+* [new branch]          claude/fix-uv-issue-19100-48OrI -> origin/claude/fix-uv-issue-19100-48OrI
+* [new branch]          claude/investigate-feature-support-5S51M -> origin/claude/investigate-feature-support-5S51M
+* [new branch]          claude/lock-build-dependencies-7KQVH -> origin/claude/lock-build-dependencies-7KQVH
+* [new branch]          claude/reproduce-issue-R9rVN -> origin/claude/reproduce-issue-R9rVN
+* [new branch]          claude/uv-clean-background-daemon-CjDfM -> origin/claude/uv-clean-background-daemon-CjDfM
+* [new branch]          codex/complete-rooster-version-files -> origin/codex/complete-rooster-version-files
+* [new branch]          codex/fix-session-rustup-install -> origin/codex/fix-session-rustup-install
+* [new branch]          codex/issue-triage-preview -> origin/codex/issue-triage-preview
+* [new branch]          codex/proxy-indexes-33-complete -> origin/codex/proxy-indexes-33-complete
+* [new branch]          codex/unify-dependency-modifiers -> origin/codex/unify-dependency-modifiers
+* [new branch]          copilot/update-revisionid-cache-usage -> origin/copilot/update-revisionid-cache-usage
+* [new branch]          ctrlc                   -> origin/ctrlc
+* [new branch]          detect_hardfloat        -> origin/detect_hardfloat
+* [new branch]          dir-file-conflicting    -> origin/dir-file-conflicting
+* [new branch]          feat/uv-no-install-env-vars-19315 -> origin/feat/uv-no-install-env-vars-19315
+* [new branch]          feat/uv-run-env-file    -> origin/feat/uv-run-env-file
+* [new branch]          feature/find-uv-bin     -> origin/feature/find-uv-bin
+* [new branch]          feature/uv-find         -> origin/feature/uv-find
+* [new branch]          fix/16235-dont-retry-on-SSL-cert-errors -> origin/fix/16235-dont-retry-on-SSL-cert-errors
+* [new branch]          fix/sync-no-sources-editable-switch -> origin/fix/sync-no-sources-editable-switch
+* [new branch]          fix_ne_pre              -> origin/fix_ne_pre
+* [new branch]          fixup-pull-request-label -> origin/fixup-pull-request-label
+* [new branch]          gankra/077              -> origin/gankra/077
+* [new branch]          gankra/add-build-deps   -> origin/gankra/add-build-deps
+* [new branch]          gankra/attest-announce  -> origin/gankra/attest-announce
+* [new branch]          gankra/fix-comment      -> origin/gankra/fix-comment
+* [new branch]          gankra/gitdep           -> origin/gankra/gitdep
+* [new branch]          gankra/implement-uv-run-followup -> origin/gankra/implement-uv-run-followup
+* [new branch]          gankra/loose-test       -> origin/gankra/loose-test
+* [new branch]          gankra/package_juice    -> origin/gankra/package_juice
+* [new branch]          gankra/regression       -> origin/gankra/regression
+* [new branch]          gankra/remove-if        -> origin/gankra/remove-if
+* [new branch]          gankra/revert-toolchain -> origin/gankra/revert-toolchain
+* [new branch]          gankra/revertv64        -> origin/gankra/revertv64
+* [new branch]          gankra/stacked2         -> origin/gankra/stacked2
+* [new branch]          gankra/test-corners     -> origin/gankra/test-corners
+* [new branch]          geofft/binary-edit-install-name -> origin/geofft/binary-edit-install-name
+* [new branch]          geofft/fix-annotate-permissions -> origin/geofft/fix-annotate-permissions
+* [new branch]          geofft/nvidiactl-ioctl  -> origin/geofft/nvidiactl-ioctl
+* [new branch]          geofft/python-download-old-versions -> origin/geofft/python-download-old-versions
+* [new branch]          ibraheem/basic-toml     -> origin/ibraheem/basic-toml
+* [new branch]          ibraheem/bdd            -> origin/ibraheem/bdd
+* [new branch]          ibraheem/fast-lock      -> origin/ibraheem/fast-lock
+* [new branch]          ibraheem/marker-tree-debug -> origin/ibraheem/marker-tree-debug
+* [new branch]          ibraheem/tmate          -> origin/ibraheem/tmate
+* [new branch]          init-nested             -> origin/init-nested
+* [new branch]          jack/but_maybe_this_works -> origin/jack/but_maybe_this_works
+* [new branch]          jack/dirhash            -> origin/jack/dirhash
+* [new branch]          jack/laughably_large_test_timeout -> origin/jack/laughably_large_test_timeout
+* [new branch]          jack/scratch            -> origin/jack/scratch
+* [new branch]          jack/sources_warning    -> origin/jack/sources_warning
+* [new branch]          jack/this_shouldnt_work -> origin/jack/this_shouldnt_work
+* [new branch]          jack/uv_active          -> origin/jack/uv_active
+* [new branch]          jack/uv_lock_dir        -> origin/jack/uv_lock_dir
+* [new branch]          joncholas/improve-update-shell -> origin/joncholas/improve-update-shell
+* [new branch]          jtfm/add-trailing-slash-for-find-links -> origin/jtfm/add-trailing-slash-for-find-links
+* [new branch]          jtfm/credentials-cli    -> origin/jtfm/credentials-cli
+* [new branch]          jtfm/credentials-cli-tests -> origin/jtfm/credentials-cli-tests
+* [new branch]          jtfm/custom-indexes-lockfile -> origin/jtfm/custom-indexes-lockfile
+* [new branch]          jtfm/docker-venv        -> origin/jtfm/docker-venv
+* [new branch]          jtfm/git-keyring-integration -> origin/jtfm/git-keyring-integration
+* [new branch]          jtfm/index-domain       -> origin/jtfm/index-domain
+* [new branch]          jtfm/keyring-exploration -> origin/jtfm/keyring-exploration
+* [new branch]          jtfm/keyring-exploration-tests -> origin/jtfm/keyring-exploration-tests
+* [new branch]          jtfm/normalize-slash-on-check -> origin/jtfm/normalize-slash-on-check
+* [new branch]          jtfm/onboarding-fixes   -> origin/jtfm/onboarding-fixes
+* [new branch]          jtfm/path-package-true  -> origin/jtfm/path-package-true
+* [new branch]          jtfm/t                  -> origin/jtfm/t
+* [new branch]          jtfm/unsafe-first-index -> origin/jtfm/unsafe-first-index
+* [new branch]          jtfm/url-proxy          -> origin/jtfm/url-proxy
+* [new branch]          jtfm/vendor-keyring-async-fn -> origin/jtfm/vendor-keyring-async-fn
+* [new branch]          jtfm/vendor-keyring-async-lifetimes -> origin/jtfm/vendor-keyring-async-lifetimes
+* [new branch]          jtfm/vendor-keyring-tests -> origin/jtfm/vendor-keyring-tests
+* [new branch]          jtfm/workspace-graph    -> origin/jtfm/workspace-graph
+* [new branch]          jtfm/workspace-member-source-build-by-default -> origin/jtfm/workspace-member-source-build-by-default
+* [new branch]          jupyter-progress        -> origin/jupyter-progress
+* [new branch]          konst/wheel-variant-auto -> origin/konst/wheel-variant-auto
+* [new branch]          konsti/a-right-horrible-uv-testing-hack -> origin/konsti/a-right-horrible-uv-testing-hack
+* [new branch]          konsti/active           -> origin/konsti/active
+* [new branch]          konsti/add-filename-to-like-error -> origin/konsti/add-filename-to-like-error
+* [new branch]          konsti/add-forks-to-lockfile -> origin/konsti/add-forks-to-lockfile
+* [new branch]          konsti/all-platform-requirements -> origin/konsti/all-platform-requirements
+* [new branch]          konsti/allthephores     -> origin/konsti/allthephores
+* [new branch]          konsti/another-dry-run-locked-fix -> origin/konsti/another-dry-run-locked-fix
+* [new branch]          konsti/assert-package-priority-size -> origin/konsti/assert-package-priority-size
+* [new branch]          konsti/async-tee        -> origin/konsti/async-tee
+* [new branch]          konsti/backup/charlie/wheel-variant -> origin/konsti/backup/charlie/wheel-variant
+* [new branch]          konsti/batch-escaping   -> origin/konsti/batch-escaping
+* [new branch]          konsti/binary-size      -> origin/konsti/binary-size
+* [new branch]          konsti/box-dist         -> origin/konsti/box-dist
+* [new branch]          konsti/box-dist-main    -> origin/konsti/box-dist-main
+* [new branch]          konsti/branching-urls   -> origin/konsti/branching-urls
+* [new branch]          konsti/build-backend-frontend-refactor -> origin/konsti/build-backend-frontend-refactor
+* [new branch]          konsti/build-backend-list -> origin/konsti/build-backend-list
+* [new branch]          konsti/build-backend3   -> origin/konsti/build-backend3
+* [new branch]          konsti/build-backend5-add-module -> origin/konsti/build-backend5-add-module
+* [new branch]          konsti/cache-python-interpreter-by-env-vars -> origin/konsti/cache-python-interpreter-by-env-vars
+* [new branch]          konsti/charlie-uv-integration-split-tool-tests-rebased-173ec11f7 -> origin/konsti/charlie-uv-integration-split-tool-tests-rebased-173ec11f7
+* [new branch]          konsti/charlie/local    -> origin/konsti/charlie/local
+* [new branch]          konsti/check-cache-changes -> origin/konsti/check-cache-changes
+* [new branch]          konsti/ci-test-0.12-prs-20260626 -> origin/konsti/ci-test-0.12-prs-20260626
+* [new branch]          konsti/codspeed-walltime -> origin/konsti/codspeed-walltime
+* [new branch]          konsti/consistent-build-binaries -> origin/konsti/consistent-build-binaries
+* [new branch]          konsti/custom-middleware -> origin/konsti/custom-middleware
+* [new branch]          konsti/debug-release    -> origin/konsti/debug-release
+* [new branch]          konsti/declarative-tests -> origin/konsti/declarative-tests
+* [new branch]          konsti/default-python   -> origin/konsti/default-python
+* [new branch]          konsti/default-source   -> origin/konsti/default-source
+* [new branch]          konsti/delete-mediafire-comments -> origin/konsti/delete-mediafire-comments
+* [new branch]          konsti/direct-src-layout -> origin/konsti/direct-src-layout
+* [new branch]          konsti/docker-reproducer -> origin/konsti/docker-reproducer
+* [new branch]          konsti/docker-tool-path -> origin/konsti/docker-tool-path
+* [new branch]          konsti/document-the-keyring -> origin/konsti/document-the-keyring
+* [new branch]          konsti/dont-do-path-lookups -> origin/konsti/dont-do-path-lookups
+* [new branch]          konsti/dont-revalidate-python -> origin/konsti/dont-revalidate-python
+* [new branch]          konsti/dont-warn-for-second-req -> origin/konsti/dont-warn-for-second-req
+* [new branch]          konsti/dynamic-requirements-files -> origin/konsti/dynamic-requirements-files
+* [new branch]          konsti/ecosystem-scale-testing -> origin/konsti/ecosystem-scale-testing
+* [new branch]          konsti/editable-rebased -> origin/konsti/editable-rebased
+* [new branch]          konsti/error-on-authentication-error-in-check-url -> origin/konsti/error-on-authentication-error-in-check-url
+* [new branch]          konsti/failing-alpine-test -> origin/konsti/failing-alpine-test
+* [new branch]          konsti/failing-windows-test -> origin/konsti/failing-windows-test
+* [new branch]          konsti/fix-benchmark-preview-init -> origin/konsti/fix-benchmark-preview-init
+* [new branch]          konsti/fix-infinite-recursion-by-sniffing-the-shebang -> origin/konsti/fix-infinite-recursion-by-sniffing-the-shebang
+* [new branch]          konsti/fix-path-deps    -> origin/konsti/fix-path-deps
+* [new branch]          konsti/fix-tilde-equal-python -> origin/konsti/fix-tilde-equal-python
+* [new branch]          konsti/from-network-settings -> origin/konsti/from-network-settings
+* [new branch]          konsti/hint-at-broken-interpreter -> origin/konsti/hint-at-broken-interpreter
+* [new branch]          konsti/improve-universal-logging -> origin/konsti/improve-universal-logging
+* [new branch]          konsti/indent-error-messages -> origin/konsti/indent-error-messages
+* [new branch]          konsti/index-pinning-example -> origin/konsti/index-pinning-example
+* [new branch]          konsti/install-in-local-bin -> origin/konsti/install-in-local-bin
+* [new branch]          konsti/intermediate-pyproject-toml-regression -> origin/konsti/intermediate-pyproject-toml-regression
+* [new branch]          konsti/iterative-resolver-error-reporting -> origin/konsti/iterative-resolver-error-reporting
+* [new branch]          konsti/keep-source-tree-around -> origin/konsti/keep-source-tree-around
+* [new branch]          konsti/locked-dependency-traversal -> origin/konsti/locked-dependency-traversal
+* [new branch]          konsti/locked-package-name-index -> origin/konsti/locked-package-name-index
+* [new branch]          konsti/log-build-output -> origin/konsti/log-build-output
+* [new branch]          konsti/log-fork-markers -> origin/konsti/log-fork-markers
+* [new branch]          konsti/log-memory-on-timeout -> origin/konsti/log-memory-on-timeout
+* [new branch]          konsti/lower-case-tool  -> origin/konsti/lower-case-tool
+* [new branch]          konsti/mac-i386-reproducer -> origin/konsti/mac-i386-reproducer
+* [new branch]          konsti/make-run-public  -> origin/konsti/make-run-public
+* [new branch]          konsti/mark-everything-send-sync -> origin/konsti/mark-everything-send-sync
+* [new branch]          konsti/merge-identical-resolutions-backup -> origin/konsti/merge-identical-resolutions-backup
+* [new branch]          konsti/metadata-error-trace -> origin/konsti/metadata-error-trace
+* [new branch]          konsti/mismatch-local-versions-in-sync -> origin/konsti/mismatch-local-versions-in-sync
+* [new branch]          konsti/more-resilient-registry-removal -> origin/konsti/more-resilient-registry-removal
+* [new branch]          konsti/much-more-powershell -> origin/konsti/much-more-powershell
+* [new branch]          konsti/negation         -> origin/konsti/negation
+* [new branch]          konsti/no-default-timeout -> origin/konsti/no-default-timeout
+* [new branch]          konsti/offlinepi-reboot -> origin/konsti/offlinepi-reboot
+* [new branch]          konsti/opt-mem          -> origin/konsti/opt-mem
+* [new branch]          konsti/packse-0.3.54    -> origin/konsti/packse-0.3.54
+* [new branch]          konsti/panic-at-the-ci-workflow -> origin/konsti/panic-at-the-ci-workflow
+* [new branch]          konsti/pep-838          -> origin/konsti/pep-838
+* [new branch]          konsti/pip-issue-templae -> origin/konsti/pip-issue-templae
+* [new branch]          konsti/ppc64le-zig      -> origin/konsti/ppc64le-zig
+* [new branch]          konsti/pr-19933-alternative -> origin/konsti/pr-19933-alternative
+* [new branch]          konsti/pr-19933-edge-markers -> origin/konsti/pr-19933-edge-markers
+* [new branch]          konsti/prefetch-packages-in-upgrade -> origin/konsti/prefetch-packages-in-upgrade
+* [new branch]          konsti/preview-feeback  -> origin/konsti/preview-feeback
+* [new branch]          konsti/preview-gate-variants -> origin/konsti/preview-gate-variants
+* [new branch]          konsti/prio-late-after-unspecified -> origin/konsti/prio-late-after-unspecified
+* [new branch]          konsti/profile-repeated -> origin/konsti/profile-repeated
+* [new branch]          konsti/pubgrub-257      -> origin/konsti/pubgrub-257
+* [new branch]          konsti/pubgrub-less-invasive-dep-constraints-iterator -> origin/konsti/pubgrub-less-invasive-dep-constraints-iterator
+* [new branch]          konsti/pubgrub-range    -> origin/konsti/pubgrub-range
+* [new branch]          konsti/pubgrub-testing-script -> origin/konsti/pubgrub-testing-script
+* [new branch]          konsti/pubgrub-update-generic-reason -> origin/konsti/pubgrub-update-generic-reason
+* [new branch]          konsti/pylock-toml-require-hashes -> origin/konsti/pylock-toml-require-hashes
+* [new branch]          konsti/ranges           -> origin/konsti/ranges
+* [new branch]          konsti/reject-incoherent-source-dist -> origin/konsti/reject-incoherent-source-dist
+* [new branch]          konsti/remove-build-backend-parking-breaks -> origin/konsti/remove-build-backend-parking-breaks
+* [new branch]          konsti/remove-cargo-util -> origin/konsti/remove-cargo-util
+* [new branch]          konsti/remove-redundant-tests -> origin/konsti/remove-redundant-tests
+* [new branch]          konsti/remove-some-duplication-untar -> origin/konsti/remove-some-duplication-untar
+* [new branch]          konsti/remove-virtual-from-lockfile -> origin/konsti/remove-virtual-from-lockfile
+* [new branch]          konsti/report-boilerplate -> origin/konsti/report-boilerplate
+* [new branch]          konsti/reqwest-retries-context -> origin/konsti/reqwest-retries-context
+* [new branch]          konsti/rockwren         -> origin/konsti/rockwren
+* [new branch]          konsti/rust-2024        -> origin/konsti/rust-2024
+* [new branch]          konsti/rust-2025        -> origin/konsti/rust-2025
+* [new branch]          konsti/setuptools-tests -> origin/konsti/setuptools-tests
+* [new branch]          konsti/shelf/oncemap-counters -> origin/konsti/shelf/oncemap-counters
+* [new branch]          konsti/show-acquired-log -> origin/konsti/show-acquired-log
+* [new branch]          konsti/show-warnings-after-sync -> origin/konsti/show-warnings-after-sync
+* [new branch]          konsti/sidecar-reproducer -> origin/konsti/sidecar-reproducer
+* [new branch]          konsti/single-versions-entry -> origin/konsti/single-versions-entry
+* [new branch]          konsti/smaller-lockfile-with-smarter-validation -> origin/konsti/smaller-lockfile-with-smarter-validation
+* [new branch]          konsti/somehow          -> origin/konsti/somehow
+* [new branch]          konsti/spawn-resolution -> origin/konsti/spawn-resolution
+* [new branch]          konsti/stack-overflow-debugging-utils -> origin/konsti/stack-overflow-debugging-utils
+* [new branch]          konsti/static-python-support -> origin/konsti/static-python-support
+* [new branch]          konsti/strip-stream-in-indicatif-layer -> origin/konsti/strip-stream-in-indicatif-layer
+* [new branch]          konsti/support-relative-path-hopping -> origin/konsti/support-relative-path-hopping
+* [new branch]          konsti/sync-priorities  -> origin/konsti/sync-priorities
+* [new branch]          konsti/sys-path-discovery -> origin/konsti/sys-path-discovery
+* [new branch]          konsti/sys-path-discovery-backup -> origin/konsti/sys-path-discovery-backup
+* [new branch]          konsti/temp/cargo-lock-churn -> origin/konsti/temp/cargo-lock-churn
+* [new branch]          konsti/test-charlie     -> origin/konsti/test-charlie
+* [new branch]          konsti/test-mid-stream-error -> origin/konsti/test-mid-stream-error
+* [new branch]          konsti/test-package-priority-size -> origin/konsti/test-package-priority-size
+* [new branch]          konsti/thishow          -> origin/konsti/thishow
+* [new branch]          konsti/toml-backwards-compatibility-preview -> origin/konsti/toml-backwards-compatibility-preview
+* [new branch]          konsti/toml-spanner     -> origin/konsti/toml-spanner
+* [new branch]          konsti/tool-editable    -> origin/konsti/tool-editable
+* [new branch]          konsti/tool-uv-sources  -> origin/konsti/tool-uv-sources
+* [new branch]          konsti/tool-uv-sources-analysis-backup -> origin/konsti/tool-uv-sources-analysis-backup
+* [new branch]          konsti/tool-uv-sources-backup -> origin/konsti/tool-uv-sources-backup
+* [new branch]          konsti/track-url-parts-in-git-source-url -> origin/konsti/track-url-parts-in-git-source-url
+* [new branch]          konsti/transitive-cached-env-vars -> origin/konsti/transitive-cached-env-vars
+* [new branch]          konsti/transitive-prerelease-stack -> origin/konsti/transitive-prerelease-stack
+* [new branch]          konsti/unify-dependency-modifiers -> origin/konsti/unify-dependency-modifiers
+* [new branch]          konsti/update-async-compression -> origin/konsti/update-async-compression
+* [new branch]          konsti/uv-build-hashes-required -> origin/konsti/uv-build-hashes-required
+* [new branch]          konsti/uv-integration-split-tool-tests -> origin/konsti/uv-integration-split-tool-tests
+* [new branch]          konsti/uv-integration-split-tool-tests-rebased-173ec11f7 -> origin/konsti/uv-integration-split-tool-tests-rebased-173ec11f7
+* [new branch]          konsti/uv-publish-no-codeberg-test -> origin/konsti/uv-publish-no-codeberg-test
+* [new branch]          konsti/uvx-dummy        -> origin/konsti/uvx-dummy
+* [new branch]          konsti/warn-direct-dep-unconstraint -> origin/konsti/warn-direct-dep-unconstraint
+* [new branch]          konsti/warn-invalid-pyproject.toml -> origin/konsti/warn-invalid-pyproject.toml
+* [new branch]          konsti/warn-old-wheels  -> origin/konsti/warn-old-wheels
+* [new branch]          konsti/warn-on-slow-resolve -> origin/konsti/warn-on-slow-resolve
+* [new branch]          konsti/warn-unnormalized-wheel-filenames -> origin/konsti/warn-unnormalized-wheel-filenames
+* [new branch]          konsti/wheel-variant-auto -> origin/konsti/wheel-variant-auto
+* [new branch]          konsti/wheel-variant-release -> origin/konsti/wheel-variant-release
+* [new branch]          konsti/workspace-benchmark -> origin/konsti/workspace-benchmark
+* [new branch]          konstin/dummy-reporter  -> origin/konstin/dummy-reporter
+* [new branch]          konstin/remove-universe-markers-alt -> origin/konstin/remove-universe-markers-alt
+* [new branch]          konti/stop-accessing-pubgrub-incompatibilities-directly -> origin/konti/stop-accessing-pubgrub-incompatibilities-directly
+* [new branch]          local-version-semantics -> origin/local-version-semantics
+* [new branch]          main                    -> origin/main
+* [new branch]          mikayla/uvx-install-prompt -> origin/mikayla/uvx-install-prompt
+* [new branch]          no-dev-tree             -> origin/no-dev-tree
+* [new branch]          pip-list-format         -> origin/pip-list-format
+* [new branch]          pip-list-outdated       -> origin/pip-list-outdated
+* [new branch]          pip-tree-version-specifier -> origin/pip-tree-version-specifier
+* [new branch]          publish-fail-fast       -> origin/publish-fail-fast
+* [new branch]          renovate/actions-setup-python-7.x -> origin/renovate/actions-setup-python-7.x
+* [new branch]          renovate/astral-tokio-tar-0.x-lockfile -> origin/renovate/astral-tokio-tar-0.x-lockfile
+* [new branch]          renovate/async-trait-0.x-lockfile -> origin/renovate/async-trait-0.x-lockfile
+* [new branch]          renovate/cyclonedx-bom-0.x-lockfile -> origin/renovate/cyclonedx-bom-0.x-lockfile
+* [new branch]          renovate/debian-13.x    -> origin/renovate/debian-13.x
+* [new branch]          renovate/pyo3-maturin-action-digest -> origin/renovate/pyo3-maturin-action-digest
+* [new branch]          renovate/test-log-0.x-lockfile -> origin/renovate/test-log-0.x-lockfile
+* [new branch]          renovate/tikv-jemallocator-0.x -> origin/renovate/tikv-jemallocator-0.x
+* [new branch]          renovate/toml_edit-0.x  -> origin/renovate/toml_edit-0.x
+* [new branch]          revert-17157-charlie/mixed-hash -> origin/revert-17157-charlie/mixed-hash
+* [new branch]          std-trampoline          -> origin/std-trampoline
+* [new branch]          tfsingh/init-script     -> origin/tfsingh/init-script
+* [new branch]          tk/absolute-relative-path-fix-orig -> origin/tk/absolute-relative-path-fix-orig
+* [new branch]          tk/assert-diff-snapshot -> origin/tk/assert-diff-snapshot
+* [new branch]          tk/centralised-envs-reviewed -> origin/tk/centralised-envs-reviewed
+* [new branch]          tk/display-chain-ext    -> origin/tk/display-chain-ext
+* [new branch]          tk/dry-run-refactor     -> origin/tk/dry-run-refactor
+* [new branch]          tk/fix-flat-index-absolute -> origin/tk/fix-flat-index-absolute
+* [new branch]          tk/fix-lossy-source-merging -> origin/tk/fix-lossy-source-merging
+* [new branch]          tk/fix-nfs-locked-file-open-mode -> origin/tk/fix-nfs-locked-file-open-mode
+* [new branch]          tk/index-by-name        -> origin/tk/index-by-name
+* [new branch]          tk/index-doc-fixups     -> origin/tk/index-doc-fixups
+* [new branch]          tk/lockedfile-preview-umask -> origin/tk/lockedfile-preview-umask
+* [new branch]          tk/macos-wheel-signing  -> origin/tk/macos-wheel-signing
+* [new branch]          tk/pip-compile-missing-py-2 -> origin/tk/pip-compile-missing-py-2
+* [new branch]          tk/pip-compile-missing-py-3 -> origin/tk/pip-compile-missing-py-3
+* [new branch]          tk/replace_symlink_lenient-standalone -> origin/tk/replace_symlink_lenient-standalone
+* [new branch]          tk/revert-b1f647f       -> origin/tk/revert-b1f647f
+* [new branch]          tk/update-zip-6-rebased -> origin/tk/update-zip-6-rebased
+* [new branch]          tk/uv-build-tokio       -> origin/tk/uv-build-tokio
+* [new branch]          tk/xz2-feature-static   -> origin/tk/xz2-feature-static
+* [new branch]          verify-commited-trampoline -> origin/verify-commited-trampoline
+* [new branch]          ww/better-clean         -> origin/ww/better-clean
+* [new branch]          ww/bump-depot-macos     -> origin/ww/bump-depot-macos
+* [new branch]          ww/bump-rand            -> origin/ww/bump-rand
+* [new branch]          ww/cov                  -> origin/ww/cov
+* [new branch]          ww/fix-16751            -> origin/ww/fix-16751
+* [new branch]          ww/fix-19050            -> origin/ww/fix-19050
+* [new branch]          ww/fix-sdist            -> origin/ww/fix-sdist
+* [new branch]          ww/linehaul-rustc       -> origin/ww/linehaul-rustc
+* [new branch]          ww/pathext              -> origin/ww/pathext
+* [new branch]          ww/pep740               -> origin/ww/pep740
+* [new branch]          ww/ppold                -> origin/ww/ppold
+* [new branch]          ww/release-ci-lint      -> origin/ww/release-ci-lint
+* [new branch]          ww/slim                 -> origin/ww/slim
+* [new branch]          ww/ta                   -> origin/ww/ta
+* [new branch]          ww/tar-codec            -> origin/ww/tar-codec
+* [new branch]          ww/zb/integration-registries -> origin/ww/zb/integration-registries
+* [new branch]          yorickvp/unsafe-any-match -> origin/yorickvp/unsafe-any-match
+* [new branch]          zanie/direct-incompat   -> origin/zanie/direct-incompat
+* [new branch]          zanie/pubgrub-iter      -> origin/zanie/pubgrub-iter
+* [new branch]          zanie/pubgrub-merge     -> origin/zanie/pubgrub-merge
+* [new branch]          zanie/validate-package-name -> origin/zanie/validate-package-name
+* [new branch]          zb-miette-remove-ii     -> origin/zb-miette-remove-ii
+* [new branch]          zb/010-cl               -> origin/zb/010-cl
+* [new branch]          zb/057-test             -> origin/zb/057-test
+* [new branch]          zb/3.12.2               -> origin/zb/3.12.2
+* [new branch]          zb/314-docker           -> origin/zb/314-docker
+* [new branch]          zb/503-retry            -> origin/zb/503-retry
+* [new branch]          zb/abort-panics-dev-builds -> origin/zb/abort-panics-dev-builds
+* [new branch]          zb/all-extra            -> origin/zb/all-extra
+* [new branch]          zb/all-versions         -> origin/zb/all-versions
+* [new branch]          zb/amazon               -> origin/zb/amazon
+* [new branch]          zb/android-ci           -> origin/zb/android-ci
+* [new branch]          zb/arch-mode            -> origin/zb/arch-mode
+* [new branch]          zb/arm-bins             -> origin/zb/arm-bins
+* [new branch]          zb/assert-compile       -> origin/zb/assert-compile
+* [new branch]          zb/auth-async           -> origin/zb/auth-async
+* [new branch]          zb/auth-default-username -> origin/zb/auth-default-username
+* [new branch]          zb/auth-urls            -> origin/zb/auth-urls
+* [new branch]          zb/av-exclusions        -> origin/zb/av-exclusions
+* [new branch]          zb/axi                  -> origin/zb/axi
+* [new branch]          zb/base-client-lazy     -> origin/zb/base-client-lazy
+* [new branch]          zb/benchmark-bigger-runner -> origin/zb/benchmark-bigger-runner
+* [new branch]          zb/benchmark-expand     -> origin/zb/benchmark-expand
+* [new branch]          zb/bootstrap            -> origin/zb/bootstrap
+* [new branch]          zb/bootstrap-ci         -> origin/zb/bootstrap-ci
+* [new branch]          zb/bootstrap-conda      -> origin/zb/bootstrap-conda
+* [new branch]          zb/bughunt100/007-reject-data-dist-info -> origin/zb/bughunt100/007-reject-data-dist-info
+* [new branch]          zb/build-self           -> origin/zb/build-self
+* [new branch]          zb/bundle               -> origin/zb/bundle
+* [new branch]          zb/bytecode-record-doc  -> origin/zb/bytecode-record-doc
+* [new branch]          zb/bytecode-timeout-doc -> origin/zb/bytecode-timeout-doc
+* [new branch]          zb/cache-python-versions -> origin/zb/cache-python-versions
+* [new branch]          zb/cache-test           -> origin/zb/cache-test
+* [new branch]          zb/cache-windows-python -> origin/zb/cache-windows-python
+* [new branch]          zb/cargo-code-sign      -> origin/zb/cargo-code-sign
+* [new branch]          zb/cargo-dev            -> origin/zb/cargo-dev
+* [new branch]          zb/changelog-ref        -> origin/zb/changelog-ref
+* [new branch]          zb/check-isolated       -> origin/zb/check-isolated
+* [new branch]          zb/ci-partition         -> origin/zb/ci-partition
+* [new branch]          zb/ci-pypi-nginx        -> origin/zb/ci-pypi-nginx
+* [new branch]          zb/ci-windows-xxl       -> origin/zb/ci-windows-xxl
+* [new branch]          zb/cite                 -> origin/zb/cite
+* [new branch]          zb/cli-help-clap-patch  -> origin/zb/cli-help-clap-patch
+* [new branch]          zb/clippy-workspace-cache-bench-20260715 -> origin/zb/clippy-workspace-cache-bench-20260715
+* [new branch]          zb/code-sign            -> origin/zb/code-sign
+* [new branch]          zb/code-sign-ii         -> origin/zb/code-sign-ii
+* [new branch]          zb/collapse-no          -> origin/zb/collapse-no
+* [new branch]          zb/compare-pip          -> origin/zb/compare-pip
+* [new branch]          zb/config-requires      -> origin/zb/config-requires
+* [new branch]          zb/conflict-explosion   -> origin/zb/conflict-explosion
+* [new branch]          zb/conflict-hint-review -> origin/zb/conflict-hint-review
+* [new branch]          zb/conflict-ok          -> origin/zb/conflict-ok
+* [new branch]          zb/content-rebase       -> origin/zb/content-rebase
+* [new branch]          zb/context-interp       -> origin/zb/context-interp
+* [new branch]          zb/copy-children-jupyter -> origin/zb/copy-children-jupyter
+* [new branch]          zb/data-dir             -> origin/zb/data-dir
+* [new branch]          zb/debug-aarch64        -> origin/zb/debug-aarch64
+* [new branch]          zb/debug-ci-i           -> origin/zb/debug-ci-i
+* [new branch]          zb/debug-conda          -> origin/zb/debug-conda
+* [new branch]          zb/debug-docker         -> origin/zb/debug-docker
+* [new branch]          zb/debug-git-fetch-deadlock -> origin/zb/debug-git-fetch-deadlock
+* [new branch]          zb/debug-github         -> origin/zb/debug-github
+* [new branch]          zb/debug-i686           -> origin/zb/debug-i686
+* [new branch]          zb/debug-net            -> origin/zb/debug-net
+* [new branch]          zb/debug-redirect       -> origin/zb/debug-redirect
+* [new branch]          zb/debug-tree           -> origin/zb/debug-tree
+* [new branch]          zb/debug-uninstall      -> origin/zb/debug-uninstall
+* [new branch]          zb/decode-password      -> origin/zb/decode-password
+* [new branch]          zb/demo                 -> origin/zb/demo
+* [new branch]          zb/demo-two             -> origin/zb/demo-two
+* [new branch]          zb/dependencies-ii      -> origin/zb/dependencies-ii
+* [new branch]          zb/dependency-traversal-poc -> origin/zb/dependency-traversal-poc
+* [new branch]          zb/depot-docker         -> origin/zb/depot-docker
+* [new branch]          zb/depot-rev            -> origin/zb/depot-rev
+* [new branch]          zb/depot-windows        -> origin/zb/depot-windows
+* [new branch]          zb/dev-profile-default  -> origin/zb/dev-profile-default
+* [new branch]          zb/devpi-test           -> origin/zb/devpi-test
+* [new branch]          zb/discover-default     -> origin/zb/discover-default
+* [new branch]          zb/display-err          -> origin/zb/display-err
+* [new branch]          zb/docker-cache         -> origin/zb/docker-cache
+* [new branch]          zb/docker-dev           -> origin/zb/docker-dev
+* [new branch]          zb/docs                 -> origin/zb/docs
+* [new branch]          zb/docs-bench-align     -> origin/zb/docs-bench-align
+* [new branch]          zb/docs-rust            -> origin/zb/docs-rust
+* [new branch]          zb/dry-run              -> origin/zb/dry-run
+* [new branch]          zb/dylib                -> origin/zb/dylib
+* [new branch]          zb/ecosystem-test       -> origin/zb/ecosystem-test
+* [new branch]          zb/ecosystem-test-trans -> origin/zb/ecosystem-test-trans
+* [new branch]          zb/ecosystem-urllib     -> origin/zb/ecosystem-urllib
+* [new branch]          zb/ed-iso               -> origin/zb/ed-iso
+* [new branch]          zb/empty-commit-test    -> origin/zb/empty-commit-test
+* [new branch]          zb/environment-missing-error -> origin/zb/environment-missing-error
+* [new branch]          zb/envvar-versioning    -> origin/zb/envvar-versioning
+* [new branch]          zb/error-constraints    -> origin/zb/error-constraints
+* [new branch]          zb/exclude-newer-parse  -> origin/zb/exclude-newer-parse
+* [new branch]          zb/exclude-newer-test   -> origin/zb/exclude-newer-test
+* [new branch]          zb/executable-names     -> origin/zb/executable-names
+* [new branch]          zb/executables-rom      -> origin/zb/executables-rom
+* [new branch]          zb/filter-win           -> origin/zb/filter-win
+* [new branch]          zb/find-all-cache       -> origin/zb/find-all-cache
+* [new branch]          zb/find-bugs-prompt     -> origin/zb/find-bugs-prompt
+* [new branch]          zb/find-links-strategy  -> origin/zb/find-links-strategy
+* [new branch]          zb/find-virtual         -> origin/zb/find-virtual
+* [new branch]          zb/fix-bounce-race      -> origin/zb/fix-bounce-race
+* [new branch]          zb/fix-bounce-race-ii   -> origin/zb/fix-bounce-race-ii
+* [new branch]          zb/fix-ci               -> origin/zb/fix-ci
+* [new branch]          zb/fix-cygpath          -> origin/zb/fix-cygpath
+* [new branch]          zb/fix-flake            -> origin/zb/fix-flake
+* [new branch]          zb/fix-metadata-free-direct-url-constraints -> origin/zb/fix-metadata-free-direct-url-constraints
+* [new branch]          zb/fix-ostype           -> origin/zb/fix-ostype
+* [new branch]          zb/fix-python-dir       -> origin/zb/fix-python-dir
+* [new branch]          zb/fix-run-pyproject    -> origin/zb/fix-run-pyproject
+* [new branch]          zb/fix-spawn-race       -> origin/zb/fix-spawn-race
+* [new branch]          zb/fix-terms            -> origin/zb/fix-terms
+* [new branch]          zb/fix-trampoline       -> origin/zb/fix-trampoline
+* [new branch]          zb/fix-typo-win         -> origin/zb/fix-typo-win
+* [new branch]          zb/flake-and-flake      -> origin/zb/flake-and-flake
+* [new branch]          zb/flash-attn           -> origin/zb/flash-attn
+* [new branch]          zb/flit-v-poetry        -> origin/zb/flit-v-poetry
+* [new branch]          zb/fork-ci              -> origin/zb/fork-ci
+* [new branch]          zb/freebsd-2            -> origin/zb/freebsd-2
+* [new branch]          zb/freebsd-debug        -> origin/zb/freebsd-debug
+* [new branch]          zb/from-executable      -> origin/zb/from-executable
+* [new branch]          zb/git-fetch-async      -> origin/zb/git-fetch-async
+* [new branch]          zb/git-libgit2-fallback -> origin/zb/git-libgit2-fallback
+* [new branch]          zb/github-windows       -> origin/zb/github-windows
+* [new branch]          zb/group-req            -> origin/zb/group-req
+* [new branch]          zb/help-plz             -> origin/zb/help-plz
+* [new branch]          zb/hookd                -> origin/zb/hookd
+* [new branch]          zb/indent-4             -> origin/zb/indent-4
+* [new branch]          zb/index-name-arg       -> origin/zb/index-name-arg
+* [new branch]          zb/init-project-dir     -> origin/zb/init-project-dir
+* [new branch]          zb/install-message      -> origin/zb/install-message
+* [new branch]          zb/install-report       -> origin/zb/install-report
+* [new branch]          zb/int                  -> origin/zb/int
+* [new branch]          zb/integration          -> origin/zb/integration
+* [new branch]          zb/integration-registries -> origin/zb/integration-registries
+* [new branch]          zb/interpreter-missing-error -> origin/zb/interpreter-missing-error
+* [new branch]          zb/introduction-index   -> origin/zb/introduction-index
+* [new branch]          zb/issue-triage-draft-response -> origin/zb/issue-triage-draft-response
+* [new branch]          zb/lfs-true             -> origin/zb/lfs-true
+* [new branch]          zb/link-entrypoints     -> origin/zb/link-entrypoints
+* [new branch]          zb/links                -> origin/zb/links
+* [new branch]          zb/list-dim             -> origin/zb/list-dim
+* [new branch]          zb/lock-check-newer-timestamp -> origin/zb/lock-check-newer-timestamp
+* [new branch]          zb/lock-check-slash     -> origin/zb/lock-check-slash
+* [new branch]          zb/lock-conflict-transitive -> origin/zb/lock-conflict-transitive
+* [new branch]          zb/lock-extra-build-dependencies -> origin/zb/lock-extra-build-dependencies
+* [new branch]          zb/lock-package         -> origin/zb/lock-package
+* [new branch]          zb/locked-tool          -> origin/zb/locked-tool
+* [new branch]          zb/log-gh               -> origin/zb/log-gh
+* [new branch]          zb/macos-86             -> origin/zb/macos-86
+* [new branch]          zb/macos-subset         -> origin/zb/macos-subset
+* [new branch]          zb/macos-workspace-cache-bench-20260715 -> origin/zb/macos-workspace-cache-bench-20260715
+* [new branch]          zb/marker-inequal       -> origin/zb/marker-inequal
+* [new branch]          zb/mdtest               -> origin/zb/mdtest
+* [new branch]          zb/memory               -> origin/zb/memory
+* [new branch]          zb/metadata-deps        -> origin/zb/metadata-deps
+* [new branch]          zb/micro-detect         -> origin/zb/micro-detect
+* [new branch]          zb/miette-remove-ii     -> origin/zb/miette-remove-ii
+* [new branch]          zb/mimalloc-v3-high-confidence-bench -> origin/zb/mimalloc-v3-high-confidence-bench
+* [new branch]          zb/mimalloc-v3-large-page-bench -> origin/zb/mimalloc-v3-large-page-bench
+* [new branch]          zb/mingw64              -> origin/zb/mingw64
+* [new branch]          zb/missing-invalid      -> origin/zb/missing-invalid
+* [new branch]          zb/mold-macos           -> origin/zb/mold-macos
+* [new branch]          zb/musl-clippy          -> origin/zb/musl-clippy
+* [new branch]          zb/native-auth-as-json  -> origin/zb/native-auth-as-json
+* [new branch]          zb/nav-spacing          -> origin/zb/nav-spacing
+* [new branch]          zb/nextest              -> origin/zb/nextest
+* [new branch]          zb/nightly-dev-builds-bench-20260715 -> origin/zb/nightly-dev-builds-bench-20260715
+* [new branch]          zb/nightly-ppcle        -> origin/zb/nightly-ppcle
+* [new branch]          zb/nightly-test-abort-bench-20260715 -> origin/zb/nightly-test-abort-bench-20260715
+* [new branch]          zb/no-more-flake-plz    -> origin/zb/no-more-flake-plz
+* [new branch]          zb/no-project-run       -> origin/zb/no-project-run
+* [new branch]          zb/no-tmp-delete        -> origin/zb/no-tmp-delete
+* [new branch]          zb/not-found            -> origin/zb/not-found
+* [new branch]          zb/offlinepi            -> origin/zb/offlinepi
+* [new branch]          zb/only-available-exclusive -> origin/zb/only-available-exclusive
+* [new branch]          zb/override-satisfies   -> origin/zb/override-satisfies
+* [new branch]          zb/packse-marker-reachability-scenario -> origin/zb/packse-marker-reachability-scenario
+* [new branch]          zb/packse-scenario-markdown -> origin/zb/packse-scenario-markdown
+* [new branch]          zb/packse-test          -> origin/zb/packse-test
+* [new branch]          zb/partial-clone        -> origin/zb/partial-clone
+* [new branch]          zb/partial-clone-2      -> origin/zb/partial-clone-2
+* [new branch]          zb/pbs-version-fetch    -> origin/zb/pbs-version-fetch
+* [new branch]          zb/pbs-version-fetch-ii -> origin/zb/pbs-version-fetch-ii
+* [new branch]          zb/pbs-version-fetch-iii -> origin/zb/pbs-version-fetch-iii
+* [new branch]          zb/pbs-version-fetch-stream -> origin/zb/pbs-version-fetch-stream
+* [new branch]          zb/peek-python-version  -> origin/zb/peek-python-version
+* [new branch]          zb/pin-find             -> origin/zb/pin-find
+* [new branch]          zb/pip-build-env        -> origin/zb/pip-build-env
+* [new branch]          zb/pip-install-compile-bytecode -> origin/zb/pip-install-compile-bytecode
+* [new branch]          zb/platform-fix         -> origin/zb/platform-fix
+* [new branch]          zb/pr-scene             -> origin/zb/pr-scene
+* [new branch]          zb/prism-ccfw           -> origin/zb/prism-ccfw
+* [new branch]          zb/proxy-review         -> origin/zb/proxy-review
+* [new branch]          zb/psh                  -> origin/zb/psh
+* [new branch]          zb/publish-dry-run      -> origin/zb/publish-dry-run
+* [new branch]          zb/publish-dry-run-concurrent -> origin/zb/publish-dry-run-concurrent
+* [new branch]          zb/publish-problems     -> origin/zb/publish-problems
+* [new branch]          zb/publish-quiet-error  -> origin/zb/publish-quiet-error
+* [new branch]          zb/py-install-cache-ci  -> origin/zb/py-install-cache-ci
+* [new branch]          zb/py-install-cache-debug -> origin/zb/py-install-cache-debug
+* [new branch]          zb/pypy-fix             -> origin/zb/pypy-fix
+* [new branch]          zb/python-cache-default -> origin/zb/python-cache-default
+* [new branch]          zb/python-dev           -> origin/zb/python-dev
+* [new branch]          zb/python-download-unpack -> origin/zb/python-download-unpack
+* [new branch]          zb/python-ex            -> origin/zb/python-ex
+* [new branch]          zb/python-list-test     -> origin/zb/python-list-test
+* [new branch]          zb/python-markers-implied -> origin/zb/python-markers-implied
+* [new branch]          zb/python-require-infer-registry -> origin/zb/python-require-infer-registry
+* [new branch]          zb/python-shim          -> origin/zb/python-shim
+* [new branch]          zb/python-source        -> origin/zb/python-source
+* [new branch]          zb/python-test-perf     -> origin/zb/python-test-perf
+* [new branch]          zb/python-update        -> origin/zb/python-update
+* [new branch]          zb/pyx-token-expire     -> origin/zb/pyx-token-expire
+* [new branch]          zb/range-and            -> origin/zb/range-and
+* [new branch]          zb/range-fmt            -> origin/zb/range-fmt
+* [new branch]          zb/readme-center        -> origin/zb/readme-center
+* [new branch]          zb/readme-install       -> origin/zb/readme-install
+* [new branch]          zb/real-environments    -> origin/zb/real-environments
+* [new branch]          zb/reason-no-versions   -> origin/zb/reason-no-versions
+* [new branch]          zb/redirect-rfc         -> origin/zb/redirect-rfc
+* [new branch]          zb/ref-docs             -> origin/zb/ref-docs
+* [new branch]          zb/refactor-version-request -> origin/zb/refactor-version-request
+* [new branch]          zb/reflink-repo         -> origin/zb/reflink-repo
+* [new branch]          zb/release-app          -> origin/zb/release-app
+* [new branch]          zb/relocatable-tool-envs -> origin/zb/relocatable-tool-envs
+* [new branch]          zb/remove-host-check    -> origin/zb/remove-host-check
+* [new branch]          zb/remove-orphaned-dependencies -> origin/zb/remove-orphaned-dependencies
+* [new branch]          zb/renovate-compile     -> origin/zb/renovate-compile
+* [new branch]          zb/renovate-reqwest     -> origin/zb/renovate-reqwest
+* [new branch]          zb/reorg                -> origin/zb/reorg
+* [new branch]          zb/reproduce-bug/20860  -> origin/zb/reproduce-bug/20860
+* [new branch]          zb/req-bound            -> origin/zb/req-bound
+* [new branch]          zb/request-system-explicit -> origin/zb/request-system-explicit
+* [new branch]          zb/reqwest              -> origin/zb/reqwest
+* [new branch]          zb/reqwest-wip          -> origin/zb/reqwest-wip
+* [new branch]          zb/resolver-no-solution-context -> origin/zb/resolver-no-solution-context
+* [new branch]          zb/resolver-workspace-member -> origin/zb/resolver-workspace-member
+* [new branch]          zb/resolver-workspace-members -> origin/zb/resolver-workspace-members
+* [new branch]          zb/revert-auth          -> origin/zb/revert-auth
+* [new branch]          zb/revert-docker        -> origin/zb/revert-docker
+* [new branch]          zb/riscv                -> origin/zb/riscv
+* [new branch]          zb/rosetta              -> origin/zb/rosetta
+* [new branch]          zb/run-python-missing   -> origin/zb/run-python-missing
+* [new branch]          zb/sandbox              -> origin/zb/sandbox
+* [new branch]          zb/shadowed-hint        -> origin/zb/shadowed-hint
+* [new branch]          zb/site-packages        -> origin/zb/site-packages
+* [new branch]          zb/site-packages-link   -> origin/zb/site-packages-link
+* [new branch]          zb/snapshot             -> origin/zb/snapshot
+* [new branch]          zb/snapshot-diff        -> origin/zb/snapshot-diff
+* [new branch]          zb/snapshot-ql          -> origin/zb/snapshot-ql
+* [new branch]          zb/sniff-virtualenv     -> origin/zb/sniff-virtualenv
+* [new branch]          zb/source-pypi          -> origin/zb/source-pypi
+* [new branch]          zb/space-multiline      -> origin/zb/space-multiline
+* [new branch]          zb/speedup-aarch64      -> origin/zb/speedup-aarch64
+* [new branch]          zb/split-uv-crate       -> origin/zb/split-uv-crate
+* [new branch]          zb/state-xdg            -> origin/zb/state-xdg
+* [new branch]          zb/storage              -> origin/zb/storage
+* [new branch]          zb/strict-known         -> origin/zb/strict-known
+* [new branch]          zb/sync-clone           -> origin/zb/sync-clone
+* [new branch]          zb/sys-info-windows     -> origin/zb/sys-info-windows
+* [new branch]          zb/system-drive         -> origin/zb/system-drive
+* [new branch]          zb/system-install       -> origin/zb/system-install
+* [new branch]          zb/system-install-build -> origin/zb/system-install-build
+* [new branch]          zb/system-install-choco -> origin/zb/system-install-choco
+* [new branch]          zb/system-install-rhel  -> origin/zb/system-install-rhel
+* [new branch]          zb/task-runner-demo-poe -> origin/zb/task-runner-demo-poe
+* [new branch]          zb/template-project-env -> origin/zb/template-project-env
+* [new branch]          zb/test-case-vitualenv  -> origin/zb/test-case-vitualenv
+* [new branch]          zb/test-ex              -> origin/zb/test-ex
+* [new branch]          zb/test-fast-build      -> origin/zb/test-fast-build
+* [new branch]          zb/test-fix             -> origin/zb/test-fix
+* [new branch]          zb/test-macos-code-signing -> origin/zb/test-macos-code-signing
+* [new branch]          zb/test-macos-code-signing-shell -> origin/zb/test-macos-code-signing-shell
+* [new branch]          zb/test-miette          -> origin/zb/test-miette
+* [new branch]          zb/test-resolver-avail  -> origin/zb/test-resolver-avail
+* [new branch]          zb/test-setup-python-5.3 -> origin/zb/test-setup-python-5.3
+* [new branch]          zb/test-zstd            -> origin/zb/test-zstd
+* [new branch]          zb/timeout              -> origin/zb/timeout
+* [new branch]          zb/timeout-malo         -> origin/zb/timeout-malo
+* [new branch]          zb/tls                  -> origin/zb/tls
+* [new branch]          zb/tmpdir               -> origin/zb/tmpdir
+* [new branch]          zb/tool-install-bak     -> origin/zb/tool-install-bak
+* [new branch]          zb/tool-locked          -> origin/zb/tool-locked
+* [new branch]          zb/tool-workspace       -> origin/zb/tool-workspace
+* [new branch]          zb/toolchain-only-installed -> origin/zb/toolchain-only-installed
+* [new branch]          zb/toolchain-vii        -> origin/zb/toolchain-vii
+* [new branch]          zb/torch-again          -> origin/zb/torch-again
+* [new branch]          zb/touchup-instal       -> origin/zb/touchup-instal
+* [new branch]          zb/tramp-build          -> origin/zb/tramp-build
+* [new branch]          zb/trampoline           -> origin/zb/trampoline
+* [new branch]          zb/transitive-sources   -> origin/zb/transitive-sources
+* [new branch]          zb/trixie-default       -> origin/zb/trixie-default
+* [new branch]          zb/trusted-host-wip     -> origin/zb/trusted-host-wip
+* [new branch]          zb/ubuntu-22            -> origin/zb/ubuntu-22
+* [new branch]          zb/unusable-versions    -> origin/zb/unusable-versions
+* [new branch]          zb/update               -> origin/zb/update
+* [new branch]          zb/upper                -> origin/zb/upper
+* [new branch]          zb/use-exe-on-windowss  -> origin/zb/use-exe-on-windowss
+* [new branch]          zb/use-mold-in-release-builds -> origin/zb/use-mold-in-release-builds
+* [new branch]          zb/use-namespace-runners -> origin/zb/use-namespace-runners
+* [new branch]          zb/use-srs-linux-macos-ci -> origin/zb/use-srs-linux-macos-ci
+* [new branch]          zb/uv-arch              -> origin/zb/uv-arch
+* [new branch]          zb/uv-auth              -> origin/zb/uv-auth
+* [new branch]          zb/uv-fs-copy           -> origin/zb/uv-fs-copy
+* [new branch]          zb/uv-lock-check-remote -> origin/zb/uv-lock-check-remote
+* [new branch]          zb/uv-test-optional     -> origin/zb/uv-test-optional
+* [new branch]          zb/validate-pyproject   -> origin/zb/validate-pyproject
+* [new branch]          zb/vendor-gauthkeyring-in-rust -> origin/zb/vendor-gauthkeyring-in-rust
+* [new branch]          zb/venv-doc             -> origin/zb/venv-doc
+* [new branch]          zb/venv-force           -> origin/zb/venv-force
+* [new branch]          zb/venv-from-venv       -> origin/zb/venv-from-venv
+* [new branch]          zb/venv-no-venv-reg     -> origin/zb/venv-no-venv-reg
+* [new branch]          zb/venv-patch           -> origin/zb/venv-patch
+* [new branch]          zb/venv-rm-marker       -> origin/zb/venv-rm-marker
+* [new branch]          zb/venv-tool-run        -> origin/zb/venv-tool-run
+* [new branch]          zb/venv-warn-ci         -> origin/zb/venv-warn-ci
+* [new branch]          zb/verbose              -> origin/zb/verbose
+* [new branch]          zb/version-file-discover-project -> origin/zb/version-file-discover-project
+* [new branch]          zb/version-infer        -> origin/zb/version-infer
+* [new branch]          zb/virtual-env-explicit -> origin/zb/virtual-env-explicit
+* [new branch]          zb/wheel-replace        -> origin/zb/wheel-replace
+* [new branch]          zb/win-32               -> origin/zb/win-32
+* [new branch]          zb/win-debug-ugh        -> origin/zb/win-debug-ugh
+* [new branch]          zb/win-def              -> origin/zb/win-def
+* [new branch]          zb/win-wor              -> origin/zb/win-wor
+* [new branch]          zb/win2019              -> origin/zb/win2019
+* [new branch]          zb/windows-ci           -> origin/zb/windows-ci
+* [new branch]          zb/windows-no-revoke    -> origin/zb/windows-no-revoke
+* [new branch]          zb/windows-reflink      -> origin/zb/windows-reflink
+* [new branch]          zb/windows-workspace-cache-bench-20260715 -> origin/zb/windows-workspace-cache-bench-20260715
+* [new branch]          zb/windows-xl           -> origin/zb/windows-xl
+* [new branch]          zb/winget-retries       -> origin/zb/winget-retries
+* [new branch]          zb/workspace-cache-bench-20260715 -> origin/zb/workspace-cache-bench-20260715
+* [new branch]          zb/workspace-marker-reachability-test -> origin/zb/workspace-marker-reachability-test
+* [new branch]          zb/workspace-scenarios  -> origin/zb/workspace-scenarios
+* [new branch]          zsol/add-firstclass-warning-hints -> origin/zsol/add-firstclass-warning-hints
+* [new branch]          zsol/contain-codex-test-generation -> origin/zsol/contain-codex-test-generation
+* [new branch]          zsol/fix-windows-clippy-lockfile -> origin/zsol/fix-windows-clippy-lockfile
+* [new branch]          zsol/jj-kryxnlurmpxt    -> origin/zsol/jj-kryxnlurmpxt
+* [new branch]          zsol/jj-nrtkxqunvuqm    -> origin/zsol/jj-nrtkxqunvuqm
+* [new branch]          zsol/jj-ormktspssmzq    -> origin/zsol/jj-ormktspssmzq
+* [new branch]          zsol/jj-purmswupkxso    -> origin/zsol/jj-purmswupkxso
+* [new branch]          zsol/jj-ttyxpnummxnm    -> origin/zsol/jj-ttyxpnummxnm
+* [new branch]          zsol/jj-wpzkvnuxrwvr    -> origin/zsol/jj-wpzkvnuxrwvr
+* [new branch]          zsol/jj-zmwropzqtzxm    -> origin/zsol/jj-zmwropzqtzxm
+* [new branch]          zsol/jj-zzyoxkssuxsl    -> origin/zsol/jj-zzyoxkssuxsl
+* [new branch]          zsol/meow               -> origin/zsol/meow
+* [new branch]          zsol/track-project-guide-version-releases -> origin/zsol/track-project-guide-version-releases
+* [new branch]          zsol/trim-python-download-metadata -> origin/zsol/trim-python-download-metadata
+* [new branch]          zsol/upgrade-03-groups  -> origin/zsol/upgrade-03-groups
+* [new branch]          zsol/upgrade-04-workspaces -> origin/zsol/upgrade-04-workspaces
+* [new branch]          zsol/upgrade-05-output  -> origin/zsol/upgrade-05-output
+* [new branch]          zsol/upgrade-06-conflicts -> origin/zsol/upgrade-06-conflicts
+* [new branch]          zsol/uv-check-source-centralization -> origin/zsol/uv-check-source-centralization
+* [new branch]          zsol/uvx-slash          -> origin/zsol/uvx-slash
+* [new branch]          zsol/venv-prompt-injection -> origin/zsol/venv-prompt-injection
+* [new tag]             0.0.5                   -> 0.0.5
+* [new tag]             0.1.0                   -> 0.1.0
+* [new tag]             0.1.1                   -> 0.1.1
+* [new tag]             0.1.10                  -> 0.1.10
+* [new tag]             0.1.11                  -> 0.1.11
+* [new tag]             0.1.12                  -> 0.1.12
+* [new tag]             0.1.13                  -> 0.1.13
+* [new tag]             0.1.14                  -> 0.1.14
+* [new tag]             0.1.15                  -> 0.1.15
+* [new tag]             0.1.16                  -> 0.1.16
+* [new tag]             0.1.17                  -> 0.1.17
+* [new tag]             0.1.18                  -> 0.1.18
+* [new tag]             0.1.19                  -> 0.1.19
+* [new tag]             0.1.2                   -> 0.1.2
+* [new tag]             0.1.20                  -> 0.1.20
+* [new tag]             0.1.21                  -> 0.1.21
+* [new tag]             0.1.22                  -> 0.1.22
+* [new tag]             0.1.23                  -> 0.1.23
+* [new tag]             0.1.24                  -> 0.1.24
+* [new tag]             0.1.25                  -> 0.1.25
+* [new tag]             0.1.26                  -> 0.1.26
+* [new tag]             0.1.27                  -> 0.1.27
+* [new tag]             0.1.28                  -> 0.1.28
+* [new tag]             0.1.29                  -> 0.1.29
+* [new tag]             0.1.3                   -> 0.1.3
+* [new tag]             0.1.30                  -> 0.1.30
+* [new tag]             0.1.31                  -> 0.1.31
+* [new tag]             0.1.32                  -> 0.1.32
+* [new tag]             0.1.33                  -> 0.1.33
+* [new tag]             0.1.34                  -> 0.1.34
+* [new tag]             0.1.35                  -> 0.1.35
+* [new tag]             0.1.36                  -> 0.1.36
+* [new tag]             0.1.37                  -> 0.1.37
+* [new tag]             0.1.38                  -> 0.1.38
+* [new tag]             0.1.39                  -> 0.1.39
+* [new tag]             0.1.4                   -> 0.1.4
+* [new tag]             0.1.40                  -> 0.1.40
+* [new tag]             0.1.41                  -> 0.1.41
+* [new tag]             0.1.42                  -> 0.1.42
+* [new tag]             0.1.43                  -> 0.1.43
+* [new tag]             0.1.44                  -> 0.1.44
+* [new tag]             0.1.45                  -> 0.1.45
+* [new tag]             0.1.5                   -> 0.1.5
+* [new tag]             0.1.6                   -> 0.1.6
+* [new tag]             0.1.7                   -> 0.1.7
+* [new tag]             0.1.8                   -> 0.1.8
+* [new tag]             0.1.9                   -> 0.1.9
+* [new tag]             0.10.0                  -> 0.10.0
+* [new tag]             0.10.1                  -> 0.10.1
+* [new tag]             0.10.10                 -> 0.10.10
+* [new tag]             0.10.11                 -> 0.10.11
+* [new tag]             0.10.12                 -> 0.10.12
+* [new tag]             0.10.2                  -> 0.10.2
+* [new tag]             0.10.3                  -> 0.10.3
+* [new tag]             0.10.4                  -> 0.10.4
+* [new tag]             0.10.5                  -> 0.10.5
+* [new tag]             0.10.6                  -> 0.10.6
+* [new tag]             0.10.7                  -> 0.10.7
+* [new tag]             0.10.8                  -> 0.10.8
+* [new tag]             0.10.9                  -> 0.10.9
+* [new tag]             0.11.0                  -> 0.11.0
+* [new tag]             0.11.1                  -> 0.11.1
+* [new tag]             0.11.10                 -> 0.11.10
+* [new tag]             0.11.11                 -> 0.11.11
+* [new tag]             0.11.12                 -> 0.11.12
+* [new tag]             0.11.13                 -> 0.11.13
+* [new tag]             0.11.14                 -> 0.11.14
+* [new tag]             0.11.15                 -> 0.11.15
+* [new tag]             0.11.16                 -> 0.11.16
+* [new tag]             0.11.17                 -> 0.11.17
+* [new tag]             0.11.18                 -> 0.11.18
+* [new tag]             0.11.19                 -> 0.11.19
+* [new tag]             0.11.2                  -> 0.11.2
+* [new tag]             0.11.20                 -> 0.11.20
+* [new tag]             0.11.21                 -> 0.11.21
+* [new tag]             0.11.22                 -> 0.11.22
+* [new tag]             0.11.23                 -> 0.11.23
+* [new tag]             0.11.24                 -> 0.11.24
+* [new tag]             0.11.25                 -> 0.11.25
+* [new tag]             0.11.26                 -> 0.11.26
+* [new tag]             0.11.27                 -> 0.11.27
+* [new tag]             0.11.28                 -> 0.11.28
+* [new tag]             0.11.29                 -> 0.11.29
+* [new tag]             0.11.3                  -> 0.11.3
+* [new tag]             0.11.30                 -> 0.11.30
+* [new tag]             0.11.31                 -> 0.11.31
+* [new tag]             0.11.32                 -> 0.11.32
+* [new tag]             0.11.33                 -> 0.11.33
+* [new tag]             0.11.4                  -> 0.11.4
+* [new tag]             0.11.5                  -> 0.11.5
+* [new tag]             0.11.6                  -> 0.11.6
+* [new tag]             0.11.7                  -> 0.11.7
+* [new tag]             0.11.8                  -> 0.11.8
+* [new tag]             0.11.9                  -> 0.11.9
+* [new tag]             0.12.0                  -> 0.12.0
+* [new tag]             0.12.1                  -> 0.12.1
+* [new tag]             0.2.0                   -> 0.2.0
+* [new tag]             0.2.1                   -> 0.2.1
+* [new tag]             0.2.10                  -> 0.2.10
+* [new tag]             0.2.11                  -> 0.2.11
+* [new tag]             0.2.12                  -> 0.2.12
+* [new tag]             0.2.13                  -> 0.2.13
+* [new tag]             0.2.14                  -> 0.2.14
+* [new tag]             0.2.15                  -> 0.2.15
+* [new tag]             0.2.16                  -> 0.2.16
+* [new tag]             0.2.17                  -> 0.2.17
+* [new tag]             0.2.18                  -> 0.2.18
+* [new tag]             0.2.19                  -> 0.2.19
+* [new tag]             0.2.2                   -> 0.2.2
+* [new tag]             0.2.20                  -> 0.2.20
+* [new tag]             0.2.21                  -> 0.2.21
+* [new tag]             0.2.22                  -> 0.2.22
+* [new tag]             0.2.23                  -> 0.2.23
+* [new tag]             0.2.24                  -> 0.2.24
+* [new tag]             0.2.25                  -> 0.2.25
+* [new tag]             0.2.26                  -> 0.2.26
+* [new tag]             0.2.27                  -> 0.2.27
+* [new tag]             0.2.28                  -> 0.2.28
+* [new tag]             0.2.29                  -> 0.2.29
+* [new tag]             0.2.3                   -> 0.2.3
+* [new tag]             0.2.30                  -> 0.2.30
+* [new tag]             0.2.31                  -> 0.2.31
+* [new tag]             0.2.32                  -> 0.2.32
+* [new tag]             0.2.33                  -> 0.2.33
+* [new tag]             0.2.34                  -> 0.2.34
+* [new tag]             0.2.35                  -> 0.2.35
+* [new tag]             0.2.36                  -> 0.2.36
+* [new tag]             0.2.37                  -> 0.2.37
+* [new tag]             0.2.4                   -> 0.2.4
+* [new tag]             0.2.5                   -> 0.2.5
+* [new tag]             0.2.6                   -> 0.2.6
+* [new tag]             0.2.7                   -> 0.2.7
+* [new tag]             0.2.8                   -> 0.2.8
+* [new tag]             0.2.9                   -> 0.2.9
+* [new tag]             0.3.0                   -> 0.3.0
+* [new tag]             0.3.1                   -> 0.3.1
+* [new tag]             0.3.2                   -> 0.3.2
+* [new tag]             0.3.3                   -> 0.3.3
+* [new tag]             0.3.4                   -> 0.3.4
+* [new tag]             0.3.5                   -> 0.3.5
+* [new tag]             0.4.0                   -> 0.4.0
+* [new tag]             0.4.1                   -> 0.4.1
+* [new tag]             0.4.10                  -> 0.4.10
+* [new tag]             0.4.11                  -> 0.4.11
+* [new tag]             0.4.12                  -> 0.4.12
+* [new tag]             0.4.13                  -> 0.4.13
+* [new tag]             0.4.14                  -> 0.4.14
+* [new tag]             0.4.15                  -> 0.4.15
+* [new tag]             0.4.16                  -> 0.4.16
+* [new tag]             0.4.17                  -> 0.4.17
+* [new tag]             0.4.18                  -> 0.4.18
+* [new tag]             0.4.19                  -> 0.4.19
+* [new tag]             0.4.2                   -> 0.4.2
+* [new tag]             0.4.20                  -> 0.4.20
+* [new tag]             0.4.21                  -> 0.4.21
+* [new tag]             0.4.22                  -> 0.4.22
+* [new tag]             0.4.23                  -> 0.4.23
+* [new tag]             0.4.24                  -> 0.4.24
+* [new tag]             0.4.25                  -> 0.4.25
+* [new tag]             0.4.26                  -> 0.4.26
+* [new tag]             0.4.27                  -> 0.4.27
+* [new tag]             0.4.28                  -> 0.4.28
+* [new tag]             0.4.29                  -> 0.4.29
+* [new tag]             0.4.3                   -> 0.4.3
+* [new tag]             0.4.30                  -> 0.4.30
+* [new tag]             0.4.4                   -> 0.4.4
+* [new tag]             0.4.5                   -> 0.4.5
+* [new tag]             0.4.6                   -> 0.4.6
+* [new tag]             0.4.7                   -> 0.4.7
+* [new tag]             0.4.8                   -> 0.4.8
+* [new tag]             0.4.9                   -> 0.4.9
+* [new tag]             0.5.0                   -> 0.5.0
+* [new tag]             0.5.1                   -> 0.5.1
+* [new tag]             0.5.10                  -> 0.5.10
+* [new tag]             0.5.11                  -> 0.5.11
+* [new tag]             0.5.12                  -> 0.5.12
+* [new tag]             0.5.13                  -> 0.5.13
+* [new tag]             0.5.14                  -> 0.5.14
+* [new tag]             0.5.15                  -> 0.5.15
+* [new tag]             0.5.16                  -> 0.5.16
+* [new tag]             0.5.17                  -> 0.5.17
+* [new tag]             0.5.18                  -> 0.5.18
+* [new tag]             0.5.19                  -> 0.5.19
+* [new tag]             0.5.2                   -> 0.5.2
+* [new tag]             0.5.20                  -> 0.5.20
+* [new tag]             0.5.21                  -> 0.5.21
+* [new tag]             0.5.22                  -> 0.5.22
+* [new tag]             0.5.23                  -> 0.5.23
+* [new tag]             0.5.24                  -> 0.5.24
+* [new tag]             0.5.25                  -> 0.5.25
+* [new tag]             0.5.26                  -> 0.5.26
+* [new tag]             0.5.27                  -> 0.5.27
+* [new tag]             0.5.28                  -> 0.5.28
+* [new tag]             0.5.29                  -> 0.5.29
+* [new tag]             0.5.3                   -> 0.5.3
+* [new tag]             0.5.30                  -> 0.5.30
+* [new tag]             0.5.31                  -> 0.5.31
+* [new tag]             0.5.4                   -> 0.5.4
+* [new tag]             0.5.5                   -> 0.5.5
+* [new tag]             0.5.6                   -> 0.5.6
+* [new tag]             0.5.7                   -> 0.5.7
+* [new tag]             0.5.8                   -> 0.5.8
+* [new tag]             0.5.9                   -> 0.5.9
+* [new tag]             0.6.0                   -> 0.6.0
+* [new tag]             0.6.1                   -> 0.6.1
+* [new tag]             0.6.10                  -> 0.6.10
+* [new tag]             0.6.11                  -> 0.6.11
+* [new tag]             0.6.12                  -> 0.6.12
+* [new tag]             0.6.13                  -> 0.6.13
+* [new tag]             0.6.14                  -> 0.6.14
+* [new tag]             0.6.15                  -> 0.6.15
+* [new tag]             0.6.16                  -> 0.6.16
+* [new tag]             0.6.17                  -> 0.6.17
+* [new tag]             0.6.2                   -> 0.6.2
+* [new tag]             0.6.3                   -> 0.6.3
+* [new tag]             0.6.4                   -> 0.6.4
+* [new tag]             0.6.5                   -> 0.6.5
+* [new tag]             0.6.6                   -> 0.6.6
+* [new tag]             0.6.7                   -> 0.6.7
+* [new tag]             0.6.8                   -> 0.6.8
+* [new tag]             0.6.9                   -> 0.6.9
+* [new tag]             0.7.0                   -> 0.7.0
+* [new tag]             0.7.1                   -> 0.7.1
+* [new tag]             0.7.10                  -> 0.7.10
+* [new tag]             0.7.11                  -> 0.7.11
+* [new tag]             0.7.12                  -> 0.7.12
+* [new tag]             0.7.13                  -> 0.7.13
+* [new tag]             0.7.14                  -> 0.7.14
+* [new tag]             0.7.15                  -> 0.7.15
+* [new tag]             0.7.16                  -> 0.7.16
+* [new tag]             0.7.17                  -> 0.7.17
+* [new tag]             0.7.18                  -> 0.7.18
+* [new tag]             0.7.19                  -> 0.7.19
+* [new tag]             0.7.2                   -> 0.7.2
+* [new tag]             0.7.20                  -> 0.7.20
+* [new tag]             0.7.21                  -> 0.7.21
+* [new tag]             0.7.22                  -> 0.7.22
+* [new tag]             0.7.3                   -> 0.7.3
+* [new tag]             0.7.4                   -> 0.7.4
+* [new tag]             0.7.5                   -> 0.7.5
+* [new tag]             0.7.6                   -> 0.7.6
+* [new tag]             0.7.7                   -> 0.7.7
+* [new tag]             0.7.8                   -> 0.7.8
+* [new tag]             0.7.9                   -> 0.7.9
+* [new tag]             0.8.0                   -> 0.8.0
+* [new tag]             0.8.1                   -> 0.8.1
+* [new tag]             0.8.10                  -> 0.8.10
+* [new tag]             0.8.11                  -> 0.8.11
+* [new tag]             0.8.12                  -> 0.8.12
+* [new tag]             0.8.13                  -> 0.8.13
+* [new tag]             0.8.14                  -> 0.8.14
+* [new tag]             0.8.15                  -> 0.8.15
+* [new tag]             0.8.16                  -> 0.8.16
+* [new tag]             0.8.17                  -> 0.8.17
+* [new tag]             0.8.18                  -> 0.8.18
+* [new tag]             0.8.19                  -> 0.8.19
+* [new tag]             0.8.2                   -> 0.8.2
+* [new tag]             0.8.20                  -> 0.8.20
+* [new tag]             0.8.21                  -> 0.8.21
+* [new tag]             0.8.22                  -> 0.8.22
+* [new tag]             0.8.23                  -> 0.8.23
+* [new tag]             0.8.24                  -> 0.8.24
+* [new tag]             0.8.3                   -> 0.8.3
+* [new tag]             0.8.4                   -> 0.8.4
+* [new tag]             0.8.5                   -> 0.8.5
+* [new tag]             0.8.6                   -> 0.8.6
+* [new tag]             0.8.7                   -> 0.8.7
+* [new tag]             0.8.8                   -> 0.8.8
+* [new tag]             0.8.9                   -> 0.8.9
+* [new tag]             0.9.0                   -> 0.9.0
+* [new tag]             0.9.1                   -> 0.9.1
+* [new tag]             0.9.10                  -> 0.9.10
+* [new tag]             0.9.11                  -> 0.9.11
+* [new tag]             0.9.12                  -> 0.9.12
+* [new tag]             0.9.13                  -> 0.9.13
+* [new tag]             0.9.14                  -> 0.9.14
+* [new tag]             0.9.15                  -> 0.9.15
+* [new tag]             0.9.16                  -> 0.9.16
+* [new tag]             0.9.17                  -> 0.9.17
+* [new tag]             0.9.18                  -> 0.9.18
+* [new tag]             0.9.2                   -> 0.9.2
+* [new tag]             0.9.20                  -> 0.9.20
+* [new tag]             0.9.21                  -> 0.9.21
+* [new tag]             0.9.22                  -> 0.9.22
+* [new tag]             0.9.23                  -> 0.9.23
+* [new tag]             0.9.24                  -> 0.9.24
+* [new tag]             0.9.25                  -> 0.9.25
+* [new tag]             0.9.26                  -> 0.9.26
+* [new tag]             0.9.27                  -> 0.9.27
+* [new tag]             0.9.28                  -> 0.9.28
+* [new tag]             0.9.29                  -> 0.9.29
+* [new tag]             0.9.3                   -> 0.9.3
+* [new tag]             0.9.30                  -> 0.9.30
+* [new tag]             0.9.4                   -> 0.9.4
+* [new tag]             0.9.5                   -> 0.9.5
+* [new tag]             0.9.6                   -> 0.9.6
+* [new tag]             0.9.7                   -> 0.9.7
+* [new tag]             0.9.8                   -> 0.9.8
+* [new tag]             0.9.9                   -> 0.9.9
+* [new ref]             81742a27ad62bb1dd1289a164f1776508279c756 -> pull/20876/merge
+##[endgroup]
+##[group]Determining the checkout info
+##[endgroup]
+[command]/usr/bin/git sparse-checkout disable
+[command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+##[group]Checking out the ref
+[command]/usr/bin/git checkout --progress --force refs/remotes/pull/20876/merge
+Note: switching to 'refs/remotes/pull/20876/merge'.
+You are in 'detached HEAD' state. You can look around, make experimental
+changes and commit them, and you can discard any commits you make in this
+state without impacting any branches by switching back to a branch.
+If you want to create a new branch to retain commits you create, you may
+do so (now or later) by using -c with the switch command. Example:
+git switch -c <new-branch-name>
+Or undo this operation with:
+git switch -
+Turn off this advice by setting config variable advice.detachedHead to false
+HEAD is now at 81742a27a Merge 1ddf5b709ad49bba88e6607af0d2a1bbe0c03ff5 into 79bbface771210df216b738e9bdc7df95e5a9e6b
+##[endgroup]
+[command]/usr/bin/git log -1 --format=%H
+81742a27ad62bb1dd1289a164f1776508279c756
+##[group]Removing auth
+Removing SSH command configuration
+[command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Removing HTTP extra header
+[command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Removing includeIf entries pointing to credentials config files
+[command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+includeif.gitdir:/home/runner/work/uv/uv/.git.path
+includeif.gitdir:/home/runner/work/uv/uv/.git/worktrees/*.path
+includeif.gitdir:/github/workspace/.git.path
+includeif.gitdir:/github/workspace/.git/worktrees/*.path
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/uv/uv/.git.path
+/home/runner/work/_temp/git-credentials-9d57241c-ab7d-4ec0-bd92-0caa16f71bef.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/uv/uv/.git.path /home/runner/work/_temp/git-credentials-9d57241c-ab7d-4ec0-bd92-0caa16f71bef.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/uv/uv/.git/worktrees/*.path
+/home/runner/work/_temp/git-credentials-9d57241c-ab7d-4ec0-bd92-0caa16f71bef.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/uv/uv/.git/worktrees/*.path /home/runner/work/_temp/git-credentials-9d57241c-ab7d-4ec0-bd92-0caa16f71bef.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git.path
+/github/runner_temp/git-credentials-9d57241c-ab7d-4ec0-bd92-0caa16f71bef.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-9d57241c-ab7d-4ec0-bd92-0caa16f71bef.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git/worktrees/*.path
+/github/runner_temp/git-credentials-9d57241c-ab7d-4ec0-bd92-0caa16f71bef.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-9d57241c-ab7d-4ec0-bd92-0caa16f71bef.config
+[command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+Removing credentials config '/home/runner/work/_temp/git-credentials-9d57241c-ab7d-4ec0-bd92-0caa16f71bef.config'
+##[endgroup]
+##[group]Run astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+with:
+version: 0.11.33
+activate-environment: false
+no-project: false
+working-directory: /home/runner/work/uv/uv
+github-token: ***
+enable-cache: auto
+cache-dependency-glob: **/*requirements*.txt
+**/*requirements*.in
+**/*constraints*.txt
+**/*constraints*.in
+**/pyproject.toml
+**/uv.lock
+**/*.py.lock
+
+restore-cache: true
+save-cache: true
+prune-cache: false
+cache-python: false
+ignore-nothing-to-cache: false
+ignore-empty-workdir: false
+download-from-astral-mirror: true
+add-problem-matchers: true
+quiet: false
+resolution-strategy: highest
+##[endgroup]
+Fetching manifest data from https://raw.githubusercontent.com/astral-sh/versions/main/v1/uv.ndjson ...
+Downloading uv from "https://releases.astral.sh/github/uv/releases/download/0.11.33/uv-x86_64-unknown-linux-gnu.tar.gz" ...
+[command]/usr/bin/tar xz --warning=no-unknown-keyword --overwrite -C /home/runner/work/_temp/eecf9e7a-46a9-4bdf-8b92-246d92f5ea44 -f /home/runner/work/_temp/987d6b5c-d7d8-4b1e-84f5-0bb3b36b5269
+Added /home/runner/.local/bin to the path
+Added /opt/hostedtoolcache/uv/0.11.33/x86_64 to the path
+Set UV_PYTHON_INSTALL_DIR to /home/runner/work/_temp/uv-python-dir
+Added /home/runner/work/_temp/uv-python-dir to the path
+Set UV_CACHE_DIR to /home/runner/work/_temp/setup-uv-cache
+Successfully installed uv version 0.11.33
+Searching files using cache dependency glob: /home/runner/work/uv/uv/**/*requirements*.txt,/home/runner/work/uv/uv/**/*requirements*.in,/home/runner/work/uv/uv/**/*constraints*.txt,/home/runner/work/uv/uv/**/*constraints*.in,/home/runner/work/uv/uv/**/pyproject.toml,/home/runner/work/uv/uv/**/uv.lock,/home/runner/work/uv/uv/**/*.py.lock
+/home/runner/work/uv/uv/agents/hooks/post-edit-format.py.lock
+/home/runner/work/uv/uv/agents/scripts/agent-review-to-github-comments.py.lock
+/home/runner/work/uv/uv/crates/uv-build/pyproject.toml
+/home/runner/work/uv/uv/crates/uv-python/fetch-download-metadata.py.lock
+/home/runner/work/uv/uv/crates/uv-requirements-txt/test-data/requirements-txt/constraints-a.txt
+/home/runner/work/uv/uv/crates/uv-requirements-txt/test-data/requirements-txt/constraints-b.txt
+/home/runner/work/uv/uv/pyproject.toml
+/home/runner/work/uv/uv/scripts/benchmark/pyproject.toml
+/home/runner/work/uv/uv/scripts/benchmark/uv.lock
+/home/runner/work/uv/uv/scripts/bump-workspace-crate-versions.py.lock
+/home/runner/work/uv/uv/scripts/check-trampoline-version-consistency.py.lock
+/home/runner/work/uv/uv/scripts/create-python-mirror.py.lock
+/home/runner/work/uv/uv/scripts/generate-crate-readmes.py.lock
+/home/runner/work/uv/uv/scripts/generate-known-stdlib.py.lock
+/home/runner/work/uv/uv/scripts/publish/test_publish.py.lock
+/home/runner/work/uv/uv/scripts/registries-test.py.lock
+/home/runner/work/uv/uv/scripts/sync-python-version-constants.py.lock
+/home/runner/work/uv/uv/scripts/update-latest-changelog-section.py.lock
+/home/runner/work/uv/uv/scripts/uv-run-remote-script-test.py.lock
+/home/runner/work/uv/uv/scripts/vendor-packaging.py.lock
+/home/runner/work/uv/uv/test/ecosystem/airflow/pyproject.toml
+/home/runner/work/uv/uv/test/ecosystem/black/pyproject.toml
+/home/runner/work/uv/uv/test/ecosystem/github-wikidata-bot/pyproject.toml
+/home/runner/work/uv/uv/test/ecosystem/home-assistant-core/pyproject.toml
+/home/runner/work/uv/uv/test/ecosystem/jupyterlab/pyproject.toml
+/home/runner/work/uv/uv/test/ecosystem/packse/pyproject.toml
+/home/runner/work/uv/uv/test/ecosystem/pandas/pyproject.toml
+/home/runner/work/uv/uv/test/ecosystem/poetry/pyproject.toml
+/home/runner/work/uv/uv/test/ecosystem/pyx-external/pyproject.toml
+/home/runner/work/uv/uv/test/ecosystem/saleor/pyproject.toml
+/home/runner/work/uv/uv/test/ecosystem/semantic-kernel/pyproject.toml
+/home/runner/work/uv/uv/test/ecosystem/transformers/pyproject.toml
+/home/runner/work/uv/uv/test/ecosystem/warehouse/pyproject.toml
+/home/runner/work/uv/uv/test/packages/anyio_local/pyproject.toml
+/home/runner/work/uv/uv/test/packages/black_editable/pyproject.toml
+/home/runner/work/uv/uv/test/packages/built-by-uv/pyproject.toml
+/home/runner/work/uv/uv/test/packages/built-by-uv/uv.lock
+/home/runner/work/uv/uv/test/packages/dependent_locals/first_local/pyproject.toml
+/home/runner/work/uv/uv/test/packages/dependent_locals/second_local/pyproject.toml
+/home/runner/work/uv/uv/test/packages/deptry_reproducer/pyproject.toml
+/home/runner/work/uv/uv/test/packages/executable_file/pyproject.toml
+/home/runner/work/uv/uv/test/packages/fake-uv/pyproject.toml
+/home/runner/work/uv/uv/test/packages/flit_editable/pyproject.toml
+/home/runner/work/uv/uv/test/packages/hatchling_dynamic/pyproject.toml
+/home/runner/work/uv/uv/test/packages/hatchling_editable/pyproject.toml
+/home/runner/work/uv/uv/test/packages/keyring_test_plugin/pyproject.toml
+/home/runner/work/uv/uv/test/packages/package.name.with.dots/pyproject.toml
+/home/runner/work/uv/uv/test/packages/poetry_editable/pyproject.toml
+/home/runner/work/uv/uv/test/packages/root_editable/pyproject.toml
+/home/runner/work/uv/uv/test/packages/setuptools_editable/pyproject.toml
+/home/runner/work/uv/uv/test/requirements/airflow2-constraints.txt
+/home/runner/work/uv/uv/test/requirements/transformers/pyproject.toml
+/home/runner/work/uv/uv/test/workspaces/albatross-dependency-rainbow/pyproject.toml
+/home/runner/work/uv/uv/test/workspaces/albatross-groups-only/pyproject.toml
+/home/runner/work/uv/uv/test/workspaces/albatross-in-example/examples/bird-feeder/pyproject.toml
+/home/runner/work/uv/uv/test/workspaces/albatross-in-example/pyproject.toml
+/home/runner/work/uv/uv/test/workspaces/albatross-just-project/pyproject.toml
+/home/runner/work/uv/uv/test/workspaces/albatross-project-in-excluded/excluded/bird-feeder/pyproject.toml
+/home/runner/work/uv/uv/test/workspaces/albatross-project-in-excluded/packages/seeds/pyproject.toml
+/home/runner/work/uv/uv/test/workspaces/albatross-project-in-excluded/pyproject.toml
+/home/runner/work/uv/uv/test/workspaces/albatross-root-workspace/packages/bird-feeder/pyproject.toml
+/home/runner/work/uv/uv/test/workspaces/albatross-root-workspace/packages/seeds/pyproject.toml
+/home/runner/work/uv/uv/test/workspaces/albatross-root-workspace/pyproject.toml
+/home/runner/work/uv/uv/test/workspaces/albatross-virtual-workspace/packages/albatross/pyproject.toml
+/home/runner/work/uv/uv/test/workspaces/albatross-virtual-workspace/packages/bird-feeder/pyproject.toml
+/home/runner/work/uv/uv/test/workspaces/albatross-virtual-workspace/packages/seeds/pyproject.toml
+/home/runner/work/uv/uv/test/workspaces/albatross-virtual-workspace/pyproject.toml
+/home/runner/work/uv/uv/uv.lock
+Found 68 files to hash.
+Trying to restore cache from GitHub Actions cache with key: setup-uv-2-x86_64-unknown-linux-gnu-ubuntu-24.04-unknown-060cdd892c753aabacd45b9a36e6e866e44998dada29c78b828152dea2c56c68
+Cache hit for: setup-uv-2-x86_64-unknown-linux-gnu-ubuntu-24.04-unknown-060cdd892c753aabacd45b9a36e6e866e44998dada29c78b828152dea2c56c68
+Received 0 of 11495618 (0.0%), 0.0 MBs/sec
+Received 11495618 of 11495618 (100.0%), 8.5 MBs/sec
+Cache Size: ~11 MB (11495618 B)
+[command]/usr/bin/tar -xf /home/runner/work/_temp/587af751-494d-4e0d-b0fa-17ca4031e6c4/cache.tzst -P -C /home/runner/work/uv/uv --use-compress-program unzstd
+Cache restored successfully
+cache restored from GitHub Actions cache with key: setup-uv-2-x86_64-unknown-linux-gnu-ubuntu-24.04-unknown-060cdd892c753aabacd45b9a36e6e866e44998dada29c78b828152dea2c56c68
+##[group]Run actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+with:
+check-latest: false
+token: ***
+update-environment: true
+allow-prereleases: false
+freethreaded: false
+env:
+UV_PYTHON_INSTALL_DIR: /home/runner/work/_temp/uv-python-dir
+UV_CACHE_DIR: /home/runner/work/_temp/setup-uv-cache
+##[endgroup]
+[warning]Neither 'python-version' nor 'python-version-file' inputs were supplied. Attempting to find '.python-version' file.
+[warning].python-version doesn't exist.
+##[warning]The `python-version` input is not set.  The version of Python currently in `PATH` will be used.
+##[group]Run Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+with:
+save-if: false
+prefix-key: v0-rust
+add-job-id-key: true
+add-rust-environment-hash-key: true
+cache-targets: true
+cache-all-crates: false
+cache-workspace-crates: false
+cache-provider: github
+cache-bin: true
+lookup-only: false
+cmd-format: {0}
+env:
+UV_PYTHON_INSTALL_DIR: /home/runner/work/_temp/uv-python-dir
+UV_CACHE_DIR: /home/runner/work/_temp/setup-uv-cache
+##[endgroup]
+(node:2372) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+##[group]Cache Configuration
+Cache Provider:
+github
+Workspaces:
+/home/runner/work/uv/uv
+Cache Paths:
+/home/runner/.cargo/bin
+/home/runner/.cargo/.crates.toml
+/home/runner/.cargo/.crates2.json
+/home/runner/.cargo/registry
+/home/runner/.cargo/git
+/home/runner/work/uv/uv/target
+Restore Key:
+v0-rust-docs-Linux-x64-4236129c
+Cache Key:
+v0-rust-docs-Linux-x64-4236129c-8ec737f4
+.. Prefix:
+- v0-rust-docs-Linux-x64
+.. Environment considered:
+- Rust Versions:
+- 1.97.1 x86_64-unknown-linux-gnu 8bab26f4f68e0e26f0bb7960be334d5b520ea452
+- 1.97.1 x86_64-unknown-linux-gnu 8bab26f4f68e0e26f0bb7960be334d5b520ea452
+- 1.97.1 x86_64-unknown-linux-gnu 8bab26f4f68e0e26f0bb7960be334d5b520ea452
+- CARGO_INCREMENTAL
+.. Lockfiles considered:
+- /home/runner/work/uv/uv/.cargo/config.toml
+- /home/runner/work/uv/uv/Cargo.lock
+- /home/runner/work/uv/uv/crates/uv-audit/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-auth/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-bench/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-bin-install/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-build-backend/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-build-frontend/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-build/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-build/rust-toolchain.toml
+- /home/runner/work/uv/uv/crates/uv-cache-info/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-cache-key/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-cache/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-cli/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-client/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-configuration/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-console/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-dev/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-dirs/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-dispatch/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-distribution-filename/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-distribution-types/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-distribution/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-errors/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-extract/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-fastid/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-flags/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-fs/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-git-types/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-git/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-globfilter/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-install-wheel/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-installer/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-keyring/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-logging/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-macros/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-metadata/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-netrc/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-normalize/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-once-map/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-options-metadata/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-pep440/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-pep508/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-performance-memory-allocator/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-platform-tags/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-platform/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-preview/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-publish/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-pypi-types/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-python/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-redacted/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-requirements-txt/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-requirements/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-resolver/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-scripts/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-settings/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-shell/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-small-str/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-state/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-static/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-test/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-toml/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-tool/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-torch/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-trampoline-builder/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-trampoline/.cargo/config.toml
+- /home/runner/work/uv/uv/crates/uv-trampoline/rust-toolchain.toml
+- /home/runner/work/uv/uv/crates/uv-types/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-unix/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-version/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-virtualenv/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-warnings/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-windows/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv-workspace/Cargo.toml
+- /home/runner/work/uv/uv/crates/uv/Cargo.toml
+- /home/runner/work/uv/uv/rust-toolchain.toml
+##[endgroup]
+... Restoring cache ...
+Cache hit for: v0-rust-docs-Linux-x64-4236129c-8ec737f4
+Received 0 of 845624132 (0.0%), 0.0 MBs/sec
+Received 83886080 of 845624132 (9.9%), 40.0 MBs/sec
+Received 213909504 of 845624132 (25.3%), 68.0 MBs/sec
+Received 373293056 of 845624132 (44.1%), 88.9 MBs/sec
+Received 536870912 of 845624132 (63.5%), 102.3 MBs/sec
+Received 692060160 of 845624132 (81.8%), 109.8 MBs/sec
+Received 845624132 of 845624132 (100.0%), 117.9 MBs/sec
+Cache Size: ~806 MB (845624132 B)
+[command]/usr/bin/tar -xf /home/runner/work/_temp/80f7b72b-4471-40f9-ba33-82407422ee52/cache.tzst -P -C /home/runner/work/uv/uv --use-compress-program unzstd
+Cache restored successfully
+Restored from cache key "v0-rust-docs-Linux-x64-4236129c-8ec737f4" full match: true.
+##[group]Run cargo dev generate-options-reference
+cargo dev generate-options-reference
+cargo dev generate-cli-reference
+cargo dev generate-env-vars-reference
+cargo dev generate-preview-features-reference
+shell: /usr/bin/bash -e {0}
+env:
+UV_PYTHON_INSTALL_DIR: /home/runner/work/_temp/uv-python-dir
+UV_CACHE_DIR: /home/runner/work/_temp/setup-uv-cache
+CACHE_ON_FAILURE: false
+CARGO_INCREMENTAL: 0
+##[endgroup]
+Updating crates.io index
+Compiling uv-macros v0.0.68 (/home/runner/work/uv/uv/crates/uv-macros)
+Compiling uv-small-str v0.0.68 (/home/runner/work/uv/uv/crates/uv-small-str)
+Compiling uv-redacted v0.0.68 (/home/runner/work/uv/uv/crates/uv-redacted)
+Compiling uv-keyring v0.0.68 (/home/runner/work/uv/uv/crates/uv-keyring)
+Compiling uv-platform-tags v0.0.68 (/home/runner/work/uv/uv/crates/uv-platform-tags)
+Compiling uv-cache-key v0.0.68 (/home/runner/work/uv/uv/crates/uv-cache-key)
+Compiling uv-pep440 v0.0.68 (/home/runner/work/uv/uv/crates/uv-pep440)
+Compiling uv-static v0.0.68 (/home/runner/work/uv/uv/crates/uv-static)
+Compiling uv-errors v0.0.68 (/home/runner/work/uv/uv/crates/uv-errors)
+Compiling uv-warnings v0.0.68 (/home/runner/work/uv/uv/crates/uv-warnings)
+Compiling uv-fs v0.0.68 (/home/runner/work/uv/uv/crates/uv-fs)
+Compiling uv-normalize v0.0.68 (/home/runner/work/uv/uv/crates/uv-normalize)
+Compiling uv-git-types v0.0.68 (/home/runner/work/uv/uv/crates/uv-git-types)
+Compiling uv-preview v0.0.68 (/home/runner/work/uv/uv/crates/uv-preview)
+Compiling uv-pep508 v0.0.68 (/home/runner/work/uv/uv/crates/uv-pep508)
+Compiling uv-distribution-filename v0.0.68 (/home/runner/work/uv/uv/crates/uv-distribution-filename)
+Compiling uv-dirs v0.0.68 (/home/runner/work/uv/uv/crates/uv-dirs)
+Compiling uv-state v0.0.68 (/home/runner/work/uv/uv/crates/uv-state)
+Compiling uv-once-map v0.0.68 (/home/runner/work/uv/uv/crates/uv-once-map)
+Compiling uv-netrc v0.0.68 (/home/runner/work/uv/uv/crates/uv-netrc)
+Compiling uv-auth v0.0.68 (/home/runner/work/uv/uv/crates/uv-auth)
+Compiling uv-trampoline-builder v0.0.68 (/home/runner/work/uv/uv/crates/uv-trampoline-builder)
+Compiling uv-shell v0.0.68 (/home/runner/work/uv/uv/crates/uv-shell)
+Compiling uv-flags v0.0.68 (/home/runner/work/uv/uv/crates/uv-flags)
+Compiling uv-pypi-types v0.0.68 (/home/runner/work/uv/uv/crates/uv-pypi-types)
+Compiling uv-cache-info v0.0.68 (/home/runner/work/uv/uv/crates/uv-cache-info)
+Compiling uv-version v0.12.1 (/home/runner/work/uv/uv/crates/uv-version)
+Compiling uv-fastid v0.0.68 (/home/runner/work/uv/uv/crates/uv-fastid)
+Compiling uv-platform v0.0.68 (/home/runner/work/uv/uv/crates/uv-platform)
+Compiling uv-git v0.0.68 (/home/runner/work/uv/uv/crates/uv-git)
+Compiling uv-install-wheel v0.0.68 (/home/runner/work/uv/uv/crates/uv-install-wheel)
+Compiling uv-metadata v0.0.68 (/home/runner/work/uv/uv/crates/uv-metadata)
+Compiling uv-python v0.0.68 (/home/runner/work/uv/uv/crates/uv-python)
+Compiling uv-distribution-types v0.0.68 (/home/runner/work/uv/uv/crates/uv-distribution-types)
+Compiling uv-globfilter v0.0.68 (/home/runner/work/uv/uv/crates/uv-globfilter)
+Compiling uv-options-metadata v0.0.68 (/home/runner/work/uv/uv/crates/uv-options-metadata)
+Compiling uv-toml v0.0.68 (/home/runner/work/uv/uv/crates/uv-toml)
+Compiling uv-console v0.0.68 (/home/runner/work/uv/uv/crates/uv-console)
+Compiling uv-build-backend v0.0.68 (/home/runner/work/uv/uv/crates/uv-build-backend)
+Compiling uv-cli v0.0.68 (/home/runner/work/uv/uv/crates/uv-cli)
+Compiling uv-performance-memory-allocator v0.0.68 (/home/runner/work/uv/uv/crates/uv-performance-memory-allocator)
+Compiling uv-cache v0.0.68 (/home/runner/work/uv/uv/crates/uv-cache)
+Compiling uv-torch v0.0.68 (/home/runner/work/uv/uv/crates/uv-torch)
+Compiling uv-configuration v0.0.68 (/home/runner/work/uv/uv/crates/uv-configuration)
+Compiling uv-client v0.0.68 (/home/runner/work/uv/uv/crates/uv-client)
+Compiling uv-extract v0.0.68 (/home/runner/work/uv/uv/crates/uv-extract)
+Compiling uv-workspace v0.0.68 (/home/runner/work/uv/uv/crates/uv-workspace)
+Compiling uv-requirements-txt v0.0.68 (/home/runner/work/uv/uv/crates/uv-requirements-txt)
+Compiling uv-audit v0.0.68 (/home/runner/work/uv/uv/crates/uv-audit)
+Compiling uv-types v0.0.68 (/home/runner/work/uv/uv/crates/uv-types)
+Compiling uv-test v0.0.68 (/home/runner/work/uv/uv/crates/uv-test)
+Compiling uv-distribution v0.0.68 (/home/runner/work/uv/uv/crates/uv-distribution)
+Compiling uv-resolver v0.0.68 (/home/runner/work/uv/uv/crates/uv-resolver)
+Compiling uv-installer v0.0.68 (/home/runner/work/uv/uv/crates/uv-installer)
+Compiling uv-settings v0.0.68 (/home/runner/work/uv/uv/crates/uv-settings)
+Compiling uv-dev v0.0.68 (/home/runner/work/uv/uv/crates/uv-dev)
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 43.71s
+Running `target/debug/uv-dev generate-options-reference`
+Updating: settings.md
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.38s
+Running `target/debug/uv-dev generate-cli-reference`
+Updating: cli.md
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.34s
+Running `target/debug/uv-dev generate-env-vars-reference`
+Updating: environment.md
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.33s
+Running `target/debug/uv-dev generate-preview-features-reference`
+Updating: .preview-features.md
+##[group]Run uv run --only-group docs mkdocs build --strict -f mkdocs.yml
+uv run --only-group docs mkdocs build --strict -f mkdocs.yml
+shell: /usr/bin/bash -e {0}
+env:
+UV_PYTHON_INSTALL_DIR: /home/runner/work/_temp/uv-python-dir
+UV_CACHE_DIR: /home/runner/work/_temp/setup-uv-cache
+CACHE_ON_FAILURE: false
+CARGO_INCREMENTAL: 0
+##[endgroup]
+Downloading cpython-3.14.0-linux-x86_64-gnu (download) (33.7MiB)
+Downloaded cpython-3.14.0-linux-x86_64-gnu (download)
+Using CPython 3.14.0
+Creating virtual environment at: .venv
+Downloading mkdocs (3.7MiB)
+Downloading babel (9.7MiB)
+Downloading pygments (1.2MiB)
+Downloading mkdocs-material (8.9MiB)
+Downloading black (1.8MiB)
+Downloaded black
+Downloaded mkdocs
+Downloaded pygments
+Downloaded babel
+Downloaded mkdocs-material
+Installed 52 packages in 332ms
+│  ⚠  Warning from the Material for MkDocs team
+│
+│  MkDocs 2.0, the underlying framework of Material for MkDocs,
+│  will introduce backward-incompatible changes, including:
+│
+│  × All plugins will stop working – the plugin system has been removed
+│  × All theme overrides will break – the theming system has been rewritten
+│  × No migration path exists – existing projects cannot be upgraded
+│  × Closed contribution model – community members can't report bugs
+│  × Currently unlicensed – unsuitable for production use
+│
+│  Our full analysis:
+│
+│  https://squidfunk.github.io/mkdocs-material/blog/2026/02/18/mkdocs-2.0/
+----------------------------------------------------------------
+WARNING: MkDocs may break support for all existing plugins and themes soon!
+The owner of MkDocs has completely abandoned maintenance of the project, and instead is planning to publish a "version 2" which will not support any existing themes, plugins or even your configuration files. This v2 may eventually replace what you download with `pip install mkdocs`, suddenly breaking the build of your existing site.
+To avoid these risks, switch to ProperDocs, a continuation of MkDocs 1.x and a drop-in replacement that supports your current MkDocs setup.
+Simply install it with `pip install properdocs` and build your site with `properdocs build` instead of the MkDocs equivalents.
+Alternatively, to just skip this warning in the future, you can set the environment variable `DISABLE_MKDOCS_2_WARNING=true`.
+For more info visit https://github.com/ProperDocs/properdocs/discussions/33 and https://properdocs.org/
+(This warning was initiated by one of the plugins that you depend on.)
+----------------------------------------------------------------
+INFO    -  Cleaning site directory
+INFO    -  Building documentation to directory: /home/runner/work/uv/uv/site/uv
+[git-revision-date-localized-plugin] '/home/runner/work/uv/uv/docs/reference/.preview-features.md' has no git logs, using current timestamp
+[git-revision-date-localized-plugin] '/home/runner/work/uv/uv/docs/reference/.preview-features.md' has no git logs, using current timestamp
+INFO    -  Doc file 'guides/integration/fastapi.md' contains a link '../../concepts/projects/init.md#unpackaged-applications', but the doc 'concepts/projects/init.md' does not contain an anchor '#unpackaged-applications'.
+INFO    -  Documentation built in 13.77 seconds
+Post job cleanup.
+(node:3782) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+Post job cleanup.
+Post job cleanup.
+UV_CACHE_DIR is already set to /home/runner/work/_temp/setup-uv-cache
+UV_PYTHON_INSTALL_DIR is already set to /home/runner/work/_temp/uv-python-dir
+Cache hit occurred on key setup-uv-2-x86_64-unknown-linux-gnu-ubuntu-24.04-unknown-060cdd892c753aabacd45b9a36e6e866e44998dada29c78b828152dea2c56c68, not saving cache.
+Post job cleanup.
+[command]/usr/bin/git version
+git version 2.54.0
+Temporarily overriding HOME='/home/runner/work/_temp/3395b723-0a11-4890-b779-794085caccb0' before making global git config changes
+Adding repository directory to the temporary git global config as a safe directory
+[command]/usr/bin/git config --global --add safe.directory /home/runner/work/uv/uv
+Removing SSH command configuration
+[command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Removing HTTP extra header
+[command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Removing includeIf entries pointing to credentials config files
+[command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+[command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+Cleaning up orphan processes

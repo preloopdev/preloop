@@ -1,0 +1,9 @@
+Evaluating phpunit-sqlite.if
+Evaluating: (success() && ((needs.changes.outputs.src != 'false')))
+Expanded: (true && ('true' != 'false'))
+Result: true
+Requested labels: ubuntu-latest
+Job defined at: nextcloud/server/.github/workflows/phpunit-sqlite.yml@refs/pull/62157/merge
+Waiting for a runner to pick up this job...
+All GitHub-hosted runners with label [ubuntu-latest] are busy. For more information, see https://gh.io/job-concurrency-limits
+Job is about to start running on the runner: garm4-24-vhejcpr1mwy7

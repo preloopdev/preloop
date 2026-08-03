@@ -23,6 +23,26 @@ pub struct ActionManifest {
     pub outputs: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
+/// Stringify an action.yml input `default` the way GitHub does.
+///
+/// GitHub treats action.yml scalar defaults as strings: `default: true`
+/// becomes the literal `"true"`, `default: 2` becomes `"2"`. The official
+/// runner tokenizes the raw YAML scalar text, so a leading-zero integer like
+/// `0755` stays `"0755"` — serde_yaml (YAML 1.2 core schema) already leaves
+/// those as strings, so no octal re-encoding is needed here. Dropping
+/// non-string defaults silently changes action behavior — e.g.
+/// `actions/checkout`'s `persist-credentials` (default `true`) falls back to
+/// its internal `'false'`, removes the git credential header after the step,
+/// and breaks later `git fetch` calls from changed-file actions.
+pub fn input_default_string(default: &serde_json::Value) -> Option<String> {
+    match default {
+        serde_json::Value::String(value) => Some(value.clone()),
+        serde_json::Value::Bool(value) => Some(value.to_string()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
 /// Load an action manifest from a directory.
 pub fn load_action_manifest(action_dir: &Path) -> Result<ActionManifest> {
     let yml_path = action_dir.join("action.yml");
@@ -136,6 +156,28 @@ pub fn load_action_manifest(action_dir: &Path) -> Result<ActionManifest> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn input_defaults_stringify_scalars_like_github() {
+        use serde_json::json;
+        assert_eq!(input_default_string(&json!("abc")), Some("abc".to_owned()));
+        assert_eq!(input_default_string(&json!(true)), Some("true".to_owned()));
+        assert_eq!(
+            input_default_string(&json!(false)),
+            Some("false".to_owned())
+        );
+        assert_eq!(input_default_string(&json!(2)), Some("2".to_owned()));
+        assert_eq!(input_default_string(&json!(2.5)), Some("2.5".to_owned()));
+        // YAML 1.2 core schema: leading-zero integers stay strings.
+        assert_eq!(
+            input_default_string(&json!("0755")),
+            Some("0755".to_owned())
+        );
+        // Structured defaults cannot be stringified and are ignored.
+        assert_eq!(input_default_string(&json!(null)), None);
+        assert_eq!(input_default_string(&json!(["a"])), None);
+        assert_eq!(input_default_string(&json!({"a": 1})), None);
+    }
 
     #[test]
     fn load_node_action_manifest() {

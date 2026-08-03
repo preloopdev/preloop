@@ -1,0 +1,192 @@
+﻿2026-08-01T04:01:36.9962991Z Current runner version: '2.336.0'
+##[group]Runner Image Provisioner
+Hosted Compute Agent
+Version: 20260707.563
+Commit: 02667638d2b423fbc733a8e32a88b44996a3ba6e
+Build Date: 2026-07-07T19:33:50Z
+Worker ID: {96e4b00e-5abc-4dc5-aef0-5059b2bb3a41}
+Azure Region: centralus
+##[endgroup]
+##[group]Operating System
+Ubuntu
+24.04.4
+LTS
+##[endgroup]
+##[group]Runner Image
+Image: ubuntu-24.04
+Version: 20260720.247.2
+Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260720.247/images/ubuntu/Ubuntu2404-Readme.md
+Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260720.247
+##[endgroup]
+##[group]GITHUB_TOKEN Permissions
+Actions: write
+ArtifactMetadata: write
+Attestations: write
+Checks: write
+CodeQuality: write
+Contents: write
+CopilotRequests: write
+Deployments: write
+Discussions: write
+Drives: write
+Issues: write
+Metadata: read
+Models: read
+Packages: write
+Pages: write
+PullRequests: write
+RepositoryProjects: write
+SecurityEvents: write
+Statuses: write
+VulnerabilityAlerts: read
+##[endgroup]
+Secret source: Actions
+Prepare workflow directory
+Prepare all required actions
+Getting action download info
+Download action repository 'actions/checkout@v6' (SHA:d23441a48e516b6c34aea4fa41551a30e30af803)
+Complete job name: Extract crate metadata
+##[group]Run actions/checkout@v6
+with:
+repository: sharkdp/bat
+token: ***
+ssh-strict: true
+ssh-user: git
+persist-credentials: true
+clean: true
+sparse-checkout-cone-mode: true
+fetch-depth: 1
+fetch-tags: false
+show-progress: true
+lfs: false
+submodules: false
+set-safe-directory: true
+allow-unsafe-pr-checkout: false
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+##[endgroup]
+Syncing repository: sharkdp/bat
+##[group]Getting Git version info
+Working directory is '/home/runner/work/bat/bat'
+[command]/usr/bin/git version
+git version 2.54.0
+##[endgroup]
+Temporarily overriding HOME='/home/runner/work/_temp/0dc2fdfa-f5b8-49b7-940a-4c95d522e075' before making global git config changes
+Adding repository directory to the temporary git global config as a safe directory
+[command]/usr/bin/git config --global --add safe.directory /home/runner/work/bat/bat
+Deleting the contents of '/home/runner/work/bat/bat'
+##[group]Determining repository object format
+##[endgroup]
+##[group]Initializing the repository
+[command]/usr/bin/git init /home/runner/work/bat/bat
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /home/runner/work/bat/bat/.git/
+[command]/usr/bin/git remote add origin https://github.com/sharkdp/bat
+##[endgroup]
+##[group]Disabling automatic garbage collection
+[command]/usr/bin/git config --local gc.auto 0
+##[endgroup]
+##[group]Setting up auth
+Removing SSH command configuration
+[command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Removing HTTP extra header
+[command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Removing includeIf entries pointing to credentials config files
+[command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+[command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+[command]/usr/bin/git config --file /home/runner/work/_temp/git-credentials-2e9920de-d7a3-46c1-8d86-728e3ce24514.config http.https://github.com/.extraheader AUTHORIZATION: basic ***
+[command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/bat/bat/.git.path /home/runner/work/_temp/git-credentials-2e9920de-d7a3-46c1-8d86-728e3ce24514.config
+[command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/bat/bat/.git/worktrees/*.path /home/runner/work/_temp/git-credentials-2e9920de-d7a3-46c1-8d86-728e3ce24514.config
+[command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-2e9920de-d7a3-46c1-8d86-728e3ce24514.config
+[command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-2e9920de-d7a3-46c1-8d86-728e3ce24514.config
+##[endgroup]
+##[group]Fetching the repository
+[command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +2ba8db9c14e5794572f5ea338c2b90404c9769cb:refs/remotes/origin/master
+From https://github.com/sharkdp/bat
+* [new ref]         2ba8db9c14e5794572f5ea338c2b90404c9769cb -> origin/master
+[command]/usr/bin/git branch --list --remote origin/master
+origin/master
+[command]/usr/bin/git rev-parse refs/remotes/origin/master
+2ba8db9c14e5794572f5ea338c2b90404c9769cb
+##[endgroup]
+##[group]Determining the checkout info
+##[endgroup]
+[command]/usr/bin/git sparse-checkout disable
+[command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+##[group]Checking out the ref
+[command]/usr/bin/git checkout --progress --force -B master refs/remotes/origin/master
+Reset branch 'master'
+branch 'master' set up to track 'origin/master'.
+##[endgroup]
+[command]/usr/bin/git log -1 --format=%H
+2ba8db9c14e5794572f5ea338c2b90404c9769cb
+##[group]Run cargo metadata --no-deps --format-version 1 | jq -r '"name=" + .packages[0].name' | tee -a $GITHUB_OUTPUT
+cargo metadata --no-deps --format-version 1 | jq -r '"name=" + .packages[0].name' | tee -a $GITHUB_OUTPUT
+cargo metadata --no-deps --format-version 1 | jq -r '"version=" + .packages[0].version' | tee -a $GITHUB_OUTPUT
+cargo metadata --no-deps --format-version 1 | jq -r '"maintainer=" + .packages[0].authors[0]' | tee -a $GITHUB_OUTPUT
+cargo metadata --no-deps --format-version 1 | jq -r '"homepage=" + .packages[0].homepage' | tee -a $GITHUB_OUTPUT
+cargo metadata --no-deps --format-version 1 | jq -r '"msrv=" + .packages[0].rust_version' | tee -a $GITHUB_OUTPUT
+shell: /usr/bin/bash -e {0}
+env:
+CICD_INTERMEDIATES_DIR: _cicd-intermediates
+MSRV_FEATURES: --no-default-features --features minimal-application,bugreport,build-assets
+##[endgroup]
+name=bat
+version=0.26.1
+maintainer=David Peter <mail@david-peter.de>
+homepage=https://github.com/sharkdp/bat
+msrv=1.88
+Post job cleanup.
+[command]/usr/bin/git version
+git version 2.54.0
+Temporarily overriding HOME='/home/runner/work/_temp/841ed85f-9104-4ae5-bfd0-3cdd146ed167' before making global git config changes
+Adding repository directory to the temporary git global config as a safe directory
+[command]/usr/bin/git config --global --add safe.directory /home/runner/work/bat/bat
+Removing SSH command configuration
+[command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Removing HTTP extra header
+[command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Removing includeIf entries pointing to credentials config files
+[command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+includeif.gitdir:/home/runner/work/bat/bat/.git.path
+includeif.gitdir:/home/runner/work/bat/bat/.git/worktrees/*.path
+includeif.gitdir:/github/workspace/.git.path
+includeif.gitdir:/github/workspace/.git/worktrees/*.path
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/bat/bat/.git.path
+/home/runner/work/_temp/git-credentials-2e9920de-d7a3-46c1-8d86-728e3ce24514.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/bat/bat/.git.path /home/runner/work/_temp/git-credentials-2e9920de-d7a3-46c1-8d86-728e3ce24514.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/bat/bat/.git/worktrees/*.path
+/home/runner/work/_temp/git-credentials-2e9920de-d7a3-46c1-8d86-728e3ce24514.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/bat/bat/.git/worktrees/*.path /home/runner/work/_temp/git-credentials-2e9920de-d7a3-46c1-8d86-728e3ce24514.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git.path
+/github/runner_temp/git-credentials-2e9920de-d7a3-46c1-8d86-728e3ce24514.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-2e9920de-d7a3-46c1-8d86-728e3ce24514.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git/worktrees/*.path
+/github/runner_temp/git-credentials-2e9920de-d7a3-46c1-8d86-728e3ce24514.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-2e9920de-d7a3-46c1-8d86-728e3ce24514.config
+[command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+Removing credentials config '/home/runner/work/_temp/git-credentials-2e9920de-d7a3-46c1-8d86-728e3ce24514.config'
+Evaluate and set job outputs
+Set output 'name'
+Set output 'version'
+Set output 'maintainer'
+Set output 'homepage'
+Set output 'msrv'
+Cleaning up orphan processes

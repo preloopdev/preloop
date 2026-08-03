@@ -220,10 +220,7 @@ pub(crate) fn build_app(
         .route("/healthz", get(healthz))
         .route(
             "/runs/:run_id",
-            get(get_public_run).route_layer(middleware::from_fn_with_state(
-                shared.clone(),
-                require_native_bearer,
-            )),
+            get(get_public_run),
         )
         .route(
             "/openapi.json",
