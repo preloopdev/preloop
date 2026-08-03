@@ -147,7 +147,7 @@ async fn run_apis_never_return_submitted_secret_values() {
 }
 
 #[tokio::test]
-async fn public_run_page_needs_no_token_and_exposes_no_submission_secrets() {
+async fn run_page_requires_native_token_and_exposes_no_submission_secrets() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state, CancellationToken::new());
@@ -167,10 +167,25 @@ async fn public_run_page_needs_no_token_and_exposes_no_submission_secrets() {
     .await;
     let run_id = accepted["run_id"].as_str().unwrap();
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method(Method::GET)
                 .uri(format!("/runs/{run_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/runs/{run_id}"))
+                .header(header::AUTHORIZATION, "Bearer aksh-system-token")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -189,6 +204,36 @@ async fn public_run_page_needs_no_token_and_exposes_no_submission_secrets() {
     assert!(body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
     assert!(!body.contains("npm_LIVE_CREDENTIAL"));
     assert!(!body.contains("NPM_TOKEN"));
+}
+
+#[tokio::test]
+async fn openapi_document_lists_native_surface_and_excludes_runner_protocol() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = app(
+        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        CancellationToken::new(),
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/openapi.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let document: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let paths = document["paths"].as_object().unwrap();
+    assert!(paths.contains_key("/api/v1/runs"));
+    assert!(paths.contains_key("/api/v1/debug/sessions"));
+    assert!(!paths.keys().any(|path| path.starts_with("/_apis/")));
+    assert!(!paths.keys().any(|path| path.starts_with("/broker/")));
+    assert!(!paths.contains_key("/api/v1/scheduler/history"));
+    assert!(!paths.contains_key("/api/v1/runners"));
 }
 
 #[tokio::test]
