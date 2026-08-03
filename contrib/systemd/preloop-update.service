@@ -1,0 +1,14 @@
+[Unit]
+Description=Update the Preloop binary from GitHub Releases
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/preloop update
+Environment=PRELOOP_HOME=/var/lib/preloop
+StateDirectory=preloop
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/usr/local/bin

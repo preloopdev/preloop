@@ -1,0 +1,8 @@
+Evaluating build.if
+Evaluating: success()
+Result: true
+Requested labels: ubuntu-latest
+Job defined at: sharkdp/bat/.github/workflows/CICD.yml@refs/heads/master
+Waiting for a runner to pick up this job...
+Job is about to start running on the hosted runner: GitHub Actions 1000134050
+Job is waiting for a hosted runner to come online.

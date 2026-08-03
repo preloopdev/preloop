@@ -1,0 +1,8 @@
+Requested labels: windows-2025
+Job defined at: sharkdp/bat/.github/workflows/CICD.yml@refs/heads/master
+Waiting for a runner to pick up this job...
+Evaluating build.if
+Evaluating: success()
+Result: true
+Job is waiting for a hosted runner to come online.
+Job is about to start running on the hosted runner: GitHub Actions 1000134040

@@ -1,0 +1,32 @@
+﻿2026-07-31T11:12:40.6009735Z Current runner version: '2.336.0'
+##[group]Runner Image Provisioner
+Hosted Compute Agent
+Version: 20260624.560
+Commit: 925d229a51159bc391ae97e54a2dd1fe20af789d
+Build Date: 2026-06-24T18:26:47Z
+Worker ID: {45985346-c767-4f31-b8b1-3e10116f8a68}
+Azure Region: northcentralus
+##[endgroup]
+##[group]VM Image
+- OS: Linux (x64)
+- Source: Docker
+- Name: ubuntu:24.04
+- Version: 20260629.59.1
+##[endgroup]
+##[group]GITHUB_TOKEN Permissions
+Metadata: read
+##[endgroup]
+Secret source: None
+Prepare workflow directory
+Prepare all required actions
+Complete job name: Build & Test Passed or Skipped
+##[group]Run echo "Build & Test Passed or Skipped"
+echo "Build & Test Passed or Skipped"
+shell: /usr/bin/bash -e {0}
+env:
+NODE_OPTIONS: --max-old-space-size=6144
+PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+VITEST_SEGFAULT_RETRY: 3
+##[endgroup]
+Build & Test Passed or Skipped
+Cleaning up orphan processes
