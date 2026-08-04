@@ -94,7 +94,18 @@ pub(crate) async fn download_action_tarball(
         .build()
         .map_err(|e| ApiError::internal(format!("failed to build reqwest client: {e}")))?;
 
-    let response = client.get(&github_url).send().await.map_err(|e| {
+    // Authenticated where possible: the anonymous GitHub API is capped at 60
+    // requests/hour per IP, and a campaign or busy engine burns that in
+    // minutes of action downloads — after which every uncached tarball fetch
+    // comes back rate-limited and every job fails at "Set up job". The
+    // engine's static PAT (env or config) raises the budget to 5000/hour and
+    // is the only credential that works for arbitrary third-party action
+    // repos (a GitHub App installation token is scoped to the App's repos).
+    let mut request = client.get(&github_url);
+    if let Some(pat) = shared.state.static_github_pat() {
+        request = request.bearer_auth(pat);
+    }
+    let response = request.send().await.map_err(|e| {
         ApiError::internal(format!("failed to send download request to GitHub: {e}"))
     })?;
 
