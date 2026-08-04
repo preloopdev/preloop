@@ -310,6 +310,20 @@ pub(crate) async fn submit_run_inner(
                 .and_then(|value| value.as_str())
                 .map(str::to_owned)
         })
+        .or_else(|| {
+            // `pull_request` payloads carry no `after`; without consulting the
+            // head sha the chain falls through to all-zeros and every checkout
+            // asks the server for `0000…`, which fails as "not our ref" with
+            // nothing pointing at the real cause.
+            submission
+                .payload
+                .get("pull_request")
+                .and_then(|pull_request| pull_request.get("head"))
+                .and_then(|head| head.get("sha"))
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        })
         .unwrap_or_else(|| {
             if submission.git_ref.len() == 40
                 && submission
