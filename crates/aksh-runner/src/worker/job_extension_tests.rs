@@ -2,6 +2,63 @@ use super::*;
 use proptest::prelude::*;
 
 #[test]
+fn snapshot_origin_rewrite_routes_hardcoded_forge_urls_to_the_snapshot() {
+    // Redirecting `actions/checkout` misses any step that wires its own
+    // remote (`git remote add origin https://github.com/owner/repo`). Those
+    // reach the real forge and fail on commits that exist only in the local
+    // workspace, so git config has to redirect them job-wide.
+    let mut job = JobContext::new(
+        "j1".into(),
+        "Test".into(),
+        serde_json::json!({}),
+        serde_json::json!({ "github": { "repository": "openclaw/openclaw" } }),
+    );
+    let msg = serde_json::json!({
+        "contextData": { "github": { "repository": "openclaw/openclaw" } },
+        "akshSnapshotOriginRewrite": {
+            "snapshotUrl": "http://127.0.0.1:9091/snapshots/run-1",
+            "forgeUrl": "https://github.com/openclaw/openclaw",
+            "authHeader": "AUTHORIZATION: basic dG9rZW4="
+        }
+    });
+
+    inject_github_env(&mut job, &msg);
+
+    assert_eq!(
+        job.env.get("GIT_CONFIG_COUNT").map(String::as_str),
+        Some("3")
+    );
+    let key = "url.http://127.0.0.1:9091/snapshots/run-1.insteadOf";
+    assert_eq!(
+        job.env.get("GIT_CONFIG_KEY_0").map(String::as_str),
+        Some(key)
+    );
+    assert_eq!(
+        job.env.get("GIT_CONFIG_VALUE_0").map(String::as_str),
+        Some("https://github.com/openclaw/openclaw.git"),
+        "the .git form must be registered too — insteadOf matches on prefix"
+    );
+    assert_eq!(
+        job.env.get("GIT_CONFIG_KEY_1").map(String::as_str),
+        Some(key)
+    );
+    assert_eq!(
+        job.env.get("GIT_CONFIG_VALUE_1").map(String::as_str),
+        Some("https://github.com/openclaw/openclaw")
+    );
+    // The snapshot demands a token even for reads; without credentials a
+    // redirected fetch prompts for a username and fails.
+    assert_eq!(
+        job.env.get("GIT_CONFIG_KEY_2").map(String::as_str),
+        Some("http.http://127.0.0.1:9091/snapshots/run-1.extraheader")
+    );
+    assert_eq!(
+        job.env.get("GIT_CONFIG_VALUE_2").map(String::as_str),
+        Some("AUTHORIZATION: basic dG9rZW4=")
+    );
+}
+
+#[test]
 fn setup_workspace_clears_stale_repository() {
     // A previous job left a checked-out repo in the workspace (the failure
     // mode behind "remote origin already exists" on long-lived runners).

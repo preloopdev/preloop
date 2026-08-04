@@ -347,6 +347,46 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
             }
         }
     }
+
+    // Route git at the run's snapshot even when a workflow hardcodes the forge
+    // URL. `actions/checkout` is redirected server-side, but a step doing its
+    // own `git remote add origin https://github.com/owner/repo` would reach
+    // the real forge and fail on any commit that exists only in the local
+    // workspace.
+    //
+    // `GIT_CONFIG_COUNT` applies config to every git invocation in the job
+    // without writing a config file. Both the bare and `.git` forms are
+    // registered because `insteadOf` matches on prefix and git prefers the
+    // longest match.
+    if let Some(rewrite) = msg.get("akshSnapshotOriginRewrite") {
+        let snapshot_url = rewrite.get("snapshotUrl").and_then(|value| value.as_str());
+        let forge_url = rewrite.get("forgeUrl").and_then(|value| value.as_str());
+        let auth_header = rewrite.get("authHeader").and_then(|value| value.as_str());
+        if let (Some(snapshot_url), Some(forge_url), Some(auth_header)) =
+            (snapshot_url, forge_url, auth_header)
+        {
+            if !job.env.contains_key("GIT_CONFIG_COUNT") {
+                let key = format!("url.{snapshot_url}.insteadOf");
+                job.env
+                    .insert("GIT_CONFIG_COUNT".to_owned(), "3".to_owned());
+                job.env.insert("GIT_CONFIG_KEY_0".to_owned(), key.clone());
+                job.env
+                    .insert("GIT_CONFIG_VALUE_0".to_owned(), format!("{forge_url}.git"));
+                job.env.insert("GIT_CONFIG_KEY_1".to_owned(), key);
+                job.env
+                    .insert("GIT_CONFIG_VALUE_1".to_owned(), forge_url.to_owned());
+                // The snapshot authenticates every read; the forge does not
+                // for public repos. A redirected fetch with no credentials
+                // prompts for a username and dies with prompts disabled.
+                job.env.insert(
+                    "GIT_CONFIG_KEY_2".to_owned(),
+                    format!("http.{snapshot_url}.extraheader"),
+                );
+                job.env
+                    .insert("GIT_CONFIG_VALUE_2".to_owned(), auth_header.to_owned());
+            }
+        }
+    }
 }
 
 /// Decode an Azure DevOps typed-dictionary value.
