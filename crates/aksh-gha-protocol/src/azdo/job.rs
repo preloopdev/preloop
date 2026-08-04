@@ -181,6 +181,39 @@ pub struct AgentJobRequestMessage {
         skip_serializing_if = "Option::is_none"
     )]
     pub aksh_snapshot_commit: Option<String>,
+
+    /// aksh extension: rewrite `<forge url>` to the run's snapshot for every
+    /// git invocation in the job.
+    ///
+    /// Redirecting `actions/checkout` covers the common case, but a workflow
+    /// that wires its own remote (`git remote add origin https://github.com/…`)
+    /// bypasses it and talks to the real forge — where a commit that exists
+    /// only in the local workspace is answered with "not our ref". The runner
+    /// turns this into git's `url.<snapshot>.insteadOf`, so unpushed work
+    /// resolves without the workflow being modified.
+    ///
+    #[serde(
+        rename = "akshSnapshotOriginRewrite",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub aksh_snapshot_origin_rewrite: Option<SnapshotOriginRewrite>,
+}
+
+/// Where to send git traffic a workflow aimed at the forge, and how to
+/// authenticate to it.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotOriginRewrite {
+    /// The run's snapshot, e.g. `http://host/snapshots/<run>`.
+    pub snapshot_url: String,
+    /// The forge URL to redirect, e.g. `https://github.com/owner/repo`.
+    pub forge_url: String,
+    /// Value for `http.<snapshot>.extraheader`. The snapshot requires a token
+    /// even for reads, while the forge serves public repos anonymously — so a
+    /// redirected fetch that carried no credentials would prompt for a
+    /// username and fail with terminal prompts disabled.
+    pub auth_header: String,
 }
 
 fn is_false(b: &bool) -> bool {

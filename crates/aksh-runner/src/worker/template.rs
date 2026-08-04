@@ -123,7 +123,24 @@ fn value_to_string(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::Null => String::new(),
         serde_json::Value::Bool(b) => b.to_string(),
-        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Number(n) => {
+            // GitHub renders whole numbers as integers. Event payloads reach
+            // us through parsers that may hand back `f64(2.0)` for a JSON `2`,
+            // and `to_string` would print "2.0" — enough to fail a workflow
+            // that validates a count or an id against `^[0-9]+$`.
+            if let Some(value) = n.as_i64() {
+                return value.to_string();
+            }
+            if let Some(value) = n.as_u64() {
+                return value.to_string();
+            }
+            match n.as_f64() {
+                Some(value) if value.fract() == 0.0 && value.abs() < 1e15 => {
+                    (value as i64).to_string()
+                }
+                _ => n.to_string(),
+            }
+        }
         serde_json::Value::String(s) => s.clone(),
         other => serde_json::to_string(other).unwrap_or_default(),
     }
@@ -132,6 +149,31 @@ fn value_to_string(value: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn whole_numbers_render_without_a_decimal_point() {
+        // A workflow validating `${{ github.event.pull_request.commits }}`
+        // against `^[0-9]+$` fails on "2.0". GitHub renders whole numbers as
+        // integers, and event payloads can reach us as f64.
+        let mut ctx = aksh_gha_expressions::Context::new();
+        ctx.insert(
+            "github",
+            serde_json::json!({
+                "event": {
+                    "pull_request": { "commits": 2.0, "number": 7 }
+                }
+            }),
+        );
+
+        assert_eq!(
+            evaluate_template("${{ github.event.pull_request.commits }}", &ctx).unwrap(),
+            "2"
+        );
+        assert_eq!(
+            evaluate_template("${{ github.event.pull_request.number }}", &ctx).unwrap(),
+            "7"
+        );
+    }
 
     fn make_ctx() -> aksh_gha_expressions::Context {
         let mut ctx = aksh_gha_expressions::Context::new();
