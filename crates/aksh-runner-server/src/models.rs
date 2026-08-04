@@ -17,6 +17,10 @@ pub(crate) struct JobDetail {
     pub(crate) name: String,
     pub(crate) conclusion: String,
     pub(crate) steps: Vec<StepRecord>,
+    /// Job-level annotations reported by the runner (worker-crash detail,
+    /// infrastructure failures). Kept as raw wire values.
+    #[serde(default)]
+    pub(crate) annotations: Vec<serde_json::Value>,
 }
 
 /// Metadata tracked per log file for results-service Twirp retrieval.
@@ -39,6 +43,31 @@ pub(crate) struct RunRecord {
     pub(crate) job_base_ids: BTreeMap<JobId, String>,
     #[serde(skip)]
     pub(crate) job_needs: BTreeMap<JobId, Vec<JobId>>,
+    /// Expanded plans for deferred reusable-caller nodes, consumed by the
+    /// scheduler when a caller's `if:` gate passes and its callee subtree is
+    /// materialized.
+    #[serde(skip)]
+    pub(crate) caller_plans: BTreeMap<JobId, aksh_gha_protocol::JobPlan>,
+    /// GitHub display name per job (evaluated `name:`, ` / ` caller/callee
+    /// separator). The run record keys everything by job id; this maps ids to
+    /// what GitHub's jobs API would show.
+    #[serde(default)]
+    pub(crate) job_names: BTreeMap<JobId, String>,
+    /// GitHub context JSON captured at submission, reused when runtime
+    /// expansion builds runner messages for a callee subtree.
+    #[serde(skip)]
+    pub(crate) github: serde_json::Value,
+    /// Resolved head SHA / workflow ref captured at submission for runtime
+    /// expansion (message context data).
+    #[serde(skip)]
+    pub(crate) head_sha: String,
+    #[serde(skip)]
+    pub(crate) workflow_ref: String,
+    /// Immutable workspace snapshot created at submission, when local
+    /// checkout redirection is active; runtime-expanded jobs check out the
+    /// same tree.
+    #[serde(skip)]
+    pub(crate) workspace_snapshot: Option<crate::snapshots::WorkspaceSnapshot>,
     pub(crate) job_fail_fast: BTreeMap<String, bool>,
     #[serde(default)]
     pub(crate) job_continue_on_error: BTreeMap<String, bool>,
@@ -83,6 +112,19 @@ pub(crate) struct TaskAgentJobRequestRecord {
     pub(crate) debug_token_issued: bool,
 }
 
+/// A job → runner pairing recorded when the pool provisions a machine for a
+/// job, or when a queued job is bound to an idle registered runner.
+///
+/// While an assignment is fresh, only sessions bearing a verified identity of
+/// `runner_id` may claim the job — this is what keeps a compromised runner
+/// (or any other code running inside a pool machine) from pulling a job that
+/// belongs to a different machine or tenant.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AssignmentRecord {
+    pub(crate) runner_id: i64,
+    pub(crate) at: std::time::SystemTime,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct QueuedJob {
     pub(crate) run_id: RunId,
@@ -101,6 +143,11 @@ pub(crate) struct QueuedJob {
     pub(crate) concurrency: Option<aksh_gha_parser::Concurrency>,
     /// Matrix values for this expansion (for concurrency expression eval).
     pub(crate) matrix: BTreeMap<String, serde_json::Value>,
+    /// Deferred expression for runtime dynamic matrix expansion, if any.
+    pub(crate) deferred_matrix: Option<String>,
+    /// Deferred reusable-workflow invocation, expanded on gate pass. This
+    /// node is scheduling-only: it never reaches `inner.queue`.
+    pub(crate) reusable_call: Option<aksh_gha_protocol::ReusableCallPlan>,
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +176,18 @@ pub(crate) struct QueuedCancellation {
     pub(crate) job_id: JobId,
     /// Agent job GUID from the job message (`jobId`), required for official JobCancelMessage.
     pub(crate) agent_job_id: uuid::Uuid,
+}
+
+/// Lifecycle of a GitHub webhook delivery ID used for dedup.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum WebhookDeliveryState {
+    /// The handler is still processing this delivery; a concurrent copy of the
+    /// same delivery must be skipped so one delivery yields one run.
+    InFlight,
+    /// Processing finished successfully at this instant; redeliveries inside
+    /// the dedup window are skipped. Failed deliveries are not recorded at all
+    /// so GitHub's retry is accepted.
+    Completed(std::time::Instant),
 }
 
 #[derive(Debug, Clone)]
