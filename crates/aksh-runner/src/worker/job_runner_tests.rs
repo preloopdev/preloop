@@ -53,7 +53,13 @@ async fn test_run_job_executes_successfully() {
     });
 
     let (_tx, cancel_rx) = watch::channel(false);
-    let res = run_job(payload, ProtocolPath::Broker, cancel_rx).await;
+    let res = run_job(
+        payload,
+        ProtocolPath::Broker,
+        cancel_rx,
+        LeaseTiming::default(),
+    )
+    .await;
     assert!(res.is_ok(), "Expected run_job to succeed, got: {:?}", res);
 }
 
@@ -180,7 +186,13 @@ async fn test_run_job_propagates_step_failure() {
     });
 
     let (_tx, cancel_rx) = watch::channel(false);
-    let res = run_job(payload, ProtocolPath::Broker, cancel_rx).await;
+    let res = run_job(
+        payload,
+        ProtocolPath::Broker,
+        cancel_rx,
+        LeaseTiming::default(),
+    )
+    .await;
     // run_job returns Ok even when steps fail — the failure result is
     // reported to the server via report_completion, not the return value.
     assert!(
@@ -219,9 +231,15 @@ async fn test_run_job_handles_cancelled() {
         let _ = cancel_tx.send(true);
     });
 
-    let res = run_job(payload, ProtocolPath::Broker, cancel_rx).await;
     // run_job returns Ok — cancellation is reported via completion, not
     // the function return value.
+    let res = run_job(
+        payload,
+        ProtocolPath::Broker,
+        cancel_rx,
+        LeaseTiming::default(),
+    )
+    .await;
     assert!(
         res.is_ok(),
         "Expected run_job to handle cancel gracefully, got: {:?}",
@@ -254,7 +272,13 @@ async fn test_run_job_with_timeout() {
     });
 
     let (_tx, cancel_rx) = watch::channel(false);
-    let res = run_job(payload, ProtocolPath::Broker, cancel_rx).await;
+    let res = run_job(
+        payload,
+        ProtocolPath::Broker,
+        cancel_rx,
+        LeaseTiming::default(),
+    )
+    .await;
     assert!(
         res.is_ok(),
         "Expected run_job to handle timeout gracefully, got: {:?}",
@@ -270,15 +294,26 @@ fn action_resolution_key_excludes_subpath() {
 }
 
 #[test]
-fn renew_backoff_caps_at_thirty_seconds() {
-    let expected = [5, 10, 20, 30, 30];
-    for (attempt, expected_seconds) in expected.into_iter().enumerate() {
-        let attempt = attempt as u32 + 1;
-        assert_eq!(
-            renew_backoff(attempt),
-            std::time::Duration::from_secs(expected_seconds),
-            "unexpected retry delay for attempt {attempt}"
-        );
+fn renew_backoff_stays_within_official_bands() {
+    // Official JobDispatcher.RenewJobRequestAsync: random 5–15 s for the
+    // first five consecutive errors, random 15–30 s afterwards.
+    for error in 1..=5_u32 {
+        for _ in 0..50 {
+            let delay = renew_backoff(error).as_secs();
+            assert!(
+                (5..=15).contains(&delay),
+                "error {error}: delay {delay}s outside 5–15s band"
+            );
+        }
+    }
+    for error in 6..=10_u32 {
+        for _ in 0..50 {
+            let delay = renew_backoff(error).as_secs();
+            assert!(
+                (15..=30).contains(&delay),
+                "error {error}: delay {delay}s outside 15–30s band"
+            );
+        }
     }
 }
 
@@ -385,4 +420,278 @@ async fn diagnostic_signed_url_uses_official_receiver_endpoint() {
     assert!(request.starts_with(
         "POST /twirp/results.services.receiver.Receiver/GetJobDiagLogsSignedBlobURL HTTP/1.1"
     ));
+}
+
+// --- Lease parity: first-renew gate + TaskResult.Abandoned (JobDispatcher) ---
+
+/// Scriptable mock control server.
+///
+/// POST `/renewjob` responds with `renew_statuses` in order (the last entry
+/// repeats); every other request gets 200/204 with `{}`. Records
+/// `(request-line, path, body)` for every request so tests can assert on the
+/// completejob wire body and on which requests ever happened.
+async fn serve_scripted_control(
+    renew_statuses: Vec<u16>,
+) -> (String, Arc<Mutex<Vec<(String, String, String)>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let renew_statuses = Arc::new(Mutex::new(renew_statuses));
+    let requests: Arc<Mutex<Vec<(String, String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let requests_w = requests.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let renew_statuses = renew_statuses.clone();
+            let requests = requests_w.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0_u8; 16384];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let raw = String::from_utf8_lossy(&buf[..n]).to_string();
+                let request_line = raw.lines().next().unwrap_or("").to_string();
+                let path = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("")
+                    .to_string();
+                let body = raw.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+                requests
+                    .lock()
+                    .await
+                    .push((request_line, path.clone(), body));
+                let status: u16 = if path == "/renewjob" {
+                    let mut statuses = renew_statuses.lock().await;
+                    if statuses.is_empty() {
+                        200
+                    } else if statuses.len() == 1 {
+                        statuses[0]
+                    } else {
+                        statuses.remove(0)
+                    }
+                } else {
+                    200
+                };
+                let reason = if status == 204 { "No Content" } else { "OK" };
+                let body = if status == 204 { "" } else { "{}" };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    (format!("http://{addr}"), requests)
+}
+
+fn control_payload(
+    addr: &str,
+    dir: &tempfile::TempDir,
+    steps: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "jobId": "job-lease-1",
+        "jobDisplayName": "Lease Job",
+        "plan": {"planId": "plan-lease-1"},
+        "resources": {
+            "endpoints": [{
+                "name": "SystemVssConnection",
+                "url": addr,
+                "authorization": {"parameters": {"AccessToken": "test-token"}}
+            }]
+        },
+        "steps": steps,
+        "fileTable": {
+            "workDirectory": dir.path().join("work").to_str().unwrap()
+        }
+    })
+}
+
+fn fast_timing() -> LeaseTiming {
+    LeaseTiming {
+        first_renew_backoff: RenewBackoff::Fixed(Duration::from_millis(1)),
+        renew_interval: Duration::from_millis(10),
+    }
+}
+
+fn recorded_completion(requests: &[(String, String, String)]) -> Option<&(String, String, String)> {
+    requests
+        .iter()
+        .find(|(_, path, _)| path.ends_with("/completejob"))
+}
+
+#[tokio::test]
+async fn first_renew_gate_404_abandons_without_running_steps() {
+    let dir = TempDir::new().unwrap();
+    let (addr, requests) = serve_scripted_control(vec![404]).await;
+    let payload = control_payload(
+        &addr,
+        &dir,
+        serde_json::json!([{
+            "id": "step-1",
+            "contextName": "step1",
+            "displayName": "Step One",
+            "run": "echo step-one-executed",
+            "shell": "bash"
+        }]),
+    );
+    let (_tx, cancel_rx) = watch::channel(false);
+    let res = run_job(
+        payload,
+        ProtocolPath::Broker,
+        cancel_rx,
+        LeaseTiming::default(),
+    )
+    .await;
+    assert!(res.is_ok(), "run_job failed: {res:?}");
+
+    let reqs = requests.lock().await.clone();
+    // One renew attempt (404 is terminal — no retries), then the job is
+    // completed as Abandoned with zero steps executed.
+    let renews = reqs
+        .iter()
+        .filter(|(_, path, _)| path.ends_with("/renewjob"))
+        .count();
+    assert_eq!(renews, 1, "404 must not be retried");
+    let complete = recorded_completion(&reqs).expect("completejob was reported");
+    assert!(
+        complete.2.contains("\"conclusion\":\"abandoned\""),
+        "completejob body: {}",
+        complete.2
+    );
+    assert!(
+        !complete.2.contains("step-1"),
+        "no user step may run before the first renewal: {}",
+        complete.2
+    );
+}
+
+#[tokio::test]
+async fn first_renew_gate_abandons_after_retry_budget() {
+    let dir = TempDir::new().unwrap();
+    // Six failures = initial attempt + official `firstRenewRetryLimit` (5)
+    // retries of ~10 s each; the sixth exhausts the budget.
+    let (addr, requests) = serve_scripted_control(vec![500; 6]).await;
+    let payload = control_payload(
+        &addr,
+        &dir,
+        serde_json::json!([{
+            "id": "step-1",
+            "contextName": "step1",
+            "displayName": "Step One",
+            "run": "echo step-one-executed",
+            "shell": "bash"
+        }]),
+    );
+    let (_tx, cancel_rx) = watch::channel(false);
+    let res = run_job(payload, ProtocolPath::Broker, cancel_rx, fast_timing()).await;
+    assert!(res.is_ok(), "run_job failed: {res:?}");
+
+    let reqs = requests.lock().await.clone();
+    let renews = reqs
+        .iter()
+        .filter(|(_, path, _)| path.ends_with("/renewjob"))
+        .count();
+    // Six logical gate failures (initial attempt + the official
+    // firstRenewRetryLimit of 5); each 500 is retried 3× on the wire by the
+    // P1.7 client policy (2 s + 4 s backoff), so 6 × 3 = 18 POSTs.
+    assert_eq!(
+        renews, 18,
+        "retry budget is 5 retries after the first attempt"
+    );
+    let complete = recorded_completion(&reqs).expect("completejob was reported");
+    assert!(
+        complete.2.contains("\"conclusion\":\"abandoned\""),
+        "completejob body: {}",
+        complete.2
+    );
+    assert!(
+        !complete.2.contains("step-1"),
+        "no user step may run before the first renewal: {}",
+        complete.2
+    );
+}
+
+#[tokio::test]
+async fn first_renew_gate_cancellation_completes_canceled() {
+    let dir = TempDir::new().unwrap();
+    let (addr, requests) = serve_scripted_control(vec![500]).await;
+    let payload = control_payload(
+        &addr,
+        &dir,
+        serde_json::json!([{
+            "id": "step-1",
+            "contextName": "step1",
+            "displayName": "Step One",
+            "run": "echo step-one-executed",
+            "shell": "bash"
+        }]),
+    );
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    let handle = tokio::spawn(run_job(
+        payload,
+        ProtocolPath::Broker,
+        cancel_rx,
+        fast_timing(),
+    ));
+    // Let the gate start failing, then cancel — the official completes a job
+    // cancelled before the first renewal as Canceled, steps never run.
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let _ = cancel_tx.send(true);
+    handle.await.unwrap().unwrap();
+
+    let reqs = requests.lock().await.clone();
+    let complete = recorded_completion(&reqs).expect("completejob was reported");
+    assert!(
+        complete.2.contains("\"conclusion\":\"canceled\""),
+        "completejob body: {}",
+        complete.2
+    );
+    assert!(
+        !complete.2.contains("step-1"),
+        "no user step may run before the first renewal: {}",
+        complete.2
+    );
+}
+
+#[tokio::test]
+async fn mid_job_lease_loss_reports_abandoned() {
+    let dir = TempDir::new().unwrap();
+    // Gate renew succeeds (200), the loop's first renew succeeds (200), then
+    // the server forgets the job (404) mid-step → the worker must cancel the
+    // steps and complete as Abandoned, not Failed.
+    let (addr, requests) = serve_scripted_control(vec![200, 200, 404]).await;
+    let payload = control_payload(
+        &addr,
+        &dir,
+        serde_json::json!([{
+            "id": "step-1",
+            "contextName": "step1",
+            "displayName": "Long Step",
+            "run": "sleep 30",
+            "shell": "bash"
+        }]),
+    );
+    let (_tx, cancel_rx) = watch::channel(false);
+    let res = run_job(payload, ProtocolPath::Broker, cancel_rx, fast_timing()).await;
+    assert!(res.is_ok(), "run_job failed: {res:?}");
+
+    let reqs = requests.lock().await.clone();
+    let complete = recorded_completion(&reqs).expect("completejob was reported");
+    assert!(
+        complete.2.contains("\"conclusion\":\"abandoned\""),
+        "mid-job lease loss must complete as abandoned: {}",
+        complete.2
+    );
+    // Unlike the gate path, the job had started — the abandoned completion
+    // carries the step's (cancelled) record.
+    assert!(
+        complete.2.contains("step-1"),
+        "started steps are still recorded: {}",
+        complete.2
+    );
 }
