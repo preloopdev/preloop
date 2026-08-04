@@ -10594,7 +10594,7 @@ async fn shallow_workspace_snapshot_preserves_upstream_shas() {
     let state_dir = temp.path().join("state");
     fs::create_dir_all(&state_dir).unwrap();
     let run_id: RunId = "22222222-2222-4222-8222-222222222222".parse().unwrap();
-    let snapshot = create_workspace_snapshot(&state_dir, &workspace, run_id)
+    let snapshot = create_workspace_snapshot(&state_dir, &workspace, run_id, None)
         .await
         .expect("snapshot creation should succeed");
 
@@ -10630,7 +10630,7 @@ async fn workspace_snapshot_survives_refs_with_missing_objects() {
     .unwrap();
 
     let run_id: RunId = "33333333-3333-4333-8333-333333333333".parse().unwrap();
-    let snapshot = create_workspace_snapshot(&state_dir, &workspace, run_id)
+    let snapshot = create_workspace_snapshot(&state_dir, &workspace, run_id, None)
         .await
         .expect("a dangling ref must not fail snapshot creation");
     assert_eq!(snapshot.commit_sha.len(), 40);
@@ -10660,7 +10660,7 @@ async fn workspace_snapshot_captures_git_state_without_mutating_source() {
     };
     let index_before = fs::read(&index_path).unwrap();
 
-    let snapshot = create_workspace_snapshot(&state_dir, &workspace, run_id)
+    let snapshot = create_workspace_snapshot(&state_dir, &workspace, run_id, None)
         .await
         .expect("snapshot creation should succeed");
 
@@ -10783,7 +10783,7 @@ async fn snapshot_before_sha_tracks_working_tree_state() {
     // Clean tree: the change under test is the last commit, so the diff base
     // is HEAD^ (an equal-tree HEAD..S would be empty).
     let clean_run: RunId = "66666666-6666-4666-8666-666666666666".parse().unwrap();
-    let clean = create_workspace_snapshot(&state_dir, &workspace, clean_run)
+    let clean = create_workspace_snapshot(&state_dir, &workspace, clean_run, None)
         .await
         .expect("clean-tree snapshot should succeed");
     assert_eq!(
@@ -10796,7 +10796,7 @@ async fn snapshot_before_sha_tracks_working_tree_state() {
     // base is HEAD itself.
     fs::write(workspace.join("file.txt"), "three (uncommitted)\n").unwrap();
     let dirty_run: RunId = "77777777-7777-4777-8777-777777777777".parse().unwrap();
-    let dirty = create_workspace_snapshot(&state_dir, &workspace, dirty_run)
+    let dirty = create_workspace_snapshot(&state_dir, &workspace, dirty_run, None)
         .await
         .expect("dirty-tree snapshot should succeed");
     assert_ne!(
@@ -10923,10 +10923,10 @@ async fn workspace_snapshots_reuse_large_base_objects_and_materialize_changes() 
     let second_run: RunId = "33333333-3333-4333-8333-333333333333".parse().unwrap();
     let changed_run: RunId = "44444444-4444-4444-8444-444444444444".parse().unwrap();
 
-    let first = create_workspace_snapshot(&state_dir, &workspace, first_run)
+    let first = create_workspace_snapshot(&state_dir, &workspace, first_run, None)
         .await
         .expect("first snapshot should succeed");
-    let second = create_workspace_snapshot(&state_dir, &workspace, second_run)
+    let second = create_workspace_snapshot(&state_dir, &workspace, second_run, None)
         .await
         .expect("second unchanged snapshot should succeed");
     let first_repository = state_dir.join(&first.repository);
@@ -10958,7 +10958,7 @@ async fn workspace_snapshots_reuse_large_base_objects_and_materialize_changes() 
     fs::create_dir_all(workspace.join("ignored-dir")).unwrap();
     fs::write(workspace.join("ignored-dir/hidden.txt"), b"ignored\n").unwrap();
 
-    let changed = create_workspace_snapshot(&state_dir, &workspace, changed_run)
+    let changed = create_workspace_snapshot(&state_dir, &workspace, changed_run, None)
         .await
         .expect("changed snapshot should succeed");
     let changed_repository = state_dir.join(&changed.repository);

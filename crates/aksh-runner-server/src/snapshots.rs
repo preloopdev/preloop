@@ -55,6 +55,7 @@ pub(crate) async fn create_workspace_snapshot(
     state_dir: &FsPath,
     workspace: &FsPath,
     run_id: RunId,
+    github_pat: Option<&str>,
 ) -> Result<WorkspaceSnapshot, ApiError> {
     let workspace = std::fs::canonicalize(workspace).map_err(|error| {
         ApiError::bad_request(format!(
@@ -104,6 +105,7 @@ pub(crate) async fn create_workspace_snapshot(
         &staging_index,
         &final_repository,
         run_id,
+        github_pat,
     )
     .await;
     if let Err(error) = tokio::fs::remove_dir_all(&staging_root).await {
@@ -144,6 +146,7 @@ async fn create_workspace_snapshot_inner(
     staging_index: &FsPath,
     final_repository: &FsPath,
     run_id: RunId,
+    github_pat: Option<&str>,
 ) -> Result<SnapshotResult, ApiError> {
     // Creating the staging repository does not depend on anything we learn
     // from the workspace, so pay for both spawns at once. Every millisecond
@@ -174,8 +177,14 @@ async fn create_workspace_snapshot_inner(
             source_objects.display()
         )));
     }
-    let cache =
-        ensure_object_cache(state_dir, workspace, &common_dir, source_head.as_deref()).await?;
+    let cache = ensure_object_cache(
+        state_dir,
+        workspace,
+        &common_dir,
+        source_head.as_deref(),
+        github_pat,
+    )
+    .await?;
     let ObjectCache {
         objects: cached_objects,
         index: cache_index,
@@ -931,6 +940,7 @@ async fn ensure_object_cache(
     workspace: &FsPath,
     common_dir: &FsPath,
     source_head: Option<&str>,
+    github_pat: Option<&str>,
 ) -> Result<ObjectCache, ApiError> {
     use sha2::Digest;
 
@@ -1018,7 +1028,8 @@ async fn ensure_object_cache(
     // later runs skip the fetch entirely.
     let mut ancestry_complete = !repository.join("shallow").is_file();
     if !ancestry_complete {
-        ancestry_complete = deepen_object_cache_from_remote(&repository, workspace).await;
+        ancestry_complete =
+            deepen_object_cache_from_remote(&repository, workspace, github_pat).await;
         refreshed = refreshed || ancestry_complete;
     }
     let mut index = repository.as_os_str().to_owned();
@@ -1093,7 +1104,11 @@ async fn present_objects(
 /// Best effort by design. No remote, no network, or a private repository
 /// without credentials simply leaves the cache shallow and the caller falls
 /// back to rewriting.
-async fn deepen_object_cache_from_remote(repository: &FsPath, workspace: &FsPath) -> bool {
+async fn deepen_object_cache_from_remote(
+    repository: &FsPath,
+    workspace: &FsPath,
+    github_pat: Option<&str>,
+) -> bool {
     let remote = Command::new("git")
         .arg("-C")
         .arg(workspace)
@@ -1118,6 +1133,17 @@ async fn deepen_object_cache_from_remote(repository: &FsPath, workspace: &FsPath
     if shallow_marker.is_file() {
         fetch.arg("--unshallow");
     }
+    if let Some((key, value)) = github_pat.and_then(|pat| github_auth_header_for_remote(&url, pat))
+    {
+        // A private remote rejects the anonymous unshallow; the engine's own
+        // GitHub credential (already used for action downloads) closes it.
+        // Scoped by `github_auth_header_for_remote` so the PAT is never sent
+        // to a host the operator did not configure it for.
+        fetch
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", key)
+            .env("GIT_CONFIG_VALUE_0", value);
+    }
     fetch
         .arg(&url)
         .arg("+refs/heads/*:refs/remotes/preloop-upstream/*");
@@ -1133,6 +1159,37 @@ async fn deepen_object_cache_from_remote(repository: &FsPath, workspace: &FsPath
             false
         }
     }
+}
+
+/// Extra-header config that authenticates a deepen fetch against the engine's
+/// GitHub credential, or `None` when the remote is not GitHub.
+///
+/// The static PAT is a GitHub credential; attaching it to any other host would
+/// leak it to a remote the operator never vouched for. Scope strictly: only
+/// `https://github.com/...` remotes get the header, matching what
+/// `actions/checkout` configures for its own auth.
+fn github_auth_header_for_remote(remote_url: &str, pat: &str) -> Option<(&'static str, String)> {
+    // The credential rides only over https to github.com: never over a
+    // plaintext remote, and never over an SSH remote (no scheme at all —
+    // SSH has its own key auth).
+    let (scheme, rest) = remote_url.split_once("://")?;
+    if scheme != "https" {
+        return None;
+    }
+    // Strip userinfo (`https://user:pass@github.com/...`) before extracting
+    // the host; the port separator `:` must not truncate a host either.
+    let authority = rest.rsplit('@').next().unwrap_or(rest);
+    let host = authority.split(['/', ':']).next().unwrap_or("");
+    if host != "github.com" {
+        return None;
+    }
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD
+        .encode(format!("x-access-token:{pat}").as_bytes());
+    Some((
+        "http.https://github.com/.extraheader",
+        format!("AUTHORIZATION: basic {encoded}"),
+    ))
 }
 /// Persist the workspace HEAD the cache was last synced to.
 ///
@@ -1555,4 +1612,49 @@ fn snapshot_authorization_token(value: &str) -> Option<String> {
     let decoded = String::from_utf8(decoded).ok()?;
     let (_, token) = decoded.split_once(':')?;
     Some(token.to_owned())
+}
+
+#[cfg(test)]
+mod auth_scoping_tests {
+    use super::github_auth_header_for_remote;
+
+    #[test]
+    fn github_remote_gets_scoped_basic_header() {
+        let (key, value) = github_auth_header_for_remote(
+            "https://github.com/preloopdev/aksh-trigger-e2e-20260715.git",
+            "gho_secret",
+        )
+        .expect("github.com remote should get the header");
+        assert_eq!(key, "http.https://github.com/.extraheader");
+        // base64("x-access-token:gho_secret")
+        assert_eq!(
+            value,
+            "AUTHORIZATION: basic eC1hY2Nlc3MtdG9rZW46Z2hvX3NlY3JldA=="
+        );
+    }
+
+    #[test]
+    fn userinfo_in_remote_url_is_stripped_before_host_matching() {
+        let header = github_auth_header_for_remote(
+            "https://x-access-token:gho_secret@github.com/owner/repo.git",
+            "gho_secret",
+        );
+        assert!(header.is_some(), "userinfo must not defeat host matching");
+    }
+
+    #[test]
+    fn non_github_remote_never_receives_the_pat() {
+        for url in [
+            "https://git.example.com/owner/repo.git",
+            "https://github.example.net/owner/repo.git",
+            "git@github.com:owner/repo.git", // SSH remotes have no scheme
+            "http://github.com/owner/repo.git", // https-only credential
+        ] {
+            assert_eq!(
+                github_auth_header_for_remote(url, "gho_secret"),
+                None,
+                "PAT must not be attached to {url}"
+            );
+        }
+    }
 }
