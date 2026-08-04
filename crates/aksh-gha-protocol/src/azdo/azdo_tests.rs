@@ -752,6 +752,14 @@ fn task_result_serialization() {
         serde_json::from_str::<TaskResult>("\"cancelled\"").unwrap(),
         TaskResult::Cancelled
     );
+    assert_eq!(
+        serde_json::to_string(&TaskResult::Abandoned).unwrap(),
+        "\"abandoned\""
+    );
+    assert_eq!(
+        serde_json::from_str::<TaskResult>("\"abandoned\"").unwrap(),
+        TaskResult::Abandoned
+    );
 }
 
 #[test]
