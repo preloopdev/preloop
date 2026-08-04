@@ -7,9 +7,12 @@
 //! so JobCancellation can arrive mid-job and be forwarded to the worker.
 
 use anyhow::{Context, Result};
+use std::collections::VecDeque;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Child;
 use tracing::{error, info, warn};
@@ -29,7 +32,6 @@ enum WorkerMessage {
     Cancel { timeout_secs: u64 },
     /// Shut down the worker process.
     #[serde(rename = "shutdown")]
-    #[allow(dead_code)]
     Shutdown,
 }
 
@@ -39,6 +41,12 @@ pub struct RunningJob {
     child: Child,
     /// Stdin handle — kept open so we can write cancel messages.
     stdin: Option<tokio::process::ChildStdin>,
+    /// The full job message. Retained so the listener can force-complete a
+    /// job whose worker died abnormally (official `ForceFailJob`).
+    pub job_message: Option<serde_json::Value>,
+    /// Captured worker stdout/stderr tail (official `workerOutput`), for the
+    /// crash annotation when the worker exits abnormally.
+    worker_output: Arc<Mutex<WorkerOutputCapture>>,
     /// The job/request ID for matching cancellation messages.
     pub request_id: String,
     /// Agent job GUID from the job message body (`jobId`), for JobCancellation matching.
@@ -49,6 +57,94 @@ pub struct RunningJob {
     cancel_sent: bool,
     /// Numeric agent request ID for status queries, if available.
     pub agent_request_id: Option<i64>,
+}
+
+/// Bounded capture of the worker's stdout/stderr.
+///
+/// Mirrors the official dispatcher's `workerOutput` list: the tail is
+/// attached to the job completion as the crash detail when the worker dies
+/// abnormally (`LogWorkerProcessUnhandledException`). Bounded so a chatty
+/// job cannot grow the listener's memory without limit; the crash is what
+/// matters, so only the tail is kept.
+#[derive(Default)]
+pub struct WorkerOutputCapture {
+    lines: VecDeque<String>,
+    bytes: usize,
+}
+
+impl WorkerOutputCapture {
+    const MAX_BYTES: usize = 64 * 1024;
+
+    fn push(&mut self, line: String) {
+        self.bytes += line.len() + 1;
+        self.lines.push_back(line);
+        while self.bytes > Self::MAX_BYTES {
+            let Some(front) = self.lines.pop_front() else {
+                break;
+            };
+            self.bytes = self.bytes.saturating_sub(front.len() + 1);
+        }
+    }
+
+    /// Tail of the worker's output, newline-joined.
+    pub fn tail(&self) -> String {
+        let mut out = String::with_capacity(self.bytes);
+        for (i, line) in self.lines.iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            out.push_str(line);
+        }
+        out
+    }
+}
+
+/// Read a worker output stream, forwarding every line to the listener's own
+/// stdout/stderr (as the worker's inherited descriptors did before) while
+/// appending it to the crash capture.
+///
+/// Byte-oriented on purpose: `lines()` errors out on invalid UTF-8, which would
+/// silently end forwarding at the first stray byte. `Stdio::inherit()` passed
+/// raw bytes through untouched, so forwarding writes the bytes exactly as read
+/// and only the crash capture goes through a lossy conversion.
+fn forward_worker_stream(
+    stream: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    capture: Arc<Mutex<WorkerOutputCapture>>,
+    to_stderr: bool,
+) {
+    tokio::spawn(async move {
+        let mut reader = tokio::io::BufReader::new(stream);
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf).await {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) => {
+                    warn!("worker output read failed: {e}");
+                    break;
+                }
+            }
+            // Capture the logical line without its terminator; the official
+            // `workerOutput` list holds lines, and `tail()` re-joins them.
+            let mut line = buf.as_slice();
+            if let [rest @ .., b'\n'] = line {
+                line = rest;
+            }
+            if let [rest @ .., b'\r'] = line {
+                line = rest;
+            }
+            capture
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(String::from_utf8_lossy(line).into_owned());
+            let _ = if to_stderr {
+                tokio::io::stderr().write_all(&buf).await
+            } else {
+                tokio::io::stdout().write_all(&buf).await
+            };
+        }
+    });
 }
 
 /// Server-side job request status provider used to resolve a busy-runner overlap.
@@ -162,6 +258,41 @@ impl RunningJob {
         true
     }
 
+    /// Official `JobDispatcher` shutdown path: ask the worker to cancel the
+    /// running job and wrap up (`RunnerShutdown`), waiting up to `grace`;
+    /// only hard-kill if the worker ignores the message.
+    ///
+    /// Returns `Some(success)` when the worker exited on its own (success =
+    /// the worker reported a normal completion, so the job concluded
+    /// cleanly), or `None` when the grace expired and the worker had to be
+    /// killed.
+    pub async fn shutdown_gracefully(&mut self, grace: Duration) -> Option<bool> {
+        if !self.cancel_sent {
+            self.cancel_sent = true;
+            if let Some(stdin) = &mut self.stdin {
+                let msg = WorkerMessage::Shutdown;
+                if let Ok(line) = serde_json::to_string(&msg) {
+                    let _ = stdin.write_all(line.as_bytes()).await;
+                    let _ = stdin.write_all(b"\n").await;
+                    let _ = stdin.flush().await;
+                }
+            }
+        }
+        // A cancel was already delivered, or just now — the worker cancels
+        // the job and exits. Wait for it within the grace before killing.
+        match tokio::time::timeout(grace, self.wait()).await {
+            Ok(result) => result.ok(),
+            Err(_) => {
+                warn!(
+                    "Worker {} did not exit within the shutdown grace — killing",
+                    self.request_id
+                );
+                self.kill().await;
+                None
+            }
+        }
+    }
+
     /// Hard-kill the worker process group (after cancel timeout expires).
     pub async fn kill(&mut self) {
         // Drop stdin first to unblock the worker's reader
@@ -262,15 +393,29 @@ pub async fn spawn_job(
         .arg(via_str)
         .current_dir(runner_root)
         .stdin(Stdio::piped())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .context("spawning worker process")?;
+
+    // Capture the worker's stdout/stderr: forward it to the listener's own
+    // descriptors (preserving the pre-pipe behavior of `inherit`) while
+    // retaining the tail for the crash annotation. Draining also prevents a
+    // chatty worker from blocking on a full pipe buffer.
+    let worker_output = Arc::new(Mutex::new(WorkerOutputCapture::default()));
+    if let Some(stdout) = child.stdout.take() {
+        forward_worker_stream(stdout, worker_output.clone(), false);
+    }
+    if let Some(stderr) = child.stderr.take() {
+        forward_worker_stream(stderr, worker_output.clone(), true);
+    }
 
     // Send job message via stdin — but keep stdin open for cancel messages
     let mut stdin = child.stdin.take();
     if let Some(s) = &mut stdin {
-        let msg = WorkerMessage::Job { body: job_message };
+        let msg = WorkerMessage::Job {
+            body: job_message.clone(),
+        };
         let line = serde_json::to_string(&msg)?;
         s.write_all(line.as_bytes()).await?;
         s.write_all(b"\n").await?;
@@ -281,12 +426,25 @@ pub async fn spawn_job(
     Ok(RunningJob {
         child,
         stdin,
+        job_message: Some(job_message),
+        worker_output,
         request_id,
         job_id,
         kill_at: None,
         cancel_sent: false,
         agent_request_id,
     })
+}
+
+impl RunningJob {
+    /// Tail of the worker's captured output (empty when the worker produced
+    /// nothing). Used for the crash annotation on abnormal worker exit.
+    pub fn worker_output_tail(&self) -> String {
+        self.worker_output
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .tail()
+    }
 }
 
 /// Effective cancellation timing from official `JobDispatcher.Cancel`.
@@ -649,6 +807,131 @@ mod tests {
             .unwrap();
         assert_eq!(running.request_id, "fallback-id");
         running.kill().await;
+    }
+
+    #[test]
+    fn worker_output_capture_keeps_bounded_tail() {
+        let mut capture = WorkerOutputCapture::default();
+        for i in 0..10_000 {
+            capture.push(format!("line {i} {}", "x".repeat(100)));
+        }
+        let tail = capture.tail();
+        assert!(
+            tail.len() <= WorkerOutputCapture::MAX_BYTES,
+            "capture exceeded cap: {}",
+            tail.len()
+        );
+        // The tail is what survives — the newest lines are present.
+        assert!(tail.contains("line 9999"), "tail must keep newest output");
+    }
+
+    /// A worker that emits a non-UTF-8 byte sequence must not silence the rest
+    /// of its output: `Stdio::inherit()` passed raw bytes through, and the
+    /// crash capture has to keep receiving the lines that follow. Fails if the
+    /// reader goes back to `lines()` with `while let Ok(Some(..))`, which ends
+    /// the task at the first decode error.
+    #[tokio::test]
+    async fn forward_worker_stream_survives_invalid_utf8() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"before-invalid\n");
+        // Lone continuation bytes: never valid UTF-8 in any position.
+        bytes.extend_from_slice(&[b'b', b'a', b'd', 0xff, 0xfe, b'\n']);
+        bytes.extend_from_slice(b"after-invalid-1\n");
+        bytes.extend_from_slice(b"after-invalid-2\n");
+
+        let capture = Arc::new(Mutex::new(WorkerOutputCapture::default()));
+        forward_worker_stream(std::io::Cursor::new(bytes), capture.clone(), false);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let tail = loop {
+            let tail = capture.lock().unwrap_or_else(|e| e.into_inner()).tail();
+            if tail.contains("after-invalid-2") || Instant::now() >= deadline {
+                break tail;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        assert!(tail.contains("before-invalid"), "tail: {tail:?}");
+        assert!(
+            tail.contains("after-invalid-1") && tail.contains("after-invalid-2"),
+            "lines after invalid UTF-8 must still be captured, got: {tail:?}"
+        );
+        // The undecodable line is kept, lossily, rather than dropped.
+        assert!(tail.contains("bad\u{fffd}"), "tail: {tail:?}");
+    }
+
+    #[tokio::test]
+    async fn spawn_job_captures_worker_stdout() {
+        let dir = TempDir::new().unwrap();
+        let workspace_dir = dir.path().join("work");
+        let payload = serde_json::json!({
+            "jobId": "capture-job",
+            "jobDisplayName": "Capture Job",
+            "steps": [
+                {
+                    "id": "step-1",
+                    "contextName": "step1",
+                    "displayName": "Step One",
+                    "run": "echo worker-capture-marker",
+                    "shell": "bash"
+                }
+            ],
+            "fileTable": {
+                "workDirectory": workspace_dir.to_str().unwrap()
+            }
+        });
+
+        let mut running = spawn_job(payload, dir.path(), ProtocolPath::Broker)
+            .await
+            .unwrap();
+        assert!(running.wait().await.unwrap());
+        // Give the forward tasks a moment to drain the pipes after exit.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let tail = running.worker_output_tail();
+        assert!(
+            tail.contains("Worker received job"),
+            "worker process output must be captured, got: {tail:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_gracefully_lets_worker_cancel_and_exit() {
+        let dir = TempDir::new().unwrap();
+        let workspace_dir = dir.path().join("work");
+        let payload = serde_json::json!({
+            "jobId": "shutdown-job",
+            "jobDisplayName": "Shutdown Job",
+            "steps": [
+                {
+                    "id": "step-1",
+                    "contextName": "step1",
+                    "displayName": "Long Step",
+                    "run": "sleep 120",
+                    "shell": "bash"
+                }
+            ],
+            "fileTable": {
+                "workDirectory": workspace_dir.to_str().unwrap()
+            }
+        });
+
+        let mut running = spawn_job(payload, dir.path(), ProtocolPath::Broker)
+            .await
+            .unwrap();
+        // Let the worker start the step, then shut it down.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let start = Instant::now();
+        let outcome = running.shutdown_gracefully(Duration::from_secs(30)).await;
+        let elapsed = start.elapsed();
+        assert_eq!(
+            outcome,
+            Some(true),
+            "worker must exit cleanly after the shutdown message"
+        );
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "graceful shutdown must finish within the grace, took {elapsed:?}"
+        );
     }
 
     #[tokio::test]
