@@ -28,6 +28,10 @@ PRELOOP=${PRELOOP:-/Users/bnjoroge/preloop/target/debug/preloop}
 ENGINE_PORT=${PRELOOP_LISTEN:-127.0.0.1:9091}
 RESULT_DIR=benchmarks/real-world/results/conformance-4repos/$OUT/c
 
+# The CLI otherwise falls back to its configured endpoint (unix socket or the
+# default port), where /api/v1/* is gated off and submission 404s.
+export AKSH_URL="http://$ENGINE_PORT"
+
 if ! curl -sf --max-time 3 "http://${ENGINE_PORT#127.0.0.1:}/healthz" >/dev/null 2>&1 \
   && ! curl -sf --max-time 3 "http://${ENGINE_PORT}/healthz" >/dev/null 2>&1; then
   echo "engine not healthy at ${ENGINE_PORT}" >&2

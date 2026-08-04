@@ -2,7 +2,9 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use tracing::info;
+use tracing::{info, warn};
+
+use anyhow::Context;
 
 use super::contexts::JobContext;
 use super::steps_runner::{Step, StepType};
@@ -30,6 +32,25 @@ pub fn setup_workspace(job_message: &serde_json::Value) -> anyhow::Result<String
         std::env::current_dir()?.join(work_path)
     };
 
+    // GitHub-hosted parity: every job starts with a fresh workspace. Hosted
+    // runners get a new VM per job, so workflows that assume an empty
+    // workspace (`git init` + `remote add origin`, for instance) never see a
+    // stale checkout. A long-lived runner reusing the same work folder must
+    // reproduce that freshness itself, or the second run of such a workflow
+    // fails with "remote origin already exists" and friends.
+    if work_path.exists() {
+        match std::fs::remove_dir_all(&work_path) {
+            Ok(()) => info!("Cleared stale workspace: {}", work_path.display()),
+            Err(error) => {
+                warn!(
+                    "Could not clear stale workspace {}: {error}",
+                    work_path.display()
+                );
+                return Err(error)
+                    .with_context(|| format!("clearing stale workspace {}", work_path.display()));
+            }
+        }
+    }
     std::fs::create_dir_all(&work_path)?;
     info!("Workspace: {}", work_path.display());
 
