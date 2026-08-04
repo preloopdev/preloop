@@ -257,15 +257,11 @@ impl WorkflowSubmission {
         if self.secrets.is_empty() {
             return Ok(value);
         }
-        let exposed = self
-            .secrets
-            .iter()
-            .map(|(name, secret)| {
-                (
-                    name.clone(),
-                    serde_json::Value::String(secret.expose().to_owned()),
-                )
-            })
+        // Resolve the whole map once through the sanctioned masking boundary,
+        // then wrap the already-plaintext values for JSON.
+        let exposed = masking::expose_all(&self.secrets)
+            .into_iter()
+            .map(|(name, value)| (name, serde_json::Value::String(value)))
             .collect();
         if let Some(object) = value.as_object_mut() {
             object.insert("secrets".to_owned(), serde_json::Value::Object(exposed));
@@ -353,6 +349,9 @@ pub struct JobPlan {
     /// User-Agent product token; `__default` is used when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matrix_index: Option<usize>,
+    /// Deferred expression for runtime dynamic matrix expansion, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_matrix: Option<String>,
     /// Job-level environment.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
@@ -425,6 +424,38 @@ pub struct JobPlan {
     /// Job-level concurrency queue mode: `"single"` or `"max"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency_queue: Option<String>,
+    /// Pending reusable-workflow invocation.
+    ///
+    /// Present on caller placeholder nodes: the callee subtree is not part of
+    /// the plan. The server expands it at runtime only when the caller's
+    /// `if:` gate passes, and otherwise records this single node as skipped —
+    /// matching GitHub, which never materializes a false-gated caller's subtree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reusable_call: Option<ReusableCallPlan>,
+}
+
+/// Everything needed to expand a reusable-workflow caller node into its
+/// callee job subtree once the caller's `if:` gate passes at runtime.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReusableCallPlan {
+    /// The raw `uses:` reference (`owner/repo/path@ref` or `./path`).
+    pub uses: String,
+    /// Normalized path of the called workflow file.
+    pub workflow_file: String,
+    /// Resolved called-workflow commit SHA.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_sha: Option<String>,
+    /// Resolved called-workflow repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_repository: Option<String>,
+    /// Reusable-call nesting depth of this caller (1 = called from the root
+    /// workflow). GitHub caps nesting at 4.
+    #[serde(default = "default_reusable_depth")]
+    pub depth: usize,
+}
+
+fn default_reusable_depth() -> usize {
+    1
 }
 
 fn default_fail_fast() -> bool {
@@ -626,6 +657,10 @@ pub struct JobCompletion {
     /// Outputs captured by the runner.
     #[serde(default)]
     pub outputs: OutputMap,
+    /// Job-level annotations reported with the completion (e.g. the
+    /// official runner's worker-crash detail from `ForceFailJob`).
+    #[serde(default)]
+    pub annotations: Vec<serde_json::Value>,
 }
 
 /// Machine-readable event emitted as NDJSON.
