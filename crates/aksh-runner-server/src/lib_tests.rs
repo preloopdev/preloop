@@ -2837,13 +2837,24 @@ async fn action_download_info_returns_remote_action_tickets() {
     .await;
 
     let tickets = response["archiveDownloadTickets"].as_object().unwrap();
+    // The URL carries a signed, expiring ticket: the download route is
+    // bearerless, so the URL itself is the capability.
+    let checkout = tickets["actions/checkout@v4"]["url"].as_str().unwrap();
+    let (base, query) = checkout.split_once('?').expect("ticket query");
     assert_eq!(
-        tickets["actions/checkout@v4"]["url"],
+        base,
         "http://127.0.0.1:9090/api/v1/actions/download/actions/checkout/v4"
     );
-    assert_eq!(
-        tickets["dtolnay/rust-toolchain@stable"]["url"],
-        "http://127.0.0.1:9090/api/v1/actions/download/dtolnay/rust-toolchain/stable"
+    assert!(query.contains("exp=") && query.contains("sig="), "{query}");
+    assert!(
+        tickets["dtolnay/rust-toolchain@stable"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with(
+                "http://127.0.0.1:9090/api/v1/actions/download/dtolnay/rust-toolchain/stable?"
+            ),
+        "{}",
+        tickets["dtolnay/rust-toolchain@stable"]["url"]
     );
     assert!(!tickets.contains_key("./.github/actions/local"));
     assert!(!tickets.contains_key("docker://alpine:3.20"));
@@ -2874,17 +2885,127 @@ async fn runnerresolve_actions_returns_runner_parseable_tar_urls() {
     )
     .await;
 
-    assert_eq!(
-        response["actions"]["actions/checkout@v4"]["tar_url"],
-        "http://127.0.0.1:9090/api/v1/actions/download/actions/checkout/v4"
+    // Signed, expiring ticket — the bearerless download route treats the URL
+    // itself as the capability.
+    assert!(
+        response["actions"]["actions/checkout@v4"]["tar_url"]
+            .as_str()
+            .unwrap()
+            .starts_with("http://127.0.0.1:9090/api/v1/actions/download/actions/checkout/v4?exp="),
+        "{}",
+        response["actions"]["actions/checkout@v4"]["tar_url"]
     );
     assert_eq!(
         response["actions"]["actions/checkout@v4"]["resolved_sha"],
         "v4"
     );
+    assert!(
+        response["actions"]["owner/repo/path@main"]["tar_url"]
+            .as_str()
+            .unwrap()
+            .starts_with("http://127.0.0.1:9090/api/v1/actions/download/owner/repo/main?exp="),
+        "{}",
+        response["actions"]["owner/repo/path@main"]["tar_url"]
+    );
+}
+
+#[tokio::test]
+async fn action_download_requires_a_ticket_for_the_action_it_serves() {
+    // The route is bearerless and reachable from inside every runner VM, so
+    // the URL is the capability. Without this, workflow code could make the
+    // engine fetch any repository with the engine's own GitHub credential.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    for (owner, repo, git_ref) in [("acme", "public-action", "v1"), ("acme", "private", "v1")] {
+        let dir = temp
+            .path()
+            .join("actions")
+            .join(owner)
+            .join(repo)
+            .join(git_ref);
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("action.tar.gz"), b"tar")
+            .await
+            .unwrap();
+    }
+
+    let future = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+    let good = state.sign_action_ticket("acme", "public-action", "v1", future);
+
+    let get = |uri: String| {
+        let app = app.clone();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+        }
+    };
+
+    // No ticket at all.
     assert_eq!(
-        response["actions"]["owner/repo/path@main"]["tar_url"],
-        "http://127.0.0.1:9090/api/v1/actions/download/owner/repo/main"
+        get("/api/v1/actions/download/acme/public-action/v1".to_owned()).await,
+        StatusCode::NOT_FOUND,
+        "an unsigned request must not be served"
+    );
+
+    // A ticket minted for one action, replayed against another — the
+    // exfiltration path: ask for a repo the workflow was never granted.
+    assert_eq!(
+        get(format!(
+            "/api/v1/actions/download/acme/private/v1?exp={future}&sig={good}"
+        ))
+        .await,
+        StatusCode::NOT_FOUND,
+        "a ticket must not authorise a different action"
+    );
+
+    // Right action, forged signature.
+    assert_eq!(
+        get(format!(
+            "/api/v1/actions/download/acme/public-action/v1?exp={future}&sig=AAAA"
+        ))
+        .await,
+        StatusCode::NOT_FOUND,
+        "a forged signature must not be served"
+    );
+
+    // Right signature, but expired.
+    let past = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - 1;
+    let stale = state.sign_action_ticket("acme", "public-action", "v1", past);
+    assert_eq!(
+        get(format!(
+            "/api/v1/actions/download/acme/public-action/v1?exp={past}&sig={stale}"
+        ))
+        .await,
+        StatusCode::NOT_FOUND,
+        "an expired ticket must not be served"
+    );
+
+    // The ticket it was actually minted for.
+    assert_eq!(
+        get(format!(
+            "/api/v1/actions/download/acme/public-action/v1?exp={future}&sig={good}"
+        ))
+        .await,
+        StatusCode::OK,
+        "the minted ticket must still work"
     );
 }
 
@@ -2907,13 +3028,21 @@ async fn download_action_tarball_serves_from_cache_and_rejects_traversal() {
         .await
         .unwrap();
 
-    // 1. Successful cache hit
+    // 1. Successful cache hit, with the signed ticket the server mints
+    let expires_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+    let signature = state.sign_action_ticket("test-owner", "test-repo", "v1", expires_at);
     let response = app
         .clone()
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri("/api/v1/actions/download/test-owner/test-repo/v1")
+                .uri(format!(
+                    "/api/v1/actions/download/test-owner/test-repo/v1?exp={expires_at}&sig={signature}"
+                ))
                 .body(Body::empty())
                 .unwrap(),
         )

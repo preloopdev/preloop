@@ -75,6 +75,55 @@ impl AppState {
         Some(payload)
     }
 
+    /// Sign an action-archive download ticket.
+    ///
+    /// The download route is deliberately bearerless — the official runner
+    /// treats archive URLs as tickets — and it is reachable from inside every
+    /// runner VM, where workflow code runs. Unsigned, it let a guest ask the
+    /// engine to fetch *any* `owner/repo` tarball using the engine's own
+    /// GitHub credential, which reads repositories the workflow was never
+    /// granted. Signing binds each URL to the one action it was minted for.
+    pub(crate) fn sign_action_ticket(
+        &self,
+        owner: &str,
+        repo: &str,
+        git_ref: &str,
+        expires_at: u64,
+    ) -> String {
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.local_jwt_key)
+            .expect("HMAC accepts keys of any length");
+        mac.update(action_ticket_payload(owner, repo, git_ref, expires_at).as_bytes());
+        URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+    }
+
+    /// Whether `signature` authorises this exact action at this expiry.
+    pub(crate) fn verify_action_ticket(
+        &self,
+        owner: &str,
+        repo: &str,
+        git_ref: &str,
+        expires_at: u64,
+        signature: &str,
+    ) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_secs())
+            .unwrap_or(u64::MAX);
+        if expires_at <= now {
+            return false;
+        }
+        let Ok(provided) = URL_SAFE_NO_PAD.decode(signature) else {
+            return false;
+        };
+        let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(&self.local_jwt_key) else {
+            return false;
+        };
+        mac.update(action_ticket_payload(owner, repo, git_ref, expires_at).as_bytes());
+        // Constant-time comparison: `verify_slice` rejects length mismatches
+        // and never short-circuits on the first differing byte.
+        mac.verify_slice(&provided).is_ok()
+    }
+
     pub(crate) fn verify_local_jwt_scope(&self, token: &str, expected_scope: &str) -> bool {
         self.verify_local_jwt_claims(token)
             .and_then(|payload| {
@@ -479,6 +528,14 @@ impl AppState {
         Some(pat.expose().to_owned())
     }
 }
+/// Canonical bytes covered by an action ticket signature.
+///
+/// The separator cannot appear in a sanitised owner/repo (both reject `/` and
+/// `.`), so no two distinct actions can produce the same payload.
+fn action_ticket_payload(owner: &str, repo: &str, git_ref: &str, expires_at: u64) -> String {
+    format!("action-archive\n{owner}\n{repo}\n{git_ref}\n{expires_at}")
+}
+
 #[cfg(test)]
 pub(crate) fn mint_runtime_token(plan_id: &str, job_id: &uuid::Uuid) -> String {
     let now = SystemTime::now()
