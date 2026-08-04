@@ -10,8 +10,10 @@ use tracing::{debug, info, warn};
 
 use crate::client::broker::BrokerClient;
 use crate::client::http::{HttpClient, SessionBackoff};
+use crate::client::run_service::RunServiceClient;
 use crate::listener::job_dispatcher::{self, cancellation_timing, parse_timespan_secs, RunningJob};
 use crate::settings::RunnerConfig;
+use crate::worker::helpers::extract_service_endpoint;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BrokerMessageKind {
@@ -39,6 +41,82 @@ fn classify_message(message_type: &str) -> BrokerMessageKind {
         "RunnerRefresh" => BrokerMessageKind::RunnerRefresh,
         "RunnerRefreshConfig" => BrokerMessageKind::RunnerRefreshConfig,
         _ => BrokerMessageKind::Unknown,
+    }
+}
+
+/// Official `JobDispatcher.ForceFailJob` (run-server variant): a worker that
+/// exits abnormally never reports completion, so the listener completes the
+/// job request as Failed itself. Without this the broker session stays
+/// "active" server-side and no further job is ever delivered to the runner
+/// (the pool-stall signature: crashed worker, everything after it queued
+/// forever). The worker's own completion path covers normal exits — this only
+/// fires when the worker process died before reporting.
+async fn force_fail_job(job: &RunningJob, conclusion: &str) {
+    let Some(message) = job.job_message.as_ref() else {
+        return;
+    };
+    let Some((service_url, token)) = extract_service_endpoint(message) else {
+        warn!(
+            "cannot force-fail job {} — no SystemVssConnection endpoint",
+            job.request_id
+        );
+        return;
+    };
+    let plan_id = message
+        .get("plan")
+        .and_then(|plan| plan.get("planId"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let job_id = message
+        .get("jobId")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    if plan_id.is_empty() || job_id.is_empty() {
+        warn!(
+            "cannot force-fail job {} — message lacks planId/jobId",
+            job.request_id
+        );
+        return;
+    }
+    let Ok(http) = HttpClient::new(None) else {
+        return;
+    };
+    // The worker's completion posts to `{SystemVssConnection url}/completejob`
+    // — the server advertises that endpoint as the runner's broker base
+    // (`/broker/{runner_id}`), NOT the bare origin. Using the same base keeps
+    // the listener's force-fail on the exact route the worker uses.
+    let client = RunServiceClient::new(http, service_url);
+    // Official `LogWorkerProcessUnhandledException` → `ForceFailJob`: the
+    // worker's captured output rides along as an error annotation so the
+    // crash isn't indistinguishable from an ordinary failure. Empty when the
+    // worker produced no output.
+    let annotations = {
+        let detail = job.worker_output_tail();
+        if detail.is_empty() {
+            Vec::new()
+        } else {
+            vec![serde_json::json!({
+                "level": "failure",
+                "message": detail,
+                "stepNumber": 0,
+                "startLine": 1,
+                "endLine": 1,
+            })]
+        }
+    };
+    let body = serde_json::json!({
+        "planId": plan_id,
+        "jobId": job_id,
+        "conclusion": conclusion,
+        "outputs": {},
+        "stepResults": [],
+        "annotations": annotations,
+        "telemetry": [],
+        "billingOwnerId": "",
+    });
+    match client.complete_job(&token, &body).await {
+        Ok(_) => info!("Listener force-failed crashed job {job_id}"),
+        Err(error) => warn!("Listener force-fail for job {job_id} failed (non-fatal): {error:#}"),
     }
 }
 
@@ -89,7 +167,30 @@ pub async fn run_broker_loop(
     let mut session_key: Option<Vec<u8>> = None;
     let mut use_fips_encryption = false;
 
-    let shutdown = tokio::signal::ctrl_c();
+    // Runner shutdown signal: Ctrl-C (user) or SIGTERM (OS shutdown, e.g.
+    // systemd stop / VM teardown) — the official runner's
+    // `RunnerShutdown`/`OperatingSystemShutdown` triggers.
+    let shutdown = async {
+        #[cfg(unix)]
+        {
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("install SIGTERM handler");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    info!("Ctrl-C received — shutting down");
+                }
+                _ = sigterm.recv() => {
+                    info!("SIGTERM received — shutting down");
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            info!("Ctrl-C received — shutting down");
+        }
+    };
     tokio::pin!(shutdown);
 
     let mut processed_message_ids: std::collections::HashSet<i64> =
@@ -131,6 +232,7 @@ pub async fn run_broker_loop(
                         info!("Worker completed job {id} successfully");
                     } else {
                         warn!("Worker failed for job {id}");
+                        force_fail_job(job, "failed").await;
                     }
                     if once || config.settings.ephemeral {
                         if once {
@@ -253,8 +355,34 @@ pub async fn run_broker_loop(
             _ = &mut shutdown => {
                 info!("Shutdown signal received");
                 if let Some(mut job) = active_job.take() {
-                    info!("Killing active worker");
-                    job.kill().await;
+                    // Official RunnerShutdown: the worker is told to cancel
+                    // the job and wrap up so the run concludes `cancelled`
+                    // instead of dangling until the lease reaper. Kill only
+                    // if the worker ignores the message within the grace.
+                    match job
+                        .shutdown_gracefully(std::time::Duration::from_secs(60))
+                        .await
+                    {
+                        Some(true) => {
+                            info!("Worker completed job {} gracefully during shutdown", job.request_id);
+                        }
+                        Some(false) => {
+                            warn!(
+                                "Worker failed job {} during shutdown — force-failing",
+                                job.request_id
+                            );
+                            force_fail_job(&job, "failed").await;
+                        }
+                        None => {
+                            warn!("Worker killed after shutdown grace expired");
+                            // The worker never reported. The official
+                            // completes the request even after the forced
+                            // kill (`CompleteJobRequestAsync` with Canceled
+                            // on the shutdown path); do the same so the job
+                            // concludes instead of dangling to the reaper.
+                            force_fail_job(&job, "canceled").await;
+                        }
+                    }
                 }
                 return Ok(());
             }
@@ -270,6 +398,7 @@ pub async fn run_broker_loop(
                             info!("Worker completed job {id} successfully");
                         } else {
                             warn!("Worker failed for job {id}");
+                            force_fail_job(active_job.as_ref().unwrap(), "failed").await;
                         }
                     }
                     Err(e) => warn!("Worker wait error: {e:#}"),
