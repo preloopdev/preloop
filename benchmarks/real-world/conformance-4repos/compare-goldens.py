@@ -234,7 +234,8 @@ def main():
     for repo, cells in (("bat", ["official", "aksh", "c"]), ("vite", ["official", "aksh", "c"]),
                         ("uv", ["official", "aksh", "c"]), ("nextcloud", ["official", "aksh", "c"]),
                         ("runner", ["c"]), ("qm", ["c"]), ("buzz", ["c"]),
-                        ("openclaw", ["c"]), ("agent-ci", ["c"])):
+                        ("openclaw", ["c"]), ("agent-ci", ["c"]),
+                        ("bento", ["c"]), ("caddy", ["c"]), ("tokio", ["c"])):
         if args.repo != "all" and repo != args.repo:
             continue
         for cell in cells:

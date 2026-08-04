@@ -374,9 +374,22 @@ the golden.
 
 ### tokio-rs/tokio — ci.yml, push master
 
-Golden: 77 jobs. Cell C started; the run is long (Rust workspace test
-matrix) and completes in the background. Status is recorded in
-`results/conformance-4repos/tokio/c/run.json` as it lands.
+Golden: 77 jobs. Cell C (run 16da55a0): 77 jobs — 3 success, 5 failure,
+69 skipped. The skip cascade is correct GitHub semantics: clippy/docs/
+minrust failed, and every job with `needs:` on that chain skipped. The
+failures are environment-class, not protocol:
+
+- **Check README** — the workspace carries the campaign's dirty README
+  change, so the "READMEs are identical" gate fails. Campaign artifact.
+- **clippy --all-features --unstable / docs / minrust / wasm32-wasip2** —
+  Rust toolchain differences between the packed golden and GitHub's
+  runners (nightly pin, MSRV 1.71, wasm targets).
+
+compare-goldens.py: 2 match, 5 semantic (all environment-caused), 94
+environment. checkout@v7, rustup installs and rust-cache all behaved.
+A re-run without the dirty README change would clear the Check README
+gate; the toolchain-cell failures need a golden with the same rustup
+versions to be strictly comparable.
 
 ### Infra findings (campaign environment, not protocol)
 
