@@ -62,13 +62,22 @@ fn control_bridge_dir(config: &RunnerPoolConfig) -> Option<PathBuf> {
         .map(|parent| parent.join("control-bridge"))
 }
 
-fn runner_volumes(config: &RunnerPoolConfig) -> Vec<VolumeMount> {
+fn runner_volumes(config: &RunnerPoolConfig, machine: &MachineName) -> Vec<VolumeMount> {
     let mut volumes = vec![VolumeMount {
         host: config.runner_bundle.clone(),
         guest: PathBuf::from("/opt/preloop/bin"),
         read_only: true,
     }];
     if let Some(host) = control_bridge_dir(config) {
+        // Per-machine target: the guest agent's mounted-socket bridge binds
+        // its listener INTO the mounted directory through virtiofs, and the
+        // node outlives the machine. A shared directory let every machine see
+        // every dead machine's socket node — connects then resolve to a dead
+        // listener and return ECONNREFUSED forever (the hung-runner class).
+        let host = host.join(machine.as_str());
+        if let Err(error) = std::fs::create_dir_all(&host) {
+            warn!(machine = machine.as_str(), %error, "control-bridge directory creation failed");
+        }
         volumes.push(VolumeMount {
             host,
             guest: PathBuf::from(GUEST_CONTROL_DIR),
@@ -853,7 +862,7 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
         storage_gib: config.storage_gib,
         overlay_gib: config.overlay_gib,
         network: NetworkPolicy::PublicOnly,
-        volumes: runner_volumes(config),
+        volumes: runner_volumes(config, golden),
         sockets: config
             .control_socket
             .iter()
@@ -927,7 +936,7 @@ async fn prepare_packed_golden<P: VmProvider + 'static>(
         storage_gib: config.storage_gib,
         overlay_gib: config.overlay_gib,
         network: NetworkPolicy::PublicOnly,
-        volumes: runner_volumes(config),
+        volumes: runner_volumes(config, golden),
         sockets: config
             .control_socket
             .iter()
@@ -1275,6 +1284,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                 .as_str()
                 .starts_with(&format!("{}-", self.config.name_prefix))
             {
+                notify_runner_gone(&self.config, &name).await;
                 if let Err(error) = self.provider.delete(&name).await {
                     warn!(machine = name.as_str(), %error, "failed to delete stale Preloop runner");
                 }
@@ -1290,6 +1300,42 @@ struct ReadyRunner {
     name: MachineName,
     run: Vec<String>,
     environment: RunnerEnvironment,
+}
+
+/// Tell the control plane a machine's runner is gone, BEFORE the VM goes
+/// away: the server purges the identity AND requeues any job the runner
+/// claimed but never finished. Without this, a machine torn down mid-job
+/// hangs that job until the 45-minute lease reaper marks it failed.
+///
+/// Fire-and-forget: machine deletion must not stall on control-plane
+/// availability, and a missed purge only reverts to the old reaper path.
+async fn notify_runner_gone(config: &RunnerPoolConfig, name: &MachineName) {
+    let Some(token) = std::env::var(&config.registration_token_env)
+        .ok()
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    let url = format!(
+        "{}/api/v1/runners/purge",
+        config.server_url.trim_end_matches('/')
+    );
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(1500))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return,
+    };
+    if let Err(error) = client
+        .post(url)
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "name": name.as_str() }))
+        .send()
+        .await
+    {
+        warn!(machine = name.as_str(), %error, "runner purge notification failed");
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1471,6 +1517,7 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
     // runners around).
     match result {
         Ok(Some(successor)) => {
+            notify_runner_gone(&config, &successor.name).await;
             let _ = provider.delete(&successor.name).await;
             Ok(())
         }
@@ -1647,6 +1694,7 @@ async fn run_slot<P: VmProvider + 'static>(
     }
 
     if let Some(spare) = spare {
+        notify_runner_gone(&config, &spare.name).await;
         let _ = provider.delete(&spare.name).await;
     }
     Ok(())
@@ -1867,15 +1915,17 @@ async fn run_one_runner<P: VmProvider + 'static>(
 
     if let Some(debug_dir) = preserved {
         hold_for_debugging(name, &debug_dir, &shutdown).await;
+        notify_runner_gone(config, name).await;
         if let Err(error) = provider.delete(name).await {
             warn!(machine = name.as_str(), %error, "failed to delete preserved machine");
         }
-        return finish(&provider, result, successor).await;
+        return finish(&provider, config, result, successor).await;
     }
 
     // Report the runner's own failure in preference to a teardown failure.
+    notify_runner_gone(config, name).await;
     let delete_result = provider.delete(name).await.map_err(OrchestratorError::from);
-    finish(&provider, result.and(delete_result), successor).await
+    finish(&provider, config, result.and(delete_result), successor).await
 }
 
 /// Hand the replacement back, or discard it if this runner is failing.
@@ -1885,6 +1935,7 @@ async fn run_one_runner<P: VmProvider + 'static>(
 /// swept stale names, so failure paths delete it explicitly.
 async fn finish<P: VmProvider + 'static>(
     provider: &Arc<P>,
+    config: &RunnerPoolConfig,
     result: Result<(), OrchestratorError>,
     successor: Option<ReadyRunner>,
 ) -> Result<Option<ReadyRunner>, OrchestratorError> {
@@ -1892,6 +1943,7 @@ async fn finish<P: VmProvider + 'static>(
         Ok(()) => Ok(successor),
         Err(error) => {
             if let Some(successor) = successor {
+                notify_runner_gone(config, &successor.name).await;
                 if let Err(cleanup) = provider.delete(&successor.name).await {
                     warn!(
                         machine = successor.name.as_str(),
@@ -2014,7 +2066,7 @@ async fn provision_runner<P: VmProvider + 'static>(
             storage_gib: config.storage_gib,
             overlay_gib: config.overlay_gib,
             network: NetworkPolicy::PublicOnly,
-            volumes: runner_volumes(config),
+            volumes: runner_volumes(config, name),
             sockets: config
                 .control_socket
                 .iter()

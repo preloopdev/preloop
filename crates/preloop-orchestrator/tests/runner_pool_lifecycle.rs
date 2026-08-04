@@ -336,6 +336,7 @@ impl Fixture {
             control_origin: None,
             control_socket: None,
             control_upstream: None,
+            dns: None,
             registration_token_env: token_env.clone(),
             labels: vec!["self-hosted".to_owned(), "linux".to_owned()],
             cpus: 2,
@@ -347,6 +348,7 @@ impl Fixture {
             pending_jobs: None,
             preload_images: Vec::new(),
             next_job_runs_on: None,
+            pending_registrations: None,
         };
         Self {
             _env_guard: env_guard,
@@ -569,7 +571,10 @@ async fn runner_keeps_public_only_egress_and_wires_control_socket_and_environmen
                 read_only: true,
             },
             VolumeMount {
-                host: fixture.root.join("control-bridge"),
+                // Per-machine control-bridge directory: the guest agent's
+                // socket node lands INSIDE this host directory, so a shared
+                // one would leak dead machines' listeners into new machines.
+                host: fixture.root.join("control-bridge").join(&runner),
                 guest: PathBuf::from("/run/preloop-control"),
                 read_only: false,
             },
