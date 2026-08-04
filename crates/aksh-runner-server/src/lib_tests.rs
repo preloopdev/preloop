@@ -6353,6 +6353,13 @@ jobs:
     assert_eq!(run_record.submission.event, "pull_request");
     assert_eq!(run_record.submission.git_ref, "refs/pull/42/head");
     assert_eq!(run_record.job_check_run_ids.len(), 1);
+    // A pull_request payload has no `after`; the head sha must still reach
+    // the job. Falling through to all-zeros makes every checkout ask the
+    // server for `0000…` and fail as "not our ref".
+    assert_eq!(
+        run_record.head_sha, "b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3",
+        "pull_request head sha must drive github.sha"
+    );
 }
 
 #[tokio::test]
@@ -11445,6 +11452,45 @@ async fn submit_simple_run(app: &Router) -> Value {
         }),
     )
     .await
+}
+
+#[tokio::test]
+async fn pull_request_submission_uses_head_sha_not_zeros() {
+    // A pull_request payload has no `after`, and a submission that does not
+    // pre-resolve a sha used to fall through to all-zeros. The job then asks
+    // its remote for `0000…` and dies with "not our ref 0000…", which points
+    // nowhere near the real cause.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: pull_request\njobs:\n  build:\n    runs-on: self-hosted\n    steps:\n      - run: echo hi\n",
+            "event": "pull_request",
+            "repository": "owner/repo",
+            "payload": {
+                "action": "opened",
+                "number": 7,
+                "pull_request": {
+                    "head": { "ref": "feature", "sha": "b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3" },
+                    "base": { "ref": "main", "sha": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2" }
+                }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(accepted["queued_jobs"], 1);
+
+    let inner = state.inner.lock().await;
+    let (_, run_record) = inner.runs.iter().next().unwrap();
+    assert_eq!(
+        run_record.head_sha, "b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3",
+        "pull_request head sha must drive github.sha instead of the zero sha"
+    );
 }
 
 async fn pool_managed_state(temp: &tempfile::TempDir) -> AppState {
