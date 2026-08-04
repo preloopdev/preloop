@@ -350,6 +350,37 @@ previously failing step green** — Checkout, Resolve checkout SHA, Resolve
 exact diff base, Ensure preflight base commit. The skip cascade for
 downstream jobs was correct.
 
+Third rerun (run `aa9cd0e0`) — **preflight fully green**: Checkout,
+Resolve checkout SHA, Resolve exact diff base, Ensure preflight base
+commit, Detect docs-only changes, Detect changed scopes, Build CI
+manifest, Check mobile protocol event coverage. The checkout log shows
+the real fetch landing:
+`* [new ref] 0758316883f5... -> origin/checkout` from github.com.
+`build-artifacts` and `pnpm-store-warmup` then ran real work (Node
+setup, dist build, artifact upload, CLI smoke tests).
+
+Getting there took two more fixes beyond the snapshot-identity one:
+
+1. **Runner bug — stale workspace** (fixed, `29804a3a`). A long-lived
+   runner reused its work folder, so openclaw's `git init` +
+   `git remote add origin` checkout died at 30 ms with
+   `error: remote origin already exists` (exit 3). Hosted runners hand
+   each job a new VM; a shared runner must reproduce that freshness.
+   `setup_workspace` now clears the workspace first, with a regression
+   test. This had been misread as a fetch timeout — the run log route
+   (`GET /api/v1/runs/{id}/logs`) is what settled it.
+2. **Campaign payload gaps.** The synthetic PR payload carried only
+   `author_association/base/draft/head`; `pull_request.commits` was
+   absent (security-fast validates it as an integer) and `base.sha` was
+   empty. Filled with openclaw's real main HEAD and a commit count.
+
+Environment note: the host cell runs on macOS while the workflow targets
+Linux. openclaw's scripts need GNU `timeout` and bash 4+ `mapfile`, so
+the cell needs `/tmp/conformance-shims` (coreutils + bash 5) on PATH.
+The VM cell — the honest Linux environment — is still blocked: on-demand
+guests fail registration because the guest control bridge never binds
+(`preloop-vm`/orchestrator, tracked separately).
+
 Second rerun (clean engine, `results/conformance-4repos/openclaw/c/run.json`):
 43 skipped + 3 failed, the same cascade shape as the golden's docs-only PR.
 The preflight failure is no longer the protocol bug: the checkout step now
