@@ -191,7 +191,12 @@ pub(crate) async fn runner_surface_only(
     let denied = DENIED_PREFIXES
         .iter()
         .any(|prefix| path.starts_with(prefix))
-        || path.starts_with("/api/v1/");
+        // `/api/v1/actions/*` is the runner's own action-archive download
+        // (sanitized GitHub tarball paths), which the runner executes inside
+        // the VM and therefore must be able to reach through the mounted
+        // control socket. Every other native prefix stays off the guest
+        // surface: workflow code is untrusted.
+        || (path.starts_with("/api/v1/") && !path.starts_with("/api/v1/actions/"));
     if denied {
         return Err(ApiError::not_found(format!(
             "{path} not available on this endpoint"
