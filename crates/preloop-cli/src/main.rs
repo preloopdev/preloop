@@ -878,7 +878,14 @@ fn local_runner_pool_config(
         // mutations into SmolVM forks.
         use_packed_artifact,
         use_fork: pool_enabled && use_packed_artifact && env_flag("PRELOOP_USE_FORK", true),
-        name_prefix: "preloop-runner".into(),
+        // Multiple engines on one host must not share a namespace: smolvm
+        // keys machines and persistent overlays by name, and cross-engine
+        // reuse boots a runner whose persisted state points at the other
+        // engine's control plane.
+        name_prefix: std::env::var("PRELOOP_RUNNER_NAME_PREFIX")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "preloop-runner".into()),
         base_image: std::env::var("PRELOOP_RUNNER_BASE_IMAGE")
             .unwrap_or_else(|_| preloop_orchestrator::environment::DEFAULT_BASE_IMAGE.into()),
         workspace: Some(workspace),
