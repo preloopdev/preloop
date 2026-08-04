@@ -477,7 +477,14 @@ pub(crate) async fn submit_run_inner(
         .map(std::path::Path::new)
         .or(shared.state.local_workspace.as_deref());
     let workspace_snapshot = if let Some(workspace) = local_workspace {
-        match create_workspace_snapshot(&shared.state.state_dir, workspace, run_id).await {
+        match create_workspace_snapshot(
+            &shared.state.state_dir,
+            workspace,
+            run_id,
+            shared.state.static_github_pat().as_deref(),
+        )
+        .await
+        {
             Ok(snapshot) => Some(snapshot),
             Err(error) => {
                 warn!(%run_id, error = ?error, "Failed to create workspace snapshot — falling back to normal checkout");
