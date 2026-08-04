@@ -21,6 +21,8 @@ pub(crate) struct BrokerRenewJobRequest {
     pub(crate) conclusion: Option<String>,
     #[serde(default)]
     pub(crate) outputs: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub(crate) annotations: Vec<serde_json::Value>,
 }
 
 pub(crate) fn execution_status_from_runner_result(result: &str) -> Option<ExecutionStatus> {
@@ -29,6 +31,10 @@ pub(crate) fn execution_status_from_runner_result(result: &str) -> Option<Execut
         "failure" | "failed" => Some(ExecutionStatus::Failure),
         "cancelled" | "canceled" => Some(ExecutionStatus::Cancelled),
         "skipped" => Some(ExecutionStatus::Skipped),
+        // Official TaskResult.Abandoned: the runner reports it when the job
+        // never finished on it (lease lost, first renew failed). GitHub
+        // concludes such jobs as failed — no retry for self-hosted runners.
+        "abandoned" => Some(ExecutionStatus::Failure),
         _ => None,
     }
 }
@@ -198,6 +204,7 @@ fn runner_version_deprecated_response(
 pub(crate) async fn next_message_broker_ref(
     State(shared): State<Arc<SharedState>>,
     Path(_pool_id): Path<i64>,
+    identity: Option<axum::Extension<RunnerIdentity>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
     if let Some(response) = runner_version_deprecated_response(&shared, &params) {
@@ -251,7 +258,11 @@ pub(crate) async fn next_message_broker_ref(
         }
 
         let runner = inner.runner_capabilities_for_session(&session_id);
-        let claimed = take_matching_job(&mut inner.queue, &runner);
+        let verified = effective_claim_runner(
+            identity.as_ref().map(|axum::Extension(id)| id),
+            Some(runner_id),
+        );
+        let claimed = take_matching_job(&mut inner, &runner, verified);
         shared
             .state
             .queue_depth
@@ -326,6 +337,7 @@ pub(crate) async fn next_message_broker_ref(
 pub(crate) async fn next_message_disttask(
     State(shared): State<Arc<SharedState>>,
     Path(pool_id): Path<i64>,
+    identity: Option<axum::Extension<RunnerIdentity>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
     let session_id = params
@@ -337,10 +349,11 @@ pub(crate) async fn next_message_disttask(
         inner.azdo_sessions.contains(&session_id)
     };
     if is_azdo {
-        let (status, body) = next_message_compat(State(shared), Path(pool_id), Query(params)).await;
+        let (status, body) =
+            next_message_compat(State(shared), Path(pool_id), identity, Query(params)).await;
         Ok((status, body).into_response())
     } else {
-        next_message_broker_ref(State(shared), Path(pool_id), Query(params)).await
+        next_message_broker_ref(State(shared), Path(pool_id), identity, Query(params)).await
     }
 }
 
@@ -552,7 +565,7 @@ pub(crate) async fn next_message_broker_ref_root(
                 None
             } else {
                 let runner = inner.runner_capabilities_for_session(&session_id);
-                let claimed = take_matching_job(&mut inner.queue, &runner);
+                let claimed = take_matching_job(&mut inner, &runner, Some(runner_id));
                 shared
                     .state
                     .queue_depth
@@ -767,6 +780,7 @@ async fn fail_unclaimable_request(shared: &Arc<SharedState>, request_id: i64) {
             job_id,
             status: ExecutionStatus::Failure,
             outputs: aksh_gha_protocol::OutputMap::new(),
+            annotations: Vec::new(),
         };
         // The caller is already returning the mint failure to the runner, so a
         // secondary bookkeeping error must not mask it.
@@ -803,16 +817,14 @@ pub(crate) async fn mint_dispatch_github_token(
             effective_permissions,
         })),
         Err(error) => {
-            let fallback = crate::github_app::fallback_token(
-                app.mint_failure,
-                std::env::var("AKSH_GITHUB_TOKEN").ok(),
-            )
-            .map_err(|refusal| {
-                ApiError::bad_gateway(format!(
-                    "GitHub App token minting failed for {}: {error:#} ({refusal})",
-                    request.repository
-                ))
-            })?;
+            let fallback =
+                crate::github_app::fallback_token(app.mint_failure, app.pat_fallback.clone())
+                    .map_err(|refusal| {
+                        ApiError::bad_gateway(format!(
+                            "GitHub App token minting failed for {}: {error:#} ({refusal})",
+                            request.repository
+                        ))
+                    })?;
             if fallback.is_some() {
                 warn!(
                     repository = %request.repository,
@@ -915,6 +927,7 @@ pub(crate) async fn broker_complete_job(
                     job_id,
                     status,
                     outputs,
+                    annotations: request.annotations.clone(),
                 })
             }
             None => {
@@ -1007,6 +1020,21 @@ mod tests {
         assert_eq!(
             wire["message"],
             "Runner version 2.330.1 is deprecated and cannot receive messages."
+        );
+    }
+
+    #[test]
+    fn abandoned_runner_result_concludes_failure() {
+        // Official TaskResult.Abandoned: the job never finished on its runner
+        // (lease lost / first renew failed). GitHub concludes abandoned
+        // self-hosted jobs as failed — no retry, dependents skip.
+        assert_eq!(
+            execution_status_from_runner_result("abandoned"),
+            Some(ExecutionStatus::Failure)
+        );
+        assert_eq!(
+            execution_status_from_runner_result("Abandoned"),
+            Some(ExecutionStatus::Failure)
         );
     }
 }

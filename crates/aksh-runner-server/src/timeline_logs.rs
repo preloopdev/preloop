@@ -104,8 +104,13 @@ pub(crate) async fn patch_timeline_records(
                     } else {
                         run.jobs_list.push(JobDetail {
                             name: job_name,
-                            conclusion: "success".to_owned(),
+                            // A timeline update means the job started; the run
+                            // record's final conclusion comes from the job
+                            // status map (projected in the runs GET). Default
+                            // to the truthful in-flight state, never "success".
+                            conclusion: "in_progress".to_owned(),
                             steps: Vec::new(),
+                            annotations: Vec::new(),
                         });
                         run.jobs_list.last_mut().unwrap()
                     };
@@ -135,6 +140,7 @@ pub(crate) async fn patch_timeline_records(
                         }
                         Some(azdo::TaskResult::Cancelled) => "cancelled",
                         Some(azdo::TaskResult::Skipped) => "skipped",
+                        Some(azdo::TaskResult::Abandoned) => "failed",
                         None if record.state == Some(azdo::TimelineRecordState::InProgress) => {
                             "in_progress"
                         }
@@ -185,6 +191,7 @@ pub(crate) fn timeline_status(record: &azdo::TimelineRecord) -> Option<Execution
         Some(azdo::TaskResult::Failed) => Some(ExecutionStatus::Failure),
         Some(azdo::TaskResult::Cancelled) => Some(ExecutionStatus::Cancelled),
         Some(azdo::TaskResult::Skipped) => Some(ExecutionStatus::Skipped),
+        Some(azdo::TaskResult::Abandoned) => Some(ExecutionStatus::Failure),
         None if record.state == Some(azdo::TimelineRecordState::InProgress) => {
             Some(ExecutionStatus::InProgress)
         }
@@ -249,20 +256,14 @@ pub(crate) fn mask_log_bytes(inner: &InnerState, plan_id: &str, body: &[u8]) -> 
         .or_else(|| plan_id.parse::<RunId>().ok());
     let run_secrets: Vec<String> = resolved_run_id
         .and_then(|run_id| inner.runs.get(&run_id))
-        .map(|run| {
-            run.submission
-                .secrets
-                .values()
-                .map(|s| s.expose().to_owned())
-                .collect()
-        })
+        .map(|run| aksh_gha_protocol::masking::expose_values(run.submission.secrets.values()))
         .unwrap_or_else(|| {
-            inner
-                .runs
-                .values()
-                .flat_map(|run| run.submission.secrets.values())
-                .map(|s| s.expose().to_owned())
-                .collect()
+            aksh_gha_protocol::masking::expose_values(
+                inner
+                    .runs
+                    .values()
+                    .flat_map(|run| run.submission.secrets.values()),
+            )
         });
 
     aksh_gha_protocol::masking::mask_secrets(&text, run_secrets.iter().map(String::as_str), &[])
@@ -332,6 +333,7 @@ pub(crate) async fn finish_job(
                 job_id,
                 status,
                 outputs,
+                annotations: Vec::new(),
             })
         } else {
             None
@@ -497,6 +499,7 @@ pub(crate) async fn finish_job_plan(
                 job_id,
                 status,
                 outputs,
+                annotations: Vec::new(),
             })
         } else {
             warn!(plan_id, "finish_job_plan: could not resolve run/job");
