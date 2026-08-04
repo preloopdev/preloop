@@ -2,11 +2,11 @@ use super::*;
 
 /// POST action download info — resolve action references to download URLs.
 pub(crate) async fn action_download_info(
-    State(_shared): State<Arc<SharedState>>,
+    State(shared): State<Arc<SharedState>>,
     Json(request): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     let mut tickets = serde_json::Map::new();
-    collect_action_download_refs(&request, &mut tickets);
+    collect_action_download_refs(&shared.state, &request, &mut tickets);
 
     Json(json!({
         "archiveDownloadTickets": tickets.clone(),
@@ -18,18 +18,31 @@ pub(crate) async fn action_download_info(
 }
 
 pub(crate) async fn runnerresolve_actions(
-    State(_shared): State<Arc<SharedState>>,
+    State(shared): State<Arc<SharedState>>,
     Json(request): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     let mut actions = serde_json::Map::new();
-    collect_runnerresolve_refs(&request, &mut actions);
+    collect_runnerresolve_refs(&shared.state, &request, &mut actions);
 
     Json(json!({ "actions": actions }))
+}
+
+/// How long a minted archive ticket stays valid. Actions are fetched during
+/// job setup, so this only has to outlive a queue wait, not a whole run.
+pub(crate) const ACTION_TICKET_TTL_SECS: u64 = 6 * 60 * 60;
+
+#[derive(serde::Deserialize)]
+pub(crate) struct ActionTicketQuery {
+    #[serde(default)]
+    exp: Option<u64>,
+    #[serde(default)]
+    sig: Option<String>,
 }
 
 pub(crate) async fn download_action_tarball(
     State(shared): State<Arc<SharedState>>,
     Path((owner, repo, git_ref)): Path<(String, String, String)>,
+    Query(ticket): Query<ActionTicketQuery>,
 ) -> Result<Response, ApiError> {
     // 1. Sanitize parameters to avoid directory traversal
     if owner.contains('.')
@@ -42,6 +55,22 @@ pub(crate) async fn download_action_tarball(
         || git_ref.contains('\\')
     {
         return Err(ApiError::bad_request("invalid owner, repo, or git_ref"));
+    }
+
+    // 2. The URL is the capability. This route is bearerless and reachable
+    // from inside every runner VM, so without a signature any workflow could
+    // make the engine fetch an arbitrary repository with the engine's own
+    // GitHub credential. Answer 404 rather than 403: an unauthorised caller
+    // learns nothing about which actions exist.
+    let authorised = match (ticket.exp, ticket.sig.as_deref()) {
+        (Some(expires_at), Some(signature)) => shared
+            .state
+            .verify_action_ticket(&owner, &repo, &git_ref, expires_at, signature),
+        _ => false,
+    };
+    if !authorised {
+        warn!("rejected action download with missing or invalid ticket: {owner}/{repo}@{git_ref}");
+        return Err(ApiError::not_found("action archive not found"));
     }
 
     let cache_dir = shared
@@ -166,18 +195,19 @@ pub(crate) async fn download_action_tarball(
 }
 
 pub(crate) fn collect_action_download_refs(
+    state: &AppState,
     value: &serde_json::Value,
     tickets: &mut serde_json::Map<String, serde_json::Value>,
 ) {
     match value {
         serde_json::Value::String(raw) => {
-            if let Some((key, ticket)) = action_download_ticket(raw, None) {
+            if let Some((key, ticket)) = action_download_ticket(state, raw, None) {
                 tickets.entry(key).or_insert(ticket);
             }
         }
         serde_json::Value::Array(items) => {
             for item in items {
-                collect_action_download_refs(item, tickets);
+                collect_action_download_refs(state, item, tickets);
             }
         }
         serde_json::Value::Object(map) => {
@@ -193,13 +223,13 @@ pub(crate) fn collect_action_download_refs(
                 .or_else(|| map.get("reference"))
                 .and_then(|v| v.as_str());
             if let Some(action) = action {
-                if let Some((key, ticket)) = action_download_ticket(action, version) {
+                if let Some((key, ticket)) = action_download_ticket(state, action, version) {
                     tickets.entry(key).or_insert(ticket);
                 }
             }
 
             for nested in map.values() {
-                collect_action_download_refs(nested, tickets);
+                collect_action_download_refs(state, nested, tickets);
             }
         }
         _ => {}
@@ -207,6 +237,7 @@ pub(crate) fn collect_action_download_refs(
 }
 
 pub(crate) fn action_download_ticket(
+    state: &AppState,
     action: &str,
     version_override: Option<&str>,
 ) -> Option<(String, serde_json::Value)> {
@@ -232,7 +263,20 @@ pub(crate) fn action_download_ticket(
 
     let key = format!("{repo_part}@{git_ref}");
     let runner_url = runner_base_url();
-    let url = format!("{runner_url}/api/v1/actions/download/{owner}/{repo}/{git_ref}");
+    // The download route is bearerless and reachable from inside runner VMs,
+    // so the URL itself has to be the capability: signed, scoped to this one
+    // action, and short-lived. Actions are fetched during job setup, so a few
+    // hours covers even a long queue wait.
+    let expires_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or_default()
+        + ACTION_TICKET_TTL_SECS;
+    let signature = state.sign_action_ticket(owner, repo, git_ref, expires_at);
+    let url = format!(
+        "{runner_url}/api/v1/actions/download/{owner}/{repo}/{git_ref}\
+?exp={expires_at}&sig={signature}"
+    );
     Some((
         key,
         json!({
@@ -245,18 +289,19 @@ pub(crate) fn action_download_ticket(
 }
 
 pub(crate) fn collect_runnerresolve_refs(
+    state: &AppState,
     value: &serde_json::Value,
     actions: &mut serde_json::Map<String, serde_json::Value>,
 ) {
     match value {
         serde_json::Value::String(raw) => {
-            if let Some((key, action)) = runnerresolve_action(raw, None) {
+            if let Some((key, action)) = runnerresolve_action(state, raw, None) {
                 actions.entry(key).or_insert(action);
             }
         }
         serde_json::Value::Array(items) => {
             for item in items {
-                collect_runnerresolve_refs(item, actions);
+                collect_runnerresolve_refs(state, item, actions);
             }
         }
         serde_json::Value::Object(map) => {
@@ -272,13 +317,13 @@ pub(crate) fn collect_runnerresolve_refs(
                 .or_else(|| map.get("reference"))
                 .and_then(|v| v.as_str());
             if let Some(action) = action {
-                if let Some((key, value)) = runnerresolve_action(action, version) {
+                if let Some((key, value)) = runnerresolve_action(state, action, version) {
                     actions.entry(key).or_insert(value);
                 }
             }
 
             for nested in map.values() {
-                collect_runnerresolve_refs(nested, actions);
+                collect_runnerresolve_refs(state, nested, actions);
             }
         }
         _ => {}
@@ -286,10 +331,11 @@ pub(crate) fn collect_runnerresolve_refs(
 }
 
 pub(crate) fn runnerresolve_action(
+    state: &AppState,
     action: &str,
     version_override: Option<&str>,
 ) -> Option<(String, serde_json::Value)> {
-    let (key, ticket) = action_download_ticket(action, version_override)?;
+    let (key, ticket) = action_download_ticket(state, action, version_override)?;
     let (name, version) = key.split_once('@')?;
     let name = name.to_string();
     let version = version.to_string();
