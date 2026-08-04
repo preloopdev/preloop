@@ -11650,6 +11650,177 @@ async fn stolen_identity_cannot_pull_another_machines_job() {
 }
 
 #[tokio::test]
+async fn failing_provisioning_cannot_starve_a_healthy_runner() {
+    // A pool that keeps provisioning machines and losing them (broken image,
+    // host that cannot start VMs) re-binds the job to each short-lived
+    // machine. Every rebind refreshed the binding window, so an established,
+    // capable, verified runner was refused forever — observed as "jobs
+    // queued, never promoted" behind a doomed on-demand loop.
+    let temp = tempfile::tempdir().unwrap();
+    let state = pool_managed_state(&temp).await;
+    let app = app(state.clone(), CancellationToken::new());
+
+    // A healthy runner is registered and polling before the job lands.
+    stage_provision_token(&state, "token-healthy");
+    let (healthy_id, healthy_token) = register_runner_with_token(
+        &app,
+        "healthy-host",
+        &["self-hosted"],
+        Some("token-healthy"),
+    )
+    .await;
+    let (_, healthy_session) = create_disttask_session(&app, &healthy_token, healthy_id).await;
+    let healthy_session_id = healthy_session["sessionId"].as_str().unwrap().to_owned();
+
+    let accepted = submit_simple_run(&app).await;
+    assert_eq!(accepted["queued_jobs"], 1);
+
+    // Phantom machines: each registers, takes the pairing, then dies without
+    // claiming. Age the binding between rounds so every phantom adopts a
+    // "stale" pairing exactly as the real churn does.
+    for round in 0..3 {
+        {
+            let mut inner = state.inner.lock().await;
+            let keys: Vec<_> = inner.job_assignments.keys().cloned().collect();
+            for key in keys {
+                if let Some(record) = inner.job_assignments.get_mut(&key) {
+                    record.at = std::time::SystemTime::now()
+                        - crate::runtime_scheduling::CLAIM_BINDING_TTL
+                        - std::time::Duration::from_secs(1);
+                    record.first_at = record.at;
+                }
+            }
+        }
+        let token_name = format!("token-phantom-{round}");
+        stage_provision_token(&state, &token_name);
+        let (phantom_id, _) = register_runner_with_token(
+            &app,
+            &format!("phantom-{round}"),
+            &["self-hosted"],
+            Some(&token_name),
+        )
+        .await;
+        // The machine dies before claiming anything.
+        let shared = std::sync::Arc::new(crate::state::SharedState {
+            state: state.clone(),
+            shutdown: CancellationToken::new(),
+        });
+        crate::runner_lifecycle::purge_runner_identity(&shared, phantom_id).await;
+    }
+
+    // The established runner must now be able to claim: the job has been
+    // bound-and-abandoned for longer than the binding window.
+    {
+        let mut inner = state.inner.lock().await;
+        let keys: Vec<_> = inner.job_assignments.keys().cloned().collect();
+        for key in keys {
+            if let Some(record) = inner.job_assignments.get_mut(&key) {
+                record.first_at = std::time::SystemTime::now()
+                    - crate::runtime_scheduling::CLAIM_BINDING_TTL
+                    - std::time::Duration::from_secs(1);
+            }
+        }
+        let pending: Vec<_> = inner.pool_pending.keys().cloned().collect();
+        for key in pending {
+            inner.pool_pending.insert(
+                key,
+                std::time::SystemTime::now()
+                    - crate::runtime_scheduling::CLAIM_BINDING_TTL
+                    - std::time::Duration::from_secs(1),
+            );
+        }
+    }
+
+    let delivered = poll_message(&app, &healthy_token, &healthy_session_id).await;
+    assert!(
+        delivered["messageType"].as_str().is_some(),
+        "established runner must rescue a job abandoned by churning machines: {delivered}"
+    );
+}
+
+#[tokio::test]
+async fn rebinding_churn_cannot_starve_an_established_runner() {
+    // Machines that register and then go silent without claiming keep
+    // adopting the stale pairing, and each adoption refreshed the binding
+    // window. An established, capable, verified runner was refused for as
+    // long as the churn continued.
+    let temp = tempfile::tempdir().unwrap();
+    let state = pool_managed_state(&temp).await;
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = submit_simple_run(&app).await;
+    assert_eq!(accepted["queued_jobs"], 1);
+
+    // The established runner registers after the job queued, so the job is
+    // pool-pending and it is not the paired machine.
+    stage_provision_token(&state, "token-established");
+    let (established_id, established_token) = register_runner_with_token(
+        &app,
+        "established-host",
+        &["self-hosted"],
+        Some("token-established"),
+    )
+    .await;
+    let (_, established_session) =
+        create_disttask_session(&app, &established_token, established_id).await;
+    let established_session_id = established_session["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Churn: each new machine adopts the pairing once the previous one's
+    // binding looks stale, refreshing `at` every round.
+    for round in 0..3 {
+        {
+            let mut inner = state.inner.lock().await;
+            let keys: Vec<_> = inner.job_assignments.keys().cloned().collect();
+            for key in keys {
+                if let Some(record) = inner.job_assignments.get_mut(&key) {
+                    record.at = std::time::SystemTime::now()
+                        - crate::runtime_scheduling::CLAIM_BINDING_TTL
+                        - std::time::Duration::from_secs(1);
+                }
+            }
+        }
+        let token_name = format!("token-churn-{round}");
+        stage_provision_token(&state, &token_name);
+        register_runner_with_token(
+            &app,
+            &format!("churn-{round}"),
+            &["self-hosted"],
+            Some(&token_name),
+        )
+        .await;
+    }
+
+    // Every round refreshed `at`, so the binding still looks fresh — but the
+    // job has been bound-and-unclaimed since the first round.
+    {
+        let mut inner = state.inner.lock().await;
+        let keys: Vec<_> = inner.job_assignments.keys().cloned().collect();
+        assert!(!keys.is_empty(), "churn must leave the job bound");
+        for key in keys {
+            if let Some(record) = inner.job_assignments.get_mut(&key) {
+                assert!(
+                    record.runner_id != established_id,
+                    "churned machine, not the established runner, holds the pairing"
+                );
+                record.first_at = std::time::SystemTime::now()
+                    - crate::runtime_scheduling::CLAIM_BINDING_TTL
+                    - std::time::Duration::from_secs(1);
+                record.at = std::time::SystemTime::now();
+            }
+        }
+    }
+
+    let delivered = poll_message(&app, &established_token, &established_session_id).await;
+    assert!(
+        delivered["messageType"].as_str().is_some(),
+        "established runner must rescue a job held by churning machines: {delivered}"
+    );
+}
+
+#[tokio::test]
 async fn queue_time_assignment_prefers_idle_registered_runner() {
     let temp = tempfile::tempdir().unwrap();
     let state = pool_managed_state(&temp).await;

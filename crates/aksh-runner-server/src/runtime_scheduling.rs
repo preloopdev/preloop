@@ -1092,6 +1092,14 @@ fn claim_permitted(inner: &InnerState, job: &QueuedJob, verified_runner_id: Opti
     let key = (job.run_id, job.job_id.clone());
     let now = std::time::SystemTime::now();
     if let Some(record) = inner.job_assignments.get(&key) {
+        if !binding_fresh(record.first_at, now) {
+            // The job has been bound to *some* machine since longer than the
+            // binding window without ever being claimed. A pool that keeps
+            // provisioning and losing machines re-stamps `at` on every
+            // registration, so without this ceiling an established, capable
+            // runner is starved for as long as the churn continues.
+            return verified_runner_id.is_some();
+        }
         if !binding_fresh(record.at, now) {
             // Stale pairing: the owner is presumed dead. Only a verified
             // runner identity may take over — unverified sessions keep the
@@ -1100,10 +1108,15 @@ fn claim_permitted(inner: &InnerState, job: &QueuedJob, verified_runner_id: Opti
         }
         return Some(record.runner_id) == verified_runner_id;
     }
-    if inner.pool_pending.contains_key(&key) {
+    if let Some(marked_at) = inner.pool_pending.get(&key) {
         // A machine is being provisioned for this job; nobody claims it
-        // until that machine registers and the assignment is stamped.
-        return false;
+        // until that machine registers and the assignment is stamped. The
+        // hold is bounded the same way: provisioning that never lands must
+        // not starve a healthy runner past the binding window.
+        if binding_fresh(*marked_at, now) {
+            return false;
+        }
+        return verified_runner_id.is_some();
     }
     !inner.require_job_assignments
 }
@@ -1154,6 +1167,7 @@ pub(crate) fn on_job_enqueued(inner: &mut InnerState, job: &QueuedJob) {
                     AssignmentRecord {
                         runner_id,
                         at: std::time::SystemTime::now(),
+                        first_at: std::time::SystemTime::now(),
                     },
                 )
                 .is_none()
@@ -1213,6 +1227,14 @@ pub(crate) fn pair_registered_runner(inner: &mut InnerState, runner_id: i64) {
             .map(|(key, _)| key.clone())
     });
     if let Some(key) = chosen {
+        // Rebinding to a replacement machine keeps the original first-bound
+        // stamp, so repeated provisioning failures cannot extend the window
+        // during which only the paired machine may claim.
+        let first_at = inner
+            .job_assignments
+            .get(&key)
+            .map(|record| record.first_at)
+            .unwrap_or_else(std::time::SystemTime::now);
         inner.pool_pending.remove(&key);
         info!(runner_id, run_id = %key.0, job_id = %key.1.0, "job assignment paired to registered runner");
         inner.job_assignments.insert(
@@ -1220,6 +1242,7 @@ pub(crate) fn pair_registered_runner(inner: &mut InnerState, runner_id: i64) {
             AssignmentRecord {
                 runner_id,
                 at: std::time::SystemTime::now(),
+                first_at,
             },
         );
     }
