@@ -97,3 +97,13 @@ benchmarks/real-world/results/aksh-runs/
 benchmarks/compatibility/runner/behavior/*-new.jsonl
 # Scratch runner roots from local pool experiments
 /runners/
+
+# 4-repo conformance campaign captures (2nd wave and later).
+#
+# NOTE: `compare-goldens.py` reads these directories and the first-wave corpus
+# (bat/vite/uv/nextcloud) is already committed, so these rules only hide NEW
+# captures — they do not untrack committed files. A capture is regenerable by
+# re-running the campaign harness against GitHub's runs API.
+benchmarks/real-world/goldens/
+benchmarks/real-world/results/conformance-4repos/**/run.json*
+benchmarks/real-world/conformance-4repos/payloads/
