@@ -175,6 +175,57 @@ pub fn matrix_to_spec(
     })
 }
 
+/// Convert any JSON matrix value (object or array) into a validated expansion specification.
+pub fn value_to_matrix_spec(job_id: &str, value: &Value) -> Result<MatrixSpec, crate::ParserError> {
+    match value {
+        Value::Object(map) => {
+            let mut axes = IndexMap::new();
+            let mut include = Vec::new();
+            let mut exclude = Vec::new();
+            for (key, val) in map {
+                if key == "include" {
+                    if let Value::Array(arr) = val {
+                        for item in arr {
+                            include.push(matrix_entry(job_id, "include", item)?);
+                        }
+                    }
+                } else if key == "exclude" {
+                    if let Value::Array(arr) = val {
+                        for item in arr {
+                            exclude.push(matrix_entry(job_id, "exclude", item)?);
+                        }
+                    }
+                } else {
+                    let axis_values = match val {
+                        Value::Array(arr) => arr.clone(),
+                        v => vec![v.clone()],
+                    };
+                    axes.insert(key.clone(), axis_values);
+                }
+            }
+            Ok(MatrixSpec {
+                axes,
+                exclude,
+                include,
+            })
+        }
+        Value::Array(arr) => {
+            let mut include = Vec::new();
+            for item in arr {
+                include.push(matrix_entry(job_id, "include", item)?);
+            }
+            Ok(MatrixSpec {
+                axes: IndexMap::new(),
+                exclude: Vec::new(),
+                include,
+            })
+        }
+        _ => Err(crate::ParserError::InvalidExpression(format!(
+            "job `{job_id}` matrix expression did not return an object or array"
+        ))),
+    }
+}
+
 fn matrix_entry(
     job_id: &str,
     field: &'static str,
@@ -715,6 +766,26 @@ jobs:
         assert_eq!(set_ab, set_ba);
     }
 
+    #[test]
+    fn value_to_matrix_spec_handles_objects_and_arrays() {
+        let json_obj = serde_json::json!({
+            "include": [
+                {"os": "ubuntu-latest", "node": "20"},
+                {"os": "macos-latest", "node": "22"}
+            ]
+        });
+        let spec = value_to_matrix_spec("test", &json_obj).unwrap();
+        let combos = expand_matrix_spec(&spec);
+        assert_eq!(combos.len(), 2);
+
+        let json_arr = serde_json::json!([
+            {"os": "ubuntu-latest"},
+            {"os": "windows-latest"}
+        ]);
+        let spec_arr = value_to_matrix_spec("test", &json_arr).unwrap();
+        let combos_arr = expand_matrix_spec(&spec_arr);
+        assert_eq!(combos_arr.len(), 2);
+    }
     /// Production-path: generated matrix → YAML → parse → expand → job count matches model.
     /// Oracle: docs/property-tests.md §2 production-path requirements.
     #[test]
