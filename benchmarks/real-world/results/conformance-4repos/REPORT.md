@@ -325,4 +325,85 @@ axum's default 2 MiB body limit on `/api/v1/runs`. Raised to 64 MiB.
 - `benchmarks/real-world/conformance-4repos/compare-goldens.py` — runner/
   qm/buzz/openclaw/agent-ci repo entries.
 
+
+## Fourth wave — 2026-08-04: openclaw rerun, nyblnet/bento, caddyserver/caddy, tokio-rs/tokio
+
+The openclaw preflight finding from the third wave is fixed and re-proven.
+
+### openclaw/openclaw — ci.yml (preflight fix)
+
+Third-wave failure: preflight's custom checkout fetched `${{ github.sha }}`
+from github.com and got `upload-pack: not our ref` — the github context
+carried the synthetic snapshot commit, which exists only in the engine's
+store. Fixed server-side:
+
+- `github.sha` (and PR payload `head.sha`) now expose the workspace's real
+  HEAD commit, not the synthetic snapshot sha (`snapshots.rs`,
+  `runs.rs`). A workflow that fetches `github.sha` from the real remote can
+  resolve it.
+- The snapshot's upload-pack now sets `uploadpack.allowReachableSHA1InWant`
+  / `allowTipSHA1InWant` (what GitHub serves), so deep fetches of real
+  commits against the snapshot work too.
+
+Rerun (host runner, 46 jobs): **preflight success with every previously
+failing step green** — Checkout, Resolve checkout SHA, Resolve exact diff
+base, Ensure preflight base commit. The skip cascade for downstream jobs
+was correct.
+
+### nyblnet/bento — ci.yml, push main
+
+**PASS (cell C, 42/42 steps).** checkout@v4 + setup-node@v4 (node 24), npm
+ci, i18n gates, typechecks, single-file shell builds and splice gates for
+slides/spaces/dash — all success.
+
+### caddyserver/caddy — ci.yml, push master
+
+**PASS (cell C).** Matrix `test` cells (linux / mac / windows) — all three
+ran to completion on the Linux pool with 15/15 steps each, Go toolchain,
+build and unit tests green; goreleaser-check and s390x cells skipped as in
+the golden.
+
+### tokio-rs/tokio — ci.yml, push master
+
+Golden: 77 jobs. Cell C started; the run is long (Rust workspace test
+matrix) and completes in the background. Status is recorded in
+`results/conformance-4repos/tokio/c/run.json` as it lands.
+
+### Infra findings (campaign environment, not protocol)
+
+- **GitHub App installation**: the configured App is not installed on
+  bento/caddy/tokio, so App token minting 422'd and jobs fell back to the
+  local runtime token, which GitHub rejects. Campaign engine now runs in
+  PAT mode (`preloop setup github --via pat`).
+- **Anonymous action downloads rate-limited**: the server fetched action
+  tarballs from api.github.com unauthenticated (60 req/hr budget); a busy
+  campaign exhausted it and every job failed at "Set up job". Fixed:
+  `download_action_tarball` now authenticates with the engine's static PAT
+  when one is configured (`actions.rs`).
+- **Guest surface guard blocked VM action downloads**: the control-socket
+  surface denies `/api/v1/*` (workflow code is untrusted), but the in-VM
+  runner's own action downloads live at `/api/v1/actions/*`. Carved out
+  in `auth.rs` (uncommitted, rides with the user's auth work).
+- **VM teardown race**: fork-based VMs die with `guest runner exited with
+  code -1` at job completion, before the final `completejob` lands, leaving
+  runs stuck queued. Campaign cells now use the host runner (same binary);
+  the VM teardown fix is preloop-vm work in progress.
+
+## Campaign source changes
+
+- `crates/aksh-runner-server/src/snapshots.rs` — snapshot exposes the real
+  workspace HEAD; upload-pack allows reachable/tip sha wants.
+- `crates/aksh-runner-server/src/runs.rs` — `github.sha` / PR `head.sha`
+  use the real HEAD, not the synthetic snapshot commit.
+- `crates/aksh-runner-server/src/actions.rs` — action tarball downloads
+  authenticated with the engine PAT.
+- `crates/aksh-runner-server/src/auth.rs` — guest surface allows
+  `/api/v1/actions/*` (runner's own download path). Uncommitted.
+- `benchmarks/real-world/conformance-4repos/run-host-cell.sh` — host-runner
+  cell C (avoids the VM teardown race).
+- `benchmarks/real-world/conformance-4repos/run-preloop-cell.sh` — PAYLOAD
+  knob for pull_request events; bash 3.2-safe arg handling.
+- `benchmarks/real-world/conformance-4repos/compare-goldens.py` — bento /
+  caddy / tokio repo entries.
+
 Generated 2026-08-03T07:45:00Z

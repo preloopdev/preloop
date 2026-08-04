@@ -11,6 +11,7 @@
 #   PRELOOP_RUNNER_LABELS      extra runner labels (e.g. X64 for the campaign repos)
 #   PRELOOP_RUNNER_BASE_IMAGE  custom base (.smolmachine sidecar) to avoid registry pulls
 #   PRELOOP_RUNNER_OVERLAY_GB  root overlay size per runner (default provider)
+#   PAYLOAD                    event payload JSON file (pull_request needs action: opened)
 #   AKSH_RUNNER_URL            host-reachable runner URL; non-loopback switches
 #                              the runner transport from the control socket to
 #                              plain TCP (macOS smolvm has no socket relay)
@@ -33,8 +34,17 @@ if ! curl -sf --max-time 3 "http://${ENGINE_PORT#127.0.0.1:}/healthz" >/dev/null
   exit 1
 fi
 
-RUN_LINE=$(cd "$REPO_DIR" && AKSH_GITHUB_TOKEN=$(gh auth token) \
-  "$PRELOOP" run -f "$REPO_DIR/$WORKFLOW" --event "$EVENT" --detach | head -1)
+PAYLOAD_ARGS=()
+if [ -n "${PAYLOAD:-}" ]; then
+  PAYLOAD_ARGS=(--payload "$PAYLOAD")
+fi
+if [ ${#PAYLOAD_ARGS[@]} -gt 0 ]; then
+  RUN_LINE=$(cd "$REPO_DIR" && AKSH_GITHUB_TOKEN=$(gh auth token) \
+    "$PRELOOP" run -f "$REPO_DIR/$WORKFLOW" --event "$EVENT" --payload "$PAYLOAD" --detach | head -1)
+else
+  RUN_LINE=$(cd "$REPO_DIR" && AKSH_GITHUB_TOKEN=$(gh auth token) \
+    "$PRELOOP" run -f "$REPO_DIR/$WORKFLOW" --event "$EVENT" --detach | head -1)
+fi
 RUN_ID=$(echo "$RUN_LINE" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
 echo "run: $RUN_ID"
 

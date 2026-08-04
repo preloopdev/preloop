@@ -38,6 +38,9 @@ REPOS = {
     "buzz": "block_buzz",
     "openclaw": "openclaw_openclaw",
     "agent-ci": "redwoodjs_agent-ci",
+    "bento": "nyblnet_bento",
+    "caddy": "caddyserver_caddy",
+    "tokio": "tokio-rs_tokio",
 }
 
 # bat's CICD on GitHub runs a 13-target cross-compile matrix; the local host

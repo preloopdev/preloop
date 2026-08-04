@@ -544,7 +544,13 @@ pub(crate) async fn submit_run_inner(
                         base.insert("sha".to_owned(), serde_json::json!(base_sha));
                     }
                     if let Some(head) = pr.get_mut("head").and_then(|v| v.as_object_mut()) {
-                        head.insert("sha".to_owned(), serde_json::json!(snapshot.commit_sha));
+                        head.insert(
+                            "sha".to_owned(),
+                            serde_json::json!(snapshot
+                                .head_sha
+                                .clone()
+                                .unwrap_or_else(|| snapshot.commit_sha.clone())),
+                        );
                     }
                 }
             }
@@ -553,7 +559,19 @@ pub(crate) async fn submit_run_inner(
         // the pieces that now describe the local tree.
         if let Some(object) = github.as_object_mut() {
             object.insert("event".to_owned(), submission.payload.clone());
-            object.insert("sha".to_owned(), serde_json::json!(snapshot.commit_sha));
+            // `github.sha` is the workspace's real HEAD commit, not the
+            // synthetic snapshot commit: the snapshot commit exists only in
+            // this engine's store, so a workflow step that fetches
+            // `${{ github.sha }}` from the real remote (custom checkouts)
+            // would be answered "not our ref". The workspace HEAD is the
+            // identity the run is really based on.
+            object.insert(
+                "sha".to_owned(),
+                serde_json::json!(snapshot
+                    .head_sha
+                    .clone()
+                    .unwrap_or_else(|| snapshot.commit_sha.clone())),
+            );
         }
     }
 
