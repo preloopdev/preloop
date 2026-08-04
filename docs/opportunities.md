@@ -27,8 +27,19 @@ These can be implemented without any protocol deviation — the official runner 
 
 #### A02: Webhook-driven workflow dispatch
 
-**Current:** Workflows are submitted via `POST /api/v1/runs`. GitHub App webhook handler exists (`github.rs`, 33.4 KB) but workflow file fetching and trigger evaluation from webhooks is incomplete.
-**Opportunity:** Complete the push/PR webhook → workflow fetch → trigger eval → job dispatch pipeline.
+**Current:** Workflows are submitted via `POST /api/v1/runs`. The GitHub App
+webhook handler (`github.rs`) is complete: signature verification
+(`x-hub-signature-256`), delivery dedup (`X-GitHub-Delivery`, 5-min window),
+event adapters with trust tiers (fork PRs → no secrets), PR changed-path
+resolution, workflow fetching from the local workspace or the repo API via an
+App-minted token, and authoritative `on:` trigger evaluation through
+`submit_run_inner`. Live trigger parity was recorded in
+`webhook-trigger-e2e-live-compatibility-report.md`. What remains is plumbing,
+not implementation: register the App's webhook URL/secret/events with GitHub
+(the endpoint is `/api/v1/github/webhooks`; `AKSH_WEBHOOK_SECRET` gates it)
+and prove live GitHub → engine delivery end to end.
+**Opportunity:** Wire the production App webhook and verify a live `git push`
+→ run → runner pickup cycle.
 **Benefit:** Users can `git push` and have aksh automatically run matching workflows, just like GitHub Actions. Essential for the "drop-in" promise.
 **Files:** `crates/aksh-runner-server/src/github.rs`, `crates/aksh-runner-server/src/events/push.rs` (8.8 KB)
 
