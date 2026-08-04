@@ -3,6 +3,8 @@
 pub mod environment;
 mod keys;
 
+include!(concat!(env!("OUT_DIR"), "/pins.rs"));
+
 use crate::environment::{EnvironmentResolver, EnvironmentSpec, ToolchainLayer};
 use crate::keys::{KeyPool, StagedKey};
 use aksh_gha_protocol::RUNNER_BUSY_SENTINEL;
@@ -164,17 +166,29 @@ const BASE_PACKAGES: &str = "\
      build-essential pkg-config libssl-dev make autoconf automake libtool m4 \
      bison flex texinfo patchelf swig dpkg-dev fakeroot binutils \
      libicu-dev libsqlite3-dev libyaml-dev \
-     nodejs npm python3 python3-pip python-is-python3 \
+     python3 python3-pip python-is-python3 \
      unzip zip xz-utils zstd bzip2 brotli lz4 pigz p7zip-full tar \
      jq file tree shellcheck parallel time acl locales tzdata \
      rsync dnsutils iputils-ping net-tools iproute2 netcat-openbsd \
      sqlite3 rpm aria2 mercurial";
 
+/// Node.js baked into the base image, pinned (via `versions.toml`) to the
+/// GitHub-hosted ubuntu-24.04 system Node. Ubuntu's apt `nodejs` (18.19) is
+/// deliberately *not* installed: workflows written against hosted runners
+/// assume a modern Node on PATH, and the apt series floats with the archive.
+pub const BASE_NODE_VERSION: &str = crate::NODE_VERSION;
+
 /// Container engine, installed separately from [`BASE_PACKAGES`].
+///
+/// Installed from Docker's official apt repository (not Ubuntu's `docker.io`
+/// package): the runner needs parity with the `ubuntu-latest` container
+/// stack, and the official packages ship `dockerd`, the CLI, and the
+/// buildx/compose plugins as first-class artifacts.
 ///
 /// Kept apart because it needs storage configuration the other packages do not
 /// — see [`DOCKER_DATA_ROOT`].
-const DOCKER_PACKAGES: &str = "docker.io";
+const DOCKER_PACKAGES: &str =
+    "docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin";
 
 /// Where the container engine stores images and layers.
 ///
@@ -220,6 +234,12 @@ pub fn base_packages() -> &'static str {
     BASE_PACKAGES
 }
 
+/// The golden image's container engine baseline. Exposed for the fidelity
+/// tests.
+pub fn docker_packages() -> &'static str {
+    DOCKER_PACKAGES
+}
+
 /// Where the container engine stores layers. Exposed for the fidelity tests.
 pub fn docker_data_root() -> &'static str {
     DOCKER_DATA_ROOT
@@ -237,7 +257,7 @@ fn node_externals_at(runner_root: &str) -> Vec<Vec<String>> {
         format!(
             "RUNNER_EXTERNALS={runner_root}/externals && \
              mkdir -p \"$RUNNER_EXTERNALS\" && \
-             for entry in 'node20 v20.19.0' 'node24 v24.3.0'; do \
+             for entry in 'node20 v{NODE20_EXTERNALS_VERSION}' 'node24 v{NODE24_EXTERNALS_VERSION}'; do \
                set -- $entry; \
                NAME=$1; VERSION=$2; \
                DEST=$RUNNER_EXTERNALS/$NAME; \
@@ -269,25 +289,39 @@ fn node_externals() -> Vec<Vec<String>> {
     node_externals_at(RUNNER_ROOT)
 }
 
+/// The guest bootstrap script, one shell round trip.
+///
+/// Every `exec` is a host process spawn plus a vsock round trip, and this runs
+/// on the engine's start-up critical path. Exposed for the fidelity tests.
+pub fn base_install_script() -> String {
+    format!(
+        "apt-get update -qq && \
+         DEBIAN_FRONTEND=noninteractive \
+         apt-get install -y -qq --no-install-recommends {BASE_PACKAGES} \
+         && printf '{LOOPBACK_HOSTS}' > /etc/hosts && \
+         (arch=$(uname -m); \
+          case \"$arch\" in x86_64) NODE_ARCH=x64 ;; aarch64|arm64) NODE_ARCH=arm64 ;; *) NODE_ARCH=x64 ;; esac; \
+          curl -fsSL \"https://nodejs.org/dist/v{BASE_NODE_VERSION}/node-v{BASE_NODE_VERSION}-linux-$NODE_ARCH.tar.gz\" \
+            | tar -xz --strip-components=1 -C /usr/local) && \
+         (install -m 0755 -d /etc/apt/keyrings && \
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc && \
+          echo \"deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable\" > /etc/apt/sources.list.d/docker.list && \
+          apt-get update -qq && \
+          DEBIAN_FRONTEND=noninteractive \
+          apt-get install -y -qq {DOCKER_PACKAGES} && \
+          mkdir -p {DOCKER_DATA_ROOT} /etc/docker && \
+          printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\"}}\\n' > /etc/docker/daemon.json \
+          || true) && \
+       (curl -sSL https://github.com/Boshen/cargo-shear/releases/download/v{CARGO_SHEAR_VERSION}/cargo-shear-$(uname -m)-unknown-linux-musl.tar.gz 2>/dev/null | tar -xz -C /usr/local/bin 2>/dev/null || true) && \
+         apt-get clean && rm -rf /var/lib/apt/lists/*"
+    )
+}
+
 fn base_install_commands() -> Vec<Vec<String>> {
-    // One shell round trip instead of several: every `exec` is a host process
-    // spawn plus a vsock round trip, and this runs on the engine's start-up
-    // critical path.
     [vec![
         "sh".to_owned(),
         "-c".to_owned(),
-        format!(
-            "apt-get update -qq && \
-             DEBIAN_FRONTEND=noninteractive \
-             apt-get install -y -qq --no-install-recommends {BASE_PACKAGES} \
-             && printf '{LOOPBACK_HOSTS}' > /etc/hosts && \
-             (DEBIAN_FRONTEND=noninteractive \
-              apt-get install -y -qq {DOCKER_PACKAGES} && \
-              mkdir -p {DOCKER_DATA_ROOT} /etc/docker && \
-              printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\"}}\\n' > /etc/docker/daemon.json \
-              || true) && \
-             apt-get clean && rm -rf /var/lib/apt/lists/*"
-        ),
+        base_install_script(),
     ]]
     .into_iter()
     .collect()
@@ -383,6 +417,71 @@ async fn install_base_dependencies<P: VmProvider>(
     Ok(())
 }
 
+/// Record what a golden actually baked, so provenance is inspectable
+/// instead of reconstructed.
+///
+/// The resolved versions are the point: channels (`stable`, `22`, `lts/*`,
+/// `go 1.24` minimums) resolve at bake time, and the manifest captures what
+/// they resolved to. `/etc/preloop-bake.json` in any fork answers "what is
+/// in this environment?" without re-deriving it.
+async fn write_bake_manifest<P: VmProvider>(
+    provider: &P,
+    name: &MachineName,
+    env_spec: &EnvironmentSpec,
+) -> Result<(), OrchestratorError> {
+    let probe = [
+        "sh".to_owned(),
+        "-c".to_owned(),
+        "for cmd in node npm python3 docker git rustc cargo go cargo-shear; do \
+           printf '%s=%s\\n' \"$cmd\" \"$($cmd --version 2>/dev/null | head -n1 || echo missing)\"; \
+         done; \
+         printf 'packages=%s\\n' \"$(dpkg-query -W -f={{Package}} | wc -l)\"; \
+         printf 'built_at=%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
+            .to_owned(),
+    ];
+    let output = provider.exec(name, &probe).await?;
+    let mut versions = serde_json::Map::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if let Some((key, value)) = line.split_once('=') {
+            versions.insert(key.to_owned(), serde_json::Value::String(value.to_owned()));
+        }
+    }
+    let manifest = serde_json::json!({
+        "base": env_spec.base,
+        "toolchains": env_spec.toolchains,
+        "versions": versions,
+        "base_node": BASE_NODE_VERSION,
+        "cargo_shear": CARGO_SHEAR_VERSION,
+        // Derived from the same generated pins the install path uses, so a
+        // version bump can never install one version and record another.
+        "node_externals": [
+            format!("node20 {NODE20_EXTERNALS_VERSION}"),
+            format!("node24 {NODE24_EXTERNALS_VERSION}"),
+        ],
+        "preloop": env!("CARGO_PKG_VERSION"),
+    });
+    let json =
+        serde_json::to_string(&manifest).expect("bake manifest is a fixed string-only structure");
+    provider
+        .exec(
+            name,
+            &[
+                "sh".to_owned(),
+                "-c".to_owned(),
+                format!(
+                    "printf '%s' '{}' > /etc/preloop-bake.json",
+                    json.replace('\'', "'\\''")
+                ),
+            ],
+        )
+        .await?;
+    info!(
+        machine = name.as_str(),
+        "bake manifest written to /etc/preloop-bake.json"
+    );
+    Ok(())
+}
+
 /// `env` prefix for guest runner invocations, empty when nothing needs setting.
 ///
 /// Control-socket routing and failure-marker debugging are independent
@@ -459,6 +558,9 @@ pub struct RunnerPoolConfig {
     /// unavailable. The bridge binds `control_origin` inside the VM and
     /// proxies accepted connections to this address over virtio-net TCP.
     pub control_upstream: Option<String>,
+    /// Guest DNS resolver override (smolvm `--dns`), for networks that
+    /// filter smolvm's default public resolvers.
+    pub dns: Option<String>,
     /// Host environment variable containing the registration credential.
     pub registration_token_env: String,
     /// Runner labels advertised to the scheduler.
@@ -496,6 +598,13 @@ pub struct RunnerPoolConfig {
     /// [`crate::environment::scan_workflow_images`].
     pub preload_images: Vec<String>,
     pub next_job_runs_on: Option<Arc<std::sync::RwLock<Vec<String>>>>,
+    /// One-time provision-token map shared with the control plane. When set,
+    /// every provisioning event registers a token here and injects it into
+    /// the guest's `configure` call; the control plane trusts only
+    /// registrations presenting a match, which is what authorizes it to bind
+    /// a queued job to a specific machine's runner identity.
+    pub pending_registrations:
+        Option<Arc<std::sync::RwLock<std::collections::BTreeMap<String, std::time::SystemTime>>>>,
 }
 
 /// Cache of environment-specific golden VMs.
@@ -753,6 +862,7 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
                 guest: PathBuf::from(GUEST_CONTROL_SOCKET),
             })
             .collect(),
+        dns: config.dns.clone(),
         rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
     };
     provider.create(&spec).await?;
@@ -772,6 +882,10 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
                 return Err(error.into());
             }
         }
+    }
+    if let Err(error) = write_bake_manifest(provider.as_ref(), golden, env_spec).await {
+        // Provenance is an audit aid, not a build gate.
+        warn!(machine = golden.as_str(), %error, "bake manifest not written");
     }
     if let Err(error) = preload_images(provider.as_ref(), golden, &config.preload_images).await {
         // A preload miss costs a run-time pull, not a broken job.
@@ -822,6 +936,7 @@ async fn prepare_packed_golden<P: VmProvider + 'static>(
                 guest: PathBuf::from(GUEST_CONTROL_SOCKET),
             })
             .collect(),
+        dns: config.dns.clone(),
         rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
     };
     provider.create(&spec).await?;
@@ -1092,6 +1207,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             network: NetworkPolicy::PublicOnly,
             volumes: Vec::new(),
             sockets: Vec::new(),
+            dns: self.config.dns.clone(),
             rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
         };
         self.provider.create(&spec).await?;
@@ -1113,6 +1229,11 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     return Err(error.into());
                 }
             }
+        }
+        let env_spec = EnvironmentSpec::new(self.config.base_image.clone(), toolchains);
+        if let Err(error) = write_bake_manifest(self.provider.as_ref(), &name, &env_spec).await {
+            // Provenance is an audit aid, not a build gate.
+            warn!(machine = name.as_str(), %error, "bake manifest not written");
         }
         self.provider.stop(&name).await?;
         let temporary = payload
@@ -1902,6 +2023,7 @@ async fn provision_runner<P: VmProvider + 'static>(
                     guest: PathBuf::from(GUEST_CONTROL_SOCKET),
                 })
                 .collect(),
+            dns: config.dns.clone(),
             rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
         };
         provider.create(&spec).await?;
@@ -1958,6 +2080,40 @@ async fn provision_runner<P: VmProvider + 'static>(
         "PRELOOP_RUNNER_TOKEN".to_owned(),
         SecretSource::HostEnv(config.registration_token_env.clone()),
     )];
+    // One-time provision token: the control plane pairs this machine's
+    // registration with the queued job the machine was provisioned for. The
+    // guest cannot fabricate a pairing because only this exact configure
+    // invocation ever sees the token value.
+    let mut provision_token_file: Option<PathBuf> = None;
+    if let Some(pending) = &config.pending_registrations {
+        let token = uuid::Uuid::new_v4().to_string();
+        let dir = config
+            .runner_key_dir
+            .clone()
+            .unwrap_or_else(std::env::temp_dir);
+        match std::fs::create_dir_all(&dir).and_then(|()| {
+            let path = dir.join(format!(".provision-token-{}", uuid::Uuid::new_v4()));
+            std::fs::write(&path, &token).map(|()| path)
+        }) {
+            Ok(path) => {
+                if let Ok(mut guard) = pending.write() {
+                    guard.insert(token, std::time::SystemTime::now());
+                    let now = std::time::SystemTime::now();
+                    guard.retain(|_, at| {
+                        now.duration_since(*at)
+                            .map(|age| age < std::time::Duration::from_secs(600))
+                            .unwrap_or(false)
+                    });
+                }
+                secrets.push((
+                    "PRELOOP_PROVISION_TOKEN".to_owned(),
+                    SecretSource::HostFile(path.clone()),
+                ));
+                provision_token_file = Some(path);
+            }
+            Err(error) => warn!(%error, "could not stage provision token"),
+        }
+    }
     // Held until `configure` returns; dropping it wipes the key from disk.
     let staged = stage_runner_key(config, name, keys).await;
     if let Some(staged) = &staged {
@@ -1975,6 +2131,9 @@ async fn provision_runner<P: VmProvider + 'static>(
         .exec_with_secret_env(name, &configure, &secrets)
         .await?;
     drop(staged);
+    if let Some(path) = provision_token_file {
+        let _ = std::fs::remove_file(path);
+    }
 
     // Bring the container engine up before the runner accepts work, so a job
     // declaring `container:` or `services:` does not race the daemon. Failure
@@ -2258,6 +2417,7 @@ chmod +x "$destination/bin/node"
             control_origin: None,
             control_socket: control_socket.then(|| PathBuf::from("/tmp/engine.sock")),
             control_upstream: None,
+            dns: None,
             registration_token_env: "LIFECYCLE_TEST_TOKEN".to_owned(),
             labels: vec!["test".to_owned()],
             cpus: 1,
@@ -2269,6 +2429,7 @@ chmod +x "$destination/bin/node"
             pending_jobs: None,
             preload_images: Vec::new(),
             next_job_runs_on: None,
+            pending_registrations: None,
         }
     }
 
