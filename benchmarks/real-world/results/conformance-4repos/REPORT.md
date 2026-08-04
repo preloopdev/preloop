@@ -161,4 +161,168 @@ Run conclusion: **failure**.
   (vite) into a fuller base image to close the environment class.
 
 ---
-Generated 2026-08-02T06:00:00Z
+---
+# Second Campaign — 2026-08-03: actions/runner, yc-software/qm, block/buzz
+
+Cells: **A** (golden): official runner vs GitHub — recent successful PR runs
+captured via the GitHub API. **C**: aksh runner (preloop smolVM pool, packed
+golden, fork-free after fork-socket flakes) vs the local aksh engine. Exact
+upstream workflow files; `runs-on:` rewritten to `[self-hosted, Linux, X64]`;
+PR events submitted with webhook-shaped payloads (`payloads/{runner,qm,buzz}-pr.json`).
+
+## actions/runner — build.yml (run f138f863, 9 jobs, **drained**)
+
+Golden: 9/9 success. Ours: **2 failure + 7 cancelled** (fail-fast).
+
+| Job | Conclusion | Class |
+|---|---|---|
+| build (linux-x64/arm64/arm, win-x64) | failure | environment — `Build & Layout Release` needs the dotnet SDK, not in the golden (8 steps executed; `Package Release`/`Publish Artifact` correctly skipped on PR) |
+| docker ×2 | failure/cancelled | environment — `Get latest runner version` needs GitHub API access (actions/github-script); sibling cancelled |
+| build (osx/win cells) | cancelled | correct — fail-fast while queued |
+
+## yc-software/qm — cicd.yml (5 attempts; never fully drained)
+
+Golden: 15/15 success. Best capture (fork-free attempt): 7 success, 6
+failure, 1 in_progress (hung), 1 queued.
+
+Real step failures: `Root tests` (test failures under 4-VM pool contention),
+`CLI` install, `checkout` on some machines, `Portal plugin` production-image
+boot — environment/network class, not protocol.
+
+The drain blocker is environmental, not a scheduler defect: a job hangs when
+a test blocks on network I/O the guest stack never completes (SYNs are
+dropped instead of answered with RST, so connection-refused expectations
+hang forever; observed a node test suite at 0 CPU for 30+ min) or when a
+fork's control-socket relay dies mid-job (the step's stdout pipe fills).
+Renewals keep succeeding, so the 45-min lease reaper never fires. This is
+the same class as the production "runner died mid-job" incident.
+
+## block/buzz — ci.yml (run 78d313e6, 23 jobs, **drained**)
+
+Golden: 21 success + 2 skipped. Ours: 1 success + 1 failure + 21 skipped.
+
+| Job | Conclusion | Class |
+|---|---|---|
+| Dead Token Reference Guard | success | match |
+| Detect Changed Paths | failure | **semantic — runner defect**: checkout@v4 (SHA-pinned) fails at the auth-setup `git submodule foreach` step (`git-sh-setup: git: not found`, exit 127). checkout@v7 works (runner cell). Investigate the v4 path under the runner's git auth handling. |
+| all dependents (21) | skipped | correct — needs-failure cascade |
+
+## Infrastructure findings (two fixed, two open)
+
+1. **Action-download race (FIXED)**: concurrent cache-miss for the same
+   action shared one temp path — interleaved truncates corrupted one
+   response (worker: `numeric field was not a number` garbage-parse) and the
+   other request 500'd (`failed to rename cached action file`). Reproduced
+   standalone; fixed with per-request temp names + winner-publishes;
+   verified both concurrent requests return 200 with valid archives.
+   (`crates/aksh-runner-server/src/actions.rs`)
+2. **Pool-wake bug (FIXED)**: `queue_depth` was refreshed at submit and
+   claim but not after `promote_ready_jobs` in `complete_job_inner` — a
+   completion that promoted fresh work left the on-demand pool asleep on the
+   last claim-time value, so the successor job queued forever. Reproduced as
+   "run stuck at queued" (qm stalls 1+2); fixed with a store after
+   promotion; verified: machine spawns continued through the final
+   completions. (`crates/aksh-runner-server/src/distributed_task.rs`)
+3. **Hung jobs (OPEN)**: guest network stack drops SYNs (no fast RST) →
+   connection-refused-expected tests hang; plus the fork control-socket
+   relay flake (forks from a rebuilt packed golden were 100% socket-broken;
+   first golden's forks mostly healthy). A hung job with live renewals never
+   drains (lease reaper needs 45 min and only fires on renewal failure).
+4. **checkout@v4 git-submodule PATH bug (FIXED)**: the runner's step
+   environment started from job-message variables only, with no PATH
+   baseline. On machines whose worker process env is sanitized (packed-golden
+   boot paths), node actions inherit no PATH: checkout@v4's `git` spawn fails
+   with ENOENT ("add Git 2.18 or higher to the PATH"), and shell-outs inside
+   git (`submodule foreach` → `git-sh-setup` → `uname`) fail the same way —
+   bash steps masked it by supplying bash's compiled-in default PATH. Fixed
+   in `aksh-runner` `build_env`: a PATH is now guaranteed per step (worker
+   machine PATH, else the platform default), mirroring the official runner's
+   job-environment contract. Verified end to end with a manual runner
+   launched under `env -i` (no PATH): the repro workflow's checkout@v4 failed
+   pre-fix with the exact "add Git 2.18" fallback and succeeded post-fix.
+
+### Post-fix rerun — block/buzz (2026-08-03 evening)
+
+Full rerun of `ci.yml` (PR payload, run `0a653504`) after the checkout@v4
+fix. **Detect Changed Paths passed** — the checkout@v4 gate step that failed
+the original run now succeeds on healthy machines (5 of 7 checkout
+invocations of the same SHA succeeded; the 2 that failed did so with
+`Recv failure: Connection reset by peer` against the snapshot server —
+the fork-machine flake, infra finding 3). Final tally: 5 success, 12
+failure, 6 skipped, 2 cancelled. The last runner (Playwright smoke) hung
+at 0% CPU for 20+ min on a live machine (the hung-job class, infra finding
+3, reproduced again), blocking its dependent; the run was cancelled to
+drain.
+
+Failure classes (all environment, none protocol):
+- `install-action` exit 127 (Server Cross-Compile ×2) — tool downloader.
+- `mesh-llm rev resolution` (Desktop Build macOS) — GitHub fetch in the
+  build script.
+- `pnpm`/`playwright` cache misses → install failures (Smoke E2E ×2),
+  Tauri deps (Desktop Core), unit tests under pool contention.
+- checkout `Connection reset` on 2 machines (fork flake).
+
+Skipped (6): Backend Integration, E2E shards ×2, Mobile, Relay E2E, Web —
+the paths-filter gating worked (golden also skips Mobile + Web).
+
+The checkout@v4 semantic divergence vs GitHub is closed; the remaining
+divergence on this run is the fork-machine flake class (open, #3).
+
+## Third wave — 2026-08-03 late evening: openclaw/openclaw, redwoodjs/agent-ci
+
+Same cell-C harness (bench engine, packed golden, `runs-on:` rewritten to
+`[self-hosted, Linux, X64]`, PR payloads). Two new findings, one fixed on the
+spot.
+
+### redwoodjs/agent-ci — tests.yml (run 65210aa4, 1 job, drained)
+
+Golden: 1/1 success. Ours: failure at the workflow's *own* gate.
+
+| Step | Result |
+|---|---|
+| checkout@34e1148 (v4) | success |
+| Setup pnpm / Node / Rust, pnpm install + check, fixture contracts, native CLI golden | all success |
+| **Check Rust smoke parity** | failure — agent-ci dogfoods itself: it runs its ~36 `smoke-*.yml` workflows through its own nested runner (official C# worker + its DTU server) inside the VM; 17 failed in 6–10s. **Root cause (source-verified)**: the nested stack synthesizes a job message with a minimal env — `system.github.token` = `"fake-token"`, no `PATH` (agent-ci's `generators.ts`; their `ts-runner/SPEC.md` documents "no GITHUB_* env vars by default"). checkout@v4's startup cannot survive that: any GitHub API call dies with `Bad credentials` (reproduced), any git spawn dies with ENOENT, and the event-file parse dies with `SyntaxError: Unexpected end of JSON input` (all three reproduced as instant exit-1 crashes). **How their CI passes (golden)**: the step short-circuits — agent-ci dogfoods its own CI with `AGENT_CI_LOCAL=true`, and the step's first line skips the suite (`Skipping nested Rust smoke parity inside agent-ci local validation.` — confirmed in the golden run's job log). The nested suite never executes on GitHub-hosted; our run is the first time it ran for real, and it exposed the fake-token/no-PATH crash their CI hides. Not our engine's protocol (outer steps all green) and not a golden capability issue (docker-ce + buildx + compose ARE baked in). |
+
+**Fixed on the spot — cache ENAMETOOLONG (server bug)**: the smoke step's
+cache restore 500'd with `cache io error: File name too long`. The legacy
+cache layout used the raw hex-encoded key as a directory component; agent-ci's
+long Rust cache key overflowed NAME_MAX and even the *probe* failed. Fixed in
+`aksh-cache`: the legacy path is only probed when the component could
+plausibly exist (long keys were never storable in that layout). Regression
+test added; verified the restore now succeeds (the step progressed past it).
+
+### openclaw/openclaw — ci.yml (run f7a78413, 46 jobs after matrix expansion)
+
+Golden: 1 executed + 19 skipped (docs-only PR). Ours: 43 skipped, 3 executed,
+3 failed — the skip cascade was correct (43 jobs gated on `preflight`
+outputs skipped when preflight died).
+
+| Job | Failure | Class |
+|---|---|---|
+| preflight | checkout — `upload-pack: not our ref <base sha>` | **finding**: the snapshot server rewrites the workspace HEAD identity and redirects only the *primary* checkout; preflight's own deep fetch of the original base SHA gets "not our ref". Deep-fetch checkouts of real base refs need the snapshot to serve the original identities. |
+| security-fast | checkout — `Connection reset by peer` | fork-machine flake (open, #3) |
+| openclaw/ci-gate | cascade of preflight | correct behavior |
+
+**Also fixed on the spot — 413 on submit (server limit)**: openclaw's 124
+workflow files (≈2 MB, inlined by the CLI as reusable workflows) exceeded
+axum's default 2 MiB body limit on `/api/v1/runs`. Raised to 64 MiB.
+
+## Campaign source changes
+
+- `crates/aksh-runner-server/src/actions.rs` — action-download race fix.
+- `crates/aksh-runner-server/src/distributed_task.rs` — pool-wake
+  queue_depth refresh after promote_ready_jobs.
+- `crates/preloop-vm/src/lib.rs`, `preloop-orchestrator`, `preloop-cli` —
+  `PRELOOP_RUNNER_DNS` guest resolver knob (unblocks registry pulls on
+  networks filtering 8.8.8.8/1.1.1.1).
+- `crates/aksh-runner/src/worker/execution_context.rs` — guaranteed per-step
+  PATH (checkout@v4 fix).
+- `crates/aksh-cache/src/lib.rs` — legacy-path probe guard for long keys
+  (cache restore ENAMETOOLONG).
+- `crates/aksh-runner-server/src/routes.rs` — 64 MiB body limit on
+  `/api/v1/runs`.
+- `benchmarks/real-world/conformance-4repos/compare-goldens.py` — runner/
+  qm/buzz/openclaw/agent-ci repo entries.
+
+Generated 2026-08-03T07:45:00Z

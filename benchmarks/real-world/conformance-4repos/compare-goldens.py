@@ -33,6 +33,11 @@ REPOS = {
     "vite": "vitejs_vite",
     "uv": "astral-sh_uv",
     "nextcloud": "nextcloud_server",
+    "runner": "actions_runner",
+    "qm": "yc_software_qm",
+    "buzz": "block_buzz",
+    "openclaw": "openclaw_openclaw",
+    "agent-ci": "redwoodjs_agent-ci",
 }
 
 # bat's CICD on GitHub runs a 13-target cross-compile matrix; the local host
@@ -224,7 +229,9 @@ def main():
     # against the local engine. `official`/`aksh` are the older host-runner
     # cells from conformance-4repos.sh.
     for repo, cells in (("bat", ["official", "aksh", "c"]), ("vite", ["official", "aksh", "c"]),
-                        ("uv", ["official", "aksh", "c"]), ("nextcloud", ["official", "aksh", "c"])):
+                        ("uv", ["official", "aksh", "c"]), ("nextcloud", ["official", "aksh", "c"]),
+                        ("runner", ["c"]), ("qm", ["c"]), ("buzz", ["c"]),
+                        ("openclaw", ["c"]), ("agent-ci", ["c"])):
         if args.repo != "all" and repo != args.repo:
             continue
         for cell in cells:
