@@ -513,6 +513,36 @@ Comprehensive source review of official `actions/runner` v2.335.1 and
 | P3 | Session reconnection backoff | Session conflicts are bounded to four minutes; poll/session failures use cancellable `[15,30)`/`[30,60)` jitter and reset after success | ✅ `67ad4447` |
 | P3 | FIPS encryption mode | Session responses select RSA-OAEP-SHA256 when `useFipsEncryption` is true; legacy/default sessions remain OAEP-SHA1, and FIPS paths reject plaintext fallback | ✅ `0673a741`, `c44a570`, `e2e1a8e` |
 
+#### Resolved (2026-08-02): deferred reusable-caller materialization + job display names
+
+The parser used to inline every reusable-workflow callee subtree into the run
+record at expand time, so a false-gated caller appeared as its full matrix
+expansion instead of GitHub's single skipped entry (uv `ci.yml` pull_request:
+145 jobs vs the golden's 33, conclusions 20/38/81/6 vs 16/17). Reusable
+callers are now deferred, mirroring the runtime deferred-matrix design:
+
+- The parser emits one placeholder node per caller (`JobPlan.reusable_call`);
+  the callee subtree materializes via `aksh_gha_parser::expand_reusable_call`
+  only when the caller's `needs` complete and its `if:` evaluates true. A
+  false gate leaves exactly one skipped entry, as GitHub does.
+- Caller/embedded concurrency JobSet gates move from submission time to
+  gate-pass time (GitHub evaluates caller concurrency when the caller starts);
+  the JobSet member set is the caller node, which aggregates its subtree's
+  result and outputs on completion (`propagate_reusable_outputs`).
+- The visible run record (`GET /api/v1/runs/:id`) drops gate-passed caller
+  entries, showing callee jobs instead — uv's run record is now 33 jobs,
+  matching golden run 30680325919.
+- Job display names match GitHub: `name:` is evaluated per matrix cell against
+  matrix/inputs contexts (`test-ecosystem / prefecthq/prefect`, not the raw
+  key with parenthesized values), and callee jobs display as
+  `caller / callee` with spaces (was `caller/callee`).
+
+Known remaining gap: runtime *deferred-matrix* expansion never registered
+runner-correlation maps (`job_requests`, `inflight_requests`, …) the way
+runtime reusable expansion now does — jobs fanned out from
+`needs`-dependent matrices lack RenewJob/timeline correlation until that path
+adopts the shared `build_job_artifacts` helper.
+
 ---
 ## 4. Pluggable backends & deployment modes
 
