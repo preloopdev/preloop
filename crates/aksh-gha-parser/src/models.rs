@@ -409,7 +409,9 @@ pub struct ReusableCallMetadata {
     pub caller_job_id: String,
     /// Output definitions (name -> value expression).
     pub output_definitions: BTreeMap<String, String>,
-    /// List of expanded inner job IDs that must complete.
+    /// Expanded inner job IDs that must complete. Empty at parse time: the
+    /// callee subtree is deferred; the server populates this when the caller's
+    /// `if:` gate passes and the subtree is materialized at runtime.
     pub inner_job_ids: Vec<String>,
     /// Evaluated inputs.
     #[serde(default)]
@@ -423,6 +425,14 @@ pub struct ReusableCallMetadata {
     /// Caller strategy matrix values.
     #[serde(default)]
     pub matrix: BTreeMap<String, Value>,
+    /// Caller job-level `if:` condition, verbatim.
+    ///
+    /// GitHub evaluates it once the caller's `needs` complete and skips the
+    /// whole invocation when it is false. The inlined inner jobs carry the
+    /// merged condition (`caller && inner`), and this field preserves the
+    /// caller's own expression for scheduling and observability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub if_condition: Option<String>,
     /// Resolved called-workflow commit SHA.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_sha: Option<String>,

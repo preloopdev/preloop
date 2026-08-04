@@ -301,6 +301,7 @@ mod tests {
                 .collect(),
             matrix: Default::default(),
             matrix_index: None,
+            deferred_matrix: None,
             env: Default::default(),
             steps: vec![],
             if_condition: None,
@@ -324,6 +325,7 @@ mod tests {
             concurrency_group: None,
             concurrency_cancel_in_progress: None,
             concurrency_queue: None,
+            reusable_call: None,
         }
     }
 
