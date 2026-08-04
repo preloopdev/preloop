@@ -345,10 +345,19 @@ store. Fixed server-side:
   / `allowTipSHA1InWant` (what GitHub serves), so deep fetches of real
   commits against the snapshot work too.
 
-Rerun (host runner, 46 jobs): **preflight success with every previously
-failing step green** — Checkout, Resolve checkout SHA, Resolve exact diff
-base, Ensure preflight base commit. The skip cascade for downstream jobs
-was correct.
+First rerun (host runner, 46 jobs): **preflight success with every
+previously failing step green** — Checkout, Resolve checkout SHA, Resolve
+exact diff base, Ensure preflight base commit. The skip cascade for
+downstream jobs was correct.
+
+Second rerun (clean engine, `results/conformance-4repos/openclaw/c/run.json`):
+43 skipped + 3 failed, the same cascade shape as the golden's docs-only PR.
+The preflight failure is no longer the protocol bug: the checkout step now
+fetches the real HEAD sha (`07583168`, verified fetchable from the host in
+17 s) and failed on fetch timeouts that evening, and security-fast's
+"Fetch pull request scan history" failed on a PAT-scope API call. Both are
+environment/credential issues, not wire-protocol divergence; the skip
+cascade (43 jobs gated on preflight) behaved correctly.
 
 ### nyblnet/bento — ci.yml, push main
 
