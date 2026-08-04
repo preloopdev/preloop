@@ -10420,6 +10420,94 @@ fn create_snapshot_fixture(root: &FsPath) -> (std::path::PathBuf, std::path::Pat
 }
 
 #[tokio::test]
+async fn shallow_workspace_snapshot_preserves_upstream_shas() {
+    // A shallow clone's cache inherits its boundary, and serving that forced a
+    // history rewrite that changed every sha. Workflows resolve a base commit
+    // from git (`HEAD^`, `merge-base`) and then fetch it from the forge, so a
+    // rewritten sha fails there with "not our ref". Deepening from the remote
+    // must keep the served ancestry byte-identical to upstream.
+    let temp = tempfile::tempdir().unwrap();
+    let upstream = temp.path().join("upstream");
+    fs::create_dir_all(&upstream).unwrap();
+    git_fixture_command(
+        &upstream,
+        &["init", "--quiet", "--initial-branch=main", "."],
+    );
+    git_fixture_command(&upstream, &["config", "user.email", "t@example.com"]);
+    git_fixture_command(&upstream, &["config", "user.name", "Test"]);
+    for n in 0..3 {
+        fs::write(upstream.join("file.txt"), format!("rev {n}\n")).unwrap();
+        git_fixture_command(&upstream, &["add", "file.txt"]);
+        git_fixture_command(
+            &upstream,
+            &["commit", "--quiet", "-m", &format!("commit {n}")],
+        );
+    }
+    let upstream_tip = String::from_utf8(git_fixture_output(&upstream, &["rev-parse", "HEAD"]))
+        .unwrap()
+        .trim()
+        .to_owned();
+
+    // Shallow clone, exactly like CI does.
+    let workspace = temp.path().join("workspace");
+    let url = format!("file://{}", upstream.display());
+    let clone = std::process::Command::new("git")
+        .args(["clone", "--quiet", "--depth=1", &url])
+        .arg(&workspace)
+        .output()
+        .unwrap();
+    assert!(clone.status.success(), "shallow clone failed: {clone:?}");
+    assert!(
+        workspace.join(".git/shallow").is_file(),
+        "fixture must be shallow"
+    );
+
+    let state_dir = temp.path().join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    let run_id: RunId = "22222222-2222-4222-8222-222222222222".parse().unwrap();
+    let snapshot = create_workspace_snapshot(&state_dir, &workspace, run_id)
+        .await
+        .expect("snapshot creation should succeed");
+
+    // The snapshot commit's parent must be the upstream sha, not a copy.
+    let repository = state_dir.join(&snapshot.repository);
+    let parent = String::from_utf8(git_fixture_output(
+        &repository,
+        &["rev-parse", &format!("{}^", snapshot.commit_sha)],
+    ))
+    .unwrap()
+    .trim()
+    .to_owned();
+    assert_eq!(
+        parent, upstream_tip,
+        "snapshot parent must be the real upstream commit, not a rewritten copy"
+    );
+}
+
+#[tokio::test]
+async fn workspace_snapshot_survives_refs_with_missing_objects() {
+    // `update-ref --stdin` is atomic, so a single tag whose object is absent
+    // used to abort the whole snapshot with "nonexistent object" — and the
+    // fallback then handed the job a zero sha.
+    let temp = tempfile::tempdir().unwrap();
+    let (state_dir, workspace) = create_snapshot_fixture(temp.path());
+    fs::create_dir_all(&state_dir).unwrap();
+    let tags = workspace.join(".git/refs/tags");
+    fs::create_dir_all(&tags).unwrap();
+    fs::write(
+        tags.join("dangling"),
+        "3c72e3fdd04bb63c9470ad0a79ad05bba0a393a4\n",
+    )
+    .unwrap();
+
+    let run_id: RunId = "33333333-3333-4333-8333-333333333333".parse().unwrap();
+    let snapshot = create_workspace_snapshot(&state_dir, &workspace, run_id)
+        .await
+        .expect("a dangling ref must not fail snapshot creation");
+    assert_eq!(snapshot.commit_sha.len(), 40);
+}
+
+#[tokio::test]
 async fn workspace_snapshot_captures_git_state_without_mutating_source() {
     let temp = tempfile::tempdir().unwrap();
     let (state_dir, workspace) = create_snapshot_fixture(temp.path());

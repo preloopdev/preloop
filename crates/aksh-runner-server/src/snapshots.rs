@@ -174,32 +174,13 @@ async fn create_workspace_snapshot_inner(
             source_objects.display()
         )));
     }
-    // A shallow workspace ends its history at the commits listed in its
-    // `shallow` file; commits behind those roots were never fetched, so
-    // their objects do not exist anywhere local. The staging repository must
-    // serve a *complete* graph: a shallow-mirrored repo advertises refs
-    // whose ancestry crosses the boundary, and a plain full fetch from it is
-    // rejected by git ("shallow roots are not allowed to be updated"),
-    // leaving the client with a broken object store and unusable
-    // merge-base/diff walks. Instead, graft every shallow root to a
-    // parentless copy (`git replace --graft`), which pack-objects honors
-    // when serving. Clients then receive the boundary commit with no parents
-    // and never see a shallow edge; `HEAD^` and the snapshot parent chain
-    // stay resolvable for changed-file diffing.
-    if source_head.is_some() {
-        let source_shallow = common_dir.join("shallow");
-        if source_shallow.is_file() {
-            // Grafting happens after the object cache is wired (below); keep
-            // the shallow root list here so the graft loop can read it once.
-            let _ = std::fs::read_to_string(&source_shallow);
-        }
-    }
     let cache =
         ensure_object_cache(state_dir, workspace, &common_dir, source_head.as_deref()).await?;
     let ObjectCache {
         objects: cached_objects,
         index: cache_index,
         refreshed: cache_refreshed,
+        ancestry_complete,
     } = cache;
 
     // A shallow workspace ends its history at the commits listed in its
@@ -231,7 +212,10 @@ async fn create_workspace_snapshot_inner(
     // the shas the submission exposes (snapshot parent, before/after base).
     let mut history_rewrite: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
-    if source_head.is_some() {
+    // Only when the real ancestry could not be recovered: rewriting is what
+    // makes the served SHAs diverge from the forge's, so it is the fallback,
+    // not the default.
+    if source_head.is_some() && !ancestry_complete {
         let source_shallow = common_dir.join("shallow");
         if source_shallow.is_file() {
             let shallow_roots = std::fs::read_to_string(&source_shallow).map_err(|error| {
@@ -585,14 +569,14 @@ async fn create_workspace_snapshot_inner(
         .map_err(|error| ApiError::internal(format!("failed to list workspace refs: {error}")))?;
     if workspace_refs.status.success() {
         let refs = String::from_utf8_lossy(&workspace_refs.stdout);
-        let mut publish = snapshot_git_command(
-            workspace,
-            staging_repository,
-            staging_index,
-            &cached_objects,
-        );
-        publish.args(["update-ref", "--stdin"]);
-        let mut publish_input = String::new();
+        // `update-ref --stdin` is atomic: one ref whose target is missing
+        // aborts the whole transaction and fails the snapshot. Workspaces
+        // collect such refs routinely — a tag fetched without its object, a
+        // filtered clone, a `--unshallow` that dropped an old tag's target.
+        // Ask once which objects actually exist and publish only those.
+        // Resolve every ref to the sha we would publish first, so the
+        // existence check below covers rewritten objects too.
+        let mut planned: Vec<(String, String)> = Vec::new();
         for line in refs.lines() {
             let Some((name, object)) = line.split_once(' ') else {
                 continue;
@@ -602,15 +586,52 @@ async fn create_workspace_snapshot_inner(
             }
             let is_default_branch =
                 default_branch.as_deref() == Some(name.strip_prefix("refs/heads/").unwrap_or(name));
-            if is_default_branch {
-                publish_input.push_str(&format!("update {name} {commit_sha}\n"));
+            let published = if is_default_branch {
+                commit_sha.clone()
             } else {
-                let published = history_rewrite
+                history_rewrite
                     .get(object)
                     .cloned()
-                    .unwrap_or_else(|| object.to_owned());
-                publish_input.push_str(&format!("update {name} {published}\n"));
+                    .unwrap_or_else(|| object.to_owned())
+            };
+            planned.push((name.to_owned(), published));
+        }
+        // `update-ref --stdin` is atomic: one ref whose target object is
+        // missing aborts the whole transaction and fails the snapshot.
+        // Workspaces collect such refs routinely — a tag fetched without its
+        // target, a filtered clone, an `--unshallow` that left an old tag
+        // dangling. Ask once which objects exist and skip the rest.
+        let candidates: std::collections::BTreeSet<String> =
+            planned.iter().map(|(_, sha)| sha.clone()).collect();
+        let present = present_objects(
+            workspace,
+            staging_repository,
+            staging_index,
+            &cached_objects,
+            &candidates,
+        )
+        .await?;
+        let mut publish = snapshot_git_command(
+            workspace,
+            staging_repository,
+            staging_index,
+            &cached_objects,
+        );
+        publish.args(["update-ref", "--stdin"]);
+        let mut publish_input = String::new();
+        let mut skipped = 0usize;
+        for (name, published) in planned {
+            if !present.contains(&published) {
+                skipped += 1;
+                continue;
             }
+            publish_input.push_str(&format!("update {name} {published}\n"));
+        }
+        if skipped > 0 {
+            warn!(
+                skipped,
+                "skipped workspace refs whose target objects are absent"
+            );
         }
         if !publish_input.is_empty() {
             run_git_with_stdin(
@@ -638,9 +659,11 @@ async fn create_workspace_snapshot_inner(
     )
     .await?;
     let mut uploadpack_tip = Command::new("git");
-    uploadpack_tip
-        .env("GIT_DIR", staging_repository)
-        .args(["config", "uploadpack.allowTipSHA1InWant", "true"]);
+    uploadpack_tip.env("GIT_DIR", staging_repository).args([
+        "config",
+        "uploadpack.allowTipSHA1InWant",
+        "true",
+    ]);
     run_git(
         &mut uploadpack_tip,
         "allow tip sha wants in snapshot upload-pack",
@@ -897,6 +920,10 @@ struct ObjectCache {
     index: PathBuf,
     /// Whether this call added objects to the cache.
     refreshed: bool,
+    /// Whether the cache holds the full ancestry behind the workspace's
+    /// shallow boundary. False means the snapshot must rewrite history to
+    /// serve a complete graph, at the cost of changing every sha.
+    ancestry_complete: bool,
 }
 
 async fn ensure_object_cache(
@@ -984,15 +1011,129 @@ async fn ensure_object_cache(
     let objects = std::fs::canonicalize(repository.join("objects")).map_err(|error| {
         ApiError::internal(format!("failed to resolve snapshot object cache: {error}"))
     })?;
+    // The cache is what the snapshot actually serves, so its boundary is the
+    // one that matters — a workspace that has since been deepened does not
+    // help if the cache was built while it was shallow. Deepen from the
+    // remote while the lock is held; once complete it stays complete and
+    // later runs skip the fetch entirely.
+    let mut ancestry_complete = !repository.join("shallow").is_file();
+    if !ancestry_complete {
+        ancestry_complete = deepen_object_cache_from_remote(&repository, workspace).await;
+        refreshed = refreshed || ancestry_complete;
+    }
     let mut index = repository.as_os_str().to_owned();
     index.push(".index");
     Ok(ObjectCache {
         objects,
         index: PathBuf::from(index),
         refreshed,
+        ancestry_complete,
     })
 }
 
+/// Which of `shas` exist in the snapshot's object view.
+///
+/// One `cat-file --batch-check` instead of a spawn per ref: a workspace can
+/// carry thousands of tags, and this runs inside `POST /api/v1/runs`.
+async fn present_objects(
+    workspace: &FsPath,
+    staging_repository: &FsPath,
+    staging_index: &FsPath,
+    cached_objects: &FsPath,
+    shas: &std::collections::BTreeSet<String>,
+) -> Result<std::collections::BTreeSet<String>, ApiError> {
+    if shas.is_empty() {
+        return Ok(std::collections::BTreeSet::new());
+    }
+    let mut query = String::with_capacity(shas.len() * 41);
+    for sha in shas {
+        query.push_str(sha);
+        query.push('\n');
+    }
+    let mut command =
+        snapshot_git_command(workspace, staging_repository, staging_index, cached_objects);
+    command.args(["cat-file", "--batch-check=%(objectname) %(objecttype)"]);
+    let output =
+        run_git_with_stdin(&mut command, query.as_bytes(), "check snapshot objects").await?;
+    let text = output_text(&output, "check snapshot objects")?;
+    let mut present = std::collections::BTreeSet::new();
+    for line in text.lines() {
+        // Present: "<sha> commit". Missing: "<sha> missing".
+        let mut parts = line.split_whitespace();
+        let (Some(sha), Some(kind)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if kind != "missing" {
+            present.insert(sha.to_owned());
+        }
+    }
+    Ok(present)
+}
+
+/// Restore the ancestry a shallow workspace never downloaded.
+///
+/// A shallow clone stops at the commits listed in its `shallow` file, and the
+/// object cache inherits that boundary. Serving a shallow graph is impossible,
+/// so the snapshot otherwise rewrites history: shallow roots become
+/// parentless and every descendant is re-created, which changes the tip's
+/// sha. Workflows that resolve a base commit from git (`rev-list --parents`,
+/// `HEAD^`, `merge-base`) and then fetch it from the forge then ask for a sha
+/// that exists nowhere upstream and fail with "not our ref".
+///
+/// Fetching the real ancestry from the workspace's own remote removes the
+/// boundary and keeps every sha identical to the forge's.
+///
+/// This fetches objects in full. `--filter=blob:none` would be enough for what
+/// diff-base resolution needs — the commit and tree graph — and far cheaper,
+/// but it leaves the cache a promisor whose missing blobs fail the snapshot's
+/// `fsck` and cannot be hydrated through the alternate. Making that work needs
+/// real partial-clone plumbing (`extensions.partialClone` on the staging repo
+/// plus a promisor remote it can reach); until then, correctness first.
+///
+/// Best effort by design. No remote, no network, or a private repository
+/// without credentials simply leaves the cache shallow and the caller falls
+/// back to rewriting.
+async fn deepen_object_cache_from_remote(repository: &FsPath, workspace: &FsPath) -> bool {
+    let remote = Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["config", "--get", "remote.origin.url"])
+        .output()
+        .await;
+    let Ok(remote) = remote else {
+        return false;
+    };
+    if !remote.status.success() {
+        return false;
+    }
+    let url = String::from_utf8_lossy(&remote.stdout).trim().to_owned();
+    if url.is_empty() {
+        return false;
+    }
+    let shallow_marker = repository.join("shallow");
+    let mut fetch = Command::new("git");
+    fetch
+        .env("GIT_DIR", repository)
+        .args(["fetch", "--quiet", "--force", "--no-tags"]);
+    if shallow_marker.is_file() {
+        fetch.arg("--unshallow");
+    }
+    fetch
+        .arg(&url)
+        .arg("+refs/heads/*:refs/remotes/preloop-upstream/*");
+    match run_git(&mut fetch, "deepen snapshot object cache").await {
+        Ok(_) => !shallow_marker.is_file(),
+        Err(error) => {
+            warn!(
+                error = ?error,
+                url = %url,
+                "could not deepen snapshot object cache from remote; \
+                 snapshot will rewrite history and expose synthetic SHAs"
+            );
+            false
+        }
+    }
+}
 /// Persist the workspace HEAD the cache was last synced to.
 ///
 /// An unborn HEAD has nothing to record; clearing the marker keeps the next

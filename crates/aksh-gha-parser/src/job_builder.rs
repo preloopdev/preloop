@@ -585,6 +585,7 @@ pub fn build_agent_job_message_with_normalized_context(
         aksh_debug_transport: None,
         preloop_preserve_on_failure: None,
         aksh_snapshot_commit: None,
+        aksh_snapshot_origin_rewrite: None,
     })
 }
 
