@@ -76,7 +76,12 @@ pub(crate) async fn download_action_tarball(
         .await
         .map_err(|e| ApiError::internal(format!("failed to create action cache dir: {e}")))?;
 
-    let temp_path = cache_dir.join("action.tar.gz.tmp");
+    // Unique per-request temp file: two jobs preparing the same uncached
+    // action concurrently must not share a path — interleaved truncates
+    // corrupt the stream (one worker gets a 500, the other a garbage
+    // archive). The rename is the atomic publish; the loser serves the
+    // winner's file.
+    let temp_path = cache_dir.join(format!("action.tar.gz.{}.tmp", uuid::Uuid::new_v4()));
     let github_url = format!("https://api.github.com/repos/{owner}/{repo}/tarball/{git_ref}");
 
     info!(
@@ -117,12 +122,20 @@ pub(crate) async fn download_action_tarball(
             })?;
     }
 
-    // Atomically rename to final target path
-    tokio::fs::rename(&temp_path, &cached_path)
-        .await
-        .map_err(|e| ApiError::internal(format!("failed to rename cached action file: {e}")))?;
-
-    info!(cached_path = ?cached_path, "Action cached successfully on server");
+    // Atomically rename to final target path. A concurrent request may have
+    // published the same action first — then the cached file is the winner's
+    // (byte-identical) download and ours is discarded.
+    if let Err(error) = tokio::fs::rename(&temp_path, &cached_path).await {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        if !cached_path.exists() {
+            return Err(ApiError::internal(format!(
+                "failed to rename cached action file: {error}"
+            )));
+        }
+        info!(cached_path = ?cached_path, "Action cache published by a concurrent request");
+    } else {
+        info!(cached_path = ?cached_path, "Action cached successfully on server");
+    }
 
     let file = tokio::fs::File::open(&cached_path)
         .await
