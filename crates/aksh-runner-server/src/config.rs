@@ -96,6 +96,12 @@ impl std::fmt::Debug for ConfigFile {
 /// Resolve the config file path: `PRELOOP_CONFIG` when set, else
 /// `$HOME/.preloop/config.toml`.
 pub fn config_path() -> PathBuf {
+    // Tests must never resolve (or worse: write) the developer's real
+    // config through the default path; route the default through the pinned
+    // per-process temp file. Callers that set `PRELOOP_CONFIG` explicitly
+    // are left alone.
+    #[cfg(test)]
+    pin_test_config_path();
     std::env::var_os(CONFIG_PATH_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| {
