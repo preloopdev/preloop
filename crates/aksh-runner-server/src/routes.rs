@@ -532,6 +532,13 @@ pub(crate) fn build_app(
             )),
         )
         .route(
+            "/api/v1/runners/purge",
+            post(purge_runners_by_name).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_native_bearer,
+            )),
+        )
+        .route(
             "/runner/session",
             post(broker_session_root).delete(broker_delete_session_root),
         )
