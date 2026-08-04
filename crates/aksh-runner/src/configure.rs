@@ -520,12 +520,22 @@ async fn create_agent(
         "provisioningState": "Provisioned",
     });
 
-    http.post_json_with_auth_headers(
+    // The pool injects a one-time provision token per machine; forwarding it
+    // lets the server pair this registration with the job the machine was
+    // provisioned for. Absent outside pool provisioning.
+    let provision_token = std::env::var("PRELOOP_PROVISION_TOKEN").ok();
+    let extra: Vec<(&str, &str)> = provision_token
+        .as_deref()
+        .into_iter()
+        .map(|token| ("X-Preloop-Provision-Token", token))
+        .collect();
+    http.post_json_with_auth_headers_extra(
         &url,
         &agent,
         &format!("Bearer {}", reg.oauth_token),
         DISTTASK_AGENT_ACCEPT,
         DISTTASK_AGENT_CONTENT_TYPE,
+        &extra,
     )
     .await
     .context("creating agent")
