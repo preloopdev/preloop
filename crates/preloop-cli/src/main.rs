@@ -5,6 +5,7 @@ use anyhow::Context;
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
+use preloop_orchestrator::environment::DEFAULT_BASE_IMAGE;
 use preloop_orchestrator::{RunnerPool, RunnerPoolConfig};
 use preloop_vm::SmolVmProvider;
 use rand::RngCore;
@@ -16,9 +17,10 @@ use std::time::Duration;
 
 mod debug_session;
 mod github_auth;
+mod github_setup;
 mod update;
 
-fn server_url() -> String {
+pub(crate) fn server_url() -> String {
     std::env::var("AKSH_URL").unwrap_or_else(|_| "http://127.0.0.1:9090".to_owned())
 }
 
@@ -51,7 +53,7 @@ fn mounted_control_origin(public_url: &str) -> Option<String> {
     loopback.then(|| public_url.trim_end_matches('/').to_owned())
 }
 
-fn api_token() -> Option<String> {
+pub(crate) fn api_token() -> Option<String> {
     std::env::var("AKSH_TOKEN")
         .or_else(|_| std::env::var("AKSH_SYSTEM_TOKEN"))
         .ok()
@@ -63,7 +65,7 @@ fn api_token() -> Option<String> {
         })
 }
 
-fn build_client() -> reqwest::Client {
+pub(crate) fn build_client() -> reqwest::Client {
     let builder = reqwest::Client::builder();
     #[cfg(unix)]
     let builder = if std::env::var("AKSH_URL").is_err() {
@@ -103,8 +105,14 @@ enum Command {
     /// Cancel the current run.
     Cancel(CancelArgs),
 
-    /// Manage secrets.
-    Secret(SecretArgs),
+    /// Manage the local secret store.
+    Secret(github_setup::SecretArgs),
+
+    /// Configure GitHub credentials (App or fine-grained PAT).
+    Setup(github_setup::SetupArgs),
+
+    /// Verify the GitHub credential configuration.
+    Doctor(github_setup::DoctorArgs),
 
     /// Open a shell in a preserved VM.
     Shell(ShellArgs),
@@ -143,7 +151,7 @@ struct BuildGoldenArgs {
     output: PathBuf,
 
     /// OCI base image to pack.
-    #[arg(long, default_value = "ubuntu:24.04")]
+    #[arg(long, default_value = DEFAULT_BASE_IMAGE)]
     base_image: String,
 }
 
@@ -259,24 +267,6 @@ struct CancelArgs {
 }
 
 #[derive(Debug, Parser)]
-struct SecretArgs {
-    #[command(subcommand)]
-    command: SecretCommand,
-}
-
-#[derive(Debug, Subcommand)]
-enum SecretCommand {
-    /// Set a secret (prompts for value).
-    Set {
-        /// Secret name.
-        name: String,
-    },
-
-    /// List secret names.
-    List,
-}
-
-#[derive(Debug, Parser)]
 struct ShellArgs {
     /// Run reference (e.g. "last-failed"). Defaults to last failed run.
     run_ref: Option<String>,
@@ -297,6 +287,17 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    // One config path for the whole process. `setup`/`doctor`/`secret` return
+    // before `cmd_engine` runs, so pinning this only inside the engine let a
+    // custom PRELOOP_HOME split the CLI's writes ($HOME/.preloop/config.toml)
+    // from the engine's reads ($PRELOOP_HOME/config.toml) — setup silently had
+    // no effect. An explicit operator override still wins.
+    if std::env::var_os(aksh_runner_server::config::CONFIG_PATH_ENV).is_none() {
+        std::env::set_var(
+            aksh_runner_server::config::CONFIG_PATH_ENV,
+            github_setup::config_path_for_home(),
+        );
+    }
     // Both run the daemon in this process, so neither may bootstrap another
     // one underneath itself.
     match cli.command {
@@ -304,6 +305,10 @@ async fn main() -> anyhow::Result<()> {
         Command::Engine => return cmd_engine(ServeArgs::default()).await,
         Command::BuildGolden(args) => return cmd_build_golden(args).await,
         Command::Update(args) => return update::run(args).await,
+        // Local configuration commands must not spawn the engine.
+        Command::Setup(args) => return github_setup::cmd_setup(args).await,
+        Command::Doctor(args) => return github_setup::cmd_doctor(args).await,
+        Command::Secret(args) => return github_setup::cmd_secret(args).await,
         _ => {}
     }
     ensure_engine_running().await?;
@@ -314,12 +319,17 @@ async fn main() -> anyhow::Result<()> {
         Command::Status => cmd_status().await,
         Command::Logs(args) => cmd_logs(args).await,
         Command::Cancel(args) => cmd_cancel(args).await,
-        Command::Secret(args) => cmd_secret(args).await,
         Command::Shell(args) => cmd_shell(args).await,
         Command::Debug(args) => {
             debug_session::run(args, build_client(), server_url(), api_token()).await
         }
-        Command::Update(_) | Command::Serve(_) | Command::Engine | Command::BuildGolden(_) => {
+        Command::Update(_)
+        | Command::Serve(_)
+        | Command::Engine
+        | Command::BuildGolden(_)
+        | Command::Setup(_)
+        | Command::Doctor(_)
+        | Command::Secret(_) => {
             unreachable!("daemon commands handled before client startup")
         }
     }
@@ -357,6 +367,7 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         control_origin: None,
         control_socket: None,
         control_upstream: None,
+        dns: std::env::var("PRELOOP_RUNNER_DNS").ok(),
         registration_token_env: TOKEN_ENV.into(),
         labels: vec![
             "self-hosted".into(),
@@ -374,6 +385,7 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         pending_jobs: None,
         preload_images: Vec::new(),
         next_job_runs_on: None,
+        pending_registrations: None,
     };
     RunnerPool::new(std::sync::Arc::new(SmolVmProvider::default()), config)?
         .rebuild_artifact()
@@ -640,6 +652,34 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
     // actually waiting, not just to whether it has an idle runner left.
     let queue_depth = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let next_job_runs_on = std::sync::Arc::new(std::sync::RwLock::new(Vec::new()));
+    // Shared one-time provision-token map. The pool writes a token for every
+    // machine it provisions and forwards it into the guest's `configure`;
+    // the control plane trusts only registrations presenting a match, which
+    // is what authorizes job → runner assignment binding. Present whenever
+    // the pool can provision.
+    let pending_registrations =
+        std::sync::Arc::new(std::sync::RwLock::new(std::collections::BTreeMap::<
+            String,
+            std::time::SystemTime,
+        >::new()));
+    let pool_enabled = env_flag("PRELOOP_RUNNER_POOL_ENABLED", false);
+    let pool_config = local_runner_pool_config(
+        &home,
+        runner_url.clone(),
+        control_origin.clone(),
+        control_upstream.clone(),
+        queue_depth.clone(),
+        next_job_runs_on.clone(),
+        pool_enabled,
+        pending_registrations.clone(),
+    );
+    let pool_available = match &pool_config {
+        Ok(_) => true,
+        Err(error) => {
+            tracing::warn!(%error, "local runner provisioning unavailable; control plane remains available");
+            false
+        }
+    };
     let mut server = tokio::spawn(aksh_runner_server::serve(
         aksh_runner_server::ServerConfig {
             listen,
@@ -647,6 +687,8 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
             unix_socket: Some(socket.clone()),
             queue_depth: Some(queue_depth.clone()),
             next_job_runs_on: Some(next_job_runs_on.clone()),
+            pending_registrations: pool_available.then_some(pending_registrations),
+            require_job_assignments: env_flag("PRELOOP_REQUIRE_JOB_ASSIGNMENTS", false),
             state_dir,
             record_flows: None,
             tls: aksh_runner_server::TlsMode::None,
@@ -664,16 +706,7 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
     }
 
     let shutdown = tokio_util::sync::CancellationToken::new();
-    let pool_enabled = env_flag("PRELOOP_RUNNER_POOL_ENABLED", false);
-    let mut pool = match local_runner_pool_config(
-        &home,
-        runner_url,
-        control_origin,
-        control_upstream,
-        queue_depth,
-        next_job_runs_on,
-        pool_enabled,
-    ) {
+    let mut pool = match pool_config {
         Ok(config) => {
             if !pool_enabled {
                 tracing::info!("local runner pool disabled; provisioning one VM per queued job");
@@ -685,10 +718,7 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
                     .await
             }))
         }
-        Err(error) => {
-            tracing::warn!(%error, "local runner provisioning unavailable; control plane remains available");
-            None
-        }
+        Err(_) => None,
     };
 
     if let Some(pool_task) = pool.as_mut() {
@@ -755,6 +785,9 @@ async fn wait_for_engine_socket(socket: &std::path::Path) -> anyhow::Result<()> 
     anyhow::bail!("local control plane did not become ready within 30 seconds")
 }
 
+// Configuration assembly, not a public API: the parameter list mirrors the
+// inputs the pool genuinely needs.
+#[allow(clippy::too_many_arguments)]
 fn local_runner_pool_config(
     home: &std::path::Path,
     server_url: String,
@@ -763,6 +796,9 @@ fn local_runner_pool_config(
     queue_depth: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     next_job_runs_on: std::sync::Arc<std::sync::RwLock<Vec<String>>>,
     pool_enabled: bool,
+    pending_registrations: std::sync::Arc<
+        std::sync::RwLock<std::collections::BTreeMap<String, std::time::SystemTime>>,
+    >,
 ) -> anyhow::Result<RunnerPoolConfig> {
     let control_bridge = home.join("control-bridge");
     std::fs::create_dir_all(&control_bridge)?;
@@ -818,8 +854,12 @@ fn local_runner_pool_config(
     // replacement has nothing to switch to: the job's implied stock base
     // (`ubuntu:24.04` from `ubuntu-latest` labels) will always differ from
     // the configured image and idle runners would be replaced forever.
+    // Compare on the plain `repository:tag`, so the digest-pinned defaults
+    // (ubuntu:24.04@sha256:…) still count as stock Ubuntu images.
     let custom_base = !matches!(
-        std::env::var("PRELOOP_RUNNER_BASE_IMAGE").as_deref(),
+        std::env::var("PRELOOP_RUNNER_BASE_IMAGE")
+            .as_deref()
+            .map(preloop_orchestrator::environment::base_name),
         Ok("ubuntu:24.04") | Ok("ubuntu:22.04") | Err(_)
     );
     Ok(RunnerPoolConfig {
@@ -840,7 +880,7 @@ fn local_runner_pool_config(
         use_fork: pool_enabled && use_packed_artifact && env_flag("PRELOOP_USE_FORK", true),
         name_prefix: "preloop-runner".into(),
         base_image: std::env::var("PRELOOP_RUNNER_BASE_IMAGE")
-            .unwrap_or_else(|_| "ubuntu:24.04".into()),
+            .unwrap_or_else(|_| preloop_orchestrator::environment::DEFAULT_BASE_IMAGE.into()),
         workspace: Some(workspace),
         artifact_stem: home
             .join("vms")
@@ -851,6 +891,7 @@ fn local_runner_pool_config(
         control_origin,
         control_socket,
         control_upstream,
+        dns: std::env::var("PRELOOP_RUNNER_DNS").ok(),
         registration_token_env: "AKSH_SYSTEM_TOKEN".into(),
         labels: runner_pool_labels(),
         cpus: RUNNER_CPUS,
@@ -868,6 +909,7 @@ fn local_runner_pool_config(
         ),
         pending_jobs: Some(queue_depth),
         next_job_runs_on: (!custom_base).then_some(next_job_runs_on),
+        pending_registrations: Some(pending_registrations),
     })
 }
 
@@ -1496,19 +1538,6 @@ async fn latest_run_id(
         .map(str::to_owned))
 }
 
-async fn cmd_secret(args: SecretArgs) -> anyhow::Result<()> {
-    match args.command {
-        SecretCommand::Set { name } => {
-            println!("preloop secret set: {name}");
-            anyhow::bail!("")
-        }
-        SecretCommand::List => {
-            println!("preloop secret list");
-            anyhow::bail!("")
-        }
-    }
-}
-
 async fn cmd_shell(args: ShellArgs) -> anyhow::Result<()> {
     let debug_dir = preloop_home().join("state").join("debug");
 
@@ -1735,6 +1764,7 @@ mod tests {
                 queue_depth.clone(),
                 next_job_runs_on.clone(),
                 false,
+                std::sync::Arc::new(std::sync::RwLock::new(std::collections::BTreeMap::new())),
             )
             .unwrap();
             unsafe {
@@ -1882,10 +1912,32 @@ mod tests {
         let Command::Secret(args) = cli.command else {
             panic!("expected Secret");
         };
-        let SecretCommand::Set { name } = args.command else {
+        let github_setup::SecretCommand::Set { name, .. } = args.command else {
             panic!("expected Set");
         };
         assert_eq!(name, "MY_TOKEN");
+    }
+
+    #[test]
+    fn secret_set_with_repo_scope() {
+        let cli = parse(&[
+            "secret",
+            "set",
+            "MY_TOKEN",
+            "--repo",
+            "owner/repo",
+            "--value",
+            "x",
+        ])
+        .unwrap();
+        let Command::Secret(args) = cli.command else {
+            panic!("expected Secret");
+        };
+        let github_setup::SecretCommand::Set { name, repo, .. } = args.command else {
+            panic!("expected Set");
+        };
+        assert_eq!(name, "MY_TOKEN");
+        assert_eq!(repo.as_deref(), Some("owner/repo"));
     }
 
     #[test]
@@ -1894,7 +1946,22 @@ mod tests {
         let Command::Secret(args) = cli.command else {
             panic!("expected Secret");
         };
-        assert!(matches!(args.command, SecretCommand::List));
+        let github_setup::SecretCommand::List { repo } = args.command else {
+            panic!("expected List");
+        };
+        assert!(repo.is_none());
+    }
+
+    #[test]
+    fn secret_list_with_repo_scope() {
+        let cli = parse(&["secret", "list", "--repo", "owner/repo"]).unwrap();
+        let Command::Secret(args) = cli.command else {
+            panic!("expected Secret");
+        };
+        let github_setup::SecretCommand::List { repo } = args.command else {
+            panic!("expected List");
+        };
+        assert_eq!(repo.as_deref(), Some("owner/repo"));
     }
 
     #[test]
