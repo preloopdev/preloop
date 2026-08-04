@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::BTreeSet;
 
 pub(crate) async fn healthz(State(shared): State<Arc<SharedState>>) -> Json<serde_json::Value> {
     Json(json!({
@@ -116,11 +117,42 @@ pub(crate) async fn submit_run_inner(
             object.insert("inputs".to_owned(), inputs_value);
         }
     }
-    if let Some(tier) = submission.trust_tier.as_deref().and_then(|value| {
-        serde_json::from_value::<crate::events::trust_tier::TrustTier>(json!(value)).ok()
-    }) {
-        if !tier.allows_secrets() {
-            submission.secrets.clear();
+    // Native submissions carry no trust tier (the webhook path sets it) and
+    // pass secrets through unmodified — None is therefore trusted. Mirror
+    // GitHub repo secrets: stored secrets are available to every trusted
+    // job, with submission-provided values winning per name.
+    let allow_secrets = submission
+        .trust_tier
+        .as_deref()
+        .and_then(|value| {
+            serde_json::from_value::<crate::events::trust_tier::TrustTier>(json!(value)).ok()
+        })
+        .map(|tier| tier.allows_secrets())
+        .unwrap_or(true);
+    if !allow_secrets {
+        submission.secrets.clear();
+    } else {
+        // Global secrets first, then per-repository secrets for the
+        // submitting repository. Precedence: submission-provided secrets
+        // (already in the map) > per-repo tier > global tier — mirroring
+        // GitHub, where repo secrets override org secrets of the same name.
+        let secret_store = shared.state.secrets.read();
+        let submission_names: BTreeSet<String> = submission.secrets.keys().cloned().collect();
+        for (name, value) in &secret_store.global {
+            submission
+                .secrets
+                .entry(name.clone())
+                .or_insert_with(|| aksh_gha_protocol::SecretString::new(value.clone()));
+        }
+        if let Some(repo_secrets) = secret_store.repo.get(&submission.repository) {
+            for (name, value) in repo_secrets {
+                if !submission_names.contains(name) {
+                    submission.secrets.insert(
+                        name.clone(),
+                        aksh_gha_protocol::SecretString::new(value.clone()),
+                    );
+                }
+            }
         }
     }
     let (branch, tag) = {
@@ -219,27 +251,19 @@ pub(crate) async fn submit_run_inner(
         let mut known: std::collections::BTreeSet<&str> =
             pairs.iter().map(|(id, _)| id.as_str()).collect();
         for requested in &submission.selected_jobs {
-            let mut matched_reusable = false;
-            for caller in reusable_calls.keys().filter(|caller| {
+            // A reusable caller is selected by its own (possibly
+            // matrix-suffixed) node: its callee subtree is not part of the
+            // plan anymore — it materializes at runtime after the gate passes.
+            let matched_reusable = reusable_calls.keys().any(|caller| {
                 caller.as_str() == requested
                     || caller
                         .strip_prefix(requested)
                         .is_some_and(|suffix| suffix.starts_with(" ("))
-            }) {
-                matched_reusable = true;
-                selected.extend(
-                    pairs
-                        .iter()
-                        .map(|(id, _)| id)
-                        .filter(|id| id.starts_with(&format!("{caller}/")))
-                        .cloned(),
-                );
-            }
+            });
             if matched_reusable {
                 known.insert(requested);
-            } else {
-                selected.insert(requested.clone());
             }
+            selected.insert(requested.clone());
         }
         let unknown: Vec<&str> = submission
             .selected_jobs
@@ -539,7 +563,7 @@ pub(crate) async fn submit_run_inner(
     // expires.
     let mut github_tokens: BTreeMap<JobId, String> = BTreeMap::new();
     if shared.state.github_app.is_none() {
-        if let Ok(pat) = std::env::var("AKSH_GITHUB_TOKEN") {
+        if let Some(pat) = shared.state.static_github_pat() {
             info!(%run_id, "Using AKSH_GITHUB_TOKEN PAT for run jobs");
             github_tokens.extend(jobs.iter().map(|job| (job.id.clone(), pat.clone())));
         }
@@ -572,11 +596,8 @@ pub(crate) async fn submit_run_inner(
     // O(jobs × map_insert).
     let base_url = runner_base_url();
     let normalized_github = aksh_gha_parser::job_builder::normalize_github_context(&github);
-    let secrets_exposed: BTreeMap<String, String> = submission
-        .secrets
-        .iter()
-        .map(|(k, v)| (k.clone(), v.expose().to_owned()))
-        .collect();
+    let secrets_exposed: BTreeMap<String, String> =
+        aksh_gha_protocol::masking::expose_all(&submission.secrets);
 
     struct PrebuiltJob {
         job: aksh_gha_protocol::JobPlan,
@@ -584,6 +605,7 @@ pub(crate) async fn submit_run_inner(
         request_id: i64,
         condition_context: aksh_gha_expressions::Context,
         skipped: bool,
+        caller: bool,
         id_token_granted: bool,
         oidc_ctx: OidcJobContext,
         job_request: Option<TaskAgentJobRequestRecord>,
@@ -597,6 +619,8 @@ pub(crate) async fn submit_run_inner(
     let mut pre_job_fail_fast: BTreeMap<String, bool> = BTreeMap::new();
     let mut pre_job_continue_on_error: BTreeMap<String, bool> = BTreeMap::new();
     let mut pre_initially_skipped: Vec<(RunId, JobId)> = Vec::new();
+    let mut pre_caller_plans: BTreeMap<JobId, aksh_gha_protocol::JobPlan> = BTreeMap::new();
+    let mut pre_job_names: BTreeMap<JobId, String> = BTreeMap::new();
 
     for job in jobs {
         pre_job_base_ids.insert(job.id.clone(), job.base_id.clone());
@@ -604,6 +628,10 @@ pub(crate) async fn submit_run_inner(
         pre_job_fail_fast.insert(job.base_id.clone(), job.fail_fast);
         pre_job_continue_on_error.insert(job.id.to_string(), job.continue_on_error);
         pre_statuses.insert(job.id.clone(), ExecutionStatus::Queued);
+        pre_job_names.insert(job.id.clone(), job.name.clone());
+        if job.reusable_call.is_some() {
+            pre_caller_plans.insert(job.id.clone(), job.clone());
+        }
 
         let condition_context = build_context(
             &github,
@@ -642,6 +670,7 @@ pub(crate) async fn submit_run_inner(
                 request_id: 0,
                 condition_context,
                 skipped: true,
+                caller: false,
                 id_token_granted: false,
                 oidc_ctx: OidcJobContext {
                     environment: None,
@@ -654,178 +683,32 @@ pub(crate) async fn submit_run_inner(
             continue;
         }
 
-        // Heavy work: build the agent message outside the lock.
-        let mut agent_msg =
-            aksh_gha_parser::job_builder::build_agent_job_message_with_normalized_context(
-                &job,
-                &normalized_github,
-                &job.env,
-                &secrets_exposed,
-                &submission.vars,
-            )
-            .map_err(|e| ApiError::bad_request(format!("failed to build job message: {e}")))?;
-
-        agent_msg.preloop_preserve_on_failure = submission.preserve_on_failure.then_some(true);
-
-        // Pre-allocate request ID atomically (no lock needed).
-        let request_id = shared
-            .state
-            .next_request_id
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        agent_msg.request_id = request_id;
-
-        // Mint tokens outside the lock (HMAC computation).
-        let runtime_token = shared
-            .state
-            .mint_runtime_token(&agent_msg.plan.plan_id, &agent_msg.job_id);
-
-        if let Some(snapshot) = workspace_snapshot.as_ref() {
-            let redirected =
-                redirect_primary_checkout(&mut agent_msg, snapshot, &base_url, &runtime_token);
-            if redirected > 0 {
-                info!(
-                    %run_id,
-                    job = %job.id,
-                    %redirected,
-                    commit = %snapshot.commit_sha,
-                    "Redirected primary checkout to local workspace snapshot"
-                );
-                agent_msg.aksh_snapshot_commit = Some(snapshot.commit_sha.clone());
-            }
-        }
-
-        let id_token_granted = job.oidc_id_token_granted;
-        if id_token_granted {
-            let oidc_url = format!(
-                "{}/runner/server/_apis/distributedtask/hubs/actions/plans/{}/jobs/{}/oidctoken?api-version=2.0",
-                base_url,
-                agent_msg.plan.plan_id,
-                agent_msg.job_id,
-            );
-            for endpoint in &mut agent_msg.resources.endpoints {
-                if endpoint.name.eq_ignore_ascii_case("SystemVssConnection") {
-                    endpoint
-                        .data
-                        .insert("GenerateIdTokenUrl".to_owned(), oidc_url.clone());
-                }
-            }
-        }
-
-        let github_token = github_tokens
-            .remove(&job.id)
-            .unwrap_or_else(|| runtime_token.clone());
-        agent_msg.variables.insert(
-            "system.github.token".to_owned(),
-            aksh_gha_protocol::azdo::VariableValue::secret(github_token.clone()),
-        );
-        agent_msg.variables.insert(
-            "github_token".to_owned(),
-            aksh_gha_protocol::azdo::VariableValue::secret(github_token),
-        );
-        agent_msg.variables.insert(
-            "actions_runner_allow_artifacts_file".to_owned(),
-            aksh_gha_protocol::azdo::VariableValue::new("false"),
-        );
-        agent_msg.variables.insert(
-            "actions_self_repository".to_owned(),
-            aksh_gha_protocol::azdo::VariableValue::new("true"),
-        );
-        // The debug-worker token is deliberately not a job variable. An
-        // official runner copies every `isSecret` variable into the `secrets`
-        // context, so shipping it here would publish it to workflow YAML as
-        // `${{ secrets['system.preloop.debug_worker_token'] }}`. The worker
-        // acquires it instead over `POST /api/v1/debug/worker-token`, which
-        // authenticates against this job's runtime token.
-        agent_msg.variables.insert(
-            "system.github.launch_endpoint".to_owned(),
-            aksh_gha_protocol::azdo::VariableValue::new(base_url.clone()),
-        );
-        agent_msg.variables.insert(
-            "system.github.results_endpoint".to_owned(),
-            aksh_gha_protocol::azdo::VariableValue::new(base_url.clone()),
-        );
-        agent_msg.variables.insert(
-            "system.orchestrationId".to_owned(),
-            aksh_gha_protocol::azdo::VariableValue::new(orchestration_id(
-                &agent_msg.plan.plan_id,
-                &job.base_id,
-                job.matrix_index,
-            )),
-        );
-        agent_msg.file_table = vec![workflow_path.clone()];
-        if let Some(aksh_gha_protocol::azdo::PipelineContextData::Dict(job_dict)) =
-            agent_msg.context_data.get_mut("job")
-        {
-            job_dict.insert(
-                "check_run_id".to_owned(),
-                aksh_gha_protocol::azdo::PipelineContextData::Number(0.0),
-            );
-            job_dict.insert(
-                "workflow_ref".to_owned(),
-                aksh_gha_protocol::azdo::PipelineContextData::String(workflow_ref.clone()),
-            );
-            job_dict.insert(
-                "workflow_sha".to_owned(),
-                aksh_gha_protocol::azdo::PipelineContextData::String(sha.clone()),
-            );
-            job_dict.insert(
-                "workflow_repository".to_owned(),
-                aksh_gha_protocol::azdo::PipelineContextData::String(submission.repository.clone()),
-            );
-            job_dict.insert(
-                "workflow_file_path".to_owned(),
-                aksh_gha_protocol::azdo::PipelineContextData::String(workflow_path.clone()),
-            );
-        }
-        agent_msg.enable_debugger = submission.enable_debugger;
-        agent_msg.debugger_welcome_message = submission.debugger_welcome_message.clone();
-        if submission.enable_debugger || submission.preserve_on_failure {
-            agent_msg.aksh_debug_run_id = Some(run_id.to_string());
-            agent_msg.aksh_debug_transport = Some("local".to_string());
-        }
-
-        let oidc_ctx = OidcJobContext {
-            environment: job.oidc_environment.clone(),
-            job_workflow_ref: job.oidc_job_workflow_ref.clone(),
-            job_workflow_sha: job.workflow_sha.clone(),
-        };
-
-        let job_request = TaskAgentJobRequestRecord {
-            request_id,
+        let artifacts = build_job_artifacts(
+            shared,
+            &submission,
             run_id,
-            job_id: job.id.clone(),
-            agent_job_id: agent_msg.job_id,
-            plan_id: agent_msg.plan.plan_id.clone(),
-            plan_type: agent_msg.plan.plan_type.clone(),
-            timeline_id: agent_msg.timeline.id,
-            result: None,
-            locked_until: agent_request_locked_until(),
-            started_at: None,
-            last_renewed_at: None,
-            timeout_triggered: false,
-            debug_token_issued: false,
-        };
-        let github_token_request = shared
-            .state
-            .github_app
-            .as_ref()
-            .map(|_| GitHubTokenRequest {
-                repository: submission.repository.clone(),
-                permissions: aksh_gha_parser::effective_token_permissions(job.permissions.as_ref())
-                    .into_owned(),
-                declared: job.permissions.is_some(),
-            });
+            &workflow_path,
+            &workflow_ref,
+            &sha,
+            &normalized_github,
+            &secrets_exposed,
+            &base_url,
+            workspace_snapshot.as_ref(),
+            &job,
+            github_tokens.remove(&job.id),
+        )?;
 
         prebuilt.push(PrebuiltJob {
+            caller: job.reusable_call.is_some(),
             job,
-            agent_msg: Some(agent_msg),
-            request_id,
+            agent_msg: Some(artifacts.agent_msg),
+            request_id: artifacts.request_id,
             condition_context,
             skipped: false,
-            id_token_granted,
-            oidc_ctx,
-            job_request: Some(job_request),
-            github_token_request,
+            id_token_granted: artifacts.id_token_granted,
+            oidc_ctx: artifacts.oidc_ctx,
+            job_request: Some(artifacts.job_request),
+            github_token_request: artifacts.github_token_request,
         });
     }
 
@@ -835,6 +718,8 @@ pub(crate) async fn submit_run_inner(
         let event = submission.event.clone();
         let github = github;
         let mut statuses = pre_statuses;
+        let caller_plans = pre_caller_plans;
+        let job_names = pre_job_names;
         let mut ready_jobs = 0usize;
         let job_base_ids = pre_job_base_ids;
         let job_needs = pre_job_needs;
@@ -855,6 +740,12 @@ pub(crate) async fn submit_run_inner(
                     job_outputs: BTreeMap::new(),
                     job_base_ids: BTreeMap::new(),
                     job_needs: BTreeMap::new(),
+                    caller_plans: BTreeMap::new(),
+                    job_names: BTreeMap::new(),
+                    github: serde_json::Value::Null,
+                    head_sha: String::new(),
+                    workflow_ref: String::new(),
+                    workspace_snapshot: None,
                     job_fail_fast: BTreeMap::new(),
                     job_continue_on_error: BTreeMap::new(),
                     status: ExecutionStatus::Failure,
@@ -900,32 +791,37 @@ pub(crate) async fn submit_run_inner(
             }
             let job = &pb.job;
             let agent_msg = pb.agent_msg.expect("non-skipped job must have agent_msg");
-            let job_request = pb
-                .job_request
-                .expect("non-skipped job must have job_request");
 
-            inner
-                .id_token_grants
-                .insert((run_id, job.id.clone()), pb.id_token_granted);
-            inner
-                .oidc_job_contexts
-                .insert((run_id, job.id.clone()), pb.oidc_ctx);
+            if !pb.caller {
+                // Caller placeholders are scheduling-only: no runner ever
+                // acquires them, so no request correlation records exist.
+                let job_request = pb
+                    .job_request
+                    .expect("non-skipped job must have job_request");
 
-            inner
-                .inflight_requests
-                .insert(job_request.request_id, (run_id, job.id.clone()));
-            inner
-                .plan_requests
-                .insert(job_request.plan_id.clone(), pb.request_id);
-            inner
-                .agent_job_requests
-                .insert(job_request.agent_job_id, pb.request_id);
-            inner
-                .timeline_requests
-                .insert(job_request.timeline_id, pb.request_id);
-            inner.job_requests.insert(pb.request_id, job_request);
-            if let Some(request) = pb.github_token_request {
-                inner.github_token_requests.insert(pb.request_id, request);
+                inner
+                    .id_token_grants
+                    .insert((run_id, job.id.clone()), pb.id_token_granted);
+                inner
+                    .oidc_job_contexts
+                    .insert((run_id, job.id.clone()), pb.oidc_ctx);
+
+                inner
+                    .inflight_requests
+                    .insert(job_request.request_id, (run_id, job.id.clone()));
+                inner
+                    .plan_requests
+                    .insert(job_request.plan_id.clone(), pb.request_id);
+                inner
+                    .agent_job_requests
+                    .insert(job_request.agent_job_id, pb.request_id);
+                inner
+                    .timeline_requests
+                    .insert(job_request.timeline_id, pb.request_id);
+                inner.job_requests.insert(pb.request_id, job_request);
+                if let Some(request) = pb.github_token_request {
+                    inner.github_token_requests.insert(pb.request_id, request);
+                }
             }
 
             let queued_job = QueuedJob {
@@ -949,6 +845,8 @@ pub(crate) async fn submit_run_inner(
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect(),
+                deferred_matrix: job.deferred_matrix.clone(),
+                reusable_call: job.reusable_call.clone(),
             };
             built_jobs.push(queued_job);
         }
@@ -988,6 +886,12 @@ pub(crate) async fn submit_run_inner(
                             job_outputs: BTreeMap::new(),
                             job_base_ids,
                             job_needs,
+                            caller_plans: caller_plans.clone(),
+                            job_names: job_names.clone(),
+                            github: github.clone(),
+                            head_sha: sha.clone(),
+                            workflow_ref: workflow_ref.clone(),
+                            workspace_snapshot: workspace_snapshot.clone(),
                             job_fail_fast,
                             job_continue_on_error,
                             status: ExecutionStatus::Cancelled,
@@ -1048,6 +952,12 @@ pub(crate) async fn submit_run_inner(
                     job_outputs: BTreeMap::new(),
                     job_base_ids,
                     job_needs,
+                    caller_plans: caller_plans.clone(),
+                    job_names: job_names.clone(),
+                    github: github.clone(),
+                    head_sha: sha.clone(),
+                    workflow_ref: workflow_ref.clone(),
+                    workspace_snapshot: workspace_snapshot.clone(),
                     job_fail_fast,
                     job_continue_on_error,
                     status: ExecutionStatus::Pending,
@@ -1100,6 +1010,12 @@ pub(crate) async fn submit_run_inner(
                 job_outputs: BTreeMap::new(),
                 job_base_ids: job_base_ids.clone(),
                 job_needs: job_needs.clone(),
+                caller_plans: caller_plans.clone(),
+                job_names: job_names.clone(),
+                github: github.clone(),
+                head_sha: sha.clone(),
+                workflow_ref: workflow_ref.clone(),
+                workspace_snapshot: workspace_snapshot.clone(),
                 job_fail_fast: job_fail_fast.clone(),
                 job_continue_on_error: job_continue_on_error.clone(),
                 status: ExecutionStatus::Queued,
@@ -1117,120 +1033,19 @@ pub(crate) async fn submit_run_inner(
             },
         );
 
-        // Reusable workflow invocations must acquire caller and embedded
-        // concurrency gates as one ordered, deduplicated admission set. A
-        // partially admitted JobSet keeps its earlier keys while waiting on
-        // the next key, preventing it from bypassing either scope.
-        let mut jobset_blocked: std::collections::HashSet<JobId> = std::collections::HashSet::new();
-        for call in reusable_calls.values() {
-            let member_ids: BTreeSet<JobId> = call
-                .inner_job_ids
-                .iter()
-                .map(|id| JobId(id.clone()))
-                .collect();
-            let id = JobSetId {
-                run_id,
-                job_ids: member_ids.clone(),
-            };
-            let mut gates = Vec::new();
-            let mut evaluation_failed = false;
-
-            for (raw, scope, label, inputs) in [
-                (
-                    call.caller_concurrency.as_ref(),
-                    concurrency::ConcurrencyScope::Job,
-                    "caller concurrency (JobSet)",
-                    &submission.inputs,
-                ),
-                (
-                    call.embedded_concurrency.as_ref(),
-                    concurrency::ConcurrencyScope::Workflow,
-                    "embedded concurrency (JobSet)",
-                    &call.inputs,
-                ),
-            ] {
-                let Some(raw) = raw else { continue };
-                let eval_ctx = concurrency::ConcurrencyContext {
-                    scope,
-                    github: &github,
-                    vars: &submission.vars,
-                    inputs,
-                    matrix: Some(&call.matrix),
-                    strategy: None,
-                    needs: None,
-                };
-                match concurrency::evaluate_concurrency(raw, &eval_ctx) {
-                    Ok((group, cancel_in_progress, queue)) if !group.trim().is_empty() => {
-                        merge_jobset_gate(
-                            &mut gates,
-                            JobSetGate {
-                                key: concurrency::concurrency_key(&submission.repository, &group),
-                                display_name: group,
-                                cancel_in_progress,
-                                queue,
-                            },
-                        );
-                    }
-                    Ok((_, _, _)) => {
-                        evaluation_failed = true;
-                    }
-                    Err(error) => {
-                        concurrency::log_eval_error(label, &error);
-                        evaluation_failed = true;
-                    }
-                }
-            }
-
-            if evaluation_failed {
-                for member_id in &member_ids {
-                    statuses.insert(member_id.clone(), ExecutionStatus::Failure);
-                }
-                jobset_blocked.extend(member_ids);
-                continue;
-            }
-            if gates.is_empty() {
-                continue;
-            }
-
-            inner.jobset_admissions.insert(
-                id.clone(),
-                JobSetAdmission {
-                    gates,
-                    acquired_keys: BTreeSet::new(),
-                },
-            );
-            match advance_jobset_admission(&mut inner, &id, None) {
-                Ok(JobSetAdmissionResult::Ready) => {}
-                Ok(JobSetAdmissionResult::Blocked) => {
-                    jobset_blocked.extend(member_ids);
-                }
-                Err(error) => {
-                    let status = if error == "concurrency_queue_overflow" {
-                        ExecutionStatus::Cancelled
-                    } else {
-                        ExecutionStatus::Failure
-                    };
-                    for member_id in &member_ids {
-                        statuses.insert(member_id.clone(), status);
-                    }
-                    jobset_blocked.extend(member_ids);
-                }
-            }
-        }
-
         // Enqueue jobs (workflow concurrency free / acquired).
         for queued_job in built_jobs {
             let job_id = queued_job.job_id.clone();
             let base_id = queued_job.base_id.clone();
 
-            // A blocked JobSet member must remain durably parked until every
-            // required key is acquired. Terminal members are not parked.
-            if jobset_blocked.contains(&job_id) {
-                let status = statuses.get(&job_id).copied();
-                if status.is_some_and(concurrency::is_awaiting_execution) {
-                    statuses.insert(job_id, ExecutionStatus::Pending);
-                    inner.concurrency_blocked.push_back(queued_job);
-                }
+            // Deferred reusable-caller nodes are scheduling-only: they wait in
+            // pending_jobs until their `if:` gate passes, when the scheduler
+            // acquires caller/embedded JobSet concurrency gates and expands
+            // the callee subtree (mirroring GitHub, which evaluates caller
+            // concurrency when the caller job starts).
+            if queued_job.reusable_call.is_some() {
+                statuses.insert(job_id, ExecutionStatus::Pending);
+                inner.pending_jobs.push_back(queued_job);
                 continue;
             }
 
@@ -1299,6 +1114,12 @@ pub(crate) async fn submit_run_inner(
                 job_outputs: BTreeMap::new(),
                 job_base_ids,
                 job_needs,
+                caller_plans,
+                job_names,
+                github,
+                head_sha: sha,
+                workflow_ref,
+                workspace_snapshot,
                 job_fail_fast,
                 job_continue_on_error,
                 status: initial_status,
@@ -1315,6 +1136,11 @@ pub(crate) async fn submit_run_inner(
                 conclusion: None,
             },
         );
+        // Deferred reusable-caller nodes whose needs are already satisfied
+        // (typically none) are reified by a first promote sweep: needs-free
+        // callers acquire their JobSet gates and materialize their callee
+        // subtree immediately.
+        promote_ready_jobs(&mut inner);
         // The on-demand runner supervisor uses this atomic as its wake-up
         // signal. Refresh it when submission makes work runnable; updating it
         // only after a runner claims a job leaves a size-zero pool asleep
@@ -1325,7 +1151,10 @@ pub(crate) async fn submit_run_inner(
             .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
         let cancel_count = inner.cancellation_queue.len();
         drop(inner);
-        if ready_jobs > 0 || cancel_count > 0 {
+        // The sweep above only recorded the intent to expand; the subtree build
+        // runs here with the lock released.
+        let expansion = drain_expansions(shared).await;
+        if ready_jobs > 0 || cancel_count > 0 || expansion.promoted > 0 {
             shared.state.message_notify.notify_waiters();
         }
         for (event_run_id, job_id) in initially_skipped {
@@ -1435,6 +1264,206 @@ pub(crate) fn collect_string_array(values: &[serde_json::Value], out: &mut Vec<S
     );
 }
 
+/// Per-job runner artifacts: agent message plus the correlation records the
+/// broker and results/timeline services use to track the delivered request.
+pub(crate) struct BuiltJobArtifacts {
+    pub(crate) agent_msg: azdo::AgentJobRequestMessage,
+    pub(crate) request_id: i64,
+    pub(crate) job_request: TaskAgentJobRequestRecord,
+    pub(crate) id_token_granted: bool,
+    pub(crate) oidc_ctx: OidcJobContext,
+    pub(crate) github_token_request: Option<GitHubTokenRequest>,
+}
+
+/// Build one job's runner message and correlation records.
+///
+/// Pure computation shared by the submission prebuild and the scheduler's
+/// runtime expansion of reusable-workflow callee subtrees (which cannot be
+/// built at submission: they exist only after the caller's `if:` gate passes).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_job_artifacts(
+    shared: &SharedState,
+    submission: &WorkflowSubmission,
+    run_id: RunId,
+    workflow_path: &str,
+    workflow_ref: &str,
+    sha: &str,
+    normalized_github: &serde_json::Value,
+    secrets_exposed: &BTreeMap<String, String>,
+    base_url: &str,
+    workspace_snapshot: Option<&WorkspaceSnapshot>,
+    job: &aksh_gha_protocol::JobPlan,
+    github_token_override: Option<String>,
+) -> Result<BuiltJobArtifacts, ApiError> {
+    let mut agent_msg =
+        aksh_gha_parser::job_builder::build_agent_job_message_with_normalized_context(
+            job,
+            normalized_github,
+            &job.env,
+            secrets_exposed,
+            &submission.vars,
+        )
+        .map_err(|e| ApiError::bad_request(format!("failed to build job message: {e}")))?;
+
+    agent_msg.preloop_preserve_on_failure = submission.preserve_on_failure.then_some(true);
+
+    // Pre-allocate request ID atomically (no lock needed).
+    let request_id = shared
+        .state
+        .next_request_id
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    agent_msg.request_id = request_id;
+
+    // Mint tokens outside the lock (HMAC computation).
+    let runtime_token = shared
+        .state
+        .mint_runtime_token(&agent_msg.plan.plan_id, &agent_msg.job_id);
+
+    if let Some(snapshot) = workspace_snapshot {
+        let redirected =
+            redirect_primary_checkout(&mut agent_msg, snapshot, base_url, &runtime_token);
+        if redirected > 0 {
+            info!(
+                %run_id,
+                job = %job.id,
+                %redirected,
+                commit = %snapshot.commit_sha,
+                "Redirected primary checkout to local workspace snapshot"
+            );
+            agent_msg.aksh_snapshot_commit = Some(snapshot.commit_sha.clone());
+        }
+    }
+
+    let id_token_granted = job.oidc_id_token_granted;
+    if id_token_granted {
+        let oidc_url = format!(
+            "{}/runner/server/_apis/distributedtask/hubs/actions/plans/{}/jobs/{}/oidctoken?api-version=2.0",
+            base_url,
+            agent_msg.plan.plan_id,
+            agent_msg.job_id,
+        );
+        for endpoint in &mut agent_msg.resources.endpoints {
+            if endpoint.name.eq_ignore_ascii_case("SystemVssConnection") {
+                endpoint
+                    .data
+                    .insert("GenerateIdTokenUrl".to_owned(), oidc_url.clone());
+            }
+        }
+    }
+
+    let github_token = github_token_override.unwrap_or_else(|| runtime_token.clone());
+    agent_msg.variables.insert(
+        "system.github.token".to_owned(),
+        aksh_gha_protocol::azdo::VariableValue::secret(github_token.clone()),
+    );
+    agent_msg.variables.insert(
+        "github_token".to_owned(),
+        aksh_gha_protocol::azdo::VariableValue::secret(github_token),
+    );
+    agent_msg.variables.insert(
+        "actions_runner_allow_artifacts_file".to_owned(),
+        aksh_gha_protocol::azdo::VariableValue::new("false"),
+    );
+    agent_msg.variables.insert(
+        "actions_self_repository".to_owned(),
+        aksh_gha_protocol::azdo::VariableValue::new("true"),
+    );
+    // The debug-worker token is deliberately not a job variable. An
+    // official runner copies every `isSecret` variable into the `secrets`
+    // context, so shipping it here would publish it to workflow YAML as
+    // `${{ secrets['system.preloop.debug_worker_token'] }}`. The worker
+    // acquires it instead over `POST /api/v1/debug/worker-token`, which
+    // authenticates against this job's runtime token.
+    agent_msg.variables.insert(
+        "system.github.launch_endpoint".to_owned(),
+        aksh_gha_protocol::azdo::VariableValue::new(base_url),
+    );
+    agent_msg.variables.insert(
+        "system.github.results_endpoint".to_owned(),
+        aksh_gha_protocol::azdo::VariableValue::new(base_url),
+    );
+    agent_msg.variables.insert(
+        "system.orchestrationId".to_owned(),
+        aksh_gha_protocol::azdo::VariableValue::new(orchestration_id(
+            &agent_msg.plan.plan_id,
+            &job.base_id,
+            job.matrix_index,
+        )),
+    );
+    agent_msg.file_table = vec![workflow_path.to_owned()];
+    if let Some(aksh_gha_protocol::azdo::PipelineContextData::Dict(job_dict)) =
+        agent_msg.context_data.get_mut("job")
+    {
+        job_dict.insert(
+            "check_run_id".to_owned(),
+            aksh_gha_protocol::azdo::PipelineContextData::Number(0.0),
+        );
+        job_dict.insert(
+            "workflow_ref".to_owned(),
+            aksh_gha_protocol::azdo::PipelineContextData::String(workflow_ref.to_owned()),
+        );
+        job_dict.insert(
+            "workflow_sha".to_owned(),
+            aksh_gha_protocol::azdo::PipelineContextData::String(sha.to_owned()),
+        );
+        job_dict.insert(
+            "workflow_repository".to_owned(),
+            aksh_gha_protocol::azdo::PipelineContextData::String(submission.repository.clone()),
+        );
+        job_dict.insert(
+            "workflow_file_path".to_owned(),
+            aksh_gha_protocol::azdo::PipelineContextData::String(workflow_path.to_owned()),
+        );
+    }
+    agent_msg.enable_debugger = submission.enable_debugger;
+    agent_msg.debugger_welcome_message = submission.debugger_welcome_message.clone();
+    if submission.enable_debugger || submission.preserve_on_failure {
+        agent_msg.aksh_debug_run_id = Some(run_id.to_string());
+        agent_msg.aksh_debug_transport = Some("local".to_string());
+    }
+
+    let oidc_ctx = OidcJobContext {
+        environment: job.oidc_environment.clone(),
+        job_workflow_ref: job.oidc_job_workflow_ref.clone(),
+        job_workflow_sha: job.workflow_sha.clone(),
+    };
+
+    let job_request = TaskAgentJobRequestRecord {
+        request_id,
+        run_id,
+        job_id: job.id.clone(),
+        agent_job_id: agent_msg.job_id,
+        plan_id: agent_msg.plan.plan_id.clone(),
+        plan_type: agent_msg.plan.plan_type.clone(),
+        timeline_id: agent_msg.timeline.id,
+        result: None,
+        locked_until: agent_request_locked_until(),
+        started_at: None,
+        last_renewed_at: None,
+        timeout_triggered: false,
+        debug_token_issued: false,
+    };
+    let github_token_request = shared
+        .state
+        .github_app
+        .as_ref()
+        .map(|_| GitHubTokenRequest {
+            repository: submission.repository.clone(),
+            permissions: aksh_gha_parser::effective_token_permissions(job.permissions.as_ref())
+                .into_owned(),
+            declared: job.permissions.is_some(),
+        });
+
+    Ok(BuiltJobArtifacts {
+        agent_msg,
+        request_id,
+        job_request,
+        id_token_granted,
+        oidc_ctx,
+        github_token_request,
+    })
+}
+
 pub(crate) async fn get_run(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
@@ -1446,24 +1475,49 @@ pub(crate) async fn get_run(
         .cloned()
         .ok_or_else(|| ApiError::not_found("run not found"))?;
 
-    // Results/timeline updates only create details for dispatched jobs. Keep
-    // the native jobs_list a complete projection by adding jobs that were
-    // cancelled or failed before dispatch with an empty step list.
-    for (job_id, status) in &run.jobs {
-        if !run.jobs_list.iter().any(|detail| detail.name == job_id.0) {
-            run.jobs_list.push(JobDetail {
-                name: job_id.0.clone(),
-                conclusion: status_string(*status),
-                steps: Vec::new(),
-            });
-        }
-    }
+    // GitHub's run record shows a gate-passed reusable caller only as its
+    // callee jobs: once the subtree is materialized, the caller entry leaves
+    // the visible job set. Gate-failed callers never materialize and stay as
+    // exactly one (skipped) entry.
+    let expanded_callers: std::collections::BTreeSet<&str> = run
+        .reusable_calls
+        .iter()
+        .filter(|(_, call)| !call.inner_job_ids.is_empty())
+        .map(|(caller_id, _)| caller_id.as_str())
+        .collect();
+    run.jobs
+        .retain(|job_id, _| !expanded_callers.contains(job_id.0.as_str()));
 
-    for job_detail in &mut run.jobs_list {
-        if let Some(status) = run.jobs.get(&JobId(job_detail.name.clone())) {
-            job_detail.conclusion = status_string(*status);
-        }
-    }
+    // Project with GitHub display names (evaluated `name:`, `caller / callee`
+    // separator). Results/timeline updates only create details for dispatched
+    // jobs; jobs skipped or cancelled before dispatch get an empty step list.
+    let existing = std::mem::take(&mut run.jobs_list);
+    run.jobs_list = run
+        .jobs
+        .iter()
+        .map(|(job_id, status)| {
+            let name = run
+                .job_names
+                .get(job_id)
+                .cloned()
+                .unwrap_or_else(|| job_id.0.clone());
+            let mut detail = existing
+                .iter()
+                .find(|detail| detail.name == job_id.0 || detail.name == name)
+                .cloned()
+                .unwrap_or(JobDetail {
+                    name: name.clone(),
+                    conclusion: status_string(*status),
+                    steps: Vec::new(),
+                    annotations: Vec::new(),
+                });
+            detail.name = name;
+            if let Some(stored) = run.jobs.get(job_id) {
+                detail.conclusion = status_string(*stored);
+            }
+            detail
+        })
+        .collect();
 
     Ok(Json(run))
 }
