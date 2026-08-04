@@ -350,14 +350,34 @@ previously failing step green** — Checkout, Resolve checkout SHA, Resolve
 exact diff base, Ensure preflight base commit. The skip cascade for
 downstream jobs was correct.
 
-Third rerun (run `aa9cd0e0`) — **preflight fully green**: Checkout,
-Resolve checkout SHA, Resolve exact diff base, Ensure preflight base
-commit, Detect docs-only changes, Detect changed scopes, Build CI
-manifest, Check mobile protocol event coverage. The checkout log shows
-the real fetch landing:
-`* [new ref] 0758316883f5... -> origin/checkout` from github.com.
-`build-artifacts` and `pnpm-store-warmup` then ran real work (Node
-setup, dist build, artifact upload, CLI smoke tests).
+Third rerun (run `aa9cd0e0`) — recorded as green at the time, but the
+saved evidence log contradicts that: `github.sha`/`head.sha` now carry
+the real HEAD (`07583168` fetched from github.com), yet **Ensure
+preflight base commit failed** — `upload-pack: not our ref
+3220e098…`. The engine's PR-base refresh (`runs.rs`) derives
+`base.sha` from the snapshot's `before_sha`, and the snapshot at that
+point still carried the fabricated rewritten root `3220e098`, which
+exists only in the engine's store. The workflow's fail-safe (missing
+base → `docs_only=false`) masked the step failure, so the stored job
+conclusion said `success` while the step had exit-coded. The base half
+of the fabricated-SHA bug was still open.
+
+Fourth rerun (run `b080672e`, fresh submission after the workspace was
+unshallowed to 76,328 commits and the snapshot cache rebuilt) —
+**preflight green at step level, verified**: Set up job, Checkout,
+Resolve checkout SHA, Resolve exact diff base, **Ensure preflight base
+commit**, Detect docs-only changes, Detect changed scopes, Build CI
+manifest, Complete job — all success. The ensure-base step reports
+`Base commit already present: 0758316883f5…` (the real main HEAD); the
+log contains zero occurrences of the fabricated `3220e098`. Run
+cancelled after preflight settled (heavy gated jobs not needed for this
+evidence). Evidence: `results/conformance-4repos/openclaw/c/run-preflight-green.{json,log}`
+(step records in `jobs_list[].steps`).
+
+Earlier evidence runs: the checkout log showed the real fetch landing
+`* [new ref] 0758316883f5... -> origin/checkout` from github.com, and
+`build-artifacts` / `pnpm-store-warmup` ran real work (Node setup, dist
+build, artifact upload, CLI smoke tests).
 
 Getting there took two more fixes beyond the snapshot-identity one:
 
