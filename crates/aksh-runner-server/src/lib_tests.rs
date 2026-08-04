@@ -3,7 +3,7 @@ use axum::body::{to_bytes, Body};
 use axum::http::{Method, Request, StatusCode};
 use serde_json::Value;
 use sha1::{Digest, Sha1};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::Path as FsPath;
@@ -253,6 +253,73 @@ jobs:
     );
 }
 
+#[tokio::test]
+async fn completejob_annotations_are_stored_on_the_job_record() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo"
+        }),
+    )
+    .await;
+    let run_id = accepted["run_id"].as_str().unwrap().to_string();
+    let job_id = {
+        let inner = state.inner.lock().await;
+        inner.queue.front().unwrap().job_id.0.clone()
+    };
+
+    // The listener's force-fail completion carries the worker-crash detail as
+    // an error annotation; the server must persist it on the job record.
+    request_json(
+        &app,
+        Method::POST,
+        "/internal/test/jobs/complete",
+        json!({
+            "run_id": run_id,
+            "job_id": job_id,
+            "status": "failure",
+            "annotations": [{
+                "level": "failure",
+                "message": "worker crashed: segmentation fault",
+                "stepNumber": 0,
+                "startLine": 1,
+                "endLine": 1,
+            }],
+        }),
+    )
+    .await;
+
+    let run = request_json(
+        &app,
+        Method::GET,
+        &format!("/api/v1/runs/{run_id}"),
+        Value::Null,
+    )
+    .await;
+    let job = run["jobs_list"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|job| job["name"] == json!(job_id))
+        .expect("job present in run record");
+    assert_eq!(job["conclusion"], "failure");
+    let annotations = job["annotations"].as_array().unwrap();
+    assert_eq!(annotations.len(), 1);
+    assert_eq!(annotations[0]["level"], "failure");
+    assert_eq!(
+        annotations[0]["message"],
+        "worker crashed: segmentation fault"
+    );
+}
+
 fn selected_jobs_workflow() -> &'static str {
     r#"
 on: push
@@ -361,7 +428,7 @@ async fn selected_jobs_runs_transitive_needs_closure_without_independent_jobs() 
 }
 
 #[tokio::test]
-async fn selected_reusable_call_runs_all_inlined_children() {
+async fn selected_reusable_call_expands_children_at_runtime() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
@@ -405,10 +472,16 @@ jobs:
 
     let inner = state.inner.lock().await;
     let run = inner.runs.values().next().unwrap();
+    // Selecting the caller selects its node; since it has no `if:` gate, the
+    // submission-time promote sweep materializes the callee subtree at once.
     let base_ids: BTreeSet<String> = run.job_base_ids.values().cloned().collect();
     assert_eq!(
         base_ids,
-        BTreeSet::from(["call/build".to_owned(), "call/test".to_owned()])
+        BTreeSet::from([
+            "call".to_owned(),
+            "call/build".to_owned(),
+            "call/test".to_owned()
+        ])
     );
 }
 
@@ -1059,6 +1132,153 @@ jobs:
         outputs.get("artifact"),
         Some(azdo::PipelineContextData::String(value)) if value == "dist.tgz"
     ));
+}
+
+#[tokio::test]
+async fn runtime_dynamic_matrix_expansion_fans_out_jobs() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": r#"
+on: push
+jobs:
+  generator:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo gen
+  downstream:
+    needs: [generator]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.generator.outputs.matrix) }}
+    steps:
+      - run: echo dynamic
+"#,
+            "event": "push",
+            "repository": "owner/repo"
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    // Complete generator job with matrix output
+    request_json(
+        &app,
+        Method::POST,
+        "/internal/test/jobs/complete",
+        json!({
+            "run_id": run_id,
+            "job_id": "generator",
+            "status": "success",
+            "outputs": {"matrix": r#"{"include": [{"os": "ubuntu-latest"}, {"os": "macos-latest"}]}"#}
+        }),
+    )
+    .await;
+
+    let inner = state.inner.lock().await;
+    let run = inner.runs.get(&run_id).unwrap();
+
+    // Verify downstream (ubuntu-latest) and downstream (macos-latest) were dynamically created and queued
+    assert!(run
+        .jobs
+        .contains_key(&JobId("downstream (ubuntu-latest)".to_string())));
+    assert!(run
+        .jobs
+        .contains_key(&JobId("downstream (macos-latest)".to_string())));
+
+    let queued_ids: Vec<String> = inner.queue.iter().map(|j| j.job_id.0.clone()).collect();
+    assert!(queued_ids.contains(&"downstream (ubuntu-latest)".to_string()));
+    assert!(queued_ids.contains(&"downstream (macos-latest)".to_string()));
+}
+
+#[tokio::test]
+async fn invalid_dynamic_matrix_fails_the_run_instead_of_skipping_it() {
+    // A dynamic matrix whose expression does not evaluate to a matrix is a
+    // workflow error, and GitHub concludes such a job as failed. Treating the
+    // expansion error as a skip would let a broken workflow report a green
+    // run, because a run whose only non-success job is skipped summarizes as
+    // success.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": r#"
+on: push
+jobs:
+  generator:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo gen
+  downstream:
+    needs: [generator]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.generator.outputs.matrix) }}
+    steps:
+      - run: echo dynamic
+"#,
+            "event": "push",
+            "repository": "owner/repo"
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    // `42` parses as JSON but is not a matrix object or array, so the runtime
+    // expansion fails rather than yielding zero combinations.
+    request_json(
+        &app,
+        Method::POST,
+        "/internal/test/jobs/complete",
+        json!({
+            "run_id": run_id,
+            "job_id": "generator",
+            "status": "success",
+            "outputs": {"matrix": "42"}
+        }),
+    )
+    .await;
+
+    let inner = state.inner.lock().await;
+    let run = inner.runs.get(&run_id).unwrap();
+
+    let downstream: Vec<(&JobId, ExecutionStatus)> = run
+        .jobs
+        .iter()
+        .filter(|(id, _)| id.0.starts_with("downstream"))
+        .map(|(id, status)| (id, *status))
+        .collect();
+    assert_eq!(
+        downstream.len(),
+        1,
+        "a failed expansion must not materialize combinations: {:?}",
+        run.jobs
+    );
+    // The un-expanded node is un-suffixed, the way GitHub shows it: the
+    // deferred expression must not leak into the job's identity.
+    assert_eq!(downstream[0].0 .0, "downstream");
+    assert_eq!(
+        downstream[0].1,
+        ExecutionStatus::Failure,
+        "a matrix expression that is not a matrix must fail the job: {:?}",
+        run.jobs
+    );
+    assert_eq!(
+        run.status,
+        ExecutionStatus::Failure,
+        "the run must not conclude green on a broken dynamic matrix"
+    );
 }
 
 #[tokio::test]
@@ -5881,6 +6101,174 @@ jobs:
     assert!(*check_run_id > 0);
 }
 
+/// Scaffolding shared by the webhook delivery dedup tests: a workspace holding
+/// one push-triggered workflow, a server with a webhook secret, and the signed
+/// push payload GitHub would deliver.
+struct WebhookDedupFixture {
+    state: AppState,
+    app: Router,
+    payload_bytes: Vec<u8>,
+    signature_header: String,
+}
+
+impl WebhookDedupFixture {
+    async fn new(temp: &tempfile::TempDir) -> Self {
+        let ws_dir = temp.path().join("ws");
+        std::fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
+        std::fs::write(
+            ws_dir.join(".github/workflows/build.yml"),
+            "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
+        )
+        .unwrap();
+
+        let mut state = AppState::new(temp.path().join("state").to_path_buf())
+            .await
+            .unwrap();
+        state.webhook_secret = Some("super-secret".to_owned());
+        state.local_workspace = Some(ws_dir.clone());
+        let app = app(state.clone(), CancellationToken::new());
+
+        let payload = serde_json::json!({
+            "ref": "refs/heads/main",
+            "before": "0000000000000000000000000000000000000000",
+            "after": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            "repository": {"full_name": "owner/repo", "default_branch": "main"},
+            "commits": [{
+                "id": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                "added": ["src/main.rs"],
+                "modified": [],
+                "removed": []
+            }],
+        });
+        let payload_bytes = serde_json::to_vec(&payload).unwrap();
+
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        type HmacSha256 = Hmac<Sha256>;
+        let mut mac = HmacSha256::new_from_slice(b"super-secret").unwrap();
+        mac.update(&payload_bytes);
+        let sig_hex = mac
+            .finalize()
+            .into_bytes()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>();
+        let signature_header = format!("sha256={sig_hex}");
+
+        Self {
+            state,
+            app,
+            payload_bytes,
+            signature_header,
+        }
+    }
+
+    /// Deliver the signed push payload under `delivery`. `event` is the
+    /// `x-github-event` header; `None` omits it, which is how this test makes
+    /// post-reservation processing fail (400) the way a transient server error
+    /// would.
+    async fn post(&self, delivery: &str, event: Option<&str>) -> StatusCode {
+        let app = self.app.clone();
+        let payload_bytes = self.payload_bytes.clone();
+        let signature_header = self.signature_header.clone();
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/github/webhooks")
+            .header("x-github-delivery", delivery)
+            .header("x-hub-signature-256", signature_header)
+            .header("content-type", "application/json");
+        if let Some(event) = event {
+            request = request.header("x-github-event", event);
+        }
+        app.oneshot(request.body(Body::from(payload_bytes)).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+}
+
+#[tokio::test]
+async fn github_webhook_same_delivery_is_deduped_but_new_delivery_creates_run() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = WebhookDedupFixture::new(&temp).await;
+
+    // The same delivery id twice (GitHub redelivery / double-fire) must not
+    // create a duplicate run; a genuinely new delivery creates another.
+    assert_eq!(
+        fixture.post("delivery-dup-1", Some("push")).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        fixture.post("delivery-dup-1", Some("push")).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        fixture.post("delivery-dup-2", Some("push")).await,
+        StatusCode::OK
+    );
+
+    let inner = fixture.state.inner.lock().await;
+    assert_eq!(
+        inner.runs.len(),
+        2,
+        "a redelivered webhook must not create a duplicate run"
+    );
+}
+
+#[tokio::test]
+async fn github_webhook_failed_delivery_is_accepted_on_redelivery() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = WebhookDedupFixture::new(&temp).await;
+
+    // First attempt fails after the delivery was reserved for dedup.
+    assert_eq!(
+        fixture.post("delivery-retry", None).await,
+        StatusCode::BAD_REQUEST
+    );
+    {
+        let inner = fixture.state.inner.lock().await;
+        assert!(
+            inner.runs.is_empty(),
+            "a failed delivery must not create a run"
+        );
+    }
+
+    // GitHub redelivers after an error response; the retry must be processed
+    // rather than dropped as a duplicate.
+    assert_eq!(
+        fixture.post("delivery-retry", Some("push")).await,
+        StatusCode::OK
+    );
+    let inner = fixture.state.inner.lock().await;
+    assert_eq!(
+        inner.runs.len(),
+        1,
+        "a redelivery of a failed delivery must create the run"
+    );
+}
+
+#[tokio::test]
+async fn github_webhook_concurrent_duplicate_delivery_creates_one_run() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = WebhookDedupFixture::new(&temp).await;
+
+    // Two copies of one delivery in flight at once: the in-flight reservation
+    // makes the loser a no-op instead of a second run.
+    let (first, second) = tokio::join!(
+        fixture.post("delivery-concurrent", Some("push")),
+        fixture.post("delivery-concurrent", Some("push"))
+    );
+    assert_eq!(first, StatusCode::OK);
+    assert_eq!(second, StatusCode::OK);
+
+    let inner = fixture.state.inner.lock().await;
+    assert_eq!(
+        inner.runs.len(),
+        1,
+        "concurrent copies of one delivery must produce exactly one run"
+    );
+}
+
 #[tokio::test]
 async fn github_webhook_pull_request_event() {
     let temp = tempfile::tempdir().unwrap();
@@ -6600,6 +6988,464 @@ async fn submit_yaml(app: &Router, yaml: &str, repo: &str) -> Value {
         }),
     )
     .await
+}
+
+#[tokio::test]
+async fn stored_secrets_are_injected_into_native_submissions() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state
+        .secrets
+        .write()
+        .global
+        .insert("E2E_TEST_SECRET".to_owned(), "stored-value".to_owned());
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = submit_yaml(
+        &app,
+        "on: push\njobs:\n  probe:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo $SECRET\n        env:\n          SECRET: ${{ secrets.E2E_TEST_SECRET }}\n",
+        "owner/repo",
+    )
+    .await;
+    let run_id = accepted["run_id"].as_str().unwrap();
+
+    // The job message must carry the stored secret as a secret variable so
+    // the worker republishes it into the `secrets.*` context.
+    let inner = state.inner.lock().await;
+    let run = inner
+        .runs
+        .values()
+        .find(|run| run.run_id.to_string() == run_id)
+        .unwrap();
+    let message = inner
+        .queue
+        .iter()
+        .find(|job| job.run_id == run.run_id)
+        .or_else(|| {
+            inner
+                .pending_jobs
+                .iter()
+                .find(|job| job.run_id == run.run_id)
+        })
+        .expect("queued job exists")
+        .message
+        .clone();
+    let secret_var = message
+        .variables
+        .values()
+        .find(|value| value.value.as_deref() == Some("stored-value"))
+        .expect("stored secret present in job message variables");
+    assert_eq!(secret_var.is_secret, Some(true));
+}
+
+/// Extract the queued job message for a run, wherever it currently sits.
+fn queued_message_for(inner: &crate::state::InnerState, run_id: &str) -> AgentJobRequestMessage {
+    let run = inner
+        .runs
+        .values()
+        .find(|run| run.run_id.to_string() == run_id)
+        .unwrap();
+    inner
+        .queue
+        .iter()
+        .find(|job| job.run_id == run.run_id)
+        .or_else(|| {
+            inner
+                .pending_jobs
+                .iter()
+                .find(|job| job.run_id == run.run_id)
+        })
+        .expect("queued job exists")
+        .message
+        .clone()
+}
+
+fn variable_value<'a>(message: &'a AgentJobRequestMessage, name: &str) -> Option<&'a str> {
+    message
+        .variables
+        .get(name)
+        .and_then(|value| value.value.as_deref())
+}
+
+/// `preloop setup github --via pat` stores the credential as `github.pat` and
+/// configures no App. That PAT must reach jobs as their `GITHUB_TOKEN`:
+/// previously only `AKSH_GITHUB_TOKEN` was consulted, so setup reported
+/// success while every job silently ran on the local runtime token instead.
+#[tokio::test]
+async fn pat_only_config_supplies_job_github_token() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    std::fs::write(&config_path, "[github]\npat = \"github_pat_testvalue\"\n").unwrap();
+    // Point this engine at the temp config directly. Mutating `PRELOOP_CONFIG`
+    // would race every other test that builds an `AppState` concurrently.
+    let state = AppState::new_with_config(temp.path().to_path_buf(), config_path)
+        .await
+        .unwrap();
+    assert!(
+        state.github_app.is_none(),
+        "config declares no app id or pem"
+    );
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = submit_yaml(
+        &app,
+        "on: push\njobs:\n  probe:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+        "owner/repo",
+    )
+    .await;
+    let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+
+    let inner = state.inner.lock().await;
+    let message = queued_message_for(&inner, &run_id);
+    let token = message
+        .variables
+        .get("system.github.token")
+        .expect("job message carries a GitHub token variable");
+    assert_eq!(token.value.as_deref(), Some("github_pat_testvalue"));
+    assert_eq!(token.is_secret, Some(true));
+}
+
+#[tokio::test]
+async fn repo_scoped_secrets_override_global_and_stay_scoped() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    {
+        let mut secrets = state.secrets.write();
+        secrets
+            .global
+            .insert("GLOBAL_TOKEN".to_owned(), "global-value".to_owned());
+        secrets.repo.insert(
+            "owner/repo".to_owned(),
+            BTreeMap::from([
+                ("REPO_TOKEN".to_owned(), "repo-value".to_owned()),
+                ("GLOBAL_TOKEN".to_owned(), "repo-wins".to_owned()),
+            ]),
+        );
+    }
+    let app = app(state.clone(), CancellationToken::new());
+    let workflow =
+        "on: push\njobs:\n  probe:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo $SECRET\n";
+
+    // owner/repo: the per-repo tier overrides the global tier per name and
+    // contributes its own names.
+    let accepted = submit_yaml(&app, workflow, "owner/repo").await;
+    let run_id = accepted["run_id"].as_str().unwrap();
+    let inner = state.inner.lock().await;
+    let message = queued_message_for(&inner, run_id);
+    assert_eq!(
+        variable_value(&message, "GLOBAL_TOKEN"),
+        Some("repo-wins"),
+        "per-repo secret overrides the global tier"
+    );
+    assert_eq!(
+        variable_value(&message, "REPO_TOKEN"),
+        Some("repo-value"),
+        "per-repo secret is injected"
+    );
+    drop(inner);
+
+    // other/repo: only the global tier applies — repo secrets stay scoped.
+    let accepted = submit_yaml(&app, workflow, "other/repo").await;
+    let run_id = accepted["run_id"].as_str().unwrap();
+    let inner = state.inner.lock().await;
+    let message = queued_message_for(&inner, run_id);
+    assert_eq!(
+        variable_value(&message, "GLOBAL_TOKEN"),
+        Some("global-value"),
+        "unscoped repo still gets the global tier"
+    );
+    assert_eq!(
+        variable_value(&message, "REPO_TOKEN"),
+        None,
+        "repo-scoped secret must not leak into another repository"
+    );
+    drop(inner);
+
+    // Submission-provided secrets still win over both tiers.
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": workflow,
+            "event": "push",
+            "repository": "owner/repo",
+            "secrets": { "GLOBAL_TOKEN": "submitted-value" }
+        }),
+    )
+    .await;
+    let run_id = accepted["run_id"].as_str().unwrap();
+    let inner = state.inner.lock().await;
+    let message = queued_message_for(&inner, run_id);
+    assert_eq!(
+        variable_value(&message, "GLOBAL_TOKEN"),
+        Some("submitted-value"),
+        "submission-provided secrets outrank both stored tiers"
+    );
+}
+
+/// Like `request_json` but returns the status instead of asserting success.
+async fn request_json_status(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    body: Value,
+) -> (StatusCode, Value) {
+    let builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::AUTHORIZATION, "Bearer aksh-system-token");
+    let request = if body.is_null() {
+        builder.body(Body::empty()).unwrap()
+    } else {
+        builder
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    (status, body)
+}
+
+#[tokio::test]
+async fn live_secrets_api_round_trips_and_persists() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    async {
+        let state = AppState::new_with_config(temp.path().to_path_buf(), config_path.clone())
+            .await
+            .unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        request_json(
+            &app,
+            Method::PUT,
+            "/api/v1/secrets/REPO_ONLY",
+            json!({ "value": "v1", "repo": "owner/repo" }),
+        )
+        .await;
+        request_json(
+            &app,
+            Method::PUT,
+            "/api/v1/secrets/GLOBAL_ONLY",
+            json!({ "value": "g1" }),
+        )
+        .await;
+        request_json(
+            &app,
+            Method::PUT,
+            "/api/v1/secrets/OTHER",
+            json!({ "value": "x", "repo": "other/repo" }),
+        )
+        .await;
+
+        // Full listing carries both tiers; scoped listing only its repo.
+        let listed = request_json(&app, Method::GET, "/api/v1/secrets", Value::Null).await;
+        let entries: Vec<(String, Option<String>)> = listed["secrets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                (
+                    entry["name"].as_str().unwrap().to_owned(),
+                    entry["repo"].as_str().map(str::to_owned),
+                )
+            })
+            .collect();
+        assert!(entries.contains(&("REPO_ONLY".to_owned(), Some("owner/repo".to_owned()))));
+        assert!(entries.contains(&("GLOBAL_ONLY".to_owned(), None)));
+        assert!(entries.contains(&("OTHER".to_owned(), Some("other/repo".to_owned()))));
+
+        let scoped = request_json(
+            &app,
+            Method::GET,
+            "/api/v1/secrets?repo=owner/repo",
+            Value::Null,
+        )
+        .await;
+        let scoped_names: Vec<&str> = scoped["secrets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(scoped_names, vec!["REPO_ONLY"]);
+
+        // Deletion, then 404 on a second attempt.
+        request_json(
+            &app,
+            Method::DELETE,
+            "/api/v1/secrets/REPO_ONLY?repo=owner/repo",
+            Value::Null,
+        )
+        .await;
+        let (status, _) = request_json_status(
+            &app,
+            Method::DELETE,
+            "/api/v1/secrets/REPO_ONLY?repo=owner/repo",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Validation: lowercase names and empty values are rejected.
+        let (status, _) = request_json_status(
+            &app,
+            Method::PUT,
+            "/api/v1/secrets/lowercase",
+            json!({ "value": "x" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = request_json_status(
+            &app,
+            Method::PUT,
+            "/api/v1/secrets/BAD",
+            json!({ "value": "", "repo": "owner/repo" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // The in-memory store and the persisted file both reflect the API.
+        let store = state.secrets.read();
+        assert!(store.global.contains_key("GLOBAL_ONLY"));
+        assert!(!store.repo.contains_key("owner/repo"));
+        assert!(store.repo["other/repo"].contains_key("OTHER"));
+        drop(store);
+        let text = std::fs::read_to_string(&config_path).unwrap();
+        assert!(text.contains("GLOBAL_ONLY"), "config persists the secret");
+        assert!(text.contains("other/repo"), "config persists the scope");
+    }
+    .await;
+}
+
+/// Concurrent secret mutations must not lose writes. Each handler loads the
+/// whole config file, changes one entry and writes it back; without the
+/// `secret_mutation` lock the requests read the same base config and the
+/// last rename wins, so the file loses secrets the in-memory store still
+/// reports. Remove the lock and this test fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_secret_mutations_keep_store_and_file_in_agreement() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    async {
+        let state = AppState::new_with_config(temp.path().to_path_buf(), config_path.clone())
+            .await
+            .unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        // Seeded so the concurrent burst has something to delete.
+        request_json(
+            &app,
+            Method::PUT,
+            "/api/v1/secrets/DOOMED",
+            json!({ "value": "gone" }),
+        )
+        .await;
+
+        const WRITERS: usize = 12;
+        let mut tasks = Vec::with_capacity(WRITERS + 1);
+        for index in 0..WRITERS {
+            let app = app.clone();
+            tasks.push(tokio::spawn(async move {
+                request_json(
+                    &app,
+                    Method::PUT,
+                    &format!("/api/v1/secrets/CONCURRENT_{index}"),
+                    json!({ "value": format!("value-{index}") }),
+                )
+                .await;
+            }));
+        }
+        let delete_app = app.clone();
+        tasks.push(tokio::spawn(async move {
+            request_json(
+                &delete_app,
+                Method::DELETE,
+                "/api/v1/secrets/DOOMED",
+                Value::Null,
+            )
+            .await;
+        }));
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        let expected: Vec<String> = (0..WRITERS)
+            .map(|index| format!("CONCURRENT_{index}"))
+            .collect();
+        let mut expected_sorted = expected.clone();
+        expected_sorted.sort();
+
+        let store = state.secrets.read();
+        assert!(
+            !store.global.contains_key("DOOMED"),
+            "deleted secret survived in the in-memory store"
+        );
+        let store_names: Vec<String> = store.global.keys().cloned().collect();
+        drop(store);
+
+        let persisted = std::fs::read_to_string(&config_path).unwrap();
+        let persisted: crate::config::ConfigFile = toml::from_str(&persisted).unwrap();
+        for name in &expected {
+            assert!(
+                persisted.secrets.contains_key(name),
+                "{name} lost from the persisted config: {:?}",
+                persisted.secrets.keys().collect::<Vec<_>>()
+            );
+            let index = name.trim_start_matches("CONCURRENT_");
+            assert_eq!(
+                persisted.secrets[name],
+                format!("value-{index}"),
+                "{name} persisted with the wrong value"
+            );
+        }
+        assert!(
+            !persisted.secrets.contains_key("DOOMED"),
+            "deleted secret was resurrected by a concurrent write"
+        );
+
+        // Neither side may carry a name the other does not, and nothing
+        // unexpected may survive on either side.
+        let persisted_names: Vec<String> = persisted.secrets.keys().cloned().collect();
+        assert_eq!(store_names, expected_sorted);
+        assert_eq!(persisted_names, expected_sorted);
+    }
+    .await;
+}
+
+/// The secret store holds plaintext values, so its `Debug` must never print
+/// them — one `debug!(?store)` would otherwise dump every stored secret.
+#[test]
+fn secret_store_debug_redacts_values() {
+    let mut store = crate::state::SecretStore::default();
+    store
+        .global
+        .insert("GLOBAL_NAME".to_owned(), "global-plaintext".to_owned());
+    store.repo.insert(
+        "owner/repo".to_owned(),
+        [("REPO_NAME".to_owned(), "repo-plaintext".to_owned())]
+            .into_iter()
+            .collect(),
+    );
+
+    let rendered = format!("{store:?}");
+    assert!(rendered.contains("GLOBAL_NAME"), "{rendered}");
+    assert!(rendered.contains("REPO_NAME"), "{rendered}");
+    assert!(rendered.contains("owner/repo"), "{rendered}");
+    assert!(!rendered.contains("global-plaintext"), "{rendered}");
+    assert!(!rendered.contains("repo-plaintext"), "{rendered}");
+    // Alternate formatting must be redacted too.
+    let pretty = format!("{store:#?}");
+    assert!(!pretty.contains("global-plaintext"), "{pretty}");
+    assert!(!pretty.contains("repo-plaintext"), "{pretty}");
 }
 
 #[tokio::test]
@@ -8429,8 +9275,16 @@ jobs:
     let second_run: RunId = second["run_id"].as_str().unwrap().parse().unwrap();
     let (first_job, second_job) = {
         let inner = state.inner.lock().await;
-        let first_job = inner.runs[&first_run].jobs.keys().next().unwrap().clone();
-        let second_job = inner.runs[&second_run].jobs.keys().next().unwrap().clone();
+        // The first caller's gate is free at submission: its callee subtree
+        // materializes immediately and `call/inner` is dispatched.
+        let first_job = JobId("call/inner".to_owned());
+        // The second caller holds the gate's pending slot: it stays one
+        // parked caller node, not a materialized subtree.
+        let second_job = JobId("call".to_owned());
+        assert_eq!(
+            inner.runs[&first_run].jobs[&JobId("call".to_owned())],
+            ExecutionStatus::InProgress
+        );
         assert_eq!(
             inner.runs[&first_run].jobs[&first_job],
             ExecutionStatus::Queued
@@ -8453,20 +9307,31 @@ jobs:
     complete_via_api(&app, &first_run.to_string(), &first_job.0).await;
     {
         let inner = state.inner.lock().await;
+        // Completing the subtree terminalizes the first caller, releasing the
+        // gate; the second caller is admitted and expanded in turn.
         assert_eq!(
-            inner.runs[&second_run].jobs[&second_job],
+            inner.runs[&first_run].jobs[&JobId("call".to_owned())],
+            ExecutionStatus::Success
+        );
+        let second_inner = JobId("call/inner".to_owned());
+        assert_eq!(
+            inner.runs[&second_run].jobs[&JobId("call".to_owned())],
+            ExecutionStatus::InProgress
+        );
+        assert_eq!(
+            inner.runs[&second_run].jobs[&second_inner],
             ExecutionStatus::Queued
         );
         assert!(inner
             .queue
             .iter()
-            .any(|job| job.run_id == second_run && job.job_id == second_job));
+            .any(|job| job.run_id == second_run && job.job_id == second_inner));
         assert!(!inner
             .concurrency_blocked
             .iter()
             .any(|job| job.run_id == second_run && job.job_id == second_job));
-    }
-    complete_via_api(&app, &second_run.to_string(), &second_job.0).await;
+    };
+    complete_via_api(&app, &second_run.to_string(), "call/inner").await;
     assert_eq!(
         state.inner.lock().await.runs[&second_run].status,
         ExecutionStatus::Success
@@ -8562,8 +9427,15 @@ jobs:
     complete_via_api(&app, &holder_run.to_string(), &holder_job.0).await;
     {
         let inner = state.inner.lock().await;
+        // Both gates acquired: the caller materialized its subtree and is
+        // tracked as the JobSet holder; the inner job is dispatched.
         assert_eq!(
             inner.runs[&reusable_run].jobs[&reusable_job],
+            ExecutionStatus::InProgress
+        );
+        let inner_job = JobId(format!("{}/inner", reusable_job.0));
+        assert_eq!(
+            inner.runs[&reusable_run].jobs[&inner_job],
             ExecutionStatus::Queued
         );
         assert!(inner.jobset_admissions.is_empty());
@@ -8574,8 +9446,8 @@ jobs:
                 Some(concurrency::Holder::JobSet { run_id, .. }) if run_id == reusable_run
             ));
         }
-    }
-    complete_via_api(&app, &reusable_run.to_string(), &reusable_job.0).await;
+    };
+    complete_via_api(&app, &reusable_run.to_string(), "call/inner").await;
 }
 
 #[tokio::test]
@@ -8615,8 +9487,16 @@ jobs:
     .await;
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
     let inner = state.inner.lock().await;
-    let job_id = inner.runs[&run_id].jobs.keys().next().unwrap();
-    assert_eq!(inner.runs[&run_id].jobs[job_id], ExecutionStatus::Queued);
+    // Identical caller+embedded group dedupes to one gate: the caller was
+    // admitted and its subtree materialized at submission.
+    assert_eq!(
+        inner.runs[&run_id].jobs[&JobId("call".to_owned())],
+        ExecutionStatus::InProgress
+    );
+    assert_eq!(
+        inner.runs[&run_id].jobs[&JobId("call/inner".to_owned())],
+        ExecutionStatus::Queued
+    );
     assert!(inner.jobset_admissions.is_empty());
     let key = concurrency::concurrency_key("owner/repo", "same-key");
     assert!(inner.concurrency_groups[&key].pending.is_empty());
@@ -8627,9 +9507,11 @@ jobs:
 }
 
 /// uv-ci shape: a reusable `plan` produces outputs; a caller job gates on
-/// `needs.plan.outputs.X == 'true'` and calls another reusable. When the
-/// plan completes with the output false, the gated caller's inner jobs must
-/// be skipped (not left queued forever).
+/// `needs.plan.outputs.X == 'true'` and calls another reusable.
+/// GitHub evaluates a reusable call's `if:` once the caller's needs complete;
+/// a false result skips the whole invocation and the run record shows exactly
+/// one skipped caller entry — the callee subtree is never materialized — and
+/// jobs that `needs` it are skipped in turn.
 #[tokio::test]
 async fn reusable_caller_gated_on_plan_outputs_is_skipped() {
     let temp = tempfile::tempdir().unwrap();
@@ -8649,6 +9531,11 @@ jobs:
     needs: plan
     if: ${{ needs.plan.outputs.flag == 'true' }}
     uses: ./.github/workflows/callee.yml
+  dependent:
+    needs: gated
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo dependent
 "#,
             "event": "push",
             "repository": "owner/repo",
@@ -8682,6 +9569,8 @@ jobs:
     let run: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
     let plan_job = {
         let inner = state.inner.lock().await;
+        // The `plan` caller itself has no gate: its callee job materialized
+        // at submission time.
         inner.runs[&run]
             .jobs
             .keys()
@@ -8699,6 +9588,274 @@ jobs:
     .await;
     {
         let inner = state.inner.lock().await;
+        // GitHub shape: exactly one skipped entry for the gated caller — and
+        // no callee job ever appeared in the run record.
+        let gated = inner.runs[&run]
+            .jobs
+            .iter()
+            .find(|(id, _)| id.0 == "gated")
+            .unwrap();
+        assert_eq!(
+            *gated.1,
+            ExecutionStatus::Skipped,
+            "gated reusable caller must be skipped when its `if:` evaluates false"
+        );
+        assert!(
+            !inner.runs[&run]
+                .jobs
+                .keys()
+                .any(|id| id.0.starts_with("gated/")),
+            "a false-gated caller's callee subtree must never materialize"
+        );
+        let dependent = inner.runs[&run]
+            .jobs
+            .iter()
+            .find(|(id, _)| id.0 == "dependent")
+            .unwrap();
+        assert_eq!(
+            *dependent.1,
+            ExecutionStatus::Skipped,
+            "a job that needs a skipped reusable call must be skipped too"
+        );
+    }
+    {
+        let inner = state.inner.lock().await;
+        assert!(
+            !inner
+                .queue
+                .iter()
+                .any(|job| job.run_id == run && job.job_id.0.starts_with("gated/")),
+            "skipped gated caller's inner job must never reach the dispatch queue"
+        );
+        assert_eq!(
+            inner.runs[&run].status,
+            ExecutionStatus::Success,
+            "a run whose gated call was skipped concludes success"
+        );
+    }
+}
+
+/// GitHub run-record parity end to end: a false-gated caller stays one
+/// skipped entry, a passing caller appears only as its callee jobs, and the
+/// jobs listing carries GitHub display names (evaluated `name:`, space-slash
+/// `caller / callee`, per-cell matrix names).
+#[tokio::test]
+async fn github_shaped_run_record_for_gated_and_passing_callers() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": r#"
+on: push
+jobs:
+  plan:
+    uses: ./.github/workflows/plan.yml
+  test-smoke:
+    needs: plan
+    if: ${{ needs.plan.outputs.smoke == 'true' }}
+    uses: ./.github/workflows/smoke.yml
+  docs:
+    needs: plan
+    if: ${{ needs.plan.outputs.docs == 'true' }}
+    uses: ./.github/workflows/docs.yml
+    with:
+      suite: guide
+"#,
+            "event": "push",
+            "repository": "owner/repo",
+            "reusable_workflows": {
+                ".github/workflows/plan.yml": r#"
+on:
+  workflow_call:
+    outputs:
+      smoke:
+        value: ${{ jobs.p.outputs.smoke }}
+      docs:
+        value: ${{ jobs.p.outputs.docs }}
+jobs:
+  p:
+    name: plan
+    runs-on: ubuntu-latest
+    outputs:
+      smoke: "false"
+      docs: "true"
+    steps:
+      - run: echo done
+"#,
+                ".github/workflows/smoke.yml": r#"
+on: workflow_call
+jobs:
+  smoke:
+    strategy:
+      matrix:
+        os: [ubuntu, macos]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - run: echo smoke
+"#,
+                ".github/workflows/docs.yml": r#"
+on:
+  workflow_call:
+    inputs:
+      suite:
+        required: true
+        type: string
+jobs:
+  mkdocs:
+    name: "docs ${{ matrix.python }} for ${{ inputs.suite }}"
+    strategy:
+      matrix:
+        python: ["3.9", "3.10"]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo docs
+"#,
+            }
+        }),
+    )
+    .await;
+    let run: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    complete_via_api_with_outputs(
+        &app,
+        &run.to_string(),
+        "plan/p",
+        serde_json::json!({"smoke": "false", "docs": "true"}),
+    )
+    .await;
+    // The docs caller's gate passed: its materialized matrix jobs complete.
+    for id in ["docs/mkdocs (3.9)", "docs/mkdocs (3.10)"] {
+        complete_via_api(&app, &run.to_string(), id).await;
+    }
+
+    let record = request_json(
+        &app,
+        Method::GET,
+        &format!("/api/v1/runs/{run}"),
+        json!(null),
+    )
+    .await;
+    let jobs = record["jobs"].as_object().unwrap();
+    let mut job_ids: Vec<&str> = jobs.keys().map(|k| k.as_str()).collect();
+    job_ids.sort();
+    assert_eq!(
+        job_ids,
+        vec![
+            "docs/mkdocs (3.10)",
+            "docs/mkdocs (3.9)",
+            "plan/p",
+            "test-smoke"
+        ],
+        "visible job set matches GitHub: passing callers as callee jobs, the \
+         false-gated caller as one skipped entry"
+    );
+    assert_eq!(jobs["test-smoke"], serde_json::json!("skipped"));
+    let names: Vec<&str> = record["jobs_list"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["name"].as_str().unwrap())
+        .collect();
+    let mut names = names;
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            "docs / docs 3.10 for guide",
+            "docs / docs 3.9 for guide",
+            "plan / plan",
+            "test-smoke"
+        ],
+        "display names follow GitHub: evaluated name:, ` / ` separator, per-cell matrix values"
+    );
+}
+
+/// The same reusable call with a true condition runs normally: the inner job
+/// is dispatched and the dependent follows.
+#[tokio::test]
+async fn reusable_caller_gated_on_true_output_runs() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": r#"
+on: push
+jobs:
+  plan:
+    uses: ./.github/workflows/plan.yml
+  gated:
+    needs: plan
+    if: ${{ needs.plan.outputs.flag == 'true' }}
+    uses: ./.github/workflows/callee.yml
+  dependent:
+    needs: gated
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo dependent
+"#,
+            "event": "push",
+            "repository": "owner/repo",
+            "reusable_workflows": {
+                ".github/workflows/plan.yml": r#"
+on:
+  workflow_call:
+    outputs:
+      flag:
+        value: ${{ jobs.p.outputs.flag }}
+jobs:
+  p:
+    runs-on: ubuntu-latest
+    outputs:
+      flag: "true"
+    steps:
+      - run: echo "flag=true" >> $GITHUB_OUTPUT
+"#,
+                ".github/workflows/callee.yml": r#"
+on: workflow_call
+jobs:
+  inner:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo inner
+"#,
+            }
+        }),
+    )
+    .await;
+    let run: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let plan_job = {
+        let inner = state.inner.lock().await;
+        inner.runs[&run]
+            .jobs
+            .keys()
+            .find(|id| id.0.starts_with("plan/"))
+            .unwrap()
+            .clone()
+    };
+    // Complete the plan with its output resolved to "true".
+    complete_via_api_with_outputs(
+        &app,
+        &run.to_string(),
+        &plan_job.0,
+        serde_json::json!({"flag": "true"}),
+    )
+    .await;
+    // The gate passed: the caller is InProgress and its materialized inner
+    // job is promoted and claimable.
+    let gated_id = {
+        let inner = state.inner.lock().await;
+        assert_eq!(
+            inner.runs[&run].jobs[&JobId("gated".to_owned())],
+            ExecutionStatus::InProgress,
+            "caller node tracks its running subtree"
+        );
         let gated = inner.runs[&run]
             .jobs
             .iter()
@@ -8707,32 +9864,50 @@ jobs:
         assert_eq!(
             *gated.1,
             ExecutionStatus::Queued,
-            "gated reusable caller stays queued until a runner claims it"
+            "gated reusable caller runs when the condition is true"
         );
-        let gated_id = gated.0.clone();
         assert!(
             inner
                 .queue
                 .iter()
-                .any(|job| job.run_id == run && job.job_id == gated_id),
-            "gated caller's inner job must be promoted to the dispatch queue \
-             once the plan completes"
+                .any(|job| job.run_id == run && job.job_id == *gated.0),
+            "gated inner job must be in the dispatch queue"
+        );
+        gated.0.clone()
+    };
+    // The dependent stays pending until the call completes.
+    {
+        let inner = state.inner.lock().await;
+        assert_eq!(
+            inner.runs[&run]
+                .jobs
+                .get(&JobId("dependent".to_owned()))
+                .copied(),
+            Some(ExecutionStatus::Queued),
+            "dependent of a running call stays queued"
         );
     }
-    // A claim pops the job from the queue.
-    let claimed = state
-        .inner
-        .lock()
-        .await
-        .queue
-        .iter()
-        .find(|job| job.run_id == run)
-        .cloned()
-        .unwrap();
-    let gated_id = claimed.job_id.clone();
     complete_via_api(&app, &run.to_string(), &gated_id.0).await;
-    let inner = state.inner.lock().await;
-    assert_eq!(inner.runs[&run].jobs[&gated_id], ExecutionStatus::Success);
+    {
+        let inner = state.inner.lock().await;
+        assert_eq!(inner.runs[&run].jobs[&gated_id], ExecutionStatus::Success);
+        // The caller node aggregates to its subtree's result.
+        assert_eq!(
+            inner.runs[&run].jobs[&JobId("gated".to_owned())],
+            ExecutionStatus::Success
+        );
+        // The dependent's needs (the inlined inner job) are now satisfied.
+        let dependent = inner.runs[&run]
+            .jobs
+            .iter()
+            .find(|(id, _)| id.0 == "dependent")
+            .unwrap();
+        assert_eq!(
+            *dependent.1,
+            ExecutionStatus::Queued,
+            "dependent of a successful call is promoted after the call completes"
+        );
+    }
 }
 
 #[tokio::test]
@@ -10105,4 +11280,444 @@ async fn pruning_replay_results_is_a_no_op_without_a_replay_directory() {
     let temp = tempfile::tempdir().unwrap();
     crate::blob_store::prune_replay_results(temp.path(), &std::collections::BTreeSet::new()).await;
     assert!(!temp.path().join("replay").exists());
+}
+
+// ─── Guest-side impersonation hardening ──────────────────────────────────
+//
+// The pool's control socket is reachable from untrusted workflow code inside
+// every runner VM, and the runner identity material on the guest disk is
+// readable by any step. These tests pin the server-side contract that makes
+// that exposure non-transitive: a guest can act as its own machine's runner
+// (self-disclosure, same as GitHub-hosted runners) but can never pull a job
+// assigned to another machine, even with a fully stolen runner identity.
+
+/// Register a runner through the AzDO compat path and mint its listen token
+/// through the mock OAuth flow with the clientId the server assigned.
+async fn register_runner_with_token(
+    app: &Router,
+    name: &str,
+    labels: &[&str],
+    provision_token: Option<&str>,
+) -> (i64, String) {
+    let labels_json = labels
+        .iter()
+        .map(|name| json!({"id": 0, "name": name, "type": "user"}))
+        .collect::<Vec<_>>();
+    let mut builder = Request::builder()
+        .method(Method::POST)
+        .uri("/runner/server/_apis/distributedtask/pools/1/agents")
+        .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+        .header("content-type", "application/json");
+    if let Some(token) = provision_token {
+        builder = builder.header("X-Preloop-Provision-Token", token);
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            builder
+                .body(Body::from(
+                    json!({"name": name, "labels": labels_json}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let registered: Value = serde_json::from_slice(&body).unwrap();
+    let runner_id = registered["id"].as_i64().unwrap();
+    let client_id = registered["authorization"]["clientId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let oauth = request_json(
+        app,
+        Method::POST,
+        "/runner/server/_apis/v1/oauth2/token",
+        json!({
+            "grant_type": "client_credentials",
+            "client_id": client_id,
+            "client_secret": "unused"
+        }),
+    )
+    .await;
+    let token = oauth["access_token"].as_str().unwrap().to_owned();
+    (runner_id, token)
+}
+
+async fn create_disttask_session(app: &Router, bearer: &str, agent_id: i64) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/runner/server/_apis/distributedtask/pools/1/sessions")
+        .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "agent": {"id": agent_id, "name": "runner"},
+                "ownerName": "owner",
+                "akshAzdo": true,
+                "useFipsEncryption": false
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+async fn poll_message(app: &Router, bearer: &str, session_id: &str) -> Value {
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(format!(
+            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId={session_id}&waitSeconds=0"
+        ))
+        .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+}
+
+async fn submit_simple_run(app: &Router) -> Value {
+    request_json(
+        app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: self-hosted\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo"
+        }),
+    )
+    .await
+}
+
+async fn pool_managed_state(temp: &tempfile::TempDir) -> AppState {
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state.inner.lock().await.pool_assignments_enabled = true;
+    state
+}
+
+/// Simulate the host-side pool staging a provision token before a machine
+/// boots and runs `configure`.
+fn stage_provision_token(state: &AppState, token: &str) {
+    state
+        .pending_registrations
+        .write()
+        .unwrap()
+        .insert(token.to_owned(), std::time::SystemTime::now());
+}
+
+#[tokio::test]
+async fn stolen_identity_cannot_pull_another_machines_job() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = pool_managed_state(&temp).await;
+    let app = app(state.clone(), CancellationToken::new());
+
+    // Machine A is provisioned for the queued job: host-side the pool staged
+    // one provision token, and the guest's configure presents it.
+    let accepted = submit_simple_run(&app).await;
+    assert_eq!(accepted["queued_jobs"], 1);
+    {
+        let inner = state.inner.lock().await;
+        assert_eq!(inner.pool_pending.len(), 1, "job waits for its machine");
+        assert!(inner.job_assignments.is_empty());
+    }
+    stage_provision_token(&state, "token-a");
+    let (runner_a, token_a) =
+        register_runner_with_token(&app, "machine-a", &["self-hosted"], Some("token-a")).await;
+    {
+        let inner = state.inner.lock().await;
+        assert_eq!(
+            inner.job_assignments.values().next().map(|r| r.runner_id),
+            Some(runner_a),
+            "registration pairing bound the job to machine A"
+        );
+    }
+
+    // A second machine + a rogue process on it: a valid identity for another
+    // runner, plus a raw bearer-free session impersonating runner A.
+    stage_provision_token(&state, "token-b");
+    let (runner_b, token_b) =
+        register_runner_with_token(&app, "machine-b", &["self-hosted"], Some("token-b")).await;
+    let (_, session_b) = create_disttask_session(&app, &token_b, runner_b).await;
+    let session_b_id = session_b["sessionId"].as_str().unwrap();
+    let stolen = poll_message(&app, &token_b, session_b_id).await;
+    assert!(
+        stolen.is_null(),
+        "other runner's identity must not receive the assigned job: {stolen}"
+    );
+
+    // Bearer-free impersonation (the test harness attaches the system token,
+    // which is not a runner token — exactly what untrusted guest code has).
+    let (_, rogue_session) = create_disttask_session(&app, "aksh-system-token", runner_a).await;
+    let rogue_id = rogue_session["sessionId"].as_str().unwrap();
+    let stolen = poll_message(&app, "aksh-system-token", rogue_id).await;
+    assert!(
+        stolen.is_null(),
+        "unverified session impersonating runner A must not claim: {stolen}"
+    );
+
+    // The legitimately paired machine's runner receives its job.
+    let (_, session_a) = create_disttask_session(&app, &token_a, runner_a).await;
+    let session_a_id = session_a["sessionId"].as_str().unwrap();
+    let delivered = poll_message(&app, &token_a, session_a_id).await;
+    assert!(
+        delivered["messageType"].as_str().is_some(),
+        "paired runner must receive its assigned job: {delivered}"
+    );
+}
+
+#[tokio::test]
+async fn queue_time_assignment_prefers_idle_registered_runner() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = pool_managed_state(&temp).await;
+    let app = app(state.clone(), CancellationToken::new());
+
+    // Runner exists and is idle before the job lands: queue-time binding.
+    stage_provision_token(&state, "token-a");
+    let (runner_id, token) =
+        register_runner_with_token(&app, "machine-a", &["self-hosted"], Some("token-a")).await;
+    let (_, session) = create_disttask_session(&app, &token, runner_id).await;
+    let session_id = session["sessionId"].as_str().unwrap().to_owned();
+
+    let accepted = submit_simple_run(&app).await;
+    assert_eq!(accepted["queued_jobs"], 1);
+    {
+        let inner = state.inner.lock().await;
+        assert_eq!(
+            inner.job_assignments.values().next().map(|r| r.runner_id),
+            Some(runner_id),
+            "queued job should bind immediately to the idle runner"
+        );
+        assert!(inner.pool_pending.is_empty());
+    }
+
+    // Unverified fabrication still cannot claim it.
+    let (_, rogue_session) = create_disttask_session(&app, "aksh-system-token", runner_id).await;
+    let rogue_id = rogue_session["sessionId"].as_str().unwrap();
+    let stolen = poll_message(&app, "aksh-system-token", rogue_id).await;
+    assert!(
+        stolen.is_null(),
+        "unverified claim must stay empty: {stolen}"
+    );
+
+    let delivered = poll_message(&app, &token, &session_id).await;
+    assert!(
+        delivered["messageType"].as_str().is_some(),
+        "verified idle runner receives its job: {delivered}"
+    );
+}
+
+#[tokio::test]
+async fn provision_pairing_requires_the_token() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = pool_managed_state(&temp).await;
+    // Host side staged a token for the next provisioning event.
+    stage_provision_token(&state, "token-a");
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = submit_simple_run(&app).await;
+    assert_eq!(accepted["queued_jobs"], 1);
+
+    // Registration without the token: runner works, but no pairing.
+    let (runner_plain, _) =
+        register_runner_with_token(&app, "external", &["self-hosted"], None).await;
+    {
+        let inner = state.inner.lock().await;
+        assert!(
+            inner.job_assignments.is_empty(),
+            "no provisioning proof, no pairing"
+        );
+        assert_eq!(inner.pool_pending.len(), 1);
+        let _ = runner_plain;
+    }
+
+    // Forged token value: no pairing either.
+    let (_runner_forged, _) =
+        register_runner_with_token(&app, "forger", &["self-hosted"], Some("wrong-token")).await;
+    {
+        let inner = state.inner.lock().await;
+        assert!(inner.job_assignments.is_empty());
+    }
+
+    // With the token: pairing stamps.
+    let (runner_a, _) =
+        register_runner_with_token(&app, "machine-a", &["self-hosted"], Some("token-a")).await;
+    {
+        let inner = state.inner.lock().await;
+        assert_eq!(
+            inner.job_assignments.values().next().map(|r| r.runner_id),
+            Some(runner_a)
+        );
+        // One-time: the token is consumed.
+        assert!(
+            state.pending_registrations.read().unwrap().is_empty(),
+            "provision token must be single-use"
+        );
+    }
+}
+
+#[tokio::test]
+async fn strict_mode_refuses_unassigned_dispatch() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = pool_managed_state(&temp).await;
+    state.inner.lock().await.require_job_assignments = true;
+    let app = app(state.clone(), CancellationToken::new());
+    // Strict-only engine: no provisioning channel, so nothing ever pairs.
+    state.inner.lock().await.pool_assignments_enabled = false;
+
+    let accepted = submit_simple_run(&app).await;
+    assert_eq!(accepted["queued_jobs"], 1);
+    let (runner_id, token) =
+        register_runner_with_token(&app, "external", &["self-hosted"], None).await;
+    let (_, session) = create_disttask_session(&app, &token, runner_id).await;
+    let session_id = session["sessionId"].as_str().unwrap();
+    let delivered = poll_message(&app, &token, session_id).await;
+    assert!(
+        delivered.is_null(),
+        "strict mode: unassigned job is never dispatched: {delivered}"
+    );
+}
+
+#[tokio::test]
+async fn permissive_default_keeps_unverified_claims_working() {
+    let temp = tempfile::tempdir().unwrap();
+    // Pool-management flags stay off — the external-runner default.
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = submit_simple_run(&app).await;
+    assert_eq!(accepted["queued_jobs"], 1);
+
+    let (_status, session) = create_disttask_session(&app, "aksh-system-token", 1).await;
+    let session_id = session["sessionId"].as_str().unwrap();
+    let delivered = poll_message(&app, "aksh-system-token", session_id).await;
+    assert!(
+        delivered["messageType"].as_str().is_some(),
+        "unverified legacy session must keep claiming without a pool: {delivered}"
+    );
+}
+
+#[tokio::test]
+async fn session_create_rejects_cross_runner_body() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = pool_managed_state(&temp).await;
+    let app = app(state.clone(), CancellationToken::new());
+    stage_provision_token(&state, "token-a");
+    stage_provision_token(&state, "token-b");
+    let (runner_a, token_a) =
+        register_runner_with_token(&app, "machine-a", &["self-hosted"], Some("token-a")).await;
+    let (runner_b, _) =
+        register_runner_with_token(&app, "machine-b", &["self-hosted"], Some("token-b")).await;
+    let _ = runner_b;
+
+    // Token for A, body asking for B: rejected.
+    let (status, _) = create_disttask_session(&app, &token_a, runner_b).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Token for A, body asking for A: created and bound to A.
+    let (status, session) = create_disttask_session(&app, &token_a, runner_a).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let session_id = session["sessionId"].as_str().unwrap();
+    let inner = state.inner.lock().await;
+    assert_eq!(inner.runner_id_for_session(session_id), Some(runner_a));
+}
+
+#[tokio::test]
+async fn delete_agent_purges_identity_and_requeues_assignment() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = pool_managed_state(&temp).await;
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = submit_simple_run(&app).await;
+    assert_eq!(accepted["queued_jobs"], 1);
+    stage_provision_token(&state, "token-a");
+    let (runner_a, _token) =
+        register_runner_with_token(&app, "machine-a", &["self-hosted"], Some("token-a")).await;
+    let (run_id, job_id) = {
+        let inner = state.inner.lock().await;
+        inner.job_assignments.keys().next().unwrap().clone()
+    };
+    let _ = (run_id, job_id);
+
+    request_json(
+        &app,
+        Method::DELETE,
+        &format!("/runner/server/_apis/distributedtask/pools/1/agents/{runner_a}"),
+        Value::Null,
+    )
+    .await;
+
+    let inner = state.inner.lock().await;
+    assert!(!inner.runner_rsa_public_keys.contains_key(&runner_a));
+    assert!(!inner.runner_public_keys.contains_key(&runner_a));
+    assert!(!inner.runners.contains_key(&runner_a));
+    assert!(inner.runner_client_ids.values().all(|id| *id != runner_a));
+    assert!(
+        inner
+            .job_assignments
+            .values()
+            .all(|r| r.runner_id != runner_a),
+        "purge drops the dead runner's assignment"
+    );
+    assert_eq!(
+        inner.pool_pending.len(),
+        1,
+        "unclaimed job returns to pool-pending for re-provisioning"
+    );
+}
+
+#[tokio::test]
+async fn control_socket_surface_denies_native_and_test_apis() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    // Mirror the bootstrap wiring: the socket router is the full router plus
+    // the runner-surface guard.
+    let socket_app = app(state.clone(), CancellationToken::new())
+        .layer(middleware::from_fn(crate::auth::runner_surface_only));
+
+    for denied in [
+        "/api/v1/secrets/owner/repo",
+        "/api/v1/runs",
+        "/internal/test/jobs/complete",
+        "/replay/results/plan/file",
+    ] {
+        let response = socket_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(denied)
+                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "socket must not expose {denied}"
+        );
+    }
+
+    // The runner surface stays reachable through the same guard.
+    let response = socket_app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/runner/server/_apis/v1/AgentPools")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 }
