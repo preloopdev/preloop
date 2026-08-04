@@ -296,7 +296,13 @@ pub(crate) async fn purge_runner_identity(shared: &Arc<SharedState>, runner_id: 
         if crate::runtime_scheduling::clear_assignment(&mut inner, key.0, &key.1)
             && inner.pool_assignments_enabled
         {
-            inner.pool_pending.insert(key, std::time::SystemTime::now());
+            // Keep the *first* mark: a pool that keeps provisioning and
+            // losing machines for the same job would otherwise refresh the
+            // hold on every purge and block healthy runners forever.
+            inner
+                .pool_pending
+                .entry(key)
+                .or_insert_with(std::time::SystemTime::now);
         }
     }
     shared

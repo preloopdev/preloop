@@ -123,6 +123,11 @@ pub(crate) struct TaskAgentJobRequestRecord {
 pub(crate) struct AssignmentRecord {
     pub(crate) runner_id: i64,
     pub(crate) at: std::time::SystemTime,
+    /// When this job was *first* bound to any machine. Rebinding to a
+    /// replacement machine refreshes `at` but never this, so a pool that
+    /// keeps provisioning and losing machines cannot hold a job away from
+    /// healthy runners indefinitely.
+    pub(crate) first_at: std::time::SystemTime,
 }
 
 #[derive(Debug, Clone)]
