@@ -107,3 +107,8 @@ benchmarks/compatibility/runner/behavior/*-new.jsonl
 benchmarks/real-world/goldens/
 benchmarks/real-world/results/conformance-4repos/**/run.json*
 benchmarks/real-world/conformance-4repos/payloads/
+
+# Conformance campaign captures: multi-MB run records and logs, regenerated
+# by the harness and not reviewable in a diff.
+benchmarks/real-world/results/conformance-4repos/**/run*.json
+benchmarks/real-world/results/conformance-4repos/**/run*.log
