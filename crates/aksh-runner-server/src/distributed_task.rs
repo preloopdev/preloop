@@ -512,6 +512,9 @@ pub(crate) async fn complete_job_inner(
     }
     let mut inner = shared.state.inner.lock().await;
     let finalized_callers: Vec<JobId>;
+    inner
+        .claimed_jobs
+        .remove(&(completion.run_id, completion.job_id.clone()));
     {
         let run = inner
             .runs

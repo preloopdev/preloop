@@ -101,6 +101,105 @@ pub(crate) fn bearer_token(request: &Request) -> Option<&str> {
         .and_then(|value| value.strip_prefix("Bearer "))
 }
 
+/// Runner identity proven by a listen token on this request.
+///
+/// `runner_id` is `Some` only when the bearer verifies as a runner-listen JWT
+/// *and* names a registered runner. Anything else — missing header, engine
+/// token, job runtime token, unresolvable mock subject — leaves it `None`,
+/// which handlers must treat as unverified (never as a runner).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RunnerIdentity {
+    pub(crate) runner_id: Option<i64>,
+}
+
+/// Non-rejecting resolver: tags every request with the [`RunnerIdentity`] its
+/// bearer proves, if any. The runner protocol predates authentication on
+/// several endpoints and external runners still rely on that, so enforcement
+/// decisions belong to the handlers; this layer only makes the identity
+/// available so handlers cannot be talked into trusting request bodies.
+pub(crate) async fn resolve_runner_identity(
+    State(shared): State<Arc<SharedState>>,
+    mut request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let bearer = bearer_token(&request).map(str::to_owned);
+    let mut runner_id = bearer
+        .as_deref()
+        .and_then(|token| shared.state.runner_id_from_token(token));
+    if runner_id.is_none() {
+        let client_id = bearer
+            .as_deref()
+            .and_then(|token| shared.state.verify_local_jwt_claims(token))
+            .and_then(|claims| {
+                claims
+                    .get("sub")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+            })
+            .and_then(|sub| {
+                sub.strip_prefix("aksh-runner-listen-mock-")
+                    .map(str::to_owned)
+            });
+        if let Some(client_id) = client_id {
+            // Mock-token subjects name the client id instead of the runner
+            // id; resolve through the registration table so mock-flow clients
+            // get the same identity enforcement as real PS256 clients.
+            runner_id = shared
+                .state
+                .inner
+                .lock()
+                .await
+                .runner_client_ids
+                .get(&client_id)
+                .copied();
+        }
+    }
+    request
+        .extensions_mut()
+        .insert(RunnerIdentity { runner_id });
+    Ok(next.run(request).await)
+}
+
+/// Compute the runner a session may claim jobs for, reconciling the session's
+/// stored binding with the token proven on the request.
+///
+/// - verified identity conflicting with the binding → `None` (no claims)
+/// - verified identity otherwise → that runner
+/// - unverified request → `None` (legacy permissive claims only; the claim
+///   filter then bars assigned and pool-pending jobs)
+pub(crate) fn effective_claim_runner(
+    identity: Option<&RunnerIdentity>,
+    bound: Option<i64>,
+) -> Option<i64> {
+    match (identity.and_then(|id| id.runner_id), bound) {
+        (Some(verified), Some(bound)) if verified != bound => None,
+        (Some(verified), _) => Some(verified),
+        (None, _) => None,
+    }
+}
+
+/// Socket-surface guard: the mounted control socket is reachable from inside
+/// every runner VM, so anything not part of the runner/broker protocol is
+/// refused there. Native management and GUI API prefixes have no legitimate
+/// use from a guest.
+pub(crate) async fn runner_surface_only(
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    const DENIED_PREFIXES: &[&str] = &["/internal/", "/replay/", "/runs/"];
+    let path = request.uri().path();
+    let denied = DENIED_PREFIXES
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+        || path.starts_with("/api/v1/");
+    if denied {
+        return Err(ApiError::not_found(format!(
+            "{path} not available on this endpoint"
+        )));
+    }
+    Ok(next.run(request).await)
+}
+
 /// The job a worker request speaks for, proven by its debug-worker token.
 ///
 /// Carried in request extensions so handlers authorize against the job rather
