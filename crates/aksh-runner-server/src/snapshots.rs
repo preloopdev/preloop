@@ -23,6 +23,13 @@ const MAX_GIT_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WorkspaceSnapshot {
     pub(crate) commit_sha: String,
+    /// The workspace's real HEAD commit (the commit the submission is based
+    /// on), when the workspace has one. This is the identity a workflow sees
+    /// as `github.sha`: it is what a custom checkout that fetches from the
+    /// real remote can actually resolve. The synthetic [`Self::commit_sha`]
+    /// exists only in this engine's snapshot store and would be rejected as
+    /// `not our ref` by the upstream host.
+    pub(crate) head_sha: Option<String>,
     pub(crate) repository: String,
     /// Current branch of the source workspace (`master`, `main`, …), when
     /// resolvable. Mirrored into the event payload as
@@ -111,6 +118,7 @@ pub(crate) async fn create_workspace_snapshot(
 
     let SnapshotResult {
         commit_sha,
+        head_sha,
         default_branch,
         before_sha,
     } = result?;
@@ -122,6 +130,7 @@ pub(crate) async fn create_workspace_snapshot(
     );
     Ok(WorkspaceSnapshot {
         commit_sha,
+        head_sha,
         repository,
         default_branch,
         before_sha,
@@ -613,6 +622,31 @@ async fn create_workspace_snapshot_inner(
         }
     }
 
+    // Allow clients to fetch arbitrary commits that exist in the snapshot's
+    // object store, not just advertised ref tips: workflows that deep-fetch a
+    // concrete SHA (`git fetch origin <sha>`, `fetch-depth: 0` checkouts of a
+    // base ref) hit exactly this path, and the official host serves it via
+    // `uploadpack.allowReachableSHA1InWant`. Without it upload-pack answers
+    // "not our ref" for any want that is not a tip.
+    let mut uploadpack_reachable = Command::new("git");
+    uploadpack_reachable
+        .env("GIT_DIR", staging_repository)
+        .args(["config", "uploadpack.allowReachableSHA1InWant", "true"]);
+    run_git(
+        &mut uploadpack_reachable,
+        "allow reachable sha wants in snapshot upload-pack",
+    )
+    .await?;
+    let mut uploadpack_tip = Command::new("git");
+    uploadpack_tip
+        .env("GIT_DIR", staging_repository)
+        .args(["config", "uploadpack.allowTipSHA1InWant", "true"]);
+    run_git(
+        &mut uploadpack_tip,
+        "allow tip sha wants in snapshot upload-pack",
+    )
+    .await?;
+
     tokio::fs::rename(staging_repository, final_repository)
         .await
         .map_err(|error| {
@@ -622,6 +656,7 @@ async fn create_workspace_snapshot_inner(
         })?;
     Ok(SnapshotResult {
         commit_sha,
+        head_sha: source_head,
         default_branch,
         before_sha,
     })
@@ -631,6 +666,7 @@ async fn create_workspace_snapshot_inner(
 /// the submission as a coherent GitHub event to changed-file actions.
 struct SnapshotResult {
     commit_sha: String,
+    head_sha: Option<String>,
     default_branch: Option<String>,
     before_sha: Option<String>,
 }

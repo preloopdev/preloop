@@ -10461,6 +10461,21 @@ async fn workspace_snapshot_captures_git_state_without_mutating_source() {
     assert!(alternates.iter().all(|alternate| {
         alternate.starts_with(&state_dir) && !alternate.starts_with(&workspace)
     }));
+    let head = git_fixture_output(&workspace, &["rev-parse", "HEAD"]);
+    assert_eq!(
+        snapshot.head_sha.as_deref(),
+        Some(std::str::from_utf8(&head).unwrap().trim()),
+        "the snapshot must expose the workspace's real HEAD as its identity"
+    );
+    let config = fs::read_to_string(repository.join("config")).unwrap();
+    assert!(
+        config.contains("allowReachableSHA1InWant = true"),
+        "deep fetches of reachable shas must be served by the snapshot: {config}"
+    );
+    assert!(
+        config.contains("allowTipSHA1InWant = true"),
+        "deep fetches of tip shas must be served by the snapshot: {config}"
+    );
     let commit = snapshot.commit_sha.as_str();
     assert!(
         git_fixture_output_allow_failure(
@@ -10871,6 +10886,7 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
     let redirected = redirect_primary_checkout(
         &mut message,
         &WorkspaceSnapshot {
+            head_sha: Some("f000000000000000000000000000000000000000".to_owned()),
             commit_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
             repository: "snapshots/11111111-1111-4111-8111-111111111111".to_owned(),
             default_branch: Some("main".to_owned()),
@@ -10910,6 +10926,7 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
         redirect_primary_checkout(
             &mut token_only,
             &WorkspaceSnapshot {
+            head_sha: Some("f000000000000000000000000000000000000000".to_owned()),
                 commit_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
                 repository: "snapshots/22222222-2222-4222-8222-222222222222".to_owned(),
                 default_branch: Some("main".to_owned()),
@@ -10929,6 +10946,7 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
         redirect_primary_checkout(
             &mut empty_ref,
             &WorkspaceSnapshot {
+            head_sha: Some("f000000000000000000000000000000000000000".to_owned()),
                 commit_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
                 repository: "snapshots/33333333-3333-4333-8333-333333333333".to_owned(),
                 default_branch: Some("main".to_owned()),
@@ -10948,6 +10966,7 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
         redirect_primary_checkout(
             &mut expr_ref,
             &WorkspaceSnapshot {
+            head_sha: Some("f000000000000000000000000000000000000000".to_owned()),
                 commit_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
                 repository: "snapshots/44444444-4444-4444-8444-444444444444".to_owned(),
                 default_branch: Some("main".to_owned()),
@@ -10983,6 +11002,36 @@ jobs:
     )
     .await;
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    // `github.sha` must be the workspace's real HEAD commit, not the
+    // synthetic snapshot commit: a workflow step that fetches
+    // `${{ github.sha }}` from the real remote (custom checkouts) must
+    // receive a sha the upstream host can actually resolve, and the
+    // snapshot commit exists only in this engine's store.
+    let inner = state.inner.lock().await;
+    let run = inner.runs.get(&run_id).unwrap();
+    let context_sha = run.github["sha"].as_str().unwrap().to_owned();
+    let snapshot_sha = run
+        .workspace_snapshot
+        .as_ref()
+        .unwrap()
+        .commit_sha
+        .clone();
+    let workspace_head = String::from_utf8(git_fixture_output(
+        &workspace,
+        &["rev-parse", "HEAD"],
+    ))
+    .unwrap();
+    drop(inner);
+    assert_eq!(
+        context_sha,
+        workspace_head.trim(),
+        "github.sha must be the real workspace HEAD"
+    );
+    assert_ne!(
+        context_sha, snapshot_sha,
+        "the synthetic snapshot sha must not leak into the github context"
+    );
 
     let session = request_json(
         &app,
@@ -11720,4 +11769,54 @@ async fn control_socket_surface_denies_native_and_test_apis() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn stale_assignment_is_taken_over_by_the_next_verified_runner() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = pool_managed_state(&temp).await;
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = submit_simple_run(&app).await;
+    assert_eq!(accepted["queued_jobs"], 1);
+    stage_provision_token(&state, "token-a");
+    let (runner_a, token_a) =
+        register_runner_with_token(&app, "machine-a", &["self-hosted"], Some("token-a")).await;
+    // Backdate the pairing past the pre-claim window, simulating a machine
+    // whose runner died between registration and its first poll.
+    {
+        let mut inner = state.inner.lock().await;
+        for record in inner.job_assignments.values_mut() {
+            record.at = std::time::SystemTime::now()
+                - crate::runtime_scheduling::CLAIM_BINDING_TTL
+                - std::time::Duration::from_secs(5);
+        }
+    }
+
+    // The dead owner's overdue pairing must not serve it; a new verified
+    // runner takes over (as a replacement machine's registration would).
+    stage_provision_token(&state, "token-b");
+    let (runner_b, token_b) =
+        register_runner_with_token(&app, "machine-b", &["self-hosted"], Some("token-b")).await;
+    {
+        let inner = state.inner.lock().await;
+        assert_eq!(
+            inner.job_assignments.values().next().map(|r| r.runner_id),
+            Some(runner_b),
+            "replacement machine takes over the stale pairing"
+        );
+    }
+    let _ = token_a;
+    let (_, session_b) = create_disttask_session(&app, &token_b, runner_b).await;
+    let session_b_id = session_b["sessionId"].as_str().unwrap();
+    let delivered = poll_message(&app, &token_b, session_b_id).await;
+    assert!(
+        delivered["messageType"].as_str().is_some(),
+        "takeover runner receives the rescued job: {delivered}"
+    );
+    // And the stale owner no longer does.
+    let (_, session_a) = create_disttask_session(&app, &token_a, runner_a).await;
+    let session_a_id = session_a["sessionId"].as_str().unwrap();
+    let stolen = poll_message(&app, &token_a, session_a_id).await;
+    assert!(stolen.is_null(), "stale owner lost the job: {stolen}");
 }
