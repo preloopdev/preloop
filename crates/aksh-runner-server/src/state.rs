@@ -706,6 +706,12 @@ pub(crate) struct InnerState {
     /// external runners. Default false keeps bring-your-own-runner installs
     /// working unchanged.
     pub(crate) require_job_assignments: bool,
+    /// Jobs popped from the queue by a dispatch claim, keyed for requeueing:
+    /// if the runner that claimed a job dies mid-execution (machine torn down,
+    /// identity purged), the stashed copy is what gets the same job back into
+    /// the queue intact instead of waiting for the lease reaper to fail it.
+    /// Entries drop on normal completion.
+    pub(crate) claimed_jobs: BTreeMap<(RunId, JobId), QueuedJob>,
     /// Recently seen GitHub webhook delivery IDs, so a redelivered (or
     /// double-fired) webhook does not create duplicate runs. An entry is
     /// `InFlight` while the handler is still processing that delivery, so a

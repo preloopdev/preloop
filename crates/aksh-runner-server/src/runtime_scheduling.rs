@@ -1053,6 +1053,7 @@ pub(crate) fn take_matching_job(
     let key = (job.run_id, job.job_id.clone());
     inner.job_assignments.remove(&key);
     inner.pool_pending.remove(&key);
+    inner.claimed_jobs.insert(key, job.clone());
     Some(job)
 }
 
@@ -1061,9 +1062,22 @@ pub(crate) fn take_matching_job(
 /// pool or dead machine can never wedge a queued job forever.
 pub(crate) const ASSIGNMENT_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// How long a pre-claim assignment stays exclusive. Provisioning is bursty
+/// and pool runners exit unexpectedly; if the paired runner has not claimed
+/// within this window, any *verified* runner may take the job (and later
+/// registrations steal the pairing), because an already-dead owner can
+/// otherwise hold a job hostage for the full [`ASSIGNMENT_TTL`].
+pub(crate) const CLAIM_BINDING_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
 fn assignment_fresh(at: std::time::SystemTime, now: std::time::SystemTime) -> bool {
     now.duration_since(at)
         .map(|age| age < ASSIGNMENT_TTL)
+        .unwrap_or(false)
+}
+
+fn binding_fresh(at: std::time::SystemTime, now: std::time::SystemTime) -> bool {
+    now.duration_since(at)
+        .map(|age| age < CLAIM_BINDING_TTL)
         .unwrap_or(false)
 }
 
@@ -1076,7 +1090,14 @@ fn assignment_fresh(at: std::time::SystemTime, now: std::time::SystemTime) -> bo
 /// machine from pulling jobs assigned to other machines.
 fn claim_permitted(inner: &InnerState, job: &QueuedJob, verified_runner_id: Option<i64>) -> bool {
     let key = (job.run_id, job.job_id.clone());
+    let now = std::time::SystemTime::now();
     if let Some(record) = inner.job_assignments.get(&key) {
+        if !binding_fresh(record.at, now) {
+            // Stale pairing: the owner is presumed dead. Only a verified
+            // runner identity may take over — unverified sessions keep the
+            // old permissive-rules treatment below.
+            return verified_runner_id.is_some();
+        }
         return Some(record.runner_id) == verified_runner_id;
     }
     if inner.pool_pending.contains_key(&key) {
@@ -1157,10 +1178,14 @@ pub(crate) fn pair_registered_runner(inner: &mut InnerState, runner_id: i64) {
     };
     let caps = capabilities_of(&runner);
     let now = std::time::SystemTime::now();
-    let chosen = inner
-        .pool_pending
+    // Also adopt jobs whose pairing went stale: the pool provisions a burst
+    // of machines per backlog entry and individual runners die — the next
+    // registration for the same job must take the pairing over or dispatch
+    // hangs behind a dead owner.
+    let stale_owned = inner
+        .job_assignments
         .iter()
-        .filter(|(_, at)| assignment_fresh(**at, now))
+        .filter(|(_, record)| !binding_fresh(record.at, now))
         .filter(|(key, _)| {
             inner
                 .queue
@@ -1169,10 +1194,27 @@ pub(crate) fn pair_registered_runner(inner: &mut InnerState, runner_id: i64) {
                 .map(|job| job_matches_runner_capabilities(job, &caps))
                 .unwrap_or(false)
         })
-        .min_by_key(|(_, at)| **at)
+        .min_by_key(|(_, record)| record.at)
         .map(|(key, _)| key.clone());
+    let chosen = stale_owned.or_else(|| {
+        inner
+            .pool_pending
+            .iter()
+            .filter(|(_, at)| assignment_fresh(**at, now))
+            .filter(|(key, _)| {
+                inner
+                    .queue
+                    .iter()
+                    .find(|job| job.run_id == key.0 && job.job_id == key.1)
+                    .map(|job| job_matches_runner_capabilities(job, &caps))
+                    .unwrap_or(false)
+            })
+            .min_by_key(|(_, at)| **at)
+            .map(|(key, _)| key.clone())
+    });
     if let Some(key) = chosen {
         inner.pool_pending.remove(&key);
+        info!(runner_id, run_id = %key.0, job_id = %key.1.0, "job assignment paired to registered runner");
         inner.job_assignments.insert(
             key,
             AssignmentRecord {

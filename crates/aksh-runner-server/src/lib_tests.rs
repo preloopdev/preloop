@@ -11021,7 +11021,7 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
         redirect_primary_checkout(
             &mut token_only,
             &WorkspaceSnapshot {
-            head_sha: Some("f000000000000000000000000000000000000000".to_owned()),
+                head_sha: Some("f000000000000000000000000000000000000000".to_owned()),
                 commit_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
                 repository: "snapshots/22222222-2222-4222-8222-222222222222".to_owned(),
                 default_branch: Some("main".to_owned()),
@@ -11061,7 +11061,7 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
         redirect_primary_checkout(
             &mut expr_ref,
             &WorkspaceSnapshot {
-            head_sha: Some("f000000000000000000000000000000000000000".to_owned()),
+                head_sha: Some("f000000000000000000000000000000000000000".to_owned()),
                 commit_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
                 repository: "snapshots/44444444-4444-4444-8444-444444444444".to_owned(),
                 default_branch: Some("main".to_owned()),
@@ -11106,17 +11106,9 @@ jobs:
     let inner = state.inner.lock().await;
     let run = inner.runs.get(&run_id).unwrap();
     let context_sha = run.github["sha"].as_str().unwrap().to_owned();
-    let snapshot_sha = run
-        .workspace_snapshot
-        .as_ref()
-        .unwrap()
-        .commit_sha
-        .clone();
-    let workspace_head = String::from_utf8(git_fixture_output(
-        &workspace,
-        &["rev-parse", "HEAD"],
-    ))
-    .unwrap();
+    let snapshot_sha = run.workspace_snapshot.as_ref().unwrap().commit_sha.clone();
+    let workspace_head =
+        String::from_utf8(git_fixture_output(&workspace, &["rev-parse", "HEAD"])).unwrap();
     drop(inner);
     assert_eq!(
         context_sha,
@@ -11953,4 +11945,105 @@ async fn stale_assignment_is_taken_over_by_the_next_verified_runner() {
     let session_a_id = session_a["sessionId"].as_str().unwrap();
     let stolen = poll_message(&app, &token_a, session_a_id).await;
     assert!(stolen.is_null(), "stale owner lost the job: {stolen}");
+}
+
+#[tokio::test]
+async fn purge_requeues_claimed_unfinished_job_to_another_runner() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = pool_managed_state(&temp).await;
+    let app = app(state.clone(), CancellationToken::new());
+
+    // Machine A registers with a provision token and claims the job.
+    let accepted = submit_simple_run(&app).await;
+    assert_eq!(accepted["queued_jobs"], 1);
+    stage_provision_token(&state, "token-a");
+    let (runner_a, token_a) =
+        register_runner_with_token(&app, "machine-a", &["self-hosted"], Some("token-a")).await;
+    let (_, session_a) = create_disttask_session(&app, &token_a, runner_a).await;
+    let session_a_id = session_a["sessionId"].as_str().unwrap().to_owned();
+    let delivered = poll_message(&app, &token_a, &session_a_id).await;
+    assert!(
+        delivered["messageType"].as_str().is_some(),
+        "machine A claimed the job: {delivered}"
+    );
+    {
+        let inner = state.inner.lock().await;
+        assert!(inner.queue.is_empty());
+        assert_eq!(inner.claimed_jobs.len(), 1, "claim is stashed");
+    }
+
+    // The pool tears machine A down mid-job: purge by machine name, then the
+    // job must be back on the queue for somebody else.
+    let purge = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runners/purge",
+        json!({ "name": "machine-a" }),
+    )
+    .await;
+    assert_eq!(purge["purged"], 1);
+    {
+        let inner = state.inner.lock().await;
+        assert_eq!(inner.queue.len(), 1, "unfinished job requeued");
+        assert!(inner.claimed_jobs.is_empty(), "stash consumed by requeue");
+        assert!(!inner.runners.contains_key(&runner_a));
+    }
+
+    // A fresh machine registers and picks the job up.
+    stage_provision_token(&state, "token-b");
+    let (runner_b, token_b) =
+        register_runner_with_token(&app, "machine-b", &["self-hosted"], Some("token-b")).await;
+    let (_, session_b) = create_disttask_session(&app, &token_b, runner_b).await;
+    let session_b_id = session_b["sessionId"].as_str().unwrap().to_owned();
+    let delivered = poll_message(&app, &token_b, &session_b_id).await;
+    assert!(
+        delivered["messageType"].as_str().is_some(),
+        "machine B receives the requeued job: {delivered}"
+    );
+}
+
+#[tokio::test]
+async fn purge_of_finished_runner_does_not_requeue() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = pool_managed_state(&temp).await;
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = submit_simple_run(&app).await;
+    assert_eq!(accepted["queued_jobs"], 1);
+    stage_provision_token(&state, "token-a");
+    let (runner_a, token_a) =
+        register_runner_with_token(&app, "machine-a", &["self-hosted"], Some("token-a")).await;
+    let (_, session_a) = create_disttask_session(&app, &token_a, runner_a).await;
+    let session_a_id = session_a["sessionId"].as_str().unwrap().to_owned();
+    let delivered = poll_message(&app, &token_a, &session_a_id).await;
+    assert!(delivered["messageType"].as_str().is_some());
+
+    // Complete the job through the broker compat completion handler, then purge.
+    let (run_id, job_id) = {
+        let inner = state.inner.lock().await;
+        inner.claimed_jobs.keys().next().unwrap().clone()
+    };
+    let _ = request_json(
+        &app,
+        Method::PATCH,
+        &format!("/runner/server/_apis/distributedtask/hubs/actions/plans/{run_id}/jobs/{job_id}"),
+        json!({ "runId": run_id, "jobId": job_id, "result": "succeeded" }),
+    )
+    .await;
+
+    request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runners/purge",
+        json!({ "name": "machine-a" }),
+    )
+    .await;
+    {
+        let inner = state.inner.lock().await;
+        assert!(
+            inner.queue.is_empty(),
+            "finished job must not come back: {:?}",
+            inner.queue
+        );
+    }
 }
