@@ -15,7 +15,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-use crate::{changed_paths_from_payload, submit_run_inner, ExecutionStatus, SharedState};
+use crate::{
+    changed_paths_from_payload, submit_run_inner, ExecutionStatus, SharedState,
+    WebhookDeliveryState,
+};
 use aksh_gha_protocol::{AnnotationLevel, JobId, NdjsonEvent, RunId, WorkflowSubmission};
 
 /// Webhook push event payload.
@@ -678,6 +681,79 @@ pub(crate) async fn handle_github_webhook(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
+    // Dedup redelivered webhooks. GitHub redelivers on 5xx and occasionally
+    // double-fires; processing the same delivery twice created duplicate runs
+    // per workflow (observed: two runs per push, every job dispatched twice
+    // and the pool saturated). The delivery ID is the authoritative key —
+    // one delivery must produce exactly one processing pass.
+    //
+    // The reservation is only permanent once processing succeeded. A delivery
+    // that failed releases its reservation below so GitHub's redelivery of it
+    // is processed instead of being silently dropped.
+    const WEBHOOK_DEDUP_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
+    let delivery_id = headers
+        .get("x-github-delivery")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    if let Some(delivery_id) = &delivery_id {
+        let now = std::time::Instant::now();
+        let mut inner = shared.state.inner.lock().await;
+        inner.webhook_deliveries.retain(|(_, state)| match state {
+            WebhookDeliveryState::InFlight => true,
+            WebhookDeliveryState::Completed(at) => now.duration_since(*at) < WEBHOOK_DEDUP_WINDOW,
+        });
+        if let Some((_, state)) = inner
+            .webhook_deliveries
+            .iter()
+            .find(|(seen, _)| seen == delivery_id)
+        {
+            let reason = match state {
+                WebhookDeliveryState::InFlight => "already in flight",
+                WebhookDeliveryState::Completed(_) => "already processed",
+            };
+            info!(delivery = %delivery_id, reason, "Duplicate GitHub webhook delivery — skipping");
+            return Ok((StatusCode::OK, Json(serde_json::json!([]))));
+        }
+        inner
+            .webhook_deliveries
+            .push_back((delivery_id.clone(), WebhookDeliveryState::InFlight));
+    }
+
+    // Everything past the reservation runs in a helper so that no `?` can
+    // escape while still holding the in-flight marker.
+    let result = process_github_webhook(&shared, &headers, &body).await;
+
+    if let Some(delivery_id) = &delivery_id {
+        let mut inner = shared.state.inner.lock().await;
+        match &result {
+            Ok(_) => {
+                let completed_at = std::time::Instant::now();
+                if let Some((_, state)) = inner
+                    .webhook_deliveries
+                    .iter_mut()
+                    .find(|(seen, _)| seen == delivery_id)
+                {
+                    *state = WebhookDeliveryState::Completed(completed_at);
+                }
+            }
+            // Release the reservation: GitHub retries this delivery and the
+            // retry must be allowed to do the work this attempt did not.
+            Err(_) => inner
+                .webhook_deliveries
+                .retain(|(seen, _)| seen != delivery_id),
+        }
+    }
+
+    result
+}
+
+/// Processing half of [`handle_github_webhook`], after signature verification
+/// and delivery reservation.
+async fn process_github_webhook(
+    shared: &Arc<SharedState>,
+    headers: &HeaderMap,
+    body: &bytes::Bytes,
+) -> Result<(StatusCode, Json<Value>), StatusCode> {
     // 2. Get event type
     let event_name = headers
         .get("x-github-event")
@@ -685,7 +761,7 @@ pub(crate) async fn handle_github_webhook(
         .ok_or(StatusCode::BAD_REQUEST)?;
 
     // 3. Parse the event payload
-    let payload_val: Value = serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let payload_val: Value = serde_json::from_slice(body).map_err(|_| StatusCode::BAD_REQUEST)?;
 
     // 4. Look up the event adapter
     let adapter = match crate::events::adapter_for(event_name) {
@@ -728,14 +804,12 @@ pub(crate) async fn handle_github_webhook(
         let api_base = std::env::var("AKSH_GITHUB_API_URL")
             .unwrap_or_else(|_| "https://api.github.com".to_owned());
         let fetched = match pr_number {
-            Some(number) => {
-                resolve_pr_changed_files_at(&shared, &repo_full_name, number, &api_base)
-                    .await
-                    .map_err(|error| {
-                        error!(?error, "failed to resolve pull request changed files");
-                        StatusCode::BAD_GATEWAY
-                    })?
-            }
+            Some(number) => resolve_pr_changed_files_at(shared, &repo_full_name, number, &api_base)
+                .await
+                .map_err(|error| {
+                    error!(?error, "failed to resolve pull request changed files");
+                    StatusCode::BAD_GATEWAY
+                })?,
             None => None,
         };
         match fetched {
@@ -777,7 +851,7 @@ pub(crate) async fn handle_github_webhook(
         } else {
             &effective.git_ref
         };
-        let workflows = match fetch_workflows(&shared, &repo_full_name, workflow_ref).await {
+        let workflows = match fetch_workflows(shared, &repo_full_name, workflow_ref).await {
             Ok(w) => w,
             Err(e) => {
                 error!("Failed to fetch workflows for {}: {:?}", effective.event, e);
@@ -920,7 +994,7 @@ pub(crate) async fn handle_github_webhook(
             };
 
             // Call submit_run_inner — it performs the authoritative trigger match.
-            match submit_run_inner(&shared, submission).await {
+            match submit_run_inner(shared, submission).await {
                 Ok(accepted) => {
                     let run_id = accepted.run_id;
                     let sha = effective
@@ -936,14 +1010,8 @@ pub(crate) async fn handle_github_webhook(
                     };
                     if let Some(jobs) = jobs {
                         for job_id in jobs {
-                            report_check_run_queued(
-                                &shared,
-                                &repo_full_name,
-                                &sha,
-                                &job_id,
-                                run_id,
-                            )
-                            .await;
+                            report_check_run_queued(shared, &repo_full_name, &sha, &job_id, run_id)
+                                .await;
                             // If the job was already resolved at submission
                             // time (e.g. skipped due to unsatisfiable
                             // dependencies), report completion immediately so
@@ -956,7 +1024,7 @@ pub(crate) async fn handle_github_webhook(
                                     .and_then(|r| r.jobs.get(&job_id).copied())
                             };
                             if let Some(status) = status.filter(|s| s.is_terminal()) {
-                                report_check_run_completed(&shared, run_id, &job_id, status).await;
+                                report_check_run_completed(shared, run_id, &job_id, status).await;
                             }
                         }
                     }
