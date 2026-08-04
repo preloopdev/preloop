@@ -1,13 +1,19 @@
-FROM ubuntu:24.04
+FROM ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90
 
 RUN apt-get update -qq && \
     apt-get install -y -qq --no-install-recommends \
-      git curl ca-certificates nodejs npm build-essential pkg-config libssl-dev && \
+     git curl ca-certificates nodejs npm build-essential pkg-config libssl-dev \
+    && install -m 0755 -d /etc/apt/keyrings && \
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" > /etc/apt/sources.list.d/docker.list && \
+    apt-get update -qq && \
+    apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin && \
     rm -rf /var/lib/apt/lists/*
 
 # Rust stable toolchain
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable 2>/dev/null && \
-    /root/.cargo/bin/rustup component add rustfmt clippy
+   /root/.cargo/bin/rustup component add rustfmt clippy && \
+   curl -sSL https://github.com/Boshen/cargo-shear/releases/download/v1.12.4/cargo-shear-aarch64-unknown-linux-musl.tar.gz 2>/dev/null | tar -xz -C /root/.cargo/bin/ 2>/dev/null || true
 
 ENV PATH="/root/.cargo/bin:${PATH}"
 
