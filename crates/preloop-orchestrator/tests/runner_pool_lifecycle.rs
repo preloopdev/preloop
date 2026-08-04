@@ -8,6 +8,7 @@ use preloop_vm::{
 };
 use std::collections::HashMap;
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -397,6 +398,34 @@ async fn wait_for_debug_marker(provider: &RecordingVmProvider, marker: &Path) {
 
 async fn yield_to_pool() {
     for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Advance paused time in small steps until `predicate` holds, bounded so a
+/// regression fails loudly instead of spinning the suite.
+///
+/// The fixed `advance(n)` + yield-budget dance this replaces was flaky under
+/// CPU contention: the pool's poll is a multi-await chain (timer → fs →
+/// provider), and when other tasks on the runtime starved it of scheduling
+/// turns the assertion ran before the chain completed. Advancing 100 ms at a
+/// time and yielding after every step lets the pool's chain interleave at
+/// every boundary; the step is far below the pool's poll interval, so no
+/// observable transition can be skipped over.
+async fn advance_until<F, Fut>(mut predicate: F, what: &str)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        if predicate().await {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("timed out waiting for: {what}");
+        }
+        tokio::time::advance(std::time::Duration::from_millis(100)).await;
         tokio::task::yield_now().await;
     }
 }
@@ -849,39 +878,32 @@ async fn removing_debug_marker_releases_preserved_runner_on_next_poll() {
     let runner = await_first_slot_machine(&provider, &name_prefix).await;
     let marker = debug_dir.join(&runner);
     wait_for_debug_marker(&provider, &marker).await;
-    for _ in 0..100 {
-        tokio::task::yield_now().await;
-    }
-    tokio::time::advance(std::time::Duration::from_secs(1)).await;
-    for _ in 0..100 {
-        tokio::task::yield_now().await;
-    }
+    advance_until(
+        || async {
+            task_provider
+                .snapshot()
+                .await
+                .machines
+                .contains_key(&runner)
+        },
+        "preserved runner to exist while its debug marker is present",
+    )
+    .await;
+
     fs::remove_file(&marker).unwrap();
 
-    tokio::time::advance(std::time::Duration::from_secs(9)).await;
-    for _ in 0..100 {
-        tokio::task::yield_now().await;
-    }
-    assert!(task_provider
-        .snapshot()
-        .await
-        .machines
-        .contains_key(&runner));
-
-    tokio::time::advance(std::time::Duration::from_secs(1)).await;
-    for _ in 0..100 {
-        tokio::task::yield_now().await;
-    }
-    println!(
-        "events at removal poll: {:?}",
-        task_provider.snapshot().await.events
-    );
-    assert!(task_provider
-        .snapshot()
-        .await
-        .events
-        .iter()
-        .any(|event| matches!(event, Event::Delete(name) if name == &runner)));
+    advance_until(
+        || async {
+            task_provider
+                .snapshot()
+                .await
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Delete(name) if name == &runner))
+        },
+        "preserved runner to be released after its debug marker was removed",
+    )
+    .await;
     shutdown.cancel();
     task.await.unwrap().unwrap();
     assert!(!provider.snapshot().await.machines.contains_key(&runner));
