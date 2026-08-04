@@ -59,8 +59,13 @@ pub(crate) async fn twirp_workflow_steps_update(
                     } else {
                         run.jobs_list.push(JobDetail {
                             name: job_name,
-                            conclusion: "success".to_owned(),
+                            // A step update means the job started; the run
+                            // record's final conclusion comes from the job
+                            // status map (projected in the runs GET). Default
+                            // to the truthful in-flight state, never "success".
+                            conclusion: "in_progress".to_owned(),
                             steps: Vec::new(),
+                            annotations: Vec::new(),
                         });
                         run.jobs_list.last_mut().unwrap()
                     };
