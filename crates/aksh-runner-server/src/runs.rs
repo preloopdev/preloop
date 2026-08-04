@@ -1364,6 +1364,24 @@ pub(crate) fn build_job_artifacts(
             );
             agent_msg.aksh_snapshot_commit = Some(snapshot.commit_sha.clone());
         }
+        // Cover the workflows the checkout redirect cannot reach: anything
+        // that hardcodes the forge URL. Without this a job running unpushed
+        // work fails the moment it fetches its own sha from github.com.
+        let repository = normalized_github
+            .get("repository")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned);
+        if let Some(repository) = repository {
+            use base64::Engine as _;
+            let credentials = base64::engine::general_purpose::STANDARD
+                .encode(format!("x-access-token:{runtime_token}"));
+            agent_msg.aksh_snapshot_origin_rewrite =
+                Some(aksh_gha_protocol::azdo::SnapshotOriginRewrite {
+                    snapshot_url: format!("{base_url}/{}", snapshot.repository),
+                    forge_url: format!("https://github.com/{repository}"),
+                    auth_header: format!("AUTHORIZATION: basic {credentials}"),
+                });
+        }
     }
 
     let id_token_granted = job.oidc_id_token_granted;
