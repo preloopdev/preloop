@@ -10,7 +10,10 @@
 //! CLIs come to roughly 90 GB and are the job of `actions/setup-*` and
 //! `container:` — which is also what keeps workflows portable.
 
-use preloop_orchestrator::{base_packages, docker_data_root, loopback_hosts};
+use preloop_orchestrator::{
+    base_install_script, base_packages, docker_data_root, docker_packages, loopback_hosts,
+    BASE_NODE_VERSION,
+};
 
 /// Commands a workflow may reasonably assume exist, because `ubuntu-latest`
 /// ships them. Grouped by the failure each omission causes.
@@ -43,8 +46,6 @@ const REQUIRED: &[(&str, &str)] = &[
     ("automake", "autotools builds"),
     ("libtool", "autotools builds"),
     // Runtimes assumed present by actions and scripts.
-    ("nodejs", "the JavaScript action runtime"),
-    ("npm", "Ubuntu packages npm separately from nodejs"),
     ("python3", "scripts and composite actions"),
     ("python-is-python3", "scripts invoking bare `python`"),
     // Shell-step staples.
@@ -75,6 +76,77 @@ fn golden_carries_every_baseline_package() {
             .collect::<Vec<_>>()
             .join("\n")
     );
+}
+
+/// Node.js is no longer an apt package in the golden: it is baked from the
+/// official dist tarball, pinned to the version GitHub's ubuntu-24.04 image
+/// ships (22.23.1). The apt series (18.19 on Ubuntu 24.04) is a fidelity bug,
+/// so this test locks the pinned-tarball install in place.
+#[test]
+fn golden_bakes_pinned_node_from_dist_tarball() {
+    let script = base_install_script();
+    assert!(
+        script.contains(&format!(
+            "https://nodejs.org/dist/v{BASE_NODE_VERSION}/node-v{BASE_NODE_VERSION}-linux-$NODE_ARCH.tar.gz"
+        )),
+        "base install must bake pinned node {BASE_NODE_VERSION} from the dist tarball"
+    );
+    assert!(
+        !script.contains("apt-get install -y -qq --no-install-recommends nodejs"),
+        "apt nodejs (18.19 on 24.04) must not be installed"
+    );
+}
+
+/// Docker's official repo packages (docker-ce stack), not Ubuntu's
+/// `docker.io`: the CLI and the buildx/compose plugins must be the official
+/// artifacts so container jobs behave exactly like they do on `ubuntu-latest`.
+const REQUIRED_DOCKER: &[&str] = &[
+    "docker-ce",
+    "docker-ce-cli",
+    "containerd.io",
+    "docker-buildx-plugin",
+    "docker-compose-plugin",
+];
+
+#[test]
+fn golden_carries_container_engine_packages() {
+    let packages: Vec<&str> = docker_packages().split_whitespace().collect();
+    let missing: Vec<&str> = REQUIRED_DOCKER
+        .iter()
+        .copied()
+        .filter(|p| !packages.contains(p))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "container engine baseline is missing packages: {missing:?}"
+    );
+    let mut seen = std::collections::BTreeSet::new();
+    let duplicates: Vec<&&str> = packages.iter().filter(|p| !seen.insert(**p)).collect();
+    assert!(
+        duplicates.is_empty(),
+        "duplicate packages in the container engine baseline: {duplicates:?}"
+    );
+}
+
+#[test]
+fn install_script_pins_docker_repo_and_cargo_shear() {
+    // The container engine is only installable after Docker's apt repo is
+    // bootstrapped (keyring + sources.list), and cargo-shear is a release
+    // tarball, not an apt package. Pin all three so a botched merge cannot
+    // silently drop the repo setup or the binary.
+    let script = base_install_script();
+    for fragment in [
+        "https://download.docker.com/linux/ubuntu/gpg",
+        "/etc/apt/sources.list.d/docker.list",
+        "docker-buildx-plugin",
+        "docker-compose-plugin",
+        "cargo-shear-$(uname -m)-unknown-linux-musl.tar.gz",
+    ] {
+        assert!(
+            script.contains(fragment),
+            "install script lost {fragment:?}"
+        );
+    }
 }
 
 #[test]
