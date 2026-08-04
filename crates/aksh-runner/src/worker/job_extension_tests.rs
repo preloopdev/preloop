@@ -2,6 +2,37 @@ use super::*;
 use proptest::prelude::*;
 
 #[test]
+fn setup_workspace_clears_stale_repository() {
+    // A previous job left a checked-out repo in the workspace (the failure
+    // mode behind "remote origin already exists" on long-lived runners).
+    // GitHub-hosted semantics: every job starts with a fresh workspace.
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("work").join("openclaw").join("openclaw");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let stale = workspace.join(".git");
+    std::fs::create_dir_all(stale.join("objects")).unwrap();
+    std::fs::write(
+        stale.join("config"),
+        b"[remote \"origin\"]\nurl = https://github.com/openclaw/openclaw.git\n",
+    )
+    .unwrap();
+    std::fs::write(workspace.join("README.md"), b"stale").unwrap();
+
+    let message = serde_json::json!({
+        "fileTable": { "workDirectory": workspace.to_str().unwrap() }
+    });
+    let resolved = setup_workspace(&message).unwrap();
+
+    let entries: Vec<_> = std::fs::read_dir(&workspace).unwrap().collect();
+    assert!(
+        entries.is_empty(),
+        "workspace must be empty after setup, got: {:?}",
+        entries
+    );
+    assert_eq!(resolved, workspace.to_string_lossy());
+}
+
+#[test]
 fn inject_github_env_sets_core_vars() {
     let mut job = JobContext::new(
         "j1".into(),
