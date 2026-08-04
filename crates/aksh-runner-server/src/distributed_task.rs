@@ -2,6 +2,7 @@ use super::*;
 
 pub(crate) async fn next_message(
     State(shared): State<Arc<SharedState>>,
+    identity: Option<axum::Extension<RunnerIdentity>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> (StatusCode, Json<Option<azdo::TaskAgentMessage>>) {
     let session_id = params
@@ -63,7 +64,11 @@ pub(crate) async fn next_message(
         }
 
         let runner = inner.runner_capabilities_for_session(&session_id);
-        let claimed = take_matching_job(&mut inner.queue, &runner);
+        let verified = effective_claim_runner(
+            identity.as_ref().map(|axum::Extension(id)| id),
+            inner.runner_id_for_session(&session_id),
+        );
+        let claimed = take_matching_job(&mut inner, &runner, verified);
         shared
             .state
             .queue_depth
@@ -278,6 +283,7 @@ pub(crate) async fn complete_job_compat(
             job_id: JobId(job_id),
             status,
             outputs: Default::default(),
+            annotations: Vec::new(),
         },
     )
     .await
@@ -352,6 +358,7 @@ pub(crate) async fn agent_request_patch(
                     job_id,
                     status: new_status,
                     outputs: Default::default(),
+                    annotations: Vec::new(),
                 })
             } else {
                 info!(
@@ -424,7 +431,16 @@ pub(crate) fn agent_request_result(status: ExecutionStatus) -> &'static str {
     }
 }
 
-pub(crate) const JOB_LEASE_SECONDS: u64 = 600;
+/// Job lock duration (and silent-runner-death reaper window).
+///
+/// Measured on GitHub-hosted runners: a job whose runner dies without
+/// reporting (killed `Runner.Listener` mid-job) concluded as `failure`
+/// exactly 45 minutes after start (run 30768824742,
+/// `Bnjoroge1/aksh-conformance-sample`, lease-expiry experiment), with no
+/// automatic retry (`run_attempt` stayed 1). 2700 s matches that window;
+/// the runner-side renew loop still gives up at LockedUntil + 5 min grace,
+/// mirroring the official dispatcher.
+pub(crate) const JOB_LEASE_SECONDS: u64 = 2700;
 
 pub(crate) fn agent_request_locked_until() -> String {
     server_iso_at(SystemTime::now() + Duration::from_secs(JOB_LEASE_SECONDS))
@@ -438,6 +454,9 @@ pub(crate) fn task_result_status(result: azdo::TaskResult) -> ExecutionStatus {
         azdo::TaskResult::Failed => ExecutionStatus::Failure,
         azdo::TaskResult::Cancelled => ExecutionStatus::Cancelled,
         azdo::TaskResult::Skipped => ExecutionStatus::Skipped,
+        // Official TaskResult.Abandoned — the job never finished on its
+        // runner; GitHub concludes abandoned self-hosted jobs as failed.
+        azdo::TaskResult::Abandoned => ExecutionStatus::Failure,
     }
 }
 
@@ -492,6 +511,7 @@ pub(crate) async fn complete_job_inner(
         ));
     }
     let mut inner = shared.state.inner.lock().await;
+    let finalized_callers: Vec<JobId>;
     {
         let run = inner
             .runs
@@ -524,11 +544,15 @@ pub(crate) async fn complete_job_inner(
         let job_name = completion.job_id.0.clone();
         if let Some(pos) = run.jobs_list.iter().position(|j| j.name == job_name) {
             run.jobs_list[pos].conclusion = format!("{:?}", effective).to_lowercase();
+            if !completion.annotations.is_empty() {
+                run.jobs_list[pos].annotations = completion.annotations.clone();
+            }
         } else {
             run.jobs_list.push(JobDetail {
                 name: job_name,
                 conclusion: format!("{:?}", effective).to_lowercase(),
                 steps: Vec::new(),
+                annotations: completion.annotations.clone(),
             });
         }
         run.job_outputs.insert(
@@ -539,7 +563,7 @@ pub(crate) async fn complete_job_inner(
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
         );
-        propagate_reusable_outputs(run);
+        finalized_callers = propagate_reusable_outputs(run);
         run.status = summarize_run(run.jobs.values().copied());
         // A completed job proves that the run has started. Keep the first
         // observed completion as a conservative fallback when the runner did
@@ -589,7 +613,20 @@ pub(crate) async fn complete_job_inner(
     }
     // Release concurrency for the completed job / run, which may promote held work.
     release_concurrency_for_job(&mut inner, completion.run_id, &completion.job_id);
-    let scheduling = promote_ready_jobs(&mut inner);
+    for caller_id in &finalized_callers {
+        release_concurrency_for_job(&mut inner, completion.run_id, caller_id);
+    }
+    let mut scheduling = promote_ready_jobs(&mut inner);
+    // The on-demand runner supervisor wakes on this atomic, and a completion
+    // can promote fresh work into the queue (a `needs:` chain or a released
+    // concurrency successor). Without refreshing it here the pool stays
+    // asleep on the last claim-time value and the promoted job queues
+    // forever — the observed "run stuck at queued" stall. Mirrors the store
+    // done at submit and at claim.
+    shared
+        .state
+        .queue_depth
+        .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
     let record = inner
         .runs
         .get(&completion.run_id)
@@ -628,6 +665,12 @@ pub(crate) async fn complete_job_inner(
     inner.dap_ports.remove(&completion.run_id);
     let queue_nonempty = !inner.queue.is_empty() || !inner.cancellation_queue.is_empty();
     drop(inner);
+
+    // Any reusable-caller or dynamic-matrix node the sweep above unblocked was
+    // deferred rather than expanded under the lock. Build those subtrees now
+    // that the guard is released, and fold the result into the outcome the
+    // notify and event fan-out below reports on.
+    scheduling.merge(drain_expansions(&shared).await);
 
     github::report_check_run_completed(
         &shared,

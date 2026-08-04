@@ -11,6 +11,7 @@ pub(crate) fn try_enqueue_with_job_concurrency(
 ) -> Result<bool, ()> {
     let Some(raw) = queued_job.concurrency.clone() else {
         statuses.insert(queued_job.job_id.clone(), ExecutionStatus::Queued);
+        on_job_enqueued(inner, &queued_job);
         inner.queue.push_back(queued_job);
         return Ok(true);
     };
@@ -52,6 +53,7 @@ pub(crate) fn try_enqueue_with_job_concurrency(
     match try_acquire_concurrency(inner, key, group, holder, cancel, queue) {
         Ok(true) => {
             statuses.insert(queued_job.job_id.clone(), ExecutionStatus::Queued);
+            on_job_enqueued(inner, &queued_job);
             inner.queue.push_back(queued_job);
             Ok(true)
         }
@@ -135,12 +137,20 @@ pub(crate) fn cancel_run_inner(
     inner.queue.retain(|job| job.run_id != run_id);
     inner.pending_jobs.retain(|job| job.run_id != run_id);
     inner.held_runs.remove(&run_id);
+    inner.job_assignments.retain(|(id, _), _| *id != run_id);
+    inner.pool_pending.retain(|(id, _), _| *id != run_id);
     inner.concurrency_blocked.retain(|job| job.run_id != run_id);
     inner.dap_ports.remove(&run_id);
+    // Drop any deferred subtree work for this run. Clearing the `expanding`
+    // reservation is what makes an in-flight build discard its result instead
+    // of folding cancelled jobs back into the run.
+    inner.pending_expansions.retain(|job| job.run_id != run_id);
+    inner.expanding.retain(|(id, _)| *id != run_id);
 
     // Release any concurrency holders belonging to this run and promote next.
     release_concurrency_for_run(inner, run_id);
     inner.jobset_admissions.retain(|id, _| id.run_id != run_id);
+    inner.jobset_ready.retain(|id| id.run_id != run_id);
 
     let _ = reason; // events emitted by caller when needed
     count
@@ -181,6 +191,12 @@ pub(crate) fn cancel_job_inner(inner: &mut InnerState, run_id: RunId, job_id: &J
         .queue
         .retain(|j| !(j.run_id == run_id && j.job_id == *job_id));
     inner
+        .job_assignments
+        .retain(|(id, jid), _| !(*id == run_id && *jid == *job_id));
+    inner
+        .pool_pending
+        .retain(|(id, jid), _| !(*id == run_id && *jid == *job_id));
+    inner
         .pending_jobs
         .retain(|j| !(j.run_id == run_id && j.job_id == *job_id));
     inner
@@ -188,6 +204,23 @@ pub(crate) fn cancel_job_inner(inner: &mut InnerState, run_id: RunId, job_id: &J
         .retain(|j| !(j.run_id == run_id && j.job_id == *job_id));
     if let Some(held) = inner.held_runs.get_mut(&run_id) {
         held.retain(|j| j.job_id != *job_id);
+    }
+    // Same for a single node: dropping the reservation makes any in-flight
+    // build of its subtree discard itself when it tries to apply.
+    inner
+        .pending_expansions
+        .retain(|j| !(j.run_id == run_id && j.job_id == *job_id));
+    inner.expanding.remove(&(run_id, job_id.clone()));
+
+    // Cancelling a reusable caller cancels its materialized subtree with it.
+    let inner_ids = inner
+        .runs
+        .get(&run_id)
+        .and_then(|run| run.reusable_calls.get(&job_id.0))
+        .map(|call| call.inner_job_ids.clone())
+        .unwrap_or_default();
+    for inner_id in inner_ids {
+        count += cancel_job_inner(inner, run_id, &JobId(inner_id));
     }
 
     release_concurrency_for_job(inner, run_id, job_id);
@@ -442,9 +475,10 @@ pub(crate) fn promote_next_from_group(
                             .all(|n| scheduling::need_satisfied(&run.jobs, n))
                     });
                     if needs_ok && under_max_parallel(inner, &job) {
-                        if let Some(run) = inner.runs.get(&run_id) {
+                        if let Some(run) = inner.runs.get_mut(&run_id) {
                             hydrate_needs_context(&mut job, run);
                         }
+                        on_job_enqueued(inner, &job);
                         inner.queue.push_back(job);
                     } else {
                         if let Some(run) = inner.runs.get_mut(&run_id) {
@@ -490,6 +524,7 @@ pub(crate) fn promote_next_from_group(
                 run.jobs.insert(job.job_id.clone(), ExecutionStatus::Queued);
                 hydrate_needs_context(&mut job, run);
             }
+            on_job_enqueued(inner, &job);
             inner.queue.push_back(job);
         }
         concurrency::Holder::JobSet { run_id, job_ids } => {
@@ -510,6 +545,10 @@ pub(crate) fn promote_next_from_group(
                 Ok(JobSetAdmissionResult::Ready) => {}
             }
 
+            // Gates acquired. Caller placeholder nodes do not dispatch: they go
+            // back to pending_jobs flagged ready, and the next promote sweep
+            // materializes the callee subtree.
+            inner.jobset_ready.insert(id.clone());
             let mut to_queue = Vec::new();
             inner.concurrency_blocked.retain(|job| {
                 if job.run_id == run_id && job_ids.contains(&job.job_id) {
@@ -520,11 +559,22 @@ pub(crate) fn promote_next_from_group(
                 }
             });
             for mut job in to_queue {
+                if job.reusable_call.is_some() {
+                    // Caller nodes terminate through their subtree, never
+                    // through dispatch.
+                    if let Some(run) = inner.runs.get_mut(&run_id) {
+                        run.jobs
+                            .insert(job.job_id.clone(), ExecutionStatus::Pending);
+                    }
+                    inner.pending_jobs.push_back(job);
+                    continue;
+                }
                 if under_max_parallel(inner, &job) {
                     if let Some(run) = inner.runs.get_mut(&run_id) {
                         run.jobs.insert(job.job_id.clone(), ExecutionStatus::Queued);
                         hydrate_needs_context(&mut job, run);
                     }
+                    on_job_enqueued(inner, &job);
                     inner.queue.push_back(job);
                 } else {
                     if let Some(run) = inner.runs.get_mut(&run_id) {
@@ -652,6 +702,10 @@ pub(crate) fn cancel_holder(
                 run_id: *run_id,
                 job_ids: job_ids.clone(),
             });
+            inner.jobset_ready.remove(&JobSetId {
+                run_id: *run_id,
+                job_ids: job_ids.clone(),
+            });
             for job_id in job_ids {
                 cancel_job_inner(inner, *run_id, job_id);
             }
@@ -672,6 +726,16 @@ pub(crate) struct SchedulingOutcome {
     pub(crate) failed: Vec<(RunId, JobId)>,
 }
 
+impl SchedulingOutcome {
+    /// Fold a later sweep's result into this one, so a caller that promotes,
+    /// expands and promotes again reports one combined outcome.
+    pub(crate) fn merge(&mut self, other: SchedulingOutcome) {
+        self.promoted += other.promoted;
+        self.skipped.extend(other.skipped);
+        self.failed.extend(other.failed);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DependencyDecision {
     Wait,
@@ -681,6 +745,11 @@ pub(crate) enum DependencyDecision {
 }
 
 /// Promote or skip pending jobs once every declared dependency is terminal.
+///
+/// Deliberately performs no subtree expansion: a ready reusable-caller or
+/// dynamic-matrix node is handed to `inner.pending_expansions` so the heavy
+/// build happens outside the global lock. Callers run [`drain_expansions`]
+/// once they have released the guard.
 pub(crate) fn promote_ready_jobs(inner: &mut InnerState) -> SchedulingOutcome {
     let mut outcome = SchedulingOutcome::default();
     loop {
@@ -696,6 +765,80 @@ pub(crate) fn promote_ready_jobs(inner: &mut InnerState) -> SchedulingOutcome {
                 .map(|run| dependency_decision(run, &job))
                 .unwrap_or(DependencyDecision::Wait);
             match decision {
+                DependencyDecision::Run if job.reusable_call.is_some() => {
+                    // Deferred reusable caller: the `if:` gate passed. Acquire
+                    // caller+embedded JobSet concurrency gates, then
+                    // materialize the callee subtree. A false gate never
+                    // reaches here — the generic Skip arm recorded the single
+                    // skipped entry.
+                    settled = true;
+                    let set_id = JobSetId {
+                        run_id: job.run_id,
+                        job_ids: BTreeSet::from([job.job_id.clone()]),
+                    };
+                    let ready = inner.jobset_ready.remove(&set_id);
+                    if !ready {
+                        if inner.jobset_admissions.contains_key(&set_id) {
+                            // Still waiting on a gate; park until a release
+                            // event routes it back via jobset_ready.
+                            inner.concurrency_blocked.push_back(job);
+                            continue;
+                        }
+                        match caller_jobset_gates(inner, &job) {
+                            Err(status) => {
+                                if let Some(run) = inner.runs.get_mut(&job.run_id) {
+                                    run.jobs.insert(job.job_id.clone(), status);
+                                    run.status = summarize_run(run.jobs.values().copied());
+                                    finalize_run_if_complete(run);
+                                }
+                                outcome.failed.push((job.run_id, job.job_id));
+                                continue;
+                            }
+                            Ok(Some(gates)) => {
+                                inner.jobset_admissions.insert(
+                                    set_id.clone(),
+                                    JobSetAdmission {
+                                        gates,
+                                        acquired_keys: BTreeSet::new(),
+                                    },
+                                );
+                                match advance_jobset_admission(inner, &set_id, None) {
+                                    Ok(JobSetAdmissionResult::Ready) => {}
+                                    Ok(JobSetAdmissionResult::Blocked) => {
+                                        inner.concurrency_blocked.push_back(job);
+                                        continue;
+                                    }
+                                    Err(error) => {
+                                        let status = if error == "concurrency_queue_overflow" {
+                                            ExecutionStatus::Cancelled
+                                        } else {
+                                            ExecutionStatus::Failure
+                                        };
+                                        if let Some(run) = inner.runs.get_mut(&job.run_id) {
+                                            run.jobs.insert(job.job_id.clone(), status);
+                                            run.status = summarize_run(run.jobs.values().copied());
+                                            finalize_run_if_complete(run);
+                                        }
+                                        outcome.failed.push((job.run_id, job.job_id));
+                                        continue;
+                                    }
+                                }
+                            }
+                            Ok(None) => {}
+                        }
+                    }
+                    // Gates are held. Building the callee subtree is heavy,
+                    // so hand it to `drain_expansions` rather than doing it
+                    // with the global lock held.
+                    defer_expansion(inner, job);
+                }
+                DependencyDecision::Run if job.deferred_matrix.is_some() => {
+                    // Dynamic `needs`-driven matrix. Expanding it re-parses the
+                    // workflow and builds a runner message per combination, so
+                    // it is deferred exactly like a reusable caller.
+                    settled = true;
+                    defer_expansion(inner, job);
+                }
                 DependencyDecision::Run
                     if under_max_parallel(inner, &job)
                         && promoted_by_base
@@ -721,6 +864,7 @@ pub(crate) fn promote_ready_jobs(inner: &mut InnerState) -> SchedulingOutcome {
                         };
                         run.jobs.insert(job.job_id.clone(), status);
                         run.status = summarize_run(run.jobs.values().copied());
+                        finalize_run_if_complete(run);
                     }
                     if decision == DependencyDecision::Skip {
                         outcome.skipped.push((job.run_id, job.job_id));
@@ -886,13 +1030,178 @@ pub(crate) fn job_matches_runner_capabilities(
 
 /// Find and remove the first job matching the given runner's labels and group.
 pub(crate) fn take_matching_job(
-    queue: &mut VecDeque<QueuedJob>,
+    inner: &mut InnerState,
     runner: &RunnerCapabilities,
+    verified_runner_id: Option<i64>,
 ) -> Option<QueuedJob> {
-    let pos = queue
+    // Drop stale bookkeeping so nothing expires into an effective grant and
+    // the maps cannot grow without bound across a long-lived server.
+    let now = std::time::SystemTime::now();
+    inner
+        .job_assignments
+        .retain(|_, record| assignment_fresh(record.at, now));
+    inner
+        .pool_pending
+        .retain(|_, at| assignment_fresh(*at, now));
+    let pos = inner.queue.iter().position(|job| {
+        if !job_matches_runner_capabilities(job, runner) {
+            return false;
+        }
+        claim_permitted(inner, job, verified_runner_id)
+    })?;
+    let job = inner.queue.remove(pos)?;
+    let key = (job.run_id, job.job_id.clone());
+    inner.job_assignments.remove(&key);
+    inner.pool_pending.remove(&key);
+    Some(job)
+}
+
+/// How long an assignment or pool-pending mark stays authoritative. After
+/// expiry a job falls back to ordinary permissive scheduling so a crashed
+/// pool or dead machine can never wedge a queued job forever.
+pub(crate) const ASSIGNMENT_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+fn assignment_fresh(at: std::time::SystemTime, now: std::time::SystemTime) -> bool {
+    now.duration_since(at)
+        .map(|age| age < ASSIGNMENT_TTL)
+        .unwrap_or(false)
+}
+
+/// Whether `verified_runner_id` may claim `job` right now, independent of
+/// runner capabilities.
+///
+/// `verified_runner_id` is the runner proven by a listen token — never the
+/// session's self-declared `agent.id`, which untrusted code inside a pool
+/// machine can fabricate. That distinction is what stops a compromised
+/// machine from pulling jobs assigned to other machines.
+fn claim_permitted(inner: &InnerState, job: &QueuedJob, verified_runner_id: Option<i64>) -> bool {
+    let key = (job.run_id, job.job_id.clone());
+    if let Some(record) = inner.job_assignments.get(&key) {
+        return Some(record.runner_id) == verified_runner_id;
+    }
+    if inner.pool_pending.contains_key(&key) {
+        // A machine is being provisioned for this job; nobody claims it
+        // until that machine registers and the assignment is stamped.
+        return false;
+    }
+    !inner.require_job_assignments
+}
+
+/// Record dispatch intent for a newly queued job.
+///
+/// Preference order:
+///  1. an idle, capable, session-bound runner already registered
+///  2. the pool-pending set (a machine will be provisioned / is being
+///     provisioned), blocking all claims until registration pairs the job
+///
+/// With no pool and no strict flag this is a no-op, leaving external-runner
+/// installs on the historical first-poller-wins behavior.
+pub(crate) fn on_job_enqueued(inner: &mut InnerState, job: &QueuedJob) {
+    if !inner.pool_assignments_enabled && !inner.require_job_assignments {
+        return;
+    }
+    let key = (job.run_id, job.job_id.clone());
+    if inner.job_assignments.contains_key(&key) {
+        return;
+    }
+    inner.pool_pending.remove(&key);
+    let mut busy: std::collections::BTreeSet<i64> = inner
+        .job_assignments
+        .values()
+        .map(|record| record.runner_id)
+        .collect();
+    for session_id in inner.session_active_requests.keys() {
+        if let Some(runner_id) = inner.runner_id_for_session(session_id) {
+            busy.insert(runner_id);
+        }
+    }
+    let mut candidates: std::collections::BTreeSet<i64> =
+        inner.broker_session_runners.values().copied().collect();
+    candidates.extend(inner.sessions.values().map(|session| session.runner_id));
+    for runner_id in candidates {
+        if busy.contains(&runner_id) {
+            continue;
+        }
+        let Some(runner) = inner.runners.get(&runner_id) else {
+            continue;
+        };
+        if job_matches_runner_capabilities(job, &capabilities_of(runner))
+            && inner
+                .job_assignments
+                .insert(
+                    key.clone(),
+                    AssignmentRecord {
+                        runner_id,
+                        at: std::time::SystemTime::now(),
+                    },
+                )
+                .is_none()
+        {
+            return;
+        }
+    }
+    if inner.pool_assignments_enabled {
+        inner.pool_pending.insert(key, std::time::SystemTime::now());
+    }
+}
+
+/// Pair a just-registered pool runner with the earliest pending job it can
+/// serve. Called from the registration path; the returned runner then claims
+/// the job by polling.
+pub(crate) fn pair_registered_runner(inner: &mut InnerState, runner_id: i64) {
+    if !inner.pool_assignments_enabled && !inner.require_job_assignments {
+        return;
+    }
+    let Some(runner) = inner.runners.get(&runner_id).cloned() else {
+        return;
+    };
+    let caps = capabilities_of(&runner);
+    let now = std::time::SystemTime::now();
+    let chosen = inner
+        .pool_pending
         .iter()
-        .position(|job| job_matches_runner_capabilities(job, runner))?;
-    queue.remove(pos)
+        .filter(|(_, at)| assignment_fresh(**at, now))
+        .filter(|(key, _)| {
+            inner
+                .queue
+                .iter()
+                .find(|job| job.run_id == key.0 && job.job_id == key.1)
+                .map(|job| job_matches_runner_capabilities(job, &caps))
+                .unwrap_or(false)
+        })
+        .min_by_key(|(_, at)| **at)
+        .map(|(key, _)| key.clone());
+    if let Some(key) = chosen {
+        inner.pool_pending.remove(&key);
+        inner.job_assignments.insert(
+            key,
+            AssignmentRecord {
+                runner_id,
+                at: std::time::SystemTime::now(),
+            },
+        );
+    }
+}
+
+/// Drop the assignment for one job (requeue paths, deregistration purge).
+/// Returns whether the job is still queued so callers can re-mark it
+/// pool-pending when a replacement runner must be provisioned.
+pub(crate) fn clear_assignment(inner: &mut InnerState, run_id: RunId, job_id: &JobId) -> bool {
+    inner.job_assignments.remove(&(run_id, job_id.clone()));
+    inner.pool_pending.remove(&(run_id, job_id.clone()));
+    inner
+        .queue
+        .iter()
+        .any(|job| job.run_id == run_id && job.job_id == *job_id)
+}
+
+fn capabilities_of(runner: &RegisteredRunner) -> RunnerCapabilities {
+    RunnerCapabilities {
+        known: true,
+        labels: runner.labels.clone(),
+        runner_group_id: runner.runner_group_id,
+        runner_group_name: runner.runner_group_name.clone(),
+    }
 }
 
 pub(crate) fn under_max_parallel(inner: &InnerState, job: &QueuedJob) -> bool {
@@ -1012,8 +1321,583 @@ pub(crate) fn needs_json_context(run: &RunRecord, needs: &[JobId]) -> serde_json
                 }),
             ))
         })
-        .collect();
+        .collect::<serde_json::Map<_, _>>();
     serde_json::Value::Object(values)
+}
+
+/// Evaluate the caller and embedded concurrency gates for one deferred
+/// reusable-call invocation. Mirrors GitHub evaluating caller concurrency when
+/// the caller job starts (after its needs complete and the `if:` gate passes).
+///
+/// `Ok(None)` means neither gate is declared. `Err(status)` records how the
+/// caller node terminates when gate evaluation itself fails.
+fn caller_jobset_gates(
+    inner: &InnerState,
+    job: &QueuedJob,
+) -> Result<Option<Vec<JobSetGate>>, ExecutionStatus> {
+    let Some(run) = inner.runs.get(&job.run_id) else {
+        return Err(ExecutionStatus::Failure);
+    };
+    let Some(call) = run.reusable_calls.get(&job.job_id.0) else {
+        return Ok(None);
+    };
+    let submission = &run.submission;
+    let mut gates = Vec::new();
+    for (raw, scope, label, inputs) in [
+        (
+            call.caller_concurrency.as_ref(),
+            concurrency::ConcurrencyScope::Job,
+            "caller concurrency (JobSet)",
+            &submission.inputs,
+        ),
+        (
+            call.embedded_concurrency.as_ref(),
+            concurrency::ConcurrencyScope::Workflow,
+            "embedded concurrency (JobSet)",
+            &call.inputs,
+        ),
+    ] {
+        let Some(raw) = raw else { continue };
+        let eval_ctx = concurrency::ConcurrencyContext {
+            scope,
+            github: &run.github,
+            vars: &submission.vars,
+            inputs,
+            matrix: Some(&job.matrix),
+            strategy: None,
+            needs: None,
+        };
+        match concurrency::evaluate_concurrency(raw, &eval_ctx) {
+            Ok((group, cancel_in_progress, queue)) if !group.trim().is_empty() => {
+                merge_jobset_gate(
+                    &mut gates,
+                    JobSetGate {
+                        key: concurrency::concurrency_key(&submission.repository, &group),
+                        display_name: group,
+                        cancel_in_progress,
+                        queue,
+                    },
+                );
+            }
+            Ok((_, _, _)) => return Err(ExecutionStatus::Failure),
+            Err(error) => {
+                concurrency::log_eval_error(label, &error);
+                return Err(ExecutionStatus::Failure);
+            }
+        }
+    }
+    Ok((!gates.is_empty()).then_some(gates))
+}
+
+/// Everything a deferred node needs in order to build its subtree, cloned out
+/// of the run record while the lock is held.
+///
+/// Snapshotting up front is what lets the expensive part — parsing workflow
+/// YAML, building one runner message per inner job, minting a runtime token
+/// per job — run with the global mutex released.
+struct ExpansionContext {
+    run_id: RunId,
+    submission: Arc<WorkflowSubmission>,
+    snapshot: Option<crate::snapshots::WorkspaceSnapshot>,
+    github_json: serde_json::Value,
+    workflow_path: String,
+    workflow_ref: String,
+    head_sha: String,
+}
+
+struct ReusableExpansionInputs {
+    ctx: ExpansionContext,
+    caller_id: JobId,
+    caller_plan: aksh_gha_protocol::JobPlan,
+    call: aksh_gha_protocol::ReusableCallPlan,
+}
+
+struct MatrixExpansionInputs {
+    ctx: ExpansionContext,
+    node_id: JobId,
+    base_id: String,
+    expression: String,
+    needs_outputs: BTreeMap<String, BTreeMap<String, serde_json::Value>>,
+}
+
+enum ExpansionPlan {
+    Reusable(Box<ReusableExpansionInputs>),
+    Matrix(Box<MatrixExpansionInputs>),
+}
+
+/// One fully built inner job, still detached from the run.
+struct BuiltJob {
+    plan: aksh_gha_protocol::JobPlan,
+    condition_context: aksh_gha_expressions::Context,
+    artifacts: crate::runs::BuiltJobArtifacts,
+}
+
+enum BuiltExpansion {
+    Reusable {
+        caller_id: JobId,
+        jobs: Vec<BuiltJob>,
+        reusable_calls: BTreeMap<String, aksh_gha_parser::ReusableCallMetadata>,
+    },
+    Matrix {
+        jobs: Vec<BuiltJob>,
+    },
+}
+
+/// Hand a gated node to [`drain_expansions`], which builds its subtree with
+/// the global lock released.
+fn defer_expansion(inner: &mut InnerState, job: QueuedJob) {
+    inner.expanding.insert((job.run_id, job.job_id.clone()));
+    inner.pending_expansions.push_back(job);
+}
+
+/// Snapshot the inputs a deferred node needs, while the lock is held.
+fn plan_expansion(inner: &InnerState, job: &QueuedJob) -> Option<ExpansionPlan> {
+    let run = inner.runs.get(&job.run_id)?;
+    let ctx = ExpansionContext {
+        run_id: job.run_id,
+        submission: run.submission.clone(),
+        snapshot: run.workspace_snapshot.clone(),
+        github_json: run.github.clone(),
+        workflow_path: run.workflow_path_str.clone(),
+        workflow_ref: run.workflow_ref.clone(),
+        head_sha: run.head_sha.clone(),
+    };
+    if let Some(call) = job.reusable_call.clone() {
+        let caller_plan = run.caller_plans.get(&job.job_id).cloned()?;
+        return Some(ExpansionPlan::Reusable(Box::new(ReusableExpansionInputs {
+            ctx,
+            caller_id: job.job_id.clone(),
+            caller_plan,
+            call,
+        })));
+    }
+    let expression = job.deferred_matrix.clone()?;
+    // `needs` outputs feed the matrix expression, so they are resolved here
+    // rather than in the build phase, which no longer sees the run record.
+    let mut needs_outputs: BTreeMap<String, BTreeMap<String, serde_json::Value>> = BTreeMap::new();
+    for need_id in &job.needs {
+        for matched in matching_need_ids(run, need_id) {
+            if let Some(outputs) = run.job_outputs.get(&matched) {
+                let base = run
+                    .job_base_ids
+                    .get(&matched)
+                    .cloned()
+                    .unwrap_or_else(|| need_id.0.clone());
+                needs_outputs
+                    .entry(base)
+                    .or_default()
+                    .extend(outputs.clone());
+            }
+        }
+    }
+    Some(ExpansionPlan::Matrix(Box::new(MatrixExpansionInputs {
+        ctx,
+        node_id: job.job_id.clone(),
+        base_id: job.base_id.clone(),
+        expression,
+        needs_outputs,
+    })))
+}
+
+/// Build one job's runner artifacts per plan. Runs with the lock released.
+fn build_jobs<F>(
+    shared: &SharedState,
+    ctx: &ExpansionContext,
+    plans: &[aksh_gha_protocol::JobPlan],
+    condition_context: F,
+) -> Result<Vec<BuiltJob>, ExecutionStatus>
+where
+    F: Fn(&aksh_gha_protocol::JobPlan, &BTreeMap<String, String>) -> aksh_gha_expressions::Context,
+{
+    let base_url = runner_base_url();
+    let normalized_github =
+        aksh_gha_parser::job_builder::normalize_github_context(&ctx.github_json);
+    // Resolve the run's secrets to plaintext exactly once, at the boundary,
+    // instead of re-exposing them per job.
+    let secrets_exposed = aksh_gha_protocol::masking::expose_all(&ctx.submission.secrets);
+    // PATs are static: embed at build time. App installation tokens are minted
+    // by the broker at dispatch.
+    let pat_override = if shared.state.github_app.is_none() {
+        shared.state.static_github_pat()
+    } else {
+        None
+    };
+    let mut built = Vec::with_capacity(plans.len());
+    for plan in plans {
+        let artifacts = crate::runs::build_job_artifacts(
+            shared,
+            &ctx.submission,
+            ctx.run_id,
+            &ctx.workflow_path,
+            &ctx.workflow_ref,
+            &ctx.head_sha,
+            &normalized_github,
+            &secrets_exposed,
+            &base_url,
+            ctx.snapshot.as_ref(),
+            plan,
+            pat_override.clone(),
+        )
+        .map_err(|error| {
+            tracing::warn!(
+                run_id = %ctx.run_id,
+                job = %plan.id,
+                ?error,
+                "job message build failed during expansion"
+            );
+            ExecutionStatus::Failure
+        })?;
+        built.push(BuiltJob {
+            plan: plan.clone(),
+            condition_context: condition_context(plan, &secrets_exposed),
+            artifacts,
+        });
+    }
+    Ok(built)
+}
+
+fn build_expansion(
+    shared: &SharedState,
+    plan: ExpansionPlan,
+) -> Result<BuiltExpansion, ExecutionStatus> {
+    match plan {
+        ExpansionPlan::Reusable(inputs) => build_reusable_expansion(shared, *inputs),
+        ExpansionPlan::Matrix(inputs) => build_matrix_expansion(shared, *inputs),
+    }
+}
+
+/// Materialize a deferred reusable caller's callee subtree. Nested reusable
+/// callers inside the callee come back as deferred caller nodes of their own.
+fn build_reusable_expansion(
+    shared: &SharedState,
+    inputs: ReusableExpansionInputs,
+) -> Result<BuiltExpansion, ExecutionStatus> {
+    let ReusableExpansionInputs {
+        ctx,
+        caller_id,
+        caller_plan,
+        call,
+    } = inputs;
+    let run_id = ctx.run_id;
+    let yaml = ctx
+        .submission
+        .reusable_workflows
+        .get(&call.uses)
+        .or_else(|| ctx.submission.reusable_workflows.get(&call.workflow_file));
+    let Some(yaml) = yaml else {
+        tracing::warn!(%run_id, job = %caller_id, "reusable workflow YAML missing at expansion");
+        return Err(ExecutionStatus::Failure);
+    };
+    let called = aksh_gha_parser::parse_workflow(yaml).map_err(|error| {
+        tracing::warn!(%run_id, job = %caller_id, %error, "callee re-parse failed at expansion");
+        ExecutionStatus::Failure
+    })?;
+    let expanded = aksh_gha_parser::expand_reusable_call(
+        &called,
+        &caller_plan,
+        &ctx.submission.reusable_workflows,
+        &ctx.submission.reusable_workflow_shas,
+    )
+    .map_err(|error| {
+        tracing::warn!(%run_id, job = %caller_id, %error, "reusable subtree expansion failed");
+        ExecutionStatus::Failure
+    })?;
+
+    let github_json = ctx.github_json.clone();
+    let vars = ctx.submission.vars.clone();
+    let jobs = build_jobs(shared, &ctx, &expanded.jobs, |plan, _secrets| {
+        aksh_gha_parser::eval::build_context(
+            &github_json,
+            &BTreeMap::new(),
+            &vars,
+            &indexmap::IndexMap::new(),
+            &serde_json::json!({}),
+            &BTreeMap::new(),
+            &plan.inputs,
+        )
+    })?;
+    Ok(BuiltExpansion::Reusable {
+        caller_id,
+        jobs,
+        reusable_calls: expanded.reusable_calls,
+    })
+}
+
+/// Materialize a dynamic `needs`-driven matrix.
+///
+/// An expression that fails to parse, evaluate or expand is a workflow error
+/// and concludes the job as failed, exactly as GitHub does. Only a valid
+/// expression that yields no combinations is a skip, and that is signalled by
+/// an empty job list rather than by an error.
+fn build_matrix_expansion(
+    shared: &SharedState,
+    inputs: MatrixExpansionInputs,
+) -> Result<BuiltExpansion, ExecutionStatus> {
+    let MatrixExpansionInputs {
+        ctx,
+        node_id,
+        base_id,
+        expression,
+        needs_outputs,
+    } = inputs;
+    let run_id = ctx.run_id;
+    let workflow = aksh_gha_parser::parse_workflow(&ctx.submission.workflow_yaml).map_err(|error| {
+        tracing::warn!(%run_id, job = %node_id, %error, "workflow re-parse failed for dynamic matrix");
+        ExecutionStatus::Failure
+    })?;
+    let plans = aksh_gha_parser::expand_deferred_matrix_job(
+        &workflow,
+        &base_id,
+        &expression,
+        &needs_outputs,
+        Some(&ctx.submission.inputs),
+    )
+    .map_err(|error| {
+        tracing::warn!(%run_id, job = %node_id, %error, "dynamic matrix expansion failed");
+        ExecutionStatus::Failure
+    })?;
+
+    let github_json = ctx.github_json.clone();
+    let vars = ctx.submission.vars.clone();
+    let submission_inputs = ctx.submission.inputs.clone();
+    let jobs = build_jobs(shared, &ctx, &plans, |plan, secrets| {
+        aksh_gha_parser::eval::build_context(
+            &github_json,
+            &BTreeMap::new(),
+            &vars,
+            &plan
+                .matrix
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            &serde_json::json!({}),
+            secrets,
+            &submission_inputs,
+        )
+    })?;
+    Ok(BuiltExpansion::Matrix { jobs })
+}
+
+/// Insert correlation records and run bookkeeping for freshly built inner
+/// jobs, returning the queue entries to hand back to the scheduler.
+fn register_expanded_jobs(
+    inner: &mut InnerState,
+    run_id: RunId,
+    jobs: Vec<BuiltJob>,
+) -> Vec<QueuedJob> {
+    let mut queued = Vec::with_capacity(jobs.len());
+    for BuiltJob {
+        plan,
+        condition_context,
+        artifacts,
+    } in jobs
+    {
+        let job_request = artifacts.job_request;
+        inner
+            .id_token_grants
+            .insert((run_id, plan.id.clone()), artifacts.id_token_granted);
+        inner
+            .oidc_job_contexts
+            .insert((run_id, plan.id.clone()), artifacts.oidc_ctx);
+        inner
+            .inflight_requests
+            .insert(job_request.request_id, (run_id, plan.id.clone()));
+        inner
+            .plan_requests
+            .insert(job_request.plan_id.clone(), job_request.request_id);
+        inner
+            .agent_job_requests
+            .insert(job_request.agent_job_id, job_request.request_id);
+        inner
+            .timeline_requests
+            .insert(job_request.timeline_id, job_request.request_id);
+        if let Some(request) = artifacts.github_token_request {
+            inner
+                .github_token_requests
+                .insert(job_request.request_id, request);
+        }
+        inner
+            .job_requests
+            .insert(job_request.request_id, job_request);
+
+        if let Some(run) = inner.runs.get_mut(&run_id) {
+            // Same flavor as submission for needs-waiting jobs (`Queued`,
+            // parked in pending_jobs): `Pending` is reserved for
+            // concurrency-blocked work.
+            run.jobs.insert(plan.id.clone(), ExecutionStatus::Queued);
+            run.job_base_ids
+                .insert(plan.id.clone(), plan.base_id.clone());
+            run.job_needs.insert(plan.id.clone(), plan.needs.clone());
+            run.job_fail_fast
+                .insert(plan.base_id.clone(), plan.fail_fast);
+            run.job_continue_on_error
+                .insert(plan.id.to_string(), plan.continue_on_error);
+            run.job_names.insert(plan.id.clone(), plan.name.clone());
+            if plan.reusable_call.is_some() {
+                run.caller_plans.insert(plan.id.clone(), plan.clone());
+            }
+        }
+
+        queued.push(QueuedJob {
+            run_id,
+            job_id: plan.id.clone(),
+            base_id: plan.base_id.clone(),
+            needs: plan.needs.clone(),
+            if_condition: plan.if_condition.clone(),
+            condition_context,
+            max_parallel: plan.max_parallel,
+            runs_on: plan.runs_on.clone(),
+            runner_group: plan.runner_group.clone(),
+            message: artifacts.agent_msg,
+            concurrency: concurrency::concurrency_from_plan_fields(
+                plan.concurrency_group.as_deref(),
+                plan.concurrency_cancel_in_progress.as_deref(),
+                plan.concurrency_queue.as_deref(),
+            ),
+            matrix: plan
+                .matrix
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            deferred_matrix: plan.deferred_matrix.clone(),
+            reusable_call: plan.reusable_call.clone(),
+        });
+    }
+    queued
+}
+
+/// Conclude a node whose subtree could not be built.
+///
+/// The JobSet gates were acquired before the build started, so they are
+/// released here: nothing else will, and a leaked gate blocks every other run
+/// in the same concurrency group.
+fn fail_expansion_node(
+    inner: &mut InnerState,
+    run_id: RunId,
+    node_id: &JobId,
+    status: ExecutionStatus,
+    outcome: &mut SchedulingOutcome,
+) {
+    if let Some(run) = inner.runs.get_mut(&run_id) {
+        run.jobs.insert(node_id.clone(), status);
+        run.status = summarize_run(run.jobs.values().copied());
+        finalize_run_if_complete(run);
+    }
+    release_concurrency_for_job(inner, run_id, node_id);
+    outcome.failed.push((run_id, node_id.clone()));
+}
+
+/// Fold a built subtree back into the run, under a freshly taken lock.
+fn apply_expansion(
+    inner: &mut InnerState,
+    job: QueuedJob,
+    built: Result<BuiltExpansion, ExecutionStatus>,
+    outcome: &mut SchedulingOutcome,
+) -> Vec<QueuedJob> {
+    let run_id = job.run_id;
+    let node_id = job.job_id;
+    // The reservation is the proof this expansion is still wanted. Cancellation
+    // drops it, so a build that finished after the run was cancelled must not
+    // resurrect the subtree.
+    if !inner.expanding.remove(&(run_id, node_id.clone())) {
+        return Vec::new();
+    }
+    let built = match built {
+        Ok(built) => built,
+        Err(status) => {
+            fail_expansion_node(inner, run_id, &node_id, status, outcome);
+            return Vec::new();
+        }
+    };
+    match built {
+        BuiltExpansion::Matrix { jobs } if jobs.is_empty() => {
+            if let Some(run) = inner.runs.get_mut(&run_id) {
+                run.jobs.insert(node_id.clone(), ExecutionStatus::Skipped);
+                run.status = summarize_run(run.jobs.values().copied());
+                finalize_run_if_complete(run);
+            }
+            outcome.skipped.push((run_id, node_id));
+            Vec::new()
+        }
+        BuiltExpansion::Matrix { jobs } => {
+            let queued = register_expanded_jobs(inner, run_id, jobs);
+            if let Some(run) = inner.runs.get_mut(&run_id) {
+                // The placeholder is replaced by its combinations; GitHub shows
+                // the fan-out, never the node that produced it.
+                run.jobs.remove(&node_id);
+                run.job_base_ids.remove(&node_id);
+                run.job_needs.remove(&node_id);
+                run.status = summarize_run(run.jobs.values().copied());
+            }
+            queued
+        }
+        BuiltExpansion::Reusable {
+            caller_id,
+            jobs,
+            reusable_calls,
+        } => {
+            let inner_ids: Vec<String> = jobs.iter().map(|job| job.plan.id.0.clone()).collect();
+            let queued = register_expanded_jobs(inner, run_id, jobs);
+            if let Some(run) = inner.runs.get_mut(&run_id) {
+                if let Some(meta) = run.reusable_calls.get_mut(&caller_id.0) {
+                    meta.inner_job_ids = inner_ids;
+                }
+                run.reusable_calls.extend(reusable_calls);
+                run.jobs.insert(caller_id, ExecutionStatus::InProgress);
+                if run.started_at.is_none() {
+                    run.started_at = Some(chrono::Utc::now());
+                }
+                run.status = summarize_run(run.jobs.values().copied());
+            }
+            queued
+        }
+    }
+}
+
+/// Build and apply every deferred subtree, then keep promoting until the
+/// scheduler is quiet.
+///
+/// The build phase deliberately runs with the global lock released: it parses
+/// workflow YAML and constructs a runner message plus a runtime token per
+/// inner job, which scales with the width of the callee matrix. Holding the
+/// mutex across that stalls every other request.
+pub(crate) async fn drain_expansions(shared: &SharedState) -> SchedulingOutcome {
+    let mut outcome = SchedulingOutcome::default();
+    loop {
+        // Phase 1 (locked): claim one node and snapshot its inputs.
+        let (job, plan) = {
+            let mut inner = shared.state.inner.lock().await;
+            let Some(job) = inner.pending_expansions.pop_front() else {
+                return outcome;
+            };
+            let plan = plan_expansion(&inner, &job);
+            (job, plan)
+        };
+
+        // Phase 2 (unlocked): the expensive part.
+        let built = match plan {
+            Some(plan) => build_expansion(shared, plan),
+            None => {
+                tracing::warn!(
+                    run_id = %job.run_id,
+                    job = %job.job_id,
+                    "expansion inputs vanished before build"
+                );
+                Err(ExecutionStatus::Failure)
+            }
+        };
+
+        // Phase 3 (locked): apply, then promote whatever the subtree unblocked.
+        let mut inner = shared.state.inner.lock().await;
+        let ready = apply_expansion(&mut inner, job, built, &mut outcome);
+        inner.pending_jobs.extend(ready);
+        let promoted = promote_ready_jobs(&mut inner);
+        outcome.merge(promoted);
+        shared
+            .state
+            .queue_depth
+            .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
+    }
 }
 
 pub(crate) fn aggregate_need_status(statuses: &[ExecutionStatus]) -> Option<ExecutionStatus> {
@@ -1069,6 +1953,25 @@ pub(crate) fn status_string(status: ExecutionStatus) -> String {
         ExecutionStatus::Cancelled => "cancelled",
     }
     .to_owned()
+}
+
+/// Stamp completion metadata once every job is terminal. Job completions via
+/// the broker/results path do this in `complete_job_inner`; runs whose last
+/// transitions happen inside the scheduler (gated callers skipping, expansion
+/// failures) need it here too.
+pub(crate) fn finalize_run_if_complete(run: &mut RunRecord) {
+    if matches!(
+        run.status,
+        ExecutionStatus::Success
+            | ExecutionStatus::Failure
+            | ExecutionStatus::Cancelled
+            | ExecutionStatus::Skipped
+    ) && run.completed_at.is_none()
+        && run.jobs.values().all(|status| status.is_terminal())
+    {
+        run.completed_at = Some(chrono::Utc::now());
+        run.conclusion = Some(status_string(run.status));
+    }
 }
 
 pub(crate) fn summarize_run(statuses: impl Iterator<Item = ExecutionStatus>) -> ExecutionStatus {
