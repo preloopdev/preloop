@@ -1099,6 +1099,25 @@ pub(crate) async fn submit_run_inner(
                 continue;
             }
 
+            // No runner host for this platform: skip rather than queue a job
+            // nothing can ever claim. Checked here, before the job reaches
+            // either the ready queue or `pending_jobs`, so a needs-gated job
+            // on an unhostable platform is skipped too and its dependents see
+            // a terminal status.
+            let platforms = runtime_scheduling::registered_runner_platforms(&inner);
+            if let Some(platform) =
+                runtime_scheduling::unhostable_platform(&queued_job.runs_on, platforms)
+            {
+                tracing::warn!(
+                    job = %job_id.0,
+                    labels = ?queued_job.runs_on,
+                    platform,
+                    "no {platform} runner is registered; skipping the job"
+                );
+                statuses.insert(job_id, ExecutionStatus::Skipped);
+                continue;
+            }
+
             let needs_empty = queued_job.needs.is_empty();
             let max_parallel = queued_job.max_parallel;
             let under_mp = max_parallel
