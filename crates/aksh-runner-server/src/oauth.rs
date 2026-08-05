@@ -9,13 +9,22 @@ pub(crate) async fn github_registration_token(
     headers: axum::http::HeaderMap,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // The runner sends `Authorization: RemoteAuth <token>`
+    // The runner sends `Authorization: RemoteAuth <token>`. That token is the
+    // system credential: the pool injects it into the configure invocation
+    // when it provisions a machine. Nothing in a job's environment carries it,
+    // so a request that reaches this route — through the mounted control
+    // socket or the TCP surface — must prove it. Accepting any bearer would
+    // let untrusted workflow code mint a RunnerManage JWT and register a
+    // rogue runner against the control plane.
     let auth = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if !auth.starts_with("RemoteAuth ") && !auth.starts_with("Bearer ") {
-        return Err(ApiError::unauthorized("missing Authorization header"));
+    let provided = auth
+        .strip_prefix("RemoteAuth ")
+        .or_else(|| auth.strip_prefix("Bearer "));
+    if provided != Some(shared.state.system_token.as_str()) {
+        return Err(ApiError::unauthorized("invalid registration credential"));
     }
 
     let token = shared.state.local_jwt(json!({
