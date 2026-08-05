@@ -59,6 +59,75 @@ fn snapshot_origin_rewrite_routes_hardcoded_forge_urls_to_the_snapshot() {
 }
 
 #[test]
+fn runtime_token_authenticates_direct_github_fetches() {
+    // `actions/checkout` only persists credentials when
+    // `persist-credentials` is set; hardcoded fetches (cargo-dist, submodule
+    // updates) need the github.com header unconditionally, exactly like
+    // GitHub-hosted runners provide it. The header rides in GIT_CONFIG_COUNT
+    // env so nothing is written to disk.
+    let mut job = JobContext::new(
+        "j1".into(),
+        "Test".into(),
+        serde_json::json!({}),
+        serde_json::json!({ "github": { "repository": "openclaw/openclaw" } }),
+    );
+    let msg = serde_json::json!({
+        "contextData": {
+            "github": {
+                "token": "gho_runtime-token",
+                "repository": "openclaw/openclaw"
+            }
+        }
+    });
+
+    inject_github_env(&mut job, &msg);
+
+    assert_eq!(
+        job.env.get("GIT_CONFIG_COUNT").map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(
+        job.env.get("GIT_CONFIG_KEY_0").map(String::as_str),
+        Some("http.https://github.com/.extraheader")
+    );
+    // base64("x-access-token:gho_runtime-token")
+    assert_eq!(
+        job.env.get("GIT_CONFIG_VALUE_0").map(String::as_str),
+        Some("AUTHORIZATION: basic eC1hY2Nlc3MtdG9rZW46Z2hvX3J1bnRpbWUtdG9rZW4=")
+    );
+}
+
+#[test]
+fn github_header_coexists_with_snapshot_rewrite() {
+    let mut job = JobContext::new(
+        "j1".into(),
+        "Test".into(),
+        serde_json::json!({}),
+        serde_json::json!({ "github": { "repository": "openclaw/openclaw" } }),
+    );
+    let msg = serde_json::json!({
+        "contextData": { "github": { "token": "gho_t", "repository": "openclaw/openclaw" } },
+        "akshSnapshotOriginRewrite": {
+            "snapshotUrl": "http://127.0.0.1:9091/snapshots/run-1",
+            "forgeUrl": "https://github.com/openclaw/openclaw",
+            "authHeader": "AUTHORIZATION: basic dG9rZW4="
+        }
+    });
+
+    inject_github_env(&mut job, &msg);
+
+    // 3 rewrite entries + 1 github.com header.
+    assert_eq!(
+        job.env.get("GIT_CONFIG_COUNT").map(String::as_str),
+        Some("4")
+    );
+    assert_eq!(
+        job.env.get("GIT_CONFIG_KEY_3").map(String::as_str),
+        Some("http.https://github.com/.extraheader")
+    );
+}
+
+#[test]
 fn setup_workspace_clears_stale_repository() {
     // A previous job left a checked-out repo in the workspace (the failure
     // mode behind "remote origin already exists" on long-lived runners).
