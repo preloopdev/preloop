@@ -1063,11 +1063,33 @@ pub(crate) fn ancestor_statuses(run: &RunRecord, job: &QueuedJob) -> Vec<Executi
     statuses
 }
 
+/// The OS a GitHub-hosted image label names, if it names one.
+fn hosted_label_os(required: &str) -> Option<&'static str> {
+    if required.starts_with("ubuntu") {
+        Some("linux")
+    } else if required.starts_with("macos") {
+        Some("macos")
+    } else if required.starts_with("windows") {
+        Some("windows")
+    } else {
+        None
+    }
+}
+
 /// Check if a job's `runs-on` labels match a runner's registered labels.
 ///
 /// A job matches when every label in the job's `runs-on` is present in the
-/// runner's label set (case-insensitive). GitHub-hosted runner labels like
-/// Match required labels against a runner's labels.
+/// runner's label set (case-insensitive). A GitHub-hosted image label
+/// (`ubuntu-latest`, `macos-14`, `windows-latest`) additionally matches a
+/// self-hosted runner of the same OS, so a workflow written for hosted
+/// runners runs unmodified here.
+///
+/// That stand-in never crosses operating systems: the official service would
+/// never put an `ubuntu-latest` job on a macOS runner, and doing so is worse
+/// than leaving the job queued — the job fails deep inside a step on a
+/// platform its workflow never targeted (a mac host claiming tokio's
+/// Linux-only `taskdump` build, say). A runner that declares no OS label at
+/// all stays eligible for any of them: it has told us nothing to contradict.
 pub(crate) fn job_matches_runner(job_labels: &[String], runner_labels: &[String]) -> bool {
     if job_labels.is_empty() {
         return true;
@@ -1078,22 +1100,21 @@ pub(crate) fn job_matches_runner(job_labels: &[String], runner_labels: &[String]
     }
     let runner_set: std::collections::HashSet<String> =
         runner_labels.iter().map(|l| l.to_lowercase()).collect();
+    let runner_os = ["linux", "macos", "windows"]
+        .into_iter()
+        .find(|os| runner_set.contains(*os));
     job_labels.iter().all(|required| {
         let req = required.to_lowercase();
         if runner_set.contains(&req) {
             return true;
         }
-        if req.starts_with("ubuntu") && runner_set.contains("linux") {
-            return true;
+        let Some(required_os) = hosted_label_os(&req) else {
+            return false;
+        };
+        match runner_os {
+            Some(os) => os == required_os,
+            None => runner_set.contains("self-hosted"),
         }
-        if req.starts_with("macos") && runner_set.contains("macos") {
-            return true;
-        }
-        if req.starts_with("windows") && runner_set.contains("windows") {
-            return true;
-        }
-        runner_set.contains("self-hosted")
-            && (req.starts_with("ubuntu") || req.starts_with("macos") || req.starts_with("windows"))
     })
 }
 
