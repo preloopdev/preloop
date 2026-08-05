@@ -48,6 +48,13 @@ jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:
     runs-on: "ubuntu-22.04"
+    # The engine mints a GitHub App token per job; an undeclared
+    # permissions block would request the broad default set (contents:
+    # write), which the App installation does not grant — the job then
+    # falls back to a local JWT and every git fetch 401s. The plan only
+    # checks out and reads the repo, so contents: read is exact.
+    permissions:
+      contents: read
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
       tag: ${{ !github.event.pull_request && github.ref_name || '' }}
@@ -58,7 +65,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          persist-credentials: false
+          # Persist the runtime token into the repo config (GitHub-hosted
+          # default): the non-persist path's temp-HOME global config does
+          # not authenticate through the aksh runner's exec environment.
           submodules: recursive
       - name: Install dist
         # we specify bash to get pipefail; it guards against the `curl` command
