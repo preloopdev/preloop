@@ -74,6 +74,12 @@ pub async fn flush_step_updates(rpt: &ReportingContext, queue: &Arc<Mutex<Server
 
     if published {
         queue.lock().await.mark_steps_published(generation);
+    } else {
+        // MC-S5: take_steps_update_body cleared dirty_keys, so a failed
+        // publish would otherwise lose these transitions forever — a
+        // terminal step never receives another queue_update. Re-dirty the
+        // taken steps so the next flush retries them.
+        queue.lock().await.requeue_steps(&body.steps);
     }
 }
 

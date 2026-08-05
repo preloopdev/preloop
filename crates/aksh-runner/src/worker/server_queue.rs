@@ -191,6 +191,19 @@ impl ServerQueue {
         self.published_generation = self.published_generation.max(generation);
     }
 
+    /// Re-queue steps that were taken but never published (the POST failed).
+    ///
+    /// `take_steps_update_body` clears `dirty_keys` at take time; if the
+    /// publish fails and nothing re-dirties the steps, the transitions are
+    /// lost forever — a step in a terminal state never receives another
+    /// `queue_update` (MC-S5). The generation already differs from the
+    /// published one, so the next take re-collects these steps.
+    pub fn requeue_steps(&mut self, steps: &[StepUpdate]) {
+        for step in steps {
+            self.dirty_keys.insert(step.external_id.clone());
+        }
+    }
+
     /// Take all pending logs (drains the queue).
     pub fn take_logs(&mut self) -> HashMap<String, Vec<String>> {
         std::mem::take(&mut self.pending_logs)
@@ -288,6 +301,41 @@ mod tests {
         assert!(json.get("change_order").is_some());
         assert!(json.get("workflow_job_run_backend_id").is_some());
         assert!(json.get("workflow_run_backend_id").is_some());
+    }
+
+    #[test]
+    fn failed_publish_requeues_taken_steps() {
+        // MC-S5: take clears dirty_keys; a failed publish must re-dirty the
+        // taken steps or a terminal transition is lost forever (a terminal
+        // step never receives another queue_update).
+        let mut q = ServerQueue::new("job-1".into(), "plan-1".into());
+        q.queue_update(StepUpdate {
+            external_id: "step-uuid-1".into(),
+            number: 1,
+            name: "Set up job".into(),
+            status: step_status::COMPLETED,
+            started_at: Some("2024-01-01T00:00:00Z".into()),
+            completed_at: Some("2024-01-01T00:00:01Z".into()),
+            conclusion: step_conclusion::SUCCEEDED,
+        });
+
+        let (body, generation) = q.take_steps_update_body().unwrap();
+        assert_eq!(body.steps.len(), 1);
+        // Publish fails: the runner does NOT mark the generation published.
+        q.requeue_steps(&body.steps);
+
+        // The next take must re-collect the same transition.
+        let (body2, generation2) = q.take_steps_update_body().unwrap();
+        assert_eq!(body2.steps.len(), 1, "requeued step must be re-taken");
+        assert_eq!(body2.steps[0].external_id, "step-uuid-1");
+        assert_eq!(body2.steps[0].status, step_status::COMPLETED);
+        assert_eq!(body2.steps[0].conclusion, step_conclusion::SUCCEEDED);
+        assert_eq!(generation2, generation, "generation must not regress");
+
+        // And it is still not published until the transport confirms.
+        assert!(q.has_pending());
+        q.mark_steps_published(generation2);
+        assert!(!q.has_pending());
     }
 
     #[test]
