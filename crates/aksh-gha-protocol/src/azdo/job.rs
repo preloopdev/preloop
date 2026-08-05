@@ -594,10 +594,10 @@ pub(crate) fn template_string_token(value: &str) -> serde_json::Value {
     let mut rest = value;
     loop {
         let Some(start) = rest.find("${{") else {
-            literal.push_str(rest);
+            literal.push_str(&escape_format_literal(rest));
             break;
         };
-        literal.push_str(&rest[..start]);
+        literal.push_str(&escape_format_literal(&rest[..start]));
         let after = &rest[start + 3..];
         let Some(end) = find_expression_end(after) else {
             return serde_json::json!({"type": 0, "lit": value});
@@ -609,9 +609,29 @@ pub(crate) fn template_string_token(value: &str) -> serde_json::Value {
     if first == 0 && literal == "{0}" && expressions.len() == 1 {
         return serde_json::json!({"type": 3, "expr": expressions[0]});
     }
-    let escaped = literal.replace('\'', "''");
-    let expr = format!("format('{}', {})", escaped, expressions.join(", "));
+    let expr = format!("format('{}', {})", literal, expressions.join(", "));
     serde_json::json!({"type": 3, "expr": expr})
+}
+
+/// Escape a literal format-string segment: `'` -> `''`, `{` -> `{{`,
+/// `}` -> `}}`.
+///
+/// MC-S6: this must match the parser copy
+/// (`aksh-gha-parser/src/job_builder.rs` `append_format_literal`); the
+/// official runner's `format()` throws `InvalidFormatString` on an unescaped
+/// lone `{`/`}`, so any template mixing a literal brace with an expression
+/// broke on dispatch through this copy.
+fn escape_format_literal(literal: &str) -> String {
+    let mut escaped = String::with_capacity(literal.len());
+    for character in literal.chars() {
+        match character {
+            '\'' => escaped.push_str("''"),
+            '{' => escaped.push_str("{{"),
+            '}' => escaped.push_str("}}"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
 }
 
 /// Find the position of `}}` that closes a `${{ ... }}` expression,
