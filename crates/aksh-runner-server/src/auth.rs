@@ -183,6 +183,21 @@ fn replay_ticket_payload(path: &str) -> String {
     format!("replay-blob\n{path}")
 }
 
+/// Marker extension: the request arrived through the mounted control socket.
+///
+/// Handlers use it to distinguish the untrusted VM surface from the operator's
+/// TCP surface. Workflow code inside a runner VM can reach the socket, so a
+/// handler that mints anything (e.g. runner-management JWTs) may require a
+/// stronger credential there than on TCP, where GitHub-compatible clients
+/// (official runner, conformance replays) present credentials only they hold.
+pub(crate) struct SocketSurface;
+
+impl Clone for SocketSurface {
+    fn clone(&self) -> Self {
+        SocketSurface
+    }
+}
+
 /// Whether a caller may mint replay blob URLs for this exact plan/job pair.
 ///
 /// The engine token may mint for any job (it is the administrator credential).
@@ -307,7 +322,7 @@ pub(crate) fn effective_claim_runner(
 /// refused there. Native management and GUI API prefixes have no legitimate
 /// use from a guest.
 pub(crate) async fn runner_surface_only(
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
     const DENIED_PREFIXES: &[&str] = &["/internal/", "/runs/"];
@@ -337,6 +352,7 @@ pub(crate) async fn runner_surface_only(
             "{path} not available on this endpoint"
         )));
     }
+    request.extensions_mut().insert(SocketSurface);
     Ok(next.run(request).await)
 }
 
