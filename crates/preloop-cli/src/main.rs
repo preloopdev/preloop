@@ -146,6 +146,14 @@ struct BuildGoldenArgs {
     #[arg(long)]
     runner_bundle: PathBuf,
 
+    /// Workspace to detect toolchains from (rust-toolchain.toml, .nvmrc, …).
+    /// Defaults to the current directory, so the release-golden workflow —
+    /// which runs from the repo checkout — bakes the project's toolchains
+    /// into the artifact. Without them every fork of the packed golden
+    /// reinstalls rust per job.
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+
     /// Destination path for the packed artifact.
     #[arg(long)]
     output: PathBuf,
@@ -359,7 +367,7 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         use_packed_artifact: false,
         name_prefix: "preloop-release-golden".into(),
         base_image: args.base_image,
-        workspace: None,
+        workspace: args.workspace.or_else(|| std::env::current_dir().ok()),
         artifact_stem: output.clone(),
         runner_bundle,
         externals_dir: std::env::var_os("PRELOOP_RUNNER_EXTERNALS")
@@ -1796,6 +1804,59 @@ mod tests {
         unsafe {
             std::env::remove_var("PRELOOP_RUNNER_BUNDLE");
         }
+    }
+
+    #[test]
+    fn packed_artifact_cache_key_tracks_base_image_digest() {
+        let home = tempfile::tempdir().unwrap();
+        let bundle = tempfile::tempdir().unwrap();
+        std::fs::write(
+            bundle.path().join("preloop-runner"),
+            [0x7f, b'E', b'L', b'F'],
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var("PRELOOP_RUNNER_BUNDLE", bundle.path());
+        }
+        let queue_depth = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let next_job_runs_on =
+            std::sync::Arc::new(std::sync::RwLock::new(vec!["ubuntu-latest".to_owned()]));
+        let stem = |digest: &str| {
+            unsafe {
+                std::env::set_var(
+                    "PRELOOP_RUNNER_BASE_IMAGE",
+                    format!("ubuntu:24.04@sha256:{digest}"),
+                );
+            }
+            let config = local_runner_pool_config(
+                home.path(),
+                "http://127.0.0.1:9090".to_owned(),
+                None,
+                None,
+                queue_depth.clone(),
+                next_job_runs_on.clone(),
+                false,
+                std::sync::Arc::new(std::sync::RwLock::new(std::collections::BTreeMap::new())),
+            )
+            .unwrap();
+            unsafe {
+                std::env::remove_var("PRELOOP_RUNNER_BASE_IMAGE");
+            }
+            config.artifact_stem
+        };
+        let first = stem("aaaa");
+        let second = stem("bbbb");
+        unsafe {
+            std::env::remove_var("PRELOOP_RUNNER_BUNDLE");
+        }
+        assert_ne!(
+            first, second,
+            "a digest bump must invalidate the packed golden cache key (stale golden reuse)"
+        );
+        assert!(
+            first.to_string_lossy().contains("ubuntu"),
+            "the cache key should still name the base image: {first:?}"
+        );
     }
 
     #[test]
