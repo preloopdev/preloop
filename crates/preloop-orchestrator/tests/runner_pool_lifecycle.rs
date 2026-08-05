@@ -332,6 +332,7 @@ impl Fixture {
             workspace: None,
             artifact_stem,
             runner_bundle: bundle,
+            externals_dir: PathBuf::from("/tmp/test-externals"),
             runner_binary_name: "preloop-runner".to_owned(),
             server_url: "https://preloop.example".to_owned(),
             control_origin: None,
@@ -597,6 +598,13 @@ async fn runner_keeps_public_only_egress_and_wires_control_socket_and_environmen
             VolumeMount {
                 host: fixture.root.join("runner-bundle"),
                 guest: PathBuf::from("/opt/preloop/bin"),
+                read_only: true,
+            },
+            VolumeMount {
+                // Node externals are mounted host-side, never baked into the
+                // machine image or downloaded per runner.
+                host: PathBuf::from("/tmp/test-externals/externals"),
+                guest: PathBuf::from("/var/lib/preloop-runner/externals"),
                 read_only: true,
             },
             VolumeMount {
