@@ -68,6 +68,14 @@ fn runner_volumes(config: &RunnerPoolConfig, machine: &MachineName) -> Vec<Volum
         guest: PathBuf::from("/opt/preloop/bin"),
         read_only: true,
     }];
+    // The Node externals are shared host-side, mounted read-only into every
+    // machine — never baked into a machine image nor downloaded per runner
+    // (that is what the `--no-externals` configure flag enforces).
+    volumes.push(VolumeMount {
+        host: config.externals_dir.join("externals"),
+        guest: PathBuf::from(RUNNER_ROOT).join("externals"),
+        read_only: true,
+    });
     if let Some(host) = control_bridge_dir(config) {
         // Per-machine target: the guest agent's mounted-socket bridge binds
         // its listener INTO the mounted directory through virtiofs, and the
@@ -85,6 +93,49 @@ fn runner_volumes(config: &RunnerPoolConfig, machine: &MachineName) -> Vec<Volum
         });
     }
     volumes
+}
+
+/// Populate the host-side externals directory once, so every VM can mount
+/// `node20`/`node24` instead of baking or downloading them per machine.
+///
+/// Reuses the same shell routine the golden bake used — it is pure
+/// `curl | tar` plus an atomic temp-dir publish, so it runs identically on
+/// the host. Skips when the external is already present, so a concurrent
+/// engine start or an operator-provided directory is left untouched.
+fn ensure_host_externals(config: &RunnerPoolConfig) -> Result<(), OrchestratorError> {
+    let externals = config.externals_dir.join("externals");
+    if externals.join("node24").join("bin").join("node").is_file() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(&externals).map_err(|error| {
+        OrchestratorError::Config(format!(
+            "failed to create externals directory {}: {error}",
+            externals.display()
+        ))
+    })?;
+    for command in node_externals_at(config.externals_dir.to_string_lossy().as_ref()) {
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command[2])
+            .status()
+            .map_err(|error| {
+                OrchestratorError::Config(format!(
+                    "failed to spawn host externals install: {error}"
+                ))
+            })?;
+        if !status.success() {
+            return Err(OrchestratorError::Config(
+                "host node externals install failed; \
+                 check network egress to nodejs.org"
+                    .to_owned(),
+            ));
+        }
+    }
+    info!(
+        path = %externals.display(),
+        "Node externals installed on host; mounting into runners"
+    );
+    Ok(())
 }
 async fn download_prebaked_golden(payload: &Path) -> bool {
     let default_url = format!(
@@ -294,10 +345,6 @@ fn node_externals_at(runner_root: &str) -> Vec<Vec<String>> {
     .collect()
 }
 
-fn node_externals() -> Vec<Vec<String>> {
-    node_externals_at(RUNNER_ROOT)
-}
-
 /// The guest bootstrap script, one shell round trip.
 ///
 /// Every `exec` is a host process spawn plus a vsock round trip, and this runs
@@ -412,17 +459,9 @@ async fn install_base_dependencies<P: VmProvider>(
             )));
         }
     }
-    for command in node_externals() {
-        let output = provider.exec(name, &command).await?;
-        if output.exit_code != 0 {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(OrchestratorError::Config(format!(
-                "node externals install failed (exit {}): {}",
-                output.exit_code,
-                stderr.lines().last().unwrap_or("unknown error")
-            )));
-        }
-    }
+    // Node externals are no longer baked: they arrive via the read-only
+    // host mount (`ensure_host_externals` + `runner_volumes`), which keeps
+    // the golden pack and every machine image lean.
     Ok(())
 }
 
@@ -554,6 +593,13 @@ pub struct RunnerPoolConfig {
     pub artifact_stem: PathBuf,
     /// Host directory containing the Linux `preloop-runner` executable.
     pub runner_bundle: PathBuf,
+    /// Host directory holding the Node externals shared with every VM.
+    ///
+    /// Populated once on the host (`node20`/`node24` downloaded from
+    /// nodejs.org), then mounted read-only into every machine at the runner
+    /// root's `externals`. Keeps the golden pack small: externals are never
+    /// baked into a machine image or downloaded per runner.
+    pub externals_dir: PathBuf,
     /// Runner executable filename within `runner_bundle`.
     pub runner_binary_name: String,
     /// Guest-visible control-plane URL.
@@ -979,6 +1025,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
 
     /// Prepare the immutable runner image once, then supervise all slots until cancellation.
     pub async fn run(&self, shutdown: CancellationToken) -> Result<(), OrchestratorError> {
+        ensure_host_externals(&self.config)?;
         if self.config.use_packed_artifact || self.config.control_socket.is_none() {
             self.prepare_artifact(true).await?;
         }
@@ -2464,6 +2511,7 @@ chmod +x "$destination/bin/node"
             workspace: None,
             artifact_stem: PathBuf::from("/tmp/lifecycle-artifact"),
             runner_bundle: PathBuf::from("/tmp"),
+            externals_dir: PathBuf::from("/tmp/lifecycle-externals"),
             runner_binary_name: "runner".to_owned(),
             server_url: "https://runner.test".to_owned(),
             control_origin: None,
