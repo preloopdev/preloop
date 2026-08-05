@@ -33,5 +33,4 @@ jobs:
 # The deep profile (official runner + pre-packed smolVM machines on the
 # dedicated macOS host) is temporarily removed: no macOS executor is deployed
 # right now, so the job would queue forever on every PR. Restore from git
-# history once a `[self-hosted, macOS, ARM64, smolvm-host]` host exists.            benchmarks/compatibility/server/protocol/captures/**
-          if-no-files-found: error
+# history once a `[self-hosted, macOS, ARM64, smolvm-host]` host exists.
