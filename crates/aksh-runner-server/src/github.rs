@@ -127,9 +127,23 @@ async fn resolve_check_run_token(shared: &Arc<SharedState>, repo: &str) -> Optio
     if let Some(app_creds) = &shared.state.github_app {
         let mut permissions = std::collections::BTreeMap::new();
         permissions.insert("checks".to_owned(), "write".to_owned());
-        if let Ok(token) = crate::github_app::get_or_mint_token(app_creds, repo, &permissions).await
-        {
-            return Some(token);
+        // The App mint intermittently 422s while the installation grants are
+        // being read; a single retry keeps a transient rejection from
+        // stranding the check run in `queued` (the fallback JWT cannot
+        // PATCH check runs and GitHub keeps showing them pending).
+        for attempt in 0..2 {
+            match crate::github_app::get_or_mint_token(app_creds, repo, &permissions).await {
+                Ok(token) => return Some(token),
+                Err(error) if attempt == 0 => {
+                    tracing::warn!(
+                        %repo,
+                        %error,
+                        "check run token mint failed; retrying once"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                Err(_) => break,
+            }
         }
     }
     std::env::var("AKSH_GITHUB_TOKEN").ok()
