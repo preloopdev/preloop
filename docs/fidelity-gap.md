@@ -344,8 +344,18 @@ workflow. All are fixed:
 
 ### 1b.4 Still open
 
-- **Non-Linux cells.** Windows and FreeBSD cells (`uv`, `tokio`) have no runner
-  host here; macOS cells run on the host runner only.
+- **Non-Linux cells are skipped, not queued.** The microVM pool builds Linux
+  guests only; macOS needs a `preloop-runner` on a Mac registered against the
+  control plane, and Windows has no host at all. GitHub would leave such a job
+  queued until it times out; we mark it `skipped` at submit so the run
+  finishes, dependents skip, and the reason lands in the log. A deliberate
+  divergence — an unclaimable job that reports nothing is worse than a visible
+  skip. The skip is conditional on *no* runner declaring that OS being
+  registered, so a Mac host serving `macos-latest` still runs the job.
+- **macOS and Windows image versions are not disambiguated.** `macos-13`
+  (x86_64), `macos-14`/`macos-15` (arm64) and every `windows-*` image are
+  distinct on GitHub; here any `macos-*` label matches whatever Mac is
+  registered. A workflow pinning `macos-13` for x86_64 gets an arm64 host.
 - **Nested virtualization.** tokio's io_uring jobs build a kernel and boot it
   under `qemu-system-x86_64`; uv's freebsd cell wants docker-in-docker plus
   `/dev/kvm`. Neither works inside a guest without nested KVM.
