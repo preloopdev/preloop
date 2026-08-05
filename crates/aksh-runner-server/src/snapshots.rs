@@ -1150,15 +1150,37 @@ async fn deepen_object_cache_from_remote(
     match run_git(&mut fetch, "deepen snapshot object cache").await {
         Ok(_) => !shallow_marker.is_file(),
         Err(error) => {
+            // The remote URL can embed a credential in its userinfo, and
+            // git's stderr echoes the URL it failed on verbatim. Scrub both
+            // before anything reaches the log.
+            let sanitized_url = sanitize_remote_url(&url);
+            let sanitized_error = format!("{error:?}").replace(&url, &sanitized_url);
             warn!(
-                error = ?error,
-                url = %url,
+                error = %sanitized_error,
+                url = %sanitized_url,
                 "could not deepen snapshot object cache from remote; \
                  snapshot will rewrite history and expose synthetic SHAs"
             );
             false
         }
     }
+}
+
+/// Strip userinfo credentials from a remote URL so a log never embeds them.
+///
+/// `https://user:token@github.com/owner/repo` becomes
+/// `https://github.com/owner/repo`. Schemeless (SSH) remotes carry no
+/// userinfo and are returned untouched.
+fn sanitize_remote_url(remote_url: &str) -> String {
+    let Some((scheme, rest)) = remote_url.split_once("://") else {
+        return remote_url.to_owned();
+    };
+    let (authority, suffix) = match rest.find('/') {
+        Some(index) => rest.split_at(index),
+        None => (rest, ""),
+    };
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    format!("{scheme}://{authority}{suffix}")
 }
 
 /// Extra-header config that authenticates a deepen fetch against the engine's
@@ -1364,18 +1386,37 @@ pub(crate) fn redirect_primary_checkout(
             .as_ref()
             .and_then(|reference| reference.name.as_deref())
             .is_some_and(|name| name.eq_ignore_ascii_case("actions/checkout"));
-        // A checkout whose `repository`/`ref`/`github-server-url` input is a
-        // literal, non-empty value points at a specific remote target and
-        // must not be rewritten. Empty values and template expressions (e.g.
-        // `ref: ${{ inputs.head-sha }}`) are GitHub's "default branch"
-        // semantics — the server never evaluates step expressions, and the
-        // snapshot IS the local default — so the redirect still applies.
-        // Skipping them sent the checkout to the real GitHub host, where the
-        // unauthenticated fetch failed.
+        // A checkout whose `repository`/`ref`/`github-server-url` input is
+        // provably absent or provably the action's declared default
+        // (`${{ github.repository }}` / `${{ github.server_url }}`) selects
+        // GitHub's "default branch" semantics — the snapshot IS the local
+        // default — so the redirect applies. Everything else is explicitly
+        // set: a literal points at a specific remote target, and an
+        // unresolved template expression (e.g. `ref: ${{ inputs.head-sha }}`)
+        // selects a target the workflow controls at runtime, which the server
+        // cannot prove is the default. Redirecting those hijacks the
+        // workflow's intended checkout once the runner evaluates them.
+        let declared_default = |name: &str| -> Option<&str> {
+            match name {
+                // actions/checkout's own action.yml defaults. `ref` declares
+                // no default, so no expression can be provably the default
+                // for it.
+                "repository" => Some("${{ github.repository }}"),
+                "github-server-url" => Some("${{ github.server_url }}"),
+                _ => None,
+            }
+        };
         let explicitly_set = |name: &str| {
             step.inputs.iter().any(|(key, value)| {
+                if !key.eq_ignore_ascii_case(name) {
+                    return false;
+                }
                 let value = value.as_str().trim();
-                key.eq_ignore_ascii_case(name) && !value.is_empty() && !value.contains("${{")
+                if value.is_empty() {
+                    return false;
+                }
+                !value.contains("${{")
+                    || declared_default(name).is_none_or(|default| value != default)
             })
         };
         if !is_checkout
@@ -1656,5 +1697,228 @@ mod auth_scoping_tests {
                 "PAT must not be attached to {url}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod deepen_and_redirect_tests {
+    use super::*;
+
+    /// A `Write` sink that records every byte, so a test can assert on what a
+    /// tracing subscriber actually emitted.
+    #[derive(Clone)]
+    struct RecordingWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for RecordingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn git_in(cwd: &FsPath, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .status()
+            .expect("git runs in tests");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// The deepen failure path must never write the remote's embedded
+    /// userinfo credential to the server log: the remote URL itself carries
+    /// it, and git's stderr echoes the URL verbatim.
+    #[tokio::test]
+    async fn deepen_failure_warning_never_logs_the_remote_credential() {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || RecordingWriter(sink.clone()))
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        git_in(&workspace, &["init", "-q", "-b", "main"]);
+        git_in(
+            &workspace,
+            &[
+                "config",
+                "remote.origin.url",
+                "https://user:super-secret-token@127.0.0.1:1/owner/repo.git",
+            ],
+        );
+        // A valid bare repository so the fetch is actually attempted: the
+        // connect to 127.0.0.1:1 is refused instantly (loopback, nothing
+        // listening), so the failure carries git's stderr, which echoes the
+        // credential-bearing URL.
+        let repository = temp.path().join("snapshot.git");
+        let status = std::process::Command::new("git")
+            .args(["init", "-q", "--bare"])
+            .arg(&repository)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let deepened = deepen_object_cache_from_remote(&repository, &workspace, None).await;
+        assert!(
+            !deepened,
+            "the deepen must fail against a refused connection"
+        );
+
+        let logs = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(
+            !logs.contains("super-secret-token"),
+            "remote credential leaked into the server log: {logs}"
+        );
+        assert!(
+            !logs.contains("user:"),
+            "userinfo leaked into the server log: {logs}"
+        );
+    }
+
+    #[test]
+    fn sanitize_remote_url_strips_userinfo_credentials() {
+        assert_eq!(
+            sanitize_remote_url("https://user:token@github.com/owner/repo.git"),
+            "https://github.com/owner/repo.git"
+        );
+        assert_eq!(
+            sanitize_remote_url("https://user@github.com"),
+            "https://github.com"
+        );
+        // Ports and paths survive; only the userinfo goes.
+        assert_eq!(
+            sanitize_remote_url("https://user:token@github.example:8443/owner/repo"),
+            "https://github.example:8443/owner/repo"
+        );
+        // An `@` inside the path is not userinfo.
+        assert_eq!(
+            sanitize_remote_url("https://user:token@github.com/owner/@releases/repo"),
+            "https://github.com/owner/@releases/repo"
+        );
+        // Schemeless (SSH) remotes carry no userinfo and are untouched.
+        assert_eq!(
+            sanitize_remote_url("git@github.com:owner/repo.git"),
+            "git@github.com:owner/repo.git"
+        );
+    }
+
+    fn checkout_message(
+        steps: serde_json::Value,
+    ) -> aksh_gha_protocol::azdo::AgentJobRequestMessage {
+        serde_json::from_value(serde_json::json!({
+            "jobId": "00000000-0000-0000-0000-000000000001",
+            "requestId": 1,
+            "plan": {
+                "planId": "plan",
+                "planType": "build",
+                "version": 1,
+                "artifactUri": "",
+                "artifactLocation": ""
+            },
+            "timeline": {
+                "id": "00000000-0000-0000-0000-000000000002",
+                "changeId": 0,
+                "location": null
+            },
+            "jobName": "build",
+            "lockedUntil": "",
+            "resources": {"endpoints": []},
+            "steps": steps,
+            "snapshot": null
+        }))
+        .unwrap()
+    }
+
+    fn snapshot_fixture() -> WorkspaceSnapshot {
+        WorkspaceSnapshot {
+            head_sha: Some("f000000000000000000000000000000000000000".to_owned()),
+            commit_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            repository: "snapshots/11111111-1111-4111-8111-111111111111".to_owned(),
+            default_branch: Some("main".to_owned()),
+            before_sha: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
+        }
+    }
+
+    fn redirect_count(inputs: serde_json::Value) -> usize {
+        let mut message = checkout_message(serde_json::json!([{
+            "id": "00000000-0000-0000-0000-000000000010",
+            "name": "checkout",
+            "reference": {"name": "actions/checkout", "version": "v4", "type": "repository"},
+            "inputs": inputs,
+            "continueOnError": false,
+            "timeoutInMinutes": null
+        }]));
+        redirect_primary_checkout(
+            &mut message,
+            &snapshot_fixture(),
+            "http://127.0.0.1:9090",
+            "local-runtime-jwt",
+        )
+    }
+
+    /// A checkout whose `ref`/`repository` input is a template expression
+    /// selects a target the workflow controls at runtime; redirecting it to
+    /// the snapshot hijacks that target once the runner evaluates the
+    /// expression. Only inputs that are provably absent — or provably the
+    /// action's declared default — may be redirected.
+    #[test]
+    fn redirect_primary_checkout_respects_dynamic_expression_inputs() {
+        // A dynamic ref is an explicit target once evaluated.
+        assert_eq!(
+            redirect_count(
+                serde_json::json!({"ref": "${{ inputs.head-sha }}", "fetch-depth": "0"})
+            ),
+            0,
+            "an unresolved expression ref must count as explicitly set"
+        );
+        // A dynamic repository likewise.
+        assert_eq!(
+            redirect_count(serde_json::json!({
+                "repository": "${{ fromJSON(inputs.targets)[0].repo }}",
+            })),
+            0,
+            "an unresolved expression repository must count as explicitly set"
+        );
+        // A literal target is explicitly set.
+        assert_eq!(
+            redirect_count(
+                serde_json::json!({"repository": "octo/other", "ref": "refs/heads/release"})
+            ),
+            0,
+            "a literal remote target must not be redirected"
+        );
+        // The declared input default (`${{ github.repository }}`) is provably
+        // the default branch the snapshot represents — redirect applies.
+        assert_eq!(
+            redirect_count(serde_json::json!({"repository": "${{ github.repository }}"})),
+            1,
+            "the declared repository default must still be redirected"
+        );
+        // `github-server-url`'s declared default is provably the default too.
+        assert_eq!(
+            redirect_count(serde_json::json!({"github-server-url": "${{ github.server_url }}"})),
+            1,
+            "the declared server-url default must still be redirected"
+        );
+        // Absent and empty inputs keep the default-branch redirect.
+        assert_eq!(
+            redirect_count(serde_json::json!({"fetch-depth": "0"})),
+            1,
+            "an absent ref/repository is default-branch semantics"
+        );
+        assert_eq!(
+            redirect_count(serde_json::json!({"ref": "", "fetch-depth": "0"})),
+            1,
+            "an empty ref is default-branch semantics"
+        );
     }
 }
