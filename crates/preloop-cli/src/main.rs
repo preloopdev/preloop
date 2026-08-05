@@ -362,6 +362,9 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         workspace: None,
         artifact_stem: output.clone(),
         runner_bundle,
+        externals_dir: std::env::var_os("PRELOOP_RUNNER_EXTERNALS")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join("preloop-externals")),
         runner_binary_name: "preloop-runner".into(),
         server_url: "http://127.0.0.1:1".into(),
         control_origin: None,
@@ -893,7 +896,13 @@ fn local_runner_pool_config(
             .join("vms")
             .join(format!("preloop-ubuntu-24.04-{}", std::env::consts::ARCH)),
         runner_bundle,
-        runner_binary_name: "preloop-runner".into(),
+        // Node externals shared with every VM via a read-only mount. The
+        // operator may point this anywhere; the default lives next to the
+        // control-bridge state.
+        externals_dir: std::env::var_os("PRELOOP_RUNNER_EXTERNALS")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join("externals")),
+        runner_binary_name: "preloop-runner".to_owned(),
         server_url,
         control_origin,
         control_socket,
