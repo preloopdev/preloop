@@ -2338,11 +2338,13 @@ async fn current_runner_registration_to_broker_job_e2e() {
         json!({
             "name": "runner-1",
             "version": "2.335.1",
-            "osDescription": "Darwin local",
+            // A Linux runner for a `runs-on: ubuntu-latest` job: the scheduler
+            // will not hand a hosted-image label to a runner of another OS.
+            "osDescription": "Linux local",
             "labels": [
                 {"name": "self-hosted", "type": "system"},
-                {"name": "macOS", "type": "system"},
-                {"name": "ARM64", "type": "system"}
+                {"name": "Linux", "type": "system"},
+                {"name": "X64", "type": "system"}
             ],
             "authorization": {
                 "publicKey": {
@@ -6799,6 +6801,44 @@ fn label_matching_rejects_missing_labels() {
         &["self-hosted".into(), "gpu".into()],
         &["self-hosted".into(), "Linux".into()]
     ));
+}
+
+/// A hosted image label names an OS, and a self-hosted runner may only stand
+/// in for one it actually runs. A macOS host claiming `ubuntu-latest` fails
+/// the job deep inside a step (Linux-only crate features, `/home/runner`
+/// paths, apt) instead of waiting for a Linux runner.
+#[test]
+fn label_matching_never_crosses_operating_systems() {
+    let mac = [
+        "self-hosted".to_owned(),
+        "macOS".to_owned(),
+        "ARM64".to_owned(),
+    ];
+    assert!(!job_matches_runner(&["ubuntu-latest".into()], &mac));
+    assert!(!job_matches_runner(&["windows-latest".into()], &mac));
+    assert!(job_matches_runner(&["macos-15".into()], &mac));
+
+    let linux = [
+        "self-hosted".to_owned(),
+        "Linux".to_owned(),
+        "X64".to_owned(),
+        "ubuntu-24.04".to_owned(),
+        "ubuntu-latest".to_owned(),
+    ];
+    // A pool advertising 24.04 still serves a 22.04 job: same OS, and the
+    // alternative is a job that never runs.
+    assert!(job_matches_runner(&["ubuntu-22.04".into()], &linux));
+    assert!(!job_matches_runner(&["macos-14".into()], &linux));
+}
+
+/// A runner that declares no OS label has told us nothing to contradict, so
+/// it stays eligible for every hosted label.
+#[test]
+fn label_matching_os_less_runner_stays_eligible() {
+    let unlabelled = ["self-hosted".to_owned(), "gpu".to_owned()];
+    assert!(job_matches_runner(&["ubuntu-latest".into()], &unlabelled));
+    assert!(job_matches_runner(&["windows-2022".into()], &unlabelled));
+    assert!(!job_matches_runner(&["nvidia".into()], &unlabelled));
 }
 
 #[test]
