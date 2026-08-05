@@ -1964,7 +1964,83 @@ fn fail_expansion_node(
         finalize_run_if_complete(run);
     }
     release_concurrency_for_job(inner, run_id, node_id);
+    retire_node_requests(inner, run_id, node_id, RequestRetirement::Settle(status));
     outcome.failed.push((run_id, node_id.clone()));
+}
+
+/// How to retire the request correlation an expandable node minted at submit.
+#[derive(Clone, Copy)]
+enum RequestRetirement {
+    /// The node stays in the run as a terminal job: record the result and drop
+    /// the live claim state, exactly as the completion path does for a job a
+    /// runner actually finished.
+    Settle(ExecutionStatus),
+    /// The node no longer exists in the run, so nothing can reference it
+    /// again: every correlation entry goes.
+    Purge,
+}
+
+/// Retire the request records an expandable node acquired at submit.
+///
+/// MC-2: `runs.rs` mints a full set of correlation records for every
+/// non-caller job, and a deferred-matrix node is non-caller — but such a node
+/// is routed to expansion and never dispatched to a runner. No completion,
+/// result patch or disconnect ever fires for it, and those are the only paths
+/// that clear `inflight_requests`. Without this the node's request stays
+/// inflight for the life of the process, resolvable to a job that expansion
+/// has already deleted from the run.
+fn retire_node_requests(
+    inner: &mut InnerState,
+    run_id: RunId,
+    node_id: &JobId,
+    retirement: RequestRetirement,
+) {
+    let request_ids: Vec<i64> = inner
+        .job_requests
+        .iter()
+        .filter(|(_, record)| record.run_id == run_id && record.job_id == *node_id)
+        .map(|(id, _)| *id)
+        .collect();
+    for request_id in request_ids {
+        inner
+            .session_active_requests
+            .retain(|_, &mut rid| rid != request_id);
+        inner.inflight_requests.remove(&request_id);
+        match retirement {
+            RequestRetirement::Settle(status) => {
+                if let Some(record) = inner.job_requests.get_mut(&request_id) {
+                    if record.result.is_none() {
+                        record.result = Some(status);
+                    }
+                }
+            }
+            RequestRetirement::Purge => {
+                inner.github_token_requests.remove(&request_id);
+                let Some(record) = inner.job_requests.remove(&request_id) else {
+                    continue;
+                };
+                // `plan_id` is run-scoped and the uuid keys are re-inserted per
+                // job, so a sibling may own the current entry. Only drop one
+                // that still points at this request.
+                if inner.plan_requests.get(&record.plan_id) == Some(&request_id) {
+                    inner.plan_requests.remove(&record.plan_id);
+                }
+                if inner.agent_job_requests.get(&record.agent_job_id) == Some(&request_id) {
+                    inner.agent_job_requests.remove(&record.agent_job_id);
+                }
+                if inner.timeline_requests.get(&record.timeline_id) == Some(&request_id) {
+                    inner.timeline_requests.remove(&record.timeline_id);
+                }
+                let agent_key = record.agent_job_id.to_string();
+                inner.live_log_lines.remove(&agent_key);
+                inner.live_log_tx.remove(&agent_key);
+            }
+        }
+    }
+    if matches!(retirement, RequestRetirement::Purge) {
+        inner.id_token_grants.remove(&(run_id, node_id.clone()));
+        inner.oidc_job_contexts.remove(&(run_id, node_id.clone()));
+    }
 }
 
 /// Fold a built subtree back into the run, under a freshly taken lock.
@@ -2000,6 +2076,14 @@ fn apply_expansion(
             // the node without a completion event, so its concurrency holder
             // must be released here (fail_expansion_node does the same).
             release_concurrency_for_job(inner, run_id, &node_id);
+            // MC-2: and no runner will ever complete it, so its request
+            // records have to be retired here too.
+            retire_node_requests(
+                inner,
+                run_id,
+                &node_id,
+                RequestRetirement::Settle(ExecutionStatus::Skipped),
+            );
             outcome.skipped.push((run_id, node_id));
             Vec::new()
         }
@@ -2013,6 +2097,9 @@ fn apply_expansion(
                 run.job_needs.remove(&node_id);
                 run.status = summarize_run(run.jobs.values().copied());
             }
+            // MC-2: the placeholder is gone from the run, so its submit-time
+            // request correlation can never be resolved to a real job again.
+            retire_node_requests(inner, run_id, &node_id, RequestRetirement::Purge);
             queued
         }
         BuiltExpansion::Reusable {
