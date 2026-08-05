@@ -293,13 +293,94 @@ impl RunningJob {
         }
     }
 
-    /// Hard-kill the worker process group (after cancel timeout expires).
+    /// Hard-kill the worker and its whole process tree (after cancel timeout
+    /// expires). Steps run in their own process groups (`process.rs`
+    /// `group_spawn`), so killing only the worker PID would orphan them
+    /// (CR-2 F-2); the official runner's JobDispatcher kills the worker with
+    /// `Process.Kill(entireProcessTree: true)`, and this mirrors that.
     pub async fn kill(&mut self) {
         // Drop stdin first to unblock the worker's reader
         self.stdin.take();
+        #[cfg(unix)]
+        if let Some(pid) = self.child.id() {
+            kill_process_tree(pid);
+        }
         if let Err(e) = self.child.kill().await {
             warn!("Failed to kill worker: {e}");
         }
+    }
+}
+
+/// Best-effort SIGKILL of `root` and every descendant in its process tree.
+///
+/// Walks a (pid, ppid) snapshot taken once, then kills each PID with
+/// `kill -9`. Errors are ignored: cleanup must never fail the listener.
+#[cfg(unix)]
+fn kill_process_tree(root: u32) {
+    use std::collections::BTreeMap;
+
+    let mut children: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(proc_dir) = std::fs::read_dir("/proc") {
+            for entry in proc_dir.flatten() {
+                let name = entry.file_name();
+                let Ok(pid) = name.to_string_lossy().parse::<u32>() else {
+                    continue;
+                };
+                let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                    continue;
+                };
+                // /proc/<pid>/stat: pid (comm) state ppid ...
+                let Some(open) = stat.find('(') else { continue };
+                let Some(close) = stat.rfind(')') else {
+                    continue;
+                };
+                let mut fields = stat[close + 1..].split_whitespace();
+                fields.next(); // state
+                let Some(ppid) = fields.next().and_then(|s| s.parse::<u32>().ok()) else {
+                    continue;
+                };
+                children.entry(ppid).or_default().push(pid);
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(out) = std::process::Command::new("ps")
+            .args(["-axo", "pid=,ppid="])
+            .output()
+        {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                let mut fields = line.split_whitespace();
+                if let (Some(pid), Some(ppid)) = (fields.next(), fields.next()) {
+                    if let (Ok(pid), Ok(ppid)) = (pid.parse::<u32>(), ppid.parse::<u32>()) {
+                        children.entry(ppid).or_default().push(pid);
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = root;
+        return;
+    }
+
+    // DFS from the worker; kill descendants first so no child outlives its
+    // reaped parent.
+    let mut stack = vec![root];
+    let mut order = Vec::new();
+    while let Some(pid) = stack.pop() {
+        order.push(pid);
+        if let Some(kids) = children.get(&pid) {
+            stack.extend(kids.iter().copied());
+        }
+    }
+    for pid in order {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
     }
 }
 
