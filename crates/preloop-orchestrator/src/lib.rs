@@ -154,9 +154,13 @@ fn ensure_host_externals(config: &RunnerPoolConfig) -> Result<(), OrchestratorEr
     // Artifact-based machines reach node through the baked symlink
     // `<root>/externals -> /opt/preloop/bin/externals` (the packed launcher
     // has no IRQ headroom for a third virtiofs mount), so the runner bundle
-    // must expose the same externals. Best-effort: the bundle lives in a
-    // root-owned release dir when the engine runs unprivileged, and the
-    // deploy step creates the link in that case.
+    // must expose the same externals. This must be a REAL directory, not a
+    // host symlink: virtiofs exports a symlink node verbatim and the guest
+    // kernel then resolves its target in the GUEST namespace, where
+    // `/var/lib/preloop/externals` does not exist — node would be missing.
+    // Best-effort copy: the bundle lives in a root-owned release dir when
+    // the engine runs unprivileged, and the deploy step materializes the
+    // externals in that case.
     let bundle_externals = config.runner_bundle.join("externals");
     if !bundle_externals
         .join("node24")
@@ -164,16 +168,24 @@ fn ensure_host_externals(config: &RunnerPoolConfig) -> Result<(), OrchestratorEr
         .join("node")
         .is_file()
     {
-        let _ = std::fs::remove_file(&bundle_externals);
-        match std::os::unix::fs::symlink(&externals, &bundle_externals) {
-            Ok(()) => info!(
+        let copy = std::process::Command::new("cp")
+            .args(["-a", externals.to_str().unwrap_or_default()])
+            .arg(format!("{}/.", bundle_externals.display()))
+            .output();
+        match copy {
+            Ok(output) if output.status.success() => info!(
                 bundle = %bundle_externals.display(),
-                "Linked runner bundle externals to host externals"
+                "Materialized node externals into runner bundle"
+            ),
+            Ok(output) => warn!(
+                status = %output.status,
+                bundle = %bundle_externals.display(),
+                "Could not materialize bundle externals (deploy step should copy them)"
             ),
             Err(error) => warn!(
                 %error,
                 bundle = %bundle_externals.display(),
-                "Could not link bundle externals (create it at deploy time)"
+                "Could not materialize bundle externals (deploy step should copy them)"
             ),
         }
     }
