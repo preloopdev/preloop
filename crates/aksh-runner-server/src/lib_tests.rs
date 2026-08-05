@@ -2254,11 +2254,12 @@ async fn registration_and_oauth_return_runner_compatible_tokens() {
         CancellationToken::new(),
     );
 
-    let registration = request_json(
+    let registration = request_json_with_bearer(
         &app,
         Method::POST,
         "/api/v3/actions/runner-registration",
         json!({"url": "https://github.com/preloopdev/aksh", "runner_event": "register"}),
+        DEFAULT_AKSH_SYSTEM_TOKEN,
     )
     .await;
     assert_eq!(registration["token_schema"], "OAuthAccessToken");
@@ -2284,6 +2285,61 @@ async fn registration_and_oauth_return_runner_compatible_tokens() {
     );
 }
 
+/// The registration mint hands out a RunnerManage JWT. Any bearer used to be
+/// accepted, so a workflow step inside a VM could mint one through the
+/// mounted control socket and register a rogue runner. Only the system
+/// credential — the token the pool injects into its own configure invocation
+/// — may mint.
+#[tokio::test]
+async fn registration_mint_requires_the_system_credential() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = app(
+        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        CancellationToken::new(),
+    );
+    let body = json!({"url": "https://github.com/preloopdev/aksh", "runner_event": "register"});
+
+    // No credential, and a wrong one: both refused.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v3/actions/runner-registration")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v3/actions/runner-registration")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer not-the-token")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let minted = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/api/v3/actions/runner-registration",
+        body,
+        DEFAULT_AKSH_SYSTEM_TOKEN,
+    )
+    .await;
+    assert_eq!(minted["token_schema"], "OAuthAccessToken");
+}
+
 #[tokio::test]
 async fn current_runner_registration_to_broker_job_e2e() {
     let temp = tempfile::tempdir().unwrap();
@@ -2306,11 +2362,12 @@ async fn current_runner_registration_to_broker_job_e2e() {
         .next()
         .unwrap();
 
-    let registration_auth = request_json(
+    let registration_auth = request_json_with_bearer(
         &app,
         Method::POST,
         "/api/v3/actions/runner-registration",
         json!({"url": "https://github.com/preloopdev/aksh", "runner_event": "register"}),
+        DEFAULT_AKSH_SYSTEM_TOKEN,
     )
     .await;
     assert_eq!(
@@ -12487,9 +12544,11 @@ async fn control_socket_surface_denies_native_and_test_apis() {
     // The v3 registration-token endpoints mint runner-management JWTs
     // (`RunnerManage` scope) for the GitHub-compatible registration flow.
     // They are engine-facing: untrusted workflow code inside the VM must not
-    // be able to mint runner-management credentials through the socket.
+    // be able to mint runner-management credentials through the socket. The
+    // one exception is the runner's own registration path, whose handler
+    // requires the system credential — a wrong one is refused, and the mint
+    // itself is tested separately.
     for v3 in [
-        "/api/v3/actions/runner-registration",
         "/api/v3/orgs/acme/actions/runners/registration-token",
         "/api/v3/repos/acme/repo/actions/runners/registration-token",
     ] {
@@ -12512,6 +12571,36 @@ async fn control_socket_surface_denies_native_and_test_apis() {
             "socket must not expose {v3}"
         );
     }
+    let response = socket_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v3/actions/runner-registration")
+                .header(header::AUTHORIZATION, "RemoteAuth aksh-registration-token")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"url":"https://github.com/acme/repo"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "the carved-out registration path still requires the system credential"
+    );
+    let minted = request_json_with_bearer(
+        &socket_app,
+        Method::POST,
+        "/api/v3/actions/runner-registration",
+        json!({"url": "https://github.com/acme/repo", "runner_event": "register"}),
+        DEFAULT_AKSH_SYSTEM_TOKEN,
+    )
+    .await;
+    assert_eq!(
+        minted["token_schema"], "OAuthAccessToken",
+        "the runner's own registration must work through the socket"
+    );
 
     // The runner's own log-blob uploads go through the same surface: the
     // in-VM runner PUTs step logs to the signed `/replay/results/*` URLs its
