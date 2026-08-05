@@ -88,7 +88,17 @@ pub(crate) async fn submit_run_inner(
     mut submission: WorkflowSubmission,
 ) -> Result<RunAccepted, ApiError> {
     let workflow = parse_workflow(&submission.workflow_yaml)?;
-    crate::remote_workflows::resolve_remote_workflows(&mut submission, &workflow).await?;
+    // The same static credential job tokens use (env `AKSH_GITHUB_TOKEN`,
+    // else the config file's `github.pat`) authenticates remote reusable
+    // workflow fetches: `preloop setup github --via pat` must resolve
+    // private `uses: owner/repo/...` references without a separately
+    // exported token.
+    crate::remote_workflows::resolve_remote_workflows(
+        &mut submission,
+        &workflow,
+        shared.state.static_github_pat().as_deref(),
+    )
+    .await?;
     if submission.event == "workflow_dispatch" {
         workflow.apply_workflow_dispatch_inputs(&mut submission.payload)?;
         if submission.dispatch_inputs.is_empty() {
@@ -546,13 +556,17 @@ pub(crate) async fn submit_run_inner(
                 payload.insert("ref".to_owned(), serde_json::json!(submission.git_ref));
             } else if submission.event == "pull_request" {
                 // Same synthetic-push shape for PR-family events: the head
-                // commit the runner checks out is the snapshot commit, and
-                // `base.sha` is the base its changes are measured against
-                // (the workspace HEAD when the tree is dirty, HEAD^ when
-                // clean — see `WorkspaceSnapshot::before_sha`). Changed-file
-                // actions (`dorny/paths-filter`, `tj-actions/changed-files`)
-                // diff these two SHAs; without the refresh they would diff
-                // the caller-supplied head against itself and see nothing.
+                // commit the runner checks out is the snapshot commit
+                // (`commit_sha` — the synthetic commit that carries the
+                // dirty tree), and `base.sha` is the base its changes are
+                // measured against (the workspace HEAD when the tree is
+                // dirty, HEAD^ when clean — see `WorkspaceSnapshot::before_sha`).
+                // Changed-file actions (`dorny/paths-filter`,
+                // `tj-actions/changed-files`) diff these two SHAs; without
+                // the refresh they would diff the caller-supplied head
+                // against itself and see nothing, and pointing `head.sha` at
+                // the real workspace HEAD diffed it against an identical
+                // tree (and a sha absent from the snapshot store).
                 let base_sha = snapshot
                     .before_sha
                     .clone()
@@ -565,13 +579,7 @@ pub(crate) async fn submit_run_inner(
                         base.insert("sha".to_owned(), serde_json::json!(base_sha));
                     }
                     if let Some(head) = pr.get_mut("head").and_then(|v| v.as_object_mut()) {
-                        head.insert(
-                            "sha".to_owned(),
-                            serde_json::json!(snapshot
-                                .head_sha
-                                .clone()
-                                .unwrap_or_else(|| snapshot.commit_sha.clone())),
-                        );
+                        head.insert("sha".to_owned(), serde_json::json!(snapshot.commit_sha));
                     }
                 }
             }
@@ -1445,7 +1453,18 @@ pub(crate) fn build_job_artifacts(
     );
     agent_msg.variables.insert(
         "github_token".to_owned(),
-        aksh_gha_protocol::azdo::VariableValue::secret(github_token),
+        aksh_gha_protocol::azdo::VariableValue::secret(github_token.clone()),
+    );
+    // GitHub's dispatcher injects the job token into the `secrets` context
+    // under the name `GITHUB_TOKEN` — that is what `${{ secrets.GITHUB_TOKEN }}`
+    // resolves to. The runner builds `secrets` from `isSecret` variables keyed
+    // by name, so without this exact key the single most common token
+    // reference in real workflows (cargo-dist's release.yml, supply-chain
+    // gates, action scaffolding) resolves empty on this control plane while
+    // working on GitHub.
+    agent_msg.variables.insert(
+        "GITHUB_TOKEN".to_owned(),
+        aksh_gha_protocol::azdo::VariableValue::secret(github_token.clone()),
     );
     agent_msg.variables.insert(
         "actions_runner_allow_artifacts_file".to_owned(),
@@ -2023,5 +2042,216 @@ mod tests {
             started.elapsed() < EVENT_STREAM_IDLE_TIMEOUT * 2,
             "stream outlived its idle deadline by more than a full bound"
         );
+    }
+
+    fn git_in(cwd: &std::path::Path, args: &[&str]) -> Vec<u8> {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .expect("git runs in tests");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    /// A local PR run over a dirty tree must present the snapshot commit that
+    /// carries the dirty tree as `pull_request.head.sha`, with `base.sha`
+    /// pointing at the base its changes are measured against. Both SHAs live
+    /// in the snapshot store, so changed-file actions
+    /// (`dorny/paths-filter`, `tj-actions/changed-files`) can actually diff
+    /// them; the real workspace HEAD is neither in the store nor the tree
+    /// carrying the uncommitted changes.
+    #[tokio::test]
+    async fn local_pull_request_head_is_the_snapshot_commit_carrying_the_dirty_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        git_in(&workspace, &["init", "-q", "-b", "main"]);
+        git_in(&workspace, &["config", "user.email", "test@example.com"]);
+        git_in(&workspace, &["config", "user.name", "Test"]);
+        std::fs::write(workspace.join("file.txt"), "one\n").unwrap();
+        git_in(&workspace, &["add", "file.txt"]);
+        git_in(&workspace, &["commit", "-qm", "initial"]);
+        let workspace_head = String::from_utf8(git_in(&workspace, &["rev-parse", "HEAD"])).unwrap();
+        // Dirty the tree: the uncommitted change must show up in the
+        // head..base diff, which it cannot when head is the workspace HEAD.
+        std::fs::write(workspace.join("file.txt"), "two (uncommitted)\n").unwrap();
+
+        let mut state = AppState::new(state_dir.clone()).await.unwrap();
+        state.local_workspace = Some(workspace.clone());
+        let shared = std::sync::Arc::new(SharedState {
+            state: state.clone(),
+            shutdown: CancellationToken::new(),
+        });
+
+        let submission = aksh_gha_protocol::WorkflowSubmission {
+            workflow_yaml: "on: pull_request\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n".to_owned(),
+            event: "pull_request".to_owned(),
+            payload: serde_json::json!({
+                "action": "opened",
+                "number": 7,
+                "pull_request": {
+                    "head": { "ref": "feature", "sha": "b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3" },
+                    "base": { "ref": "main", "sha": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2" }
+                }
+            }),
+            repository: "owner/repo".to_owned(),
+            ..Default::default()
+        };
+        let accepted = submit_run_inner(&shared, submission).await.unwrap();
+
+        let inner = state.inner.lock().await;
+        let run = inner.runs.get(&accepted.run_id).expect("run is recorded");
+        let snapshot = run
+            .workspace_snapshot
+            .as_ref()
+            .expect("local runs must create a workspace snapshot");
+        let pr = run.submission.payload["pull_request"].as_object().unwrap();
+        let head_sha = pr["head"]["sha"].as_str().unwrap().to_owned();
+        let base_sha = pr["base"]["sha"].as_str().unwrap().to_owned();
+
+        assert_eq!(
+            head_sha, snapshot.commit_sha,
+            "PR head must be the snapshot commit carrying the dirty tree"
+        );
+        assert_ne!(
+            head_sha,
+            snapshot.head_sha.as_deref().unwrap(),
+            "PR head must not be the real workspace HEAD"
+        );
+        assert_ne!(
+            head_sha,
+            workspace_head.trim(),
+            "head must not be the workspace HEAD"
+        );
+        assert_eq!(
+            base_sha,
+            snapshot.before_sha.as_deref().unwrap(),
+            "PR base must be the base the dirty tree is measured against"
+        );
+        assert_ne!(
+            base_sha, head_sha,
+            "a dirty tree must diff against its base"
+        );
+
+        // Both endpoints resolve inside the snapshot store, and the diff names
+        // exactly the uncommitted change.
+        let snapshot_repository = state_dir.join(&snapshot.repository);
+        let changed = git_in(
+            &snapshot_repository,
+            &["diff", "--name-only", &base_sha, &head_sha],
+        );
+        assert_eq!(
+            String::from_utf8(changed).unwrap().trim(),
+            "file.txt",
+            "changed-file actions must see the dirty tree's changes"
+        );
+    }
+
+    /// A PAT stored by `preloop setup github --via pat` must authenticate
+    /// remote reusable-workflow resolution, not just queued job tokens:
+    /// private `uses: owner/repo/...` references fetch through the same
+    /// credential the config file holds.
+    #[tokio::test]
+    async fn remote_reusable_workflow_resolution_uses_config_backed_pat() {
+        use axum::body::Body;
+        use axum::http::{header, HeaderMap, Method, Request, StatusCode};
+        use axum::routing::get;
+        use axum::Json;
+        use tower::ServiceExt;
+
+        // A mock GitHub API that REQUIRES the engine credential, exactly like
+        // a private repository: without a bearer token it answers 404.
+        let seen_auth = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let callee_yaml =
+            "on: workflow_call\njobs:\n  callee:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo callee\n";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(callee_yaml.as_bytes());
+        let mock = axum::Router::new()
+            .route(
+                "/repos/:owner/:repo/contents/*path",
+                get({
+                    let seen = seen_auth.clone();
+                    move |headers: HeaderMap| async move {
+                        let auth = headers
+                            .get(header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned);
+                        *seen.lock().unwrap() = auth.clone();
+                        if auth.is_some() {
+                            Json(serde_json::json!({
+                                "content": encoded,
+                                "encoding": "base64",
+                            }))
+                            .into_response()
+                        } else {
+                            (
+                                StatusCode::NOT_FOUND,
+                                Json(serde_json::json!({"message": "Not Found"})),
+                            )
+                                .into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/repos/:owner/:repo/commits/:git_ref",
+                get(|| async move {
+                    Json(serde_json::json!({"sha": "c0ffee0000000000000000000000000000000000"}))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        std::env::set_var("AKSH_GITHUB_API_URL", api_base);
+
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        std::fs::write(&config_path, "[github]\npat = \"ghp_config_pat_value\"\n").unwrap();
+        let state = AppState::new_with_config(temp.path().to_path_buf(), config_path)
+            .await
+            .unwrap();
+        let app = crate::app(state, CancellationToken::new());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/runs")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {DEFAULT_AKSH_SYSTEM_TOKEN}"),
+                    )
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "workflow_yaml": "on: push\njobs:\n  call:\n    uses: acme/private/.github/workflows/callee.yml@main\n",
+                            "event": "push",
+                            "repository": "owner/repo",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "submission must succeed when the config PAT authenticates the remote reusable fetch"
+        );
+        let received = seen_auth.lock().unwrap().clone();
+        assert_eq!(
+            received.as_deref(),
+            Some("Bearer ghp_config_pat_value"),
+            "remote reusable-workflow resolution must send the config-backed PAT"
+        );
+
+        std::env::remove_var("AKSH_GITHUB_API_URL");
     }
 }
