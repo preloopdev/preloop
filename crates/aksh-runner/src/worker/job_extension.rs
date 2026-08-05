@@ -387,62 +387,6 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
             }
         }
     }
-
-    // GitHub-hosted parity for direct github.com fetches: the runtime token
-    // authenticates git over HTTPS, and `actions/checkout` only persists it
-    // into the repo config when `persist-credentials` is set — hardcoded
-    // fetches (cargo-dist's `git fetch https://github.com/...`, submodule
-    // updates) need the header unconditionally. Env-based like the snapshot
-    // rewrite above, so no config file is written and no credential leaks
-    // onto disk.
-    // Same source as the `GITHUB_TOKEN` env mapping: the github context's
-    // token when the server embeds one, otherwise the broker-minted runtime
-    // token in `variables.system.github.token` (the App installation token
-    // minted at claim time — the context is built before the claim, so it
-    // can never carry it).
-    let token = github_runtime_token(msg);
-    if !token.is_empty() {
-        use base64::Engine as _;
-        let credentials = base64::engine::general_purpose::STANDARD
-            .encode(format!("x-access-token:{token}").as_bytes());
-        let count: usize = job
-            .env
-            .get("GIT_CONFIG_COUNT")
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(0);
-        job.env.insert(
-            format!("GIT_CONFIG_KEY_{count}"),
-            "http.https://github.com/.extraheader".to_owned(),
-        );
-        job.env.insert(
-            format!("GIT_CONFIG_VALUE_{count}"),
-            format!("AUTHORIZATION: basic {credentials}"),
-        );
-        job.env
-            .insert("GIT_CONFIG_COUNT".to_owned(), (count + 1).to_string());
-    }
-}
-
-/// The job's GitHub runtime token, mirroring the `GITHUB_TOKEN` env mapping:
-/// the github context first, then the broker-minted variable.
-fn github_runtime_token(msg: &serde_json::Value) -> String {
-    let raw_github = msg
-        .get("contextData")
-        .and_then(|cd| cd.get("github"))
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
-    let github = decode_typed_value(&raw_github);
-    let token = str_from_json(&github, "token");
-    if token.is_empty() {
-        msg.get("variables")
-            .and_then(|v| v.get("system.github.token"))
-            .and_then(|v| v.get("value"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string()
-    } else {
-        token
-    }
 }
 
 /// Decode an Azure DevOps typed-dictionary value.
