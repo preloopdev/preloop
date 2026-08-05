@@ -56,13 +56,15 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # The checkout above ran with `persist-credentials: false`, so the
-          # clone holds no credential and this repo is private: an anonymous
-          # `git fetch origin main` gets a 401 and asks for a username, which
-          # on a runner means `could not read Username for 'https://github.com'`
-          # and exit 128. Fetch with the job's own read-only token instead of
-          # persisting one in the clone for later steps to inherit.
-          git fetch --depth=1 \
-            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" main
+          # clone holds no credential and this repo is private. The runner
+          # masks secrets, so embedding the token in a URL or an env-var fetch
+          # gets rewritten before the process starts and git sees an invalid
+          # credential. Use the same mechanism actions/checkout itself uses:
+          # a per-invocation extraheader, so nothing is persisted into the
+          # clone for later steps to inherit.
+          encoded=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64)
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${encoded}" \
+            fetch --depth=1 origin main
           # Two-dot, not three: `A...B` needs a merge base, and neither side of
           # this comparison has one — the checkout and this fetch are both
           # depth 1. Comparing the trees answers the gate's actual question,
