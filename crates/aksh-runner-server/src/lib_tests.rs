@@ -2285,13 +2285,14 @@ async fn registration_and_oauth_return_runner_compatible_tokens() {
     );
 }
 
-/// The registration mint hands out a RunnerManage JWT. Any bearer used to be
-/// accepted, so a workflow step inside a VM could mint one through the
-/// mounted control socket and register a rogue runner. Only the system
-/// credential — the token the pool injects into its own configure invocation
-/// — may mint.
+/// The registration mint hands out a RunnerManage JWT. On the TCP surface it
+/// accepts any non-empty credential, exactly as GitHub accepts any token it
+/// issued — the conformance golden replays a real GitHub registration token
+/// and must get a 200. Through the mounted control socket, where workflow
+/// code inside a VM can reach, only the system credential — the token the
+/// pool injects into its own configure invocation — may mint.
 #[tokio::test]
-async fn registration_mint_requires_the_system_credential() {
+async fn registration_mint_credential_rules_follow_the_surface() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
         AppState::new(temp.path().to_path_buf()).await.unwrap(),
@@ -2299,7 +2300,7 @@ async fn registration_mint_requires_the_system_credential() {
     );
     let body = json!({"url": "https://github.com/preloopdev/aksh", "runner_event": "register"});
 
-    // No credential, and a wrong one: both refused.
+    // No credential: refused on every surface.
     let response = app
         .clone()
         .oneshot(
@@ -2314,27 +2315,14 @@ async fn registration_mint_requires_the_system_credential() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/api/v3/actions/runner-registration")
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::AUTHORIZATION, "Bearer not-the-token")
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-
+    // TCP: any non-empty credential mints — GitHub-equivalent, and what the
+    // official runner and the conformance replay need.
     let minted = request_json_with_bearer(
         &app,
         Method::POST,
         "/api/v3/actions/runner-registration",
         body,
-        DEFAULT_AKSH_SYSTEM_TOKEN,
+        "an-operator-supplied-token",
     )
     .await;
     assert_eq!(minted["token_schema"], "OAuthAccessToken");

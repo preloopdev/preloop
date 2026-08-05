@@ -6,26 +6,43 @@ use super::*;
 /// `token`, `token_schema`, and `tenant_url`.
 pub(crate) async fn github_registration_token(
     State(shared): State<Arc<SharedState>>,
-    headers: axum::http::HeaderMap,
-    Json(payload): Json<serde_json::Value>,
+    request: axum::http::Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // The runner sends `Authorization: RemoteAuth <token>`. That token is the
-    // system credential: the pool injects it into the configure invocation
-    // when it provisions a machine. Nothing in a job's environment carries it,
-    // so a request that reaches this route — through the mounted control
-    // socket or the TCP surface — must prove it. Accepting any bearer would
-    // let untrusted workflow code mint a RunnerManage JWT and register a
-    // rogue runner against the control plane.
-    let auth = headers
+    // The runner sends `Authorization: RemoteAuth <token>` (the official
+    // runner does the same against GitHub, where the token is one GitHub
+    // issued). GitHub validates because it issued the token; this control
+    // plane cannot validate third-party credentials, so any non-empty one is
+    // accepted — that is what keeps the official runner and the conformance
+    // replays working (the golden sends a real GitHub registration token).
+    //
+    // The mounted control socket is different: workflow code inside a runner
+    // VM can reach it, and accepting any credential there would let a
+    // malicious step mint a RunnerManage JWT and register a rogue runner.
+    // The pool injects the system credential into its own configure
+    // invocation and nothing in a job's environment carries it, so the
+    // socket requires it.
+    let auth = request
+        .headers()
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let provided = auth
         .strip_prefix("RemoteAuth ")
         .or_else(|| auth.strip_prefix("Bearer "));
-    if provided != Some(shared.state.system_token.as_str()) {
+    let on_socket = request
+        .extensions()
+        .get::<crate::auth::SocketSurface>()
+        .is_some();
+    let missing = provided.is_none_or(|token| token.is_empty());
+    if missing || (on_socket && provided != Some(shared.state.system_token.as_str())) {
         return Err(ApiError::unauthorized("invalid registration credential"));
     }
+
+    let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .map_err(|error| ApiError::bad_request(format!("invalid registration body: {error}")))?;
+    let payload: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| ApiError::bad_request(format!("invalid registration body: {error}")))?;
 
     let token = shared.state.local_jwt(json!({
         "sub": "aksh-runner-registration",
