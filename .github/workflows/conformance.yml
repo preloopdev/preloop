@@ -1,4 +1,6 @@
 name: server-conformance
+permissions:
+  contents: read
 
 on:
   pull_request:
@@ -10,6 +12,10 @@ on:
 jobs:
   server-light:
     name: Server light conformance
+    # Trusted contexts only. Fork PRs are untrusted code and must not run on
+    # the self-hosted pool; they still get hosted ci.yml + supply-chain
+    # coverage. Same-repo PRs, main pushes, and the nightly schedule run here.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: self-hosted
     timeout-minutes: 15
     env:

@@ -2,10 +2,10 @@ server := "http://127.0.0.1:9090"
 repo := "preloopdev/aksh"
 
 build:
-    cargo build --release -p aksh-runner-server
+    cargo build --locked --release -p aksh-runner-server
 
 build-all:
-    cargo build --release --workspace
+    cargo build --locked --release --workspace
 
 #preloop
 
@@ -29,7 +29,7 @@ preloop-shell: build-preloop
 
 
 check:
-    cargo check --workspace
+    cargo check --locked --workspace
 
 fmt:
     cargo fmt --all
@@ -38,20 +38,29 @@ fmt-check:
     cargo fmt --all --check
 
 clippy:
-    cargo clippy --workspace --all-targets -- -D warnings
+    cargo clippy --locked --workspace --all-targets -- -D warnings
 
 
 test:
-    cargo test --workspace --quiet
+    cargo test --locked --workspace --quiet
 
 test-properties-full:
-    PROPTEST_CASES=10000 cargo test -p aksh-runner-server --quiet
-    PROPTEST_CASES=10000 cargo test -p aksh-runner-server --quiet -- --ignored
+    PROPTEST_CASES=10000 cargo test --locked -p aksh-runner-server --quiet
+    PROPTEST_CASES=10000 cargo test --locked -p aksh-runner-server --quiet -- --ignored
 
 test-ci: fmt-check clippy
-    PROPTEST_CASES=8 cargo test --workspace --quiet
+    PROPTEST_CASES=8 cargo test --locked --workspace --quiet
     just conform
     @echo CI: all checks passed
+
+# Supply-chain gate: dependency version-change policing (vet), RustSec
+# advisories (audit), and license/ban/source policy (deny). Local runs are on
+# trusted code; CI (supply-chain.yml) additionally drops any PR-shipped
+# .cargo/config.toml and rejects PRs that touch the policy files.
+supply-chain:
+    cargo vet
+    cargo audit
+    cargo deny check all
 
 #lint (ast-grep structural rules)
 
