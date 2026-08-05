@@ -8,6 +8,11 @@
 # run `runner-watch conform`, but drop the heavy raw captures and binary bodies.
 /.runner-watch/golden/**/*.mitm
 /.runner-watch/golden/**/*.bin
+# Real-world repo campaign captures: GitHub's own run logs for third-party
+# repos, fetched on demand (tens of MB). The findings live in
+# docs/fidelity-gap.md; the raw logs are regenerable with `gh run view --log`.
+/.runner-watch/goldens/
+/.runner-watch/repos-conformance-*.md
 *.db
 *.sqlite
 *.log
