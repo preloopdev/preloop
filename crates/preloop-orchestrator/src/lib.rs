@@ -151,6 +151,27 @@ fn ensure_host_externals(config: &RunnerPoolConfig) -> Result<(), OrchestratorEr
         path = %externals.display(),
         "Node externals installed on host; mounting into runners"
     );
+    // Artifact-based machines reach node through the baked symlink
+    // `<root>/externals -> /opt/preloop/bin/externals` (the packed launcher
+    // has no IRQ headroom for a third virtiofs mount), so the runner bundle
+    // must expose the same externals. Best-effort: the bundle lives in a
+    // root-owned release dir when the engine runs unprivileged, and the
+    // deploy step creates the link in that case.
+    let bundle_externals = config.runner_bundle.join("externals");
+    if !bundle_externals.join("node24").join("bin").join("node").is_file() {
+        let _ = std::fs::remove_file(&bundle_externals);
+        match std::os::unix::fs::symlink(&externals, &bundle_externals) {
+            Ok(()) => info!(
+                bundle = %bundle_externals.display(),
+                "Linked runner bundle externals to host externals"
+            ),
+            Err(error) => warn!(
+                %error,
+                bundle = %bundle_externals.display(),
+                "Could not link bundle externals (create it at deploy time)"
+            ),
+        }
+    }
     Ok(())
 }
 async fn download_prebaked_golden(payload: &Path) -> bool {
@@ -1301,6 +1322,31 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     return Err(error.into());
                 }
             }
+        }
+        // Bake the externals *pointer*, not the externals: the packed rootfs
+        // gets `<root>/externals -> /opt/preloop/bin/externals` so node rides
+        // the runner-bundle mount instead of being baked into the image or
+        // downloaded per machine. The symlink must live in the pack itself —
+        // forkable snapshots do not capture exec writes made after create —
+        // and it must be baked here, in the builder, where the rootfs layer
+        // is flattened into the artifact. The bundle's host side carries the
+        // real `externals/` (see `ensure_host_externals`).
+        let link_command = format!(
+            "mkdir -p {root} && rm -rf {root}/externals && \
+             ln -s /opt/preloop/bin/externals {root}/externals",
+            root = RUNNER_ROOT
+        );
+        let output = self
+            .provider
+            .exec(&name, &["sh".to_owned(), "-c".to_owned(), link_command])
+            .await?;
+        if output.exit_code != 0 {
+            let _ = self.provider.delete(&name).await;
+            return Err(OrchestratorError::Config(format!(
+                "baking externals symlink failed (exit {}): {}",
+                output.exit_code,
+                String::from_utf8_lossy(&output.stderr).lines().last().unwrap_or("unknown")
+            )));
         }
         let env_spec = EnvironmentSpec::new(self.config.base_image.clone(), toolchains);
         if let Err(error) = write_bake_manifest(self.provider.as_ref(), &name, &env_spec).await {
