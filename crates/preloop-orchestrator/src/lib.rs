@@ -2180,7 +2180,26 @@ async fn provision_runner<P: VmProvider + 'static>(
     if let Some(golden) = golden {
         // Fork from the already-booted golden VM instant CoW clone.
         provider.fork(golden, name).await?;
-        // The golden carries the toolchains pre-installed; nothing to do.
+        // The PACKED golden carries its bake inside the artifact's flattened
+        // rootfs, which forks inherit through the storage chain — nothing to
+        // do. Environment goldens are different: `prepare_golden_for_env`
+        // bakes via guest `exec`, and SmolVM's forkable snapshot does NOT
+        // carry post-create exec writes into clones (verified empirically),
+        // so an env-golden fork boots the bare stock base image. Install the
+        // apt baseline and toolchains into the fork itself — it is the job's
+        // single-use machine, so the writes persist for its lifetime.
+        let golden_is_packed = config.use_packed_artifact
+            && golden.as_str() == format!("{}-golden", config.name_prefix);
+        if !golden_is_packed {
+            install_base_dependencies(provider.as_ref(), name).await?;
+            for layer in toolchains {
+                for command in layer.install_commands() {
+                    if let Err(error) = provider.exec(name, &command).await {
+                        return Err(error.into());
+                    }
+                }
+            }
+        }
     } else {
         let uses_packed_artifact = config.use_packed_artifact;
         let spec = MachineSpec {
