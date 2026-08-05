@@ -62,20 +62,36 @@ fn control_bridge_dir(config: &RunnerPoolConfig) -> Option<PathBuf> {
         .map(|parent| parent.join("control-bridge"))
 }
 
-fn runner_volumes(config: &RunnerPoolConfig, machine: &MachineName) -> Vec<VolumeMount> {
+fn runner_volumes(
+    config: &RunnerPoolConfig,
+    machine: &MachineName,
+    mount_externals: bool,
+) -> Vec<VolumeMount> {
     let mut volumes = vec![VolumeMount {
         host: config.runner_bundle.clone(),
         guest: PathBuf::from("/opt/preloop/bin"),
         read_only: true,
     }];
-    // The Node externals are shared host-side, mounted read-only into every
-    // machine — never baked into a machine image nor downloaded per runner
-    // (that is what the `--no-externals` configure flag enforces).
-    volumes.push(VolumeMount {
-        host: config.externals_dir.join("externals"),
-        guest: PathBuf::from(RUNNER_ROOT).join("externals"),
-        read_only: true,
-    });
+    // The Node externals are shared host-side, mounted read-only into machines
+    // built from a registry base image — never baked into a machine image nor
+    // downloaded per runner (that is what the `--no-externals` configure flag
+    // enforces). Artifact-based machines (packed golden and create-per-runner)
+    // skip the mount: the packed artifact already carries the externals baked
+    // into its rootfs, and every virtio device consumes one of libkrun's 11
+    // x86_64 IRQ lines — the packed launcher is already the device-heaviest
+    // config (root + layers virtiofs + 2 disks + mounts + vsock + net +
+    // console), so a third mount pushes it past the budget and the golden
+    // fails to start (`RegisterNetDevice(IrqsExhausted)`). When the pack is
+    // rebuilt without the baked externals, fold the mount back in (e.g. a
+    // guest symlink `<root>/externals -> /opt/preloop/bin/externals` pointing
+    // at an `externals/` dir shipped inside the runner bundle).
+    if mount_externals {
+        volumes.push(VolumeMount {
+            host: config.externals_dir.join("externals"),
+            guest: PathBuf::from(RUNNER_ROOT).join("externals"),
+            read_only: true,
+        });
+    }
     if let Some(host) = control_bridge_dir(config) {
         // Per-machine target: the guest agent's mounted-socket bridge binds
         // its listener INTO the mounted directory through virtiofs, and the
@@ -908,7 +924,7 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
         storage_gib: config.storage_gib,
         overlay_gib: config.overlay_gib,
         network: NetworkPolicy::PublicOnly,
-        volumes: runner_volumes(config, golden),
+        volumes: runner_volumes(config, golden, true),
         sockets: config
             .control_socket
             .iter()
@@ -982,7 +998,7 @@ async fn prepare_packed_golden<P: VmProvider + 'static>(
         storage_gib: config.storage_gib,
         overlay_gib: config.overlay_gib,
         network: NetworkPolicy::PublicOnly,
-        volumes: runner_volumes(config, golden),
+        volumes: runner_volumes(config, golden, false),
         sockets: config
             .control_socket
             .iter()
@@ -2113,7 +2129,7 @@ async fn provision_runner<P: VmProvider + 'static>(
             storage_gib: config.storage_gib,
             overlay_gib: config.overlay_gib,
             network: NetworkPolicy::PublicOnly,
-            volumes: runner_volumes(config, name),
+            volumes: runner_volumes(config, name, !uses_packed_artifact),
             sockets: config
                 .control_socket
                 .iter()
