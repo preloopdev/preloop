@@ -52,9 +52,22 @@ jobs:
       # malicious dependency, so any PR touching them fails immediately.
       - name: Reject gate-config tampering in PRs
         if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git fetch origin main --depth=1
-          changed=$(git diff --name-only origin/main...HEAD -- deny.toml .cargo/audit.toml supply-chain/ || true)
+          # The checkout above ran with `persist-credentials: false`, so the
+          # clone holds no credential and this repo is private: an anonymous
+          # `git fetch origin main` gets a 401 and asks for a username, which
+          # on a runner means `could not read Username for 'https://github.com'`
+          # and exit 128. Fetch with the job's own read-only token instead of
+          # persisting one in the clone for later steps to inherit.
+          git fetch --depth=1 \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" main
+          # Two-dot, not three: `A...B` needs a merge base, and neither side of
+          # this comparison has one — the checkout and this fetch are both
+          # depth 1. Comparing the trees answers the gate's actual question,
+          # "do these files differ from main's tip".
+          changed=$(git diff --name-only FETCH_HEAD HEAD -- deny.toml .cargo/audit.toml supply-chain/ || true)
           if [ -n "$changed" ]; then
             echo "supply-chain policy files must not change in PRs: $changed" >&2
             exit 1
