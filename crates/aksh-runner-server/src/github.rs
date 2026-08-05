@@ -346,6 +346,7 @@ pub(crate) async fn report_check_run_completed(
         ExecutionStatus::Success => "success",
         ExecutionStatus::Failure => "failure",
         ExecutionStatus::Cancelled => "cancelled",
+        ExecutionStatus::Skipped => "skipped",
         _ => "failure",
     };
 
