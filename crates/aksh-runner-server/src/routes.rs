@@ -218,10 +218,7 @@ pub(crate) fn build_app(
 
     let router = Router::new()
         .route("/healthz", get(healthz))
-        .route(
-            "/runs/:run_id",
-            get(get_public_run),
-        )
+        .route("/runs/:run_id", get(get_public_run))
         .route(
             "/openapi.json",
             get(|| async { axum::Json(crate::openapi::ApiDoc::openapi()) }),
