@@ -12402,3 +12402,275 @@ async fn purge_of_finished_runner_does_not_requeue() {
         );
     }
 }
+
+#[tokio::test]
+async fn workflow_gate_released_when_run_ends_via_dependency_skip() {
+    // MC-S2: a workflow-level Holder::Run must be released when the run
+    // concludes through the dependency-skip arm of promote_ready_jobs
+    // (previously the slot leaked forever and same-group successors without
+    // cancel-in-progress parked permanently).
+    let temp = tempfile::tempdir().unwrap();
+    let app = app(
+        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        CancellationToken::new(),
+    );
+    let yaml = r#"
+on: push
+concurrency:
+  group: skip-group
+jobs:
+  dep:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo dep
+  main:
+    runs-on: ubuntu-latest
+    needs: [dep]
+    if: false
+    steps:
+      - run: echo main
+"#;
+    let a = submit_yaml(&app, yaml, "owner/repo").await;
+    let a_id = a["run_id"].as_str().unwrap();
+
+    // Dispatch and complete `dep`; `main` then evaluates `if: false` and is
+    // skipped, concluding run A through the skip arm.
+    let msg = request_json(
+        &app,
+        Method::GET,
+        "/runner/server/_apis/v1/Message/1?sessionId=default&waitSeconds=0",
+        Value::Null,
+    )
+    .await;
+    assert!(!msg.is_null(), "run A `dep` should be dispatchable");
+    complete_via_api(&app, a_id, "dep").await;
+
+    let run_a = get_run_json(&app, a_id).await;
+    assert_eq!(run_a["jobs"]["main"], "skipped", "main must be skipped");
+    assert!(
+        run_a["status"].as_str().unwrap() == "success"
+            || run_a["status"].as_str().unwrap() == "completed",
+        "run A must be terminal after the skip, got {}",
+        run_a["status"]
+    );
+
+    // A successor in the same group must now acquire the slot instead of
+    // parking behind the leaked holder.
+    let b = submit_yaml(&app, yaml, "owner/repo").await;
+    let b_id = b["run_id"].as_str().unwrap();
+    let run_b = get_run_json(&app, b_id).await;
+    assert_eq!(
+        run_b["status"], "queued",
+        "run B must acquire the freed workflow gate (MC-S2), got {}",
+        run_b["status"]
+    );
+    assert_eq!(run_b["jobs"]["dep"], "queued");
+}
+
+#[tokio::test]
+async fn needs_gated_job_concurrency_acquired_at_promote_time() {
+    // MC-S3: job-level concurrency must gate needs-gated jobs at promote
+    // time. Previously the gate was evaluated only at submit for needs-empty
+    // jobs, so a needs-gated job with a busy group was dispatched anyway.
+    let temp = tempfile::tempdir().unwrap();
+    let app = app(
+        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        CancellationToken::new(),
+    );
+    // Run A: `one` holds job group g (needs-empty → gated at submit).
+    let a = submit_yaml(
+        &app,
+        r#"
+on: push
+jobs:
+  one:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: shared-gate
+    steps:
+      - run: echo one
+"#,
+        "owner/repo",
+    )
+    .await;
+    let a_id = a["run_id"].as_str().unwrap();
+    // Claim `one` so it is InProgress and keeps holding the group.
+    let msg = request_json(
+        &app,
+        Method::GET,
+        "/runner/server/_apis/v1/Message/1?sessionId=default&waitSeconds=0",
+        Value::Null,
+    )
+    .await;
+    assert!(!msg.is_null(), "run A `one` should be dispatchable");
+
+    // Run B: `dep` (no gate) + `two` (needs [dep], same group g).
+    let b = submit_yaml(
+        &app,
+        r#"
+on: push
+jobs:
+  dep:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo dep
+  two:
+    runs-on: ubuntu-latest
+    needs: [dep]
+    concurrency:
+      group: shared-gate
+    steps:
+      - run: echo two
+"#,
+        "owner/repo",
+    )
+    .await;
+    let b_id = b["run_id"].as_str().unwrap();
+
+    // Dispatch and complete `dep`; `two` becomes ready and must evaluate its
+    // gate — the group is busy, so it parks instead of dispatching.
+    let msg = request_json(
+        &app,
+        Method::GET,
+        "/runner/server/_apis/v1/Message/1?sessionId=default&waitSeconds=0",
+        Value::Null,
+    )
+    .await;
+    assert!(!msg.is_null(), "run B `dep` should be dispatchable");
+    complete_via_api(&app, b_id, "dep").await;
+
+    let run_b = get_run_json(&app, b_id).await;
+    assert_eq!(
+        run_b["jobs"]["two"], "pending",
+        "needs-gated job must park while its group is held (MC-S3), got {}",
+        run_b["jobs"]["two"]
+    );
+
+    // Completing `one` releases the group; `two` must then dispatch.
+    complete_via_api(&app, a_id, "one").await;
+    let run_b = get_run_json(&app, b_id).await;
+    assert_eq!(
+        run_b["jobs"]["two"], "queued",
+        "parked gated job must dispatch once the group frees, got {}",
+        run_b["jobs"]["two"]
+    );
+}
+
+#[tokio::test]
+async fn expanded_matrix_placeholder_does_not_leak_request_correlation() {
+    // MC-2: a deferred-matrix node is non-caller, so submit mints its full
+    // request correlation, but the node is routed to expansion and never
+    // dispatched to a runner. Expansion deletes it from the run and no
+    // completion path ever fires for it, so without explicit retirement its
+    // request stays inflight for the life of the process, still resolvable to
+    // a job that no longer exists.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": r#"
+on: push
+jobs:
+  generator:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo gen
+  downstream:
+    needs: [generator]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.generator.outputs.matrix) }}
+    steps:
+      - run: echo dynamic
+"#,
+            "event": "push",
+            "repository": "owner/repo"
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let placeholder = JobId("downstream".to_string());
+
+    // The placeholder holds a real, inflight request record before expansion.
+    let (request_id, plan_id, agent_job_id, timeline_id) = {
+        let inner = state.inner.lock().await;
+        let record = inner
+            .job_requests
+            .values()
+            .find(|r| r.run_id == run_id && r.job_id == placeholder)
+            .expect("deferred-matrix placeholder must have a submit-time request");
+        let ids = (
+            record.request_id,
+            record.plan_id.clone(),
+            record.agent_job_id,
+            record.timeline_id,
+        );
+        assert!(
+            inner.inflight_requests.contains_key(&ids.0),
+            "placeholder request must start out inflight"
+        );
+        ids
+    };
+
+    request_json(
+        &app,
+        Method::POST,
+        "/internal/test/jobs/complete",
+        json!({
+            "run_id": run_id,
+            "job_id": "generator",
+            "status": "success",
+            "outputs": {"matrix": r#"{"include": [{"os": "ubuntu-latest"}, {"os": "macos-latest"}]}"#}
+        }),
+    )
+    .await;
+
+    let inner = state.inner.lock().await;
+    let run = inner.runs.get(&run_id).unwrap();
+    assert!(
+        !run.jobs.contains_key(&placeholder),
+        "expansion must replace the placeholder with its combinations"
+    );
+    assert!(
+        !inner.inflight_requests.contains_key(&request_id),
+        "MC-2: placeholder request leaked in inflight_requests after expansion"
+    );
+    assert!(
+        !inner.job_requests.contains_key(&request_id),
+        "MC-2: placeholder job_request record leaked after expansion"
+    );
+    assert_ne!(
+        inner.plan_requests.get(&plan_id),
+        Some(&request_id),
+        "MC-2: plan_requests still resolves to the deleted placeholder"
+    );
+    assert_ne!(
+        inner.agent_job_requests.get(&agent_job_id),
+        Some(&request_id),
+        "MC-2: agent_job_requests still resolves to the deleted placeholder"
+    );
+    assert_ne!(
+        inner.timeline_requests.get(&timeline_id),
+        Some(&request_id),
+        "MC-2: timeline_requests still resolves to the deleted placeholder"
+    );
+
+    // The fan-out jobs that replaced it keep their own correlation intact.
+    for id in ["downstream (ubuntu-latest)", "downstream (macos-latest)"] {
+        let job_id = JobId(id.to_string());
+        let record = inner
+            .job_requests
+            .values()
+            .find(|r| r.run_id == run_id && r.job_id == job_id)
+            .unwrap_or_else(|| panic!("fan-out job {id} must keep its request record"));
+        assert!(
+            inner.inflight_requests.contains_key(&record.request_id),
+            "fan-out job {id} must still be inflight"
+        );
+    }
+}
