@@ -1892,6 +1892,14 @@ async fn wait_for_environment_change(
         std::future::pending::<()>().await;
         return;
     };
+    // Grace before reaping: a freshly-paired machine is not idle — the broker
+    // assigns jobs before the guest runner has even received the request, and
+    // the guest announces its claim on stdout moments later. Reaping on the
+    // first observed mismatch killed machines mid-claim and requeued jobs
+    // forever under mixed environments. Require the mismatch to persist across
+    // a few checks so only genuinely idle runners are recycled.
+    const REAP_GRACE_CHECKS: u32 = 25; // ~2.5 s at the 100 ms cadence below.
+    let mut mismatch_checks = 0u32;
     loop {
         if claimed.load(Ordering::Acquire) {
             std::future::pending::<()>().await;
@@ -1902,7 +1910,12 @@ async fn wait_for_environment_change(
             .map(|labels| labels.clone())
             .unwrap_or_default();
         if !labels.is_empty() && EnvironmentSpec::default_base(&labels) != current_base {
-            return;
+            mismatch_checks += 1;
+            if mismatch_checks >= REAP_GRACE_CHECKS {
+                return;
+            }
+        } else {
+            mismatch_checks = 0;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -2181,8 +2194,9 @@ async fn provision_runner<P: VmProvider + 'static>(
         // Fork from the already-booted golden VM instant CoW clone.
         provider.fork(golden, name).await?;
         // The PACKED golden carries its bake inside the artifact's flattened
-        // rootfs, which forks inherit through the storage chain — nothing to
-        // do. Environment goldens are different: `prepare_golden_for_env`
+        // rootfs, which forks inherit through the storage chain — so the apt
+        // baseline is already there. Environment goldens are different:
+        // `prepare_golden_for_env`
         // bakes via guest `exec`, and SmolVM's forkable snapshot does NOT
         // carry post-create exec writes into clones (verified empirically),
         // so an env-golden fork boots the bare stock base image. Install the
@@ -2190,7 +2204,35 @@ async fn provision_runner<P: VmProvider + 'static>(
         // single-use machine, so the writes persist for its lifetime.
         let golden_is_packed = config.use_packed_artifact
             && golden.as_str() == format!("{}-golden", config.name_prefix);
-        if !golden_is_packed {
+        if golden_is_packed {
+            // A pack is only as baked as whoever produced it: `prepare_artifact`
+            // bakes the workspace toolchains, but `download_prebaked_golden`
+            // short-circuits that path, and a published pack can predate (or
+            // simply omit) the toolchain the workspace now asks for. Probing
+            // beats assuming — a fork missing cargo runs the job anyway and
+            // cargo-dist dies with "you don't appear to have cargo installed",
+            // blaming the workflow for a broken machine. A fully baked pack
+            // pays one `command -v` per layer.
+            for layer in toolchains {
+                if verify_toolchain_installed(provider.as_ref(), name, layer)
+                    .await
+                    .is_ok()
+                {
+                    continue;
+                }
+                warn!(
+                    machine = name.as_str(),
+                    toolchain = %layer,
+                    "packed golden lacks toolchain; installing into the fork"
+                );
+                for command in layer.install_commands() {
+                    if let Err(error) = provider.exec(name, &command).await {
+                        return Err(error.into());
+                    }
+                }
+                verify_toolchain_installed(provider.as_ref(), name, layer).await?;
+            }
+        } else {
             install_base_dependencies(provider.as_ref(), name).await?;
             for layer in toolchains {
                 for command in layer.install_commands() {
@@ -2198,6 +2240,7 @@ async fn provision_runner<P: VmProvider + 'static>(
                         return Err(error.into());
                     }
                 }
+                verify_toolchain_installed(provider.as_ref(), name, layer).await?;
             }
         }
     } else {
@@ -2242,6 +2285,7 @@ async fn provision_runner<P: VmProvider + 'static>(
                     return Err(error.into());
                 }
             }
+            verify_toolchain_installed(provider.as_ref(), name, layer).await?;
         }
     }
 
@@ -2363,6 +2407,26 @@ async fn provision_runner<P: VmProvider + 'static>(
     Ok(run)
 }
 
+/// Fail the provision if a toolchain layer's binary is not on the default
+/// PATH after install. A provision interrupted between install commands (or
+/// an install that silently succeeded without producing the binary) would
+/// otherwise leave the job running without its toolchain — e.g. cargo-dist
+/// failing on "you don't appear to have cargo installed" with no hint that
+/// the machine itself was broken.
+async fn verify_toolchain_installed<P: VmProvider>(
+    provider: &P,
+    name: &MachineName,
+    layer: &ToolchainLayer,
+) -> Result<(), OrchestratorError> {
+    let binary = layer.verify_binary();
+    let mut command = vec!["sh".to_owned(), "-c".to_owned()];
+    command.push(format!("command -v {binary}"));
+    if let Err(error) = provider.exec(name, &command).await {
+        return Err(OrchestratorError::Vm(error));
+    }
+    Ok(())
+}
+
 /// Stage a pre-generated keypair for one `configure` call, if one is ready.
 ///
 /// Absent a staged key the guest generates its own, which is simply the
@@ -2469,6 +2533,8 @@ mod lifecycle_tests {
         fail_configure: bool,
         fail_run: bool,
         fail_delete: bool,
+        /// Binary that `command -v` cannot find until its toolchain installs.
+        absent_binary: Mutex<Option<&'static str>>,
     }
 
     impl TestProvider {
@@ -2487,6 +2553,16 @@ mod lifecycle_tests {
                 fail_configure,
                 fail_run,
                 fail_delete,
+                absent_binary: Mutex::new(None),
+            }
+        }
+
+        /// A provider whose guests lack `binary` until an install command for
+        /// it runs — a pack baked without the workspace's toolchain.
+        fn without_binary(binary: &'static str) -> Self {
+            Self {
+                absent_binary: Mutex::new(Some(binary)),
+                ..Self::new(false, false, false, false, false)
             }
         }
 
@@ -2723,6 +2799,18 @@ chmod +x "$destination/bin/node"
                 .lock()
                 .await
                 .push(format!("exec:{}:{:?}", name.as_str(), argv));
+            let mut absent = self.absent_binary.lock().await;
+            if let Some(binary) = *absent {
+                let probe = format!("command -v {binary}");
+                if argv.contains(&probe) {
+                    return Err(test_error("binary-not-found"));
+                }
+                // An install command that names the binary lands it on PATH.
+                if argv.iter().any(|arg| arg.contains(binary)) {
+                    *absent = None;
+                }
+            }
+            drop(absent);
             if self.fail_install && argv.iter().any(|arg| arg.contains("apt-get")) {
                 return Err(test_error("install-failure"));
             }
@@ -2843,6 +2931,86 @@ chmod +x "$destination/bin/node"
         let config = test_config(false);
         let golden = MachineName::new("lifecycle-test-golden").unwrap();
         provisioning_failure(provider, &config, Some(&golden), "configure-failure").await;
+    }
+
+    fn packed_fork_config() -> RunnerPoolConfig {
+        let mut config = test_config(false);
+        config.use_fork = true;
+        config.use_packed_artifact = true;
+        config
+    }
+
+    /// A published pack can be older than the workspace's toolchain pin, so a
+    /// fork of the packed golden must not be trusted to already have cargo:
+    /// cargo-dist's plan job installs no toolchain of its own and fails with
+    /// "you don't appear to have cargo installed" on a bare machine.
+    #[tokio::test]
+    async fn packed_golden_fork_installs_a_toolchain_the_pack_lacks() {
+        let provider = Arc::new(TestProvider::without_binary("cargo"));
+        let config = packed_fork_config();
+        let golden = MachineName::new("lifecycle-test-golden").unwrap();
+        let name = MachineName::new("lifecycle-test-0-1").unwrap();
+
+        provision_runner(
+            &provider,
+            &config,
+            &name,
+            Some(&golden),
+            &Arc::new(KeyPool::new()),
+            &config.base_image.clone(),
+            &[ToolchainLayer::Rust("1.97".to_owned())],
+        )
+        .await
+        .expect("the fork installs the toolchain its pack lacks");
+
+        let events = provider.events().await;
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("command -v cargo")),
+            "the fork must probe for the toolchain: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| event.contains("rustup-init")),
+            "a probe miss must install the toolchain: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| event.contains("apt-get")),
+            "the pack already carries the apt baseline: {events:?}"
+        );
+    }
+
+    /// The probe is the whole cost on a pack that is already baked: no reinstall.
+    #[tokio::test]
+    async fn packed_golden_fork_keeps_a_baked_toolchain() {
+        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
+        let config = packed_fork_config();
+        let golden = MachineName::new("lifecycle-test-golden").unwrap();
+        let name = MachineName::new("lifecycle-test-0-2").unwrap();
+
+        provision_runner(
+            &provider,
+            &config,
+            &name,
+            Some(&golden),
+            &Arc::new(KeyPool::new()),
+            &config.base_image.clone(),
+            &[ToolchainLayer::Rust("1.97".to_owned())],
+        )
+        .await
+        .expect("provisioning succeeds");
+
+        let events = provider.events().await;
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("command -v cargo")),
+            "the fork must probe for the toolchain: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| event.contains("rustup-init")),
+            "a baked toolchain must not be reinstalled: {events:?}"
+        );
     }
 
     #[tokio::test]
