@@ -167,6 +167,20 @@ fn golden_keeps_apt_lists_for_workflow_installs() {
     );
 }
 
+/// GitHub's images ship `/etc/apt/apt.conf.d/90assumeyes`, which is why
+/// `sudo apt-get install musl-tools` (uv's musl cell — no `-y`) installs three
+/// new packages in the golden without ever printing a confirmation prompt.
+/// Without it the same step stops at `Do you want to continue? [Y/n]`.
+#[test]
+fn golden_assumes_yes_for_apt_like_hosted_images() {
+    let script = base_install_script();
+    assert!(
+        script.contains("APT::Get::Assume-Yes")
+            && script.contains("/etc/apt/apt.conf.d/90assumeyes"),
+        "the golden must carry the hosted images' apt assume-yes config"
+    );
+}
+
 /// `sudo` resolves its own hostname on every invocation; an unresolvable one
 /// prints `sudo: unable to resolve host <name>` before each command, which no
 /// hosted-runner log contains.
