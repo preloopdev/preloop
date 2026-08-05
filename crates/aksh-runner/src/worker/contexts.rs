@@ -341,7 +341,7 @@ impl JobContext {
                     }
                 }
             }
-            tracing::debug!(
+            tracing::info!(
                 context_token_len,
                 env_token = self.env.get("GITHUB_TOKEN").map(|t| t.len()).unwrap_or(0),
                 "github context token resolution"
