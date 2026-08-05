@@ -1,0 +1,80 @@
+name: supply-chain
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Nightly refresh of the RustSec advisory DB and vet imports.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+# Supply-chain gate: three independent checks.
+#   cargo vet   - fails on any dependency version change that has not been
+#                 re-vouched (the "same publisher, new malicious version"
+#                 attack class — cf. the Aug 2026 keyv/npm worm).
+#   cargo audit - RustSec advisory DB: known-vulnerable versions.
+#   cargo deny  - advisories, license policy, banned crates, and source
+#                 policy (crates.io only; no git/unknown registries).
+
+jobs:
+  audit-vet-deny:
+    runs-on: self-hosted
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.86"
+
+      - name: Cache supply-chain tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin
+          key: cargo-tools-vet-0.10.1-audit-0.22.2-deny-0.20.2-${{ runner.os }}
+
+      - name: Install cargo-vet
+        run: cargo install --locked cargo-vet --version 0.10.1
+
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit --version 0.22.2
+
+      - name: Install cargo-deny
+        run: cargo install --locked cargo-deny --version 0.20.2
+
+      # The gate's own policy files (deny.toml, supply-chain/, audit.toml)
+      # are trusted inputs from main. A PR that edits them could exempt a
+      # malicious dependency, so any PR touching them fails immediately.
+      - name: Reject gate-config tampering in PRs
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch origin main --depth=1
+          changed=$(git diff --name-only origin/main...HEAD -- deny.toml .cargo/audit.toml supply-chain/ || true)
+          if [ -n "$changed" ]; then
+            echo "supply-chain policy files must not change in PRs: $changed" >&2
+            exit 1
+          fi
+
+      # Neutralize the article's attack vectors from the PR checkout:
+      # `.cargo/config.toml` can alias any `cargo <tool>` to `run` or point
+      # rustc at a repo script (shnatsel: "Do not run any cargo commands on
+      # untrusted projects"). The repo's own config is gitignored, so any
+      # `.cargo/config.toml` here was shipped by the PR — remove it. This
+      # runs on the self-hosted pool, so the drop is load-bearing, not
+      # cosmetic; the workflow token stays read-only.
+      - name: Drop PR-shipped .cargo/config.toml
+        run: rm -f .cargo/config.toml .cargo/config
+
+      - name: cargo vet (dependency version-change gate)
+        run: cargo vet
+
+      - name: cargo audit (RustSec advisory DB)
+        run: cargo audit --ignore RUSTSEC-2023-0071
+
+      - name: cargo deny (advisories, licenses, bans, sources)
+        run: cargo deny check all
