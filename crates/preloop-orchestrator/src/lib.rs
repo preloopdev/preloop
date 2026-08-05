@@ -513,12 +513,17 @@ async fn await_guest_ready<P: VmProvider>(
 /// script ended in `rm -rf /var/lib/apt/lists/*` boots without them, and each
 /// of those steps fails with `E: Unable to locate package`. Cheap to check,
 /// and a no-op on an image that has them.
+///
+/// Hard-bounded: a fork of a packed golden can inherit a held apt lock from the
+/// frozen image, and `apt-get update` then waits forever — which would block
+/// provisioning, not just the refresh. A missed refresh costs a workflow one
+/// `apt-get update`; a hung one costs the whole pool.
 fn apt_lists_refresh_command() -> Vec<String> {
     vec![
         "sh".to_owned(),
         "-c".to_owned(),
         "[ -n \"$(find /var/lib/apt/lists -name '*_Packages*' -print -quit 2>/dev/null)\" ] \
-         || apt-get update -qq || true"
+         || timeout 120 apt-get -o DPkg::Lock::Timeout=10 update -qq || true"
             .to_owned(),
     ]
 }
@@ -3085,9 +3090,10 @@ chmod +x "$destination/bin/node"
 
         let events = provider.events().await;
         assert!(
-            events
-                .iter()
-                .any(|event| event.contains("_Packages") && event.contains("apt-get update")),
+            events.iter().any(|event| event.contains("_Packages")
+                && event.contains("apt-get")
+                && event.contains("update")
+                && event.contains("timeout 120")),
             "the fork must restore apt indices when the pack has none: {events:?}"
         );
     }
