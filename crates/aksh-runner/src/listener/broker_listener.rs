@@ -120,6 +120,41 @@ async fn force_fail_job(job: &RunningJob, conclusion: &str) {
     }
 }
 
+/// Ask the worker to cancel the running job and wrap up, waiting up to the
+/// official 60s grace; if the worker fails or ignores the message, force-fail
+/// the job request so the run concludes instead of dangling until the lease
+/// reaper. Shared by the OS-signal and RunnerShutdown-broker-message paths
+/// (CR-2 F-1); mirrors the official `RunnerShutdown`/`OperatingSystemShutdown`
+/// handling in `JobDispatcher`.
+async fn shutdown_job_gracefully(job: &mut RunningJob) {
+    match job
+        .shutdown_gracefully(std::time::Duration::from_secs(60))
+        .await
+    {
+        Some(true) => {
+            info!(
+                "Worker completed job {} gracefully during shutdown",
+                job.request_id
+            );
+        }
+        Some(false) => {
+            warn!(
+                "Worker failed job {} during shutdown — force-failing",
+                job.request_id
+            );
+            force_fail_job(job, "failed").await;
+        }
+        None => {
+            warn!("Worker killed after shutdown grace expired");
+            // The worker never reported. The official completes the request
+            // even after the forced kill (`CompleteJobRequestAsync` with
+            // Canceled on the shutdown path); do the same so the job
+            // concludes instead of dangling to the reaper.
+            force_fail_job(job, "canceled").await;
+        }
+    }
+}
+
 async fn delete_broker_session(client: &BrokerClient, token: &str, session_id: &mut String) {
     if session_id.is_empty() {
         return;
@@ -355,34 +390,7 @@ pub async fn run_broker_loop(
             _ = &mut shutdown => {
                 info!("Shutdown signal received");
                 if let Some(mut job) = active_job.take() {
-                    // Official RunnerShutdown: the worker is told to cancel
-                    // the job and wrap up so the run concludes `cancelled`
-                    // instead of dangling until the lease reaper. Kill only
-                    // if the worker ignores the message within the grace.
-                    match job
-                        .shutdown_gracefully(std::time::Duration::from_secs(60))
-                        .await
-                    {
-                        Some(true) => {
-                            info!("Worker completed job {} gracefully during shutdown", job.request_id);
-                        }
-                        Some(false) => {
-                            warn!(
-                                "Worker failed job {} during shutdown — force-failing",
-                                job.request_id
-                            );
-                            force_fail_job(&job, "failed").await;
-                        }
-                        None => {
-                            warn!("Worker killed after shutdown grace expired");
-                            // The worker never reported. The official
-                            // completes the request even after the forced
-                            // kill (`CompleteJobRequestAsync` with Canceled
-                            // on the shutdown path); do the same so the job
-                            // concludes instead of dangling to the reaper.
-                            force_fail_job(&job, "canceled").await;
-                        }
-                    }
+                    shutdown_job_gracefully(&mut job).await;
                 }
                 return Ok(());
             }
@@ -490,6 +498,16 @@ pub async fn run_broker_loop(
 
                         match classify_message(&message_type) {
                             BrokerMessageKind::RunnerJobRequest => {
+                                // The runner is spoken for the moment the
+                                // request arrives: the orchestrator's
+                                // environment-adaptation reaper kills idle
+                                // machines to make room for a queued job of a
+                                // different image, and it watches stdout for
+                                // this sentinel. Announcing after the oauth
+                                // renewal and acquire round-trips left a
+                                // window where a freshly-paired machine was
+                                // still "idle" and got reaped mid-claim.
+                                announce_busy();
                                 if let Some(mut prev) = active_job.take() {
                                     // C-04: Official run-service dispatcher cancels
                                     // the previous worker immediately on overlap
@@ -522,7 +540,6 @@ pub async fn run_broker_loop(
                                 }
                                 let job = acquire_job_from_ref(&body, http, &token).await?;
                                 if let Some(job_msg) = job {
-                                    announce_busy();
                                     let running = job_dispatcher::spawn_job(
                                         job_msg,
                                         runner_root,
@@ -626,6 +643,15 @@ pub async fn run_broker_loop(
                                     .and_then(|value| value.as_str())
                                     .unwrap_or("unspecified");
                                 info!(%reason, "Service requested runner shutdown");
+                                // CR-2 F-1: this is the broker equivalent of
+                                // the OS shutdown path — ask the worker to
+                                // cancel the running job and wrap up so the
+                                // run concludes instead of dangling until the
+                                // lease reaper; force-fail if the worker
+                                // fails or ignores the grace period.
+                                if let Some(mut job) = active_job.take() {
+                                    shutdown_job_gracefully(&mut job).await;
+                                }
                                 return Ok(());
                             }
                             BrokerMessageKind::RunnerRefresh => {
@@ -878,6 +904,11 @@ fn parse_message_body(
 
 /// Tell a supervising orchestrator that this single-use runner is now spoken
 /// for, so it can build the replacement while the job runs instead of after.
+///
+/// Called as soon as the job request is received rather than once the claim
+/// completes: the orchestrator must never reap a machine that is taking a job,
+/// and the acquire handshake is exactly the window its environment-adaptation
+/// reaper was losing the race in.
 ///
 /// Written straight to stdout rather than through `tracing` so it survives any
 /// log filter and stays trivially greppable in the process output stream.
