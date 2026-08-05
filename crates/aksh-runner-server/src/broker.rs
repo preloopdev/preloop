@@ -666,13 +666,14 @@ pub(crate) async fn broker_acquire_job(
             }
         };
         if let Some(minted) = minted {
+            let token = minted.token;
             message.variables.insert(
                 "system.github.token".to_owned(),
-                aksh_gha_protocol::azdo::VariableValue::secret(minted.token.clone()),
+                aksh_gha_protocol::azdo::VariableValue::secret(token.clone()),
             );
             message.variables.insert(
                 "github_token".to_owned(),
-                aksh_gha_protocol::azdo::VariableValue::secret(minted.token),
+                aksh_gha_protocol::azdo::VariableValue::secret(token.clone()),
             );
             // Restate what the token carries when the installation could not
             // grant everything. The message was built with the requested set,
@@ -685,6 +686,24 @@ pub(crate) async fn broker_acquire_job(
                     aksh_gha_protocol::azdo::VariableValue::new(
                         aksh_gha_parser::job_builder::token_permissions_wire_json(&effective),
                     ),
+                );
+            }
+            // The workflow's `github` context is built at submission time,
+            // before the App token can exist, so `${{ github.token }}`
+            // inputs (actions/checkout's token, the persist-credentials
+            // config, the non-persist temp-config include) resolve empty
+            // and every git fetch prompts for a username. Patch the minted
+            // token into the context at claim so checkout authenticates
+            // exactly like it does on GitHub-hosted runners — no runner-side
+            // env header needed (an env `extraheader` would duplicate the
+            // one checkout persists itself: "Duplicate header: Authorization",
+            // HTTP 400).
+            if let Some(aksh_gha_protocol::azdo::PipelineContextData::Dict(github)) =
+                message.context_data.get_mut("github")
+            {
+                github.insert(
+                    "token".to_owned(),
+                    aksh_gha_protocol::azdo::PipelineContextData::String(token),
                 );
             }
         }
