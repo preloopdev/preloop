@@ -415,6 +415,7 @@ pub fn base_install_script() -> String {
          apt-get install -y -qq --no-install-recommends {BASE_PACKAGES} \
          && printf '{LOOPBACK_HOSTS}' > /etc/hosts && \
          printf '127.0.0.1 %s\\n' \"$(hostname)\" >> /etc/hosts && \
+         printf 'APT::Get::Assume-Yes \"true\";\\n' > /etc/apt/apt.conf.d/90assumeyes && \
          (arch=$(uname -m); \
           case \"$arch\" in x86_64) NODE_ARCH=x64 ;; aarch64|arm64) NODE_ARCH=arm64 ;; *) NODE_ARCH=x64 ;; esac; \
           curl -fsSL \"https://nodejs.org/dist/v{BASE_NODE_VERSION}/node-v{BASE_NODE_VERSION}-linux-$NODE_ARCH.tar.gz\" \
