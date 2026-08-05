@@ -364,6 +364,11 @@ pub fn loopback_hosts() -> &'static str {
     LOOPBACK_HOSTS
 }
 
+/// PATH exported to the guest runner. Exposed for the lifecycle tests.
+pub fn guest_runner_path() -> &'static str {
+    GUEST_RUNNER_PATH
+}
+
 fn node_externals_at(runner_root: &str) -> Vec<Vec<String>> {
     [vec![
         "sh".to_owned(),
@@ -409,6 +414,7 @@ pub fn base_install_script() -> String {
          DEBIAN_FRONTEND=noninteractive \
          apt-get install -y -qq --no-install-recommends {BASE_PACKAGES} \
          && printf '{LOOPBACK_HOSTS}' > /etc/hosts && \
+         printf '127.0.0.1 %s\\n' \"$(hostname)\" >> /etc/hosts && \
          (arch=$(uname -m); \
           case \"$arch\" in x86_64) NODE_ARCH=x64 ;; aarch64|arm64) NODE_ARCH=arm64 ;; *) NODE_ARCH=x64 ;; esac; \
           curl -fsSL \"https://nodejs.org/dist/v{BASE_NODE_VERSION}/node-v{BASE_NODE_VERSION}-linux-$NODE_ARCH.tar.gz\" \
@@ -423,7 +429,7 @@ pub fn base_install_script() -> String {
           printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\"}}\\n' > /etc/docker/daemon.json \
           || true) && \
        (curl -sSL https://github.com/Boshen/cargo-shear/releases/download/v{CARGO_SHEAR_VERSION}/cargo-shear-$(uname -m)-unknown-linux-musl.tar.gz 2>/dev/null | tar -xz -C /usr/local/bin 2>/dev/null || true) && \
-         apt-get clean && rm -rf /var/lib/apt/lists/*"
+         apt-get clean"
     )
 }
 
@@ -496,6 +502,24 @@ async fn await_guest_ready<P: VmProvider>(
             Err(_) => tokio::time::sleep(GUEST_READY_POLL).await,
         }
     }
+}
+
+/// Restore apt's package indices when the image shipped without them.
+///
+/// Hosted images keep populated lists, so real workflows run
+/// `sudo apt-get install <pkg>` with no `apt-get update` first (uv's musl cell
+/// installs `musl-tools` that way). Every pack published while the baseline
+/// script ended in `rm -rf /var/lib/apt/lists/*` boots without them, and each
+/// of those steps fails with `E: Unable to locate package`. Cheap to check,
+/// and a no-op on an image that has them.
+fn apt_lists_refresh_command() -> Vec<String> {
+    vec![
+        "sh".to_owned(),
+        "-c".to_owned(),
+        "[ -n \"$(find /var/lib/apt/lists -name '*_Packages*' -print -quit 2>/dev/null)\" ] \
+         || apt-get update -qq || true"
+            .to_owned(),
+    ]
 }
 
 async fn install_base_dependencies<P: VmProvider>(
@@ -584,6 +608,20 @@ async fn write_bake_manifest<P: VmProvider>(
     Ok(())
 }
 
+/// PATH the guest runner process exports to every step.
+///
+/// Hosted images carry the toolchain bin directories on the runner's own PATH,
+/// which is what makes `cargo install`-style actions work: `taiki-e/install-action`
+/// drops `cargo-hack` in `$CARGO_HOME/bin` and the next step runs `cargo hack`.
+/// dtolnay/rust-toolchain only appends that directory to `$GITHUB_PATH` when it
+/// has to install rustup itself, so on an image that already has rustup — ours,
+/// and GitHub's — the directory is on PATH or the tool is simply unreachable.
+/// Guests run as root, so `$HOME/.cargo` is `/root/.cargo`; the Go layer
+/// untars into `/usr/local/go`. Absent directories cost nothing.
+const GUEST_RUNNER_PATH: &str = "/root/.cargo/bin:/usr/local/go/bin:\
+                                 /usr/local/sbin:/usr/local/bin:\
+                                 /usr/sbin:/usr/bin:/sbin:/bin";
+
 /// `env` prefix for guest runner invocations, empty when nothing needs setting.
 ///
 /// Control-socket routing and failure-marker debugging are independent
@@ -591,6 +629,7 @@ async fn write_bake_manifest<P: VmProvider>(
 /// vice versa, so neither may gate the other.
 fn guest_env_prefix(config: &RunnerPoolConfig, name: &MachineName) -> Vec<String> {
     let mut env = Vec::new();
+    env.push(format!("PATH={GUEST_RUNNER_PATH}"));
     // The guest needs its own VM name so a debug session can tell a controller
     // which machine to open a shell into. Nothing else in the guest knows it.
     env.push(format!("PRELOOP_MACHINE_NAME={}", name.as_str()));
@@ -2205,6 +2244,14 @@ async fn provision_runner<P: VmProvider + 'static>(
         let golden_is_packed = config.use_packed_artifact
             && golden.as_str() == format!("{}-golden", config.name_prefix);
         if golden_is_packed {
+            // The pack carries the apt baseline, but not necessarily apt's
+            // indices — restore them before any workflow apt-installs.
+            if let Err(error) = provider.exec(name, &apt_lists_refresh_command()).await {
+                warn!(
+                    machine = name.as_str(),
+                    %error, "apt list refresh failed; workflow apt installs may not resolve"
+                );
+            }
             // A pack is only as baked as whoever produced it: `prepare_artifact`
             // bakes the workspace toolchains, but `download_prebaked_golden`
             // short-circuits that path, and a published pack can predate (or
@@ -2656,6 +2703,37 @@ chmod +x "$destination/bin/node"
         assert!(!env.contains(&"PRELOOP_CONTROL_ORIGIN=http://192.168.1.20:9090".to_owned()));
     }
 
+    /// A workflow that installs a cargo subcommand and runs it in the next
+    /// step (`taiki-e/install-action` + `cargo hack`) only works when the
+    /// toolchain's bin directory is on the runner's PATH, as it is on hosted
+    /// images. Without it the install "succeeds" and the next step reports
+    /// `no such command: hack`.
+    #[test]
+    fn runner_path_carries_toolchain_bin_directories() {
+        let config = test_config(false);
+        let name = MachineName::new("runner").unwrap();
+
+        let env = guest_env_prefix(&config, &name);
+
+        let path = env
+            .iter()
+            .find_map(|entry| entry.strip_prefix("PATH="))
+            .expect("the runner is launched with an explicit PATH");
+        let entries: Vec<&str> = path.split(':').collect();
+        assert!(
+            entries.contains(&"/root/.cargo/bin"),
+            "cargo-installed binaries must be reachable: {path}"
+        );
+        assert!(
+            entries.contains(&"/usr/local/go/bin"),
+            "the go layer untars into /usr/local/go: {path}"
+        );
+        assert!(
+            entries.contains(&"/usr/local/bin") && entries.contains(&"/usr/bin"),
+            "the system PATH must survive: {path}"
+        );
+    }
+
     #[test]
     fn tcp_upstream_sets_origin_and_upstream_without_socket() {
         let mut config = test_config(false);
@@ -2975,8 +3053,41 @@ chmod +x "$destination/bin/node"
             "a probe miss must install the toolchain: {events:?}"
         );
         assert!(
-            !events.iter().any(|event| event.contains("apt-get")),
+            !events
+                .iter()
+                .any(|event| event.contains("--no-install-recommends")),
             "the pack already carries the apt baseline: {events:?}"
+        );
+    }
+
+    /// A pack published before the baseline stopped wiping `/var/lib/apt/lists`
+    /// boots without apt indices, and `sudo apt-get install <pkg>` — how real
+    /// workflows install system packages — then resolves nothing.
+    #[tokio::test]
+    async fn packed_golden_fork_restores_apt_indices() {
+        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
+        let config = packed_fork_config();
+        let golden = MachineName::new("lifecycle-test-golden").unwrap();
+        let name = MachineName::new("lifecycle-test-0-3").unwrap();
+
+        provision_runner(
+            &provider,
+            &config,
+            &name,
+            Some(&golden),
+            &Arc::new(KeyPool::new()),
+            &config.base_image.clone(),
+            &[],
+        )
+        .await
+        .expect("provisioning succeeds");
+
+        let events = provider.events().await;
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("_Packages") && event.contains("apt-get update")),
+            "the fork must restore apt indices when the pack has none: {events:?}"
         );
     }
 
