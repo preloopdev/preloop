@@ -464,6 +464,61 @@ jobs:
     assert_eq!(jobs[0].runs_on, vec!["self-hosted", "linux"]);
 }
 
+/// `runs-on: ${{ matrix.os }}` is the most common shape in real workflows
+/// (tokio, caddy, uv). An unresolved label is one no runner can advertise, so
+/// the cell queues forever and the cause looks like a scheduling bug.
+#[test]
+fn matrix_runs_on_resolves_per_combination() {
+    let workflow = parse_workflow(
+        r#"
+on: push
+jobs:
+  cell:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap();
+    let jobs = expand_jobs(&workflow).unwrap();
+
+    let labels: Vec<Vec<String>> = jobs.iter().map(|job| job.runs_on.clone()).collect();
+    assert_eq!(
+        labels,
+        vec![
+            vec!["ubuntu-latest".to_owned()],
+            vec!["ubuntu-22.04".to_owned()]
+        ]
+    );
+}
+
+/// The list form carries expressions too, and a literal label beside an
+/// expression must survive untouched.
+#[test]
+fn matrix_runs_on_resolves_inside_a_label_list() {
+    let workflow = parse_workflow(
+        r#"
+on: push
+jobs:
+  cell:
+    strategy:
+      matrix:
+        include:
+          - arch: X64
+    runs-on: [self-hosted, "${{ matrix.arch }}"]
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap();
+    let jobs = expand_jobs(&workflow).unwrap();
+
+    assert_eq!(jobs[0].runs_on, vec!["self-hosted", "X64"]);
+}
+
 #[test]
 fn parses_local_action_metadata() {
     let action = parse_action_metadata(

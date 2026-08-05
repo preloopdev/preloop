@@ -35,6 +35,33 @@ fn resolved_job_name(
     }
 }
 
+/// Resolve `runs-on` for one concrete matrix combination.
+///
+/// `runs-on: ${{ matrix.os }}` is the single most common shape in real
+/// workflows (tokio, caddy and uv all use it), and the label decides which
+/// machine the job can run on. Leaving the raw `${{ … }}` in place produces a
+/// label no runner can ever advertise, so the cell is expanded, queued, and
+/// then waits forever — the failure looks like a scheduling bug rather than an
+/// unevaluated expression. GitHub evaluates `runs-on` with the matrix in
+/// context, so every other per-cell field here already resolves the same way.
+fn resolved_runs_on(
+    labels: Vec<String>,
+    matrix: &IndexMap<String, Value>,
+    inputs: Option<&BTreeMap<String, Value>>,
+) -> Vec<String> {
+    let context = expression_context(matrix, inputs);
+    labels
+        .into_iter()
+        .map(|label| {
+            if !label.contains("${{") {
+                return label;
+            }
+            crate::eval::resolve_string(&label, &context).unwrap_or(label)
+        })
+        .filter(|label| !label.trim().is_empty())
+        .collect()
+}
+
 fn resolved_continue_on_error(
     job_id: &str,
     value: Option<&JobContinueOnError>,
@@ -385,7 +412,7 @@ fn job_plan_from_job(
         base_id: job_id.to_owned(),
         name,
         runner_group: job.runs_on.group(),
-        runs_on: job.runs_on.labels(),
+        runs_on: resolved_runs_on(job.runs_on.labels(), &matrix, inputs),
         needs: job.needs.ids(),
         matrix,
         matrix_index,
