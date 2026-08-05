@@ -6895,6 +6895,52 @@ async fn claims_prefer_a_job_the_runner_exactly_matches() {
     assert_eq!(second.job_id.0, "pinned");
 }
 
+/// A job for a platform with no runner host can never be claimed. Queuing it
+/// forever means a run that never finishes and a check that never reports, so
+/// it is skipped — but only when nothing is registered that could serve it.
+#[test]
+fn jobs_are_skipped_only_for_platforms_nothing_can_host() {
+    let linux_pool = || ["linux", "linux"].into_iter();
+
+    assert_eq!(
+        crate::runtime_scheduling::unhostable_platform(
+            &["windows-latest".to_owned()],
+            linux_pool()
+        ),
+        Some("windows")
+    );
+    assert_eq!(
+        crate::runtime_scheduling::unhostable_platform(&["macos-15".to_owned()], linux_pool()),
+        Some("macos")
+    );
+
+    // A registered Mac host makes macOS a supported deployment, not a gap.
+    assert_eq!(
+        crate::runtime_scheduling::unhostable_platform(
+            &["macos-latest".to_owned()],
+            ["linux", "macos"].into_iter()
+        ),
+        None
+    );
+
+    // Linux is never skipped: the pool provisions it on demand, and an
+    // ephemeral pool is routinely between runners.
+    assert_eq!(
+        crate::runtime_scheduling::unhostable_platform(
+            &["ubuntu-22.04".to_owned()],
+            std::iter::empty()
+        ),
+        None
+    );
+    assert_eq!(
+        crate::runtime_scheduling::unhostable_platform(
+            &["self-hosted".to_owned(), "gpu".to_owned()],
+            std::iter::empty()
+        ),
+        None
+    );
+}
+
 #[test]
 fn label_matching_empty_runner_matches_all() {
     // Unknown runner (empty labels) matches everything

@@ -1076,6 +1076,52 @@ fn hosted_label_os(required: &str) -> Option<&'static str> {
     }
 }
 
+/// The platform a job needs that this deployment cannot host, if any.
+///
+/// The microVM pool only builds Linux guests; macOS and Windows need a runner
+/// process on such a machine, registered against this control plane. When none
+/// is registered, a `runs-on: windows-latest` job can never be claimed, and
+/// leaving it queued means a wave that never finishes and a check that never
+/// reports — the cause invisible unless you read the scheduler's mind. Skip it
+/// instead, the way GitHub skips a job whose `if:` excludes it: the run
+/// completes, dependents skip, and the reason is in the log.
+///
+/// Deliberately narrow. A Linux label is never skipped, because the pool
+/// provisions Linux on demand and momentarily having no registered runner is
+/// normal for an ephemeral pool. And a macOS label is only skipped when no
+/// macOS runner is registered — a Mac host serving `macos-latest` is a
+/// supported deployment, not an unsupported platform.
+pub(crate) fn unhostable_platform(
+    job_labels: &[String],
+    runners: impl IntoIterator<Item = &'static str>,
+) -> Option<&'static str> {
+    let needed = job_labels
+        .iter()
+        .filter_map(|label| hosted_label_os(&label.to_lowercase()))
+        .find(|os| *os == "macos" || *os == "windows")?;
+    let hosted_by_someone = runners.into_iter().any(|os| os == needed);
+    (!hosted_by_someone).then_some(needed)
+}
+
+/// The operating systems registered runners declare, for [`unhostable_platform`].
+pub(crate) fn registered_runner_platforms(inner: &InnerState) -> Vec<&'static str> {
+    inner
+        .runners
+        .values()
+        .filter_map(|runner| {
+            runner
+                .labels
+                .iter()
+                .find_map(|label| match label.to_lowercase().as_str() {
+                    "linux" => Some("linux"),
+                    "macos" => Some("macos"),
+                    "windows" => Some("windows"),
+                    _ => None,
+                })
+        })
+        .collect()
+}
+
 /// Check if a job's `runs-on` labels match a runner's registered labels.
 ///
 /// A job matches when every label in the job's `runs-on` is present in the
