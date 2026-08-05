@@ -158,7 +158,12 @@ fn ensure_host_externals(config: &RunnerPoolConfig) -> Result<(), OrchestratorEr
     // root-owned release dir when the engine runs unprivileged, and the
     // deploy step creates the link in that case.
     let bundle_externals = config.runner_bundle.join("externals");
-    if !bundle_externals.join("node24").join("bin").join("node").is_file() {
+    if !bundle_externals
+        .join("node24")
+        .join("bin")
+        .join("node")
+        .is_file()
+    {
         let _ = std::fs::remove_file(&bundle_externals);
         match std::os::unix::fs::symlink(&externals, &bundle_externals) {
             Ok(()) => info!(
@@ -1345,7 +1350,10 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             return Err(OrchestratorError::Config(format!(
                 "baking externals symlink failed (exit {}): {}",
                 output.exit_code,
-                String::from_utf8_lossy(&output.stderr).lines().last().unwrap_or("unknown")
+                String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .last()
+                    .unwrap_or("unknown")
             )));
         }
         let env_spec = EnvironmentSpec::new(self.config.base_image.clone(), toolchains);
