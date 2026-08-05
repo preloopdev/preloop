@@ -37,7 +37,9 @@ __pycache__/
 
 
 # Local toolchains & runner binaries
-.cargo/
+.cargo/*
+# Except the cargo-audit config, which the supply-chain gate needs tracked.
+!.cargo/audit.toml
 .rustup/
 actions-runner/
 official-runner.tar.gz
