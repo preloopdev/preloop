@@ -6841,6 +6841,60 @@ fn label_matching_os_less_runner_stays_eligible() {
     assert!(!job_matches_runner(&["nvidia".into()], &unlabelled));
 }
 
+/// A 24.04 machine may stand in for an `ubuntu-22.04` job, but it must not
+/// take one while a job it exactly matches is claimable: the pool is usually
+/// already building the 22.04 machine that job asked for, and the stand-in
+/// would hand it a different base image for no reason.
+#[tokio::test]
+async fn claims_prefer_a_job_the_runner_exactly_matches() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    // `pinned` is first in the queue, so only the preference can reorder it.
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  pinned:\n    runs-on: ubuntu-22.04\n    steps:\n      - run: echo pinned\n  wide:\n    runs-on: self-hosted\n    steps:\n      - run: echo wide\n",
+            "event": "push",
+            "repository": "owner/repo"
+        }),
+    )
+    .await;
+    assert!(
+        accepted["run_id"].is_string(),
+        "the run was accepted: {accepted}"
+    );
+
+    let machine = RunnerCapabilities {
+        known: true,
+        labels: vec![
+            "self-hosted".to_owned(),
+            "Linux".to_owned(),
+            "X64".to_owned(),
+            "ubuntu-24.04".to_owned(),
+            "ubuntu-latest".to_owned(),
+        ],
+        runner_group_id: None,
+        runner_group_name: None,
+    };
+
+    let mut inner = state.inner.lock().await;
+    let first = crate::runtime_scheduling::take_matching_job(&mut inner, &machine, Some(1))
+        .expect("a claimable job");
+    assert_eq!(
+        first.job_id.0, "wide",
+        "the exact `self-hosted` match must win over the 22.04 stand-in"
+    );
+
+    // And the stand-in still happens rather than starving the pinned job.
+    let second = crate::runtime_scheduling::take_matching_job(&mut inner, &machine, Some(1))
+        .expect("the pinned job is still claimable");
+    assert_eq!(second.job_id.0, "pinned");
+}
+
 #[test]
 fn label_matching_empty_runner_matches_all() {
     // Unknown runner (empty labels) matches everything
