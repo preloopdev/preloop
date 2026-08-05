@@ -361,10 +361,11 @@ pub(crate) async fn get_or_mint_token(
 
 /// [`get_or_mint_token`], told whether the workflow declared `permissions:`.
 ///
-/// A declared set is minted verbatim and fails loudly when the installation
-/// cannot grant it. An undeclared set is this server's own default, so it is
-/// narrowed to the installation's grants rather than failing a job that never
-/// asked for the missing scope.
+/// Either way the request is narrowed to the installation's grants: GitHub's
+/// `GITHUB_TOKEN` is the intersection of the workflow's `permissions:` block
+/// and the installation's grant, and its App API rejects a mint naming scopes
+/// the installation lacks, so refusing the whole claim would cost the job its
+/// GitHub authority for a scope it could never have carried.
 ///
 /// The second element is the set the token *actually* carries, present only
 /// when narrowing occurred. Callers must restate it to the job: a token that
@@ -418,24 +419,27 @@ async fn mint_for_repository(
     let (token, expires_at) = if unprocessable {
         let granted = installation_grants(api_base, &app_jwt, installation_id).await?;
         let missing = ungranted_scopes(permissions, &granted);
-        if declared {
-            return Err(attempt.unwrap_err()).with_context(|| {
-                format!(
-                    "the GitHub App installation on {owner} does not grant [{}] required by this \
-                     workflow's `permissions:` block; grant them to the App installation",
-                    missing.join(", ")
-                )
-            });
-        }
         let clamped = clamp_to_grants(permissions, &granted);
-        warn!(
-            repository,
-            installation_id,
-            ungranted = %missing.join(", "),
-            "the GitHub App installation does not grant [{}]; this job's GITHUB_TOKEN will not \
-             carry them. Grant them to the installation if your workflows need them",
-            missing.join(", ")
-        );
+        if declared {
+            warn!(
+                repository,
+                installation_id,
+                ungranted = %missing.join(", "),
+                "the workflow declares permissions the GitHub App installation does not grant [{}]; \
+                 this job's GITHUB_TOKEN will not carry them. Grant them to the installation if \
+                 your workflows need them",
+                missing.join(", ")
+            );
+        } else {
+            warn!(
+                repository,
+                installation_id,
+                ungranted = %missing.join(", "),
+                "the GitHub App installation does not grant [{}]; this job's GITHUB_TOKEN will not \
+                 carry them. Grant them to the installation if your workflows need them",
+                missing.join(", ")
+            );
+        }
         let minted =
             mint_installation_token(api_base, &app_jwt, installation_id, repo, &clamped).await?;
         narrowed = Some(clamped);
