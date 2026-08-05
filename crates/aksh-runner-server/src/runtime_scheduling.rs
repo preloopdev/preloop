@@ -1153,7 +1153,31 @@ pub(crate) fn job_matches_runner_capabilities(
         && job_matches_runner_group(job.runner_group.as_deref(), runner)
 }
 
+/// Whether the runner carries every label the job asked for, verbatim.
+///
+/// The difference from [`job_matches_runner`] is the hosted-image stand-in: a
+/// 24.04 machine *may* run an `ubuntu-22.04` job, but it is not what the job
+/// asked for, and the pool is usually already building the machine that is.
+fn job_labels_covered_exactly(job_labels: &[String], runner_labels: &[String]) -> bool {
+    if job_labels.is_empty() {
+        return true;
+    }
+    if runner_labels.is_empty() {
+        return false;
+    }
+    let runner_set: std::collections::HashSet<String> =
+        runner_labels.iter().map(|l| l.to_lowercase()).collect();
+    job_labels
+        .iter()
+        .all(|required| runner_set.contains(&required.to_lowercase()))
+}
+
 /// Find and remove the first job matching the given runner's labels and group.
+///
+/// Exact label matches win. A machine that advertises `ubuntu-24.04` will take
+/// an `ubuntu-22.04` job rather than let it sit — but only once no job it
+/// exactly matches is claimable, so the 22.04 job stays available for the
+/// machine the pool is building for it.
 pub(crate) fn take_matching_job(
     inner: &mut InnerState,
     runner: &RunnerCapabilities,
@@ -1168,12 +1192,15 @@ pub(crate) fn take_matching_job(
     inner
         .pool_pending
         .retain(|_, at| assignment_fresh(*at, now));
-    let pos = inner.queue.iter().position(|job| {
-        if !job_matches_runner_capabilities(job, runner) {
-            return false;
-        }
-        claim_permitted(inner, job, verified_runner_id)
-    })?;
+    let claimable = |job: &QueuedJob| {
+        job_matches_runner_capabilities(job, runner)
+            && claim_permitted(inner, job, verified_runner_id)
+    };
+    let pos = inner
+        .queue
+        .iter()
+        .position(|job| job_labels_covered_exactly(&job.runs_on, &runner.labels) && claimable(job))
+        .or_else(|| inner.queue.iter().position(claimable))?;
     let job = inner.queue.remove(pos)?;
     let key = (job.run_id, job.job_id.clone());
     inner.job_assignments.remove(&key);
