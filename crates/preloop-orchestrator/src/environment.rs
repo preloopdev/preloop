@@ -81,6 +81,17 @@ pub enum ToolchainLayer {
     Go(String),
 }
 
+impl std::fmt::Display for ToolchainLayer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Node(version) => write!(f, "node {version}"),
+            Self::Rust(channel) => write!(f, "rust {channel}"),
+            Self::Python(version) => write!(f, "python {version}"),
+            Self::Go(version) => write!(f, "go {version}"),
+        }
+    }
+}
+
 impl ToolchainLayer {
     /// Return shell commands to install this toolchain in a SmolVM.
     ///
@@ -196,6 +207,19 @@ impl ToolchainLayer {
                     safe_component(version)
                 ),
             ]],
+        }
+    }
+
+    /// Binary that must exist on the default PATH once this layer is
+    /// installed. Verified after install so a provision interrupted mid-way
+    /// (or a toolchain that silently failed) fails the machine instead of
+    /// running the job without the tool it asked for.
+    pub fn verify_binary(&self) -> &'static str {
+        match self {
+            Self::Node(_) => "node",
+            Self::Rust(_) => "cargo",
+            Self::Python(_) => "python3",
+            Self::Go(_) => "go",
         }
     }
 }
