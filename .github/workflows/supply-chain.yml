@@ -53,7 +53,12 @@ jobs:
       - name: Reject gate-config tampering in PRs
         if: github.event_name == 'pull_request'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # `secrets.GITHUB_TOKEN` does not resolve on the aksh control plane
+          # (the magic secret is substituted by GitHub's own dispatch, not by
+          # the engine), so take the job token from the github context, which
+          # the engine patches with the credential it actually minted. Same
+          # value on GitHub-hosted runners.
+          GH_TOKEN: ${{ github.token }}
         run: |
           # The checkout above ran with `persist-credentials: false`, so the
           # clone holds no credential and this repo is private. The runner
