@@ -48,13 +48,6 @@ jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:
     runs-on: "ubuntu-22.04"
-    # The engine mints a GitHub App token per job; an undeclared
-    # permissions block would request the broad default set (contents:
-    # write), which the App installation does not grant — the job then
-    # falls back to a local JWT and every git fetch 401s. The plan only
-    # checks out and reads the repo, so contents: read is exact.
-    permissions:
-      contents: read
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
       tag: ${{ !github.event.pull_request && github.ref_name || '' }}
@@ -65,14 +58,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          # Persist the runtime token into the repo config (GitHub-hosted
-          # default): the non-persist path's temp-HOME global config does
-          # not authenticate through the aksh runner's exec environment.
+          persist-credentials: false
           submodules: recursive
-      # cargo-dist's `dist plan` needs cargo on PATH; the aksh VM runners do
-      # not bake toolchains into environment goldens, so install the
-      # toolchain explicitly like the other jobs do.
-      - uses: dtolnay/rust-toolchain@stable
       - name: Install dist
         # we specify bash to get pipefail; it guards against the `curl` command
         # failing. otherwise `sh` won't catch that `curl` returned non-0
