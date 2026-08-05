@@ -667,6 +667,10 @@ pub(crate) async fn broker_acquire_job(
         };
         if let Some(minted) = minted {
             let token = minted.token;
+            tracing::info!(
+                token_len = token.len(),
+                "minted dispatch GitHub token at claim"
+            );
             message.variables.insert(
                 "system.github.token".to_owned(),
                 aksh_gha_protocol::azdo::VariableValue::secret(token.clone()),
@@ -698,13 +702,18 @@ pub(crate) async fn broker_acquire_job(
             // env header needed (an env `extraheader` would duplicate the
             // one checkout persists itself: "Duplicate header: Authorization",
             // HTTP 400).
-            if let Some(aksh_gha_protocol::azdo::PipelineContextData::Dict(github)) =
-                message.context_data.get_mut("github")
-            {
-                github.insert(
-                    "token".to_owned(),
-                    aksh_gha_protocol::azdo::PipelineContextData::String(token),
-                );
+            match message.context_data.get_mut("github") {
+                Some(aksh_gha_protocol::azdo::PipelineContextData::Dict(github)) => {
+                    github.insert(
+                        "token".to_owned(),
+                        aksh_gha_protocol::azdo::PipelineContextData::String(token),
+                    );
+                    tracing::info!("patched minted token into github context");
+                }
+                other => tracing::warn!(
+                    github_context = %match (other) { Some(_) => "non-dict", None => "missing" },
+                    "could not patch github context token"
+                ),
             }
         }
         let mut inner = shared.state.inner.lock().await;
