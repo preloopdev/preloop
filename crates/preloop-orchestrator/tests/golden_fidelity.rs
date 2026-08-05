@@ -149,6 +149,36 @@ fn install_script_pins_docker_repo_and_cargo_shear() {
     }
 }
 
+/// Hosted images keep their apt package lists, so real workflows install
+/// system packages with a bare `sudo apt-get install <pkg>` and no preceding
+/// `apt-get update` — uv's musl cell (`apt-get install musl-tools`) is one.
+/// Wiping `/var/lib/apt/lists` to save image bytes turns every one of those
+/// steps into `E: Unable to locate package`.
+#[test]
+fn golden_keeps_apt_lists_for_workflow_installs() {
+    let script = base_install_script();
+    assert!(
+        !script.contains("/var/lib/apt/lists"),
+        "the golden must keep apt lists: workflows apt-install without updating"
+    );
+    assert!(
+        script.contains("apt-get clean"),
+        "cached .deb archives are still dropped"
+    );
+}
+
+/// `sudo` resolves its own hostname on every invocation; an unresolvable one
+/// prints `sudo: unable to resolve host <name>` before each command, which no
+/// hosted-runner log contains.
+#[test]
+fn golden_resolves_its_own_hostname() {
+    let script = base_install_script();
+    assert!(
+        script.contains("$(hostname)") && script.contains(">> /etc/hosts"),
+        "the golden must add its own hostname to /etc/hosts"
+    );
+}
+
 #[test]
 fn baseline_has_no_duplicate_entries() {
     // A duplicate is harmless to apt but signals a botched merge, and the list
