@@ -650,7 +650,37 @@ pub(crate) async fn broker_acquire_job(
             inner.github_token_requests.get(&request_id).cloned(),
         )
     };
-    if let Some(token_request) = github_token_request {
+    // The token request is registered at build time and removed after the
+    // first claim's mint. A re-claim after a runner disconnect finds it
+    // consumed; without a re-mint the job keeps the build-time local runtime
+    // token, which cannot authenticate git against github.com (401, prompts
+    // disabled). Rebuild the request from the message in that case.
+    let token_request = github_token_request.or_else(|| {
+        let repository = message
+            .context_data
+            .get("github")
+            .and_then(|github| match github {
+                aksh_gha_protocol::azdo::PipelineContextData::Dict(dict) => dict.get("repository"),
+                _ => None,
+            })
+            .and_then(|repository| match repository {
+                aksh_gha_protocol::azdo::PipelineContextData::String(repo) => Some(repo.clone()),
+                _ => None,
+            });
+        repository.map(|repository| {
+            tracing::info!(
+                request_id,
+                %repository,
+                "broker acquire: token request consumed; re-minting from message"
+            );
+            crate::models::GitHubTokenRequest {
+                repository,
+                permissions: aksh_gha_parser::effective_token_permissions(None).into_owned(),
+                declared: false,
+            }
+        })
+    });
+    if let Some(token_request) = token_request {
         tracing::info!(
             request_id,
             repository = %token_request.repository,
