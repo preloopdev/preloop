@@ -59,81 +59,7 @@ fn snapshot_origin_rewrite_routes_hardcoded_forge_urls_to_the_snapshot() {
 }
 
 #[test]
-fn runtime_token_authenticates_direct_github_fetches() {
-    // `actions/checkout` only persists credentials when
-    // `persist-credentials` is set; hardcoded fetches (cargo-dist, submodule
-    // updates) need the github.com header unconditionally, exactly like
-    // GitHub-hosted runners provide it. The header rides in GIT_CONFIG_COUNT
-    // env so nothing is written to disk.
-    let mut job = JobContext::new(
-        "j1".into(),
-        "Test".into(),
-        serde_json::json!({}),
-        serde_json::json!({ "github": { "repository": "openclaw/openclaw" } }),
-    );
-    let msg = serde_json::json!({
-        "contextData": {
-            "github": {
-                "token": "gho_runtime-token",
-                "repository": "openclaw/openclaw"
-            }
-        }
-    });
-
-    inject_github_env(&mut job, &msg);
-
-    assert_eq!(
-        job.env.get("GIT_CONFIG_COUNT").map(String::as_str),
-        Some("1")
-    );
-    assert_eq!(
-        job.env.get("GIT_CONFIG_KEY_0").map(String::as_str),
-        Some("http.https://github.com/.extraheader")
-    );
-    // base64("x-access-token:gho_runtime-token")
-    assert_eq!(
-        job.env.get("GIT_CONFIG_VALUE_0").map(String::as_str),
-        Some("AUTHORIZATION: basic eC1hY2Nlc3MtdG9rZW46Z2hvX3J1bnRpbWUtdG9rZW4=")
-    );
-}
-
-#[test]
-fn minted_variable_token_authenticates_when_context_has_none() {
-    // The broker mints the App installation token at claim time — after the
-    // message context was built — so `variables.system.github.token` is the
-    // only token a job carries when the server never embeds one in the
-    // context. `checkout` with `persist-credentials: false` (cargo-dist's
-    // plan job) and hardcoded fetches both rely on the injected header.
-    let mut job = JobContext::new(
-        "j1".into(),
-        "Test".into(),
-        serde_json::json!({}),
-        serde_json::json!({ "github": { "repository": "openclaw/openclaw" } }),
-    );
-    let msg = serde_json::json!({
-        "contextData": {
-            "github": { "repository": "openclaw/openclaw" }
-        },
-        "variables": {
-            "system.github.token": { "value": "gho_minted-token", "isSecret": true }
-        }
-    });
-
-    inject_github_env(&mut job, &msg);
-
-    assert_eq!(
-        job.env.get("GIT_CONFIG_COUNT").map(String::as_str),
-        Some("1")
-    );
-    // base64("x-access-token:gho_minted-token")
-    assert_eq!(
-        job.env.get("GIT_CONFIG_VALUE_0").map(String::as_str),
-        Some("AUTHORIZATION: basic eC1hY2Nlc3MtdG9rZW46Z2hvX21pbnRlZC10b2tlbg==")
-    );
-}
-
-#[test]
-fn github_header_coexists_with_snapshot_rewrite() {
+fn snapshot_rewrite_installs_its_own_extraheader_only() {
     let mut job = JobContext::new(
         "j1".into(),
         "Test".into(),
@@ -151,15 +77,16 @@ fn github_header_coexists_with_snapshot_rewrite() {
 
     inject_github_env(&mut job, &msg);
 
-    // 3 rewrite entries + 1 github.com header.
+    // The rewrite installs only its own snapshot header. github.com auth is
+    // the checkout's own job (the broker patches the minted token into the
+    // github context at claim); a runner-side env header would duplicate the
+    // one checkout persists — GitHub rejects duplicate Authorization headers
+    // with HTTP 400.
     assert_eq!(
         job.env.get("GIT_CONFIG_COUNT").map(String::as_str),
-        Some("4")
+        Some("3")
     );
-    assert_eq!(
-        job.env.get("GIT_CONFIG_KEY_3").map(String::as_str),
-        Some("http.https://github.com/.extraheader")
-    );
+    assert_eq!(job.env.get("GIT_CONFIG_KEY_3").map(String::as_str), None);
 }
 
 #[test]
