@@ -1,0 +1,14 @@
+
+# cargo-vet audits file
+
+[[audits.anyhow]]
+who = "Bnjoroge1 <bnjoroge1@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "1.0.104"
+notes = "Diff review 1.0.102..1.0.104: downcast_ref/downcast_mut reworked from Ref::new(&deref) to ptr::addr_of + Ref::from_raw(NonNull), fixing RUSTSEC-2026-0190 unsoundness; regression test added; remainder is CI churn and a doc url bump."
+
+[[audits.spin]]
+who = "Bnjoroge1 <bnjoroge1@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.9.9"
+notes = "Diff review 0.9.8..0.9.9: unsoundness fix in Once::force_into_inner/try_into_inner/into_inner_unchecked (0.9.8 yanked for this); build metadata cleanup otherwise."
