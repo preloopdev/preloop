@@ -651,6 +651,11 @@ pub(crate) async fn broker_acquire_job(
         )
     };
     if let Some(token_request) = github_token_request {
+        tracing::info!(
+            request_id,
+            repository = %token_request.repository,
+            "broker acquire: dispatch token request present"
+        );
         // The polling path has already dequeued this job, marked the run
         // `InProgress` and pinned the request to this session, so bubbling the
         // mint refusal out as a 502 would leave nothing holding the claim: the
@@ -719,6 +724,11 @@ pub(crate) async fn broker_acquire_job(
         let mut inner = shared.state.inner.lock().await;
         inner.github_token_requests.remove(&request_id);
         inner.broker_messages.insert(request_id, message.clone());
+    } else {
+        tracing::warn!(
+            request_id,
+            "broker acquire: no dispatch token request for job"
+        );
     }
     message.message_type = Some(azdo::message_type::RUNNER_JOB_REQUEST.to_owned());
     let run_service_url = broker_run_service_url(runner_id);
