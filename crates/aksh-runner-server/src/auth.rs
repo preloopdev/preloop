@@ -186,7 +186,7 @@ pub(crate) async fn runner_surface_only(
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    const DENIED_PREFIXES: &[&str] = &["/internal/", "/replay/", "/runs/"];
+    const DENIED_PREFIXES: &[&str] = &["/internal/", "/runs/"];
     let path = request.uri().path();
     let denied = DENIED_PREFIXES
         .iter()
@@ -194,8 +194,10 @@ pub(crate) async fn runner_surface_only(
         // `/api/v1/actions/*` is the runner's own action-archive download
         // (sanitized GitHub tarball paths), which the runner executes inside
         // the VM and therefore must be able to reach through the mounted
-        // control socket. Every other native prefix stays off the guest
-        // surface: workflow code is untrusted.
+        // control socket. `/replay/*` is the other half of the same class:
+        // the in-VM runner uploads its step logs and summaries to the signed
+        // blob URLs its own Twirp handlers minted. Every other native prefix
+        // stays off the guest surface: workflow code is untrusted.
         || (path.starts_with("/api/v1/") && !path.starts_with("/api/v1/actions/"));
     if denied {
         return Err(ApiError::not_found(format!(

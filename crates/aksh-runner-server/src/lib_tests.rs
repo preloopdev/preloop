@@ -12207,7 +12207,6 @@ async fn control_socket_surface_denies_native_and_test_apis() {
         "/api/v1/secrets/owner/repo",
         "/api/v1/runs",
         "/internal/test/jobs/complete",
-        "/replay/results/plan/file",
     ] {
         let response = socket_app
             .clone()
@@ -12227,6 +12226,26 @@ async fn control_socket_surface_denies_native_and_test_apis() {
             "socket must not expose {denied}"
         );
     }
+
+    // The runner's own log-blob uploads go through the same surface: the
+    // in-VM runner PUTs step logs to the signed `/replay/results/*` URLs its
+    // Twirp handlers minted, so the guard must not turn them into 404s.
+    let replay = socket_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/replay/results/plan/job/step-1.txt")
+                .body(Body::from("log bytes"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        replay.status(),
+        StatusCode::NOT_FOUND,
+        "socket must not hide the runner's own log uploads"
+    );
 
     // The runner surface stays reachable through the same guard.
     let response = socket_app
