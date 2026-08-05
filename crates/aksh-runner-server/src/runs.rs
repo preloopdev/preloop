@@ -860,6 +860,17 @@ pub(crate) async fn submit_run_inner(
                 inner.job_requests.insert(pb.request_id, job_request);
                 if let Some(request) = pb.github_token_request {
                     inner.github_token_requests.insert(pb.request_id, request);
+                    tracing::info!(
+                        request_id = pb.request_id,
+                        job = %job.id,
+                        "prebuild: dispatch token request inserted"
+                    );
+                } else {
+                    tracing::warn!(
+                        request_id = pb.request_id,
+                        job = %job.id,
+                        "prebuild: job has no dispatch token request"
+                    );
                 }
             }
 

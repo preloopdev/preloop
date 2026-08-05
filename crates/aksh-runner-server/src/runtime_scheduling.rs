@@ -1,19 +1,34 @@
 use super::*;
 
-/// Enqueue a ready job, applying job-level concurrency if present.
-/// Returns Ok(true) if pushed to ready queue, Ok(false) if parked, Err if cancelled.
-pub(crate) fn try_enqueue_with_job_concurrency(
+/// Outcome of evaluating and acquiring a job-level concurrency gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JobGateOutcome {
+    /// No gate declared, or the gate was acquired — the job may be queued.
+    Proceed,
+    /// The gate is busy — park the job in `concurrency_blocked`; the group
+    /// release path (`promote_next_from_group`) re-promotes it later.
+    Parked,
+    /// Gate evaluation failed or the queue overflowed — the job must be
+    /// concluded with the given terminal status.
+    Failed(ExecutionStatus),
+}
+
+/// Evaluate and (if free) acquire the job-level concurrency gate for a job
+/// that is about to be dispatched.
+///
+/// This is the *only* place a `Holder::Job` gate is evaluated. The submit path
+/// calls it for needs-empty jobs (`try_enqueue_with_job_concurrency`); the
+/// promote paths call it for needs-gated and held-run jobs that skipped the
+/// submit-time check (MC-S3), using the run record's `github`/`submission`
+/// context.
+pub(crate) fn try_acquire_job_gate(
     inner: &mut InnerState,
     github: &serde_json::Value,
     submission: &WorkflowSubmission,
-    queued_job: QueuedJob,
-    statuses: &mut BTreeMap<JobId, ExecutionStatus>,
-) -> Result<bool, ()> {
+    queued_job: &QueuedJob,
+) -> JobGateOutcome {
     let Some(raw) = queued_job.concurrency.clone() else {
-        statuses.insert(queued_job.job_id.clone(), ExecutionStatus::Queued);
-        on_job_enqueued(inner, &queued_job);
-        inner.queue.push_back(queued_job);
-        return Ok(true);
+        return JobGateOutcome::Proceed;
     };
 
     let strategy = queued_job
@@ -36,13 +51,11 @@ pub(crate) fn try_enqueue_with_job_concurrency(
         Ok(v) => v,
         Err(e) => {
             concurrency::log_eval_error("job concurrency", &e);
-            statuses.insert(queued_job.job_id.clone(), ExecutionStatus::Failure);
-            return Err(());
+            return JobGateOutcome::Failed(ExecutionStatus::Failure);
         }
     };
     if group.trim().is_empty() {
-        statuses.insert(queued_job.job_id.clone(), ExecutionStatus::Failure);
-        return Err(());
+        return JobGateOutcome::Failed(ExecutionStatus::Failure);
     }
 
     let key = concurrency::concurrency_key(&submission.repository, &group);
@@ -51,24 +64,38 @@ pub(crate) fn try_enqueue_with_job_concurrency(
         job_id: queued_job.job_id.clone(),
     };
     match try_acquire_concurrency(inner, key, group, holder, cancel, queue) {
-        Ok(true) => {
+        Ok(true) => JobGateOutcome::Proceed,
+        Ok(false) => JobGateOutcome::Parked,
+        Err(e) if e == "concurrency_queue_overflow" => {
+            JobGateOutcome::Failed(ExecutionStatus::Cancelled)
+        }
+        Err(_) => JobGateOutcome::Failed(ExecutionStatus::Failure),
+    }
+}
+
+/// Enqueue a ready job, applying job-level concurrency if present.
+/// Returns Ok(true) if pushed to ready queue, Ok(false) if parked, Err if cancelled.
+pub(crate) fn try_enqueue_with_job_concurrency(
+    inner: &mut InnerState,
+    github: &serde_json::Value,
+    submission: &WorkflowSubmission,
+    queued_job: QueuedJob,
+    statuses: &mut BTreeMap<JobId, ExecutionStatus>,
+) -> Result<bool, ()> {
+    match try_acquire_job_gate(inner, github, submission, &queued_job) {
+        JobGateOutcome::Proceed => {
             statuses.insert(queued_job.job_id.clone(), ExecutionStatus::Queued);
             on_job_enqueued(inner, &queued_job);
             inner.queue.push_back(queued_job);
             Ok(true)
         }
-        Ok(false) => {
+        JobGateOutcome::Parked => {
             statuses.insert(queued_job.job_id.clone(), ExecutionStatus::Pending);
             inner.concurrency_blocked.push_back(queued_job);
             Ok(false)
         }
-        Err(e) if e == "concurrency_queue_overflow" => {
-            statuses.insert(queued_job.job_id.clone(), ExecutionStatus::Cancelled);
-            let _ = queued_job;
-            Err(())
-        }
-        Err(_) => {
-            statuses.insert(queued_job.job_id.clone(), ExecutionStatus::Failure);
+        JobGateOutcome::Failed(status) => {
+            statuses.insert(queued_job.job_id.clone(), status);
             Err(())
         }
     }
@@ -475,11 +502,43 @@ pub(crate) fn promote_next_from_group(
                             .all(|n| scheduling::need_satisfied(&run.jobs, n))
                     });
                     if needs_ok && under_max_parallel(inner, &job) {
-                        if let Some(run) = inner.runs.get_mut(&run_id) {
-                            hydrate_needs_context(&mut job, run);
+                        // MC-S3: jobs held behind a workflow-level gate were
+                        // parked before the per-job gate evaluation ran at
+                        // submit, so their job-level gates were never checked.
+                        // Evaluate and acquire now; park in
+                        // `concurrency_blocked` when busy.
+                        let gate = inner
+                            .runs
+                            .get(&run_id)
+                            .map(|run| (run.github.clone(), run.submission.clone()));
+                        let gate_outcome = if let Some((github, submission)) = gate {
+                            try_acquire_job_gate(inner, &github, &submission, &job)
+                        } else {
+                            JobGateOutcome::Proceed
+                        };
+                        match gate_outcome {
+                            JobGateOutcome::Proceed => {
+                                if let Some(run) = inner.runs.get_mut(&run_id) {
+                                    hydrate_needs_context(&mut job, run);
+                                }
+                                on_job_enqueued(inner, &job);
+                                inner.queue.push_back(job);
+                            }
+                            JobGateOutcome::Parked => {
+                                if let Some(run) = inner.runs.get_mut(&run_id) {
+                                    run.jobs
+                                        .insert(job.job_id.clone(), ExecutionStatus::Pending);
+                                }
+                                inner.concurrency_blocked.push_back(job);
+                            }
+                            JobGateOutcome::Failed(status) => {
+                                if let Some(run) = inner.runs.get_mut(&run_id) {
+                                    run.jobs.insert(job.job_id.clone(), status);
+                                    run.status = summarize_run(run.jobs.values().copied());
+                                    finalize_run_if_complete(run);
+                                }
+                            }
                         }
-                        on_job_enqueued(inner, &job);
-                        inner.queue.push_back(job);
                     } else {
                         if let Some(run) = inner.runs.get_mut(&run_id) {
                             // keep Queued status in pending_jobs path
@@ -850,10 +909,46 @@ pub(crate) fn promote_ready_jobs(inner: &mut InnerState) -> SchedulingOutcome {
                     if let Some(run) = inner.runs.get(&job.run_id) {
                         hydrate_needs_context(&mut job, run);
                     }
-                    *promoted_by_base
-                        .entry((job.run_id, job.base_id.clone()))
-                        .or_default() += 1;
-                    promoted.push(job);
+                    // MC-S3: the submit path only evaluates job-level
+                    // concurrency for needs-empty jobs (runs.rs gates on
+                    // needs_empty && under_mp), so a needs-gated job that
+                    // reaches dispatch here never had its gate checked.
+                    // Evaluate and acquire it now; park in
+                    // `concurrency_blocked` when busy so the group release
+                    // path re-promotes it later.
+                    let gate = inner
+                        .runs
+                        .get(&job.run_id)
+                        .map(|run| (run.github.clone(), run.submission.clone()));
+                    let gate_outcome = if let Some((github, submission)) = gate {
+                        try_acquire_job_gate(inner, &github, &submission, &job)
+                    } else {
+                        JobGateOutcome::Proceed
+                    };
+                    match gate_outcome {
+                        JobGateOutcome::Proceed => {
+                            *promoted_by_base
+                                .entry((job.run_id, job.base_id.clone()))
+                                .or_default() += 1;
+                            promoted.push(job);
+                        }
+                        JobGateOutcome::Parked => {
+                            if let Some(run) = inner.runs.get_mut(&job.run_id) {
+                                run.jobs
+                                    .insert(job.job_id.clone(), ExecutionStatus::Pending);
+                            }
+                            inner.concurrency_blocked.push_back(job);
+                        }
+                        JobGateOutcome::Failed(status) => {
+                            if let Some(run) = inner.runs.get_mut(&job.run_id) {
+                                run.jobs.insert(job.job_id.clone(), status);
+                                run.status = summarize_run(run.jobs.values().copied());
+                                finalize_run_if_complete(run);
+                            }
+                            outcome.failed.push((job.run_id, job.job_id));
+                            settled = true;
+                        }
+                    }
                 }
                 DependencyDecision::Skip | DependencyDecision::Error => {
                     if let Some(run) = inner.runs.get_mut(&job.run_id) {
@@ -866,6 +961,15 @@ pub(crate) fn promote_ready_jobs(inner: &mut InnerState) -> SchedulingOutcome {
                         run.status = summarize_run(run.jobs.values().copied());
                         finalize_run_if_complete(run);
                     }
+                    // MC-S2: a run that concludes through this arm (dependency
+                    // skip / eval error) never passes through the normal
+                    // completion path, so its concurrency holder would leak
+                    // forever — a workflow-level `Holder::Run` is only
+                    // released by cancel_run_inner, which this path never
+                    // reaches. Release the concluded job now; the holder
+                    // machinery releases a Run holder only once every job is
+                    // terminal and a Job holder immediately.
+                    release_concurrency_for_job(inner, job.run_id, &job.job_id);
                     if decision == DependencyDecision::Skip {
                         outcome.skipped.push((job.run_id, job.job_id));
                     } else {
@@ -1780,6 +1884,17 @@ fn register_expanded_jobs(
             inner
                 .github_token_requests
                 .insert(job_request.request_id, request);
+            tracing::info!(
+                request_id = job_request.request_id,
+                job = %plan.id,
+                "build: dispatch token request inserted"
+            );
+        } else {
+            tracing::warn!(
+                request_id = job_request.request_id,
+                job = %plan.id,
+                "build: job has no dispatch token request"
+            );
         }
         inner
             .job_requests
@@ -1881,6 +1996,10 @@ fn apply_expansion(
                 run.status = summarize_run(run.jobs.values().copied());
                 finalize_run_if_complete(run);
             }
+            // MC-S2: like the dependency-skip arm, an empty matrix concludes
+            // the node without a completion event, so its concurrency holder
+            // must be released here (fail_expansion_node does the same).
+            release_concurrency_for_job(inner, run_id, &node_id);
             outcome.skipped.push((run_id, node_id));
             Vec::new()
         }
