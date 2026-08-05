@@ -2127,13 +2127,18 @@ async fn provision_runner<P: VmProvider + 'static>(
         };
         provider.create(&spec).await?;
         provider.start(name).await?;
-        if !uses_packed_artifact {
-            install_base_dependencies(provider.as_ref(), name).await?;
-            for layer in toolchains {
-                for command in layer.install_commands() {
-                    if let Err(error) = provider.exec(name, &command).await {
-                        return Err(error.into());
-                    }
+        // The packed artifact is the golden's frozen image; the live golden
+        // receives the apt baseline and toolchain bake *after* boot, so a
+        // machine created from the artifact is bare and must install the
+        // baseline itself — otherwise node actions die with "curl: command
+        // not found" and rust jobs with "cargo: command not found". The
+        // installs are idempotent, so a fully baked artifact only pays the
+        // presence checks.
+        install_base_dependencies(provider.as_ref(), name).await?;
+        for layer in toolchains {
+            for command in layer.install_commands() {
+                if let Err(error) = provider.exec(name, &command).await {
+                    return Err(error.into());
                 }
             }
         }
