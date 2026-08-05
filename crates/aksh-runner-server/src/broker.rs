@@ -746,7 +746,7 @@ pub(crate) async fn broker_acquire_job(
                     tracing::info!("patched minted token into github context");
                 }
                 other => tracing::warn!(
-                    github_context = %match (other) { Some(_) => "non-dict", None => "missing" },
+                    github_context = %match other { Some(_) => "non-dict", None => "missing" },
                     "could not patch github context token"
                 ),
             }
