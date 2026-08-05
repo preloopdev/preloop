@@ -147,7 +147,7 @@ async fn run_apis_never_return_submitted_secret_values() {
 }
 
 #[tokio::test]
-async fn run_page_requires_native_token_and_exposes_no_submission_secrets() {
+async fn run_page_is_public_safe_status_page_without_secret_leaks() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state, CancellationToken::new());
@@ -178,20 +178,11 @@ async fn run_page_requires_native_token_and_exposes_no_submission_secrets() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method(Method::GET)
-                .uri(format!("/runs/{run_id}"))
-                .header(header::AUTHORIZATION, "Bearer aksh-system-token")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
+    // The page is deliberately public: it is the check-run `details_url`
+    // GitHub renders when the runner reports a check — the runner has no
+    // native token to forward, so an authenticated page would 404 in the
+    // checks UI. The public contract is "safe": no submission secrets, no
+    // secret names, and the workflow path HTML-escaped (no XSS).
     assert_eq!(response.status(), StatusCode::OK);
     let body = String::from_utf8(
         to_bytes(response.into_body(), usize::MAX)
