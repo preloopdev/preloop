@@ -988,6 +988,65 @@ async fn preload_images<P: VmProvider>(
 /// Prepare a running forkable golden VM with the requested environment.
 ///
 /// SmolVM takes the forkable RAM/disk snapshot when `start --forkable` runs.
+/// Host-side record of the environment a golden was baked for.
+///
+/// Lives beside the packed artifact, which is already the pool's writable home
+/// for VM assets. The fingerprint covers the base-image digest and every
+/// toolchain layer, so bumping any of them leaves the record unmatched and the
+/// golden is rebuilt rather than wrongly adopted.
+fn golden_record_path(config: &RunnerPoolConfig, golden: &MachineName) -> Option<PathBuf> {
+    let directory = config.artifact_stem.parent()?.join("goldens");
+    Some(directory.join(format!("{}.fingerprint", golden.as_str())))
+}
+
+/// Record what this golden was baked for, replacing any earlier record.
+fn write_golden_record(config: &RunnerPoolConfig, golden: &MachineName, fingerprint: &str) {
+    let Some(path) = golden_record_path(config, golden) else {
+        return;
+    };
+    let written = path
+        .parent()
+        .map(std::fs::create_dir_all)
+        .transpose()
+        .and_then(|_| std::fs::write(&path, fingerprint));
+    if let Err(error) = written {
+        // A missing record costs one rebake on the next start, nothing more.
+        warn!(path = %path.display(), %error, "golden bake record not written");
+    }
+}
+
+/// Drop the record, so an interrupted rebake cannot be adopted.
+fn remove_golden_record(config: &RunnerPoolConfig, golden: &MachineName) {
+    if let Some(path) = golden_record_path(config, golden) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Whether `golden` is already booted as a fork base for `fingerprint`.
+///
+/// Deliberately host-side: the golden is frozen as SmolVM's fork base, and
+/// probing it through the guest would touch the very snapshot every clone is
+/// taken from.
+async fn golden_is_reusable<P: VmProvider>(
+    provider: &Arc<P>,
+    config: &RunnerPoolConfig,
+    golden: &MachineName,
+    fingerprint: &str,
+) -> bool {
+    if !matches!(provider.status(golden).await, Ok(MachineState::Running)) {
+        return false;
+    }
+    let Some(path) = golden_record_path(config, golden) else {
+        return false;
+    };
+    std::fs::read_to_string(path)
+        .map(|recorded| recorded.trim() == fingerprint)
+        .unwrap_or(false)
+}
+
+/// Prepare a running forkable golden VM with the requested environment.
+///
+/// SmolVM takes the forkable RAM/disk snapshot when `start --forkable` runs.
 /// Provision the guest while it is a normal machine, then restart it as the
 /// fork base so package and external-runtime writes are inherited by clones.
 async fn prepare_golden_for_env<P: VmProvider + 'static>(
@@ -996,6 +1055,22 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
     golden: &MachineName,
     env_spec: &EnvironmentSpec,
 ) -> Result<(), OrchestratorError> {
+    // The golden registry is in-memory, so without this every engine restart
+    // rebakes a golden that is still sitting there fully baked and forkable —
+    // apt plus rustup, five to eleven minutes, before the first job of that
+    // environment can run, paid again on every deploy.
+    if golden_is_reusable(provider, config, golden, &env_spec.fingerprint).await {
+        info!(
+            machine = golden.as_str(),
+            fingerprint = %env_spec.fingerprint,
+            "adopted the existing golden fork base"
+        );
+        return Ok(());
+    }
+    // Any record must die before the machine does: a rebake interrupted
+    // halfway would otherwise leave a fingerprint claiming a golden that no
+    // longer carries it.
+    remove_golden_record(config, golden);
     if provider.status(golden).await? != MachineState::Missing {
         provider.delete(golden).await?;
     }
@@ -1056,6 +1131,7 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
         let _ = provider.delete(golden).await;
         return Err(error.into());
     }
+    write_golden_record(config, golden, &env_spec.fingerprint);
     info!(machine = golden.as_str(), "golden fork base ready");
     Ok(())
 }
@@ -3129,6 +3205,48 @@ chmod +x "$destination/bin/node"
             !events.iter().any(|event| event.contains("rustup-init")),
             "a baked toolchain must not be reinstalled: {events:?}"
         );
+    }
+
+    /// The golden registry dies with the process, so a restart would rebake a
+    /// golden that is still running and still correct. The host-side record is
+    /// what makes adoption safe: it must match the requested fingerprint, and
+    /// the machine must actually be up to serve as a fork base.
+    #[tokio::test]
+    async fn golden_is_adopted_only_when_running_and_recorded() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = test_config(false);
+        config.artifact_stem = temp.path().join("runner-image");
+        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
+        let golden = MachineName::new("lifecycle-test-golden-abc123").unwrap();
+
+        // Recorded, but the machine was never started.
+        write_golden_record(&config, &golden, "fp-1");
+        assert!(!golden_is_reusable(&provider, &config, &golden, "fp-1").await);
+
+        provider
+            .create(&MachineSpec {
+                name: golden.clone(),
+                image: config.base_image.clone(),
+                cpus: config.cpus,
+                memory_mib: config.memory_mib,
+                storage_gib: config.storage_gib,
+                overlay_gib: None,
+                network: NetworkPolicy::PublicOnly,
+                volumes: Vec::new(),
+                sockets: Vec::new(),
+                dns: None,
+                rosetta: false,
+            })
+            .await
+            .unwrap();
+        provider.start(&golden).await.unwrap();
+
+        assert!(golden_is_reusable(&provider, &config, &golden, "fp-1").await);
+        // A base-image or toolchain bump changes the fingerprint: rebake.
+        assert!(!golden_is_reusable(&provider, &config, &golden, "fp-2").await);
+
+        remove_golden_record(&config, &golden);
+        assert!(!golden_is_reusable(&provider, &config, &golden, "fp-1").await);
     }
 
     #[tokio::test]
