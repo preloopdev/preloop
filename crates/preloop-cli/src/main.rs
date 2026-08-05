@@ -860,6 +860,8 @@ fn local_runner_pool_config(
     } else {
         control_socket
     };
+    let base_image = std::env::var("PRELOOP_RUNNER_BASE_IMAGE")
+        .unwrap_or_else(|_| preloop_orchestrator::environment::DEFAULT_BASE_IMAGE.into());
     // A custom base image (`.smolmachine` artifact or any non-stock OCI
     // reference) serves every queued job itself, so environment-based runner
     // replacement has nothing to switch to: the job's implied stock base
@@ -868,10 +870,8 @@ fn local_runner_pool_config(
     // Compare on the plain `repository:tag`, so the digest-pinned defaults
     // (ubuntu:24.04@sha256:…) still count as stock Ubuntu images.
     let custom_base = !matches!(
-        std::env::var("PRELOOP_RUNNER_BASE_IMAGE")
-            .as_deref()
-            .map(preloop_orchestrator::environment::base_name),
-        Ok("ubuntu:24.04") | Ok("ubuntu:22.04") | Err(_)
+        preloop_orchestrator::environment::base_name(&base_image),
+        "ubuntu:24.04" | "ubuntu:22.04"
     );
     Ok(RunnerPoolConfig {
         // Size zero is the deliberate low-memory mode: keep the local
@@ -897,12 +897,18 @@ fn local_runner_pool_config(
             .ok()
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "preloop-runner".into()),
-        base_image: std::env::var("PRELOOP_RUNNER_BASE_IMAGE")
-            .unwrap_or_else(|_| preloop_orchestrator::environment::DEFAULT_BASE_IMAGE.into()),
+        base_image: base_image.clone(),
         workspace: Some(workspace),
-        artifact_stem: home
-            .join("vms")
-            .join(format!("preloop-ubuntu-24.04-{}", std::env::consts::ARCH)),
+        // The packed artifact cache key includes the resolved base image
+        // (tag AND digest): the digest-pinned defaults are a golden's
+        // provenance. When the pin moves, a stale packed golden baked from
+        // the old digest must not be reused. Custom `.smolmachine` bases are
+        // filesystem paths, so separators are normalized out of the key.
+        artifact_stem: home.join("vms").join(format!(
+            "preloop-{}-{}",
+            base_image.replace(['/', ':', '@'], "-"),
+            std::env::consts::ARCH
+        )),
         runner_bundle,
         // Node externals shared with every VM via a read-only mount. The
         // operator may point this anywhere; the default lives next to the
@@ -1660,6 +1666,12 @@ mod tests {
     use super::*;
     use clap::error::ErrorKind;
 
+    /// Serializes tests that mutate process-global env vars read by
+    /// `local_runner_pool_config` (`PRELOOP_RUNNER_BUNDLE`,
+    /// `PRELOOP_RUNNER_BASE_IMAGE`): parallel test threads would otherwise
+    /// race each other's set_var/remove_var pairs.
+    static TEST_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn first_serve_token_creates_private_home_and_file() {
         let root = tempfile::tempdir().unwrap();
@@ -1761,6 +1773,7 @@ mod tests {
 
     #[test]
     fn custom_base_image_disables_environment_replacement() {
+        let _env_guard = TEST_ENV_MUTEX.lock().unwrap();
         let home = tempfile::tempdir().unwrap();
         // The config resolves a Linux guest runner bundle; fabricate one so
         // the construction reaches the base-image decision.
@@ -1808,6 +1821,7 @@ mod tests {
 
     #[test]
     fn packed_artifact_cache_key_tracks_base_image_digest() {
+        let _env_guard = TEST_ENV_MUTEX.lock().unwrap();
         let home = tempfile::tempdir().unwrap();
         let bundle = tempfile::tempdir().unwrap();
         std::fs::write(
