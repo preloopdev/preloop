@@ -296,16 +296,26 @@ fn resolve_shell(
             ))
         }
         custom => {
-            // Custom shell template: e.g. "perl {0}"
+            // Custom shell template: e.g. `perl {0}`, or the whole command line
+            // `/usr/bin/env -u ENV -u BASH_ENV /bin/sh -eu {0}` that
+            // `taiki-e/install-action` uses. Every whitespace-separated token
+            // after the program is its own argument — collapsing them into one
+            // argv entry hands `env` a single `-u ENV -u … /bin/sh -eu <script>`
+            // option, which it accepts as one variable name to unset, finds no
+            // command left to run, prints the environment and exits 0. The step
+            // then "succeeds" having executed nothing.
             let path = temp_dir.join(format!("{script_id}.sh"));
-            let parts: Vec<&str> = custom.splitn(2, ' ').collect();
-            let program = parts[0].to_string();
-            let mut args = Vec::new();
-            if parts.len() > 1 {
-                let template = parts[1];
-                args.push(template.replace("{0}", &path.to_string_lossy()));
-            } else {
-                args.push(path.to_string_lossy().to_string());
+            let script = path.to_string_lossy().to_string();
+            let mut tokens = custom.split_whitespace();
+            let program = tokens
+                .next()
+                .expect("a non-empty shell name reached the custom branch")
+                .to_owned();
+            let mut args: Vec<String> = tokens.map(|token| token.replace("{0}", &script)).collect();
+            // No `{0}` placeholder: the script path is the final argument,
+            // matching the official runner's ScriptHandler default.
+            if !args.iter().any(|arg| arg.contains(&script)) {
+                args.push(script);
             }
             Ok((path, program, args))
         }
@@ -344,6 +354,63 @@ mod tests {
         let (_, prog, args) = resolve_shell(Some("perl {0}"), &dir, &id).unwrap();
         assert_eq!(prog, "perl");
         assert!(args[0].ends_with(".sh"));
+    }
+
+    /// `taiki-e/install-action` declares
+    /// `shell: /usr/bin/env -u ENV -u BASH_ENV -u CDPATH -u SHELLOPTS -u BASHOPTS /bin/sh -eu {0}`.
+    /// Each token has to be its own argument: one collapsed argv entry makes
+    /// `env` unset a variable literally named `ENV -u BASH_ENV … {script}`,
+    /// leaving no command to run — it prints the environment, exits 0, and the
+    /// tool the workflow asked for is never installed.
+    #[test]
+    fn resolve_custom_shell_splits_every_token() {
+        let dir = std::path::PathBuf::from("/tmp");
+        let id = uuid::Uuid::nil();
+        let (path, prog, args) = resolve_shell(
+            Some("/usr/bin/env -u ENV -u BASH_ENV -u CDPATH -u SHELLOPTS -u BASHOPTS /bin/sh -eu {0}"),
+            &dir,
+            &id,
+        )
+        .unwrap();
+
+        assert_eq!(prog, "/usr/bin/env");
+        let script = path.to_string_lossy().to_string();
+        assert_eq!(
+            args,
+            vec![
+                "-u".to_owned(),
+                "ENV".to_owned(),
+                "-u".to_owned(),
+                "BASH_ENV".to_owned(),
+                "-u".to_owned(),
+                "CDPATH".to_owned(),
+                "-u".to_owned(),
+                "SHELLOPTS".to_owned(),
+                "-u".to_owned(),
+                "BASHOPTS".to_owned(),
+                "/bin/sh".to_owned(),
+                "-eu".to_owned(),
+                script,
+            ]
+        );
+    }
+
+    /// A template without `{0}` still runs the script: the official handler
+    /// appends it.
+    #[test]
+    fn resolve_custom_shell_without_placeholder_appends_the_script() {
+        let dir = std::path::PathBuf::from("/tmp");
+        let id = uuid::Uuid::nil();
+        let (path, prog, args) = resolve_shell(Some("busybox sh -e"), &dir, &id).unwrap();
+        assert_eq!(prog, "busybox");
+        assert_eq!(
+            args,
+            vec![
+                "sh".to_owned(),
+                "-e".to_owned(),
+                path.to_string_lossy().to_string()
+            ]
+        );
     }
 
     // --- P0 container step host gap coverage ---
