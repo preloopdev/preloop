@@ -98,6 +98,41 @@ fn runtime_token_authenticates_direct_github_fetches() {
 }
 
 #[test]
+fn minted_variable_token_authenticates_when_context_has_none() {
+    // The broker mints the App installation token at claim time — after the
+    // message context was built — so `variables.system.github.token` is the
+    // only token a job carries when the server never embeds one in the
+    // context. `checkout` with `persist-credentials: false` (cargo-dist's
+    // plan job) and hardcoded fetches both rely on the injected header.
+    let mut job = JobContext::new(
+        "j1".into(),
+        "Test".into(),
+        serde_json::json!({}),
+        serde_json::json!({ "github": { "repository": "openclaw/openclaw" } }),
+    );
+    let msg = serde_json::json!({
+        "contextData": {
+            "github": { "repository": "openclaw/openclaw" }
+        },
+        "variables": {
+            "system.github.token": { "value": "gho_minted-token", "isSecret": true }
+        }
+    });
+
+    inject_github_env(&mut job, &msg);
+
+    assert_eq!(
+        job.env.get("GIT_CONFIG_COUNT").map(String::as_str),
+        Some("1")
+    );
+    // base64("x-access-token:gho_minted-token")
+    assert_eq!(
+        job.env.get("GIT_CONFIG_VALUE_0").map(String::as_str),
+        Some("AUTHORIZATION: basic eC1hY2Nlc3MtdG9rZW46Z2hvX21pbnRlZC10b2tlbg==")
+    );
+}
+
+#[test]
 fn github_header_coexists_with_snapshot_rewrite() {
     let mut job = JobContext::new(
         "j1".into(),
