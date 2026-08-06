@@ -229,11 +229,7 @@ async fn setup_pat(args: &GithubSetupArgs) -> anyhow::Result<()> {
         Some(workspace) => workflow_permission_checklist(workspace)?,
         None => (Vec::new(), false),
     };
-    let checklist = if derived.is_empty() {
-        baseline
-    } else {
-        derived
-    };
+    let checklist = pat_permission_checklist(&baseline, &derived);
     println!(
         "Create a fine-grained PAT for the repositories you run workflows against:\n\
          \x20 https://github.com/settings/personal-access-tokens/new\n\
@@ -349,6 +345,22 @@ fn workflow_permission_checklist(workspace: &Path) -> anyhow::Result<(Vec<String
     Ok((checklist, oidc_declared))
 }
 
+/// The PAT checklist: the mandatory baseline unioned with whatever the
+/// workspace's workflows explicitly declare. `contents: read` is GitHub's
+/// enforced floor and `pull-requests: read` covers the engine's token
+/// defaults, so the baseline must survive even when a workflow declares its
+/// own permissions — dropping it would print a checklist that omits the one
+/// permission GitHub always requires.
+fn pat_permission_checklist(baseline: &[String], derived: &[String]) -> Vec<String> {
+    let mut checklist = baseline.to_vec();
+    for line in derived {
+        if !checklist.contains(line) {
+            checklist.push(line.clone());
+        }
+    }
+    checklist
+}
+
 fn collect_permissions(doc: &serde_yaml::Value, out: &mut std::collections::BTreeSet<String>) {
     if let Some(permissions) = doc.get("permissions") {
         match permissions {
@@ -359,8 +371,10 @@ fn collect_permissions(doc: &serde_yaml::Value, out: &mut std::collections::BTre
                     }
                 }
             }
-            serde_yaml::Value::String(access) if access == "read-all" => {
-                out.insert("contents: read".into());
+            serde_yaml::Value::String(access) => {
+                for line in scalar_permission_lines(access) {
+                    out.insert(line);
+                }
             }
             _ => {}
         }
@@ -377,6 +391,22 @@ fn collect_permissions(doc: &serde_yaml::Value, out: &mut std::collections::BTre
             }
         }
     }
+}
+
+/// Expand a scalar `permissions:` value (`read-all`/`write-all`) over the
+/// parser's complete permission-scope list. GitHub applies these to every
+/// scope, so the checklist must too — `permissions: read-all` is not just
+/// `contents: read`.
+fn scalar_permission_lines(access: &str) -> Vec<String> {
+    let level = match access {
+        "read-all" => "read",
+        "write-all" => "write",
+        _ => return Vec::new(),
+    };
+    aksh_gha_parser::PERMISSION_SCOPES
+        .iter()
+        .map(|scope| format!("{scope}: {level}"))
+        .collect()
 }
 
 async fn doctor_app(app_id: &str, pem: &str, repos: &[String]) -> anyhow::Result<()> {
@@ -790,5 +820,57 @@ mod tests {
         let (checklist, oidc) = workflow_permission_checklist(dir.path()).unwrap();
         assert!(checklist.is_empty());
         assert!(!oidc);
+    }
+
+    #[test]
+    fn checklist_expands_scalar_read_all_and_write_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let wf = dir.path().join(".github/workflows");
+        std::fs::create_dir_all(&wf).unwrap();
+        std::fs::write(
+            wf.join("read-all.yml"),
+            "on: push\npermissions: read-all\njobs: {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            wf.join("write-all.yml"),
+            "on: push\npermissions: write-all\njobs: {}\n",
+        )
+        .unwrap();
+        let (checklist, oidc) = workflow_permission_checklist(dir.path()).unwrap();
+        assert!(oidc, "read-all/write-all cover id-token too");
+        for scope in aksh_gha_parser::PERMISSION_SCOPES {
+            if scope == "id-token" {
+                continue;
+            }
+            assert!(
+                checklist.contains(&format!("{scope}: read")),
+                "read-all must expand to {scope}: read, got {checklist:?}"
+            );
+            assert!(
+                checklist.contains(&format!("{scope}: write")),
+                "write-all must expand to {scope}: write, got {checklist:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pat_checklist_keeps_baseline_when_explicit_permissions_exist() {
+        let baseline = vec![
+            "contents: read".to_owned(),
+            "pull-requests: read".to_owned(),
+        ];
+        let derived = vec!["issues: write".to_owned(), "contents: read".to_owned()];
+        let checklist = pat_permission_checklist(&baseline, &derived);
+        assert_eq!(
+            checklist,
+            vec![
+                "contents: read".to_owned(),
+                "pull-requests: read".to_owned(),
+                "issues: write".to_owned()
+            ],
+            "the mandatory baseline (contents: read, pull-requests: read) must survive \
+             any explicit workflow permissions"
+        );
     }
 }
