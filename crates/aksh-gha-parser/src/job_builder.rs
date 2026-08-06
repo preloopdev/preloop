@@ -6,8 +6,9 @@
 use std::collections::BTreeMap;
 
 use aksh_gha_protocol::azdo::{
-    AgentJobRequestMessage, EndpointAuthorization, MaskHint, MaskType, PipelineContextData,
-    PlanReference, ServiceEndpoint, TaskResources, TaskStep, TimelineReference, VariableValue,
+    append_format_literal, AgentJobRequestMessage, EndpointAuthorization, MaskHint, MaskType,
+    PipelineContextData, PlanReference, ServiceEndpoint, TaskResources, TaskStep,
+    TimelineReference, VariableValue,
 };
 
 use crate::eval::{build_context, resolve_string};
@@ -123,17 +124,6 @@ fn template_string_token(raw: &str) -> Value {
     })
 }
 
-fn append_format_literal(target: &mut String, literal: &str) {
-    for character in literal.chars() {
-        match character {
-            '\'' => target.push_str("''"),
-            '{' => target.push_str("{{"),
-            '}' => target.push_str("}}"),
-            _ => target.push(character),
-        }
-    }
-}
-
 fn template_token(value: &Value) -> Value {
     let location = || json!({"file": 1, "line": 1, "col": 1});
     match value {
@@ -214,6 +204,7 @@ pub fn normalize_github_context(github: &Value) -> Value {
     let ref_name = git_ref
         .strip_prefix("refs/heads/")
         .or_else(|| git_ref.strip_prefix("refs/tags/"))
+        .or_else(|| git_ref.strip_prefix("refs/pull/"))
         .unwrap_or(&git_ref)
         .to_owned();
     let ref_type = if git_ref.starts_with("refs/tags/") {
@@ -223,14 +214,19 @@ pub fn normalize_github_context(github: &Value) -> Value {
     };
 
     // These values are part of the runner's stable github context, rather than
-    // event-payload fields. Keep server-supplied run/actor metadata intact while
-    // deriving the ref and repository fields from the submission context.
-    object.insert("server_url".to_owned(), json!("https://github.com"));
-    object.insert("api_url".to_owned(), json!("https://api.github.com"));
-    object.insert(
-        "graphql_url".to_owned(),
-        json!("https://api.github.com/graphql"),
-    );
+    // event-payload fields. Keep server-supplied run/actor metadata intact
+    // (including a configured forge's server/api/graphql URLs) while deriving
+    // the ref and repository fields from the submission context. Only fill
+    // gaps — never clobber what the server sent.
+    object
+        .entry("server_url".to_owned())
+        .or_insert_with(|| json!("https://github.com"));
+    object
+        .entry("api_url".to_owned())
+        .or_insert_with(|| json!("https://api.github.com"));
+    object
+        .entry("graphql_url".to_owned())
+        .or_insert_with(|| json!("https://api.github.com/graphql"));
     object.insert("ref_name".to_owned(), json!(ref_name));
     object.insert("ref_protected".to_owned(), json!(false));
     object.insert("ref_type".to_owned(), json!(ref_type));
@@ -519,8 +515,21 @@ pub fn build_agent_job_message_with_normalized_context(
             "fail-fast".to_owned(),
             PipelineContextData::Bool(plan.fail_fast),
         ),
-        ("job-index".to_owned(), PipelineContextData::Number(0.0)),
-        ("job-total".to_owned(), PipelineContextData::Number(1.0)),
+        // GitHub: strategy.job-index is the 0-based matrix cell index;
+        // strategy.job-total is the 1-based cell count. plan.matrix_index is
+        // stored 1-based for system.orchestrationId, hence the -1.
+        (
+            "job-index".to_owned(),
+            PipelineContextData::Number(
+                plan.matrix_index
+                    .map(|index| (index - 1) as f64)
+                    .unwrap_or(0.0),
+            ),
+        ),
+        (
+            "job-total".to_owned(),
+            PipelineContextData::Number(plan.matrix_total.unwrap_or(1) as f64),
+        ),
         (
             "max-parallel".to_owned(),
             PipelineContextData::Number(plan.max_parallel.unwrap_or(1) as f64),
@@ -1021,6 +1030,35 @@ jobs:
 
         // Matrix should be in context data
         assert!(msg.context_data.contains_key("matrix"));
+
+        // strategy.job-index / job-total must be per-cell (0-based index,
+        // 1-based total), matching GitHub.
+        let strategy_of = |plan: &crate::JobPlan| {
+            let msg = build_agent_job_message(
+                plan,
+                &github,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+            )
+            .unwrap();
+            let strategy = msg
+                .context_data
+                .get("strategy")
+                .map(aksh_gha_protocol::azdo::PipelineContextData::to_json)
+                .and_then(|v| v.as_object().cloned())
+                .unwrap();
+            (
+                strategy.get("job-index").unwrap().clone(),
+                strategy.get("job-total").unwrap().clone(),
+            )
+        };
+        let (idx0, total0) = strategy_of(&plans[0]);
+        let (idx1, total1) = strategy_of(&plans[1]);
+        assert_eq!(idx0, serde_json::json!(0.0));
+        assert_eq!(idx1, serde_json::json!(1.0));
+        assert_eq!(total0, serde_json::json!(2.0));
+        assert_eq!(total1, serde_json::json!(2.0));
     }
 
     #[test]
