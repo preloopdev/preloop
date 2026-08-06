@@ -71,6 +71,7 @@ use models::*;
 mod store;
 use store::*;
 mod bootstrap;
+mod store_pg;
 #[cfg(test)]
 use bootstrap::reap_once;
 pub use bootstrap::{generate_self_signed_cert, serve, SelfSignedCert, ServerConfig, TlsMode};

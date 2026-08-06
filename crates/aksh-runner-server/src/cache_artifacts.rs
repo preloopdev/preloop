@@ -128,7 +128,7 @@ pub(crate) async fn cache_reserve(
             bytes: Vec::new(),
         },
     );
-    if let Err(error) = shared.state.store.store_meta_only(&inner) {
+    if let Err(error) = shared.state.store.store_meta_only(&inner).await {
         tracing::warn!(?error, "failed to persist cache reservation");
     }
     Json(CacheReserveResponse { cache_id })
@@ -145,7 +145,7 @@ pub(crate) async fn cache_upload(
         .get_mut(&cache_id)
         .ok_or_else(|| ApiError::not_found("cache reservation not found"))?;
     pending.bytes.extend_from_slice(&bytes);
-    if let Err(error) = shared.state.store.store_meta_only(&inner) {
+    if let Err(error) = shared.state.store.store_meta_only(&inner).await {
         tracing::warn!(?error, "failed to persist cache upload");
     }
     Ok(StatusCode::ACCEPTED)
@@ -165,7 +165,7 @@ pub(crate) async fn cache_commit(
     };
     {
         let inner = shared.state.inner.lock().await;
-        if let Err(error) = shared.state.store.store_meta_only(&inner) {
+        if let Err(error) = shared.state.store.store_meta_only(&inner).await {
             tracing::warn!(?error, "failed to persist cache commit");
         }
     }
@@ -258,7 +258,7 @@ pub(crate) async fn put_artifact(
     };
     let mut inner = shared.state.inner.lock().await;
     inner.artifacts.insert(record.id.clone(), record.clone());
-    if let Err(error) = shared.state.store.store_meta_only(&inner) {
+    if let Err(error) = shared.state.store.store_meta_only(&inner).await {
         tracing::warn!(?error, "failed to persist artifact metadata");
     }
     Ok(Json(record))

@@ -281,7 +281,7 @@ pub(crate) static GITHUB_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::
 #[derive(Clone)]
 pub struct AppState {
     pub(crate) inner: Arc<Mutex<InnerState>>,
-    pub(crate) store: Arc<Store>,
+    pub(crate) store: Arc<dyn Store>,
     pub(crate) events: broadcast::Sender<NdjsonEvent>,
     pub(crate) message_notify: Arc<Notify>,
     /// Atomic counter for pre-allocating request IDs outside the dispatch
@@ -452,6 +452,19 @@ impl AppState {
     /// whole life, and lets tests point at a temp file without mutating
     /// process-wide environment state that other tests race against.
     pub async fn new_with_config(state_dir: PathBuf, config_path: PathBuf) -> anyhow::Result<Self> {
+        Self::new_with_store(state_dir, config_path, None).await
+    }
+
+    /// [`AppState::new_with_config`] against an explicit store URL.
+    ///
+    /// `store_url` takes precedence over the `AKSH_STORE_URL` environment
+    /// variable; `None` falls back to the environment, then to SQLite at
+    /// `<state_dir>/aksh.db`.
+    pub async fn new_with_store(
+        state_dir: PathBuf,
+        config_path: PathBuf,
+        store_url: Option<&str>,
+    ) -> anyhow::Result<Self> {
         let cache = CacheStore::new(state_dir.join("cache")).await?;
         let artifacts = ArtifactStore::new(state_dir.join("artifacts")).await?;
         let (events, _) = broadcast::channel(1024);
@@ -500,9 +513,9 @@ impl AppState {
             oidc_keypair: Some(oidc_keypair),
             ..Default::default()
         };
-        let store = Arc::new(Store::open(&state_dir, &local_jwt_key)?);
+        let store = crate::store::open_store(store_url, &state_dir, &local_jwt_key).await?;
         let mut recovered = inner;
-        store.load_into(&mut recovered)?;
+        store.load_into(&mut recovered).await?;
         let next_request_id = recovered
             .job_requests
             .keys()
@@ -618,13 +631,13 @@ impl AppState {
         };
         let has_run_projection = run_id.is_some();
         if let Some(run_id) = run_id {
-            if let Err(error) = self.store.store_run_event(&inner, run_id, &event) {
+            if let Err(error) = self.store.store_run_event(&inner, run_id, &event).await {
                 error!(?error, %run_id, "failed to persist control-plane run event");
             }
         }
         drop(inner);
         if !has_run_projection {
-            if let Err(error) = self.store.append_event(&event) {
+            if let Err(error) = self.store.append_event(&event).await {
                 error!(?error, "failed to append durable control-plane event");
             }
         }

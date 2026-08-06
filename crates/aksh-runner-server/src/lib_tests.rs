@@ -130,6 +130,7 @@ async fn sqlite_recovery_restores_queued_runs_and_next_run_number() {
             state
                 .store
                 .store_log_chunk("plan-1/7", 0, b"durable log\n", 13, 1)
+                .await
                 .unwrap();
             inner.cache_v2_pending.insert(
                 "cache-upload".to_owned(),
@@ -138,7 +139,7 @@ async fn sqlite_recovery_restores_queued_runs_and_next_run_number() {
                     version: "cache-version".to_owned(),
                 },
             );
-            state.store.store_meta_only(&inner).unwrap();
+            state.store.store_meta_only(&inner).await.unwrap();
         }
         (
             accepted["run_id"].as_str().unwrap().to_owned(),
@@ -263,10 +264,12 @@ async fn sqlite_recovery_restores_post_restart_state() {
         state
             .store
             .store_log_chunk("plan-1/0", 0, b"first line\n", 11, 1)
+            .await
             .unwrap();
         state
             .store
             .store_log_chunk("plan-1/0", 11, b"second line\n", 23, 2)
+            .await
             .unwrap();
 
         (run_id, rid, session_id, public_xml)
@@ -351,6 +354,207 @@ async fn sqlite_recovery_restores_post_restart_state() {
         }),
     )
     .await;
+}
+
+/// Postgres twin of `sqlite_recovery_restores_post_restart_state`: proves
+/// the translated SQL (dialect, upserts, sealed blobs) round-trips the same
+/// state a restart must restore. Skipped unless `AKSH_TEST_PG_URL` points at
+/// a disposable Postgres (the repo gate does not assume one is running).
+#[tokio::test]
+async fn postgres_recovery_restores_post_restart_state() {
+    let pg_url = match std::env::var("AKSH_TEST_PG_URL") {
+        Ok(url) if !url.trim().is_empty() => url,
+        _ => {
+            eprintln!(
+                "skipping postgres_recovery_restores_post_restart_state: \
+                 set AKSH_TEST_PG_URL to a disposable Postgres URL"
+            );
+            return;
+        }
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let workflow =
+        "on: push\njobs:\n  build:\n    runs-on: self-hosted\n    steps:\n      - run: echo hi\n";
+    let config_path = crate::config::config_path();
+
+    let (run_id_str, runner_id, session_id, public_xml) = {
+        let state = AppState::new_with_store(
+            temp.path().to_path_buf(),
+            config_path.clone(),
+            Some(&pg_url),
+        )
+        .await
+        .unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": workflow,
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        assert_eq!(accepted["run_number"], 1);
+        let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+
+        // Register a runner with an RSA public key.
+        let runner_keypair = AgentRsaKeypair::generate().unwrap();
+        let public_xml = runner_keypair.public_key_xml();
+        let modulus = public_xml
+            .split("<Modulus>")
+            .nth(1)
+            .unwrap()
+            .split("</Modulus>")
+            .next()
+            .unwrap()
+            .to_owned();
+        let exponent = public_xml
+            .split("<Exponent>")
+            .nth(1)
+            .unwrap()
+            .split("</Exponent>")
+            .next()
+            .unwrap()
+            .to_owned();
+        let runner = request_json(
+            &app,
+            Method::POST,
+            "/runner/server/_apis/distributedtask/pools/1/agents",
+            json!({
+                "name": "pg-recovery-runner",
+                "labels": [{"name": "self-hosted", "type": "system"}],
+                "authorization": {
+                    "publicKey": { "exponent": exponent, "modulus": modulus }
+                }
+            }),
+        )
+        .await;
+        let runner_id = runner["id"].as_i64().unwrap();
+
+        // Create a session (sealed session key).
+        let session_json = request_json(
+            &app,
+            Method::POST,
+            "/runner/server/_apis/distributedtask/pools/1/sessions",
+            json!({"ownerName": "pg-recovery-runner", "agent": {"id": runner_id}}),
+        )
+        .await;
+        let session_id = session_json["sessionId"].as_str().unwrap().to_owned();
+
+        // Claim the queued job so `job_requests`, `session_active_requests`,
+        // and the per-session broker queue all have rows to persist.
+        let claimed = request_json(
+            &app,
+            Method::GET,
+            &format!("/runner/server/_apis/v1/Message/1?sessionId={session_id}&waitSeconds=0"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            claimed["messageType"],
+            azdo::message_type::PIPELINE_AGENT_JOB_REQUEST,
+            "claimed job must round-trip through the postgres store"
+        );
+
+        // Persist log chunks (hot path) and a full snapshot so every table
+        // is written through the translated SQL before the restart.
+        state
+            .store
+            .store_log_chunk("plan-1/0", 0, b"first line\n", 11, 1)
+            .await
+            .unwrap();
+        state
+            .store
+            .store_log_chunk("plan-1/0", 11, b"second line\n", 23, 2)
+            .await
+            .unwrap();
+        {
+            let inner = state.inner.lock().await;
+            state.store.store_inner(&inner).await.unwrap();
+        }
+
+        (run_id, runner_id, session_id, public_xml)
+    };
+
+    // Restart against the same database.
+    let recovered = AppState::new_with_store(
+        temp.path().to_path_buf(),
+        config_path.clone(),
+        Some(&pg_url),
+    )
+    .await
+    .unwrap();
+    {
+        let inner = recovered.inner.lock().await;
+
+        // Runs survive.
+        let recovered_run = inner
+            .runs
+            .get(&run_id_str.parse::<RunId>().unwrap())
+            .cloned()
+            .expect("run must survive restart");
+        assert_eq!(recovered_run.run_number, 1);
+
+        // The claimed job is gone from the ready queue but its agent job
+        // request is restored for re-delivery.
+        assert_eq!(inner.queue.len(), 0, "claimed job must not re-queue");
+        assert_eq!(inner.job_requests.len(), 1, "job request must survive");
+        assert_eq!(
+            inner.session_active_requests.len(),
+            1,
+            "session active request must survive"
+        );
+
+        // Runner + RSA key + sealed session key survive.
+        assert!(inner.runners.contains_key(&runner_id));
+        assert_eq!(
+            inner
+                .runner_rsa_public_keys
+                .get(&runner_id)
+                .map(|k| k.to_xml_string()),
+            Some(public_xml.clone()),
+            "RSA public key must survive restart"
+        );
+        assert!(
+            inner.session_keys.contains_key(&session_id),
+            "session_keys must survive restart"
+        );
+        assert!(inner.sessions.contains_key(&session_id));
+
+        // Log chunks survive.
+        assert_eq!(
+            inner.logs.get("plan-1/0").cloned().unwrap_or_default(),
+            b"first line\nsecond line\n".to_vec(),
+            "log bytes must survive restart via log_chunks"
+        );
+        assert_eq!(
+            inner
+                .log_metadata
+                .get("plan-1/0")
+                .map(|m| (m.byte_count, m.line_count)),
+            Some((23, 2)),
+            "log counter must survive restart"
+        );
+    }
+
+    // The run-number allocator survives: the next submission is #2.
+    let recovered_app = app(recovered, CancellationToken::new());
+    let accepted = request_json(
+        &recovered_app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": workflow,
+            "event": "push",
+            "repository": "owner/repo"
+        }),
+    )
+    .await;
+    assert_eq!(accepted["run_number"], 2);
 }
 
 #[tokio::test]

@@ -189,7 +189,7 @@ pub(crate) async fn patch_timeline_records(
     };
     {
         let inner = shared.state.inner.lock().await;
-        if let Err(error) = shared.state.store.store_meta_only(&inner) {
+        if let Err(error) = shared.state.store.store_meta_only(&inner).await {
             warn!(?error, "failed to persist timeline records");
         }
     }
@@ -234,7 +234,7 @@ pub(crate) async fn create_log(
         let key = format!("{}/{}", plan_id, next_id);
         inner.logs.entry(key.clone()).or_default();
         inner.log_metadata.entry(key).or_default();
-        if let Err(error) = shared.state.store.store_meta_only(&inner) {
+        if let Err(error) = shared.state.store.store_meta_only(&inner).await {
             warn!(?error, "failed to persist created log");
         }
     }
@@ -266,13 +266,18 @@ pub(crate) async fn append_log(
     // append-only event stream. We use the new byte count as the chunk
     // index so each append maps to a unique `(log_key, chunk_index)` row.
     let chunk_index = meta.byte_count as i64;
-    if let Err(error) = shared.state.store.store_log_chunk(
-        &key,
-        chunk_index,
-        &masked,
-        meta.byte_count as i64,
-        meta.line_count as i64,
-    ) {
+    if let Err(error) = shared
+        .state
+        .store
+        .store_log_chunk(
+            &key,
+            chunk_index,
+            &masked,
+            meta.byte_count as i64,
+            meta.line_count as i64,
+        )
+        .await
+    {
         warn!(?error, "failed to persist appended log chunk");
     }
     StatusCode::ACCEPTED
