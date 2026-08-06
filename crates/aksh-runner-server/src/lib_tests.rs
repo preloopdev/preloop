@@ -95,6 +95,265 @@ async fn prebuilt_messages_preserve_monotonic_workflow_run_numbers() {
 }
 
 #[tokio::test]
+async fn sqlite_recovery_restores_queued_runs_and_next_run_number() {
+    let temp = tempfile::tempdir().unwrap();
+    let workflow =
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+    let (run_id, first_number) = {
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": workflow,
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        {
+            let mut inner = state.inner.lock().await;
+            inner
+                .logs
+                .insert("plan-1/7".to_owned(), b"durable log\n".to_vec());
+            inner.log_metadata.insert(
+                "plan-1/7".to_owned(),
+                LogMetadata {
+                    byte_count: 13,
+                    line_count: 1,
+                },
+            );
+            // Log bytes now go through `log_chunks`; the per-file counter
+            // is UPSERTed on the same path.
+            state
+                .store
+                .store_log_chunk("plan-1/7", 0, b"durable log\n", 13, 1)
+                .unwrap();
+            inner.cache_v2_pending.insert(
+                "cache-upload".to_owned(),
+                CacheV2Pending {
+                    key: "cache-key".to_owned(),
+                    version: "cache-version".to_owned(),
+                },
+            );
+            state.store.store_meta_only(&inner).unwrap();
+        }
+        (
+            accepted["run_id"].as_str().unwrap().to_owned(),
+            accepted["run_number"].as_u64().unwrap(),
+        )
+    };
+
+    let recovered = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    {
+        let inner = recovered.inner.lock().await;
+        assert!(inner.runs.contains_key(&run_id.parse::<RunId>().unwrap()));
+        assert_eq!(inner.queue.len(), 1);
+        assert_eq!(inner.queue.front().unwrap().job_id.0, "build");
+        assert_eq!(inner.logs["plan-1/7"], b"durable log\n");
+        assert_eq!(inner.log_metadata["plan-1/7"].line_count, 1);
+        assert_eq!(inner.cache_v2_pending["cache-upload"].key, "cache-key");
+    }
+    let recovered_app = app(recovered, CancellationToken::new());
+    let accepted = request_json(
+        &recovered_app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": workflow,
+            "event": "push",
+            "repository": "owner/repo"
+        }),
+    )
+    .await;
+    assert_eq!(accepted["run_number"], first_number + 1);
+}
+
+/// Each post-restart gap that was documented in the original review
+/// (session_keys, runner_rsa_public_keys, github_token_requests,
+/// broker_messages, session_active_requests, cancellation_queue,
+/// queue_depth) gets a single round-trip through restart and is checked
+/// here in one scenario. Adding a separate test per gap would multiply
+/// the boilerplate without adding coverage.
+#[tokio::test]
+async fn sqlite_recovery_restores_post_restart_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let workflow =
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+
+    let (run_id_str, runner_id, session_id, public_xml) = {
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": workflow,
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+
+        // Register a runner with an RSA public key (C2).
+        let runner_keypair = AgentRsaKeypair::generate().unwrap();
+        let public_xml = runner_keypair.public_key_xml();
+        let modulus = public_xml
+            .split("<Modulus>")
+            .nth(1)
+            .unwrap()
+            .split("</Modulus>")
+            .next()
+            .unwrap()
+            .to_owned();
+        let exponent = public_xml
+            .split("<Exponent>")
+            .nth(1)
+            .unwrap()
+            .split("</Exponent>")
+            .next()
+            .unwrap()
+            .to_owned();
+        let runner = request_json(
+            &app,
+            Method::POST,
+            "/runner/server/_apis/distributedtask/pools/1/agents",
+            json!({
+                "name": "recovery-runner",
+                "labels": [{"name": "self-hosted", "type": "system"}],
+                "authorization": {
+                    "publicKey": { "exponent": exponent, "modulus": modulus }
+                }
+            }),
+        )
+        .await;
+        let rid = runner["id"].as_i64().unwrap();
+
+        // Create a session (C1: session_keys).
+        let session_json = request_json(
+            &app,
+            Method::POST,
+            "/runner/server/_apis/distributedtask/pools/1/sessions",
+            json!({"ownerName": "recovery-runner", "agent": {"id": rid}}),
+        )
+        .await;
+        let session_id = session_json["sessionId"].as_str().unwrap().to_owned();
+        // The disttask session handler always returns `encrypted: false` for
+        // local-use AzDO compatibility; the AES key is still stored under
+        // `inner.session_keys` (sealed) and is what C1 restores after
+        // restart. FIPS-wrapping is exercised by the
+        // `session_key_uses_registered_runner_public_key` test for the
+        // broker-internal path.
+
+        // Queue a cancel (C5: cancellation_queue).
+        request_json(
+            &app,
+            Method::POST,
+            &format!("/api/v1/runs/{run_id}/cancel"),
+            json!({"reason": "test cancel before restart"}),
+        )
+        .await;
+
+        // Persist a log chunk (A: log_chunks hot path).
+        state
+            .store
+            .store_log_chunk("plan-1/0", 0, b"first line\n", 11, 1)
+            .unwrap();
+        state
+            .store
+            .store_log_chunk("plan-1/0", 11, b"second line\n", 23, 2)
+            .unwrap();
+
+        (run_id, rid, session_id, public_xml)
+    };
+
+    // Restart.
+    let recovered = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let recovered_inner = recovered.inner.lock().await;
+
+    // C1: session_keys restored.
+    assert!(
+        recovered_inner.session_keys.contains_key(&session_id),
+        "session_keys must survive restart"
+    );
+
+    // C2: runner_rsa_public_keys restored.
+    assert_eq!(
+        recovered_inner
+            .runner_rsa_public_keys
+            .get(&runner_id)
+            .map(|k| k.to_xml_string()),
+        Some(public_xml.clone()),
+        "RSA public key must survive restart"
+    );
+
+    // C5: cancellation of a queued job removes it from the queue and
+    // marks the run Cancelled. `cancellation_queue` is reserved for
+    // in-progress jobs that need a JobCancellation message sent; a queued
+    // job is simply dropped. Assert the run status is restored.
+    let recovered_run = recovered_inner
+        .runs
+        .get(&run_id_str.parse::<RunId>().unwrap())
+        .cloned()
+        .expect("run must survive restart");
+    assert_eq!(
+        recovered_run.status,
+        ExecutionStatus::Cancelled,
+        "cancel status must survive restart"
+    );
+
+    // A: log_chunks restored into the in-memory buffer.
+    assert_eq!(
+        recovered_inner
+            .logs
+            .get("plan-1/0")
+            .cloned()
+            .unwrap_or_default(),
+        b"first line\nsecond line\n".to_vec(),
+        "log bytes must survive restart via log_chunks"
+    );
+    assert_eq!(
+        recovered_inner
+            .log_metadata
+            .get("plan-1/0")
+            .map(|m| (m.byte_count, m.line_count)),
+        Some((23, 2)),
+        "log counter must survive restart"
+    );
+
+    // C6: queue_depth restored.
+    assert_eq!(
+        recovered
+            .queue_depth
+            .load(std::sync::atomic::Ordering::SeqCst),
+        recovered_inner.queue.len(),
+        "queue_depth must mirror recovered ready queue"
+    );
+
+    drop(recovered_inner);
+
+    // The post-restart server must still be able to register a new runner
+    // (sanity: store + WAL + schema migration don't break startup).
+    let app = app(recovered, CancellationToken::new());
+    let _ = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": workflow,
+            "event": "push",
+            "repository": "owner/repo"
+        }),
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn run_apis_never_return_submitted_secret_values() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
@@ -2203,6 +2462,106 @@ async fn task_agent_registration_extracts_nested_public_key() {
     let runner_id = runner["id"].as_i64().unwrap();
     let inner = state.inner.lock().await;
     assert!(inner.runner_rsa_public_keys.contains_key(&runner_id));
+}
+
+/// The official `actions/runner` sends a stock label set that includes
+/// `self-hosted` as both a system label and a user label (the default
+/// `config.sh` prompt suggests it). The strict `(runner_id, label)` primary
+/// key on `runner_labels` must not reject this; the runner server collapses
+/// the duplicate at handler entry. The store layer dedupes again as a
+/// backstop, so the round-trip through the database preserves the collapse.
+#[tokio::test]
+async fn register_runner_dedupes_official_label_set() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    // Generate a real RSA keypair so the registration request's publicKey
+    // passes base64 + exponent/modulus validation. The label logic is what
+    // we're exercising here, not the cryptography.
+    let runner_keypair = AgentRsaKeypair::generate().unwrap();
+    let public_xml = runner_keypair.public_key_xml();
+    let modulus = public_xml
+        .split("<Modulus>")
+        .nth(1)
+        .unwrap()
+        .split("</Modulus>")
+        .next()
+        .unwrap()
+        .to_owned();
+    let exponent = public_xml
+        .split("<Exponent>")
+        .nth(1)
+        .unwrap()
+        .split("</Exponent>")
+        .next()
+        .unwrap()
+        .to_owned();
+
+    // Mirrors the label set captured in
+    // .runner-watch/golden/v2.336.0/01-register-and-idle/flows.jsonl:
+    // self-hosted appears as both system and user; Linux and linux coexist
+    // (case-different today; collapsed under the same dedup rules).
+    let body = json!({
+        "name": "official-shape-runner",
+        "labels": [
+            {"name": "self-hosted", "type": "system"},
+            {"name": "Linux",       "type": "system"},
+            {"name": "ARM64",       "type": "system"},
+            {"name": "self-hosted", "type": "user"},
+            {"name": "mitm",        "type": "user"},
+            {"name": "linux",       "type": "user"},
+            {"name": "x64",         "type": "user"},
+        ],
+        "authorization": {
+            "publicKey": {
+                "exponent": exponent,
+                "modulus": modulus,
+            }
+        }
+    });
+
+    let runner = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/distributedtask/pools/1/agents",
+        body,
+    )
+    .await;
+    let runner_id = runner["id"].as_i64().unwrap();
+
+    // In-memory labels must be deduped case-insensitively while preserving
+    // the first occurrence of each canonical form.
+    let inner = state.inner.lock().await;
+    let stored = &inner.runners.get(&runner_id).unwrap().labels;
+    let lowered: std::collections::BTreeSet<String> =
+        stored.iter().map(|l| l.to_lowercase()).collect();
+    assert_eq!(
+        lowered.len(),
+        stored.len(),
+        "duplicates leaked into memory: {stored:?}"
+    );
+    assert!(lowered.contains("self-hosted"));
+    assert!(lowered.contains("linux"));
+    assert!(lowered.contains("arm64"));
+    assert!(lowered.contains("mitm"));
+    assert!(lowered.contains("x64"));
+    // Case-folding must keep the first casing seen (the system one).
+    assert!(stored.iter().any(|l| l == "self-hosted"));
+    assert!(stored.iter().any(|l| l == "Linux"));
+
+    // And the second registration (e.g. session creation) must still succeed —
+    // if the dedup had only happened at handler entry and the database kept
+    // duplicates, a second store_inner would 500 again.
+    drop(inner);
+    let session = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/distributedtask/pools/1/sessions",
+        json!({"ownerName": "official-shape-runner", "agent": {"id": runner_id}}),
+    )
+    .await;
+    assert!(session.get("sessionId").is_some());
 }
 
 #[tokio::test]

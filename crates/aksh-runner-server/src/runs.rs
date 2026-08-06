@@ -688,7 +688,17 @@ pub(crate) async fn submit_run_inner(
             .entry(workflow_path.clone())
             .or_insert(0);
         *counter += 1;
-        *counter
+        let value = *counter;
+        if let Err(error) = shared
+            .state
+            .store
+            .store_workflow_run_counter(&workflow_path, value.saturating_add(1))
+        {
+            return Err(ApiError::internal(format!(
+                "failed to persist workflow run counter: {error}"
+            )));
+        }
+        value
     };
     if let Some(object) = github.as_object_mut() {
         object.insert(

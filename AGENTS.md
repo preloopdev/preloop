@@ -36,6 +36,9 @@ just dogfood    # E2E with real runner
 - **Wire compatibility**: `/_apis/…` is the source of truth. Validate protocol changes against the **official runner**, not only unit tests.
 - **Broker path only**: all work targets the modern broker + Twirp results-service protocol (v2.329.0+).
 - **ARM64 local target**: smolvm on Apple Silicon.
+- **Single-writer SQLite**: `<state_dir>/aksh.db` is owned by one process. Two servers on the same state dir will diverge in-memory even though WAL + `busy_timeout=5000` accepts the writes. `PRAGMA user_version` tracks the schema; `MIGRATIONS` in `store.rs` is the source of truth.
+- **Store is best-effort**: in-memory state is the source of truth, the database is a restart source. Store failures are logged; the affected event is still broadcast (see `state.rs::emit`).
+- **Encryption-at-rest is obfuscation, not security**: `<state_dir>/hmac-key.bin` and `aksh.db` sit in the same directory; the store key is HKDF-derived from the JWT HMAC key with domain separation. It stops a stolen DB file, not a compromised state dir. Key loss = unbootable state.
 
 ## Important Files
 

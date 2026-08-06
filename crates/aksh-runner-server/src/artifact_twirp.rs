@@ -85,6 +85,9 @@ pub(crate) async fn twirp_artifact_v2_create(
         inner
             .artifact_v2_pending
             .insert(token.clone(), ArtifactV2Pending { registry_key });
+        if let Err(error) = shared.state.store.store_meta_only(&inner) {
+            tracing::warn!(?error, "failed to persist artifact v2 reservation");
+        }
     }
     let upload_url = format!("{}/twirp-blob/artifact/{token}", runner_base_url());
     info!(token, name = request.name, "artifact v2 create");
@@ -153,6 +156,9 @@ pub(crate) async fn twirp_artifact_v2_finalize(
                 blob_token: token,
             },
         );
+        if let Err(error) = shared.state.store.store_meta_only(&inner) {
+            tracing::warn!(?error, "failed to persist artifact v2 finalization");
+        }
     }
     let _ = save_artifact_v2_registry(&shared).await;
     info!(
@@ -251,6 +257,12 @@ pub(crate) async fn twirp_artifact_v2_delete(
         inner.artifact_v2_registry.remove(&registry_key)
     };
     if let Some(e) = removed {
+        {
+            let inner = shared.state.inner.lock().await;
+            if let Err(error) = shared.state.store.store_meta_only(&inner) {
+                tracing::warn!(?error, "failed to persist artifact v2 deletion");
+            }
+        }
         let _ = save_artifact_v2_registry(&shared).await;
         let blob_dir = shared
             .state

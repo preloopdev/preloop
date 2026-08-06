@@ -54,6 +54,20 @@ pub struct AgentRsaPublicKey {
 }
 
 impl AgentRsaPublicKey {
+    /// Export this public key as the XML string the runner registration
+    /// protocol accepts. Same shape as `AgentRsaKeypair::public_key_xml`,
+    /// available on the parsed public key so the store layer can persist
+    /// the typed key alongside its on-wire form.
+    pub fn to_xml_string(&self) -> String {
+        use base64::Engine;
+        use rsa::traits::PublicKeyParts;
+        format!(
+            "<RSAKeyValue><Modulus>{}</Modulus><Exponent>{}</Exponent></RSAKeyValue>",
+            BASE64_STANDARD.encode(self.public_key.n().to_bytes_be()),
+            BASE64_STANDARD.encode(self.public_key.e().to_bytes_be()),
+        )
+    }
+
     /// Parse runner public-key material from XML, JWK, or PEM.
     pub fn parse(value: &str) -> Result<Self, CryptoError> {
         let trimmed = value.trim();

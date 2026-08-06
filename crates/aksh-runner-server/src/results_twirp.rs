@@ -274,6 +274,9 @@ pub(crate) async fn twirp_create_step_summary_metadata(
             line_count: 0,
         },
     );
+    if let Err(error) = shared.state.store.store_meta_only(&inner) {
+        tracing::warn!(?error, "failed to persist step summary metadata");
+    }
 
     Json(json!({"ok": true}))
 }
@@ -312,6 +315,9 @@ pub(crate) async fn twirp_create_step_logs_metadata(
                 line_count: line_count_usize,
             },
         );
+        if let Err(error) = shared.state.store.store_meta_only(&inner) {
+            tracing::warn!(?error, "failed to persist step log metadata");
+        }
     }
 
     Json(json!({"ok": true}))
@@ -348,6 +354,9 @@ pub(crate) async fn twirp_create_job_logs_metadata(
                 line_count: line_count_usize,
             },
         );
+        if let Err(error) = shared.state.store.store_meta_only(&inner) {
+            tracing::warn!(?error, "failed to persist job log metadata");
+        }
     }
 
     Json(json!({"ok": true}))
@@ -444,6 +453,9 @@ pub(crate) async fn twirp_cache_v2_create(
                     version: request.version,
                 },
             );
+            if let Err(error) = shared.state.store.store_meta_only(&inner) {
+                tracing::warn!(?error, "failed to persist cache v2 reservation");
+            }
             false
         }
     };
@@ -531,6 +543,9 @@ pub(crate) async fn twirp_cache_v2_finalize(
     {
         let mut inner = shared.state.inner.lock().await;
         inner.cache_v2_pending.remove(&token);
+        if let Err(error) = shared.state.store.store_meta_only(&inner) {
+            tracing::warn!(?error, "failed to persist cache v2 finalization");
+        }
     }
 
     // Clean up staging directory.
