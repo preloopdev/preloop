@@ -6749,7 +6749,7 @@ async fn github_app_manifest_registration_flow() {
         .unwrap();
     let html = String::from_utf8(bytes.to_vec()).unwrap();
     assert!(html.contains("https://github.com/settings/apps/new"));
-    assert!(html.contains("aksh-local-app"));
+    assert!(html.contains("Preloop"));
 
     // 4. Request callback conversion (GET /api/v1/github/callback?code=mock_code_123)
     let response_callback = app

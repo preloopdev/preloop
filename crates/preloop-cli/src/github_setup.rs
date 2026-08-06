@@ -170,7 +170,7 @@ async fn cmd_setup_github(args: GithubSetupArgs) -> anyhow::Result<()> {
                  \n\
                  Run `preloop setup github --via app --app-id <ID> --pem-file <KEY>` after\n\
                  creating the App:\n\
-                 \x20 1. github.com/settings/apps/new — name it (e.g. `dummy-aksh-app`),\n\
+                 \x20 1. github.com/settings/apps/new — name it (e.g. `Preloop`),\n\
                  \x20    disable webhook, permissions: Contents: Read-only and\n\
                  \x20    Pull requests: Read-only (if your workflows read PRs).\n\
                  \x20 2. Generate a private key — save the PEM.\n\

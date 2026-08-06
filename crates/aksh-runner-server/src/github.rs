@@ -1169,7 +1169,7 @@ pub(crate) async fn github_register(headers: HeaderMap) -> impl IntoResponse {
     let is_local = host.contains("localhost") || host.contains("127.0.0.1");
 
     let mut manifest_json = serde_json::json!({
-        "name": "aksh-local-app",
+        "name": "Preloop",
         "url": base_url,
         "redirect_url": format!("{}/api/v1/github/callback", base_url),
         "public": false,
