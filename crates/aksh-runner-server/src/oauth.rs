@@ -109,11 +109,40 @@ pub(crate) fn token_ttl_secs() -> u64 {
 
 pub(crate) async fn oauth2_token(
     State(shared): State<Arc<SharedState>>,
-    _headers: axum::http::HeaderMap,
+    headers: axum::http::HeaderMap,
     body: bytes::Bytes,
 ) -> Result<Json<TokenResponse>, ApiError> {
     // Try JSON first (mock flow from existing tests)
     if let Ok(req) = serde_json::from_slice::<JsonOAuth2Request>(&body) {
+        // The JSON shape carries no proof of key possession — `client_secret`
+        // is accepted for shape compatibility and never checked — so without a
+        // gate here the endpoint is an unauthenticated signing oracle handing
+        // runner-scoped JWTs to any caller. The real runner never takes this
+        // path; it presents a PS256 client assertion over the urlencoded form
+        // below.
+        //
+        // Authorize on either of the two things that make the request
+        // legitimate: a client id this server itself issued at registration
+        // (a v4 UUID the caller could only know by having registered), or the
+        // system token, which is how in-process harnesses and the local
+        // control plane drive the mock flow.
+        let authorized = {
+            let bearer = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer "));
+            bearer.is_some_and(|token| token == shared.state.system_token)
+                || shared
+                    .state
+                    .inner
+                    .lock()
+                    .await
+                    .runner_client_ids
+                    .contains_key(&req.client_id)
+        };
+        if !authorized {
+            return Err(ApiError::unauthorized("unknown OAuth client"));
+        }
         let token = shared.state.local_jwt(json!({
             "sub": format!("aksh-runner-listen-mock-{}", req.client_id),
             "scp": "ActionsRuntime.RunnerListen Framework.GenericRead Identity.ReadRefs LocationService.Connect",
