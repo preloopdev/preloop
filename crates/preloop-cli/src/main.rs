@@ -69,7 +69,7 @@ pub(crate) fn build_client() -> reqwest::Client {
     let builder = reqwest::Client::builder();
     #[cfg(unix)]
     let builder = if std::env::var("AKSH_URL").is_err() {
-        builder.unix_socket(preloop_home().join("preloop.sock"))
+        builder.unix_socket(preloop_home().join("preloop-native.sock"))
     } else {
         builder
     };
@@ -98,7 +98,7 @@ enum Command {
     Plan(PlanArgs),
 
     /// Show active and recent runs.
-    Status,
+    Status(StatusArgs),
 
     Logs(LogsArgs),
 
@@ -242,6 +242,15 @@ struct RunArgs {
     /// Submit and return immediately without streaming events.
     #[arg(short = 'd', long)]
     detach: bool,
+
+    /// Print the accepted run as JSON (`run_id`, `queued_jobs`) and exit.
+    ///
+    /// With `--detach` this is the whole output; without it the run still
+    /// executes and the summary line is JSON. Machines want this. And a
+    /// cancelled run keeps its final summary, so polling for the run to leave
+    /// `queued` works regardless of how the human interrupted it.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -272,6 +281,18 @@ struct LogsArgs {
 struct CancelArgs {
     /// Run ID. Defaults to the most recent active run.
     run_id: Option<String>,
+
+    /// Print the cancelled run as JSON (`run_id`, `status`) and exit.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct StatusArgs {
+    /// Print the run list as JSON (the same records `status` renders as a
+    /// table) and exit. For agents and scripts.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -281,7 +302,7 @@ struct ShellArgs {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> std::process::ExitCode {
     // `fmt::init()` alone filters to ERROR when `RUST_LOG` is unset, which hid
     // a runner pool that failed to provision 77 times in a row: every
     // provisioning fault logs at `warn` or `info`, so the operator saw a server
@@ -294,6 +315,76 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {error:#}");
+            // Distinct failure classes so scripts and agents can branch on
+            // why a command failed: 3 = the control plane was unreachable or
+            // rejected the request, 4 = local file/argument validation,
+            // 1 = everything else (including a run that completed failing).
+            if error.downcast_ref::<UpstreamError>().is_some() {
+                std::process::ExitCode::from(3)
+            } else if error.downcast_ref::<LocalError>().is_some() {
+                std::process::ExitCode::from(4)
+            } else {
+                std::process::ExitCode::from(1)
+            }
+        }
+    }
+}
+
+/// Marker for failures talking to the control plane (connection, 4xx/5xx,
+/// malformed response). Maps to exit code 3.
+///
+/// The marker stores the formatted chain rather than the error itself: a
+/// wrapper that delegates `Display` to its inner error would print the same
+/// message twice in the top-level `{error:#}` chain.
+#[derive(Debug)]
+pub(crate) struct UpstreamError {
+    message: String,
+}
+
+impl UpstreamError {
+    fn wrap(error: anyhow::Error) -> anyhow::Error {
+        anyhow::Error::new(Self {
+            message: format!("{error:#}"),
+        })
+    }
+}
+
+impl std::fmt::Display for UpstreamError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for UpstreamError {}
+
+/// Marker for local failures (missing workflow file, unparsable payload,
+/// invalid flags). Maps to exit code 4.
+#[derive(Debug)]
+pub(crate) struct LocalError {
+    message: String,
+}
+
+impl LocalError {
+    fn wrap(error: anyhow::Error) -> anyhow::Error {
+        anyhow::Error::new(Self {
+            message: format!("{error:#}"),
+        })
+    }
+}
+
+impl std::fmt::Display for LocalError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for LocalError {}
+
+async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     // One config path for the whole process. `setup`/`doctor`/`secret` return
     // before `cmd_engine` runs, so pinning this only inside the engine let a
@@ -324,7 +415,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Run(args) => cmd_run(args).await,
         Command::Plan(args) => cmd_plan(args).await,
-        Command::Status => cmd_status().await,
+        Command::Status(args) => cmd_status(args).await,
         Command::Logs(args) => cmd_logs(args).await,
         Command::Cancel(args) => cmd_cancel(args).await,
         Command::Shell(args) => cmd_shell(args).await,
@@ -696,6 +787,11 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
             listen,
             systemd_socket_activation: systemd_socket_activation_requested(),
             unix_socket: Some(socket.clone()),
+            // The CLI's default transport (AKSH_URL unset) talks to the engine
+            // over this socket. It must carry the full native surface: the
+            // runner socket is VM-mounted and guarded to the runner protocol,
+            // so a CLI pointed at it would see nothing but 404s.
+            host_socket: Some(home.join("preloop-native.sock")),
             queue_depth: Some(queue_depth.clone()),
             next_job_runs_on: Some(next_job_runs_on.clone()),
             pending_registrations: pool_available.then_some(pending_registrations),
@@ -1070,10 +1166,74 @@ fn parse_flag(value: &str) -> Option<bool> {
     }
 }
 
+/// What the operator is most likely to have wrong when the control plane is
+/// unreachable, appended to connection errors. The engine's unix socket is the
+/// default transport; a TCP target needs a token.
+fn upstream_hint(url: &str) -> String {
+    let mut hint = String::from("start the engine with `preloop serve`");
+    if !url.starts_with("http://127.0.0.1") && !url.starts_with("http://localhost") {
+        hint.push_str(", and point AKSH_URL at it");
+    }
+    if api_token().is_none() {
+        hint.push_str(", and set AKSH_SYSTEM_TOKEN to the engine's token");
+    }
+    hint
+}
+
+/// Map an HTTP status into an actionable error: a 401 is almost always a
+/// missing or mismatched token, a 404 on a known endpoint means the server is
+/// not running the same binary as this CLI (its native API is served from the
+/// unix socket, not the runner-facing TCP surface).
+fn upstream_error_with_hint(status: reqwest::StatusCode, message: String) -> anyhow::Error {
+    let mut detail = message;
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        detail.push_str(
+            "\ncheck AKSH_SYSTEM_TOKEN (or `preloop secret`/config.toml): the engine \
+             rejected the token this CLI presented",
+        );
+    } else if status == reqwest::StatusCode::NOT_FOUND {
+        detail.push_str(
+            "\nthis endpoint is not served by that listener — the engine serves the \
+             native API on its unix socket (AKSH_URL unset), and the TCP listener \
+             only serves the runner protocol",
+        );
+    }
+    UpstreamError::wrap(anyhow::anyhow!("{detail}"))
+}
+
+/// Send a request to the control plane and turn connection and HTTP failures
+/// into `UpstreamError`s with a hint about the likely cause.
+async fn send_api(
+    request: reqwest::RequestBuilder,
+    endpoint: &str,
+) -> anyhow::Result<reqwest::Response> {
+    let response = request.send().await.map_err(|error| {
+        UpstreamError::wrap(anyhow::anyhow!(
+            "failed to reach the preloop control plane ({endpoint}): {error}\n{}",
+            upstream_hint(endpoint)
+        ))
+    })?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        let message = if body.trim().is_empty() {
+            format!("server returned {status} for {endpoint}")
+        } else {
+            format!("server returned {status} for {endpoint}: {body}")
+        };
+        return Err(upstream_error_with_hint(status, message));
+    }
+    Ok(response)
+}
+
 async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
-    let workflow_path = resolve_workflow_path(args.file.as_deref())?;
-    let workflow_yaml = std::fs::read_to_string(&workflow_path)
-        .with_context(|| format!("failed to read workflow: {}", workflow_path.display()))?;
+    let workflow_path = resolve_workflow_path(args.file.as_deref()).map_err(LocalError::wrap)?;
+    let workflow_yaml = std::fs::read_to_string(&workflow_path).map_err(|error| {
+        LocalError::wrap(anyhow::Error::new(error)).context(format!(
+            "failed to read workflow: {}",
+            workflow_path.display()
+        ))
+    })?;
     let event = args.event.as_deref().unwrap_or("push");
 
     // Hand local reusable workflows (`uses: ./.github/workflows/…`) to the
@@ -1107,8 +1267,12 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         Some(path) => {
             let text = std::fs::read_to_string(path)
                 .with_context(|| format!("failed to read payload: {}", path.display()))?;
-            serde_json::from_str(&text)
-                .with_context(|| format!("parse payload {}: not valid JSON", path.display()))?
+            serde_json::from_str(&text).map_err(|error| {
+                LocalError::wrap(anyhow::anyhow!(
+                    "parse payload {}: not valid JSON ({error})",
+                    path.display()
+                ))
+            })?
         }
         None => serde_json::json!({}),
     };
@@ -1121,7 +1285,9 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
                 aksh_gha_protocol::SecretString::new(value.to_owned()),
             );
         } else {
-            anyhow::bail!("invalid --secret format `{secret}`: expected NAME=VALUE");
+            return Err(LocalError::wrap(anyhow::anyhow!(
+                "invalid --secret format `{secret}`: expected NAME=VALUE"
+            )));
         }
     }
 
@@ -1163,27 +1329,47 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     if let Some(token) = api_token() {
         request = request.bearer_auth(token);
     }
-    let response = request.send().await?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("server returned {status}: {body}");
-    }
+    let response = send_api(request, "/api/v1/runs").await?;
+    let accepted: RunAccepted = response.json().await.map_err(|error| {
+        UpstreamError::wrap(anyhow::Error::new(error))
+            .context("control plane returned an unparsable run-acceptance response")
+    })?;
 
-    let accepted: RunAccepted = response.json().await?;
-    println!(
-        "Run {} created ({} jobs queued)",
-        accepted.run_id, accepted.queued_jobs
-    );
-
-    let mut final_status = None;
     if args.detach {
-        println!(
-            "Run {} submitted in detached mode. Use `preloop status` to check",
-            accepted.run_id
-        );
+        if args.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "run_id": accepted.run_id,
+                    "queued_jobs": accepted.queued_jobs,
+                    "status": "queued",
+                })
+            );
+        } else {
+            println!(
+                "Run {} submitted in detached mode. Use `preloop status` to check",
+                accepted.run_id
+            );
+        }
         return Ok(());
     }
+    if !args.json {
+        println!(
+            "Run {} created ({} jobs queued)",
+            accepted.run_id, accepted.queued_jobs
+        );
+    }
+
+    let mut final_status = None;
+    let mut interrupted = false;
+    // A run that stays `queued` is often a provisioning failure the CLI could
+    // be silently sitting on (the engine logs it, the CLI sees nothing). Say
+    // something after a quiet spell instead of hanging forever. The hint is
+    // suppressed once a job actually starts (an InProgress event) or the run
+    // goes terminal — either way "no runner picked it up" stops being true.
+    let mut job_started = false;
+    let mut stall_since: Option<std::time::Instant> = None;
+    let mut stalled_printed = false;
     let mut seen_events = HashSet::new();
     loop {
         let mut events_request = client.get(format!(
@@ -1193,12 +1379,11 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         if let Some(token) = api_token() {
             events_request = events_request.bearer_auth(token);
         }
-        let events_response = events_request.send().await?;
-        if !events_response.status().is_success() {
-            let status = events_response.status();
-            let body = events_response.text().await.unwrap_or_default();
-            anyhow::bail!("server returned {status}: {body}");
-        }
+        let events_response = send_api(
+            events_request,
+            &format!("/api/v1/runs/{}/events.ndjson", accepted.run_id),
+        )
+        .await?;
 
         let mut stream = events_response.bytes_stream();
         let mut pending = String::new();
@@ -1225,7 +1410,30 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
                     if paused.is_some() {
                         break;
                     }
+                    // Nothing arrived and nothing is paused: the run is still
+                    // queued. Eventually say so.
+                    stall_since.get_or_insert_with(std::time::Instant::now);
+                    if !stalled_printed
+                        && !job_started
+                        && !final_status.is_some_and(ExecutionStatus::is_terminal)
+                        && stall_since.is_some_and(|since| {
+                            since.elapsed() > Duration::from_secs(20)
+                        })
+                    {
+                        stalled_printed = true;
+                        eprintln!(
+                            "run {} is still queued — no runner has picked up a job. \
+                             `preloop status` shows the queue; check the `preloop serve` \
+                             logs for provisioning failures, or register a runner \
+                             (`preloop-runner configure` then `preloop-runner run`).",
+                            accepted.run_id
+                        );
+                    }
                     continue;
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    interrupted = true;
+                    break;
                 }
             };
             pending.push_str(&String::from_utf8_lossy(&chunk));
@@ -1233,12 +1441,25 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
                 let line = pending[..newline].trim().to_owned();
                 pending.drain(..=newline);
                 if seen_events.insert(line.clone()) {
+                    if matches!(
+                        serde_json::from_str::<NdjsonEvent>(&line),
+                        Ok(NdjsonEvent::JobStatus {
+                            status: ExecutionStatus::InProgress,
+                            ..
+                        })
+                    ) {
+                        job_started = true;
+                    }
                     update_run_status(&mut final_status, render_event(&line));
                 }
             }
             if final_status.is_some_and(ExecutionStatus::is_terminal) {
                 break;
             }
+        }
+
+        if interrupted {
+            break;
         }
 
         if let Some(session) = paused {
@@ -1270,15 +1491,39 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
+    if interrupted {
+        // The run is still executing on the server; the CLI is the only thing
+        // that died. Say so in a way a terminal user actually reads, and in a
+        // way that does not look like a crash to a script.
+        if !args.json {
+            eprintln!(
+                "interrupted: run {} continues in the background. \
+                 `preloop status` to follow, `preloop cancel {}` to stop it.",
+                accepted.run_id, accepted.run_id
+            );
+        }
+        std::process::exit(130);
+    }
+
     if let Some(status) = final_status {
-        let symbol = if status == ExecutionStatus::Success {
-            "✓"
+        if args.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "run_id": accepted.run_id,
+                    "status": serde_json::to_value(status)?,
+                })
+            );
         } else {
-            "✗"
-        };
-        println!("{symbol} Run: {status:?}");
+            let symbol = if status == ExecutionStatus::Success {
+                "✓"
+            } else {
+                "✗"
+            };
+            println!("{symbol} Run: {status:?}");
+        }
         if status != ExecutionStatus::Success {
-            anyhow::bail!("run completed with status {status:?}");
+            return Err(anyhow::anyhow!("run completed with status {status:?}"));
         }
     }
 
@@ -1422,33 +1667,120 @@ fn detect_git_ref() -> String {
 }
 
 async fn cmd_plan(args: PlanArgs) -> anyhow::Result<()> {
-    let workflow = args
-        .file
-        .as_ref()
-        .map_or("all workflows".into(), |p| p.display().to_string());
+    let workflow_path = resolve_workflow_path(args.file.as_deref()).map_err(LocalError::wrap)?;
+    let workflow_yaml = std::fs::read_to_string(&workflow_path).map_err(|error| {
+        LocalError::wrap(anyhow::Error::new(error)).context(format!(
+            "failed to read workflow: {}",
+            workflow_path.display()
+        ))
+    })?;
 
-    println!("preloop plan: {workflow}");
-    if args.json {
-        println!("  format: json");
+    // Hand local reusable workflows (`uses: ./.github/workflows/…`) to the
+    // expander the same way `run` hands them to the server. Remote reusables
+    // (`owner/repo/…`) are left for the server to fetch at expansion time and
+    // reported as such.
+    let mut reusable_workflows = BTreeMap::new();
+    if let Ok(current_dir) = std::env::current_dir() {
+        let workflows_dir = current_dir.join(".github").join("workflows");
+        if let Ok(entries) = std::fs::read_dir(&workflows_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !matches!(
+                    path.extension().and_then(|ext| ext.to_str()),
+                    Some("yml" | "yaml")
+                ) || same_file_path(&path, &workflow_path)
+                {
+                    continue;
+                }
+                let Some(relative) = path.strip_prefix(&current_dir).ok() else {
+                    continue;
+                };
+                let yaml = std::fs::read_to_string(&path)
+                    .with_context(|| format!("read reusable workflow {}", path.display()))?;
+                reusable_workflows.insert(relative.to_string_lossy().into_owned(), yaml);
+            }
+        }
     }
 
-    anyhow::bail!("")
+    let parsed = aksh_gha_parser::parse_workflow(&workflow_yaml).map_err(|error| {
+        LocalError::wrap(anyhow::anyhow!(
+            "parse workflow {}: {error}",
+            workflow_path.display()
+        ))
+    })?;
+    let expanded = aksh_gha_parser::expand_jobs_with_reusables(&parsed, &reusable_workflows)
+        .map_err(|error| {
+            LocalError::wrap(anyhow::anyhow!(
+                "expand workflow {}: {error}",
+                workflow_path.display()
+            ))
+        })?;
+
+    let jobs = &expanded.jobs;
+    let step_count: usize = jobs.iter().map(|job| job.steps.len()).sum();
+    if args.json {
+        let summary = serde_json::json!({
+            "workflow": workflow_path.display().to_string(),
+            "jobs": jobs,
+            "total_steps": step_count,
+        });
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+        return Ok(());
+    }
+
+    println!(
+        "Plan for {}: {} job(s), {} step(s)",
+        workflow_path.display(),
+        jobs.len(),
+        step_count
+    );
+    for job in jobs {
+        let needs = if job.needs.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "  (needs {})",
+                job.needs
+                    .iter()
+                    .map(|need| need.0.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        println!(
+            "  - {}  runs-on: {}{needs}",
+            job.name,
+            job.runs_on.join(", ")
+        );
+        for (index, step) in job.steps.iter().enumerate() {
+            let label = step
+                .name
+                .as_deref()
+                .or(step.uses.as_deref())
+                .or(step.run.as_deref())
+                .unwrap_or("(anonymous step)");
+            println!("      {}. {label}", index + 1);
+        }
+    }
+    Ok(())
 }
 
-async fn cmd_status() -> anyhow::Result<()> {
+async fn cmd_status(args: StatusArgs) -> anyhow::Result<()> {
     let client = build_client();
     let url = server_url();
     let mut request = client.get(format!("{url}/api/v1/runs?limit=20"));
     if let Some(token) = api_token() {
         request = request.bearer_auth(token);
     }
-    let response = request.send().await?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("server returned {status}: {body}");
+    let response = send_api(request, "/api/v1/runs?limit=20").await?;
+    let runs: Vec<serde_json::Value> = response.json().await.map_err(|error| {
+        UpstreamError::wrap(anyhow::Error::new(error))
+            .context("control plane returned an unparsable run list")
+    })?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&runs)?);
+        return Ok(());
     }
-    let runs: Vec<serde_json::Value> = response.json().await?;
     if runs.is_empty() {
         println!("No runs found.");
         return Ok(());
@@ -1502,18 +1834,13 @@ async fn cmd_logs(args: LogsArgs) -> anyhow::Result<()> {
         Some(id) => id,
         None => latest_run_id(&client, &url, None)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("no runs found"))?,
+            .ok_or_else(|| LocalError::wrap(anyhow::anyhow!("no runs found")))?,
     };
     let mut request = client.get(format!("{url}/api/v1/runs/{run_id}/logs"));
     if let Some(token) = api_token() {
         request = request.bearer_auth(token);
     }
-    let response = request.send().await?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("server returned {status}: {body}");
-    }
+    let response = send_api(request, &format!("/api/v1/runs/{run_id}/logs")).await?;
     let body = response.text().await?;
     print!("{body}");
     Ok(())
@@ -1524,21 +1851,31 @@ async fn cmd_cancel(args: CancelArgs) -> anyhow::Result<()> {
     let url = server_url();
     let run_id = match args.run_id {
         Some(id) => id,
-        None => latest_run_id(&client, &url, Some("in_progress"))
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("no active runs found"))?,
+        None => {
+            // Prefer an in-progress run, then a queued one: cancelling a queued
+            // run is exactly what a stuck pipeline needs, and it is valid.
+            match latest_run_id(&client, &url, Some("in_progress")).await? {
+                Some(id) => id,
+                None => latest_run_id(&client, &url, Some("queued"))
+                    .await?
+                    .ok_or_else(|| LocalError::wrap(anyhow::anyhow!("no active runs found")))?,
+            }
+        }
     };
     let mut request = client.post(format!("{url}/api/v1/runs/{run_id}/cancel"));
     if let Some(token) = api_token() {
         request = request.bearer_auth(token);
     }
-    let response = request.send().await?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("server returned {status}: {body}");
+    let response = send_api(request, &format!("/api/v1/runs/{run_id}/cancel")).await?;
+    let _ = response;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({ "run_id": run_id, "status": "cancelled" })
+        );
+    } else {
+        println!("Run {run_id} cancelled.");
     }
-    println!("Run {run_id} cancelled.");
     Ok(())
 }
 
@@ -1555,13 +1892,11 @@ async fn latest_run_id(
     if let Some(token) = api_token() {
         request = request.bearer_auth(token);
     }
-    let response = request.send().await?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("server returned {status}: {body}");
-    }
-    let runs: Vec<serde_json::Value> = response.json().await?;
+    let response = send_api(request, &format!("/api/v1/runs?{query}")).await?;
+    let runs: Vec<serde_json::Value> = response.json().await.map_err(|error| {
+        UpstreamError::wrap(anyhow::Error::new(error))
+            .context("control plane returned an unparsable run list")
+    })?;
     Ok(runs
         .first()
         .and_then(|run| run["run_id"].as_str())
@@ -2098,7 +2433,7 @@ mod tests {
     #[test]
     fn status_parses() {
         let cli = parse(&["status"]).unwrap();
-        assert!(matches!(cli.command, Command::Status));
+        assert!(matches!(cli.command, Command::Status(_)));
     }
 
     #[test]

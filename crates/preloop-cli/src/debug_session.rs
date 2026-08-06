@@ -84,6 +84,10 @@ pub async fn run(
     let session = match (&args.session, sessions.len()) {
         (Some(reference), _) => ctx.get(reference).await?,
         (None, 0) => {
+            if args.json {
+                println!("[]");
+                return Ok(());
+            }
             println!("No paused jobs.");
             println!();
             println!("A job pauses at a failed step when `preloop run` is attached to a");
@@ -94,6 +98,10 @@ pub async fn run(
         }
         (None, 1) => sessions.into_iter().next().expect("length checked"),
         (None, _) => {
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&sessions)?);
+                return Ok(());
+            }
             println!("{} paused jobs:", sessions.len());
             println!();
             for session in &sessions {
@@ -283,33 +291,61 @@ impl Api {
         }
     }
 
+    /// Send a request and turn connection/status failures into errors that
+    /// say which endpoint failed and how to reach the engine.
+    async fn send(
+        &self,
+        request: reqwest::RequestBuilder,
+        path: &str,
+        what: &str,
+    ) -> Result<reqwest::Response> {
+        let response = request.send().await.with_context(|| {
+            format!(
+                "{what}: failed to reach the preloop control plane ({path}); \
+                 start the engine with `preloop serve`"
+            )
+        })?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            let body = if body.trim().is_empty() {
+                String::new()
+            } else {
+                format!(": {body}")
+            };
+            anyhow::bail!("{what}: server returned {status} for {path}{body}");
+        }
+        Ok(response)
+    }
+
     async fn list(&self) -> Result<Vec<DebugSession>> {
         #[derive(serde::Deserialize)]
         struct Listing {
             sessions: Vec<DebugSession>,
         }
         let response = self
-            .request(reqwest::Method::GET, "/api/v1/debug/sessions")
-            .send()
-            .await
-            .context("listing debug sessions")?
-            .error_for_status()?;
+            .send(
+                self.request(reqwest::Method::GET, "/api/v1/debug/sessions"),
+                "/api/v1/debug/sessions",
+                "listing debug sessions",
+            )
+            .await?;
         Ok(response.json::<Listing>().await?.sessions)
     }
 
     async fn get(&self, reference: &str) -> Result<DebugSession> {
+        let path = format!("/api/v1/debug/sessions/{reference}");
         let response = self
-            .request(
-                reqwest::Method::GET,
-                &format!("/api/v1/debug/sessions/{reference}"),
+            .send(
+                self.request(reqwest::Method::GET, &path),
+                &path,
+                "fetching debug session",
             )
-            .send()
-            .await
-            .context("fetching debug session")?;
+            .await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             anyhow::bail!("no paused job matching `{reference}`");
         }
-        Ok(response.error_for_status()?.json().await?)
+        Ok(response.json().await?)
     }
 
     async fn verdict(
@@ -327,16 +363,14 @@ impl Api {
             source_revision,
             retry_from_step,
         };
+        let path = format!("/api/v1/debug/sessions/{session_id}/verdict");
         let response = self
-            .request(
-                reqwest::Method::POST,
-                &format!("/api/v1/debug/sessions/{session_id}/verdict"),
+            .send(
+                self.request(reqwest::Method::POST, &path).json(&body),
+                &path,
+                "issuing verdict",
             )
-            .json(&body)
-            .send()
-            .await
-            .context("issuing verdict")?
-            .error_for_status()?;
+            .await?;
         Ok(response.json().await?)
     }
 }
