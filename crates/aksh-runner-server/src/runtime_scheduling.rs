@@ -687,10 +687,21 @@ pub(crate) fn try_acquire_concurrency(
         let _ = group;
         track_holder_key(inner, &holder, key.clone());
         if let Some(prev) = prev {
-            cancel_holder(inner, &prev, concurrency::cancelled_reason().as_deref());
+            // MC-R2: never cancel a predecessor belonging to the run that is
+            // arriving. `release_concurrency_for_run` matches `group.running`
+            // by `run_id` alone, so it would match the holder installed just
+            // above, evict it, promote the next pending holder, and drop this
+            // run's `holder_keys` — the arriving job would then run believing
+            // it owns a slot it no longer owns. The contended path below
+            // already skips same-run holders for the same reason.
+            if prev.run_id() != holder.run_id() {
+                cancel_holder(inner, &prev, concurrency::cancelled_reason().as_deref());
+            }
         }
         for pending in stale_pending {
-            cancel_holder(inner, &pending, concurrency::cancelled_reason().as_deref());
+            if pending.run_id() != holder.run_id() {
+                cancel_holder(inner, &pending, concurrency::cancelled_reason().as_deref());
+            }
         }
         return Ok(true);
     }
@@ -1229,15 +1240,26 @@ pub(crate) fn take_matching_job(
     runner: &RunnerCapabilities,
     verified_runner_id: Option<i64>,
 ) -> Option<QueuedJob> {
-    // Drop stale bookkeeping so nothing expires into an effective grant and
-    // the maps cannot grow without bound across a long-lived server.
     let now = std::time::SystemTime::now();
-    inner
-        .job_assignments
-        .retain(|_, record| assignment_fresh(record.at, now));
-    inner
-        .pool_pending
-        .retain(|_, at| assignment_fresh(*at, now));
+    if !inner.require_job_assignments {
+        // Drop stale bookkeeping so nothing expires into an effective grant and
+        // the maps cannot grow without bound across a long-lived server.
+        inner
+            .job_assignments
+            .retain(|_, record| assignment_fresh(record.at, now));
+        inner
+            .pool_pending
+            .retain(|_, at| assignment_fresh(*at, now));
+    }
+    // Strict mode deliberately keeps expired assignments/pool-pending marks:
+    // dropping them would make `claim_permitted` fall through to the
+    // permissive default (`!require_job_assignments` == false) and deny every
+    // runner — including a verified pool machine — permanently wedging the job
+    // once the 10-minute assignment TTL passes without a claim. The preserved
+    // marker keeps the binding-window fallback in `claim_permitted` available
+    // to any verified runner and lets `pair_registered_runner` re-pair the job
+    // to a fresh registration. Entries still disappear on claim, cancellation,
+    // and purge, so the maps remain bounded by the queue.
     let claimable = |job: &QueuedJob| {
         job_matches_runner_capabilities(job, runner)
             && claim_permitted(inner, job, verified_runner_id)
@@ -1350,6 +1372,17 @@ pub(crate) fn on_job_enqueued(inner: &mut InnerState, job: &QueuedJob) {
     let mut candidates: std::collections::BTreeSet<i64> =
         inner.broker_session_runners.values().copied().collect();
     candidates.extend(inner.sessions.values().map(|session| session.runner_id));
+    if inner.pool_assignments_enabled {
+        // Pool-managed jobs bind at queue time only to runners the pool itself
+        // proved (a registration that presented a matching provision token, or
+        // came through the engine-bearer native path). A runner that registered
+        // before the job existed without such proof is external: binding the
+        // job to it would bypass the provision-token contract, the job would
+        // never become pool-pending, and the pool would never provision a
+        // machine for it. External runners stay out of the binding and the job
+        // waits pool-pending for a token-backed registration to pair it.
+        candidates.retain(|runner_id| inner.pool_proven_runners.contains(runner_id));
+    }
     for runner_id in candidates {
         if busy.contains(&runner_id) {
             continue;
@@ -1385,6 +1418,12 @@ pub(crate) fn pair_registered_runner(inner: &mut InnerState, runner_id: i64) {
     if !inner.pool_assignments_enabled && !inner.require_job_assignments {
         return;
     }
+    // Every caller of this function is a pool-authorized registration: the
+    // compat path presents a matching one-time provision token and the native
+    // path is engine-bearer gated. Record that proof so queue-time binding
+    // (`on_job_enqueued`) can tell token-proven pool runners apart from
+    // external registrations that never presented a token.
+    inner.pool_proven_runners.insert(runner_id);
     let Some(runner) = inner.runners.get(&runner_id).cloned() else {
         return;
     };
@@ -1550,6 +1589,14 @@ pub(crate) fn apply_matrix_fail_fast(
         }
     });
     inner.cancellation_queue.extend(cancellations);
+    // MC-R1: a sibling cancelled by fail-fast never reaches the completion
+    // path, so nothing else releases the concurrency slot it holds.
+    // `release_concurrency_for_job` is the only per-job slot/key cleanup, and
+    // without it every fail-fast matrix leaks one group slot permanently —
+    // later runs in the same group then park forever.
+    for job_id in &cancelled_jobs {
+        release_concurrency_for_job(inner, run_id, job_id);
+    }
     cancelled_jobs
 }
 
@@ -1673,6 +1720,7 @@ struct ReusableExpansionInputs {
     caller_id: JobId,
     caller_plan: aksh_gha_protocol::JobPlan,
     call: aksh_gha_protocol::ReusableCallPlan,
+    needs_outputs: BTreeMap<String, BTreeMap<String, serde_json::Value>>,
 }
 
 struct MatrixExpansionInputs {
@@ -1681,6 +1729,10 @@ struct MatrixExpansionInputs {
     base_id: String,
     expression: String,
     needs_outputs: BTreeMap<String, BTreeMap<String, serde_json::Value>>,
+    /// Home workflow of the deferred node: set when the node lives inside a
+    /// reusable callee, so the build phase parses the callee YAML rather than
+    /// the root workflow.
+    workflow_file: Option<String>,
 }
 
 enum ExpansionPlan {
@@ -1732,11 +1784,35 @@ fn plan_expansion(inner: &InnerState, job: &QueuedJob) -> Option<ExpansionPlan> 
             caller_id: job.job_id.clone(),
             caller_plan,
             call,
+            needs_outputs: collect_needs_outputs(run, job),
         })));
     }
     let expression = job.deferred_matrix.clone()?;
-    // `needs` outputs feed the matrix expression, so they are resolved here
-    // rather than in the build phase, which no longer sees the run record.
+    // A deferred matrix inside a reusable workflow carries its home workflow
+    // on the plan (`register_expanded_jobs` stores it alongside the node), so
+    // the build phase can parse the callee YAML instead of the root workflow.
+    let workflow_file = run
+        .caller_plans
+        .get(&job.job_id)
+        .and_then(|plan| plan.workflow_file.clone());
+    Some(ExpansionPlan::Matrix(Box::new(MatrixExpansionInputs {
+        ctx,
+        node_id: job.job_id.clone(),
+        base_id: job.base_id.clone(),
+        expression,
+        // `needs` outputs feed the expression, so they are resolved here
+        // rather than in the build phase, which no longer sees the run record.
+        needs_outputs: collect_needs_outputs(run, job),
+        workflow_file,
+    })))
+}
+
+/// Collect each completed need's outputs for a deferred expression, keyed by
+/// the need's base job id (matrix cells share one base key).
+fn collect_needs_outputs(
+    run: &RunRecord,
+    job: &QueuedJob,
+) -> BTreeMap<String, BTreeMap<String, serde_json::Value>> {
     let mut needs_outputs: BTreeMap<String, BTreeMap<String, serde_json::Value>> = BTreeMap::new();
     for need_id in &job.needs {
         for matched in matching_need_ids(run, need_id) {
@@ -1753,13 +1829,7 @@ fn plan_expansion(inner: &InnerState, job: &QueuedJob) -> Option<ExpansionPlan> 
             }
         }
     }
-    Some(ExpansionPlan::Matrix(Box::new(MatrixExpansionInputs {
-        ctx,
-        node_id: job.job_id.clone(),
-        base_id: job.base_id.clone(),
-        expression,
-        needs_outputs,
-    })))
+    needs_outputs
 }
 
 /// Build one job's runner artifacts per plan. Runs with the lock released.
@@ -1829,6 +1899,44 @@ fn build_expansion(
     }
 }
 
+/// The workflow that contains a deferred reusable caller: the called workflow
+/// named by the plan's `workflow_file` when it actually holds the caller job
+/// (a nested caller lives in the workflow that called it), otherwise the root
+/// submitted workflow.
+fn caller_workflow_of(
+    ctx: &ExpansionContext,
+    caller_plan: &aksh_gha_protocol::JobPlan,
+) -> Result<aksh_gha_parser::Workflow, ExecutionStatus> {
+    let tail = caller_plan
+        .base_id
+        .rsplit_once('/')
+        .map(|(_, tail)| tail)
+        .unwrap_or(&caller_plan.base_id);
+    let holds_caller = |workflow: &aksh_gha_parser::Workflow| {
+        workflow.jobs.contains_key(&caller_plan.base_id) || workflow.jobs.contains_key(tail)
+    };
+    let yaml = caller_plan
+        .workflow_file
+        .as_deref()
+        .and_then(|file| ctx.submission.reusable_workflows.get(file))
+        .filter(|yaml| {
+            aksh_gha_parser::parse_workflow(yaml)
+                .map(|workflow| holds_caller(&workflow))
+                .unwrap_or(false)
+        })
+        .map(String::as_str)
+        .unwrap_or(ctx.submission.workflow_yaml.as_str());
+    aksh_gha_parser::parse_workflow(yaml).map_err(|error| {
+        tracing::warn!(
+            run_id = %ctx.run_id,
+            job = %caller_plan.id,
+            %error,
+            "caller workflow re-parse failed at expansion"
+        );
+        ExecutionStatus::Failure
+    })
+}
+
 /// Materialize a deferred reusable caller's callee subtree. Nested reusable
 /// callers inside the callee come back as deferred caller nodes of their own.
 fn build_reusable_expansion(
@@ -1840,6 +1948,7 @@ fn build_reusable_expansion(
         caller_id,
         caller_plan,
         call,
+        needs_outputs,
     } = inputs;
     let run_id = ctx.run_id;
     let yaml = ctx
@@ -1855,16 +1964,40 @@ fn build_reusable_expansion(
         tracing::warn!(%run_id, job = %caller_id, %error, "callee re-parse failed at expansion");
         ExecutionStatus::Failure
     })?;
-    let expanded = aksh_gha_parser::expand_reusable_call(
-        &called,
-        &caller_plan,
-        &ctx.submission.reusable_workflows,
-        &ctx.submission.reusable_workflow_shas,
-    )
+    let expanded = if caller_plan.deferred_matrix.is_some() {
+        // A caller whose matrix reads `needs` cannot be materialized from the
+        // parse-time placeholder (its matrix is intentionally empty until the
+        // needs outputs exist). Resolve the matrix against the completed
+        // outputs first, then materialize the callee once per combination,
+        // which is the shape a static-matrix caller has from parse time.
+        let caller_workflow = caller_workflow_of(&ctx, &caller_plan)?;
+        aksh_gha_parser::expand_deferred_reusable_call(
+            &called,
+            &caller_workflow,
+            &caller_plan,
+            &needs_outputs,
+            &ctx.submission.reusable_workflows,
+            &ctx.submission.reusable_workflow_shas,
+        )
+    } else {
+        aksh_gha_parser::expand_reusable_call(
+            &called,
+            &caller_plan,
+            &ctx.submission.reusable_workflows,
+            &ctx.submission.reusable_workflow_shas,
+        )
+    }
     .map_err(|error| {
         tracing::warn!(%run_id, job = %caller_id, %error, "reusable subtree expansion failed");
         ExecutionStatus::Failure
     })?;
+    if expanded.jobs.is_empty() {
+        // The caller's deferred matrix resolved to zero combinations: GitHub
+        // concludes the invocation as skipped, exactly like an empty matrix
+        // job. The empty-Matrix arm of `apply_expansion` performs that
+        // conclusion on the node, so hand it an empty job list.
+        return Ok(BuiltExpansion::Matrix { jobs: Vec::new() });
+    }
 
     let github_json = ctx.github_json.clone();
     let vars = ctx.submission.vars.clone();
@@ -1902,9 +2035,20 @@ fn build_matrix_expansion(
         base_id,
         expression,
         needs_outputs,
+        workflow_file,
     } = inputs;
     let run_id = ctx.run_id;
-    let workflow = aksh_gha_parser::parse_workflow(&ctx.submission.workflow_yaml).map_err(|error| {
+    // A deferred matrix that lives inside a reusable workflow must be expanded
+    // against the called workflow, not the root one: its runtime job id is the
+    // callee-local name (possibly caller-prefixed), which does not exist in the
+    // root workflow. `workflow_file` is stamped on the plan when the caller
+    // subtree is materialized, so the callee YAML is available here.
+    let workflow_yaml = workflow_file
+        .as_deref()
+        .and_then(|file| ctx.submission.reusable_workflows.get(file))
+        .map(String::as_str)
+        .unwrap_or(ctx.submission.workflow_yaml.as_str());
+    let workflow = aksh_gha_parser::parse_workflow(workflow_yaml).map_err(|error| {
         tracing::warn!(%run_id, job = %node_id, %error, "workflow re-parse failed for dynamic matrix");
         ExecutionStatus::Failure
     })?;
@@ -1923,7 +2067,12 @@ fn build_matrix_expansion(
     let github_json = ctx.github_json.clone();
     let vars = ctx.submission.vars.clone();
     let submission_inputs = ctx.submission.inputs.clone();
-    let jobs = build_jobs(shared, &ctx, &plans, |plan, secrets| {
+    // No `secrets` in the job-level condition context: GitHub does not expose
+    // the `secrets` context to a job `if:`, precisely so a workflow cannot
+    // branch on a secret's value. The reusable-expansion path already passes
+    // an empty map; this one used to pass the resolved secrets, which both
+    // diverged from GitHub and let `if: secrets.X != ''` observe them.
+    let jobs = build_jobs(shared, &ctx, &plans, |plan, _secrets| {
         aksh_gha_parser::eval::build_context(
             &github_json,
             &BTreeMap::new(),
@@ -1934,7 +2083,7 @@ fn build_matrix_expansion(
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
             &serde_json::json!({}),
-            secrets,
+            &BTreeMap::new(),
             &submission_inputs,
         )
     })?;
@@ -1974,17 +2123,21 @@ fn register_expanded_jobs(
         inner
             .timeline_requests
             .insert(job_request.timeline_id, job_request.request_id);
+        // Per-inner-job, so a wide matrix logs this once per leg: a 12k-leg
+        // callee emitted 12k warnings for the ordinary no-GitHub-App setup and
+        // buried every real diagnostic. Absence of a token request is the
+        // normal local case, not a fault, so it belongs at debug.
         if let Some(request) = artifacts.github_token_request {
             inner
                 .github_token_requests
                 .insert(job_request.request_id, request);
-            tracing::info!(
+            tracing::debug!(
                 request_id = job_request.request_id,
                 job = %plan.id,
                 "build: dispatch token request inserted"
             );
         } else {
-            tracing::warn!(
+            tracing::debug!(
                 request_id = job_request.request_id,
                 job = %plan.id,
                 "build: job has no dispatch token request"
@@ -2007,7 +2160,11 @@ fn register_expanded_jobs(
             run.job_continue_on_error
                 .insert(plan.id.to_string(), plan.continue_on_error);
             run.job_names.insert(plan.id.clone(), plan.name.clone());
-            if plan.reusable_call.is_some() {
+            if plan.reusable_call.is_some() || plan.deferred_matrix.is_some() {
+                // Deferred nodes keep their plan (including the home
+                // `workflow_file`) so a later expansion pass can resolve a
+                // nested caller's matrix or parse the callee that holds a
+                // deferred matrix.
                 run.caller_plans.insert(plan.id.clone(), plan.clone());
             }
         }
@@ -2190,6 +2347,20 @@ fn apply_expansion(
                 run.job_base_ids.remove(&node_id);
                 run.job_needs.remove(&node_id);
                 run.status = summarize_run(run.jobs.values().copied());
+                // A reusable caller whose callee contains this deferred-matrix
+                // node recorded the placeholder in its `inner_job_ids`; the
+                // placeholder no longer exists as a job, so substitute the
+                // concrete legs or the caller's aggregate conclusion can never
+                // fire (the run would stay InProgress forever).
+                let leg_ids: Vec<String> = queued.iter().map(|job| job.job_id.0.clone()).collect();
+                if !leg_ids.is_empty() {
+                    for meta in run.reusable_calls.values_mut() {
+                        if let Some(pos) = meta.inner_job_ids.iter().position(|id| id == &node_id.0)
+                        {
+                            meta.inner_job_ids.splice(pos..pos + 1, leg_ids.clone());
+                        }
+                    }
+                }
             }
             // MC-2: the placeholder is gone from the run, so its submit-time
             // request correlation can never be resolved to a real job again.
@@ -2230,9 +2401,17 @@ pub(crate) async fn drain_expansions(shared: &SharedState) -> SchedulingOutcome 
     let mut outcome = SchedulingOutcome::default();
     loop {
         // Phase 1 (locked): claim one node and snapshot its inputs.
+        //
+        // The node is *cloned*, not popped. Between here and phase 3 the only
+        // thing keeping it alive is this stack frame, so popping would lose it
+        // outright if this future were ever dropped mid-build — the node would
+        // stay `Pending` forever, holding its JobSet gate and blocking every
+        // other run in the same concurrency group. No caller drops it today
+        // (there is no timeout layer on the submit route), but the cost of not
+        // depending on that is one clone of a queue entry.
         let (job, plan) = {
-            let mut inner = shared.state.inner.lock().await;
-            let Some(job) = inner.pending_expansions.pop_front() else {
+            let inner = shared.state.inner.lock().await;
+            let Some(job) = inner.pending_expansions.front().cloned() else {
                 return outcome;
             };
             let plan = plan_expansion(&inner, &job);
@@ -2254,6 +2433,17 @@ pub(crate) async fn drain_expansions(shared: &SharedState) -> SchedulingOutcome 
 
         // Phase 3 (locked): apply, then promote whatever the subtree unblocked.
         let mut inner = shared.state.inner.lock().await;
+        // Retire the claim now that the result is in hand. A concurrent drain
+        // may have applied it already, in which case the front entry is no
+        // longer ours and `apply_expansion`'s `expanding` reservation check
+        // discards this build.
+        if inner
+            .pending_expansions
+            .front()
+            .is_some_and(|front| front.run_id == job.run_id && front.job_id == job.job_id)
+        {
+            inner.pending_expansions.pop_front();
+        }
         let ready = apply_expansion(&mut inner, job, built, &mut outcome);
         inner.pending_jobs.extend(ready);
         let promoted = promote_ready_jobs(&mut inner);
@@ -2309,10 +2499,10 @@ pub(crate) fn need_context(run: &RunRecord, need: &JobId) -> Option<azdo::Pipeli
 
 pub(crate) fn status_string(status: ExecutionStatus) -> String {
     match status {
-        ExecutionStatus::Queued
-        | ExecutionStatus::Pending
-        | ExecutionStatus::InProgress
-        | ExecutionStatus::Success => "success",
+        ExecutionStatus::Queued | ExecutionStatus::Pending | ExecutionStatus::InProgress => {
+            "in_progress"
+        }
+        ExecutionStatus::Success => "success",
         ExecutionStatus::Failure => "failure",
         ExecutionStatus::Skipped => "skipped",
         ExecutionStatus::Cancelled => "cancelled",
@@ -2414,5 +2604,221 @@ mod runner_group_tests {
             Some("private"),
             &RunnerCapabilities::default(),
         ));
+    }
+}
+
+#[cfg(test)]
+mod assignment_tests {
+    use super::*;
+
+    fn self_hosted_caps() -> RunnerCapabilities {
+        RunnerCapabilities {
+            known: true,
+            labels: vec!["self-hosted".to_owned()],
+            runner_group_id: None,
+            runner_group_name: None,
+        }
+    }
+
+    fn test_queued_job(job_id: &str) -> QueuedJob {
+        QueuedJob {
+            run_id: RunId::new(),
+            job_id: JobId(job_id.to_owned()),
+            base_id: job_id.to_owned(),
+            needs: Vec::new(),
+            if_condition: None,
+            condition_context: aksh_gha_expressions::Context::default(),
+            max_parallel: None,
+            runs_on: vec!["self-hosted".to_owned()],
+            runner_group: None,
+            message: serde_json::from_value(serde_json::json!({
+                "jobId": "00000000-0000-0000-0000-000000000001",
+                "requestId": 1,
+                "plan": {"planId": "plan", "planType": "build", "version": 1, "artifactUri": "", "artifactLocation": ""},
+                "timeline": {"id": "00000000-0000-0000-0000-000000000002", "changeId": 0, "location": null},
+                "jobName": job_id,
+                "lockedUntil": "",
+                "resources": {"endpoints": []},
+                "steps": [],
+                "snapshot": null
+            }))
+            .unwrap(),
+            concurrency: None,
+            matrix: BTreeMap::new(),
+            deferred_matrix: None,
+            reusable_call: None,
+        }
+    }
+
+    #[test]
+    fn strict_pool_pending_job_survives_assignment_ttl_expiry() {
+        // A strict-pool job whose 10-minute assignment TTL expired with no
+        // machine ever registering used to have its pool-pending mark dropped
+        // by the claim-time cleanup. `claim_permitted` then fell through to the
+        // permissive default, which is false in strict mode, so EVERY runner
+        // was denied and the job wedged forever. The expired mark must be
+        // preserved so a verified runner can take the job over.
+        let mut inner = InnerState {
+            pool_assignments_enabled: true,
+            require_job_assignments: true,
+            ..Default::default()
+        };
+        let job = test_queued_job("build");
+        let key = (job.run_id, job.job_id.clone());
+        inner.queue.push_back(job);
+        inner.pool_pending.insert(
+            key,
+            std::time::SystemTime::now() - ASSIGNMENT_TTL - std::time::Duration::from_secs(1),
+        );
+
+        let claimed = take_matching_job(&mut inner, &self_hosted_caps(), Some(7));
+        assert!(
+            claimed.is_some(),
+            "verified runner must be able to claim the expired strict-pool job"
+        );
+        assert!(
+            inner.pool_pending.is_empty(),
+            "the claim must consume the preserved mark"
+        );
+    }
+
+    #[test]
+    fn strict_pool_assignment_expired_is_takeable_by_a_verified_runner() {
+        let mut inner = InnerState {
+            pool_assignments_enabled: true,
+            require_job_assignments: true,
+            ..Default::default()
+        };
+        let job = test_queued_job("build");
+        let key = (job.run_id, job.job_id.clone());
+        inner.queue.push_back(job);
+        let stale =
+            std::time::SystemTime::now() - ASSIGNMENT_TTL - std::time::Duration::from_secs(1);
+        inner.job_assignments.insert(
+            key,
+            AssignmentRecord {
+                runner_id: 1,
+                at: stale,
+                first_at: stale,
+            },
+        );
+
+        let claimed = take_matching_job(&mut inner, &self_hosted_caps(), Some(9));
+        assert!(
+            claimed.is_some(),
+            "verified runner must take over the expired strict-mode assignment"
+        );
+    }
+
+    #[test]
+    fn permissive_mode_still_expires_marks_into_an_open_grant() {
+        // Non-strict pool: the TTL cleanup must keep dropping stale marks so an
+        // expired hold falls back to ordinary permissive scheduling instead of
+        // blocking a crashed pool's backlog forever.
+        let mut inner = InnerState {
+            pool_assignments_enabled: true,
+            ..Default::default()
+        };
+        let job = test_queued_job("build");
+        let key = (job.run_id, job.job_id.clone());
+        inner.queue.push_back(job);
+        inner.pool_pending.insert(
+            key,
+            std::time::SystemTime::now() - ASSIGNMENT_TTL - std::time::Duration::from_secs(1),
+        );
+
+        let claimed = take_matching_job(&mut inner, &self_hosted_caps(), None);
+        assert!(
+            claimed.is_some(),
+            "permissive mode must fall back to an open grant after the TTL"
+        );
+    }
+
+    #[test]
+    fn pool_job_is_not_bound_to_an_external_runner_at_queue_time() {
+        // A pool-managed job must not be queue-time bound to a runner that
+        // registered before the job existed without a provision token: the
+        // binding would bypass the pool's provisioning contract and the job
+        // would never become pool-pending. It stays pool-pending until a
+        // token-backed registration pairs it.
+        let mut inner = InnerState {
+            pool_assignments_enabled: true,
+            ..Default::default()
+        };
+        inner.runners.insert(
+            1,
+            RegisteredRunner {
+                id: 1,
+                name: "external".to_owned(),
+                labels: vec!["self-hosted".to_owned()],
+                ephemeral: true,
+                public_key: None,
+                runner_group_id: None,
+                runner_group_name: None,
+            },
+        );
+        inner.sessions.insert(
+            "sess-1".to_owned(),
+            RunnerSession {
+                session_id: aksh_gha_protocol::SessionId::new(),
+                runner_id: 1,
+            },
+        );
+        let job = test_queued_job("build");
+        let key = (job.run_id, job.job_id.clone());
+        on_job_enqueued(&mut inner, &job);
+
+        assert!(
+            inner.pool_pending.contains_key(&key),
+            "external runner must not steal the binding; the job stays pool-pending"
+        );
+        assert!(
+            inner.job_assignments.is_empty(),
+            "no assignment may be stamped for the external runner"
+        );
+    }
+
+    #[test]
+    fn pool_job_binds_to_a_token_proven_idle_runner_at_queue_time() {
+        // The pool's own machine registered earlier with a matching provision
+        // token (pair_registered_runner recorded the proof); an idle, capable,
+        // proven runner is still the preferred queue-time binding.
+        let mut inner = InnerState {
+            pool_assignments_enabled: true,
+            ..Default::default()
+        };
+        inner.pool_proven_runners.insert(1);
+        inner.runners.insert(
+            1,
+            RegisteredRunner {
+                id: 1,
+                name: "machine-a".to_owned(),
+                labels: vec!["self-hosted".to_owned()],
+                ephemeral: true,
+                public_key: None,
+                runner_group_id: None,
+                runner_group_name: None,
+            },
+        );
+        inner.sessions.insert(
+            "sess-1".to_owned(),
+            RunnerSession {
+                session_id: aksh_gha_protocol::SessionId::new(),
+                runner_id: 1,
+            },
+        );
+        let job = test_queued_job("build");
+        let key = (job.run_id, job.job_id.clone());
+        on_job_enqueued(&mut inner, &job);
+
+        assert_eq!(
+            inner
+                .job_assignments
+                .get(&key)
+                .map(|record| record.runner_id),
+            Some(1),
+            "token-proven idle runner must receive the queue-time binding"
+        );
+        assert!(inner.pool_pending.is_empty());
     }
 }
