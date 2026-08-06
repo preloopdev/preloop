@@ -307,10 +307,12 @@ fn resolve_shell(
             let path = temp_dir.join(format!("{script_id}.sh"));
             let script = path.to_string_lossy().to_string();
             let mut tokens = custom.split_whitespace();
-            let program = tokens
-                .next()
-                .expect("a non-empty shell name reached the custom branch")
-                .to_owned();
+            // `shell:` is workflow-controlled and only `None` takes the default
+            // branch above, so a blank or whitespace-only value lands here with
+            // no program to run. That is a workflow error, not a worker crash.
+            let Some(program) = tokens.next().map(str::to_owned) else {
+                anyhow::bail!("`shell` must name a program; got an empty value");
+            };
             let mut args: Vec<String> = tokens.map(|token| token.replace("{0}", &script)).collect();
             // No `{0}` placeholder: the script path is the final argument,
             // matching the official runner's ScriptHandler default.
@@ -354,6 +356,23 @@ mod tests {
         let (_, prog, args) = resolve_shell(Some("perl {0}"), &dir, &id).unwrap();
         assert_eq!(prog, "perl");
         assert!(args[0].ends_with(".sh"));
+    }
+
+    /// REVIEW REPRO: `shell:` is workflow-controlled, and only `None` takes the
+    /// default branch. An empty or whitespace-only value reaches the `custom`
+    /// arm, where `split_whitespace().next()` yields `None` and the `.expect()`
+    /// aborts the worker mid-job instead of returning a step error.
+    #[test]
+    fn resolve_blank_shell_does_not_panic() {
+        let dir = std::path::PathBuf::from("/tmp");
+        let id = uuid::Uuid::nil();
+        for blank in ["", "   ", "\t"] {
+            let outcome = std::panic::catch_unwind(|| resolve_shell(Some(blank), &dir, &id));
+            assert!(
+                outcome.is_ok(),
+                "shell: {blank:?} panicked the worker instead of erroring"
+            );
+        }
     }
 
     /// `taiki-e/install-action` declares
