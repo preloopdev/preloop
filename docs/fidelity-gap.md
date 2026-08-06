@@ -377,16 +377,109 @@ workflow. All are fixed:
 
 ### 1b.5 Second campaign — CLI dogfood (2026-08-06): just, gin
 
-The dogfood campaign (see `docs/conformance/just.md`, `docs/conformance/gin.md`)
-runs a second wave of unmodified third-party workflows: `casey/just`,
-`gin-gonic/gin`, plus `psf/black` and `antfu/eslint-config` in progress. New
-gaps it surfaced:
+The dogfood campaign (see `docs/conformance/just.md`, `docs/conformance/gin.md`,
+`docs/conformance/black.md`) runs a second wave of unmodified third-party
+workflows: `casey/just`, `gin-gonic/gin`, `psf/black`, and `antfu/eslint-config`
+in progress. New gaps it surfaced:
 
 | Gap | Symptom in a real workflow | Status |
 | --- | --- | --- |
 | Host steps lacked the user-session environment | just's `dirs::runtime_dir` / `env_var('USER')` tests failed: no `XDG_RUNTIME_DIR` (hosted images run under systemd with `/run/user/<uid>`) and no `USER`/`LOGNAME` (steps run as the runner account) | ✅ fixed — `job_extension.rs` provisions `/run/user/0`; `execution_context.rs` supplies the host-surface contract (`XDG_RUNTIME_DIR`, `USER=root`, `LOGNAME=root`); container surfaces stay clean |
 | `ref: ${{ github.ref }}` checkout bypassed the snapshot redirect | gin checks out with a template `ref`; the job fetched `master` from github.com with the engine's local token → 401 → git interactive credential prompt → checkout failed ("could not read Username … terminal prompts disabled") | ✅ fixed — the redirect also applies to `ref: ${{ github.ref }}` when the run's ref provably targets the snapshot (`refs/heads/<default branch>`); other template refs stay conservative |
 | **The runner executes as root; GitHub runs steps as uid 1001** | gin's `TestSaveUploadedFileWithPermissionFailed` expects EACCES writing into a read-only dir; as root the write succeeds → "An error is expected but got nil" | ⚠️ documented, not fixed — see 1b.4 |
+| **The CLI could not submit workflows with path filters** | black's `test.yml` filters `on: push.paths`; the server must reject a submission without a complete changed-file list (it cannot know whether the filter should skip the run), and the CLI had no way to provide one → `400 workflow path filters require a complete changed-file list` before any job ran | ✅ fixed — the CLI computes the local push delta (`git diff --name-only HEAD^ HEAD`; every tracked file counts as new for an initial commit, mirroring GitHub's null-SHA initial-push base) and sends it as the changed-file list |
+| **amd64-only images can't run inside docker containers in the VM** | black's coveralls step docker-builds `thekevjames/coveralls:4.0.0` (amd64-only) on the arm64 VM: `rosetta-wrapper: unexpected initial stop: 32512` — the translator works (static x86_64 binaries run translated), but `/mnt/rosetta` is not mounted into container namespaces, so the wrapper's path lookup fails | ⚠️ documented, not fixed — the fix is a default-runtime shim injecting the mount, see 1b.6 |
+
+### 1b.6 Rosetta/amd64 container execution in the VM (2026-08-06)
+
+**Symptom.** Workflows that build or run amd64-only container images hit
+`rosetta-wrapper: unexpected initial stop: 32512` on the arm64 pool. First
+seen in the black replay: the coveralls step docker-builds an image whose base
+`thekevjames/coveralls:4.0.0` has no arm64 manifest, so buildx pulls the amd64
+variant and the `RUN` step dies. A trivial `docker run --platform linux/amd64
+alpine uname -m` reproduces it.
+
+**How smolvm's Rosetta works** (from source + live probes). smolvm's
+`--rosetta` (passed by the orchestrator, `rosetta: true`) attaches the
+translator via virtiofs at `/mnt/rosetta/{rosetta,rosettad}` and sets a guest
+env sentinel; the guest agent then registers a binfmt_misc handler for x86_64
+ELF whose interpreter is a **ptrace wrapper** (`/usr/bin/rosetta-wrapper`,
+shipped in the agent rootfs, registered with the `F` flag so the fd survives
+into other mount namespaces). The wrapper's job: the translator refuses to run
+outside Apple's Virtualization.framework ("Rosetta is only intended to run on
+Apple Silicon with a macOS host using Virtualization.framework with Rosetta
+mode enabled") — which is a **validation ioctl**, not a real requirement —
+and the wrapper intercepts that ioctl via ptrace, returns the expected magic,
+then detaches for full-speed translation. This is required because smolvm
+runs on libkrun (Hypervisor.framework), which has no Virtualization.framework
+Rosetta mode; Docker Desktop works out of the box because it *is* a
+Virtualization.framework VM with Rosetta mode enabled.
+
+**Evidence chain** (each result was reproduced live):
+
+| Probe | Result | Conclusion |
+| --- | --- | --- |
+| `docker run --platform amd64 alpine` in engine VM | `rosetta-wrapper: unexpected initial stop: 32512` | container path broken |
+| `/mnt/rosetta/rosetta` exec'd directly | refuses (Virtualization.framework message), SIGTRAP 133 | *expected* — the refusal is the validation the wrapper spoofs; not evidence the feature is dead |
+| static x86_64 busybox exec'd in guest rootfs | `uname -m` → `x86_64`, rc=0 | **binfmt → wrapper → translator chain works** |
+| same busybox in fresh 1.6.13 machine | translator runs, only fails on missing amd64 loader (`/lib64/ld-linux-x86-64.so.2`) | works on 1.6.13 too — **not a version regression** |
+| `docker run --platform amd64 -v /mnt/rosetta:/mnt/rosetta:ro alpine` | `x86_64`, rc=0 | the only broken link is the mount visibility in docker containers |
+
+So Rosetta translation itself is fully functional in the engine's VMs; the
+diagnostic trap is that the direct-translator refusal and the container
+failure look like the same "emulation unavailable" root cause, when in fact
+both are *designed* behaviors of layers around a working core.
+
+**Container runtime topology** (verified in the engine VM and fresh machines):
+
+- smolvm provides **no docker at all**: a fresh machine has `docker: not
+  found` and no dockerd. Its containers (machine workloads, `machine exec`)
+  run on its own crun-based OCI runtime, and the agent injects the
+  `/mnt/rosetta` bind mount into every spec it builds
+  (`rosetta::inject_into_container`, with tests) — confirmed live: the mount
+  is visible inside `machine exec` containers. That path is complete
+  end-to-end; this is why "it used to work" — anything smolvm's own runtime
+  launched never had this problem.
+- Docker exists in the engine VMs **only because the engine installs
+  docker-ce** (`base_install_script`) and runs dockerd in the guest rootfs
+  (the runner runs alongside it as a plain process, not in a container). The
+  runner's container work — `container:` jobs, `services:`, and workflow
+  `docker` steps — shells out to the docker CLI against that dockerd
+  (`container_ops.rs`, mirroring the official runner's `container_ops.ts`).
+  Those containers are created by dockerd's own containerd/runc, which
+  smolvm's agent never sees, so no injection happens — the sole uncovered
+  path, and the only one that fails.
+- smolvm's "docker socket bridge" is a host→guest socket forwarder for users
+  who install dockerd themselves — not a docker implementation.
+
+**What the fix is.** dockerd has no "default mounts" option, and binfmt
+handlers are kernel-global (fine); the only broken link is that the wrapper
+execs `/mnt/rosetta/rosetta` by path inside the container's mount namespace,
+where the runtime is not mounted → ENOENT → 32512. The faithful engine fix is
+a **default-runtime shim** in the guest:
+
+1. `preloop-rosetta-runtime` — a small Rust bin (arm64, existing zigbuild
+   toolchain, unit-testable spec injection): read the OCI spec dockerd passes
+   (runc-style `--bundle <dir> run <id>`); if `mounts` lacks `/mnt/rosetta`,
+   append `{type: bind, source: /mnt/rosetta, destination: /mnt/rosetta,
+   options: [rbind, ro, nosuid, nodev]}`; `exec runc` with the same args.
+   Passthrough untouched when `/mnt/rosetta` is absent. Covers both `docker
+   run` and buildx `RUN` steps (docker-driver builds go through dockerd).
+2. Guest config: `/etc/docker/daemon.json` gains `"default-runtime":
+   "preloop-rosetta"` plus a `runtimes` entry. The binary itself lives on the
+   already-mounted `/opt/preloop/bin` (host `target/aarch64-unknown-linux-gnu/
+   debug`), so no image changes — but the golden needs re-provisioning since
+   daemon.json is baked at install time.
+3. Verify: `docker run --platform linux/amd64 alpine uname -m` → `x86_64`
+   with no explicit `-v`; rebuild the coveralls image (black's cell); then
+   `just test-ci` + black replay.
+
+**Status.** ⚠️ documented, not fixed — tracked as a follow-up (the faithful
+fix is the default-runtime shim above; a qemu-user fallback is slower and has
+the same namespace-visibility problem, needing image patching like Docker
+Desktop's). The campaign continues with the limitation documented: black's
+tox suites all pass; only the coveralls docker-build step diverges (see
+`docs/conformance/black.md`).
 
 ---
 

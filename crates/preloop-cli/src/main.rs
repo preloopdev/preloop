@@ -1291,6 +1291,7 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         }
     }
 
+    let changed_paths = collect_changed_paths();
     let submission = WorkflowSubmission {
         workflow_yaml,
         event: event.to_owned(),
@@ -1303,6 +1304,14 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         reusable_workflows,
         selected_jobs: args.job.into_iter().collect(),
         base_ref: args.base,
+        // Path-filter parity: GitHub evaluates `paths:` / `paths-ignore:`
+        // against the files the push touched. The local submission's push
+        // is the last commit, so the delta is `HEAD^..HEAD` (every tracked
+        // file counts as new for an initial commit — the engine's null-SHA
+        // base). Without a complete list the server must reject
+        // path-filtered workflows: it cannot know whether they should run.
+        changed_paths_known: changed_paths.is_some(),
+        changed_paths: changed_paths.unwrap_or_default(),
         // On by default where it can be acted on: a paused job blocks until a
         // controller answers, so pausing a piped or detached run would hang
         // something with no way to respond. `--preserve-on-failure` is the
@@ -1664,6 +1673,43 @@ fn detect_git_ref() -> String {
     }
 
     "refs/heads/main".to_owned()
+}
+
+/// The files the local push touched, for workflow path filters.
+///
+/// The engine's synthetic push is measured against `HEAD^` when the tree is
+/// clean, so the last commit IS the pushed delta. An initial commit has no
+/// parent — GitHub's null-SHA "initial push" base — in which case every
+/// tracked file counts as new. Best-effort: when git cannot answer, the
+/// submission keeps the list unknown and the server rejects path-filtered
+/// workflows with a clear error.
+fn collect_changed_paths() -> Option<Vec<String>> {
+    let initial_commit = !std::process::Command::new("git")
+        .args(["rev-parse", "--verify", "-q", "HEAD^"])
+        .output()
+        .ok()?
+        .status
+        .success();
+    let output = if initial_commit {
+        std::process::Command::new("git")
+            .args(["ls-files"])
+            .output()
+            .ok()?
+    } else {
+        std::process::Command::new("git")
+            .args(["diff", "--name-only", "HEAD^", "HEAD"])
+            .output()
+            .ok()?
+    };
+    if !output.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect(),
+    )
 }
 
 async fn cmd_plan(args: PlanArgs) -> anyhow::Result<()> {
