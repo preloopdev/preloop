@@ -1,0 +1,6 @@
+on: push
+jobs:
+  e2e:
+    runs-on: self-hosted
+    steps:
+      - run: echo "sync-e2e-ok"
