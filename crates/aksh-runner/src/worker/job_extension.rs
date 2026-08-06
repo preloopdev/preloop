@@ -78,6 +78,23 @@ pub fn setup_workspace(job_message: &serde_json::Value) -> anyhow::Result<String
         std::fs::create_dir_all(&tool_dir)?;
     }
 
+    // GitHub-hosted parity: the step environment advertises
+    // XDG_RUNTIME_DIR=/run/user/<uid> and hosted runners boot with that
+    // directory present (systemd session). Step processes that resolve the
+    // runtime directory (dirs-crate consumers) observe the same contract.
+    #[cfg(target_os = "linux")]
+    {
+        let runtime_dir = std::path::Path::new("/run/user/0");
+        if !runtime_dir.exists() {
+            std::fs::create_dir_all(runtime_dir)?;
+            #[allow(clippy::permissions_set_readonly_false)]
+            let _ = std::fs::set_permissions(
+                runtime_dir,
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
+            );
+        }
+    }
+
     Ok(work_path.to_string_lossy().into_owned())
 }
 

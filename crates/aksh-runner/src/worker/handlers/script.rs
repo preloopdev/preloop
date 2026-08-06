@@ -179,6 +179,8 @@ pub async fn run_script_in_container(
         }
     }
     env.insert("HOME".to_string(), "/github/home".to_string());
+    // XDG_RUNTIME_DIR is supplied by build_env for every step surface; the
+    // container path must not inherit the host's value here.
 
     let container_args_ref: Vec<&str> = container_args.iter().map(|s| s.as_str()).collect();
     let shell_desc = if let Some(custom) = container_shell {

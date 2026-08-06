@@ -402,6 +402,21 @@ impl<'a> StepContext<'a> {
             // way.
             ensure_path(&mut env, std::env::var("PATH").ok().as_deref());
         }
+        // GitHub-hosted parity: hosted runners run steps as a dedicated user
+        // in a systemd session, so USER/LOGNAME (the runner account) and
+        // XDG_RUNTIME_DIR (to /run/user/<uid>, existing) are present in the
+        // step environment. Our VMs run as root without a session manager;
+        // without the same contract, workflows and test suites that consult
+        // them (e.g. just's `env_var('USER')` and `runtime_directory()`
+        // tests) diverge from ubuntu-latest behavior. Host surfaces only —
+        // containers have neither the runtime dir nor the host user on
+        // hosted images either.
+        if !for_container {
+            env.insert("USER".to_string(), "root".to_string());
+            env.insert("LOGNAME".to_string(), "root".to_string());
+            env.entry("XDG_RUNTIME_DIR".to_string())
+                .or_insert_with(|| "/run/user/0".to_string());
+        }
         // Post action steps receive state saved by their paired main step via
         // GITHUB_STATE. A post step is named `__post_<main-step-id>`.
         let state_step_id = self
@@ -567,6 +582,65 @@ mod tests {
         if let Ok(worker_path) = std::env::var("PATH") {
             assert_eq!(path, &worker_path);
         }
+    }
+
+    /// Host surfaces receive the hosted-runner runtime-directory contract
+    /// (`/run/user/0` on our root VMs), so tools like just's
+    /// `runtime_directory()` behave as on ubuntu-latest.
+    #[test]
+    fn host_env_has_runtime_dir_contract() {
+        let mut job = make_job();
+        let ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+
+        let env = ctx.build_env();
+        assert_eq!(
+            env.get("XDG_RUNTIME_DIR").map(String::as_str),
+            Some("/run/user/0")
+        );
+    }
+
+    /// Host surfaces carry the hosted-runner user identity (the runner
+    /// account), which workflows and suites read via `env_var('USER')`.
+    #[test]
+    fn host_env_has_user_contract() {
+        let mut job = make_job();
+        let ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+
+        let env = ctx.build_env();
+        assert_eq!(env.get("USER").map(String::as_str), Some("root"));
+        assert_eq!(env.get("LOGNAME").map(String::as_str), Some("root"));
+    }
+
+    /// An explicit job/step XDG_RUNTIME_DIR is user intent and must win over
+    /// the host contract default.
+    #[test]
+    fn host_env_keeps_explicit_runtime_dir() {
+        let mut job = make_job();
+        job.env
+            .insert("XDG_RUNTIME_DIR".into(), "/custom/runtime".into());
+        let ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+
+        let env = ctx.build_env();
+        assert_eq!(
+            env.get("XDG_RUNTIME_DIR").map(String::as_str),
+            Some("/custom/runtime")
+        );
+    }
+
+    /// Container surfaces must not receive the host runtime dir: hosted
+    /// container steps do not get the machine's XDG_RUNTIME_DIR.
+    #[test]
+    fn container_env_does_not_leak_host_runtime_dir() {
+        let mut job = make_job();
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        ctx.translate_container_path = true;
+
+        let env = ctx.build_env();
+        assert!(
+            !env.contains_key("XDG_RUNTIME_DIR"),
+            "container env must not carry the host runtime dir, got {:?}",
+            env.get("XDG_RUNTIME_DIR")
+        );
     }
 
     /// A container environment must NOT receive the host PATH fallback: the
